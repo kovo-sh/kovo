@@ -92,8 +92,12 @@ jobs:
             }
             const next = pkg.version.split('.').map(BigInt);
             for (const version of Object.keys(body.versions)) {
-              const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
-              if (!match) throw new Error('Malformed registry version');
+              const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(version);
+              if (!match || [match[4], match[5]].some(suffix =>
+                  suffix && suffix.split('.').some(part => !/^[0-9A-Za-z-]+$/.test(part))) ||
+                  match[4]?.split('.').some(part => /^0\d+$/.test(part))) {
+                throw new Error('Malformed registry version');
+              }
               const previous = match.slice(1, 4).map(BigInt);
               const different = next.findIndex((part, i) => part !== previous[i]);
               if (different === -1 ? !match[4] : next[different] < previous[different]) {
