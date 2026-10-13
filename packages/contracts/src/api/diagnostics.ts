@@ -1,0 +1,93 @@
+import { z } from "zod";
+import {
+  diagnosticTimelineRequestSchema,
+  diagnosticTimelineResponseSchema,
+  diagnosticGrantRequestSchema,
+  diagnosticGrantSchema,
+  diagnosticQueryNameSchema,
+  diagnosticQueryRequestSchema,
+  diagnosticQueryResponseSchema,
+} from "../diagnostics.js";
+import { utcDateTimeSchema } from "../time.js";
+import { defineEndpoint } from "./endpoint.js";
+import { reproBundleRequestSchema } from "../repro-bundle.js";
+const authorization = {
+  spec: `Owner-approved D9 (2026-10-03): human operators and Kovo coding agents may request a
+metadata-only diagnostic grant for one account and optionally one repository, with a
+20–1000-character justification and a duration of at most two hours.`,
+  actors: ["operator"],
+  tenant: "none",
+} as const;
+export const DIAGNOSTIC_ENDPOINTS = {
+  reproBundle: defineEndpoint({
+    operationId: "reproBundle",
+    auditStorage: "diagnostic_query_audit",
+    area: "operator",
+    method: "GET",
+    path: "/v1/operator/repos/{repo}/repro-bundle",
+    summary: "Stream a metadata-only repro bundle after its live scoped grant audit commits.",
+    source: { kind: "spec_implied", section: "Security model and data retention" },
+    params: z.strictObject({ repo: z.uuid() }),
+    query: reproBundleRequestSchema.omit({ repo_id: true }),
+    body: null,
+    responses: { 200: z.instanceof(ReadableStream<Uint8Array>) },
+    authorization,
+  }),
+  diagnosticTimeline: defineEndpoint({
+    operationId: "diagnosticTimeline",
+    paginated: true,
+    auditStorage: "diagnostic_query_audit",
+    area: "operator",
+    method: "GET",
+    path: "/v1/operator/repos/{repo}/timeline",
+    summary: "Read an audited metadata timeline under a live diagnostic grant.",
+    source: { kind: "spec_implied", section: "Security model and data retention" },
+    params: z.strictObject({ repo: z.uuid() }),
+    query: diagnosticTimelineRequestSchema,
+    body: null,
+    responses: { 200: diagnosticTimelineResponseSchema },
+    authorization,
+  }),
+  createDiagnosticGrant: defineEndpoint({
+    operationId: "createDiagnosticGrant",
+    auditStorage: "diagnostic_grants",
+    area: "operator",
+    method: "POST",
+    path: "/v1/operator/diagnostic-grants",
+    summary: "Request a scoped metadata diagnostic grant for at most two hours.",
+    source: { kind: "spec_implied", section: "Security model and data retention" },
+    params: null,
+    query: null,
+    body: diagnosticGrantRequestSchema,
+    responses: { 201: diagnosticGrantSchema },
+    authorization,
+  }),
+  revokeDiagnosticGrant: defineEndpoint({
+    operationId: "revokeDiagnosticGrant",
+    auditStorage: "diagnostic_grants",
+    area: "operator",
+    method: "POST",
+    path: "/v1/operator/diagnostic-grants/{grant}/revoke",
+    summary: "Revoke an owned diagnostic grant; the immutable grant records the revocation.",
+    source: { kind: "spec_implied", section: "Security model and data retention" },
+    params: z.strictObject({ grant: z.uuid() }),
+    query: null,
+    body: z.strictObject({}),
+    responses: { 200: z.strictObject({ id: z.uuid(), revoked_at: utcDateTimeSchema }) },
+    authorization,
+  }),
+  queryDiagnostics: defineEndpoint({
+    operationId: "queryDiagnostics",
+    auditStorage: "diagnostic_query_audit",
+    area: "operator",
+    method: "POST",
+    path: "/v1/operator/diagnostics/{query}",
+    summary: "Run one vetted metadata query under a scoped diagnostic grant.",
+    source: { kind: "spec_implied", section: "Security model and data retention" },
+    params: z.strictObject({ query: diagnosticQueryNameSchema }),
+    query: null,
+    body: diagnosticQueryRequestSchema,
+    responses: { 200: diagnosticQueryResponseSchema },
+    authorization,
+  }),
+} as const;
