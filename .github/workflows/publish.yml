@@ -110,6 +110,8 @@ jobs:
           umask 077
           auth_file=$(mktemp)
           trap 'rm -f "$auth_file"' EXIT
+          # npm expands this placeholder; keep the credential out of the file.
+          # shellcheck disable=SC2016
           printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$auth_file"
           NPM_CONFIG_USERCONFIG="$auth_file" npm publish --provenance --access public
       - name: Publish with OIDC provenance
