@@ -7,9 +7,12 @@ source; source syncs leave this document and `.github/workflows` intact.
 The Publish workflow runs only through `workflow_dispatch` on `main`, using the
 `npm-publish` environment. The environment permits `main`, so publishing does
 not run on a version-tag push. The package version must be a stable `X.Y.Z`
-version. A release builds `dist/kovo.js`, verifies `dist/kovo.js.sha256`, runs
-`node dist/kovo.js --version`, and publishes with npm provenance and public
-access. The package must retain `"license": "SEE LICENSE IN LICENSE"` and zero
+version. An unprivileged build job builds `dist/kovo.js`, verifies `dist/kovo.js.sha256`, runs
+`node dist/kovo.js --version`, and packs a tarball with lifecycle scripts disabled.
+The `npm-publish` job downloads that tarball, verifies its SHA-256 against the
+build output, revalidates its package metadata, and publishes that exact file
+with npm provenance and public access. It installs and builds no package
+dependencies. The tarball artifact is retained for one day. The package must retain `"license": "SEE LICENSE IN LICENSE"` and zero
 runtime dependencies.
 
 The owner and release operator perform these steps after review and merge:
@@ -25,7 +28,7 @@ The owner and release operator perform these steps after review and merge:
 4. For subsequent versions, dispatch Publish from `main` with
    `bootstrap: false`. This uses OIDC only and requires a version newer than
    every published version. A registry error refuses publication.
-5. After confirming successful publication, create the matching `vX.Y.Z` tag
+5. Tag after publish: only after npm shows the intended version, create the matching `vX.Y.Z` tag
    on the workflow's published commit. Tags are release records and do not
    trigger publishing. An existing matching tag must identify that same commit;
    do not move a tag.
