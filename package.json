@@ -1,0 +1,33 @@
+{
+  "name": "@kovo-security/cli",
+  "version": "0.1.0",
+  "description": "Kovo's command-line client: `kovo deps check` judges a lockfile diff's changed and new dependency versions.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kovo-sh/kovo-cli.git"
+  },
+  "bin": {
+    "kovo": "dist/kovo.js"
+  },
+  "files": [
+    "dist/kovo.js",
+    "dist/kovo.js.sha256",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "semver": "7.8.5",
+    "yaml": "2.9.1",
+    "zod": "4.6.5"
+  }
+}
