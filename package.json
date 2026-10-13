@@ -6,7 +6,7 @@
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kovo-sh/kovo-cli.git"
+    "url": "git+https://github.com/kovo-sh/kovo.git"
   },
   "bin": {
     "kovo": "dist/kovo.js"
