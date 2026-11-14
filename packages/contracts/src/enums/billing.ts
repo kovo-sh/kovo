@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+import { writerPinned } from "../compatibility.js";
+import { persistedReader } from "../tolerant-reader.js";
+
 // Billing, usage and spend (SPEC "Plans, billing, and usage", data model billing tables).
 
 /** Stripe subscription statuses (`subscriptions.status`, stripe 22.6.2 `Subscription.Status`). */
@@ -92,8 +95,16 @@ export const usageUnitSchema = z.enum(USAGE_UNITS);
 export type UsageUnit = z.infer<typeof usageUnitSchema>;
 
 /** `usage_ledger.provider`: who reported the charge. */
-export const USAGE_PROVIDERS = ["openrouter", "daytona"] as const;
-export const usageProviderSchema = z.enum(USAGE_PROVIDERS);
+export const USAGE_PROVIDERS = ["openrouter", "daytona", "gce"] as const;
+/**
+ * Reader first (plans/gce-sandbox-provider.md §8, R1): this release reads `gce` charges but never
+ * writes one; the writer slices drop this pin once a reader release is promoted.
+ */
+export const USAGE_PROVIDER_WRITES = ["openrouter", "daytona"] as const;
+export const usageProviderSchema = writerPinned(
+  z.enum(USAGE_PROVIDERS),
+  z.enum(USAGE_PROVIDER_WRITES),
+);
 export type UsageProvider = z.infer<typeof usageProviderSchema>;
 
 /**
@@ -109,10 +120,101 @@ export const USAGE_KIND_REPORTING = {
   { readonly provider: UsageProvider; readonly unit: UsageUnit }
 >;
 
+/**
+ * Every provider that may report each usage kind (the `usage_ledger` and
+ * `pending_provider_charges` CHECKs `provider_matches_kind`): sandbox runs on Daytona or GCE
+ * (plans/gce-sandbox-provider.md). {@link USAGE_KIND_REPORTING} names the provider this release
+ * books.
+ */
+export const USAGE_KIND_PROVIDERS = {
+  model: ["openrouter"],
+  sandbox: ["daytona", "gce"],
+} as const satisfies Record<UsageKind, readonly UsageProvider[]>;
+
 /** `overage_invoice_items.status` (idempotent Stripe invoice items, reconciled by listing). */
 export const OVERAGE_ITEM_STATUSES = ["pending", "uncertain", "created", "failed"] as const;
 export const overageItemStatusSchema = z.enum(OVERAGE_ITEM_STATUSES);
 export type OverageItemStatus = z.infer<typeof overageItemStatusSchema>;
+
+/**
+ * `subscriptions.billing_mode` (plans/stripe-managed-payments.md §6.1): how Stripe bills the
+ * subscription. `direct` is Kovo as merchant of record with standalone overage invoices;
+ * `managed` is a Stripe Managed Payments subscription whose overage is reported to a meter. The
+ * column is nullable and null means `direct` (every row written before Managed Payments). Not
+ * Stripe's own `Subscription.billing_mode` (`classic`/`flexible`).
+ */
+export const BILLING_MODES = ["direct", "managed"] as const;
+// Persisted readers (tolerant-reader.ts): an unknown stored value refuses with the sanitized
+// `persisted_enum_unknown` reason instead of joining the closed-enum read baseline.
+export const billingModeSchema = persistedReader(z.enum(BILLING_MODES));
+export type BillingMode = z.infer<typeof billingModeSchema>;
+
+/**
+ * `managed_payments_gate_checks.check` (plans/stripe-managed-payments.md §6.5 "Migration", Phase 5):
+ * the worker's checks whose latest results open the Managed Payments Checkout gate. Part 1 of the
+ * payment-method health check (Managed Payments mode is configured; no Stripe read), the overage
+ * price check, and the live Checkout probe run in
+ * Managed Payments mode (which also proves Managed Payments is active and every billed product has
+ * a tax code).
+ */
+export const MANAGED_PAYMENTS_GATE_CHECKS = [
+  "payment_method_health",
+  "overage_price",
+  "managed_checkout_probe",
+] as const;
+export const managedPaymentsGateCheckSchema = persistedReader(z.enum(MANAGED_PAYMENTS_GATE_CHECKS));
+export type ManagedPaymentsGateCheck = z.infer<typeof managedPaymentsGateCheckSchema>;
+
+/**
+ * Why the Managed Payments Checkout gate is closed: the first unmet condition, in the gate's order
+ * (`@kovo/core/billing` managed-payments-gate.ts, whose `${check}_missing|failed|stale` reasons
+ * typecheck against this list). Logged as the `managed_payments_gate` line's `reason_code`. The
+ * log reader (`scripts/ops/prod-logs`) evaluates this declaration, so it stays a plain `as const`
+ * list (no `satisfies` clause, which that reader does not parse).
+ */
+export const MANAGED_PAYMENTS_GATE_REASONS = [
+  "kill_switch_off",
+  "overage_price_unconfigured",
+  "payment_method_health_missing",
+  "payment_method_health_failed",
+  "payment_method_health_stale",
+  "overage_price_missing",
+  "overage_price_failed",
+  "overage_price_stale",
+  "managed_checkout_probe_missing",
+  "managed_checkout_probe_failed",
+  "managed_checkout_probe_stale",
+] as const;
+export type ManagedPaymentsGateReason = (typeof MANAGED_PAYMENTS_GATE_REASONS)[number];
+
+/**
+ * `overage_usage_reports.status` (plans/stripe-managed-payments.md §3.1, the metered-overage
+ * outbox): `pending` until delivered, `uncertain` while a Stripe call's outcome is ambiguous (it
+ * is reconciled against the meter's event summaries before any re-send), `reported` once Stripe
+ * accepted the meter event, `failed` on a permanent refusal (an operator billing exception), and
+ * `written_off` when Kovo funds the delta instead of reporting it (with a write-off reason).
+ */
+export const OVERAGE_USAGE_REPORT_STATUSES = [
+  "pending",
+  "uncertain",
+  "reported",
+  "failed",
+  "written_off",
+] as const;
+export const overageUsageReportStatusSchema = persistedReader(
+  z.enum(OVERAGE_USAGE_REPORT_STATUSES),
+);
+export type OverageUsageReportStatus = z.infer<typeof overageUsageReportStatusSchema>;
+
+/**
+ * `overage_usage_reports.write_off_reason`: why a metered overage delta was Kovo-funded instead of
+ * billed. `overage_residual_after_final_invoice`: a charge settled after the subscription's final
+ * invoice and no later renewal will carry it (canceled, downgraded, deactivated or deleted
+ * customer; plans/stripe-managed-payments.md §3.1 "Late usage").
+ */
+export const OVERAGE_WRITE_OFF_REASONS = ["overage_residual_after_final_invoice"] as const;
+export const overageWriteOffReasonSchema = persistedReader(z.enum(OVERAGE_WRITE_OFF_REASONS));
+export type OverageWriteOffReason = z.infer<typeof overageWriteOffReasonSchema>;
 
 /**
  * `billing_adjustments.reason`: what added to a cycle's included-cost allowance. "1× the account's

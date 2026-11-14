@@ -3,8 +3,8 @@ import semver from "semver";
 
 import { pointerOf } from "../../manifest/json-pointer.js";
 import type { ManifestDependency, PackageManifest } from "../../manifest/package-json.js";
-import type { LockfileName } from "../parse.js";
-import { LOCKFILE_NAMES } from "../parse.js";
+import type { StoredLockfileName } from "../parse.js";
+import { STORED_LOCKFILE_NAMES } from "../parse.js";
 import {
   indexPackages,
   type DependencyEdge,
@@ -70,7 +70,7 @@ export class LadderContext {
   readonly input: LadderInput;
   readonly graph: DependencyGraph;
   readonly registry: RegistryIndex;
-  readonly lockfileName: LockfileName;
+  readonly lockfileName: StoredLockfileName;
   readonly nodes: ReadonlyMap<PackageKey, ResolvedPackageNode>;
   /** Safe versions, ascending. */
   readonly safe: readonly PackageVersion[];
@@ -82,7 +82,7 @@ export class LadderContext {
     this.input = input;
     this.graph = input.graph;
     this.registry = new RegistryIndex(input.registry);
-    this.lockfileName = LOCKFILE_NAMES[input.graph.packageManager];
+    this.lockfileName = STORED_LOCKFILE_NAMES[input.graph.packageManager];
     this.nodes = indexPackages(input.graph);
     this.safe = [...new Set(input.target.safeVersions)]
       .filter((version) => !input.target.affectedVersions.includes(version))

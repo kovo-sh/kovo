@@ -1,4 +1,5 @@
-import { packageVersionSchema, type PackageName, type PackageVersion } from "@kovo/contracts";
+import { packageVersionSchema } from "@kovo/contracts/npm";
+import type { PackageName, PackageVersion } from "@kovo/contracts";
 import semver from "semver";
 
 import { isCompatibleUpgrade } from "../semver-change.js";
@@ -105,8 +106,7 @@ function chooseAncestorVersion(
   // Other packages depending on the ancestor keep their own (old) copy unless their ranges admit
   // the new version; pnpm never re-points them on `add`.
   const dependents = ctx.parents(ancestor.key);
-  if (dependents.length > 0 && (ctx.pm === "pnpm" || ctx.pm === "yarn"))
-    return { ok: false, reason: "shared_ancestor" };
+  if (dependents.length > 0 && ctx.pm !== "npm") return { ok: false, reason: "shared_ancestor" };
   const ranges = ctx.knownRanges(dependents);
   if (ranges === null) return { ok: false, reason: "range_unknown" };
   const pkg = ctx.registry.package(ancestor.name);

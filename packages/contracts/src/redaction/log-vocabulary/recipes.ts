@@ -1,0 +1,40 @@
+// Closed log vocabulary: apps/control-plane/src/services/recipes.
+// Changes require review; never derive this from runtime values. One string literal per
+// line, sorted, no duplicates; each code lives in one area file (log-vocabulary.test.ts).
+export const LOG_EVENT_CODES = [
+  "fix_plus_agent_judged",
+  "fix_plus_agent_skipped",
+  "recipe_customer_tool_refused",
+  "recipe_discovery_read_transient",
+  "recipe_discovery_unexpected_failure",
+  "recipe_doctor_record_unavailable",
+  "recipe_gap_fill_skipped",
+  "recipe_gap_fill_smoke_missed",
+  "recipe_project_skipped",
+] as const;
+export const LOG_ENUM_CODES = [
+  "converge_ceiling_reached",
+  "converge_no_lockfile_key",
+  "converge_running",
+  "convergence_disabled",
+  "discovery_record_refused",
+  "discovery_unexpected_exception",
+  "plus_agent_accepted",
+  "plus_agent_ai_unavailable",
+  "plus_agent_already_attempted",
+  "plus_agent_ceiling_reached",
+  "plus_agent_no_ai_entitlement",
+  "plus_agent_no_diff",
+  "plus_agent_not_funded",
+  "plus_agent_relay_refused",
+  "plus_agent_result_too_large",
+  "plus_agent_runs_unavailable",
+  "plus_agent_sandbox_unavailable",
+  "recipe_test_count_stale",
+  "rediscover_reinventory_admitted",
+  "rediscover_reinventory_deadline",
+  "rediscover_reinventory_identity_stale",
+  "rediscover_reinventory_refused",
+  "retry_base_unavailable",
+  "root_nested_project",
+] as const;

@@ -41,6 +41,7 @@ export {
   type ReconcileInput,
   type ReconcileResult,
 } from "./findings.js";
+export { firstUnaffectedVersion } from "./fixed-version.js";
 export {
   introducedSevere,
   isIntroducedSevere,
@@ -113,6 +114,7 @@ export {
   type VersionBounds,
 } from "./published.js";
 export { reviewedRemovalFeasible } from "./removal.js";
+export { targetedFindingsCleared } from "./targeted.js";
 export {
   resolveTarget,
   type CandidateCounts,

@@ -3,7 +3,7 @@ import {
   type DependencyVerdictChangeWire,
   type UnsupportedRepoReason,
 } from "@kovo/contracts";
-import { dependencySourceOf } from "@kovo/core/dependency-verdicts";
+import { dependencySourceOfNode } from "@kovo/core/dependency-verdicts";
 import {
   aggregateWorkspaceGraph,
   classifyVersionChange,
@@ -17,7 +17,7 @@ import {
   type ResolvedPackageNode,
   type WorkspaceInput,
 } from "@kovo/core/lockfile";
-import { parsePackageJson } from "@kovo/core/manifest";
+import { OPAQUE_KIND_REASON, parsePackageJson } from "@kovo/core/manifest";
 
 // The change list `kovo deps check` sends (plans/dependency-firewall.md Part 2 "Distribution for any
 // CI"): the changed and new versions between a base and a head lockfile, as
@@ -116,7 +116,19 @@ export function snapshotGraph(fileName: LockfileName, snapshot: ProjectSnapshot)
     text: snapshot.lockfile,
     ...(manifest === undefined ? {} : { manifest }),
   });
-  if (parsed.ok) return { ok: true, graph: parsed.graph };
+  if (parsed.ok) {
+    // Opaque nodes (owner D-726: git, remote tarball and local path sources) sit outside the
+    // graph's packages, and this change list carries registry versions only. The CLI still
+    // refuses such a lockfile rather than judge it clean without them.
+    const opaque = parsed.graph.opaque?.nodes ?? [];
+    if (opaque.length > 0)
+      return refused(
+        "non_registry_dependency",
+        opaque.map((node) => OPAQUE_KIND_REASON[node.kind]),
+        opaque.map((node) => node.name),
+      );
+    return { ok: true, graph: parsed.graph };
+  }
   if (parsed.unsupported === "workspaces") return workspaceGraph(fileName, snapshot);
   return refused(
     parsed.unsupported,
@@ -169,7 +181,7 @@ function wireChange(
     kind: previousVersion === null ? "new" : "changed",
     direct: node.isDirect,
     previous_version: previousVersion,
-    source: dependencySourceOf(node.resolved, node.name, node.version),
+    source: dependencySourceOfNode(node),
   });
   if (!parsed.success) throw new RangeError("a changed version does not fit the change schema");
   return parsed.data;

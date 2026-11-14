@@ -1,4 +1,5 @@
-import { advisoryIdSchema, type AdvisoryId } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import type { AdvisoryId } from "@kovo/contracts";
 import { z } from "zod";
 
 import { limitByteStream, readJsonLimited } from "../http/body.js";

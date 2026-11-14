@@ -77,6 +77,7 @@ const ALWAYS_SENSITIVE_TOKENS: ReadonlySet<string> = new Set(["blob", "blobs"]);
 
 /** Adjacent token pairs whose combination denotes content although each token alone does not. */
 const SENSITIVE_PAIRS: readonly (readonly [string, string])[] = [
+  ["waitlist", "code"],
   ["agent", "summary"],
   ["agent", "message"],
   ["model", "summary"],

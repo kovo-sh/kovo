@@ -10,6 +10,10 @@ export const INSTALL_BINARY_DISCLOSURE_HOSTS = [
   ...INSTALL_BINARY_HOSTS,
   "download.cypress.io",
   "cdn.cypress.io",
+  // D-729: GitHub release downloads (GET/HEAD through the read-only bridge) and their storage.
+  "github.com",
+  "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
 ] as const;
 
 export const EGRESS_MODES = ["strict", "trust_kovo", "review_new_hosts", "open"] as const;
@@ -21,6 +25,26 @@ export function readEgressMode(value: unknown): "strict" | "trust_kovo" | "open"
   return value === "trust_kovo" || value === "open" ? value : "strict";
 }
 export const writableEgressModeSchema = z.enum(["strict", "trust_kovo", "open"]);
+/**
+ * The modes a repository admin may choose (owner D-706 and D-710, source:
+ * https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6725387341 and
+ * https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6725432185): Trust Kovo, the
+ * default, and Open. Strict and Review new hosts are retired; a request for either is refused with
+ * the stable `egress_mode_retired` reason. `strict` stays only as the internal fail-closed
+ * authority for unknown, unreadable or unapproved stored values (`readEgressMode`).
+ */
+export const SELECTABLE_EGRESS_MODES = ["trust_kovo", "open"] as const;
+export const EGRESS_MODE_RETIRED_MESSAGE =
+  "egress_mode_retired: Strict and Review new hosts are no longer offered. Choose trust_kovo or open.";
+export const selectableEgressModeSchema = z.enum(SELECTABLE_EGRESS_MODES, {
+  error: EGRESS_MODE_RETIRED_MESSAGE,
+});
+export type SelectableEgressMode = z.output<typeof selectableEgressModeSchema>;
+/**
+ * The dashboard notice for a repository that the D-706/D-710 migration moved off Strict or Review
+ * new hosts to Trust Kovo (`repo_egress_settings.mode_notice`). Cleared when an admin sets a mode.
+ */
+export const EGRESS_MODE_NOTICES = ["strict_retired"] as const;
 export const EGRESS_DECISION_BASES = [
   "vetted",
   "llm",
@@ -98,6 +122,8 @@ const disclosureShape = z.strictObject({
     .array(z.strictObject({ hostname: deniedEgressHostnameSchema, curated: z.boolean() }))
     .max(100),
   issue_notice: z.enum(["permission_missing", "delivery_failed"]).nullable(),
+  /** D-706/D-710: set while the repository shows the moved-to-Trust-Kovo notice. */
+  mode_notice: z.enum(EGRESS_MODE_NOTICES).nullable().exactOptional(),
   allowed_hosts: z.array(deniedEgressHostnameSchema).max(100),
   decisions: z
     .array(

@@ -45,12 +45,18 @@ export const RUNTIME_VARIABLES = {
     "set by Cloud Run in a job's containers: a local or test environment is refused where it is set (@kovo/config)",
   CLOUD_RUN_WORKER_POOL:
     "set by Cloud Run in a worker pool's containers: a local or test environment is refused where it is set (@kovo/config)",
+  K_REVISION:
+    "set by Cloud Run in a service's containers: the running revision, logged on the db_round_trip probe line (#8283)",
+  CLOUD_RUN_WORKER_POOL_REVISION:
+    "set by Cloud Run in a worker pool's containers: the running revision, logged on the db_round_trip probe line (#8283)",
   PORT: "the port the platform (or a dev script) tells the process to listen on",
   KOVO_VERSION: "the release the image was built as (its build argument; telemetry and Sentry)",
   KOVO_ENTRYPOINT:
     "the backend process kind the image's entrypoint runs (the instrument file names the telemetry service by it)",
   KOVO_RELEASE_RECORD_B64:
     "the release record one `release record` execution carries (the release tool's input, not configuration)",
+  DBOS_APPLICATION_VERSION:
+    "the worker's DBOS application version, the release ID its runtime spec sets (owner D-731); production refuses any other value (`dbos_version_not_release`)",
 } as const;
 
 /** The name of an environment variable a Kovo process reads. */

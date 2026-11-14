@@ -13,7 +13,7 @@ import {
 import { resourceVersionSchema } from "../http.js";
 import { apiKeyIdSchema, recipeVersionIdSchema, repoIdSchema } from "../ids.js";
 import { pageSchema, paginationQueryShape } from "../pagination.js";
-import { activationScopeShape } from "../policy.js";
+import { activationScopeShape, policyBodyWriterSchema } from "../policy.js";
 import {
   countSchema,
   egressHostSchema,
@@ -89,12 +89,20 @@ function checkRecipeVersionSummary(version: RecipeVersionSummaryValue, ctx: z.Re
       message: "exactly approved versions record how and when they were approved",
     });
   }
-  if (approved && version.calibration_status !== "calibrated") {
-    // "approves a specific calibrated version"; "Weak recipes cannot authorize autopilot".
+  if (
+    approved &&
+    version.calibration_status !== "calibrated" &&
+    !(
+      version.calibration_status === "limited" &&
+      (version.approved_via === "human" || version.approved_via === "management_key")
+    )
+  ) {
+    // "approves a specific calibrated version"; "Weak recipes cannot authorize autopilot". A
+    // `limited` version (owner D-627) is approved only explicitly, by a person or a Management key.
     ctx.addIssue({
       code: "custom",
       path: ["approval_status"],
-      message: "only calibrated versions are approved",
+      message: "only calibrated versions, or limited ones approved explicitly, are approved",
     });
   }
   if ((version.approved_via === "inherited") !== (version.approved_from_version_id !== null)) {
@@ -181,8 +189,12 @@ function refusalMatchesState(version: RecipeVersionSummaryValue): boolean {
   if (version.approval_status === "approved") return refusal === null;
   if (refusal === "superseded") return version.superseded_at !== null;
   if (version.superseded_at !== null) return false;
-  const status = refusal === null || refusal === "stale" ? "calibrated" : refusal;
-  return version.calibration_status === status;
+  // Owner D-689: nothing can be approved any more.
+  if (refusal === "approval_removed") return true;
+  if (refusal === null || refusal === "stale")
+    // A `limited` version (owner D-627) is approvable like a calibrated one.
+    return version.calibration_status === "calibrated" || version.calibration_status === "limited";
+  return version.calibration_status === refusal;
 }
 
 export const recipeVersionSummarySchema = z
@@ -206,11 +218,14 @@ export const recipeVersionDetailSchema = z
   .superRefine((version, ctx) => {
     checkRecipeVersionSummary(version, ctx);
     const calibration = version.calibration;
-    if ((version.calibration_status === "calibrating") !== (calibration === null)) {
+    // Owner D-674: a `ready` version was never calibrated, so it has no record.
+    const recorded =
+      version.calibration_status !== "calibrating" && version.calibration_status !== "ready";
+    if (recorded !== (calibration !== null)) {
       ctx.addIssue({
         code: "custom",
         path: ["calibration"],
-        message: "exactly finished calibrations have a record",
+        message: "exactly versions calibrated before the D-674 removal have a record",
       });
     }
     if (calibration !== null) {
@@ -272,6 +287,7 @@ export const activationDisclosureSchema = z.strictObject({
    * exists (`when_ready`).
    */
   ...activationScopeShape,
+  policy: policyBodyWriterSchema,
 });
 
 /** `GET /v1/repos/{repo}/recipe`: "Active recipe, calibration and deviations; version ETag". */
@@ -324,6 +340,8 @@ export const RECIPE_CHANGE_AREAS = [
   "steps",
   "smoke",
   "sabotageTargets",
+  // #8256 R3: the repository's own workflow jobs (agent decision, pending owner review #8753).
+  "workflow",
 ] as const;
 export const recipeChangeAreaSchema = z.enum(RECIPE_CHANGE_AREAS);
 
@@ -664,15 +682,16 @@ export const RECIPE_ENDPOINTS = {
     // calibrations per rolling day); spend never refuses it: a deterministic rediscovery is never
     // denied for budget, and an unfunded or capped Plus gap-fill is skipped, not refused
     // (docs/decisions/recipes.md "Rediscovery rate and cost limits"). `conflict`: the repository's
-    // first discovery has not run yet.
-    problems: ["repo_not_enabled", "rate_limited", "conflict"],
+    // first discovery has not run yet. `unsupported_repository`: refused as a workspace while the
+    // re-inventory kill switch is off (#2135); with it on, a fresh inventory round runs first.
+    problems: ["repo_not_enabled", "rate_limited", "conflict", "unsupported_repository"],
   }),
   approveRecipeVersion: defineEndpoint({
     operationId: "approveRecipeVersion",
     area: "recipes",
     method: "POST",
     path: "/v1/repos/{repo}/recipe/versions/{v}/approve",
-    summary: "Approve exactly this calibrated version; approval alone does not enable merging.",
+    summary: "Removed by owner D-689: recipe versions are no longer approved; always refuses.",
     source: { kind: "spec_row", path: "/v1/repos/{repo}/recipe/versions/{v}/approve" },
     // An approved version that replaces the active one becomes active in the same change.
     auditActions: ["recipe.approved", "recipe.activated"],

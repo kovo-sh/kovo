@@ -1,5 +1,6 @@
 import semver from "semver";
 
+import { OPAQUE_KIND_REASON } from "../../manifest/reasons.js";
 import { buildGraph } from "../build-graph.js";
 import type { Instance, InstanceEdge, InstanceSet, RootDependency } from "../instances.js";
 import { parseYarnLockfile } from "../yarn.js";
@@ -7,6 +8,7 @@ import { parseNpmLockfile } from "../npm.js";
 import { parsePnpmLockfile } from "../pnpm.js";
 import { GRAPH_LIMITS, packageKey, type LockfileLimits } from "../types.js";
 import type { LockfileInput } from "../parse.js";
+import type { RegistryIntegrityFill } from "../registry-source.js";
 import type { ResolvedRuntime } from "../compat.js";
 import { discoverWorkspaces } from "./discover.js";
 import { WorkspaceParserContext } from "./parser-context.js";
@@ -98,6 +100,11 @@ export function parseWorkspaceGraph(
   lockfile: LockfileInput,
   limits: WorkspaceLimits = WORKSPACE_LIMITS,
   graphLimits: LockfileLimits = GRAPH_LIMITS,
+  /**
+   * The public registry's integrity for npm entries of the registry-sourced shape (#7338), looked
+   * up by the caller; absent keeps today's `missing_integrity` refusal exactly.
+   */
+  registryIntegrity?: RegistryIntegrityFill,
 ): WorkspaceResult<WorkspaceGraph> {
   const discovered = discoverWorkspaces(input, limits);
   if (!discovered.ok) return discovered;
@@ -113,21 +120,42 @@ export function parseWorkspaceGraph(
     return workspaceFailure("manager_mismatch");
   const treeLock = input.entries.find((entry) => entry.path === lockfile.fileName);
   if (treeLock?.mode !== "file" || treeLock.text !== lockfile.text)
-    return workspaceFailure("invalid_lockfile");
+    return workspaceFailure("invalid_lockfile", "lockfile_not_in_tree");
   const context = new WorkspaceParserContext(layout);
+  const npmParsed =
+    layout.packageManager === "npm"
+      ? parseNpmLockfile(lockfile.text, graphLimits, context, registryIntegrity)
+      : undefined;
   const parsed =
     layout.packageManager === "yarn"
       ? parseYarnLockfile(lockfile.text, graphLimits, undefined, context)
-      : layout.packageManager === "npm"
-        ? parseNpmLockfile(lockfile.text, graphLimits, context)
-        : parsePnpmLockfile(lockfile.text, graphLimits, context);
-  if (!parsed.ok)
-    return workspaceFailure(
+      : (npmParsed ?? parsePnpmLockfile(lockfile.text, graphLimits, context));
+  if (!parsed.ok) {
+    // The first rejection's reason is a closed code, never lockfile content (D-267).
+    const first = parsed.rejections.rejections[0]?.reason;
+    const failure = workspaceFailure(
       parsed.rejections.rejections.some((rejection) => rejection.reason === "catalog_protocol")
         ? "catalogs_unsupported"
         : "invalid_lockfile",
+      first,
     );
+    const candidates =
+      npmParsed === undefined || npmParsed.ok ? undefined : npmParsed.registryIntegrityCandidates;
+    return candidates === undefined || failure.ok
+      ? failure
+      : { ...failure, registryIntegrityCandidates: candidates };
+  }
   const set = parsed.instances;
+  // Opaque nodes (owner D-726) are supported in single-project repositories only so far: the
+  // workspace projections, churn and ownership checks do not model them yet, so a workspace
+  // graph with one keeps today's refusal, with the source's own reason.
+  for (const instance of set.instances.values())
+    if (instance.opaque !== undefined)
+      return workspaceFailure("invalid_lockfile", OPAQUE_KIND_REASON[instance.opaque]);
+  // D-726 fix-only covers single-package roots only: a workspace keeps refusing a package locked
+  // at a private registry exactly as the parsers did before they kept such entries.
+  if ([...set.instances.values()].some((instance) => instance.privateRegistry === true))
+    return workspaceFailure("invalid_lockfile", "private_registry_dependency");
   const registry = new Map(
     [...set.instances].filter(([, instance]) => instance.localMember === undefined),
   );
@@ -138,14 +166,14 @@ export function parseWorkspaceGraph(
       const key = `${instance.name}@${instance.version}`;
       const previous = integrity.get(key);
       if (previous !== undefined && previous !== instance.integrity)
-        return workspaceFailure("invalid_lockfile");
+        return workspaceFailure("invalid_lockfile", "integrity_conflict");
       integrity.set(key, instance.integrity);
     }
     if (instance.resolved !== null) {
       const key = `${instance.name}@${instance.version}`;
       const previous = resolved.get(key);
       if (previous !== undefined && previous !== instance.resolved)
-        return workspaceFailure("invalid_lockfile");
+        return workspaceFailure("invalid_lockfile", "resolved_conflict");
       resolved.set(key, instance.resolved);
     }
   }

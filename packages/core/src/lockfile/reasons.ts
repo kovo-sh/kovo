@@ -30,6 +30,9 @@ export const LOCKFILE_REJECTION_REASONS = [
   "dangling_reference", // pnpm: a snapshot or importer names a package the lockfile lacks
   "too_many_packages",
   "too_many_dependencies", // more declared dependency edges than GRAPH_LIMITS allows
+  // #8256 R2: a Yarn 2/3 (or older Yarn 4) lockfile, or a Bun lockfile version, the pinned tool
+  // would rewrite whole.
+  "pm_version_unsupported",
 ] as const;
 export type LockfileRejectionReason = (typeof LOCKFILE_REJECTION_REASONS)[number];
 
@@ -52,6 +55,7 @@ const LOCKFILE_ONLY_UNSUPPORTED = {
   dangling_reference: "unsupported_lockfile_format",
   too_many_packages: "too_large",
   too_many_dependencies: "too_large",
+  pm_version_unsupported: "unsupported_pm_version",
 } as const satisfies Record<LockfileOnlyReason, UnsupportedRepoReason>;
 
 export const LOCKFILE_REJECTION_UNSUPPORTED: Readonly<

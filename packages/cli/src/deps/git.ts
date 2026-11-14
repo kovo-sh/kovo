@@ -80,14 +80,35 @@ export function runGit(
   env: NodeJS.ProcessEnv,
   maxBytes: number,
   input?: string,
+  timeoutMs?: number,
 ): Promise<GitResult> {
   return new Promise((resolve, reject) => {
+    const grouped = timeoutMs !== undefined && process.platform !== "win32";
     const child = spawn(
       "git",
       ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", ...args],
-      { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"] },
+      {
+        cwd,
+        env,
+        detached: grouped,
+        stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
+      },
     );
     const chunks: Buffer[] = [];
+    const stop = () => {
+      // A fetch may have started an SSH/transport child that holds stdout open. Stop the group
+      // so its descendants cannot keep the fetch alive beyond the deadline.
+      if (grouped && child.pid !== undefined) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+          return;
+        } catch {
+          // The process can exit just before its deadline.
+        }
+      }
+      child.kill("SIGKILL");
+    };
+    const timer = timeoutMs === undefined ? undefined : setTimeout(stop, timeoutMs);
     let size = 0;
     let overflow = false;
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -101,13 +122,17 @@ export function runGit(
       chunks.push(chunk);
     });
     child.on("error", (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
       reject(
         error.code === "ENOENT"
           ? usageError("git_missing", "git is not installed or not on PATH.")
           : usageError("git_failed", "git could not be started."),
       );
     });
-    child.on("close", (status) => resolve({ status, stdout: Buffer.concat(chunks), overflow }));
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ status, stdout: Buffer.concat(chunks), overflow });
+    });
     if (input !== undefined && child.stdin !== null) {
       // The process may exit before reading every line (a bound was hit); `close` reports it.
       child.stdin.on("error", () => {});
@@ -205,11 +230,15 @@ export async function resolveCommit(
 /** Remote-tracking default branches tried, in order, after `origin/HEAD`. */
 const DEFAULT_BRANCHES = ["refs/remotes/origin/main", "refs/remotes/origin/master"];
 
+const BASE_FETCH_DEPTH = 256;
+const BASE_FETCH_TIMEOUT_MS = 30_000;
+
 /**
  * The default base: the merge base of the default branch and `head` (a commit, or HEAD for the
- * working tree). The default branch is what `origin/HEAD` points at, else `origin/main`, else
- * `origin/master`. Errors (exit 2): no default branch is known, or no merge base exists (a shallow
- * clone or unrelated history).
+ * working tree). A PR's GITHUB_BASE_REF takes priority over origin/HEAD, main and master.
+ * A shallow checkout gets one bounded fetch of the target branch and head ancestry.
+ * Errors (exit 2): no target branch or no merge base after recovery; never compare HEAD to itself
+ * as a substitute for missing history.
  */
 export async function defaultBase(
   root: string,
@@ -217,26 +246,77 @@ export async function defaultBase(
   env: NodeJS.ProcessEnv,
 ): Promise<{ readonly commit: string; readonly branch: string }> {
   const symbolic = await gitOk(root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], env);
-  const candidates = [
-    ...(symbolic === null ? [] : [symbolic.toString("utf8").trim()]),
-    ...DEFAULT_BRANCHES,
-  ].filter((ref) => ref.startsWith("refs/remotes/"));
-  for (const ref of candidates) {
-    const exists = await gitOk(root, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], env);
-    if (exists === null) continue;
-    const base = await gitOk(root, ["merge-base", ref, head ?? "HEAD"], env);
-    const commit = base?.toString("utf8").trim();
-    const branch = ref.slice("refs/remotes/".length);
-    if (commit === undefined || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(commit))
-      throw usageError(
-        "no_merge_base",
-        `No merge base with ${branch}: fetch the full history (for example fetch-depth: 0) or pass --base.`,
-      );
-    return { commit, branch };
+  const prBranch = env["GITHUB_BASE_REF"] || undefined;
+  if (
+    prBranch !== undefined &&
+    (await gitOk(
+      root,
+      ["check-ref-format", `refs/heads/${checkRef(prBranch, "GITHUB_BASE_REF")}`],
+      env,
+    )) === null
+  )
+    throw usageError("invalid_ref", "GITHUB_BASE_REF must name a branch.");
+  const candidates =
+    prBranch === undefined
+      ? [
+          ...(symbolic === null ? [] : [symbolic.toString("utf8").trim()]),
+          ...DEFAULT_BRANCHES,
+        ].filter((ref) => ref.startsWith("refs/remotes/origin/"))
+      : [`refs/remotes/origin/${prBranch}`];
+  const unique = [...new Set(candidates)];
+  const find = async () => {
+    for (const ref of unique) {
+      const base = await gitOk(root, ["merge-base", ref, head ?? "HEAD"], env);
+      const commit = base?.toString("utf8").trim();
+      if (commit !== undefined && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(commit))
+        return { commit, branch: ref.slice("refs/remotes/".length) };
+    }
+    return null;
+  };
+  const local = await find();
+  if (local !== null) return local;
+  const known = await Promise.all(
+    unique.map((ref) => gitOk(root, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], env)),
+  );
+  const shallow = await gitOk(root, ["rev-parse", "--is-shallow-repository"], env);
+  if (shallow?.toString("utf8").trim() === "true") {
+    const target = unique[known.findIndex((ref) => ref !== null)] ?? unique[0]!;
+    const branch = target.slice("refs/remotes/origin/".length);
+    const headSha = await resolveCommit(root, head ?? "HEAD", "--head", env);
+    const fetched = await runGit(
+      root,
+      [
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        `--depth=${BASE_FETCH_DEPTH}`,
+        "origin",
+        `refs/heads/${branch}:${target}`,
+        headSha,
+      ],
+      env,
+      MAX_SMALL_OUTPUT,
+      undefined,
+      BASE_FETCH_TIMEOUT_MS,
+    );
+    if (fetched.status === 0 && !fetched.overflow) {
+      const recovered = await find();
+      if (recovered !== null) return recovered;
+    }
+    throw usageError(
+      "no_merge_base",
+      "No merge base found after a bounded shallow-checkout fetch. Fetch more history (for example actions/checkout fetch-depth: 0), or fetch a base commit and pass --base before ci or install in a wrapper.",
+    );
   }
+  if (known.some((ref) => ref !== null))
+    throw usageError(
+      "no_merge_base",
+      "No merge base found. Fetch the target branch's history or pass --base before ci or install in a wrapper.",
+    );
   throw usageError(
     "no_default_branch",
-    "No default branch found (origin/HEAD, origin/main or origin/master): pass --base.",
+    "No default branch found (GITHUB_BASE_REF, origin/HEAD, origin/main or origin/master). Fetch the base and pass --base before ci or install in a wrapper.",
   );
 }
 

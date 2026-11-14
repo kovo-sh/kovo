@@ -1,4 +1,4 @@
-import { packageNameSchema, packageVersionSchema } from "@kovo/contracts";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 
 import { DEPENDENCY_SECTIONS, type DependencySection } from "../../manifest/package-json.js";
 import type { Instance } from "../instances.js";
@@ -103,10 +103,29 @@ export function memberDeclarationsMatch(
 ): boolean {
   const member = context.layout.members.find((item) => item.path === path);
   if (member === undefined) return false;
+  const declarations = [...member.manifest.dependencies, ...member.local];
+  // pnpm writes each alias once: optionalDependencies wins over dependencies, which wins
+  // over devDependencies, even when the shadowed declarations have different specifiers.
+  // npm's package entries retain the original sections and must still match them exactly.
+  const optional = new Set(
+    declarations.filter((dep) => dep.section === "optionalDependencies").map((dep) => dep.alias),
+  );
+  const runtime = new Set(
+    declarations
+      .filter((dep) => dep.section === "dependencies" || dep.section === "optionalDependencies")
+      .map((dep) => dep.alias),
+  );
+  const effective = peers
+    ? declarations
+    : declarations.filter(
+        (dep) =>
+          !(dep.section === "dependencies" && optional.has(dep.alias)) &&
+          !(dep.section === "devDependencies" && runtime.has(dep.alias)),
+      );
   for (const section of DEPENDENCY_SECTIONS) {
     if (!peers && section === "peerDependencies") continue;
     const locked = entry[section] ?? {};
-    const declared = [...member.manifest.dependencies, ...member.local].filter(
+    const declared = effective.filter(
       (dep) =>
         dep.section === section ||
         (!peers &&

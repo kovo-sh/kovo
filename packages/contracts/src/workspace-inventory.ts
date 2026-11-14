@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { writerPinned } from "./compatibility.js";
 
-import { packageManagerSchema, lockfileFormatSchema } from "./enums/index.js";
+import { packageManagerSchema, lockfileFormatSchema } from "./enums/recipes.js";
 import { gitShaSchema, sha256HexSchema } from "./primitives.js";
 import { packageNameSchema, packageVersionSchema } from "./npm.js";
 
@@ -71,7 +72,7 @@ const pkg = z.strictObject({
   isDev: z.boolean(),
   depPaths: z.array(z.array(packageNameSchema).min(1).max(64)).min(1).max(32),
 });
-export const workspaceInventorySchema = z
+const repositoryWorkspaceInventorySchema = z
   .strictObject({
     packageManager: packageManagerSchema,
     format: lockfileFormatSchema,
@@ -120,6 +121,12 @@ export const workspaceInventorySchema = z
           version: packageVersionSchema.nullable(),
           localMember: workspacePathSchema.nullable(),
           integrity: z.string().max(1024).nullable(),
+          /**
+           * Present only when `integrity` came from the public registry's metadata rather than the
+           * lockfile (registry-sourced integrity, #7338); absent means the lockfile recorded it.
+           * A closed value, never customer text.
+           */
+          integritySource: z.literal("registry").exactOptional(),
           edges: z
             .array(
               z.strictObject({
@@ -136,7 +143,14 @@ export const workspaceInventorySchema = z
   })
   .refine((value) => workspaceInventoryWithinByteLimit(value), "workspace inventory size limit");
 
-export const workspaceInventoryWriteSchema = workspaceInventorySchema.refine(
+export const workspaceInventorySchema = writerPinned(
+  repositoryWorkspaceInventorySchema.safeExtend({
+    installRootPath: workspacePathSchema.exactOptional(),
+  }),
+  repositoryWorkspaceInventorySchema,
+);
+
+export const workspaceInventoryWriteSchema = repositoryWorkspaceInventorySchema.refine(
   (value) => workspaceInventoryWithinByteLimit(value, WORKSPACE_INVENTORY_WRITE_MAX_BYTES),
   "workspace inventory writer size limit",
 );

@@ -7,6 +7,7 @@ import {
   runRecordIdSchema,
   staffAccessGrantIdSchema,
 } from "../ids.js";
+import { runRecordListResponseSchema } from "../run-record.js";
 import { utcDateTimeSchema } from "../time.js";
 import { defineEndpoint } from "./endpoint.js";
 
@@ -28,6 +29,8 @@ export const staffGrantSchema = z.strictObject({
   expires_at: utcDateTimeSchema,
 });
 export type StaffGrantRequest = z.infer<typeof staffGrantRequestSchema>;
+/** At most this many records per staff list: a job's by seq, a repository's newest first. */
+export const STAFF_RUN_RECORD_LIST_LIMIT = 500;
 const authorization = {
   spec: "Human Kovo operators debugging a customer report require an account/repository-scoped grant (optionally narrowed to one job), with a 20–1000 character justification and duration at most two hours.",
   actors: ["operator"],
@@ -79,6 +82,20 @@ export const STAFF_RECORD_ENDPOINTS = {
     authorization,
     auditStorage: "staff_access_audit",
     problems: ["record_expired", "record_unavailable"],
+  }),
+  listStaffRunRecords: defineEndpoint({
+    operationId: "listStaffRunRecords",
+    area: "operator",
+    method: "GET",
+    path: "/v1/operator/run-records",
+    summary: "List record metadata (never content or keys) in a live staff grant's scope, audited.",
+    source,
+    params: null,
+    query: z.strictObject({ grant_id: staffAccessGrantIdSchema, job: jobIdSchema.optional() }),
+    body: null,
+    responses: { 200: runRecordListResponseSchema },
+    authorization,
+    auditStorage: "admin_audit",
   }),
 } as const;
 

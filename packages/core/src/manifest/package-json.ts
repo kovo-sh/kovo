@@ -4,7 +4,9 @@ import {
   pnpmSettingJsonValueAccepted,
   pnpmSettingsOverrides,
 } from "./pnpm-settings.js";
-import { packageNameSchema, type PackageName, type UnsupportedRepoReason } from "@kovo/contracts";
+import { workspaceDeclarationHasMembers } from "./workspace-members.js";
+import { packageNameSchema } from "@kovo/contracts/npm";
+import type { PackageName, StoredPackageManager, UnsupportedRepoReason } from "@kovo/contracts";
 import { z } from "zod";
 
 import {
@@ -20,12 +22,14 @@ import {
   type DependencySpec,
   type RegistrySpec,
 } from "./dependency-spec.js";
-import { pointerOf } from "./json-pointer.js";
+import { getAtPointer, pointerOf } from "./json-pointer.js";
 import {
   manifestRejection,
+  opaqueSourceKind,
   primaryUnsupportedReason,
   type ManifestRejection,
   type ManifestRejectionReason,
+  type OpaqueSourceKind,
 } from "./reasons.js";
 import { reportedPointer } from "./safe-pointer.js";
 import { parsePnpmSelector, parseSelectorStep, parseYarnSelector } from "./selectors.js";
@@ -82,11 +86,27 @@ export interface OverrideRule {
   readonly spec: string;
 }
 
+/**
+ * A dependency or override whose value is a non-registry source (owner D-726): Kovo leaves it
+ * byte-identical, never edits it, and discloses it on the fix PR. Only the location and kind are
+ * kept; the spec (which may carry a URL with credentials) is never copied out of the document.
+ */
+export interface OpaqueManifestEntry {
+  readonly kind: OpaqueSourceKind;
+  /** RFC 6901 pointer to the entry (`/dependencies/foo`, `/overrides/bar`). */
+  readonly pointer: string;
+  /** The dependency key, or the package an override replaces. */
+  readonly target: PackageName;
+  readonly via: "dependency" | "override";
+}
+
 export interface PackageManifest {
   readonly name: string | null;
   readonly version: string | null;
   readonly dependencies: readonly ManifestDependency[];
   readonly overrides: readonly OverrideRule[];
+  /** Non-registry dependencies and overrides left alone as opaque nodes (D-726); absent means none. */
+  readonly opaque?: readonly OpaqueManifestEntry[];
   readonly engines: {
     readonly node: string | null;
     readonly npm: string | null;
@@ -115,8 +135,11 @@ export interface PackageManifest {
 export interface PackageJsonInput {
   /** The raw package.json text at the inventoried commit. */
   readonly text: string;
-  /** Lockfile manager; absent preserves legacy npm/pnpm resolutions interpretation. */
-  readonly packageManager?: "npm" | "pnpm" | "yarn";
+  /**
+   * Lockfile manager; absent preserves legacy npm/pnpm resolutions interpretation. Yarn 4 reads
+   * `resolutions` as Yarn does and may use PnP; Bun and a lockfile-less root read as npm (#8256 R2).
+   */
+  readonly packageManager?: StoredPackageManager;
   /** Whether `pnpm-workspace.yaml` exists at the repository root (a pnpm workspace). */
   readonly pnpmWorkspaceYamlPresent: boolean;
   /** Complete root configuration text; omitted/unreadable present files still refuse. */
@@ -174,16 +197,6 @@ const PNPM_FIELDS_VALIDATED = new Set(["overrides", "patchedDependencies", "pack
  */
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
-function hasWorkspaces(value: JsonValue | undefined): boolean {
-  if (value === undefined || value === null) return false;
-  if (Array.isArray(value)) return value.length > 0;
-  if (isJsonObject(value)) {
-    const packages = value["packages"];
-    return !(Array.isArray(packages) && packages.length === 0 && Object.keys(value).length === 1);
-  }
-  return true;
-}
-
 const JSON_ERROR_REASON = {
   too_large: "json_too_large",
   too_deep: "json_too_deep",
@@ -222,6 +235,26 @@ function checkOverrideValue(
 
 class ManifestReader {
   readonly rejections: ManifestRejection[] = [];
+  readonly opaque: OpaqueManifestEntry[] = [];
+
+  /**
+   * Records an opaque source instead of rejecting it (D-726), or rejects any other reason. Returns
+   * whether the entry was opaque.
+   */
+  opaqueOrReject(
+    reason: ManifestRejectionReason,
+    segments: readonly string[],
+    target: PackageName | null,
+    via: OpaqueManifestEntry["via"],
+  ): boolean {
+    const kind = opaqueSourceKind(reason);
+    if (kind === null || target === null) {
+      this.reject(reason, segments);
+      return false;
+    }
+    this.opaque.push({ kind, pointer: pointerOf(segments), target, via });
+    return true;
+  }
   /** The parsed document, once there is one (positions of unshowable keys come from it). */
   document: JsonObject | null = null;
 
@@ -245,7 +278,7 @@ class ManifestReader {
         }
         const classified = registrySpecOrReason(spec);
         if ("reason" in classified) {
-          this.reject(classified.reason, segments);
+          this.opaqueOrReject(classified.reason, segments, alias.data, "dependency");
           continue;
         }
         const aliased = classified.spec.kind === "alias";
@@ -275,13 +308,13 @@ class ManifestReader {
           continue;
         }
         if (typeof value === "string") {
-          const problem = checkOverrideValue(value, "npm");
-          if (problem !== null) {
-            this.reject(problem, segments);
-            continue;
-          }
           const targetStep = key === "." ? path[path.length - 1] : key;
           const target = targetStep === undefined ? null : parseSelectorStep(targetStep);
+          const problem = checkOverrideValue(value, "npm");
+          if (problem !== null) {
+            this.opaqueOrReject(problem, segments, target, "override");
+            continue;
+          }
           if (target === null) {
             this.reject("invalid_override", segments);
             continue;
@@ -319,7 +352,7 @@ class ManifestReader {
       }
       const problem = checkOverrideValue(value, "pnpm");
       if (problem !== null) {
-        this.reject(problem, segments);
+        this.opaqueOrReject(problem, segments, selector.target, "override");
         continue;
       }
       rules.push({
@@ -339,6 +372,10 @@ class ManifestReader {
       const segments = ["resolutions", key];
       const selector = parseYarnSelector(key);
       const problem = checkOverrideValue(value, "yarn");
+      if (selector !== null && problem !== null) {
+        this.opaqueOrReject(problem, segments, selector.target, "override");
+        continue;
+      }
       if (selector === null || problem !== null) {
         this.reject(problem ?? "invalid_override", segments);
         continue;
@@ -452,9 +489,10 @@ export function parsePackageJson(input: PackageJsonInput): PackageJsonResult {
   const document = parsed.value;
   reader.document = document;
   if (
-    input.packageManager === "yarn" ||
-    (typeof document["packageManager"] === "string" &&
-      document["packageManager"].startsWith("yarn@"))
+    input.packageManager !== "yarn-berry" &&
+    (input.packageManager === "yarn" ||
+      (typeof document["packageManager"] === "string" &&
+        document["packageManager"].startsWith("yarn@")))
   ) {
     const installConfig = document["installConfig"];
     if (
@@ -464,7 +502,8 @@ export function parsePackageJson(input: PackageJsonInput): PackageJsonResult {
     )
       reader.reject("invalid_field", ["installConfig", "pnp"]);
   }
-  if (hasWorkspaces(document["workspaces"])) reader.reject("npm_workspaces", ["workspaces"]);
+  if (workspaceDeclarationHasMembers(document["workspaces"]))
+    reader.reject("npm_workspaces", ["workspaces"]);
 
   const shape = packageJsonShapeSchema.safeParse(document);
   if (!shape.success) {
@@ -483,7 +522,9 @@ export function parsePackageJson(input: PackageJsonInput): PackageJsonResult {
     ...reader.npmOverrides(document["overrides"]),
     ...reader.pnpmOverrides(fields.pnpm?.overrides, ["pnpm", "overrides"]),
     ...reader.pnpmOverrides(pnpmSettingsOverrides(input.pnpmWorkspaceYaml), ["pnpm", "overrides"]),
-    ...(input.packageManager === "yarn" || fields.packageManager?.startsWith("yarn@")
+    ...(input.packageManager === "yarn" ||
+    input.packageManager === "yarn-berry" ||
+    fields.packageManager?.startsWith("yarn@")
       ? reader.yarnResolutions(fields.resolutions)
       : reader.pnpmOverrides(fields.resolutions, ["resolutions"])),
   ];
@@ -505,6 +546,7 @@ export function parsePackageJson(input: PackageJsonInput): PackageJsonResult {
       version: fields.version ?? null,
       dependencies,
       overrides,
+      ...(reader.opaque.length === 0 ? {} : { opaque: reader.opaque }),
       engines: {
         node: engines["node"] ?? null,
         npm: engines["npm"] ?? null,
@@ -541,6 +583,48 @@ export function packageJsonFixRefusal(text: string): PnpmFixRefusalReason | null
   return isJsonObject(pnpm) && Object.hasOwn(pnpm, "trustPolicy") && pnpm["trustPolicy"] !== "off"
     ? "trust_policy_unenforced"
     : null;
+}
+
+/**
+ * The opaque dependencies (owner D-726) with their sections and declared specs, read from the
+ * parsed document for lockfile parsers that resolve root dependencies from package.json (Yarn v1).
+ * In memory only: a spec may be a URL with credentials, so it is never persisted or logged.
+ */
+export function opaqueDependencySpecs(manifest: PackageManifest): readonly {
+  readonly section: DependencySection;
+  readonly alias: PackageName;
+  readonly spec: string;
+}[] {
+  const result: { section: DependencySection; alias: PackageName; spec: string }[] = [];
+  for (const entry of manifest.opaque ?? []) {
+    if (entry.via !== "dependency") continue;
+    for (const section of DEPENDENCY_SECTIONS) {
+      if (entry.pointer !== pointerOf([section, entry.target])) continue;
+      const map = manifest.document[section];
+      const spec = isJsonObject(map) && Object.hasOwn(map, entry.target) ? map[entry.target] : null;
+      if (typeof spec === "string") result.push({ section, alias: entry.target, spec });
+    }
+  }
+  return result;
+}
+
+/**
+ * Whether a fix changed an opaque package.json entry (owner D-726): the set of opaque entries must
+ * be the same, and each entry's value byte-identical. A fix may neither edit, remove nor add one.
+ */
+export function opaqueManifestChanged(before: PackageManifest, after: PackageManifest): boolean {
+  const entries = (manifest: PackageManifest): string[] =>
+    (manifest.opaque ?? [])
+      .map((entry) => `${entry.via}\u0000${entry.kind}\u0000${entry.pointer}`)
+      .toSorted();
+  const a = entries(before);
+  const b = entries(after);
+  if (a.length !== b.length || a.some((entry, index) => entry !== b[index])) return true;
+  return (before.opaque ?? []).some(
+    (entry) =>
+      JSON.stringify(getAtPointer(before.document, entry.pointer)) !==
+      JSON.stringify(getAtPointer(after.document, entry.pointer)),
+  );
 }
 
 /** The dependencies declared under `alias` (normally one; npm tolerates duplicates across sections). */

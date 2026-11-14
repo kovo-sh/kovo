@@ -18,6 +18,35 @@ import { utcDateTimeSchema } from "./time.js";
 // (`repos.branch_protection_*`) so a lower-only mode recompute and `GET /v1/repos` need no GitHub
 // call, and shown in the repository view.
 
+/** The levels a ruleset can be defined at: a repository, an organization or an enterprise. */
+export const RULESET_LEVELS = ["repository", "organization", "enterprise"] as const;
+export type RulesetLevel = (typeof RULESET_LEVELS)[number];
+
+/**
+ * Ruleset rule types that require human review (core `ruleCategory` "review"). Their remedy is a
+ * review-only bypass, never removing them; the instructions read this list too (#7316).
+ */
+export const REVIEW_RULE_TYPES = ["pull_request", "copilot_code_review"] as const;
+
+/**
+ * Ruleset rule types GitHub enforces on the write itself (core `ruleCategory` "neutral"): once Kovo
+ * can read their ruleset they never block autopilot, so the instructions never ask to remove one.
+ */
+export const NEUTRAL_RULE_TYPES = [
+  "required_linear_history",
+  "non_fast_forward",
+  "deletion",
+  "creation",
+  "commit_message_pattern",
+  "commit_author_email_pattern",
+  "committer_email_pattern",
+  "branch_name_pattern",
+  "file_path_restriction",
+  "max_file_path_length",
+  "file_extension_restriction",
+  "max_file_size",
+] as const;
+
 /**
  * One concrete rule that blocks autopilot. Names and identifiers only: the rule type is GitHub's
  * token (`pull_request`, `required_status_checks`, `merge_queue`, `required_signatures`, …) or the
@@ -33,11 +62,24 @@ export const branchProtectionBlockerSchema = z
       .string()
       .regex(/^[a-z][a-z0-9_]{0,63}$/, { error: "must be a GitHub rule type token" }),
     reason: branchProtectionBlockerReasonSchema,
+    /**
+     * Where a ruleset is defined (GitHub's `ruleset_source_type`), so the instructions can link to
+     * the page that edits it (#7275). Display only: it never changes what blocks. Absent for
+     * classic protection, an unrecognised level and assessments stored before it existed.
+     */
+    // A bounded token, not a closed enum: stored assessments are persisted readers, and a reader
+    // of a later level must not fail. Kovo writes only RULESET_LEVELS; anything else links to the
+    // repository's rulesets page.
+    ruleset_level: z
+      .string()
+      .regex(/^[a-z]{1,32}$/)
+      .exactOptional(),
   })
   .refine(
     (blocker) =>
       (blocker.source === "classic") === (blocker.ruleset_id === null) &&
-      (blocker.ruleset_id === null) === (blocker.ruleset_name === null),
+      (blocker.ruleset_id === null) === (blocker.ruleset_name === null) &&
+      (blocker.source === "ruleset" || blocker.ruleset_level === undefined),
     { ...whenValid, error: "exactly ruleset blockers name their ruleset", path: ["ruleset_id"] },
   );
 export type BranchProtectionBlocker = z.output<typeof branchProtectionBlockerSchema>;

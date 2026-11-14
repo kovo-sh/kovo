@@ -1,15 +1,11 @@
 import {
   NPM_PUBLIC_REGISTRY_ORIGIN,
   exactVersionSchema,
-  hasControlCharacter,
   packageNameSchema,
   packageVersionSchema,
-  sriSha512Schema,
-  whenValid,
-  type PackageName,
-  type PackageVersion,
-  type SriSha512,
-} from "@kovo/contracts";
+} from "@kovo/contracts/npm";
+import { hasControlCharacter, sriSha512Schema, whenValid } from "@kovo/contracts/primitives";
+import type { PackageName, PackageVersion, SriSha512 } from "@kovo/contracts";
 import { z } from "zod";
 
 import {

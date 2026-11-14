@@ -276,7 +276,8 @@ const OBFUSCATED_BODY = String.raw`${OBFUSCATED_BODY_CHARACTER}*(?:[\r\n\v\f\x85
 // still win (notably re_ also names Resend keys). Kovo entity IDs are UUIDs; derived DBOS
 // IDs contain those UUIDs and hex source hashes separated by punctuation.
 const NON_SECRET_IDENTIFIER_PATTERNS: readonly RegExp[] = [
-  /^(?:sub|pi|cus|in|price|evt|ch|re|prod|seti)_[A-Za-z0-9]{8,255}$/,
+  // Stripe object IDs; `mtr_` is Kovo's own billing meter (#5514).
+  /^(?:sub|pi|cus|in|price|evt|ch|re|prod|seti|mtr)_[A-Za-z0-9]{8,255}$/,
   /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-8][a-fA-F0-9]{3}-[89abAB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$/,
   // Git SHA-1/SHA-256 and OTel trace/span IDs (exact hex lengths).
   /^(?:[a-fA-F0-9]{16}|[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/,
@@ -678,20 +679,54 @@ function basicCredential(body: string): boolean {
   return false;
 }
 
+/**
+ * The credential-evidence rules with their global patterns compiled once (Refs #8393). Building a
+ * RegExp from these long sources on every call dominated callers such as the correlation-ID
+ * projection, which runs on every unit of work. Private to {@link containsCredential}, which resets
+ * `lastIndex` before each scan and never calls itself, so sharing one object per rule is safe.
+ */
+const EVIDENCE_RULES: readonly {
+  readonly rule: RedactionRule;
+  readonly pattern: RegExp;
+  /** Whether an empty match steps by code point (`u` or `v`), as `matchAll` does. */
+  readonly unicode: boolean;
+}[] = RULES.flatMap((rule) =>
+  rule.name === "random_token" || rule.name.startsWith("terminal_escape")
+    ? []
+    : [
+        {
+          rule,
+          pattern: new RegExp(
+            rule.pattern.source,
+            rule.pattern.flags.includes("g") ? rule.pattern.flags : rule.pattern.flags + "g",
+          ),
+          unicode: rule.pattern.flags.includes("u") || rule.pattern.flags.includes("v"),
+        },
+      ],
+);
+
+/** `String.prototype.matchAll`'s step past an empty match (ECMA-262 AdvanceStringIndex). */
+function advanceStringIndex(text: string, index: number, unicode: boolean): number {
+  if (!unicode) return index + 1;
+  const code = text.codePointAt(index);
+  return index + (code !== undefined && code > 0xffff ? 2 : 1);
+}
+
 /** Reject credential evidence without guessing from entropy; conservative redaction stays separate. */
 export function containsCredential(value: string): boolean {
   const normalized = stripCompleteTerminalEscapes(value);
   // eslint-disable-next-line no-control-regex -- malformed terminal syntax fails closed.
   if (/[\x1b\u009b]/.test(normalized)) return true;
-  return RULES.some((rule) => {
-    if (rule.name === "random_token" || rule.name.startsWith("terminal_escape")) return false;
+  // The scan is a pure function of the text: an unchanged normalization needs no second pass.
+  const texts = normalized === value ? [value] : [value, normalized];
+  return EVIDENCE_RULES.some(({ rule, pattern, unicode }) => {
     if (rule.name.startsWith("raw_terminal_") && !value.includes("\u001b")) return false;
-    return [value, normalized].some((text) => {
-      const pattern = new RegExp(
-        rule.pattern.source,
-        rule.pattern.flags.includes("g") ? rule.pattern.flags : rule.pattern.flags + "g",
-      );
-      for (const match of text.matchAll(pattern)) {
+    return texts.some((text) => {
+      // Exactly `text.matchAll(pattern)` on a fresh copy, without constructing one per call.
+      pattern.lastIndex = 0;
+      for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
+        if (match[0] === "")
+          pattern.lastIndex = advanceStringIndex(text, pattern.lastIndex, unicode);
         const prefix = text.slice(0, match.index);
         if (rule.name === "authorization_scheme" || rule.name === "obfuscated_bearer") {
           const scheme = match[1]?.toLowerCase();

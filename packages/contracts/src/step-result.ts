@@ -5,6 +5,7 @@ import { stepFailureCodeSchema, stepStatusSchema } from "./enums/verification.js
 import { FAILURE_EXCERPT_STEP_STATUSES, failureExcerptRefSchema } from "./failure-excerpt.js";
 import { countSchema, hasControlCharacter, sha256HexSchema, whenValid } from "./primitives.js";
 import { regressionObservationSchema } from "./regression.js";
+import { persistedReader } from "./tolerant-reader.js";
 import { wellKnownPackageSchema } from "./well-known-packages.js";
 
 /** Advisory classification of bounded untrusted install output; never changes a verdict. */
@@ -15,6 +16,7 @@ export const INSTALL_DIAGNOSTICS = [
   "integrity_mismatch",
   "lifecycle_failed",
   "unsupported_runtime",
+  "package_not_found",
   "unknown",
 ] as const;
 export const installDiagnosticSchema = z.enum(INSTALL_DIAGNOSTICS);
@@ -31,6 +33,42 @@ export const CHECK_DIAGNOSTICS = [
 ] as const;
 export const checkDiagnosticSchema = z.enum(CHECK_DIAGNOSTICS);
 export type CheckDiagnostic = z.infer<typeof checkDiagnosticSchema>;
+
+/**
+ * Which workspace orchestrator a pinned Turbo or Nx check ran (D-674, #7846; docs/decisions/
+ * recipes.md "Repository-locked Turbo and Nx"): `*_unproven_repo_version` discloses that the
+ * repository's own locked release, not the proven one, ran (an ordinary result of any status);
+ * `*_not_installed` (no package of that name installed) and `*_proof_failed` (the proven command's
+ * version check failed) are harness errors.
+ */
+export const ORCHESTRATION_REASONS = [
+  "turbo_unproven_repo_version",
+  "turbo_not_installed",
+  "turbo_proof_failed",
+  "nx_unproven_repo_version",
+  "nx_not_installed",
+  "nx_proof_failed",
+] as const;
+export const orchestrationReasonSchema = persistedReader(z.enum(ORCHESTRATION_REASONS));
+export type OrchestrationReason = z.infer<typeof orchestrationReasonSchema>;
+
+/**
+ * The D-597 list version 2 host classes (#8256 E3, plans/js-coverage-phase1.md section 2.7): the
+ * closed names an `egress_blocked:<class>` category may carry. Each class's trigger packages and
+ * hosts are the reviewed list in `@kovo/core/recipe` (`CURATED_PUBLIC_FETCH_HOSTS`). A name grants
+ * nothing.
+ */
+export const EGRESS_HOST_CLASSES = [
+  "next-fonts",
+  "playwright",
+  "puppeteer",
+  "electron",
+  "github-release-assets",
+  "node-gyp",
+  "cypress",
+  "sentry-cli",
+] as const;
+export type EgressHostClass = (typeof EGRESS_HOST_CLASSES)[number];
 
 /**
  * Why a failed step failed, as far as Kovo can tell without keeping its output (docs/decisions/
@@ -56,15 +94,66 @@ export const FAILURE_CATEGORIES = [
   // Read first, written later: a check that failed after an install the completeness probe found
   // incomplete, with the count of declared packages missing from node_modules.
   "dependencies_not_installed",
+  // An install that failed because the registry (Kovo's proxy or its upstream) was unavailable: a
+  // 5xx, a connection error or a timeout, from the install hint (#7637).
+  "registry_unavailable",
+  // A dependency's install lifecycle script exited nonzero during the install step (#7746). It
+  // names the package only when the package is well known.
+  "install_script_failed",
+  // The repository's own (root or workspace) install lifecycle script failed: an install step's
+  // lifecycle failure that names no dependency's directory (#7746). Never names a package.
+  "project_install_script_failed",
+  // A build-phase check exited nonzero and printed nothing any fixed signature or vocabulary bit
+  // matches: no failing output to classify (#7637). Chosen by a closed output-shape hash.
+  "no_failure_output",
+  // A test step exited nonzero with a test runner and a lifecycle-failure footer in its output
+  // but no failed-test count or suite report (#7637). Chosen by a closed output-shape hash.
+  "test_run_failed_without_report",
+  // V1 failure taxonomy (#8256, plans/js-coverage-phase1.md section 2.9; docs/decisions/recipes.md
+  // "Toolchain fingerprints and failure categories"). `egress_blocked:<class>` names the E3 host
+  // class (`EGRESS_HOST_CLASSES`) of a refused fetch, from trusted facts only; `unknown` is the
+  // shell's category and any refusal no applicable class explains. The plan's `oom` is
+  // `out_of_memory` above, kept under its recorded name.
+  "egress_blocked:unknown",
+  "egress_blocked:next-fonts",
+  "egress_blocked:playwright",
+  "egress_blocked:puppeteer",
+  "egress_blocked:electron",
+  "egress_blocked:github-release-assets",
+  "egress_blocked:node-gyp",
+  "egress_blocked:cypress",
+  "egress_blocked:sentry-cli",
+  "node_version_mismatch",
+  "native_build_missing_toolchain",
+  "next_font_fetch_failed",
+  "browser_binary_missing",
+  "test_needs_display",
+  // A step stopped by its own timeout that printed nothing at all: the one category a timed-out
+  // step carries.
+  "timeout_no_output",
+  "prisma_generate_missing",
+  "pm_version_unsupported",
+  "script_missing",
+  // The plain outcomes: a failed check whose output no signature names, by what the check runs.
+  "typecheck_failed",
+  "build_failed",
+  "test_failed",
   "unclassified",
 ] as const;
-export const failureCategoryNameSchema = z.enum(FAILURE_CATEGORIES);
+type FailureCategoryEnum = { [K in (typeof FAILURE_CATEGORIES)[number]]: K };
+/**
+ * Named so declaration emit refers to it instead of inlining every category in each API schema
+ * that embeds a step result (the API registry's type otherwise exceeds TS7056's bound).
+ */
+export interface FailureCategoryNameSchema extends z.ZodEnum<FailureCategoryEnum> {}
+export const failureCategoryNameSchema: FailureCategoryNameSchema = z.enum(FAILURE_CATEGORIES);
 export type FailureCategoryName = z.infer<typeof failureCategoryNameSchema>;
 
 /** Categories that may name the well-known public package involved. */
 export const FAILURE_CATEGORIES_WITH_PACKAGE: ReadonlySet<FailureCategoryName> = new Set([
   "npm_proxy_refused",
   "module_not_found",
+  "install_script_failed",
 ]);
 /** Categories that may carry a count (errors or failed tests). */
 export const FAILURE_CATEGORIES_WITH_COUNT: ReadonlySet<FailureCategoryName> = new Set([
@@ -101,6 +190,46 @@ export type FailureCategory = z.infer<typeof failureCategorySchema>;
 // Sanitized results of executed recipe steps, shared by calibration records and fix evidence.
 // SPEC "Sandbox B": "Capture only exit codes, durations, counts, failure codes and hashes; raw
 // stdout/stderr stays ephemeral."
+
+/**
+ * What a watched file a step rewrote is (owner D-726, the base-relative Sandbox B guard): the
+ * kinds a paired verification discloses when both runs rewrote the same files to the same bytes.
+ * Kinds and counts only, never a path or content.
+ */
+export const REWRITE_KINDS = [
+  "kovo",
+  "lockfile",
+  "manifest",
+  "other",
+  "package_manager_config",
+  "tests",
+  "verification_config",
+] as const;
+export const rewriteKindSchema = persistedReader(z.enum(REWRITE_KINDS));
+export type RewriteKind = z.infer<typeof rewriteKindSchema>;
+
+/**
+ * Owner D-726 disclosure: by the end of this step the repository's own commands had rewritten
+ * watched files, and the paired unchanged-base run rewrote exactly the same files from the same
+ * bytes to the same bytes, so Kovo ignored that rewrite on both sides. Kinds (sorted, unique) and
+ * the number of distinct files only.
+ */
+export interface ExpectedRewrite {
+  readonly kinds: readonly RewriteKind[];
+  readonly files: number;
+}
+// Annotated so the step schema's (widely embedded) declared type stays a short named reference.
+export const expectedRewriteSchema: z.ZodType<ExpectedRewrite> = z
+  .strictObject({
+    kinds: z.array(rewriteKindSchema).min(1).max(REWRITE_KINDS.length).readonly(),
+    files: z.int().min(1).max(1_000_000),
+  })
+  .readonly()
+  .refine(
+    (rewrite) =>
+      rewrite.kinds.every((kind, index) => index === 0 || (rewrite.kinds[index - 1] ?? "") < kind),
+    { ...whenValid, error: "rewrite kinds are sorted and unique" },
+  );
 
 /** A recipe step name (`Recipe.steps[].name`): 1–100 characters, no surrounding whitespace. */
 export const stepNameSchema = z
@@ -140,7 +269,10 @@ export const stepResultSchema = z
     install_diagnostic: installDiagnosticSchema.exactOptional(),
     /** Optional for old records; only a failed check with a nonzero process exit may carry it. */
     check_diagnostic: checkDiagnosticSchema.exactOptional(),
-    /** Optional for old records; only a failed install or check with a nonzero exit carries it. */
+    /**
+     * Optional for old records; only a failed install or check with a nonzero exit carries it, and
+     * a timed-out step only `timeout_no_output`.
+     */
     failure_category: failureCategorySchema.exactOptional(),
     tests: testCountsSchema.exactOptional(),
     /** SHA-256 of the reporter file the verifier parsed. */
@@ -155,10 +287,49 @@ export const stepResultSchema = z
      * other step, on records written before excerpts existed, and while excerpts are switched off.
      */
     failure_excerpt: failureExcerptRefSchema.exactOptional(),
+    /**
+     * Owner D-664 disclosure: this passed install ran its dependency install scripts with internet
+     * access before the code was present (open install, sealed code). Only a passed B_install step
+     * carries it; absent on every other step and on records written before D-664.
+     */
+    open_install: z.literal(true).exactOptional(),
+    /**
+     * Owner D-713 disclosure and posture record: this build or test step ran under `ci_like_open`
+     * (CI-like internet access in the sealed isolation-tier VM). Only an executed B_build or
+     * B_tests step carries it; absent on every other step and on records written before D-713.
+     */
+    ci_like_open: z.literal(true).exactOptional(),
+    /** Optional for old records; only an executed pinned Turbo or Nx check carries it. */
+    orchestration_reason: orchestrationReasonSchema.exactOptional(),
+    /**
+     * Owner D-726: the rewrite this executed step's run shared with its paired unchanged-base run
+     * (`expectedRewriteSchema`). Absent on every other step and on records written before D-726.
+     */
+    expected_rewrite: expectedRewriteSchema.exactOptional(),
   })
   .superRefine((step, ctx) => {
     const problems: [path: string, message: string][] = [];
+    if (step.open_install !== undefined && (step.phase !== "B_install" || step.status !== "passed"))
+      problems.push(["open_install", "only a passed install discloses the open install"]);
+    if (
+      step.ci_like_open !== undefined &&
+      ((step.phase !== "B_build" && step.phase !== "B_tests") || step.status === "skipped")
+    )
+      problems.push(["ci_like_open", "only an executed build or test step discloses ci_like_open"]);
     const hasFailureCode = step.failure_code !== undefined;
+    if (step.expected_rewrite !== undefined && step.status === "skipped")
+      problems.push(["expected_rewrite", "only an executed step discloses a shared rewrite"]);
+    if (
+      step.orchestration_reason !== undefined &&
+      (step.status === "skipped" ||
+        (step.phase !== "B_build" && step.phase !== "B_tests") ||
+        (!step.orchestration_reason.endsWith("_unproven_repo_version") && step.status !== "error"))
+    ) {
+      problems.push([
+        "orchestration_reason",
+        "orchestration reasons belong to executed checks; a missing installation is an error",
+      ]);
+    }
     if (step.install_diagnostic !== undefined && step.failure_code !== "install_failed") {
       problems.push(["install_diagnostic", "install diagnostics belong to failed installs only"]);
     }
@@ -175,7 +346,10 @@ export const stepResultSchema = z
         "check diagnostics require a failed check with nonzero exit",
       ]);
     }
-    if (
+    if (step.failure_category?.category === "timeout_no_output") {
+      if (step.status !== "timed_out" || step.failure_code !== "timeout")
+        problems.push(["failure_category", "timeout_no_output belongs to a timed-out step only"]);
+    } else if (
       step.failure_category !== undefined &&
       ((step.failure_code !== "nonzero_exit" && step.failure_code !== "install_failed") ||
         step.status !== "failed" ||

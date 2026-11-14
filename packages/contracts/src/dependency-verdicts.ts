@@ -74,6 +74,9 @@ export type DependencySource = z.infer<typeof dependencySourceSchema>;
 /** At most this many changes are judged in one request. */
 export const MAX_DEPENDENCY_VERDICT_CHANGES = 500;
 
+/** One hosted evaluation's registry budget; clients must allow time for the response too. */
+export const DEPENDENCY_VERDICT_REGISTRY_BUDGET_MS = 120_000;
+
 /** One changed or new version, as callers derive it from a lockfile diff: identifiers only. */
 export const dependencyVerdictChangeSchema = z
   .strictObject({

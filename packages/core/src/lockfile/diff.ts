@@ -1,11 +1,11 @@
-import {
-  dependencyChangeSchema,
-  type DependencyChange,
-  type DependencyChangeKind,
-  type MergeBlockReason,
-  type PackageName,
-  type PackageVersion,
-  type SemverBump,
+import { dependencyChangeSchema } from "@kovo/contracts/evidence";
+import type {
+  DependencyChange,
+  DependencyChangeKind,
+  MergeBlockReason,
+  PackageName,
+  PackageVersion,
+  SemverBump,
 } from "@kovo/contracts";
 import semver from "semver";
 
@@ -21,6 +21,8 @@ import {
   GRAPH_LIMITS,
   indexPackages,
   nameOfKey,
+  packageKey,
+  type DependencyEdge,
   type DependencyGraph,
   type DependencyPath,
   type PackageKey,
@@ -208,6 +210,69 @@ function groupByName(graph: DependencyGraph): Map<string, ResolvedPackageNode[]>
   return groups;
 }
 
+/** Follow declared edges as well as version sets: several old versions can collapse to one. */
+function includeEdgeChanges(
+  before: DependencyGraph,
+  after: DependencyGraph,
+  changes: readonly PackageChange[],
+): PackageChange[] {
+  const was = indexPackages(before);
+  const now = indexPackages(after);
+  const removed = new Set(
+    changes
+      .filter((change) => change.change === "removed" && change.from !== null)
+      .map((change) => packageKey(change.name, change.from!)),
+  );
+  if (removed.size === 0) return [...changes];
+  const replacements = new Map<PackageKey, ResolvedPackageNode[]>();
+  for (const change of changes) {
+    if (change.from === null || change.to === null) continue;
+    const from = packageKey(change.name, change.from);
+    const to = now.get(packageKey(change.name, change.to));
+    if (to === undefined) continue;
+    const list = replacements.get(from) ?? [];
+    list.push(to);
+    replacements.set(from, list);
+  }
+  const steps = new Map<string, PackageChange>();
+  const stepKey = (change: PackageChange) => JSON.stringify([change.name, change.from, change.to]);
+  for (const change of changes) steps.set(stepKey(change), change);
+  const moved = new Set<PackageKey>();
+  for (const parent of before.packages) {
+    const retained = now.get(parent.key);
+    const parents = retained === undefined ? (replacements.get(parent.key) ?? []) : [retained];
+    for (const nextParent of parents) {
+      const edges = new Map<string, DependencyEdge[]>();
+      for (const edge of nextParent.dependencies) {
+        const key = JSON.stringify([edge.alias, edge.kind]);
+        const list = edges.get(key) ?? [];
+        list.push(edge);
+        edges.set(key, list);
+      }
+      for (const edge of parent.dependencies) {
+        if (!removed.has(edge.target)) continue;
+        const from = was.get(edge.target);
+        if (from === undefined) continue;
+        for (const next of edges.get(JSON.stringify([edge.alias, edge.kind])) ?? []) {
+          const to = now.get(next.target);
+          if (to === undefined || from.name !== to.name || semver.eq(from.version, to.version))
+            continue;
+          const change = versionChange(from, to);
+          steps.set(stepKey(change), change);
+          moved.add(from.key);
+        }
+      }
+    }
+  }
+  // An edge that disappears remains a removal; a redirected edge records its actual step.
+  return [...steps.values()].filter(
+    (change) =>
+      change.change !== "removed" ||
+      change.from === null ||
+      !moved.has(packageKey(change.name, change.from)),
+  );
+}
+
 function directTargets(graph: DependencyGraph): Map<string, PackageKey | null> {
   return new Map(graph.direct.map((dependency) => [dependency.alias, dependency.target]));
 }
@@ -268,7 +333,7 @@ export function diffGraphs(before: DependencyGraph, after: DependencyGraph): Gra
     diffPackage(beforeGroups.get(name) ?? [], afterGroups.get(name) ?? []),
   );
   return {
-    changes,
+    changes: includeEdgeChanges(before, after, changes),
     topLevel: topLevelChanges(before, after),
     integrityChanges: integrityChanges(before, after),
   };
@@ -427,7 +492,9 @@ export interface DependencyChangesEvidence {
   readonly changes: DependencyChange[];
   /**
    * The diff held more changes than evidence records. Changes that need review come first, so a
-   * truncated list still carries every review reason the full diff has (up to the bound).
+   * truncated list still carries every review reason the full diff has (up to the bound). It is
+   * the evidence's `dependency_changes_truncated`, which core `evidenceBoundRefusal` reads in
+   * place of the list's length, so it never depends on the bound itself.
    */
   readonly truncated: boolean;
 }

@@ -10,6 +10,7 @@ export * from "./audit.js";
 export * from "./billing.js";
 export * from "./common.js";
 export * from "./dependency-verdicts.js";
+export * from "./dependency-overrides.js";
 export * from "./email-preferences.js";
 export * from "./endpoint.js";
 export * from "./findings.js";
@@ -19,7 +20,10 @@ export * from "./jobs.js";
 export * from "./me.js";
 export * from "./notifications.js";
 export * from "./onboarding.js";
+export * from "./package-manager-choice.js";
 export * from "./admin.js";
+export * from "./waitlist.js";
+export * from "./prod-verification.js";
 export * from "./operator.js";
 export * from "./pauses.js";
 export * from "./policy.js";
@@ -33,6 +37,7 @@ export * from "./webhooks.js";
 
 export * from "./recipe-labels.js";
 
+export * from "./customer-asks.js";
 export * from "./egress.js";
 
 export * from "./recipe-limited.js";
@@ -43,3 +48,7 @@ export * from "./run-records-staff.js";
 
 export * from "./workspaces.js";
 export * from "./research-watch.js";
+export * from "./synthetic-drill.js";
+export * from "./outreach.js";
+export * from "./outreach-admin.js";
+export * from "./support-admin.js";

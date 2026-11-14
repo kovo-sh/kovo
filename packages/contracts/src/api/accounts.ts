@@ -97,6 +97,8 @@ export const accountSchema = z
     role: accountRoleSchema,
     plan: planSchema,
     pause: accountPauseSchema.nullable(),
+    /** Reader first: absent until the deactivation writer is promoted (#2779). */
+    deactivated_at: utcDateTimeSchema.nullable().exactOptional(),
     installation: installationSummarySchema.nullable(),
     /** The latest onboarding request, for "onboarding/install approval status". */
     onboarding: onboardingRequestSchema.nullable(),
@@ -324,7 +326,7 @@ const ROW_MEMBERS =
  * owners and admins change it, and no API key (Runtime or Management) does either.
  */
 const ROW_THIRD_PARTY_SCANNERS =
-  "Human member reads; human owner/admin changes; audited; API keys refused";
+  "Human member reads; human owner/admin changes; audited; customer API keys refused; D-238 internal-test Custom drill exception below";
 const OWNER_CHANGES = [
   {
     when: "changes_owner_membership",
@@ -361,10 +363,18 @@ export const ACCOUNT_ENDPOINTS = {
     auditActions: ["account.created"],
     params: null,
     query: null,
-    body: emptyBodySchema,
+    // Admission is enforced in the account-creating transaction, regardless of entry path.
+    body: z.strictObject({ waitlist_code: z.string().max(128).exactOptional() }),
     responses: { 201: accountResponseSchema },
     authorization: { spec: ROW_ACCOUNTS, actors: HUMAN, tenant: "user" },
     idempotency: "accepted",
+    problems: [
+      "waitlist_code_required",
+      "waitlist_code_invalid",
+      "waitlist_code_expired",
+      "waitlist_code_exhausted",
+      "waitlist_code_revoked",
+    ],
   }),
   deleteAccount: defineEndpoint({
     operationId: "deleteAccount",
@@ -632,7 +642,12 @@ export const ACCOUNT_ENDPOINTS = {
     query: null,
     body: null,
     responses: { 200: thirdPartyScannersSchema },
-    authorization: { spec: ROW_THIRD_PARTY_SCANNERS, actors: HUMAN, tenant: "path_account" },
+    authorization: {
+      spec: ROW_THIRD_PARTY_SCANNERS,
+      actors: HUMAN,
+      tenant: "path_account",
+      managementPermission: "setThirdPartyScannersDrill",
+    },
   }),
   setThirdPartyScanners: defineEndpoint({
     operationId: "setThirdPartyScanners",
@@ -649,6 +664,7 @@ export const ACCOUNT_ENDPOINTS = {
     responses: { 200: thirdPartyScannersSchema },
     authorization: {
       spec: ROW_THIRD_PARTY_SCANNERS,
+      managementPermission: "setThirdPartyScannersDrill",
       actors: HUMAN,
       tenant: "path_account",
       accountRoles: ACCOUNT_ADMIN_ROLES,

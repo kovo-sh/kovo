@@ -1,11 +1,13 @@
 import type {
   AdvisoryId,
+  FixOnlyPackageManager,
   LadderRung,
   MergeBlockReason,
   PackageManager,
   PackageName,
   PackageVersion,
   Plan,
+  StoredPackageManager,
 } from "@kovo/contracts";
 
 import type { PackageManifest } from "../../manifest/package-json.js";
@@ -114,7 +116,8 @@ export type ManifestEdit =
 
 /** A package-manager invocation; `args` never contain a shell and always disable scripts. */
 export interface PmCommand {
-  readonly executable: PackageManager;
+  /** A verifiable package manager, or Kovo's pinned Yarn 4 or Bun (#8256 R2). */
+  readonly executable: PackageManager | Exclude<FixOnlyPackageManager, "manifest-only">;
   readonly args: readonly string[];
 }
 
@@ -175,7 +178,7 @@ export type RollbackEvidence =
 export interface LadderPlan {
   readonly rung: PlanRung;
   readonly kind: LadderPlanKind;
-  readonly packageManager: PackageManager;
+  readonly packageManager: StoredPackageManager;
   readonly target: PackageName;
   readonly steps: readonly LadderStep[];
   /** package.json edits trusted code applies before running `commands` (overrides, removals). */
@@ -226,6 +229,7 @@ export const LADDER_SKIP_REASONS = [
   "removal_infeasible", // other packages depend on the malicious package
   "conflicting_edits", // two instances need different values at one pointer
   "no_major_version", // rung 6: no safe version on a newer major line
+  "lockfile_absent_transitive", // #8256 R2: a root without a lockfile fixes direct dependencies only
 ] as const;
 export type LadderSkipReason = (typeof LADDER_SKIP_REASONS)[number];
 

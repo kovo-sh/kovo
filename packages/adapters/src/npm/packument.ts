@@ -1,10 +1,5 @@
-import {
-  exactVersionSchema,
-  packageNameSchema,
-  packageVersionSchema,
-  type PackageName,
-  type PackageVersion,
-} from "@kovo/contracts";
+import { exactVersionSchema, packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
+import type { PackageName, PackageVersion } from "@kovo/contracts";
 
 import { IntegrityError } from "../ports/errors.js";
 import {

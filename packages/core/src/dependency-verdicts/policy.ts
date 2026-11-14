@@ -1,8 +1,6 @@
 import {
   DEPENDENCY_VERDICT_REASONS,
   DEPENDENCY_VERDICTS,
-  DURATIONS,
-  dependencyChangeSchema,
   type DependencyChange,
   type DependencyEcosystem,
   type DependencySource,
@@ -11,6 +9,8 @@ import {
   type DependencyVerdictReason,
   type SriSha512,
 } from "@kovo/contracts";
+import { DURATIONS } from "@kovo/contracts/time";
+import { dependencyChangeSchema } from "@kovo/contracts/evidence";
 
 import { classifyVersionChange } from "../lockfile/semver-change.js";
 import { detectPublishingPath, type PublishingPathIdentity } from "../policy/publishing-path.js";
@@ -114,6 +114,8 @@ export interface DependencyVerdictResult {
   readonly verdicts: readonly DependencyVerdict[];
   /** Signals that could not run for this request; disclosed, never a verdict by themselves. */
   readonly unavailableSignals: readonly DependencyVerdictSignal[];
+  /** Internal metadata; hosted wire responses select their existing strict fields. */
+  readonly popularityRevision?: string;
 }
 
 const SEVERITY = new Map(DEPENDENCY_VERDICTS.map((verdict, index) => [verdict, index]));
@@ -282,6 +284,7 @@ export function evaluateDependencyChanges(
   return {
     verdicts,
     unavailableSignals: request.popular === null && typosquatApplies ? ["possible_typosquat"] : [],
+    ...(request.popular === null ? {} : { popularityRevision: request.popular.revision }),
   };
 }
 

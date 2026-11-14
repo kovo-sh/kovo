@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { writerPinned } from "../compatibility.js";
 
 import { branchProtectionAssessmentSchema } from "../branch-protection.js";
 import { fixHoldReasonSchema } from "../enums/fixes.js";
@@ -6,6 +7,7 @@ import {
   approvalStatusSchema,
   calibrationStatusSchema,
   packageManagerSchema,
+  storedPackageManagerSchema,
 } from "../enums/recipes.js";
 import {
   MODE_REASONS,
@@ -28,13 +30,19 @@ import {
   fixIdSchema,
   githubRepoIdSchema,
   installationIdSchema,
+  installRootIdSchema,
+  projectIdSchema,
+  installRootObservationIdSchema,
   recipeVersionIdSchema,
   repoIdSchema,
+  userIdSchema,
 } from "../ids.js";
+import { nonNegativeMicroUsdWireSchema } from "../money.js";
 import { packageNameSchema } from "../npm.js";
+import { workspacePathSchema } from "../workspace-inventory.js";
 import { LIMITS } from "../limits.js";
 import { pageSchema, paginationQueryShape } from "../pagination.js";
-import { countSchema, sha256HexSchema, whenValid } from "../primitives.js";
+import { countSchema, gitShaSchema, sha256HexSchema, whenValid } from "../primitives.js";
 import { utcDateTimeSchema } from "../time.js";
 import { repoFullNameSchema } from "../github.js";
 import { branchNameSchema, emptyBodySchema, tierCountsSchema, userRefSchema } from "./common.js";
@@ -56,7 +64,7 @@ export const PROTECTION_STATES = ["enabled", "pending_capacity", "disabled"] as 
 export const protectionStateSchema = z.enum(PROTECTION_STATES);
 export type ProtectionState = z.infer<typeof protectionStateSchema>;
 
-export const repoProtectionSchema = z
+const repositoryProtectionSchema = z
   .strictObject({
     state: protectionStateSchema,
     enabled_at: utcDateTimeSchema.nullable(),
@@ -79,6 +87,19 @@ export const repoProtectionSchema = z
       });
     }
   }, whenValid);
+
+export const repoProtectionSchema = writerPinned(
+  repositoryProtectionSchema.safeExtend({
+    projects: z
+      .strictObject({
+        discovered: countSchema,
+        protected: countSchema,
+        pending_capacity: countSchema,
+      })
+      .exactOptional(),
+  }),
+  repositoryProtectionSchema,
+);
 
 /**
  * One reason the effective mode is gated, with its dashboard category and the next actions that
@@ -285,7 +306,7 @@ export const repoSchema = z
     full_name: repoFullNameSchema,
     default_branch: branchNameSchema,
     installation_id: installationIdSchema,
-    package_manager: packageManagerSchema.nullable(),
+    package_manager: storedPackageManagerSchema.nullable(),
     unsupported_reason: unsupportedRepoReasonSchema.nullable(),
     archived_at: utcDateTimeSchema.nullable(),
     protection: repoProtectionSchema,
@@ -374,6 +395,20 @@ export type Repo = z.output<typeof repoSchema>;
 export const repoResponseSchema = z.strictObject({ repo: repoSchema });
 
 /**
+ * `POST /v1/repos/{repo}/protection/check` (#7275): the repository after its GitHub branch
+ * protection was read again (`repo.branch_protection.assessed_at` is that read), and when Kovo's
+ * scheduled nightly check last visited the repository's installation (null: not yet).
+ */
+export const protectionCheckResponseSchema = z.strictObject({
+  repo: repoSchema,
+  scheduled_check_at: utcDateTimeSchema.nullable(),
+});
+export type ProtectionCheckResponse = z.output<typeof protectionCheckResponseSchema>;
+
+/** How often one repository's protection may be checked again on request (any caller). */
+export const PROTECTION_RECHECK_INTERVAL_SECONDS = 30;
+
+/**
  * `PUT /v1/repos/{repo}/mode`: a partial update, where an absent member is left unchanged, so a
  * key can change `pr_parallel_cap` without resending consent. Requesting autopilot (either
  * activation path) binds the authorization to the disclosed consent scope the admin reviewed
@@ -423,7 +458,439 @@ const ROW_MODE = "Human repo admin for autopilot/activation policy; enforce plan
 
 const repoParams = z.strictObject({ repo: repoIdSchema });
 
+/**
+ * Read-only identity inventory. Project selection and protection have their own endpoints (M10b,
+ * `projectSelectionSchema` below).
+ */
+export const repoProjectsResponseSchema = z.strictObject({
+  roots: z.array(
+    z.strictObject({
+      id: installRootIdSchema,
+      path: z.string().min(1).max(1024),
+      stale: z.boolean(),
+      generation: countSchema,
+      published_generation: countSchema.nullable(),
+    }),
+  ),
+  projects: z.array(
+    z.strictObject({
+      id: projectIdSchema,
+      install_root_id: installRootIdSchema,
+      path: z.string().min(1).max(1024),
+      kind: z.enum(["app", "library", "library_bundle"]),
+      classification_rule: z.enum([
+        "override_v1",
+        "apps_path_v1",
+        "leaf_framework_v1",
+        "library_v1",
+        "root_application_v1",
+        "single_package_v1",
+        "library_bundle_v1",
+      ]),
+    }),
+  ),
+  observations: z.array(
+    z.strictObject({
+      id: installRootObservationIdSchema,
+      install_root_id: installRootIdSchema,
+      commit_sha: gitShaSchema,
+      generation: countSchema,
+      kind: z.enum(["single_package", "workspace", "refused"]),
+      package_manager: packageManagerSchema.nullable(),
+      reason: z.string().max(128).nullable(),
+      member_count: countSchema,
+      project_count: countSchema,
+    }),
+  ),
+});
+
+/**
+ * A repository's project selection (M10b, plans/monorepo-projects.md §6.4, SPEC "Project billing:
+ * interpretations"): every live project with its protection state. `selection_due_at` is set while
+ * the repository is in its no-charge selection grace: every listed project stays protected at no
+ * new charge until then, and `PUT …/projects/selection` ends the grace with the customer's choice.
+ * Counts and states only, never charges.
+ */
+export const projectSelectionSchema = z
+  .strictObject({
+    repo_id: repoIdSchema,
+    /** Whether the account's billing counts projects; before it, protection is per repository. */
+    project_billing: z.boolean(),
+    selection_due_at: utcDateTimeSchema.nullable(),
+    projects: z
+      .array(
+        z
+          .strictObject({
+            id: projectIdSchema,
+            install_root_id: installRootIdSchema,
+            path: z.string().min(1).max(1024),
+            kind: z.enum(["app", "library", "library_bundle"]),
+            protection: protectionStateSchema,
+            capacity_requested_at: utcDateTimeSchema.nullable(),
+          })
+          .refine(
+            (project) =>
+              (project.protection === "pending_capacity") ===
+              (project.capacity_requested_at !== null),
+            {
+              ...whenValid,
+              error: "exactly a pending project records when capacity was requested",
+              path: ["capacity_requested_at"],
+            },
+          ),
+      )
+      .max(100),
+  })
+  .refine((selection) => selection.project_billing || selection.selection_due_at === null, {
+    ...whenValid,
+    error: "only project billing has a selection grace",
+    path: ["selection_due_at"],
+  });
+export type ProjectSelection = z.infer<typeof projectSelectionSchema>;
+
+/** `PUT …/projects/selection`: the projects to keep protected; every other one is released. */
+export const selectProjectsBodySchema = z.strictObject({
+  project_ids: z
+    .array(projectIdSchema)
+    .min(1)
+    .max(100)
+    .refine((ids) => new Set(ids).size === ids.length, {
+      ...whenValid,
+      error: "duplicate project",
+    }),
+});
+
+const projectParams = z.strictObject({ repo: repoIdSchema, project: projectIdSchema });
+const ROW_PROJECT_SELECTION =
+  "Human session: repo read to view, repo admin to change; billing-authorized capacity grant if needed; reuses paid capacity first ([#2135](https://github.com/kovo-sh/kovo-cloud/issues/2135))";
+
+/** A project change's response: the selection after it, and the project it changed. */
+const projectChangeSchema = (state: ProtectionState) =>
+  z
+    .strictObject({ selection: projectSelectionSchema, project_id: projectIdSchema })
+    .refine(
+      (body) =>
+        body.selection.projects.find((project) => project.id === body.project_id)?.protection ===
+        state,
+      { ...whenValid, error: `the project's protection is ${state}` },
+    );
+
+// ---- Classification overrides (M10b, plans/monorepo-projects.md §5.3) ----
+
+const memberKindSchema = z.enum(["app", "library"]);
+
+/**
+ * One customer classification declaration for a member of the repository-root workspace: binding
+ * (§5.2 rule 1), keyed by member path (a renamed member loses it), applied by the next discovery.
+ * Identifiers only: never manifests, scripts or dependency values.
+ */
+export const classificationOverrideSchema = z.strictObject({
+  member_path: workspacePathSchema,
+  kind: memberKindSchema,
+  /** The member's kind when it was declared; null when unknown. */
+  previous_kind: memberKindSchema.nullable(),
+  declared_by: userIdSchema,
+  declared_at: utcDateTimeSchema,
+});
+export type ClassificationOverride = z.infer<typeof classificationOverrideSchema>;
+
+const previewProjectSchema = z.strictObject({
+  path: workspacePathSchema,
+  kind: z.enum(["app", "library", "library_bundle"]),
+  /** The project is protected now (only a removed project can be). */
+  protected: z.boolean(),
+});
+
+export const CLASSIFICATION_CHARGE_UNAVAILABLE = [
+  "billing_authority_required",
+  "plan_required",
+  "payment_past_due",
+] as const;
+
+/**
+ * What a declaration would change, charging nothing and recording nothing: the repository's live
+ * projects before and after, and the paid slots that protecting the projects it adds would need
+ * beyond the free ones. The prorated amount is the billing preview's own price
+ * (`/v1/billing/capacity/preview`), shown only to a billing-authorized person; paying for it still
+ * takes that preview and its two-actor confirm. Before project billing, protection counts
+ * repositories, so a declaration needs no slot.
+ */
+export const classificationPreviewSchema = z
+  .strictObject({
+    member_path: workspacePathSchema,
+    current_kind: memberKindSchema,
+    kind: memberKindSchema,
+    project_count: z.int().min(0).max(100),
+    resulting_project_count: z.int().min(0).max(101),
+    added_projects: z.array(previewProjectSchema).max(101),
+    removed_projects: z.array(previewProjectSchema).max(100),
+    project_billing: z.boolean(),
+    available_slots: z.int().min(0),
+    additional_slots: z.int().min(0).max(101),
+    prorated_charge_usd: nonNegativeMicroUsdWireSchema.nullable(),
+    charge_unavailable: z.enum(CLASSIFICATION_CHARGE_UNAVAILABLE).nullable(),
+  })
+  .refine(
+    (preview) =>
+      preview.additional_slots === 0
+        ? preview.prorated_charge_usd === null && preview.charge_unavailable === null
+        : (preview.prorated_charge_usd === null) !== (preview.charge_unavailable === null),
+    {
+      ...whenValid,
+      error: "a needed slot has either its prorated charge or why it cannot be shown",
+      path: ["prorated_charge_usd"],
+    },
+  )
+  .refine((preview) => preview.project_billing || preview.additional_slots === 0, {
+    ...whenValid,
+    error: "only project billing counts projects",
+    path: ["additional_slots"],
+  });
+export type ClassificationPreview = z.infer<typeof classificationPreviewSchema>;
+
+/** `POST …/projects/classification/preview`: `kind` null previews withdrawing the declaration. */
+export const previewClassificationBodySchema = z.strictObject({
+  member_path: workspacePathSchema,
+  kind: memberKindSchema.nullable(),
+});
+export const setClassificationBodySchema = z.strictObject({
+  member_path: workspacePathSchema,
+  kind: memberKindSchema,
+});
+const ROW_PROJECT_CLASSIFICATION =
+  "Human session: repo read to view, repo admin to change; never charges; added paid capacity only through the billing preview and confirm ([#2135](https://github.com/kovo-sh/kovo-cloud/issues/2135))";
+
+const ROW_PROJECT_CLASSIFICATION_POSTS =
+  "Human session: repo admin for both; never charges; added paid capacity only through the billing preview and confirm ([#2135](https://github.com/kovo-sh/kovo-cloud/issues/2135))";
+
 export const REPO_ENDPOINTS = {
+  getProjectSelection: defineEndpoint({
+    operationId: "getProjectSelection",
+    area: "repos",
+    method: "GET",
+    path: "/v1/repos/{repo}/projects/selection",
+    summary:
+      "Read the repository's live projects with their protection state and any no-charge selection grace.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/selection" },
+    params: repoParams,
+    query: null,
+    body: null,
+    responses: { 200: z.strictObject({ selection: projectSelectionSchema }) },
+    authorization: {
+      spec: ROW_PROJECT_SELECTION,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "read", over: "path_repo" },
+    },
+  }),
+  selectProjects: defineEndpoint({
+    operationId: "selectProjects",
+    area: "repos",
+    method: "PUT",
+    path: "/v1/repos/{repo}/projects/selection",
+    summary:
+      "End a repository's no-charge selection grace: keep the listed projects protected and release the rest. Already-paid capacity is reused first; a selection that needs more paid capacity is refused until a billing-authorized purchase is confirmed.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/selection" },
+    auditActions: ["project.protection_enabled", "project.protection_disabled"],
+    params: repoParams,
+    query: null,
+    body: selectProjectsBodySchema,
+    responses: { 200: z.strictObject({ selection: projectSelectionSchema }) },
+    authorization: {
+      spec: ROW_PROJECT_SELECTION,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "admin", over: "path_repo" },
+    },
+    problems: ["plan_required", "payment_past_due", "installation_suspended", "conflict"],
+  }),
+  protectProject: defineEndpoint({
+    operationId: "protectProject",
+    area: "repos",
+    method: "PUT",
+    path: "/v1/repos/{repo}/projects/{project}/protection",
+    summary:
+      "Select one project for protection: 200 when an included or already-paid unused slot is free, otherwise 202 pending a billing-authorized capacity confirmation.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/{project}/protection" },
+    // 200 into an unprotected repository writes `repo.protection_enabled`, into a protected one
+    // `project.protection_enabled`; 202 (pending capacity) writes `repo.protection_requested`.
+    auditActions: [
+      "repo.protection_enabled",
+      "project.protection_enabled",
+      "repo.protection_requested",
+    ],
+    params: projectParams,
+    query: null,
+    body: emptyBodySchema,
+    responses: {
+      200: projectChangeSchema("enabled"),
+      202: projectChangeSchema("pending_capacity"),
+    },
+    authorization: {
+      // Never charged here: beyond free capacity the selection waits as a pending request (202)
+      // until a billing-authorized person previews and confirms paid capacity.
+      spec: ROW_PROJECT_SELECTION,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "admin", over: "path_repo" },
+    },
+    problems: [
+      "plan_required",
+      "payment_past_due",
+      "account_not_linked",
+      "installation_suspended",
+      "conflict",
+    ],
+  }),
+  unprotectProject: defineEndpoint({
+    operationId: "unprotectProject",
+    area: "repos",
+    method: "DELETE",
+    path: "/v1/repos/{repo}/projects/{project}/protection",
+    summary:
+      "Stop protecting one project or withdraw its pending request; paid capacity drops only at the next renewal, with no mid-cycle refund.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/{project}/protection" },
+    // The repository's last protected project ends its protection (`repo.protection_disabled`).
+    auditActions: ["project.protection_disabled", "repo.protection_disabled"],
+    params: projectParams,
+    query: null,
+    body: null,
+    responses: { 200: projectChangeSchema("disabled") },
+    authorization: {
+      spec: ROW_PROJECT_SELECTION,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "admin", over: "path_repo" },
+    },
+    problems: ["conflict"],
+  }),
+  getClassificationOverrides: defineEndpoint({
+    operationId: "getClassificationOverrides",
+    area: "repos",
+    method: "GET",
+    path: "/v1/repos/{repo}/projects/classification",
+    summary:
+      "Read the customer's binding app or library declarations for members of the repository-root workspace.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/classification" },
+    params: repoParams,
+    query: null,
+    body: null,
+    responses: {
+      200: z.strictObject({ overrides: z.array(classificationOverrideSchema).max(101) }),
+    },
+    authorization: {
+      spec: ROW_PROJECT_CLASSIFICATION,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "read", over: "path_repo" },
+    },
+  }),
+  previewClassificationOverride: defineEndpoint({
+    operationId: "previewClassificationOverride",
+    area: "repos",
+    method: "POST",
+    path: "/v1/repos/{repo}/projects/classification/preview",
+    summary:
+      "Preview declaring a member an app or a library (or withdrawing the declaration): the project count before and after, and the paid slots and prorated charge protecting added projects would need. Charges and records nothing.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/classification/preview" },
+    params: repoParams,
+    query: null,
+    body: previewClassificationBodySchema,
+    responses: { 200: z.strictObject({ preview: classificationPreviewSchema }) },
+    authorization: {
+      spec: ROW_PROJECT_CLASSIFICATION_POSTS,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "admin", over: "path_repo" },
+    },
+    problems: ["conflict", "upstream_error"],
+  }),
+  setClassificationOverride: defineEndpoint({
+    operationId: "setClassificationOverride",
+    area: "repos",
+    method: "PUT",
+    path: "/v1/repos/{repo}/projects/classification",
+    summary:
+      "Declare a member of the repository-root workspace an app or a library. The next discovery applies it; it protects nothing and charges nothing.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/classification" },
+    auditActions: ["project.classification_overridden"],
+    params: repoParams,
+    query: null,
+    body: setClassificationBodySchema,
+    responses: {
+      200: z
+        .strictObject({
+          override: classificationOverrideSchema,
+          preview: classificationPreviewSchema,
+        })
+        .refine(
+          (body) =>
+            body.override.member_path === body.preview.member_path &&
+            body.override.kind === body.preview.kind,
+          { ...whenValid, error: "the preview is the declaration's own" },
+        ),
+    },
+    authorization: {
+      spec: ROW_PROJECT_CLASSIFICATION,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "admin", over: "path_repo" },
+    },
+    problems: ["conflict", "upstream_error"],
+  }),
+  revokeClassificationOverride: defineEndpoint({
+    operationId: "revokeClassificationOverride",
+    area: "repos",
+    method: "POST",
+    path: "/v1/repos/{repo}/projects/classification/revoke",
+    summary:
+      "Withdraw a member's declaration: the next discovery classifies it by Kovo's rules again. A member without one is unchanged.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects/classification/revoke" },
+    auditActions: ["project.classification_override_revoked"],
+    params: repoParams,
+    query: null,
+    body: z.strictObject({ member_path: workspacePathSchema }),
+    responses: {
+      200: z
+        .strictObject({
+          member_path: workspacePathSchema,
+          revoked: z.boolean(),
+          preview: classificationPreviewSchema.nullable(),
+        })
+        .refine((body) => body.revoked === (body.preview !== null), {
+          ...whenValid,
+          error: "a withdrawn declaration has its preview",
+          path: ["preview"],
+        }),
+    },
+    authorization: {
+      spec: ROW_PROJECT_CLASSIFICATION_POSTS,
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "admin", over: "path_repo" },
+    },
+    problems: ["conflict", "upstream_error"],
+  }),
+  listRepoProjects: defineEndpoint({
+    operationId: "listRepoProjects",
+    area: "repos",
+    method: "GET",
+    path: "/v1/repos/{repo}/projects",
+    summary:
+      "Read install roots, project identities and the latest complete-discovery observations.",
+    source: { kind: "spec_row", path: "/v1/repos/{repo}/projects" },
+    params: repoParams,
+    query: null,
+    body: null,
+    responses: { 200: repoProjectsResponseSchema },
+    authorization: {
+      managementPermission: "getRepo",
+      spec: "Scoped read; install-root and project identities, kinds, classification rules and latest complete-discovery counts; stale roots retain their last published state. Read-only before project activation ([#2135](https://github.com/kovo-sh/kovo-cloud/issues/2135)).",
+      actors: READERS,
+      tenant: "path_resource",
+      repoAuthority: { level: "read", over: "path_repo" },
+    },
+  }),
   getRepoFixConcurrency: defineEndpoint({
     operationId: "getRepoFixConcurrency",
     area: "repos",
@@ -530,6 +997,28 @@ export const REPO_ENDPOINTS = {
       "unsupported_repository",
       "conflict",
     ],
+  }),
+  recheckProtection: defineEndpoint({
+    operationId: "recheckProtection",
+    area: "repos",
+    method: "POST",
+    path: "/v1/repos/{repo}/protection/check",
+    summary:
+      "Read a protected repository's GitHub branch protection again now and recompute its mode (Check again); at most once every 30 seconds per repository.",
+    source: { kind: "spec_implied", section: "Web application and onboarding UI" },
+    // Written only when the fresh read changes the effective mode (the recompute's own event).
+    auditActions: ["repo.mode_changed"],
+    params: repoParams,
+    query: null,
+    body: emptyBodySchema,
+    responses: { 200: protectionCheckResponseSchema },
+    authorization: {
+      spec: "Check again reads the repository's GitHub branch protection again in a human session, at most once every 30 seconds per repository",
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "read", over: "path_repo" },
+    },
+    problems: ["repo_not_enabled", "upstream_error"],
   }),
   disableProtection: defineEndpoint({
     operationId: "disableProtection",

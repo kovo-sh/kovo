@@ -23,16 +23,23 @@ export * from "./limits.js";
 export * from "./llm-judgment.js";
 export * from "./money.js";
 export * from "./npm.js";
+export * from "./package-manager-choice.js";
 export * from "./pagination.js";
 export * from "./policy.js";
 export * from "./primitives.js";
+export * from "./convergence.js";
+export * from "./plus-recipe-agent.js";
+export * from "./probes.js";
 export * from "./problem.js";
 export * from "./rate-limit.js";
 export * from "./recipe.js";
+export * from "./workflow-jobs.js";
 export * from "./env-fixture.js";
 export * from "./regression.js";
 export * from "./secret-tokens.js";
 export * from "./step-result.js";
+export * from "./coverage-signature.js";
+export * from "./customer-asks.js";
 export * from "./tier.js";
 export * from "./time.js";
 export * from "./toolchain.js";
@@ -67,6 +74,10 @@ export {
 } from "./content-egress.js";
 
 export * from "./sandbox-egress.js";
+export * from "./support-budget.js";
 
 export * from "./install-binaries.js";
+export * from "./artifact-cache.js";
 export * from "./dependency-verdicts.js";
+export * from "./public-repo-check.js";
+export { ACCOUNT_DEACTIVATION_EMAIL, ACCOUNT_REACTIVATION_EMAIL } from "./account-deactivation.js";

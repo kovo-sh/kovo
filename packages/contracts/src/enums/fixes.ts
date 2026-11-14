@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { persistedReader } from "../tolerant-reader.js";
 import type { Plan } from "./accounts.js";
 import type { WaitReason } from "./waits.js";
 
@@ -155,6 +156,15 @@ export function ladderRungsForPlan(plan: Plan): LadderRung[] {
 export const SLOT_KINDS = ["fix", "p0_extra", "failed_verification", "revert"] as const;
 export const slotKindSchema = z.enum(SLOT_KINDS);
 export type SlotKind = z.infer<typeof slotKindSchema>;
+
+/**
+ * `fix_constituents.state` (plans/monorepo-projects.md §7.2 "Constituents"): a project the fix PR
+ * acts on (`included`), one that could not verify (`failed`; the PR never merges with it), or one
+ * removed from the PR by a re-plan or a project deselection (`deselected`).
+ */
+export const FIX_CONSTITUENT_STATES = ["included", "failed", "deselected"] as const;
+export const fixConstituentStateSchema = persistedReader(z.enum(FIX_CONSTITUENT_STATES));
+export type FixConstituentState = z.infer<typeof fixConstituentStateSchema>;
 
 /**
  * `fixes.outcome_reason`: why a fix reached its terminal state. {@link FIX_OUTCOME_STATUS} maps

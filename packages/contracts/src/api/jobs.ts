@@ -27,7 +27,7 @@ import { durableFailureReasonCodeSchema } from "../problem.js";
 import { stepNameSchema } from "../step-result.js";
 import { utcDateTimeSchema } from "../time.js";
 import { pullRequestRefSchema } from "../webhooks.js";
-import { runRecordListResponseSchema } from "../run-record.js";
+import { runRecordListResponseSchema, runRecordMetadataSchema } from "../run-record.js";
 import { defineEndpoint } from "./endpoint.js";
 
 // `GET /v1/jobs/{id}`: asynchronous work (SPEC Public API row "Scoped read, including tenant
@@ -65,7 +65,9 @@ export const JOB_RESULT_SCHEMAS = {
   recipe_discovery: z.strictObject({ recipe_version: discoveredVersionSchema }),
   /** `recipe_version` is null when the fingerprint was unchanged. */
   recipe_rediscovery: z.strictObject({ recipe_version: discoveredVersionSchema.nullable() }),
-  recipe_calibration: z.strictObject({ calibration_status: z.enum(["calibrated", "weak"]) }),
+  recipe_calibration: z.strictObject({
+    calibration_status: z.enum(["calibrated", "weak", "limited"]),
+  }),
   /**
    * Sandbox A: the rung that produced the staged candidate and whether the agent helped, for this
    * job (a fix's later attempts may differ). The staged patch itself never leaves the control plane.
@@ -331,6 +333,31 @@ export const failureDiagnosesQuerySchema = z
     },
   );
 
+/** The most command records one failed-step lookup returns, newest first. */
+export const FAILED_STEP_RECORDS_MAX = 20;
+
+/**
+ * Which failed step's output to find in the run-records vault (owner D-803): the run it belongs to,
+ * named by exactly one verification evidence record or recipe version, and the step's phase and
+ * name. `run_kind` narrows an evidence lookup to the verification, revert or unchanged-base run.
+ */
+export const failedStepRecordsQuerySchema = z
+  .strictObject({
+    evidence: evidenceIdSchema.exactOptional(),
+    recipe_version: recipeVersionIdSchema.exactOptional(),
+    phase: sandboxPhaseSchema,
+    step_name: stepNameSchema,
+    run_kind: failureExcerptRunKindSchema.exactOptional(),
+  })
+  .refine((query) => (query.evidence === undefined) !== (query.recipe_version === undefined), {
+    error: "Name exactly one evidence record or recipe version.",
+  });
+export type FailedStepRecordsQuery = z.output<typeof failedStepRecordsQuerySchema>;
+
+export const failedStepRecordsResponseSchema = z.strictObject({
+  records: z.array(runRecordMetadataSchema).max(FAILED_STEP_RECORDS_MAX),
+});
+
 export const JOB_ENDPOINTS = {
   listJobRunRecords: defineEndpoint({
     operationId: "listJobRunRecords",
@@ -376,6 +403,29 @@ export const JOB_ENDPOINTS = {
       repoAuthority: { level: "read", over: "path_repo" },
     },
     problems: ["record_expired", "record_unavailable"],
+  }),
+  listFailedStepRunRecords: defineEndpoint({
+    operationId: "listFailedStepRunRecords",
+    area: "jobs",
+    method: "GET",
+    path: "/v1/repos/{repo}/failed-step-records",
+    summary:
+      "List the run-record metadata of a failed step's command output, newest first, for a human repository reader.",
+    source: {
+      kind: "owner_directed",
+      decision: "run-records.md",
+      heading: "Customer reads (owner-directed, R5)",
+    },
+    params: z.strictObject({ repo: repoIdSchema }),
+    query: failedStepRecordsQuerySchema,
+    body: null,
+    responses: { 200: failedStepRecordsResponseSchema },
+    authorization: {
+      spec: "Human members who can read the repo's fixes may read records through a repo-authorized session; API keys are excluded in v1.",
+      actors: ["human_session"],
+      tenant: "path_resource",
+      repoAuthority: { level: "read", over: "path_repo" },
+    },
   }),
   getFailureDiagnoses: defineEndpoint({
     operationId: "getFailureDiagnoses",

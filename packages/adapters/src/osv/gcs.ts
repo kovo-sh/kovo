@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { getWithRetries, sendGet, type HttpClientDeps } from "../http/client.js";
+import { upstreamCircuit } from "../http/circuit.js";
 import { malformedDocument, readJsonLimited } from "../http/body.js";
 import type { HttpCallContext } from "../http/errors.js";
 import { withRetries } from "../http/retry.js";
@@ -109,18 +110,24 @@ export async function openGeneration(
     handledStatuses: [404],
   };
   const response = await withRetries(
-    async () => {
-      if (transferTimeoutMs !== null) {
-        return sendGet(deps, request, deadlineSignal(transferTimeoutMs, signal));
-      }
-      const headers = headersDeadline(deps.requestTimeoutMs, signal);
+    async (_attempt, remainingMs) => {
+      const transferSignal =
+        transferTimeoutMs === null ? signal : deadlineSignal(transferTimeoutMs, signal);
+      const headers = headersDeadline(Math.min(deps.requestTimeoutMs, remainingMs), transferSignal);
       try {
         return await sendGet(deps, request, headers.signal);
       } finally {
         headers.settle();
       }
     },
-    { policy: deps.retry, sleep: deps.sleep, signal },
+    {
+      policy: deps.retry,
+      sleep: deps.sleep,
+      signal,
+      clock: deps.clock,
+      circuit: upstreamCircuit(deps.transport, request.url.origin),
+      context,
+    },
   );
   if (response.status === 404) {
     await response.body?.cancel().catch(() => undefined);

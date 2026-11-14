@@ -1,29 +1,13 @@
-import { ERROR_MESSAGE_MARKER, registeredErrorMessage } from "./error-messages.js";
-import { isSensitiveLogKey } from "./keys.js";
-import { REDACTED } from "./marker.js";
-import { redactText, stripUrlQuery, type TextRedactor } from "./patterns.js";
+import { z } from "zod";
 import {
-  DATABASE_ERROR_MARKER,
-  VALIDATION_ERROR_MARKER,
-  describeValidationError,
-  isParameterEmbeddingError,
-  isValidationError,
-  sanitizeValue,
-  safeErrorName,
-  validatedErrorFrames,
-  type Sanitized,
-  type SanitizeOptions,
-} from "./sanitize.js";
+  FREE_TEXT_MARKER,
+  logErrorIdentity,
+  logErrorClassSchema,
+  projectLogFields,
+} from "./log-metadata.js";
+import type { SanitizeOptions } from "./sanitize.js";
+import type { TextRedactor } from "./patterns.js";
 
-// Scrubbing of exception reports (Sentry events and breadcrumbs) with the shared redaction rules,
-// for every process that reports exceptions: the control plane's Sentry reporter
-// (`@kovo/adapters/telemetry`) and the web app's server and browser reporters (`apps/web`). SPEC
-// Observability: "Sentry captures sanitized exceptions with default PII capture disabled and
-// request/body/console scrubbing." The shapes below are the members of Sentry's `ErrorEvent`,
-// `EventHint` and `Breadcrumb` these functions touch, declared structurally so this package imports
-// no SDK; the SDK types satisfy them.
-
-/** A stack frame of an exception report. */
 export interface ScrubbableFrame {
   vars?: unknown;
   pre_context?: unknown;
@@ -33,23 +17,17 @@ export interface ScrubbableFrame {
   abs_path?: string;
   filename?: string;
 }
-
-/** One exception value of an exception report (the captured error or one of its causes). */
 export interface ScrubbableException {
   type?: string;
   value?: string;
   stacktrace?: { frames?: ScrubbableFrame[] };
 }
-
-/** A breadcrumb (an event that happened before the exception). */
 export interface ScrubbableBreadcrumb {
   type?: string;
   category?: string;
   message?: string;
   data?: { [key: string]: unknown };
 }
-
-/** The members of an exception report that can carry request, user or content data. */
 export interface ScrubbableEvent {
   request?: unknown;
   user?: unknown;
@@ -65,26 +43,17 @@ export interface ScrubbableEvent {
   contexts?: { [key: string]: unknown };
   breadcrumbs?: ScrubbableBreadcrumb[];
 }
-
-/** What the reporter knows about the event: the thrown value itself. */
 export interface ScrubbableHint {
   originalException?: unknown;
 }
 
-const NO_BODIES: never[] = [];
-
-/**
- * The data-collection lockdown of every exception reporter (Sentry's `dataCollection` option,
- * docs/libraries/billing-comms-telemetry.md §4: the v11 defaults collect user info, cookies,
- * headers, bodies, query strings, AI inputs and outputs, database data and frame locals). A fresh
- * object per call, so no SDK can mutate the policy another reporter reads.
- */
+/** SDK collection is off before scrubbing; content never enters SDK request/AI integrations. */
 export function exceptionReportDataCollection() {
   return {
     userInfo: false,
     cookies: false,
     httpHeaders: false,
-    httpBodies: NO_BODIES,
+    httpBodies: [] as never[],
     urlQueryParams: false,
     genAI: { inputs: false, outputs: false },
     databaseQueryData: false,
@@ -94,223 +63,131 @@ export function exceptionReportDataCollection() {
     frameContextLines: 0,
   };
 }
+export const KEPT_EVENT_CONTEXTS: ReadonlySet<string> = new Set(["trace"]);
 
-/** Event contexts kept (runtime and trace linkage); every other context is dropped. */
-export const KEPT_EVENT_CONTEXTS: ReadonlySet<string> = new Set([
-  "trace",
-  "runtime",
-  "os",
-  "app",
-  "device",
-  "browser",
-]);
-
-/** Breadcrumb data members kept for http/fetch breadcrumbs. */
-const KEPT_BREADCRUMB_DATA: ReadonlySet<string> = new Set(["method", "status_code", "url"]);
-
-function chainOf(error: unknown): unknown[] {
-  const chain: unknown[] = [];
-  let current: unknown = error;
-  while (current !== undefined && current !== null && chain.length < 10) {
-    if (chain.includes(current)) break;
-    chain.push(current);
-    current = typeof current === "object" ? Reflect.get(current, "cause") : undefined;
-  }
-  return chain;
-}
-
-/** Replace SDK-parsed stacks: the SDK may parse message text as frames after its first line. */
+/** SDK-parsed stacks and application stack strings are never exported. */
 export function rebuildErrorEventFrames<E extends ScrubbableEvent>(
   event: E,
-  hint: ScrubbableHint | undefined,
-  parse: ((stack: string) => ScrubbableFrame[]) | undefined,
-  options: SanitizeOptions = {},
+  _hint: ScrubbableHint | undefined,
+  _parse: ((stack: string) => ScrubbableFrame[]) | undefined,
+  _options: SanitizeOptions = {},
 ): E {
-  const values = event.exception?.values;
-  if (values === undefined) return event;
-  const chain = chainOf(hint?.originalException);
-  const aligned = chain.length === values.length;
-  values.forEach((exception, index) => {
-    const hadStacktrace = exception.stacktrace !== undefined;
-    delete exception.stacktrace;
-    // Rebuild existing SDK stacks only; do not add runtime metadata to stackless events.
-    if (!hadStacktrace || !aligned || parse === undefined) return;
-    const region = validatedErrorFrames(chain[values.length - 1 - index], options);
-    if (region === undefined) return;
-    const frames = parse(region);
-    if (frames.length > 0) exception.stacktrace = { frames };
-  });
+  for (const value of event.exception?.values ?? []) delete value.stacktrace;
   return event;
 }
 
-function nameOf(error: unknown): unknown {
-  return typeof error === "object" && error !== null ? Reflect.get(error, "name") : "";
-}
-
-function scrubFrames(event: ScrubbableEvent, extra: readonly TextRedactor[]): void {
-  for (const exception of event.exception?.values ?? []) {
-    for (const frame of exception.stacktrace?.frames ?? []) {
-      delete frame.vars;
-      delete frame.pre_context;
-      delete frame.context_line;
-      delete frame.post_context;
-      delete frame.module_metadata;
-      if (frame.abs_path !== undefined) frame.abs_path = redactText(frame.abs_path, extra);
-      if (frame.filename !== undefined) frame.filename = redactText(frame.filename, extra);
-    }
-  }
-}
-
-/**
- * Exception values follow the logger's error rules (`serializeError`): a driver error that embeds
- * SQL parameters loses its message, a Zod error keeps only issue codes and paths, and only an
- * aligned constructor-registered application error retains its pattern-redacted message.
- */
-function scrubExceptionValues(
-  event: ScrubbableEvent,
-  hint: ScrubbableHint | undefined,
-  extra: readonly TextRedactor[],
-): void {
-  const values = event.exception?.values;
-  if (values === undefined) return;
-  // Linked errors are ordered innermost cause first, the captured error last.
-  const chain = chainOf(hint?.originalException);
-  const aligned = chain.length === values.length;
-  const embeddingTypes = new Set(chain.filter(isParameterEmbeddingError).map(nameOf));
-  const validationErrors = chain.filter(isValidationError);
-  values.forEach((exception, index) => {
-    const original = aligned ? chain[values.length - 1 - index] : undefined;
-    const embeds = aligned
-      ? isParameterEmbeddingError(original)
-      : exception.type !== undefined && embeddingTypes.has(exception.type);
-    const validation = aligned
-      ? isValidationError(original)
-      : exception.type === "ZodError" && validationErrors.length > 0;
-    // Without alignment a Zod value is described only when the chain has exactly one Zod error.
-    const zodSource = aligned
-      ? original
-      : validationErrors.length === 1
-        ? validationErrors[0]
-        : undefined;
-    if (exception.value !== undefined) {
-      if (embeds) exception.value = DATABASE_ERROR_MARKER;
-      else if (validation) {
-        exception.value =
-          zodSource === undefined
-            ? VALIDATION_ERROR_MARKER
-            : describeValidationError(zodSource, { extraRedactors: extra });
-      } else {
-        const message = registeredErrorMessage(original);
-        exception.value = message === undefined ? ERROR_MESSAGE_MARKER : redactText(message, extra);
-      }
-    }
-    if (exception.type !== undefined)
-      exception.type = safeErrorName(redactText(exception.type, extra));
-  });
-}
-
-function isRecord(value: Sanitized): value is { readonly [key: string]: Sanitized } {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function scrubRecord(
-  record: Readonly<Record<string, unknown>>,
-  extra: readonly TextRedactor[],
-): Record<string, unknown> {
-  const sanitized = sanitizeValue(record, { extraRedactors: extra });
-  return isRecord(sanitized) ? { ...sanitized } : {};
-}
-
-/**
- * The breadcrumb scrubber: drops console breadcrumbs, strips query strings from http/fetch URLs and
- * keeps only method, status and URL; withholds messages and redacts other data.
- */
-export function scrubBreadcrumb<B extends ScrubbableBreadcrumb>(
-  breadcrumb: B,
+/** Free-text breadcrumbs are dropped whole; retained data uses exactly the logger schema. */
+export function scrubBreadcrumb(
+  breadcrumb: ScrubbableBreadcrumb,
   extra: readonly TextRedactor[] = [],
-): B | null {
-  if (breadcrumb.category === "console") return null;
-  const scrubbed: B = { ...breadcrumb };
-  delete scrubbed.message;
-  if (scrubbed.data !== undefined) {
-    const isHttp =
-      breadcrumb.category === "http" ||
-      breadcrumb.category === "fetch" ||
-      breadcrumb.category === "xhr" ||
-      breadcrumb.type === "http";
-    const data: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(scrubbed.data)) {
-      if (isHttp && !KEPT_BREADCRUMB_DATA.has(key)) continue;
-      data[key] =
-        key === "url" && typeof value === "string"
-          ? redactText(stripUrlQuery(value), extra)
-          : value;
-    }
-    scrubbed.data = isHttp ? data : scrubRecord(data, extra);
+): { data: ReturnType<typeof projectLogFields>["fields"] } | null {
+  try {
+    if (breadcrumb.message !== undefined || breadcrumb.category === "console") return null;
+    const projected = projectLogFields(breadcrumb.data ?? {}, extra);
+    if (projected.redacted > 0) return null;
+    // No category, URL or type supplied by an SDK is forwarded as an unchecked string.
+    return { data: projected.fields };
+  } catch {
+    return null;
   }
-  return scrubbed;
+}
+/**
+ * Fields that ordinary log lines may carry (D-423, #5514) but a Sentry event never does: the
+ * request's route, method and operation, an error's redacted message and cause chain, and Zod
+ * issue paths. Sentry keeps only the closed error identity and its existing tag allowlist; a
+ * supplied log-only field stays the withheld marker, as before those fields had a log schema.
+ */
+const LOG_ONLY_FIELDS: ReadonlySet<string> = new Set([
+  "route",
+  "method",
+  "operation_id",
+  "error_message",
+  "cause_classes",
+  "cause_messages",
+  "cause_count",
+  "zod_issue_paths",
+  "zod_issue_codes",
+  "zod_issue_count",
+]);
+
+function withholdLogOnly(fields: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(fields).map(([key, value]) => [
+      key,
+      LOG_ONLY_FIELDS.has(key) ? FREE_TEXT_MARKER : value,
+    ]),
+  );
 }
 
-/**
- * The exception-report scrubber (`beforeSend`): drops request, user and server identity, module
- * and thread lists, frame locals and source lines and non-runtime contexts; redacts messages,
- * exception values (dropping those of driver errors that embed SQL parameters and the received
- * values of Zod errors, including linked causes), tags and extras; withholds serialized thrown
- * values and breadcrumb messages. `extra` redactors
- * (known values) run before the patterns everywhere. Mutates and returns the event.
- */
-export function scrubErrorEvent<E extends ScrubbableEvent>(
-  event: E,
+const routing = {
+  event_id: z.string().regex(/^[a-f0-9]{32}$/i),
+  timestamp: z.number().finite(),
+  level: z.enum(["fatal", "error", "warning", "log", "info", "debug"]),
+  platform: z.enum(["node", "javascript"]),
+  environment: z.enum(["prod", "test", "local"]),
+  release: z.string().regex(/^[a-f0-9]{40,64}$/i),
+} as const;
+const routingSchemas: ReadonlyMap<string, z.ZodType> = new Map(Object.entries(routing));
+const routingSchema = z.strictObject(routing).partial();
+// Missing SDK routing fields are omitted, never assigned undefined. This preserves
+// the SDK's exact-optional-property contract without asserting a vendor event type.
+type SafeRouting = {
+  [K in keyof z.output<typeof routingSchema>]?: Exclude<
+    z.output<typeof routingSchema>[K],
+    undefined
+  >;
+};
+interface SafeErrorEvent extends SafeRouting {
+  type: undefined;
+  request?: never;
+  user?: never;
+  server_name?: never;
+  contexts?: never;
+  message?: never;
+  exception?: { values: { type: string; stacktrace?: { frames?: never[] } }[] };
+  tags?: Record<string, string>;
+  extra?: Record<string, unknown>;
+  breadcrumbs?: ScrubbableBreadcrumb[];
+}
+
+/** Closed beforeSend projection; messages, stacks, request bodies and arbitrary extras disappear. */
+export function scrubErrorEvent(
+  event: ScrubbableEvent,
   hint?: ScrubbableHint,
   extra: readonly TextRedactor[] = [],
-): E {
-  const target: ScrubbableEvent = event;
-  delete target.request;
-  delete target.user;
-  delete target.server_name;
-  delete target.modules;
-  delete target.threads;
-  const registered = registeredErrorMessage(hint?.originalException);
-  if (target.message !== undefined)
-    target.message =
-      registered === undefined ? ERROR_MESSAGE_MARKER : redactText(registered, extra);
-  if (target.logentry !== undefined) {
-    target.logentry =
-      target.logentry.message === undefined ? {} : { message: ERROR_MESSAGE_MARKER };
-  }
-  if (target.transaction !== undefined) {
-    target.transaction = redactText(stripUrlQuery(target.transaction), extra);
-  }
-  scrubExceptionValues(target, hint, extra);
-  scrubFrames(target, extra);
-  if (target.extra !== undefined) {
-    // Sentry puts thrown non-error content here. Withhold it before traversing or redacting it,
-    // including accessor-backed payloads; copying descriptors does not execute their getters.
-    const descriptors = Object.getOwnPropertyDescriptors(target.extra);
-    delete descriptors["__serialized__"];
-    target.extra = scrubRecord(Object.defineProperties({}, descriptors), extra);
-  }
-  if (target.tags !== undefined) {
-    const tags: Record<string, string> = {};
-    for (const [key, value] of Object.entries(target.tags)) {
-      // Tags are primitives; anything else is dropped rather than stringified. A sensitive name
-      // withholds the value whole, as in logs.
-      if (isSensitiveLogKey(key)) tags[key] = REDACTED;
-      else if (typeof value === "string") tags[key] = redactText(value, extra);
-      else if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint")
-        tags[key] = redactText(String(value), extra);
+): SafeErrorEvent {
+  const output: SafeErrorEvent = { type: undefined };
+  try {
+    const routed: Record<string, unknown> = {};
+    for (const [key, schema] of routingSchemas) {
+      const descriptor = Object.getOwnPropertyDescriptor(event, key);
+      const parsed = schema.safeParse(descriptor?.value);
+      if (parsed.success) routed[key] = parsed.data;
     }
-    target.tags = tags;
-  }
-  if (target.contexts !== undefined) {
-    target.contexts = Object.fromEntries(
-      Object.entries(target.contexts).filter(([key]) => KEPT_EVENT_CONTEXTS.has(key)),
+    Object.assign(output, routingSchema.parse(routed));
+    const sdkClass = logErrorClassSchema.safeParse(event.exception?.values?.at(-1)?.type);
+    const identity =
+      hint?.originalException === undefined
+        ? {
+            error_class: sdkClass.success ? sdkClass.data : "Error",
+            reason_code: "untrusted_error",
+          }
+        : logErrorIdentity(hint.originalException);
+    if (event.exception !== undefined)
+      output["exception"] = { values: [{ type: logErrorClassSchema.parse(identity.error_class) }] };
+    const tags = withholdLogOnly(projectLogFields(event.tags ?? {}, extra).fields);
+    output["tags"] = Object.fromEntries(
+      Object.entries({ ...tags, ...identity }).map(([key, value]) => [key, String(value)]),
     );
+    if (event.extra !== undefined)
+      output["extra"] = withholdLogOnly(projectLogFields(event.extra, extra).fields);
+    if (event.breadcrumbs !== undefined)
+      output["breadcrumbs"] = event.breadcrumbs
+        .slice(0, 30)
+        .map((value) => scrubBreadcrumb(value, extra))
+        .filter((value) => value !== null);
+  } catch {
+    /* A malformed SDK event carries no content, even when accessors throw. */
   }
-  if (target.breadcrumbs !== undefined) {
-    target.breadcrumbs = target.breadcrumbs
-      .map((breadcrumb) => scrubBreadcrumb(breadcrumb, extra))
-      .filter((breadcrumb): breadcrumb is ScrubbableBreadcrumb => breadcrumb !== null);
-  }
-  return event;
+  return output;
 }

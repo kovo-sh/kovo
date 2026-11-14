@@ -1,8 +1,5 @@
-import {
-  packageNameSchema,
-  type DependencyVerdictChangeWire,
-  type DependencyVerdictWire,
-} from "@kovo/contracts";
+import { packageNameSchema } from "@kovo/contracts/npm";
+import type { DependencyVerdictChangeWire, DependencyVerdictWire } from "@kovo/contracts";
 import {
   evaluateDependencyChanges,
   PLATFORM_DEPENDENCY_POLICY,

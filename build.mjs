@@ -20,8 +20,15 @@ const options = {
 }
 ;
 const aliases = {
+  "@kovo/contracts/primitives": "packages/contracts/src/primitives.ts",
   "@kovo/contracts": "packages/contracts/src/index.ts",
+  "@kovo/contracts/npm": "packages/contracts/src/npm.ts",
+  "@kovo/contracts/recipe": "packages/contracts/src/recipe.ts",
+  "@kovo/contracts/evidence": "packages/contracts/src/evidence.ts",
+  "@kovo/contracts/problem": "packages/contracts/src/problem.ts",
   "@kovo/contracts/api": "packages/contracts/src/api/index.ts",
+  "@kovo/contracts/time": "packages/contracts/src/time.ts",
+  "@kovo/contracts/ids": "packages/contracts/src/ids.ts",
   "@kovo/contracts/redaction": "packages/contracts/src/redaction/index.ts",
   "@kovo/adapters/osv": "packages/adapters/src/osv/index.ts",
   "@kovo/core/advisory": "packages/core/src/advisory/index.ts",

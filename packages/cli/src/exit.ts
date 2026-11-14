@@ -3,7 +3,7 @@
 // on 3 to fall back to `--offline` in the same job (plans/dependency-firewall.md Part 4 item 3).
 
 /** The package version (packages/cli/package.json; a test keeps them equal). */
-export const CLI_VERSION = "0.1.0";
+export const CLI_VERSION = "0.1.1";
 
 export const EXIT = {
   /** Every changed or new version is `allow` or `warn` (warnings are printed). */

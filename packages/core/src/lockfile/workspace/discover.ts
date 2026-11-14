@@ -1,4 +1,4 @@
-import { packageNameSchema, packageVersionSchema } from "@kovo/contracts";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 import semver from "semver";
 import { z } from "zod";
 
@@ -7,6 +7,10 @@ import { compileWorkspaceGlob, GlobWorkExceeded, PreparedPath } from "../../mani
 import { checkNpmrc } from "../../manifest/npmrc.js";
 import { npmrcKeyName, tokenizeNpmrc } from "../../manifest/npmrc-tokens.js";
 import { pnpmWorkspaceSettings } from "../../manifest/pnpm-settings.js";
+import {
+  isRootOnlyWorkspacePattern,
+  workspacePatternsDeclareMembers,
+} from "../../manifest/workspace-members.js";
 import {
   catalogEntry,
   catalogName,
@@ -202,11 +206,18 @@ export function discoverWorkspaces(
     if (yamlEntry !== undefined) return workspaceFailure("manager_mismatch");
     patterns = npmPatterns.data;
   } else if (npmPatterns.data.length > 0) return workspaceFailure("manager_mismatch");
-  if (input.packageManager === "yarn" && patterns.length > 0 && root.value["private"] !== true)
+  // A root-only set (`["."]`) declares no members beyond the root: one project (D-228).
+  const hasWorkspaces = workspacePatternsDeclareMembers(patterns);
+  if (
+    input.packageManager === "yarn" &&
+    patterns.some((pattern) => !isRootOnlyWorkspacePattern(pattern)) &&
+    root.value["private"] !== true
+  )
     return workspaceFailure("unsupported_layout");
   if (patterns.length > limits.maxPatterns) return workspaceFailure("resource_limit");
   const matchers = [];
-  for (const pattern of patterns) {
+  // The root is always a member, so root-only positive patterns add nothing to match.
+  for (const pattern of patterns.filter((glob) => !isRootOnlyWorkspacePattern(glob))) {
     const exclude = pattern.startsWith("!");
     const glob = exclude ? pattern.slice(1) : pattern;
     if (glob.length > limits.maxPatternLength) return workspaceFailure("resource_limit");
@@ -430,7 +441,7 @@ export function discoverWorkspaces(
     value: {
       packageManager: input.packageManager,
       members,
-      hasWorkspaces: patterns.some((pattern) => !pattern.startsWith("!")),
+      hasWorkspaces,
       workspaceConfigOid: yamlEntry?.oid ?? null,
       ...(catalogs === undefined ? {} : { catalogs }),
       ...(catalogs === undefined || pnpmWorkspaceConfig === undefined

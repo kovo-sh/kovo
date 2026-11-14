@@ -30,6 +30,10 @@ export function overrideEdits(
 ):
   | { readonly ok: true; readonly edits: readonly ManifestEdit[] }
   | { readonly ok: false; readonly reason: LadderSkipReason } {
+  // #8256 R2: Yarn 4 and Bun store overrides with their own selector rules, which Kovo's trusted
+  // whole-graph checks do not model yet; a root without a lockfile has no transitive instance.
+  if (ctx.pm === "yarn-berry" || ctx.pm === "bun" || ctx.pm === "manifest-only")
+    return { ok: false, reason: "override_storage_unsupported" };
   if (
     ctx.pm === "pnpm" &&
     ctx.input.pmVersion !== undefined &&
@@ -41,6 +45,23 @@ export function overrideEdits(
   if (parents.length === 0) return { ok: false, reason: "not_transitive" };
   if (parents.some((link) => link.edge.alias !== node.name))
     return { ok: false, reason: "aliased_edge" };
+  if (ctx.pm === "yarn") {
+    // Name-path selectors span every version of each parent, including unaffected children.
+    const names = new Set(parents.map(({ parent }) => parent.name));
+    for (const parent of ctx.graph.packages) {
+      if (!names.has(parent.name)) continue;
+      for (const edge of parent.dependencies) {
+        if (edge.alias !== node.name) continue;
+        const child = ctx.nodes.get(edge.target);
+        if (
+          child === undefined ||
+          child.name !== node.name ||
+          compatibilityLine(child.version) !== compatibilityLine(node.version)
+        )
+          return { ok: false, reason: "override_conflict" };
+      }
+    }
+  }
   const document: JsonValue = ctx.manifest.document;
   const edits = new Map<string, ManifestEdit>();
   for (const { parent } of parents) {

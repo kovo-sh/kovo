@@ -31,6 +31,10 @@ export const stepDiagnosticFailureSchema = z
       "timeout",
       "killed",
       "command_not_found",
+      "ci_runner_variable_missing",
+      "unknown_option",
+      // #5500: the check rewrote watched repository files (`protected_config_modified`).
+      "check_modified_repository_files",
       "unclassified",
     ]),
     package: diagnosticPackageSchema.exactOptional(),

@@ -1,9 +1,5 @@
 import {
   ADVISORY_RANGE_EVENT_KINDS,
-  advisoryIdSchema,
-  normalizeOsvTimestamp,
-  osvTimestampToDate,
-  packageNameSchema,
   type AdvisoryId,
   type AdvisoryRangeEventKind,
   type CweId,
@@ -11,6 +7,9 @@ import {
   type PackageName,
   type PackageVersion,
 } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import { normalizeOsvTimestamp, osvTimestampToDate } from "@kovo/contracts/time";
+import { packageNameSchema } from "@kovo/contracts/npm";
 
 import {
   INTRODUCED_ZERO,

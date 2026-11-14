@@ -47,7 +47,7 @@ export const RECIPE_LABEL_ENDPOINTS = {
     area: "recipes",
     method: "POST",
     path: "/v1/repos/{repo}/recipe/versions/{v}/labels/approve",
-    summary: "Approve exactly this calibrated recipe including disclosed model proposals.",
+    summary: "Removed by owner D-689: recipe versions are no longer approved; always refuses.",
     source: {
       kind: "owner_directed",
       decision: "recipes.md",

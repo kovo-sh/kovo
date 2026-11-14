@@ -1,10 +1,7 @@
-import {
-  advisoryIdSchema,
-  normalizeOsvTimestamp,
-  packageNameSchema,
-  packageVersionSchema,
-  type AdvisoryId,
-} from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import { normalizeOsvTimestamp } from "@kovo/contracts/time";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
+import type { AdvisoryId } from "@kovo/contracts";
 import { z } from "zod";
 
 import { jsonObjectSchema } from "./common.js";

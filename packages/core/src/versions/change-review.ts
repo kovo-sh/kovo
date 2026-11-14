@@ -1,7 +1,14 @@
 import type { DependencyChangeKind, MergeBlockReason, SemverBump } from "@kovo/contracts";
 import semver from "semver";
 
-import { VERSION_STEP_SEVERITY, versionStep, type VersionStep } from "./step.js";
+import { VERSION_STEP_SEVERITY, versionStepWithChangelog, type VersionStep } from "./step.js";
+
+/**
+ * Owner D-726: whether the move `from → to` of the change's package has a clean changelog check.
+ * Absent means none has (every step judged as before).
+ */
+export type ChangelogClearFor = (from: string, to: string) => boolean;
+const NONE_CLEAR: ChangelogClearFor = () => false;
 
 // Why one changed resolved package makes a fix review-only (decideMerge gate 3: "a
 // dependency-only patch/minor diff throughout the graph. Major upgrades, overrides,
@@ -47,11 +54,11 @@ function isNotForward(from: string | null, to: string | null): boolean {
 }
 
 /** The more severe of the recorded bump and the step computed from the versions. */
-function effectiveStep(change: ReviewedChange): VersionStep {
+function effectiveStep(change: ReviewedChange, clear: ChangelogClearFor): VersionStep {
   const computed =
     change.from === null || change.to === null
       ? "unparseable"
-      : versionStep(change.from, change.to);
+      : versionStepWithChangelog(change.from, change.to, clear(change.from, change.to));
   const recorded = change.bump ?? "unparseable";
   return VERSION_STEP_SEVERITY[recorded] > VERSION_STEP_SEVERITY[computed] ? recorded : computed;
 }
@@ -80,13 +87,21 @@ export function nearestBaseVersion(
  * integrity), unless it is a prerelease. A new instance of a package the graph already resolves is
  * a version step from the nearest base version, judged like an upgrade.
  */
-function addedInstanceKinds(to: string, baseVersions: readonly string[]): DependencyReviewKind[] {
+function addedInstanceKinds(
+  to: string,
+  baseVersions: readonly string[],
+  clear: ChangelogClearFor,
+): DependencyReviewKind[] {
   const added = semver.parse(to);
   if (added === null) return ["transitive_major"];
   if (baseVersions.length === 0) return added.prerelease.length > 0 ? ["prerelease"] : [];
   const nearest = nearestBaseVersion(to, baseVersions);
   if (nearest === null) return ["transitive_major"];
-  const step = versionStep(nearest.version, added.version);
+  const step = versionStepWithChangelog(
+    nearest.version,
+    added.version,
+    clear(nearest.version, added.version),
+  );
   if (step === "major" || step === "unparseable") return ["transitive_major"];
   if (step === "prerelease") return ["prerelease"];
   return nearest.below ? [] : ["downgrade"];
@@ -95,10 +110,13 @@ function addedInstanceKinds(to: string, baseVersions: readonly string[]): Depend
 /**
  * Why one change needs review (empty for a patch/minor step or a new transitive package).
  * `baseVersions` are the versions of the package the base graph resolves (for additions).
+ * `changelogClear` (D-726) says which of the package's moves have a clean changelog check: a 0.x
+ * patch move among them is a patch step, not a major one.
  */
 export function changeReviewKinds(
   change: ReviewedChange,
   baseVersions: readonly string[],
+  changelogClear: ChangelogClearFor = NONE_CLEAR,
 ): DependencyReviewKind[] {
   if (change.change === "downgraded") return ["downgrade"];
   if (change.change === "removed") {
@@ -108,11 +126,13 @@ export function changeReviewKinds(
   }
   if (change.change === "added") {
     if (change.isDirect) return ["new_top_level_dependency"];
-    return change.to === null ? ["transitive_major"] : addedInstanceKinds(change.to, baseVersions);
+    return change.to === null
+      ? ["transitive_major"]
+      : addedInstanceKinds(change.to, baseVersions, changelogClear);
   }
   // An "upgrade" that does not move forward is a rollback, whatever the record says.
   if (isNotForward(change.from, change.to)) return ["downgrade"];
-  const step = effectiveStep(change);
+  const step = effectiveStep(change, changelogClear);
   if (step === "major" || step === "unparseable") {
     return [change.isDirect ? "direct_major" : "transitive_major"];
   }

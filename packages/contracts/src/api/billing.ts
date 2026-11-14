@@ -8,7 +8,12 @@ import {
   subscriptionStatusSchema,
   type CapacityQuoteState,
 } from "../enums/billing.js";
-import { accountIdSchema, quoteIdSchema, repoIdSchema } from "../ids.js";
+import {
+  accountIdSchema,
+  quoteIdSchema,
+  repoIdSchema,
+  stripeCheckoutSessionIdSchema,
+} from "../ids.js";
 import { LIMITS } from "../limits.js";
 import {
   EXTRA_REPO,
@@ -34,7 +39,7 @@ import { defineEndpoint, type AuthorizationInit } from "./endpoint.js";
  * counts, never repository names ("Billing-only views expose counts and charges, not private
  * repository names"): `retained_repo` is shown only when the caller can read it.
  */
-export const billingStatusSchema = z
+const repositoryBillingStatusSchema = z
   .strictObject({
     plan: planSchema,
     subscription: z
@@ -120,14 +125,78 @@ export const billingStatusSchema = z
       });
     }
   }, whenValid);
+/**
+ * `unlimited_projects` (D-437, #6043) marks a Kovo-grant coupon's unlimited included projects, so
+ * the billing page says "unlimited" instead of the count that covers today's projects. Absent
+ * means finite.
+ */
+const billingCapacitySchema = repositoryBillingStatusSchema.shape.capacity.extend({
+  included_projects: countSchema.exactOptional(),
+  protected_projects: countSchema.exactOptional(),
+  pending_project_requests: countSchema.exactOptional(),
+  unlimited_projects: z.literal(true).exactOptional(),
+});
+export const billingStatusSchema = repositoryBillingStatusSchema
+  .safeExtend({
+    capacity: billingCapacitySchema,
+    /**
+     * `activating` (BILLING-UX, #7603) marks an upgrade whose Checkout completed but whose
+     * subscription is not applied yet, so the billing page says "Plus (activating)" and turns the
+     * Checkout button off. Absent means nothing is being activated.
+     */
+    activating: z.literal(true).exactOptional(),
+    /**
+     * `managed_payments` (#5514 Phase 5): Link (Stripe) sells to this account, so the billing page
+     * says it handles payment and tax. Present when the account's subscription is a Managed
+     * Payments one, or the Managed Payments gate is open for its next Checkout. Absent: Kovo is the
+     * seller (the direct path) and the page says so.
+     */
+    managed_payments: z.literal(true).exactOptional(),
+  })
+  .superRefine((billing, ctx) => {
+    const capacity = billing.capacity;
+    const included = capacity.included_projects ?? capacity.included_repos;
+    const expected = billing.plan === "plus" ? INCLUDED_REPOS : FREE_REPOS;
+    if (
+      capacity.included_projects !== undefined &&
+      (included < expected || (billing.plan === "free" && included !== expected))
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["capacity", "included_projects"],
+        message: "project capacity obeys the plan's included allowance",
+      });
+    }
+    if (
+      capacity.protected_projects !== undefined &&
+      capacity.protected_projects > included + capacity.paid_extra_slots
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["capacity", "protected_projects"],
+        message: "protected projects never exceed included plus paid capacity",
+      });
+    }
+  }, whenValid);
 export type BillingStatus = z.output<typeof billingStatusSchema>;
+
+/**
+ * The lead of the `conflict` detail a Checkout button press gets while an upgrade is being
+ * activated, so the page can say it in plain words (the same detail-prefix reader as the coupon
+ * refusal; BILLING-UX #7603).
+ */
+export const CHECKOUT_PENDING_DETAIL_PREFIX = "checkout_pending:";
 
 export const billingResponseSchema = z.strictObject({ billing: billingStatusSchema });
 
 // ---- Checkout and portal ----
 
 /** Stripe-hosted pages. They are short-lived bearer links: returned once, never logged. */
-export const stripeCheckoutUrlSchema = httpsUrlSchema(/^checkout\.stripe\.com$/);
+// Stripe's Checkout URL ends in a `#fid…` fragment the hosted page needs (#5514): refusing it made
+// every real Checkout fail encoding the 201 response after the session was created.
+export const stripeCheckoutUrlSchema = httpsUrlSchema(/^checkout\.stripe\.com$/, {
+  allowFragment: true,
+});
 export const stripePortalUrlSchema = httpsUrlSchema(/^billing\.stripe\.com$/);
 /**
  * Stripe's hosted invoice page, where the customer authenticates (3-D Secure) a capacity charge that
@@ -149,7 +218,7 @@ const SETTLED: ReadonlySet<CapacityQuoteState> = new Set(SETTLED_CAPACITY_QUOTE_
  * prorated charge (tax is shown by Stripe); `monthly_total_usd` the subscription price afterwards,
  * $20 plus $10 per extra repository.
  */
-export const capacityQuoteSchema = z
+const repositoryCapacityQuoteSchema = z
   .strictObject({
     id: quoteIdSchema,
     state: capacityQuoteStateSchema,
@@ -219,6 +288,9 @@ export const capacityQuoteSchema = z
       });
     }
   }, whenValid);
+export const capacityQuoteSchema = repositoryCapacityQuoteSchema.safeExtend({
+  quantity_unit: z.enum(["repository", "project"]).exactOptional(),
+});
 export type CapacityQuote = z.output<typeof capacityQuoteSchema>;
 
 export const previewCapacityBodySchema = z.strictObject({
@@ -375,6 +447,8 @@ function billingAuthorization(
 }
 
 const ROW_CHECKOUT = "Billing-authorized human; server-selected Stripe customer/account";
+const ROW_CONFIRM_CHECKOUT =
+  "accepts it only when it belongs to the signed-in account (a session of another account, or an unknown one, is refused and never applied)";
 const ROW_CAPACITY = "Billing-authorized human; bind confirmation to quoted quantity/amount/expiry";
 const ROW_CANCEL = "Billing-authorized human; period-end cancellation";
 const ROW_OVERAGES =
@@ -481,6 +555,25 @@ export const BILLING_ENDPOINTS = {
     // server keeps one open session per account; docs/decisions/contracts.md "One-time secrets").
     oneTimeFields: ["/checkout_url"],
     problems: ["conflict", "upstream_error"],
+  }),
+  confirmCheckout: defineEndpoint({
+    operationId: "confirmCheckout",
+    area: "billing",
+    method: "POST",
+    path: "/v1/billing/checkout/confirmation",
+    summary:
+      "Confirm the Stripe Checkout the browser returned from: the API reads the session from Stripe and applies it as the payment event would, so Plus shows without waiting for the webhook. Another account's or an unknown session is refused.",
+    source: { kind: "spec_implied", section: "Plans, billing, and usage" },
+    // A first paid invoice activates Plus, once, whichever of this and the payment event comes first.
+    auditActions: ["billing.plus_activated"],
+    params: null,
+    query: null,
+    body: z.strictObject({ session_id: stripeCheckoutSessionIdSchema }),
+    responses: {
+      200: z.strictObject({ outcome: z.enum(["active", "activating", "not_complete"]) }),
+    },
+    authorization: billingAuthorization(ROW_CONFIRM_CHECKOUT),
+    problems: ["not_found", "upstream_error"],
   }),
   openPortal: defineEndpoint({
     operationId: "openPortal",

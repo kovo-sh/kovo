@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { resourceVersionSchema } from "../http.js";
 import { repoIdSchema } from "../ids.js";
-import { policyBodySchema } from "../policy.js";
+import { policyBodyWriterSchema } from "../policy.js";
 import { whenValid } from "../primitives.js";
 import { utcDateTimeSchema } from "../time.js";
 import { actorRefSchema } from "./common.js";
@@ -11,12 +11,13 @@ import { defineEndpoint } from "./endpoint.js";
 // `/v1/repos/{repo}/policy`: the versioned repository policy (SPEC data model `policies`, Public API
 // row "Scoped read; repo-admin authority for writes; keys may only tighten"). Reads return an ETag
 // of the version; writes require If-Match and a stale version is `412 precondition_failed`.
+// The body is `policyBodyWriterSchema`; `open_pr_on_kovo_side_failure` (D-414) is optional, absent means on.
 
 /** The repository policy resource. Its `version` is the ETag. */
 export const repoPolicySchema = z
   .strictObject({
     repo_id: repoIdSchema,
-    body: policyBodySchema,
+    body: policyBodyWriterSchema,
     version: resourceVersionSchema,
     updated_at: utcDateTimeSchema.nullable(),
     updated_by: actorRefSchema.nullable(),
@@ -60,7 +61,7 @@ export const POLICY_ENDPOINTS = {
     auditActions: ["policy.updated"],
     params: repoParams,
     query: null,
-    body: policyBodySchema,
+    body: policyBodyWriterSchema,
     responses: { 200: repoPolicySchema },
     authorization: {
       spec: ROW_POLICY,

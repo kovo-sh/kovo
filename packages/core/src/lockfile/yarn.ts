@@ -1,17 +1,19 @@
 import semver from "semver";
 
-import {
-  hasControlCharacter,
-  npmTarballUrl,
-  packageNameSchema,
-  packageVersionSchema,
-} from "@kovo/contracts";
+import { hasControlCharacter } from "@kovo/contracts/primitives";
+import { npmTarballUrl, packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 
 import { classifyDependencySpec } from "../manifest/dependency-spec.js";
-import type { PackageManifest } from "../manifest/package-json.js";
+import { opaqueDependencySpecs, type PackageManifest } from "../manifest/package-json.js";
+import { opaqueSourceKind } from "../manifest/reasons.js";
 import type { Instance, InstanceEdge, InstanceSet, RootDependency } from "./instances.js";
 import { RejectionCollector } from "./reasons.js";
-import { checkIntegrity, checkTarballSource } from "./registry-source.js";
+import {
+  checkIntegrity,
+  checkTarballSource,
+  opaqueLocationKind,
+  opaqueVersion,
+} from "./registry-source.js";
 import { GRAPH_LIMITS, SECTION_KIND, type LockfileLimits } from "./types.js";
 import { localInstance, type WorkspaceParserContext } from "./workspace/parser-context.js";
 
@@ -77,7 +79,10 @@ function selector(value: string): { alias: string; spec: string; name: string } 
     spec = value.slice(at + 1);
   if (!packageNameSchema.safeParse(alias).success) return null;
   const classified = classifyDependencySpec(spec);
-  if (classified.kind === "invalid" || classified.kind === "rejected") return null;
+  if (classified.kind === "invalid") return null;
+  // A git, remote-tarball or `file:` key names an opaque node (owner D-726, #8256): the entry is
+  // kept as one below. Any other rejected spec still refuses the lockfile.
+  if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null) return null;
   return { alias, spec, name: classified.kind === "alias" ? classified.name : alias };
 }
 function entryId(entry: Entry): string {
@@ -100,6 +105,42 @@ function legacyIntegrity(hex: string): string {
     encoded += i + 2 < bytes.length ? alphabet[c & 63] : "=";
   }
   return `sha1-${encoded}`;
+}
+/**
+ * The sha1 fragment of each entry's `resolved` URL (`…tgz#<sha1>`), by the instance ID
+ * `parseYarnLockfile` gives the entry. Yarn names its cache directories by it, so a lockfile that
+ * must hit the same cache keeps it (D-664 open install). Call only on text `parseYarnLockfile`
+ * accepted; an entry without a fragment is absent.
+ */
+export function yarnResolvedFragments(text: string): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  let selectors: string[] | null = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (!line || line.startsWith("#")) continue;
+    if (!line.startsWith(" ")) {
+      selectors = line.endsWith(":") ? tokens(line.slice(0, -1), "comma") : null;
+      continue;
+    }
+    if (selectors === null || !line.startsWith("  resolved ") || line.startsWith("   ")) continue;
+    const pair = tokens(line.slice(2), "space");
+    const value = pair?.[1];
+    if (value === undefined) continue;
+    const hash = value.indexOf("#");
+    if (hash < 0) continue;
+    const fragment = value.slice(hash + 1);
+    if (/^[a-f0-9]{40}$/u.test(fragment))
+      out.set(
+        entryId({
+          selectors,
+          fields: new Map(),
+          dependencies: new Map(),
+          optionalDependencies: new Map(),
+        }),
+        fragment,
+      );
+  }
+  return out;
 }
 export type YarnParseResult =
   | { readonly ok: true; readonly instances: InstanceSet }
@@ -235,12 +276,52 @@ export function parseYarnLockfile(
       continue;
     }
     const name = packageNameSchema.parse(first.name);
+    const rawResolved = entry.fields.get("resolved");
+    // Git, remote-tarball and `file:` entries are opaque nodes (owner D-726): named by their
+    // selectors' specs, or by a non-registry `resolved` location.
+    const specKinds = names.flatMap((item) => {
+      const classified = item === null ? null : classifyDependencySpec(item.spec);
+      const kind = classified?.kind === "rejected" ? opaqueSourceKind(classified.reason) : null;
+      return kind === null ? [] : [kind];
+    });
+    const locationKind =
+      rawResolved === undefined
+        ? null
+        : opaqueLocationKind(
+            checkTarballSource(
+              rawResolved.split("#")[0] ?? rawResolved,
+              name,
+              entry.fields.get("version") ?? "",
+            ),
+          );
+    const opaqueKind = specKinds[0] ?? locationKind;
+    if (opaqueKind !== null) {
+      const id = entryId(entry);
+      instances.set(id, {
+        id,
+        name,
+        version: opaqueVersion(entry.fields.get("version")),
+        integrity: null,
+        integrityAlgorithm: null,
+        resolved: rawResolved ?? id,
+        bundled: false,
+        bundles: [],
+        hasInstallScript: null,
+        patched: false,
+        edges: [],
+        opaque: opaqueKind,
+      });
+      for (const key of entry.selectors) {
+        if (selectors.has(key)) rejections.add("lockfile_duplicate_key", name);
+        selectors.set(key, id);
+      }
+      continue;
+    }
     const version = packageVersionSchema.safeParse(entry.fields.get("version"));
     if (!version.success) {
       rejections.add("invalid_package_version", name);
       continue;
     }
-    const rawResolved = entry.fields.get("resolved");
     if (rawResolved === undefined) {
       rejections.add("lockfile_invalid", name);
       continue;
@@ -286,6 +367,7 @@ export function parseYarnLockfile(
       version: version.data,
       integrity: integrity.integrity,
       integrityAlgorithm: integrity.algorithm,
+      ...(integrity.algorithm === "sha1" ? { legacySha1: integrity.sha1 } : {}),
       resolved: npmTarballUrl(name, version.data),
       bundled: false,
       bundles: [],
@@ -311,7 +393,7 @@ export function parseYarnLockfile(
       rejections.add("invalid_package_name");
       return null;
     }
-    if (classified.kind === "rejected") {
+    if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null) {
       rejections.add(classified.reason, name.data);
       return null;
     }
@@ -346,7 +428,11 @@ export function parseYarnLockfile(
     context?.layout.members ?? (manifest === undefined ? [] : [{ path: ".", manifest, local: [] }]);
   for (const member of members) {
     const direct: RootDependency[] = [];
-    for (const dep of member.manifest.dependencies) {
+    // Opaque dependencies (owner D-726) are root edges too, so their nodes are found and disclosed.
+    for (const dep of [
+      ...member.manifest.dependencies,
+      ...opaqueDependencySpecs(member.manifest),
+    ]) {
       if (++edgeCount > limits.maxDependencyEdges) {
         rejections.add("too_many_dependencies");
         return fail();
@@ -398,77 +484,93 @@ export function parseYarnLockfile(
   if (!rejections.empty) return fail();
   if (mismatches.size > 0) {
     const proved = new Set<string>();
-    const budget = { remaining: limits.maxPathWork };
-    const matchesPath = (steps: readonly string[], path: readonly string[]): boolean => {
-      const pattern = steps.length === 1 ? ["**", ...steps] : steps;
-      let states = new Set([0]);
-      const closure = (input: Set<number>): Set<number> => {
-        const out = new Set(input);
-        for (let i = 0; i < pattern.length; i += 1) {
-          if (--budget.remaining < 0) return new Set();
-          if (out.has(i) && pattern[i] === "**") out.add(i + 1);
-        }
-        return out;
-      };
-      states = closure(states);
-      for (const alias of path) {
-        const next = new Set<number>();
-        for (const state of states) {
-          if (--budget.remaining < 0) return false;
-          if (pattern[state] === "**") next.add(state);
-          else if (pattern[state] === "*" || pattern[state] === alias) next.add(state + 1);
-        }
-        states = closure(next);
+    // A vector of NFA states represents exactly the selector history relevant to future
+    // edges. Histories with the same vector are interchangeable; unioning different
+    // histories would incorrectly let one inbound path justify another.
+    const patterns = resolutions.map((rule) =>
+      rule.selector.length === 1 ? ["**", ...rule.selector] : rule.selector,
+    );
+    let remaining = limits.maxPathWork;
+    const closure = (pattern: readonly string[], states: Set<number>): number[] => {
+      for (let i = 0; i < pattern.length; i += 1) {
+        if (--remaining < 0) break;
+        if (states.has(i) && pattern[i] === "**") states.add(i + 1);
       }
-      return states.has(pattern.length);
+      return [...states].toSorted((a, b) => a - b);
     };
-    for (const direct of root) {
-      // Each importer is a separate Yarn request root; scoped names remain single path steps.
-      const stack: { edge: InstanceEdge; exit: boolean }[] = [{ edge: direct.edge, exit: false }];
-      const path: string[] = [];
-      const active = new Set<string>();
-      while (stack.length > 0) {
-        if (--budget.remaining < 0) {
+    const initial = patterns.map((pattern) => closure(pattern, new Set([0])));
+    const visited = new Map<string, Set<string>>();
+    const queue: ({ edge: InstanceEdge; states: number[][]; depth: number } | undefined)[] =
+      root.map((direct) => ({ edge: direct.edge, states: initial, depth: 1 }));
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const frame = queue[cursor];
+      queue[cursor] = undefined;
+      if (--remaining < 0) {
+        rejections.add("too_many_dependencies");
+        return fail();
+      }
+      if (frame === undefined || frame.edge.target === null) continue;
+      const target = instances.get(frame.edge.target);
+      if (target === undefined) continue;
+      const states = patterns.map((pattern, index) => {
+        const next = new Set<number>();
+        for (const state of frame.states[index] ?? []) {
+          if (--remaining < 0) break;
+          if (pattern[state] === "**") next.add(state);
+          else if (pattern[state] === "*" || pattern[state] === frame.edge.alias)
+            next.add(state + 1);
+        }
+        return closure(pattern, next);
+      });
+      if (remaining < 0) {
+        rejections.add("too_many_dependencies");
+        return fail();
+      }
+      const key = `${target.id}\u0000${frame.edge.alias}\u0000${frame.edge.range ?? ""}`;
+      if (mismatches.has(key)) {
+        const applied = resolutions.some((rule, index) => {
+          if (--remaining < 0) return false;
+          if (
+            rule.target !== frame.edge.alias ||
+            !states[index]?.includes(patterns[index]?.length ?? -1)
+          )
+            return false;
+          const value = classifyDependencySpec(rule.spec);
+          const resolvedName = value.kind === "alias" ? value.name : frame.edge.alias;
+          const range = value.kind === "alias" ? value.target : value;
+          return (
+            resolvedName === target.name &&
+            range.kind === "range" &&
+            semver.satisfies(target.version, range.range)
+          );
+        });
+        if (remaining < 0) {
           rejections.add("too_many_dependencies");
           return fail();
         }
-        const frame = stack.pop();
-        if (frame === undefined || frame.edge.target === null) continue;
-        const target = instances.get(frame.edge.target);
-        if (target === undefined) continue;
-        if (frame.exit) {
-          active.delete(target.id);
-          path.pop();
-          continue;
-        }
-        path.push(frame.edge.alias);
-        const key = `${target.id}\u0000${frame.edge.alias}\u0000${frame.edge.range ?? ""}`;
-        if (mismatches.has(key)) {
-          const applied = resolutions.some((rule) => {
-            if (--budget.remaining < 0) return false;
-            if (rule.target !== frame.edge.alias || !matchesPath(rule.selector, path)) return false;
-            const value = classifyDependencySpec(rule.spec);
-            const resolvedName = value.kind === "alias" ? value.name : frame.edge.alias;
-            const range = value.kind === "alias" ? value.target : value;
-            return (
-              resolvedName === target.name &&
-              range.kind === "range" &&
-              semver.satisfies(target.version, range.range)
-            );
-          });
-          if (!applied || budget.remaining < 0) {
-            rejections.add("lockfile_invalid", target.name);
-            return fail();
-          }
-          proved.add(key);
-        }
-        if (active.has(target.id) || path.length > limits.maxPathDepth) {
-          rejections.add("lockfile_too_deep");
+        if (!applied) {
+          rejections.add("lockfile_invalid", target.name);
           return fail();
         }
-        active.add(target.id);
-        stack.push({ edge: frame.edge, exit: true });
-        for (const child of target.edges) stack.push({ edge: child, exit: false });
+        proved.add(key);
+      }
+      const signature = JSON.stringify(states);
+      const seen = visited.get(target.id) ?? new Set<string>();
+      // Includes back edges: a repeated instance/state has no new proof obligations.
+      // Check the incoming edge above even if its target's children were visited.
+      if (seen.has(signature)) continue;
+      if (frame.depth > limits.maxPathDepth) {
+        rejections.add("lockfile_too_deep");
+        return fail();
+      }
+      seen.add(signature);
+      visited.set(target.id, seen);
+      for (const child of target.edges) {
+        if (--remaining < 0) {
+          rejections.add("too_many_dependencies");
+          return fail();
+        }
+        queue.push({ edge: child, states, depth: frame.depth + 1 });
       }
     }
     if ([...mismatches.keys()].some((key) => !proved.has(key))) {

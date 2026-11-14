@@ -15,3 +15,4 @@ export * from "./safe-pointer.js";
 export * from "./selectors.js";
 export * from "./pnpm-settings.js";
 export * from "./pnpm-workspace-edits.js";
+export * from "./workspace-members.js";

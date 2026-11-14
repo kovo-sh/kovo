@@ -98,7 +98,7 @@ export const ANALYTICS_EVENT_PROPERTIES = {
   recipe_calibrated: z.strictObject({
     plan,
     duration_bucket,
-    outcome: z.enum(["calibrated", "weak"]).exactOptional(),
+    outcome: z.enum(["calibrated", "weak", "limited"]).exactOptional(),
   }),
   recipe_approved: z.strictObject({ plan, outcome: approvedViaSchema.exactOptional() }),
   autopilot_authorized: z.strictObject({ plan, outcome: activationPolicySchema.exactOptional() }),

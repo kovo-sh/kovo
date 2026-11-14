@@ -65,6 +65,7 @@ export function kovoSecretTokenPatternSource(): string {
   const noBase64After = "(?![A-Za-z0-9_-])";
   return (
     `${noBase64Before}(?:(?:${fixed.join("|")})[A-Za-z0-9_-]{${ONE_TIME_SECRET_BODY_LENGTH}}${noBase64After}` +
-    `|(?:${signed.join("|")})[A-Za-z0-9_-]{${SIGNED_TOKEN_BODY_MIN},${SIGNED_TOKEN_BODY_MAX}})`
+    `|(?:${signed.join("|")})[A-Za-z0-9_-]{${SIGNED_TOKEN_BODY_MIN},${SIGNED_TOKEN_BODY_MAX}}` +
+    `|[Kk][Oo][Vv][Oo](?:-[0-9A-HJ-KM-NP-TV-Za-hj-km-np-tv-z]{4}){5})`
   );
 }

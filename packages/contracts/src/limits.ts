@@ -47,6 +47,7 @@ export const LIMITS = {
    * mutations, all caught, with at least one exercising application code/build behavior".
    */
   calibration: {
+    maxPerProjectPerWindow: 3,
     maxPerRepoPerWindow: 3,
     windowMs: DURATIONS.calibrationRateWindow,
     minMeaningfulMutations: 2,

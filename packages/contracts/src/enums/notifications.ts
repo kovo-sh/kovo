@@ -27,6 +27,8 @@ export type NotificationEvent = z.infer<typeof notificationEventSchema>;
  * failure, revert") get one kind per message; {@link EMAIL_KIND_EVENT} maps every kind to its row.
  */
 export const EMAIL_KINDS = [
+  "account_deactivated",
+  "account_reactivated",
   "onboarding_update",
   "p0_detected",
   "pr_opened",
@@ -51,11 +53,18 @@ export const EMAIL_KINDS = [
   // Plus coupons: "Fourteen days before a Kovo grant ends, the billing page and an email ask which
   // repository to keep on Free".
   "coupon_grant_ending",
+  // BILLING-UX (#7603): "Your Plus upgrade is active", once per activation.
+  "plus_activated",
 ] as const;
 export const emailKindSchema = z.enum(EMAIL_KINDS);
 export type EmailKind = z.infer<typeof emailKindSchema>;
 
 export const EMAIL_KIND_EVENT = {
+  // Administrative suspension is the account-scoped GLOBAL pause (#2779/#184), so these
+  // notices share the existing pause event category. Required delivery bypasses preferences;
+  // these kinds have no webhook counterpart and never reuse a persisted webhook event ID.
+  account_deactivated: "merge_pause",
+  account_reactivated: "merge_pause",
   onboarding_update: "installation_onboarding",
   p0_detected: "p0_detection",
   pr_opened: "pr_opened",
@@ -80,6 +89,8 @@ export const EMAIL_KIND_EVENT = {
   installation_removed_billing: "installation_onboarding",
   // The same billing row as the downgrade it announces.
   coupon_grant_ending: "downgraded_to_free",
+  // The payments row: it confirms the first payment, as "Payment recovered" confirms a later one.
+  plus_activated: "payment_recovered",
 } as const satisfies Record<EmailKind, NotificationEvent>;
 
 /**
@@ -93,6 +104,7 @@ export const EMAIL_EVENT_KEY_MAX_LENGTH = 200;
  * names/findings".
  */
 export const RECIPIENT_CLASSES = [
+  "account_owners",
   "initiating_user_and_admins",
   "repo_recipients", // "Authorized repo recipients"
   "repo_admins",
@@ -103,6 +115,8 @@ export const recipientClassSchema = z.enum(RECIPIENT_CLASSES);
 export type RecipientClass = z.infer<typeof recipientClassSchema>;
 
 export const EMAIL_KIND_RECIPIENTS = {
+  account_deactivated: "account_owners",
+  account_reactivated: "account_owners",
   onboarding_update: "initiating_user_and_admins",
   p0_detected: "repo_recipients",
   pr_opened: "repo_recipients",
@@ -125,6 +139,7 @@ export const EMAIL_KIND_RECIPIENTS = {
   allowance_limit_reached: "billing_users",
   installation_removed_billing: "billing_users",
   coupon_grant_ending: "billing_users",
+  plus_activated: "billing_users",
 } as const satisfies Record<EmailKind, RecipientClass>;
 
 /**
@@ -244,6 +259,8 @@ export type EmailPreferenceGroup = z.infer<typeof emailPreferenceGroupSchema>;
 
 /** Each email kind's preference group, or null for a required kind (never unsubscribable). */
 export const EMAIL_KIND_PREFERENCE_GROUP = {
+  account_deactivated: null,
+  account_reactivated: null,
   onboarding_update: "onboarding_updates",
   p0_detected: null,
   pr_opened: "fix_updates",
@@ -266,6 +283,7 @@ export const EMAIL_KIND_PREFERENCE_GROUP = {
   allowance_limit_reached: null,
   installation_removed_billing: null,
   coupon_grant_ending: null,
+  plus_activated: null,
 } as const satisfies Record<EmailKind, EmailPreferenceGroup | null>;
 
 /** The preference group of `kind`, or null when the kind is required. */

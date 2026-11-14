@@ -28,6 +28,7 @@ import {
 } from "../evidence.js";
 import {
   accountIdSchema,
+  apiKeyIdSchema,
   evidenceIdSchema,
   findingIdSchema,
   fixIdSchema,
@@ -205,7 +206,15 @@ export const evidenceSummarySchema = z
 export type EvidenceSummary = z.output<typeof evidenceSummarySchema>;
 
 /** Derives the list summary from a full evidence record. */
-export function summarizeEvidence(evidence: FixEvidence): EvidenceSummary {
+export function summarizeEvidence(input: FixEvidence): EvidenceSummary {
+  // Validate the full proof before projecting it. The strict summary predates paired
+  // comparisons and cannot represent a pass that retains baseline failures without its
+  // comparison proof. Keep that summary conservative, as the durable legacy projection does.
+  const evidence = fixEvidenceSchema.decode(fixEvidenceSchema.encode(input));
+  const comparisonPassWithFailures =
+    evidence.result === "passed" &&
+    evidence.comparison !== undefined &&
+    evidence.step_results.some((step) => step.status !== "passed" && step.status !== "skipped");
   const changes = evidence.dependency_changes;
   const count = (kind: (typeof changes)[number]["change"]) =>
     changes.filter((change) => change.change === kind).length;
@@ -223,7 +232,7 @@ export function summarizeEvidence(evidence: FixEvidence): EvidenceSummary {
         };
   const summary: EvidenceSummary = {
     id: evidence.id,
-    result: evidence.result,
+    result: comparisonPassWithFailures ? "inconclusive" : evidence.result,
     verified_at: evidence.verified_at,
     expires_at: evidence.expires_at,
     base_sha: evidence.base_sha,
@@ -581,6 +590,32 @@ export const publishNowAvailabilitySchema = z.strictObject({
 export type PublishNowAvailability = z.output<typeof publishNowAvailabilitySchema>;
 export type PublishNowBinding = z.output<typeof publishNowBindingSchema>;
 
+/**
+ * The kinds of the deny-only kovo-tests fix-verification drill fault (D-238, #5699; D-552 slice 9,
+ * #6945). Each one only denies or withholds, as the real failure it stands for would:
+ * - `isolation_unavailable`: the fix's verification run does not start (Sandbox B egress isolation);
+ * - `calibration_sandbox_create_failed`: the drill repository's calibration runs fail as a Sandbox B
+ *   create failure;
+ * - `sandbox_b_unavailable`: the fix's verification run fails as a Sandbox B create failure;
+ * - `osv_feed_stale`: the fix's verification run does not start, and the D-552 fallback checks of
+ *   that fix read the OSV feed as stale;
+ * - `generation_forced_cancel`: the CRITICAL-1 paging drill (#5659, #8573). Armed on a fix of the
+ *   `kovo-tests/fx-critical1-drill` repository with the `incident-drill` run it belongs to, it lets
+ *   the worker's `worker.fixDrillFault` refuse that repository's generation runs with
+ *   `drill_forced_cancel` until it expires (30 minutes) or is cleared; unarmed, they run normally.
+ */
+export const FIX_VERIFICATION_DRILL_FAULT_KINDS = [
+  "isolation_unavailable",
+  "calibration_sandbox_create_failed",
+  "sandbox_b_unavailable",
+  "osv_feed_stale",
+  "generation_forced_cancel",
+] as const;
+/** The `incident-drill` run an arm of `generation_forced_cancel` names (and only that kind). */
+export const fixDrillRunSchema = z.string().regex(/^drill-[a-z0-9-]{1,100}$/);
+export const fixVerificationDrillFaultKindSchema = z.enum(FIX_VERIFICATION_DRILL_FAULT_KINDS);
+export type FixVerificationDrillFaultKind = z.output<typeof fixVerificationDrillFaultKindSchema>;
+
 // ---- Endpoints ----
 
 const READERS = ["human_session", "api_key_read", "api_key_write"] as const;
@@ -793,6 +828,64 @@ export const FIX_ENDPOINTS = {
     },
     idempotency: "required",
     problems: ["conflict"],
+  }),
+  configureRevertDrillFault: defineEndpoint({
+    operationId: "configureRevertDrillFault",
+    auditActions: ["api_key.revert_drill_fault_changed"],
+    area: "fixes",
+    method: "PUT",
+    path: "/v1/fixes/{id}/revert/drill-fault",
+    summary: "Configure or clear a bounded kovo-tests child-key authority fault.",
+    source: { kind: "spec_implied", section: "Accounts and permissions" },
+    params: fixParams,
+    query: null,
+    body: z.strictObject({
+      mode: z.enum(["publication_delay", "authority_unavailable"]).nullable(),
+    }),
+    responses: { 200: z.strictObject({ api_key_id: apiKeyIdSchema }) },
+    authorization: {
+      spec: "Customer accounts cannot configure faults.",
+      actors: ["human_session"],
+      tenant: "path_resource",
+      managementPermission: "revertFix",
+      repoAuthority: { level: "admin", over: "resource_repos" },
+    },
+    problems: ["forbidden_actor", "fix_not_merged", "conflict"],
+  }),
+  configureFixVerificationDrillFault: defineEndpoint({
+    operationId: "configureFixVerificationDrillFault",
+    auditActions: ["fix.verification_drill_fault_changed"],
+    area: "fixes",
+    method: "PUT",
+    path: "/v1/fixes/{id}/verification/drill-fault",
+    summary:
+      "Arm or clear the deny-only kovo-tests drill fault that fails or withholds one fix on Kovo's side.",
+    source: { kind: "spec_implied", section: "Accounts and permissions" },
+    params: fixParams,
+    query: null,
+    // `kind` (default `isolation_unavailable`) only with `armed: true`; clearing clears any kind.
+    // `drill_run` names the `incident-drill` run; required with `generation_forced_cancel` only.
+    body: z.strictObject({
+      armed: z.boolean(),
+      kind: fixVerificationDrillFaultKindSchema.optional(),
+      drill_run: fixDrillRunSchema.optional(),
+    }),
+    responses: {
+      200: z.strictObject({
+        fix_id: fixIdSchema,
+        armed: z.boolean(),
+        expires_at: utcDateTimeSchema.nullable(),
+      }),
+    },
+    authorization: {
+      spec: "Customer accounts cannot configure faults.",
+      actors: ["human_session"],
+      tenant: "path_resource",
+      // D-238 (#5699): only the distinct internal-test Custom drill grant reaches the key path.
+      managementPermission: "armFixVerificationDrillFault",
+      repoAuthority: { level: "admin", over: "resource_repos" },
+    },
+    problems: ["forbidden_actor", "conflict"],
   }),
   revertFix: defineEndpoint({
     operationId: "revertFix",

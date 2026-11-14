@@ -1,19 +1,16 @@
 import {
   advisoryEcosystemSchema,
-  advisoryIdSchema,
   advisoryRangeEventKindSchema,
   advisoryRangeTypeSchema,
-  canonicalOsvTimestampSchema,
-  cweIdSchema,
-  labelSchema,
   maliciousReasonSchema,
-  packageNameSchema,
-  packageVersionSchema,
   severityReasonSchema,
   severitySchema,
   severitySourceSchema,
-  whenValid,
 } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import { canonicalOsvTimestampSchema } from "@kovo/contracts/time";
+import { cweIdSchema, labelSchema, whenValid } from "@kovo/contracts/primitives";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 import { cvssScoreSchema } from "@kovo/contracts/api";
 import { z } from "zod";
 

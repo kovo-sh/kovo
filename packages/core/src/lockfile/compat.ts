@@ -2,13 +2,13 @@ import {
   LOCKFILE_FORMATS_BY_PM,
   SUPPORTED_NODE_MAJORS,
   SUPPORTED_PM_MAJORS,
-  exactVersionSchema,
-  runtimeSupport,
-  whenValid,
   type LockfileFormat,
   type PackageManager,
   type UnsupportedRepoReason,
 } from "@kovo/contracts";
+import { exactVersionSchema } from "@kovo/contracts/npm";
+import { runtimeSupport } from "@kovo/contracts/recipe";
+import { whenValid } from "@kovo/contracts/primitives";
 import semver from "semver";
 import { z } from "zod";
 
@@ -326,7 +326,10 @@ interface NodeChoice {
   readonly declared: string | null;
 }
 
-function resolveNode(input: RuntimeInput, ignored: IgnoredDeclaration[]): Step<NodeChoice> {
+function resolveNode(
+  input: Omit<RuntimeInput, "lockfileFormat">,
+  ignored: IgnoredDeclaration[],
+): Step<NodeChoice> {
   const { catalog } = input;
   const found = nodeDeclarations(input.declarations, catalog.ltsNodeMajor);
   if (!found.ok) return found;
@@ -430,7 +433,7 @@ interface PmChoice {
 }
 
 function resolvePackageManager(
-  input: RuntimeInput,
+  input: Omit<RuntimeInput, "lockfileFormat">,
   bundledNpm: string,
   ignored: IgnoredDeclaration[],
 ): Step<PmChoice> {
@@ -549,6 +552,31 @@ function rejected(reason: RuntimeRejectionReason): RuntimeResolution {
 export function resolveRuntime(input: RuntimeInput): RuntimeResolution {
   const formats: readonly LockfileFormat[] = LOCKFILE_FORMATS_BY_PM[input.packageManager];
   if (!formats.includes(input.lockfileFormat)) return rejected("lockfile_format_mismatch");
+  const releases = resolveRuntimeReleases(input);
+  if (!releases.ok) return releases;
+  return { ok: true, runtime: { ...releases.runtime, lockfileFormat: input.lockfileFormat } };
+}
+
+/** The resolved releases, before the lockfile's format is known. */
+export type ResolvedReleases = Omit<ResolvedRuntime, "lockfileFormat">;
+
+export type ReleaseResolution =
+  | { readonly ok: true; readonly runtime: ResolvedReleases }
+  | {
+      readonly ok: false;
+      readonly reason: RuntimeRejectionReason;
+      readonly unsupported: UnsupportedRepoReason;
+    };
+
+/**
+ * {@link resolveRuntime} without the lockfile-format check: the exact Node and package-manager
+ * releases the declarations admit in the pinned image, or the same rejection reason. A recorded
+ * two-lockfile choice validates its version with this before any lockfile is read; admission
+ * still runs {@link resolveRuntime} on the kept lockfile.
+ */
+export function resolveRuntimeReleases(
+  input: Omit<RuntimeInput, "lockfileFormat">,
+): ReleaseResolution {
   const ignored: IgnoredDeclaration[] = [];
   const node = resolveNode(input, ignored);
   if (!node.ok) return rejected(node.reason);
@@ -560,7 +588,7 @@ export function resolveRuntime(input: RuntimeInput): RuntimeResolution {
     pm.value.version.split(".")[0] === "9"
   )
     return rejected("pnpm_settings_requires_v10");
-  const runtime: ResolvedRuntime = {
+  const runtime: ResolvedReleases = {
     node: node.value.version,
     nodeSource: node.value.source,
     nodeDeclared: node.value.declared,
@@ -568,7 +596,6 @@ export function resolveRuntime(input: RuntimeInput): RuntimeResolution {
     pmVersion: pm.value.version,
     pmSource: pm.value.source,
     pmDeclared: pm.value.declared,
-    lockfileFormat: input.lockfileFormat,
     ignored: [...new Set(ignored)],
   };
   // The catalog schema and the checks above keep every result inside the matrix; re-check with the

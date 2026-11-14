@@ -10,6 +10,7 @@ import {
   RateLimitedError,
   UnavailableError,
   type PortService,
+  type PortErrorInit,
 } from "../ports/errors.js";
 import { parseRetryAfterMs } from "./retry-after.js";
 
@@ -17,7 +18,7 @@ import { parseRetryAfterMs } from "./retry-after.js";
 // the response body or URL reaches an error message (ports/errors.ts).
 
 /** Which port call an HTTP exchange belongs to (labels every error it produces). */
-export interface HttpCallContext {
+export interface HttpCallContext extends Pick<PortErrorInit, "package_name" | "package_version"> {
   readonly service: PortService;
   readonly operation: string;
 }
@@ -44,7 +45,10 @@ export function errorForStatus(context: HttpCallContext, response: Response, now
     code: `http_${status}`,
     providerRequestId: providerRequestIdOf(response),
   };
-  if (status === 429) {
+  if (
+    status === 429 ||
+    ((status === 408 || status >= 500) && response.headers.has("retry-after"))
+  ) {
     const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"), now) ?? 0;
     return new RateLimitedError({ ...init, retryAfterMs });
   }

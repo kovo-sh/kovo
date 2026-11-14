@@ -51,6 +51,8 @@ import { fetchedChange, resolveSpec } from "./spec.js";
 
 /** Options for the check, given before the package-manager command. */
 interface CheckOptions {
+  readonly base: string | undefined;
+  readonly head: string | undefined;
   readonly offline: boolean;
   readonly apiUrl: string | undefined;
   readonly osvCache: string | undefined;
@@ -60,6 +62,8 @@ interface CheckOptions {
 }
 
 const VALUE_OPTIONS = {
+  "--base": "base",
+  "--head": "head",
   "--api-url": "apiUrl",
   "--osv-cache": "osvCache",
   "--osv-generation": "osvGeneration",
@@ -101,6 +105,8 @@ function splitArgs(
   }
   return {
     options: {
+      base: values["base"],
+      head: values["head"],
       offline,
       apiUrl: values["apiUrl"],
       osvCache: values["osvCache"],
@@ -183,6 +189,14 @@ class Wrapper {
       // does, before classification so the refusal names the key rule.
       if (!FETCH_COMMANDS.has(split.rest[0] ?? "")) refuseKeyFlags(split.rest);
       const command = classify(this.#pm, split.rest);
+      if (
+        command.kind !== "frozen" &&
+        (split.options.base !== undefined || split.options.head !== undefined)
+      )
+        throw usageError(
+          "invalid_options",
+          "--base and --head apply only to npm ci or pnpm install --frozen-lockfile.",
+        );
       if (command.kind === "passthrough") return await this.#inherit(command.args);
       if (command.kind === "frozen") return await this.#frozen(command, split.options);
       if (command.kind === "fetch") return await this.#fetch(command, split.options);
@@ -206,7 +220,7 @@ class Wrapper {
     const mode = modeOf(options, options.registryUrl);
     const project = await openProject(this.#pm, this.#io.cwd);
     const code = await depsCheck(
-      { base: undefined, head: undefined, lockfile: project.fileName, format: "text", mode },
+      { base: options.base, head: options.head, lockfile: project.fileName, format: "text", mode },
       { ...this.#io, cwd: project.dir, stdout: this.#io.stderr },
     );
     if (code !== EXIT.pass) {

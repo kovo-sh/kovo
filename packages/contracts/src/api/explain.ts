@@ -46,6 +46,9 @@ const knownReasons: ReadonlySet<string> = new Set([
   "no_actionable_findings",
   "declined",
   "repo_inactive",
+  // The enqueue machine's legacy-overlap refusal (monorepo M8): read before any writer emits it.
+  "identity_overlap",
+  "legacy_root_overlap",
   "breaking_change_hint",
 ]);
 const reason = code.refine((value) => knownReasons.has(value), {

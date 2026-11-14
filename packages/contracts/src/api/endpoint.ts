@@ -369,6 +369,9 @@ export interface EndpointInit<
     | "flag_override_audit"
     | "flag_email_acknowledgments"
     | "malware_hold_audit"
+    | "waitlist_audit"
+    | "support_content_grants"
+    | "support_content_audit"
     | "admin_audit";
   /** Endpoint-specific reasons; the reasons implied by the descriptor are added automatically. */
   readonly problems?: readonly ReasonCode[];
@@ -409,6 +412,9 @@ export interface Endpoint<
     | "flag_override_audit"
     | "flag_email_acknowledgments"
     | "malware_hold_audit"
+    | "waitlist_audit"
+    | "support_content_grants"
+    | "support_content_audit"
     | "admin_audit"
     | null;
   /** Session-cookie mutations need the Origin check and the double-submit token. */

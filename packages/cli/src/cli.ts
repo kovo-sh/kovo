@@ -30,9 +30,10 @@ pnpm-lock.yaml (v9) and yarn.lock (v1), including workspaces.
 
 Options:
   --base <ref>           Base commit (default: the merge base with origin/HEAD, origin/main or
-                         origin/master).
+                         origin/master; GITHUB_BASE_REF takes priority in PR jobs).
   --head <ref>           Head commit (default: the working tree).
   --lockfile <path>      The lockfile (default: the one in the current directory).
+  --all-projects         Check every discovered project in the repository.
   --format <f>           text (default) or json.
   --api-url <url>        The Kovo API (default: ${DEFAULT_API_URL}).
   --offline              Judge without the Kovo API.
@@ -52,7 +53,7 @@ Exit codes:
   3  The check could not be answered: the hosted check (online), or OSV's database or the
      registry (offline), could not be reached or read.
 
-kovo pnpm and kovo npm check before anything installs. The check options (--offline, --api-url,
+kovo pnpm and kovo npm check before anything installs. The check options (--base, --head, --offline, --api-url,
 --osv-cache, --osv-generation, --osv-url, --registry-url) go before the package-manager command;
 everything after it is the package manager's. Their own output goes to stderr.
   add, install, update, remove, dedupe (and their aliases)
@@ -66,7 +67,10 @@ everything after it is the package manager's. Their own output goes to stderr.
       --no-optional; npm's --omit, --include) carry over to the install.
   pnpm install --frozen-lockfile, npm ci
       Run kovo deps check (merge base against the working tree) first; then the command. It takes
-      no package names.
+      no package names. --base and --head before the command select the compared commits.
+      Shallow PR checkouts try one fetch of the base and head (depth 256, at most 30 seconds).
+      If no merge base is found, use actions/checkout fetch-depth: 0 or fetch a base and run
+      kovo npm --base <ref> ci / kovo pnpm --base <ref> install --frozen-lockfile.
   pnpm dlx, pnpm create, npm exec, npm init <starter>
       Resolve the one package (an exact version or a dist-tag) from registry metadata, check it as
       a new direct dependency, then run it pinned to that version. Its own dependencies are not in
@@ -121,6 +125,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         base: { type: "string" },
         head: { type: "string" },
         lockfile: { type: "string" },
+        "all-projects": { type: "boolean" },
         "api-url": { type: "string" },
         format: { type: "string" },
         offline: { type: "boolean" },
@@ -161,7 +166,14 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     mode = { kind: "online", apiUrl: values["api-url"] };
   }
   return depsCheck(
-    { base: values.base, head: values.head, lockfile: values.lockfile, format, mode },
+    {
+      base: values.base,
+      head: values.head,
+      lockfile: values.lockfile,
+      allProjects: values["all-projects"],
+      format,
+      mode,
+    },
     io,
   );
 }

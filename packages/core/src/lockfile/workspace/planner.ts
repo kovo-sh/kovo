@@ -70,6 +70,11 @@ export interface WorkspaceLadderInput {
   readonly workspace: WorkspaceGraph;
   readonly target: LadderTarget;
   readonly registry: readonly RegistryPackage[];
+  /**
+   * M7 scoped edits: the members a fix may edit (`plannedScopeMembers`). Omitted for today's
+   * repository-wide protection, which keeps the historical plans verbatim until M10b.
+   */
+  readonly projectScope?: { readonly members: readonly string[] };
 }
 export interface WorkspaceLadderResult {
   readonly plans: readonly WorkspaceLadderPlan[];
@@ -393,6 +398,23 @@ export function planWorkspaceLadder(input: WorkspaceLadderInput): WorkspaceLadde
       skipped.push({ rung, reason: "conflicting_edits", importer: null });
       continue;
     }
+    // M7 scoped edits: member manifests outside the protected closures are never planned. The
+    // root's shared files (lockfile, root manifest, workspace YAML) stay editable as before.
+    if (input.projectScope !== undefined) {
+      const scope = new Set(input.projectScope.members);
+      const outside = manifests.find(
+        (item) =>
+          item.importer !== "." && item.expectedManifest.length > 0 && !scope.has(item.importer),
+      );
+      if (outside !== undefined || scope.size === 0) {
+        skipped.push({
+          rung,
+          reason: "out_of_project_scope",
+          importer: outside?.importer ?? null,
+        });
+        continue;
+      }
+    }
     const commands = [
       ...(workspaceYamlEdits.length > 0 || manifests.some((item) => item.manifestEdits.length > 0)
         ? [workspaceCommand(relockCommand(workspace.layout.packageManager), ".")]
@@ -606,8 +628,12 @@ export function aggregateWorkspaceGraph(workspace: WorkspaceGraph): DependencyGr
           [...prior.dependencies, ...node.dependencies].map((edge) => [JSON.stringify(edge), edge]),
         ).values(),
       ];
+      const { bundleArtifacts: priorBundles, ...priorFacts } = prior;
       nodes.set(node.key, {
-        ...prior,
+        ...priorFacts,
+        ...(priorBundles !== undefined && node.bundleArtifacts !== undefined
+          ? { bundleArtifacts: [...priorBundles, ...node.bundleArtifacts] }
+          : {}),
         integrity: prior.integrity ?? node.integrity,
         integrityAlgorithm:
           prior.integrity !== null

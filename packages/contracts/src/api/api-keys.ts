@@ -1,7 +1,7 @@
 import { z } from "zod";
 import {
   apiKeyAuthoritySchema,
-  apiKeyKindSchema,
+  apiKeyKindWriteSchema,
   apiKeyRepositoryAuthoritySchema,
   managementKeyPermissionWriteSchema,
 } from "../api-key-authority-schemas.js";
@@ -58,7 +58,7 @@ export const apiKeySchema = z
     last_used_at: utcDateTimeSchema.nullable(),
     revoked_at: utcDateTimeSchema.nullable(),
   })
-  .refine((key) => key.authority?.kind === "management" || key.repo_ids.length > 0, {
+  .refine((key) => (key.authority?.kind ?? "runtime") !== "runtime" || key.repo_ids.length > 0, {
     ...whenValid,
     error: "Runtime keys delegate at least one repository",
     path: ["repo_ids"],
@@ -66,6 +66,12 @@ export const apiKeySchema = z
   .superRefine((key, ctx) => {
     const authority = key.authority;
     if (authority === undefined) return;
+    if (authority.kind === "registry" && key.scope !== "read")
+      ctx.addIssue({
+        code: "custom",
+        path: ["scope"],
+        message: "Registry keys are read-only",
+      });
     if (authority.kind === "management" && key.scope !== "write")
       ctx.addIssue({
         code: "custom",
@@ -106,7 +112,7 @@ export const createApiKeyBodySchema = z
     name: apiKeyNameSchema,
     scope: apiKeyScopeSchema,
     repo_ids: uniqueArraySchema(repoIdSchema, MAX_API_KEY_REPOS, 0),
-    kind: apiKeyKindSchema.exactOptional(),
+    kind: apiKeyKindWriteSchema.exactOptional(),
     issuance_intent: apiKeyIssuanceIntentSchema.exactOptional(),
     permission_preset: z.enum(["full", "custom"]).exactOptional(),
     permissions: uniqueArraySchema(managementKeyPermissionWriteSchema, 100, 0).exactOptional(),
@@ -114,7 +120,20 @@ export const createApiKeyBodySchema = z
     expires_at: utcDateTimeSchema.nullable().exactOptional(),
   })
   .superRefine((value, ctx) => {
-    if (value.kind !== "management") {
+    if (value.kind === "registry") {
+      if (
+        value.scope !== "read" ||
+        value.repo_ids.length !== 0 ||
+        value.permission_preset !== undefined ||
+        value.permissions !== undefined ||
+        value.repo_authority !== undefined
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["kind"],
+          message: "Registry keys have only packages:read and no repository authority",
+        });
+    } else if (value.kind !== "management") {
       if (value.repo_ids.length === 0)
         ctx.addIssue({
           code: "custom",

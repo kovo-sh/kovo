@@ -108,15 +108,17 @@ export function pinDirect(
       pointer: dependencyPointer(declaration),
       value: specFor(declaration, version, style),
     });
-    commands.push(
-      installCommand(
-        ctx.pm,
-        direct.alias,
-        installSpecFor(declaration, version),
-        direct.section,
-        style,
-      ),
-    );
+    // A root without a lockfile (#8256 R2) takes the written edit alone: nothing runs.
+    if (ctx.pm !== "manifest-only")
+      commands.push(
+        installCommand(
+          ctx.pm,
+          direct.alias,
+          installSpecFor(declaration, version),
+          direct.section,
+          style,
+        ),
+      );
     pins.push({ alias: direct.alias, name: declaration.name, version });
   }
   return { ok: true, pinning: { writtenEdits, commands, pins } };

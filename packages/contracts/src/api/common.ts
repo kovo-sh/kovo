@@ -140,16 +140,26 @@ export const branchNameSchema = z
 
 /**
  * An `https:` URL without credentials or fragment, optionally restricted to hosts matching
- * `hostname` (used for GitHub and Stripe redirect targets).
+ * `hostname` (used for GitHub and Stripe redirect targets). `allowFragment` admits a fragment for a
+ * vendor page whose own URL carries one (Stripe Checkout's `#fid…`, #5514); credentials never.
  */
-export function httpsUrlSchema(hostname?: RegExp) {
+export function httpsUrlSchema(
+  hostname?: RegExp,
+  options: { readonly allowFragment?: boolean } = {},
+) {
   const base = z.url({ protocol: /^https$/, ...(hostname === undefined ? {} : { hostname }) });
+  const allowFragment = options.allowFragment === true;
   return base.max(2048).refine(
     (text) => {
       const url = new URL(text);
-      return url.username === "" && url.password === "" && url.hash === "";
+      return url.username === "" && url.password === "" && (allowFragment || url.hash === "");
     },
-    { ...whenValid, error: "must not contain credentials or a fragment" },
+    {
+      ...whenValid,
+      error: allowFragment
+        ? "must not contain credentials"
+        : "must not contain credentials or a fragment",
+    },
   );
 }
 

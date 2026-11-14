@@ -72,12 +72,24 @@ export const usageLedgerEntryIdSchema = kovoIdSchema("UsageLedgerEntryId");
 export type UsageLedgerEntryId = z.infer<typeof usageLedgerEntryIdSchema>;
 export const overageInvoiceItemIdSchema = kovoIdSchema("OverageInvoiceItemId");
 export type OverageInvoiceItemId = z.infer<typeof overageInvoiceItemIdSchema>;
+/** One metered overage report (`overage_usage_reports`, the Managed Payments meter outbox). */
+export const overageUsageReportIdSchema = kovoIdSchema("OverageUsageReportId");
+export type OverageUsageReportId = z.infer<typeof overageUsageReportIdSchema>;
 /** A capacity preview quote that `/v1/billing/capacity/confirm` binds to. */
 export const quoteIdSchema = kovoIdSchema("QuoteId");
 export type QuoteId = z.infer<typeof quoteIdSchema>;
 
 export const repoIdSchema = kovoIdSchema("RepoId");
 export type RepoId = z.infer<typeof repoIdSchema>;
+/** One "Kovo needs X" ask on a repository (`repo_customer_asks`, #8256 V6). */
+export const customerAskIdSchema = kovoIdSchema("CustomerAskId");
+export type CustomerAskId = z.infer<typeof customerAskIdSchema>;
+export const installRootIdSchema = kovoIdSchema("InstallRootId");
+export type InstallRootId = z.infer<typeof installRootIdSchema>;
+export const projectIdSchema = kovoIdSchema("ProjectId");
+export type ProjectId = z.infer<typeof projectIdSchema>;
+export const installRootObservationIdSchema = kovoIdSchema("InstallRootObservationId");
+export type InstallRootObservationId = z.infer<typeof installRootObservationIdSchema>;
 export const snapshotIdSchema = kovoIdSchema("SnapshotId");
 export type SnapshotId = z.infer<typeof snapshotIdSchema>;
 export const findingIdSchema = kovoIdSchema("FindingId");
@@ -121,6 +133,9 @@ export type WorkflowOutboxId = z.infer<typeof workflowOutboxIdSchema>;
 /** A recorded workflow wake (`workflow_wakes`), delivered with its wake key as idempotency key. */
 export const workflowWakeIdSchema = kovoIdSchema("WorkflowWakeId");
 export type WorkflowWakeId = z.infer<typeof workflowWakeIdSchema>;
+/** A parked workflow wait (`workflow_parks`, owner D-731): the sweep starts a fresh run when due. */
+export const workflowParkIdSchema = kovoIdSchema("WorkflowParkId");
+export type WorkflowParkId = z.infer<typeof workflowParkIdSchema>;
 /**
  * A model relay grant (`relay_grants.id`): the non-secret identity the relay's bearer token is a MAC
  * over, together with the job and expiry. The token itself is never stored.
@@ -138,6 +153,12 @@ export const analyticsEventIdSchema = kovoIdSchema("AnalyticsEventId");
 export type AnalyticsEventId = z.infer<typeof analyticsEventIdSchema>;
 export const releaseRecordIdSchema = kovoIdSchema("ReleaseRecordId");
 export type ReleaseRecordId = z.infer<typeof releaseRecordIdSchema>;
+/** A support case (plans/support-flow.md §7.1); opaque to the budget ledger until case intake. */
+export const supportCaseIdSchema = kovoIdSchema("SupportCaseId");
+export type SupportCaseId = z.infer<typeof supportCaseIdSchema>;
+/** One reserved support operation (`support_budget_reservations.id`). */
+export const supportBudgetReservationIdSchema = kovoIdSchema("SupportBudgetReservationId");
+export type SupportBudgetReservationId = z.infer<typeof supportBudgetReservationIdSchema>;
 
 // ---- GitHub (immutable numeric IDs; SPEC: keyed "by immutable GitHub account ID, not login") ----
 
@@ -215,6 +236,31 @@ export const stripeCheckoutSessionIdSchema = stripeIdSchema("StripeCheckoutSessi
 export type StripeCheckoutSessionId = z.infer<typeof stripeCheckoutSessionIdSchema>;
 export const stripePromotionCodeIdSchema = stripeIdSchema("StripePromotionCodeId", ["promo"]);
 export type StripePromotionCodeId = z.infer<typeof stripePromotionCodeIdSchema>;
+/** A charge (`ch_`, or `py_` for a non-card payment) behind a refund or dispute event. */
+export const stripeChargeIdSchema = stripeIdSchema("StripeChargeId", ["ch", "py"]);
+export type StripeChargeId = z.infer<typeof stripeChargeIdSchema>;
+/** A dispute (`dp_`, or `du_` for some payment methods). */
+export const stripeDisputeIdSchema = stripeIdSchema("StripeDisputeId", ["dp", "du"]);
+export type StripeDisputeId = z.infer<typeof stripeDisputeIdSchema>;
+/** The billing meter Kovo reports AI overage cents to (`mtr_`). */
+export const stripeMeterIdSchema = stripeIdSchema("StripeMeterId", ["mtr"]);
+export type StripeMeterId = z.infer<typeof stripeMeterIdSchema>;
+/** A product of Kovo's own Stripe catalog (`prod_`), such as the AI-overage product (#5514). */
+export const stripeProductIdSchema = stripeIdSchema("StripeProductId", ["prod"]);
+export type StripeProductId = z.infer<typeof stripeProductIdSchema>;
+/**
+ * The identifier of one overage meter event, `kovo-overage:<cycleId>:<sequence>`
+ * (plans/stripe-managed-payments.md §3.1): Stripe deduplicates meter events by it, and it is at most
+ * 100 characters.
+ */
+export const overageMeterEventIdentifierSchema = z
+  .string()
+  .max(100)
+  .regex(/^kovo-overage:[0-9a-f-]{36}:[0-9]{1,9}$/, {
+    error: "must be kovo-overage:<cycle UUID>:<sequence>",
+  })
+  .brand<"OverageMeterEventIdentifier">();
+export type OverageMeterEventIdentifier = z.infer<typeof overageMeterEventIdentifierSchema>;
 /**
  * A Stripe coupon Kovo created for a Plus coupon. Stripe coupon IDs are free-form; Kovo derives its
  * own from the Kovo coupon ID (`kovo_plus_<32 hex>`), so a creation retried after Stripe's 24-hour

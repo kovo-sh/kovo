@@ -4,6 +4,7 @@ import { gitShaSchema } from "./primitives.js";
 import { envExampleBindingSchema } from "./env-fixture.js";
 import { envVarNameSchema } from "./primitives.js";
 import { ciDeviationSchema, recipeSchema } from "./recipe.js";
+import { persistedReader } from "./tolerant-reader.js";
 
 /** Deterministic bounded configuration, retained to restore rejected model authority. */
 export const recipeLabelFallbackSchema = z.strictObject({
@@ -17,6 +18,11 @@ export const recipeLabelFallbackWriteSchema = recipeLabelFallbackSchema.extend({
   deviations: z.array(ciDeviationSchema).max(200),
 });
 export type RecipeLabelFallback = z.output<typeof recipeLabelFallbackSchema>;
+/**
+ * The stored fallback's reader: it keeps fields and closed-enum values a later writer adds (its
+ * body is a recipe, read like `recipes.body`), while writers keep `recipeLabelFallbackSchema`.
+ */
+export const recipeLabelFallbackReader = persistedReader(recipeLabelFallbackSchema);
 export const recipeLabelRejectionsSchema = z.strictObject({
   envNames: z.array(envVarNameSchema).max(100),
   secretNames: z.array(envVarNameSchema).max(100),

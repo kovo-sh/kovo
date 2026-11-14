@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { writerPinned } from "../compatibility.js";
 
 import type { NextAction } from "./waits.js";
 
@@ -198,7 +199,8 @@ export const MODE_REASON_NEXT_ACTIONS = {
  * the compatibility matrix"; npm proxy: "Reject private registries and external git/file/HTTP
  * dependency sources").
  */
-export const UNSUPPORTED_REPO_REASONS = [
+/** Production writer vocabulary; M1 must not widen the database CHECK. */
+export const UNSUPPORTED_REPO_WRITE_REASONS = [
   "workspaces",
   "missing_package_json",
   "invalid_package_json",
@@ -211,8 +213,34 @@ export const UNSUPPORTED_REPO_REASONS = [
   "private_registry",
   "non_registry_dependency",
   "too_large",
+  // A pnpm setting (`.npmrc`, pnpm-workspace.yaml or package.json `pnpm`) Kovo cannot run yet (#2135).
+  "unsupported_pnpm_setting",
 ] as const;
-export const unsupportedRepoReasonSchema = z.enum(UNSUPPORTED_REPO_REASONS);
+export const PROJECT_SCOPE_REASONS = [
+  "nested_project",
+  "too_many_projects",
+  "required_app_unprotected",
+  "out_of_project_scope",
+  "project_scope_ambiguous",
+] as const;
+/**
+ * #8256 R8 (plans/js-coverage-phase2.md §2.6): why a fix's affected closure could not be computed,
+ * so every project ran (`closure_fallback_all`, disclosed). Closed codes, never graph content.
+ */
+export const CLOSURE_FALLBACK_CAUSES = [
+  "graph_unavailable",
+  "dependency_cycle",
+  "unknown_importer",
+] as const;
+export type ClosureFallbackCause = (typeof CLOSURE_FALLBACK_CAUSES)[number];
+export const UNSUPPORTED_REPO_REASONS = [
+  ...UNSUPPORTED_REPO_WRITE_REASONS,
+  ...PROJECT_SCOPE_REASONS,
+] as const;
+export const unsupportedRepoReasonSchema = writerPinned(
+  z.enum(UNSUPPORTED_REPO_REASONS),
+  z.enum(UNSUPPORTED_REPO_WRITE_REASONS),
+);
 export type UnsupportedRepoReason = z.infer<typeof unsupportedRepoReasonSchema>;
 
 /**

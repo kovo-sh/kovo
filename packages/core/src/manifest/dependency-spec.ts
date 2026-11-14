@@ -1,4 +1,5 @@
-import { NPM_PUBLIC_REGISTRY_ORIGIN, packageNameSchema, type PackageName } from "@kovo/contracts";
+import { NPM_PUBLIC_REGISTRY_ORIGIN, packageNameSchema } from "@kovo/contracts/npm";
+import type { PackageName } from "@kovo/contracts";
 import semver from "semver";
 
 import type { SourceRejectionReason } from "./reasons.js";

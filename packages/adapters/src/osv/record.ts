@@ -1,4 +1,5 @@
-import { advisoryEcosystemSchema, advisoryIdSchema, type AdvisoryId } from "@kovo/contracts";
+import { advisoryEcosystemSchema, type AdvisoryId } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
 import { z } from "zod";
 
 import { jsonObjectSchema, type JsonObject, type JsonValue } from "../ports/common.js";
