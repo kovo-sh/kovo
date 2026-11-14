@@ -3,8 +3,7 @@ import type { PackageManager } from "@kovo/contracts";
 import { frozenInstallCommand } from "./commands.js";
 import type { PmCommand } from "./types.js";
 
-// Owner D-615 item 3 (source: https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6673702551;
-// specs/npm-proxy-and-network-egress.md): sandbox installs are lockfile-only. With a present,
+// Per specs/npm-proxy-and-network-egress.md, sandbox installs are lockfile-only. With a present,
 // current lockfile the package manager installs exactly what the lockfile names and never resolves
 // a version: `npm ci` (package-lock's resolved URL and integrity; npm's default replace-registry-host
 // rewrites the URL to the proxy), `pnpm install --frozen-lockfile`, and for the admitted yarn

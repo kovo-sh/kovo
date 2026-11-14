@@ -95,7 +95,7 @@ function cliProjects(scope: GateRootScope): GateRootScope["projects"] {
     : scope.projects;
 }
 
-/** Ignore patterns cannot suppress the root/member exceptions from D-227. */
+/** Ignore patterns cannot suppress the root/member exceptions. */
 async function readRetainedLocks(
   reader: ProjectReader,
   entries: readonly WorkspaceTreeEntry[],

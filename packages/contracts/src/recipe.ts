@@ -113,7 +113,7 @@ export type RecipeStep = z.infer<typeof recipeStepSchema>;
 export const SMOKE_BODY_MAX_LENGTH = 4096;
 
 /**
- * A smoke request body, or the answer of a loopback fake (owner D-654, layer 1): bounded text with
+ * A smoke request body, or the answer of a loopback fake (layer 1): bounded text with
  * its content type. It is recipe configuration, a non-secret fixture like an environment stub,
  * never a customer response. Tabs and newlines are allowed; other control characters are not.
  */
@@ -156,7 +156,7 @@ export const SMOKE_PROBE_ENV: readonly string[] = ["PORT", "HOST", "HOSTNAME"];
 
 /**
  * An outside service the app calls, replaced for the smoke check by a fake on loopback inside the
- * sandbox (owner D-654, layer 1). The probe starts the fake on a free loopback port and sets `env`
+ * sandbox (layer 1). The probe starts the fake on a free loopback port and sets `env`
  * to its origin (`http://127.0.0.1:<port>`) for the app; the fake answers every request with
  * `status` and `body`. `placeholderEnv` names the variables the app's client needs set before it calls,
  * set to a fixed inert placeholder (never a credential). No egress setting changes: the fake is on
@@ -174,7 +174,7 @@ export type SmokeFake = z.infer<typeof smokeFakeSchema>;
 /** The fixed value of a loopback fake's `placeholderEnv` variables: inert, never a credential. */
 export const SMOKE_FAKE_KEY_VALUE = "kovo-loopback-fake";
 
-/** SPEC `smoke`, plus D-654's `readyStatus` and loopback `fakes`, and phase 2 R4's T4 and T5. */
+/** SPEC `smoke`, plus layer 1's `readyStatus` and loopback `fakes`, and phase 2 R4's T4 and T5. */
 export const smokeSchema = z
   .strictObject({
     start: cmdSchema,
@@ -185,12 +185,12 @@ export const smokeSchema = z
     timeoutSec: timeoutSecSchema,
     fakes: z.array(smokeFakeSchema).max(5).exactOptional(),
     /**
-     * T4 boot smoke (#8256, phase 2 §2.5): a 3xx also passes wherever any 2xx would (the ready
+     * T4 boot smoke (phase 2): a 3xx also passes wherever any 2xx would (the ready
      * path, and a route expecting 200). An exact expected status is still judged exactly.
      */
     redirectsPass: z.literal(true).exactOptional(),
     /**
-     * T5 end to end (#8256, phase 2 §2.5): the repository's own Playwright or Cypress specs, run
+     * T5 end to end (phase 2): the repository's own Playwright or Cypress specs, run
      * by the smoke probe against the app it booted, as the harness step `kovo e2e`. Its timeout
      * is the specs' own budget, counted once the app is ready.
      */
@@ -280,7 +280,7 @@ export const recipeSchema = z
     smoke: smokeSchema.exactOptional(),
     sabotageTargets: z.array(sabotageTargetSchema).max(20),
     /**
-     * #8256 R3: the repository's own `pull_request` workflow jobs the executor runs on the isolation
+     * R3: the repository's own `pull_request` workflow jobs the executor runs on the isolation
      * tier under `ci_like_open` (metadata only; `workflow-jobs.ts`). Absent: none selected.
      */
     workflow: recipeWorkflowSchema.exactOptional(),
@@ -555,7 +555,7 @@ export type RegressionCalibrationComparison = z.output<
 
 /**
  * Whether a calibration that missed the bar still qualifies for `limited` verification (owner
- * D-627, 2026-11-06, docs/decisions/recipes.md "Limited verification for thin-test repositories"):
+ * decision, 2026-11-06, docs/decisions/recipes.md "Limited verification for thin-test repositories"):
  * no step failed on the unchanged code, an install and at least one later check (build,
  * typecheck, tests or the entry import) passed, every applied deliberate break was caught by a
  * check, and the only weak reasons are in `LIMITED_VERIFICATION_WEAK_REASONS`. A failed or

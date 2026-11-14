@@ -65,7 +65,7 @@ export interface ResolvedPackageNode {
   /** Which integrity the lockfile records: sha512, only a legacy sha1, or none (bundled). */
   readonly integrityAlgorithm: "sha512" | "sha1" | null;
   /**
-   * The distinct `sha1-` SRI tokens of this version's sha1-only instances, sorted (#8951): the
+   * The distinct `sha1-` SRI tokens of this version's sha1-only instances, sorted: the
    * malware gate cross-checks them against the registry's `dist.shasum` before it trusts the
    * registry's sha512 for the version. Absent when no instance is sha1-only.
    */
@@ -73,7 +73,7 @@ export interface ResolvedPackageNode {
   /** The canonical public tarball URL when the lockfile records one. */
   readonly resolved: string | null;
   /**
-   * D-726 fix-only: some instance is locked at a private HTTPS registry (its location is never
+   * Fix-only: some instance is locked at a private HTTPS registry (its location is never
    * kept). Absent on every other node. A scope the repository's `.npmrc` declares private makes a
    * node private too (`privateRegistryPackages`), even when pnpm records no location for it.
    */
@@ -125,7 +125,7 @@ export interface UnresolvedDependency {
 }
 
 export interface DependencyGraph {
-  /** A fix-only value (#8256 R2) only on the fix paths' parses (`LockfileInput.fixOnly`). */
+  /** A fix-only value only on the fix paths' parses (`LockfileInput.fixOnly`). */
   readonly packageManager: StoredPackageManager;
   readonly format: StoredLockfileFormat;
   readonly direct: readonly DirectDependency[];
@@ -134,11 +134,11 @@ export interface DependencyGraph {
   readonly unresolved: readonly UnresolvedDependency[];
   /** pnpm lockfile `overrides` selectors (npm does not record overrides in the lockfile). */
   readonly lockfileOverrides: readonly string[];
-  /** Non-registry sources left alone as opaque nodes (owner D-726); absent means none. */
+  /** Non-registry sources left alone as opaque nodes; absent means none. */
   readonly opaque?: OpaqueGraph;
 }
 
-/** One non-registry dependency Kovo did not resolve, update or vet (owner D-726). */
+/** One non-registry dependency Kovo did not resolve, update or vet. */
 export interface OpaqueNode {
   readonly name: PackageName;
   readonly kind: OpaqueSourceKind;
@@ -178,7 +178,7 @@ export function opaqueNodeChanges(
   });
 }
 
-/** A registry package/version reachable only through opaque nodes (owner D-726). */
+/** A registry package/version reachable only through opaque nodes. */
 export interface HiddenPackage {
   readonly key: PackageKey;
   readonly name: PackageName;
@@ -213,7 +213,7 @@ export interface OpaqueGraph {
   readonly identities: readonly string[];
 }
 
-/** The evidence counts of a graph's opaque nodes (owner D-726), or undefined when it has none. */
+/** The evidence counts of a graph's opaque nodes, or undefined when it has none. */
 export function opaqueDependencyCounts(graph: DependencyGraph): OpaqueDependencies | undefined {
   const opaque = graph.opaque;
   if (opaque === undefined || opaque.nodes.length === 0) return undefined;
@@ -247,7 +247,7 @@ const VERIFIABLE_FORMATS: ReadonlySet<string> = new Set<LockfileFormat>([
   "yarn-v1",
 ]);
 
-/** Whether a graph belongs to a package manager Kovo runs, not a fix-only one (#8256 R2). */
+/** Whether a graph belongs to a package manager Kovo runs, not a fix-only one. */
 export function isVerifiableGraph(graph: DependencyGraph): graph is VerifiableGraph {
   return VERIFIABLE_FORMATS.has(graph.format);
 }

@@ -9,7 +9,7 @@ import type { Instance, InstanceEdge, InstanceSet, RootDependency } from "./inst
 import { RejectionCollector } from "./reasons.js";
 import { GRAPH_LIMITS, SECTION_KIND, type LockfileLimits } from "./types.js";
 
-// Yarn 4's `yarn.lock` (#8256 R2): a YAML document Yarn writes in one fixed layout, read here by a
+// Yarn 4's `yarn.lock`: a YAML document Yarn writes in one fixed layout, read here by a
 // bounded line scanner, never by a YAML engine (no anchors, aliases, tags, flow collections or
 // multi-line scalars are accepted). Kovo fixes a Yarn 4 repository with its own pinned Yarn
 // (`FIX_ONLY_TOOLS["yarn-berry"]`) and never runs it in Sandbox B, so the graph serves inventory,

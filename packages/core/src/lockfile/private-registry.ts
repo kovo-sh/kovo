@@ -2,8 +2,8 @@ import type { PackageName, StoredPackageManager } from "@kovo/contracts";
 
 import type { DependencyGraph } from "./types.js";
 
-// D-726 fix-only mode for private registries (owner, #626 comment 6733241173: "private registries
-// and token lines in fix-only mode"). A single-package npm repository whose root `.npmrc`
+// Fix-only mode for private registries ("private registries and token lines in fix-only mode").
+// A single-package npm repository whose root `.npmrc`
 // names a private registry for some scopes (`checkNpmrcFixOnly`) is admitted. Kovo changes its
 // lockfile and manifest for public packages only, through the proxy, and never sends a request to
 // the private registry, never reads or injects its token and never runs the repository; the
@@ -56,7 +56,7 @@ export type PrivateRegistryRefusal =
  * update keeps a locked private entry without fetching it; pnpm's re-resolves the importer's
  * direct dependencies and needs the private registry's metadata (probed with pnpm 10 in the
  * hermetic generation test), and Yarn reads scope registries from other files. Each refusal is a
- * `private_registry` repository, as before D-726.
+ * `private_registry` repository, as before fix-only mode.
  */
 export function privateRegistryAdmission(
   graph: DependencyGraph,
@@ -75,7 +75,7 @@ export function privateRegistryAdmission(
 }
 
 /**
- * The fixed reason a fix-only plan or fix is refused (D-726: every refusal says which setups it
+ * The fixed reason a fix-only plan or fix is refused (every refusal says which setups it
  * blocks). A fix that needs a new version of a private-registry package, or moves one through a
  * parent bump, cannot be made without contacting that registry, so it is never attempted: the
  * customer updates private packages themselves. It blocks only fixes whose vulnerable package, or

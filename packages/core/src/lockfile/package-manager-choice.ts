@@ -20,7 +20,7 @@ import { FOREIGN_LOCKFILES, detectPackageManager } from "./detect.js";
 import { LOCKFILE_NAMES } from "./parse.js";
 
 // Repositories whose root commits both `package-lock.json` and `pnpm-lock.yaml` (owner choice A,
-// 2026-10-27, #5500; SPEC "Web application and onboarding UI" → "Two root lockfiles"): detection
+// 2026-10-27; SPEC "Web application and onboarding UI" → "Two root lockfiles"): detection
 // refuses them (`multiple_lockfiles`) until a repository admin records which manager they use.
 // Pure: names, versions and timestamps come in, decisions come out; nothing is read or logged.
 
@@ -58,7 +58,7 @@ export function isTwoLockfileRoot(rootFiles: readonly string[]): boolean {
   );
 }
 
-/** Why admission did not apply a stored choice (D-267 reason codes; metadata only). */
+/** Why admission did not apply a stored choice (reason codes; metadata only). */
 export const CHOICE_ADMISSION_REASONS = [
   "package_manager_choice_absent", // no choice is recorded: `multiple_lockfiles` stays
   "package_manager_choice_unreadable", // a stored value no known shape reads: fail closed

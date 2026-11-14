@@ -3,7 +3,7 @@ import type { ClosureFallbackCause } from "@kovo/contracts";
 import type { WorkspaceGraph } from "../workspace/types.js";
 import type { ChangedMembers } from "./project-scope.js";
 
-// #8256 phase 2 R8 (plans/js-coverage-phase2.md §2.6): monorepo checks by affected closure. Pure
+// Monorepo checks by affected closure. Pure
 // and transient: inputs are the parsed workspace graphs (manifests' local declarations and the
 // lockfile importers, read in Sandbox A's trusted reads as today), outputs are member paths,
 // counts and closed cause codes, never file contents.

@@ -94,7 +94,7 @@ export const WORKSPACE_REASONS = [
 ] as const;
 export type WorkspaceReason = (typeof WORKSPACE_REASONS)[number];
 /**
- * The finer cause of an `invalid_lockfile` or `catalogs_unsupported` failure (D-267, #2135): the
+ * The finer cause of an `invalid_lockfile` or `catalogs_unsupported` failure: the
  * lockfile parser's own rejection reason, or the workspace check that failed. A closed code; never
  * lockfile content.
  */
@@ -111,7 +111,7 @@ export type WorkspaceResult<T> =
       readonly lockfileReason?: WorkspaceLockfileReason;
       /**
        * The npm entries of the registry-sourced integrity shape whose `missing_integrity` is the
-       * lockfile's only problem (#7338); the caller may look them up and parse again.
+       * lockfile's only problem; the caller may look them up and parse again.
        */
       readonly registryIntegrityCandidates?: readonly RegistryIntegrityCandidate[];
     };

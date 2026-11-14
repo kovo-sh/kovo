@@ -5,7 +5,7 @@ import { envVarNameSchema } from "./primitives.js";
 import { EGRESS_HOST_CLASSES, failureCategoryNameSchema, stepNameSchema } from "./step-result.js";
 import { DAY_MS } from "./time.js";
 
-// Phase 2 R7 and V2 (#8256, plans/js-coverage-phase2.md §2.8; owner D-674, D-689, D-217): the Plus
+// Phase 2 R7 and V2: the Plus
 // product agent plans checks (R7, the planner) and repairs a failing check's recipe fields (V2, the
 // medic). It runs inside production under the customer's authorization, through the relay, like
 // the fix agent. What it hands back is this closed structure, never free text: commands are

@@ -35,7 +35,7 @@ export const checkDiagnosticSchema = z.enum(CHECK_DIAGNOSTICS);
 export type CheckDiagnostic = z.infer<typeof checkDiagnosticSchema>;
 
 /**
- * Which workspace orchestrator a pinned Turbo or Nx check ran (D-674, #7846; docs/decisions/
+ * Which workspace orchestrator a pinned Turbo or Nx check ran (docs/decisions/
  * recipes.md "Repository-locked Turbo and Nx"): `*_unproven_repo_version` discloses that the
  * repository's own locked release, not the proven one, ran (an ordinary result of any status);
  * `*_not_installed` (no package of that name installed) and `*_proof_failed` (the proven command's
@@ -53,7 +53,7 @@ export const orchestrationReasonSchema = persistedReader(z.enum(ORCHESTRATION_RE
 export type OrchestrationReason = z.infer<typeof orchestrationReasonSchema>;
 
 /**
- * The D-597 list version 2 host classes (#8256 E3, plans/js-coverage-phase1.md section 2.7): the
+ * The public-fetch list version 2 host classes (E3): the
  * closed names an `egress_blocked:<class>` category may carry. Each class's trigger packages and
  * hosts are the reviewed list in `@kovo/core/recipe` (`CURATED_PUBLIC_FETCH_HOSTS`). A name grants
  * nothing.
@@ -95,21 +95,21 @@ export const FAILURE_CATEGORIES = [
   // incomplete, with the count of declared packages missing from node_modules.
   "dependencies_not_installed",
   // An install that failed because the registry (Kovo's proxy or its upstream) was unavailable: a
-  // 5xx, a connection error or a timeout, from the install hint (#7637).
+  // 5xx, a connection error or a timeout, from the install hint.
   "registry_unavailable",
-  // A dependency's install lifecycle script exited nonzero during the install step (#7746). It
+  // A dependency's install lifecycle script exited nonzero during the install step. It
   // names the package only when the package is well known.
   "install_script_failed",
   // The repository's own (root or workspace) install lifecycle script failed: an install step's
-  // lifecycle failure that names no dependency's directory (#7746). Never names a package.
+  // lifecycle failure that names no dependency's directory. Never names a package.
   "project_install_script_failed",
   // A build-phase check exited nonzero and printed nothing any fixed signature or vocabulary bit
-  // matches: no failing output to classify (#7637). Chosen by a closed output-shape hash.
+  // matches: no failing output to classify. Chosen by a closed output-shape hash.
   "no_failure_output",
   // A test step exited nonzero with a test runner and a lifecycle-failure footer in its output
-  // but no failed-test count or suite report (#7637). Chosen by a closed output-shape hash.
+  // but no failed-test count or suite report. Chosen by a closed output-shape hash.
   "test_run_failed_without_report",
-  // V1 failure taxonomy (#8256, plans/js-coverage-phase1.md section 2.9; docs/decisions/recipes.md
+  // V1 failure taxonomy (docs/decisions/recipes.md
   // "Toolchain fingerprints and failure categories"). `egress_blocked:<class>` names the E3 host
   // class (`EGRESS_HOST_CLASSES`) of a refused fetch, from trusted facts only; `unknown` is the
   // shell's category and any refusal no applicable class explains. The plan's `oom` is
@@ -192,7 +192,7 @@ export type FailureCategory = z.infer<typeof failureCategorySchema>;
 // stdout/stderr stays ephemeral."
 
 /**
- * What a watched file a step rewrote is (owner D-726, the base-relative Sandbox B guard): the
+ * What a watched file a step rewrote is (the base-relative Sandbox B guard): the
  * kinds a paired verification discloses when both runs rewrote the same files to the same bytes.
  * Kinds and counts only, never a path or content.
  */
@@ -209,7 +209,7 @@ export const rewriteKindSchema = persistedReader(z.enum(REWRITE_KINDS));
 export type RewriteKind = z.infer<typeof rewriteKindSchema>;
 
 /**
- * Owner D-726 disclosure: by the end of this step the repository's own commands had rewritten
+ * Disclosure: by the end of this step the repository's own commands had rewritten
  * watched files, and the paired unchanged-base run rewrote exactly the same files from the same
  * bytes to the same bytes, so Kovo ignored that rewrite on both sides. Kinds (sorted, unique) and
  * the number of distinct files only.
@@ -288,22 +288,22 @@ export const stepResultSchema = z
      */
     failure_excerpt: failureExcerptRefSchema.exactOptional(),
     /**
-     * Owner D-664 disclosure: this passed install ran its dependency install scripts with internet
+     * Open-install disclosure: this passed install ran its dependency install scripts with internet
      * access before the code was present (open install, sealed code). Only a passed B_install step
-     * carries it; absent on every other step and on records written before D-664.
+     * carries it; absent on every other step and on records written before open install.
      */
     open_install: z.literal(true).exactOptional(),
     /**
-     * Owner D-713 disclosure and posture record: this build or test step ran under `ci_like_open`
+     * The `ci_like_open` disclosure and posture record: this build or test step ran under `ci_like_open`
      * (CI-like internet access in the sealed isolation-tier VM). Only an executed B_build or
-     * B_tests step carries it; absent on every other step and on records written before D-713.
+     * B_tests step carries it; absent on every other step and on records written before it.
      */
     ci_like_open: z.literal(true).exactOptional(),
     /** Optional for old records; only an executed pinned Turbo or Nx check carries it. */
     orchestration_reason: orchestrationReasonSchema.exactOptional(),
     /**
-     * Owner D-726: the rewrite this executed step's run shared with its paired unchanged-base run
-     * (`expectedRewriteSchema`). Absent on every other step and on records written before D-726.
+     * The rewrite this executed step's run shared with its paired unchanged-base run
+     * (`expectedRewriteSchema`). Absent on every other step and on records written before it.
      */
     expected_rewrite: expectedRewriteSchema.exactOptional(),
   })

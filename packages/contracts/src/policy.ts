@@ -37,7 +37,7 @@ export const policyBodySchema = z.strictObject({
   base_freshness: baseFreshnessSchema,
   open_pr_on_verification_failure: z.strictObject({ P0: z.boolean(), P1: z.boolean() }),
   /**
-   * D-414 opt-out (agent decision 2026-10-28, pending owner review #5712): whether Kovo opens a
+   * The Kovo-side failure opt-out (agent decision 2026-10-28, pending owner review): whether Kovo opens a
    * review-only PR, and sends one email, when a patch exists but verification could not run or complete because of a failure on Kovo's side
    * (`KovoSideVerificationFailure`). Absent means the default, on for both tiers
    * (`DEFAULT_OPEN_PR_ON_KOVO_SIDE_FAILURE`); `false` opts the repository out for that tier.
@@ -50,7 +50,7 @@ export const policyBodySchema = z.strictObject({
 });
 export type PolicyBody = z.infer<typeof policyBodySchema>;
 
-/** The D-414 fallback default when a policy records no `open_pr_on_kovo_side_failure`. */
+/** The fallback default when a policy records no `open_pr_on_kovo_side_failure`. */
 export const DEFAULT_OPEN_PR_ON_KOVO_SIDE_FAILURE: Readonly<Record<FixTier, boolean>> = {
   P0: true,
   P1: true,
@@ -64,7 +64,7 @@ export function openPrOnKovoSideFailure(
 }
 
 /**
- * The policy body writers produce. The D-414 `open_pr_on_kovo_side_failure` key is open on the
+ * The policy body writers produce. The `open_pr_on_kovo_side_failure` key is open on the
  * writers now that the release with its tolerant readers is in production (AGENTS.md "Ship enabled
  * by default": reader first, then writer). Absent still means the default, on for both tiers.
  */

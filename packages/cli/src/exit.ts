@@ -1,6 +1,6 @@
 // The `kovo` CLI's identity and its documented exit codes (SPEC "Recipes and verification" →
 // "`kovo deps check`"). The exit codes are a public contract: CI jobs branch on them, in particular
-// on 3 to fall back to `--offline` in the same job (plans/dependency-firewall.md Part 4 item 3).
+// on 3 to fall back to `--offline` in the same job.
 
 /** The package version (packages/cli/package.json; a test keeps them equal). */
 export const CLI_VERSION = "0.1.1";

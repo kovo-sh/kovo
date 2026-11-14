@@ -206,7 +206,7 @@ export function discoverWorkspaces(
     if (yamlEntry !== undefined) return workspaceFailure("manager_mismatch");
     patterns = npmPatterns.data;
   } else if (npmPatterns.data.length > 0) return workspaceFailure("manager_mismatch");
-  // A root-only set (`["."]`) declares no members beyond the root: one project (D-228).
+  // A root-only set (`["."]`) declares no members beyond the root: one project.
   const hasWorkspaces = workspacePatternsDeclareMembers(patterns);
   if (
     input.packageManager === "yarn" &&
@@ -418,7 +418,7 @@ export function discoverWorkspaces(
     const parsed = parsePackageJson({
       text: JSON.stringify(copy),
       pnpmWorkspaceYamlPresent: false,
-      // pnpm 9/10 read settings from the `pnpm` field, so pnpm members get the settings allowlist (#1879).
+      // pnpm 9/10 read settings from the `pnpm` field, so pnpm members get the settings allowlist.
       ...(input.packageManager === "npm" ? {} : { packageManager: input.packageManager }),
     });
     if (!parsed.ok) return workspaceFailure("invalid_manifest");

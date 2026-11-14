@@ -52,7 +52,7 @@ export function checkTarballSource(
 }
 
 /**
- * The opaque kind (owner D-726) of a recorded location `checkTarballSource` refused, or null when
+ * The opaque kind of a recorded location `checkTarballSource` refused, or null when
  * the refusal stands (a private registry, a public-registry URL mismatch, another protocol).
  */
 export function opaqueLocationKind(
@@ -68,7 +68,7 @@ export function opaqueVersion(raw: string | undefined): PackageVersion {
 }
 
 /**
- * D-726 fix-only (#626 comment 6733241173): whether a recorded tarball location that
+ * Fix-only: whether a recorded tarball location that
  * `checkTarballSource` refuses is a scoped package served by a private registry over HTTPS
  * (`https://npm.pkg.github.com/download/@acme/ui/1.2.0/…`, an Artifactory or Verdaccio scope).
  * The parsers keep such an entry as an opaque private-registry node (`privateRegistry`) with no
@@ -98,7 +98,7 @@ export type IntegrityCheck =
   /**
    * Only a legacy sha1 digest (packages published before npm recorded sha512). `sha1` lists its
    * distinct `sha1-` SRI tokens, so a caller can cross-check them against the registry's
-   * `dist.shasum` before trusting the registry's sha512 for the same version (#8951).
+   * `dist.shasum` before trusting the registry's sha512 for the same version.
    */
   | {
       readonly ok: true;
@@ -132,7 +132,7 @@ export function checkIntegrity(value: string | undefined): IntegrityCheck {
 }
 
 /**
- * Registry-sourced integrity (agent decision 2026-11-05, pending owner review #7338): an npm
+ * Registry-sourced integrity (agent decision, pending owner review): an npm
  * workspace lockfile may record an entry under a member's `node_modules` with a `version` but no
  * `resolved` and no `integrity`, which `npm ci` installs by trusting the public registry's
  * metadata. Core never fetches anything: the caller supplies the registry's `dist.integrity` for

@@ -112,7 +112,7 @@ export type AdvisoryFeed = z.infer<typeof advisoryFeedSchema>;
 /**
  * The age past which a feed's polls are stale: the stale-poll alert's thresholds (SPEC
  * Observability "stale advisory polls over 30 minutes"; KEV is polled hourly) and, for OSV, the
- * D-552 bound past which a Kovo-side fallback PR is withheld.
+ * bound past which a Kovo-side fallback PR is withheld.
  */
 export const ADVISORY_FEED_STALE_AFTER_SECONDS: Readonly<Record<AdvisoryFeed, number>> = {
   osv: 30 * 60,

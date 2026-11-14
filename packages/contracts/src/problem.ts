@@ -122,12 +122,12 @@ export const PUBLIC_REASON_CODES = REASON_CODES.filter(
     reason !== "egress_account_share_exhausted" &&
     reason !== "packument_too_large" &&
     reason !== "required_app_unprotected" &&
-    // Reader first (#3738): the admin pause emits `forbidden_actor` until this reader is promoted.
+    // Reader first: the admin pause emits `forbidden_actor` until this reader is promoted.
     reason !== "repo_pause_customer_unapproved" &&
-    // Reader first (#6043): redemption answers `coupon_not_redeemable`, its detail leading with
+    // Reader first: redemption answers `coupon_not_redeemable`, its detail leading with
     // this code, until this reader is promoted.
     reason !== "coupon_account_already_redeemed" &&
-    // Reader first (plans/kovo-tests-prod-verification.md slice 2b): the verification channel
+    // Reader first: the verification channel
     // answers `service_unavailable` and `not_found`, its detail naming the stable code, until this
     // reader is promoted.
     !reason.startsWith("prod_verification_"),
@@ -177,7 +177,7 @@ export const REASONS = {
   quote_mismatch: { status: 409, title: "Capacity quote does not match the request" },
   payment_declined: { status: 402, title: "Payment was declined" },
   payment_past_due: { status: 402, title: "Payment is past due" },
-  // The account already holds a coupon redemption (one per account, #6043). It depends only on the
+  // The account already holds a coupon redemption (one per account). It depends only on the
   // account, never on the code, so it reveals nothing about codes.
   coupon_account_already_redeemed: { status: 422, title: "Account has already used a coupon" },
   // One refusal for every other reason a code cannot be redeemed, so codes cannot be probed.
@@ -225,7 +225,7 @@ export const REASONS = {
   waitlist_code_expired: { status: 403, title: "Waitlist code is not valid" },
   waitlist_code_exhausted: { status: 403, title: "Waitlist code is not valid" },
   waitlist_code_revoked: { status: 403, title: "Waitlist code is not valid" },
-  // The bounded production-verification operator channel (plans/kovo-tests-prod-verification.md).
+  // The bounded production-verification operator channel.
   prod_verification_disabled: { status: 503, title: "Production verification is turned off" },
   prod_verification_out_of_scope: { status: 404, title: "Resource not found" },
 
@@ -340,7 +340,7 @@ export interface ProblemInit {
 
 /** Builds a validated problem document for `reason`. */
 /**
- * Reader first (#6043): the detail prefix that names `coupon_account_already_redeemed` on a
+ * Reader first: the detail prefix that names `coupon_account_already_redeemed` on a
  * `coupon_not_redeemable` problem while that reason is not public.
  */
 export const COUPON_ACCOUNT_ALREADY_REDEEMED_DETAIL_PREFIX = "coupon_account_already_redeemed:";
@@ -349,10 +349,10 @@ export function problemDetails(reason: ReasonCode, init: ProblemInit): ProblemDe
   // Keep HTTP writers compatible with r776 while the tolerant reader rolls out.
   if (reason === "egress_account_share_exhausted") reason = "rate_limited";
   if (reason === "packument_too_large") reason = "service_unavailable";
-  // Reader first (#3738): a refused customer-repository pause answers `forbidden_actor` (its
+  // Reader first: a refused customer-repository pause answers `forbidden_actor` (its
   // detail names the stable code) until promoted readers accept the new top-level reason.
   if (reason === "repo_pause_customer_unapproved") reason = "forbidden_actor";
-  // Reader first (#6043): an account that already used a coupon answers `coupon_not_redeemable`,
+  // Reader first: an account that already used a coupon answers `coupon_not_redeemable`,
   // its detail leading with the stable code, until promoted readers accept the new reason.
   if (reason === "coupon_account_already_redeemed") {
     init = {
@@ -361,7 +361,7 @@ export function problemDetails(reason: ReasonCode, init: ProblemInit): ProblemDe
     };
     reason = "coupon_not_redeemable";
   }
-  // Reader first (plans/kovo-tests-prod-verification.md slice 2b): the verification channel's
+  // Reader first: the verification channel's
   // refusals answer their promoted equivalents, the detail naming the stable code.
   if (reason === "prod_verification_disabled" || reason === "prod_verification_out_of_scope") {
     init = {

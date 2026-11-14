@@ -213,7 +213,7 @@ export const UNSUPPORTED_REPO_WRITE_REASONS = [
   "private_registry",
   "non_registry_dependency",
   "too_large",
-  // A pnpm setting (`.npmrc`, pnpm-workspace.yaml or package.json `pnpm`) Kovo cannot run yet (#2135).
+  // A pnpm setting (`.npmrc`, pnpm-workspace.yaml or package.json `pnpm`) Kovo cannot run yet.
   "unsupported_pnpm_setting",
 ] as const;
 export const PROJECT_SCOPE_REASONS = [
@@ -224,7 +224,7 @@ export const PROJECT_SCOPE_REASONS = [
   "project_scope_ambiguous",
 ] as const;
 /**
- * #8256 R8 (plans/js-coverage-phase2.md §2.6): why a fix's affected closure could not be computed,
+ * Why a fix's affected closure could not be computed,
  * so every project ran (`closure_fallback_all`, disclosed). Closed codes, never graph content.
  */
 export const CLOSURE_FALLBACK_CAUSES = [

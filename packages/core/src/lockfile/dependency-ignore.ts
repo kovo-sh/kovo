@@ -72,7 +72,7 @@ export function dependencyWorkspacePatterns(
     const parsed = z.array(z.string().min(1).max(200)).max(100).safeParse(declaration);
     if (!parsed.success) return null;
     // The root is always a member, so root-only positive patterns (`.`, `./`) name no further
-    // member (D-228); an exclusion of the root (`!.`) still fails the pattern check below.
+    // member; an exclusion of the root (`!.`) still fails the pattern check below.
     const patterns = parsed.data.filter((pattern) => !isRootOnlyWorkspacePattern(pattern));
     if (
       patterns.some(

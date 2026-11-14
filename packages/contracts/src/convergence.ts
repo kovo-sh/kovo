@@ -4,14 +4,14 @@ import { DAY_MS } from "./time.js";
 import { plusAgentAppliedSchema } from "./plus-recipe-agent.js";
 import { failureCategoryNameSchema, stepNameSchema } from "./step-result.js";
 
-// Phase 1 R4 and R5 (#8256, plans/js-coverage-phase1.md §2.3-§2.4; owner D-674, D-689): check
+// Phase 1 R4 and R5: check
 // tiers and check admission on the unchanged base. Every candidate check (imported CI, a package
 // script, the R4 convention planner, a Plus gap-fill) is kept only if it passes on the unchanged
 // base in Sandbox B within its time budget; otherwise it is dropped with one closed reason and
 // disclosed by tier and reason, never by command text. No mutation bar and no approval. Only exit
 // codes, durations, counts and these enums leave Sandbox B.
 //
-// Owner D-748 (1) (#8256 R7, #626 comment 6761223852): one base control per base commit decides
+// The owner's R7 decision: one base control per base commit decides
 // (cached by recipe version, image runtime content and base commit), and a check that passes on
 // the control and fails on the fix is re-run on both sides before it blocks. The three up-front
 // runs and their start ceilings (`CONVERGENCE_LIMITS`) remain only behind the R7 kill switch
@@ -39,7 +39,7 @@ export const CONVERGE_DROP_REASONS = [
   /** Failed on the base control (or all three base runs), with no specific failure class. */
   "converge_failed_on_base",
   /**
-   * Flipped on unchanged code: failed the base control's re-run after passing it (owner D-748 (1)),
+   * Flipped on unchanged code: failed the base control's re-run after passing it,
    * was quarantined by an earlier flip for the recipe version, or passed one or two of three runs.
    */
   "converge_flaky",
@@ -53,13 +53,13 @@ export const convergeDropReasonSchema = z.union([
 export type ConvergeDropReason = z.infer<typeof convergeDropReasonSchema>;
 
 /**
- * Retired from the default path by owner D-748 (1): read only by the three-run convergence the R7
+ * Retired from the default path by the owner: read only by the three-run convergence the R7
  * kill switch restores (`maxChecks` also bounds a control's judged set).
  *
  * Convergence's own start ceilings in any rolling 24 hours, sized so the worst case stays under
  * $100 a month (an owner-first cost line): a start is at most three one-hour 2 vCPU / 4 GiB
  * sandboxes, $0.50 at the configured rates, so six starts a day fleet-wide is at most $3.00 a day,
- * about $91 a month. Raising them above that worst case is the owner's call (#8330). They are not
+ * about $91 a month. Raising them above that worst case is the owner's call. They are not
  * the calibration ceilings and read none of its overrides.
  */
 export const CONVERGENCE_LIMITS = {
@@ -88,7 +88,7 @@ export const convergenceResultSchema = z.discriminatedUnion("status", [
       .array(convergedCheckSchema.extend({ reason: convergeDropReasonSchema }))
       .max(CONVERGENCE_LIMITS.maxChecks),
     /**
-     * The Plus agent's accepted diff (#8256 R7 and V2, plans/js-coverage-phase2.md §2.8), when
+     * The Plus agent's accepted diff (R7 and V2), when
      * this set was judged with it: retained recipe configuration that `convergedRecipe` applies.
      */
     agent: plusAgentAppliedSchema.exactOptional(),

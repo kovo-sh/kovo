@@ -10,7 +10,7 @@ import { RejectionCollector } from "./reasons.js";
 import { checkIntegrity } from "./registry-source.js";
 import { GRAPH_LIMITS, SECTION_KIND, type LockfileLimits } from "./types.js";
 
-// Bun's text lockfile `bun.lock` (#8256 R2): JSON with trailing commas, read by the strict bounded
+// Bun's text lockfile `bun.lock`: JSON with trailing commas, read by the strict bounded
 // JSON parser after a string-aware pass drops only the commas before a closing `}` or `]`. Kovo
 // fixes a Bun repository with its own pinned Bun (`FIX_ONLY_TOOLS.bun`) and never runs it in
 // Sandbox B. Versions 1 and 2 are read; the pinned Bun 1.4.4 keeps a version 1 file at version 1

@@ -80,7 +80,7 @@ export const STEP_FAILURE_CODES = [
   // commit's tree (`export-ignore`, `export-subst`, LFS objects in archives) and the checkout could
   // not be restored to the exact tree: the run did not test the tree its evidence names.
   "archive_differs_from_tree",
-  // #9013: a fix moves a direct dependency across a major, and some code that calls it is reached
+  // A fix moves a direct dependency across a major, and some code that calls it is reached
   // by no test, so a clean run cannot show the upgrade works there: the run is recorded as
   // unverified, never passed (a PR for review; the step is Kovo's own, recorded in phase A).
   "major_untested_callsite",
@@ -152,8 +152,8 @@ export const PROVENANCE_RULES = {
 
 /**
  * Why Sandbox B verification of a staged patch could not run or complete because of a failure on
- * Kovo's side (D-414, SPEC "fixWorkflow" step 4; the list is an agent decision, 2026-10-28,
- * pending owner review #5712). These are never a verification result: the customer's tests did
+ * Kovo's side (SPEC "fixWorkflow" step 4; the list is an agent decision, 2026-10-28,
+ * pending owner review). These are never a verification result: the customer's tests did
  * not fail, Kovo could not run them. A real verification failure keeps
  * `open_pr_on_verification_failure`.
  *
@@ -182,8 +182,7 @@ export const kovoSideVerificationFailureSchema = persistedReader(
 export type KovoSideVerificationFailure = z.infer<typeof kovoSideVerificationFailureSchema>;
 
 /**
- * D-552 option A (source: https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6614513938):
- * why a fix had no recipe, or its no-recipe install failed, because of a failure on Kovo's side.
+ * Why a fix had no recipe, or its no-recipe install failed, because of a failure on Kovo's side.
  * Proven only by trusted control-plane records, never by sandbox output.
  *
  * - `calibration_unavailable`: the repository's latest calibration job failed on a Kovo-side cause

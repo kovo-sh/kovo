@@ -11,7 +11,7 @@ import {
 import { rootFileOwnership } from "./ownership.js";
 import { DISCOVERY_LIMITS, type InstallRoot } from "./types.js";
 
-// M7 slice a (plans/monorepo-projects.md §7.1 "Affected projects" and "Edits"). Pure and
+// Monorepo affected projects and edits. Pure and
 // transient: inputs are trusted immutable reads, outputs are member paths and fixed reason codes.
 
 export type ProjectScopeReason = "out_of_project_scope" | "project_scope_ambiguous";

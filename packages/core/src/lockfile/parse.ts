@@ -38,7 +38,7 @@ export const LOCKFILE_MAX_BYTES = {
 } as const satisfies Record<LockfileName, number>;
 
 /**
- * The file that pins each stored package manager's versions (#8256 R2): the verifiable ones'
+ * The file that pins each stored package manager's versions: the verifiable ones'
  * lockfiles, Yarn 4's `yarn.lock`, Bun's text `bun.lock`, and package.json itself for a root
  * without a lockfile. Only fix paths use it; discovery and the gate keep `LOCKFILE_NAMES`.
  */
@@ -68,7 +68,7 @@ export interface LockfileInput {
   /** Required for Yarn v1, which contains no root dependency declarations. */
   readonly manifest?: PackageManifest;
   /**
-   * Read the fix-only formats (#8256 R2): a Yarn 2+ `yarn.lock` as Yarn 4, `bun.lock`, and a
+   * Read the fix-only formats: a Yarn 2+ `yarn.lock` as Yarn 4, `bun.lock`, and a
    * lockfile-less package.json. Off, a Berry `yarn.lock` stays `unsupported_package_manager` and the
    * other two are never parsed (every reader outside the fix paths).
    */

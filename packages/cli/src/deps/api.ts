@@ -2,14 +2,14 @@ import {
   DEPENDENCY_VERDICT_REGISTRY_BUDGET_MS,
   MAX_DEPENDENCY_VERDICT_CHANGES,
   type DependencyVerdictChangeWire,
-} from "@kovo/contracts";
+} from "@kovo/contracts/cli";
 import { reasonCodeSchema } from "@kovo/contracts/problem";
 import {
   DEPENDENCY_VERDICT_ENDPOINTS,
   dependencyVerdictsResponseSchema,
   evaluateDependencyChangesBodySchema,
   type DependencyVerdictsResponse,
-} from "@kovo/contracts/api";
+} from "@kovo/contracts/api/cli";
 
 import { CLI_VERSION } from "../exit.js";
 import { unavailableError, usageError } from "../errors.js";

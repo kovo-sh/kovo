@@ -5,7 +5,7 @@ import { PROJECT_SCOPE_REASONS } from "./repos.js";
 // `decideMerge` gates and required-check inputs (SPEC "GitHub integration and merge policy").
 
 /**
- * Project-specific gate reasons (#5517 note N2, plans/monorepo-projects.md §9 M10b): once a
+ * Project-specific gate reasons (note N2, M10b): once a
  * repository has a project selection, an unselected project and a project without its own recipe
  * are named for what they are instead of reusing `repo_not_enabled` and `recipe_missing`. Reader
  * first (docs/decisions/schema-compatibility.md "Reader-first sequencing"): readers accept them
@@ -18,7 +18,7 @@ export const PROJECT_GATE_REASONS = ["project_not_protected", "project_recipe_mi
  */
 export const MERGE_GATES = [
   "repo_entitlement_authority", // 1. enabled repo, Plus, consent, authority; no pause/suspension/removal/downgrade
-  "autopilot_recipe", // 2. effective autopilot (D-674: a calibrated recipe is no longer required)
+  "autopilot_recipe", // 2. effective autopilot (a calibrated recipe is no longer required)
   "dependency_scope", // 3. actionable P0/P1 allowed by policy; dependency-only patch/minor graph
   "allowed_changes", // 4. exact allowed paths and manifest fields; protections unchanged
   "fresh_evidence", // 5. unexpired evidence for the exact head/tree; findings, cooldown, provenance
@@ -29,10 +29,10 @@ export const mergeGateSchema = z.enum(MERGE_GATES);
 export type MergeGate = z.infer<typeof mergeGateSchema>;
 
 /**
- * The disclosed evidence level of a fix (owner D-674, D-715): `ci_verified` (CI green and P
+ * The disclosed evidence level of a fix: `ci_verified` (CI green and P
  * probed), `ci_verified_not_probed` (CI decides, P not probed), `kovo_probed` (no usable CI, P's
  * probes green), `build_verified` (no usable CI; Kovo's converged typecheck and build pass on base
- * and fix, for the fix classes the merge-tier table allows), `kovo_checks_verified` (D-722: no
+ * and fix, for the fix classes the merge-tier table allows), `kovo_checks_verified` (no
  * usable CI; typecheck, smoke suite and changelog check pass on base and update, for minors) and
  * `not_covered` (a PR for review).
  */
@@ -143,11 +143,11 @@ export const MERGE_GATE_REASONS = {
     "strict_freshness_unenforceable",
     "merge_queue_required",
     "protection_unreadable",
-    // D-674: a check green on the base commit is still red on the fix after one re-run.
+    // A check green on the base commit is still red on the fix after one re-run.
     "ci_regressed",
-    // D-674: no usable CI on Kovo's branches and no accepted probe for the package.
+    // No usable CI on Kovo's branches and no accepted probe for the package.
     "evidence_not_covered",
-    // D-674: Kovo's probes for the changed package failed on the fix.
+    // Kovo's probes for the changed package failed on the fix.
     "probes_failed",
   ],
   pinned_head: [
@@ -181,9 +181,9 @@ export const MERGE_BLOCK_REASONS = [
   ...MERGE_GATE_REASONS.checks_and_protection,
   ...MERGE_GATE_REASONS.pinned_head,
 ] as const;
-// M10b lifts the M1 pin on PROJECT_SCOPE_REASONS (read since #2218, promoted long before): the M7a
+// M10b lifts the M1 pin on PROJECT_SCOPE_REASONS (read and promoted long before): the M7a
 // scoped-edit writer may record them. The N2 writer switch lifts the project gate reasons' pin too:
-// their readers shipped in #5512 and are promoted to production-current.
+// their readers shipped earlier and are promoted to production-current.
 export const mergeBlockReasonSchema = z.enum(MERGE_BLOCK_REASONS);
 export type MergeBlockReason = z.infer<typeof mergeBlockReasonSchema>;
 
@@ -254,6 +254,6 @@ export const KOVO_CHECK_NAME = "Kovo verification";
 
 /**
  * The read-only check run the PR dependency gate posts on pull requests in a protected repository
- * (plans/dependency-firewall.md Part 2; SPEC "Recipes and verification" → "PR dependency gate").
+ * (SPEC "Recipes and verification" → "PR dependency gate").
  */
 export const KOVO_DEPENDENCIES_CHECK_NAME = "Kovo dependencies";

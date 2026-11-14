@@ -7,8 +7,7 @@ import { usageError } from "../errors.js";
 
 // Reads a project's files at a commit (through `git`) or in the working tree, into memory only.
 // Nothing is written to disk: a lockfile is a child process's stdout or one file read, held in a
-// buffer for the parse and dropped (plans/dependency-firewall.md Part 2: "send only the change
-// list, never the lockfile").
+// buffer for the parse and dropped: send only the change list, never the lockfile.
 
 export type TreeMode = "file" | "directory" | "symlink" | "submodule";
 

@@ -80,7 +80,7 @@ function selector(value: string): { alias: string; spec: string; name: string } 
   if (!packageNameSchema.safeParse(alias).success) return null;
   const classified = classifyDependencySpec(spec);
   if (classified.kind === "invalid") return null;
-  // A git, remote-tarball or `file:` key names an opaque node (owner D-726, #8256): the entry is
+  // A git, remote-tarball or `file:` key names an opaque node: the entry is
   // kept as one below. Any other rejected spec still refuses the lockfile.
   if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null) return null;
   return { alias, spec, name: classified.kind === "alias" ? classified.name : alias };
@@ -109,7 +109,7 @@ function legacyIntegrity(hex: string): string {
 /**
  * The sha1 fragment of each entry's `resolved` URL (`…tgz#<sha1>`), by the instance ID
  * `parseYarnLockfile` gives the entry. Yarn names its cache directories by it, so a lockfile that
- * must hit the same cache keeps it (D-664 open install). Call only on text `parseYarnLockfile`
+ * must hit the same cache keeps it (the open install). Call only on text `parseYarnLockfile`
  * accepted; an entry without a fragment is absent.
  */
 export function yarnResolvedFragments(text: string): ReadonlyMap<string, string> {
@@ -277,7 +277,7 @@ export function parseYarnLockfile(
     }
     const name = packageNameSchema.parse(first.name);
     const rawResolved = entry.fields.get("resolved");
-    // Git, remote-tarball and `file:` entries are opaque nodes (owner D-726): named by their
+    // Git, remote-tarball and `file:` entries are opaque nodes: named by their
     // selectors' specs, or by a non-registry `resolved` location.
     const specKinds = names.flatMap((item) => {
       const classified = item === null ? null : classifyDependencySpec(item.spec);
@@ -428,7 +428,7 @@ export function parseYarnLockfile(
     context?.layout.members ?? (manifest === undefined ? [] : [{ path: ".", manifest, local: [] }]);
   for (const member of members) {
     const direct: RootDependency[] = [];
-    // Opaque dependencies (owner D-726) are root edges too, so their nodes are found and disclosed.
+    // Opaque dependencies are root edges too, so their nodes are found and disclosed.
     for (const dep of [
       ...member.manifest.dependencies,
       ...opaqueDependencySpecs(member.manifest),

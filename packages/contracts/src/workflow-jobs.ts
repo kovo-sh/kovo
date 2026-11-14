@@ -4,7 +4,7 @@ import { checkTierSchema } from "./convergence.js";
 import { repoFilePathSchema } from "./primitives.js";
 import { stepNameSchema } from "./step-result.js";
 
-// Phase 2 R3 (#8256, plans/js-coverage-phase2.md §2.7; owner D-674, D-708, D-713, D-714): Kovo runs
+// Phase 2 R3: Kovo runs
 // the repository's own `pull_request` workflow jobs with a pinned act-style executor inside the
 // isolation tier's Sandbox B, instead of translating them (the importer, now frozen). Each job is a
 // candidate check that R5 keeps only when it passes on the unchanged base. These are the job's
@@ -15,9 +15,9 @@ import { stepNameSchema } from "./step-result.js";
 /**
  * The workflow executor baked into the sandbox image: nektos/act, host mode (`-self-hosted`
  * platform), no Docker. Plan §0.8 and §2.7: it enters at this reviewed version, and every later
- * version change needs owner approval on #626 before merge. The image's tool manifest
+ * version change needs owner approval before merge. The image's tool manifest
  * (`infra/sandbox-image/tool-cache.json`, `act`) pins the release tarballs' sha256 from the tag's
- * published checksums (D-761, screened under D-363), and the image build verifies the download
+ * published checksums (screened before use), and the image build verifies the download
  * against it. On an image built before that, R3 jobs fail on the base and R5 drops them, so the
  * imported checks they would replace keep running.
  */
@@ -34,13 +34,13 @@ export const WORKFLOW_JOB_DROP_REASONS = [
   "workflow_job_not_pull_request",
   /** The job names a deployment environment (`environment:`). */
   "workflow_job_environment",
-  /** The job's name or ID marks it as a deploy or publish job (the D-674 name rules). */
+  /** The job's name or ID marks it as a deploy or publish job (the name rules). */
   "workflow_job_deploy_or_publish",
-  /** Service containers (`services:`): containers are owner D-708, phase 3. */
+  /** Service containers (`services:`): containers are phase 3. */
   "workflow_job_services",
-  /** A job container (`container:`): D-708, phase 3. */
+  /** A job container (`container:`): phase 3. */
   "workflow_job_container",
-  /** A Docker action (`docker://` or `runs.using: docker`): D-708, phase 3. */
+  /** A Docker action (`docker://` or `runs.using: docker`): phase 3. */
   "workflow_job_docker_action",
   /** A reusable workflow call (`jobs.<id>.uses`). */
   "workflow_job_reusable_workflow",
@@ -103,7 +103,7 @@ const matrixValueSchema = z.string().regex(/^[A-Za-z0-9._@+/-]{1,64}$/);
 /**
  * A public action reference as written in a workflow (`owner/repo[/path]@ref`): GitHub owner and
  * repository name rules, an optional subdirectory, and a tag, branch or SHA without spaces or shell
- * metacharacters. It is public package-like metadata (D-242), resolved by trusted code.
+ * metacharacters. It is public package-like metadata, resolved by trusted code.
  */
 export const actionUsesSchema = z
   .string()

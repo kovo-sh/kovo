@@ -2,7 +2,7 @@ import {
   dependencyVerdictChangeSchema,
   type DependencyVerdictChangeWire,
   type UnsupportedRepoReason,
-} from "@kovo/contracts";
+} from "@kovo/contracts/cli";
 import { dependencySourceOfNode } from "@kovo/core/dependency-verdicts";
 import {
   aggregateWorkspaceGraph,
@@ -19,8 +19,7 @@ import {
 } from "@kovo/core/lockfile";
 import { OPAQUE_KIND_REASON, parsePackageJson } from "@kovo/core/manifest";
 
-// The change list `kovo deps check` sends (plans/dependency-firewall.md Part 2 "Distribution for any
-// CI"): the changed and new versions between a base and a head lockfile, as
+// The change list `kovo deps check` sends: the changed and new versions between a base and a head lockfile, as
 // `dependencyVerdictChangeSchema` items, identifiers only. Pure: the caller reads the files into
 // memory and passes their text; nothing here does I/O, and no lockfile or manifest text leaves this
 // module. Graphs and diffs are `@kovo/core/lockfile`'s, the same code Kovo's PR gate uses.
@@ -117,7 +116,7 @@ export function snapshotGraph(fileName: LockfileName, snapshot: ProjectSnapshot)
     ...(manifest === undefined ? {} : { manifest }),
   });
   if (parsed.ok) {
-    // Opaque nodes (owner D-726: git, remote tarball and local path sources) sit outside the
+    // Opaque nodes (git, remote tarball and local path sources) sit outside the
     // graph's packages, and this change list carries registry versions only. The CLI still
     // refuses such a lockfile rather than judge it clean without them.
     const opaque = parsed.graph.opaque?.nodes ?? [];

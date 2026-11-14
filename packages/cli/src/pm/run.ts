@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 
-import type { DependencyVerdictChangeWire } from "@kovo/contracts";
+import type { DependencyVerdictChangeWire } from "@kovo/contracts/cli";
 import type { LockfileName } from "@kovo/core/lockfile";
 
 import { CliError, usageError } from "../errors.js";
@@ -41,7 +41,7 @@ import {
 import { exitOf, packageManagerEnvironment, runChild } from "./process.js";
 import { fetchedChange, resolveSpec } from "./spec.js";
 
-// `kovo pnpm …` and `kovo npm …` (plans/dependency-firewall.md Part 3b): check before anything
+// `kovo pnpm …` and `kovo npm …`: check before anything
 // installs. A resolving command runs lockfile-only (no dependency is fetched into node_modules and
 // no lifecycle script runs), the lockfile diff is judged exactly as `kovo deps check` judges it, and
 // only a passing check reaches the frozen install. Anything else (a block or wait, an unreadable

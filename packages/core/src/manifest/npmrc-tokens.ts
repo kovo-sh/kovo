@@ -1,4 +1,4 @@
-// The one strict `.npmrc` tokenizer every `.npmrc` check uses (#1841, #1842).
+// The one strict `.npmrc` tokenizer every `.npmrc` check uses.
 //
 // npm 10/11 and pnpm 9/10 read `.npmrc` with the `ini` package: it splits lines on any run of CR
 // and LF, treats a line starting with optional whitespace (any Unicode whitespace) and `#` or `;`
@@ -64,7 +64,7 @@ const SECTION = /^[ \t]*\[/u;
  * Keys every reader reads verbatim: a plain setting name, a scope setting (`@scope:registry`) or
  * a per-registry setting (`//host/path/:_authToken`). Only a per-registry key may hold an
  * environment reference, and only `${NAME}`: whatever it expands to, the key still starts with
- * `//` and names a per-registry setting, never `registry` or a scope (#1853 review N4). Quotes,
+ * `//` and names a per-registry setting, never `registry` or a scope. Quotes,
  * escapes, `#`, `;`, whitespace and every other `${` form are refused.
  */
 const KEY =

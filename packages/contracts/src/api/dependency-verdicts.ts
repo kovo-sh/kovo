@@ -10,14 +10,14 @@ import { whenValid } from "../primitives.js";
 import { defineEndpoint } from "./endpoint.js";
 
 // `POST /v1/dependency-verdicts`: the dependency verdict engine as a public endpoint
-// (plans/dependency-firewall.md Part 1 "Where it lives"; SPEC "Public API" and "Recipes and
+// (SPEC "Public API" and "Recipes and
 // verification" → "Dependency verdict engine"). A caller sends the changed or new versions it
 // derived from a lockfile diff (identifiers only, never a lockfile or manifest) and gets one verdict
 // per change, in request order. Nothing about the request is persisted: no audit event, idempotency
 // record, workflow or cache entry, so the route writes nothing although it takes a body. Verdicts
 // name no evidence source. Callers are members' sessions and Management keys explicitly granted
 // `evaluateDependencyChanges` (explicitly grantable after its reader-first promotion); Runtime keys are
-// refused until their reach is decided (#1327).
+// refused until their reach is decided.
 
 /** SPEC Public API row `POST /v1/dependency-verdicts`, verbatim. */
 export const DEPENDENCY_VERDICTS_ROW =

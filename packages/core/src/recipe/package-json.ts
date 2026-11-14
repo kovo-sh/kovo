@@ -91,7 +91,7 @@ export function readPackageFacts(content: string): PackageFactsResult {
       packageManager: typeof packageManager === "string" ? packageManager : null,
       volta: stringEntries(Reflect.get(parsed, "volta"), 10),
       dependencyNames,
-      // A root-only declaration (`["."]`) is one project (D-228); other shapes keep refusing.
+      // A root-only declaration (`["."]`) is one project; other shapes keep refusing.
       hasWorkspaces:
         (Array.isArray(workspaces) && workspacePatternsDeclareMembers(workspaces)) ||
         (isRecord(workspaces) &&

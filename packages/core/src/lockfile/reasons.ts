@@ -30,7 +30,7 @@ export const LOCKFILE_REJECTION_REASONS = [
   "dangling_reference", // pnpm: a snapshot or importer names a package the lockfile lacks
   "too_many_packages",
   "too_many_dependencies", // more declared dependency edges than GRAPH_LIMITS allows
-  // #8256 R2: a Yarn 2/3 (or older Yarn 4) lockfile, or a Bun lockfile version, the pinned tool
+  // A Yarn 2/3 (or older Yarn 4) lockfile, or a Bun lockfile version, the pinned tool
   // would rewrite whole.
   "pm_version_unsupported",
 ] as const;

@@ -1,26 +1,14 @@
 import { z } from "zod";
 
+import { kovoIdSchema, providerRefSchema } from "./id-schemas.js";
+
 // Identifiers (ARCHITECTURE §3 "IDs"). Kovo-generated IDs are UUIDs (v7 from the IdGenerator port)
 // branded per entity so a RepoId can never be passed where a FixId is expected. External IDs keep
 // their provider identity and are never used as Kovo primary keys.
-
-const NIL_UUID = "00000000-0000-0000-0000-000000000000";
-const MAX_UUID = "ffffffff-ffff-ffff-ffff-ffffffffffff";
-
-/**
- * A branded Kovo entity ID: an RFC 9562 UUID of any version (rows may also carry database-generated
- * v4 defaults), normalized to lower case so derived strings such as workflow IDs are canonical. The
- * nil and max UUIDs are never entity IDs.
- */
-function kovoIdSchema<const Brand extends string>(brand: Brand) {
-  return z
-    .uuid({ error: `${brand} must be a UUID` })
-    .toLowerCase()
-    .refine((value) => value !== NIL_UUID && value !== MAX_UUID, {
-      error: `${brand} cannot be the nil or max UUID`,
-    })
-    .brand<Brand>();
-}
+//
+// The billing IDs (plan, usage, overage and Stripe) live in ids-billing.ts; the package root and the
+// `@kovo/contracts/ids` subpath (ids-all.ts) re-export both. The public CLI bundle takes this module
+// alone, so it must never import or re-export a billing module.
 
 // ---- Kovo entities (SPEC "Data model" plus the supporting tables BUILD_PLAN item 3 lists) ----
 
@@ -51,37 +39,9 @@ export type WebhookDeliveryId = z.infer<typeof webhookDeliveryIdSchema>;
 export const eventIdSchema = kovoIdSchema("EventId");
 export type EventId = z.infer<typeof eventIdSchema>;
 
-export const cycleIdSchema = kovoIdSchema("CycleId");
-export type CycleId = z.infer<typeof cycleIdSchema>;
-/** A Plus coupon (SPEC "Plus coupons"). */
-export const couponIdSchema = kovoIdSchema("CouponId");
-export type CouponId = z.infer<typeof couponIdSchema>;
-export const billingAdjustmentIdSchema = kovoIdSchema("BillingAdjustmentId");
-export type BillingAdjustmentId = z.infer<typeof billingAdjustmentIdSchema>;
-/** A Plus grant stored in `plan_grants` (a Kovo-grant coupon redemption). */
-export const planGrantIdSchema = kovoIdSchema("PlanGrantId");
-export type PlanGrantId = z.infer<typeof planGrantIdSchema>;
-/** One redemption of a Plus coupon by an account. */
-export const couponRedemptionIdSchema = kovoIdSchema("CouponRedemptionId");
-export type CouponRedemptionId = z.infer<typeof couponRedemptionIdSchema>;
-export const overageConsentIdSchema = kovoIdSchema("OverageConsentId");
-export type OverageConsentId = z.infer<typeof overageConsentIdSchema>;
-export const reservationIdSchema = kovoIdSchema("ReservationId");
-export type ReservationId = z.infer<typeof reservationIdSchema>;
-export const usageLedgerEntryIdSchema = kovoIdSchema("UsageLedgerEntryId");
-export type UsageLedgerEntryId = z.infer<typeof usageLedgerEntryIdSchema>;
-export const overageInvoiceItemIdSchema = kovoIdSchema("OverageInvoiceItemId");
-export type OverageInvoiceItemId = z.infer<typeof overageInvoiceItemIdSchema>;
-/** One metered overage report (`overage_usage_reports`, the Managed Payments meter outbox). */
-export const overageUsageReportIdSchema = kovoIdSchema("OverageUsageReportId");
-export type OverageUsageReportId = z.infer<typeof overageUsageReportIdSchema>;
-/** A capacity preview quote that `/v1/billing/capacity/confirm` binds to. */
-export const quoteIdSchema = kovoIdSchema("QuoteId");
-export type QuoteId = z.infer<typeof quoteIdSchema>;
-
 export const repoIdSchema = kovoIdSchema("RepoId");
 export type RepoId = z.infer<typeof repoIdSchema>;
-/** One "Kovo needs X" ask on a repository (`repo_customer_asks`, #8256 V6). */
+/** One "Kovo needs X" ask on a repository (`repo_customer_asks`). */
 export const customerAskIdSchema = kovoIdSchema("CustomerAskId");
 export type CustomerAskId = z.infer<typeof customerAskIdSchema>;
 export const installRootIdSchema = kovoIdSchema("InstallRootId");
@@ -133,7 +93,7 @@ export type WorkflowOutboxId = z.infer<typeof workflowOutboxIdSchema>;
 /** A recorded workflow wake (`workflow_wakes`), delivered with its wake key as idempotency key. */
 export const workflowWakeIdSchema = kovoIdSchema("WorkflowWakeId");
 export type WorkflowWakeId = z.infer<typeof workflowWakeIdSchema>;
-/** A parked workflow wait (`workflow_parks`, owner D-731): the sweep starts a fresh run when due. */
+/** A parked workflow wait (`workflow_parks`): the sweep starts a fresh run when due. */
 export const workflowParkIdSchema = kovoIdSchema("WorkflowParkId");
 export type WorkflowParkId = z.infer<typeof workflowParkIdSchema>;
 /**
@@ -153,7 +113,7 @@ export const analyticsEventIdSchema = kovoIdSchema("AnalyticsEventId");
 export type AnalyticsEventId = z.infer<typeof analyticsEventIdSchema>;
 export const releaseRecordIdSchema = kovoIdSchema("ReleaseRecordId");
 export type ReleaseRecordId = z.infer<typeof releaseRecordIdSchema>;
-/** A support case (plans/support-flow.md §7.1); opaque to the budget ledger until case intake. */
+/** A support case; opaque to the budget ledger until case intake. */
 export const supportCaseIdSchema = kovoIdSchema("SupportCaseId");
 export type SupportCaseId = z.infer<typeof supportCaseIdSchema>;
 /** One reserved support operation (`support_budget_reservations.id`). */
@@ -201,89 +161,8 @@ export const advisoryIdSchema = z
   .brand<"AdvisoryId">();
 export type AdvisoryId = z.infer<typeof advisoryIdSchema>;
 
-// ---- Stripe (object IDs are `<prefix>_<token>`; test-mode tokens may contain `_`) ----
-
-function stripeIdSchema<const Brand extends string>(brand: Brand, prefixes: readonly string[]) {
-  const pattern = new RegExp(`^(?:${prefixes.join("|")})_[A-Za-z0-9_]+$`);
-  return z
-    .string()
-    .max(255)
-    .regex(pattern, {
-      error: `${brand} must start with ${prefixes.map((p) => `${p}_`).join(" or ")}`,
-    })
-    .brand<Brand>();
-}
-
-export const stripeCustomerIdSchema = stripeIdSchema("StripeCustomerId", ["cus"]);
-export type StripeCustomerId = z.infer<typeof stripeCustomerIdSchema>;
-export const stripeSubscriptionIdSchema = stripeIdSchema("StripeSubscriptionId", ["sub"]);
-export type StripeSubscriptionId = z.infer<typeof stripeSubscriptionIdSchema>;
-export const stripeSubscriptionItemIdSchema = stripeIdSchema("StripeSubscriptionItemId", ["si"]);
-export type StripeSubscriptionItemId = z.infer<typeof stripeSubscriptionItemIdSchema>;
-export const stripeInvoiceIdSchema = stripeIdSchema("StripeInvoiceId", ["in"]);
-export type StripeInvoiceId = z.infer<typeof stripeInvoiceIdSchema>;
-/** `billing_adjustments.stripe_line_id`: an invoice line (`il_`, older `sli_`/`ii_` line IDs). */
-export const stripeInvoiceLineIdSchema = stripeIdSchema("StripeInvoiceLineId", ["il", "sli", "ii"]);
-export type StripeInvoiceLineId = z.infer<typeof stripeInvoiceLineIdSchema>;
-/** `overage_invoice_items.stripe_item_id`. */
-export const stripeInvoiceItemIdSchema = stripeIdSchema("StripeInvoiceItemId", ["ii"]);
-export type StripeInvoiceItemId = z.infer<typeof stripeInvoiceItemIdSchema>;
-export const stripeEventIdSchema = stripeIdSchema("StripeEventId", ["evt"]);
-export type StripeEventId = z.infer<typeof stripeEventIdSchema>;
-export const stripePriceIdSchema = stripeIdSchema("StripePriceId", ["price"]);
-export type StripePriceId = z.infer<typeof stripePriceIdSchema>;
-export const stripeCheckoutSessionIdSchema = stripeIdSchema("StripeCheckoutSessionId", ["cs"]);
-export type StripeCheckoutSessionId = z.infer<typeof stripeCheckoutSessionIdSchema>;
-export const stripePromotionCodeIdSchema = stripeIdSchema("StripePromotionCodeId", ["promo"]);
-export type StripePromotionCodeId = z.infer<typeof stripePromotionCodeIdSchema>;
-/** A charge (`ch_`, or `py_` for a non-card payment) behind a refund or dispute event. */
-export const stripeChargeIdSchema = stripeIdSchema("StripeChargeId", ["ch", "py"]);
-export type StripeChargeId = z.infer<typeof stripeChargeIdSchema>;
-/** A dispute (`dp_`, or `du_` for some payment methods). */
-export const stripeDisputeIdSchema = stripeIdSchema("StripeDisputeId", ["dp", "du"]);
-export type StripeDisputeId = z.infer<typeof stripeDisputeIdSchema>;
-/** The billing meter Kovo reports AI overage cents to (`mtr_`). */
-export const stripeMeterIdSchema = stripeIdSchema("StripeMeterId", ["mtr"]);
-export type StripeMeterId = z.infer<typeof stripeMeterIdSchema>;
-/** A product of Kovo's own Stripe catalog (`prod_`), such as the AI-overage product (#5514). */
-export const stripeProductIdSchema = stripeIdSchema("StripeProductId", ["prod"]);
-export type StripeProductId = z.infer<typeof stripeProductIdSchema>;
-/**
- * The identifier of one overage meter event, `kovo-overage:<cycleId>:<sequence>`
- * (plans/stripe-managed-payments.md §3.1): Stripe deduplicates meter events by it, and it is at most
- * 100 characters.
- */
-export const overageMeterEventIdentifierSchema = z
-  .string()
-  .max(100)
-  .regex(/^kovo-overage:[0-9a-f-]{36}:[0-9]{1,9}$/, {
-    error: "must be kovo-overage:<cycle UUID>:<sequence>",
-  })
-  .brand<"OverageMeterEventIdentifier">();
-export type OverageMeterEventIdentifier = z.infer<typeof overageMeterEventIdentifierSchema>;
-/**
- * A Stripe coupon Kovo created for a Plus coupon. Stripe coupon IDs are free-form; Kovo derives its
- * own from the Kovo coupon ID (`kovo_plus_<32 hex>`), so a creation retried after Stripe's 24-hour
- * idempotency window finds the coupon instead of making a second one.
- */
-export const stripeCouponIdSchema = z
-  .string()
-  .regex(/^kovo_plus_[0-9a-f]{32}$/, { error: "must be a Kovo Plus coupon ID" })
-  .brand<"StripeCouponId">();
-export type StripeCouponId = z.infer<typeof stripeCouponIdSchema>;
-
 // ---- Other provider references (opaque; printable ASCII, bounded) ----
 
-function providerRefSchema<const Brand extends string>(brand: Brand) {
-  return z
-    .string()
-    .regex(/^[\x21-\x7e]{1,255}$/, { error: `${brand} must be 1-255 printable ASCII characters` })
-    .brand<Brand>();
-}
-
-/** `usage_ledger.provider_charge_id` (OpenRouter generation ID, Daytona usage record, …). */
-export const providerChargeIdSchema = providerRefSchema("ProviderChargeId");
-export type ProviderChargeId = z.infer<typeof providerChargeIdSchema>;
 /** `emails.provider_id` (Resend email ID). */
 export const providerMessageIdSchema = providerRefSchema("ProviderMessageId");
 export type ProviderMessageId = z.infer<typeof providerMessageIdSchema>;

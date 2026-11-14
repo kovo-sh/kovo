@@ -111,7 +111,7 @@ export function discoverInstallRoots(
     return fail("invalid_ignore_config");
   if (!runtimeCatalogSchema.safeParse(input.catalog).success) return fail("runtime_mismatch");
   const work = { remaining: limits.maxWork };
-  // A recorded two-lockfile choice (#5500) applies to the repository root only, and only when it
+  // A recorded two-lockfile choice applies to the repository root only, and only when it
   // really commits both npm and pnpm lockfiles: the other root lockfile is then not an input.
   const choice = admitPackageManagerChoice(
     input.entries.flatMap((entry) =>
@@ -271,7 +271,7 @@ export function discoverInstallRoots(
           continue;
         }
       }
-      // D-726 fix-only: the repository's own single-package npm root may name private registries
+      // Fix-only: the repository's own single-package npm root may name private registries
       // for some scopes; every other root keeps the public-registry-only rule.
       const fixOnlyRoot = path === "." && declared === null && detection.packageManager === "npm";
       const npmrcOf = (text: string | null): NpmrcFixOnlyResult => {
@@ -359,7 +359,7 @@ export function discoverInstallRoots(
           { fileName: detection.lockfileName, text: lock },
           workspaceLimits,
           graphLimits,
-          // Only this root's own registry-sourced integrity (#7338), never another root's.
+          // Only this root's own registry-sourced integrity, never another root's.
           input.registryIntegrity?.get(path),
         );
         if (!graph.ok) {
@@ -419,7 +419,7 @@ export function discoverInstallRoots(
           refusals.push({ path, reason: "unsupported_package_manager" });
           continue;
         }
-        // D-726: a package locked at a private registry needs its scope declared private in this
+        // A package locked at a private registry needs its scope declared private in this
         // root's `.npmrc` (and fix-only covers npm and pnpm only).
         if (
           privateRegistryAdmission(

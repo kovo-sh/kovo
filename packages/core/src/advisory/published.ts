@@ -4,7 +4,7 @@ import type { AdvisoryFacts } from "./model.js";
 import { compileAdvisory, compiledAdvisoryAffects, type CompiledAdvisory } from "./ranges.js";
 import { parseNpmVersion, type NpmVersion } from "./version.js";
 
-// Evaluating a version that is only known as a range (plans/site-scanner.md §6.3): a detection that
+// Evaluating a version that is only known as a range: a detection that
 // bounds a site's `next` between two versions is affected by an advisory only if EVERY published
 // release inside the bounds is affected. Backports make "older than the fix" wrong (14.2.25 is fixed
 // for a bug that 15.0.0–15.2.2 still have), so this always asks the advisory's own ranges, release

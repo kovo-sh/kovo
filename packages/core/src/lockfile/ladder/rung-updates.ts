@@ -108,7 +108,7 @@ export function pinDirect(
       pointer: dependencyPointer(declaration),
       value: specFor(declaration, version, style),
     });
-    // A root without a lockfile (#8256 R2) takes the written edit alone: nothing runs.
+    // A root without a lockfile takes the written edit alone: nothing runs.
     if (ctx.pm !== "manifest-only")
       commands.push(
         installCommand(

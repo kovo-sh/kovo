@@ -7,7 +7,7 @@ import {
   type ScopedWorkspaceRoot,
 } from "./project-scope.js";
 
-// M7 slice b (plans/monorepo-projects.md §7.1 "Verification" and "Disclosure"). Pure and
+// Monorepo project verification and disclosure. Pure and
 // transient: inputs are trusted immutable reads and the stored protection selection; outputs are
 // project identities, member paths and fixed reason codes, never file contents.
 
@@ -38,7 +38,7 @@ export type ProjectVerificationReason =
   | "project_recipe_missing";
 
 /**
- * The affected-closure outcome of a per-project plan (#8256 R8): `affected` counts the affected
+ * The affected-closure outcome of a per-project plan: `affected` counts the affected
  * projects of the install root among `total`; `fallback_all` ran every protected project of the
  * root because the graph was unknown or ambiguous (`closure_fallback_all`, with its cause).
  */
@@ -56,7 +56,7 @@ export type ProjectVerificationPlan =
       readonly verify: readonly ProtectedProject[];
       /** Affected unprotected projects (by path): disclosed, never verified (C2). */
       readonly unverified: readonly string[];
-      /** How the affected set was found (#8256 R8): its closure, or every project, disclosed. */
+      /** How the affected set was found: its closure, or every project, disclosed. */
       readonly closure: ProjectClosure;
     }
   | { readonly ok: false; readonly reason: ProjectVerificationReason };
@@ -80,7 +80,7 @@ export function planProjectVerification(input: {
       };
   readonly protection: ProtectionSnapshot | null;
   /**
-   * #8256 R8 (`worker.affectedClosureEnabled`, default on): the member closure widens the
+   * Affected closure (`worker.affectedClosureEnabled`, default on): the member closure widens the
    * affected set and an unknown or ambiguous graph runs every protected project. Off restores
    * M7 exactly: a missing graph is refused and only the classified closure decides.
    */
@@ -110,7 +110,7 @@ export function planProjectVerification(input: {
   for (const project of inRoot) {
     // A protected project the base does not declare, or the candidate removes or reclassifies,
     // has no single identity; duplicate selections of one path are never resolved by guessing.
-    // A side whose graph is unavailable (#8256 R8 fallback) cannot contradict it; each project's
+    // A side whose graph is unavailable (the fallback) cannot contradict it; each project's
     // own run re-derives its member commands at the base and refuses a lost identity.
     const seen = new Set(kinds.map((side) => side.get(project.path)));
     if (seen.has(undefined) || seen.size > 1 || byPath.has(project.path))
@@ -121,7 +121,7 @@ export function planProjectVerification(input: {
   for (const edge of sides.flatMap((side) => side.classified.appEdges))
     if (byPath.has(edge.from) && !byPath.has(edge.to))
       return { ok: false, reason: "required_app_unprotected" };
-  // #8256 R8: the dependency closure of the change, on the union of both graphs. An unknown or
+  // The dependency closure of the change, on the union of both graphs. An unknown or
   // ambiguous graph (a side unavailable, a cycle, an unknown importer) affects every project:
   // every protected project of the root runs (`closure_fallback_all`, disclosed), and every
   // unprotected one is disclosed.

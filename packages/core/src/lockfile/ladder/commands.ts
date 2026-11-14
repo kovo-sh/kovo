@@ -23,7 +23,7 @@ export type SaveStyle = "exact" | "^" | "~";
 
 const NPM_SUFFIX = ["--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"] as const;
 const PNPM_SUFFIX = ["--lockfile-only", "--ignore-scripts"] as const;
-// Yarn 4 and Bun (#8256 R2, verified on Yarn 4.18.1 and Bun 1.4.4 in a worker, 2026-11-08): Yarn's
+// Yarn 4 and Bun (verified on Yarn 4.18.1 and Bun 1.4.4 in a worker, 2026-11-08): Yarn's
 // `--mode=update-lockfile` resolves and fetches into a throwaway cache but never links or runs a
 // script; Bun's `--lockfile-only` resolves from packuments alone. `yarn up -R <name>` moves a
 // transitive package to the newest version its dependents' ranges admit, as `npm update` does, and
@@ -39,7 +39,7 @@ const BUN_SECTION = {
   peerDependencies: ["--peer"],
 } as const satisfies Record<DependencySection, readonly string[]>;
 
-/** A root without a lockfile runs no package manager: every edit is trusted code's (#8256 R2). */
+/** A root without a lockfile runs no package manager: every edit is trusted code's. */
 function noCommand(pm: "manifest-only"): never {
   throw new RangeError(`${pm} plans carry no package-manager command`);
 }

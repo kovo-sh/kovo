@@ -7,8 +7,8 @@ import type { Instance, InstanceSet, RootDependency } from "./instances.js";
 import { RejectionCollector } from "./reasons.js";
 import { GRAPH_LIMITS, SECTION_KIND, type LockfileLimits } from "./types.js";
 
-// A root with a package.json and no lockfile (#8256 R2, replacing #7542's "a missing lockfile stays
-// refused before any sandbox" for direct dependencies only). Nothing pins what an install gets, so
+// A root with a package.json and no lockfile (no longer refused before any sandbox, for direct
+// dependencies only). Nothing pins what an install gets, so
 // the graph is the declared ranges' floors: each registry dependency is one direct instance at the
 // lowest version its range admits (`semver.minVersion`), and nothing is known below it. A finding is
 // then "this range still admits an affected version", and the only fix is a range edit at the

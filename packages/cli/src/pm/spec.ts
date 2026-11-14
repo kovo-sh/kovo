@@ -2,7 +2,7 @@ import {
   dependencyVerdictChangeSchema,
   type DependencyVerdictChangeWire,
   type PackageName,
-} from "@kovo/contracts";
+} from "@kovo/contracts/cli";
 import { exactVersionSchema, packageNameSchema } from "@kovo/contracts/npm";
 
 import { unavailableError, usageError } from "../errors.js";

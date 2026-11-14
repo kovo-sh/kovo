@@ -138,8 +138,8 @@ export type DependencyChange = z.infer<typeof dependencyChangeSchema>;
 export const dependencyChangesSchema = z.array(dependencyChangeSchema).max(5000);
 
 /**
- * Non-registry dependencies Kovo left alone as opaque nodes in the verified base (owner D-726,
- * #626 comment 6733241173): counts by kind, plus the packages reachable only through them. Kovo did
+ * Non-registry dependencies Kovo left alone as opaque nodes in the verified base (an owner
+ * decision): counts by kind, plus the packages reachable only through them. Kovo did
  * not resolve, update or vet any of them, and the fix changed none of them (a fix that does is
  * refused). Counts only: no names, specs or URLs. The fix PR discloses them.
  */
@@ -176,7 +176,7 @@ export const changedFilesSchema = z
     error: "each path appears once",
   });
 
-// ---- restored protected files (owner D-726) ----
+// ---- restored protected files ----
 
 /**
  * The kinds of protected path (core `@kovo/core/manifest` `PROTECTED_PATH_CATEGORIES`, which is
@@ -196,11 +196,11 @@ export const PROTECTED_FILE_KINDS = [
 export const protectedFileKindSchema = z.enum(PROTECTED_FILE_KINDS);
 export type ProtectedFileKind = z.infer<typeof protectedFileKindSchema>;
 
-/** The fixed reason code of a restore (D-267): logs and the PR disclosure name it. */
+/** The fixed reason code of a restore: logs and the PR disclosure name it. */
 export const PROTECTED_RESTORE_REASON = "protected_config_restored";
 
 /**
- * Owner D-726: the protected files a fix's tooling changed and Kovo restored to their base bytes
+ * The protected files a fix's tooling changed and Kovo restored to their base bytes
  * before the candidate was checked and verified (`fixes.restored_protected`). Kinds and counts only,
  * never paths or contents; one entry per kind, in {@link PROTECTED_FILE_KINDS} order.
  */
@@ -534,7 +534,7 @@ export const fixEvidenceSchema = z
      */
     dependency_changes_truncated: z.boolean().exactOptional(),
     /**
-     * Non-registry dependencies left alone as opaque nodes (owner D-726). Absent when the base
+     * Non-registry dependencies left alone as opaque nodes. Absent when the base
      * has none, or on evidence recorded before the field.
      */
     opaque_dependencies: opaqueDependenciesSchema.exactOptional(),
@@ -648,7 +648,7 @@ export const fixEvidenceSchema = z
 export type FixEvidence = z.output<typeof fixEvidenceSchema>;
 
 /**
- * #8256 R8 (plans/js-coverage-phase2.md §2.6): how a per-project fix verification found its
+ * How a per-project fix verification found its
  * projects. `affected`: the change's dependency closure, `affected` of the root's `total`
  * projects. `fallback_all`: the graph was unknown or ambiguous, so every protected project of the
  * root ran (`closure_fallback_all`, disclosed), with its closed cause. Counts and codes only.
@@ -709,7 +709,7 @@ export const projectScopeEvidenceSchema = z
       .max(100),
     /** Disclosure only: these projects never acquire verification evidence. */
     unprotected_moved_paths: z.array(repoFilePathSchema).max(100),
-    /** #8256 R8 disclosure; absent on proofs written before it. */
+    /** The R8 disclosure; absent on proofs written before it. */
     closure: projectClosureSchema.optional(),
   })
   .superRefine((proof, ctx) => {
@@ -794,7 +794,7 @@ export const mergeDecisionSchema = z
     authorization_version: z.int().positive().nullable(),
     tier_config_version: tierConfigVersionSchema,
     /**
-     * The fix's D-674 evidence level at this decision (D-715 adds `build_verified`), shown on the
+     * The fix's evidence level at this decision (including `build_verified`), shown on the
      * dashboard as on the PR. Absent on decisions recorded before it existed.
      */
     evidence_level: ciEvidenceLevelSchema.exactOptional(),

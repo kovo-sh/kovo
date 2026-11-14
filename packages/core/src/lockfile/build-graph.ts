@@ -303,7 +303,7 @@ function aggregate(
 }
 
 /**
- * The registry part of a parser's instances (owner D-726): edges into opaque instances are
+ * The registry part of a parser's instances: edges into opaque instances are
  * dropped, so opaque nodes and the packages only they reach are never reachable, never get paths
  * and never appear in `packages`. Returns the set unchanged when it has no opaque instance.
  */

@@ -95,7 +95,7 @@ function refuse(code: string, message: string): never {
 }
 
 /**
- * The fixed refusal for a registry option (agent decision, owner review #1475): `--registry`,
+ * The fixed refusal for a registry option (agent decision, pending owner review): `--registry`,
  * pnpm's dotted `--config.registry` and the scoped `--@scope:registry` / `--//host/:registry` forms.
  */
 export const REGISTRY_REFUSAL =

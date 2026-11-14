@@ -30,7 +30,7 @@ export function overrideEdits(
 ):
   | { readonly ok: true; readonly edits: readonly ManifestEdit[] }
   | { readonly ok: false; readonly reason: LadderSkipReason } {
-  // #8256 R2: Yarn 4 and Bun store overrides with their own selector rules, which Kovo's trusted
+  // Yarn 4 and Bun store overrides with their own selector rules, which Kovo's trusted
   // whole-graph checks do not model yet; a root without a lockfile has no transitive instance.
   if (ctx.pm === "yarn-berry" || ctx.pm === "bun" || ctx.pm === "manifest-only")
     return { ok: false, reason: "override_storage_unsupported" };

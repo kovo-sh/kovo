@@ -3,7 +3,7 @@ import type { SabotageTarget } from "@kovo/contracts";
 import { validateDiscovery } from "./validation.js";
 
 // Discovery's sabotage-target *proposals* from the repository's file layout (SPEC `Recipe`
-// `sabotageTargets`). They are hints only: nothing mutates them since owner D-674 removed
+// `sabotageTargets`). They are hints only: nothing mutates them since the owner removed
 // calibration, whose sabotage selection validated them against trusted evidence.
 
 const PER_KIND = 3;

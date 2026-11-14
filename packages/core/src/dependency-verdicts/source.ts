@@ -39,7 +39,7 @@ export function dependencySourceOf(
 
 /**
  * The source of a parsed lockfile node. A node the lockfile locks at a private registry
- * (`privateRegistry`, D-726 fix-only) has no recorded location left, which `dependencySourceOf`
+ * (`privateRegistry`, fix-only) has no recorded location left, which `dependencySourceOf`
  * would read as the public registry: it is a private-registry package instead, so no caller ever
  * looks its name up at the public registry (a same-name public package is not the customer's).
  */

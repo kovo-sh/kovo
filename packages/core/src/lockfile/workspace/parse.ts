@@ -101,7 +101,7 @@ export function parseWorkspaceGraph(
   limits: WorkspaceLimits = WORKSPACE_LIMITS,
   graphLimits: LockfileLimits = GRAPH_LIMITS,
   /**
-   * The public registry's integrity for npm entries of the registry-sourced shape (#7338), looked
+   * The public registry's integrity for npm entries of the registry-sourced shape, looked
    * up by the caller; absent keeps today's `missing_integrity` refusal exactly.
    */
   registryIntegrity?: RegistryIntegrityFill,
@@ -131,7 +131,7 @@ export function parseWorkspaceGraph(
       ? parseYarnLockfile(lockfile.text, graphLimits, undefined, context)
       : (npmParsed ?? parsePnpmLockfile(lockfile.text, graphLimits, context));
   if (!parsed.ok) {
-    // The first rejection's reason is a closed code, never lockfile content (D-267).
+    // The first rejection's reason is a closed code, never lockfile content.
     const first = parsed.rejections.rejections[0]?.reason;
     const failure = workspaceFailure(
       parsed.rejections.rejections.some((rejection) => rejection.reason === "catalog_protocol")
@@ -146,13 +146,13 @@ export function parseWorkspaceGraph(
       : { ...failure, registryIntegrityCandidates: candidates };
   }
   const set = parsed.instances;
-  // Opaque nodes (owner D-726) are supported in single-project repositories only so far: the
+  // Opaque nodes are supported in single-project repositories only so far: the
   // workspace projections, churn and ownership checks do not model them yet, so a workspace
   // graph with one keeps today's refusal, with the source's own reason.
   for (const instance of set.instances.values())
     if (instance.opaque !== undefined)
       return workspaceFailure("invalid_lockfile", OPAQUE_KIND_REASON[instance.opaque]);
-  // D-726 fix-only covers single-package roots only: a workspace keeps refusing a package locked
+  // Fix-only covers single-package roots only: a workspace keeps refusing a package locked
   // at a private registry exactly as the parsers did before they kept such entries.
   if ([...set.instances.values()].some((instance) => instance.privateRegistry === true))
     return workspaceFailure("invalid_lockfile", "private_registry_dependency");

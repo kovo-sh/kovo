@@ -156,7 +156,7 @@ function splitKey(key: string): KeyParts | null {
 
 type RefTarget =
   | { readonly kind: "snapshot"; readonly key: string }
-  /** A `link:` symlink outside the workspace: an opaque local-path node (owner D-726). */
+  /** A `link:` symlink outside the workspace: an opaque local-path node. */
   | { readonly kind: "link"; readonly key: string };
 
 const KEYED_REF_PREFIXES = [
@@ -221,7 +221,7 @@ function loadYaml(
 
 /**
  * One marker-free pnpm lockfile document, parsed by the same bounded, strict YAML reader the graph
- * parser uses (failsafe schema: every scalar a string). For D-664's open install synthesis.
+ * parser uses (failsafe schema: every scalar a string). For the open install synthesis.
  */
 export function loadPnpmLockfileYaml(
   text: string,
@@ -285,7 +285,7 @@ export function parsePnpmLockfile(
     limits,
   );
   if (!validated.ok) return validated;
-  // Bootstrap packages come from the public registry only: no opaque node (owner D-726 covers
+  // Bootstrap packages come from the public registry only: no opaque node (opaque nodes cover
   // the project's own dependencies, never the package manager Kovo bootstraps).
   for (const instance of validated.instances.instances.values())
     if (instance.opaque !== undefined) return rejectedDocument(OPAQUE_KIND_REASON[instance.opaque]);
@@ -408,14 +408,14 @@ function parsePnpmDocument(
     lockfileOverrides.push(selector);
     if (value === "-" || /^\$\S+$/.test(value)) continue;
     const classified = classifyDependencySpec(value);
-    // A non-registry override value is an opaque node (owner D-726); package.json records it.
+    // A non-registry override value is an opaque node; package.json records it.
     if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null)
       rejections.add(classified.reason);
     else if (classified.kind === "invalid") rejections.add("lockfile_invalid");
   }
 
   // Validate every package entry: name, exact version and a public-registry source. Git,
-  // directory and non-registry tarball entries are opaque nodes (owner D-726).
+  // directory and non-registry tarball entries are opaque nodes.
   const validPackages = new Map<
     string,
     {
@@ -459,11 +459,11 @@ function parsePnpmDocument(
         name.data,
         version.success ? version.data : (entry.version ?? parts.version),
       );
-      // D-726 fix-only: a scoped package from a private HTTPS registry is an opaque node.
+      // Fix-only: a scoped package from a private HTTPS registry is an opaque node.
       privateRegistry =
         (source === "private_registry_dependency" || source === "remote_tarball_dependency") &&
         isPrivateScopeTarball(resolution.tarball, name.data);
-      // Any other remote or local tarball is an opaque non-registry node (owner D-726); a private
+      // Any other remote or local tarball is an opaque non-registry node; a private
       // registry's entry stays a private-registry node, whose location is never kept.
       const kind = privateRegistry ? null : opaqueLocationKind(source);
       if (kind !== null) {
@@ -622,8 +622,8 @@ function parsePnpmDocument(
       ...(integrity.ok && opaque === undefined && integrity.algorithm === "sha1"
         ? { legacySha1: integrity.sha1 }
         : {}),
-      // An opaque node's identity (owner D-726): the snapshot key carries its git commit or URL.
-      // A private registry's location is never kept: nothing may fetch it (D-726).
+      // An opaque node's identity: the snapshot key carries its git commit or URL.
+      // A private registry's location is never kept: nothing may fetch it.
       resolved:
         opaque !== undefined
           ? key
@@ -658,7 +658,7 @@ function parsePnpmDocument(
       return { alias: name.data, kind, range, optional, target: ref };
     const target = refTarget(alias, ref);
     if (target.kind === "link") {
-      // A `link:` outside the workspace members (owner D-726): an opaque local-path node with
+      // A `link:` outside the workspace members: an opaque local-path node with
       // nothing read inside it. The key carries the link path as its identity.
       if (!instances.has(target.key))
         instances.set(target.key, {
@@ -729,7 +729,7 @@ function parsePnpmDocument(
       !ref.startsWith("workspace:")
     ) {
       // A non-registry spec at the root is opaque whatever the lockfile resolved, and of the kind
-      // package.json declares (owner D-726); declared workspace-member links (`workspace:` refs)
+      // package.json declares; declared workspace-member links (`workspace:` refs)
       // are first-party edges instead.
       const target = required(instances, edge.target);
       if (target.opaque !== opaqueKind)

@@ -1,4 +1,4 @@
-import type { DependencyVerdictChangeWire } from "@kovo/contracts";
+import type { DependencyVerdictChangeWire } from "@kovo/contracts/cli";
 import {
   LOCKFILE_MAX_BYTES,
   WORKSPACE_LIMITS,

@@ -5,7 +5,7 @@ import { tolerantReader } from "./tolerant-reader.js";
 import { utcDateTimeSchema } from "./time.js";
 
 // A repository admin's recorded package-manager choice for a repository whose root commits both
-// `package-lock.json` and `pnpm-lock.yaml` (owner choice A, 2026-10-27, #5500; SPEC "Web
+// `package-lock.json` and `pnpm-lock.yaml` (owner choice A, 2026-10-27; SPEC "Web
 // application and onboarding UI" → "Two root lockfiles"). Detection still refuses such a root
 // (`multiple_lockfiles`); once a choice is recorded, admission protects the repository with the
 // chosen manager and its lockfile and ignores the other. The choice holds names, an exact version

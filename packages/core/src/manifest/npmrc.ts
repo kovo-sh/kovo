@@ -16,7 +16,7 @@ import { primaryUnsupportedReason } from "./reasons.js";
 // omit `resolved` too. Inventory therefore checks the registry settings here.
 //
 // Every check reads the file through the one strict tokenizer (`tokenizeNpmrc`): a file it cannot
-// read exactly as npm 10/11 and pnpm 9-12 do is refused as `npmrc_unverifiable` (#1841, #1842).
+// read exactly as npm 10/11 and pnpm 9-12 do is refused as `npmrc_unverifiable`.
 //
 // The file is hostile and often holds credentials (`//host/:_authToken=…`): nothing from it is
 // returned. A rejection names only its reason and line number.
@@ -26,7 +26,7 @@ export const NPMRC_MAX_LENGTH = 64 * 1024;
 
 export const NPMRC_REJECTION_REASONS = [
   "npmrc_too_large",
-  "npmrc_unverifiable", // a construct Kovo cannot read exactly as npm and pnpm do (#1841)
+  "npmrc_unverifiable", // a construct Kovo cannot read exactly as npm and pnpm do
   "registry_override", // `registry=` names anything but the public registry
   "package_manager_override", // executable package-manager configuration
   "scoped_registry", // `@scope:registry=` names anything but the public registry
@@ -41,7 +41,7 @@ export const NPMRC_REJECTION_UNSUPPORTED = {
   package_manager_override: "unsupported_package_manager",
   registry_override: "private_registry",
   scoped_registry: "private_registry",
-  // The coarse reason pnpm-workspace.yaml settings outside the allowlist get (#2135).
+  // The coarse reason pnpm-workspace.yaml settings outside the allowlist get.
   unsupported_workspace_setting: "unsupported_pnpm_setting",
 } as const satisfies Record<NpmrcRejectionReason, UnsupportedRepoReason>;
 
@@ -201,7 +201,7 @@ export type NpmrcFixOnlyResult =
   | Extract<NpmrcResult, { readonly ok: false }>;
 
 /**
- * D-726 fix-only admission of root `.npmrc` (null when absent; source: #626 comment 6733241173).
+ * Fix-only admission of root `.npmrc` (null when absent).
  * Exactly `checkNpmrc`, except that a file whose only refusals are scope registries naming
  * something other than the public registry (`@acme:registry=https://npm.pkg.github.com`, a
  * `${REGISTRY}` reference, any host) is admitted with those scopes. Such a repository gets fix-only
@@ -249,7 +249,7 @@ function loggableSettingKey(entry: NpmrcEntry): string | null {
   return /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/u.test(name) ? name : null;
 }
 
-/** pnpm majors that read every non-auth setting from `.npmrc` (#1836). pnpm 11 and 12 do not. */
+/** pnpm majors that read every non-auth setting from `.npmrc`. pnpm 11 and 12 do not. */
 const PNPM_MAJORS_READING_NPMRC_SETTINGS = new Set([9, 10]);
 
 /**
@@ -257,7 +257,7 @@ const PNPM_MAJORS_READING_NPMRC_SETTINGS = new Set([9, 10]);
  * in its raw configuration but never acts on them: pnpm 9.15.9's and 10.34.5's bundles read no
  * `legacy-peer-deps` setting (pnpm 9's only use is a fixed `npm install --legacy-peer-deps` flag
  * when it prepares a git-hosted dependency, whatever the file says). A repository that keeps one
- * for an npm workflow is a single pnpm package, not a workspace setting Kovo cannot model (#7503).
+ * for an npm workflow is a single pnpm package, not a workspace setting Kovo cannot model.
  * The config differential harness (`normal-npm-only-settings`) compares the value pnpm reads.
  */
 const NPM_ONLY_SETTINGS: ReadonlyMap<string, (value: string) => boolean> = new Map([
@@ -287,7 +287,7 @@ export const PER_REGISTRY_FIELDS: ReadonlySet<string> = new Set([
  * pnpm's documented kebab-case spelling and with the same values), plus the registry settings
  * `checkNpmrc` checks, per-registry credentials and the npm-only settings pnpm never acts on
  * (`NPM_ONLY_SETTINGS`). Anything else is refused as
- * `unsupported_workspace_setting`, the coarse reason (`workspaces`) the YAML file gets (#1836).
+ * `unsupported_workspace_setting`, the coarse reason (`workspaces`) the YAML file gets.
  * pnpm 11 and 12 read only registry, credential and TLS settings from `.npmrc`. An unparseable
  * version is treated as pnpm 9/10.
  */
@@ -337,7 +337,7 @@ export function checkPnpmNpmrcSettings(text: string | null, pmVersion: string): 
 }
 
 /**
- * CI-first admission (#8256 R2): when `result` refuses a pnpm root's `.npmrc` only for top-level
+ * CI-first admission: when `result` refuses a pnpm root's `.npmrc` only for top-level
  * settings Kovo's harness cannot model (`unsupported_workspace_setting`, never a per-registry
  * field, an unreadable file or a registry setting), the lockfile edit is still possible: pnpm
  * applies those settings itself in Sandbox A. The root is then admitted with `can_verify` false,

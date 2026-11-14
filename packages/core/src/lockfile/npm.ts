@@ -85,7 +85,7 @@ export type NpmParseResult =
       readonly rejections: RejectionCollector;
       /**
        * Present only when every rejection is a `missing_integrity` of an entry of the
-       * registry-sourced integrity shape (#7338): supplying the registry's integrity for exactly
+       * registry-sourced integrity shape: supplying the registry's integrity for exactly
        * these `name@version`s is what the parser would need. The rejections are unchanged.
        */
       readonly registryIntegrityCandidates?: readonly RegistryIntegrityCandidate[];
@@ -248,7 +248,7 @@ export function parseNpmLockfile(
   registryIntegrity?: RegistryIntegrityFill,
 ): NpmParseResult {
   const rejections = new RejectionCollector();
-  // Registry-sourced integrity (#7338): the entries of that shape still lacking a supplied value,
+  // Registry-sourced integrity: the entries of that shape still lacking a supplied value,
   // reported only when they are the lockfile's sole problem (otherwise filling cannot help).
   const candidates = new Map<string, RegistryIntegrityCandidate>();
   let otherMissingIntegrity = false;
@@ -298,7 +298,7 @@ export function parseNpmLockfile(
     rejections.add("too_many_dependencies");
     return fail();
   }
-  // A root-only declaration (`["."]`) has no members beyond the root (D-228).
+  // A root-only declaration (`["."]`) has no members beyond the root.
   const workspaces =
     root.workspaces !== undefined &&
     (root.workspaces === null || workspaceDeclarationHasMembers(root.workspaces));
@@ -333,7 +333,7 @@ export function parseNpmLockfile(
   }
 
   // Root dependencies are validated as package.json specs. A git, URL or local-path spec is an
-  // opaque node (owner D-726) even when npm recorded a canonical-looking `resolved` for it: its
+  // opaque node even when npm recorded a canonical-looking `resolved` for it: its
   // target is marked opaque below, so Kovo never plans a change to it. Other refusals stand.
   const rootDeclared = declaredDependencies(root, true);
   for (const declared of rootDeclared) {
@@ -410,7 +410,7 @@ export function parseNpmLockfile(
     if (place === null) {
       // A package folder outside node_modules: the target of a workspace or file: link. Without
       // workspaces, a link entry's target is the inside of a `file:` dependency, which stays
-      // opaque (owner D-726): the link entry is the node, and nothing inside it is read. Any other
+      // opaque: the link entry is the node, and nothing inside it is read. Any other
       // location outside node_modules (`node_modules/../x`) is still refused.
       const insideLink = [...fileLinkTargets].some(
         (target) => location === target || location.startsWith(`${target}/node_modules/`),
@@ -440,7 +440,7 @@ export function parseNpmLockfile(
     });
     if (entry.link === true) {
       if (!workspaces && workspace === undefined) {
-        // A `file:` directory dependency (owner D-726): an opaque local-path node. Its target's
+        // A `file:` directory dependency: an opaque local-path node. Its target's
         // declared dependencies are its edges, so the packages only it brings in are known.
         const target =
           entry.resolved !== undefined && Object.hasOwn(packages, entry.resolved)
@@ -461,12 +461,12 @@ export function parseNpmLockfile(
     }
     if (entry.resolved !== undefined) {
       // A scoped package from a private HTTPS registry is a private-registry node (below), whose
-      // location is never kept, not an opaque tarball (D-726).
+      // location is never kept, not an opaque tarball.
       const kind = isPrivateScopeTarball(entry.resolved, name.data)
         ? null
         : opaqueLocationKind(checkTarballSource(entry.resolved, name.data, entry.version ?? ""));
       if (kind !== null) {
-        // Git, a remote tarball or a local tarball (owner D-726): an opaque node whose own
+        // Git, a remote tarball or a local tarball: an opaque node whose own
         // dependencies are still resolved below, so the subtree only it reaches is known.
         entries.set(location, { entry, at });
         instances.set(location, opaqueInstance(kind));
@@ -481,7 +481,7 @@ export function parseNpmLockfile(
     let privateRegistry = false;
     if (entry.resolved !== undefined) {
       const source = checkTarballSource(entry.resolved, name.data, version.data);
-      // D-726 fix-only: a scoped package from a private HTTPS registry is an opaque node.
+      // Fix-only: a scoped package from a private HTTPS registry is an opaque node.
       privateRegistry =
         (source === "private_registry_dependency" || source === "remote_tarball_dependency") &&
         isPrivateScopeTarball(entry.resolved, name.data);
@@ -495,7 +495,7 @@ export function parseNpmLockfile(
     // package declaring `bundleDependencies` (npm derives bundling from the bundler, too).
     const bundledBy = entry.inBundle === true ? tree.bundleOwner(at) : null;
     const bundled = bundledBy !== null;
-    // Registry-sourced integrity (#7338): only an entry below a workspace member's own
+    // Registry-sourced integrity: only an entry below a workspace member's own
     // `node_modules` that records a version but neither `resolved` nor `integrity`, and is neither
     // bundled nor a link, may take the integrity its caller read from the public registry.
     const registryShape =
@@ -530,7 +530,7 @@ export function parseNpmLockfile(
       integrityAlgorithm: integrity === null ? null : integrity.algorithm,
       ...(integrity?.algorithm === "sha1" ? { legacySha1: integrity.sha1 } : {}),
       ...(supplied === undefined ? {} : { integritySource: "registry" as const }),
-      // A private registry's location is never kept: nothing may fetch it (D-726).
+      // A private registry's location is never kept: nothing may fetch it.
       resolved: privateRegistry ? null : (entry.resolved ?? null),
       ...(privateRegistry ? { privateRegistry: true as const } : {}),
       bundled,
@@ -609,7 +609,7 @@ export function parseNpmLockfile(
         edge.target !== null
       ) {
         // A non-registry spec at the root is opaque whatever npm recorded for it, and of the kind
-        // package.json declares (owner D-726).
+        // package.json declares.
         const target = required(instances, edge.target);
         if (target.localMember !== undefined) rejections.add("local_path_dependency", edge.alias);
         else if (target.opaque !== opaqueKind)

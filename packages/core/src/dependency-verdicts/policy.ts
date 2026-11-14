@@ -16,7 +16,7 @@ import { classifyVersionChange } from "../lockfile/semver-change.js";
 import { detectPublishingPath, type PublishingPathIdentity } from "../policy/publishing-path.js";
 import { typosquatTarget, type PopularPackageIndex } from "./typosquat.js";
 
-// The dependency verdict engine (plans/dependency-firewall.md Part 1; SPEC "Recipes and
+// The dependency verdict engine (SPEC "Recipes and
 // verification" → "Dependency verdict engine"). Pure: the control plane gathers the evidence of each
 // change through its ports and passes the time in; this module only decides. Platform defaults:
 // block confirmed malware, integrity mismatches and exotic transitive sources; wait while under the

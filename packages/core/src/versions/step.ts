@@ -70,8 +70,7 @@ export function isZeroPatchMove(from: string, to: string): boolean {
 }
 
 /**
- * Owner D-726 (source: https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6733241173):
- * the step policy judges when the move's changelog check came back clear. A 0.x patch move with a
+ * The step policy judges when the move's changelog check came back clear. A 0.x patch move with a
  * clean changelog is a patch step, as a patch at or above 1.0.0 is; a 0.x minor move and every
  * other step are unchanged (`versionStep`).
  */

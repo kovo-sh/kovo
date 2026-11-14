@@ -158,7 +158,7 @@ export const slotKindSchema = z.enum(SLOT_KINDS);
 export type SlotKind = z.infer<typeof slotKindSchema>;
 
 /**
- * `fix_constituents.state` (plans/monorepo-projects.md §7.2 "Constituents"): a project the fix PR
+ * `fix_constituents.state`: a project the fix PR
  * acts on (`included`), one that could not verify (`failed`; the PR never merges with it), or one
  * removed from the PR by a re-plan or a project deselection (`deselected`).
  */

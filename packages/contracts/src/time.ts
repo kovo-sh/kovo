@@ -117,7 +117,7 @@ export function addUtcCalendarYears(date: Date, years: number): Date {
   return result;
 }
 
-/** Shared P0/P1 publication and merge age (owner D-210). */
+/** Shared P0/P1 publication and merge age (an owner decision). */
 export const MINIMUM_PUBLICATION_AGE_MS = DAY_MS;
 
 /**
@@ -128,7 +128,7 @@ export const DURATIONS = {
   permissionCacheMaxAge: 10 * MINUTE_MS,
   /** P1 tier: "24 hours on changed/new versions"; npm proxy: "at least 24 hours old". */
   p1PublicationCooldown: MINIMUM_PUBLICATION_AGE_MS,
-  /** P0 publication and merge age (D-210), identical to P1. */
+  /** P0 publication and merge age, identical to P1. */
   p0MinimumAge: MINIMUM_PUBLICATION_AGE_MS,
   /** "Encrypted patch blobs: Delete on successful PR publication or at 72 hours". */
   patchBlobMaxAge: 72 * HOUR_MS,

@@ -116,7 +116,7 @@ export const SANDBOX_STATES = [
 export const sandboxStateSchema = z.enum(SANDBOX_STATES);
 export type SandboxState = z.infer<typeof sandboxStateSchema>;
 
-/** The terminal sandbox states a job records as its sandbox outcome (#5500). */
+/** The terminal sandbox states a job records as its sandbox outcome. */
 export const JOB_SANDBOX_OUTCOME_STATES = [
   "destroyed",
   "expired",
@@ -128,7 +128,7 @@ export type JobSandboxOutcomeState = z.infer<typeof jobSandboxOutcomeStateSchema
 /**
  * Why a sandbox ended other than at its step's end: the fixed codes the sandbox service records on
  * `sandboxes.failure_code` and, as the job's first sandbox failure, on
- * `jobs.sandbox_outcome_failure_code` (#5500). Never provider text, command output or paths. The
+ * `jobs.sandbox_outcome_failure_code`. Never provider text, command output or paths. The
  * `provider_*` codes are `provider_<PortErrorKind>` of a failed create; the control plane checks at
  * compile time that every port error kind is listed.
  */
@@ -177,18 +177,17 @@ export type SandboxFailureCode = z.infer<typeof sandboxFailureCodeSchema>;
 
 /**
  * "Use the same policy implementation for Docker and Daytona sandbox providers". `gce` is the
- * alternate provider for Kovo-owned repositories (plans/gce-sandbox-provider.md, #5641).
+ * alternate provider for Kovo-owned repositories.
  */
 export const SANDBOX_PROVIDER_KINDS = ["daytona", "docker", "gce"] as const;
 /**
- * Which owner decision put a sandbox on GCE (plans/js-coverage-phase2.md §2.1): the D-714
- * isolation tier, D-400 Kovo-owned routing or the D-552 failover. Every route posts to the D-714
- * cost ledger; only `isolation_tier` carries tier-only authority.
+ * Which owner decision put a sandbox on GCE: the isolation tier, Kovo-owned routing or the
+ * failover. Every route posts to the GCE cost ledger; only `isolation_tier` carries tier-only authority.
  */
 export const GCE_ROUTES = ["isolation_tier", "kovo_owned", "failover"] as const;
 export type GceRoute = (typeof GCE_ROUTES)[number];
 /**
- * Reader first (plans/gce-sandbox-provider.md §8, R1): this release reads `gce` rows but never
+ * Reader first (R1): this release reads `gce` rows but never
  * writes one; the writer slices drop this pin once a reader release is promoted.
  */
 export const SANDBOX_PROVIDER_WRITE_KINDS = ["daytona", "docker"] as const;
@@ -242,13 +241,13 @@ export const AUDIT_ACTIONS = [
   "repo.recorded",
   "repo.github_changed",
   // A human repository admin recorded which package manager a repository with two root lockfiles
-  // uses (owner choice A, #5500): the manager, exact version and its source only.
+  // uses (owner choice A): the manager, exact version and its source only.
   "repo.package_manager_chosen",
   "policy.updated",
   "finding.dismissed",
   "recipe.overrides_updated",
   "recipe.rediscovery_requested",
-  // #8256 V6: a person answered a "Kovo needs X" ask (its kind and the new status only).
+  // V6: a person answered a "Kovo needs X" ask (its kind and the new status only).
   "recipe.customer_ask_answered",
   "recipe.approved",
   "recipe.approval_inherited",
@@ -271,8 +270,8 @@ export const AUDIT_ACTIONS = [
   // A human repository admin asked Kovo to evaluate one unevaluated pull request head again
   // (SPEC "PR dependency gate"): the pull request number, head SHA and request ID only.
   "dependency_gate.retry_requested",
-  // The kovo-tests drill key armed or cleared the deny-only dependency-gate drill fault of one
-  // exact head (D-238, #3703): the pull request number, head SHA, window and expiry only.
+  // Kovo's own drill key armed or cleared the deny-only dependency-gate drill fault of one
+  // exact head: the pull request number, head SHA, window and expiry only.
   "dependency_gate.drill_fault_changed",
   "fix.auto_merged",
   // The generation step staged a fix's encrypted patch, and a verified consumer (verification,
@@ -290,8 +289,8 @@ export const AUDIT_ACTIONS = [
   "api_key.created",
   "api_key.revoked",
   "api_key.revert_drill_fault_changed",
-  // The kovo-tests drill key armed or cleared the deny-only verification drill fault of one exact
-  // fix (D-238, #5699): the fix ID, armed and expiry only.
+  // Kovo's own drill key armed or cleared the deny-only verification drill fault of one exact
+  // fix: the fix ID, armed and expiry only.
   "fix.verification_drill_fault_changed",
   "webhook.created",
   "webhook.revoked",
@@ -317,8 +316,7 @@ export const AUDIT_ACTIONS = [
   "billing.grace_started",
   "billing.customer_bound",
   "billing.renewal_quantity_synced",
-  // Project billing became active for the account (M10b, plans/monorepo-projects.md §6.4, owner
-  // D-390 (a)): counts of what the transition mapped, never project names or paths.
+  // Project billing became active for the account (M10b): counts of what the transition mapped, never project names or paths.
   "billing.project_billing_activated",
   // Once project billing is active, one project's protection changed while its repository stayed
   // protected (a fill into an already protected repository; over-capacity repair or the end of an
@@ -326,8 +324,7 @@ export const AUDIT_ACTIONS = [
   "project.protection_enabled",
   "project.protection_disabled",
   // A repository admin declared a member of the repository-root workspace an app or a library, or
-  // withdrew that declaration (plans/monorepo-projects.md §5.3: "every override records actor,
-  // time and reason"): the override and project IDs, the kinds and the reason code; never a member
+  // withdrew that declaration (every override records actor, time and reason): the override and project IDs, the kinds and the reason code; never a member
   // path or manifest content.
   "project.classification_overridden",
   "project.classification_override_revoked",
@@ -344,7 +341,7 @@ export const AUDIT_ACTIONS = [
   // gauges): the row ID, its outbox and workflow kind, attempts, error codes, the operator's closed
   // reason code and the times; identifiers and codes only, never its inputs.
   "operator.outbox_row_abandoned",
-  // Owner D-763: an operator removed one `integrity_unavailable` malware_scans investigation row
+  // An operator removed one `integrity_unavailable` malware_scans investigation row
   // (empty integrity, verdict unknown, no suspicion) after repairing its binding: the public
   // scanner namespace, package name and exact version, the closed reason code, the tracker issue,
   // the self-declared label and the times. Never an integrity, verdict or suspicion change.
@@ -568,10 +565,10 @@ export const RELAY_PURPOSES = [
   "baseline_judgment",
   "failure_diagnosis",
   "failure_triage",
-  /** Owner D-674: just-in-time probe proposals, on a fix's own verification job only. */
+  /** Just-in-time probe proposals, on a fix's own verification job only. */
   "recipe_probe",
   /**
-   * #8256 R7 and V2 (plans/js-coverage-phase2.md §2.8): the Plus agent's planner and medic, on a
+   * R7 and V2: the Plus agent's planner and medic, on a
    * fix's own verification job only, after its base convergence.
    */
   "recipe_planner",

@@ -37,10 +37,10 @@ export const repoFilesSchema = z
  * 10/11 and pnpm 9/10 … Resolve an exact compatible runtime/PM version into each recipe"): the
  * digest, the image's runtime catalog, the one `@kovo/core/lockfile` resolves every runtime
  * against (`catalogNodeVersions` and `catalogPmVersions` list what it bakes), and the digest of
- * its runtime toolchain manifest (`runtime-manifest.ts`, D-496).
+ * its runtime toolchain manifest (`runtime-manifest.ts`).
  *
  * The fingerprint's `sandbox_image` component covers the runtimes and the manifest digest, not
- * `digest` (D-496): an image rebuilt with the same runtime content keeps every fingerprint. The
+ * `digest`: an image rebuilt with the same runtime content keeps every fingerprint. The
  * digest stays the image a sandbox runs and the provenance recipes and evidence record.
  *
  * A `SandboxImage` is built from the deployment's configuration and never crosses a DBOS step or

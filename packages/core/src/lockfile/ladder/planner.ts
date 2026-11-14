@@ -48,7 +48,7 @@ function techniqueFor(
   node: ResolvedPackageNode,
   rung: UpgradeRung,
 ): TechniqueResult {
-  // #8256 R2: without a lockfile only a direct dependency's declared range can move.
+  // Without a lockfile only a direct dependency's declared range can move.
   if (ctx.pm === "manifest-only" && !node.isDirect)
     return { ok: false, reason: "lockfile_absent_transitive" };
   switch (rung) {
@@ -119,7 +119,7 @@ function combine(
   techniques: readonly Technique[],
   evidence: RollbackEvidence | null,
 ): LadderPlan | "conflicting_edits" {
-  // Yarn classic, and a root without a lockfile (#8256 R2), take every pin as trusted code's own
+  // Yarn classic, and a root without a lockfile, take every pin as trusted code's own
   // package.json edit: classic re-locks after it, a lockfile-less root runs nothing at all.
   const trustedPins = ctx.pm === "yarn" || ctx.pm === "manifest-only";
   const applyEdits = mergeEdits(

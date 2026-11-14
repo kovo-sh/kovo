@@ -2,7 +2,7 @@ import semver from "semver";
 
 import { CHANGELOG_SCAN_LIMITS, releaseSectionsInRange } from "./changelog-check.js";
 
-// Trusted checks of a major upgrade's migration (#9013, the fix eval's live-baseline-3). Kovo
+// Trusted checks of a major upgrade's migration. Kovo
 // verified wrong fixes because nothing it ran looked at the code the upgrade breaks:
 // - a silent return-shape change breaks no repository check, so the ladder's bump with no
 //   migration passed verification;
@@ -10,7 +10,7 @@ import { CHANGELOG_SCAN_LIMITS, releaseSectionsInRange } from "./changelog-check
 //   unsafe turns it green (suppressions and casts are `findCheckBypasses`' in `@kovo/core/patch`).
 // The checks here are pure and can only refuse a candidate. They read the release notes the
 // installed package ships and the repository files that import it, as untrusted data matched by
-// fixed patterns (no model reads them, so text in them cannot steer anything: the D-363 screen is
+// fixed patterns (no model reads them, so text in them cannot steer anything: the upstream screen is
 // structural). Nothing but outcomes, reason codes and counts leaves this module.
 
 export type MigrationCallSiteOutcome = "clear" | "unavailable" | "blocked";
@@ -81,7 +81,7 @@ export interface MajorNotes {
 }
 
 /**
- * Bounds on what the notes may yield (D-363: the notes are untrusted upstream text). Only
+ * Bounds on what the notes may yield (the notes are untrusted upstream text). Only
  * identifiers ever leave the parse, each at most `maxIdentifierChars` long and at most
  * `maxNames` of them; nothing else of the text is kept, returned, logged or given to a model.
  */

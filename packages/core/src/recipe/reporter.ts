@@ -244,7 +244,7 @@ function appendedOptionsReceiver(
 
 /**
  * The step's command with options that make its ESLint or tsc write machine-readable diagnostics.
- * The options are added only when they reach that tool (#7741): a `"build": "tsc && tsup"` script
+ * The options are added only when they reach that tool: a `"build": "tsc && tsup"` script
  * would hand tsc's `--pretty false` to tsup, which then fails on the unknown option, so such a
  * step runs unchanged (`unsupported_runner`).
  */

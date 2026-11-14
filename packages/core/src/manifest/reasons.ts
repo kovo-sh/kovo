@@ -22,7 +22,7 @@ export const SOURCE_REJECTION_REASONS = [
 export type SourceRejectionReason = (typeof SOURCE_REJECTION_REASONS)[number];
 
 /**
- * Non-registry sources Kovo leaves alone as opaque nodes (owner D-726, #626 comment 6733241173):
+ * Non-registry sources Kovo leaves alone as opaque nodes:
  * a git source (`git+…`, `github:`, `user/repo`), a remote tarball URL, or a local path (`file:`,
  * `link:`, a relative path or local tarball). Kovo does not resolve, update or vet inside them,
  * keeps their manifest and lockfile entries byte-identical, still fixes the registry dependencies
@@ -65,7 +65,7 @@ export const MANIFEST_REJECTION_REASONS = [
   "invalid_dependency_name",
   "invalid_dependency_spec",
   "invalid_override",
-  // pnpm 9/10: a package.json `pnpm` setting the pnpm-workspace.yaml allowlist refuses (#1879), the
+  // pnpm 9/10: a package.json `pnpm` setting the pnpm-workspace.yaml allowlist refuses, the
   // same reason `.npmrc` and pnpm-workspace.yaml settings get.
   "unsupported_workspace_setting",
 ] as const;

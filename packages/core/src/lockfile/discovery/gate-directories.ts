@@ -7,8 +7,7 @@ import {
 import { LOCKFILE_NAMES } from "../parse.js";
 import { dependencyWorkspaceMember } from "../dependency-ignore.js";
 
-// Which lockfiles a pull request's evaluation reads (agent decision 2026-10-13, pending owner review
-// #1120; #2005): every npm, pnpm and Yarn lockfile in the head tree, not only the root's. Pure: it
+// Which lockfiles a pull request's evaluation reads (agent decision, pending owner review): every npm, pnpm and Yarn lockfile in the head tree, not only the root's. Pure: it
 // sees the paths and blob IDs of both sides' trees (or, when GitHub truncated a tree, the compared
 // file list) and never a file's text.
 //
@@ -44,7 +43,7 @@ export const DEPENDENCY_LAYOUT_REASONS = [
   "dependency_ignore_config_invalid",
   "dependency_ignore_workspace_invalid",
   "dependency_ignore_list_too_large",
-  // The hosted gate's reads of one evaluation passed their GitHub request cap (#4717).
+  // The hosted gate's reads of one evaluation passed their GitHub request cap.
   "dependency_read_limit",
 ] as const;
 export type DependencyLayoutReason = (typeof DEPENDENCY_LAYOUT_REASONS)[number];
@@ -84,7 +83,7 @@ function hasListedBlob(entries: readonly ListedEntry[], path: string): boolean {
   return entries.some((entry) => entry.type === "blob" && entry.path === path);
 }
 
-/** D-227 root/member exemptions, shared by the hosted and CLI directory gates. */
+/** Root/member exemptions, shared by the hosted and CLI directory gates. */
 export function protectedGateLockfile(
   path: string,
   declarations: readonly { readonly dir: string; readonly patterns: readonly string[] }[],

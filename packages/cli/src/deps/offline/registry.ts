@@ -1,4 +1,4 @@
-import type { PackageName } from "@kovo/contracts";
+import type { PackageName } from "@kovo/contracts/cli";
 import type { DependencyRegistryFacts } from "@kovo/core/dependency-verdicts";
 import { packumentFromDocument } from "@kovo/adapters/npm/packument";
 

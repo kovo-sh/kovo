@@ -19,7 +19,7 @@ import { WorkspaceParserContext } from "./workspace/parser-context.js";
 import type { WorkspaceLayout } from "./workspace/types.js";
 import { parseYarnLockfile, yarnResolvedFragments } from "./yarn.js";
 
-// Owner D-664 "open install, sealed code" (specs/npm-proxy-and-network-egress.md): the manifest
+// "Open install, sealed code" (specs/npm-proxy-and-network-egress.md): the manifest
 // set a Sandbox B open install runs from, synthesized by trusted code from the customer's lockfile
 // (npm, pnpm, and Yarn classic, whose v1 lockfile is rewritten with resolved URLs at the job-scoped
 // proxy by name@version).
@@ -80,7 +80,7 @@ export interface PnpmBuildPolicy {
 }
 
 /**
- * A mirrored root `.npmrc` setting (D-664 E1): one of a closed set of keys with a literal boolean
+ * A mirrored root `.npmrc` setting: one of a closed set of keys with a literal boolean
  * or enum value, validated by the caller. Written into the open install root as `key=value`.
  */
 export type OpenInstallNpmrcSetting = readonly [key: string, value: string];
@@ -774,7 +774,7 @@ function synthesizeYarn(text: string, input: YarnOpenInstallInput): OpenInstallM
   if (!parsed.ok)
     refuse(yarnRefusal(parsed.rejections.rejections.map((rejection) => rejection.reason)));
   const { instances, root } = parsed.instances;
-  // Opaque nodes (owner D-726) stay on the restricted install path: the open install is
+  // Opaque nodes stay on the restricted install path: the open install is
   // registry-only, as for npm and pnpm, whose synthesis refuses their non-registry entries.
   if ([...instances.values()].some((instance) => instance.opaque !== undefined))
     refuse("non_registry_dependency");

@@ -87,7 +87,7 @@ export interface OverrideRule {
 }
 
 /**
- * A dependency or override whose value is a non-registry source (owner D-726): Kovo leaves it
+ * A dependency or override whose value is a non-registry source: Kovo leaves it
  * byte-identical, never edits it, and discloses it on the fix PR. Only the location and kind are
  * kept; the spec (which may carry a URL with credentials) is never copied out of the document.
  */
@@ -105,7 +105,7 @@ export interface PackageManifest {
   readonly version: string | null;
   readonly dependencies: readonly ManifestDependency[];
   readonly overrides: readonly OverrideRule[];
-  /** Non-registry dependencies and overrides left alone as opaque nodes (D-726); absent means none. */
+  /** Non-registry dependencies and overrides left alone as opaque nodes; absent means none. */
   readonly opaque?: readonly OpaqueManifestEntry[];
   readonly engines: {
     readonly node: string | null;
@@ -137,7 +137,7 @@ export interface PackageJsonInput {
   readonly text: string;
   /**
    * Lockfile manager; absent preserves legacy npm/pnpm resolutions interpretation. Yarn 4 reads
-   * `resolutions` as Yarn does and may use PnP; Bun and a lockfile-less root read as npm (#8256 R2).
+   * `resolutions` as Yarn does and may use PnP; Bun and a lockfile-less root read as npm.
    */
   readonly packageManager?: StoredPackageManager;
   /** Whether `pnpm-workspace.yaml` exists at the repository root (a pnpm workspace). */
@@ -192,7 +192,7 @@ const packageJsonShapeSchema = z.looseObject({
 const PNPM_FIELDS_VALIDATED = new Set(["overrides", "patchedDependencies", "packageExtensions"]);
 
 /**
- * Keys a JavaScript reader may resolve through the prototype chain rather than as data (#1828):
+ * Keys a JavaScript reader may resolve through the prototype chain rather than as data:
  * refused anywhere inside the `pnpm` field of a pnpm repository.
  */
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -238,7 +238,7 @@ class ManifestReader {
   readonly opaque: OpaqueManifestEntry[] = [];
 
   /**
-   * Records an opaque source instead of rejecting it (D-726), or rejects any other reason. Returns
+   * Records an opaque source instead of rejecting it, or rejects any other reason. Returns
    * whether the entry was opaque.
    */
   opaqueOrReject(
@@ -393,7 +393,7 @@ class ManifestReader {
 
   /**
    * The other `pnpm` keys of a pnpm repository's package.json. pnpm 9 and 10 read settings from
-   * this field (#1879; pnpm 11 and 12 ignore it), so it may set only what `pnpm-workspace.yaml` may:
+   * this field (pnpm 11 and 12 ignore it), so it may set only what `pnpm-workspace.yaml` may:
    * a key the shared allowlist admits, with a value it accepts (`pnpmSettingJsonValueAccepted`).
    * Anything else, and a reserved key at any depth, is refused as `unsupported_workspace_setting`,
    * the reason the YAML and `.npmrc` settings get. The pnpm major is not always known here, so the
@@ -571,7 +571,7 @@ export function parsePackageJson(input: PackageJsonInput): PackageJsonResult {
  * Why fixes are refused for a pnpm repository's root package.json, or null. Dependency checks
  * still accept the file; only fix generation and verification refuse it.
  *
- * pnpm 9 and 10 read settings from the `pnpm` field (#1879), and Kovo's verification install
+ * pnpm 9 and 10 read settings from the `pnpm` field, and Kovo's verification install
  * cannot enforce `trustPolicy: no-downgrade` (see `pnpmFixRefusal`). A `pnpm.trustPolicy` other
  * than exactly `"off"` refuses as `trust_policy_unenforced`. Text `parsePackageJson` refuses yields
  * null: callers refuse it already.
@@ -586,7 +586,7 @@ export function packageJsonFixRefusal(text: string): PnpmFixRefusalReason | null
 }
 
 /**
- * The opaque dependencies (owner D-726) with their sections and declared specs, read from the
+ * The opaque dependencies with their sections and declared specs, read from the
  * parsed document for lockfile parsers that resolve root dependencies from package.json (Yarn v1).
  * In memory only: a spec may be a URL with credentials, so it is never persisted or logged.
  */
@@ -609,7 +609,7 @@ export function opaqueDependencySpecs(manifest: PackageManifest): readonly {
 }
 
 /**
- * Whether a fix changed an opaque package.json entry (owner D-726): the set of opaque entries must
+ * Whether a fix changed an opaque package.json entry: the set of opaque entries must
  * be the same, and each entry's value byte-identical. A fix may neither edit, remove nor add one.
  */
 export function opaqueManifestChanged(before: PackageManifest, after: PackageManifest): boolean {

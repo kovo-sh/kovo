@@ -1,10 +1,10 @@
 /**
- * Whether a declared workspace package set has members beyond the install root (D-228).
+ * Whether a declared workspace package set has members beyond the install root.
  *
  * The root is always a project. A `pnpm-workspace.yaml` `packages` list or a package.json
  * `workspaces` list whose patterns can select only the root (`.` or `./`, which Dyad generates
  * for single-package pnpm apps) declares no members, so the root is one single-package project.
- * Agent decision (2026-10-27), pending owner review #5501: SPEC "Monorepo projects (D-228)".
+ * Agent decision, pending owner review: SPEC "Monorepo projects".
  *
  * Every reader that decides `hasWorkspaces` or the `workspaces` refusal uses these helpers so the
  * readers cannot disagree. Anything unrecognised counts as declaring members: when unsure, refuse.

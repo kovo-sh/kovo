@@ -11,20 +11,20 @@ import type { RuntimeCatalog } from "./compat.js";
 import { detectPackageManager, YARN_BERRY_MARKERS } from "./detect.js";
 import { STORED_LOCKFILE_NAMES, type StoredLockfileName } from "./parse.js";
 
-// CI-first admission (#8256 R2, plans/js-coverage-phase1.md §2.2): a root Kovo can fix but not run.
+// CI-first admission: a root Kovo can fix but not run.
 // Kovo produces the change with its own pinned Yarn 4 or Bun in Sandbox A (or, without a lockfile,
 // a range edit in package.json), Sandbox B never installs it (`can_verify` is false), and the
-// repository's CI decides under owner D-674. This module holds the pure parts: which root layouts
+// repository's CI decides. This module holds the pure parts: which root layouts
 // are fix-only, the keys-only readers of `.yarnrc.yml` and `bunfig.toml` (never a value), the runtime
 // a fix-only root records, and the canonical form of a Bun lockfile Kovo's proxy resolved.
 //
 // Only the repository root is admitted this way: install-root discovery (`discovery/`) and the
-// dependency gate keep refusing these layouts, so no repository gains a project (D-228).
+// dependency gate keep refusing these layouts, so no repository gains a project.
 
-/** The closed refusal details of fix-only roots (D-267), each with its coarse stored reason. */
+/** The closed refusal details of fix-only roots, each with its coarse stored reason. */
 export const FIX_ONLY_REFUSALS = {
   // A Yarn configuration that would run the repository's own code (committed plugins), or one Kovo
-  // cannot read well enough to rule plugins out (owner D-726 keeps only this Yarn refusal).
+  // cannot read well enough to rule plugins out (the only Yarn refusal kept).
   "pm_config_unsupported:yarn_plugin": "unsupported_package_manager",
   // `.yarn/cache` is committed (zero-installs): a lockfile-only update cannot add the archives.
   "pm_config_unsupported:yarn_zero_install": "unsupported_package_manager",
@@ -83,8 +83,8 @@ export function detectFixOnlyRoot(rootFiles: readonly string[]): FixOnlyDetectio
 export const FIX_ONLY_CONFIG_MAX_BYTES = 64 * 1024;
 
 /**
- * `.yarnrc.yml` keys whose value routes registry requests (scopes, registries, credentials). Owner
- * D-726: they are not refused; Sandbox A's copy of the file drops them (`yarnrcForProxy`), so the
+ * `.yarnrc.yml` keys whose value routes registry requests (scopes, registries, credentials).
+ * They are not refused; Sandbox A's copy of the file drops them (`yarnrcForProxy`), so the
  * environment-forced registry, the job-scoped proxy, serves every request.
  */
 const YARN_REGISTRY_KEYS = new Set([
@@ -147,7 +147,7 @@ function yarnrcBlocks(text: string): Block[] | null {
 }
 
 /**
- * Why a Yarn 4 root's `.yarnrc.yml` refuses the fix, or null. Owner D-726 keeps exactly one
+ * Why a Yarn 4 root's `.yarnrc.yml` refuses the fix, or null. Exactly one
  * refusal: `plugins` (Yarn would run the repository's own plugin code in Sandbox A), and a file
  * Kovo cannot read well enough to rule plugins out. Registry, scope and network keys are routed
  * through the proxy instead (`yarnrcForProxy`); `yarnPath` never runs (`YARN_IGNORE_PATH`).
@@ -161,7 +161,7 @@ export function yarnrcRefusal(text: string | null): FixOnlyRefusal | null {
 }
 
 /**
- * Sandbox A's copy of a Yarn 4 root's `.yarnrc.yml` (owner D-726), or null when it names no
+ * Sandbox A's copy of a Yarn 4 root's `.yarnrc.yml`, or null when it names no
  * registry, scope or network setting (the file stays as committed). Each such top-level block is
  * dropped whole, by key, never reading a value; every other line stays byte for byte. With the
  * registry forced to the job-scoped proxy by `YARN_NPM_REGISTRY_SERVER`, every package, scoped ones
@@ -283,7 +283,7 @@ function bunfigRegistryKey(key: string): boolean {
 
 /**
  * Why a Bun root's `bunfig.toml` refuses the fix, or null: only a file Kovo cannot read well
- * enough to route its registries through the proxy (owner D-726). Registry and scope settings are
+ * enough to route its registries through the proxy. Registry and scope settings are
  * routed instead (`bunfigForProxy`; `--registry` already beats `[install] registry`).
  */
 export function bunfigRefusal(text: string | null): FixOnlyRefusal | null {
@@ -292,7 +292,7 @@ export function bunfigRefusal(text: string | null): FixOnlyRefusal | null {
 }
 
 /**
- * Sandbox A's copy of a Bun root's `bunfig.toml` (owner D-726), or null when it names no registry
+ * Sandbox A's copy of a Bun root's `bunfig.toml`, or null when it names no registry
  * or scope (the file stays as committed). Every `install.registry*` and `install.scopes*` table and
  * assignment is dropped whole, by key, never reading a value; every other line stays byte for
  * byte. Bun then resolves every package, scoped ones included, at `--registry`, the job-scoped
@@ -313,8 +313,7 @@ export function bunfigForProxy(text: string | null): string | null {
 }
 
 /**
- * A Bun root's project `.npmrc` with every registry routed through the job-scoped proxy (#8256 R2,
- * review N1), or null when it names no registry (nothing to rewrite). Bun reads a project
+ * A Bun root's project `.npmrc` with every registry routed through the job-scoped proxy, or null when it names no registry (nothing to rewrite). Bun reads a project
  * `.npmrc`, and a scope line (`@acme:registry=…`) is not covered by `--registry`: left alone, Bun
  * would resolve that scope at the named registry itself, past the proxy's malware and advisory
  * screening. Admission has already judged the file (`checkNpmrc`: only the public registry may be

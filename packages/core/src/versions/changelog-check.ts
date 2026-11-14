@@ -1,7 +1,6 @@
 import semver from "semver";
 
-// Owner D-722 check 3 (source: https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6728249336):
-// the release notes between the two versions, screened first under D-363, have no breaking or
+// Changelog check: the release notes between the two versions, screened first, have no breaking or
 // deprecation note for an API the repository uses. This check can only block.
 //
 // The screen is structural: no model reads the notes. This pure scanner treats them as untrusted
@@ -148,8 +147,7 @@ export function scanChangelog(input: ChangelogScanInput): ChangelogScanResult {
 }
 
 /**
- * Owner D-726 (DX-PRINCIPLE a, source:
- * https://github.com/kovo-sh/kovo-cloud/issues/626#issuecomment-6733241173): one package move
+ * One package move
  * whose changelog check came back `clear` (never `unavailable`). A 0.x patch move on this list is
  * judged as a patch step (`versionStepWithChangelog`); every other move is judged as before.
  * Names and versions only (metadata).

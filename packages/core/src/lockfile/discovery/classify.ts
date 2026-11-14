@@ -5,7 +5,7 @@ import { canonicalWorkspacePath } from "../workspace/discover.js";
 import { WORKSPACE_LIMITS, type WorkspaceMember } from "../workspace/types.js";
 import { DISCOVERY_LIMITS, type InstallRoot } from "./types.js";
 
-/** Agent interpretation pending owner review (#2140); changes require a new version. */
+/** Agent interpretation pending owner review; changes require a new version. */
 export const APPLICATION_FRAMEWORKS = {
   version: 1,
   names: [

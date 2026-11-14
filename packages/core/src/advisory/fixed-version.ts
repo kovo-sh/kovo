@@ -4,7 +4,7 @@ import type { AdvisoryRange } from "./model.js";
 import { compileRange, compiledRangeAffects } from "./ranges.js";
 import { parseNpmVersion, type NpmVersion } from "./version.js";
 
-// The public repo check's "Kovo would update it to" version (plans/public-repo-check.md): the lowest
+// The public repo check's "Kovo would update it to" version: the lowest
 // version above the installed one that a range of the package names as `fixed` and that no known
 // advisory range or listed version of the package affects. It is read from advisory data alone (no
 // registry read), so it is the first fixed version, not a verified install target: the real fix

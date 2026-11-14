@@ -1,7 +1,7 @@
 import type { MemberKind } from "./classify.js";
 
-// The project-count preview of one classification declaration (plans/monorepo-projects.md §5.2
-// and §5.3; the M10b "overrides with billing preview"). Pure and transient: identifiers in, member
+// The project-count preview of one classification declaration (the M10b "overrides with billing
+// preview"). Pure and transient: identifiers in, member
 // paths out. It applies the declaration to a workspace install root's current projects with the
 // classifier's own project rules: every app is a project, and a workspace root with no app is one
 // library bundle at '.'. Rule 3's same-component interaction (an app in a cycle with a framework

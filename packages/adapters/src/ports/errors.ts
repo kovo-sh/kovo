@@ -123,12 +123,12 @@ export interface PortErrorInit {
   readonly param?: string | undefined;
   /**
    * The type the billing provider put on its error (Stripe's `invalid_request_error`, ...); kept
-   * only when it is one of {@link STRIPE_ERROR_TYPES}, otherwise `other` (#5514, D-267).
+   * only when it is one of {@link STRIPE_ERROR_TYPES}, otherwise `other`.
    */
   readonly providerErrorType?: string | undefined;
   /**
    * The code the provider itself sent (Stripe's `error.code`), kept only when it is a short machine
-   * token. For error logging only (#5514): callers branch on {@link PortError.code}, which an
+   * token. For error logging only: callers branch on {@link PortError.code}, which an
    * adapter may set to its own value (a decline code, `http_500`, `idempotency_key_reused`).
    */
   readonly providerCode?: string | undefined;
@@ -170,12 +170,12 @@ export abstract class PortError extends Error {
   readonly code: string | undefined;
   /**
    * The refused request parameter's name, when the vendor named one. Not part of
-   * {@link PortErrorDescription}; error logging reads it directly (D-267).
+   * {@link PortErrorDescription}; error logging reads it directly.
    */
   declare readonly param?: string;
   /**
    * The provider's own error type, as one of {@link STRIPE_ERROR_TYPES}; absent when the error did
-   * not come from the provider's SDK. Error logging reads it directly (#5514, D-267).
+   * not come from the provider's SDK. Error logging reads it directly.
    */
   declare readonly providerErrorType?: (typeof STRIPE_ERROR_TYPES)[number];
   /** The provider's own error code, for logging only; never branch on it (see `code`). */

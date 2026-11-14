@@ -249,7 +249,7 @@ export interface OsvFeedPort {
   /**
    * The IDs of the advisories OSV's own matcher says affect an npm package version
    * (`POST api.osv.dev/v1/query`, every page), sorted and unique: an independent check of core's
-   * range evaluation (plans/site-scanner.md §7.1). LimitExceededError past OSV_QUERY_MAX_PAGES
+   * range evaluation. LimitExceededError past OSV_QUERY_MAX_PAGES
    * pages or OSV_QUERY_PAGE_MAX_BYTES per page.
    */
   queryVersion(query: OsvVersionQuery): Promise<readonly AdvisoryId[]>;

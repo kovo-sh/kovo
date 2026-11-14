@@ -4,7 +4,7 @@ import semver from "semver";
 import { VERSION_STEP_SEVERITY, versionStepWithChangelog, type VersionStep } from "./step.js";
 
 /**
- * Owner D-726: whether the move `from → to` of the change's package has a clean changelog check.
+ * Whether the move `from → to` of the change's package has a clean changelog check.
  * Absent means none has (every step judged as before).
  */
 export type ChangelogClearFor = (from: string, to: string) => boolean;
@@ -110,7 +110,7 @@ function addedInstanceKinds(
 /**
  * Why one change needs review (empty for a patch/minor step or a new transitive package).
  * `baseVersions` are the versions of the package the base graph resolves (for additions).
- * `changelogClear` (D-726) says which of the package's moves have a clean changelog check: a 0.x
+ * `changelogClear` says which of the package's moves have a clean changelog check: a 0.x
  * patch move among them is a patch step, not a major one.
  */
 export function changeReviewKinds(

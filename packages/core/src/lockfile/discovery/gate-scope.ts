@@ -28,7 +28,7 @@ export interface GateRootScope {
  * projects are discovery's projects. The default (no declarations) is the historical scope. The
  * map arrives over transient IPC, so it is validated here by `classifyInstallRoots`, which refuses
  * (null: `project_scope_ambiguous`) a malformed or hostile map rather than dropping a declaration.
- * `registryIntegrity` is the registry-sourced integrity (#7338) the caller looked up for this
+ * `registryIntegrity` is the registry-sourced integrity the caller looked up for this
  * side's workspace graph; absent keeps today's parse exactly.
  */
 export function discoverGateScope(

@@ -13,7 +13,7 @@ export type ApiKeyKind = z.infer<typeof apiKeyKindSchema>;
 
 /**
  * Exact account permissions, never wildcard authority or automatic future-route grants.
- * Agent decision (2026-10-04), pending owner review #334: reevaluateFix maps to retryFix.
+ * Agent decision (2026-10-04), pending owner review: reevaluateFix maps to retryFix.
  * As a strict-subset exception to the future-route rule, existing Management
  * keys holding retryFix (including delegated keys) can call POST /v1/fixes/{id}/reevaluate,
  * subject to fresh repository admin authority, key lineage and current reevaluation gates.
@@ -104,11 +104,11 @@ export const MANAGEMENT_KEY_PERMISSIONS = [
 
 /**
  * Permissions accepted by a tolerant reader before their issuance release.
- * Empty after promotion of the #5699 and #3703 D-238 drill grants to explicit Custom issuance.
+ * Empty after promotion of the reader-only grants to explicit Custom issuance.
  */
 export const READER_ONLY_MANAGEMENT_KEY_PERMISSIONS = [] as const;
 
-/** Issuance stays limited to the promoted catalog (D-176/D-185 permissions included). */
+/** Issuance stays limited to the promoted catalog. */
 export const managementKeyPermissionWriteSchema = z.enum(MANAGEMENT_KEY_PERMISSIONS);
 export const managementKeyPermissionSchema = writerPinned(
   z.enum([...MANAGEMENT_KEY_PERMISSIONS, ...READER_ONLY_MANAGEMENT_KEY_PERMISSIONS]),
@@ -116,7 +116,7 @@ export const managementKeyPermissionSchema = writerPinned(
 );
 export type ManagementKeyPermission = z.infer<typeof managementKeyPermissionSchema>;
 
-/** Materialized at issuance. #1327 requires dependency evaluation to be explicitly selected. */
+/** Materialized at issuance. Dependency evaluation must be explicitly selected. */
 export const FULL_MANAGEMENT_KEY_PERMISSIONS = MANAGEMENT_KEY_PERMISSIONS.filter(
   (permission) =>
     permission !== "evaluateDependencyChanges" &&

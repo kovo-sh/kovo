@@ -25,7 +25,7 @@ import {
 // package_manager_config (.npmrc, pnpm hooks and workspace settings), runtime_config (runtime
 // declarations and environment files), verification_config (test runner, typecheck, lint and build
 // configuration, Dockerfiles), repository_config (git metadata that changes what a checkout
-// contains), policy (the repository's own `protected_paths`). The list is contracts' (D-726: a
+// contains), policy (the repository's own `protected_paths`). The list is contracts' (a
 // restore records kinds by these names).
 export const PROTECTED_PATH_CATEGORIES = PROTECTED_FILE_KINDS;
 export type ProtectedPathCategory = (typeof PROTECTED_PATH_CATEGORIES)[number];

@@ -116,7 +116,7 @@ export type ManifestEdit =
 
 /** A package-manager invocation; `args` never contain a shell and always disable scripts. */
 export interface PmCommand {
-  /** A verifiable package manager, or Kovo's pinned Yarn 4 or Bun (#8256 R2). */
+  /** A verifiable package manager, or Kovo's pinned Yarn 4 or Bun. */
   readonly executable: PackageManager | Exclude<FixOnlyPackageManager, "manifest-only">;
   readonly args: readonly string[];
 }
@@ -229,7 +229,7 @@ export const LADDER_SKIP_REASONS = [
   "removal_infeasible", // other packages depend on the malicious package
   "conflicting_edits", // two instances need different values at one pointer
   "no_major_version", // rung 6: no safe version on a newer major line
-  "lockfile_absent_transitive", // #8256 R2: a root without a lockfile fixes direct dependencies only
+  "lockfile_absent_transitive", // a root without a lockfile fixes direct dependencies only
 ] as const;
 export type LadderSkipReason = (typeof LADDER_SKIP_REASONS)[number];
 

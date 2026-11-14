@@ -4,7 +4,7 @@ import { exactVersionSchema, packageNameSchema } from "./npm.js";
 import { sriSha512Schema, whenValid } from "./primitives.js";
 import { utcDateTimeSchema } from "./time.js";
 
-// The dependency verdict engine's stable vocabulary (plans/dependency-firewall.md Part 1; SPEC
+// The dependency verdict engine's stable vocabulary (SPEC
 // "Recipes and verification" → "Dependency verdict engine"). One engine answers the same question
 // for every enforcement point: is this `(ecosystem, name, version, integrity)` change safe to admit?
 // Reason codes are stable API, so customers can map them to their own policy. They never name an
