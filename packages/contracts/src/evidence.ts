@@ -421,8 +421,7 @@ export const MAX_SERVED_LABELS = 16;
  * order, joined by `, ` (a single label is its own list). An agent run is many model requests, and
  * the relay may fall back among compliant providers of the same model between them ("Allow fallback
  * only among compliant providers for that same model"), so "the actual inference provider" of the
- * patch is every provider that served it (docs/decisions/ai.md "Every provider that served an agent
- * run is on its evidence"). A label containing a comma cannot be listed unambiguously and is
+ * patch is every provider that served it. A label containing a comma cannot be listed unambiguously and is
  * refused.
  */
 function servedLabelsSchema(label: z.ZodType<string>, maxLength: number) {

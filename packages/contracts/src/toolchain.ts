@@ -6,8 +6,7 @@ import { whenValid } from "./primitives.js";
 import { stepNameSchema } from "./step-result.js";
 import { wellKnownPackageSchema } from "./well-known-packages.js";
 
-// A repository's toolchain fingerprint (docs/decisions/recipes.md "Toolchain fingerprints and
-// failure categories"): the facts about how a repository builds that trusted code already holds in
+// A repository's toolchain fingerprint: the facts about how a repository builds that trusted code already holds in
 // memory when it verifies one (the manifest, the lockfile, the GitHub tree), recorded so a failed
 // calibration or verification can be diagnosed without reading the repository. Enums, versions and
 // counts only: no file contents, no private package names (only `WELL_KNOWN_PACKAGES`), no paths

@@ -213,7 +213,7 @@ export const FIX_OUTCOME_STATUS = {
 /**
  * The fix state diagram's moves between nonterminal states (SPEC "Workflows" mermaid diagram).
  * Waits do not change the status: a fix waiting for cooldown, capacity or AI funding keeps its
- * status and carries `wait_reason`/`next_action` (docs/decisions/contracts.md "Fix transitions").
+ * status and carries `wait_reason`/`next_action`.
  * Beyond the diagram: `reverifying → awaiting_human` ("allow at most two automatic refresh attempts
  * per fix, then request review"; a refresh whose verification fails or conflicts), and `merging →
  * pr_open | awaiting_human` (the merge request was refused because the head, checks or rules

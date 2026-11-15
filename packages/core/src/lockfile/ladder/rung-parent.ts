@@ -13,7 +13,7 @@ import type { LadderSkipReason, LadderStep, ManifestEdit, PmCommand } from "./ty
 // dependency is moved to the smallest patch/minor version whose declared ranges force the package
 // manager off the affected version and onto a safe one. The prediction follows how npm and pnpm
 // resolve: a range still admitting a locked version may keep it, a fresh range resolves to
-// `latest` or the newest admitted version (docs/decisions/lockfile.md "The ladder planner").
+// `latest` or the newest admitted version.
 
 type Simulation =
   | { readonly ok: true; readonly target: PackageVersion | null }

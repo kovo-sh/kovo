@@ -1,4 +1,4 @@
-// @kovo/core/lockfile: npm v2/v3 and pnpm v9 lockfile graphs, graph diff and ladder planning (BUILD_PLAN item 7).
+// @kovo/core/lockfile: npm v2/v3 and pnpm v9 lockfile graphs, graph diff and ladder planning.
 
 export * from "./build-graph.js";
 export * from "./compat.js";

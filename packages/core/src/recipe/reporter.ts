@@ -7,11 +7,10 @@ import { pnpmBinInvocation, scriptInvocation } from "./shell/scripts.js";
 
 // How the Sandbox B harness makes a report step write its report where Kovo reads it (SPEC "Sandbox
 // B": "Execute a fixed baseline-derived harness with protected recipe/reporting configuration";
-// docs/decisions/recipe.md "Reporter expectations": "How the harness appends reporter options is
-// the verifier's"). The reporter and its output path come from trusted code, never from the
-// repository: the step's approved command runs unchanged, with only these options added.
+// how the harness appends reporter options is the verifier's). The reporter and its output path
+// come from trusted code, never from the repository: the step's approved command runs unchanged, with only these options added.
 //
-// Verified against the pinned runtimes (docs/decisions/verification.md "Reporter injection"):
+// Verified against the pinned runtimes:
 // - `node --test` (TAP): `NODE_OPTIONS=--test-reporter=tap --test-reporter-destination=<path>`.
 //   Node reads test-runner options from NODE_OPTIONS whatever script chain starts it, while an
 //   option appended after a positional file argument is passed to the test file instead.

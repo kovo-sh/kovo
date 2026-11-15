@@ -15,8 +15,8 @@ import {
 } from "../ports/npm-upstream.js";
 
 // Registry packument JSON → the port's typed view, shared by the real adapter and the fake
-// registry so both apply exactly the same per-version rules (docs/decisions/adapters.md
-// "Packuments are typed version by version"). Registry content is hostile: nothing here repairs a
+// registry so both apply exactly the same per-version rules (packuments are typed version by
+// version). Registry content is hostile: nothing here repairs a
 // value; a malformed version fails `npmVersionSchema` and is omitted and counted.
 
 /** The media type of the abbreviated ("corgi") packument. */

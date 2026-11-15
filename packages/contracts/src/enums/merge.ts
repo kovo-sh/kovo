@@ -8,7 +8,7 @@ import { PROJECT_SCOPE_REASONS } from "./repos.js";
  * Project-specific gate reasons (note N2, M10b): once a
  * repository has a project selection, an unselected project and a project without its own recipe
  * are named for what they are instead of reusing `repo_not_enabled` and `recipe_missing`. Reader
- * first (docs/decisions/schema-compatibility.md "Reader-first sequencing"): readers accept them
+ * first: readers accept them
  * now; `decideMerge` switches to them only after a release with these readers is promoted.
  */
 export const PROJECT_GATE_REASONS = ["project_not_protected", "project_recipe_missing"] as const;

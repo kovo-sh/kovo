@@ -1,4 +1,4 @@
-// @kovo/core/manifest: package.json parsing, JSON-pointer allowlist and protected paths (BUILD_PLAN item 7).
+// @kovo/core/manifest: package.json parsing, JSON-pointer allowlist and protected paths.
 
 export * from "./allowlist.js";
 export * from "./bounded-json.js";

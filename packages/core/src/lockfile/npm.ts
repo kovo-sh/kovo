@@ -37,8 +37,8 @@ import { canonicalWorkspacePath } from "./workspace/discover.js";
 // dependency resolves the way Node does, from the dependent's own `node_modules` up to the root.
 
 /**
- * The bounded parser's limits for package-lock.json (docs/decisions/lockfile.md "Hostile files are
- * parsed with bounded, strict parsers"). Real entries hold 10–20 JSON values, so the node bound
+ * The bounded parser's limits for package-lock.json (hostile files are parsed with bounded,
+ * strict parsers). Real entries hold 10–20 JSON values, so the node bound
  * follows the package bound (`GRAPH_LIMITS.maxPackages` × 20); 16 MiB holds more than 20 000 real
  * entries. At either bound a hostile document parses within about 400 MB of heap and a few seconds
  * (measured, `npm.test.ts` › hostile shapes), where the former 64 MiB / 5 000 000 nodes needed

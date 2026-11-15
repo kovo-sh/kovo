@@ -38,7 +38,7 @@ import {
 import { osvExportItem, osvRecordFromDocument } from "./record.js";
 import { readZipEntries } from "./zip.js";
 
-// The real OsvFeedPort (BUILD_PLAN item 11). Change list and full export come from OSV's public
+// The real OsvFeedPort. Change list and full export come from OSV's public
 // bucket by object generation (gcs.ts); single records from `api.osv.dev/v1/vulns/{id}`, which is
 // not edge-cached; OSV's own matching for one version from `api.osv.dev/v1/query`, a read-only JSON
 // POST. Every read has a deadline, bounded retries and byte limits.

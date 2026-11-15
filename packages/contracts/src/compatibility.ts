@@ -35,7 +35,7 @@ export function persistedReaderSchemas(): ReadonlyMap<string, z.ZodType> {
 }
 
 /**
- * Reader first (docs/decisions/schema-compatibility.md "Reader-first sequencing"): `schema` already
+ * Reader first (reader-first sequencing): `schema` already
  * accepts values this release does not emit yet. Wherever `schema` appears in a boundary's writer,
  * at its root or nested, the snapshot describes `writer` instead, until the writer PR drops the pin.
  * The runtime parser keeps its identity and its full reader language.

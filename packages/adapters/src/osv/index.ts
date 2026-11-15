@@ -1,5 +1,5 @@
-// @kovo/adapters/osv: the real OsvFeedPort over OSV's public bucket and API (BUILD_PLAN item 11).
-// Fake: @kovo/adapters/fakes/osv. Status: docs/status/adapter-feeds.md.
+// @kovo/adapters/osv: the real OsvFeedPort over OSV's public bucket and API.
+// Fake: @kovo/adapters/fakes/osv.
 
 export {
   DEFAULT_OSV_FEED_LIMITS,

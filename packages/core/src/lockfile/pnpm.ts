@@ -45,9 +45,8 @@ import {
 //
 // The YAML is parsed with the failsafe schema (every scalar a string, so `1.10` never becomes
 // `1.1`), unique keys (checked in one linear walk), no aliases, at most the verified toolchain/project pair, and bounded size,
-// node count and nesting checked before the parser runs (docs/decisions/lockfile.md "Hostile files
-// are parsed with bounded, strict parsers": the yaml library holds up to about 1 KiB per node while
-// parsing, so the structural-character bound is what keeps a parse within a worker's memory).
+// node count and nesting checked before the parser runs (the yaml library holds up to about 1 KiB
+// per node while parsing, so the structural-character bound is what keeps a parse within a worker's memory).
 
 export const PNPM_LOCKFILE_LIMITS = {
   /** 8 MiB: a real lockfile needs about 350 bytes per package (over 20 000 packages). */

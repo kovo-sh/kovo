@@ -10,7 +10,7 @@ import { kovoIdSchema, providerRefSchema } from "./id-schemas.js";
 // `@kovo/contracts/ids` subpath (ids-all.ts) re-export both. The public CLI bundle takes this module
 // alone, so it must never import or re-export a billing module.
 
-// ---- Kovo entities (SPEC "Data model" plus the supporting tables BUILD_PLAN item 3 lists) ----
+// ---- Kovo entities (SPEC "Data model" plus its supporting tables) ----
 
 export const accountIdSchema = kovoIdSchema("AccountId");
 export type AccountId = z.infer<typeof accountIdSchema>;

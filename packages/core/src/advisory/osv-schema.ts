@@ -4,7 +4,7 @@ import { z } from "zod";
 // and sizes are strict; unknown members are dropped rather than rejected, because OSV promises that
 // "new minor and patch versions of the schema only add new fields" and tells clients to ignore
 // them. Optional members may be absent or null. Every bound is well above the largest value in the
-// full npm export (docs/decisions/advisory.md "OSV parsing: strict types and bounds, unknown members dropped") and keeps a hostile record from
+// full npm export (strict types and bounds; unknown members are dropped) and keeps a hostile record from
 // ballooning memory or storage. Semantic checks (IDs, versions, timestamps, package names) happen
 // in `normalize.ts`, which can then drop or reject individual values with a recorded reason.
 

@@ -15,10 +15,10 @@ import type { LockfileName } from "../parse.js";
 import type { DependencyGraph } from "../types.js";
 import type { RegistryPackage } from "./registry.js";
 
-// Ladder plans are data (BUILD_PLAN item 7): what to edit in package.json (JSON pointers), which
+// Ladder plans are data: what to edit in package.json (JSON pointers), which
 // package-manager commands to run (always with lifecycle scripts disabled), what the resulting
 // lockfile must look like, and whether the result is expected to be auto-merge eligible. Sandbox A
-// executes them (BUILD_PLAN item 23); trusted code checks the outcome with `checkLadderOutcome`.
+// executes them; trusted code checks the outcome with `checkLadderOutcome`.
 
 /** The rungs this planner produces: SPEC rungs 1–5 and M (6 and 7 are major upgrades). */
 export const PLANNED_RUNGS = [
@@ -34,7 +34,7 @@ export type PlannedRung = (typeof PLANNED_RUNGS)[number];
 /**
  * SPEC rung 6, "Major upgrade, optionally agent-assisted on Plus": `planMajorUpgrade` plans its
  * deterministic part (a direct dependency moved to a safe version on a newer major line); agent
- * assistance and rung 7 are the control plane's (BUILD_PLAN items 23 and 26).
+ * assistance and rung 7 are the control plane's.
  */
 export const MAJOR_RUNG = "6" as const satisfies LadderRung;
 

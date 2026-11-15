@@ -29,7 +29,7 @@ import {
   type ResolvedPackageNode,
 } from "./types.js";
 
-// Before/after graph diff (BUILD_PLAN item 7; SPEC "Evaluate semantic version changes across the
+// Before/after graph diff (SPEC "Evaluate semantic version changes across the
 // whole changed dependency graph, including transitives; a nominally patch-only direct update that
 // adds a transitive major is review-only. Any override/source edit/new top-level dependency
 // prevents auto-merge regardless of rung."; "Use package-manager adapters to make narrowly scoped

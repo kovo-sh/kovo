@@ -10,7 +10,7 @@ import { jsonObjectSchema } from "./common.js";
 // modified-record feed, then changed records; periodic full reconciliation"; "Persist source cursors
 // only after durable ingestion." Notes: docs/libraries/sandbox-ai-feeds.md §5.
 //
-// Implementations (BUILD_PLAN item 11; status in docs/status/adapters.md): real HTTP client that
+// Implementations: real HTTP client that
 // polls the `npm/modified_id.csv` object metadata by generation (not the edge-cached public URL),
 // reads records from `api.osv.dev/v1/vulns/{id}` and streams `npm/all.zip` for reconciliation; fake
 // serving scripted records and a scripted change list.
@@ -22,8 +22,8 @@ import { jsonObjectSchema } from "./common.js";
 // ---- OSV timestamps (variable fractional precision; must not be compared as JS Dates) ----
 
 // The parser is contracts' `normalizeOsvTimestamp`, shared with `@kovo/core/advisory`, so the
-// canonical `modified` of the envelope and of the normalized document are byte-identical
-// (docs/decisions/adapters.md). Contracts' `osvTimestampToDate` gives the millisecond `Date`.
+// canonical `modified` of the envelope and of the normalized document are byte-identical.
+// Contracts' `osvTimestampToDate` gives the millisecond `Date`.
 
 /** A canonical OSV timestamp (nine fractional digits, `Z`). Accepts raw OSV input and normalizes. */
 export const osvTimestampSchema = z

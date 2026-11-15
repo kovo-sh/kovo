@@ -20,7 +20,7 @@ import { compareVersionText } from "./version.js";
 // `finding.p0_detected` on a newly detected/reopened P0". "A withdrawn advisory withdraws its
 // findings". `reclassify`: "Re-tier affected findings". A pure reducer over one repository's
 // findings; the inventory and advisory services persist its output. Transitions
-// (docs/decisions/advisory.md "Finding lifecycle"; "matched" means the current snapshot has the
+// (the finding lifecycle; "matched" means the current snapshot has the
 // version and the advisory's current revision affects it):
 //
 // | before \ now | matched, advisory active     | matched, withdrawn | unmatched, active | unmatched, withdrawn |

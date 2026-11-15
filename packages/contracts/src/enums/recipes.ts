@@ -169,7 +169,7 @@ export const SABOTAGE_INAPPLICABLE_REASONS = [
   // two below); rejected discovery proposals stay listed in the calibration plan.
   "proposal_rejected", // "Proposals from discovery must be independently validated"
   // The analysis read nothing: the commit's source archive was missing, too large or malformed,
-  // so no kind could find evidence (docs/decisions/recipe.md "Sabotage selection").
+  // so no kind could find evidence.
   "sources_unavailable",
   // The analysis could not read the root package.json as a supported manifest, so it found no
   // entry, framework or dependency to sabotage.
@@ -209,7 +209,7 @@ export const CALIBRATION_WEAK_REASONS = [
   "too_few_mutations",
   "no_app_code_mutation",
   // A mutation run that errored (sandbox or harness failure, inconclusive result) proves neither
-  // detection nor its absence, so "all caught" cannot be shown (docs/decisions/recipe.md).
+  // detection nor its absence, so "all caught" cannot be shown.
   "mutation_errored",
   // A step that expects a test report passed at baseline without one (no counts or digest): "If a
   // recipe expects tests, missing/unparseable reports … fail verification", and the baseline "must
@@ -226,7 +226,7 @@ export const CALIBRATION_WEAK_REASONS = [
   // The recipe's only check is Kovo's entry import (no other step, no smoke) and it caught fewer
   // than the minimum meaningful mutations: loading the entry cannot exercise routes or returns.
   // Replaces `too_few_mutations` for that recipe; the bar itself is unchanged (agent decision
-  // (2026-11-05), pending owner review, docs/decisions/recipes.md).
+  // (2026-11-05), pending owner review).
   "entry_import_only",
 ] as const;
 export const calibrationWeakReasonSchema = z.enum(CALIBRATION_WEAK_REASONS);
@@ -301,17 +301,17 @@ export const DEVIATION_REASONS = [
   "matrix_narrowed", // a CI matrix reduced to the recipe's resolved runtime
   "deployment_step",
   "unparseable",
-  // Added with core/recipe discovery (docs/decisions/recipe.md "Deviations: exactly one per CI step"):
+  // Added with core/recipe discovery (exactly one deviation per CI step):
   "unsupported_runtime", // CI runs a Node/PM major outside the compatibility matrix
   "runtime_mismatch", // CI runs a supported major other than the one the repo declares
   "not_a_check", // not a gating PR check: release/schedule-only workflow, continue-on-error step
   "unresolved_expression", // depends on CI context values Kovo cannot know (github.*, vars.*, …)
   "removed_by_override", // a recipe override removed the step that ran this CI check
   "replaced_by_override", // a recipe override replaced the command that ran this CI check
-  // Added later (docs/decisions/recipe.md "Checks never write files"):
+  // Added later (checks never write files):
   "mutating_flags_removed", // a linter or formatter runs with its fix/write flags dropped
   "mutating_check", // a linter or formatter that writes files, with no safe read-only form
-  // Added later (docs/decisions/recipe.md "Deviations: exactly one per CI step"):
+  // Added later (exactly one deviation per CI step):
   "infra_tool_unavailable", // an infrastructure CLI (Terraform, kubectl, …) the image lacks
 ] as const;
 export const deviationReasonSchema = z.enum(DEVIATION_REASONS);

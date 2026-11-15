@@ -34,7 +34,7 @@ import {
 import { reportedPointer } from "./safe-pointer.js";
 import { parsePnpmSelector, parseSelectorStep, parseYarnSelector } from "./selectors.js";
 
-// package.json parsing (BUILD_PLAN item 7; SPEC inventoryWorkflow step 1 "Reject customer
+// package.json parsing (SPEC inventoryWorkflow step 1 "Reject customer
 // workspaces …"; "single-package customer repos (no workspaces)"). The file is hostile input: it is
 // parsed with the bounded JSON parser, validated with Zod, and every dependency spec is classified.
 // The parsed manifest lives in memory only; package.json content is never persisted or logged

@@ -35,8 +35,8 @@ export const checkDiagnosticSchema = z.enum(CHECK_DIAGNOSTICS);
 export type CheckDiagnostic = z.infer<typeof checkDiagnosticSchema>;
 
 /**
- * Which workspace orchestrator a pinned Turbo or Nx check ran (docs/decisions/
- * recipes.md "Repository-locked Turbo and Nx"): `*_unproven_repo_version` discloses that the
+ * Which workspace orchestrator a pinned Turbo or Nx check ran (repository-locked Turbo and Nx):
+ * `*_unproven_repo_version` discloses that the
  * repository's own locked release, not the proven one, ran (an ordinary result of any status);
  * `*_not_installed` (no package of that name installed) and `*_proof_failed` (the proven command's
  * version check failed) are harness errors.
@@ -71,8 +71,7 @@ export const EGRESS_HOST_CLASSES = [
 export type EgressHostClass = (typeof EGRESS_HOST_CLASSES)[number];
 
 /**
- * Why a failed step failed, as far as Kovo can tell without keeping its output (docs/decisions/
- * recipes.md "Toolchain fingerprints and failure categories"): an enum from fixed signatures over
+ * Why a failed step failed, as far as Kovo can tell without keeping its output: an enum from fixed signatures over
  * the ephemeral output and trusted facts (the exit code, the parsed report's counts). Advisory
  * only: hostile output can imitate a signature, so a category never changes a verdict.
  */
@@ -109,8 +108,7 @@ export const FAILURE_CATEGORIES = [
   // A test step exited nonzero with a test runner and a lifecycle-failure footer in its output
   // but no failed-test count or suite report. Chosen by a closed output-shape hash.
   "test_run_failed_without_report",
-  // V1 failure taxonomy (docs/decisions/recipes.md
-  // "Toolchain fingerprints and failure categories"). `egress_blocked:<class>` names the E3 host
+  // V1 failure taxonomy. `egress_blocked:<class>` names the E3 host
   // class (`EGRESS_HOST_CLASSES`) of a refused fetch, from trusted facts only; `unknown` is the
   // shell's category and any refusal no applicable class explains. The plan's `oom` is
   // `out_of_memory` above, kept under its recorded name.
@@ -282,9 +280,8 @@ export const stepResultSchema = z
     /** Additive evidence only; legacy records do not gain a regression exception. */
     regression: regressionObservationSchema.exactOptional(),
     /**
-     * The encrypted, redacted tail of a failed or timed-out step's output, by reference only
-     * (docs/decisions/verification.md "Failed-step output excerpts"). Optional: absent on every
-     * other step, on records written before excerpts existed, and while excerpts are switched off.
+     * The encrypted, redacted tail of a failed or timed-out step's output, by reference only.
+     * Optional: absent on every other step, on records written before excerpts existed, and while excerpts are switched off.
      */
     failure_excerpt: failureExcerptRefSchema.exactOptional(),
     /**

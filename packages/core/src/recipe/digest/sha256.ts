@@ -3,7 +3,7 @@ import type { Sha256Hex } from "@kovo/contracts";
 
 // FIPS 180-4 SHA-256, synchronous and dependency-free. `@kovo/core` may not import `node:crypto`
 // (it must stay pure and browser-safe), and WebCrypto's `crypto.subtle.digest` is asynchronous,
-// which would make every fingerprint and report hash async (docs/decisions/recipe.md "Purity, hashing and the seed").
+// which would make every fingerprint and report hash async.
 
 const K = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,

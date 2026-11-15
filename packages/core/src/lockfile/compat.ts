@@ -27,8 +27,7 @@ import {
 // proxy."
 //
 // The one resolver: inventory judges a repository's support with it, and recipe discovery resolves
-// the exact runtime of each recipe with it, so the two never disagree (docs/decisions/lockfile.md
-// "Runtime resolution"). Support is judged by major: a version declaration (`.nvmrc`,
+// the exact runtime of each recipe with it, so the two never disagree. Support is judged by major: a version declaration (`.nvmrc`,
 // `.node-version`, `.tool-versions`, Volta, `packageManager`) fixes the major, which must be in the
 // matrix and baked into the image; the exact version resolved is the image's baked release of that
 // major. `engines` ranges must be satisfied exactly by the baked release. A major outside the
@@ -545,8 +544,7 @@ function rejected(reason: RuntimeRejectionReason): RuntimeResolution {
 
 /**
  * Resolves the exact Node and package-manager releases a repository runs with in the pinned image,
- * or the explicit reason it is outside the matrix (docs/decisions/lockfile.md "Runtime
- * resolution"). Declarations are constraints that must all hold; CI preferences only choose among
+ * or the explicit reason it is outside the matrix. Declarations are constraints that must all hold; CI preferences only choose among
  * what they admit; with none, the catalog's default Node major is used.
  */
 export function resolveRuntime(input: RuntimeInput): RuntimeResolution {

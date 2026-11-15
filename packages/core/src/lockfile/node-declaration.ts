@@ -5,7 +5,7 @@ import semver from "semver";
 // Volta `node` pin, or a CI `setup-node` version. Repository content is hostile input: the text is
 // bounded, codenames are looked up in a Map (never on an object, where `lts/constructor` would find a
 // prototype member), and anything else is refused explicitly. One parser for inventory, recipe
-// discovery and CI runtime preferences (docs/decisions/lockfile.md "Runtime resolution").
+// discovery and CI runtime preferences.
 
 /** Node LTS codenames and their majors (immutable once assigned). */
 export const NODE_LTS_CODENAMES: ReadonlyMap<string, number> = new Map([

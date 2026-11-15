@@ -269,7 +269,7 @@ export const GRAPH_LIMITS = {
   /**
    * Path-enumeration work (edges examined plus chain steps of cycle checks and recorded paths)
    * across the whole graph; beyond it every package is marked `pathsTruncated`. The largest real
-   * lockfiles measured need well under a tenth of it (docs/decisions/lockfile.md).
+   * lockfiles measured need well under a tenth of it.
    */
   maxPathWork: 20_000_000,
 } as const;

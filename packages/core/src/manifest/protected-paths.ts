@@ -19,7 +19,7 @@ import {
 // "Tests/CI/config edited to pass | Trusted protected-path and manifest-field checks"). A fix may
 // change only the files its plan allows, and never a protected one. The built-in protections cannot
 // be removed by policy; policy `protected_paths` globs only add to them (contracts
-// DEFAULT_POLICY_BODY, docs/decisions/contracts.md "Policy defaults").
+// DEFAULT_POLICY_BODY).
 
 // tests (test sources, fixtures and snapshots), ci (CI configuration), kovo (`.kovo*` files),
 // package_manager_config (.npmrc, pnpm hooks and workspace settings), runtime_config (runtime

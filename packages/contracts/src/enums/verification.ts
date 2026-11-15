@@ -118,8 +118,8 @@ export type NpmInstallOutcome = z.infer<typeof npmInstallOutcomeSchema>;
 /**
  * The registry digest that verified a served tarball (`npm_installs.integrity_algorithm`): its sha512
  * `dist.integrity`, or the legacy SHA-1 `dist.shasum` of a version published before sha512
- * integrity, which is weaker evidence (collisions are practical; docs/decisions/adapter-feeds.md
- * "Tarball integrity: sha512 decides, SHA-1 only without it").
+ * integrity, which is weaker evidence (collisions are practical; sha512 decides, SHA-1 only
+ * without it).
  */
 export const TARBALL_DIGEST_ALGORITHMS = ["sha512", "sha1"] as const;
 export const tarballDigestAlgorithmSchema = z.enum(TARBALL_DIGEST_ALGORITHMS);

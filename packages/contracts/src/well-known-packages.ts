@@ -1,8 +1,7 @@
 import { z } from "zod";
 
 // Well-known public npm packages whose names (and, in a toolchain fingerprint, resolved versions)
-// Kovo may record as diagnostic facts about a repository (docs/decisions/recipes.md "Toolchain
-// fingerprints and failure categories"). An explicit list, never a scope or pattern: a private
+// Kovo may record as diagnostic facts about a repository. An explicit list, never a scope or pattern: a private
 // package can never be named by a diagnostic, whatever its registry or scope. SPEC Sandbox B:
 // "Capture only exit codes, durations, counts, failure codes and hashes"; a name from this list is a
 // fixed code, not text taken from a repository or its output.

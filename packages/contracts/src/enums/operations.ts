@@ -280,9 +280,8 @@ export const AUDIT_ACTIONS = [
   // workflow, never the blob's ID or content.
   "fix.patch_staged",
   "fix.patch_decrypted",
-  // A person read (decrypted) a failed step's redacted output excerpt (docs/decisions/
-  // verification.md "Failed-step output excerpts"): the excerpt's ID and run identity, never its
-  // text.
+  // A person read (decrypted) a failed step's redacted output excerpt: the excerpt's ID and run
+  // identity, never its text.
   "repo.failure_excerpt_read",
   "repo.run_record_read",
   "notifications.updated",
@@ -306,8 +305,7 @@ export const AUDIT_ACTIONS = [
   "billing.retained_repo_selected",
   "billing.downgraded",
   "billing.payment_recovered",
-  // Recorded from authoritative Stripe state by the billing workflows (docs/decisions/billing.md
-  // "Services other areas implement"): a paid first invoice made the account Plus; a confirmed
+  // Recorded from authoritative Stripe state by the billing workflows: a paid first invoice made the account Plus; a confirmed
   // capacity charge was paid (slots active) or declined; a failed renewal started grace; the
   // account's Stripe customer was bound; the quantity the next renewal bills was synced.
   "billing.plus_activated",
@@ -367,8 +365,7 @@ export const AUDIT_ACTIONS = [
   // no account, target the user; never the session's token.
   "sign_in.revoked",
   // A person turned an optional email group off or on for one account, in their settings or with a
-  // message's one-click unsubscribe link (docs/decisions/notifications.md "Email preferences and
-  // one-click unsubscribe"): the group, the new state and the source; the target is the user.
+  // message's one-click unsubscribe link: the group, the new state and the source; the target is the user.
   "email_preferences.changed",
   // An account owner or admin turned the account's "no third-party scanners" setting on or off
   // (SPEC "Third-party scanner opt-out"): the boolean only; the target is the account.

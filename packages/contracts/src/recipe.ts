@@ -555,7 +555,7 @@ export type RegressionCalibrationComparison = z.output<
 
 /**
  * Whether a calibration that missed the bar still qualifies for `limited` verification (owner
- * decision, 2026-11-06, docs/decisions/recipes.md "Limited verification for thin-test repositories"):
+ * decision, 2026-11-06, limited verification for thin-test repositories):
  * no step failed on the unchanged code, an install and at least one later check (build,
  * typecheck, tests or the entry import) passed, every applied deliberate break was caught by a
  * check, and the only weak reasons are in `LIMITED_VERIFICATION_WEAK_REASONS`. A failed or
