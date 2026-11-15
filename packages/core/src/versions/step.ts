@@ -56,6 +56,33 @@ export function versionStep(from: string, to: string): VersionStep {
   return "patch";
 }
 
+/**
+ * Whether `from → to` is a forward 0.x patch move: both below 1.0.0, the same minor, a higher
+ * patch, no prerelease. Below 0.1.0 npm's caret calls it a major step (`0.0.3 → 0.0.4`); above,
+ * it is already a patch step.
+ */
+export function isZeroPatchMove(from: string, to: string): boolean {
+  const a = semver.parse(from);
+  const b = semver.parse(to);
+  if (a === null || b === null) return false;
+  if (a.prerelease.length > 0 || b.prerelease.length > 0) return false;
+  return a.major === 0 && b.major === 0 && a.minor === b.minor && b.patch > a.patch;
+}
+
+/**
+ * The step policy judges when the move's changelog check came back clear. A 0.x patch move with a
+ * clean changelog is a patch step, as a patch at or above 1.0.0 is; a 0.x minor move and every
+ * other step are unchanged (`versionStep`).
+ */
+export function versionStepWithChangelog(
+  from: string,
+  to: string,
+  changelogClear: boolean,
+): VersionStep {
+  const step = versionStep(from, to);
+  return step === "major" && changelogClear && isZeroPatchMove(from, to) ? "patch" : step;
+}
+
 /** Whether `from → to` moves forward by a patch/minor step (what autopilot may merge). */
 export function isPatchMinorUpgrade(from: string, to: string): boolean {
   const step = versionStep(from, to);

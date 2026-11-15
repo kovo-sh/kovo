@@ -1,3 +1,4 @@
+import { systemTimers } from "../clock/index.js";
 import { setTimeout as delay } from "node:timers/promises";
 
 // Shared HTTP plumbing for the feed and registry adapters (OSV, KEV, npm upstream). These adapters
@@ -50,7 +51,7 @@ export function headersDeadline(
   signal?: AbortSignal,
 ): { readonly signal: AbortSignal; settle(): void } {
   const controller = new AbortController();
-  const timer = setTimeout(() => {
+  const timer = systemTimers.setTimeout(() => {
     controller.abort(new DOMException("response headers timed out", "TimeoutError"));
   }, timeoutMs);
   return {

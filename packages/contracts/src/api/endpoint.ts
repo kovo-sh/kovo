@@ -11,9 +11,8 @@ import { REASON_CODES, type ReasonCode } from "../problem.js";
 
 // The building blocks of the typed `/v1` endpoint registry (SPEC "Public API"). Every endpoint
 // declares its HTTP shape (method, path template, params, query, body, responses), an
-// authorization descriptor derived from SPEC's table and "Accounts and permissions" section
-// (docs/decisions/auth.md, docs/decisions/contracts.md "Public API"), its concurrency and replay
-// rules (Idempotency-Key, If-Match, ETag, CSRF) and the stable problem reasons it may return.
+// authorization descriptor derived from SPEC's table and "Accounts and permissions" section, its
+// concurrency and replay rules (Idempotency-Key, If-Match, ETag, CSRF) and the stable problem reasons it may return.
 // The control plane enforces these descriptors through core/authz and its middleware; the web
 // client uses the same schemas and flags. Nothing here performs I/O.
 
@@ -87,8 +86,8 @@ export const TENANT_SOURCES = [
 export type TenantSource = (typeof TENANT_SOURCES)[number];
 
 /**
- * Verified GitHub authority over repositories (docs/decisions/contracts.md "Account context, scoped
- * reads and writes"; docs/decisions/ports.md "Repository access levels and freshness"):
+ * Verified GitHub authority over repositories (account context, scoped reads and writes, and
+ * repository access levels and freshness):
  * - `read`: current GitHub read access ("Repository visibility always requires current GitHub read
  *   access"). For a public repository every GitHub user has it.
  * - `explicit_read`: read access held as a collaborator (directly, through a team, or through
@@ -298,7 +297,7 @@ export type EndpointSource =
     }
   | {
       readonly kind: "owner_directed";
-      /** The decision record under `docs/decisions/` (`verification.md`). */
+      /** The decision record's file name (`verification.md`). */
       readonly decision: string;
       /** The record's `##` heading for the exception, exactly as written. */
       readonly heading: string;
@@ -350,8 +349,7 @@ export interface EndpointInit<
   readonly oneTimeFields?: readonly string[];
   /**
    * JSON Pointers to redacted step output the success body deliberately reveals: the owner-directed
-   * exception for failed-step output excerpts (docs/decisions/verification.md "Failed-step output
-   * excerpts"). Nothing else may carry output.
+   * exception for failed-step output excerpts. Nothing else may carry output.
    */
   readonly revealedOutputFields?: readonly string[];
   /**
@@ -369,6 +367,9 @@ export interface EndpointInit<
     | "flag_override_audit"
     | "flag_email_acknowledgments"
     | "malware_hold_audit"
+    | "waitlist_audit"
+    | "support_content_grants"
+    | "support_content_audit"
     | "admin_audit";
   /** Endpoint-specific reasons; the reasons implied by the descriptor are added automatically. */
   readonly problems?: readonly ReasonCode[];
@@ -409,6 +410,9 @@ export interface Endpoint<
     | "flag_override_audit"
     | "flag_email_acknowledgments"
     | "malware_hold_audit"
+    | "waitlist_audit"
+    | "support_content_grants"
+    | "support_content_audit"
     | "admin_audit"
     | null;
   /** Session-cookie mutations need the Origin check and the double-submit token. */

@@ -9,6 +9,7 @@ import {
 } from "./enums/fixes.js";
 import {
   MERGE_GATES,
+  ciEvidenceLevelSchema,
   gateOfReason,
   gateOutcomeSchema,
   mergeBlockReasonSchema,
@@ -16,7 +17,12 @@ import {
   requiredCheckSourceSchema,
   requiredCheckStateSchema,
 } from "./enums/merge.js";
-import { baseFreshnessSchema, repoModeSchema } from "./enums/repos.js";
+import {
+  baseFreshnessSchema,
+  CLOSURE_FALLBACK_CAUSES,
+  repoModeSchema,
+  type ClosureFallbackCause,
+} from "./enums/repos.js";
 import {
   POLICY_CHECKS,
   dependencyChangeKindSchema,
@@ -33,6 +39,8 @@ import {
   findingIdSchema,
   fixIdSchema,
   githubAppIdSchema,
+  installRootIdSchema,
+  projectIdSchema,
   recipeVersionIdSchema,
 } from "./ids.js";
 import { exactVersionSchema, packageNameSchema, packageVersionSchema } from "./npm.js";
@@ -129,6 +137,20 @@ export type DependencyChange = z.infer<typeof dependencyChangeSchema>;
 
 export const dependencyChangesSchema = z.array(dependencyChangeSchema).max(5000);
 
+/**
+ * Non-registry dependencies Kovo left alone as opaque nodes in the verified base (an owner
+ * decision): counts by kind, plus the packages reachable only through them. Kovo did
+ * not resolve, update or vet any of them, and the fix changed none of them (a fix that does is
+ * refused). Counts only: no names, specs or URLs. The fix PR discloses them.
+ */
+export const opaqueDependenciesSchema = z.strictObject({
+  git_count: z.int().nonnegative().max(100_000),
+  tarball_count: z.int().nonnegative().max(100_000),
+  local_path_count: z.int().nonnegative().max(100_000),
+  hidden_package_count: z.int().nonnegative().max(100_000),
+});
+export type OpaqueDependencies = z.infer<typeof opaqueDependenciesSchema>;
+
 // ---- changed_files ----
 
 /** A changed file: path, change kind and role; for manifests, the JSON pointers that changed. */
@@ -153,6 +175,50 @@ export const changedFilesSchema = z
     ...whenValid,
     error: "each path appears once",
   });
+
+// ---- restored protected files ----
+
+/**
+ * The kinds of protected path (core `@kovo/core/manifest` `PROTECTED_PATH_CATEGORIES`, which is
+ * this list): tests, CI configuration, `.kovo*` files, package-manager configuration, runtime
+ * declarations, verification configuration, Git metadata and the repository's own policy globs.
+ */
+export const PROTECTED_FILE_KINDS = [
+  "tests",
+  "ci",
+  "kovo",
+  "package_manager_config",
+  "runtime_config",
+  "verification_config",
+  "repository_config",
+  "policy",
+] as const;
+export const protectedFileKindSchema = z.enum(PROTECTED_FILE_KINDS);
+export type ProtectedFileKind = z.infer<typeof protectedFileKindSchema>;
+
+/** The fixed reason code of a restore: logs and the PR disclosure name it. */
+export const PROTECTED_RESTORE_REASON = "protected_config_restored";
+
+/**
+ * The protected files a fix's tooling changed and Kovo restored to their base bytes
+ * before the candidate was checked and verified (`fixes.restored_protected`). Kinds and counts only,
+ * never paths or contents; one entry per kind, in {@link PROTECTED_FILE_KINDS} order.
+ */
+export const restoredProtectedFilesSchema = z
+  .array(z.strictObject({ kind: protectedFileKindSchema, count: z.int().positive().max(1000) }))
+  .min(1)
+  .max(PROTECTED_FILE_KINDS.length)
+  .refine(
+    (entries) =>
+      entries.every(
+        (entry, index) =>
+          index === 0 ||
+          PROTECTED_FILE_KINDS.indexOf(entries[index - 1]!.kind) <
+            PROTECTED_FILE_KINDS.indexOf(entry.kind),
+      ),
+    { ...whenValid, error: "one entry per kind, in kind order" },
+  );
+export type RestoredProtectedFiles = z.infer<typeof restoredProtectedFilesSchema>;
 
 // ---- step_results ----
 
@@ -355,8 +421,7 @@ export const MAX_SERVED_LABELS = 16;
  * order, joined by `, ` (a single label is its own list). An agent run is many model requests, and
  * the relay may fall back among compliant providers of the same model between them ("Allow fallback
  * only among compliant providers for that same model"), so "the actual inference provider" of the
- * patch is every provider that served it (docs/decisions/ai.md "Every provider that served an agent
- * run is on its evidence"). A label containing a comma cannot be listed unambiguously and is
+ * patch is every provider that served it. A label containing a comma cannot be listed unambiguously and is
  * refused.
  */
 function servedLabelsSchema(label: z.ZodType<string>, maxLength: number) {
@@ -461,6 +526,17 @@ export const fixEvidenceSchema = z
     policy_version: z.int().positive(),
     base_freshness: baseFreshnessSchema,
     dependency_changes: dependencyChangesSchema,
+    /**
+     * Whether the verified lockfile diff held more changes than `dependency_changes` records
+     * (core `toDependencyChanges`). Absent on older evidence: readers treat it as unknown and
+     * fall back to the length rule (core `evidenceBoundRefusal`), never as false.
+     */
+    dependency_changes_truncated: z.boolean().exactOptional(),
+    /**
+     * Non-registry dependencies left alone as opaque nodes. Absent when the base
+     * has none, or on evidence recorded before the field.
+     */
+    opaque_dependencies: opaqueDependenciesSchema.exactOptional(),
     changed_files: changedFilesSchema,
     step_results: stepResultsSchema,
     comparison: regressionVerificationComparisonSchema.exactOptional(),
@@ -570,6 +646,102 @@ export const fixEvidenceSchema = z
   }, whenValid);
 export type FixEvidence = z.output<typeof fixEvidenceSchema>;
 
+/**
+ * How a per-project fix verification found its
+ * projects. `affected`: the change's dependency closure, `affected` of the root's `total`
+ * projects. `fallback_all`: the graph was unknown or ambiguous, so every protected project of the
+ * root ran (`closure_fallback_all`, disclosed), with its closed cause. Counts and codes only.
+ */
+//
+// One flat object with a refinement, not a discriminated union: the compatibility diff proves a
+// writer `oneOf` only against an identical reader `oneOf`, and a tolerant reader's branches differ
+// from the strict writer's (open versus closed objects), so a union could never be proven.
+export const projectClosureSchema = z
+  .strictObject({
+    mode: z.enum(["affected", "fallback_all"]),
+    affected: z.number().int().min(0).max(100).optional(),
+    total: z.number().int().min(0).max(100).optional(),
+    cause: z.enum(CLOSURE_FALLBACK_CAUSES).optional(),
+  })
+  .superRefine((closure, ctx) => {
+    const counts = closure.affected !== undefined && closure.total !== undefined;
+    if (
+      closure.mode === "affected"
+        ? !counts || closure.cause !== undefined
+        : closure.cause === undefined ||
+          closure.affected !== undefined ||
+          closure.total !== undefined
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["mode"],
+        message: "affected carries counts only; fallback_all carries its cause only",
+      });
+  });
+/** The closure a writer records (exactly one of the two shapes `projectClosureSchema` admits). */
+export type ProjectClosure =
+  | { readonly mode: "affected"; readonly affected: number; readonly total: number }
+  | { readonly mode: "fallback_all"; readonly cause: ClosureFallbackCause };
+
+/** Reader-first M7 proof. Kept outside fixEvidenceSchema for old-release rollback safety. */
+export const projectScopeEvidenceSchema = z
+  .strictObject({
+    schema: z.literal("kovo.project-scope/1"),
+    evidence_id: evidenceIdSchema,
+    fix_id: fixIdSchema,
+    install_root_id: installRootIdSchema,
+    base_sha: gitShaSchema,
+    patch_sha256: sha256HexSchema.nullable(),
+    base_graph_sha256: sha256HexSchema,
+    candidate_graph_sha256: sha256HexSchema,
+    /** Hash of the complete protection snapshot, including selection generations. */
+    protection_sha256: sha256HexSchema,
+    projects: z
+      .array(
+        z.strictObject({
+          project_id: projectIdSchema,
+          /** Each protected project's own recipe and sanitized execution results. */
+          evidence: fixEvidenceSchema,
+        }),
+      )
+      .min(1)
+      .max(100),
+    /** Disclosure only: these projects never acquire verification evidence. */
+    unprotected_moved_paths: z.array(repoFilePathSchema).max(100),
+    /** The R8 disclosure; absent on proofs written before it. */
+    closure: projectClosureSchema.optional(),
+  })
+  .superRefine((proof, ctx) => {
+    if (new Set(proof.projects.map((p) => p.project_id)).size !== proof.projects.length)
+      ctx.addIssue({
+        code: "custom",
+        path: ["projects"],
+        message: "protected project identities are unique",
+      });
+    if (new Set(proof.unprotected_moved_paths).size !== proof.unprotected_moved_paths.length)
+      ctx.addIssue({
+        code: "custom",
+        path: ["unprotected_moved_paths"],
+        message: "disclosure paths are unique",
+      });
+    for (const [index, project] of proof.projects.entries()) {
+      const evidence = project.evidence;
+      if (
+        evidence.id !== proof.evidence_id ||
+        evidence.fix_id !== proof.fix_id ||
+        evidence.base_sha !== proof.base_sha ||
+        evidence.patch_sha256 !== proof.patch_sha256 ||
+        evidence.recipe === null
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["projects", index],
+          message: "project proof requires its own recipe and the exact candidate identity",
+        });
+    }
+  }, whenValid);
+export type ProjectScopeEvidence = z.output<typeof projectScopeEvidenceSchema>;
+
 // ---- decideMerge record (`fixes.decision`) ----
 
 /** One gate's result: reasons belong to that gate and are present exactly when it did not pass. */
@@ -620,6 +792,11 @@ export const mergeDecisionSchema = z
     policy_version: z.int().positive().nullable(),
     authorization_version: z.int().positive().nullable(),
     tier_config_version: tierConfigVersionSchema,
+    /**
+     * The fix's evidence level at this decision (including `build_verified`), shown on the
+     * dashboard as on the PR. Absent on decisions recorded before it existed.
+     */
+    evidence_level: ciEvidenceLevelSchema.exactOptional(),
     merge: z
       .strictObject({
         merged_sha: gitShaSchema,

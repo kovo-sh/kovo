@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { DependencyVerdictChangeWire, DependencyVerdictWire } from "@kovo/contracts";
+import type { DependencyVerdictChangeWire, DependencyVerdictWire } from "@kovo/contracts/cli";
 import { LOCKFILE_NAMES, detectPackageManager, type LockfileName } from "@kovo/core/lockfile";
 
 import { CliError, unavailableError, usageError } from "../errors.js";
@@ -31,9 +31,9 @@ import {
   type CheckReport,
 } from "./report.js";
 import { readChangeList, UnsupportedLockfileError } from "./snapshot.js";
+import { checkAllProjects } from "./all-projects.js";
 
-// `kovo deps check` (plans/dependency-firewall.md Part 2 "Distribution for any CI", Part 3b and
-// Part 4 items 3-4): diff the lockfile between a base commit and the head (the working tree by
+// `kovo deps check`: diff the lockfile between a base commit and the head (the working tree by
 // default), judge only the changed and new versions (online: the hosted check gets the change list;
 // offline: the same engine over OSV's public export and the public registry), print the verdicts
 // and exit 0, 1, 2 or 3.
@@ -55,6 +55,7 @@ export interface OfflineMode {
 }
 
 export interface DepsCheckOptions {
+  readonly allProjects?: boolean | undefined;
   readonly base: string | undefined;
   readonly head: string | undefined;
   readonly lockfile: string | undefined;
@@ -259,6 +260,14 @@ export async function depsCheck(options: DepsCheckOptions, io: CliIo): Promise<E
     const root = await repositoryRoot(io.cwd, env);
     const headCommit =
       options.head === undefined ? null : await resolveCommit(root, options.head, "--head", env);
+    if (options.allProjects === true) {
+      if (options.lockfile !== undefined)
+        throw usageError(
+          "conflicting_options",
+          "--all-projects cannot be combined with --lockfile.",
+        );
+      return await checkAllProjects(options, io, root, headCommit, env, judge);
+    }
     const located = await locate(root, io.cwd, options.lockfile);
     const head: ProjectReader =
       headCommit === null

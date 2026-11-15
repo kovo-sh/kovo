@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { writerPinned } from "../compatibility.js";
+import { persistedReader } from "../tolerant-reader.js";
 
 // Jobs, sandboxes, audit and operator controls (SPEC "npm proxy and network egress", "Security
 // model", "Operations, analytics, and deployment", Public API `/v1/jobs`, `/v1/audit`).
@@ -115,9 +116,85 @@ export const SANDBOX_STATES = [
 export const sandboxStateSchema = z.enum(SANDBOX_STATES);
 export type SandboxState = z.infer<typeof sandboxStateSchema>;
 
-/** "Use the same policy implementation for Docker and Daytona sandbox providers". */
-export const SANDBOX_PROVIDER_KINDS = ["daytona", "docker"] as const;
-export const sandboxProviderKindSchema = z.enum(SANDBOX_PROVIDER_KINDS);
+/** The terminal sandbox states a job records as its sandbox outcome. */
+export const JOB_SANDBOX_OUTCOME_STATES = [
+  "destroyed",
+  "expired",
+  "failed",
+] as const satisfies readonly SandboxState[];
+export const jobSandboxOutcomeStateSchema = persistedReader(z.enum(JOB_SANDBOX_OUTCOME_STATES));
+export type JobSandboxOutcomeState = z.infer<typeof jobSandboxOutcomeStateSchema>;
+
+/**
+ * Why a sandbox ended other than at its step's end: the fixed codes the sandbox service records on
+ * `sandboxes.failure_code` and, as the job's first sandbox failure, on
+ * `jobs.sandbox_outcome_failure_code`. Never provider text, command output or paths. The
+ * `provider_*` codes are `provider_<PortErrorKind>` of a failed create; the control plane checks at
+ * compile time that every port error kind is listed.
+ */
+export const SANDBOX_FAILURE_CODES = [
+  // Creation.
+  "isolation_unavailable",
+  "provider_expiry_missing",
+  "provider_expiry_too_late",
+  "provider_unexpected_failure",
+  "provider_rate_limited",
+  "provider_ambiguous_outcome",
+  "provider_not_found",
+  "provider_conflict",
+  "provider_precondition_failed",
+  "provider_permission_denied",
+  "provider_authentication_failed",
+  "provider_invalid_request",
+  "provider_unavailable",
+  "provider_integrity",
+  "provider_limit_exceeded",
+  "provider_blocked_destination",
+  "provider_isolation_unavailable",
+  "provider_installation_suspended",
+  "provider_payment_declined",
+  "provider_recipient_inactive",
+  "provider_no_compliant_provider",
+  "create_abandoned",
+  // A step's destroy other than at its end.
+  "step_failed",
+  "cancelled",
+  "interrupted_attempt",
+  // A sandbox discarded as unusable.
+  "egress_grant_exceeded",
+  "phase_mismatch",
+  "lifetime_exhausted",
+  "exec_ambiguous",
+  "hard_expiry",
+  // The watchdog.
+  "missing_provider_expiry",
+  "provider_expiry_failed",
+  "provider_vanished",
+  "job_ended",
+] as const;
+export const sandboxFailureCodeSchema = persistedReader(z.enum(SANDBOX_FAILURE_CODES));
+export type SandboxFailureCode = z.infer<typeof sandboxFailureCodeSchema>;
+
+/**
+ * "Use the same policy implementation for Docker and Daytona sandbox providers". `gce` is the
+ * alternate provider for Kovo-owned repositories.
+ */
+export const SANDBOX_PROVIDER_KINDS = ["daytona", "docker", "gce"] as const;
+/**
+ * Which owner decision put a sandbox on GCE: the isolation tier, Kovo-owned routing or the
+ * failover. Every route posts to the GCE cost ledger; only `isolation_tier` carries tier-only authority.
+ */
+export const GCE_ROUTES = ["isolation_tier", "kovo_owned", "failover"] as const;
+export type GceRoute = (typeof GCE_ROUTES)[number];
+/**
+ * Reader first (R1): this release reads `gce` rows but never
+ * writes one; the writer slices drop this pin once a reader release is promoted.
+ */
+export const SANDBOX_PROVIDER_WRITE_KINDS = ["daytona", "docker"] as const;
+export const sandboxProviderKindSchema = writerPinned(
+  z.enum(SANDBOX_PROVIDER_KINDS),
+  z.enum(SANDBOX_PROVIDER_WRITE_KINDS),
+);
 export type SandboxProviderKind = z.infer<typeof sandboxProviderKindSchema>;
 
 /**
@@ -163,10 +240,15 @@ export const AUDIT_ACTIONS = [
   // branch), matched by its stable GitHub repository ID.
   "repo.recorded",
   "repo.github_changed",
+  // A human repository admin recorded which package manager a repository with two root lockfiles
+  // uses (owner choice A): the manager, exact version and its source only.
+  "repo.package_manager_chosen",
   "policy.updated",
   "finding.dismissed",
   "recipe.overrides_updated",
   "recipe.rediscovery_requested",
+  // V6: a person answered a "Kovo needs X" ask (its kind and the new status only).
+  "recipe.customer_ask_answered",
   "recipe.approved",
   "recipe.approval_inherited",
   "recipe.rolled_back",
@@ -179,7 +261,18 @@ export const AUDIT_ACTIONS = [
   "recipe.activated",
   "fix.retry_requested",
   "fix.revert_requested",
+  "fix.revert_authority_checked",
+  "fix.revert_published",
+  "fix.revert_refused",
+  "fix.revert_closed",
   "fix.publication_override_requested",
+  "dependency_gate.override_accepted",
+  // A human repository admin asked Kovo to evaluate one unevaluated pull request head again
+  // (SPEC "PR dependency gate"): the pull request number, head SHA and request ID only.
+  "dependency_gate.retry_requested",
+  // Kovo's own drill key armed or cleared the deny-only dependency-gate drill fault of one
+  // exact head: the pull request number, head SHA, window and expiry only.
+  "dependency_gate.drill_fault_changed",
   "fix.auto_merged",
   // The generation step staged a fix's encrypted patch, and a verified consumer (verification,
   // trusted checks, publication) decrypted it (SPEC: "Encrypt patch blobs with per-blob data keys
@@ -187,14 +280,17 @@ export const AUDIT_ACTIONS = [
   // workflow, never the blob's ID or content.
   "fix.patch_staged",
   "fix.patch_decrypted",
-  // A person read (decrypted) a failed step's redacted output excerpt (docs/decisions/
-  // verification.md "Failed-step output excerpts"): the excerpt's ID and run identity, never its
-  // text.
+  // A person read (decrypted) a failed step's redacted output excerpt: the excerpt's ID and run
+  // identity, never its text.
   "repo.failure_excerpt_read",
   "repo.run_record_read",
   "notifications.updated",
   "api_key.created",
   "api_key.revoked",
+  "api_key.revert_drill_fault_changed",
+  // Kovo's own drill key armed or cleared the deny-only verification drill fault of one exact
+  // fix: the fix ID, armed and expiry only.
+  "fix.verification_drill_fault_changed",
   "webhook.created",
   "webhook.revoked",
   "webhook.rotated",
@@ -209,8 +305,7 @@ export const AUDIT_ACTIONS = [
   "billing.retained_repo_selected",
   "billing.downgraded",
   "billing.payment_recovered",
-  // Recorded from authoritative Stripe state by the billing workflows (docs/decisions/billing.md
-  // "Services other areas implement"): a paid first invoice made the account Plus; a confirmed
+  // Recorded from authoritative Stripe state by the billing workflows: a paid first invoice made the account Plus; a confirmed
   // capacity charge was paid (slots active) or declined; a failed renewal started grace; the
   // account's Stripe customer was bound; the quantity the next renewal bills was synced.
   "billing.plus_activated",
@@ -219,6 +314,18 @@ export const AUDIT_ACTIONS = [
   "billing.grace_started",
   "billing.customer_bound",
   "billing.renewal_quantity_synced",
+  // Project billing became active for the account (M10b): counts of what the transition mapped, never project names or paths.
+  "billing.project_billing_activated",
+  // Once project billing is active, one project's protection changed while its repository stayed
+  // protected (a fill into an already protected repository; over-capacity repair or the end of an
+  // unselected grace releasing one project). Repository-level changes stay `repo.protection_*`.
+  "project.protection_enabled",
+  "project.protection_disabled",
+  // A repository admin declared a member of the repository-root workspace an app or a library, or
+  // withdrew that declaration (every override records actor, time and reason): the override and project IDs, the kinds and the reason code; never a member
+  // path or manifest content.
+  "project.classification_overridden",
+  "project.classification_override_revoked",
   "permission.revoked",
   "operator.global_paused",
   "operator.global_resumed",
@@ -228,6 +335,15 @@ export const AUDIT_ACTIONS = [
   // exhausted external retries, with visible action reasons"; operator actions "log actor/reason"):
   // the workflow's kind, what the re-drive did and the operator's reason code; identifiers only.
   "operator.dead_letter_redriven",
+  // An operator abandoned one stuck outbox start or wake (kept, never deleted; it leaves the lag
+  // gauges): the row ID, its outbox and workflow kind, attempts, error codes, the operator's closed
+  // reason code and the times; identifiers and codes only, never its inputs.
+  "operator.outbox_row_abandoned",
+  // An operator removed one `integrity_unavailable` malware_scans investigation row
+  // (empty integrity, verdict unknown, no suspicion) after repairing its binding: the public
+  // scanner namespace, package name and exact version, the closed reason code, the tracker issue,
+  // the self-declared label and the times. Never an integrity, verdict or suspicion change.
+  "operator.malware_scan_removed",
   // A release applied a new versioned tier configuration ("Lists are versioned config").
   "tier_config.applied",
   // The worker issued a sandbox's bounded npm proxy capability, or revoked one (SPEC npm proxy:
@@ -249,12 +365,13 @@ export const AUDIT_ACTIONS = [
   // no account, target the user; never the session's token.
   "sign_in.revoked",
   // A person turned an optional email group off or on for one account, in their settings or with a
-  // message's one-click unsubscribe link (docs/decisions/notifications.md "Email preferences and
-  // one-click unsubscribe"): the group, the new state and the source; the target is the user.
+  // message's one-click unsubscribe link: the group, the new state and the source; the target is the user.
   "email_preferences.changed",
   // An account owner or admin turned the account's "no third-party scanners" setting on or off
   // (SPEC "Third-party scanner opt-out"): the boolean only; the target is the account.
   "account.third_party_scanners_changed",
+  "synthetic_advisory.created",
+  "synthetic_advisory.retracted",
 ] as const;
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 /**
@@ -262,11 +379,51 @@ export type AuditAction = (typeof AUDIT_ACTIONS)[number];
  * the legacy finite selector stays exactly what deployed strict enum readers accept.
  */
 type ReaderFirstAuditAction =
+  | "fix.revert_authority_checked"
+  | "fix.revert_published"
+  | "fix.revert_refused"
+  | "fix.revert_closed"
+  | "api_key.revert_drill_fault_changed"
+  | "fix.verification_drill_fault_changed"
+  | "synthetic_advisory.created"
+  | "synthetic_advisory.retracted"
   | "fix.publication_override_requested"
-  | "account.third_party_scanners_changed";
+  | "dependency_gate.override_accepted"
+  | "dependency_gate.retry_requested"
+  | "dependency_gate.drill_fault_changed"
+  | "repo.package_manager_chosen"
+  | "account.third_party_scanners_changed"
+  | "billing.project_billing_activated"
+  | "project.protection_enabled"
+  | "project.protection_disabled"
+  | "project.classification_overridden"
+  | "project.classification_override_revoked"
+  | "operator.outbox_row_abandoned"
+  | "recipe.customer_ask_answered"
+  | "operator.malware_scan_removed";
 const READER_FIRST_AUDIT_ACTIONS: ReadonlySet<string> = new Set<ReaderFirstAuditAction>([
+  "operator.malware_scan_removed",
+  "operator.outbox_row_abandoned",
+  "recipe.customer_ask_answered",
+  "repo.package_manager_chosen",
+  "fix.revert_authority_checked",
+  "fix.revert_published",
+  "fix.revert_refused",
+  "fix.revert_closed",
+  "api_key.revert_drill_fault_changed",
+  "fix.verification_drill_fault_changed",
+  "synthetic_advisory.created",
+  "synthetic_advisory.retracted",
   "fix.publication_override_requested",
+  "dependency_gate.override_accepted",
+  "dependency_gate.retry_requested",
+  "dependency_gate.drill_fault_changed",
   "account.third_party_scanners_changed",
+  "billing.project_billing_activated",
+  "project.protection_enabled",
+  "project.protection_disabled",
+  "project.classification_overridden",
+  "project.classification_override_revoked",
 ]);
 /** Legacy finite action selector retained for deployed strict enum readers. */
 export const auditActionWriterSchema = z.enum(
@@ -300,13 +457,58 @@ export const auditActionSchema = writerPinned(
 /**
  * Filters remain limited to registered actions; no broad key or mutation capability is implied.
  * The API reads a filter naming any registered action; clients name only the actions the promoted
- * query readers accept, so the scanner opt-out action joins client filters in a later release.
+ * query readers accept, so new actions join client filters in a later release.
  */
 const auditActionQueryWriteSchema = z
   .enum(
     AUDIT_ACTIONS.filter(
-      (action): action is Exclude<AuditAction, "account.third_party_scanners_changed"> =>
-        action !== "account.third_party_scanners_changed",
+      (
+        action,
+      ): action is Exclude<
+        AuditAction,
+        | "fix.revert_authority_checked"
+        | "fix.revert_published"
+        | "fix.revert_refused"
+        | "fix.revert_closed"
+        | "account.third_party_scanners_changed"
+        | "synthetic_advisory.created"
+        | "synthetic_advisory.retracted"
+        | "api_key.revert_drill_fault_changed"
+        | "fix.verification_drill_fault_changed"
+        | "dependency_gate.override_accepted"
+        | "dependency_gate.retry_requested"
+        | "dependency_gate.drill_fault_changed"
+        | "repo.package_manager_chosen"
+        | "billing.project_billing_activated"
+        | "project.protection_enabled"
+        | "project.protection_disabled"
+        | "project.classification_overridden"
+        | "project.classification_override_revoked"
+        | "operator.outbox_row_abandoned"
+        | "recipe.customer_ask_answered"
+        | "operator.malware_scan_removed"
+      > =>
+        action !== "operator.malware_scan_removed" &&
+        action !== "operator.outbox_row_abandoned" &&
+        action !== "recipe.customer_ask_answered" &&
+        action !== "project.classification_overridden" &&
+        action !== "project.classification_override_revoked" &&
+        action !== "repo.package_manager_chosen" &&
+        action !== "fix.revert_authority_checked" &&
+        action !== "fix.revert_published" &&
+        action !== "fix.revert_refused" &&
+        action !== "fix.revert_closed" &&
+        action !== "account.third_party_scanners_changed" &&
+        action !== "synthetic_advisory.created" &&
+        action !== "api_key.revert_drill_fault_changed" &&
+        action !== "fix.verification_drill_fault_changed" &&
+        action !== "synthetic_advisory.retracted" &&
+        action !== "dependency_gate.override_accepted" &&
+        action !== "dependency_gate.retry_requested" &&
+        action !== "dependency_gate.drill_fault_changed" &&
+        action !== "billing.project_billing_activated" &&
+        action !== "project.protection_enabled" &&
+        action !== "project.protection_disabled",
     ),
   )
   .meta({ maxLength: 160, pattern: "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$" });
@@ -360,6 +562,14 @@ export const RELAY_PURPOSES = [
   "baseline_judgment",
   "failure_diagnosis",
   "failure_triage",
+  /** Just-in-time probe proposals, on a fix's own verification job only. */
+  "recipe_probe",
+  /**
+   * R7 and V2: the Plus agent's planner and medic, on a
+   * fix's own verification job only, after its base convergence.
+   */
+  "recipe_planner",
+  "recipe_medic",
 ] as const;
 export const relayPurposeSchema = z.enum(RELAY_PURPOSES);
 export type RelayPurpose = z.infer<typeof relayPurposeSchema>;

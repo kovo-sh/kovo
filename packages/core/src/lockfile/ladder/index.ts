@@ -3,6 +3,7 @@
 
 export * from "./agent-candidate.js";
 export * from "./commands.js";
+export * from "./install-mode.js";
 export * from "./outcome.js";
 export * from "./planner.js";
 export * from "./registry.js";

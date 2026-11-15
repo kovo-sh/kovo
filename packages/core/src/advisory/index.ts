@@ -1,6 +1,6 @@
 // @kovo/core/advisory: OSV/GHSA normalization, severity (GHSA label, CVSS v4.0/v3.x), npm range
 // evaluation, matching, SPEC's tier(), the finding lifecycle, target resolution and the P1
-// cooldown (BUILD_PLAN item 6). Pure: no I/O; time is always a parameter.
+// cooldown. Pure: no I/O; time is always a parameter.
 
 export {
   cooldownAllows,
@@ -41,6 +41,7 @@ export {
   type ReconcileInput,
   type ReconcileResult,
 } from "./findings.js";
+export { firstUnaffectedVersion } from "./fixed-version.js";
 export {
   introducedSevere,
   isIntroducedSevere,
@@ -113,6 +114,7 @@ export {
   type VersionBounds,
 } from "./published.js";
 export { reviewedRemovalFeasible } from "./removal.js";
+export { targetedFindingsCleared } from "./targeted.js";
 export {
   resolveTarget,
   type CandidateCounts,

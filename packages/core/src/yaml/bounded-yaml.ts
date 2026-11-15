@@ -2,8 +2,7 @@ import { isMap, isPair, isScalar, isSeq } from "yaml";
 
 // Bounds for hostile YAML (pnpm-lock.yaml, GitHub Actions workflows and actions). SPEC: "Treat
 // repositories, packages and model output as hostile"; ARCHITECTURE §6: "parsed with bounded
-// parsers". Measured on yaml 2.9.1 (docs/decisions/lockfile.md "Hostile files are parsed with
-// bounded, strict parsers"):
+// parsers". Measured on yaml 2.9.1:
 //
 // - Its `uniqueKeys` check compares every new key with every earlier key of the same map, so a map
 //   of n keys costs n² comparisons (41 000 keys: 8.7 s instead of 0.28 s). Callers parse with

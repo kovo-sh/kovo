@@ -314,8 +314,7 @@ export function cvss4Score(metrics: Metrics): number {
 /**
  * The CVSS-B score: the vector's Base metrics with every threat, environmental and supplemental
  * metric reset to `X` (so `E` counts as Attacked and `CR`/`IR`/`AR` as High, as in a published
- * Base-only vector). Kovo derives severity from it, as it does from a v3.x Base score
- * (docs/decisions/advisory.md "Severity").
+ * Base-only vector). Kovo derives severity from it, as it does from a v3.x Base score.
  */
 export function cvss4BaseScore(metrics: Metrics): number {
   const base: Record<string, string> = {};

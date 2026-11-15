@@ -1,11 +1,13 @@
 import type {
   AdvisoryId,
+  FixOnlyPackageManager,
   LadderRung,
   MergeBlockReason,
   PackageManager,
   PackageName,
   PackageVersion,
   Plan,
+  StoredPackageManager,
 } from "@kovo/contracts";
 
 import type { PackageManifest } from "../../manifest/package-json.js";
@@ -13,10 +15,10 @@ import type { LockfileName } from "../parse.js";
 import type { DependencyGraph } from "../types.js";
 import type { RegistryPackage } from "./registry.js";
 
-// Ladder plans are data (BUILD_PLAN item 7): what to edit in package.json (JSON pointers), which
+// Ladder plans are data: what to edit in package.json (JSON pointers), which
 // package-manager commands to run (always with lifecycle scripts disabled), what the resulting
 // lockfile must look like, and whether the result is expected to be auto-merge eligible. Sandbox A
-// executes them (BUILD_PLAN item 23); trusted code checks the outcome with `checkLadderOutcome`.
+// executes them; trusted code checks the outcome with `checkLadderOutcome`.
 
 /** The rungs this planner produces: SPEC rungs 1–5 and M (6 and 7 are major upgrades). */
 export const PLANNED_RUNGS = [
@@ -32,7 +34,7 @@ export type PlannedRung = (typeof PLANNED_RUNGS)[number];
 /**
  * SPEC rung 6, "Major upgrade, optionally agent-assisted on Plus": `planMajorUpgrade` plans its
  * deterministic part (a direct dependency moved to a safe version on a newer major line); agent
- * assistance and rung 7 are the control plane's (BUILD_PLAN items 23 and 26).
+ * assistance and rung 7 are the control plane's.
  */
 export const MAJOR_RUNG = "6" as const satisfies LadderRung;
 
@@ -114,7 +116,8 @@ export type ManifestEdit =
 
 /** A package-manager invocation; `args` never contain a shell and always disable scripts. */
 export interface PmCommand {
-  readonly executable: PackageManager;
+  /** A verifiable package manager, or Kovo's pinned Yarn 4 or Bun. */
+  readonly executable: PackageManager | Exclude<FixOnlyPackageManager, "manifest-only">;
   readonly args: readonly string[];
 }
 
@@ -175,7 +178,7 @@ export type RollbackEvidence =
 export interface LadderPlan {
   readonly rung: PlanRung;
   readonly kind: LadderPlanKind;
-  readonly packageManager: PackageManager;
+  readonly packageManager: StoredPackageManager;
   readonly target: PackageName;
   readonly steps: readonly LadderStep[];
   /** package.json edits trusted code applies before running `commands` (overrides, removals). */
@@ -226,6 +229,7 @@ export const LADDER_SKIP_REASONS = [
   "removal_infeasible", // other packages depend on the malicious package
   "conflicting_edits", // two instances need different values at one pointer
   "no_major_version", // rung 6: no safe version on a newer major line
+  "lockfile_absent_transitive", // a root without a lockfile fixes direct dependencies only
 ] as const;
 export type LadderSkipReason = (typeof LADDER_SKIP_REASONS)[number];
 

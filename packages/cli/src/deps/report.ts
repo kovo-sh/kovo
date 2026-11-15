@@ -3,7 +3,7 @@ import {
   type DependencyVerdictChangeWire,
   type DependencyVerdictKind,
   type DependencyVerdictWire,
-} from "@kovo/contracts";
+} from "@kovo/contracts/cli";
 
 import { CliError } from "../errors.js";
 import { EXIT, type ExitCode } from "../exit.js";

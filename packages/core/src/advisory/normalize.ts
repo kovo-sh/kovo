@@ -1,9 +1,5 @@
 import {
   ADVISORY_RANGE_EVENT_KINDS,
-  advisoryIdSchema,
-  normalizeOsvTimestamp,
-  osvTimestampToDate,
-  packageNameSchema,
   type AdvisoryId,
   type AdvisoryRangeEventKind,
   type CweId,
@@ -11,6 +7,9 @@ import {
   type PackageName,
   type PackageVersion,
 } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import { normalizeOsvTimestamp, osvTimestampToDate } from "@kovo/contracts/time";
+import { packageNameSchema } from "@kovo/contracts/npm";
 
 import {
   INTRODUCED_ZERO,
@@ -43,7 +42,7 @@ export type NormalizeFailureReason =
   | "id_mismatch" // the record's ID differs from the ID the feed listed
   | "invalid_modified"
   | "invalid_withdrawn"
-  | "wildcard_package" // OSV 1.9 `*`: every npm package; never acted on (docs/decisions/advisory.md)
+  | "wildcard_package" // OSV 1.9 `*`: every npm package; never acted on
   | "invalid_range"; // unknown range type, malformed event or unusable bound
 
 /** A non-fatal observation, recorded with the advisory. Paths only: never the offending text. */
@@ -195,7 +194,7 @@ function normalizeCwes(
 }
 
 /**
- * Malicious-package recognition (docs/decisions/advisory.md): an OpenSSF `MAL-` ID, an alias to a
+ * Malicious-package recognition: an OpenSSF `MAL-` ID, an alias to a
  * `MAL-` record (GitHub malware advisories reach OSV as MAL records aliasing their GHSA ID, and a
  * GHSA may alias the MAL record), or CWE-506 "Embedded Malicious Code" (GitHub's compromised-release
  * advisories such as event-stream).

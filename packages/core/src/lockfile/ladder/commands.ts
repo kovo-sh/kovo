@@ -1,4 +1,4 @@
-import type { PackageManager } from "@kovo/contracts";
+import type { PackageManager, StoredPackageManager } from "@kovo/contracts";
 
 import type { DependencySection } from "../../manifest/package-json.js";
 import type { PmCommand } from "./types.js";
@@ -23,6 +23,37 @@ export type SaveStyle = "exact" | "^" | "~";
 
 const NPM_SUFFIX = ["--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"] as const;
 const PNPM_SUFFIX = ["--lockfile-only", "--ignore-scripts"] as const;
+// Yarn 4 and Bun (verified on Yarn 4.18.1 and Bun 1.4.4 in a worker, 2026-11-08): Yarn's
+// `--mode=update-lockfile` resolves and fetches into a throwaway cache but never links or runs a
+// script; Bun's `--lockfile-only` resolves from packuments alone. `yarn up -R <name>` moves a
+// transitive package to the newest version its dependents' ranges admit, as `npm update` does, and
+// `bun update <name>` does the same; `yarn up <alias>@<version>` and `bun add <alias>@<spec>` pin a
+// direct dependency and rewrite its declared spec in its own section.
+const BERRY_SUFFIX = ["--mode=update-lockfile"] as const;
+const BUN_SUFFIX = ["--lockfile-only", "--ignore-scripts"] as const;
+const BERRY_STYLE = { exact: "--exact", "^": "--caret", "~": "--tilde" } as const;
+const BUN_SECTION = {
+  dependencies: [],
+  devDependencies: ["--dev"],
+  optionalDependencies: ["--optional"],
+  peerDependencies: ["--peer"],
+} as const satisfies Record<DependencySection, readonly string[]>;
+
+/** A root without a lockfile runs no package manager: every edit is trusted code's. */
+function noCommand(pm: "manifest-only"): never {
+  throw new RangeError(`${pm} plans carry no package-manager command`);
+}
+
+function unknownManager(pm: never): never {
+  throw new RangeError(`unknown package manager ${String(pm)}`);
+}
+
+/** `1.2.3` → `^1.2.3`; an `npm:` alias keeps its name (`npm:foo@^1.2.3`). */
+function bunRangeSpec(installSpec: string, style: "^" | "~"): string {
+  if (!installSpec.startsWith("npm:")) return `${style}${installSpec}`;
+  const at = installSpec.lastIndexOf("@");
+  return `${installSpec.slice(0, at + 1)}${style}${installSpec.slice(at + 1)}`;
+}
 
 const SECTION_FLAG = {
   dependencies: "--save-prod",
@@ -44,36 +75,77 @@ export function isUnsafePositional(value: string): boolean {
 }
 
 /** Lockfile-only update of a (transitive) package within its dependents' ranges (rung 1). */
-export function updateCommand(pm: PackageManager, name: string): PmCommand {
-  if (pm === "yarn") return relockCommand(pm);
-  return pm === "npm"
-    ? { executable: "npm", args: ["update", name, ...NPM_SUFFIX] }
-    : { executable: "pnpm", args: ["update", name, ...PNPM_SUFFIX] };
+export function updateCommand(pm: StoredPackageManager, name: string): PmCommand {
+  switch (pm) {
+    case "yarn":
+      return relockCommand(pm);
+    case "npm":
+      return { executable: "npm", args: ["update", name, ...NPM_SUFFIX] };
+    case "pnpm":
+      return { executable: "pnpm", args: ["update", name, ...PNPM_SUFFIX] };
+    case "yarn-berry":
+      return { executable: "yarn-berry", args: ["up", "-R", name, ...BERRY_SUFFIX] };
+    case "bun":
+      return { executable: "bun", args: ["update", name, ...BUN_SUFFIX] };
+    case "manifest-only":
+      return noCommand(pm);
+    default:
+      return unknownManager(pm);
+  }
 }
 
 /** Pins a direct dependency to an exact version and rewrites its declared spec (rungs 2–4, M). */
 export function installCommand(
-  pm: PackageManager,
+  pm: StoredPackageManager,
   alias: string,
   installSpec: string,
   section: DependencySection,
   style: SaveStyle,
 ): PmCommand {
   const positional = `${alias}@${installSpec}`;
-  if (pm === "yarn") return relockCommand(pm);
-  return pm === "npm"
-    ? {
+  switch (pm) {
+    case "yarn":
+      return relockCommand(pm);
+    case "npm":
+      return {
         executable: "npm",
         args: ["install", positional, SECTION_FLAG[section], saveFlag(style), ...NPM_SUFFIX],
-      }
-    : {
+      };
+    case "pnpm":
+      return {
         executable: "pnpm",
         args: ["add", positional, SECTION_FLAG[section], saveFlag(style), ...PNPM_SUFFIX],
       };
+    case "yarn-berry":
+      // `yarn up` keeps the dependency in its own section.
+      return {
+        executable: "yarn-berry",
+        args: ["up", positional, BERRY_STYLE[style], ...BERRY_SUFFIX],
+      };
+    case "bun":
+      // Bun saves a range spec as given (`^1.2.3`, `~1.2.3`) and an exact one with `--exact`.
+      return {
+        executable: "bun",
+        args: [
+          "add",
+          style === "exact" ? positional : `${alias}@${bunRangeSpec(installSpec, style)}`,
+          ...BUN_SECTION[section],
+          ...(style === "exact" ? ["--exact"] : []),
+          ...BUN_SUFFIX,
+        ],
+      };
+    case "manifest-only":
+      return noCommand(pm);
+    default:
+      return unknownManager(pm);
+  }
 }
 
 /** Re-locks after trusted code edited package.json (overrides, removals). */
-export function relockCommand(pm: PackageManager): PmCommand {
+export function relockCommand(pm: StoredPackageManager): PmCommand {
+  if (pm === "yarn-berry") return { executable: "yarn-berry", args: ["install", ...BERRY_SUFFIX] };
+  if (pm === "bun") return { executable: "bun", args: ["install", ...BUN_SUFFIX] };
+  if (pm === "manifest-only") return noCommand(pm);
   if (pm === "yarn")
     return {
       executable: "yarn",

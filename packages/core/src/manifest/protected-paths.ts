@@ -1,4 +1,6 @@
-import { repoFilePathSchema, type MergeBlockReason } from "@kovo/contracts";
+import { PROTECTED_FILE_KINDS } from "@kovo/contracts/evidence";
+import { repoFilePathSchema } from "@kovo/contracts/primitives";
+import type { MergeBlockReason } from "@kovo/contracts";
 import {
   isPnpmWorkspaceEntryChange,
   type PnpmWorkspaceEntryChange,
@@ -17,18 +19,15 @@ import {
 // "Tests/CI/config edited to pass | Trusted protected-path and manifest-field checks"). A fix may
 // change only the files its plan allows, and never a protected one. The built-in protections cannot
 // be removed by policy; policy `protected_paths` globs only add to them (contracts
-// DEFAULT_POLICY_BODY, docs/decisions/contracts.md "Policy defaults").
+// DEFAULT_POLICY_BODY).
 
-export const PROTECTED_PATH_CATEGORIES = [
-  "tests", // test sources, fixtures and snapshots
-  "ci", // CI configuration
-  "kovo", // `.kovo*` files
-  "package_manager_config", // .npmrc, pnpm hooks and workspace settings
-  "runtime_config", // runtime declarations and environment files
-  "verification_config", // test runner, typecheck, lint and build configuration, Dockerfiles
-  "repository_config", // git metadata that changes what a checkout contains
-  "policy", // the repository's own `protected_paths`
-] as const;
+// tests (test sources, fixtures and snapshots), ci (CI configuration), kovo (`.kovo*` files),
+// package_manager_config (.npmrc, pnpm hooks and workspace settings), runtime_config (runtime
+// declarations and environment files), verification_config (test runner, typecheck, lint and build
+// configuration, Dockerfiles), repository_config (git metadata that changes what a checkout
+// contains), policy (the repository's own `protected_paths`). The list is contracts' (a
+// restore records kinds by these names).
+export const PROTECTED_PATH_CATEGORIES = PROTECTED_FILE_KINDS;
 export type ProtectedPathCategory = (typeof PROTECTED_PATH_CATEGORIES)[number];
 
 /** Version of the built-in list, recorded with evidence so a later change is attributable. */

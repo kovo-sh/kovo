@@ -1,9 +1,5 @@
-import {
-  SUPPORTED_PM_MAJORS,
-  packageNameSchema,
-  packageVersionSchema,
-  type PackageName,
-} from "@kovo/contracts";
+import { SUPPORTED_PM_MAJORS, type PackageName } from "@kovo/contracts";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 import { parseDocument } from "yaml";
 import { z } from "zod";
 import semver from "semver";
@@ -20,7 +16,18 @@ import {
 } from "../yaml/bounded-yaml.js";
 import type { Instance, InstanceEdge, InstanceSet, RootDependency } from "./instances.js";
 import { RejectionCollector, type LockfileRejectionReason } from "./reasons.js";
-import { checkIntegrity, checkTarballSource } from "./registry-source.js";
+import {
+  OPAQUE_KIND_REASON,
+  opaqueSourceKind,
+  type OpaqueSourceKind,
+} from "../manifest/reasons.js";
+import {
+  checkIntegrity,
+  checkTarballSource,
+  isPrivateScopeTarball,
+  opaqueLocationKind,
+  opaqueVersion,
+} from "./registry-source.js";
 import { GRAPH_LIMITS, SECTION_KIND, type LockfileLimits } from "./types.js";
 import { required } from "./util.js";
 import { resolveMemberLink } from "./workspace/discover.js";
@@ -38,9 +45,8 @@ import {
 //
 // The YAML is parsed with the failsafe schema (every scalar a string, so `1.10` never becomes
 // `1.1`), unique keys (checked in one linear walk), no aliases, at most the verified toolchain/project pair, and bounded size,
-// node count and nesting checked before the parser runs (docs/decisions/lockfile.md "Hostile files
-// are parsed with bounded, strict parsers": the yaml library holds up to about 1 KiB per node while
-// parsing, so the structural-character bound is what keeps a parse within a worker's memory).
+// node count and nesting checked before the parser runs (the yaml library holds up to about 1 KiB
+// per node while parsing, so the structural-character bound is what keeps a parse within a worker's memory).
 
 export const PNPM_LOCKFILE_LIMITS = {
   /** 8 MiB: a real lockfile needs about 350 bytes per package (over 20 000 packages). */
@@ -149,18 +155,28 @@ function splitKey(key: string): KeyParts | null {
 
 type RefTarget =
   | { readonly kind: "snapshot"; readonly key: string }
-  | { readonly kind: "rejected"; readonly reason: LockfileRejectionReason };
+  /** A `link:` symlink outside the workspace: an opaque local-path node. */
+  | { readonly kind: "link"; readonly key: string };
+
+const KEYED_REF_PREFIXES = [
+  "http://",
+  "https://",
+  "file:",
+  "git+",
+  "git:",
+  "github:",
+  "gitlab:",
+  "bitbucket:",
+];
 
 /**
  * Resolves a dependency reference (`2.1.2`, `4.3.4(supports-color@7.2.0)`, `debug@2.6.9`,
- * `link:../x`, `file:x`, a URL) to the snapshot key it names.
+ * `link:../x`, `file:x`, a git or tarball URL) to the snapshot key it names.
  */
 function refTarget(alias: string, ref: string): RefTarget {
   const lower = ref.toLowerCase();
-  if (lower.startsWith("link:") || lower.startsWith("file:")) {
-    return { kind: "rejected", reason: "local_path_dependency" };
-  }
-  if (/^\d/.test(ref) || lower.startsWith("http://") || lower.startsWith("https://")) {
+  if (lower.startsWith("link:")) return { kind: "link", key: `opaque-link:${alias}@${ref}` };
+  if (/^\d/.test(ref) || KEYED_REF_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
     return { kind: "snapshot", key: `${alias}@${ref}` };
   }
   return { kind: "snapshot", key: ref };
@@ -200,6 +216,18 @@ function loadYaml(
   } catch (error) {
     return { ok: false, reason: jsonShapeError(error) };
   }
+}
+
+/**
+ * One marker-free pnpm lockfile document, parsed by the same bounded, strict YAML reader the graph
+ * parser uses (failsafe schema: every scalar a string). For the open install synthesis.
+ */
+export function loadPnpmLockfileYaml(
+  text: string,
+): { ok: true; value: unknown } | { ok: false; reason: LockfileRejectionReason } {
+  if (text.length > PNPM_LOCKFILE_LIMITS.maxLength)
+    return { ok: false, reason: "lockfile_too_large" };
+  return loadYaml(text);
 }
 
 const IMPORTER_SECTIONS = ["dependencies", "devDependencies", "optionalDependencies"] as const;
@@ -256,6 +284,10 @@ export function parsePnpmLockfile(
     limits,
   );
   if (!validated.ok) return validated;
+  // Bootstrap packages come from the public registry only: no opaque node (opaque nodes cover
+  // the project's own dependencies, never the package manager Kovo bootstraps).
+  for (const instance of validated.instances.instances.values())
+    if (instance.opaque !== undefined) return rejectedDocument(OPAQUE_KIND_REASON[instance.opaque]);
   const main = loadYaml(normalized.slice(separator + 5));
   if (!main.ok) return rejectedDocument(main.reason);
   return parsePnpmDocument(main.value, limits, workspace);
@@ -375,14 +407,23 @@ function parsePnpmDocument(
     lockfileOverrides.push(selector);
     if (value === "-" || /^\$\S+$/.test(value)) continue;
     const classified = classifyDependencySpec(value);
-    if (classified.kind === "rejected") rejections.add(classified.reason);
+    // A non-registry override value is an opaque node; package.json records it.
+    if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null)
+      rejections.add(classified.reason);
     else if (classified.kind === "invalid") rejections.add("lockfile_invalid");
   }
 
-  // Validate every package entry: name, exact version and a public-registry source.
+  // Validate every package entry: name, exact version and a public-registry source. Git,
+  // directory and non-registry tarball entries are opaque nodes.
   const validPackages = new Map<
     string,
-    { name: PackageName; entry: PackageEntry; version: string }
+    {
+      name: PackageName;
+      entry: PackageEntry;
+      version: string;
+      opaque?: OpaqueSourceKind;
+      privateRegistry?: boolean;
+    }
   >();
   for (const [key, entry] of Object.entries(packages)) {
     const parts = splitKey(key);
@@ -392,29 +433,43 @@ function parsePnpmDocument(
       continue;
     }
     const resolution = entry.resolution;
+    const packageName = name.data;
+    const nodeVersion = opaqueVersion(
+      packageVersionSchema.safeParse(parts.version).success ? parts.version : entry.version,
+    );
+    const opaqueEntry = (kind: OpaqueSourceKind): void => {
+      validPackages.set(key, { name: packageName, entry, version: nodeVersion, opaque: kind });
+    };
     if (resolution.type !== undefined) {
-      rejections.add(
-        resolution.type === "git"
-          ? "git_dependency"
-          : resolution.type === "directory"
-            ? "local_path_dependency"
-            : "unsupported_protocol",
-        name.data,
-      );
+      if (resolution.type === "git") opaqueEntry("git");
+      else if (resolution.type === "directory") opaqueEntry("local_path");
+      else rejections.add("unsupported_protocol", name.data);
       continue;
     }
     if (resolution.gitHosted === "true") {
-      rejections.add("git_dependency", name.data);
+      opaqueEntry("git");
       continue;
     }
     const version = packageVersionSchema.safeParse(parts.version);
+    let privateRegistry = false;
     if (resolution.tarball !== undefined) {
       const source = checkTarballSource(
         resolution.tarball,
         name.data,
         version.success ? version.data : (entry.version ?? parts.version),
       );
-      if (source !== null) {
+      // Fix-only: a scoped package from a private HTTPS registry is an opaque node.
+      privateRegistry =
+        (source === "private_registry_dependency" || source === "remote_tarball_dependency") &&
+        isPrivateScopeTarball(resolution.tarball, name.data);
+      // Any other remote or local tarball is an opaque non-registry node; a private
+      // registry's entry stays a private-registry node, whose location is never kept.
+      const kind = privateRegistry ? null : opaqueLocationKind(source);
+      if (kind !== null) {
+        opaqueEntry(kind);
+        continue;
+      }
+      if (source !== null && !privateRegistry) {
         rejections.add(source, name.data);
         continue;
       }
@@ -428,7 +483,7 @@ function parsePnpmDocument(
       rejections.add(integrity.reason, name.data);
       continue;
     }
-    validPackages.set(key, { name: name.data, entry, version: version.data });
+    validPackages.set(key, { name: name.data, entry, version: version.data, privateRegistry });
   }
 
   // Importer specifiers are package.json specs; reject non-registry ones explicitly.
@@ -517,7 +572,7 @@ function parsePnpmDocument(
             });
           continue;
         }
-        if (classified.kind === "rejected") {
+        if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null) {
           rejections.add(classified.reason, name.data);
           continue;
         }
@@ -556,18 +611,31 @@ function parsePnpmDocument(
     const integrity = checkIntegrity(base.entry.resolution.integrity);
     const bundles = base.entry.bundledDependencies;
     snapshotEntries.set(key, { snapshot, base });
+    const opaque = base.opaque;
     instances.set(key, {
       id: key,
       name: base.name,
       version: packageVersionSchema.parse(base.version),
-      integrity: integrity.ok ? integrity.integrity : null,
-      integrityAlgorithm: integrity.ok ? integrity.algorithm : null,
-      resolved: base.entry.resolution.tarball ?? null,
+      integrity: integrity.ok && opaque === undefined ? integrity.integrity : null,
+      integrityAlgorithm: integrity.ok && opaque === undefined ? integrity.algorithm : null,
+      ...(integrity.ok && opaque === undefined && integrity.algorithm === "sha1"
+        ? { legacySha1: integrity.sha1 }
+        : {}),
+      // An opaque node's identity: the snapshot key carries its git commit or URL.
+      // A private registry's location is never kept: nothing may fetch it.
+      resolved:
+        opaque !== undefined
+          ? key
+          : base.privateRegistry === true
+            ? null
+            : (base.entry.resolution.tarball ?? null),
+      ...(base.privateRegistry === true ? { privateRegistry: true as const } : {}),
       bundled: false,
       bundles: Array.isArray(bundles) ? bundles.toSorted() : [],
       hasInstallScript: null,
       patched: parts.suffix.includes("(patch_hash="),
       edges: [],
+      ...(opaque === undefined ? {} : { opaque }),
     });
   }
   if (!rejections.empty) return fail();
@@ -588,9 +656,25 @@ function parsePnpmDocument(
     if (allowLocal && ref.startsWith("workspace:") && instances.has(ref))
       return { alias: name.data, kind, range, optional, target: ref };
     const target = refTarget(alias, ref);
-    if (target.kind === "rejected") {
-      rejections.add(target.reason, name.data);
-      return null;
+    if (target.kind === "link") {
+      // A `link:` outside the workspace members: an opaque local-path node with
+      // nothing read inside it. The key carries the link path as its identity.
+      if (!instances.has(target.key))
+        instances.set(target.key, {
+          id: target.key,
+          name: name.data,
+          version: opaqueVersion(undefined),
+          integrity: null,
+          integrityAlgorithm: null,
+          resolved: target.key,
+          bundled: false,
+          bundles: [],
+          hasInstallScript: null,
+          patched: false,
+          edges: [],
+          opaque: "local_path",
+        });
+      return { alias: name.data, kind, range, optional, target: target.key };
     }
     if (!instances.has(target.key)) {
       rejections.add("dangling_reference", name.data);
@@ -635,6 +719,21 @@ function parsePnpmDocument(
   for (const { importer, alias, section, spec, ref } of rootRefs) {
     const kind = SECTION_KIND[section];
     const edge = edgeTo(alias, ref, kind, kind === "optional", spec, true);
+    const declared = classifyDependencySpec(spec);
+    const opaqueKind = declared.kind === "rejected" ? opaqueSourceKind(declared.reason) : null;
+    if (
+      edge !== null &&
+      edge.target !== null &&
+      opaqueKind !== null &&
+      !ref.startsWith("workspace:")
+    ) {
+      // A non-registry spec at the root is opaque whatever the lockfile resolved, and of the kind
+      // package.json declares; declared workspace-member links (`workspace:` refs)
+      // are first-party edges instead.
+      const target = required(instances, edge.target);
+      if (target.opaque !== opaqueKind)
+        instances.set(edge.target, { ...target, opaque: opaqueKind });
+    }
     if (edge !== null)
       root.push({ ...(workspace === undefined ? {} : { importer }), alias, section, spec, edge });
   }

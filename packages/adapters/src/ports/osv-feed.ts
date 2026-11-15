@@ -1,10 +1,7 @@
-import {
-  advisoryIdSchema,
-  normalizeOsvTimestamp,
-  packageNameSchema,
-  packageVersionSchema,
-  type AdvisoryId,
-} from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import { normalizeOsvTimestamp } from "@kovo/contracts/time";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
+import type { AdvisoryId } from "@kovo/contracts";
 import { z } from "zod";
 
 import { jsonObjectSchema } from "./common.js";
@@ -13,7 +10,7 @@ import { jsonObjectSchema } from "./common.js";
 // modified-record feed, then changed records; periodic full reconciliation"; "Persist source cursors
 // only after durable ingestion." Notes: docs/libraries/sandbox-ai-feeds.md §5.
 //
-// Implementations (BUILD_PLAN item 11; status in docs/status/adapters.md): real HTTP client that
+// Implementations: real HTTP client that
 // polls the `npm/modified_id.csv` object metadata by generation (not the edge-cached public URL),
 // reads records from `api.osv.dev/v1/vulns/{id}` and streams `npm/all.zip` for reconciliation; fake
 // serving scripted records and a scripted change list.
@@ -25,8 +22,8 @@ import { jsonObjectSchema } from "./common.js";
 // ---- OSV timestamps (variable fractional precision; must not be compared as JS Dates) ----
 
 // The parser is contracts' `normalizeOsvTimestamp`, shared with `@kovo/core/advisory`, so the
-// canonical `modified` of the envelope and of the normalized document are byte-identical
-// (docs/decisions/adapters.md). Contracts' `osvTimestampToDate` gives the millisecond `Date`.
+// canonical `modified` of the envelope and of the normalized document are byte-identical.
+// Contracts' `osvTimestampToDate` gives the millisecond `Date`.
 
 /** A canonical OSV timestamp (nine fractional digits, `Z`). Accepts raw OSV input and normalizes. */
 export const osvTimestampSchema = z
@@ -252,7 +249,7 @@ export interface OsvFeedPort {
   /**
    * The IDs of the advisories OSV's own matcher says affect an npm package version
    * (`POST api.osv.dev/v1/query`, every page), sorted and unique: an independent check of core's
-   * range evaluation (plans/site-scanner.md §7.1). LimitExceededError past OSV_QUERY_MAX_PAGES
+   * range evaluation. LimitExceededError past OSV_QUERY_MAX_PAGES
    * pages or OSV_QUERY_PAGE_MAX_BYTES per page.
    */
   queryVersion(query: OsvVersionQuery): Promise<readonly AdvisoryId[]>;

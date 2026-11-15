@@ -6,8 +6,8 @@ import type { TierDecision } from "./tier.js";
 // versions for every targeted package instance and avoid new P0/P1 or malicious findings."
 // fixWorkflow step 5: "no newly introduced P0/P1 or malicious findings … Existing unrelated
 // findings and new digest findings are disclosed, not treated as a globally clean-lockfile
-// requirement." This is the one definition of "new" for both (docs/decisions/advisory.md "What a
-// new P0/P1 or malicious finding is"); the trusted checks re-match the patched graph and use it too.
+// requirement." This is the one definition of a new P0/P1 or malicious finding for both; the
+// trusted checks re-match the patched graph and use it too.
 // Whether targeted findings were cleared is a separate check.
 
 /** An advisory affecting a package version, tiered for it (`AdvisoryMatch` satisfies it). */

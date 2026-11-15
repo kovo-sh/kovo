@@ -20,7 +20,7 @@ import { compareVersionText } from "./version.js";
 // `finding.p0_detected` on a newly detected/reopened P0". "A withdrawn advisory withdraws its
 // findings". `reclassify`: "Re-tier affected findings". A pure reducer over one repository's
 // findings; the inventory and advisory services persist its output. Transitions
-// (docs/decisions/advisory.md "Finding lifecycle"; "matched" means the current snapshot has the
+// (the finding lifecycle; "matched" means the current snapshot has the
 // version and the advisory's current revision affects it):
 //
 // | before \ now | matched, advisory active     | matched, withdrawn | unmatched, active | unmatched, withdrawn |
@@ -192,6 +192,17 @@ function tiered(state: FindingState, match: AdvisoryMatch, now: Date): FindingSt
   };
 }
 
+// Keep the risk assessed at dismissal, including across withdrawal/reinstatement. Otherwise a
+// temporary downgrade makes a return to the dismissed risk look like a new P0 escalation.
+function seenDismissal(state: FindingState, match: AdvisoryMatch, now: Date): FindingState {
+  return {
+    ...state,
+    status: "dismissed",
+    isDev: match.isDev,
+    lastSeenAt: laterOf(state.lastSeenAt, now),
+  };
+}
+
 function inScope(scope: ReconcileInput["scope"], advisoryId: AdvisoryId): boolean {
   return scope === "all" || scope.has(advisoryId);
 }
@@ -299,7 +310,7 @@ export function reconcileFindings(input: ReconcileInput): ReconcileResult {
             detectedAt: occurrenceStart(now, before),
           });
         } else {
-          push("seen", before, updated);
+          push("seen", before, seenDismissal(before, match, now));
         }
         break;
       case "resolved":
@@ -314,7 +325,7 @@ export function reconcileFindings(input: ReconcileInput): ReconcileResult {
           "reinstated",
           before,
           dismissalIsCurrent(before) && !escalatesDismissal(before, match.tier)
-            ? { ...updated, status: "dismissed" }
+            ? seenDismissal(before, match, now)
             : { ...updated, status: "open", detectedAt: detectedAtFor(advisory, before) },
         );
         break;

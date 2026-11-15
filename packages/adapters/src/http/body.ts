@@ -1,3 +1,4 @@
+import { systemTimers } from "../clock/index.js";
 import { IntegrityError, LimitExceededError, UnavailableError } from "../ports/errors.js";
 import { errorForFailure, type HttpCallContext } from "./errors.js";
 
@@ -37,7 +38,7 @@ async function withinIdleTimeout<T>(
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const stalled = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
+    timer = systemTimers.setTimeout(() => {
       reject(new UnavailableError({ ...context, reason: "timeout", code: "read_stalled" }));
     }, timeoutMs);
   });

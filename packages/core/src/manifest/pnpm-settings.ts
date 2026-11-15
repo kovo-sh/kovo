@@ -1,4 +1,4 @@
-import { exactVersionSchema, packageNameSchema } from "@kovo/contracts";
+import { exactVersionSchema, packageNameSchema } from "@kovo/contracts/npm";
 import { z } from "zod";
 
 import { workspaceYaml } from "../lockfile/workspace/yaml.js";
@@ -6,6 +6,7 @@ import { isJsonObject, type JsonObject } from "./bounded-json.js";
 import { classifyDependencySpec } from "./dependency-spec.js";
 import { parsePnpmSelector } from "./selectors.js";
 import { parsePnpmCatalogs } from "./pnpm-catalogs.js";
+import { workspacePatternsDeclareMembers } from "./workspace-members.js";
 
 // Settings-only YAML is single-package configuration, never inferred workspace membership.
 // Resolution-changing features need graph support. Admitted text is preserved byte-for-byte.
@@ -89,12 +90,12 @@ const LIST_VALUED = new Set([...LIST_SETTINGS, "trustPolicyExclude"]);
 
 /** The `.npmrc` spelling pnpm documents for a setting: `saveExact` is `save-exact`. */
 const kebab = (name: string) => name.replaceAll(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
-const NPMRC_SETTINGS: ReadonlyMap<string, string> = new Map(
+export const NPMRC_SETTINGS: ReadonlyMap<string, string> = new Map(
   [...SETTING_VALUES.keys()].map((name) => [kebab(name), name]),
 );
 
 /**
- * The admitted `pnpm-workspace.yaml` setting a root `.npmrc` key sets for pnpm 9 and 10 (#1836),
+ * The admitted `pnpm-workspace.yaml` setting a root `.npmrc` key sets for pnpm 9 and 10,
  * or null. Only the documented kebab-case spelling counts: pnpm also folds other spellings
  * (`saveExact`, `SAVE_EXACT`), which the `.npmrc` check refuses rather than models. `list` says
  * whether the value is a list (written `key[]=…`).
@@ -118,7 +119,7 @@ const JSON_BOOLEAN_SETTINGS = new Set([...BOOLEAN_SETTINGS, "managePackageManage
 
 /**
  * Whether an admitted setting accepts this typed JSON value, as the root package.json `pnpm` field
- * holds it (pnpm 9 and 10 read settings there, #1879). The same allowlist and values as
+ * holds it (pnpm 9 and 10 read settings there). The same allowlist and values as
  * `pnpm-workspace.yaml`, in JSON's own types: a boolean setting takes a JSON boolean, a minutes
  * setting a non-negative integer, a list setting an array of strings and every other setting a
  * string. A value of another type (the string `"false"`, which JavaScript reads as true, or the
@@ -136,10 +137,21 @@ export function pnpmSettingJsonValueAccepted(name: string, value: unknown): bool
 
 const settingsSchema = z.record(z.string(), z.json());
 
-/** Returns validated settings, or null for unreadable/unsupported configuration. */
+/**
+ * Returns validated settings, or null for unreadable/unsupported configuration. A `packages` list
+ * that selects only the root (`["."]`) declares no members, so the file is settings-only.
+ * An empty `packages` list stays refused, as before.
+ */
 export function singlePackagePnpmSettings(text: string): JsonObject | null {
   const settings = pnpmWorkspaceSettings(text);
-  return settings !== null && !Object.hasOwn(settings, "packages") ? settings : null;
+  if (settings === null) return null;
+  const packages = settings["packages"];
+  if (packages === undefined) return settings;
+  return Array.isArray(packages) &&
+    packages.length > 0 &&
+    !workspacePatternsDeclareMembers(packages)
+    ? settings
+    : null;
 }
 
 /** Shared validation for root workspace and settings-only files; never admits nested roots. */

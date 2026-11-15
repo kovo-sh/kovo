@@ -1,14 +1,15 @@
 import {
+  DEPENDENCY_VERDICT_REGISTRY_BUDGET_MS,
   MAX_DEPENDENCY_VERDICT_CHANGES,
-  reasonCodeSchema,
   type DependencyVerdictChangeWire,
-} from "@kovo/contracts";
+} from "@kovo/contracts/cli";
+import { reasonCodeSchema } from "@kovo/contracts/problem";
 import {
   DEPENDENCY_VERDICT_ENDPOINTS,
   dependencyVerdictsResponseSchema,
   evaluateDependencyChangesBodySchema,
   type DependencyVerdictsResponse,
-} from "@kovo/contracts/api";
+} from "@kovo/contracts/api/cli";
 
 import { CLI_VERSION } from "../exit.js";
 import { unavailableError, usageError } from "../errors.js";
@@ -28,7 +29,8 @@ export const MAX_RETRY_AFTER_SECONDS = 60;
 export const DEFAULT_RETRY_AFTER_SECONDS = 10;
 /** Requests per batch, the first included, before a 429 gives up. */
 export const MAX_ATTEMPTS = 4;
-export const REQUEST_TIMEOUT_MS = 60_000;
+/** Registry budget plus 60 seconds for server overhead, transport and reading the response. */
+export const REQUEST_TIMEOUT_MS = DEPENDENCY_VERDICT_REGISTRY_BUDGET_MS + 60_000;
 /** A 500-verdict response is well under this; anything larger is not a valid answer. */
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 

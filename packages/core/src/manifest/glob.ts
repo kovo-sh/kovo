@@ -1,6 +1,5 @@
 // A small, dependency-free glob matcher for repository paths (protected paths and policy
-// `protected_paths`). Semantics, chosen to fail closed (docs/decisions/lockfile.md "Manifest
-// allowlist and protected paths"):
+// `protected_paths`). Semantics, chosen to fail closed:
 // - Patterns are anchored at the repository root; `**` spans any number of path segments
 //   (including none), `*` and `?` stay inside one segment, `[…]` is a character class (`[!…]` or
 //   `[^…]` negated), `{a,b}` is an alternation.

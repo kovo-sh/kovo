@@ -1,5 +1,8 @@
+import type { PackageName } from "@kovo/contracts";
 import semver from "semver";
 
+import type { OpaqueSourceKind } from "../manifest/reasons.js";
+import { sha256Hex } from "../recipe/digest/sha256.js";
 import type { Instance, InstanceEdge, InstanceSet } from "./instances.js";
 import {
   GRAPH_LIMITS,
@@ -9,6 +12,9 @@ import {
   type DependencyPath,
   type DirectDependency,
   type LockfileLimits,
+  type HiddenPackage,
+  type OpaqueGraph,
+  type OpaqueNode,
   type PackageKey,
   type ResolvedPackageNode,
   type UnresolvedDependency,
@@ -240,7 +246,24 @@ function aggregate(
     }
   }
   const installScripts = instances.map((instance) => instance.hasInstallScript);
+  // Resolve ownership before aggregating by name/version: a different installed copy may have
+  // a different digest or bundler. Dependency paths are capped and cannot prove byte coverage.
+  const bundleArtifacts = instances.map((instance) => {
+    let owner = instance;
+    const seen = new Set<string>();
+    while (owner.bundled) {
+      if (owner.bundledBy === undefined || seen.has(owner.id)) return null;
+      seen.add(owner.id);
+      const parent = set.instances.get(owner.bundledBy);
+      if (parent === undefined) return null;
+      owner = parent;
+    }
+    return { name: owner.name, version: owner.version, integrity: owner.integrity };
+  });
   const integrityOf = instances.find((instance) => instance.integrity !== null);
+  const legacySha1 = [
+    ...new Set(instances.flatMap((instance) => instance.legacySha1 ?? [])),
+  ].toSorted();
   return {
     key,
     name: first.name,
@@ -250,11 +273,19 @@ function aggregate(
       integrityOf?.integrityAlgorithm ??
       instances.find((instance) => instance.integrityAlgorithm !== null)?.integrityAlgorithm ??
       null,
+    ...(legacySha1.length > 0 ? { legacySha1 } : {}),
     resolved: instances.find((instance) => instance.resolved !== null)?.resolved ?? null,
+    ...(instances.some((instance) => instance.privateRegistry === true)
+      ? { privateRegistry: true as const }
+      : {}),
     isDirect: instances.some((instance) => facts.directTargets.has(instance.id)),
     isDev: !instances.some((instance) => facts.production.has(instance.id)),
     isOptional: !instances.some((instance) => facts.required.has(instance.id)),
     bundled: instances.every((instance) => instance.bundled),
+    ...(instances.every((instance) => instance.bundled) &&
+    bundleArtifacts.every((artifact) => artifact !== null)
+      ? { bundleArtifacts }
+      : {}),
     bundles: [...new Set(instances.flatMap((instance) => instance.bundles))].toSorted(),
     hasInstallScript: installScripts.includes(true)
       ? true
@@ -271,8 +302,107 @@ function aggregate(
   };
 }
 
+/**
+ * The registry part of a parser's instances: edges into opaque instances are
+ * dropped, so opaque nodes and the packages only they reach are never reachable, never get paths
+ * and never appear in `packages`. Returns the set unchanged when it has no opaque instance.
+ */
+function registryView(set: InstanceSet): InstanceSet {
+  const opaqueIds = new Set<string>();
+  for (const [id, instance] of set.instances) if (instance.opaque !== undefined) opaqueIds.add(id);
+  if (opaqueIds.size === 0) return set;
+  const intoOpaque = (edge: InstanceEdge): boolean =>
+    edge.target !== null && opaqueIds.has(edge.target);
+  const instances = new Map<string, Instance>();
+  for (const [id, instance] of set.instances) {
+    instances.set(
+      id,
+      instance.edges.some(intoOpaque)
+        ? { ...instance, edges: instance.edges.filter((edge) => !intoOpaque(edge)) }
+        : instance,
+    );
+  }
+  return { ...set, root: set.root.filter((root) => !intoOpaque(root.edge)), instances };
+}
+
+/** The opaque nodes of `set` reachable from its root, and the packages only they reach. */
+function opaqueGraph(
+  set: InstanceSet,
+  registryReachable: ReadonlySet<string>,
+): OpaqueGraph | undefined {
+  const edges = edgeTable(set);
+  const everything = reachable(
+    set,
+    edges,
+    set.root.flatMap((root) => (root.edge.target === null ? [] : [root.edge.target])),
+    () => true,
+  );
+  const directIds = new Set(set.root.map((root) => root.edge.target));
+  const nodes = new Map<
+    string,
+    { name: PackageName; kind: OpaqueSourceKind; isDirect: boolean; identities: string[] }
+  >();
+  const hidden = new Map<string, HiddenPackage>();
+  const identities: string[] = [];
+  for (const id of everything) {
+    if (registryReachable.has(id)) continue;
+    const instance = required(set.instances, id);
+    // Hashed: an opaque location can be a URL with credentials, and the graph must never carry it.
+    const identity = sha256Hex(
+      [
+        instance.opaque ?? "registry",
+        instance.name,
+        instance.version,
+        instance.resolved ?? "",
+        instance.integrity ?? "",
+      ].join("\u0000"),
+    );
+    identities.push(identity);
+    if (instance.opaque === undefined) {
+      hidden.set(`${keyOf(instance)}\u0000${instance.integrity ?? ""}`, {
+        key: keyOf(instance),
+        name: instance.name,
+        version: instance.version,
+        integrity: instance.integrity,
+        resolved: instance.resolved,
+      });
+      continue;
+    }
+    const nodeKey = `${instance.name}\u0000${instance.opaque}`;
+    const node = nodes.get(nodeKey) ?? {
+      name: instance.name,
+      kind: instance.opaque,
+      isDirect: false,
+      identities: [],
+    };
+    node.isDirect ||= directIds.has(id);
+    node.identities.push(identity);
+    nodes.set(nodeKey, node);
+  }
+  if (nodes.size === 0) return undefined;
+  const opaqueNodes: OpaqueNode[] = [...nodes.values()].map((node) => ({
+    name: node.name,
+    kind: node.kind,
+    isDirect: node.isDirect,
+    identity: sha256Hex([...new Set(node.identities)].toSorted(compareStrings).join(",")),
+  }));
+  return {
+    nodes: opaqueNodes.toSorted((a, b) =>
+      a.name === b.name ? compareStrings(a.kind, b.kind) : compareStrings(a.name, b.name),
+    ),
+    hiddenPackages: new Set([...hidden.values()].map((item) => item.key)).size,
+    hidden: [...hidden.values()].toSorted((a, b) =>
+      a.key === b.key
+        ? compareStrings(a.integrity ?? "", b.integrity ?? "")
+        : compareStrings(a.key, b.key),
+    ),
+    identities: [...new Set(identities)].toSorted(compareStrings),
+  };
+}
+
 /** Builds the normalized graph from a parser's instances. */
-export function buildGraph(set: InstanceSet, limits: GraphLimits = GRAPH_LIMITS): DependencyGraph {
+export function buildGraph(full: InstanceSet, limits: GraphLimits = GRAPH_LIMITS): DependencyGraph {
+  const set = registryView(full);
   const rootTargets = (predicate: (edge: InstanceEdge) => boolean): string[] =>
     set.root.flatMap((root) =>
       root.edge.target !== null && predicate(root.edge) ? [root.edge.target] : [],
@@ -344,6 +474,7 @@ export function buildGraph(set: InstanceSet, limits: GraphLimits = GRAPH_LIMITS)
     })
     .toSorted((a, b) => compareStrings(a.alias, b.alias));
 
+  const opaque = set === full ? undefined : opaqueGraph(full, all);
   return {
     packageManager: set.packageManager,
     format: set.format,
@@ -351,5 +482,6 @@ export function buildGraph(set: InstanceSet, limits: GraphLimits = GRAPH_LIMITS)
     packages,
     unresolved,
     lockfileOverrides: set.lockfileOverrides.toSorted(),
+    ...(opaque === undefined ? {} : { opaque }),
   };
 }

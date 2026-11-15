@@ -1,4 +1,6 @@
-import { advisoryIdSchema, packageNameSchema, type PackageName } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
+import { packageNameSchema } from "@kovo/contracts/npm";
+import type { PackageName } from "@kovo/contracts/cli";
 import { isAffected, normalizeOsvRecord, type NormalizedAdvisory } from "@kovo/core/advisory";
 import type { DependencyHoldTier } from "@kovo/core/dependency-verdicts";
 import { osvRecordFromDocument, readZipEntries } from "@kovo/adapters/osv";

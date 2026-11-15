@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { persistedReader } from "../tolerant-reader.js";
 import type { FixTier } from "./advisories.js";
 
 // Verification, dependency changes and supply-chain provenance (SPEC "fixWorkflow" steps 4–5,
@@ -79,6 +80,10 @@ export const STEP_FAILURE_CODES = [
   // commit's tree (`export-ignore`, `export-subst`, LFS objects in archives) and the checkout could
   // not be restored to the exact tree: the run did not test the tree its evidence names.
   "archive_differs_from_tree",
+  // A fix moves a direct dependency across a major, and some code that calls it is reached
+  // by no test, so a clean run cannot show the upgrade works there: the run is recorded as
+  // unverified, never passed (a PR for review; the step is Kovo's own, recorded in phase A).
+  "major_untested_callsite",
 ] as const;
 export const stepFailureCodeSchema = z.enum(STEP_FAILURE_CODES);
 export type StepFailureCode = z.infer<typeof stepFailureCodeSchema>;
@@ -113,8 +118,8 @@ export type NpmInstallOutcome = z.infer<typeof npmInstallOutcomeSchema>;
 /**
  * The registry digest that verified a served tarball (`npm_installs.integrity_algorithm`): its sha512
  * `dist.integrity`, or the legacy SHA-1 `dist.shasum` of a version published before sha512
- * integrity, which is weaker evidence (collisions are practical; docs/decisions/adapter-feeds.md
- * "Tarball integrity: sha512 decides, SHA-1 only without it").
+ * integrity, which is weaker evidence (collisions are practical; sha512 decides, SHA-1 only
+ * without it).
  */
 export const TARBALL_DIGEST_ALGORITHMS = ["sha512", "sha1"] as const;
 export const tarballDigestAlgorithmSchema = z.enum(TARBALL_DIGEST_ALGORITHMS);
@@ -144,3 +149,62 @@ export const PROVENANCE_RULES = {
   // "Reject artifact/fix"
   integrity_mismatch: { P0: "rejected", P1: "rejected" },
 } as const satisfies Record<ProvenanceFindingKind, Record<FixTier, ProvenanceResult>>;
+
+/**
+ * Why Sandbox B verification of a staged patch could not run or complete because of a failure on
+ * Kovo's side (SPEC "fixWorkflow" step 4; the list is an agent decision, 2026-10-28,
+ * pending owner review). These are never a verification result: the customer's tests did
+ * not fail, Kovo could not run them. A real verification failure keeps
+ * `open_pr_on_verification_failure`.
+ *
+ * - `sandbox_unavailable`: no sandbox or isolated runtime could be created for the run (provider
+ *   quota, isolation not established).
+ * - `sandbox_lost`: the sandbox went away before the run completed.
+ * - `egress_probe_failed`: the sandbox's egress isolation could not be applied and verified for
+ *   the verification phase.
+ * - `database_exhausted`: Kovo's database stayed unavailable through the bounded retries.
+ * - `provider_outage`: another provider Kovo depends on stayed unavailable through the bounded
+ *   retries.
+ */
+export const KOVO_SIDE_VERIFICATION_FAILURES = [
+  "sandbox_unavailable",
+  "sandbox_lost",
+  "egress_probe_failed",
+  "database_exhausted",
+  "provider_outage",
+] as const;
+// Persisted reader (tolerant-reader.ts, `fix_kovo_side_fallbacks.reason`): an unknown stored value
+// refuses with the sanitized `persisted_enum_unknown` reason instead of joining the closed-enum read
+// baseline.
+export const kovoSideVerificationFailureSchema = persistedReader(
+  z.enum(KOVO_SIDE_VERIFICATION_FAILURES),
+);
+export type KovoSideVerificationFailure = z.infer<typeof kovoSideVerificationFailureSchema>;
+
+/**
+ * Why a fix had no recipe, or its no-recipe install failed, because of a failure on Kovo's side.
+ * Proven only by trusted control-plane records, never by sandbox output.
+ *
+ * - `calibration_unavailable`: the repository's latest calibration job failed on a Kovo-side cause
+ *   (`jobs.kovo_side_cause`, written by the calibration's own failure step), so no calibrated recipe
+ *   exists for reasons that are not the repository's.
+ * - `egress_policy_unavailable`: the repository's latest calibration failed, and in it Kovo's egress
+ *   gateway recorded a denial (`sandbox_egress_observations`) of one of Kovo's own hosts (the npm
+ *   proxy) in a phase whose applied egress always lists it, under a live grant, with a step of that
+ *   phase that failed blocked on egress.
+ *
+ * Stored only in new nullable columns no earlier release reads (`jobs.kovo_side_cause`,
+ * `fix_kovo_side_fallbacks.cause`); `fix_kovo_side_fallbacks.reason` keeps its five-code language
+ * (`KOVO_SIDE_VERIFICATION_FAILURES`), so no reader-first release is needed. A plain tuple, not a
+ * Zod enum: the readers are this release's own (`kovoSideNoRecipeCauseOf`).
+ */
+export const KOVO_SIDE_NO_RECIPE_CAUSES = [
+  "calibration_unavailable",
+  "egress_policy_unavailable",
+] as const;
+export type KovoSideNoRecipeCause = (typeof KOVO_SIDE_NO_RECIPE_CAUSES)[number];
+
+/** The stored cause, or null for an absent or unrecognized value (never an error). */
+export function kovoSideNoRecipeCauseOf(value: unknown): KovoSideNoRecipeCause | null {
+  return KOVO_SIDE_NO_RECIPE_CAUSES.find((cause) => cause === value) ?? null;
+}

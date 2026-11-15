@@ -3,6 +3,7 @@ import { PortError, UnavailableError } from "../ports/errors.js";
 import { discardBody } from "./body.js";
 import { errorForFailure, errorForStatus, type HttpCallContext } from "./errors.js";
 import { validateRetryPolicy, withRetries, type RetryPolicy } from "./retry.js";
+import { upstreamCircuit } from "./circuit.js";
 import { deadlineSignal, type HttpTransport, type Sleep } from "./transport.js";
 
 // One small request layer shared by the OSV, KEV and npm adapters: reads only (GET, or a
@@ -93,8 +94,11 @@ export async function getWithRetries<T>(
 ): Promise<T> {
   validateRetryPolicy(deps.retry);
   return withRetries(
-    async () => {
-      const attemptSignal = deadlineSignal(deps.requestTimeoutMs, request.signal);
+    async (_attempt, remainingMs) => {
+      const attemptSignal = deadlineSignal(
+        Math.min(deps.requestTimeoutMs, remainingMs),
+        request.signal,
+      );
       const response = await sendGet(deps, request, attemptSignal);
       try {
         return await consume(response, request.signal, attemptSignal);
@@ -103,7 +107,14 @@ export async function getWithRetries<T>(
         throw attemptFailure(request, attemptSignal, error);
       }
     },
-    { policy: deps.retry, sleep: deps.sleep, signal: request.signal },
+    {
+      policy: deps.retry,
+      sleep: deps.sleep,
+      signal: request.signal,
+      clock: deps.clock,
+      circuit: upstreamCircuit(deps.transport, request.url.origin),
+      context: request.context,
+    },
   );
 }
 

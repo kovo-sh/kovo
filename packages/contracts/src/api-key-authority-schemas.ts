@@ -5,13 +5,15 @@ import { apiKeyIdSchema, installationIdSchema, repoIdSchema } from "./ids.js";
 import { utcDateTimeSchema } from "./time.js";
 
 /** Owner-directed account automation; legacy keys remain Runtime keys. */
-export const API_KEY_KINDS = ["runtime", "management"] as const;
-export const apiKeyKindSchema = z.enum(API_KEY_KINDS);
+export const API_KEY_KINDS = ["runtime", "management", "registry"] as const;
+/** Registry issuance follows the production promotion of the tolerant reader. */
+export const apiKeyKindWriteSchema = z.enum(API_KEY_KINDS);
+export const apiKeyKindSchema = writerPinned(z.enum(API_KEY_KINDS), apiKeyKindWriteSchema);
 export type ApiKeyKind = z.infer<typeof apiKeyKindSchema>;
 
 /**
  * Exact account permissions, never wildcard authority or automatic future-route grants.
- * Agent decision (2026-10-04), pending owner review #334: reevaluateFix maps to retryFix.
+ * Agent decision (2026-10-04), pending owner review: reevaluateFix maps to retryFix.
  * As a strict-subset exception to the future-route rule, existing Management
  * keys holding retryFix (including delegated keys) can call POST /v1/fixes/{id}/reevaluate,
  * subject to fresh repository admin authority, key lineage and current reevaluation gates.
@@ -88,21 +90,25 @@ export const MANAGEMENT_KEY_PERMISSIONS = [
   "revokeManagementKey",
   "recipe.egress.refresh_catalog",
   "evaluateDependencyChanges",
-] as const;
-
-/**
- * Permissions accepted by a tolerant reader before their issuance release.
- * Synthetic drill operations remain reader-only until this reader is promoted to production.
- * No issuance preset or endpoint grants them in this release.
- */
-export const READER_ONLY_MANAGEMENT_KEY_PERMISSIONS = [
   "createMalwareReport",
   "createSyntheticAdvisory",
   "retractMalwareReport",
   "retractSyntheticAdvisory",
+  "acceptDependencyOverrideDrill",
+  "setThirdPartyScannersDrill",
+  "armFixVerificationDrillFault",
+  "retryDependencyGateDrill",
+  "overrideUnevaluatedDependencyGateDrill",
+  "armDependencyGateDrillFault",
 ] as const;
 
-/** Issuance stays limited to the promoted catalog (D-176/D-185 permissions included). */
+/**
+ * Permissions accepted by a tolerant reader before their issuance release.
+ * Empty after promotion of the reader-only grants to explicit Custom issuance.
+ */
+export const READER_ONLY_MANAGEMENT_KEY_PERMISSIONS = [] as const;
+
+/** Issuance stays limited to the promoted catalog. */
 export const managementKeyPermissionWriteSchema = z.enum(MANAGEMENT_KEY_PERMISSIONS);
 export const managementKeyPermissionSchema = writerPinned(
   z.enum([...MANAGEMENT_KEY_PERMISSIONS, ...READER_ONLY_MANAGEMENT_KEY_PERMISSIONS]),
@@ -110,9 +116,20 @@ export const managementKeyPermissionSchema = writerPinned(
 );
 export type ManagementKeyPermission = z.infer<typeof managementKeyPermissionSchema>;
 
-/** Materialized at issuance. #1327 requires dependency evaluation to be explicitly selected. */
+/** Materialized at issuance. Dependency evaluation must be explicitly selected. */
 export const FULL_MANAGEMENT_KEY_PERMISSIONS = MANAGEMENT_KEY_PERMISSIONS.filter(
-  (permission) => permission !== "evaluateDependencyChanges",
+  (permission) =>
+    permission !== "evaluateDependencyChanges" &&
+    permission !== "createMalwareReport" &&
+    permission !== "createSyntheticAdvisory" &&
+    permission !== "retractMalwareReport" &&
+    permission !== "retractSyntheticAdvisory" &&
+    permission !== "acceptDependencyOverrideDrill" &&
+    permission !== "setThirdPartyScannersDrill" &&
+    permission !== "armFixVerificationDrillFault" &&
+    permission !== "retryDependencyGateDrill" &&
+    permission !== "overrideUnevaluatedDependencyGateDrill" &&
+    permission !== "armDependencyGateDrillFault",
 );
 export const MAX_API_KEY_LINEAGE_DEPTH = 8;
 export const managementKeyPermissionsSchema = writerPinned(
@@ -156,16 +173,18 @@ export const apiKeyAuthoritySchema = z
     expires_at: utcDateTimeSchema.nullable(),
   })
   .refine((authority) => authority.kind === "management" || authority.permissions.length === 0, {
-    error: "Runtime keys do not hold Management permissions",
+    error: "Only Management keys hold Management permissions",
     path: ["permissions"],
   })
   .refine(
     (authority) =>
       authority.kind === "management" ||
       (authority.repo_authority.kind === "explicit" &&
-        authority.repo_authority.repo_ids.length > 0),
+        (authority.kind === "registry"
+          ? authority.repo_authority.repo_ids.length === 0
+          : authority.repo_authority.repo_ids.length > 0)),
     {
-      error: "Runtime keys name explicit repositories",
+      error: "Runtime keys name explicit repositories; Registry keys have none",
       path: ["repo_authority"],
     },
   );

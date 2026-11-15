@@ -1,4 +1,6 @@
-import { hasControlCharacter, packageNameSchema, type PackageName } from "@kovo/contracts";
+import { hasControlCharacter } from "@kovo/contracts/primitives";
+import { packageNameSchema } from "@kovo/contracts/npm";
+import type { PackageName } from "@kovo/contracts";
 import semver from "semver";
 
 // Override selectors (npm `overrides` keys, pnpm `pnpm.overrides`/`resolutions` keys and

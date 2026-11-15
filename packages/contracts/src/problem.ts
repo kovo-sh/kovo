@@ -19,6 +19,9 @@ interface ReasonDefinition {
 /** Stable reason codes (public API). */
 export const REASON_CODES = [
   "unauthenticated",
+  "account_deactivated",
+  "account_already_deactivated",
+  "account_not_deactivated",
   "invalid_signature",
   "csrf_failed",
   "forbidden_actor",
@@ -37,6 +40,7 @@ export const REASON_CODES = [
   "quote_mismatch",
   "payment_declined",
   "payment_past_due",
+  "coupon_account_already_redeemed",
   "coupon_not_redeemable",
   "malformed_request",
   "invalid_cursor",
@@ -60,10 +64,19 @@ export const REASON_CODES = [
   "onboarding_mismatch",
   "owner_required",
   "invitation_invalid",
+  "waitlist_code_required",
+  "waitlist_code_invalid",
+  "waitlist_code_expired",
+  "waitlist_code_exhausted",
+  "waitlist_code_revoked",
+  "prod_verification_disabled",
+  "prod_verification_out_of_scope",
   "repo_not_enabled",
   "repo_paused",
+  "repo_pause_customer_unapproved",
   "installation_suspended",
   "unsupported_repository",
+  "required_app_unprotected",
   "recipe_not_approvable",
   "fix_not_retriable",
   "fix_not_merged",
@@ -86,32 +99,64 @@ export const PERSISTED_REASON_CODES: readonly [ReasonCode, ...ReasonCode[]] = [
   REASON_CODES[0],
   ...REASON_CODES.slice(1).filter(
     (reason) =>
+      reason !== "account_deactivated" &&
+      reason !== "account_already_deactivated" &&
+      reason !== "account_not_deactivated" &&
+      !reason.startsWith("waitlist_code_") &&
       reason !== "not_reevaluable" &&
       reason !== "already_evaluated_at_version" &&
       reason !== "reevaluation_budget_exhausted" &&
       reason !== "coupon_not_redeemable" &&
+      reason !== "coupon_account_already_redeemed" &&
       reason !== "packument_too_large" &&
-      reason !== "egress_account_share_exhausted",
+      reason !== "required_app_unprotected" &&
+      reason !== "egress_account_share_exhausted" &&
+      reason !== "repo_pause_customer_unapproved" &&
+      !reason.startsWith("prod_verification_"),
   ),
 ] as const;
 // Reader first: promote this reader before publishing new top-level API reasons. Packument
 // limits currently use upstream_error plus a fixed subreason, and the proxy's separate catalog.
 export const PUBLIC_REASON_CODES = REASON_CODES.filter(
-  (reason) => reason !== "egress_account_share_exhausted" && reason !== "packument_too_large",
+  (reason) =>
+    reason !== "egress_account_share_exhausted" &&
+    reason !== "packument_too_large" &&
+    reason !== "required_app_unprotected" &&
+    // Reader first: the admin pause emits `forbidden_actor` until this reader is promoted.
+    reason !== "repo_pause_customer_unapproved" &&
+    // Reader first: redemption answers `coupon_not_redeemable`, its detail leading with
+    // this code, until this reader is promoted.
+    reason !== "coupon_account_already_redeemed" &&
+    // Reader first: the verification channel
+    // answers `service_unavailable` and `not_found`, its detail naming the stable code, until this
+    // reader is promoted.
+    !reason.startsWith("prod_verification_"),
 );
 export const reasonCodeSchema = writerPinned(z.enum(REASON_CODES), z.enum(PUBLIC_REASON_CODES));
 // Transient packument refusals use upstream_error details, never durable job/dead-letter reasons.
 // Keep these nested readers identical to their promoted boundary and its compatibility proofs.
 export const durableFailureReasonCodeSchema = writerPinned(
-  z.enum(REASON_CODES.filter((reason) => reason !== "packument_too_large")),
-  z.enum(PUBLIC_REASON_CODES),
+  z.enum(
+    REASON_CODES.filter(
+      (reason) =>
+        reason !== "packument_too_large" &&
+        !reason.startsWith("waitlist_code_") &&
+        reason !== "repo_pause_customer_unapproved" &&
+        !reason.startsWith("prod_verification_"),
+    ),
+  ),
+  // Signup refusals are top-level HTTP problems, never persisted job/activity failures.
+  z.enum(PUBLIC_REASON_CODES.filter((reason) => !reason.startsWith("waitlist_code_"))),
 );
 export type ReasonCode = z.infer<typeof reasonCodeSchema>;
 
 /** Every reason code with its fixed HTTP status and title. */
 export const REASONS = {
-  // Authentication and authorization
   unauthenticated: { status: 401, title: "Authentication required" },
+  account_deactivated: { status: 403, title: "Account is turned off for now" },
+  account_already_deactivated: { status: 409, title: "Account is already turned off" },
+  account_not_deactivated: { status: 409, title: "Account is already active" },
+  // Authentication and authorization
   invalid_signature: { status: 401, title: "Signature verification failed" },
   csrf_failed: { status: 403, title: "CSRF check failed" },
   forbidden_actor: { status: 403, title: "This kind of caller cannot use this route" },
@@ -132,7 +177,10 @@ export const REASONS = {
   quote_mismatch: { status: 409, title: "Capacity quote does not match the request" },
   payment_declined: { status: 402, title: "Payment was declined" },
   payment_past_due: { status: 402, title: "Payment is past due" },
-  // One refusal for every reason a code cannot be redeemed, so codes cannot be probed.
+  // The account already holds a coupon redemption (one per account). It depends only on the
+  // account, never on the code, so it reveals nothing about codes.
+  coupon_account_already_redeemed: { status: 422, title: "Account has already used a coupon" },
+  // One refusal for every other reason a code cannot be redeemed, so codes cannot be probed.
   coupon_not_redeemable: { status: 422, title: "Coupon code cannot be redeemed" },
 
   // Request handling
@@ -172,12 +220,25 @@ export const REASONS = {
   },
   owner_required: { status: 409, title: "The account must keep an owner" },
   invitation_invalid: { status: 410, title: "Invitation is invalid or expired" },
+  waitlist_code_required: { status: 403, title: "Waitlist code required" },
+  waitlist_code_invalid: { status: 403, title: "Waitlist code is not valid" },
+  waitlist_code_expired: { status: 403, title: "Waitlist code is not valid" },
+  waitlist_code_exhausted: { status: 403, title: "Waitlist code is not valid" },
+  waitlist_code_revoked: { status: 403, title: "Waitlist code is not valid" },
+  // The bounded production-verification operator channel.
+  prod_verification_disabled: { status: 503, title: "Production verification is turned off" },
+  prod_verification_out_of_scope: { status: 404, title: "Resource not found" },
 
   // Repositories, recipes and fixes
   repo_not_enabled: { status: 409, title: "Repository protection is not enabled" },
   repo_paused: { status: 409, title: "Repository is paused" },
+  repo_pause_customer_unapproved: {
+    status: 403,
+    title: "Pausing a customer repository is not approved",
+  },
   installation_suspended: { status: 409, title: "GitHub App installation is suspended" },
   unsupported_repository: { status: 422, title: "Repository is not supported" },
+  required_app_unprotected: { status: 409, title: "A required application is not protected" },
   recipe_not_approvable: { status: 409, title: "Recipe version cannot be approved" },
   fix_not_retriable: { status: 409, title: "Fix cannot be retried" },
   fix_not_merged: { status: 409, title: "Fix is not merged" },
@@ -278,10 +339,40 @@ export interface ProblemInit {
 }
 
 /** Builds a validated problem document for `reason`. */
+/**
+ * Reader first: the detail prefix that names `coupon_account_already_redeemed` on a
+ * `coupon_not_redeemable` problem while that reason is not public.
+ */
+export const COUPON_ACCOUNT_ALREADY_REDEEMED_DETAIL_PREFIX = "coupon_account_already_redeemed:";
+
 export function problemDetails(reason: ReasonCode, init: ProblemInit): ProblemDetails {
   // Keep HTTP writers compatible with r776 while the tolerant reader rolls out.
   if (reason === "egress_account_share_exhausted") reason = "rate_limited";
   if (reason === "packument_too_large") reason = "service_unavailable";
+  // Reader first: a refused customer-repository pause answers `forbidden_actor` (its
+  // detail names the stable code) until promoted readers accept the new top-level reason.
+  if (reason === "repo_pause_customer_unapproved") reason = "forbidden_actor";
+  // Reader first: an account that already used a coupon answers `coupon_not_redeemable`,
+  // its detail leading with the stable code, until promoted readers accept the new reason.
+  if (reason === "coupon_account_already_redeemed") {
+    init = {
+      ...init,
+      detail: `${COUPON_ACCOUNT_ALREADY_REDEEMED_DETAIL_PREFIX} This account has already used a coupon.`,
+    };
+    reason = "coupon_not_redeemable";
+  }
+  // Reader first: the verification channel's
+  // refusals answer their promoted equivalents, the detail naming the stable code.
+  if (reason === "prod_verification_disabled" || reason === "prod_verification_out_of_scope") {
+    init = {
+      ...init,
+      detail:
+        reason === "prod_verification_disabled"
+          ? "prod_verification_disabled: the production-verification channel is turned off."
+          : "prod_verification_out_of_scope: no such resource within the verification channel's bounds.",
+    };
+    reason = reason === "prod_verification_disabled" ? "service_unavailable" : "not_found";
+  }
   const definition: ReasonDefinition = REASONS[reason];
   return problemDetailsSchema.parse({
     type: problemTypeUri(reason),

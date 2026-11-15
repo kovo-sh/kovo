@@ -1,7 +1,9 @@
-import type { PackageManager, PackageName } from "@kovo/contracts";
+import { PROJECT_SCOPE_REASONS, type PackageManager, type PackageName } from "@kovo/contracts";
 
 import type { PackageManifest, DependencySection } from "../../manifest/package-json.js";
 import type { DependencyGraph } from "../types.js";
+import type { LockfileRejectionReason } from "../reasons.js";
+import type { RegistryIntegrityCandidate } from "../registry-source.js";
 import type { Instance, RootDependency } from "../instances.js";
 import type { PnpmCatalogs } from "../../manifest/pnpm-catalogs.js";
 import type { JsonObject } from "../../manifest/bounded-json.js";
@@ -65,6 +67,7 @@ export const WORKSPACE_LIMITS = {
 } as const;
 export type WorkspaceLimits = { readonly [K in keyof typeof WORKSPACE_LIMITS]: number };
 export const WORKSPACE_REASONS = [
+  ...PROJECT_SCOPE_REASONS,
   "incomplete_tree",
   "invalid_path",
   "unsafe_tree_entry",
@@ -90,11 +93,35 @@ export const WORKSPACE_REASONS = [
   "incomplete_graph",
 ] as const;
 export type WorkspaceReason = (typeof WORKSPACE_REASONS)[number];
+/**
+ * The finer cause of an `invalid_lockfile` or `catalogs_unsupported` failure: the
+ * lockfile parser's own rejection reason, or the workspace check that failed. A closed code; never
+ * lockfile content.
+ */
+export type WorkspaceLockfileReason =
+  | LockfileRejectionReason
+  | "lockfile_not_in_tree"
+  | "integrity_conflict"
+  | "resolved_conflict";
 export type WorkspaceResult<T> =
   | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly reason: WorkspaceReason };
-export function workspaceFailure(reason: WorkspaceReason): WorkspaceResult<never> {
-  return { ok: false, reason };
+  | {
+      readonly ok: false;
+      readonly reason: WorkspaceReason;
+      readonly lockfileReason?: WorkspaceLockfileReason;
+      /**
+       * The npm entries of the registry-sourced integrity shape whose `missing_integrity` is the
+       * lockfile's only problem; the caller may look them up and parse again.
+       */
+      readonly registryIntegrityCandidates?: readonly RegistryIntegrityCandidate[];
+    };
+export function workspaceFailure(
+  reason: WorkspaceReason,
+  lockfileReason?: WorkspaceLockfileReason,
+): WorkspaceResult<never> {
+  return lockfileReason === undefined
+    ? { ok: false, reason }
+    : { ok: false, reason, lockfileReason };
 }
 export interface WorkspaceImporter {
   readonly member: WorkspaceMember;

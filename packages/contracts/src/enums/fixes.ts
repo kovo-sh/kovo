@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { persistedReader } from "../tolerant-reader.js";
 import type { Plan } from "./accounts.js";
 import type { WaitReason } from "./waits.js";
 
@@ -157,6 +158,15 @@ export const slotKindSchema = z.enum(SLOT_KINDS);
 export type SlotKind = z.infer<typeof slotKindSchema>;
 
 /**
+ * `fix_constituents.state`: a project the fix PR
+ * acts on (`included`), one that could not verify (`failed`; the PR never merges with it), or one
+ * removed from the PR by a re-plan or a project deselection (`deselected`).
+ */
+export const FIX_CONSTITUENT_STATES = ["included", "failed", "deselected"] as const;
+export const fixConstituentStateSchema = persistedReader(z.enum(FIX_CONSTITUENT_STATES));
+export type FixConstituentState = z.infer<typeof fixConstituentStateSchema>;
+
+/**
  * `fixes.outcome_reason`: why a fix reached its terminal state. {@link FIX_OUTCOME_STATUS} maps
  * each to the terminal status it implies.
  */
@@ -203,7 +213,7 @@ export const FIX_OUTCOME_STATUS = {
 /**
  * The fix state diagram's moves between nonterminal states (SPEC "Workflows" mermaid diagram).
  * Waits do not change the status: a fix waiting for cooldown, capacity or AI funding keeps its
- * status and carries `wait_reason`/`next_action` (docs/decisions/contracts.md "Fix transitions").
+ * status and carries `wait_reason`/`next_action`.
  * Beyond the diagram: `reverifying → awaiting_human` ("allow at most two automatic refresh attempts
  * per fix, then request review"; a refresh whose verification fails or conflicts), and `merging →
  * pr_open | awaiting_human` (the merge request was refused because the head, checks or rules

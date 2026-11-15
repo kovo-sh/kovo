@@ -1,4 +1,5 @@
-import { advisoryEcosystemSchema, advisoryIdSchema, type AdvisoryId } from "@kovo/contracts";
+import { advisoryEcosystemSchema, type AdvisoryId } from "@kovo/contracts";
+import { advisoryIdSchema } from "@kovo/contracts/ids";
 import { z } from "zod";
 
 import { jsonObjectSchema, type JsonObject, type JsonValue } from "../ports/common.js";
@@ -15,8 +16,8 @@ import {
 
 // The OSV record envelope, shared by the real adapter and the fake so both hand callers the same
 // view of a document. The port validates only the envelope; `@kovo/core/advisory` normalizes the
-// rest (docs/decisions/adapters.md "OSV records"). One normalization happens here: `affected[]`
-// entries for other ecosystems are removed (docs/decisions/adapter-feeds.md "Foreign-ecosystem entries are removed from OSV records at the adapter").
+// rest. One normalization happens here: `affected[]` entries for other ecosystems are removed at
+// the adapter.
 
 const envelopeSchema = z.looseObject({
   id: advisoryIdSchema,
@@ -86,7 +87,7 @@ function isExportRejection(code: string | undefined): code is OsvExportRejection
 /**
  * The export item for one archive entry, shared by the real adapter and the fake: null for a file
  * that is not a record (anything but `*.json`), otherwise the record, or a rejection when the entry
- * cannot be read as one (docs/decisions/adapter-feeds.md "One bad export entry is reported").
+ * cannot be read as one (one bad export entry is reported, not fatal).
  */
 export function osvExportItem(entry: OsvExportEntry): OsvExportItem | null {
   if (!entry.name.endsWith(".json")) return null;

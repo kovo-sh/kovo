@@ -3,8 +3,7 @@ import { z } from "zod";
 import { failureExcerptIdSchema } from "./ids.js";
 import { utcDateTimeSchema } from "./time.js";
 
-// Failed-step output excerpts (docs/decisions/verification.md "Failed-step output excerpts",
-// an owner-directed exception to SPEC's "Raw prompts, responses, tool output, stdout/stderr and
+// Failed-step output excerpts (an owner-directed exception to SPEC's "Raw prompts, responses, tool output, stdout/stderr and
 // source archives | Ephemeral only"). Only a recipe step that failed or timed out in a Sandbox B
 // run (calibration or verification) may keep the redacted tail of its combined output, encrypted,
 // for seven days. Step results and the API carry the excerpt's ID and expiry only; its text is

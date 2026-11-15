@@ -15,8 +15,8 @@ import {
 import { packageKey, type DependencyGraph } from "../types.js";
 import type { LadderPlan, LockfileExpectation, ManifestEdit } from "./types.js";
 
-// Trusted checks of what running a plan actually produced (BUILD_PLAN items 23–24: "rejecting
-// churn"; "trusted checks (allowed files, manifest pointer allowlist, …)"). Everything is computed
+// Trusted checks of what running a plan actually produced (rejecting churn; allowed files, the
+// manifest pointer allowlist, …). Everything is computed
 // from the base and patched graphs and manifests the control plane parses itself.
 
 export interface ExpectationViolation {

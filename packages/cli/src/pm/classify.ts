@@ -14,7 +14,7 @@ import {
 import { parseCreateSpec, parseRegistrySpec, type RegistrySpec } from "./spec.js";
 
 // What `kovo pnpm …` and `kovo npm …` do with a package-manager command line, decided before
-// anything runs (plans/dependency-firewall.md Part 3b). Pure: the arguments are only classified,
+// anything runs. Pure: the arguments are only classified,
 // never printed.
 //
 // - resolve: `add`, `install`, `update`, `remove`, `dedupe` (and their aliases). The command runs

@@ -36,8 +36,39 @@ export const policyBodySchema = z.strictObject({
     .refine(unique, { error: "protected paths must be unique" }),
   base_freshness: baseFreshnessSchema,
   open_pr_on_verification_failure: z.strictObject({ P0: z.boolean(), P1: z.boolean() }),
+  /**
+   * The Kovo-side failure opt-out (agent decision 2026-10-28, pending owner review): whether Kovo opens a
+   * review-only PR, and sends one email, when a patch exists but verification could not run or complete because of a failure on Kovo's side
+   * (`KovoSideVerificationFailure`). Absent means the default, on for both tiers
+   * (`DEFAULT_OPEN_PR_ON_KOVO_SIDE_FAILURE`); `false` opts the repository out for that tier.
+   * Such a PR never gets a successful `Kovo verification` check and autopilot never merges it.
+   * Optional so every stored body, activation scope and hash stays as it was.
+   */
+  open_pr_on_kovo_side_failure: z
+    .strictObject({ P0: z.boolean(), P1: z.boolean() })
+    .exactOptional(),
 });
 export type PolicyBody = z.infer<typeof policyBodySchema>;
+
+/** The fallback default when a policy records no `open_pr_on_kovo_side_failure`. */
+export const DEFAULT_OPEN_PR_ON_KOVO_SIDE_FAILURE: Readonly<Record<FixTier, boolean>> = {
+  P0: true,
+  P1: true,
+};
+
+/** The effective `open_pr_on_kovo_side_failure` of a policy, its default filled in. */
+export function openPrOnKovoSideFailure(
+  policy: Pick<PolicyBody, "open_pr_on_kovo_side_failure">,
+): Readonly<Record<FixTier, boolean>> {
+  return policy.open_pr_on_kovo_side_failure ?? DEFAULT_OPEN_PR_ON_KOVO_SIDE_FAILURE;
+}
+
+/**
+ * The policy body writers produce. The `open_pr_on_kovo_side_failure` key is open on the
+ * writers now that the release with its tolerant readers is in production (AGENTS.md "Ship enabled
+ * by default": reader first, then writer). Absent still means the default, on for both tiers.
+ */
+export const policyBodyWriterSchema = policyBodySchema;
 
 /**
  * The policy a newly protected repository starts with. Autopilot itself is the opt-in, so both fix
@@ -87,6 +118,10 @@ export const activationScopeShape = {
   policy: policyBodySchema,
 };
 export const activationScopeSchema = z.strictObject(activationScopeShape);
+/** What activation-scope writers record (`policyBodyWriterSchema`). */
+export const activationScopeWriterSchema = activationScopeSchema.extend({
+  policy: policyBodyWriterSchema,
+});
 export type ActivationScope = z.output<typeof activationScopeSchema>;
 
 // ---- Tiering configuration ----

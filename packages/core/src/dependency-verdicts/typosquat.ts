@@ -1,6 +1,5 @@
-// Typosquat candidates by name distance against a mirrored list of popular package names (plans/
-// dependency-firewall.md Part 1, "Likely typosquat of a popular package (new direct dependency
-// only)"). The signal only warns, and has false positives by design: a name one edit away from a
+// Typosquat candidates by name distance against a mirrored list of popular package names ("Likely
+// typosquat of a popular package (new direct dependency only)"). The signal only warns, and has false positives by design: a name one edit away from a
 // popular name, or equal to one once case and the separators `-`, `_` and `.` are ignored.
 //
 // Distance is the optimal-string-alignment edit distance (insertion, deletion, substitution and

@@ -1,10 +1,9 @@
 import {
   dependencyVerdictChangeSchema,
-  exactVersionSchema,
-  packageNameSchema,
   type DependencyVerdictChangeWire,
   type PackageName,
-} from "@kovo/contracts";
+} from "@kovo/contracts/cli";
+import { exactVersionSchema, packageNameSchema } from "@kovo/contracts/npm";
 
 import { unavailableError, usageError } from "../errors.js";
 import { readPackuments, versionFacts } from "../deps/offline/registry.js";

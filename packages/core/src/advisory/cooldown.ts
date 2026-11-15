@@ -1,4 +1,5 @@
-import { DURATIONS, type FixTier } from "@kovo/contracts";
+import { DURATIONS } from "@kovo/contracts/time";
+import type { FixTier } from "@kovo/contracts";
 
 // Publication age applies to every introduced version: P0 24 hours, P1 24 hours.
 // Sandbox admission is a separate decision.

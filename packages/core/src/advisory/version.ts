@@ -1,4 +1,5 @@
-import { exactVersionSchema, type PackageVersion } from "@kovo/contracts";
+import { exactVersionSchema } from "@kovo/contracts/npm";
+import type { PackageVersion } from "@kovo/contracts";
 import semver from "semver";
 
 // npm version handling for advisory ranges. OSV evaluates SEMVER and ECOSYSTEM ranges on npm with

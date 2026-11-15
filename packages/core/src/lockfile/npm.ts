@@ -1,12 +1,27 @@
-import { packageNameSchema, packageVersionSchema } from "@kovo/contracts";
+import { packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 import { z } from "zod";
 
 import { isJsonObject, parseBoundedJson, type JsonLimits } from "../manifest/bounded-json.js";
 import { classifyDependencySpec } from "../manifest/dependency-spec.js";
 import { DEPENDENCY_SECTIONS, type DependencySection } from "../manifest/package-json.js";
+import { workspaceDeclarationHasMembers } from "../manifest/workspace-members.js";
 import type { Instance, InstanceEdge, InstanceSet, RootDependency } from "./instances.js";
-import { RejectionCollector, type LockfileRejectionReason } from "./reasons.js";
-import { checkIntegrity, checkTarballSource } from "./registry-source.js";
+import {
+  MAX_LOCKFILE_REJECTIONS,
+  RejectionCollector,
+  type LockfileRejectionReason,
+} from "./reasons.js";
+import { opaqueSourceKind, type OpaqueSourceKind } from "../manifest/reasons.js";
+import {
+  checkIntegrity,
+  checkTarballSource,
+  isPrivateScopeTarball,
+  opaqueLocationKind,
+  opaqueVersion,
+  registryIntegrityKey,
+  type RegistryIntegrityCandidate,
+  type RegistryIntegrityFill,
+} from "./registry-source.js";
 import { GRAPH_LIMITS, SECTION_KIND, type DependencyKind, type LockfileLimits } from "./types.js";
 import { required } from "./util.js";
 import {
@@ -22,8 +37,8 @@ import { canonicalWorkspacePath } from "./workspace/discover.js";
 // dependency resolves the way Node does, from the dependent's own `node_modules` up to the root.
 
 /**
- * The bounded parser's limits for package-lock.json (docs/decisions/lockfile.md "Hostile files are
- * parsed with bounded, strict parsers"). Real entries hold 10–20 JSON values, so the node bound
+ * The bounded parser's limits for package-lock.json (hostile files are parsed with bounded,
+ * strict parsers). Real entries hold 10–20 JSON values, so the node bound
  * follows the package bound (`GRAPH_LIMITS.maxPackages` × 20); 16 MiB holds more than 20 000 real
  * entries. At either bound a hostile document parses within about 400 MB of heap and a few seconds
  * (measured, `npm.test.ts` › hostile shapes), where the former 64 MiB / 5 000 000 nodes needed
@@ -65,7 +80,16 @@ const npmLockfileSchema = z.looseObject({
 
 export type NpmParseResult =
   | { readonly ok: true; readonly instances: InstanceSet }
-  | { readonly ok: false; readonly rejections: RejectionCollector };
+  | {
+      readonly ok: false;
+      readonly rejections: RejectionCollector;
+      /**
+       * Present only when every rejection is a `missing_integrity` of an entry of the
+       * registry-sourced integrity shape: supplying the registry's integrity for exactly
+       * these `name@version`s is what the parser would need. The rejections are unchanged.
+       */
+      readonly registryIntegrityCandidates?: readonly RegistryIntegrityCandidate[];
+    };
 
 const NODE_MODULES = "node_modules/";
 const NESTED = "/node_modules/";
@@ -134,12 +158,12 @@ class InstallTree {
     return null;
   }
 
-  /** Whether a folder above `at` bundles its dependencies (npm `bundleDependencies`). */
-  insideBundle(at: Folder): boolean {
+  /** The nearest containing tarball, before equal package versions are aggregated. */
+  bundleOwner(at: Folder): string | null {
     for (let current = at.parent; current !== null; current = current.parent) {
-      if (current.bundler) return true;
+      if (current.bundler) return current.entry;
     }
-    return false;
+    return null;
   }
 }
 
@@ -221,9 +245,20 @@ export function parseNpmLockfile(
   text: string,
   limits: LockfileLimits = GRAPH_LIMITS,
   workspace?: WorkspaceParserContext,
+  registryIntegrity?: RegistryIntegrityFill,
 ): NpmParseResult {
   const rejections = new RejectionCollector();
-  const fail = (): NpmParseResult => ({ ok: false, rejections });
+  // Registry-sourced integrity: the entries of that shape still lacking a supplied value,
+  // reported only when they are the lockfile's sole problem (otherwise filling cannot help).
+  const candidates = new Map<string, RegistryIntegrityCandidate>();
+  let otherMissingIntegrity = false;
+  const fail = (): NpmParseResult =>
+    candidates.size > 0 &&
+    !otherMissingIntegrity &&
+    rejections.rejections.length < MAX_LOCKFILE_REJECTIONS &&
+    rejections.rejections.every((rejection) => rejection.reason === "missing_integrity")
+      ? { ok: false, rejections, registryIntegrityCandidates: [...candidates.values()] }
+      : { ok: false, rejections };
 
   const json = parseBoundedJson(text, NPM_LOCKFILE_LIMITS);
   if (!json.ok) {
@@ -263,7 +298,10 @@ export function parseNpmLockfile(
     rejections.add("too_many_dependencies");
     return fail();
   }
-  const workspaces = root.workspaces !== undefined;
+  // A root-only declaration (`["."]`) has no members beyond the root.
+  const workspaces =
+    root.workspaces !== undefined &&
+    (root.workspaces === null || workspaceDeclarationHasMembers(root.workspaces));
   const linkReason: LockfileRejectionReason = workspaces
     ? "workspace_packages"
     : "local_path_dependency";
@@ -294,8 +332,9 @@ export function parseNpmLockfile(
     }
   }
 
-  // Root dependencies are validated as package.json specs: a URL or git spec is rejected even
-  // when npm recorded a canonical-looking `resolved` for it.
+  // Root dependencies are validated as package.json specs. A git, URL or local-path spec is an
+  // opaque node even when npm recorded a canonical-looking `resolved` for it: its
+  // target is marked opaque below, so Kovo never plans a change to it. Other refusals stand.
   const rootDeclared = declaredDependencies(root, true);
   for (const declared of rootDeclared) {
     const name = packageNameSchema.safeParse(declared.alias);
@@ -306,7 +345,8 @@ export function parseNpmLockfile(
     if (workspace?.localTarget(".", declared.section, declared.alias, declared.range) !== undefined)
       continue;
     const classified = classifyDependencySpec(declared.range);
-    if (classified.kind === "rejected") rejections.add(classified.reason, name.data);
+    if (classified.kind === "rejected" && opaqueSourceKind(classified.reason) === null)
+      rejections.add(classified.reason, name.data);
     else if (classified.kind === "invalid") rejections.add("lockfile_invalid", name.data);
   }
 
@@ -328,7 +368,12 @@ export function parseNpmLockfile(
   const located: {
     readonly location: string;
     readonly entry: NpmEntry;
-    readonly place: { readonly segments: string[]; readonly at: Folder } | null;
+    readonly place: {
+      readonly segments: string[];
+      readonly at: Folder;
+      /** Installed below a workspace member's own `node_modules`, not the root's. */
+      readonly inMember: boolean;
+    } | null;
   }[] = [];
   for (const [location, entry] of Object.entries(packages)) {
     if (location === "") continue;
@@ -344,28 +389,67 @@ export function parseNpmLockfile(
     located.push({
       location,
       entry,
-      place: segments === null || at === null ? null : { segments, at },
+      place:
+        segments === null || at === null || placed === null
+          ? null
+          : { segments, at, inMember: placed.tree !== tree },
     });
   }
 
   const instances = new Map<string, Instance>();
   for (const member of workspace?.layout.members ?? [])
     if (member.path !== ".") instances.set(`workspace:${member.path}`, localInstance(member));
+  // The targets npm records for `file:` directory links (`"node_modules/a": {link, resolved}`).
+  const fileLinkTargets = new Set<string>();
+  for (const { entry, place } of located)
+    if (place !== null && entry.link === true && entry.resolved !== undefined)
+      fileLinkTargets.add(entry.resolved);
   const links = new Map<string, string>();
   const entries = new Map<string, { readonly entry: NpmEntry; readonly at: Folder }>();
   for (const { location, entry, place } of located) {
     if (place === null) {
-      // A package folder outside node_modules: the target of a workspace or file: link.
-      rejections.add(linkReason);
+      // A package folder outside node_modules: the target of a workspace or file: link. Without
+      // workspaces, a link entry's target is the inside of a `file:` dependency, which stays
+      // opaque: the link entry is the node, and nothing inside it is read. Any other
+      // location outside node_modules (`node_modules/../x`) is still refused.
+      const insideLink = [...fileLinkTargets].some(
+        (target) => location === target || location.startsWith(`${target}/node_modules/`),
+      );
+      if (workspaces || workspace !== undefined || !insideLink) rejections.add(linkReason);
       continue;
     }
-    const { segments, at } = place;
+    const { segments, at, inMember } = place;
     const name = packageNameSchema.safeParse(entry.name ?? segments.at(-1));
     if (!name.success) {
       rejections.add("invalid_package_name");
       continue;
     }
+    const opaqueInstance = (kind: OpaqueSourceKind, version = entry.version): Instance => ({
+      id: location,
+      name: name.data,
+      version: opaqueVersion(version),
+      integrity: null,
+      integrityAlgorithm: null,
+      resolved: entry.resolved ?? null,
+      bundled: false,
+      bundles: [],
+      hasInstallScript: entry.hasInstallScript === true,
+      patched: false,
+      edges: [],
+      opaque: kind,
+    });
     if (entry.link === true) {
+      if (!workspaces && workspace === undefined) {
+        // A `file:` directory dependency: an opaque local-path node. Its target's
+        // declared dependencies are its edges, so the packages only it brings in are known.
+        const target =
+          entry.resolved !== undefined && Object.hasOwn(packages, entry.resolved)
+            ? packages[entry.resolved]
+            : undefined;
+        instances.set(location, opaqueInstance("local_path", target?.version));
+        if (target !== undefined) entries.set(location, { entry: target, at });
+        continue;
+      }
       const member = workspace?.layout.members.find(
         (item) =>
           item.path === entry.resolved && item.path !== "." && item.manifest.name === name.data,
@@ -375,14 +459,33 @@ export function parseNpmLockfile(
       else links.set(location, `workspace:${member.path}`);
       continue;
     }
+    if (entry.resolved !== undefined) {
+      // A scoped package from a private HTTPS registry is a private-registry node (below), whose
+      // location is never kept, not an opaque tarball.
+      const kind = isPrivateScopeTarball(entry.resolved, name.data)
+        ? null
+        : opaqueLocationKind(checkTarballSource(entry.resolved, name.data, entry.version ?? ""));
+      if (kind !== null) {
+        // Git, a remote tarball or a local tarball: an opaque node whose own
+        // dependencies are still resolved below, so the subtree only it reaches is known.
+        entries.set(location, { entry, at });
+        instances.set(location, opaqueInstance(kind));
+        continue;
+      }
+    }
     const version = packageVersionSchema.safeParse(entry.version);
     if (!version.success) {
       rejections.add("invalid_package_version", name.data);
       continue;
     }
+    let privateRegistry = false;
     if (entry.resolved !== undefined) {
       const source = checkTarballSource(entry.resolved, name.data, version.data);
-      if (source !== null) {
+      // Fix-only: a scoped package from a private HTTPS registry is an opaque node.
+      privateRegistry =
+        (source === "private_registry_dependency" || source === "remote_tarball_dependency") &&
+        isPrivateScopeTarball(entry.resolved, name.data);
+      if (source !== null && !privateRegistry) {
         rejections.add(source, name.data);
         continue;
       }
@@ -390,11 +493,32 @@ export function parseNpmLockfile(
     // Bundled packages ship inside their bundler's tarball, whose integrity covers them. The
     // `inBundle` flag is the lockfile's claim; it only exempts an entry that really sits below a
     // package declaring `bundleDependencies` (npm derives bundling from the bundler, too).
-    const bundled = entry.inBundle === true && tree.insideBundle(at);
+    const bundledBy = entry.inBundle === true ? tree.bundleOwner(at) : null;
+    const bundled = bundledBy !== null;
+    // Registry-sourced integrity: only an entry below a workspace member's own
+    // `node_modules` that records a version but neither `resolved` nor `integrity`, and is neither
+    // bundled nor a link, may take the integrity its caller read from the public registry.
+    const registryShape =
+      workspace !== undefined &&
+      inMember &&
+      entry.resolved === undefined &&
+      entry.integrity === undefined &&
+      entry.inBundle !== true;
+    const key = registryIntegrityKey(name.data, version.data);
+    const supplied = registryShape ? registryIntegrity?.get(key) : undefined;
     const integrity =
-      bundled && entry.integrity === undefined ? null : checkIntegrity(entry.integrity);
+      bundled && entry.integrity === undefined ? null : checkIntegrity(supplied ?? entry.integrity);
     if (integrity !== null && !integrity.ok) {
       rejections.add(integrity.reason, name.data);
+      if (integrity.reason === "missing_integrity") {
+        if (registryShape) candidates.set(key, { name: name.data, version: version.data });
+        else otherMissingIntegrity = true;
+      }
+      continue;
+    }
+    // A registry value must be a sha512 digest; a legacy sha1 is never accepted from it.
+    if (supplied !== undefined && integrity?.algorithm !== "sha512") {
+      rejections.add("invalid_integrity", name.data);
       continue;
     }
     entries.set(location, { entry, at });
@@ -404,8 +528,13 @@ export function parseNpmLockfile(
       version: version.data,
       integrity: integrity === null ? null : integrity.integrity,
       integrityAlgorithm: integrity === null ? null : integrity.algorithm,
-      resolved: entry.resolved ?? null,
+      ...(integrity?.algorithm === "sha1" ? { legacySha1: integrity.sha1 } : {}),
+      ...(supplied === undefined ? {} : { integritySource: "registry" as const }),
+      // A private registry's location is never kept: nothing may fetch it.
+      resolved: privateRegistry ? null : (entry.resolved ?? null),
+      ...(privateRegistry ? { privateRegistry: true as const } : {}),
       bundled,
+      ...(bundledBy === null ? {} : { bundledBy }),
       bundles: Array.isArray(entry.bundleDependencies) ? entry.bundleDependencies.toSorted() : [],
       hasInstallScript: entry.hasInstallScript === true,
       patched: false,
@@ -467,10 +596,25 @@ export function parseNpmLockfile(
         declared.range,
       );
       const classified = classifyDependencySpec(declared.range);
-      if (expectedLocal === undefined && classified.kind === "rejected")
+      const opaqueKind =
+        classified.kind === "rejected" ? opaqueSourceKind(classified.reason) : null;
+      if (expectedLocal === undefined && classified.kind === "rejected" && opaqueKind === null)
         rejections.add(classified.reason);
       if (classified.kind === "invalid") rejections.add("lockfile_invalid");
       const edge = edgeFor(tree.root, declared, importer === "." ? "" : importer);
+      if (
+        expectedLocal === undefined &&
+        opaqueKind !== null &&
+        edge !== null &&
+        edge.target !== null
+      ) {
+        // A non-registry spec at the root is opaque whatever npm recorded for it, and of the kind
+        // package.json declares.
+        const target = required(instances, edge.target);
+        if (target.localMember !== undefined) rejections.add("local_path_dependency", edge.alias);
+        else if (target.opaque !== opaqueKind)
+          instances.set(edge.target, { ...target, opaque: opaqueKind });
+      }
       if (
         workspace !== undefined &&
         edge !== null &&

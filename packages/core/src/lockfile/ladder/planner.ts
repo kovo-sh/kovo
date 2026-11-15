@@ -48,6 +48,9 @@ function techniqueFor(
   node: ResolvedPackageNode,
   rung: UpgradeRung,
 ): TechniqueResult {
+  // Without a lockfile only a direct dependency's declared range can move.
+  if (ctx.pm === "manifest-only" && !node.isDirect)
+    return { ok: false, reason: "lockfile_absent_transitive" };
   switch (rung) {
     case "1":
       return lockfileUpdate(ctx, node);
@@ -116,14 +119,17 @@ function combine(
   techniques: readonly Technique[],
   evidence: RollbackEvidence | null,
 ): LadderPlan | "conflicting_edits" {
+  // Yarn classic, and a root without a lockfile, take every pin as trusted code's own
+  // package.json edit: classic re-locks after it, a lockfile-less root runs nothing at all.
+  const trustedPins = ctx.pm === "yarn" || ctx.pm === "manifest-only";
   const applyEdits = mergeEdits(
     techniques.flatMap((technique) => [
       ...technique.applyEdits,
-      ...(ctx.pm === "yarn" ? technique.writtenEdits : []),
+      ...(trustedPins ? technique.writtenEdits : []),
     ]),
   );
   const writtenEdits = mergeEdits(
-    ctx.pm === "yarn" ? [] : techniques.flatMap((technique) => technique.writtenEdits),
+    trustedPins ? [] : techniques.flatMap((technique) => technique.writtenEdits),
   );
   if (applyEdits === null || writtenEdits === null) return "conflicting_edits";
   const expectedManifest = mergeEdits([...applyEdits, ...writtenEdits]);
@@ -131,12 +137,17 @@ function combine(
 
   // Trusted code applies the edits, the re-lock picks them up, then dependents of shared
   // instances move, then direct pins, then lockfile-only updates.
-  const commands = uniqueCommands([
-    ...(applyEdits.length > 0 ? [relockCommand(ctx.pm)] : []),
-    ...techniques.flatMap((technique) => technique.preCommands),
-    ...techniques.filter((t) => !isLockfileUpdate(t)).flatMap((technique) => technique.commands),
-    ...techniques.filter(isLockfileUpdate).flatMap((technique) => technique.commands),
-  ]);
+  const commands =
+    ctx.pm === "manifest-only"
+      ? []
+      : uniqueCommands([
+          ...(applyEdits.length > 0 ? [relockCommand(ctx.pm)] : []),
+          ...techniques.flatMap((technique) => technique.preCommands),
+          ...techniques
+            .filter((t) => !isLockfileUpdate(t))
+            .flatMap((technique) => technique.commands),
+          ...techniques.filter(isLockfileUpdate).flatMap((technique) => technique.commands),
+        ]);
 
   const target = ctx.input.target;
   const pins = new Map(
@@ -190,8 +201,14 @@ function combine(
     manifestEdits: applyEdits,
     expectedManifest,
     allowedManifestPointers,
-    allowedFiles:
-      allowedManifestPointers.length > 0 ? ["package.json", ctx.lockfileName] : [ctx.lockfileName],
+    // A root without a lockfile pins in package.json itself (`lockfileName` is package.json).
+    allowedFiles: [
+      ...new Set(
+        allowedManifestPointers.length > 0
+          ? ["package.json", ctx.lockfileName]
+          : [ctx.lockfileName],
+      ),
+    ],
     commands,
     expectations,
     anchors,

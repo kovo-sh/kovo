@@ -1,4 +1,4 @@
-import { exactVersionSchema, packageNameSchema, packageVersionSchema } from "@kovo/contracts";
+import { exactVersionSchema, packageNameSchema, packageVersionSchema } from "@kovo/contracts/npm";
 import semver from "semver";
 import { z } from "zod";
 

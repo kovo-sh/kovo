@@ -2,13 +2,13 @@ import {
   LOCKFILE_FORMATS_BY_PM,
   SUPPORTED_NODE_MAJORS,
   SUPPORTED_PM_MAJORS,
-  exactVersionSchema,
-  runtimeSupport,
-  whenValid,
   type LockfileFormat,
   type PackageManager,
   type UnsupportedRepoReason,
 } from "@kovo/contracts";
+import { exactVersionSchema } from "@kovo/contracts/npm";
+import { runtimeSupport } from "@kovo/contracts/recipe";
+import { whenValid } from "@kovo/contracts/primitives";
 import semver from "semver";
 import { z } from "zod";
 
@@ -27,8 +27,7 @@ import {
 // proxy."
 //
 // The one resolver: inventory judges a repository's support with it, and recipe discovery resolves
-// the exact runtime of each recipe with it, so the two never disagree (docs/decisions/lockfile.md
-// "Runtime resolution"). Support is judged by major: a version declaration (`.nvmrc`,
+// the exact runtime of each recipe with it, so the two never disagree. Support is judged by major: a version declaration (`.nvmrc`,
 // `.node-version`, `.tool-versions`, Volta, `packageManager`) fixes the major, which must be in the
 // matrix and baked into the image; the exact version resolved is the image's baked release of that
 // major. `engines` ranges must be satisfied exactly by the baked release. A major outside the
@@ -326,7 +325,10 @@ interface NodeChoice {
   readonly declared: string | null;
 }
 
-function resolveNode(input: RuntimeInput, ignored: IgnoredDeclaration[]): Step<NodeChoice> {
+function resolveNode(
+  input: Omit<RuntimeInput, "lockfileFormat">,
+  ignored: IgnoredDeclaration[],
+): Step<NodeChoice> {
   const { catalog } = input;
   const found = nodeDeclarations(input.declarations, catalog.ltsNodeMajor);
   if (!found.ok) return found;
@@ -430,7 +432,7 @@ interface PmChoice {
 }
 
 function resolvePackageManager(
-  input: RuntimeInput,
+  input: Omit<RuntimeInput, "lockfileFormat">,
   bundledNpm: string,
   ignored: IgnoredDeclaration[],
 ): Step<PmChoice> {
@@ -542,13 +544,37 @@ function rejected(reason: RuntimeRejectionReason): RuntimeResolution {
 
 /**
  * Resolves the exact Node and package-manager releases a repository runs with in the pinned image,
- * or the explicit reason it is outside the matrix (docs/decisions/lockfile.md "Runtime
- * resolution"). Declarations are constraints that must all hold; CI preferences only choose among
+ * or the explicit reason it is outside the matrix. Declarations are constraints that must all hold; CI preferences only choose among
  * what they admit; with none, the catalog's default Node major is used.
  */
 export function resolveRuntime(input: RuntimeInput): RuntimeResolution {
   const formats: readonly LockfileFormat[] = LOCKFILE_FORMATS_BY_PM[input.packageManager];
   if (!formats.includes(input.lockfileFormat)) return rejected("lockfile_format_mismatch");
+  const releases = resolveRuntimeReleases(input);
+  if (!releases.ok) return releases;
+  return { ok: true, runtime: { ...releases.runtime, lockfileFormat: input.lockfileFormat } };
+}
+
+/** The resolved releases, before the lockfile's format is known. */
+export type ResolvedReleases = Omit<ResolvedRuntime, "lockfileFormat">;
+
+export type ReleaseResolution =
+  | { readonly ok: true; readonly runtime: ResolvedReleases }
+  | {
+      readonly ok: false;
+      readonly reason: RuntimeRejectionReason;
+      readonly unsupported: UnsupportedRepoReason;
+    };
+
+/**
+ * {@link resolveRuntime} without the lockfile-format check: the exact Node and package-manager
+ * releases the declarations admit in the pinned image, or the same rejection reason. A recorded
+ * two-lockfile choice validates its version with this before any lockfile is read; admission
+ * still runs {@link resolveRuntime} on the kept lockfile.
+ */
+export function resolveRuntimeReleases(
+  input: Omit<RuntimeInput, "lockfileFormat">,
+): ReleaseResolution {
   const ignored: IgnoredDeclaration[] = [];
   const node = resolveNode(input, ignored);
   if (!node.ok) return rejected(node.reason);
@@ -560,7 +586,7 @@ export function resolveRuntime(input: RuntimeInput): RuntimeResolution {
     pm.value.version.split(".")[0] === "9"
   )
     return rejected("pnpm_settings_requires_v10");
-  const runtime: ResolvedRuntime = {
+  const runtime: ResolvedReleases = {
     node: node.value.version,
     nodeSource: node.value.source,
     nodeDeclared: node.value.declared,
@@ -568,7 +594,6 @@ export function resolveRuntime(input: RuntimeInput): RuntimeResolution {
     pmVersion: pm.value.version,
     pmSource: pm.value.source,
     pmDeclared: pm.value.declared,
-    lockfileFormat: input.lockfileFormat,
     ignored: [...new Set(ignored)],
   };
   // The catalog schema and the checks above keep every result inside the matrix; re-check with the

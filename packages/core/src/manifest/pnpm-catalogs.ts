@@ -1,4 +1,4 @@
-import { packageNameSchema } from "@kovo/contracts";
+import { packageNameSchema } from "@kovo/contracts/npm";
 import { z } from "zod";
 
 import { classifyDependencySpec, isRegistrySpec } from "./dependency-spec.js";

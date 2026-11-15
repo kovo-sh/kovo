@@ -4,7 +4,7 @@ import { exactVersionSchema, packageNameSchema } from "./npm.js";
 import { sriSha512Schema, whenValid } from "./primitives.js";
 import { utcDateTimeSchema } from "./time.js";
 
-// The dependency verdict engine's stable vocabulary (plans/dependency-firewall.md Part 1; SPEC
+// The dependency verdict engine's stable vocabulary (SPEC
 // "Recipes and verification" → "Dependency verdict engine"). One engine answers the same question
 // for every enforcement point: is this `(ecosystem, name, version, integrity)` change safe to admit?
 // Reason codes are stable API, so customers can map them to their own policy. They never name an
@@ -73,6 +73,9 @@ export type DependencySource = z.infer<typeof dependencySourceSchema>;
 
 /** At most this many changes are judged in one request. */
 export const MAX_DEPENDENCY_VERDICT_CHANGES = 500;
+
+/** One hosted evaluation's registry budget; clients must allow time for the response too. */
+export const DEPENDENCY_VERDICT_REGISTRY_BUDGET_MS = 120_000;
 
 /** One changed or new version, as callers derive it from a lockfile diff: identifiers only. */
 export const dependencyVerdictChangeSchema = z

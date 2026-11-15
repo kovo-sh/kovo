@@ -1,4 +1,9 @@
-import { registerErrorMessage } from "@kovo/contracts/redaction";
+import {
+  STRIPE_ERROR_TYPES,
+  registerErrorMessage,
+  upstreamFailureMetadata,
+  type UpstreamFailureMetadata,
+} from "@kovo/contracts/redaction";
 // Typed errors every port may throw (ARCHITECTURE §5). Adapters translate vendor failures into
 // these classes so callers branch on `kind`, never on vendor error types or message text.
 //
@@ -30,12 +35,16 @@ export const PORT_SERVICES = [
   "secrets",
   "object_storage",
   "scan_store",
+  "outreach_source",
   "site_fetch",
   "analytics",
   "docs",
   "webhook",
   "workload_identity",
   "iap",
+  "support_mailbox",
+  "pubsub",
+  "github_public",
 ] as const;
 export type PortService = (typeof PORT_SERVICES)[number];
 
@@ -88,12 +97,41 @@ export function safeToken(value: string | null | undefined): string | undefined 
   return value != null && SAFE_TOKEN.test(value) ? value : undefined;
 }
 
+/** A request parameter's name such as `line_items[0][price]`: lower-case keys and indices only. */
+const PARAM_NAME = /^[a-z][a-z0-9_]{0,63}(?:\[[a-z0-9_]{1,64}\]){0,8}$/;
+
+/**
+ * Keeps only the name of the request parameter a vendor refused (Stripe's `param`), never its
+ * value. Anything not shaped like a parameter path is dropped.
+ */
+export function safeParamName(value: string | null | undefined): string | undefined {
+  return value != null && value.length <= 128 && PARAM_NAME.test(value) ? value : undefined;
+}
+
 export interface PortErrorInit {
+  readonly package_name?: UpstreamFailureMetadata["package_name"];
+  readonly package_version?: UpstreamFailureMetadata["package_version"];
   readonly service: PortService;
   /** The port method, e.g. `mergePullRequest`. */
   readonly operation: string;
   /** A vendor error code or sub-reason; kept only when it is a short machine token. */
   readonly code?: string | undefined;
+  /**
+   * The name (never the value) of the request parameter the vendor refused, e.g. Stripe's
+   * `line_items[0][price]`; kept only when it is shaped like a parameter path.
+   */
+  readonly param?: string | undefined;
+  /**
+   * The type the billing provider put on its error (Stripe's `invalid_request_error`, ...); kept
+   * only when it is one of {@link STRIPE_ERROR_TYPES}, otherwise `other`.
+   */
+  readonly providerErrorType?: string | undefined;
+  /**
+   * The code the provider itself sent (Stripe's `error.code`), kept only when it is a short machine
+   * token. For error logging only: callers branch on {@link PortError.code}, which an
+   * adapter may set to its own value (a decline code, `http_500`, `idempotency_key_reused`).
+   */
+  readonly providerCode?: string | undefined;
   /** The provider's request ID (e.g. `x-github-request-id`) for support correlation. */
   readonly providerRequestId?: string | undefined;
   /**
@@ -117,6 +155,10 @@ export interface PortErrorDescription {
 
 /** Base class of every port error. Use the subclasses; `kind` discriminates them. */
 export abstract class PortError extends Error {
+  /** This call spent its inline retry budget; outer step retries must not multiply it. */
+  declare readonly retryStopped?: true;
+  declare readonly package_name?: UpstreamFailureMetadata["package_name"];
+  declare readonly package_version?: UpstreamFailureMetadata["package_version"];
   abstract readonly kind: PortErrorKind;
   /**
    * Whether repeating the same call later is safe and may succeed. Ambiguous outcomes are never
@@ -126,6 +168,18 @@ export abstract class PortError extends Error {
   readonly service: PortService;
   readonly operation: string;
   readonly code: string | undefined;
+  /**
+   * The refused request parameter's name, when the vendor named one. Not part of
+   * {@link PortErrorDescription}; error logging reads it directly.
+   */
+  declare readonly param?: string;
+  /**
+   * The provider's own error type, as one of {@link STRIPE_ERROR_TYPES}; absent when the error did
+   * not come from the provider's SDK. Error logging reads it directly.
+   */
+  declare readonly providerErrorType?: (typeof STRIPE_ERROR_TYPES)[number];
+  /** The provider's own error code, for logging only; never branch on it (see `code`). */
+  declare readonly providerCode?: string;
   readonly providerRequestId: string | undefined;
   readonly #vendorCause: unknown;
 
@@ -136,8 +190,19 @@ export abstract class PortError extends Error {
     this.service = init.service;
     this.operation = operation;
     this.code = safeToken(init.code);
+    const param = safeParamName(init.param);
+    if (param !== undefined) this.param = param;
+    const providerCode = safeToken(init.providerCode);
+    if (providerCode !== undefined) this.providerCode = providerCode;
+    if (init.providerErrorType != null) {
+      this.providerErrorType =
+        STRIPE_ERROR_TYPES.find((type) => type === init.providerErrorType) ?? "other";
+    }
     this.providerRequestId = safeToken(init.providerRequestId);
     this.#vendorCause = init.vendorCause;
+    const metadata = upstreamFailureMetadata(init);
+    if (metadata.package_name !== undefined) this.package_name = metadata.package_name;
+    if (metadata.package_version !== undefined) this.package_version = metadata.package_version;
     registerErrorMessage(this);
   }
 
@@ -148,6 +213,11 @@ export abstract class PortError extends Error {
    */
   vendorCause(): unknown {
     return this.#vendorCause;
+  }
+
+  stopRetries(): this {
+    Object.defineProperty(this, "retryStopped", { value: true, enumerable: true });
+    return this;
   }
 
   /** Sanitized fields for logs and telemetry. The vendor cause is deliberately omitted. */

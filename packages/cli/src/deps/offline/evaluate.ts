@@ -1,8 +1,5 @@
-import {
-  packageNameSchema,
-  type DependencyVerdictChangeWire,
-  type DependencyVerdictWire,
-} from "@kovo/contracts";
+import { packageNameSchema } from "@kovo/contracts/npm";
+import type { DependencyVerdictChangeWire, DependencyVerdictWire } from "@kovo/contracts/cli";
 import {
   evaluateDependencyChanges,
   PLATFORM_DEPENDENCY_POLICY,
@@ -20,7 +17,7 @@ import {
   type RegistryOptions,
 } from "./registry.js";
 
-// `kovo deps check --offline` (plans/dependency-firewall.md Part 4 items 3-4): the same change list
+// `kovo deps check --offline`: the same change list
 // judged by the same pure engine (`evaluateDependencyChanges`, `PLATFORM_DEPENDENCY_POLICY`) from
 // evidence the CLI reads itself: OSV's public npm export and the public npm registry. Kovo's own
 // holds are not consulted, and neither is the popular-package list (the typosquat signal is then

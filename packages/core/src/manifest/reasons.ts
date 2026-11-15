@@ -21,6 +21,37 @@ export const SOURCE_REJECTION_REASONS = [
 ] as const;
 export type SourceRejectionReason = (typeof SOURCE_REJECTION_REASONS)[number];
 
+/**
+ * Non-registry sources Kovo leaves alone as opaque nodes:
+ * a git source (`git+…`, `github:`, `user/repo`), a remote tarball URL, or a local path (`file:`,
+ * `link:`, a relative path or local tarball). Kovo does not resolve, update or vet inside them,
+ * keeps their manifest and lockfile entries byte-identical, still fixes the registry dependencies
+ * around them, and discloses them on the fix PR. Any other protocol (`jsr:`, `exec:`, `patch:`)
+ * and private registries are not opaque sources and still refuse with their own reasons.
+ */
+export const OPAQUE_SOURCE_KINDS = ["git", "tarball", "local_path"] as const;
+export type OpaqueSourceKind = (typeof OPAQUE_SOURCE_KINDS)[number];
+
+const OPAQUE_KIND_OF_REASON: Readonly<Record<string, OpaqueSourceKind>> = {
+  git_dependency: "git",
+  remote_tarball_dependency: "tarball",
+  local_path_dependency: "local_path",
+};
+
+/** The source rejection reason of each opaque kind, for the places that still refuse them. */
+export const OPAQUE_KIND_REASON = {
+  git: "git_dependency",
+  tarball: "remote_tarball_dependency",
+  local_path: "local_path_dependency",
+} as const satisfies Record<OpaqueSourceKind, (typeof SOURCE_REJECTION_REASONS)[number]>;
+
+/** The opaque kind a source rejection reason names, or null when the source still refuses. */
+export function opaqueSourceKind(reason: string): OpaqueSourceKind | null {
+  return Object.hasOwn(OPAQUE_KIND_OF_REASON, reason)
+    ? (OPAQUE_KIND_OF_REASON[reason] ?? null)
+    : null;
+}
+
 export const MANIFEST_REJECTION_REASONS = [
   ...SOURCE_REJECTION_REASONS,
   "npm_workspaces", // a non-empty `workspaces` field
@@ -34,7 +65,7 @@ export const MANIFEST_REJECTION_REASONS = [
   "invalid_dependency_name",
   "invalid_dependency_spec",
   "invalid_override",
-  // pnpm 9/10: a package.json `pnpm` setting the pnpm-workspace.yaml allowlist refuses (#1879), the
+  // pnpm 9/10: a package.json `pnpm` setting the pnpm-workspace.yaml allowlist refuses, the
   // same reason `.npmrc` and pnpm-workspace.yaml settings get.
   "unsupported_workspace_setting",
 ] as const;
@@ -59,7 +90,7 @@ export const MANIFEST_REJECTION_UNSUPPORTED = {
   invalid_dependency_name: "invalid_package_json",
   invalid_dependency_spec: "invalid_package_json",
   invalid_override: "invalid_package_json",
-  unsupported_workspace_setting: "workspaces",
+  unsupported_workspace_setting: "unsupported_pnpm_setting",
 } as const satisfies Record<ManifestRejectionReason, UnsupportedRepoReason>;
 
 /**
@@ -68,7 +99,13 @@ export const MANIFEST_REJECTION_UNSUPPORTED = {
  * malformed content.
  */
 export const UNSUPPORTED_PRIORITY: readonly UnsupportedRepoReason[] = [
+  "nested_project",
+  "too_many_projects",
+  "required_app_unprotected",
+  "out_of_project_scope",
+  "project_scope_ambiguous",
   "workspaces",
+  "unsupported_pnpm_setting",
   "too_large",
   "invalid_package_json",
   "private_registry",

@@ -1,12 +1,16 @@
 import type {
   LockfileFormat,
+  OpaqueDependencies,
   PackageManager,
   PackageName,
   PackageVersion,
   SriSha512,
+  StoredLockfileFormat,
+  StoredPackageManager,
 } from "@kovo/contracts";
 
 import type { DependencySection } from "../manifest/package-json.js";
+import type { OpaqueSourceKind } from "../manifest/reasons.js";
 
 // The normalized dependency graph every supported lockfile format parses into (SPEC
 // inventoryWorkflow step 2: "Parse every resolved package/version and dependency path. Aggregate a
@@ -60,8 +64,20 @@ export interface ResolvedPackageNode {
   readonly integrity: SriSha512 | null;
   /** Which integrity the lockfile records: sha512, only a legacy sha1, or none (bundled). */
   readonly integrityAlgorithm: "sha512" | "sha1" | null;
+  /**
+   * The distinct `sha1-` SRI tokens of this version's sha1-only instances, sorted: the
+   * malware gate cross-checks them against the registry's `dist.shasum` before it trusts the
+   * registry's sha512 for the version. Absent when no instance is sha1-only.
+   */
+  readonly legacySha1?: readonly string[];
   /** The canonical public tarball URL when the lockfile records one. */
   readonly resolved: string | null;
+  /**
+   * Fix-only: some instance is locked at a private HTTPS registry (its location is never
+   * kept). Absent on every other node. A scope the repository's `.npmrc` declares private makes a
+   * node private too (`privateRegistryPackages`), even when pnpm records no location for it.
+   */
+  readonly privateRegistry?: true;
   /** Reached by a root (package.json) dependency. */
   readonly isDirect: boolean;
   /** False when any production path reaches it (optional and peer paths count as production). */
@@ -70,6 +86,12 @@ export interface ResolvedPackageNode {
   readonly isOptional: boolean;
   /** Installed from inside another package's tarball (npm `inBundle`). */
   readonly bundled: boolean;
+  /** Exact containing tarballs for every bundled instance; absent if coverage is unproven. */
+  readonly bundleArtifacts?: readonly {
+    readonly name: PackageName;
+    readonly version: PackageVersion;
+    readonly integrity: SriSha512 | null;
+  }[];
   /** Packages this one bundles, as the lockfile names them (pnpm lists names only). */
   readonly bundles: readonly string[];
   /** npm's `hasInstallScript`; null when the format does not record it (pnpm v9). */
@@ -103,14 +125,131 @@ export interface UnresolvedDependency {
 }
 
 export interface DependencyGraph {
-  readonly packageManager: PackageManager;
-  readonly format: LockfileFormat;
+  /** A fix-only value only on the fix paths' parses (`LockfileInput.fixOnly`). */
+  readonly packageManager: StoredPackageManager;
+  readonly format: StoredLockfileFormat;
   readonly direct: readonly DirectDependency[];
   /** Every package reachable from the root, sorted by name then SemVer precedence. */
   readonly packages: readonly ResolvedPackageNode[];
   readonly unresolved: readonly UnresolvedDependency[];
   /** pnpm lockfile `overrides` selectors (npm does not record overrides in the lockfile). */
   readonly lockfileOverrides: readonly string[];
+  /** Non-registry sources left alone as opaque nodes; absent means none. */
+  readonly opaque?: OpaqueGraph;
+}
+
+/** One non-registry dependency Kovo did not resolve, update or vet. */
+export interface OpaqueNode {
+  readonly name: PackageName;
+  readonly kind: OpaqueSourceKind;
+  /** Declared in package.json (otherwise a dependency of a registry package or another node). */
+  readonly isDirect: boolean;
+  /**
+   * The SHA-256 of the node's lockfile identity (its instances' versions, locations and
+   * integrity), compared between two graphs to find a new or changed node. A hash, so a location
+   * with credentials never reaches the graph; still used in memory only.
+   */
+  readonly identity: string;
+}
+
+/** An opaque node `head` adds or changes relative to `base` (dependency gate input). */
+export interface OpaqueNodeChange {
+  readonly name: PackageName;
+  readonly kind: OpaqueSourceKind;
+  readonly isDirect: boolean;
+  /** The base has no opaque node of this name and kind. */
+  readonly isNew: boolean;
+}
+
+/** The opaque nodes `head` adds or changes relative to `base` (null: every node is new). */
+export function opaqueNodeChanges(
+  base: DependencyGraph | null,
+  head: DependencyGraph,
+): OpaqueNodeChange[] {
+  const before = new Map(
+    (base?.opaque?.nodes ?? []).map((node) => [`${node.name}\u0000${node.kind}`, node.identity]),
+  );
+  return (head.opaque?.nodes ?? []).flatMap((node) => {
+    const known = before.get(`${node.name}\u0000${node.kind}`);
+    if (known === node.identity) return [];
+    return [
+      { name: node.name, kind: node.kind, isDirect: node.isDirect, isNew: known === undefined },
+    ];
+  });
+}
+
+/** A registry package/version reachable only through opaque nodes. */
+export interface HiddenPackage {
+  readonly key: PackageKey;
+  readonly name: PackageName;
+  readonly version: PackageVersion;
+  /** sha512 integrity, or null for bundled and legacy sha1-only entries. */
+  readonly integrity: SriSha512 | null;
+  /** The canonical public tarball URL when the lockfile records one. */
+  readonly resolved: string | null;
+}
+
+/**
+ * The opaque part of a graph: the non-registry nodes themselves, and the packages reachable only
+ * through them (their own dependencies, which Kovo does not vet either). Neither appears in
+ * `packages`, in dependency paths or in edges, so no advisory matches and no fix plans them.
+ */
+export interface OpaqueGraph {
+  /** Sorted by name, then kind; one entry per name and kind. */
+  readonly nodes: readonly OpaqueNode[];
+  /** How many package/versions are reachable only through opaque nodes. */
+  readonly hiddenPackages: number;
+  /**
+   * The registry package/versions reachable only through opaque nodes, sorted by key. They passed
+   * the registry source checks (canonical URL, integrity), so the customer PR dependency gate
+   * judges their changes like any other transitive registry change; fixes still never plan them.
+   */
+  readonly hidden: readonly HiddenPackage[];
+  /**
+   * Sorted SHA-256 identities (of `name`, `version`, `resolved`, `integrity`) of every opaque node
+   * and hidden package, compared before and after a fix: a fix may never change any of them.
+   * Hashed because `resolved` can be a URL with credentials; still used in memory only.
+   */
+  readonly identities: readonly string[];
+}
+
+/** The evidence counts of a graph's opaque nodes, or undefined when it has none. */
+export function opaqueDependencyCounts(graph: DependencyGraph): OpaqueDependencies | undefined {
+  const opaque = graph.opaque;
+  if (opaque === undefined || opaque.nodes.length === 0) return undefined;
+  const count = (kind: OpaqueSourceKind): number =>
+    opaque.nodes.filter((node) => node.kind === kind).length;
+  return {
+    git_count: count("git"),
+    tarball_count: count("tarball"),
+    local_path_count: count("local_path"),
+    hidden_package_count: opaque.hiddenPackages,
+  };
+}
+
+/** Whether a graph change touched any opaque node or the packages only they reach. */
+export function opaqueChanged(before: DependencyGraph, after: DependencyGraph): boolean {
+  const a = before.opaque?.identities ?? [];
+  const b = after.opaque?.identities ?? [];
+  return a.length !== b.length || a.some((identity, index) => identity !== b[index]);
+}
+
+/** A graph of a package manager Kovo runs (every parse without `fixOnly` gives one). */
+export type VerifiableGraph = DependencyGraph & {
+  readonly packageManager: PackageManager;
+  readonly format: LockfileFormat;
+};
+
+const VERIFIABLE_FORMATS: ReadonlySet<string> = new Set<LockfileFormat>([
+  "npm-v2",
+  "npm-v3",
+  "pnpm-v9",
+  "yarn-v1",
+]);
+
+/** Whether a graph belongs to a package manager Kovo runs, not a fix-only one. */
+export function isVerifiableGraph(graph: DependencyGraph): graph is VerifiableGraph {
+  return VERIFIABLE_FORMATS.has(graph.format);
 }
 
 /** Bounds on graph size and path enumeration (paths grow combinatorially in large graphs). */
@@ -130,7 +269,7 @@ export const GRAPH_LIMITS = {
   /**
    * Path-enumeration work (edges examined plus chain steps of cycle checks and recorded paths)
    * across the whole graph; beyond it every package is marked `pathsTruncated`. The largest real
-   * lockfiles measured need well under a tenth of it (docs/decisions/lockfile.md).
+   * lockfiles measured need well under a tenth of it.
    */
   maxPathWork: 20_000_000,
 } as const;

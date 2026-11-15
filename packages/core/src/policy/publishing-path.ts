@@ -13,6 +13,49 @@ export interface PublishingPathIdentity {
   readonly repositoryIdHash: string | null;
   /** Verified normalized source URL hash; absence of an immutable ID remains unknown. */
   readonly repositoryUrlHash?: string | null;
+  readonly signerWorkflowHash?: string;
+  readonly signer_workflow_differs?: true;
+  readonly reason?: "attestation_missing" | "publishing_identity_mismatch";
+}
+
+/** Advisory only, kept separate from suspicion signals and persistent policy schemas. */
+export function publishingPathObservations(
+  current: PublishingPathIdentity,
+  history: readonly PublishingPathIdentity[],
+): readonly "publishing_workflow_changed"[] {
+  const previous = history
+    .filter(
+      (item) =>
+        item.package === current.package &&
+        line(item.version) === line(current.version) &&
+        item.publishedAt < current.publishedAt,
+    )
+    .toSorted((a, b) => b.publishedAt - a.publishedAt)
+    .slice(0, PUBLISHING_PATH_RUN_LENGTH);
+  return current.verifiedAttestation === true &&
+    current.signerWorkflowHash !== undefined &&
+    previous.length === PUBLISHING_PATH_RUN_LENGTH &&
+    previous.every(
+      (item) =>
+        item.mode === "trusted" &&
+        item.verifiedAttestation === true &&
+        item.repositoryIdHash === current.repositoryIdHash &&
+        item.signerWorkflowHash !== undefined &&
+        item.signerWorkflowHash !== current.signerWorkflowHash,
+    )
+    ? ["publishing_workflow_changed"]
+    : [];
+}
+
+/** Fixed diagnostic reason, never a retry or a hold-clearance instruction. */
+export function publishingPathReason(
+  current: PublishingPathIdentity,
+  history: readonly PublishingPathIdentity[],
+): "attestation_missing" | "publishing_identity_mismatch" | undefined {
+  const signals = detectPublishingPath(current, history);
+  if (signals.includes("source_repository_changed")) return "publishing_identity_mismatch";
+  if (signals.includes("publishing_path_attestation_missing")) return current.reason;
+  return undefined;
 }
 
 export type PublishingPathSignal =

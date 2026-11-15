@@ -14,7 +14,7 @@ export const NPM_PACKAGE_NAME_MAX_LENGTH = 214;
 const SEGMENT = "[A-Za-z0-9~-][A-Za-z0-9._~!'()*-]*";
 // npm checks the leading-underscore rule on the whole name, which starts with `@` when scoped, so a
 // scope or scoped name may begin with `_` (validate-npm-package-name). Real packages do, including
-// malicious ones (OpenSSF MAL-2026-2420 `@_wnpm/wnpm-cli`); docs/decisions/advisory.md.
+// malicious ones (OpenSSF MAL-2026-2420 `@_wnpm/wnpm-cli`).
 const SCOPED_SEGMENT = "[A-Za-z0-9~_-][A-Za-z0-9._~!'()*-]*";
 const PACKAGE_NAME = new RegExp(`^(?:${SEGMENT}|@${SCOPED_SEGMENT}/${SCOPED_SEGMENT})$`);
 

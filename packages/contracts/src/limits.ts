@@ -47,6 +47,7 @@ export const LIMITS = {
    * mutations, all caught, with at least one exercising application code/build behavior".
    */
   calibration: {
+    maxPerProjectPerWindow: 3,
     maxPerRepoPerWindow: 3,
     windowMs: DURATIONS.calibrationRateWindow,
     minMeaningfulMutations: 2,
@@ -54,7 +55,7 @@ export const LIMITS = {
   },
   /**
    * The rediscovery rate limit (SPEC Public API: `POST …/recipe/rediscover` "Scoped write; async
-   * job; rate/cost limits"; docs/decisions/recipes.md "Rediscovery rate and cost limits"): at most
+   * job; rate/cost limits"): at most
    * four discoveries of one repository start in any rolling hour, whatever asked for them.
    */
   discovery: { maxPerRepoPerWindow: 4, windowMs: HOUR_MS },
@@ -65,20 +66,18 @@ export const LIMITS = {
   /** "Sandbox defaults: 2 vCPU/4 GiB, fixed per-step timeout, absolute 60-minute lifetime". */
   sandbox: { vcpus: 2, memoryGib: 4, maxLifetimeMs: DURATIONS.sandboxMaxLifetime },
   /**
-   * Paid capacity: one quote adds at most this many slots (docs/decisions/contracts.md "Billing
-   * shapes"), which bounds a mistyped quantity.
+   * Paid capacity: one quote adds at most this many slots, which bounds a mistyped quantity.
    */
   capacity: { maxAdditionalSlotsPerQuote: 100 },
   /**
    * Per-account resource caps (SPEC Pauses and resilience: "Global/account/repo resource caps …
-   * prevent one tenant monopolizing workers"; docs/decisions/accounts.md and notifications.md): an
+   * prevent one tenant monopolizing workers"): an
    * account holds at most this many pending invitations and live (not revoked) webhook
    * subscriptions; one more is `409 conflict` until one is revoked or expires.
    */
   accounts: { maxPendingInvitations: 50, maxLiveWebhookSubscriptions: 25 },
   /**
-   * Requested test events (`POST /v1/webhooks/{id}/test`; docs/decisions/notifications.md "Test
-   * events"): at most this many per subscription per window, one attempt each, so a test cannot
+   * Requested test events (`POST /v1/webhooks/{id}/test`): at most this many per subscription per window, one attempt each, so a test cannot
    * turn Kovo into a request generator against a destination ("prevent one tenant monopolizing
    * workers"); one more is `429 rate_limited`.
    */
