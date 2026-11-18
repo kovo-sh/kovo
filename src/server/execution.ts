@@ -118,11 +118,19 @@ class Execution {
       const current = this.storage.worker(id)
       if (current.status === 'running' && current.lease === job.assignment.lease) {
         const run = this.storage.run(current.runId)
-        const requeue = run.status === 'running' && current.phase === 'verification' && run.phase === 'analysis'
-        const outcome = requeue ? 'Waiting for analysis of the expanded scope.' : 'Assignment authorization changed.'
+        const mayVerify = run.status === 'running' && current.phase === 'verification' &&
+          run.goalRevision === current.goalRevision && current.assetId !== null && run.approved.includes(current.assetId)
+        const waitingForAnalysis = mayVerify && run.phase === 'analysis'
+        const revisedInputs = mayVerify && run.phase === 'verification' &&
+          [...job.origins].some(origin => !this.permitted(run, origin))
+        const requeue = waitingForAnalysis || revisedInputs
+        const outcome = waitingForAnalysis ? 'Waiting for analysis of the expanded scope.'
+          : revisedInputs ? 'Verification will continue with the approved inputs.' : 'Assignment authorization changed.'
         this.storage.db.transaction(() => {
           this.storage.updateWorker(id, { status: requeue ? 'queued' : 'canceled', lease: null, outcome })
-          this.storage.event(run.id, requeue ? 'worker.waiting' : 'worker.canceled', outcome)
+          this.storage.event(run.id, requeue ? 'worker.waiting' : 'worker.canceled', outcome, {
+            assignmentId: id, scopeRevision: run.scopeRevision,
+          })
         })
       }
     }

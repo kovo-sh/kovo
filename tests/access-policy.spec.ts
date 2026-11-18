@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -210,18 +210,23 @@ async function importAccessRecords(page: Page, policy: AccessPolicySnapshot) {
     new URL(policy.origin).hostname)
 }
 
-test('retains independently verified access findings after a redirect host is removed', async ({ page }) => {
+async function redirectedReview(hold: 'mixed' | 'response-only') {
   const gate = await mkdtemp(join(tmpdir(), 'guardian-redirect-verification-'))
+  const marker = join(gate, 'held')
   const docker = execFileSync('which', ['docker'], { encoding: 'utf8' }).trim()
-  // Hold the relay's response-only verification so the operator can stop after the primary host finishes.
+  // Hold one kind of verification while the real container handles every other command.
   await writeFile(join(gate, 'docker'), `#!/usr/bin/env node
-const { readFileSync } = require('node:fs')
+const { readFileSync, writeFileSync } = require('node:fs')
 const { spawnSync } = require('node:child_process')
 const args = process.argv.slice(2)
 const startsWorker = args[0] === 'container' && args[1] === 'start'
 const input = startsWorker ? readFileSync(0, 'utf8') : undefined
-const verification = input && JSON.parse(input).files.find(file => file.name === 'verification-input.json')
-if (verification && JSON.parse(verification.content).access === null) {
+const job = input && JSON.parse(input)
+const verification = job && job.files.find(file => file.name === 'verification-input.json')
+const records = verification && JSON.parse(verification.content)
+const hold = records && (${JSON.stringify(hold)} === 'mixed' ? records.access !== null && records.response.length > 0 : records.access === null)
+if (hold) {
+  writeFileSync(${JSON.stringify(marker)}, job.assignmentId)
   setTimeout(() => process.exit(1), 15_000)
 } else {
   const options = input === undefined ? { stdio: 'inherit' } : { input, stdio: ['pipe', 'inherit', 'inherit'] }
@@ -238,16 +243,40 @@ if (verification && JSON.parse(verification.content).access === null) {
     },
   })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin, PATH: gate + delimiter + process.env.PATH })
+  return {
+    app, fixture, requested,
+    async start(page: Page) {
+      await app.start()
+      await page.goto(app.url)
+      await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+      await page.getByLabel('Project name').fill('Northstar redirected response')
+      await page.getByLabel('Seed hosts').fill([primaryOrigin, healthyOrigin].join('\n'))
+      await page.getByRole('button', { name: 'Create project', exact: true }).click()
+      await importAccessRecords(page, severeAccessPolicy)
+      await openScopeReview(page, combinedGoal, true)
+      await saveScope(page)
+    },
+    heldWorker: () => readFile(marker, 'utf8').catch(() => ''),
+    async dispose() {
+      await app.dispose()
+      await fixture.close()
+      await rm(gate, { recursive: true, force: true })
+    },
+  }
+}
+
+async function removeRedirectHost(page: Page) {
+  await page.getByRole('button', { name: 'Review scope' }).click()
+  await page.getByRole('checkbox', { name: 'Include healthy.northstar.example' }).uncheck()
+  await saveScope(page, 'Save scope revision')
+  await expect(page.getByRole('button', { name: 'Save scope revision', exact: true })).toBeHidden()
+}
+
+test('retains independently verified access findings after a redirect host is removed', async ({ page }) => {
+  const review = await redirectedReview('response-only')
+  const { fixture, requested } = review
   try {
-    await app.start()
-    await page.goto(app.url)
-    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
-    await page.getByLabel('Project name').fill('Northstar redirected response')
-    await page.getByLabel('Seed hosts').fill([primaryOrigin, healthyOrigin].join('\n'))
-    await page.getByRole('button', { name: 'Create project', exact: true }).click()
-    await importAccessRecords(page, severeAccessPolicy)
-    await openScopeReview(page, combinedGoal, true)
-    await saveScope(page)
+    await review.start(page)
     await page.getByRole('link', { name: /^Trace/ }).click()
     await expect(page.getByRole('link', { name: 'Verify northstar.example, complete', exact: true }))
       .toBeVisible({ timeout: 15_000 })
@@ -262,14 +291,12 @@ if (verification && JSON.parse(verification.content).access === null) {
     expect(oldProof.inputEvidence).toEqual([oldResponse.artifactId, access.artifactId])
 
     await page.getByRole('link', { name: 'Workflow', exact: true }).click()
-    await page.getByRole('button', { name: 'Review scope' }).click()
-    await page.getByRole('checkbox', { name: 'Include healthy.northstar.example' }).uncheck()
-    await saveScope(page, 'Save scope revision')
-    await expect(page.getByText('1 approved host · Revision 2', { exact: true })).toBeVisible()
+    await removeRedirectHost(page)
     await page.getByRole('button', { name: 'Resume', exact: true }).click()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
     await expect(report).toContainText('2 confirmed findings')
+    await expect(report).toContainText('1 approved host · Scope revision 2')
     await expect(report).toContainText('1 check met baseline · 2 verified gaps · 4 checks inconclusive')
     const priority = report.getByRole('region', { name: 'Fix first' })
     await expect(priority).toContainText('workspace-ownership')
@@ -299,9 +326,45 @@ if (verification && JSON.parse(verification.content).access === null) {
     expect(fixture.requested.slice().sort()).toEqual(requested.slice().sort())
     expect(fixture.unexpected).toEqual([])
   } finally {
-    await app.dispose()
-    await fixture.close()
-    await rm(gate, { recursive: true, force: true })
+    await review.dispose()
+  }
+})
+
+test('finishes independent access verification when scope changes during comparison', async ({ page }) => {
+  const review = await redirectedReview('mixed')
+  const { app, fixture, requested } = review
+  try {
+    await review.start(page)
+    await expect.poll(review.heldWorker, { timeout: 15_000 }).toMatch(/^[a-f0-9-]{36}$/)
+    const assignmentId = await review.heldWorker()
+    await removeRedirectHost(page)
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('2 confirmed findings')
+    await expect(report).toContainText('1 approved host · Scope revision 2')
+    await expect(report).toContainText('1 check met baseline · 2 verified gaps · 4 checks inconclusive')
+    const exported = await downloadReport(page, 'Markdown with evidence')
+    const records = markdownEvidence(exported.content)
+    expect(records.map(({ kind }) => kind)).toEqual(['access-policy', 'verification'])
+    expect(records[1]).toMatchObject({
+      assignmentId, inputEvidence: [records[0].artifactId], exitStatus: 0,
+    })
+    expect(exported.content).not.toContain(healthyOrigin)
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      expect(db.prepare('SELECT status FROM assignments WHERE id = ?').get(assignmentId)?.status).toBe('complete')
+      expect(db.prepare("SELECT scope_revision FROM evidence WHERE assignment_id = ? AND operation_id = 'verification'")
+        .all(assignmentId)).toEqual([{ scope_revision: 2 }])
+      const history = db.prepare(`SELECT kind FROM events WHERE json_extract(detail, '$.assignmentId') = ?
+        AND kind IN ('worker.started', 'worker.waiting', 'worker.complete') ORDER BY id`).all(assignmentId)
+      expect(history.map(({ kind }) => kind)).toEqual(['worker.started', 'worker.waiting', 'worker.started', 'worker.complete'])
+    } finally {
+      db.close()
+    }
+    expect(fixture.requested.slice().sort()).toEqual(requested.slice().sort())
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await review.dispose()
   }
 })
 
