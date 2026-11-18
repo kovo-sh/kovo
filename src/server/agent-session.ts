@@ -5,6 +5,7 @@ import { createRegistry, defineExtension, defineTool, Harness } from '@earendil-
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 import { obj, str } from '@earendil-works/pi-schema'
 import type { ProviderSettings } from '../domain.ts'
+import type { PublicObservation } from './broker.ts'
 import { provider } from './provider.ts'
 import type { ProviderCall } from './provider.ts'
 import { redact } from './redact.ts'
@@ -31,8 +32,13 @@ export function coordinatorPrompt(input: {
   return JSON.stringify({ task: 'coordinator status', ...input })
 }
 
-export function workerPrompt(observation: object) {
-  return JSON.stringify({ task: 'summarize observed public transport policy', observation })
+export function transportEvidence(observation: PublicObservation) {
+  const { origin, finalOrigin, status, mediaType, transportMaxAge, includeSubDomains, source } = observation
+  return { origin, finalOrigin, status, mediaType, transportMaxAge, includeSubDomains, source }
+}
+
+export function workerPrompt(observation: PublicObservation) {
+  return JSON.stringify({ task: 'summarize observed public transport policy', observation: transportEvidence(observation) })
 }
 
 type AgentTurn = {

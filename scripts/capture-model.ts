@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_PROVIDER } from '../src/domain.ts'
-import { agentTurn, coordinatorPrompt, workerPrompt } from '../src/server/agent-session.ts'
+import { agentTurn, coordinatorPrompt, transportEvidence, workerPrompt } from '../src/server/agent-session.ts'
 import { derivedResult } from '../src/server/execution.ts'
 import { testProvider } from '../src/server/provider.ts'
 import type { ProviderCall } from '../src/server/provider.ts'
@@ -53,7 +53,7 @@ if (selected !== 'responses' && selected !== 'messages') {
     for (const [name, observation] of Object.entries({ primary, unavailable, healthy })) {
       await record(name, workerPrompt(observation), 'worker-analysis', async (command, signal) => {
         const result = await backend.run({
-          assignmentId: randomUUID(), files: [{ name: 'observed.json', content: JSON.stringify(observation) }],
+          assignmentId: randomUUID(), files: [{ name: 'observed.json', content: JSON.stringify(transportEvidence(observation)) }],
           command, outputs: ['result.txt'],
         }, signal)
         return derivedResult({ exitStatus: result.exitCode, stdout: result.stdout, result: result.outputs['result.txt'] ?? '' })

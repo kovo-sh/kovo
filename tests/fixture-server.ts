@@ -56,7 +56,12 @@ export async function fixtureServer(options: { hold?: string; holdModel?: string
     response.writeHead(capture.status, {
       'Content-Type': capture.mediaType,
       'Set-Cookie': 'sid=' + sensitiveFixtureValue,
-      ...(capture.transportMaxAge !== null ? { 'Strict-Transport-Security': 'max-age=' + capture.transportMaxAge } : {}),
+      ...(capture.transportMaxAge !== null ? { 'Strict-Transport-Security': `max-age="${capture.transportMaxAge}"` } : {}),
+      ...(capture === primary ? { 'Referrer-Policy': `no-referrer, ${sensitiveFixtureValue}, unsafe-url` } : {}),
+      ...(capture === healthy ? {
+        'X-Content-Type-Options': 'NoSnIfF',
+        'Referrer-Policy': 'unsafe-url, strict-origin-when-cross-origin',
+      } : {}),
     }).end('Prepared response with local-only data. ' + sensitiveFixtureValue)
   }
 

@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { and, asc, eq } from 'drizzle-orm'
-import type { Candidate, Finding, ProviderSettings } from '../domain.ts'
-import { agentTurn, coordinatorPrompt, workerPrompt } from './agent-session.ts'
+import type { Candidate, CheckCoverage, Finding, ProviderSettings, ResponseCheckId } from '../domain.ts'
+import { agentTurn, coordinatorPrompt, transportEvidence, workerPrompt } from './agent-session.ts'
 import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { PublicObservation } from './broker.ts'
 import { privateModelSettings } from './model-settings.ts'
 import { redact } from './redact.ts'
+import { checkCoverage, meetsBaseline, readComparisons, responseReview, responseVerificationCommand } from './response-checks.ts'
+import type { ResponseReview } from './response-checks.ts'
 import { findings, messages } from './schema.ts'
 import { assessmentAssignments, store } from './store.ts'
 import type { Assignment, Run, Store } from './store.ts'
@@ -21,13 +23,6 @@ type Capture = { observation: PublicObservation | null; note: string }
 export function derivedResult(result: { exitStatus: number; result: string; stdout: string }) {
   return JSON.stringify({ exitStatus: result.exitStatus, result: (result.result || result.stdout).slice(0, 1200) })
 }
-
-export const verificationCommand = [
-  "jq '{expected: \"positive HSTS max-age\", observed: .transportMaxAge, origin, finalOrigin, result:",
-  '  (if .origin == .finalOrigin and .status >= 200 and .status < 300 then',
-  '     if (.transportMaxAge // 0) > 0 then "present" else "missing" end',
-  '   else "inconclusive" end)}\' /evidence/observed.json > /work/verification.json',
-].join('\n')
 
 function createBroker() {
   const target = process.env.GUARDIAN_NETWORK_FIXTURE
@@ -144,7 +139,7 @@ class Execution {
         for (const asset of run.candidates.filter(asset => run.approved.includes(asset.id))) {
           if (!assessmentAssignments(workers, asset.id, run.goalRevision).verification) {
             this.storage.makeWorker(updated, 'verification', asset, `Verify ${new URL(asset.origin).hostname}`,
-              'Compare the recorded public response metadata with the transport policy baseline.')
+              'Compare the recorded response metadata with the HTTPS and browser header baselines.')
           }
         }
         this.storage.event(run.id, 'verification.started', 'Verification started from recorded evidence.')
@@ -239,7 +234,8 @@ class Execution {
     const run = this.check(job)
     let summary = capture.note
     if (capture.observation) {
-      const inputs = [{ name: 'observed.json', content: JSON.stringify(capture.observation) }]
+      const transport = transportEvidence(capture.observation)
+      const inputs = [{ name: 'observed.json', content: JSON.stringify(transport) }]
       summary = await agentTurn({
         directory: this.storage.directory, sessionId: job.assignment.sessionId,
         requestId: 'analysis:' + job.assignment.attempt + ':' + id,
@@ -257,7 +253,7 @@ class Execution {
           const receipt = this.storage.db.transaction(() => this.storage.addArtifact(
             current, job.assignment, 'analysis', 'Derived evidence',
             JSON.stringify({
-              command: redact(command), inputEvidence: [id], interpreter: 'just-bash 3.6.1',
+              command: redact(command), inputEvidence: [id], inputFields: Object.keys(transport), interpreter: 'just-bash 3.6.1',
               exitStatus: result.exitCode, stdout: result.stdout, stderr: result.stderr,
               result: result.outputs['result.txt'] ?? '',
             }, null, 2), operation))
@@ -267,11 +263,13 @@ class Execution {
     }
 
     const current = this.check(job)
-    const observation = capture.observation
     this.storage.db.transaction(() => {
-      if (observation && observation.origin === observation.finalOrigin && observation.status >= 200 &&
-          observation.status < 300 && !observation.transportMaxAge) {
-        this.saveFinding(current, asset, 'pending', 'The recorded response did not show a positive HSTS max-age.', [id])
+      for (const review of responseReview(capture.observation, capture.note)) {
+        if (review.comparison && !meetsBaseline(review.comparison)) {
+          const reason = 'The recorded value falls outside the response baseline. Verification is pending.'
+          const earlier = this.finding(current, asset, review.rule.id)
+          this.saveFinding(current, asset, review, 'pending', reason, [id], earlier?.id)
+        }
       }
       this.complete(job, current, summary, id)
     }, { behavior: 'immediate' })
@@ -283,80 +281,85 @@ class Execution {
     const stored = analysis?.status === 'complete' ? this.storage.assignmentObservation(analysis.id) : undefined
     const record = stored ? JSON.parse(this.storage.artifact(run.id, stored.id).content) as Capture : undefined
     const origins = analysis && record?.observation ? this.observationOrigins(analysis, record.observation) : []
-    const observation = [...origins].every(origin => this.permitted(run, origin)) ? record?.observation : null
-    let status = 'inconclusive'
-    let transcript: object = { expected: 'positive HSTS max-age', observed: null, result: status }
-    let command: string | undefined
-    let exitStatus: number | undefined
-    if (observation) {
-      for (const origin of origins) job.origins.add(origin)
-      command = verificationCommand
-      const result = await this.backend.run({
-        assignmentId: job.assignment.id,
-        files: [{ name: 'observed.json', content: JSON.stringify(observation) }],
-        command, outputs: ['verification.json'],
-      }, job.controller.signal)
-      exitStatus = result.exitCode
-      if (result.exitCode === 0 && result.outputs['verification.json']) {
-        const parsed = JSON.parse(result.outputs['verification.json'])
-        if (['present', 'missing', 'inconclusive'].includes(parsed.result)) {
-          status = parsed.result
-          transcript = parsed
-        }
-      }
-    }
+    const authorized = [...origins].every(origin => this.permitted(run, origin))
+    const observation = authorized ? record?.observation : null
+    const note = authorized ? record?.note : 'The saved observation includes a host outside the current approval.'
+    const reviews = responseReview(observation, note)
+    const comparisons = reviews.flatMap(review => review.comparison ? [review.comparison] : [])
+    if (authorized) for (const origin of origins) job.origins.add(origin)
+    const result = comparisons.length ? await this.backend.run({
+      assignmentId: job.assignment.id,
+      files: [{ name: 'checks.json', content: JSON.stringify(comparisons) }],
+      command: responseVerificationCommand, outputs: ['verification.json'],
+    }, job.controller.signal) : undefined
+    const outcomes = readComparisons(result?.exitCode === 0 ? result.outputs['verification.json'] : undefined)
+    const checks = reviews.map(review => checkCoverage(review, outcomes.get(review.rule.id)))
 
     const current = this.check(job)
-    let reason = 'Inconclusive: a successful response with a current evidence source was unavailable.'
-    if (status === 'present') reason = 'The recorded response matches the expected transport policy.'
-    else if (status === 'missing') reason = 'The recorded successful HTTPS response did not contain a positive HSTS max-age.'
-    else if (observation && observation.finalOrigin !== observation.origin) {
-      reason = `Inconclusive: the requested host redirected to ${new URL(observation.finalOrigin).hostname}. The final response describes that host.`
-    }
+    const assessed = checks.filter(check => check.status === 'met' || check.status === 'gap').length
+    const gaps = checks.filter(check => check.status === 'gap').length
+    const outcome = assessed
+      ? `${assessed} checks verified · ${gaps === 1 ? '1 gap' : gaps + ' gaps'}`
+      : 'Inconclusive: ' + checks[0].reason
     this.storage.db.transaction(() => {
-      const evidence = this.storage.addArtifact(current, job.assignment, 'verification', 'Transport policy verification',
-        JSON.stringify({ ...transcript, command, exitStatus, inputEvidence: observation && stored ? [stored.id] : [],
-          interpreter: command ? 'just-bash 3.6.1' : undefined }, null, 2), 'verification')
-      const links = observation && stored ? [stored.id, evidence.id] : [evidence.id]
-      if (status === 'missing') this.saveFinding(current, asset, 'confirmed', reason, links)
-      else if (status === 'inconclusive') this.saveFinding(current, asset, 'inconclusive', reason, links)
-      else if (this.finding(current, asset)) this.saveFinding(current, asset, 'dismissed', reason, links)
-      this.complete(job, current, reason, evidence.id)
+      const inputs = authorized && stored ? [stored.id] : []
+      const evidence = this.storage.addArtifact(current, job.assignment, 'verification', 'Response policy verification',
+        JSON.stringify({
+          origin: asset.origin, inputEvidence: inputs, checks, comparisons,
+          command: result ? responseVerificationCommand : undefined,
+          exitStatus: result?.exitCode, interpreter: result ? 'just-bash 3.6.1' : undefined,
+        }, null, 2), 'verification')
+      const links = [...inputs, evidence.id]
+      for (const [index, review] of reviews.entries()) {
+        const { status, reason } = checks[index]
+        const earlier = this.finding(current, asset, review.rule.id)
+        if (status === 'gap') this.saveFinding(current, asset, review, 'confirmed', reason, links, earlier?.id)
+        else if (status === 'inconclusive' && (earlier || review.rule.id === 'hsts')) {
+          this.saveFinding(current, asset, review, 'inconclusive', reason, links, earlier?.id)
+        } else if (earlier) this.saveFinding(current, asset, review, 'dismissed', reason, links, earlier.id)
+      }
+      this.complete(job, current, outcome, evidence.id, checks)
     }, { behavior: 'immediate' })
   }
 
-  private finding(run: Run, asset: Candidate) {
+  private finding(run: Run, asset: Candidate, checkId: ResponseCheckId) {
     return this.storage.db.select().from(findings).where(and(
       eq(findings.runId, run.id), eq(findings.assetId, asset.id), eq(findings.goalRevision, run.goalRevision),
+      eq(findings.checkId, checkId),
     )).get()
   }
 
-  private saveFinding(run: Run, asset: Candidate, status: Finding['status'], reason: string, evidenceIds: string[]) {
-    const existing = this.finding(run, asset)
+  private saveFinding(run: Run, asset: Candidate, review: ResponseReview, status: Finding['status'], reason: string,
+    evidenceIds: string[], existingId?: string) {
+    const { rule, coverage } = review
+    const confirmed = status === 'confirmed'
     const record: Finding = {
-      id: existing?.id ?? randomUUID(),
+      id: existingId ?? randomUUID(),
       origin: asset.origin,
-      title: status === 'inconclusive' ? 'Transport policy could not be assessed' : 'Public response transport policy',
-      status, severity: status === 'confirmed' ? 'low' : 'informational',
+      title: status === 'inconclusive' ? rule.title + ' could not be assessed' : rule.findingTitle,
+      status, severity: confirmed ? rule.severity : 'informational',
       reason,
-      remediation: status === 'inconclusive' ? 'Supply an authorized response record and repeat the review.'
-        : status === 'confirmed' ? 'Review the HTTPS transport policy for this host and set a suitable HSTS max-age where appropriate.'
-          : 'See verification evidence.',
+      remediation: confirmed ? rule.remediation : status === 'inconclusive'
+        ? 'Supply a current authorized response record and repeat the review.'
+        : status === 'pending' ? 'Resume the run to verify the observation.' : 'Review the verification evidence.',
+      impact: confirmed ? rule.impact : undefined,
+      recheck: confirmed ? rule.recheck : undefined,
+      check: { id: rule.id, expected: coverage.expected, observed: coverage.observed },
       evidenceIds, scopeRevision: run.scopeRevision,
     }
-    if (existing) this.storage.db.update(findings).set({ finding: record }).where(eq(findings.id, record.id)).run()
+    if (existingId) this.storage.db.update(findings).set({ finding: record }).where(eq(findings.id, record.id)).run()
     else this.storage.db.insert(findings).values({
-      id: record.id, runId: run.id, assetId: asset.id, goalRevision: run.goalRevision, finding: record,
+      id: record.id, runId: run.id, assetId: asset.id, goalRevision: run.goalRevision, checkId: rule.id, finding: record,
     }).run()
   }
 
-  private complete(job: Active, run: Run, summary: string, artifactId: string) {
+  private complete(job: Active, run: Run, summary: string, artifactId: string, checks?: CheckCoverage[]) {
     const worker = job.assignment
     const outcome = redact(summary)
     this.storage.addArtifact(run, worker, 'handoff', 'result.md', [
       '# Result', '', outcome, '', 'Evidence: ' + artifactId,
     ].join('\n'), 'result')
-    this.storage.updateWorker(worker.id, { status: 'complete', lease: null, outcome })
+    this.storage.updateWorker(worker.id, { status: 'complete', lease: null, outcome, checks })
     this.storage.message(run.id, worker.id, 'worker', outcome)
     this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', { assignmentId: worker.id, artifactId })
   }

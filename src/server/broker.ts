@@ -2,14 +2,12 @@ import { lookup } from 'node:dns/promises'
 import { request } from 'node:https'
 import type { IncomingHttpHeaders } from 'node:http'
 import ipaddr from 'ipaddr.js'
+import { referrerPolicies } from '../domain.ts'
+import type { PreparedObservation } from '../domain.ts'
 
-export interface PublicObservation {
+export interface PublicObservation extends PreparedObservation {
   origin: string
   finalOrigin: string
-  status: number
-  mediaType: string
-  transportMaxAge: number | null
-  includeSubDomains: boolean
   source: 'public response' | 'fixture response' | 'supplied observation'
 }
 
@@ -53,7 +51,16 @@ function isPublic({ address }: PublicAddress) {
 
 function header(headers: IncomingHttpHeaders, key: string) {
   const value = headers[key]
-  return typeof value === 'string' ? value : ''
+  return Array.isArray(value) ? value.join(', ') : value
+}
+
+function referrerPolicy(value: string | undefined): PublicObservation['referrerPolicy'] {
+  if (value === undefined) return 'absent'
+  // Treat quoted lists as ambiguous so embedded commas cannot produce a false policy finding.
+  if (value.includes('"')) return 'unrecognized'
+  const tokens = value.split(',').map(token => token.trim())
+  return tokens.findLast((token): token is typeof referrerPolicies[number] =>
+    referrerPolicies.some(policy => policy === token)) ?? 'unrecognized'
 }
 
 function safePage(url: URL) {
@@ -81,10 +88,13 @@ function httpsRead(url: URL, address: PublicAddress, signal: AbortSignal): Promi
 }
 
 function observed(origin: string, url: URL, response: HeadersRead, source: PublicObservation['source']): PublicObservation {
-  const transport = header(response.headers, 'strict-transport-security')
-  const parsed = transport.match(/(?:^|;)\s*max-age\s*=\s*(\d+)\s*(?:;|$)/i)
-  const maxAge = parsed ? Number(parsed[1]) : NaN
-  const rawType = header(response.headers, 'content-type').split(';', 1)[0].trim().toLowerCase()
+  const transport = header(response.headers, 'strict-transport-security') ?? ''
+  const ages = transport.split(';').filter(directive => /^\s*max-age\s*(?:=|$)/i.test(directive))
+  const parsed = ages.length === 1 ? ages[0].match(/^\s*max-age\s*=\s*(?:"(\d+)"|(\d+))\s*$/i) : null
+  const maxAge = parsed ? Number(parsed[1] ?? parsed[2]) : NaN
+  const rawType = header(response.headers, 'content-type')?.split(';', 1)[0].trim().toLowerCase() ?? ''
+  const typeOptions = header(response.headers, 'x-content-type-options')
+  const nosniff = typeOptions?.split(',', 1)[0].trim().toLowerCase() === 'nosniff'
   return {
     origin,
     finalOrigin: url.origin,
@@ -93,6 +103,8 @@ function observed(origin: string, url: URL, response: HeadersRead, source: Publi
     transportMaxAge: Number.isSafeInteger(maxAge) && maxAge >= 0 ? maxAge : null,
     includeSubDomains: /(?:^|;)\s*includeSubDomains\s*(?:;|$)/i.test(transport),
     source,
+    contentTypeOptions: typeOptions === undefined ? 'absent' : nosniff ? 'nosniff' : 'unrecognized',
+    referrerPolicy: referrerPolicy(header(response.headers, 'referrer-policy')),
   }
 }
 
@@ -142,8 +154,8 @@ export class RequestBroker {
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         return observed(grant.origin, url, response, this.options.source ?? 'public response')
       }
-      const location = header(response.headers, 'location')
-      if (!location || redirect === 3) deny('The public response could not be followed within the redirect limit.')
+      const location = response.headers.location
+      if (!location || redirect === 3) return deny('The public response could not be followed within the redirect limit.')
       try {
         url = new URL(location, url)
       } catch {

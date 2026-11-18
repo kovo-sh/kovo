@@ -89,7 +89,7 @@ function ProjectPage() {
           <CollapsibleTrigger render={<Button variant="ghost" />}>Supply prepared evidence</CollapsibleTrigger>
           <CollapsibleContent keepMounted>
             <label>Prepared response metadata
-              <Textarea name="prepared" rows={4} placeholder={'{"status":200,"mediaType":"text/html","transportMaxAge":31536000,"includeSubDomains":false}'} />
+              <Textarea name="prepared" rows={4} placeholder={'{"status":200,"mediaType":"text/html","transportMaxAge":31536000,"includeSubDomains":false,"contentTypeOptions":"nosniff","referrerPolicy":"strict-origin-when-cross-origin"}'} />
             </label>
           </CollapsibleContent>
         </Collapsible>

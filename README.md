@@ -15,7 +15,9 @@ npm start
 
 Open http://127.0.0.1:8000. Use **Model settings** to enter an OpenRouter key, test the DeepSeek Flash preset, and save it. Advanced settings accept OpenAI Responses and Anthropic Messages-compatible providers.
 
-Create a project with the authorized hosts and start a run. Review and approve specific hosts after inventory discovery. Runs use supplied response metadata by default. Enable **Read approved public pages during this run** to collect selected HTTPS response metadata through the scope broker. The current verification check reviews the recorded HTTP Strict Transport Security (HSTS) policy. Open the workflow graph to inspect worker threads and the report to follow verification back to its evidence.
+Create a project with the authorized hosts and start a run. Review and approve specific hosts after inventory discovery. Runs use supplied response metadata by default. Enable **Read approved public pages during this run** to collect selected HTTPS response metadata through the scope broker. Guardian checks HSTS, MIME sniffing protection, and explicit referrer policy. The report shows the expected and observed settings and links each confirmed gap to its verification evidence. [HTTP Strict Transport Security](https://www.rfc-editor.org/rfc/rfc6797.html) · [Fetch Standard](https://fetch.spec.whatwg.org/#x-content-type-options-header) · [Referrer Policy](https://www.w3.org/TR/referrer-policy/#referrer-policy-header-dfn)
+
+In **Supply prepared evidence**, enter the observed fields for the host. Use `absent` in `contentTypeOptions` or `referrerPolicy` when the header was absent from a captured response. Leave fields out when the source did not record them.
 
 Use **Import DNS export** to bring in candidates from a local, self-contained zone file. The preview shows hosts from A, AAAA, and CNAME records and flags aliases to outside the zone. Guardian records host and source information, then puts the imported candidates into the next run's scope review for selection. [DNS master-file syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-5.1)
 

@@ -99,6 +99,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
       </table></div>
       {review && <div className="scope-footer">
         {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
+        <p className="muted">Review HSTS, MIME sniffing protection, and referrer policy on the selected hosts.</p>
         <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
         <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
         <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>

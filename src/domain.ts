@@ -31,11 +31,18 @@ export const newRun = z.object({
   requestId: id, projectId: id, goal: goalText,
   sourceMode: z.enum(['prepared', 'public']).default('prepared'),
 })
+export const referrerPolicies = [
+  'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin',
+  'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url',
+] as const
+
 const preparedObservation = z.object({
   status: z.number().int().min(100).max(599),
   mediaType: z.string().regex(/^[a-z0-9.+-]{1,40}\/[a-z0-9.+-]{1,60}$/),
   transportMaxAge: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
   includeSubDomains: z.boolean(),
+  contentTypeOptions: z.enum(['absent', 'nosniff', 'unrecognized']).optional(),
+  referrerPolicy: z.enum(['absent', 'unrecognized', ...referrerPolicies]).optional(),
 })
 export const addCandidate = z.object({
   origin: assetOrigin,
@@ -98,6 +105,20 @@ export interface Finding {
   remediation: string
   evidenceIds: string[]
   scopeRevision: number
+  impact?: string
+  recheck?: string
+  check?: Pick<CheckCoverage, 'id' | 'expected' | 'observed'>
+}
+
+export type ResponseCheckId = 'hsts' | 'nosniff' | 'referrer-policy'
+
+export interface CheckCoverage {
+  id: ResponseCheckId
+  title: string
+  status: 'met' | 'gap' | 'inconclusive' | 'not-applicable'
+  expected: string
+  observed: string | null
+  reason: string
 }
 
 export interface ReportBody {
@@ -105,7 +126,13 @@ export interface ReportBody {
   scope: Candidate[]
   scopeRevision: number
   goalRevision: number
-  coverage: { origin: string; status: string; evidenceId: string | null; analysisEvidenceId?: string }[]
+  coverage: {
+    origin: string
+    status: string
+    evidenceId: string | null
+    analysisEvidenceId?: string
+    checks?: CheckCoverage[]
+  }[]
   findings: Finding[]
   gaps: string[]
 }

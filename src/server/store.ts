@@ -387,7 +387,7 @@ export class Store {
     }
     for (const asset of updated.candidates.filter(asset => added.includes(asset.id))) {
       this.makeWorker(updated, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
-        'Review the approved public root response and record the observed transport policy.')
+        'Record the response metadata for the approved host and identify candidate control gaps.')
     }
     this.event(run.id, 'scope.approved', `Recorded scope revision ${scopeRevision}.`, {
       actorId: this.workspace.actorId, scopeRevision,
@@ -411,7 +411,8 @@ export class Store {
         }
       }
       for (const asset of updated.candidates.filter(item => run.approved.includes(item.id))) {
-        this.makeWorker(updated, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`, 'Review the approved public root response.')
+        this.makeWorker(updated, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
+          'Record the response metadata for the approved host and identify candidate control gaps.')
       }
     }
     this.message(run.id, run.coordinatorId, 'operator', `Revised goal: ${goal}`)
@@ -423,12 +424,15 @@ export class Store {
     const scope = run.candidates.filter(candidate => run.approved.includes(candidate.id))
     const approvedOrigins = new Set(scope.map(asset => asset.origin))
     const currentEvidence = new Set<string>()
+    const gaps: string[] = []
     const coverage = scope.map(asset => {
       const { analysis, verification } = assessmentAssignments(snapshot.assignments, asset.id, run.goalRevision)
       const analyzed = analysis?.status === 'complete' ? analysis : undefined
       const verified = verification?.status === 'complete' ? verification : undefined
       if (analyzed && this.brokerOrigins(analyzed).some(origin => !approvedOrigins.has(origin))) {
-        return { origin: asset.origin, status: 'Inconclusive: a source in the recorded redirect chain is no longer approved.', evidenceId: null }
+        const status = 'Inconclusive: a source in the recorded redirect chain is no longer approved.'
+        gaps.push(asset.origin + ' · ' + status)
+        return { origin: asset.origin, status, evidenceId: null }
       }
       const done = verified ?? analyzed
       const evidence = snapshot.evidence.filter(item => item.assignmentId === analyzed?.id || item.assignmentId === verified?.id)
@@ -436,21 +440,34 @@ export class Store {
       const artifact = evidence.findLast(item => item.assignmentId === done?.id &&
         (verified ? item.kind === 'verification' : item.kind === 'observation'))
       const derived = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'analysis')
+      const status = verified?.outcome ?? (analyzed ? 'Analysis complete. Verification pending.' : 'Pending review')
+      if (!verified || !artifact) {
+        gaps.push(asset.origin + ' · ' + status)
+      } else if (verified.checks) {
+        const reasons = new Set(verified.checks.filter(check => check.status === 'inconclusive').map(check => check.reason))
+        for (const reason of reasons) gaps.push(asset.origin + ' · ' + reason)
+      } else if (status.startsWith('Inconclusive')) {
+        gaps.push(asset.origin + ' · ' + status)
+      }
       return {
-        origin: asset.origin, status: done?.outcome ?? 'Pending review',
+        origin: asset.origin, status,
         evidenceId: artifact?.id ?? null, analysisEvidenceId: derived?.id,
+        ...(verified?.checks ? { checks: verified.checks } : {}),
       }
     })
     const results = this.db.select().from(tables.findings).where(and(
       eq(tables.findings.runId, run.id), eq(tables.findings.goalRevision, run.goalRevision),
     )).all().filter(row => run.approved.includes(row.assetId) && row.finding.evidenceIds.length > 0 &&
       row.finding.evidenceIds.every(id => currentEvidence.has(id))).map(row => row.finding)
+    const statusOrder = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
+    const severityOrder = { low: 0, informational: 1 }
+    results.sort((a, b) => statusOrder[a.status] - statusOrder[b.status] ||
+      severityOrder[a.severity] - severityOrder[b.severity] ||
+      a.origin.localeCompare(b.origin) || a.title.localeCompare(b.title))
+    if (!scope.length) gaps.push('No approved hosts in this report.')
     const body: ReportBody = {
-      goal: run.goal, scope, scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results,
-      gaps: coverage.filter(item => !item.evidenceId || item.status.startsWith('Inconclusive'))
-        .map(item => item.origin + ': ' + item.status),
+      goal: run.goal, scope, scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results, gaps,
     }
-    if (!scope.length) body.gaps.push('No approved hosts in this report.')
     this.db.insert(tables.reports).values({
       id: randomUUID(), runId: run.id, partial, body,
       version: (snapshot.reports[0]?.version ?? 0) + 1, createdAt: Date.now(),

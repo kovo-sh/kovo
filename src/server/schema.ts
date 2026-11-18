@@ -1,5 +1,5 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
-import type { Candidate, DnsSource, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
+import type { Candidate, CheckCoverage, DnsSource, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, ResponseCheckId, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -67,6 +67,7 @@ export const assignments = sqliteTable('assignments', {
   title: text('title').notNull(),
   objective: text('objective').notNull(),
   outcome: text('outcome'),
+  checks: text('checks', { mode: 'json' }).$type<CheckCoverage[]>(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('assignments_run').on(table.runId)])
 
@@ -87,8 +88,12 @@ export const findings = sqliteTable('findings', {
   runId: text('run_id').notNull().references(() => runs.id),
   assetId: text('asset_id').notNull(),
   goalRevision: integer('goal_revision').notNull(),
+  checkId: text('check_id').$type<ResponseCheckId>().notNull().default('hsts'),
   finding: text('finding', { mode: 'json' }).$type<Finding>().notNull(),
-}, table => [index('findings_run').on(table.runId)])
+}, table => [
+  index('findings_run').on(table.runId),
+  uniqueIndex('findings_check').on(table.runId, table.assetId, table.goalRevision, table.checkId),
+])
 
 export const reports = sqliteTable('reports', {
   id: text('id').primaryKey().notNull(),

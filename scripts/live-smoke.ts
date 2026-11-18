@@ -86,11 +86,12 @@ try {
     assert.ok(await report.isVisible())
     for (const host of hosts) await report.getByText(host, { exact: true }).first().waitFor()
     await report.getByRole('button', { name: 'Open evidence', exact: true }).first().click()
-    const evidence = page.getByRole('dialog', { name: 'Transport policy verification' })
+    const verificationTitle = /^(Transport|Response) policy verification$/
+    const evidence = page.getByRole('dialog', { name: verificationTitle })
     await evidence.waitFor()
     await evidence.getByRole('link', { name: /Open worker thread/ }).click()
     const worker = page.getByRole('region', { name: 'Worker thread' })
-    await worker.getByRole('button', { name: 'Transport policy verification', exact: true }).waitFor()
+    await worker.getByRole('button', { name: verificationTitle }).waitFor()
     assert.equal(await worker.getByRole('textbox').count(), 0)
 
     stage = 'durable approval, request audit, and evidence'

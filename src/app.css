@@ -278,8 +278,19 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .report-body { max-width: 850px; margin-inline: auto; padding: 35px 38px 45px; }
 .report-top h2 { font: 400 clamp(35px,6vw,58px)/1.05 'Instrument Serif', Georgia, serif; color: var(--text); }
 .report-summary { margin: 19px 0 6px; font-weight: 650; font-size: 17px; }
-.finding { display: grid; gap: 7px; margin-top: 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 14px; overflow-wrap: anywhere; }
-.finding button { justify-self: start; }
+.finding { display: grid; gap: 8px; padding: 15px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.finding-meta { color: var(--muted); font-size: 12px; }
+.finding-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 18px; margin: 4px 0; font-size: 13px; line-height: 1.6; }
+.finding-details dt { color: var(--muted); }
+.finding-details dd { margin: 0; }
+.report-evidence { flex-wrap: wrap; }
+.report-hosts, .report-checks ul { list-style: none; padding: 0; margin: 8px 0 0; overflow-wrap: anywhere; }
+.report-hosts > li { padding: 10px 0; border-top: 1px solid var(--line); }
+.report-hosts .list-row { padding: 0; flex-wrap: wrap; }
+.report-hosts small { display: block; margin-block: 2px; }
+.report-checks summary { padding-block: 6px; cursor: pointer; color: var(--muted); }
+.report-checks li { padding: 8px 0 10px 12px; border-inline-start: 1px solid var(--line); }
+.report-checks li .section-heading > span { color: var(--muted); font-size: 12px; white-space: nowrap; }
 @media (max-width: 980px) {
   .overview-body { padding: 25px 23px; }
   .workbench[data-with-chat=true] { grid-template-columns: minmax(0,1fr) min(var(--chat-width), 36vw); }

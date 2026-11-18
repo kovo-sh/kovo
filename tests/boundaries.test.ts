@@ -11,7 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
-import { verificationCommand } from '../src/server/execution.ts'
+import { checkCoverage, responseReview } from '../src/server/response-checks.ts'
 import { findings } from '../src/server/schema.ts'
 import { assessmentAssignments, Store } from '../src/server/store.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
@@ -168,16 +168,31 @@ test('keeps cross-origin redirects inconclusive for the requested host', async (
   })
   const signal = AbortSignal.timeout(5_000)
   const observation = await broker.readPublicRoot({ ...allowed, canRead: origin => [northstar, finalOrigin].includes(origin) }, signal)
-  const result = await new LinuxWorkerBackend().run({
-    assignmentId: randomUUID(),
-    files: [{ name: 'observed.json', content: JSON.stringify(observation) }],
-    command: verificationCommand,
-    outputs: ['verification.json'],
-  }, signal)
-  assert.equal(result.exitCode, 0)
-  assert.deepEqual(JSON.parse(result.outputs['verification.json']), {
-    expected: 'positive HSTS max-age', observed: 31_536_000, origin: northstar, finalOrigin, result: 'inconclusive',
-  })
+  const reviews = responseReview(observation)
+  assert.equal(reviews.length, 3)
+  for (const review of reviews) {
+    assert.equal(review.comparison, undefined)
+    assert.equal(review.coverage.status, 'inconclusive')
+    assert.equal(review.coverage.observed, null)
+    assert.match(review.coverage.reason, /final response came from docs\.northstar\.example/)
+  }
+})
+
+test('keeps older observations and ambiguous header values from confirming unsupported gaps', () => {
+  const oldObservation = {
+    origin: northstar, finalOrigin: northstar, status: 200, mediaType: 'text/html',
+    transportMaxAge: 31_536_000, includeSubDomains: false, source: 'supplied observation' as const,
+  }
+  const [hsts, mime, referrer] = responseReview(oldObservation)
+  assert.equal(checkCoverage(hsts, 'met').status, 'met')
+  assert.equal(checkCoverage(hsts, 'gap').status, 'inconclusive')
+  assert.equal(mime.coverage.status, 'inconclusive')
+  assert.equal(referrer.coverage.status, 'inconclusive')
+
+  const ambiguity = responseReview({ ...oldObservation, referrerPolicy: 'unrecognized' })
+  assert.equal(ambiguity[2].comparison, undefined)
+  const json = responseReview({ ...oldObservation, mediaType: 'application/json', referrerPolicy: 'unsafe-url' })
+  assert.equal(json[2].coverage.status, 'not-applicable')
 })
 
 test('requires a local Docker Unix socket before staging worker data', async () => {
