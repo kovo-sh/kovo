@@ -103,16 +103,17 @@ export async function agentTurn(job: AgentTurn) {
     const conversation = await harness.root(context, { agent })
     // Existing sessions keep their history when the operator changes the workspace model.
     await conversation.configure(agent, context)
-    let submission = await conversation.submit({
-      type: 'input', content: scrub(job.prompt), requestId: job.requestId,
-    }, context)
-    const previous = await submission.status(context)
-    if (previous.status === 'unanswered' && previous.reason === 'aborted') {
-      submission = await conversation.submit({
-        type: 'input', content: scrub(job.prompt), requestId: job.requestId + ':resume:' + previous.id,
-      }, context)
+    const input = { type: 'input' as const, content: scrub(job.prompt) }
+    const submission = await conversation.submit({ ...input, requestId: job.requestId }, context)
+    let result = await submission.wait(context)
+    while (result.status === 'unanswered' && (result.reason === 'interrupted' || result.reason === 'aborted')) {
+      job.signal.throwIfAborted()
+      const requestId = job.requestId + ':resume:' + result.id
+      // Interrupted generation can continue from the already committed prompt.
+      const continuation = result.reason === 'interrupted' || result.type === 'continue'
+      const retry = await conversation.submit(continuation ? { type: 'continue', requestId } : { ...input, requestId }, context)
+      result = await retry.wait(context)
     }
-    const result = await submission.wait(context)
     if (result.status !== 'done' || !result.answer) {
       throw new Error('The model did not finish the requested evidence turn.')
     }

@@ -111,6 +111,60 @@ test('revokes a host while its real fixture connection is pending and discards t
   }
 })
 
+test('resumes a saved observation after narrowing scope for an unrelated host', async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: mainScenes, holdModel: 'primary:responses:0' })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await reviewScope(page, { project: 'Northstar', seeds, goal: mainGoal, live: true })
+    await saveScope(page)
+    await fixture.modelWithheld
+    await expect(page.getByRole('region', { name: 'Coordinator chat' }).locator('[data-role=coordinator]').first()).toBeVisible()
+    await page.getByRole('button', { name: 'Review scope' }).click()
+    await page.getByRole('checkbox', { name: 'Include docs.northstar.example' }).uncheck()
+    await saveScope(page, 'Save scope revision')
+    await expect(page.getByText('1 approved hosts · Revision 2')).toBeVisible()
+
+    await app.stop('SIGKILL')
+    fixture.dropHeldModel()
+    await app.start()
+    const resume = page.getByRole('button', { name: 'Resume', exact: true })
+    await expect(resume).toBeVisible()
+    expect(fixture.requested.filter(url => url === primaryOrigin + '/')).toHaveLength(1)
+    await resume.click()
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
+    expect(fixture.requested.filter(url => url === primaryOrigin + '/')).toHaveLength(1)
+    expect(fixture.unexpected).toEqual([])
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    let sessionId: string
+    try {
+      expect(db.prepare(`SELECT evidence.scope_revision FROM evidence JOIN assignments ON evidence.assignment_id = assignments.id
+        WHERE assignments.title = 'Review northstar.example' AND evidence.kind = 'observation'`).all())
+        .toMatchObject([{ scope_revision: 1 }])
+      sessionId = String(db.prepare("SELECT session_id FROM assignments WHERE title = 'Review northstar.example'").get()?.session_id)
+    } finally {
+      db.close()
+    }
+    const session = new DatabaseSync(join(app.directory, 'agent-sessions', sessionId + '.sqlite'), { readOnly: true })
+    try {
+      expect(session.prepare("SELECT count(*) AS n FROM entries WHERE json_extract(record, '$.kind') = 'pi.user'").get()?.n).toBe(1)
+    } finally {
+      session.close()
+    }
+  } finally {
+    if (test.info().status !== test.info().expectedStatus) await test.info().attach('fixture activity', {
+      body: JSON.stringify({ requested: fixture.requested, accepted: fixture.accepted, unexpected: fixture.unexpected }, null, 2),
+      contentType: 'application/json',
+    })
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
 test('verifies both model protocols and produces a zero-finding report with coverage', async ({ page }) => {
   const fixture = await fixtureServer({ scenes: ['connection', 'coordinator-healthy', 'healthy'] })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })

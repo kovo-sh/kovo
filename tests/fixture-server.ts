@@ -32,13 +32,16 @@ function withOutputLimit(body: string) {
   })].join('\n\n')
 }
 
-export async function fixtureServer(options: { hold?: string; scenes: string[]; truncate?: string }) {
+export async function fixtureServer(options: { hold?: string; holdModel?: string; scenes: string[]; truncate?: string }) {
   const requested: string[] = []
   const accepted: string[] = []
   const unexpected: string[] = []
   const pending: ServerResponse[] = []
   const withheld = Promise.withResolvers<void>()
+  const modelWithheld = Promise.withResolvers<void>()
   let hold = options.hold
+  let holdModel = options.holdModel
+  let heldModelResponse: ServerResponse | undefined
   const selected = recordings.filter(fixture => options.scenes.includes(fixture.scenario))
   const responseList = selected.flatMap(recording => recording.calls.map((call, turn) => ({
     ...call, name: recording.scenario + ':' + recording.protocol + ':' + turn, seen: false,
@@ -74,6 +77,11 @@ export async function fixtureServer(options: { hold?: string; scenes: string[]; 
         const candidate = responseList.find(call => call.endpoint === endpoint && !call.seen)
         unexpected.push(JSON.stringify({ endpoint, actual: normalized, expected: candidate && comparableRequest(candidate.request) }))
         response.writeHead(422, { 'Content-Type': 'application/json' }).end('{"error":{"message":"No recording matched the request"}}')
+        return
+      }
+      if (match.name === holdModel) {
+        heldModelResponse = response
+        modelWithheld.resolve()
         return
       }
       const body = options.truncate && match.name === `${options.truncate}:responses:0` ? withOutputLimit(match.body) : match.body
@@ -119,7 +127,12 @@ export async function fixtureServer(options: { hold?: string; scenes: string[]; 
     accepted,
     unexpected,
     withheld: withheld.promise,
+    modelWithheld: modelWithheld.promise,
     sensitiveFixtureValue,
+    dropHeldModel() {
+      holdModel = undefined
+      heldModelResponse?.destroy()
+    },
     release() {
       const target = hold
       hold = undefined

@@ -73,6 +73,10 @@ class Execution {
     return run.candidates.some(asset => asset.origin === origin && run.approved.includes(asset.id))
   }
 
+  private observationOrigins(assignment: Assignment, observation: PublicObservation) {
+    return new Set([observation.origin, observation.finalOrigin, ...this.storage.brokerOrigins(assignment)])
+  }
+
   private authorize(job: Active) {
     const current = this.storage.worker(job.assignment.id)
     const run = this.storage.run(current.runId)
@@ -185,15 +189,18 @@ class Execution {
   private async capture(job: Active, asset: Candidate): Promise<{ capture: Capture; id: string }> {
     const run = this.check(job)
     const operation = 'capture:' + run.scopeRevision
-    const saved = this.storage.assignmentEvidence(job.assignment.id, operation)
+    const saved = this.storage.assignmentObservation(job.assignment.id)
+    let capture: Capture
     if (saved) {
       const record = JSON.parse(this.storage.artifact(run.id, saved.id).content) as Capture
-      if (record.observation) job.origins.add(record.observation.finalOrigin)
-      this.check(job)
-      return { capture: record, id: saved.id }
-    }
-    let capture: Capture
-    if (run.sourceMode === 'prepared') {
+      const origins = record.observation ? this.observationOrigins(job.assignment, record.observation) : []
+      if ([...origins].every(origin => this.permitted(run, origin))) {
+        for (const origin of origins) job.origins.add(origin)
+        this.check(job)
+        return { capture: record, id: saved.id }
+      }
+      capture = { observation: null, note: 'The saved observation includes a host outside the current approval.' }
+    } else if (run.sourceMode === 'prepared') {
       capture = asset.prepared ? {
         observation: { ...asset.prepared, origin: asset.origin, finalOrigin: asset.origin, source: 'supplied observation' },
         note: 'Supplied project evidence.',
@@ -272,19 +279,18 @@ class Execution {
 
   private async verify(job: Active, asset: Candidate) {
     const run = this.check(job)
-    const detail = this.storage.runDetail(run.id)
-    const analysis = [...detail.assignments].reverse().find(worker =>
+    const analysis = this.storage.workerList(run.id).findLast(worker =>
       worker.phase === 'analysis' && worker.assetId === asset.id && worker.goalRevision === run.goalRevision && worker.status === 'complete')
-    const stored = analysis && [...detail.evidence].reverse().find(item => item.assignmentId === analysis.id && item.kind === 'observation')
+    const stored = analysis && this.storage.assignmentObservation(analysis.id)
     const record = stored ? JSON.parse(this.storage.artifact(run.id, stored.id).content) as Capture : undefined
-    let observation = record?.observation
-    if (observation && !this.permitted(run, observation.finalOrigin)) observation = null
+    const origins = analysis && record?.observation ? this.observationOrigins(analysis, record.observation) : []
+    const observation = [...origins].every(origin => this.permitted(run, origin)) ? record?.observation : null
     let status = 'inconclusive'
     let transcript: object = { expected: 'positive HSTS max-age', observed: null, result: status }
     let command: string | undefined
     let exitStatus: number | undefined
     if (observation) {
-      job.origins.add(observation.finalOrigin)
+      for (const origin of origins) job.origins.add(origin)
       command = verificationCommand
       const result = await this.backend.run({
         assignmentId: job.assignment.id,

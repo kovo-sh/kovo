@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { and, asc, desc, eq, gt, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
@@ -166,6 +166,20 @@ export class Store {
     return this.db.select().from(tables.evidence).where(and(
       eq(tables.evidence.assignmentId, assignmentId), eq(tables.evidence.operationId, operationId),
     )).get()
+  }
+
+  assignmentObservation(assignmentId: string) {
+    return this.db.select().from(tables.evidence).where(and(
+      eq(tables.evidence.assignmentId, assignmentId), eq(tables.evidence.kind, 'observation'),
+    )).orderBy(desc(tables.evidence.scopeRevision), desc(tables.evidence.createdAt)).limit(1).get()
+  }
+
+  brokerOrigins(assignment: Assignment) {
+    return this.db.selectDistinct({ origin: sql<string>`json_extract(${tables.events.detail}, '$.origin')` })
+      .from(tables.events).where(and(
+        eq(tables.events.runId, assignment.runId), eq(tables.events.kind, 'broker.allowed'),
+        sql`json_extract(${tables.events.detail}, '$.assignmentId') = ${assignment.id}`,
+      )).all().map(row => row.origin)
   }
 
   artifact(runId: string, artifactId: string) {
