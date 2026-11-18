@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -343,5 +343,32 @@ test('enforces the worker container boundary independently of just-bash', { time
     abort.abort()
     await stopped
     await target.close()
+  }
+})
+
+test('expires a real worker whose controller keeps stdin open', { timeout: 25_000 }, async () => {
+  const name = 'guardian-' + randomUUID()
+  const args = ['container', 'run', '--rm', '--interactive', '--name', name, '--network', 'none',
+    '--read-only', '--pull', 'never', 'guardian-worker:local']
+  const child = spawn('docker', args, { stdio: ['pipe', 'ignore', 'ignore'], signal: AbortSignal.timeout(22_000) })
+  const filter = ['--filter', 'name=' + name]
+  const running = async () => {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const { stdout } = await exec('docker', ['container', 'ls', '--quiet', ...filter])
+      if (stdout.trim()) return true
+      await delay(50)
+    }
+    return false
+  }
+  try {
+    const [started, [status]] = await Promise.all([running(), once(child, 'exit')])
+    assert.ok(started, 'The image must reach its running state.')
+    assert.equal(status, 137)
+    const { stdout } = await exec('docker', ['container', 'ls', '--all', '--quiet', ...filter])
+    assert.equal(stdout.trim(), '')
+  } finally {
+    child.stdin.destroy()
+    child.kill()
+    await exec('docker', ['container', 'rm', '--force', name]).catch(() => undefined)
   }
 })

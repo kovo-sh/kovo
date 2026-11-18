@@ -4,4 +4,4 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY bridge.ts ./
 USER 10001:10001
-ENTRYPOINT ["node", "--max-old-space-size=128", "/opt/guardian-worker/bridge.ts"]
+ENTRYPOINT ["/usr/bin/timeout", "--signal=KILL", "15s", "node", "--max-old-space-size=128", "/opt/guardian-worker/bridge.ts"]

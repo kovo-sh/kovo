@@ -5,9 +5,9 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | Check | Result |
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
-| `npm run test:e2e` | Eleven production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, passive DNS and access policy imports, explicit scope approval, revised check plans, coordinator chat, new assets awaiting approval, worker deep links, restart and event replay, evidence exports for multiple report versions, and output-limit recovery. |
-| `npm run test:boundaries` | Eleven tests passed. They cover plan and access case validation, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older and ambiguous observations, local Docker socket enforcement, read-only evidence, process-level network isolation, and container resource limits. |
-| GitHub Actions | The access policy commit passed the workflow on a fresh Ubuntu checkout, including the Docker worker build, eleven boundary tests, and eleven production browser tests. [Hosted verification run for `853eb27`](https://github.com/wwwillchen/guardian/actions/runs/44277267781) |
+| `npm run test:e2e` | Twelve production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, passive DNS and access policy imports, explicit scope approval, revised check plans, coordinator chat, new assets awaiting approval, worker deep links, restart and event replay, container cleanup after an abrupt crash, evidence exports, and output-limit recovery. |
+| `npm run test:boundaries` | Twelve tests passed. They cover plan and access case validation, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, process-level network isolation, container resource limits, and the worker's independent deadline. |
+| GitHub Actions | The portable report export commit passed on a fresh Ubuntu checkout, including the Docker worker build, eleven boundary tests, and eleven production browser tests. [Hosted verification run for `3833cac`](https://github.com/wwwillchen/guardian/actions/runs/44278482996) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -25,6 +25,12 @@ The browser stops the server while a broad plan is in flight. The run view recon
 A second scenario replaces a pending broad plan with a referrer-only goal. It records one plan for the new revision and one brokered fixture read for the approved host. The worker handoff, verification receipt, and report show only the selected check. A controlled provider failure uses the standard plan, and the worker completes its comparison from the recorded metadata.
 
 Both saved Dyad report versions and the linked worker thread reopened from an offline copy after the plan migration. A separate upgrade test interrupted the coordinator on the previous build and resumed its original saved prompt on the new build.
+
+## Worker lifetime and recovery
+
+The browser test killed the production server after Docker had created a verification container. On restart Guardian removed the workspace's abandoned container and left a container labeled for another workspace in place. The assignment remained paused with its lease cleared. Explicit resume reused the assignment and saved one verification record. The provider stream was replayed once and the run made zero page requests.
+
+A separate test held the real container's input stream open without a Guardian server. The image terminated the worker at its 15-second deadline, and Docker removed the container. An offline upgrade check reopened both saved Dyad reports and retained the original three broker audit entries.
 
 ## Response policy reports
 
@@ -44,7 +50,7 @@ The browser downloaded the partial and complete versions from one stopped and re
 
 The scope boundary test exported each version after a scope change and reapproval. The restricted version omitted the removed origin and affected evidence. The earlier version preserved its approved scope. A simulated cross-host input reference was marked unavailable. An offline copy of the Dyad workspace exported both original report versions, resolved both legacy verification records, and retained the three-read audit. The export menu was checked in desktop light mode and at 390 pixels in dark mode.
 
-The Artex Markdown renderer and the Guardian app were given the same synthetic access policy case. Artex's renderer received two pre-adjudicated discrepancies. Both exports described those discrepancies and the source timestamp. Guardian's export included the omitted decision as inconclusive and linked the policy snapshot and verification. The matched assessment benchmark remains open.
+The Artex Markdown renderer and the Guardian app were given the same synthetic access policy case. Artex's renderer received two pre-adjudicated discrepancies. Both exports described those discrepancies and the source timestamp. Guardian's export included the omitted decision as inconclusive and linked the policy snapshot and verification. A read-only aggregate check of the Artex database found 34 pending findings and zero tasks or findings mentioning the Northstar fixture. The matched assessment benchmark remains open.
 
 ## Live Dyad smoke run
 

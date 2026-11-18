@@ -56,19 +56,25 @@ function createBroker() {
 class Execution {
   private readonly storage: Store
   private readonly broker = createBroker()
-  private readonly backend = new LinuxWorkerBackend()
+  private readonly backend: LinuxWorkerBackend
   private readonly active = new Map<string, Active>()
   private readonly coordinator = new Map<string, CoordinatorTask>()
   private timer?: NodeJS.Timeout
 
   constructor(storage: Store) {
     this.storage = storage
+    this.backend = new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
   }
 
   start() {
     if (this.timer) return
     this.timer = setInterval(() => this.wake(), 300)
     this.timer.unref()
+    const reclaim = () => void this.backend.reclaimInactive().catch(() => {
+      // Workspace reads still work while Docker is unavailable. Worker dispatch retries the cleanup.
+    })
+    reclaim()
+    setInterval(reclaim, 30_000).unref()
   }
 
   private permitted(run: Run, origin: string) {
