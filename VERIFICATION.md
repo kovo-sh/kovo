@@ -7,6 +7,7 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | `npm run check` | TypeScript passed. |
 | `npm run test:e2e` | Eight production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, explicit scope approval, goal revisions, new assets awaiting approval, worker deep links, restart and event replay, partial and complete reporting, and output-limit recovery. |
 | `npm run test:boundaries` | Eight tests passed. They cover mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and report selection after a scope change, HTTPS policy attribution across redirects, local Docker socket enforcement, read-only evidence, process-level network isolation, and the container's resource configuration. |
+| GitHub Actions | A fresh Ubuntu checkout on Node.js 24.22.2 passed dependency setup, TypeScript, the Docker worker build, eight boundary tests, and eight production browser tests. [Hosted verification run for `f9e4e77`](https://github.com/wwwillchen/guardian/actions/runs/44271275569) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
