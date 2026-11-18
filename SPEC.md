@@ -113,6 +113,7 @@ Use compact navigation, restrained borders, and emphasis that follows the curren
 
 - Store model credentials in a workspace-scoped local secret store. Give only the provider adapter access to the key for authentication. Keep credentials out of agent sessions, Markdown handoffs, logs, and reports.
 - Redact authorization headers, cookies, session identifiers, passwords, private keys, and sensitive request values before evidence is sent to a provider or written to transcripts, handoffs, fixture recordings, browser event streams, and exports. Use consistent placeholders within a run when repetition matters to the analysis.
+- Redact assembled model text and tool arguments across provider events before releasing the bounded turn to Pi Durable or recording a fixture.
 - Send the smallest sanitized excerpt that supports the task. Keep raw user-supplied evidence local and outside model context and report exports by default. Reports and transcripts link to the sanitized evidence they cite.
 
 ### Threat model

@@ -5,11 +5,11 @@ import type { Api, Model, ProviderStreams } from '@earendil-works/pi-ai'
 import { obj, str } from '@earendil-works/pi-schema'
 import { DEFAULT_PROVIDER } from '../domain.ts'
 import type { ProviderSettings } from '../domain.ts'
+import { redactProviderText, sanitizeProviderStream, sanitizeProviderValue } from './provider-stream.ts'
 import { redact } from './redact.ts'
 
 type Protocol = 'openai-responses' | 'anthropic-messages'
 const modelTokenLimit = 384
-const responseLimit = 768 * 1024
 const providerId = 'guardian'
 
 export type ProviderCall = {
@@ -21,52 +21,6 @@ export type ProviderCall = {
   body: string
 }
 type CallRecorder = (call: ProviderCall) => void
-
-function sanitize(value: unknown, key: string): unknown {
-  if (typeof value === 'string') return redact(value.split(key).join('[redacted]'))
-  if (Array.isArray(value)) return value.map(item => sanitize(item, key))
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitize(item, key)]))
-  }
-  return value
-}
-
-function sanitizeFrame(frame: string, key: string) {
-  return frame.split('\n').map(line => {
-    if (!line.startsWith('data:')) return line
-    const data = line.slice(5).trimStart()
-    if (data === '[DONE]') return 'data: [DONE]'
-    return 'data: ' + JSON.stringify(sanitize(JSON.parse(data), key))
-  }).join('\n')
-}
-
-function sanitizeStream(body: ReadableStream<Uint8Array>, key: string) {
-  let pending = ''
-  let size = 0
-  const decoder = new TextDecoder()
-  const encoder = new TextEncoder()
-  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      size += chunk.byteLength
-      if (size > responseLimit) throw new Error('The model response exceeded Guardian’s size limit.')
-      pending += decoder.decode(chunk, { stream: true })
-      let boundary: RegExpMatchArray | null
-      while ((boundary = pending.match(/\r?\n\r?\n/))) {
-        const frame = pending.slice(0, boundary.index).replaceAll('\r\n', '\n')
-        pending = pending.slice(boundary.index! + boundary[0].length)
-        const result = sanitizeFrame(frame, key) + '\n\n'
-        controller.enqueue(encoder.encode(result))
-      }
-    },
-    flush(controller) {
-      pending += decoder.decode()
-      if (pending.trim()) {
-        const result = sanitizeFrame(pending.trimEnd(), key) + '\n\n'
-        controller.enqueue(encoder.encode(result))
-      }
-    },
-  }))
-}
 
 function transport(settings: ProviderSettings, scenario: string, signal?: AbortSignal, record?: CallRecorder) {
   const endpoint = settings.protocol === 'responses' ? settings.endpoint + '/responses'
@@ -97,8 +51,9 @@ function transport(settings: ProviderSettings, scenario: string, signal?: AbortS
     })
     const contentType = response.headers.get('content-type') ?? 'application/json'
     const recordResponse = record && ((body: string) => record({
-      scenario, endpoint: new URL(endpoint).pathname, request: sanitize(payload, settings.key) as Record<string, unknown>,
-      status: response.status, contentType, body,
+      scenario, endpoint: redactProviderText(new URL(endpoint).pathname, settings.key),
+      request: sanitizeProviderValue(payload, settings.key) as Record<string, unknown>,
+      status: response.status, contentType: redactProviderText(contentType, settings.key), body,
     }))
     if (!response.ok) {
       await response.body?.cancel()
@@ -114,7 +69,7 @@ function transport(settings: ProviderSettings, scenario: string, signal?: AbortS
       await response.body?.cancel()
       throw new Error('The provider did not return a streaming response.')
     }
-    const stream = sanitizeStream(response.body, settings.key)
+    const stream = sanitizeProviderStream(response.body, settings.key, settings.protocol)
     let body: BodyInit = stream
     if (recordResponse) {
       body = await new Response(stream).text()
