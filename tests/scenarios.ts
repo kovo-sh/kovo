@@ -8,7 +8,7 @@ export const healthyOrigin = 'https://healthy.northstar.example'
 export const excludedOrigin = 'https://help.vendor.example'
 export const mainGoal = 'Review the public transport policy for our selected Northstar hosts.'
 export const healthyGoal = 'Review the transport policy for the healthy Northstar fixture.'
-export const allChecksGoal = 'Review all supported security headers on the approved responses.'
+export const allChecksGoal = 'Review every supported response and application security control on the approved evidence.'
 export const referrerGoal = 'Review only the Referrer-Policy header on the approved responses.'
 export const statusQuestion = 'What is the current progress of this review?'
 export const accessPolicyGoal = 'Compare only the recorded access decisions with the supplied authorization policy.'
@@ -70,10 +70,22 @@ export function observation(origin: string, status: number, transportMaxAge: num
 
 export const primary: PublicObservation = {
   ...observation(primaryOrigin, 200, null), contentTypeOptions: 'absent', referrerPolicy: 'unsafe-url',
+  contentSecurityPolicy: 'absent', frameProtection: 'absent', serverDisclosure: 'technology',
 }
 export const unavailable: PublicObservation = {
   ...observation(unavailableOrigin, 503, null), contentTypeOptions: 'absent', referrerPolicy: 'absent',
+  contentSecurityPolicy: 'absent', frameProtection: 'absent', serverDisclosure: 'absent',
 }
 export const healthy: PublicObservation = {
   ...observation(healthyOrigin, 200, 31_536_000), contentTypeOptions: 'nosniff', referrerPolicy: 'strict-origin-when-cross-origin',
+  contentSecurityPolicy: 'enforced', frameProtection: 'both', serverDisclosure: 'absent',
+}
+
+export const deepPrimary: PublicObservation = {
+  ...primary,
+  source: 'supplied observation',
+  recordedAt: '2026-11-18T17:00:00Z',
+  corsPolicy: 'reflected-origin-with-credentials',
+  errorExposure: 'stack-trace',
+  sessionCookiePolicy: 'insecure',
 }

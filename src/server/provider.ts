@@ -9,7 +9,10 @@ import { redactProviderText, sanitizeProviderStream, sanitizeProviderValue } fro
 import { redact } from './redact.ts'
 
 type Protocol = 'openai-responses' | 'anthropic-messages'
-const modelTokenLimit = 384
+// Reasoning-capable compatibility models can spend part of this allowance before
+// emitting the short JSON/tool call Guardian requests. Keep the budget bounded,
+// but large enough for the full verified check catalog.
+const modelTokenLimit = 768
 const providerId = 'guardian'
 
 export type ProviderCall = {

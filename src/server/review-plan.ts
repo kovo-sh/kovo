@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { assessmentCheckIds, assessmentCheckTitles, responseCheckIds } from '../domain.ts'
+import { assessmentCheckIds, assessmentCheckTitles, publicResponseCheckIds, responseCheckIds } from '../domain.ts'
 import type { AssessmentCheckId, Candidate, SelectedChecks } from '../domain.ts'
 
 const preferredChecks = z.strictObject({
@@ -7,8 +7,13 @@ const preferredChecks = z.strictObject({
 })
 
 export function availableReviewChecks(assets: Candidate[], sourceMode: 'prepared' | 'public'): readonly AssessmentCheckId[] {
-  if (!assets.some(asset => asset.accessPolicy)) return responseCheckIds
-  return sourceMode === 'public' || assets.some(asset => asset.prepared) ? assessmentCheckIds : ['access-policy']
+  const response: AssessmentCheckId[] = sourceMode === 'public' ? [...publicResponseCheckIds] : [
+    ...publicResponseCheckIds,
+    ...(assets.some(asset => asset.prepared?.corsPolicy !== undefined) ? ['cors-policy' as const] : []),
+    ...(assets.some(asset => asset.prepared?.errorExposure !== undefined) ? ['error-exposure' as const] : []),
+    ...(assets.some(asset => asset.prepared?.sessionCookiePolicy !== undefined) ? ['session-cookie' as const] : []),
+  ]
+  return assets.some(asset => asset.accessPolicy) ? [...response, 'access-policy'] : response
 }
 
 export function standardChecks(available: readonly AssessmentCheckId[] = responseCheckIds): SelectedChecks {

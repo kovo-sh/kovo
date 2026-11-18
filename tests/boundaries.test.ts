@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
 import { accessPolicySnapshot } from '../src/access-policy.ts'
-import { assessmentCheckIds, preparedObservation, workerHistory } from '../src/domain.ts'
+import { assessmentCheckIds, preparedObservation, responseCheckIds, workerHistory } from '../src/domain.ts'
 import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
 import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
 import { responseEvidence, responseReview } from '../src/server/response-checks.ts'
@@ -228,7 +228,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const original = storage.runDetail(runId).reports[0]
   assert.deepEqual(original.body.coverage.find(item => item.origin === northstar)?.checks?.map(check => check.status), ['gap'])
   assert.deepEqual(original.body.coverage.find(item => item.origin === docsOrigin)?.checks?.map(check => check.status),
-    ['untested', 'untested', 'untested'])
+    responseCheckIds.map(() => 'untested'))
   const exportOriginal = () => exportReportMarkdown(storage, runId, original.id).content
   const originalMarkdown = exportOriginal()
   assert.match(originalMarkdown, /Review &lt;em&gt;response metadata&lt;\/em&gt;/)
@@ -247,12 +247,11 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.match(restricted.body.coverage[0].status, /redirect chain is no longer approved/)
   assert.deepEqual(restricted.body.coverage[0].checks?.map(({ id, status, observed }) => ({ id, status, observed })), [
     { id: 'hsts', status: 'inconclusive', observed: null },
-    { id: 'nosniff', status: 'untested', observed: null },
-    { id: 'referrer-policy', status: 'untested', observed: null },
+    ...responseCheckIds.slice(1).map(id => ({ id, status: 'untested' as const, observed: null })),
   ])
   const restrictedMarkdown = exportReportMarkdown(storage, runId, restricted.id).content
   assert.doesNotMatch(restrictedMarkdown, /## Fix first/)
-  assert.match(restrictedMarkdown, /1 check inconclusive · 2 checks untested/)
+  assert.match(restrictedMarkdown, new RegExp(`1 check inconclusive · ${responseCheckIds.length - 1} checks untested`))
   assert.match(restrictedMarkdown, /\*\*HSTS policy\*\* · Inconclusive/)
   assert.match(restrictedMarkdown, /\*\*MIME sniffing protection\*\* · Untested/)
   for (const removed of [docsOrigin, observation.id, evidence.id, 'Header absent in the earlier capture.']) {
@@ -279,7 +278,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const pending = latest.coverage.find(item => item.origin === northstar)
   assert.equal(pending?.status, 'Pending review')
   assert.equal(pending?.evidenceId, null)
-  assert.deepEqual(pending?.checks?.map(check => check.status), ['untested', 'untested', 'untested'])
+  assert.deepEqual(pending?.checks?.map(check => check.status), responseCheckIds.map(() => 'untested'))
   assert.equal(history.at(-1)?.body.findings[0].id, findingId)
   assert.equal(exportOriginal(), originalMarkdown)
 
@@ -315,7 +314,7 @@ test('keeps cross-origin redirects inconclusive for the requested host', async (
   const signal = AbortSignal.timeout(5_000)
   const observation = await broker.readPublicRoot({ ...allowed, canRead: origin => [northstar, finalOrigin].includes(origin) }, signal)
   const reviews = responseReview(observation)
-  assert.equal(reviews.length, 3)
+  assert.equal(reviews.length, responseCheckIds.length)
   for (const review of reviews) {
     assert.equal(review.comparison, undefined)
     assert.equal(review.coverage.status, 'inconclusive')

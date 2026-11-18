@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
-import { assessmentCheckIds, DEFAULT_PROVIDER, responseCheckIds } from '../src/domain.ts'
+import { assessmentCheckIds, DEFAULT_PROVIDER, publicResponseCheckIds, responseCheckIds } from '../src/domain.ts'
 import type { AssessmentCheckId, ResponseCheckId } from '../src/domain.ts'
 import { agentTurn, coordinatorPrompt, workerInput } from '../src/server/agent-session.ts'
 import type { AgentScenario } from '../src/server/agent-session.ts'
@@ -14,7 +14,7 @@ import type { ProviderCall } from '../src/server/provider.ts'
 import { parseReviewPlan, reviewPlanPrompt } from '../src/server/review-plan.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 import {
-  accessPolicyGoal, allChecksGoal, combinedGoal, healthy, healthyGoal, mainGoal, primary, referrerGoal, statusQuestion, unavailable,
+  accessPolicyGoal, allChecksGoal, combinedGoal, deepPrimary, healthy, healthyGoal, mainGoal, primary, referrerGoal, statusQuestion, unavailable,
 } from '../tests/scenarios.ts'
 import { saveRecording } from './fixture-record.ts'
 
@@ -33,22 +33,32 @@ function workerScenario(name: string, observation: PublicObservation, checks?: r
 }
 
 const onlyReferrer = ['referrer-policy'] as const
+const publicAssessmentChecks = [...publicResponseCheckIds, 'access-policy'] as const
 const scenarios: Scenario[] = [
-  { name: 'plan-all', scenario: 'coordinator-plan', prompt: reviewPlanPrompt(allChecksGoal, 'public'), expectedChecks: responseCheckIds },
+  { name: 'plan-all', scenario: 'coordinator-plan', prompt: reviewPlanPrompt(allChecksGoal, 'public', publicResponseCheckIds),
+    availableChecks: publicResponseCheckIds, expectedChecks: publicResponseCheckIds },
+  { name: 'plan-prepared-all', scenario: 'coordinator-plan', prompt: reviewPlanPrompt(allChecksGoal, 'prepared', responseCheckIds),
+    availableChecks: responseCheckIds, expectedChecks: responseCheckIds },
   { name: 'plan-referrer', scenario: 'coordinator-plan', prompt: reviewPlanPrompt(referrerGoal, 'public'), expectedChecks: onlyReferrer },
   {
     name: 'plan-access-policy', scenario: 'coordinator-plan',
-    prompt: reviewPlanPrompt(accessPolicyGoal, 'public', assessmentCheckIds),
-    availableChecks: assessmentCheckIds, expectedChecks: ['access-policy'],
+    prompt: reviewPlanPrompt(accessPolicyGoal, 'public', publicAssessmentChecks),
+    availableChecks: publicAssessmentChecks, expectedChecks: ['access-policy'],
   },
   {
     name: 'plan-combined', scenario: 'coordinator-plan',
-    prompt: reviewPlanPrompt(combinedGoal, 'public', assessmentCheckIds),
-    availableChecks: assessmentCheckIds, expectedChecks: assessmentCheckIds,
+    prompt: reviewPlanPrompt(combinedGoal, 'public', publicAssessmentChecks),
+    availableChecks: publicAssessmentChecks, expectedChecks: publicAssessmentChecks,
   },
-  workerScenario('response-primary', primary, responseCheckIds),
-  workerScenario('response-unavailable', unavailable, responseCheckIds),
-  workerScenario('response-healthy', healthy, responseCheckIds),
+  {
+    name: 'plan-combined-narrowed', scenario: 'coordinator-plan',
+    prompt: reviewPlanPrompt(combinedGoal, 'public', publicResponseCheckIds),
+    availableChecks: publicResponseCheckIds, expectedChecks: publicResponseCheckIds,
+  },
+  workerScenario('response-primary', primary, publicResponseCheckIds),
+  workerScenario('response-prepared-primary', deepPrimary, responseCheckIds),
+  workerScenario('response-unavailable', unavailable, publicResponseCheckIds),
+  workerScenario('response-healthy', healthy, publicResponseCheckIds),
   workerScenario('response-referrer', primary, onlyReferrer),
   {
     name: 'coordinator-status', scenario: 'coordinator',

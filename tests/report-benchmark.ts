@@ -1,9 +1,10 @@
 import type { Verdict } from '../scripts/report-metrics.ts'
 import type { AccessPolicySnapshot } from '../src/access-policy.ts'
+import { publicResponseCheckIds } from '../src/domain.ts'
 import type { AssessmentCheckId, Finding, ResponseCheckId } from '../src/domain.ts'
 import type { PublicObservation } from '../src/server/broker.ts'
 import {
-  accessPolicy, accessPolicyGoal, allChecksGoal, healthy, healthyOrigin, primary, primaryOrigin,
+  accessPolicy, accessPolicyGoal, allChecksGoal, deepPrimary, healthy, healthyOrigin, primary, primaryOrigin,
   secondaryAccessPolicy, severeAccessPolicy, unavailable, unavailableOrigin,
 } from './scenarios.ts'
 
@@ -34,12 +35,14 @@ export type BenchmarkInput = {
 
 type ReportScenario = { version: number; partial: boolean; basis: string; input: BenchmarkInput; cases: ExpectedCase[] }
 
-function responseCases(origin: string, expected: Verdict): ExpectedCase[] {
+function responseCases(origin: string, expected: Verdict, checks: readonly ResponseCheckId[] = publicResponseCheckIds): ExpectedCase[] {
   const severities: Record<ResponseCheckId, Finding['severity']> = {
     hsts: 'low', nosniff: 'informational', 'referrer-policy': 'low',
+    'content-security-policy': 'low', 'frame-protection': 'low', 'server-disclosure': 'informational',
+    'cors-policy': 'high', 'error-exposure': 'low', 'session-cookie': 'medium',
   }
-  return Object.entries(severities).map(([key, severity]) => {
-    const check = key as ResponseCheckId
+  return checks.map(check => {
+    const severity = severities[check]
     return expected === 'confirmed' ? { origin, check, expected, severity } : { origin, check, expected }
   })
 }
@@ -85,6 +88,18 @@ export const benchmarkScenarios = {
       capturedEvidence: { responseObservations: [healthy] },
     },
     cases: responseCases(healthyOrigin, 'met'),
+  },
+  'response-deep-prepared': {
+    version: 1, partial: false,
+    basis: 'The supplied snapshot records six response-policy gaps plus arbitrary credentialed CORS, a stack trace, and an insecure session-cookie classification.',
+    input: {
+      goal: allChecksGoal, scope: [primaryOrigin], stoppingPoint: 'complete',
+      capturedEvidence: { responseObservations: [deepPrimary] },
+    },
+    cases: responseCases(primaryOrigin, 'confirmed', [
+      'hsts', 'nosniff', 'referrer-policy', 'content-security-policy', 'frame-protection', 'server-disclosure',
+      'cors-policy', 'error-exposure', 'session-cookie',
+    ]),
   },
   'access-policy': {
     version: 1, partial: false,

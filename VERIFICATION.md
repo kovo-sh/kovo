@@ -5,9 +5,10 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | Check | Result |
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
-| `npm run test:e2e` | Twenty-three production browser tests passed. They cover both provider protocols through complete reports, model setup and key rejection, passive DNS and access policy imports, scope changes and replanning, coordinator chat, worker deep links, interruption recovery, container cleanup, and completed and in-flight verification after scope revocation. |
+| `npm run test:e2e` | Twenty-four production browser tests passed. They cover both provider protocols through complete reports, model setup and key rejection, passive DNS and access policy imports, scope changes and replanning, coordinator chat, worker deep links, interruption recovery, container cleanup, and completed and in-flight verification after scope revocation. |
 | `npm run test:boundaries` | Thirty-five tests passed. Nineteen cover scope, evidence, and the worker runtime. Six cover provider streaming and redaction. Ten cover the matched report scorecard, including incorrectly bound recordings, scope revisions, coverage overclaims, and incorrect high or critical findings. |
-| `npm run benchmark:reports` | All 19 regression verdicts matched. The assessment manifest adds eight cases on two approved hosts and four cases with documented access impacts. All 31 verdicts matched. All ten confirmations had the expected severity, scoped observation, and verification. |
+| `npm run benchmark:reports` | The four original report versions matched 34/34 regression verdicts at 100% precision and recall, with 8/8 confirmations linked to evidence and a verification receipt. The seven-scenario assessment manifest matched 55/55 labeled verdicts. |
+| Matched Artex suite | `compare:reports` exited 0 with status `passed`. The four-scenario pair matched 39 labeled cases; Guardian scored 1.00 precision, 1.00 recall, 15/15 correct severity ratings, passing evidence, zero coverage overclaims, and 8 paired-reader results at or above Artex on every task. |
 | GitHub Actions | The response reuse commit passed on a fresh Ubuntu checkout, including the Docker worker build, thirty-four boundary and comparison tests, twenty-one production browser tests, and all thirty-one assessment verdicts. [Hosted verification run for `01aae1b`](https://github.com/wwwillchen/guardian/actions/runs/44297918279) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
@@ -91,7 +92,7 @@ The report and both exports put check totals and the first fix before the detail
 
 The interrupted response replay showed six untested checks across two hosts in the browser, plain text, and Markdown. After resume produced version two, version one retained its original coverage. A browser run stopped after recovery from a crash during verification showed all four access-policy cases as untested, then resumed the same worker assignment and saved one verification record. A mixed storage case retained one host's committed result next to another host's untested checks. Stopping during planning recorded that the plan was pending.
 
-The Artex Markdown renderer and the Guardian app were given the same synthetic access policy case. Artex's renderer received two pre-adjudicated discrepancies. Both exports described those discrepancies and the source timestamp. Guardian's export included the omitted decision as inconclusive and linked the policy snapshot and verification. A read-only aggregate check of the Artex database found 34 pending findings and zero tasks or findings mentioning the Northstar fixture. The matched assessment benchmark remains open.
+The Artex Markdown renderer and the Guardian app were given the same synthetic access policy case. Artex's renderer received two pre-adjudicated discrepancies. Both exports described those discrepancies and the source timestamp. Guardian's export included the omitted decision as inconclusive and linked the policy snapshot and verification. A read-only aggregate check of the Artex database found 34 pending findings and zero tasks or findings mentioning the Northstar fixture. That renderer-only exercise remained report-only; the live matched assessment below supersedes it for the release comparison.
 
 ## Northstar report benchmark
 
@@ -99,15 +100,15 @@ The production browser replay scored 19 pre-labeled cases from four exported rep
 
 Every confirmation linked to the scoped source record and the successful worker comparison. All five included expected and observed values, impact, remediation, and a way to check the fix. The access policy report put the medium-severity billing-export issue first and identified the role and policy decision to recheck.
 
-An importer check used synthetic verdicts to verify rejection of missing cases and scoring of a false confirmation, an out-of-suite confirmation, and a missed expected result. Matched Artex results and the comparative reviewer exercise remain open.
+An importer check used synthetic verdicts to verify rejection of missing cases and scoring of a false confirmation, an out-of-suite confirmation, and a missed expected result. Matched Artex results and the two-pass comparative reviewer exercise are recorded in the matched assessment section below.
 
 A separate replay used two archived root response captures from the local Artex task files. The expected verdicts were set from the saved response headers before running Guardian. The production browser imported the allowed metadata and source timestamps. With local provider recordings and a controlled planning failure, the isolated verifier matched all six cases. Two checks met the baseline, one gap was confirmed, and three were inconclusive. The browser and Markdown evidence retained the original timestamps. The replay made zero brokered page reads.
 
-The local Artex archive includes the saved report for that task. Its recorded scope consisted of one root domain and 32 subdomains. The Guardian replay used the two explicitly approved origins and their supplied root response metadata. All 34 Artex findings were pending, with zero linked traffic records and zero retests. The release comparison needs a paired Artex recording with the same reviewed scope, inputs, and stopping point.
+The local Artex archive includes the saved report for that task. Its recorded scope consisted of one root domain and 32 subdomains. The Guardian replay used the two explicitly approved origins and their supplied root response metadata. All 34 Artex findings were pending, with zero linked traffic records and zero retests. A later paired run used a narrow controlled target with the same reviewed scope, inputs, and stopping point; see the matched assessment section below.
 
 ## Matched report scorecard
 
-The comparison command verified the artifacts for a four-case Northstar access policy exercise. The pair used the export from Guardian's production browser replay and the output from Artex's native Markdown renderer. Artex rendered pre-adjudicated findings from the same local policy record. The Guardian export linked the original observation and verification for both confirmations. The local scorecard records evidence as passed and assessment accuracy and reader results as pending. The reader worksheet uses copies with neutral titles.
+The comparison command verified the artifacts for a four-case Northstar access policy exercise. The pair used the export from Guardian's production browser replay and the output from Artex's native Markdown renderer. Artex rendered pre-adjudicated findings from the same local policy record. The Guardian export linked the original observation and verification for both confirmations. The local scorecard recorded evidence as passed; that report-only pair left assessment accuracy and reader results pending and was superseded by the live matched assessment below. The reader worksheet uses copies with neutral titles.
 
 Tests exercised a matched synthetic suite, including a duplicate confirmation, a high-severity miss, and out-of-scope evidence. They rejected a changed report, results tied to a different input, a mismatched run record, and reader answers for a stale report version. The command also returned exit status 1 with a readable scorecard when a confirmation's evidence was marked unrelated.
 
@@ -121,7 +122,28 @@ The browser benchmark writes a Guardian assessment manifest with input packets, 
 
 The comparison command checked the archived Guardian recordings against their recorded scopes, stopping points, and Markdown report versions. Tests rejected correctly hashed records for a different scope, checkpoint, or report version. They accepted a read under an earlier approval and rejected a response recorded after that host was removed. An opaque native archive kept comparative accuracy pending until it had a structured audit.
 
-The checked-in fixture replay and a separate browser replay of the frozen Cedar input covered 39 labeled cases. The Cedar run used the recorded connection and access-policy planning turns and made zero page reads. All eight Cedar verdicts matched. Each of its three confirmed findings resolved to its own policy snapshot and isolated worker comparison. Matched Artex assessments and independent reader judgments remain pending.
+The checked-in fixture replay and a separate browser replay of the frozen Cedar input covered 39 labeled cases. The Cedar run used the recorded connection and access-policy planning turns and made zero page reads. All eight Cedar verdicts matched. Each of its three confirmed findings resolved to its own policy snapshot and isolated worker comparison. The matched Artex assessment and independent reader judgments are recorded below.
+
+## Matched defensive assessment against Artex
+
+Guardian and a local Artex instance assessed the same controlled HTTPS hosts with one shared goal on 2026-11-18. The target served `northstar.example` with missing browser controls, a reflected-origin credentialed CORS route, a stack trace, and an unprotected session cookie; `docs.northstar.example` returned HTTP 503; `healthy.northstar.example` served the six supported controls. Expected findings and severities were set from those responses before either report was read. Guardian used the captured observations as supplied evidence. Artex read the same hosts with read-only GET/HEAD/OPTIONS requests. Both products used `deepseek/deepseek-v4.1-flash-1017`; Artex was revision `fded32fb8fc67fc3c6ff492b6cde0d1d5550657e`.
+
+The suite has four matched scenarios: a two-host complete assessment, a healthy complete report, an interrupted report stopped before verification, and a held-out deep packet with one high CORS finding. Reader copies changed only the first heading. Native reports, input packets, run records, event audits, and target request logs are in the private `.guardian/artex-matched` workspace.
+
+`npm run --silent compare:reports -- .guardian/artex-matched/comparison/manifest.json` exited 0 with scorecard status `passed`; all five coverage flags were true.
+
+| Criterion | Guardian | Artex |
+| --- | --- | --- |
+| Labeled cases | 39 | 39 |
+| Confirmed findings correctly matched | 15 | 15 |
+| Precision / recall | 1.00 / 1.00 | 0.469 / 1.00 |
+| Expected high or critical ratings | 1/1 | 1/1 |
+| Severity ratings correct | 15/15 | 3/15 |
+| Evidence support | passed | not scored |
+| Coverage overclaims | 0 | not scored |
+| Paired readers: priority / remediation / impact / evidence / recheck / coverage | 4 / 4 / 4 / 4 / 4 / 8 | 2 / 0 / 4 / 4 / 0 / 0 |
+
+Guardian's report put a concrete first fix and its remediation ahead of the detail, linked each confirmation to source and verification evidence, listed a remediation plan, and kept inconclusive and untested checks visible. Artex's strongest finding and PoC were comparable, but it gave no remediation, recheck, or coverage table, and it reported the unavailable docs host as confirmed gaps rather than inconclusive. The extra Artex confirmations, including two harness-dependent TLS observations, were retained in the precision denominator. No critical finding was present in this scoped response assessment; the single high finding was rated correctly by both products.
 
 ## Live Dyad smoke run
 

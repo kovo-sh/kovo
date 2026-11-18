@@ -33,6 +33,11 @@ export function RunReport({ detail, openEvidence }: {
   const evidenceSource = reportEvidenceSource(detail.run.sourceMode, body.selectedChecks)
   const plannedChecks = reportPlanLabel(body.selectedChecks)
   const evidenceTitles = new Map(detail.evidence.map(item => [item.id, item.title]))
+  const confirmedFindings = body.findings.filter(item => item.status === 'confirmed')
+  const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
+    const count = confirmedFindings.filter(item => item.severity === severity).length
+    return count ? [`${count} ${severity}`] : []
+  })
 
   async function exportMarkdown(reportId: string) {
     setExportError('')
@@ -76,9 +81,12 @@ export function RunReport({ detail, openEvidence }: {
       '', 'Findings',
       ...body.findings.flatMap(item => [
         `${item.title} · ${item.origin} · ${item.severity} · ${item.status}`,
+        ...(item.category ? [`Class: ${item.category}${item.cwe ? ` · ${item.cwe}` : ''}`] : []),
+        ...(item.confidence ? [`Confidence: ${item.confidence}`] : []),
         ...(item.check ? [`Observed: ${item.check.observed ?? 'Unavailable'}`, `Expected: ${item.check.expected}`] : []),
         item.reason,
         ...(item.impact ? [`Impact: ${item.impact}`] : []),
+        ...(item.verification ? [`Verification: ${item.verification}`] : []),
         `Remediation: ${item.remediation}`,
         ...(item.recheck ? [`Check the fix: ${item.recheck}`] : []),
         `Evidence ${item.evidenceIds.join(', ')}`, '',
@@ -114,6 +122,7 @@ export function RunReport({ detail, openEvidence }: {
     <FormError error={exportError} />
     <p className="report-summary">{findingCount}</p>
     {coverage && <p className="report-check-summary">{coverage}</p>}
+    {severityCounts.length > 0 && <p className="muted">Confirmed severity · {severityCounts.join(' · ')}</p>}
     <p>{body.goal}</p>
     <p className="muted">{approvedHosts} · Scope revision {body.scopeRevision} · Goal revision {body.goalRevision}</p>
     <p className="muted">{evidenceSource}</p>
@@ -132,9 +141,12 @@ export function RunReport({ detail, openEvidence }: {
         <div className="section-heading"><h4>{item.title}</h4><Status status={item.status} /></div>
         <p className="finding-meta">{new URL(item.origin).hostname} · {item.severity}</p>
         {item.check && <dl className="finding-details">
+          {item.category && <><dt>Class</dt><dd>{item.category}{item.cwe && <> · {item.cwe}</>}</dd></>}
+          {item.confidence && <><dt>Confidence</dt><dd>{item.confidence}</dd></>}
           <dt>Observed</dt><dd>{item.check.observed ?? 'Unavailable'}</dd>
           <dt>Expected</dt><dd>{item.check.expected}</dd>
           {item.impact && <><dt>Impact</dt><dd>{item.impact}</dd></>}
+          {item.verification && <><dt>Verification</dt><dd>{item.verification}</dd></>}
           <dt>{item.status === 'confirmed' ? 'Remediation' : 'Follow-up'}</dt><dd>{item.remediation}</dd>
           {item.recheck && <><dt>Check the fix</dt><dd>{item.recheck}</dd></>}
         </dl>}
@@ -146,6 +158,12 @@ export function RunReport({ detail, openEvidence }: {
           </Button>)}
         </div>
       </div>)}
+    </section>}
+    {confirmedFindings.length > 0 && <section className="stacked-section">
+      <h3>Remediation plan</h3>
+      <ol>{confirmedFindings.map(item => <li key={item.id}>
+        <strong>{item.title}</strong><p>{item.remediation}</p><p className="muted">Recheck · {item.recheck}</p>
+      </li>)}</ol>
     </section>}
     <section className="stacked-section">
       <h3>Coverage</h3>
@@ -178,5 +196,10 @@ export function RunReport({ detail, openEvidence }: {
     {body.gaps.length > 0 && <section className="stacked-section">
       <h3>Coverage gaps</h3><ul>{body.gaps.map(gap => <li key={gap}>{gap}</li>)}</ul>
     </section>}
+    <section className="stacked-section">
+      <h3>Methodology and limitations</h3>
+      <p>Guardian evaluated only the approved hosts, selected checks, and recorded evidence in this report. A confirmed finding requires an isolated-worker comparison linked to source evidence; model commentary alone cannot confirm it.</p>
+      <p className="muted">Inconclusive, not-applicable, and untested checks remain visible rather than counting as passes. This evidence-led review does not guarantee that no other vulnerability exists.</p>
+    </section>
   </article>
 }

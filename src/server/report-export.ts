@@ -91,6 +91,11 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
   const findings = body.findings.filter(item => approved.has(item.origin))
   const { coverage, confirmed, priority } = reportHighlights(body)
   const plan = reportPlanLabel(body.selectedChecks)
+  const confirmedFindings = findings.filter(item => item.status === 'confirmed')
+  const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
+    const count = confirmedFindings.filter(item => item.severity === severity).length
+    return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)}** ${count}`] : []
+  })
   const lines = [
     `# Guardian ${report.partial ? 'partial' : 'complete'} report`, '',
     `**${confirmed} confirmed ${confirmed === 1 ? 'finding' : 'findings'}**`, '',
@@ -102,8 +107,14 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     `- **Scope revision** ${body.scopeRevision} · **Goal revision** ${body.goalRevision}`,
     `- **Evidence source** ${inline(reportEvidenceSource(run.sourceMode, body.selectedChecks))}`,
     ...(plan ? ['- ' + inline(plan)] : []),
+    '', '## Executive summary', '',
+    ...(confirmedFindings.length ? [
+      `${confirmedFindings.length} evidence-backed ${confirmedFindings.length === 1 ? 'finding was' : 'findings were'} confirmed within the approved scope. ` +
+        `${severityCounts.length ? 'The confirmed severity distribution is listed below.' : ''}`, '',
+      ...severityCounts, '',
+    ] : ['No evidence-backed security gap was confirmed in the completed checks. This does not mean the approved assets are free of vulnerabilities.', '']),
     ...(priority ? [
-      '', '## Fix first', '',
+      '## Fix first', '',
       ...(priority.finding ? [
         `**${inline(priority.label)}** · ${inline(priority.finding.origin)}`, '', inline(priority.finding.remediation),
       ] : [inline(priority.label), '', '[Findings](#findings)']),
@@ -119,16 +130,27 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
       `### ${inline(finding.title)}`, '',
       `- **Host** ${inline(finding.origin)}`,
       `- **Severity** ${inline(finding.severity)} · **Status** ${inline(finding.status)}`,
+      ...(finding.category ? [`- **Class** ${inline(finding.category)}${finding.cwe ? ` · ${inline(finding.cwe)}` : ''}`] : []),
+      ...(finding.confidence ? [`- **Confidence** ${inline(finding.confidence)}`] : []),
       ...(finding.check ? [
         `- **Observed** ${inline(finding.check.observed ?? 'Unavailable')}`,
         `- **Expected** ${inline(finding.check.expected)}`,
       ] : []),
       `- **Result** ${inline(finding.reason)}`,
       ...(finding.impact ? [`- **Impact** ${inline(finding.impact)}`] : []),
+      ...(finding.verification ? [`- **Verification** ${inline(finding.verification)}`] : []),
       `- **${finding.status === 'confirmed' ? 'Remediation' : 'Follow-up'}** ${inline(finding.remediation)}`,
       ...(finding.recheck ? [`- **Check the fix** ${inline(finding.recheck)}`] : []),
       ...(links ? ['- **Evidence** ' + links] : []), '',
     )
+  }
+
+  if (confirmedFindings.length) {
+    lines.push('## Remediation plan', '')
+    for (const [index, finding] of confirmedFindings.entries()) {
+      lines.push(`${index + 1}. **${inline(finding.title)}** — ${inline(finding.remediation)} Recheck: ${inline(finding.recheck ?? 'repeat the verified evidence check after the change.')}`)
+    }
+    lines.push('')
   }
 
   lines.push('## Coverage', '')
@@ -149,6 +171,11 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     lines.push('')
   }
   if (body.gaps.length) lines.push('## Coverage gaps', '', ...body.gaps.map(gap => '- ' + inline(gap)), '')
+  lines.push('## Methodology and limitations', '',
+    '- Guardian evaluated only the approved hosts, selected checks, and recorded evidence identified in this report.',
+    '- A confirmed finding requires a successful isolated-worker comparison linked to its source evidence. Model commentary alone cannot confirm a finding.',
+    '- Inconclusive, not-applicable, and untested checks are retained in coverage instead of being treated as passes.',
+    '- This evidence-led review is not a guarantee that no other vulnerability exists. New routes, authenticated roles, application state, and infrastructure changes can alter the result.', '')
   if (attachments.size) lines.push('## Evidence', '')
   for (const entry of attachments.values()) {
     lines.push(`### Evidence ${entry.number}`, '')

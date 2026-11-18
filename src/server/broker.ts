@@ -63,6 +63,33 @@ function referrerPolicy(value: string | undefined): PublicObservation['referrerP
     referrerPolicies.some(policy => policy === token)) ?? 'unrecognized'
 }
 
+function contentSecurityPolicy(headers: IncomingHttpHeaders): PublicObservation['contentSecurityPolicy'] {
+  const enforced = header(headers, 'content-security-policy')
+  const reportOnly = header(headers, 'content-security-policy-report-only')
+  if (enforced !== undefined) return enforced.trim() ? 'enforced' : 'unrecognized'
+  if (reportOnly !== undefined) return reportOnly.trim() ? 'report-only' : 'unrecognized'
+  return 'absent'
+}
+
+function frameProtection(headers: IncomingHttpHeaders): PublicObservation['frameProtection'] {
+  const csp = header(headers, 'content-security-policy')
+  const xfo = header(headers, 'x-frame-options')
+  const frameAncestors = Boolean(csp && /(?:^|;)\s*frame-ancestors\s+[^;]+/i.test(csp))
+  const validXfo = Boolean(xfo && /^(?:deny|sameorigin)\s*$/i.test(xfo.split(',', 1)[0]))
+  if (frameAncestors && validXfo) return 'both'
+  if (frameAncestors) return 'csp-frame-ancestors'
+  if (validXfo) return 'x-frame-options'
+  if (xfo !== undefined) return 'unrecognized'
+  return 'absent'
+}
+
+function serverDisclosure(headers: IncomingHttpHeaders): PublicObservation['serverDisclosure'] {
+  if (header(headers, 'x-powered-by')) return 'technology'
+  const server = header(headers, 'server')?.trim()
+  if (!server) return 'absent'
+  return /(?:\d|\/|next|express|php|asp\.net|nginx|apache)/i.test(server) ? 'technology' : 'generic'
+}
+
 function safePage(url: URL) {
   return url.protocol === 'https:' && !url.port && !url.username && !url.password &&
     !url.search && !url.hash && url.pathname.length <= 512 && !url.pathname.startsWith('//')
@@ -105,6 +132,9 @@ function observed(origin: string, url: URL, response: HeadersRead, source: Publi
     source,
     contentTypeOptions: typeOptions === undefined ? 'absent' : nosniff ? 'nosniff' : 'unrecognized',
     referrerPolicy: referrerPolicy(header(response.headers, 'referrer-policy')),
+    contentSecurityPolicy: contentSecurityPolicy(response.headers),
+    frameProtection: frameProtection(response.headers),
+    serverDisclosure: serverDisclosure(response.headers),
   }
 }
 

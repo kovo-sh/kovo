@@ -15,7 +15,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "{\"goal\":\"Review only the Referrer-Policy header on the approved responses.\",\"evidence\":\"approved HTTPS response metadata\",\"availableChecks\":[{\"id\":\"hsts\",\"title\":\"HSTS policy\"},{\"id\":\"nosniff\",\"title\":\"MIME sniffing protection\"},{\"id\":\"referrer-policy\",\"title\":\"Referrer policy\"}]}",
+                "text": "{\"goal\":\"Review only the Referrer-Policy header on the approved responses.\",\"evidence\":\"approved HTTPS response metadata\",\"availableChecks\":[{\"id\":\"hsts\",\"title\":\"HSTS policy\"},{\"id\":\"nosniff\",\"title\":\"MIME sniffing protection\"},{\"id\":\"referrer-policy\",\"title\":\"Referrer policy\"},{\"id\":\"content-security-policy\",\"title\":\"Content Security Policy\"},{\"id\":\"frame-protection\",\"title\":\"Frame embedding protection\"},{\"id\":\"server-disclosure\",\"title\":\"Server technology disclosure\"}]}",
                 "cache_control": {
                   "type": "ephemeral"
                 }
@@ -23,7 +23,7 @@
             ]
           }
         ],
-        "max_tokens": 384,
+        "max_tokens": 768,
         "stream": true,
         "system": [
           {

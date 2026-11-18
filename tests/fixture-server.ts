@@ -57,7 +57,10 @@ export async function fixtureServer(options: {
       ...(capture === healthy ? {
         'X-Content-Type-Options': 'NoSnIfF',
         'Referrer-Policy': 'unsafe-url, strict-origin-when-cross-origin',
+        'Content-Security-Policy': "default-src 'self'; frame-ancestors 'self'",
+        'X-Frame-Options': 'SAMEORIGIN',
       } : {}),
+      ...(capture === primary ? { 'X-Powered-By': 'Synthetic Framework 1.0' } : {}),
     }).end('Prepared response with local-only data. ' + sensitiveFixtureValue)
   }
 

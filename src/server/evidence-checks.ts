@@ -14,6 +14,9 @@ export type FindingRule = {
   impact: string
   remediation: string
   recheck: string
+  category?: string
+  cwe?: string
+  verification?: string
 }
 
 export type EvidenceReview = {

@@ -134,7 +134,11 @@ export async function agentTurn(job: AgentTurn) {
     const agent = {
       model: { provider: model.provider, modelId: model.id },
       thinkingLevel: 'off' as const,
-      maxTurns: job.derive ? 3 : 1,
+      // Responses recordings can hit their token ceiling on the same turn that
+      // produces the tool call, so the derivation artifact is authoritative and
+      // Guardian records a deterministic handoff. Messages keeps the follow-up
+      // turn because its recovery path intentionally resumes a held final reply.
+      maxTurns: job.settings.protocol === 'messages' ? 3 : 1,
       extensions,
       instructions: instructions[job.scenario],
     }
@@ -151,6 +155,11 @@ export async function agentTurn(job: AgentTurn) {
       const continuation = result.reason === 'interrupted' || result.type === 'continue'
       const retry = await conversation.submit(continuation ? { type: 'continue', requestId } : { ...input, requestId }, context)
       result = await retry.wait(context)
+    }
+    if (result.status === 'unanswered' && result.reason === 'turn_limit' && job.derive) {
+      const view = await conversation.context(context)
+      const usedTool = view.entries.some(item => item.model?.some(message => message.role === 'toolResult' && !message.isError))
+      if (usedTool) return 'The model reached its output limit after recording the evidence command result.'
     }
     if (result.status !== 'done' || !result.answer) {
       throw new Error('The model did not finish the requested evidence turn.')

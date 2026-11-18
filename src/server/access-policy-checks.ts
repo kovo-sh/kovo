@@ -10,6 +10,9 @@ const baseRule: FindingRule = {
   impact: 'The recorded role and capability resolve to a different decision than the supplied policy specifies.',
   remediation: 'Review this role and capability in the application’s server-side authorization policy and align the decision with the intended rule.',
   recheck: 'Rerun the owner’s authorization test for this case and import the new decision.',
+  category: 'Authorization',
+  cwe: 'CWE-862',
+  verification: 'Matched the supplied authorization case by stable identifier and compared the recorded decision with the owner-defined expected decision.',
 }
 
 const policyImpacts = {

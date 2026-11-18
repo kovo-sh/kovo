@@ -440,6 +440,10 @@ class Execution {
         : status === 'pending' ? 'Resume the run to verify the observation.' : 'Review the verification evidence.',
       impact: confirmed ? rule.impact : undefined,
       recheck: confirmed ? rule.recheck : undefined,
+      category: rule.category,
+      cwe: rule.cwe,
+      confidence: confirmed ? 'high' : status === 'inconclusive' ? 'low' : 'medium',
+      verification: confirmed ? rule.verification : undefined,
       check: { id: rule.id, caseId: coverage.caseId, expected: coverage.expected, observed: coverage.observed },
       evidenceIds, scopeRevision: run.scopeRevision,
     }

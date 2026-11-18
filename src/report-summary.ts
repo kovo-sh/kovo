@@ -47,8 +47,10 @@ export function reportHighlights(body: ReportBody) {
     ? { label: first.title, finding: first }
     : {
         label: count + (first.severity === 'informational' ? ' informational' : ' ' + first.severity + '-severity') +
-          ' findings share top priority.',
-        finding: undefined,
+          ' findings share top priority. Start with ' + first.title + '.',
+        // Keep a concrete first fix even when several findings share the top
+        // severity, so the reader can identify and verify one action.
+        finding: first,
       })
   return { coverage, confirmed: confirmed.length, priority }
 }

@@ -45,6 +45,12 @@ export const preparedObservation = z.object({
   recordedAt: z.iso.datetime().optional(),
   contentTypeOptions: z.enum(['absent', 'nosniff', 'unrecognized']).optional(),
   referrerPolicy: z.enum(['absent', 'unrecognized', ...referrerPolicies]).optional(),
+  contentSecurityPolicy: z.enum(['absent', 'enforced', 'report-only', 'unrecognized']).optional(),
+  frameProtection: z.enum(['absent', 'x-frame-options', 'csp-frame-ancestors', 'both', 'unrecognized']).optional(),
+  serverDisclosure: z.enum(['absent', 'generic', 'technology']).optional(),
+  corsPolicy: z.enum(['absent', 'restricted', 'wildcard', 'reflected-origin', 'reflected-origin-with-credentials']).optional(),
+  errorExposure: z.enum(['none', 'internal-details', 'stack-trace']).optional(),
+  sessionCookiePolicy: z.enum(['none', 'secure-httponly', 'secure-only', 'insecure']).optional(),
 })
 export const addCandidate = z.object({
   origin: assetOrigin,
@@ -152,10 +158,18 @@ export interface Finding {
   scopeRevision: number
   impact?: string
   recheck?: string
+  category?: string
+  cwe?: string
+  confidence?: 'high' | 'medium' | 'low'
+  verification?: string
   check?: Pick<CheckCoverage, 'id' | 'caseId' | 'expected' | 'observed'>
 }
 
-export const responseCheckIds = ['hsts', 'nosniff', 'referrer-policy'] as const
+export const publicResponseCheckIds = [
+  'hsts', 'nosniff', 'referrer-policy', 'content-security-policy', 'frame-protection', 'server-disclosure',
+] as const
+export const preparedOnlyCheckIds = ['cors-policy', 'error-exposure', 'session-cookie'] as const
+export const responseCheckIds = [...publicResponseCheckIds, ...preparedOnlyCheckIds] as const
 export type ResponseCheckId = typeof responseCheckIds[number]
 export const assessmentCheckIds = [...responseCheckIds, 'access-policy'] as const
 export type AssessmentCheckId = typeof assessmentCheckIds[number]
@@ -163,6 +177,12 @@ export const assessmentCheckTitles: Record<AssessmentCheckId, string> = {
   hsts: 'HSTS policy',
   nosniff: 'MIME sniffing protection',
   'referrer-policy': 'Referrer policy',
+  'content-security-policy': 'Content Security Policy',
+  'frame-protection': 'Frame embedding protection',
+  'server-disclosure': 'Server technology disclosure',
+  'cors-policy': 'Cross-origin access policy',
+  'error-exposure': 'Error detail exposure',
+  'session-cookie': 'Session cookie attributes',
   'access-policy': 'Access policy decisions',
 }
 

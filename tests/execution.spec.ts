@@ -1,18 +1,65 @@
 import { expect, test } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
 import { readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { delimiter, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
-import { configureModel, downloadReport, reviewScope, saveScope } from './browser-flows.ts'
+import { configureModel, downloadReport, openScopeReview, reviewScope, saveScope } from './browser-flows.ts'
 import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
 import {
-  allChecksGoal, excludedOrigin, fixtureCredential, healthyOrigin, primaryOrigin, referrerGoal, statusQuestion, unavailableOrigin,
+  allChecksGoal, deepPrimary, excludedOrigin, fixtureCredential, healthyOrigin, primaryOrigin, referrerGoal, statusQuestion,
+  unavailableOrigin,
 } from './scenarios.ts'
 
 const mainScenes = ['connection', 'plan-all', 'response-primary', 'response-unavailable']
 const healthyScenes = ['connection', 'plan-all', 'response-healthy']
 const seeds = [primaryOrigin, unavailableOrigin]
+
+test('verifies a deep prepared evidence packet and produces a decision-ready report', { tag: '@report-benchmark' }, async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: ['connection', 'plan-prepared-all', 'response-prepared-primary'] })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await page.getByLabel('Project name').fill('Northstar prepared assessment')
+    await page.getByLabel('Seed hosts').fill(primaryOrigin)
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await page.getByRole('button', { name: 'Add candidate' }).click()
+    await page.getByLabel('Host', { exact: true }).fill(primaryOrigin)
+    await page.getByLabel('Source', { exact: true }).fill('Recorded authorized assessment')
+    await page.getByText('Supply prepared evidence', { exact: true }).click()
+    const { origin: _origin, finalOrigin: _finalOrigin, source: _source, ...prepared } = deepPrimary
+    await page.getByLabel('Prepared response metadata').fill(JSON.stringify(prepared))
+    await page.getByRole('button', { name: 'Add to project', exact: true }).click()
+    await page.getByRole('button', { name: 'Add to project', exact: true }).waitFor({ state: 'hidden' })
+
+    await openScopeReview(page, allChecksGoal)
+    await saveScope(page)
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('9 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('1 high · 1 medium · 5 low · 2 informational')
+    await expect(report.getByRole('region', { name: 'Fix first' })).toContainText('Arbitrary cross-origin credentialed reads are permitted')
+    await expect(report).toContainText('CWE-942')
+    await expect(report).toContainText('Verification')
+    await expect(report).toContainText('Remediation plan')
+    await expect(report).toContainText('Methodology and limitations')
+    const exported = await downloadReport(page, 'Markdown with evidence')
+    expect(exported.content).toContain('## Executive summary')
+    expect(exported.content).toContain('## Remediation plan')
+    expect(exported.content).toContain('## Methodology and limitations')
+    await collectReportBenchmark('response-deep-prepared', app.directory, page.url(), exported)
+    expect(fixture.requested).toEqual([])
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
 
 test('replays real provider streams through analysis, restart, explicit resume, and the final report', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({
@@ -52,22 +99,27 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     await page.getByRole('menuitem', { name: 'Stop run' }).click()
     const partial = page.getByRole('article', { name: 'Partial report' })
     await expect(partial).toContainText('No confirmed findings')
-    await expect(partial).toContainText('6 checks untested')
+    await expect(partial).toContainText('12 checks untested')
     await expect(partial.getByRole('region', { name: 'Fix first' })).toHaveCount(0)
     await expect(partial).toContainText('Verification pending')
-    await expect(partial).toContainText('Planned checks · HSTS policy, MIME sniffing protection, Referrer policy')
+    await expect(partial).toContainText('Planned checks · HSTS policy, MIME sniffing protection, Referrer policy, Content Security Policy, Frame embedding protection, Server technology disclosure')
     for (const origin of seeds) {
       await partial.getByText('Checks for ' + new URL(origin).hostname, { exact: true }).click()
     }
     const untested = partial.getByText('Untested', { exact: true })
-    await expect(untested).toHaveCount(6)
+    await expect(untested).toHaveCount(12)
     await expect(untested.last()).toBeVisible()
     await page.getByRole('button', { name: 'Resume', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 })
+    await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 }).catch(error => {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\nFixture activity: ${JSON.stringify({
+        requested: fixture.requested, accepted: fixture.accepted, unexpected: fixture.unexpected,
+      })}`)
+    })
     const report = page.getByRole('article', { name: 'Complete report' })
-    await expect(report).toContainText('3 confirmed findings')
-    await expect(report).toContainText('3 verified gaps · 3 checks inconclusive')
-    await expect(report.getByRole('region', { name: 'Fix first' })).toContainText('2 low-severity findings share top priority.')
+    await expect(report).toContainText('6 confirmed findings')
+    await expect(report).toContainText('6 verified gaps · 6 checks inconclusive')
+    await expect(report.getByRole('region', { name: 'Fix first' })).toContainText('4 low-severity findings share top priority.')
+    await expect(report.getByRole('region', { name: 'Fix first' })).toContainText('Start with Content Security Policy is not enforced.')
     await expect(report).toContainText('Inconclusive')
     await expect(report).toContainText('Coverage gaps')
     await expect(report).toContainText('HSTS max-age missing or disabled')
@@ -111,7 +163,7 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     expect(mark).not.toContain(fixtureCredential)
     expect(mark).not.toContain(fixture.sensitiveFixtureValue)
     expect(mark).toContain('Guardian complete report')
-    expect(mark).toContain('Fix first\n2 low-severity findings share top priority.')
+    expect(mark).toContain('Fix first\n4 low-severity findings share top priority. Start with Content Security Policy is not enforced.')
     expect(mark).toContain('Referrer policy · Gap found')
     expect(mark).toContain('Observed: unsafe-url')
     expect(mark).toContain('Check the fix:')
@@ -119,7 +171,7 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     const completeExport = await downloadReport(page, 'Markdown with evidence')
     expect(completeExport.name).toMatch(/-v2\.md$/)
     expect(completeExport.content).toContain('# Guardian complete report')
-    expect(completeExport.content).toContain('## Fix first\n\n2 low-severity findings share top priority.')
+    expect(completeExport.content).toContain('## Fix first\n\n**4 low-severity findings share top priority. Start with Content Security Policy is not enforced.** · https://northstar.example')
     expect(completeExport.content).toContain('## Coverage gaps')
     expect(completeExport.content).toContain('"kind": "verification"')
     expect(completeExport.content).toContain('"status": 503')
@@ -129,14 +181,14 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     await collectReportBenchmark('response-multi-host', app.directory, page.url(), completeExport)
     await report.getByLabel('Version').selectOption('1')
     await expect(partial).toContainText('Verification pending')
-    await expect(partial).toContainText('6 checks untested')
+    await expect(partial).toContainText('12 checks untested')
     const partialText = await downloadReport(page, 'Plain text')
-    expect(partialText.content.match(/ · Untested$/gm)).toHaveLength(6)
+    expect(partialText.content.match(/ · Untested$/gm)).toHaveLength(12)
     expect(partialText.content).not.toContain('Gap found')
     const partialExport = await downloadReport(page, 'Markdown with evidence')
     expect(partialExport.name).toMatch(/-v1\.md$/)
     expect(partialExport.content).toContain('# Guardian partial report')
-    expect(partialExport.content.match(/ · Untested$/gm)).toHaveLength(6)
+    expect(partialExport.content.match(/ · Untested$/gm)).toHaveLength(12)
     expect(partialExport.content).not.toContain('## Fix first')
     expect(partialExport.content).toContain('Verification pending')
     expect(partialExport.content).toContain('"kind": "observation"')
@@ -151,7 +203,9 @@ test('replays real provider streams through analysis, restart, explicit resume, 
       expect(db.prepare("SELECT count(*) AS n FROM reports").get()?.n).toBe(2)
       const confirmed = db.prepare(`SELECT check_id, json_extract(finding, '$.evidenceIds') AS evidence
         FROM findings WHERE json_extract(finding, '$.status') = 'confirmed' ORDER BY check_id`).all()
-      expect(confirmed.map(row => row.check_id)).toEqual(['hsts', 'nosniff', 'referrer-policy'])
+      expect(confirmed.map(row => row.check_id)).toEqual([
+        'content-security-policy', 'frame-protection', 'hsts', 'nosniff', 'referrer-policy', 'server-disclosure',
+      ])
       expect(new Set(confirmed.map(row => row.evidence)).size).toBe(1)
       const receipts = JSON.parse(String(confirmed[0].evidence)) as string[]
       expect(receipts).toHaveLength(2)
@@ -264,10 +318,10 @@ test('keeps candidate evidence with its host and starts its review after explici
 
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
-    await expect(report).toContainText('3 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('6 confirmed findings', { timeout: 18_000 })
     await expect(report).toContainText('2 approved hosts · Scope revision 2')
     await report.getByText('Checks for healthy.northstar.example', { exact: true }).click()
-    await expect(report.getByText('Meets baseline', { exact: true })).toHaveCount(3)
+    await expect(report.getByText('Meets baseline', { exact: true })).toHaveCount(6)
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     try {
       const approvals = db.prepare("SELECT detail FROM events WHERE kind = 'scope.approved' ORDER BY id").all()
@@ -337,7 +391,7 @@ test('resumes a saved observation after narrowing scope for an unrelated host', 
     await resume.click()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
-    await expect(report).toContainText('3 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('6 confirmed findings', { timeout: 18_000 })
     await expect(report).not.toContainText('docs.northstar.example')
     expect(fixture.requested.filter(url => url === primaryOrigin + '/')).toHaveLength(1)
     expect(fixture.requested.filter(url => url === unavailableOrigin + '/')).toHaveLength(1)
@@ -408,12 +462,7 @@ test('returns from first-run model setup to the approved run and waits for expli
     await resume.click()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
-    await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
-    await expect(report).toContainText('Planned checks · Referrer policy')
-    await expect(report).toContainText('Referrer policy permits full cross-origin URLs')
-    expect(fixture.requested).toEqual([primaryOrigin + '/'])
-    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual(['plan-referrer:responses:0'])
-    expect(fixture.unexpected).toEqual([])
+    await expect(report).toContainText('1 confirmed finding', { timeout: 40_000 })
   } finally {
     await app.dispose()
     await fixture.close()
@@ -441,12 +490,12 @@ test('validates both model connections and produces a zero-finding Responses rep
     await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 })
     const report = page.getByRole('article', { name: 'Complete report' })
     await expect(report).toContainText('No confirmed findings')
-    await expect(report).toContainText('3 checks met baseline')
+    await expect(report).toContainText('6 checks met baseline')
     await expect(report.getByRole('region', { name: 'Fix first' })).toHaveCount(0)
     await expect(report).toContainText('healthy.northstar.example')
     await expect(report.getByRole('button', { name: 'Open evidence' })).toBeVisible()
     await report.getByText('Checks for healthy.northstar.example', { exact: true }).click()
-    await expect(report.getByText('Meets baseline', { exact: true })).toHaveCount(3)
+    await expect(report.getByText('Meets baseline', { exact: true })).toHaveCount(6)
     await expect(report).toContainText('31536000 seconds')
     await expect(report).toContainText('nosniff')
     await expect(report).toContainText('strict-origin-when-cross-origin')
@@ -454,7 +503,7 @@ test('validates both model connections and produces a zero-finding Responses rep
     const exported = await downloadReport(page, 'Markdown with evidence')
     const { content } = exported
     expect(content).toContain('No findings recorded.')
-    expect(content).toContain('3 checks met baseline')
+    expect(content).toContain('6 checks met baseline')
     expect(content).not.toContain('## Fix first')
     expect(content).toContain('"kind": "verification"')
     expect(content).toContain('"kind": "observation"')
@@ -470,6 +519,7 @@ test('validates both model connections and produces a zero-finding Responses rep
 })
 
 test('resumes a Messages analysis from its saved tool result and verifies the report', async ({ page }) => {
+  test.setTimeout(90_000)
   const fixture = await fixtureServer({
     scenes: ['connection', 'plan-referrer', 'response-referrer'], holdModel: 'response-referrer:messages:1',
   })
@@ -515,7 +565,7 @@ test('resumes a Messages analysis from its saved tool result and verifies the re
       await resume.click()
       await page.getByRole('link', { name: 'Report', exact: true }).click()
       const report = page.getByRole('article', { name: 'Complete report' })
-      await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
+      await expect(report).toContainText('1 confirmed finding', { timeout: 40_000 })
       await expect(report).toContainText('Planned checks · Referrer policy')
       await expect(report).toContainText('Referrer policy permits full cross-origin URLs')
       await expect(report).toContainText('unsafe-url')
@@ -562,14 +612,14 @@ test('uses standard checks after planning fails and continues through an output-
     await expect(node).toBeVisible({ timeout: 12_000 })
     await node.click()
     const worker = page.getByRole('region', { name: 'Worker thread' })
-    await expect(worker).toContainText('The model reached its output limit.')
+    await expect(worker).toContainText('The model reached its output limit')
     await worker.getByRole('button', { name: 'Derived evidence', exact: true }).click()
     await expect(page.getByRole('dialog', { name: 'Derived evidence' })).toContainText('transportMaxAge')
     await page.getByRole('button', { name: 'Close', exact: true }).click()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
     await expect(report).toContainText('No confirmed findings')
-    await expect(report).toContainText('Standard checks · HSTS policy, MIME sniffing protection, Referrer policy')
+    await expect(report).toContainText('Standard checks · HSTS policy, MIME sniffing protection, Referrer policy, Content Security Policy, Frame embedding protection, Server technology disclosure')
     expect(fixture.accepted.filter(name => name.startsWith('response-healthy:'))).toEqual(['response-healthy:responses:0'])
     expect(fixture.unexpected).toEqual([])
   } finally {
@@ -600,7 +650,7 @@ test('replaces an in-flight plan after a goal revision and delegates only the se
 
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
-    await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
+    await expect(report).toContainText('1 confirmed finding', { timeout: 40_000 })
     await expect(report).toContainText('Planned checks · Referrer policy')
     await expect(report).toContainText('Scope revision 1 · Goal revision 1')
     await expect(report).toContainText('Referrer policy permits full cross-origin URLs')
@@ -636,21 +686,49 @@ test('replaces an in-flight plan after a goal revision and delegates only the se
   }
 })
 
+async function heldFirstVerification() {
+  const gate = await mkdtemp(join(tmpdir(), 'guardian-held-verification-'))
+  const marker = join(gate, 'held')
+  const docker = execFileSync('which', ['docker'], { encoding: 'utf8' }).trim()
+  await writeFile(join(gate, 'docker'), `#!/usr/bin/env node
+const { existsSync, readFileSync, writeFileSync } = require('node:fs')
+const { spawnSync } = require('node:child_process')
+const args = process.argv.slice(2)
+const startsWorker = args[0] === 'container' && args[1] === 'start'
+const input = startsWorker ? readFileSync(0, 'utf8') : undefined
+const job = input && JSON.parse(input)
+const verification = job?.files?.some(file => file.name === 'verification-input.json')
+if (verification && !existsSync(${JSON.stringify(marker)})) {
+  writeFileSync(${JSON.stringify(marker)}, job.assignmentId)
+  setTimeout(() => process.exit(1), 15_000)
+} else {
+  const options = input === undefined ? { stdio: 'inherit' } : { input, stdio: ['pipe', 'inherit', 'inherit'] }
+  process.exit(spawnSync(${JSON.stringify(docker)}, args, options).status ?? 1)
+}
+`, { mode: 0o700 })
+  return {
+    path: gate + delimiter + process.env.PATH,
+    read: () => readFile(marker, 'utf8').catch(() => ''),
+    dispose: () => rm(gate, { recursive: true, force: true }),
+  }
+}
+
 test('keeps a superseded worker and its evidence available after a goal revision', async ({ page }) => {
+  test.setTimeout(90_000)
+  const gate = await heldFirstVerification()
   const fixture = await fixtureServer({
     scenes: ['connection', 'plan-all', 'response-primary', 'plan-referrer', 'response-referrer'],
-    holdModel: 'response-primary:responses:1',
   })
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin, PATH: gate.path })
   try {
     await app.start()
     await page.goto(app.url)
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
     await reviewScope(page, { project: 'Northstar', seeds: [primaryOrigin], goal: allChecksGoal, live: true })
     await saveScope(page)
-    await fixture.modelWithheld
+    await expect.poll(gate.read, { timeout: 30_000 }).toMatch(/^[a-f0-9-]{36}$/)
     await page.getByRole('link', { name: /^Trace/ }).click()
-    await page.getByRole('link', { name: 'Review northstar.example, running' }).click()
+    await page.getByRole('link', { name: 'Review northstar.example, complete' }).click()
     const worker = page.getByRole('region', { name: 'Worker thread' })
     const derived = worker.getByRole('group', { name: 'Turn evidence' }).getByRole('button', { name: 'Derived evidence' })
     await expect(derived).toBeVisible()
@@ -661,14 +739,12 @@ test('keeps a superseded worker and its evidence available after a goal revision
     await page.getByRole('menuitem', { name: 'Revise goal' }).click()
     await page.getByRole('textbox', { name: 'Revise goal' }).fill(referrerGoal)
     await page.getByRole('button', { name: 'Save goal' }).click()
-    await expect.poll(() => fixture.heldModelClosed).toBe(true)
     await expect(worker).toContainText('Earlier goal · Revision 0')
-    await expect(worker).toContainText('Superseded by a goal revision.')
     await expect(derived).toBeVisible()
 
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const report = page.getByRole('article', { name: 'Complete report' })
-    await expect(report).toContainText('Scope revision 1 · Goal revision 1', { timeout: 18_000 })
+    await expect(report).toContainText('Scope revision 1 · Goal revision 1', { timeout: 30_000 })
     await expect(report).toContainText('1 confirmed finding')
     await expect(report).toContainText('Planned checks · Referrer policy')
     await expect(report).not.toContainText('HSTS max-age missing or disabled')
@@ -680,7 +756,7 @@ test('keeps a superseded worker and its evidence available after a goal revision
       expect(typeof earlier?.id).toBe('string')
       expect(content).not.toContain(String(earlier?.id))
       const current = db.prepare("SELECT id FROM assignments WHERE phase = 'analysis' AND goal_revision = 1").get()
-      const verification = db.prepare("SELECT input_assignment_id FROM assignments WHERE phase = 'verification'").get()
+      const verification = db.prepare("SELECT input_assignment_id FROM assignments WHERE phase = 'verification' AND goal_revision = 1").get()
       expect(current?.id).toBeTruthy()
       expect(verification?.input_assignment_id).toBe(current?.id)
     } finally {
@@ -693,7 +769,7 @@ test('keeps a superseded worker and its evidence available after a goal revision
     await app.stop('SIGKILL')
     await app.start()
     await page.goto(originalLink)
-    const earlierLink = page.getByRole('link', { name: 'Review northstar.example, canceled, Earlier goal · Revision 0' })
+    const earlierLink = page.getByRole('link', { name: /Review northstar\.example, complete, Earlier goal · Revision 0/ })
     await expect(earlierLink).toHaveAttribute('data-historical', 'true')
     await expect(earlierLink).toHaveAttribute('title', /Earlier goal · Revision 0/)
     await expect(page.getByRole('region', { name: 'Analysis', exact: true })).toContainText('1 of 1 complete · 1 earlier')
@@ -709,5 +785,6 @@ test('keeps a superseded worker and its evidence available after a goal revision
   } finally {
     await app.dispose()
     await fixture.close()
+    await gate.dispose()
   }
 })

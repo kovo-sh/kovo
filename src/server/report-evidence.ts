@@ -26,7 +26,13 @@ const receipt = z.object({
   exitStatus: z.number().int().min(0).max(255).optional(),
 })
 const minimum = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
-const values = z.enum(['absent', 'unrecognized', 'nosniff', 'allow', 'deny', ...referrerPolicies])
+const values = z.enum([
+  'absent', 'unrecognized', 'nosniff', 'allow', 'deny', ...referrerPolicies,
+  'enforced', 'report-only', 'x-frame-options', 'csp-frame-ancestors', 'both',
+  'generic', 'technology', 'restricted', 'wildcard', 'reflected-origin',
+  'reflected-origin-with-credentials', 'none', 'internal-details', 'stack-trace',
+  'secure-httponly', 'secure-only', 'insecure',
+])
 const maxComparisons = maxAccessPolicyCases + responseCheckIds.length
 const comparison = z.object({
   id: z.string().refine(value => responseCheckIds.some(id => id === value) ||
