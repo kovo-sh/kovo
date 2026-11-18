@@ -143,6 +143,26 @@ test('fails the scorecard for a missed or incorrectly rated serious finding', as
   assert.deepEqual(corrected.accuracy.seriousFindingIssues, [])
 })
 
+test('fails the scorecard when a report overstates coverage', async t => {
+  const fixture = await comparison(t)
+  const baseline = await fixture.score()
+  const [, , missing, stopped] = fixture.manifest.scenarios
+  for (const product of ['guardian', 'artex'] as const) {
+    missing[product].verdicts[0].verdict = 'met'
+    stopped[product].verdicts[0].verdict = 'inconclusive'
+  }
+  const score = await fixture.score()
+  assert.equal(score.status, 'failed')
+  assert.equal(score.evidence.status, 'passed')
+  assert.equal(score.readers.status, 'passed')
+  assert.equal(score.accuracy.guardian?.precision, baseline.accuracy.guardian?.precision)
+  assert.equal(score.accuracy.guardian?.recall, baseline.accuracy.guardian?.recall)
+  assert.deepEqual(score.accuracy.coverageOverclaims, [
+    { scenario: 'missing', asset: primary, issue: 'export', expected: 'inconclusive', reported: 'met' },
+    { scenario: 'stopped', asset: primary, issue: 'export', expected: 'untested', reported: 'inconclusive' },
+  ])
+})
+
 test('keeps assessment pending for renderer-only data or missing reader reviews', async t => {
   const fixture = await comparison(t)
   fixture.manifest.mode = 'report-only'

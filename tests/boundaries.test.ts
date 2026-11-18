@@ -214,7 +214,8 @@ test('keeps reports tied to current approval and requires fresh verification aft
     /Invalid worker input/)
   storage.updateWorker(verification.id, {
     status: 'complete', outcome: 'Confirmed from scope revision 1.',
-    checks: [{ ...responseReview(null)[0].coverage, status: 'gap', reason: 'The response lacked HSTS.' }],
+    checks: [{ ...responseReview(null)[0].coverage, status: 'gap',
+      observed: 'Header absent in the earlier capture.', reason: 'The response lacked HSTS.' }],
   })
   const findingId = randomUUID()
   storage.db.insert(findings).values({
@@ -243,9 +244,19 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const restricted = storage.runDetail(runId).reports[0]
   assert.equal(restricted.body.findings.length, 0)
   assert.match(restricted.body.coverage[0].status, /redirect chain is no longer approved/)
+  assert.deepEqual(restricted.body.coverage[0].checks?.map(({ id, status, observed }) => ({ id, status, observed })), [
+    { id: 'hsts', status: 'inconclusive', observed: null },
+    { id: 'nosniff', status: 'untested', observed: null },
+    { id: 'referrer-policy', status: 'untested', observed: null },
+  ])
   const restrictedMarkdown = exportReportMarkdown(storage, runId, restricted.id).content
   assert.doesNotMatch(restrictedMarkdown, /## Fix first/)
-  for (const removed of [docsOrigin, observation.id, evidence.id]) assert.ok(!restrictedMarkdown.includes(removed))
+  assert.match(restrictedMarkdown, /1 check inconclusive · 2 checks untested/)
+  assert.match(restrictedMarkdown, /\*\*HSTS policy\*\* · Inconclusive/)
+  assert.match(restrictedMarkdown, /\*\*MIME sniffing protection\*\* · Untested/)
+  for (const removed of [docsOrigin, observation.id, evidence.id, 'Header absent in the earlier capture.']) {
+    assert.ok(!restrictedMarkdown.includes(removed))
+  }
   assert.equal(exportOriginal(), originalMarkdown)
 
   approve([docs.id])

@@ -279,6 +279,16 @@ function findSeriousFindingIssues(scenarios: CheckedScenario[]) {
   })
 }
 
+function findCoverageOverclaims(scenarios: CheckedScenario[]) {
+  return scenarios.flatMap(({ id, guardian }) => {
+    if (guardian?.recordingAudit !== 'verified') return []
+    return guardian.cases.filter(({ expected, reported }) => {
+      if (expected === 'untested') return reported !== 'untested'
+      return expected === 'inconclusive' && (reported === 'confirmed' || reported === 'met')
+    }).map(({ asset, issue, expected, reported }) => ({ scenario: id, asset, issue, expected, reported }))
+  })
+}
+
 function scoreProduct(scenarios: CheckedScenario[], product: Product) {
   const reports = scenarios.flatMap(item => {
     const report = item[product]
@@ -360,8 +370,9 @@ export async function compareReports(manifestPath: string) {
   const guardian = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'guardian') : null
   const artex = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'artex') : null
   const seriousFindingIssues = manifest.mode === 'assessment' ? findSeriousFindingIssues(scenarios) : []
-  const accuracyStatus: Status = seriousFindingIssues.length ? 'failed' : compareAccuracy(guardian, artex)
-  const accuracy = { status: accuracyStatus, guardian, artex, seriousFindingIssues }
+  const coverageOverclaims = manifest.mode === 'assessment' ? findCoverageOverclaims(scenarios) : []
+  const accuracyStatus: Status = seriousFindingIssues.length || coverageOverclaims.length ? 'failed' : compareAccuracy(guardian, artex)
+  const accuracy = { status: accuracyStatus, guardian, artex, seriousFindingIssues, coverageOverclaims }
   const evidenceIssues = scenarios.flatMap(item => item.guardian?.evidenceIssues.map(issue => ({ scenario: item.id, ...issue })) ?? [])
   const evidenceStatus: Status = evidenceIssues.some(issue => issue.reason !== 'unreviewed') ? 'failed'
     : scenarios.some(item => !item.guardian) || evidenceIssues.length ? 'pending' : 'passed'

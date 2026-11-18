@@ -45,6 +45,8 @@ function validWorkerInput(worker: Pick<Assignment, 'runId' | 'phase' | 'assetId'
     input.assetId === worker.assetId && input.goalRevision === worker.goalRevision
 }
 
+const untestedReason = 'Verification had no saved result when this report was created.'
+
 function untestedCoverage(asset: Candidate, selection: SelectedChecks): CheckCoverage[] {
   const reviews = responseReview(null, undefined, selection.checks.filter(id => id !== 'access-policy'))
   if (selection.checks.includes('access-policy')) {
@@ -52,7 +54,7 @@ function untestedCoverage(asset: Candidate, selection: SelectedChecks): CheckCov
   }
   return reviews.map(({ coverage }) => ({
     ...coverage, observed: null, status: 'untested',
-    reason: 'Verification had no saved result when this report was created.',
+    reason: untestedReason,
   }))
 }
 
@@ -580,9 +582,20 @@ export class Store {
       const analyzed = analysis?.status === 'complete' ? analysis : undefined
       const verified = verification?.status === 'complete' ? verification : undefined
       if (analyzed && this.brokerOrigins(analyzed).some(origin => !approvedOrigins.has(origin))) {
-        const status = 'Inconclusive: a source in the recorded redirect chain is no longer approved.'
+        const reason = 'A source in the recorded redirect chain is no longer approved.'
+        const status = 'Inconclusive. ' + reason
+        const checks: CheckCoverage[] = (verified?.checks ?? []).map(check => ({
+          ...check, observed: null,
+          status: check.status === 'untested' ? 'untested' : 'inconclusive',
+          reason: check.status === 'untested' ? untestedReason : reason,
+        }))
+        if (selection) {
+          for (const check of untestedCoverage(asset, selection)) {
+            if (!checks.some(saved => saved.id === check.id && saved.caseId === check.caseId)) checks.push(check)
+          }
+        }
         gaps.push(asset.origin + ' · ' + status)
-        return { origin: asset.origin, status, evidenceId: null }
+        return { origin: asset.origin, status, evidenceId: null, ...(checks.length ? { checks } : {}) }
       }
       const done = verified ?? analyzed
       const evidence = snapshot.evidence.filter(item => item.assignmentId === analyzed?.id || item.assignmentId === verified?.id)

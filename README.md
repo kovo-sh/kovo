@@ -93,6 +93,8 @@ Use the same asset and issue identifiers in the expected cases and both sets of 
 
 For an assessment, record the reported severity of every expected high or critical finding. The scorecard fails a verified Guardian recording for a missed finding at either level or a missing or different rating. The accuracy section lists the scenario, asset, issue, expected severity, reported verdict, and reported severity for each failure. This criterion applies as soon as a Guardian recording verifies.
 
+The accuracy section also lists coverage overclaims. A verified Guardian recording fails if a check labeled untested has a reported result, or a check labeled inconclusive appears as passed or confirmed.
+
 The recording audit uses a string `runId`, the `status` at export, an `approval` object with the final approval's `eventId` and `scope`, and an `events` array in increasing numeric `id` order. Give each event its `kind`. Use `run.created` at the start, `scope.approved` with the approved origins in `scope` for each approval, and `report.complete` or `report.partial` at the chosen report save. Record bounded reads as `broker.allowed` or `broker.observed` with their destination `origin`. Use `complete` for a complete report and `stopped`, `paused`, or `failed` for an interrupted run. Guardian's export records include the `reportVersion` and `reportId`. The scorecard checks the Guardian run and version against the Markdown. Keep the native recording alongside any reviewed excerpt.
 
 A passing release scorecard requires matched run records, representative cases, and paired reader results. Invalid references or a failed criterion exit with an error. A failed comparison still writes the scorecard so the reasons can be reviewed.
