@@ -16,6 +16,7 @@ import { assessmentCheckIds, preparedObservation, workerHistory } from '../src/d
 import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
 import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
 import { responseEvidence, responseReview } from '../src/server/response-checks.ts'
+import { restrictAccessVerification } from '../src/server/report-evidence.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { parseReviewPlan, standardChecks } from '../src/server/review-plan.ts'
 import { findings } from '../src/server/schema.ts'
@@ -511,6 +512,31 @@ test('requires unique policy cases and leaves missing access decisions inconclus
   assert.equal(checkCoverage(reviews[0], unexpected).status, 'inconclusive')
   assert.equal(checkCoverage(reviews[3], unexpected).status, 'inconclusive')
   assert.equal(reviews[3].comparison, undefined)
+})
+
+test('retains only access verdicts supported by the saved snapshot and comparison', () => {
+  const source = { id: randomUUID(), content: JSON.stringify({ origin: northstar, snapshot: accessPolicy }) }
+  const reviews = accessPolicyReviews(accessPolicy)
+  const receipt = {
+    origin: northstar, inputEvidence: [randomUUID(), source.id], exitStatus: 0,
+    checks: reviews.map(({ coverage }) => ({ ...coverage, status: 'gap' })),
+    comparisons: reviews.flatMap(({ comparison }) => comparison ? [{
+      ...comparison, observed: comparison.id === 'access-policy:audit-summary' ? 'allow' : comparison.observed,
+    }] : []),
+  }
+  const content = JSON.stringify(receipt)
+  assert.equal(restrictAccessVerification(content, { ...source, id: randomUUID() }, northstar), undefined)
+  const wrongHost = { ...source, content: JSON.stringify({
+    origin: northstar, snapshot: { ...accessPolicy, origin: 'https://docs.northstar.example' },
+  }) }
+  assert.equal(restrictAccessVerification(content, wrongHost, northstar), undefined)
+  const retained = restrictAccessVerification(content, source, northstar)
+  assert.deepEqual(retained?.receipt.inputEvidence, [source.id])
+  assert.deepEqual(retained?.receipt.checks.map(({ caseId, status }) => [caseId, status]), [
+    ['billing-export', 'gap'], ['audit-summary', 'inconclusive'], ['read-summary', 'inconclusive'], ['modify-schedule', 'inconclusive'],
+  ])
+  const failed = restrictAccessVerification(JSON.stringify({ ...receipt, exitStatus: 1 }), source, northstar)
+  assert.ok(failed?.receipt.checks.every(check => check.status === 'inconclusive'))
 })
 
 test('requires a local Docker Unix socket before staging worker data', async () => {

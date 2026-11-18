@@ -12,7 +12,7 @@ import type { Candidate, CheckCoverage, EvidenceSummary, ReportBody, RunCommand,
 import { parseDnsInventory } from '../passive-dns.ts'
 import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
-import { responseCapture } from './report-evidence.ts'
+import { responseCapture, restrictAccessVerification } from './report-evidence.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks } from './review-plan.ts'
 import * as tables from './schema.ts'
@@ -21,7 +21,9 @@ import { redact } from './redact.ts'
 export type Run = typeof tables.runs.$inferSelect
 export type Assignment = typeof tables.assignments.$inferSelect
 type Project = typeof tables.projects.$inferSelect
+type Evidence = typeof tables.evidence.$inferSelect
 const inventoryTitle = 'Supplied asset inventory'
+const reportAccessOperation = 'report-access:'
 
 function evidenceTitle(run: Run, kind: EvidenceSummary['kind'], title: string) {
   return run.sourceMode === 'prepared' && kind === 'observation' && title === 'Observed public response'
@@ -58,6 +60,10 @@ function untestedCoverage(asset: Candidate, selection: SelectedChecks): CheckCov
     ...coverage, observed: null, status: 'untested',
     reason: untestedReason,
   }))
+}
+
+function inconclusiveReasons(checks: readonly CheckCoverage[]) {
+  return new Set(checks.filter(check => check.status === 'inconclusive').map(check => check.reason))
 }
 
 export class Store {
@@ -648,11 +654,36 @@ export class Store {
     this.event(run.id, 'goal.revised', `Goal revision ${revision} recorded.`, { actorId: this.workspace.actorId, revision, goal })
   }
 
+  private retainAccessVerification(run: Run, origin: string, worker: Assignment, source: Evidence, receipt: Evidence) {
+    if (source.goalRevision !== run.goalRevision || receipt.goalRevision !== run.goalRevision ||
+      source.scopeRevision > receipt.scopeRevision || receipt.scopeRevision > run.scopeRevision ||
+      source.createdAt > receipt.createdAt) return
+    const restricted = (() => {
+      try {
+        return restrictAccessVerification(this.artifact(run.id, receipt.id).content, this.artifact(run.id, source.id), origin)
+      } catch {
+        return undefined
+      }
+    })()
+    if (!restricted) return
+
+    const operation = reportAccessOperation + run.scopeRevision
+    const existing = this.assignmentEvidence(worker.id, operation)
+    const evidence = existing ?? this.addArtifact(run, worker, 'verification', 'Access policy verification',
+      JSON.stringify({ ...restricted.receipt, verifiedAt: new Date(receipt.createdAt).toISOString() }, null, 2), operation)
+    if (!existing) this.event(run.id, 'evidence.restricted', 'Preserved the independent access verification for the current scope.', {
+      assignmentId: worker.id, artifactId: evidence.id, sourceArtifactId: receipt.id, scopeRevision: run.scopeRevision,
+    })
+    return { sourceId: source.id, receiptId: receipt.id, evidenceId: evidence.id, origin,
+      checks: restricted.receipt.checks, recordedAt: restricted.recordedAt }
+  }
+
   writeReport(run: Run, partial: boolean) {
     const snapshot = this.runDetail(run.id)
     const scope = run.candidates.filter(candidate => run.approved.includes(candidate.id))
     const approvedOrigins = new Set(scope.map(asset => asset.origin))
     const currentEvidence = new Set<string>()
+    const retainedAccess = new Map<string, NonNullable<ReturnType<Store['retainAccessVerification']>>>()
     const gaps: string[] = []
     const plan = run.reviewPlan
     const selection = plan?.status === 'ready' ? { checks: plan.checks, source: plan.source } : plan?.previous
@@ -661,37 +692,50 @@ export class Store {
       const { analysis, verification } = assessmentAssignments(snapshot.assignments, asset.id, run.goalRevision)
       const analyzed = analysis?.status === 'complete' ? analysis : undefined
       const verified = verification?.status === 'complete' ? verification : undefined
+      const done = verified ?? analyzed
+      const evidence = snapshot.evidence.filter(item => (item.assignmentId === analyzed?.id || item.assignmentId === verified?.id) &&
+        !item.operationId?.startsWith(reportAccessOperation))
+      const artifact = evidence.findLast(item => item.assignmentId === done?.id &&
+        (verified ? item.kind === 'verification' : ['observation', 'access-policy'].includes(item.kind)))
+      const access = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'access-policy')
       if (analyzed && this.brokerOrigins(analyzed).some(origin => !approvedOrigins.has(origin))) {
         const reason = 'A source in the recorded redirect chain is no longer approved.'
-        const status = 'Inconclusive. ' + reason
-        const checks: CheckCoverage[] = (verified?.checks ?? []).map(check => ({
+        const retained = verified?.inputAssignmentId === analyzed.id && access && artifact
+          ? this.retainAccessVerification(run, asset.origin, verified, access, artifact) : undefined
+        if (retained) retainedAccess.set(asset.id, retained)
+        const checks: CheckCoverage[] = (verified?.checks ?? []).filter(check => check.id !== 'access-policy' || !retained).map(check => ({
           ...check, observed: null,
           status: check.status === 'untested' ? 'untested' : 'inconclusive',
-          reason: check.status === 'untested' ? untestedReason : reason,
+          reason: check.status === 'untested' ? untestedReason : check.id === 'access-policy'
+            ? 'The saved verification does not support a separate access policy result.' : reason,
         }))
+        if (retained) checks.push(...retained.checks)
         if (selection) {
           for (const check of untestedCoverage(asset, selection)) {
             if (!checks.some(saved => saved.id === check.id && saved.caseId === check.caseId)) checks.push(check)
           }
         }
+        const status = 'Inconclusive. ' + reason
         gaps.push(asset.origin + ' · ' + status)
-        return { origin: asset.origin, status, evidenceId: null, ...(checks.length ? { checks } : {}) }
+        for (const reason of inconclusiveReasons(retained?.checks ?? [])) gaps.push(asset.origin + ' · ' + reason)
+        return {
+          origin: asset.origin,
+          status: retained?.checks.some(check => check.status === 'met' || check.status === 'gap')
+            ? 'Access policy reviewed. Response checks inconclusive.' : status,
+          evidenceId: retained?.evidenceId ?? null,
+          ...(retained ? { accessEvidence: { id: retained.sourceId, recordedAt: retained.recordedAt } } : {}),
+          ...(checks.length ? { checks } : {}),
+        }
       }
-      const done = verified ?? analyzed
-      const evidence = snapshot.evidence.filter(item => item.assignmentId === analyzed?.id || item.assignmentId === verified?.id)
       for (const item of evidence) currentEvidence.add(item.id)
-      const artifact = evidence.findLast(item => item.assignmentId === done?.id &&
-        (verified ? item.kind === 'verification' : ['observation', 'access-policy'].includes(item.kind)))
       const derived = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'analysis')
-      const access = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'access-policy')
       const status = verified?.outcome ?? (analyzed ? 'Analysis complete. Verification pending.'
         : run.reviewPlan?.status === 'pending' ? 'Check plan pending' : 'Pending review')
       const checks = verified ? verified.checks : selection && untestedCoverage(asset, selection)
       if (!verified || !artifact) {
         gaps.push(asset.origin + ' · ' + status)
       } else if (verified.checks) {
-        const reasons = new Set(verified.checks.filter(check => check.status === 'inconclusive').map(check => check.reason))
-        for (const reason of reasons) gaps.push(asset.origin + ' · ' + reason)
+        for (const reason of inconclusiveReasons(verified.checks)) gaps.push(asset.origin + ' · ' + reason)
       } else if (status.startsWith('Inconclusive')) {
         gaps.push(asset.origin + ' · ' + status)
       }
@@ -704,8 +748,18 @@ export class Store {
     })
     const results = this.db.select().from(tables.findings).where(and(
       eq(tables.findings.runId, run.id), eq(tables.findings.goalRevision, run.goalRevision),
-    )).all().filter(row => run.approved.includes(row.assetId) && row.finding.evidenceIds.length > 0 &&
-      row.finding.evidenceIds.every(id => currentEvidence.has(id))).map(row => row.finding)
+    )).all().flatMap(({ assetId, finding, checkId, caseId }) => {
+      if (!run.approved.includes(assetId) || !finding.evidenceIds.length) return []
+      if (finding.evidenceIds.every(id => currentEvidence.has(id))) return [finding]
+      const retained = retainedAccess.get(assetId)
+      const check = finding.check
+      if (!retained || checkId !== 'access-policy' || finding.status !== 'confirmed' || finding.origin !== retained.origin ||
+        check?.id !== 'access-policy' || check.caseId !== caseId || finding.evidenceIds.length !== 2 ||
+        !finding.evidenceIds.includes(retained.sourceId) || !finding.evidenceIds.includes(retained.receiptId)) return []
+      const verified = retained.checks.find(item => item.caseId === caseId && item.status === 'gap')
+      if (!verified || verified.observed !== check.observed || verified.expected !== check.expected) return []
+      return [{ ...finding, evidenceIds: [retained.sourceId, retained.evidenceId] }]
+    })
     const statusOrder = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
     results.sort((a, b) => statusOrder[a.status] - statusOrder[b.status] ||
       findingSeverityOrder[a.severity] - findingSeverityOrder[b.severity] ||

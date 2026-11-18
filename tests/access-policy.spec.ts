@@ -1,7 +1,10 @@
 import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { join } from 'node:path'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { delimiter, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { AccessPolicySnapshot } from '../src/access-policy.ts'
 import { createApp } from './app.ts'
@@ -9,9 +12,17 @@ import { configureModel, downloadReport, openScopeReview, saveScope } from './br
 import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
 import {
-  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, healthyOrigin, primaryOrigin, secondaryAccessPolicy,
+  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, healthyOrigin, primary, primaryOrigin, secondaryAccessPolicy,
   severeAccessPolicy, unavailableOrigin,
 } from './scenarios.ts'
+
+function markdownEvidence(markdown: string) {
+  return [...markdown.matchAll(/\*\*SHA-256 of the JSON below\*\* `([a-f0-9]{64})`\n\n~~~json\n([\s\S]*?)\n~~~/g)]
+    .map(([, digest, json]) => {
+      expect(createHash('sha256').update(json).digest('hex')).toBe(digest)
+      return JSON.parse(json)
+    })
+}
 
 test('imports and verifies access policy cases alone and alongside response checks', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy', 'plan-combined', 'response-primary'] })
@@ -135,11 +146,7 @@ test('imports and verifies access policy cases alone and alongside response chec
     const linked = [...markdown.matchAll(/\]\(#evidence-(\d+)\)/g)].map(match => match[1])
     const sections = [...markdown.matchAll(/^### Evidence (\d+)$/gm)].map(match => match[1])
     expect([...new Set(linked)].sort()).toEqual(sections.sort())
-    const attachments = [...markdown.matchAll(/\*\*SHA-256 of the JSON below\*\* `([a-f0-9]{64})`\n\n~~~json\n([\s\S]*?)\n~~~/g)]
-      .map(([, digest, json]) => {
-        expect(createHash('sha256').update(json).digest('hex')).toBe(digest)
-        return JSON.parse(json)
-      })
+    const attachments = markdownEvidence(markdown)
     expect(attachments).toHaveLength(sections.length)
     const access = attachments.find(record => record.kind === 'access-policy')
     const response = attachments.find(record => record.kind === 'observation')
@@ -202,6 +209,101 @@ async function importAccessRecords(page: Page, policy: AccessPolicySnapshot) {
   await expect(page.getByRole('status')).toContainText('Imported ' + policy.expected.length + ' access cases for ' +
     new URL(policy.origin).hostname)
 }
+
+test('retains independently verified access findings after a redirect host is removed', async ({ page }) => {
+  const gate = await mkdtemp(join(tmpdir(), 'guardian-redirect-verification-'))
+  const docker = execFileSync('which', ['docker'], { encoding: 'utf8' }).trim()
+  // Hold the relay's response-only verification so the operator can stop after the primary host finishes.
+  await writeFile(join(gate, 'docker'), `#!/usr/bin/env node
+const { readFileSync } = require('node:fs')
+const { spawnSync } = require('node:child_process')
+const args = process.argv.slice(2)
+const startsWorker = args[0] === 'container' && args[1] === 'start'
+const input = startsWorker ? readFileSync(0, 'utf8') : undefined
+const verification = input && JSON.parse(input).files.find(file => file.name === 'verification-input.json')
+if (verification && JSON.parse(verification.content).access === null) {
+  setTimeout(() => process.exit(1), 15_000)
+} else {
+  const options = input === undefined ? { stdio: 'inherit' } : { input, stdio: ['pipe', 'inherit', 'inherit'] }
+  process.exit(spawnSync(${JSON.stringify(docker)}, args, options).status ?? 1)
+}
+`, { mode: 0o700 })
+  const requested = [primaryOrigin + '/', healthyOrigin + '/relay', primaryOrigin + '/headers', healthyOrigin + '/']
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-combined', 'response-primary', 'response-healthy'],
+    pages: {
+      [primaryOrigin + '/']: healthyOrigin + '/relay',
+      [healthyOrigin + '/relay']: primaryOrigin + '/headers',
+      [primaryOrigin + '/headers']: primary,
+    },
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin, PATH: gate + delimiter + process.env.PATH })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await page.getByLabel('Project name').fill('Northstar redirected response')
+    await page.getByLabel('Seed hosts').fill([primaryOrigin, healthyOrigin].join('\n'))
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await importAccessRecords(page, severeAccessPolicy)
+    await openScopeReview(page, combinedGoal, true)
+    await saveScope(page)
+    await page.getByRole('link', { name: /^Trace/ }).click()
+    await expect(page.getByRole('link', { name: 'Verify northstar.example, complete', exact: true }))
+      .toBeVisible({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Run actions' }).click()
+    await page.getByRole('menuitem', { name: 'Stop run' }).click()
+    await expect(page.getByRole('article', { name: 'Partial report' })).toContainText('5 confirmed findings')
+    const original = await downloadReport(page, 'Markdown with evidence')
+    const originalRecords = markdownEvidence(original.content)
+    const oldProof = originalRecords.find(record => record.kind === 'verification')
+    const oldResponse = originalRecords.find(record => record.kind === 'observation' && record.origin === primaryOrigin)
+    const access = originalRecords.find(record => record.kind === 'access-policy' && record.origin === primaryOrigin)
+    expect(oldProof.inputEvidence).toEqual([oldResponse.artifactId, access.artifactId])
+
+    await page.getByRole('link', { name: 'Workflow', exact: true }).click()
+    await page.getByRole('button', { name: 'Review scope' }).click()
+    await page.getByRole('checkbox', { name: 'Include healthy.northstar.example' }).uncheck()
+    await saveScope(page, 'Save scope revision')
+    await expect(page.getByText('1 approved host · Revision 2', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Resume', exact: true }).click()
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('2 confirmed findings')
+    await expect(report).toContainText('1 check met baseline · 2 verified gaps · 4 checks inconclusive')
+    const priority = report.getByRole('region', { name: 'Fix first' })
+    await expect(priority).toContainText('workspace-ownership')
+    await expect(priority).toContainText('northstar.example · critical')
+    await expect(report.locator('.finding').nth(1)).toContainText('northstar.example · high')
+    await report.getByText('Checks for northstar.example', { exact: true }).click()
+    await expect(report).toContainText('The supplied records omit a decision for payroll-records.')
+    await report.locator('.finding').first().getByRole('button', { name: 'Access policy verification' }).click()
+    const proofDialog = page.getByRole('dialog', { name: 'Access policy verification' })
+    await expect(proofDialog.locator('pre')).not.toContainText(oldResponse.artifactId)
+    await expect(proofDialog.locator('pre')).toContainText(access.artifactId)
+    await proofDialog.getByRole('button', { name: 'Close', exact: true }).click()
+
+    const narrowed = await downloadReport(page, 'Markdown with evidence')
+    const currentRecords = markdownEvidence(narrowed.content)
+    expect(currentRecords.map(({ kind }) => kind)).toEqual(['access-policy', 'verification'])
+    expect(currentRecords[1]).toMatchObject({
+      inputEvidence: [access.artifactId], verifiedAt: oldProof.capturedAt, exitStatus: 0,
+      comparisons: expect.arrayContaining([{ id: 'access-policy:workspace-ownership', observed: 'allow', baseline: { allowed: ['deny'] } }]),
+    })
+    expect(currentRecords[1].checks.map(({ id }: { id: string }) => id)).toEqual(Array(4).fill('access-policy'))
+    for (const excluded of [healthyOrigin, oldResponse.artifactId, oldProof.artifactId, 'Supporting record unavailable']) {
+      expect(narrowed.content).not.toContain(excluded)
+    }
+    await report.getByLabel('Version').selectOption('1')
+    expect(await downloadReport(page, 'Markdown with evidence')).toEqual(original)
+    expect(fixture.requested.slice().sort()).toEqual(requested.slice().sort())
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+    await rm(gate, { recursive: true, force: true })
+  }
+})
 
 test('keeps overlapping access findings and verification tied to each approved host', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy'] })

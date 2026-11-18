@@ -5,6 +5,7 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { comparableRequest } from '../scripts/fixture-record.ts'
 import type { ProviderCall } from '../src/server/provider.ts'
+import type { PublicObservation } from '../src/server/broker.ts'
 import { fixtureCredential, healthy, primary, unavailable } from './scenarios.ts'
 
 type Recording = { scenario: string; protocol: string; calls: ProviderCall[] }
@@ -19,6 +20,7 @@ export async function fixtureServer(options: {
   holdModel?: string
   scenes: string[]
   failModel?: string
+  pages?: Record<string, PublicObservation | string>
 }) {
   const requested: string[] = []
   const accepted: string[] = []
@@ -36,7 +38,12 @@ export async function fixtureServer(options: {
     ...call, name: recording.scenario + ':' + recording.protocol + ':' + turn, seen: false,
   })))
   function sendPage(target: string, response: ServerResponse) {
-    const capture = [primary, unavailable, healthy].find(item => item.origin + '/' === target)
+    const page = options.pages?.[target]
+    if (typeof page === 'string') {
+      response.writeHead(302, { Location: page }).end()
+      return
+    }
+    const capture = page ?? [primary, unavailable, healthy].find(item => item.origin + '/' === target)
     if (!capture) {
       unexpected.push('Unexpected target: ' + target)
       response.writeHead(404).end('Fixture missing')

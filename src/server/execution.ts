@@ -46,7 +46,8 @@ function createBroker() {
       ? [{ address: '127.0.0.1', family: 4 }] : [{ address: '93.184.216.34', family: 4 }],
     transport: async (url, _address, signal) => {
       const response = await fetch(fixture, {
-        signal, redirect: 'error', headers: { 'x-guardian-fixture-target': url.href },
+        // Return redirect responses to the broker so scope checks still apply at every hop.
+        signal, redirect: 'manual', headers: { 'x-guardian-fixture-target': url.href },
       })
       await response.body?.cancel()
       return { status: response.status, headers: Object.fromEntries(response.headers) }
