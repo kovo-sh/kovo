@@ -9,6 +9,7 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | `npm run test:boundaries` | Thirty-five tests passed. Nineteen cover scope, evidence, and the worker runtime. Six cover provider streaming and redaction. Ten cover the matched report scorecard, including incorrectly bound recordings, scope revisions, coverage overclaims, and incorrect high or critical findings. |
 | `npm run benchmark:reports` | The four original report versions matched 34/34 regression verdicts at 100% precision and recall, with 8/8 confirmations linked to evidence and a verification receipt. The seven-scenario assessment manifest matched 55/55 labeled verdicts. |
 | Matched Artex suite | `compare:reports` exited 0 with status `passed`. The four-scenario pair matched 39 labeled cases; Guardian scored 1.00 precision, 1.00 recall, 15/15 correct severity ratings, passing evidence, zero coverage overclaims, and 8 paired-reader results at or above Artex on every task. |
+| Live Dyad scope run | A real OpenRouter run approved 30 `dyad.sh` hosts and completed report version 2 with 32 confirmed gaps. Against the existing Artex report, all 66 definitively assessed overlapping header cells agreed and none disagreed; 84 cells remained inconclusive under Guardian's non-2xx coverage policy. |
 | GitHub Actions | The response reuse commit passed on a fresh Ubuntu checkout, including the Docker worker build, thirty-four boundary and comparison tests, twenty-one production browser tests, and all thirty-one assessment verdicts. [Hosted verification run for `01aae1b`](https://github.com/wwwillchen/guardian/actions/runs/44297918279) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
@@ -152,6 +153,18 @@ One run used the default OpenRouter Responses preset and explicit approval for `
 One initial model turn reached its output limit and the run saved a partial report. After adding and testing local evidence fallback for that condition, the operator resumed the same run. Guardian reused both observations with zero additional Dyad requests. Report version 2 covered both approved origins, linked two derived analysis artifacts, and showed zero confirmed HSTS findings. The browser follow-through opened verification evidence and then its read-only worker thread. The SQLite database, reports, and credentials from this run stay in the local `.guardian/dyad-smoke` directory on the verification machine.
 
 The latest production build downloaded both saved report versions from an offline copy after the worker message migration and opened the verification receipt under Supporting evidence in its read-only worker thread. Both exports matched the originals byte for byte. The audit retained the original three reads.
+
+## Live Dyad 30-host scope run
+
+A second live run expanded the approved scope to 30 `dyad.sh` hosts taken from the existing Artex task: the apex, the marketing and application subdomains, and the API, upload, auth, preview, gateway, and dangling hosts. The operator approved all 30 after discovery and authorized read-only public responses. Guardian read each approved root once and completed report version 2.
+
+The run exposed a real provider edge case. The model returned an empty `derive_evidence` tool call for `accounts.dyad.sh`, and the failed tool result previously stopped the remaining 28 paused assignments. The worker now recognizes a tool call that produced no usable command and runs the standard observation extraction itself, recording that deterministic handoff in the worker thread. The same run then resumed, reused the captured 403 observation, and completed every host.
+
+Report version 2 recorded 32 confirmed gaps (21 low, 11 informational), 37 checks meeting baseline, 108 inconclusive checks, and 3 not applicable. The confirmed gaps were 10 CSP, 10 frame protection, 8 MIME sniffing, 3 server disclosure, and 1 HSTS finding.
+
+The existing Artex report's scope matrix covers 24 of the 30 hosts. On the overlapping HSTS, CSP, frame, MIME, referrer, and server checks, 66 cells had a definitive Guardian result and every one agreed with the Artex expectation; none disagreed. The remaining 84 cells were inconclusive because Guardian does not treat a 308, 403, 404, or 525 root as a usable response. Artex inspected headers on some error responses and counted them as gaps, which accounts for the difference. Artex-only DNS takeover, TLS protocol, certificate, authentication/authorization, upload, GraphQL, and CORS/exploitation findings remain outside Guardian's supported evidence and are not counted as Guardian misses.
+
+Artifacts, including the exported report, run recording, comparison table, and per-host results, are in the private `.guardian/dyad-live` workspace.
 
 ## Dependency audit
 

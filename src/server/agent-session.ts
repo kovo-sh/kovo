@@ -156,10 +156,20 @@ export async function agentTurn(job: AgentTurn) {
       const retry = await conversation.submit(continuation ? { type: 'continue', requestId } : { ...input, requestId }, context)
       result = await retry.wait(context)
     }
-    if (result.status === 'unanswered' && result.reason === 'turn_limit' && job.derive) {
+    if ((result.status !== 'done' || !result.answer) && job.derive) {
       const view = await conversation.context(context)
-      const usedTool = view.entries.some(item => item.model?.some(message => message.role === 'toolResult' && !message.isError))
-      if (usedTool) return 'The model reached its output limit after recording the evidence command result.'
+      const toolResults = view.entries.flatMap(item => item.model ?? []).filter(message => message.role === 'toolResult')
+      if (toolResults.some(message => !message.isError)) {
+        return 'The model reached its output limit after recording the evidence command result.'
+      }
+      if (toolResults.length) {
+        // A reasoning model can emit an empty or malformed tool call. The
+        // observation is already isolated evidence, so keep the run moving with
+        // the standard extraction rather than failing every remaining host.
+        job.signal.throwIfAborted()
+        await job.derive('jq -c . /evidence/observed.json > /work/result.txt && cat /work/result.txt', job.signal)
+        return 'The model did not provide a usable evidence command. Guardian recorded the standard observation extraction.'
+      }
     }
     if (result.status !== 'done' || !result.answer) {
       throw new Error('The model did not finish the requested evidence turn.')
