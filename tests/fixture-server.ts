@@ -29,6 +29,8 @@ export async function fixtureServer(options: {
   let hold = options.hold
   let holdModel = options.holdModel
   let heldModelResponse: ServerResponse | undefined
+  let revoked = false
+  let authorizationFailures = 0
   const selected = recordings.filter(fixture => options.scenes.includes(fixture.scenario))
   const responseList = selected.flatMap(recording => recording.calls.map((call, turn) => ({
     ...call, name: recording.scenario + ':' + recording.protocol + ':' + turn, seen: false,
@@ -54,7 +56,9 @@ export async function fixtureServer(options: {
 
   async function serve(request: IncomingMessage, response: ServerResponse) {
     if (request.method === 'POST') {
-      if (request.headers.authorization !== 'Bearer ' + fixtureCredential && request.headers['x-api-key'] !== fixtureCredential) {
+      const validKey = request.headers.authorization === 'Bearer ' + fixtureCredential || request.headers['x-api-key'] === fixtureCredential
+      if (revoked || !validKey) {
+        authorizationFailures += 1
         response.writeHead(401, { 'Content-Type': 'application/json' }).end('{"error":{"message":"Invalid test key"}}')
         return
       }
@@ -121,6 +125,8 @@ export async function fixtureServer(options: {
     requested,
     accepted,
     unexpected,
+    get authorizationFailures() { return authorizationFailures },
+    revokeKey() { revoked = true },
     withheld: withheld.promise,
     modelWithheld: modelWithheld.promise,
     sensitiveFixtureValue,

@@ -8,6 +8,7 @@ import { modelConfig } from './schema.ts'
 import { store } from './store.ts'
 
 let lastTest: { digest: string; expires: number } | undefined
+let latestTestAttempt = 0
 const hash = (settings: ProviderSettings) => createHash('sha256').update(JSON.stringify(settings)).digest('hex')
 
 function savedConfiguration() {
@@ -29,8 +30,11 @@ export function privateModelSettings(): ProviderSettings | null {
 }
 
 export async function checkModelConnection(settings: ProviderSettings) {
+  const digest = hash(settings)
+  const attempt = ++latestTestAttempt
+  if (lastTest?.digest === digest) lastTest = undefined
   await testProvider(settings)
-  lastTest = { digest: hash(settings), expires: Date.now() + 5 * 60_000 }
+  if (attempt === latestTestAttempt) lastTest = { digest, expires: Date.now() + 5 * 60_000 }
   return { ok: true as const }
 }
 

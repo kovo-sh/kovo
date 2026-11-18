@@ -1,8 +1,12 @@
 import { expect, test } from '@playwright/test'
+import { existsSync } from 'node:fs'
 import { request } from 'node:http'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
+import { enterModelSettings } from './browser-flows.ts'
+import { fixtureServer } from './fixture-server.ts'
+import { fixtureCredential } from './scenarios.ts'
 
 test('persists project, approval, and worker context across production restarts', async ({ page }) => {
   const app = await createApp()
@@ -111,6 +115,35 @@ test('guards host, origin, and unauthenticated event streams', async ({ request:
     expect((await client.get(app.url + '/api/runs/abc/events')).status()).toBe(401)
   } finally {
     await app.dispose()
+  }
+})
+
+test('rechecks credentials on save after the provider rejects a previously verified key', async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: ['connection'] })
+  const app = await createApp()
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await enterModelSettings(page, fixture.origin + '/api/v1', fixtureCredential)
+    const check = page.getByRole('button', { name: 'Test connection' })
+    const verified = page.getByRole('status').filter({ hasText: 'Connection verified' })
+    await check.click()
+    await expect(verified).toBeVisible()
+
+    fixture.revokeKey()
+    await check.click()
+    const alert = page.getByRole('alert')
+    await expect(alert).toContainText('The provider rejected the API key.')
+    await expect(verified).toHaveCount(0)
+    expect(fixture.authorizationFailures).toBe(1)
+    await page.getByRole('button', { name: 'Save model' }).click()
+    await expect.poll(() => fixture.authorizationFailures).toBe(2)
+    await expect(alert).toContainText('The provider rejected the API key.')
+    expect(existsSync(join(app.directory, 'credentials'))).toBe(false)
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
   }
 })
 

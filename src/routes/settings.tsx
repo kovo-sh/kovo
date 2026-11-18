@@ -21,6 +21,7 @@ function ModelPage() {
     <div className="page-title"><h1>Model settings</h1></div>
     <form className="form-card" onInput={() => setFeedback('')} onSubmit={event => {
       event.preventDefault()
+      setFeedback('')
       const form = new FormData(event.currentTarget)
       const command = (event.nativeEvent as SubmitEvent).submitter?.getAttribute('value')
       const data = {

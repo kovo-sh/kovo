@@ -1,13 +1,17 @@
 import type { Page } from '@playwright/test'
 import { DEFAULT_PROVIDER } from '../src/domain.ts'
 
-export async function configureModel(page: Page, base: string, key: string, protocol: 'messages' | 'responses' = 'responses') {
+export async function enterModelSettings(page: Page, base: string, key: string, protocol: 'messages' | 'responses' = 'responses') {
   await page.getByRole('link', { name: 'Model settings' }).click()
   await page.getByLabel('API key').fill(key)
   await page.getByText('Advanced provider settings', { exact: true }).click()
   await page.getByLabel('Base URL').fill(base)
   await page.getByLabel('Model ID').fill(DEFAULT_PROVIDER.model)
   await page.getByLabel('Protocol').selectOption(protocol)
+}
+
+export async function configureModel(page: Page, base: string, key: string, protocol: 'messages' | 'responses' = 'responses') {
+  await enterModelSettings(page, base, key, protocol)
   await page.getByRole('button', { name: 'Test connection' }).click()
   await page.getByRole('status').filter({ hasText: 'Connection verified' }).waitFor()
   await page.getByRole('button', { name: 'Save model' }).click()
