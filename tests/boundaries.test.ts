@@ -209,6 +209,9 @@ test('keeps reports tied to current approval and requires fresh verification aft
     stdout: 'private fixture annotation',
   }
   const evidence = storage.addArtifact(run, verification, 'verification', 'Fixture verification', JSON.stringify(proof))
+  assert.equal(storage.runDetail(runId).assignments.find(worker => worker.id === verification.id)?.inputAssignmentId, analysis.id)
+  assert.throws(() => storage.makeWorker(run, 'verification', docs, 'Invalid verification', 'Review the fixture.', analysis),
+    /Invalid worker input/)
   storage.updateWorker(verification.id, {
     status: 'complete', outcome: 'Confirmed from scope revision 1.',
     checks: [{ ...responseReview(null)[0].coverage, status: 'gap', reason: 'The response lacked HSTS.' }],
@@ -250,6 +253,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const current = assessmentAssignments(storage.workerList(runId), primary.id, 0)
   assert.equal(current.analysis?.scopeRevision, 4)
   assert.equal(current.verification, undefined)
+  assert.equal(storage.runDetail(runId).assignments.find(worker => worker.id === verification.id)?.inputAssignmentId, analysis.id)
   const earlierWork = workerHistory(storage.run(runId), storage.workerList(runId))
   assert.equal(earlierWork.get(analysis.id), 'Earlier scope approval · Revision 1')
   assert.equal(earlierWork.get(verification.id), 'Earlier scope approval · Revision 1')
@@ -281,6 +285,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   storage.command(pendingApproval)
   assert.equal(storage.run(otherRunId).scopeRevision, 1)
   writeFileSync(join(directory, 'artifacts', evidence.id + '.txt'), JSON.stringify({ ...proof, inputEvidence: [otherHost.id] }))
+  assert.equal(storage.runDetail(runId).assignments.find(worker => worker.id === verification.id)?.inputAssignmentId, null)
   const unavailable = exportOriginal()
   assert.match(unavailable, /Supporting record unavailable for this report version/)
   assert.ok(!unavailable.includes(otherHost.id))

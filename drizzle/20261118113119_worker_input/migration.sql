@@ -1,0 +1,1 @@
+ALTER TABLE `assignments` ADD `input_assignment_id` text;

@@ -54,6 +54,9 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   cursor.current = Math.max(cursor.current, detail.cursor)
   const selectedWorker = assignments.find(item => item.id === workerId)
   const worker = showCoordinator ? undefined : selectedWorker
+  const inputWorker = worker?.inputAssignmentId
+    ? assignments.find(item => item.id === worker.inputAssignmentId)
+    : undefined
   const threadId = worker?.id ?? run.coordinatorId
   const messages = detail.messages.filter(item => item.threadId === threadId)
   const attachments = detail.evidence.filter(item => item.assignmentId === worker?.id)
@@ -148,8 +151,8 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   function fitGraph() {
     const pane = viewport.current
     const graph = pane?.firstElementChild
-    if (!pane || !(graph instanceof HTMLElement) || !graph.offsetWidth) return
-    setZoom(Math.min(1, pane.clientWidth / graph.offsetWidth))
+    if (!pane || !(graph instanceof HTMLElement) || !graph.offsetWidth || !graph.offsetHeight) return
+    setZoom(Math.min(1, pane.clientWidth / graph.offsetWidth, pane.clientHeight / graph.offsetHeight))
     pane.scrollTo(0, 0)
   }
 
@@ -249,6 +252,8 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
               {worker && <header className="worker-intro">
                 <h2>{worker.title}</h2><p className="muted">{phaseNames[worker.phase]} · <Status status={worker.status} /></p>
                 {workerHistoryLabel && <p className="muted">{workerHistoryLabel}</p>}
+                {inputWorker && <p className="muted worker-input">Input from <Link to="/runs/$runId/workers/$workerId"
+                  params={{ runId, workerId: inputWorker.id }} search={{ view: 'trace' }}>{inputWorker.title}</Link></p>}
                 {worker.outcome && <p className="outcome">{worker.outcome}</p>}
               </header>}
               <ThreadTranscript messages={messages} worker={worker} attachments={attachments} openEvidence={setArtifact} />

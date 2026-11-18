@@ -37,6 +37,14 @@ export function assessmentAssignments(assignments: readonly Assignment[], assetI
   return { analysis, verification }
 }
 
+function validWorkerInput(worker: Pick<Assignment, 'runId' | 'phase' | 'assetId' | 'goalRevision' | 'scopeRevision'>,
+  input: Assignment | undefined): input is Assignment {
+  if (!input || input.runId !== worker.runId || input.scopeRevision > worker.scopeRevision) return false
+  if (worker.phase === 'analysis') return input.phase === 'discovery'
+  return worker.phase === 'verification' && input.phase === 'analysis' &&
+    input.assetId === worker.assetId && input.goalRevision === worker.goalRevision
+}
+
 function untestedCoverage(asset: Candidate, selection: SelectedChecks): CheckCoverage[] {
   const reviews = responseReview(null, undefined, selection.checks.filter(id => id !== 'access-policy'))
   if (selection.checks.includes('access-policy')) {
@@ -166,10 +174,11 @@ export class Store {
     const evidence = this.db.select().from(tables.evidence).where(eq(tables.evidence.runId, runId))
       .orderBy(asc(tables.evidence.createdAt)).all()
     const initialInventory = evidence.find(item => item.kind === 'inventory' && item.title === inventoryTitle)
+    const candidates = this.linkLegacySources(run, initialInventory?.id)
     return {
-      run: { ...run, candidates: this.linkLegacySources(run, initialInventory?.id) },
+      run: { ...run, candidates },
       project: this.project(run.projectId),
-      assignments: this.workerList(runId),
+      assignments: this.linkLegacyWorkerInputs(runId, candidates, this.workerList(runId), evidence),
       messages: this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
         .orderBy(asc(tables.messages.createdAt), sql`${tables.messages}.rowid`).all(),
       evidence: evidence.map(item => ({ ...item, title: evidenceTitle(run, item.kind, item.title) })),
@@ -177,6 +186,40 @@ export class Store {
         .orderBy(desc(tables.reports.version)).all(),
       cursor: streamHead?.id ?? 0,
     }
+  }
+
+  private linkLegacyWorkerInputs(runId: string, candidates: Candidate[], workers: Assignment[],
+    evidence: (typeof tables.evidence.$inferSelect)[]) {
+    const byWorkerId = new Map(workers.map(worker => [worker.id, worker]))
+    const byEvidenceId = new Map(evidence.map(item => [item.id, item]))
+    const verifications = new Map(evidence.filter(item => item.kind === 'verification').map(item => [item.assignmentId, item]))
+    return workers.map(worker => {
+      if (worker.inputAssignmentId || worker.phase === 'discovery') return worker
+      if (worker.phase === 'analysis') {
+        const sourceId = candidates.find(asset => asset.id === worker.assetId)?.sourceEvidenceId
+        const source = sourceId ? byEvidenceId.get(sourceId) : undefined
+        const input = source?.kind === 'inventory' ? byWorkerId.get(source.assignmentId) : undefined
+        return validWorkerInput(worker, input) ? { ...worker, inputAssignmentId: input.id } : worker
+      }
+      const receipt = verifications.get(worker.id)
+      if (!receipt) return worker
+      try {
+        const record = JSON.parse(this.artifact(runId, receipt.id).content) as { inputEvidence?: unknown } | null
+        if (!Array.isArray(record?.inputEvidence)) return worker
+        let input: Assignment | undefined
+        for (const id of record.inputEvidence) {
+          const item = typeof id === 'string' ? byEvidenceId.get(id) : undefined
+          if (!item || (item.kind !== 'observation' && item.kind !== 'access-policy') ||
+              item.goalRevision !== worker.goalRevision || item.scopeRevision > receipt.scopeRevision) return worker
+          const producer = byWorkerId.get(item.assignmentId)
+          if (!validWorkerInput(worker, producer) || (input && input.id !== producer.id)) return worker
+          input = producer
+        }
+        return input ? { ...worker, inputAssignmentId: input.id } : worker
+      } catch {
+        return worker
+      }
+    })
   }
 
   private linkLegacySources(run: Run, inventoryId: string | undefined) {
@@ -365,25 +408,33 @@ export class Store {
     )).get()!
   }
 
-  makeWorker(run: Run, phase: WorkerPhase, candidate: Candidate | undefined, title: string, objective: string): Assignment {
+  makeWorker(run: Run, phase: WorkerPhase, candidate: Candidate | undefined, title: string, objective: string,
+    input?: Assignment): Assignment {
+    const context = { runId: run.id, phase, assetId: candidate?.id ?? null, scopeRevision: run.scopeRevision, goalRevision: run.goalRevision }
+    if (input && !validWorkerInput(context, input)) throw new Error('Invalid worker input.')
     const assignment = this.db.insert(tables.assignments).values({
-      id: randomUUID(), runId: run.id, assetId: candidate?.id ?? null, title, objective, phase, status: 'queued',
-      scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, sessionId: randomUUID(),
+      ...context, id: randomUUID(), title, objective, status: 'queued',
+      inputAssignmentId: input?.id, sessionId: randomUUID(),
       outcome: null, createdAt: Date.now(),
     }).returning().get()
     const target = candidate?.origin ?? 'Supplied project records'
     const checks = run.reviewPlan?.status === 'ready' && phase !== 'discovery'
       ? ['Checks: ' + run.reviewPlan.checks.map(id => assessmentCheckTitles[id]).join(', ')] : []
     this.addArtifact(run, assignment, 'handoff', 'assignment.md',
-      ['# Assignment', '', objective, '', 'Input: ' + target, 'Goal: ' + run.goal,
+      ['# Assignment', '', objective, '', 'Input: ' + target, ...(input ? ['Input assignment: ' + input.id] : []), 'Goal: ' + run.goal,
         'Goal revision: ' + run.goalRevision, 'Scope revision: ' + run.scopeRevision, ...checks].join('\n'), 'assignment')
     return assignment
   }
 
   private queueAnalysis(run: Run, assetIds: string[]) {
+    const discovery = new Map(this.workerList(run.id).filter(worker => worker.phase === 'discovery').map(worker => [worker.id, worker]))
+    const inventory = new Map(this.db.select({ id: tables.evidence.id, assignmentId: tables.evidence.assignmentId })
+      .from(tables.evidence).where(and(eq(tables.evidence.runId, run.id), eq(tables.evidence.kind, 'inventory'))).all()
+      .map(item => [item.id, item.assignmentId]))
     for (const asset of run.candidates.filter(asset => assetIds.includes(asset.id))) {
+      const source = asset.sourceEvidenceId && inventory.get(asset.sourceEvidenceId)
       this.makeWorker(run, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
-        'Review the approved evidence and identify gaps in the planned checks.')
+        'Review the approved evidence and identify gaps in the planned checks.', source ? discovery.get(source) : undefined)
     }
   }
 

@@ -60,6 +60,7 @@ export const assignments = sqliteTable('assignments', {
   id: text('id').primaryKey().notNull(),
   runId: text('run_id').notNull().references(() => runs.id),
   assetId: text('asset_id'),
+  inputAssignmentId: text('input_assignment_id'),
   phase: text('phase').$type<WorkerPhase>().notNull(),
   status: text('status').$type<WorkerStatus>().notNull(),
   scopeRevision: integer('scope_revision').notNull(),

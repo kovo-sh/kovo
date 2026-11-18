@@ -8,7 +8,7 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | `npm run test:e2e` | Twenty production browser tests passed. They cover both provider protocols through complete reports, returning from model setup to an approved run, key rejection, passive DNS and access policy imports, scope changes during planning and analysis, revision labels on earlier work, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and prioritization of access policy findings. |
 | `npm run test:boundaries` | Thirty tests passed. Fifteen cover scope, evidence, and the worker runtime. Six cover provider streaming and redaction. Nine cover the matched report scorecard, including incorrectly bound recordings, scope revisions, missing coverage grades, and incorrect high or critical findings. |
 | `npm run benchmark:reports` | All 19 regression verdicts matched. The assessment manifest adds eight cases on two approved hosts and four cases with documented access impacts. All 31 verdicts matched. All ten confirmations had the expected severity, scoped observation, and verification. |
-| GitHub Actions | The report severity commit passed on a fresh Ubuntu checkout, including the Docker worker build, thirty boundary and comparison tests, nineteen production browser tests, and all thirty-one assessment verdicts. [Hosted verification run for `cc64d27`](https://github.com/wwwillchen/guardian/actions/runs/44293709586) |
+| GitHub Actions | The run revision commit passed on a fresh Ubuntu checkout, including the Docker worker build, thirty boundary and comparison tests, twenty production browser tests, and all thirty-one assessment verdicts. [Hosted verification run for `78a9f57`](https://github.com/wwwillchen/guardian/actions/runs/44295116223) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -52,6 +52,10 @@ Both saved Dyad report versions and the linked worker thread reopened from an of
 The browser test killed the production server after Docker had created a verification container. On restart Guardian removed the workspace's abandoned container and left a container labeled for another workspace in place. The assignment remained paused with its lease cleared. Explicit resume reused the assignment and saved one verification record. The provider stream was replayed once and the run made zero page requests.
 
 A separate test held the real container's input stream open without a Guardian server. The image terminated the worker at its 15-second deadline, and Docker removed the container. An offline upgrade check reopened both saved Dyad reports and retained the original three broker audit entries.
+
+The report replay followed a verification worker to its recorded analysis and source inventory. The graph selected that branch and linked the two verification workers recorded in the completed report to the report node. The revised-goal replay checked the saved input assignment ID on the new verification. A storage test recovered an older worker link from its receipt and rejected a cross-host reference.
+
+The 34-worker sample showed 26 recorded connections. Fit brought the worker lanes inside the scrollable viewport, and the selected branch was inspected in Porcelain and Studio dark. A migrated offline copy of the Dyad workspace resolved the verification, analysis, and inventory links. Both downloaded Markdown reports matched their original digests and the audit retained its three reads.
 
 ## Response policy reports
 

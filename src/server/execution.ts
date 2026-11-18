@@ -164,9 +164,10 @@ class Execution {
         const updated = this.storage.updateRun(run.id, { phase: 'verification' })
         const workers = this.storage.workerList(run.id)
         for (const asset of run.candidates.filter(asset => run.approved.includes(asset.id))) {
-          if (!assessmentAssignments(workers, asset.id, run.goalRevision).verification) {
+          const { analysis, verification } = assessmentAssignments(workers, asset.id, run.goalRevision)
+          if (!verification) {
             this.storage.makeWorker(updated, 'verification', asset, `Verify ${new URL(asset.origin).hostname}`,
-              'Compare the recorded evidence with the selected baselines.')
+              'Compare the recorded evidence with the selected baselines.', analysis?.status === 'complete' ? analysis : undefined)
           }
         }
         this.storage.event(run.id, 'verification.started', 'Verification started from recorded evidence.')
@@ -356,7 +357,8 @@ class Execution {
   private async verify(job: Active, asset: Candidate) {
     const run = this.check(job)
     const { analysis } = assessmentAssignments(this.storage.workerList(run.id), asset.id, run.goalRevision)
-    const ready = analysis?.status === 'complete' ? analysis : undefined
+    const inputId = job.assignment.inputAssignmentId
+    const ready = analysis?.status === 'complete' && (!inputId || inputId === analysis.id) ? analysis : undefined
     const selected: readonly AssessmentCheckId[] = run.reviewPlan?.status === 'ready' ? run.reviewPlan.checks : responseCheckIds
     const responseChecks = selected.filter(id => id !== 'access-policy')
     const includesAccess = selected.includes('access-policy')

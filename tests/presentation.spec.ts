@@ -32,6 +32,11 @@ test('navigates the 34-worker sample with shadcn controls across desktop and mob
     await page.getByRole('link', { name: 'Trace 34' }).click()
     const graph = page.getByLabel('Worker graph')
     await expect(graph.getByRole('link')).toHaveCount(34)
+    await expect(graph.locator('.trace-edge')).toHaveCount(26)
+    await expect.poll(() => graph.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true)
+    await page.getByRole('button', { name: 'Fit', exact: true }).click()
+    await expect.poll(() => graph.evaluate(element => element.scrollWidth <= element.clientWidth + 2 &&
+      element.scrollHeight <= element.clientHeight + 2)).toBe(true)
     await page.keyboard.press('/')
     const search = page.getByRole('textbox', { name: 'Find worker' })
     await expect(search).toBeFocused()
