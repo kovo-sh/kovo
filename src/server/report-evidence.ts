@@ -3,13 +3,18 @@ import { accessCaseLabel, accessPolicySnapshot, maxAccessPolicyCases } from '../
 import { assessmentCheckIds, assetOrigin, id, preparedObservation, referrerPolicies, responseCheckIds } from '../domain.ts'
 import type { EvidenceSummary } from '../domain.ts'
 
-const observation = z.object({
+export const responseCapture = z.object({
   observation: preparedObservation.extend({
     origin: assetOrigin,
     finalOrigin: assetOrigin,
     mediaType: z.union([preparedObservation.shape.mediaType, z.literal('unknown')]),
     source: z.enum(['public response', 'fixture response', 'supplied observation']),
   }).nullable(),
+  reusedFrom: z.object({
+    artifactId: id,
+    capturedAt: z.iso.datetime(),
+    scopeRevision: z.number().int().positive(),
+  }).optional(),
 })
 const accessRecord = z.object({ origin: assetOrigin, snapshot: accessPolicySnapshot.nullable() })
 const interpreter = z.string().regex(/^just-bash \d+\.\d+\.\d+$/)
@@ -64,11 +69,12 @@ export function projectReportEvidence(
   }
   switch (kind) {
     case 'observation': {
-      const parsed = observation.safeParse(input)
+      const parsed = responseCapture.safeParse(input)
       if (!parsed.success) return
       const observed = parsed.data.observation
       if (observed && (observed.origin !== origin || !approved.has(observed.finalOrigin))) return
-      return { data: parsed.data }
+      const source = parsed.data.reusedFrom
+      return { data: source ? { ...parsed.data, capturedAt: source.capturedAt } : parsed.data }
     }
     case 'access-policy': {
       const parsed = accessRecord.safeParse(input)

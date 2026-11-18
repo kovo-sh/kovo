@@ -333,8 +333,7 @@ test('plans again with the remaining approved inputs when scope changes during p
 test('replans an active run when a newly approved host supplies access records', async ({ page }) => {
   const fixture = await fixtureServer({
     scenes: ['connection', 'plan-combined-narrowed', 'plan-combined', 'response-primary', 'response-unavailable'],
-    hold: primaryOrigin + '/',
-    holdModel: 'plan-combined:responses:0',
+    holdModel: 'response-primary:responses:0',
   })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
@@ -349,31 +348,39 @@ test('replans an active run when a newly approved host supplies access records',
     const docs = page.getByRole('checkbox', { name: 'Include docs.northstar.example' })
     await docs.uncheck()
     await saveScope(page)
-    await fixture.withheld
+    await fixture.modelWithheld
     expect(fixture.requested).toEqual([primaryOrigin + '/'])
     expect(fixture.accepted).toContain('plan-combined-narrowed:responses:0')
 
+    const expandedPlan = fixture.holdNextModel('plan-combined:responses:0')
     await page.getByRole('button', { name: 'Review scope' }).click()
     await docs.check()
     await saveScope(page, 'Save scope revision')
     await expect(page.getByText('2 approved hosts · Revision 2')).toBeVisible()
-    await fixture.modelWithheld
+    await expandedPlan
     await expect(page.getByText('Preparing review plan', { exact: true })).toBeVisible()
     expect(fixture.requested).toEqual([primaryOrigin + '/'])
     let earlierId: string
+    let originalCapture: { artifactId: string; capturedAt: string; scopeRevision: number }
     const before = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     try {
       const worker = before.prepare("SELECT id, status, scope_revision FROM assignments WHERE phase = 'analysis'").all()
       expect(worker).toHaveLength(1)
       expect(worker[0]).toMatchObject({ status: 'running', scope_revision: 1 })
       earlierId = String(worker[0].id)
+      const observation = before.prepare("SELECT id, created_at, scope_revision FROM evidence WHERE assignment_id = ? AND kind = 'observation'")
+        .get(earlierId)
+      expect(observation).toBeDefined()
+      originalCapture = {
+        artifactId: String(observation?.id), capturedAt: new Date(Number(observation?.created_at)).toISOString(),
+        scopeRevision: Number(observation?.scope_revision),
+      }
     } finally {
       before.close()
     }
 
     await app.stop('SIGKILL')
     fixture.dropHeldModel()
-    fixture.release()
     await app.start()
     const resume = page.getByRole('button', { name: 'Resume', exact: true })
     await expect(resume).toBeVisible()
@@ -388,7 +395,10 @@ test('replans an active run when a newly approved host supplies access records',
     await expect(report.locator('.finding').filter({ has: policy })).toContainText('docs.northstar.example')
     const { content } = await downloadReport(page, 'Markdown with evidence')
     expect(content).toContain(secondaryAccessPolicy.recordedAt)
-    expect(fixture.requested.toSorted()).toEqual([primaryOrigin + '/', primaryOrigin + '/', unavailableOrigin + '/'].toSorted())
+    const retained = [...content.matchAll(/~~~json\n([\s\S]*?)\n~~~/g)].map(([, json]) => JSON.parse(json))
+      .find(record => record.kind === 'observation' && record.observation?.origin === primaryOrigin)
+    expect(retained).toMatchObject({ capturedAt: originalCapture.capturedAt, reusedFrom: originalCapture })
+    expect(fixture.requested).toEqual([primaryOrigin + '/', unavailableOrigin + '/'])
     expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual([
       'plan-combined-narrowed:responses:0', 'plan-combined:responses:0',
     ])
@@ -398,7 +408,13 @@ test('replans an active run when a newly approved host supplies access records',
     try {
       const attempt = after.prepare('SELECT status, outcome FROM assignments WHERE id = ?').get(earlierId)
       expect(attempt).toEqual({ status: 'canceled', outcome: 'Superseded by the revised check plan.' })
-      expect(after.prepare("SELECT count(*) AS n FROM evidence WHERE assignment_id = ? AND kind = 'observation'").get(earlierId)?.n).toBe(0)
+      expect(after.prepare("SELECT id FROM evidence WHERE assignment_id = ? AND kind = 'observation'").get(earlierId)?.id)
+        .toBe(originalCapture.artifactId)
+      const reuse = after.prepare("SELECT detail FROM events WHERE kind = 'evidence.reused'").all()
+      expect(reuse).toHaveLength(1)
+      expect(JSON.parse(String(reuse[0].detail))).toMatchObject({
+        sourceArtifactId: originalCapture.artifactId, origins: [primaryOrigin],
+      })
       const fresh = after.prepare("SELECT count(*) AS n FROM assignments WHERE scope_revision = 2 AND status = 'complete'").get()
       expect(fresh?.n).toBe(4)
     } finally {

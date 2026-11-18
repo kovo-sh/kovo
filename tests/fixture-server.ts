@@ -25,7 +25,7 @@ export async function fixtureServer(options: {
   const unexpected: string[] = []
   const pending: ServerResponse[] = []
   const withheld = Promise.withResolvers<void>()
-  const modelWithheld = Promise.withResolvers<void>()
+  let modelWithheld = Promise.withResolvers<void>()
   let hold = options.hold
   let holdModel = options.holdModel
   let heldModelResponse: ServerResponse | undefined
@@ -128,7 +128,12 @@ export async function fixtureServer(options: {
     get authorizationFailures() { return authorizationFailures },
     revokeKey() { revoked = true },
     withheld: withheld.promise,
-    modelWithheld: modelWithheld.promise,
+    get modelWithheld() { return modelWithheld.promise },
+    holdNextModel(name: string) {
+      holdModel = name
+      modelWithheld = Promise.withResolvers<void>()
+      return modelWithheld.promise
+    },
     get heldModelClosed() { return heldModelResponse?.destroyed ?? false },
     sensitiveFixtureValue,
     dropHeldModel() {

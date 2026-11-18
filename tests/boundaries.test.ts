@@ -427,6 +427,68 @@ test('keeps completed assignments when an expanded approval selects the same che
   assert.equal(attempts.find(worker => worker.assetId !== primary.id)?.scopeRevision, 2)
 })
 
+for (const revoked of [false, true]) {
+  test(revoked ? 'rejects a saved response after an intervening redirect revocation'
+    : 'keeps a reused response subject to every recorded redirect approval', t => {
+    const directory = mkdtempSync(join(tmpdir(), 'guardian-reused-response-'))
+    t.after(() => rmSync(directory, { recursive: true, force: true }))
+    const storage = new Store(directory)
+    const relay = 'https://relay.northstar.example'
+    const records = 'https://records.northstar.example'
+    const { id: projectId } = storage.createProject({
+      requestId: randomUUID(), name: 'Northstar', seeds: [northstar, relay, records],
+    })
+    storage.importProjectAccessPolicy({
+      requestId: randomUUID(), projectId, snapshot: { ...accessPolicy, origin: records },
+    })
+    const { id: runId } = storage.createRun({
+      requestId: randomUUID(), projectId, goal: 'Review the approved records.', sourceMode: 'public',
+    })
+    storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+    const candidates = new Map(storage.run(runId).candidates.map(asset => [asset.origin, asset.id]))
+    const approve = (...origins: string[]) => storage.command({
+      requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: storage.run(runId).scopeRevision,
+      assetIds: origins.map(origin => candidates.get(origin)!), consent: true,
+    })
+    approve(northstar, relay)
+    const first = storage.run(runId)
+    storage.commitReviewPlan(first, standardChecks())
+    const worker = storage.workerList(runId).find(worker => worker.assetId === candidates.get(northstar))!
+    for (const origin of [northstar, relay]) {
+      storage.event(runId, 'broker.allowed', 'Read a fixture response.', { assignmentId: worker.id, origin })
+    }
+    storage.addArtifact(first, worker, 'observation', 'Observed public response', JSON.stringify({
+      observation: {
+        origin: northstar, finalOrigin: northstar, status: 200, mediaType: 'text/html',
+        transportMaxAge: null, includeSubDomains: false, source: 'fixture response',
+      },
+    }), 'capture:1')
+    storage.updateWorker(worker.id, { status: 'complete' })
+    if (revoked) approve(northstar)
+    approve(northstar, relay, records)
+    const expanded = storage.run(runId)
+    assert.equal(expanded.reviewPlan?.status, 'pending')
+    storage.commitReviewPlan(expanded, standardChecks(assessmentCheckIds))
+    const current = assessmentAssignments(storage.workerList(runId), candidates.get(northstar)!, 0).analysis!
+    assert.notEqual(current.id, worker.id)
+    const capture = storage.assignmentObservation(current.id)
+    if (revoked) {
+      assert.equal(capture, undefined)
+    } else {
+      assert.ok(capture)
+      assert.deepEqual(storage.brokerOrigins(current).sort(), [northstar, relay].sort())
+      storage.updateWorker(current.id, { status: 'complete' })
+      approve(northstar, records)
+      storage.command({ requestId: randomUUID(), runId, action: 'stop' })
+      const report = storage.runDetail(runId).reports[0]
+      const coverage = report.body.coverage.find(row => row.origin === northstar)
+      assert.equal(coverage?.evidenceId, null)
+      assert.match(coverage?.status ?? '', /redirect chain is no longer approved/)
+      assert.ok(!exportReportMarkdown(storage, runId, report.id).content.includes(capture.id))
+    }
+  })
+}
+
 test('requires unique policy cases and leaves missing access decisions inconclusive', () => {
   const invalid = { ...accessPolicy, observed: [...accessPolicy.observed, accessPolicy.observed[0]] }
   assert.equal(accessPolicySnapshot.safeParse(invalid).success, false)

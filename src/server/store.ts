@@ -12,6 +12,7 @@ import type { Candidate, CheckCoverage, EvidenceSummary, ReportBody, RunCommand,
 import { parseDnsInventory } from '../passive-dns.ts'
 import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
+import { responseCapture } from './report-evidence.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks } from './review-plan.ts'
 import * as tables from './schema.ts'
@@ -269,11 +270,15 @@ export class Store {
   }
 
   brokerOrigins(assignment: Assignment) {
-    return this.db.selectDistinct({ origin: sql<string>`json_extract(${tables.events.detail}, '$.origin')` })
+    const events = this.db.select({ kind: tables.events.kind, detail: tables.events.detail })
       .from(tables.events).where(and(
-        eq(tables.events.runId, assignment.runId), eq(tables.events.kind, 'broker.allowed'),
+        eq(tables.events.runId, assignment.runId), inArray(tables.events.kind, ['broker.allowed', 'evidence.reused']),
         sql`json_extract(${tables.events.detail}, '$.assignmentId') = ${assignment.id}`,
-      )).all().map(row => row.origin)
+      )).all()
+    return [...new Set(events.flatMap(({ kind, detail }) => {
+      const origins = kind === 'broker.allowed' ? [detail.origin] : detail.origins
+      return Array.isArray(origins) && origins.length ? origins.map(origin => typeof origin === 'string' ? origin : '') : ['']
+    }))]
   }
 
   artifact(runId: string, artifactId: string) {
@@ -429,15 +434,57 @@ export class Store {
     return assignment
   }
 
-  private queueAnalysis(run: Run, assetIds: string[]) {
+  private reuseResponse(run: Run, assignment: Assignment, origin: string, earlier: Assignment) {
+    const saved = this.assignmentObservation(earlier.id)
+    if (!saved || earlier.scopeRevision >= run.scopeRevision || saved.scopeRevision > run.scopeRevision) return
+    let input: unknown
+    try {
+      input = JSON.parse(this.artifact(run.id, saved.id).content)
+    } catch {
+      return
+    }
+    const parsed = responseCapture.safeParse(input)
+    if (!parsed.success) return
+    const { observation, reusedFrom } = parsed.data
+    if (!observation || observation.origin !== origin || observation.source === 'supplied observation' ||
+        observation.status < 200 || observation.status >= 300) return
+    const origins = this.brokerOrigins(earlier)
+    if (!origins.includes(origin) || !origins.includes(observation.finalOrigin)) return
+    const captureScope = /^capture:(\d+)$/.exec(saved.operationId ?? '')?.[1]
+    const source = reusedFrom ?? {
+      artifactId: saved.id, capturedAt: new Date(saved.createdAt).toISOString(),
+      scopeRevision: captureScope === undefined ? earlier.scopeRevision : Number(captureScope),
+    }
+    if (!Number.isSafeInteger(source.scopeRevision) || source.scopeRevision <= 0 || source.scopeRevision > saved.scopeRevision) return
+    const approvals = this.db.select({ detail: tables.events.detail }).from(tables.events)
+      .where(and(eq(tables.events.runId, run.id), eq(tables.events.kind, 'scope.approved'))).all()
+    const byRevision = new Map(approvals.map(({ detail }) => [detail.scopeRevision, detail.approved]))
+    for (let revision = source.scopeRevision; revision <= run.scopeRevision; revision++) {
+      const approved = byRevision.get(revision)
+      if (!Array.isArray(approved) || !origins.every(host => approved.includes(host))) return
+    }
+    const copy = this.addArtifact(run, assignment, 'observation', saved.title, JSON.stringify({
+      observation, note: 'Reused response metadata for the revised check plan.', reusedFrom: source,
+    }, null, 2), 'capture:' + run.scopeRevision)
+    this.message(run.id, assignment.id, 'worker', 'Reused a saved response observation.', undefined, [copy.id])
+    this.event(run.id, 'evidence.reused', 'Reused response evidence for the revised check plan.', {
+      assignmentId: assignment.id, artifactId: copy.id, sourceArtifactId: saved.id, origins,
+    })
+  }
+
+  private queueAnalysis(run: Run, assetIds: string[], reuse?: readonly Assignment[]) {
     const discovery = new Map(this.workerList(run.id).filter(worker => worker.phase === 'discovery').map(worker => [worker.id, worker]))
     const inventory = new Map(this.db.select({ id: tables.evidence.id, assignmentId: tables.evidence.assignmentId })
       .from(tables.evidence).where(and(eq(tables.evidence.runId, run.id), eq(tables.evidence.kind, 'inventory'))).all()
       .map(item => [item.id, item.assignmentId]))
     for (const asset of run.candidates.filter(asset => assetIds.includes(asset.id))) {
       const source = asset.sourceEvidenceId && inventory.get(asset.sourceEvidenceId)
-      this.makeWorker(run, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
+      const worker = this.makeWorker(run, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
         'Review the approved evidence and identify gaps in the planned checks.', source ? discovery.get(source) : undefined)
+      if (reuse) {
+        const { analysis } = assessmentAssignments(reuse, asset.id, run.goalRevision)
+        if (analysis) this.reuseResponse(run, worker, asset.origin, analysis)
+      }
     }
   }
 
@@ -464,7 +511,6 @@ export class Store {
         const { analysis } = assessmentAssignments(workers, id, run.goalRevision)
         return !analysis || analysis.status === 'canceled' || analysis.status === 'failed'
       }) : updated.approved
-      this.queueAnalysis(updated, toQueue)
       const titles = selection.checks.map(id => assessmentCheckTitles[id]).join(', ')
       const planned = selection.source === 'coordinator'
       this.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'guardian',
@@ -472,6 +518,9 @@ export class Store {
       this.event(run.id, 'review.planned', 'Review plan saved.', {
         goalRevision: run.goalRevision, scopeRevision: run.scopeRevision, ...selection,
       })
+      const reuse = previous && !sameChecks && run.sourceMode === 'public' &&
+        selection.checks.some(check => check !== 'access-policy') ? workers : undefined
+      this.queueAnalysis(updated, toQueue, reuse)
     }, { behavior: 'immediate' })
   }
 
