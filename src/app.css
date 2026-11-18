@@ -278,6 +278,14 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .report-body { max-width: 850px; margin-inline: auto; padding: 35px 38px 45px; }
 .report-top h2 { font: 400 clamp(35px,6vw,58px)/1.05 'Instrument Serif', Georgia, serif; color: var(--text); }
 .report-summary { margin: 19px 0 6px; font-weight: 650; font-size: 17px; }
+.report-check-summary { margin-bottom: 12px; color: var(--muted); line-height: 1.5; }
+.report-priority {
+  display: grid; gap: 5px; margin-top: 20px; padding: 14px 16px; border-radius: 8px;
+  background: var(--surface); overflow-wrap: anywhere;
+}
+.report-priority h3 { color: var(--muted); font-size: 12px; font-weight: 600; }
+.report-priority a { width: fit-content; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; }
+#report-findings, .finding { scroll-margin-block-start: 12px; }
 .finding { display: grid; gap: 8px; padding: 15px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 .finding .state { flex-shrink: 0; white-space: nowrap; }
 .finding-meta { color: var(--muted); font-size: 12px; }

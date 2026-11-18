@@ -3,6 +3,7 @@ import { and, asc, eq } from 'drizzle-orm'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import { responseCheckIds } from '../domain.ts'
 import type { AssessmentCheckId, Candidate, CheckCoverage, Finding, ProviderSettings, ResponseCheckId } from '../domain.ts'
+import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { agentTurn, coordinatorPrompt, workerInput } from './agent-session.ts'
 import { BrokerDenied, RequestBroker } from './broker.ts'
@@ -247,7 +248,8 @@ class Execution {
     }
     const updated = this.check(job)
     const evidence = this.storage.db.transaction(() => {
-      const item = this.storage.addArtifact(updated, job.assignment, 'observation', 'Observed public response',
+      const title = run.sourceMode === 'prepared' ? suppliedResponseLabel : 'Observed public response'
+      const item = this.storage.addArtifact(updated, job.assignment, 'observation', title,
         JSON.stringify(capture, null, 2), operation)
       this.storage.event(run.id, 'evidence.committed', 'Response evidence recorded.', { assignmentId: job.assignment.id, artifactId: item.id })
       return item

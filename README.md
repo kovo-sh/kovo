@@ -19,7 +19,7 @@ Open http://127.0.0.1:8000. Use **Model settings** to enter an OpenRouter key, t
 
 Create a project with the authorized hosts and start a run. Review and approve specific hosts after inventory discovery. The coordinator selects checks for the goal from the available evidence. Runs use supplied records by default. Enable **Read approved public pages during this run** to allow selected HSTS, MIME sniffing protection, and referrer policy checks to collect HTTPS response metadata through the scope broker. The report records the plan, the expected and observed settings, and links each confirmed gap to its verification evidence. [HTTP Strict Transport Security](https://www.rfc-editor.org/rfc/rfc6797.html) · [Fetch Standard](https://fetch.spec.whatwg.org/#x-content-type-options-header) · [Referrer Policy](https://www.w3.org/TR/referrer-policy/#referrer-policy-header-dfn)
 
-In **Supply prepared evidence**, enter the observed fields for the host. Use `absent` in `contentTypeOptions` or `referrerPolicy` when the header was absent from a captured response. Leave fields out when the source did not record them.
+In **Supply prepared evidence**, enter the observed fields for the host. Use `absent` in `contentTypeOptions` or `referrerPolicy` when the header was absent from a captured response. Leave fields out when the source did not record them. If the response record has a UTC timestamp, include it in `recordedAt` so the export shows when the supplied observation was made.
 
 In **Report**, choose a version and open **Export**. **Markdown with evidence** includes sanitized source observations and worker comparisons for offline review. **Plain text** is also available.
 

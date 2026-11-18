@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { downloadReportMarkdown } from '../actions.ts'
-import { checkLabels, reportEvidenceSource, reportPlanLabel } from '../report-summary.ts'
+import { checkLabels, reportEvidenceSource, reportHighlights, reportPlanLabel } from '../report-summary.ts'
 import { FormError, Status, timeText } from './common.tsx'
 import type { RunDetail } from './run-state.ts'
 import { Button } from './ui/button.tsx'
@@ -27,7 +27,8 @@ export function RunReport({ detail, openEvidence }: {
   if (!report) return <div className="report-body"><h2>Report</h2><p className="muted">The report will appear here when the run ends.</p></div>
 
   const { body } = report
-  const confirmed = body.findings.filter(item => item.status === 'confirmed').length
+  const { coverage, confirmed, priority } = reportHighlights(body)
+  const findingCount = confirmed ? confirmed + (confirmed === 1 ? ' confirmed finding' : ' confirmed findings') : 'No confirmed findings'
   const approvedHosts = body.scope.length === 1 ? '1 approved host' : body.scope.length + ' approved hosts'
   const evidenceSource = reportEvidenceSource(detail.run.sourceMode, body.selectedChecks)
   const plannedChecks = reportPlanLabel(body.selectedChecks)
@@ -50,9 +51,15 @@ export function RunReport({ detail, openEvidence }: {
     setExportError('')
     const lines = [
       `Guardian ${report.partial ? 'partial report' : 'complete report'} • Version ${report.version}`,
+      '', findingCount, ...(coverage ? [coverage] : []),
       '', body.goal, '', evidenceSource, `Scope revision ${body.scopeRevision} · Goal revision ${body.goalRevision}`,
       ...(plannedChecks ? [plannedChecks] : []),
-      ...body.scope.map(asset => asset.origin), '', 'Coverage',
+      ...body.scope.map(asset => asset.origin),
+      ...(priority ? [
+        '', 'Fix first', priority.label,
+        ...(priority.finding ? [priority.finding.origin, priority.finding.remediation] : []),
+      ] : []),
+      '', 'Coverage',
       ...body.coverage.flatMap(item => [
         [item.origin, item.status, item.evidenceId && `Evidence ${item.evidenceId}`,
           item.analysisEvidenceId && `Derived evidence ${item.analysisEvidenceId}`,
@@ -105,14 +112,23 @@ export function RunReport({ detail, openEvidence }: {
       </div>
     </div>
     <FormError error={exportError} />
-    <p className="report-summary">{confirmed ? `${confirmed} confirmed ${confirmed === 1 ? 'finding' : 'findings'}` : 'No confirmed findings'}</p>
+    <p className="report-summary">{findingCount}</p>
+    {coverage && <p className="report-check-summary">{coverage}</p>}
     <p>{body.goal}</p>
     <p className="muted">{approvedHosts} · Scope revision {body.scopeRevision} · Goal revision {body.goalRevision}</p>
     <p className="muted">{evidenceSource}</p>
     {plannedChecks && <p className="muted">{plannedChecks}</p>}
-    {body.findings.length > 0 && <section className="stacked-section">
+    {priority && <section className="report-priority" aria-labelledby="report-priority-title">
+      <h3 id="report-priority-title">Fix first</h3>
+      <a href={priority.finding ? '#report-finding-' + priority.finding.id : '#report-findings'}>{priority.label}</a>
+      {priority.finding && <>
+        <p className="finding-meta">{new URL(priority.finding.origin).hostname} · {priority.finding.severity}</p>
+        <p>{priority.finding.remediation}</p>
+      </>}
+    </section>}
+    {body.findings.length > 0 && <section className="stacked-section" id="report-findings" tabIndex={-1}>
       <h3>Findings</h3>
-      {body.findings.map(item => <div key={item.id} className="finding">
+      {body.findings.map(item => <div key={item.id} className="finding" id={'report-finding-' + item.id} tabIndex={-1}>
         <div className="section-heading"><h4>{item.title}</h4><Status status={item.status} /></div>
         <p className="finding-meta">{new URL(item.origin).hostname} · {item.severity}</p>
         {item.check && <dl className="finding-details">

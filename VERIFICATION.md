@@ -6,9 +6,9 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
 | `npm run test:e2e` | Fifteen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, candidate source evidence and scope changes, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and output-limit recovery. |
-| `npm run test:boundaries` | Thirteen tests passed. They cover plan and access case validation, legacy inventory links, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, network isolation, resource limits, and the worker's independent deadline. |
+| `npm run test:boundaries` | Fourteen tests passed. They cover plan and access case validation, legacy inventory links, supplied response provenance, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, network isolation, resource limits, and the worker's independent deadline. |
 | `npm run benchmark:reports` | All 19 case verdicts matched across four report versions. All five confirmed findings supplied scoped evidence, worker comparisons, impact, and a fix check. |
-| GitHub Actions | The Messages workflow commit passed on a fresh Ubuntu checkout, including the Docker worker build, twelve boundary tests, thirteen production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `746c032`](https://github.com/wwwillchen/guardian/actions/runs/44283178932) |
+| GitHub Actions | The model retry fix passed on a fresh Ubuntu checkout, including the Docker worker build, thirteen boundary tests, fifteen production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `f48b400`](https://github.com/wwwillchen/guardian/actions/runs/44285482124) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -59,6 +59,8 @@ The browser downloaded the partial and complete versions from one stopped and re
 
 The scope boundary test exported each version after a scope change and reapproval. The restricted version omitted the removed origin and affected evidence. The earlier version preserved its approved scope. A simulated cross-host input reference was marked unavailable. An offline copy of the Dyad workspace exported both original report versions, resolved both legacy verification records, and retained the three-read audit. The export menu was checked in desktop light mode and at 390 pixels in dark mode.
 
+The report and both exports put check totals and the first fix before the detailed findings. The access policy replay placed the excess billing permission first and the browser followed its link with the keyboard. The response replay showed two tied findings, the interrupted report called out missing check details, and the healthy report listed verified checks without a fix. A before-and-after comparison on offline copies of the saved Dyad workspace preserved both report bodies, their evidence sections, and the three allowed reads.
+
 The Artex Markdown renderer and the Guardian app were given the same synthetic access policy case. Artex's renderer received two pre-adjudicated discrepancies. Both exports described those discrepancies and the source timestamp. Guardian's export included the omitted decision as inconclusive and linked the policy snapshot and verification. A read-only aggregate check of the Artex database found 34 pending findings and zero tasks or findings mentioning the Northstar fixture. The matched assessment benchmark remains open.
 
 ## Northstar report benchmark
@@ -68,6 +70,8 @@ The production browser replay scored 19 pre-labeled cases from four exported rep
 Every confirmation linked to the scoped source record and the successful worker comparison. All five included expected and observed values, impact, remediation, and a way to check the fix. The access policy report put the medium-severity billing-export issue first and identified the role and policy decision to recheck.
 
 An importer check used synthetic verdicts to verify rejection of missing cases and scoring of a false confirmation, an out-of-suite confirmation, and a missed expected result. Matched Artex results and the comparative reviewer exercise remain open.
+
+A separate replay used two archived root response captures from the local Artex task files. The expected verdicts were set from the saved response headers before running Guardian. The production browser imported the allowed metadata and source timestamps. With local provider recordings and a controlled planning failure, the isolated verifier matched all six cases. Two checks met the baseline, one gap was confirmed, and three were inconclusive. The browser and Markdown evidence retained the original timestamps. Those timestamps stayed local and the run made zero brokered page reads. The Artex task was marked done with 34 pending findings and no captured traffic linked to those findings. The replay supplies a holdout for Guardian's accuracy and handoff. A paired Artex baseline is still pending.
 
 ## Live Dyad smoke run
 

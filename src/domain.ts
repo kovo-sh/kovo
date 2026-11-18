@@ -42,6 +42,7 @@ export const preparedObservation = z.object({
   mediaType: z.string().regex(/^[a-z0-9.+-]{1,40}\/[a-z0-9.+-]{1,60}$/),
   transportMaxAge: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
   includeSubDomains: z.boolean(),
+  recordedAt: z.iso.datetime().optional(),
   contentTypeOptions: z.enum(['absent', 'nosniff', 'unrecognized']).optional(),
   referrerPolicy: z.enum(['absent', 'unrecognized', ...referrerPolicies]).optional(),
 })

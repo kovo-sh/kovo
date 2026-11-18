@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import { id as evidenceId } from '../domain.ts'
 import type { EvidenceSummary } from '../domain.ts'
-import { checkLabels, reportEvidenceSource, reportPlanLabel } from '../report-summary.ts'
+import { checkLabels, reportEvidenceSource, reportHighlights, reportPlanLabel, suppliedResponseLabel } from '../report-summary.ts'
 import { redact } from './redact.ts'
 import { isReportSource, projectReportEvidence } from './report-evidence.ts'
 import { reports } from './schema.ts'
@@ -89,11 +89,12 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
   }
 
   const findings = body.findings.filter(item => approved.has(item.origin))
-  const confirmed = findings.filter(item => item.status === 'confirmed').length
+  const { coverage, confirmed, priority } = reportHighlights(body)
   const plan = reportPlanLabel(body.selectedChecks)
   const lines = [
     `# Guardian ${report.partial ? 'partial' : 'complete'} report`, '',
     `**${confirmed} confirmed ${confirmed === 1 ? 'finding' : 'findings'}**`, '',
+    ...(coverage ? [inline(coverage), ''] : []),
     `- **Run** ${run.id}`,
     `- **Report version** ${report.version}`,
     `- **Saved** ${new Date(createdAt).toISOString()}`,
@@ -101,6 +102,12 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     `- **Scope revision** ${body.scopeRevision} · **Goal revision** ${body.goalRevision}`,
     `- **Evidence source** ${inline(reportEvidenceSource(run.sourceMode, body.selectedChecks))}`,
     ...(plan ? ['- ' + inline(plan)] : []),
+    ...(priority ? [
+      '', '## Fix first', '',
+      ...(priority.finding ? [
+        `**${inline(priority.label)}** · ${inline(priority.finding.origin)}`, '', inline(priority.finding.remediation),
+      ] : [inline(priority.label), '', '[Findings](#findings)']),
+    ] : []),
     '', '## Approved scope', '',
     ...(approved.size ? [...approved].map(origin => '- ' + inline(origin)) : ['No approved hosts.']),
     '', '## Findings', '',
@@ -150,8 +157,10 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
       continue
     }
     const sha = createHash('sha256').update(entry.json).digest('hex')
+    const label = entry.kind === 'observation' && run.sourceMode === 'prepared'
+      ? suppliedResponseLabel : entry.kind && evidenceLabels[entry.kind]
     lines.push(
-      `${entry.kind && evidenceLabels[entry.kind]} · ${inline(entry.origin)}`, '',
+      `${label} · ${inline(entry.origin)}`, '',
       ...(entry.sources?.length ? ['**Inputs** ' + entry.sources.map(linkTo).join(' · '), ''] : []),
       `**SHA-256 of the JSON below** \`${sha}\``, '',
       '~~~json', entry.json, '~~~', '',

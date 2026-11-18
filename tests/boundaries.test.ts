@@ -12,10 +12,10 @@ import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
 import { accessPolicySnapshot } from '../src/access-policy.ts'
-import { assessmentCheckIds } from '../src/domain.ts'
+import { assessmentCheckIds, preparedObservation } from '../src/domain.ts'
 import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
 import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
-import { responseReview } from '../src/server/response-checks.ts'
+import { responseEvidence, responseReview } from '../src/server/response-checks.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { parseReviewPlan, standardChecks } from '../src/server/review-plan.ts'
 import { findings } from '../src/server/schema.ts'
@@ -137,6 +137,41 @@ test('links legacy candidates only to inventory that contains their origin', t =
   assert.deepEqual(storage.run(runId).candidates, [legacy, later])
 })
 
+test('shows the source and original timestamp of supplied response evidence', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'guardian-supplied-response-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const storage = new Store(directory)
+  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar] })
+  const { id: runId } = storage.createRun({
+    requestId: randomUUID(), projectId, goal: 'Review the supplied response.', sourceMode: 'prepared',
+  })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const [asset] = storage.run(runId).candidates
+  storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds: [asset.id], consent: true })
+  storage.commitReviewPlan(runId, 0, standardChecks())
+  const analysis = storage.workerList(runId).find(worker => worker.phase === 'analysis')
+  assert.ok(analysis)
+  const recordedAt = '2026-11-16T08:20:00Z'
+  const supplied = preparedObservation.parse({
+    status: 200, mediaType: 'text/html', transportMaxAge: 31_536_000, includeSubDomains: false, recordedAt,
+  })
+  assert.equal(preparedObservation.safeParse({ ...supplied, recordedAt: 'yesterday' }).success, false)
+  const observation = { ...supplied, origin: northstar, finalOrigin: northstar, source: 'supplied observation' as const }
+  assert.ok(!('recordedAt' in responseEvidence(observation, ['hsts'])))
+  const run = storage.run(runId)
+  const evidence = storage.addArtifact(run, analysis, 'observation', 'Observed public response', JSON.stringify({ observation }))
+  storage.updateWorker(analysis.id, { status: 'complete', outcome: 'Recorded a supplied response.' })
+  storage.writeReport(run, true)
+
+  const detail = storage.runDetail(runId)
+  assert.equal(detail.evidence.find(item => item.id === evidence.id)?.title, 'Supplied response metadata')
+  assert.equal(storage.artifact(runId, evidence.id).title, 'Supplied response metadata')
+  const markdown = exportReportMarkdown(storage, runId, detail.reports[0].id).content
+  assert.ok(markdown.includes('Supplied response metadata · ' + northstar))
+  assert.ok(markdown.includes('"recordedAt": "' + recordedAt + '"'))
+  assert.equal(storage.assignmentObservation(analysis.id)?.title, 'Observed public response')
+})
+
 test('keeps reports tied to current approval and requires fresh verification after reapproval', t => {
   const directory = mkdtempSync(join(tmpdir(), 'guardian-approval-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
@@ -195,6 +230,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.equal(restricted.body.findings.length, 0)
   assert.match(restricted.body.coverage[0].status, /redirect chain is no longer approved/)
   const restrictedMarkdown = exportReportMarkdown(storage, runId, restricted.id).content
+  assert.doesNotMatch(restrictedMarkdown, /## Fix first/)
   for (const removed of [docsOrigin, observation.id, evidence.id]) assert.ok(!restrictedMarkdown.includes(removed))
   assert.equal(exportOriginal(), originalMarkdown)
 

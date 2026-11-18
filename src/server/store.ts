@@ -8,8 +8,9 @@ import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
 import { assessmentCheckTitles } from '../domain.ts'
-import type { Candidate, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
+import type { Candidate, EvidenceSummary, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
+import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
 import * as tables from './schema.ts'
 import { redact } from './redact.ts'
 
@@ -17,6 +18,11 @@ export type Run = typeof tables.runs.$inferSelect
 export type Assignment = typeof tables.assignments.$inferSelect
 type Project = typeof tables.projects.$inferSelect
 const inventoryTitle = 'Supplied asset inventory'
+
+function evidenceTitle(run: Run, kind: EvidenceSummary['kind'], title: string) {
+  return run.sourceMode === 'prepared' && kind === 'observation' && title === 'Observed public response'
+    ? suppliedResponseLabel : title
+}
 
 export const dataDirectory = () => resolve(process.env.GUARDIAN_DATA_DIR ?? '.guardian')
 
@@ -152,7 +158,7 @@ export class Store {
       assignments: this.workerList(runId),
       messages: this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
         .orderBy(asc(tables.messages.createdAt), asc(tables.messages.id)).all(),
-      evidence,
+      evidence: evidence.map(item => ({ ...item, title: evidenceTitle(run, item.kind, item.title) })),
       reports: this.db.select().from(tables.reports).where(eq(tables.reports.runId, runId))
         .orderBy(desc(tables.reports.version)).all(),
       cursor: streamHead?.id ?? 0,
@@ -211,12 +217,13 @@ export class Store {
   }
 
   artifact(runId: string, artifactId: string) {
-    this.run(runId)
+    const run = this.run(runId)
     const item = this.db.select().from(tables.evidence).where(and(
       eq(tables.evidence.id, artifactId), eq(tables.evidence.runId, runId),
     )).get()
     if (!item) throw new Error('Evidence not found.')
-    return { ...item, content: readFileSync(join(this.directory, 'artifacts', item.id + '.txt'), 'utf8') }
+    return { ...item, title: evidenceTitle(run, item.kind, item.title),
+      content: readFileSync(join(this.directory, 'artifacts', item.id + '.txt'), 'utf8') }
   }
 
   addArtifact(run: Run, assignment: Assignment, kind: typeof tables.evidence.$inferSelect.kind, title: string, content: string, operationId?: string) {
@@ -533,9 +540,8 @@ export class Store {
     )).all().filter(row => run.approved.includes(row.assetId) && row.finding.evidenceIds.length > 0 &&
       row.finding.evidenceIds.every(id => currentEvidence.has(id))).map(row => row.finding)
     const statusOrder = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
-    const severityOrder = { medium: 0, low: 1, informational: 2 }
     results.sort((a, b) => statusOrder[a.status] - statusOrder[b.status] ||
-      severityOrder[a.severity] - severityOrder[b.severity] ||
+      findingSeverityOrder[a.severity] - findingSeverityOrder[b.severity] ||
       a.origin.localeCompare(b.origin) || a.title.localeCompare(b.title))
     if (!scope.length) gaps.push('No approved hosts in this report.')
     const body: ReportBody = {
