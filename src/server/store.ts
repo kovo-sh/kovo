@@ -106,10 +106,11 @@ export class Store {
     }).run()
   }
 
-  message(runId: string, threadId: string, role: typeof tables.messages.$inferSelect.role, content: string, replyTo?: string) {
+  message(runId: string, threadId: string, role: typeof tables.messages.$inferSelect.role, content: string,
+    replyTo?: string, evidenceIds?: string[]) {
     const id = randomUUID()
     this.db.insert(tables.messages).values({
-      id, runId, threadId, role, content: redact(content), replyTo, createdAt: Date.now(),
+      id, runId, threadId, role, content: redact(content), replyTo, evidenceIds, createdAt: Date.now(),
     }).onConflictDoNothing().run()
     return id
   }
@@ -170,7 +171,7 @@ export class Store {
       project: this.project(run.projectId),
       assignments: this.workerList(runId),
       messages: this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
-        .orderBy(asc(tables.messages.createdAt), asc(tables.messages.id)).all(),
+        .orderBy(asc(tables.messages.createdAt), sql`${tables.messages}.rowid`).all(),
       evidence: evidence.map(item => ({ ...item, title: evidenceTitle(run, item.kind, item.title) })),
       reports: this.db.select().from(tables.reports).where(eq(tables.reports.runId, runId))
         .orderBy(desc(tables.reports.version)).all(),
@@ -439,7 +440,8 @@ export class Store {
     const worker = this.makeWorker(run, 'discovery', undefined, 'Asset inventory', 'Review supplied project records and attribute the candidate origins.')
     const initial = this.recordInventory(run, worker, inventoryTitle, inventory)
     this.updateWorker(worker.id, { status: 'complete', outcome: 'Reviewed supplied project records.' })
-    this.message(run.id, worker.id, 'worker', `Recorded ${inventory.length} candidates from supplied project records.`)
+    this.message(run.id, worker.id, 'worker', `Recorded ${inventory.length} candidates from supplied project records.`,
+      undefined, [initial.id])
     this.updateRun(run.id, {
       phase: 'review', status: 'waiting',
       candidates: inventory.map(asset => ({ ...asset, sourceEvidenceId: initial.id })),

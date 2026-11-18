@@ -9,12 +9,31 @@ import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigg
 
 const roleNames = { operator: 'You', coordinator: 'Coordinator', worker: 'Worker', guardian: 'Guardian' } as const
 
+function EvidenceRows({ items, label, openEvidence }: {
+  items: RunDetail['evidence']
+  label: string
+  openEvidence: (id: string) => void
+}) {
+  if (!items.length) return null
+  return <Trace role="group" aria-label={label}>
+    {items.map(item => <Button key={item.id} variant="ghost" className="evidence-row" onClick={() => openEvidence(item.id)}>
+      <TraceLine><TraceIcon>↳</TraceIcon><TraceTitle>{item.title}</TraceTitle></TraceLine>
+      <span aria-hidden="true">↗</span>
+    </Button>)}
+  </Trace>
+}
+
 export function ThreadTranscript({ messages, worker, attachments, openEvidence }: {
   messages: RunDetail['messages']
   worker?: Worker
   attachments: RunDetail['evidence']
   openEvidence: (id: string) => void
 }) {
+  const evidenceById = new Map(attachments.map(item => [item.id, item]))
+  const linked = new Set(messages.flatMap(message => message.evidenceIds ?? []))
+  const assignment = attachments.find(item => item.operationId === 'assignment')
+  const supporting = attachments.filter(item => item.id !== assignment?.id && !linked.has(item.id))
+
   return <MessageScrollerProvider autoScroll={!worker} defaultScrollPosition={worker ? 'start' : 'end'}>
     <MessageScroller>
       <MessageScrollerViewport aria-label={worker ? 'Worker transcript' : 'Coordinator transcript'}>
@@ -24,11 +43,18 @@ export function ThreadTranscript({ messages, worker, attachments, openEvidence }
               <TraceCollapsibleTrigger>
                 <TraceLine><TraceIcon>◎</TraceIcon><TraceTitle>Assignment</TraceTitle></TraceLine>
               </TraceCollapsibleTrigger>
-              <TraceCollapsibleContent>{worker.objective}</TraceCollapsibleContent>
+              <TraceCollapsibleContent>
+                <p>{worker.objective}</p>
+                {assignment && <EvidenceRows items={[assignment]} label="Assignment file" openEvidence={openEvidence} />}
+              </TraceCollapsibleContent>
             </TraceCollapsible>
           </Trace>}
           {messages.map(message => {
             const fromOperator = message.role === 'operator'
+            const evidence = (message.evidenceIds ?? []).flatMap(id => {
+              const item = evidenceById.get(id)
+              return item ? [item] : []
+            })
             return <MessageScrollerItem key={message.id} messageId={message.id} scrollAnchor={fromOperator}>
               <Message align={fromOperator ? 'end' : 'start'} data-role={message.role}>
                 <MessageContent>
@@ -38,16 +64,12 @@ export function ThreadTranscript({ messages, worker, attachments, openEvidence }
                   <Bubble variant={fromOperator ? 'muted' : 'ghost'}>
                     <BubbleContent>{message.content}</BubbleContent>
                   </Bubble>
+                  <EvidenceRows items={evidence} label="Turn evidence" openEvidence={openEvidence} />
                 </MessageContent>
               </Message>
             </MessageScrollerItem>
           })}
-          {attachments.length > 0 && <Trace aria-label="Supporting evidence">
-            {attachments.map(item => <Button key={item.id} variant="ghost" className="evidence-row" onClick={() => openEvidence(item.id)}>
-              <TraceLine><TraceIcon>↳</TraceIcon><TraceTitle>{item.title}</TraceTitle></TraceLine>
-              <span aria-hidden="true">↗</span>
-            </Button>)}
-          </Trace>}
+          <EvidenceRows items={supporting} label="Supporting evidence" openEvidence={openEvidence} />
         </MessageScrollerContent>
       </MessageScrollerViewport>
       <MessageScrollerButton aria-label="Jump to latest message" render={<Button size="icon" />}>

@@ -34,8 +34,8 @@ storage.db.transaction(() => {
         'Inspect the prepared record for ' + title.toLowerCase() + '.')
       if (phase === 'discovery') {
         storage.updateWorker(worker.id, { status: 'complete', outcome: 'Reviewed a synthetic service inventory record.' })
-        storage.message(runId, worker.id, 'worker', 'Attribution is from the supplied synthetic inventory.')
-        storage.addArtifact(run, worker, 'inventory', 'Sample inventory note', 'Northstar synthetic project evidence.')
+        const evidence = storage.addArtifact(run, worker, 'inventory', 'Sample inventory note', 'Northstar synthetic project evidence.')
+        storage.message(runId, worker.id, 'worker', 'Attribution is from the supplied synthetic inventory.', undefined, [evidence.id])
       }
     }
   }

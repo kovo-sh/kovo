@@ -115,6 +115,7 @@ export const messages = sqliteTable('messages', {
   role: text('role').$type<'operator' | 'coordinator' | 'worker' | 'guardian'>().notNull(),
   content: text('content').notNull(),
   replyTo: text('reply_to'),
+  evidenceIds: text('evidence_ids', { mode: 'json' }).$type<string[]>(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('thread_messages').on(table.runId, table.threadId), uniqueIndex('run_replies').on(table.runId, table.replyTo)])
 

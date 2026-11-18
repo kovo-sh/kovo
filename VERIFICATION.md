@@ -17,7 +17,7 @@ Eighteen checked-in OpenRouter recordings contain twenty-five HTTP responses fro
 
 The first synthetic Messages analysis response reached the output limit before calling its tool. The DeepSeek preset now sends its thinking-off setting explicitly in Messages requests. Four new Messages responses captured the connection check, a focused plan, a worker tool call, and the model's response to the result. [OpenRouter Messages compatibility](https://openrouter.ai/docs/guides/coding-agents/claude-code-integration)
 
-The production browser test replayed those streams and killed Guardian while the worker's follow-up response was pending. Restart left the run paused. Explicit resume reused one brokered fixture observation, one analysis receipt, and the original Pi Durable user and tool-result entries. The finished report confirmed the expected referrer policy gap and linked the successful Docker verification.
+The production browser test replayed those streams and killed Guardian while the worker's follow-up response was pending. The derived receipt was already visible under the worker's tool-result message. Restart left the run paused and preserved the attachment. Explicit resume reused one brokered fixture observation, the same analysis receipt and worker message, and the original Pi Durable user and tool-result entries. The finished report confirmed the expected referrer policy gap and linked the successful Docker verification. The Responses replay followed a report's verification link to the worker's message and its evidence.
 
 The browser replay revoked a previously verified fixture key. The next connection check replaced the success message with the provider rejection. Save made a fresh request and left the workspace without a saved credential. A two-page check finished an older successful request after a newer rejection and verified that Save still rechecked the key.
 
@@ -107,7 +107,7 @@ One run used the default OpenRouter Responses preset and explicit approval for `
 
 One initial model turn reached its output limit and the run saved a partial report. After adding and testing local evidence fallback for that condition, the operator resumed the same run. Guardian reused both observations with zero additional Dyad requests. Report version 2 covered both approved origins, linked two derived analysis artifacts, and showed zero confirmed HSTS findings. The browser follow-through opened verification evidence and then its read-only worker thread. The SQLite database, reports, and credentials from this run stay in the local `.guardian/dyad-smoke` directory on the verification machine.
 
-The latest production build downloaded both saved report versions from an offline copy and opened verification evidence and its read-only worker thread. The audit retained the original three reads.
+The latest production build downloaded both saved report versions from an offline copy after the worker message migration and opened the verification receipt under Supporting evidence in its read-only worker thread. Both exports matched the originals byte for byte. The audit retained the original three reads.
 
 ## Dependency audit
 

@@ -87,7 +87,10 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     await expect(verification).toContainText('"exitStatus": 0')
     await expect(verification).not.toContainText(fixture.sensitiveFixtureValue)
     await verification.getByRole('link', { name: /Open worker thread/ }).click()
-    await expect(page.getByRole('region', { name: 'Worker thread' })).toContainText('Verify northstar.example')
+    const verificationWorker = page.getByRole('region', { name: 'Worker thread' })
+    await expect(verificationWorker).toContainText('Verify northstar.example')
+    await expect(verificationWorker.locator('[data-role=worker]').getByRole('group', { name: 'Turn evidence' })
+      .getByRole('button', { name: 'Response policy verification' })).toBeVisible()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     const { content: mark } = await downloadReport(page, 'Plain text')
     expect(mark).not.toContain(fixtureCredential)
@@ -461,12 +464,23 @@ test('resumes a Messages analysis from its saved tool result and verifies the re
     await fixture.modelWithheld
     expect(fixture.accepted).toEqual(beforeResume)
     expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    await page.getByRole('link', { name: /^Trace/ }).click()
+    await page.getByRole('link', { name: 'Review northstar.example, running' }).click()
+    const worker = page.getByRole('region', { name: 'Worker thread' })
+    const derived = worker.locator('[data-role=worker]').filter({ hasText: 'Recorded the evidence command result.' })
+      .getByRole('group', { name: 'Turn evidence' }).getByRole('button', { name: 'Derived evidence', exact: true })
+    await expect(derived).toBeVisible()
 
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     try {
       const analysisReceipts = db.prepare("SELECT id FROM evidence WHERE kind = 'analysis'")
       const originalReceipt = analysisReceipts.all()
       expect(originalReceipt).toHaveLength(1)
+      const analysisTurns = db.prepare(`SELECT messages.id FROM messages JOIN json_each(messages.evidence_ids) AS attachment
+        JOIN evidence ON evidence.id = attachment.value AND evidence.assignment_id = messages.thread_id
+        WHERE evidence.kind = 'analysis'`)
+      const originalTurn = analysisTurns.all()
+      expect(originalTurn).toHaveLength(1)
       const assignment = db.prepare("SELECT session_id FROM assignments WHERE phase = 'analysis'").get()
       expect(typeof assignment?.session_id).toBe('string')
       await app.stop('SIGKILL')
@@ -475,6 +489,7 @@ test('resumes a Messages analysis from its saved tool result and verifies the re
 
       const resume = page.getByRole('button', { name: 'Resume', exact: true })
       await expect(resume).toBeVisible()
+      await expect(derived).toBeVisible()
       expect(fixture.accepted).toEqual(beforeResume)
       expect(fixture.requested).toEqual([primaryOrigin + '/'])
       await resume.click()
@@ -489,6 +504,7 @@ test('resumes a Messages analysis from its saved tool result and verifies the re
       await expect(verification).toContainText('just-bash 3.6.1')
       await expect(verification).toContainText('"exitStatus": 0')
       expect(analysisReceipts.all()).toEqual(originalReceipt)
+      expect(analysisTurns.all()).toEqual(originalTurn)
       expect(db.prepare("SELECT check_id FROM findings WHERE json_extract(finding, '$.status') = 'confirmed'").all())
         .toEqual([{ check_id: 'referrer-policy' }])
 

@@ -278,13 +278,21 @@ class Execution {
             assignmentId: job.assignment.id, files: inputs, command, outputs: ['result.txt'],
           }, signal)
           const current = this.check(job)
-          const receipt = this.storage.db.transaction(() => this.storage.addArtifact(
-            current, job.assignment, 'analysis', 'Derived evidence',
-            JSON.stringify({
-              command: redact(command), inputEvidence: [id], inputFields: Object.keys(input.evidence), interpreter: 'just-bash 3.6.1',
-              exitStatus: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-              result: result.outputs['result.txt'] ?? '',
-            }, null, 2), operation))
+          const receipt = this.storage.db.transaction(() => {
+            const item = this.storage.addArtifact(current, job.assignment, 'analysis', 'Derived evidence',
+              JSON.stringify({
+                command: redact(command), inputEvidence: [id], inputFields: Object.keys(input.evidence), interpreter: 'just-bash 3.6.1',
+                exitStatus: result.exitCode, stdout: result.stdout, stderr: result.stderr,
+                result: result.outputs['result.txt'] ?? '',
+              }, null, 2), operation)
+            const note = result.exitCode === 0 ? 'Recorded the evidence command result.'
+              : 'The evidence command exited with status ' + result.exitCode + '.'
+            this.storage.message(current.id, job.assignment.id, 'worker', note, undefined, [item.id])
+            this.storage.event(current.id, 'evidence.committed', 'Derived evidence recorded.', {
+              assignmentId: job.assignment.id, artifactId: item.id,
+            })
+            return item
+          })
           return derivedResult(JSON.parse(this.storage.artifact(run.id, receipt.id).content))
         },
       })
@@ -432,11 +440,11 @@ class Execution {
   private complete(job: Active, run: Run, summary: string, artifactIds: string[], checks?: CheckCoverage[]) {
     const worker = job.assignment
     const outcome = redact(summary)
-    this.storage.addArtifact(run, worker, 'handoff', 'result.md', [
+    const result = this.storage.addArtifact(run, worker, 'handoff', 'result.md', [
       '# Result', '', outcome, '', 'Evidence: ' + artifactIds.join(', '),
     ].join('\n'), 'result')
     this.storage.updateWorker(worker.id, { status: 'complete', lease: null, outcome, checks })
-    this.storage.message(run.id, worker.id, 'worker', outcome)
+    this.storage.message(run.id, worker.id, 'worker', outcome, undefined, [...artifactIds, result.id])
     this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', { assignmentId: worker.id, artifactId: artifactIds[0] })
   }
 

@@ -84,7 +84,7 @@ test('navigates the 34-worker sample with shadcn controls across desktop and mob
     await expect(root).toHaveCSS('color-scheme', 'light')
     expect((await worker.boundingBox())!.y).toBeGreaterThan((await graph.boundingBox())!.y)
     expect(await root.evaluate(element => element.scrollWidth <= window.innerWidth)).toBe(true)
-    await worker.getByRole('button', { name: 'Sample inventory note' }).click()
+    await worker.getByRole('group', { name: 'Turn evidence' }).getByRole('button', { name: 'Sample inventory note' }).click()
     await expect(page.getByRole('dialog')).toContainText('Northstar synthetic project evidence.')
     await page.getByRole('button', { name: 'Close', exact: true }).click()
     expect(errors).toEqual([])
