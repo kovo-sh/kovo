@@ -126,6 +126,8 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .project-list li > a,.list-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 15px; overflow-wrap: anywhere; }
 .project-list li a:hover { background: var(--surface); }
 .project-list small { display: block; margin-top: 3px; }
+.inventory-toolbar { flex-wrap: wrap; justify-content: flex-end; }
+.dns-import-preview { max-height: 20rem; overflow: auto; margin-top: 0; }
 .stacked-section { margin-top: 22px; }
 .stacked-section h3 { margin-bottom: 7px; }
 .state { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; line-height: 1.2; text-transform: capitalize; }

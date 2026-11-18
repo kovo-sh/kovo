@@ -3,6 +3,8 @@ import { z } from 'zod'
 export const id = z.uuid()
 export const shortText = z.string().trim().min(1).max(120)
 export const goalText = z.string().trim().min(1).max(1500)
+export const maxScopeHosts = 48
+export const maxDnsExportBytes = 128 * 1024
 
 export const assetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
   try {
@@ -41,10 +43,13 @@ export const addCandidate = z.object({
   thirdParty: z.boolean(),
 })
 export const projectAsset = addCandidate.extend({ requestId: id, projectId: id, prepared: preparedObservation.optional() })
+export const importDnsInventory = z.object({
+  requestId: id, projectId: id, zone: assetOrigin, document: z.string().min(1).max(maxDnsExportBytes),
+})
 const commandBase = z.object({ requestId: id, runId: id })
 export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({ action: z.literal('discover'), consent: z.literal(true) }),
-  commandBase.extend({ action: z.literal('scope'), assetIds: z.array(id).max(48), consent: z.literal(true), saveProject: z.boolean().optional() }),
+  commandBase.extend({ action: z.literal('scope'), assetIds: z.array(id).max(maxScopeHosts), consent: z.literal(true), saveProject: z.boolean().optional() }),
   commandBase.extend({ action: z.literal('candidate'), candidate: addCandidate }),
   commandBase.extend({ action: z.literal('revise'), goal: goalText }),
   commandBase.extend({ action: z.literal('message'), message: goalText }),
@@ -63,6 +68,13 @@ export interface Candidate {
   source: string
   thirdParty: boolean
   prepared?: PreparedObservation | null
+  dnsSource?: DnsSource | null
+}
+
+export interface DnsSource {
+  zone: string
+  recordTypes: ('A' | 'AAAA' | 'CNAME')[]
+  externalAliases: string[]
 }
 
 export type PreparedObservation = z.output<typeof preparedObservation>

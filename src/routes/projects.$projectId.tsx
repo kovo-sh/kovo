@@ -2,6 +2,7 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { addProjectAsset, createRun, projectData } from '../actions.ts'
 import { FormError, Status, timeText, useAction } from '../components/common.tsx'
+import { DnsInventoryImport } from '../components/dns-inventory-import.tsx'
 import { Button } from '../components/ui/button.tsx'
 import { Checkbox } from '../components/ui/checkbox.tsx'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible.tsx'
@@ -16,6 +17,8 @@ function ProjectPage() {
   const { project, assets, runs } = Route.useLoaderData()
   const navigate = useNavigate()
   const [adding, setAdding] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [notice, setNotice] = useState('')
   const [starting, setStarting] = useState(runs.length === 0)
   const action = useAction()
   const inventoryAction = useAction()
@@ -49,8 +52,17 @@ function ProjectPage() {
     </section>}
     <section className="stacked-section">
       <div className="section-heading"><h2>Project inventory</h2>
-        <Button onClick={() => setAdding(value => !value)} aria-expanded={adding}>Add candidate</Button>
+        <div className="toolbar inventory-toolbar">
+          <Button onClick={() => { setAdding(value => !value); setImporting(false); setNotice('') }} aria-expanded={adding}>Add candidate</Button>
+          <Button onClick={() => { setImporting(value => !value); setAdding(false); setNotice('') }} aria-expanded={importing}>Import DNS export</Button>
+        </div>
       </div>
+      {notice && <p role="status" className="muted">{notice}</p>}
+      {importing && <DnsInventoryImport projectId={project.id} defaultZone={new URL(project.seeds[0]).hostname}
+        cancel={() => setImporting(false)} imported={({ added, existing }) => {
+          setImporting(false)
+          setNotice(`Added ${added} ${added === 1 ? 'host' : 'hosts'}. Skipped ${existing} existing.`)
+        }} />}
       {adding && <form className="form-card" onSubmit={event => {
         event.preventDefault()
         const form = new FormData(event.currentTarget)
@@ -85,7 +97,8 @@ function ProjectPage() {
         <div className="form-actions"><Button type="submit" variant="default" disabled={inventoryAction.pending}>Add to project</Button></div>
       </form>}
       <ul className="project-list">{assets.map(asset => <li key={asset.id}>
-        <div className="list-row"><span><strong>{new URL(asset.origin).hostname}</strong><small>{asset.source}</small></span>
+        <div className="list-row"><span><strong>{new URL(asset.origin).hostname}</strong>
+          <small>{asset.source}{asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}</small></span>
           <span className="muted">{asset.thirdParty ? 'Third party' : project.defaultScope.includes(asset.origin) ? 'Project default' : 'Candidate'}</span>
         </div>
       </li>)}</ul>

@@ -1,5 +1,5 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
-import type { Candidate, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
+import type { Candidate, DnsSource, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -33,6 +33,7 @@ export const projectAssets = sqliteTable('project_assets', {
   source: text('source').notNull(),
   thirdParty: integer('third_party', { mode: 'boolean' }).notNull(),
   prepared: text('prepared', { mode: 'json' }).$type<PreparedObservation>(),
+  dnsSource: text('dns_source', { mode: 'json' }).$type<DnsSource>(),
 }, table => [uniqueIndex('project_assets_origin').on(table.projectId, table.origin)])
 
 export const runs = sqliteTable('runs', {

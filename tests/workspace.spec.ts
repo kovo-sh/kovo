@@ -113,3 +113,70 @@ test('guards host, origin, and unauthenticated event streams', async ({ request:
     await app.dispose()
   }
 })
+
+test('imports attributed DNS candidates and requires their own scope selection', async ({ page }) => {
+  const app = await createApp()
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await page.getByLabel('Project name').fill('Northstar')
+    await page.getByLabel('Seed hosts').fill('northstar.example')
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await page.getByRole('button', { name: 'Import DNS export' }).click()
+    const file = page.getByLabel('DNS export', { exact: true })
+    await file.setInputFiles({ name: 'invalid.zone', mimeType: 'text/plain', buffer: Buffer.from('$INCLUDE other.zone') })
+    await page.getByRole('button', { name: 'Review import' }).click()
+    await expect(page.getByRole('alert')).toContainText('Use a self-contained DNS export')
+    const privateValue = 'inert-private-asset-inventory-value'
+    await file.setInputFiles({ name: 'northstar.zone', mimeType: 'text/plain', buffer: Buffer.from([
+      '$ORIGIN northstar.example.',
+      '$TTL 1h',
+      '@ IN SOA ns admin (',
+      '  100 1h 1h 1d 60 )',
+      '@ IN A 192.0.2.10',
+      'api 300 IN A 192.0.2.20',
+      '    IN AAAA 2001:db8::20',
+      'partner IN CNAME www.vendor.example.',
+      `tracking IN TXT "${privateValue}; ignored"`,
+      '* IN A 192.0.2.42',
+      'outside.example. IN A 192.0.2.90',
+    ].join('\n')) })
+    await page.getByRole('button', { name: 'Review import' }).click()
+    const preview = page.getByRole('region', { name: 'DNS import preview' })
+    await expect(preview).toContainText('3 hosts in northstar.example')
+    await expect(preview).toContainText('A, AAAA')
+    await expect(preview).toContainText('Third-party alias · www.vendor.example')
+    await expect(preview).not.toContainText('outside.example')
+    await expect(preview).not.toContainText(privateValue)
+    await preview.getByRole('button', { name: 'Import hosts' }).click()
+    await expect(page.getByRole('status')).toContainText('Added 2 hosts. Skipped 1 existing.')
+    await expect(page.getByText('Project seed', { exact: true })).toBeVisible()
+
+    await page.getByLabel('Run goal').fill('Review the declared public web inventory.')
+    await page.getByRole('button', { name: 'Create run', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Discovery consent' })).toBeVisible()
+    await page.getByRole('checkbox', { name: 'I authorize discovery for these assets.' }).check()
+    await page.getByRole('button', { name: 'Start discovery' }).click()
+    await page.getByRole('button', { name: 'Review scope' }).click()
+    const api = page.getByRole('checkbox', { name: 'Include api.northstar.example' })
+    await expect(api).not.toBeChecked()
+    await expect(page.getByRole('checkbox', { name: 'Include partner.northstar.example' })).not.toBeChecked()
+    await expect(page.getByRole('checkbox', { name: 'Include www.vendor.example' })).toHaveCount(0)
+    await page.getByRole('button', { name: 'DNS export · A, AAAA ↗' }).click()
+    const evidence = page.getByRole('dialog', { name: 'Supplied asset inventory' })
+    await expect(evidence).toContainText('externalAliases')
+    await expect(evidence).toContainText('www.vendor.example')
+    await expect(evidence).not.toContainText(privateValue)
+    await expect(evidence).not.toContainText('192.0.2.20')
+    await page.getByRole('button', { name: 'Close', exact: true }).click()
+    await api.check()
+    await page.getByRole('checkbox', { name: 'I authorize read-only review of the selected hosts.' }).check()
+    await page.getByRole('button', { name: 'Approve scope' }).click()
+    await expect(page.getByText('2 approved hosts · Revision 1')).toBeVisible()
+    await page.getByRole('link', { name: /^Trace/ }).click()
+    await expect(page.getByRole('link', { name: 'Review api.northstar.example, queued' })).toBeVisible()
+    await expect(page.getByRole('link', { name: /^Review partner/ })).toHaveCount(0)
+  } finally {
+    await app.dispose()
+  }
+})

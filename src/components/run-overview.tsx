@@ -1,4 +1,5 @@
 import { Fragment, useState } from 'react'
+import { maxScopeHosts } from '../domain.ts'
 import type { RunCommand } from '../domain.ts'
 import { Status } from './common.tsx'
 import { phaseNames, workerPhases } from './run-state.ts'
@@ -22,10 +23,11 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
   const { run, project, assignments, evidence } = detail
   const [adding, setAdding] = useState(false)
   const initialSelection = () => run.scopeRevision > 0 ? run.approved
-    : run.candidates.filter(asset => !asset.thirdParty && (!project.defaultScope.length ||
-      project.defaultScope.includes(asset.origin))).map(asset => asset.id)
+    : run.candidates.filter(asset => !asset.thirdParty && (project.defaultScope.length
+      ? project.defaultScope.includes(asset.origin) : !asset.dnsSource)).map(asset => asset.id)
   const [selection, setSelection] = useState<string[] | null>(null)
   const selected = selection ?? initialSelection()
+  const overLimit = selected.length > maxScopeHosts
   const inventory = evidence.find(item => item.kind === 'inventory')
 
   return <div className="overview-body">
@@ -54,7 +56,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
     }}>
       <div>
         <h2>Discovery consent</h2>
-        <p>Review supplied project records for {project.seeds.map(seed => new URL(seed).hostname).join(', ')}.</p>
+        <p>Review project records and imported DNS exports for {project.seeds.map(seed => new URL(seed).hostname).join(', ')}.</p>
         <label className="checkbox"><Checkbox name="discoveryConsent" required aria-label="I authorize discovery for these assets." /> I authorize discovery for these assets.</label>
       </div>
       <Button type="submit" variant="default" disabled={pending || run.status !== 'waiting'}>Start discovery</Button>
@@ -75,7 +77,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
     {run.candidates.length > 0 && <form className="inventory" onSubmit={event => {
       event.preventDefault()
       const form = new FormData(event.currentTarget)
-      if (!form.has('scopeConsent')) return
+      if (!form.has('scopeConsent') || overLimit) return
       execute({ action: 'scope', assetIds: selected, consent: true, saveProject: form.has('defaultScope') }, () => {
         setReview(false)
         setSelection(null)
@@ -96,9 +98,10 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
         </tr>)}</tbody>
       </table></div>
       {review && <div className="scope-footer">
+        {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
         <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
         <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
-        <Button type="submit" variant="default" disabled={pending || (run.phase === 'review' && selected.length === 0)}>
+        <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>
           {run.phase === 'review' ? 'Approve scope' : 'Save scope revision'}
         </Button>
       </div>}

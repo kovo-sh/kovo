@@ -6,7 +6,8 @@ import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
-import type { Candidate, ReportBody, RunCommand, WorkerPhase, newProject, newRun, projectAsset } from '../domain.ts'
+import type { Candidate, ReportBody, RunCommand, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
+import { parseDnsInventory } from '../passive-dns.ts'
 import * as tables from './schema.ts'
 import { redact } from './redact.ts'
 
@@ -213,6 +214,7 @@ export class Store {
     }).returning().get()
   }
 
+  operate<Result extends { id: string }>(input: { requestId: string }, apply: () => Result): Result
   operate(input: { requestId: string }, apply: () => { id: string }): { id: string } {
     const fingerprint = createHash('sha256').update(JSON.stringify(input)).digest('hex')
     return this.db.transaction(() => {
@@ -266,6 +268,26 @@ export class Store {
       const project = this.project(input.projectId)
       const candidate = this.saveCandidate(project.id, input)
       return { id: candidate.id }
+    })
+  }
+
+  importProjectDns(input: z.output<typeof importDnsInventory>) {
+    return this.operate(input, () => {
+      const project = this.project(input.projectId)
+      const { zone, candidates } = parseDnsInventory(input.zone, input.document)
+      let added = 0
+      for (let offset = 0; offset < candidates.length; offset += 100) {
+        const rows = candidates.slice(offset, offset + 100).map(candidate => ({
+          ...candidate, id: randomUUID(), projectId: project.id,
+        }))
+        added += this.db.insert(tables.projectAssets).values(rows).onConflictDoNothing()
+          .returning({ id: tables.projectAssets.id }).all().length
+      }
+      const existing = candidates.length - added
+      this.event(null, 'inventory.dns_imported', 'Passive DNS inventory imported.', {
+        projectId: project.id, actorId: this.workspace.actorId, zone, added, existing,
+      })
+      return { id: project.id, added, existing }
     })
   }
 
@@ -331,8 +353,8 @@ export class Store {
     const inventory = this.db.select().from(tables.projectAssets).where(eq(tables.projectAssets.projectId, run.projectId)).all()
     this.updateRun(run.id, { candidates: inventory, phase: 'discovery', status: 'running' })
     const worker = this.makeWorker(run, 'discovery', undefined, 'Asset inventory', 'Review supplied project records and attribute the candidate origins.')
-    this.addArtifact(run, worker, 'inventory', 'Supplied asset inventory', JSON.stringify(inventory.map(({ origin, thirdParty, source }) =>
-      ({ origin, thirdParty, source })), null, 2))
+    this.addArtifact(run, worker, 'inventory', 'Supplied asset inventory', JSON.stringify(inventory.map(({ origin, thirdParty, source, dnsSource }) =>
+      ({ origin, thirdParty, source, ...(dnsSource ? { dnsSource } : {}) })), null, 2))
     this.updateWorker(worker.id, { status: 'complete', outcome: 'Reviewed supplied project records.' })
     this.message(run.id, worker.id, 'worker', `Recorded ${inventory.length} candidates from supplied project records.`)
     this.updateRun(run.id, { phase: 'review', status: 'waiting' })
@@ -448,7 +470,6 @@ export class Store {
           break
         case 'candidate': {
           if (run.phase === 'complete') throw new Error('Add the host to the project for the next run.')
-          if (run.candidates.length >= 48) throw new Error('This run already has 48 candidate hosts.')
           if (run.candidates.some(candidate => candidate.origin === input.candidate.origin)) throw new Error('This host is already in the inventory.')
           const asset = this.saveCandidate(run.projectId, input.candidate, false)
           this.updateRun(run.id, { candidates: [...run.candidates, asset] })

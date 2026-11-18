@@ -1,0 +1,1 @@
+ALTER TABLE `project_assets` ADD `dns_source` text;
