@@ -1,10 +1,10 @@
-import { z } from 'zod'
+import type { Verdict } from '../scripts/report-metrics.ts'
 import type { AssessmentCheckId } from '../src/domain.ts'
 import { healthyOrigin, primaryOrigin, unavailableOrigin } from './scenarios.ts'
 
 export const benchmarkSuite = 'northstar-report-v1'
-export const verdictSchema = z.enum(['confirmed', 'met', 'inconclusive', 'untested'])
-export type Verdict = z.infer<typeof verdictSchema>
+export { scoreReportCases, verdictSchema } from '../scripts/report-metrics.ts'
+export type { Verdict } from '../scripts/report-metrics.ts'
 
 export type ExpectedCase = {
   origin: string
@@ -65,23 +65,3 @@ export type CaseResult = {
 }
 
 export type ReportResult = { scenario: ScenarioId; cases: CaseResult[]; unmatchedConfirmations: number }
-
-export function scoreReportCases(cases: { expected: Verdict; reported: Verdict }[], unmatchedConfirmations: number) {
-  const expected = cases.filter(row => row.expected === 'confirmed').length
-  const confirmed = cases.filter(row => row.reported === 'confirmed').length + unmatchedConfirmations
-  const correct = cases.filter(row => row.expected === 'confirmed' && row.reported === 'confirmed').length
-  return {
-    cases: cases.length,
-    agreeingVerdicts: cases.filter(row => row.expected === row.reported).length,
-    expectedConfirmations: expected,
-    reportedConfirmations: confirmed,
-    correctConfirmations: correct,
-    falseConfirmations: confirmed - correct,
-    missedConfirmations: expected - correct,
-    precision: confirmed ? correct / confirmed : null,
-    recall: expected ? correct / expected : null,
-    met: cases.filter(row => row.reported === 'met').length,
-    inconclusive: cases.filter(row => row.reported === 'inconclusive').length,
-    untested: cases.filter(row => row.reported === 'untested').length,
-  }
-}

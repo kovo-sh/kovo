@@ -6,9 +6,9 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
 | `npm run test:e2e` | Fifteen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, candidate source evidence and scope changes, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and output-limit recovery. |
-| `npm run test:boundaries` | Fourteen tests passed. They cover plan and access case validation, legacy inventory links, supplied response provenance, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, network isolation, resource limits, and the worker's independent deadline. |
+| `npm run test:boundaries` | Nineteen tests passed. Fourteen cover scope, evidence, and the worker runtime. Five cover the matched report scorecard, including incorrect evidence, stale artifact references, and missing review results. |
 | `npm run benchmark:reports` | All 19 case verdicts matched across four report versions. All five confirmed findings supplied scoped evidence, worker comparisons, impact, and a fix check. |
-| GitHub Actions | The model retry fix passed on a fresh Ubuntu checkout, including the Docker worker build, thirteen boundary tests, fifteen production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `f48b400`](https://github.com/wwwillchen/guardian/actions/runs/44285482124) |
+| GitHub Actions | The report handoff and provenance commit passed on a fresh Ubuntu checkout, including the Docker worker build, fourteen boundary tests, fifteen production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `6c55af9`](https://github.com/wwwillchen/guardian/actions/runs/44286459363) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -72,6 +72,12 @@ Every confirmation linked to the scoped source record and the successful worker 
 An importer check used synthetic verdicts to verify rejection of missing cases and scoring of a false confirmation, an out-of-suite confirmation, and a missed expected result. Matched Artex results and the comparative reviewer exercise remain open.
 
 A separate replay used two archived root response captures from the local Artex task files. The expected verdicts were set from the saved response headers before running Guardian. The production browser imported the allowed metadata and source timestamps. With local provider recordings and a controlled planning failure, the isolated verifier matched all six cases. Two checks met the baseline, one gap was confirmed, and three were inconclusive. The browser and Markdown evidence retained the original timestamps. Those timestamps stayed local and the run made zero brokered page reads. The Artex task was marked done with 34 pending findings and no captured traffic linked to those findings. The replay supplies a holdout for Guardian's accuracy and handoff. A paired Artex baseline is still pending.
+
+## Matched report scorecard
+
+The comparison command verified the artifacts for a four-case Northstar access policy exercise. The pair used the export from Guardian's production browser replay and the output from Artex's native Markdown renderer. Artex rendered pre-adjudicated findings from the same local policy record. The Guardian export linked the original observation and verification for both confirmations. The local scorecard records evidence as passed and assessment accuracy and reader results as pending. The reader worksheet uses copies with neutral titles.
+
+Tests exercised a matched synthetic suite, including a duplicate confirmation, a high-severity miss, and out-of-scope evidence. They rejected a changed report, results tied to a different input, a mismatched run record, and reader answers for a stale report version. The command also returned exit status 1 with a readable scorecard when a confirmation's evidence was marked unrelated.
 
 ## Live Dyad smoke run
 

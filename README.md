@@ -69,6 +69,28 @@ Run `npm run benchmark:reports` to replay the Northstar cases through the produc
 
 To compare independently reviewed Artex reports for the same cases, set `GUARDIAN_ARTEX_REPORT_RESULTS` to a local JSON file outside `test-results/`. Use the scorecard's `suite` value, the Artex `version` and `model`, an `unmatchedConfirmations` count, and a `cases` object keyed by each case ID in the scorecard. Each case takes one of `confirmed`, `met`, `inconclusive`, or `untested`. Use `untested` for unsupported cases. Keep the source reports with the verdicts so the comparison can be audited.
 
+### Compare matched reports
+
+Use the offline scorecard for the release comparison. Keep the input packets, reports, and reviewed recordings in a private local directory. Use `{ "path": "report.md", "sha256": "…" }` for each file reference, with paths relative to the manifest directory and digests from `sha256sum`.
+
+```sh
+npm run --silent compare:reports -- .guardian/comparison/manifest.json > .guardian/comparison/scorecard.json
+```
+
+The manifest has `format` set to `1`, a `suite` name, a `mode` of `assessment` or `report-only`, and a list of `scenarios`. Give each scenario a unique `id` and these fields.
+
+| Field | Contents |
+| --- | --- |
+| `input` | Reference to JSON containing the shared `goal`, `scope` as HTTPS origins, `stoppingPoint` as `complete` or `interrupted`, and `capturedEvidence`. Set `overlappingObservations` to true for the multi-host case that uses them. Set `heldOut` on the scenario for a case reserved from tuning. |
+| `cases` | The verdicts established before reading the reports. Each entry has an `asset`, an `issue` identifier, and an `expected` verdict. Include `severity` on expected confirmations. |
+| `guardian` and `artex` | Optional results with the tool `version`, `model`, shared `inputSha256`, a `report` file reference, and reviewed `verdicts`. Each verdict has an `asset`, `issue`, and `verdict`. Enter one row per displayed confirmation, including repeats. For Guardian confirmations, label the `evidence` as `supported`, `missing`, `unrelated`, or `out-of-scope` after checking the original observation and verification. |
+| `runRecord` inside each product result | For an assessment, reference a JSON record containing `inputSha256`, `reportSha256`, and a `recording` file reference to the saved run. |
+| `reviews` | Optional paired reviews. Enter a `reader` ID, `guardian` and `artex` answers, and optional `notes`. Each product's answers contain its `reportSha256` and `tasks` with entries for `priority`, `remediation`, `impact`, `evidence`, and `recheck`. Grade each answer as `correct`, `incorrect`, or `unanswered`. |
+
+Use the same asset and issue identifiers in the expected cases and both sets of verdicts. Mark unsupported checks `untested`. Put pre-adjudicated export exercises in `report-only` mode. The scorecard checks file integrity and uses the recorded judgments to score precision, recall, misses by severity, duplicate findings, and reader tasks. Review the saved artifacts when adjudicating any verdict or evidence link.
+
+The release status stays pending while matched run records, representative cases, or paired reader results are missing. Invalid references or a failed criterion exit with an error. A failed comparison still writes the scorecard so the reasons can be reviewed.
+
 ## View the sample run
 
 ```sh
