@@ -1,26 +1,18 @@
-import { z } from 'zod'
-import { referrerPolicies, responseCheckIds, responseCheckTitles } from '../domain.ts'
-import type { CheckCoverage, Finding, PreparedObservation, ResponseCheckId } from '../domain.ts'
+import { assessmentCheckTitles, referrerPolicies, responseCheckIds } from '../domain.ts'
+import type { CheckCoverage, PreparedObservation, ResponseCheckId } from '../domain.ts'
 import type { PublicObservation } from './broker.ts'
+import type { Baseline, CheckValue, EvidenceReview, FindingRule } from './evidence-checks.ts'
 
-type Baseline = { minimum: number } | { allowed: readonly string[] }
-type CheckValue = number | string | null
-type Control = {
+type Control = FindingRule & {
   id: ResponseCheckId
   field: keyof Pick<PreparedObservation, 'transportMaxAge' | 'contentTypeOptions' | 'referrerPolicy'>
-  title: string
-  findingTitle: string
-  severity: Finding['severity']
   expected: string
   baseline: Baseline
-  impact: string
-  remediation: string
-  recheck: string
 }
 
 const controls: readonly Control[] = [
   {
-    id: 'hsts', field: 'transportMaxAge', title: responseCheckTitles.hsts,
+    id: 'hsts', field: 'transportMaxAge', title: assessmentCheckTitles.hsts,
     findingTitle: 'HSTS max-age missing or disabled', severity: 'low',
     expected: 'A positive Strict-Transport-Security max-age.',
     baseline: { minimum: 1 },
@@ -29,7 +21,7 @@ const controls: readonly Control[] = [
     recheck: 'Review a fresh authorized HTTPS response for this host and confirm the max-age is positive.',
   },
   {
-    id: 'nosniff', field: 'contentTypeOptions', title: responseCheckTitles.nosniff,
+    id: 'nosniff', field: 'contentTypeOptions', title: assessmentCheckTitles.nosniff,
     findingTitle: 'MIME sniffing protection missing', severity: 'informational',
     expected: 'X-Content-Type-Options set to nosniff.',
     baseline: { allowed: ['nosniff'] },
@@ -38,7 +30,7 @@ const controls: readonly Control[] = [
     recheck: 'Review a fresh authorized response for nosniff and check that scripts and stylesheets in a controlled browser session still load.',
   },
   {
-    id: 'referrer-policy', field: 'referrerPolicy', title: responseCheckTitles['referrer-policy'],
+    id: 'referrer-policy', field: 'referrerPolicy', title: assessmentCheckTitles['referrer-policy'],
     findingTitle: 'Referrer policy permits full cross-origin URLs', severity: 'low',
     expected: 'No explicit header policy that sends full URLs to other HTTPS origins.',
     baseline: {
@@ -49,14 +41,6 @@ const controls: readonly Control[] = [
     recheck: 'Review a fresh authorized response and confirm the last recognized Referrer-Policy value is restrictive.',
   },
 ]
-
-type Comparison = { id: ResponseCheckId; observed: CheckValue; baseline: Baseline }
-
-export type ResponseReview = {
-  rule: Control
-  coverage: CheckCoverage
-  comparison?: Comparison
-}
 
 export function responseEvidence(observation: PublicObservation, checks: readonly ResponseCheckId[]) {
   const { origin, finalOrigin, status, mediaType, source } = observation
@@ -77,7 +61,7 @@ function displayValue(value: CheckValue) {
 }
 
 export function responseReview(observation: PublicObservation | null | undefined, readNote?: string,
-  checks: readonly ResponseCheckId[] = responseCheckIds): ResponseReview[] {
+  checks: readonly ResponseCheckId[] = responseCheckIds): EvidenceReview[] {
   // A successful final response on a different host cannot establish the policy of the initiating host.
   const blocked = !observation
     ? readNote ?? 'A response under the current approval was unavailable.'
@@ -111,47 +95,4 @@ export function responseReview(observation: PublicObservation | null | undefined
     }
     return { rule, coverage, comparison: { id: rule.id, observed, baseline: rule.baseline } }
   })
-}
-
-export function meetsBaseline({ observed, baseline }: Comparison) {
-  if ('minimum' in baseline) return typeof observed === 'number' && observed >= baseline.minimum
-  return typeof observed === 'string' && baseline.allowed.includes(observed)
-}
-
-export const responseVerificationCommand = [
-  "jq 'map({id, outcome: (",
-  '  if .baseline.minimum != null then',
-  '    if (.observed | type) == "number" and .observed >= .baseline.minimum then "met" else "gap" end',
-  '  else',
-  '    if (.observed as $value | .baseline.allowed | index($value)) != null then "met" else "gap" end',
-  '  end',
-  ")})' /evidence/checks.json > /work/verification.json",
-].join('\n')
-
-const outcomes = z.array(z.object({
-  id: z.enum(responseCheckIds),
-  outcome: z.enum(['met', 'gap']),
-})).max(controls.length)
-
-export function readComparisons(output: string | undefined) {
-  if (!output) return new Map<ResponseCheckId, 'met' | 'gap'>()
-  try {
-    const results = outcomes.parse(JSON.parse(output))
-    const map = new Map(results.map(result => [result.id, result.outcome]))
-    if (map.size === results.length) return map
-  } catch {
-    // An incomplete worker result is handled as inconclusive.
-  }
-  return new Map<ResponseCheckId, 'met' | 'gap'>()
-}
-
-export function checkCoverage(review: ResponseReview, result: 'met' | 'gap' | undefined): CheckCoverage {
-  const { coverage, comparison } = review
-  if (!comparison) return coverage
-  if (!result || (result === 'met') !== meetsBaseline(comparison)) {
-    return { ...coverage, reason: 'The worker did not return a valid comparison for this observation.' }
-  }
-  return { ...coverage, status: result, reason: result === 'met'
-    ? 'The recorded value meets the response baseline.'
-    : 'The recorded value falls outside the response baseline.' }
 }

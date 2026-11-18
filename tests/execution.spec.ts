@@ -142,7 +142,7 @@ test('revokes a host while its real fixture connection is pending and discards t
     await page.getByRole('button', { name: 'Review scope' }).click()
     await page.getByRole('checkbox', { name: 'Include docs.northstar.example' }).uncheck()
     await saveScope(page, 'Save scope revision')
-    await expect(page.getByText('1 approved hosts · Revision 2')).toBeVisible()
+    await expect(page.getByText('1 approved host · Revision 2')).toBeVisible()
     fixture.release()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 })
@@ -185,7 +185,7 @@ test('resumes a saved observation after narrowing scope for an unrelated host', 
     await page.getByRole('button', { name: 'Review scope' }).click()
     await page.getByRole('checkbox', { name: 'Include docs.northstar.example' }).uncheck()
     await saveScope(page, 'Save scope revision')
-    await expect(page.getByText('1 approved hosts · Revision 2')).toBeVisible()
+    await expect(page.getByText('1 approved host · Revision 2')).toBeVisible()
 
     await app.stop('SIGKILL')
     fixture.dropHeldModel()

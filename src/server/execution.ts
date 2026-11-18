@@ -1,14 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { and, asc, eq } from 'drizzle-orm'
-import type { Candidate, CheckCoverage, Finding, ProviderSettings, ResponseCheckId } from '../domain.ts'
+import type { AccessPolicySnapshot } from '../access-policy.ts'
+import { responseCheckIds } from '../domain.ts'
+import type { AssessmentCheckId, Candidate, CheckCoverage, Finding, ProviderSettings, ResponseCheckId } from '../domain.ts'
+import { accessPolicyReviews } from './access-policy-checks.ts'
 import { agentTurn, coordinatorPrompt, workerInput } from './agent-session.ts'
 import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { PublicObservation } from './broker.ts'
+import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
+import type { EvidenceReview } from './evidence-checks.ts'
 import { privateModelSettings } from './model-settings.ts'
 import { redact } from './redact.ts'
-import { checkCoverage, meetsBaseline, readComparisons, responseReview, responseVerificationCommand } from './response-checks.ts'
-import type { ResponseReview } from './response-checks.ts'
-import { parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
+import { responseReview } from './response-checks.ts'
+import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { findings, messages } from './schema.ts'
 import { assessmentAssignments, store } from './store.ts'
 import type { Assignment, Run, Store } from './store.ts'
@@ -20,6 +24,7 @@ type Active = {
   controller: AbortController
 }
 type Capture = { observation: PublicObservation | null; note: string }
+type ReviewInput = { artifactId?: string; reviews: EvidenceReview[]; policy?: AccessPolicySnapshot }
 type CoordinatorTask = { controller: AbortController; goalRevision: number; scopeRevision?: number }
 
 export function derivedResult(result: { exitStatus: number; result: string; stdout: string }) {
@@ -122,8 +127,9 @@ class Execution {
     }
     for (const run of this.storage.runnable()) {
       if (run.phase === 'analysis' && run.reviewPlan?.status === 'pending') {
-        if (model && run.approved.length) this.startPlanning(run, model)
-        else this.storage.commitReviewPlan(run.id, run.goalRevision, standardChecks)
+        const available = availableReviewChecks(run.candidates.filter(asset => run.approved.includes(asset.id)), run.sourceMode)
+        if (model && run.approved.length) this.startPlanning(run, model, available)
+        else this.storage.commitReviewPlan(run.id, run.goalRevision, standardChecks(available))
         continue
       }
       if (!model) continue
@@ -153,7 +159,7 @@ class Execution {
         for (const asset of run.candidates.filter(asset => run.approved.includes(asset.id))) {
           if (!assessmentAssignments(workers, asset.id, run.goalRevision).verification) {
             this.storage.makeWorker(updated, 'verification', asset, `Verify ${new URL(asset.origin).hostname}`,
-              'Compare the recorded response metadata with the HTTPS and browser header baselines.')
+              'Compare the recorded evidence with the selected baselines.')
           }
         }
         this.storage.event(run.id, 'verification.started', 'Verification started from recorded evidence.')
@@ -243,13 +249,12 @@ class Execution {
     return { capture, id: evidence.id }
   }
 
-  private async analyze(job: Active, asset: Candidate, model: ProviderSettings) {
+  private async analyzeResponse(job: Active, asset: Candidate, model: ProviderSettings, checks?: readonly ResponseCheckId[]) {
     const { capture, id } = await this.capture(job, asset)
     const run = this.check(job)
-    const selectedChecks = run.reviewPlan?.status === 'ready' ? run.reviewPlan.checks : undefined
     let summary = capture.note
     if (capture.observation) {
-      const input = workerInput(capture.observation, selectedChecks)
+      const input = workerInput(capture.observation, checks)
       const inputs = [{ name: 'observed.json', content: JSON.stringify(input.evidence) }]
       summary = await agentTurn({
         directory: this.storage.directory, sessionId: job.assignment.sessionId,
@@ -276,40 +281,85 @@ class Execution {
         },
       })
     }
+    return { artifactId: id, summary, reviews: responseReview(capture.observation, capture.note, checks) }
+  }
 
+  private async analyze(job: Active, asset: Candidate, model: ProviderSettings) {
+    const run = this.check(job)
+    const plan = run.reviewPlan?.status === 'ready' ? run.reviewPlan : undefined
+    const selected: readonly AssessmentCheckId[] = plan?.checks ?? responseCheckIds
+    const responseChecks = selected.filter(id => id !== 'access-policy')
+    const response = responseChecks.length ? await this.analyzeResponse(job, asset, model, plan ? responseChecks : undefined) : undefined
     const current = this.check(job)
     this.storage.db.transaction(() => {
-      for (const review of responseReview(capture.observation, capture.note, selectedChecks)) {
-        if (review.comparison && !meetsBaseline(review.comparison)) {
-          const reason = 'The recorded value falls outside the response baseline. Verification is pending.'
-          const earlier = this.finding(current, asset, review.rule.id)
-          this.saveFinding(current, asset, review, 'pending', reason, [id], earlier?.id)
+      const inputs = response ? [response] : []
+      if (selected.includes('access-policy')) {
+        // Use the run inventory snapshot so later project imports cannot replace the evidence mid-run.
+        const snapshot = asset.accessPolicy?.origin === asset.origin ? asset.accessPolicy : undefined
+        const artifact = this.storage.addArtifact(current, job.assignment, 'access-policy', 'Supplied access policy records',
+          JSON.stringify({ origin: asset.origin, snapshot: snapshot ?? null }, null, 2), 'access-policy')
+        inputs.push({
+          artifactId: artifact.id, reviews: accessPolicyReviews(snapshot),
+          summary: snapshot ? `Prepared ${snapshot.expected.length} access policy cases for verification.` : 'Access policy records are needed for this host.',
+        })
+      }
+      for (const { artifactId, reviews } of inputs) {
+        for (const review of reviews) {
+          if (review.comparison && !meetsBaseline(review.comparison)) {
+            const reason = 'The recorded value falls outside the expected policy. Verification is pending.'
+            const earlier = this.finding(current, asset, review)
+            this.saveFinding(current, asset, review, 'pending', reason, [artifactId], earlier?.id)
+          }
         }
       }
-      this.complete(job, current, summary, id)
+      this.complete(job, current, inputs.map(input => input.summary).join('\n'), inputs.map(input => input.artifactId))
     }, { behavior: 'immediate' })
   }
 
-  private async verify(job: Active, asset: Candidate) {
+  private responseVerificationInput(job: Active, analysis: Assignment | undefined, checks: readonly ResponseCheckId[]): ReviewInput {
     const run = this.check(job)
-    const { analysis } = assessmentAssignments(this.storage.workerList(run.id), asset.id, run.goalRevision)
-    const stored = analysis?.status === 'complete' ? this.storage.assignmentObservation(analysis.id) : undefined
+    const stored = analysis ? this.storage.assignmentObservation(analysis.id) : undefined
     const record = stored ? JSON.parse(this.storage.artifact(run.id, stored.id).content) as Capture : undefined
     const origins = analysis && record?.observation ? this.observationOrigins(analysis, record.observation) : []
     const authorized = [...origins].every(origin => this.permitted(run, origin))
     const observation = authorized ? record?.observation : null
     const note = authorized ? record?.note : 'The saved observation includes a host outside the current approval.'
-    const selectedChecks = run.reviewPlan?.status === 'ready' ? run.reviewPlan.checks : undefined
-    const reviews = responseReview(observation, note, selectedChecks)
-    const comparisons = reviews.flatMap(review => review.comparison ? [review.comparison] : [])
     if (authorized) for (const origin of origins) job.origins.add(origin)
+    return { artifactId: authorized ? stored?.id : undefined, reviews: responseReview(observation, note, checks) }
+  }
+
+  private accessVerificationInput(run: Run, asset: Candidate, analysis: Assignment | undefined): ReviewInput {
+    const stored = analysis ? this.storage.assignmentEvidence(analysis.id, 'access-policy') : undefined
+    const record = stored ? JSON.parse(this.storage.artifact(run.id, stored.id).content) as {
+      origin: string; snapshot: AccessPolicySnapshot | null
+    } : undefined
+    const snapshot = record?.origin === asset.origin && record.snapshot?.origin === asset.origin ? record.snapshot : undefined
+    return { artifactId: record?.origin === asset.origin ? stored?.id : undefined, reviews: accessPolicyReviews(snapshot), policy: snapshot }
+  }
+
+  private async verify(job: Active, asset: Candidate) {
+    const run = this.check(job)
+    const { analysis } = assessmentAssignments(this.storage.workerList(run.id), asset.id, run.goalRevision)
+    const ready = analysis?.status === 'complete' ? analysis : undefined
+    const selected: readonly AssessmentCheckId[] = run.reviewPlan?.status === 'ready' ? run.reviewPlan.checks : responseCheckIds
+    const responseChecks = selected.filter(id => id !== 'access-policy')
+    const includesAccess = selected.includes('access-policy')
+    const response = responseChecks.length ? this.responseVerificationInput(job, ready, responseChecks) : undefined
+    const access = includesAccess ? this.accessVerificationInput(run, asset, ready) : undefined
+    const inputs = [response, access].filter(input => input !== undefined)
+    const responseComparisons = response?.reviews.flatMap(review => review.comparison ? [review.comparison] : []) ?? []
+    const accessComparisons = access?.reviews.flatMap(review => review.comparison ? [review.comparison] : []) ?? []
+    const comparisons = [...responseComparisons, ...accessComparisons]
+    const payload = { response: responseComparisons, access: access?.policy ?? null }
     const result = comparisons.length ? await this.backend.run({
       assignmentId: job.assignment.id,
-      files: [{ name: 'checks.json', content: JSON.stringify(comparisons) }],
-      command: responseVerificationCommand, outputs: ['verification.json'],
+      files: [{ name: 'verification-input.json', content: JSON.stringify(payload) }],
+      command: verificationCommand, outputs: ['verification.json'],
     }, job.controller.signal) : undefined
-    const outcomes = readComparisons(result?.exitCode === 0 ? result.outputs['verification.json'] : undefined)
-    const checks = reviews.map(review => checkCoverage(review, outcomes.get(review.rule.id)))
+    const outcomes = readComparisons(result?.exitCode === 0 ? result.outputs['verification.json'] : undefined, comparisons)
+    const verified = inputs.flatMap(({ artifactId, reviews }) =>
+      reviews.map(review => ({ artifactId, review, coverage: checkCoverage(review, outcomes) })))
+    const checks = verified.map(item => item.coverage)
 
     const current = this.check(job)
     const assessed = checks.filter(check => check.status === 'met' || check.status === 'gap').length
@@ -318,34 +368,35 @@ class Execution {
       ? `${assessed} checks verified · ${gaps === 1 ? '1 gap' : gaps + ' gaps'}`
       : 'Inconclusive: ' + checks[0].reason
     this.storage.db.transaction(() => {
-      const inputs = authorized && stored ? [stored.id] : []
-      const evidence = this.storage.addArtifact(current, job.assignment, 'verification', 'Response policy verification',
+      const title = includesAccess ? (responseChecks.length ? 'Evidence verification' : 'Access policy verification') : 'Response policy verification'
+      const evidence = this.storage.addArtifact(current, job.assignment, 'verification', title,
         JSON.stringify({
-          origin: asset.origin, inputEvidence: inputs, checks, comparisons,
-          command: result ? responseVerificationCommand : undefined,
+          origin: asset.origin, inputEvidence: inputs.flatMap(input => input.artifactId ? [input.artifactId] : []), checks, comparisons,
+          accessRecord: access?.artifactId,
+          command: result ? verificationCommand : undefined,
           exitStatus: result?.exitCode, interpreter: result ? 'just-bash 3.6.1' : undefined,
         }, null, 2), 'verification')
-      const links = [...inputs, evidence.id]
-      for (const [index, review] of reviews.entries()) {
-        const { status, reason } = checks[index]
-        const earlier = this.finding(current, asset, review.rule.id)
+      for (const { artifactId, review, coverage } of verified) {
+        const { status, reason } = coverage
+        const links = artifactId ? [artifactId, evidence.id] : [evidence.id]
+        const earlier = this.finding(current, asset, review)
         if (status === 'gap') this.saveFinding(current, asset, review, 'confirmed', reason, links, earlier?.id)
         else if (status === 'inconclusive' && (earlier || review.rule.id === 'hsts')) {
           this.saveFinding(current, asset, review, 'inconclusive', reason, links, earlier?.id)
         } else if (earlier) this.saveFinding(current, asset, review, 'dismissed', reason, links, earlier.id)
       }
-      this.complete(job, current, outcome, evidence.id, checks)
+      this.complete(job, current, outcome, [evidence.id], checks)
     }, { behavior: 'immediate' })
   }
 
-  private finding(run: Run, asset: Candidate, checkId: ResponseCheckId) {
+  private finding(run: Run, asset: Candidate, review: EvidenceReview) {
     return this.storage.db.select().from(findings).where(and(
       eq(findings.runId, run.id), eq(findings.assetId, asset.id), eq(findings.goalRevision, run.goalRevision),
-      eq(findings.checkId, checkId),
+      eq(findings.checkId, review.rule.id), eq(findings.caseId, review.coverage.caseId ?? ''),
     )).get()
   }
 
-  private saveFinding(run: Run, asset: Candidate, review: ResponseReview, status: Finding['status'], reason: string,
+  private saveFinding(run: Run, asset: Candidate, review: EvidenceReview, status: Finding['status'], reason: string,
     evidenceIds: string[], existingId?: string) {
     const { rule, coverage } = review
     const confirmed = status === 'confirmed'
@@ -356,40 +407,41 @@ class Execution {
       status, severity: confirmed ? rule.severity : 'informational',
       reason,
       remediation: confirmed ? rule.remediation : status === 'inconclusive'
-        ? 'Supply a current authorized response record and repeat the review.'
+        ? 'Supply a current record from the approved host and repeat the review.'
         : status === 'pending' ? 'Resume the run to verify the observation.' : 'Review the verification evidence.',
       impact: confirmed ? rule.impact : undefined,
       recheck: confirmed ? rule.recheck : undefined,
-      check: { id: rule.id, expected: coverage.expected, observed: coverage.observed },
+      check: { id: rule.id, caseId: coverage.caseId, expected: coverage.expected, observed: coverage.observed },
       evidenceIds, scopeRevision: run.scopeRevision,
     }
     if (existingId) this.storage.db.update(findings).set({ finding: record }).where(eq(findings.id, record.id)).run()
     else this.storage.db.insert(findings).values({
-      id: record.id, runId: run.id, assetId: asset.id, goalRevision: run.goalRevision, checkId: rule.id, finding: record,
+      id: record.id, runId: run.id, assetId: asset.id, goalRevision: run.goalRevision, checkId: rule.id,
+      caseId: coverage.caseId ?? '', finding: record,
     }).run()
   }
 
-  private complete(job: Active, run: Run, summary: string, artifactId: string, checks?: CheckCoverage[]) {
+  private complete(job: Active, run: Run, summary: string, artifactIds: string[], checks?: CheckCoverage[]) {
     const worker = job.assignment
     const outcome = redact(summary)
     this.storage.addArtifact(run, worker, 'handoff', 'result.md', [
-      '# Result', '', outcome, '', 'Evidence: ' + artifactId,
+      '# Result', '', outcome, '', 'Evidence: ' + artifactIds.join(', '),
     ].join('\n'), 'result')
     this.storage.updateWorker(worker.id, { status: 'complete', lease: null, outcome, checks })
     this.storage.message(run.id, worker.id, 'worker', outcome)
-    this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', { assignmentId: worker.id, artifactId })
+    this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', { assignmentId: worker.id, artifactId: artifactIds[0] })
   }
 
-  private startPlanning(run: Run, model: ProviderSettings) {
+  private startPlanning(run: Run, model: ProviderSettings, available: readonly AssessmentCheckId[]) {
     if (this.coordinator.has(run.id) || run.reviewPlan?.status !== 'pending') return
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision }
     this.coordinator.set(run.id, task)
     void agentTurn({
       directory: this.storage.directory, sessionId: run.reviewPlan.goalMessageId, requestId: 'plan',
-      settings: model, scenario: 'coordinator-plan', prompt: reviewPlanPrompt(run.goal, run.sourceMode),
+      settings: model, scenario: 'coordinator-plan', prompt: reviewPlanPrompt(run.goal, run.sourceMode, available),
       signal: controller.signal,
-    }).then(answer => parseReviewPlan(answer) ?? standardChecks, () => standardChecks).then(selection => {
+    }).then(answer => parseReviewPlan(answer, available) ?? standardChecks(available), () => standardChecks(available)).then(selection => {
       if (!this.currentCoordinator(run.id, task)) return
       this.storage.commitReviewPlan(run.id, run.goalRevision, selection)
     }).catch(() => {

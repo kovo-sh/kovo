@@ -279,6 +279,7 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .report-top h2 { font: 400 clamp(35px,6vw,58px)/1.05 'Instrument Serif', Georgia, serif; color: var(--text); }
 .report-summary { margin: 19px 0 6px; font-weight: 650; font-size: 17px; }
 .finding { display: grid; gap: 8px; padding: 15px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.finding .state { flex-shrink: 0; white-space: nowrap; }
 .finding-meta { color: var(--muted); font-size: 12px; }
 .finding-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 18px; margin: 4px 0; font-size: 13px; line-height: 1.6; }
 .finding-details dt { color: var(--muted); }

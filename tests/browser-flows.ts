@@ -33,8 +33,12 @@ export async function reviewScope(page: Page, options: {
     await page.getByRole('button', { name: 'Add to project' }).click()
     await page.getByRole('button', { name: 'Add to project' }).waitFor({ state: 'hidden' })
   }
-  await page.getByLabel('Run goal').fill(options.goal)
-  if (options.live) await page.getByRole('checkbox', { name: 'Read approved public pages during this run' }).check()
+  await openScopeReview(page, options.goal, options.live)
+}
+
+export async function openScopeReview(page: Page, goal: string, live = false) {
+  await page.getByLabel('Run goal').fill(goal)
+  if (live) await page.getByRole('checkbox', { name: 'Read approved public pages during this run' }).check()
   await page.getByRole('button', { name: 'Create run', exact: true }).click()
   await page.getByRole('checkbox', { name: 'I authorize discovery for these assets.' }).check()
   await page.getByRole('button', { name: 'Start discovery' }).click()

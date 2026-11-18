@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { AccessPolicySnapshot } from './access-policy.ts'
 
 export const id = z.uuid()
 export const shortText = z.string().trim().min(1).max(120)
@@ -76,6 +77,7 @@ export interface Candidate {
   thirdParty: boolean
   prepared?: PreparedObservation | null
   dnsSource?: DnsSource | null
+  accessPolicy?: AccessPolicySnapshot | null
 }
 
 export interface DnsSource {
@@ -91,7 +93,7 @@ export interface EvidenceSummary {
   assignmentId: string
   scopeRevision: number
   title: string
-  kind: 'inventory' | 'observation' | 'analysis' | 'verification' | 'handoff'
+  kind: 'inventory' | 'observation' | 'access-policy' | 'analysis' | 'verification' | 'handoff'
   createdAt: number
 }
 
@@ -100,26 +102,29 @@ export interface Finding {
   origin: string
   title: string
   status: 'pending' | 'confirmed' | 'dismissed' | 'inconclusive'
-  severity: 'low' | 'informational'
+  severity: 'medium' | 'low' | 'informational'
   reason: string
   remediation: string
   evidenceIds: string[]
   scopeRevision: number
   impact?: string
   recheck?: string
-  check?: Pick<CheckCoverage, 'id' | 'expected' | 'observed'>
+  check?: Pick<CheckCoverage, 'id' | 'caseId' | 'expected' | 'observed'>
 }
 
 export const responseCheckIds = ['hsts', 'nosniff', 'referrer-policy'] as const
 export type ResponseCheckId = typeof responseCheckIds[number]
-export const responseCheckTitles: Record<ResponseCheckId, string> = {
+export const assessmentCheckIds = [...responseCheckIds, 'access-policy'] as const
+export type AssessmentCheckId = typeof assessmentCheckIds[number]
+export const assessmentCheckTitles: Record<AssessmentCheckId, string> = {
   hsts: 'HSTS policy',
   nosniff: 'MIME sniffing protection',
   'referrer-policy': 'Referrer policy',
+  'access-policy': 'Access policy decisions',
 }
 
 export interface SelectedChecks {
-  checks: ResponseCheckId[]
+  checks: AssessmentCheckId[]
   source: 'coordinator' | 'standard'
 }
 
@@ -128,7 +133,8 @@ export type ReviewPlan =
   | ({ status: 'ready'; goalMessageId: string } & SelectedChecks)
 
 export interface CheckCoverage {
-  id: ResponseCheckId
+  id: AssessmentCheckId
+  caseId?: string
   title: string
   status: 'met' | 'gap' | 'inconclusive' | 'not-applicable'
   expected: string
@@ -147,6 +153,7 @@ export interface ReportBody {
     status: string
     evidenceId: string | null
     analysisEvidenceId?: string
+    accessEvidence?: { id: string; recordedAt?: string }
     checks?: CheckCoverage[]
   }[]
   findings: Finding[]

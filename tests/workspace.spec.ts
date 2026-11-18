@@ -40,7 +40,7 @@ test('persists project, approval, and worker context across production restarts'
     await expect(page.getByRole('checkbox', { name: 'Include docs.northstar.example' })).not.toBeChecked()
     await page.getByRole('checkbox', { name: 'I authorize read-only review of the selected hosts.' }).check()
     await page.getByRole('button', { name: 'Approve scope' }).click()
-    await expect(page.getByText('1 approved hosts · Revision 1')).toBeVisible()
+    await expect(page.getByText('1 approved host · Revision 1')).toBeVisible()
     await page.getByRole('button', { name: 'Run actions', exact: true }).click()
     await page.getByRole('menuitem', { name: 'Revise goal' }).click()
     await page.getByRole('textbox', { name: 'Revise goal' }).fill('Review only the public transport policy.')

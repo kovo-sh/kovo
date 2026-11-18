@@ -6,7 +6,8 @@ import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
-import { responseCheckTitles } from '../domain.ts'
+import type { importAccessPolicy } from '../access-policy.ts'
+import { assessmentCheckTitles } from '../domain.ts'
 import type { Candidate, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import * as tables from './schema.ts'
@@ -293,6 +294,24 @@ export class Store {
     })
   }
 
+  importProjectAccessPolicy(input: z.output<typeof importAccessPolicy>) {
+    return this.operate(input, () => {
+      const project = this.project(input.projectId)
+      const snapshot = input.snapshot
+      const json = JSON.stringify(snapshot)
+      if (redact(json) !== json) throw new Error('Use case, role, and capability labels without credentials.')
+      const target = and(eq(tables.projectAssets.projectId, project.id), eq(tables.projectAssets.origin, snapshot.origin))
+      const asset = this.db.update(tables.projectAssets).set({ accessPolicy: snapshot }).where(target)
+        .returning({ id: tables.projectAssets.id }).get()
+      if (!asset) throw new Error('Select a file for an existing project host.')
+      this.event(null, 'inventory.access_policy_imported', 'Access policy records imported.', {
+        projectId: project.id, assetId: asset.id, actorId: this.workspace.actorId,
+        recordedAt: snapshot.recordedAt, expected: snapshot.expected.length, observed: snapshot.observed.length,
+      })
+      return { id: asset.id, origin: snapshot.origin, cases: snapshot.expected.length }
+    })
+  }
+
   private saveCandidate(projectId: string, input: Omit<Candidate, 'id'>, replace = true) {
     const candidate = {
       id: randomUUID(), projectId, origin: input.origin, source: redact(input.source),
@@ -317,7 +336,7 @@ export class Store {
     }).returning().get()
     const target = candidate?.origin ?? 'Supplied project records'
     const checks = run.reviewPlan?.status === 'ready' && phase !== 'discovery'
-      ? ['Checks: ' + run.reviewPlan.checks.map(id => responseCheckTitles[id]).join(', ')] : []
+      ? ['Checks: ' + run.reviewPlan.checks.map(id => assessmentCheckTitles[id]).join(', ')] : []
     this.addArtifact(run, assignment, 'handoff', 'assignment.md',
       ['# Assignment', '', objective, '', 'Input: ' + target, 'Goal: ' + run.goal,
         'Goal revision: ' + run.goalRevision, 'Scope revision: ' + run.scopeRevision, ...checks].join('\n'), 'assignment')
@@ -327,7 +346,7 @@ export class Store {
   private queueAnalysis(run: Run, assetIds: string[]) {
     for (const asset of run.candidates.filter(asset => assetIds.includes(asset.id))) {
       this.makeWorker(run, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
-        'Record the approved response metadata and identify gaps in the planned checks.')
+        'Review the approved evidence and identify gaps in the planned checks.')
     }
   }
 
@@ -338,7 +357,7 @@ export class Store {
       if (run.status !== 'running' || run.phase !== 'analysis' || run.goalRevision !== goalRevision || plan?.status !== 'pending') return
       const updated = this.updateRun(run.id, { reviewPlan: { status: 'ready', goalMessageId: plan.goalMessageId, ...selection } })
       this.queueAnalysis(updated, updated.approved)
-      const titles = selection.checks.map(id => responseCheckTitles[id]).join(', ')
+      const titles = selection.checks.map(id => assessmentCheckTitles[id]).join(', ')
       const planned = selection.source === 'coordinator'
       this.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'guardian',
         (planned ? 'I’ll review ' : 'Standard checks selected for this run. Checks include ') + titles + '.', plan.goalMessageId)
@@ -422,7 +441,8 @@ export class Store {
       excluded: updated.candidates.filter(asset => !approved.includes(asset.id)).map(asset => asset.origin),
       removed, added,
     })
-    this.message(run.id, run.coordinatorId, 'guardian', `Scope revision ${scopeRevision} approved for ${approved.length} hosts.`)
+    this.message(run.id, run.coordinatorId, 'guardian',
+      `Scope revision ${scopeRevision} approved for ${approved.length} ${approved.length === 1 ? 'host' : 'hosts'}.`)
   }
 
   private revise(run: Run, input: string) {
@@ -465,8 +485,9 @@ export class Store {
       const evidence = snapshot.evidence.filter(item => item.assignmentId === analyzed?.id || item.assignmentId === verified?.id)
       for (const item of evidence) currentEvidence.add(item.id)
       const artifact = evidence.findLast(item => item.assignmentId === done?.id &&
-        (verified ? item.kind === 'verification' : item.kind === 'observation'))
+        (verified ? item.kind === 'verification' : ['observation', 'access-policy'].includes(item.kind)))
       const derived = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'analysis')
+      const access = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'access-policy')
       const status = verified?.outcome ?? (analyzed ? 'Analysis complete. Verification pending.' : 'Pending review')
       if (!verified || !artifact) {
         gaps.push(asset.origin + ' · ' + status)
@@ -479,6 +500,7 @@ export class Store {
       return {
         origin: asset.origin, status,
         evidenceId: artifact?.id ?? null, analysisEvidenceId: derived?.id,
+        ...(access ? { accessEvidence: { id: access.id, recordedAt: asset.accessPolicy?.recordedAt } } : {}),
         ...(verified?.checks ? { checks: verified.checks } : {}),
       }
     })
@@ -487,13 +509,14 @@ export class Store {
     )).all().filter(row => run.approved.includes(row.assetId) && row.finding.evidenceIds.length > 0 &&
       row.finding.evidenceIds.every(id => currentEvidence.has(id))).map(row => row.finding)
     const statusOrder = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
-    const severityOrder = { low: 0, informational: 1 }
+    const severityOrder = { medium: 0, low: 1, informational: 2 }
     results.sort((a, b) => statusOrder[a.status] - statusOrder[b.status] ||
       severityOrder[a.severity] - severityOrder[b.severity] ||
       a.origin.localeCompare(b.origin) || a.title.localeCompare(b.title))
     if (!scope.length) gaps.push('No approved hosts in this report.')
     const body: ReportBody = {
-      goal: run.goal, scope, scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results, gaps,
+      goal: run.goal, scope: scope.map(({ accessPolicy, ...asset }) => asset),
+      scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results, gaps,
       ...(run.reviewPlan?.status === 'ready'
         ? { selectedChecks: { checks: run.reviewPlan.checks, source: run.reviewPlan.source } } : {}),
     }

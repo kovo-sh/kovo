@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { responseCheckTitles } from '../domain.ts'
+import { assessmentCheckTitles } from '../domain.ts'
 import type { CheckCoverage } from '../domain.ts'
 import { Status, timeText } from './common.tsx'
 import type { RunDetail } from './run-state.ts'
@@ -24,10 +24,14 @@ export function RunReport({ detail, openEvidence }: {
   const { body } = report
   const confirmed = body.findings.filter(item => item.status === 'confirmed').length
   const approvedHosts = body.scope.length === 1 ? '1 approved host' : body.scope.length + ' approved hosts'
-  const evidenceSource = detail.run.sourceMode === 'prepared' ? 'Supplied response metadata' : 'Approved HTTPS root responses'
   const plan = body.selectedChecks
+  const evidenceSource = [
+    ...(!plan || plan.checks.some(id => id !== 'access-policy')
+      ? [detail.run.sourceMode === 'prepared' ? 'Supplied response metadata' : 'Approved HTTPS root responses'] : []),
+    ...(plan?.checks.includes('access-policy') ? ['Supplied access policy records'] : []),
+  ].join(' · ')
   const plannedChecks = plan && (plan.source === 'standard' ? 'Standard checks' : 'Planned checks') +
-    ' · ' + plan.checks.map(id => responseCheckTitles[id]).join(', ')
+    ' · ' + plan.checks.map(id => assessmentCheckTitles[id]).join(', ')
   const evidenceTitles = new Map(detail.evidence.map(item => [item.id, item.title]))
 
   function exportText() {
@@ -38,7 +42,10 @@ export function RunReport({ detail, openEvidence }: {
       ...body.scope.map(asset => asset.origin), '', 'Coverage',
       ...body.coverage.flatMap(item => [
         [item.origin, item.status, item.evidenceId && `Evidence ${item.evidenceId}`,
-          item.analysisEvidenceId && `Derived evidence ${item.analysisEvidenceId}`].filter(Boolean).join(' · '),
+          item.analysisEvidenceId && `Derived evidence ${item.analysisEvidenceId}`,
+          item.accessEvidence && `Access records ${item.accessEvidence.id}`,
+          item.accessEvidence?.recordedAt && `Recorded ${item.accessEvidence.recordedAt}`,
+        ].filter(Boolean).join(' · '),
         ...(item.checks ?? []).flatMap(check => [
           `  ${check.title} · ${checkLabels[check.status]}`,
           `    Observed: ${check.observed ?? 'Unavailable'}`,
@@ -108,15 +115,20 @@ export function RunReport({ detail, openEvidence }: {
       <h3>Coverage</h3>
       <ul className="report-hosts">{body.coverage.map(item => <li key={item.origin}>
         <div className="list-row">
-          <span><strong>{new URL(item.origin).hostname}</strong><small>{item.status}</small></span>
+          <span><strong>{new URL(item.origin).hostname}</strong><small>{item.status}</small>
+            {item.accessEvidence?.recordedAt && <small>Access decisions recorded <time dateTime={item.accessEvidence.recordedAt}>
+              {timeText(Date.parse(item.accessEvidence.recordedAt))}
+            </time></small>}
+          </span>
           <div className="toolbar report-evidence">
             {item.evidenceId && <Button variant="ghost" onClick={() => openEvidence(item.evidenceId!)}>Open evidence</Button>}
             {item.analysisEvidenceId && <Button variant="ghost" onClick={() => openEvidence(item.analysisEvidenceId!)}>Derived evidence</Button>}
+            {item.accessEvidence && <Button variant="ghost" onClick={() => openEvidence(item.accessEvidence!.id)}>Access records</Button>}
           </div>
         </div>
         {item.checks && <details className="report-checks">
           <summary>Checks for {new URL(item.origin).hostname}</summary>
-          <ul>{item.checks.map(check => <li key={check.id}>
+          <ul>{item.checks.map(check => <li key={check.caseId ? check.id + ':' + check.caseId : check.id}>
             <div className="section-heading"><strong>{check.title}</strong><span>{checkLabels[check.status]}</span></div>
             <dl className="finding-details">
               <dt>Observed</dt><dd>{check.observed ?? 'Unavailable'}</dd>

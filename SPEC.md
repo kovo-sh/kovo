@@ -38,6 +38,8 @@ The API key stays on the local server. A connection test can be retried without 
 
 Discovery finishes before analysis. Analysis finishes before verification. If a candidate host appears after approval, keep it outside the run's scope until the user adds it through a recorded approval. The user can add it to the current run or leave it for a future run. Verification is performed by workers. The user approves scope and steers the run.
 
+Access policy decisions can be reviewed from an owner's supplied authorization test records and explicit expected decisions for an existing project host. Discovery snapshots the records. An isolated worker matches cases by identifier and verifies observed decisions against expected ones. Report discrepancies and missing observations with the capture time and evidence links. A plan can select access policy checks on their own or together with response controls.
+
 ### Steering and recovery
 
 - The coordinator answers status questions, accepts goal revisions, and handles pause and stop requests. Use explicit controls for actions that change run state. Keep the original goal and timestamp each revision. Flag assignments and evidence affected by a change. A revised goal can select a new check plan within the approved hosts.
@@ -47,7 +49,7 @@ Discovery finishes before analysis. Analysis finishes before verification. If a 
 
 ## Agents and handoffs
 
-**Coordinator.** One coordinator per run. It is the only conversational entry point for the user. After scope approval, it selects applicable checks from the supported catalog for the run goal. Guardian validates and saves the selection before delegating to workers on approved hosts. Use the standard response checks if model planning is unavailable. The coordinator tracks phase progress, handles revisions, and assembles the report from recorded results.
+**Coordinator.** One coordinator per run. It is the only conversational entry point for the user. After scope approval, it selects applicable checks from the supported catalog for the run goal. Guardian validates and saves the selection before delegating to workers on approved hosts. Use the standard checks for the available evidence if model planning is unavailable. The coordinator tracks phase progress, handles revisions, and assembles the report from recorded results.
 
 **Workers.** Workers take individual assignments, return their work to the coordinator, and have separate read-only threads in the UI. They can access the assignment, its permitted inputs, and the relevant evidence. An assignment identifies its run, phase, objective, scope revision, inputs, and expected output.
 
@@ -145,6 +147,7 @@ For local fixture capture, read the OpenRouter key from `~/.config/guardian-fixt
 - Stop a run and read its partial report. Restart the app mid-run and confirm that work waits for explicit resume. Resume from the last committed state without duplicate assignments, findings, or reports.
 - Run the TanStack Start production build on loopback. Open a worker thread through its deep link. With a run paused, restart the server and verify that the event stream reconnects from the last event ID and the run stays paused until explicit resume.
 - Finish verification with confirmed response policy gaps and inconclusive fixture results. Follow a confirmed finding to its observed value, expected setting, remediation, and worker verification. Run the zero-finding case and verify that the report shows which checks met the baseline.
+- Import recorded access decisions for an existing project host. Verify matching decisions, a decision that differs from policy, and a missing decision. Run access policy alone and with response checks. Confirm that each finding links to its own input and the corresponding worker comparison.
 - Have a worker compose a just-bash pipeline that extracts fields from prepared JSON evidence, compares them with a baseline, and writes a derived artifact. Verify that the report links to the artifact and that the worker record identifies the commands and inputs. Verify that attempts to read files outside the assignment and make direct network requests are denied.
 - Through the broker, verify that an approved read succeeds. Reject redirects out of scope and DNS responses that resolve an approved public hostname to a private address. Remove the approved host while a fixture read is pending. Verify that a subsequent read is denied and the pending result never becomes evidence.
 - Verify that untrusted evidence cannot grant scope, confirm a finding, or execute markup in the UI or report. Verify that the loopback API rejects unexpected hosts, cross-origin actions, and event streams without a valid local session.

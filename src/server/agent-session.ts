@@ -26,7 +26,7 @@ const workerInstructions = [
 ].join(' ')
 
 const planInstructions = [
-  'Choose checks for a read-only review of response metadata.',
+  'Choose checks for a read-only review of the supplied evidence types.',
   'Select only IDs from availableChecks. Include all for a general review and the requested IDs for a focused review.',
   'Return only a JSON object with a checks array. The operator controls the approved hosts.',
 ].join(' ')

@@ -1,5 +1,6 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
+import { importAccessPolicy } from './access-policy.ts'
 import { id, importDnsInventory, newProject, newRun, projectAsset, providerSettings, runCommand } from './domain.ts'
 import { execution } from './server/execution.ts'
 import { checkModelConnection, publicModelSettings, saveModelSettings } from './server/model-settings.ts'
@@ -37,6 +38,9 @@ export const addProjectAsset = createServerFn({ method: 'POST' }).validator(proj
 
 export const importProjectDns = createServerFn({ method: 'POST' }).validator(importDnsInventory)
   .handler(({ data }) => store().importProjectDns(data))
+
+export const importProjectAccessPolicy = createServerFn({ method: 'POST' }).validator(importAccessPolicy)
+  .handler(({ data }) => store().importProjectAccessPolicy(data))
 
 export const commandRun = createServerFn({ method: 'POST' }).validator(runCommand)
   .handler(({ data }) => {

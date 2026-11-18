@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DEFAULT_PROVIDER, responseCheckIds } from '../src/domain.ts'
-import type { ResponseCheckId } from '../src/domain.ts'
+import { assessmentCheckIds, DEFAULT_PROVIDER, responseCheckIds } from '../src/domain.ts'
+import type { AssessmentCheckId, ResponseCheckId } from '../src/domain.ts'
 import { agentTurn, coordinatorPrompt, workerInput } from '../src/server/agent-session.ts'
 import type { AgentScenario } from '../src/server/agent-session.ts'
 import type { PublicObservation } from '../src/server/broker.ts'
@@ -12,7 +12,9 @@ import { testProvider } from '../src/server/provider.ts'
 import type { ProviderCall } from '../src/server/provider.ts'
 import { parseReviewPlan, reviewPlanPrompt } from '../src/server/review-plan.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
-import { allChecksGoal, healthy, healthyGoal, mainGoal, primary, referrerGoal, statusQuestion, unavailable } from '../tests/scenarios.ts'
+import {
+  accessPolicyGoal, allChecksGoal, combinedGoal, healthy, healthyGoal, mainGoal, primary, referrerGoal, statusQuestion, unavailable,
+} from '../tests/scenarios.ts'
 import { saveRecording } from './fixture-record.ts'
 
 type Scenario = {
@@ -20,7 +22,8 @@ type Scenario = {
   prompt: string
   scenario: AgentScenario
   evidence?: object
-  expectedChecks?: readonly ResponseCheckId[]
+  expectedChecks?: readonly AssessmentCheckId[]
+  availableChecks?: readonly AssessmentCheckId[]
   historical?: boolean
 }
 
@@ -32,6 +35,16 @@ const onlyReferrer = ['referrer-policy'] as const
 const scenarios: Scenario[] = [
   { name: 'plan-all', scenario: 'coordinator-plan', prompt: reviewPlanPrompt(allChecksGoal, 'public'), expectedChecks: responseCheckIds },
   { name: 'plan-referrer', scenario: 'coordinator-plan', prompt: reviewPlanPrompt(referrerGoal, 'public'), expectedChecks: onlyReferrer },
+  {
+    name: 'plan-access-policy', scenario: 'coordinator-plan',
+    prompt: reviewPlanPrompt(accessPolicyGoal, 'public', assessmentCheckIds),
+    availableChecks: assessmentCheckIds, expectedChecks: ['access-policy'],
+  },
+  {
+    name: 'plan-combined', scenario: 'coordinator-plan',
+    prompt: reviewPlanPrompt(combinedGoal, 'public', assessmentCheckIds),
+    availableChecks: assessmentCheckIds, expectedChecks: assessmentCheckIds,
+  },
   workerScenario('response-primary', primary, responseCheckIds),
   workerScenario('response-unavailable', unavailable, responseCheckIds),
   workerScenario('response-healthy', healthy, responseCheckIds),
@@ -76,7 +89,7 @@ if (selectedScenarios.length) {
   const directory = mkdtempSync(join(tmpdir(), 'guardian-record-'))
   const backend = new LinuxWorkerBackend()
   try {
-    for (const { name, prompt, scenario, evidence, expectedChecks } of selectedScenarios) {
+    for (const { name, prompt, scenario, evidence, expectedChecks, availableChecks } of selectedScenarios) {
       const calls: ProviderCall[] = []
       const answer = await agentTurn({
         scenario, directory, prompt,
@@ -92,7 +105,7 @@ if (selectedScenarios.length) {
         record: call => calls.push(call),
       })
       if (!calls.length || calls.some(call => call.status !== 200)) throw new Error('The provider did not complete ' + name + '.')
-      if (expectedChecks && parseReviewPlan(answer)?.checks.join(',') !== expectedChecks.join(',')) {
+      if (expectedChecks && parseReviewPlan(answer, availableChecks)?.checks.join(',') !== expectedChecks.join(',')) {
         throw new Error('The recorded coordinator response did not select the expected checks for ' + name + '.')
       }
       saveRecording(name, 'responses', calls, key)

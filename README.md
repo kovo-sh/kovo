@@ -15,13 +15,32 @@ npm start
 
 Open http://127.0.0.1:8000. Use **Model settings** to enter an OpenRouter key, test the DeepSeek Flash preset, and save it. Advanced settings accept OpenAI Responses and Anthropic Messages-compatible providers.
 
-Create a project with the authorized hosts and start a run. Review and approve specific hosts after inventory discovery. The coordinator then selects checks for the goal from HSTS, MIME sniffing protection, and explicit referrer policy. Runs use supplied response metadata by default. Enable **Read approved public pages during this run** to collect selected HTTPS response metadata through the scope broker. The report records the plan, the expected and observed settings, and links each confirmed gap to its verification evidence. [HTTP Strict Transport Security](https://www.rfc-editor.org/rfc/rfc6797.html) · [Fetch Standard](https://fetch.spec.whatwg.org/#x-content-type-options-header) · [Referrer Policy](https://www.w3.org/TR/referrer-policy/#referrer-policy-header-dfn)
+Create a project with the authorized hosts and start a run. Review and approve specific hosts after inventory discovery. The coordinator selects checks for the goal from the available evidence. Runs use supplied records by default. Enable **Read approved public pages during this run** to allow selected HSTS, MIME sniffing protection, and referrer policy checks to collect HTTPS response metadata through the scope broker. The report records the plan, the expected and observed settings, and links each confirmed gap to its verification evidence. [HTTP Strict Transport Security](https://www.rfc-editor.org/rfc/rfc6797.html) · [Fetch Standard](https://fetch.spec.whatwg.org/#x-content-type-options-header) · [Referrer Policy](https://www.w3.org/TR/referrer-policy/#referrer-policy-header-dfn)
 
 In **Supply prepared evidence**, enter the observed fields for the host. Use `absent` in `contentTypeOptions` or `referrerPolicy` when the header was absent from a captured response. Leave fields out when the source did not record them.
 
 Use **Import DNS export** to bring in candidates from a local, self-contained zone file. The preview shows hosts from A, AAAA, and CNAME records and flags aliases to outside the zone. Guardian records host and source information, then puts the imported candidates into the next run's scope review for selection. [DNS master-file syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-5.1)
 
 The server binds to loopback. Set `PORT` to use a different port. Set `GUARDIAN_DATA_DIR` to choose a private data directory. Its default is `.guardian/`.
+
+## Review access policy records
+
+Use **Import access records** on the project. Supply a JSON file for an existing project host with the intended decisions from your policy and the decisions recorded by your authorization tests. The worker matches case IDs and compares the decisions in the local sandbox. A missing recorded decision remains inconclusive. Access policy checks use the supplied records.
+
+```json
+{
+  "origin": "https://portal.example",
+  "recordedAt": "2026-11-17T15:45:00Z",
+  "expected": [
+    { "caseId": "read-summary", "role": "team-viewer", "capability": "read-summary", "decision": "allow" }
+  ],
+  "observed": [
+    { "caseId": "read-summary", "decision": "allow" }
+  ]
+}
+```
+
+Use non-sensitive case, role, and capability labels, unique case IDs in each list, and a UTC timestamp. The importer accepts up to 64 cases. Imports are available to the next discovery. Runs that already captured their inventory keep their saved record.
 
 ## Verify
 

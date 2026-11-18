@@ -11,11 +11,16 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
-import { checkCoverage, responseReview } from '../src/server/response-checks.ts'
+import { accessPolicySnapshot } from '../src/access-policy.ts'
+import { assessmentCheckIds } from '../src/domain.ts'
+import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
+import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
+import { responseReview } from '../src/server/response-checks.ts'
 import { parseReviewPlan, standardChecks } from '../src/server/review-plan.ts'
 import { findings } from '../src/server/schema.ts'
 import { assessmentAssignments, Store } from '../src/server/store.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
+import { accessPolicy } from './scenarios.ts'
 
 const exec = promisify(execFile)
 
@@ -122,7 +127,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.ok(primary && docs)
   const approve = (assetIds: string[]) => storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true })
   approve([primary.id, docs.id])
-  storage.commitReviewPlan(runId, 0, standardChecks)
+  storage.commitReviewPlan(runId, 0, standardChecks())
 
   const analysis = storage.workerList(runId).find(worker => worker.assetId === primary.id && worker.phase === 'analysis')
   assert.ok(analysis)
@@ -186,8 +191,8 @@ test('keeps older observations and ambiguous header values from confirming unsup
     transportMaxAge: 31_536_000, includeSubDomains: false, source: 'supplied observation' as const,
   }
   const [hsts, mime, referrer] = responseReview(oldObservation)
-  assert.equal(checkCoverage(hsts, 'met').status, 'met')
-  assert.equal(checkCoverage(hsts, 'gap').status, 'inconclusive')
+  assert.equal(checkCoverage(hsts, new Map([['hsts', 'met']])).status, 'met')
+  assert.equal(checkCoverage(hsts, new Map([['hsts', 'gap']])).status, 'inconclusive')
   assert.equal(mime.coverage.status, 'inconclusive')
   assert.equal(referrer.coverage.status, 'inconclusive')
 
@@ -202,9 +207,28 @@ test('accepts only supported check identifiers as a coordinator plan', () => {
     source: 'coordinator', checks: ['hsts', 'referrer-policy'],
   })
   assert.equal(parseReviewPlan('{"checks":["other-check"]}'), null)
+  assert.equal(parseReviewPlan('{"checks":["access-policy"]}'), null)
+  assert.deepEqual(parseReviewPlan('{"checks":["access-policy"]}', assessmentCheckIds), {
+    source: 'coordinator', checks: ['access-policy'],
+  })
   assert.equal(parseReviewPlan('{"checks":[]}'), null)
   assert.equal(parseReviewPlan('{"checks":["hsts"],"hosts":["unapproved.example"]}'), null)
   assert.equal(parseReviewPlan('{"checks":["hsts"],"command":"unexpected operation"}'), null)
+})
+
+test('requires unique policy cases and leaves missing access decisions inconclusive', () => {
+  const invalid = { ...accessPolicy, observed: [...accessPolicy.observed, accessPolicy.observed[0]] }
+  assert.equal(accessPolicySnapshot.safeParse(invalid).success, false)
+  assert.equal(accessPolicySnapshot.safeParse({
+    ...accessPolicy, observed: [{ caseId: 'unmatched', decision: 'allow' }],
+  }).success, false)
+  const reviews = accessPolicyReviews(accessPolicySnapshot.parse(accessPolicy))
+  const comparisons = reviews.flatMap(review => review.comparison ? [review.comparison] : [])
+  const unexpected = readComparisons('[{"id":"unmatched","outcome":"gap"}]', comparisons)
+  assert.equal(unexpected.size, 0)
+  assert.equal(checkCoverage(reviews[0], unexpected).status, 'inconclusive')
+  assert.equal(checkCoverage(reviews[3], unexpected).status, 'inconclusive')
+  assert.equal(reviews[3].comparison, undefined)
 })
 
 test('requires a local Docker Unix socket before staging worker data', async () => {

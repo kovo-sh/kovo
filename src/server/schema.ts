@@ -1,5 +1,6 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
-import type { Candidate, CheckCoverage, DnsSource, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, ResponseCheckId, ReviewPlan, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
+import type { AccessPolicySnapshot } from '../access-policy.ts'
+import type { AssessmentCheckId, Candidate, CheckCoverage, DnsSource, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, ReviewPlan, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -34,6 +35,7 @@ export const projectAssets = sqliteTable('project_assets', {
   thirdParty: integer('third_party', { mode: 'boolean' }).notNull(),
   prepared: text('prepared', { mode: 'json' }).$type<PreparedObservation>(),
   dnsSource: text('dns_source', { mode: 'json' }).$type<DnsSource>(),
+  accessPolicy: text('access_policy', { mode: 'json' }).$type<AccessPolicySnapshot>(),
 }, table => [uniqueIndex('project_assets_origin').on(table.projectId, table.origin)])
 
 export const runs = sqliteTable('runs', {
@@ -89,11 +91,12 @@ export const findings = sqliteTable('findings', {
   runId: text('run_id').notNull().references(() => runs.id),
   assetId: text('asset_id').notNull(),
   goalRevision: integer('goal_revision').notNull(),
-  checkId: text('check_id').$type<ResponseCheckId>().notNull().default('hsts'),
+  checkId: text('check_id').$type<AssessmentCheckId>().notNull().default('hsts'),
+  caseId: text('case_id').notNull().default(''),
   finding: text('finding', { mode: 'json' }).$type<Finding>().notNull(),
 }, table => [
   index('findings_run').on(table.runId),
-  uniqueIndex('findings_check').on(table.runId, table.assetId, table.goalRevision, table.checkId),
+  uniqueIndex('findings_check_case').on(table.runId, table.assetId, table.goalRevision, table.checkId, table.caseId),
 ])
 
 export const reports = sqliteTable('reports', {

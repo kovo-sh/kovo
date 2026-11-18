@@ -1,5 +1,5 @@
 import { Fragment, useState } from 'react'
-import { maxScopeHosts, responseCheckTitles } from '../domain.ts'
+import { assessmentCheckTitles, maxScopeHosts } from '../domain.ts'
 import type { RunCommand } from '../domain.ts'
 import { Status } from './common.tsx'
 import { phaseNames, workerPhases } from './run-state.ts'
@@ -71,9 +71,9 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
     </div>}
     {['analysis', 'verification'].includes(run.phase) && <div className="workflow-callout">
       <div>
-        <h2>Approved scope</h2><p>{run.approved.length} approved hosts · Revision {run.scopeRevision}</p>
+        <h2>Approved scope</h2><p>{run.approved.length} approved {run.approved.length === 1 ? 'host' : 'hosts'} · Revision {run.scopeRevision}</p>
         {plan?.status === 'pending' && <p>{run.status === 'running' ? 'Preparing review plan' : 'Review plan pending'}</p>}
-        {plan?.status === 'ready' && <p>{plan.source === 'standard' ? 'Standard checks' : 'Planned checks'} · {plan.checks.map(id => responseCheckTitles[id]).join(', ')}</p>}
+        {plan?.status === 'ready' && <p>{plan.source === 'standard' ? 'Standard checks' : 'Planned checks'} · {plan.checks.map(id => assessmentCheckTitles[id]).join(', ')}</p>}
       </div>
       <Button onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review}>
         {review ? 'Close review' : 'Review scope'}
@@ -96,7 +96,8 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
           {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
             onCheckedChange={checked => setSelection(checked
               ? [...selected, asset.id] : selected.filter(item => item !== asset.id))} /></td>}
-          <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}</td>
+          <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}
+            {asset.accessPolicy && <small>Access policy records</small>}</td>
           <td>{inventory ? <Button variant="ghost" className="text-button" onClick={() => openEvidence(inventory.id)}>{asset.source} ↗</Button> : asset.source}</td>
           <td><Status status={run.approved.includes(asset.id) ? 'approved'
             : !run.scopeRevision && !asset.thirdParty ? 'proposed' : 'excluded'} /></td>
@@ -104,7 +105,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
       </table></div>
       {review && <div className="scope-footer">
         {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
-        {run.phase === 'review' && <p className="muted">The review uses HSTS, MIME sniffing protection, and referrer policy checks selected for the run goal.</p>}
+        {run.phase === 'review' && <p className="muted">The coordinator selects checks for your goal from the available evidence.</p>}
         <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
         <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
         <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>
