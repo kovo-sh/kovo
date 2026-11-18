@@ -3,6 +3,7 @@ import { stream as responses, streamSimple as simpleResponses } from '@earendil-
 import { stream as messages, streamSimple as simpleMessages } from '@earendil-works/pi-ai/api/anthropic-messages'
 import type { Api, Model, ProviderStreams } from '@earendil-works/pi-ai'
 import { obj, str } from '@earendil-works/pi-schema'
+import { DEFAULT_PROVIDER } from '../domain.ts'
 import type { ProviderSettings } from '../domain.ts'
 import { redact } from './redact.ts'
 
@@ -135,7 +136,8 @@ export function provider(settings: ProviderSettings, scenario: string, signal?: 
     api,
     baseUrl: settings.protocol === 'messages' ? settings.endpoint.replace(/\/v1$/, '') : settings.endpoint,
     input: ['text'],
-    reasoning: false,
+    // The Messages adapter sends the disabled setting for reasoning-capable models.
+    reasoning: api === 'anthropic-messages' && settings.model === DEFAULT_PROVIDER.model,
     contextWindow: 24_000,
     maxTokens: modelTokenLimit,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -155,12 +157,13 @@ export function provider(settings: ProviderSettings, scenario: string, signal?: 
         : simpleResponses(selected as Model<'openai-responses'>, transcript, { ...streamOptions, ...options }),
   } : {
     stream: (selected, transcript, streamOptions) => messages(selected as Model<'anthropic-messages'>, transcript, {
-      ...streamOptions, ...options, ...(connection ? { toolChoice: { type: 'tool' as const, name: 'guardian_connection' } } : {}),
+      ...streamOptions, ...options, thinkingEnabled: false,
+      ...(connection ? { toolChoice: { type: 'tool' as const, name: 'guardian_connection' } } : {}),
     }),
     streamSimple: (selected, transcript, streamOptions) =>
       chooseEvidenceTool(transcript)
         ? messages(selected as Model<'anthropic-messages'>, transcript, {
-          ...streamOptions, ...options, toolChoice: { type: 'tool', name: 'derive_evidence' },
+          ...streamOptions, ...options, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' },
         })
         : simpleMessages(selected as Model<'anthropic-messages'>, transcript, { ...streamOptions, ...options }),
   }

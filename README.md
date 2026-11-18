@@ -57,7 +57,7 @@ npm run test:boundaries
 
 Playwright runs against the production build with a temporary SQLite database per test. It replays recorded OpenRouter streams and local network fixtures through Guardian's request guards. The verification job uses the same tests on Linux.
 
-Record fresh fixtures explicitly with `npm run fixtures:capture -- responses`, `messages`, or `workflow`. Capture uses only synthetic inputs and reads the key from `~/.config/guardian-fixtures/openrouter.key`, with owner-only permissions.
+Record fresh fixtures explicitly with `npm run fixtures:capture -- responses`, `messages`, or `workflow`. Use `npm run fixtures:capture -- response-referrer --protocol messages` to record one named workflow scene using Messages. Capture uses only synthetic inputs and reads the key from `~/.config/guardian-fixtures/openrouter.key`, with owner-only permissions.
 
 The separate opt-in command `npm run smoke:live -- --live` runs the production browser flow against live OpenRouter and the approved Dyad public home pages. It prints the local report path and data directory. Resume that run with `npm run smoke:live -- --live --resume <data-directory>` if it stops early.
 

@@ -150,6 +150,7 @@ The Northstar case matrix defines expected verdicts for four report versions fro
 ## V1 acceptance criteria
 
 - From a fresh install, connect an OpenRouter key using the preset model, then connect to a test endpoint for each supported protocol. A rejected key or unsupported tool-call response produces a specific setup error.
+- Complete a report through each supported protocol. For Messages, stop the process after a worker saves its tool result. Reopen the run, resume explicitly, and verify that the saved tool result and source observation lead to one confirmed finding.
 - Create a project with related seed domains. Consent to passive discovery, review the candidates, inspect evidence, and approve scope. Analysis stays gated until approval, and third-party assets are excluded by default.
 - Open the 34-worker synthetic run. Navigate phase groups, find and deep-link to a read-only worker thread, and return from evidence to the scope table without losing draft selections.
 - During analysis, revise the goal, narrow scope, and review a newly found asset. Work linked to changed scope is canceled, while the new asset stays outside scope until approved.

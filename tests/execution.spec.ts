@@ -242,7 +242,7 @@ test('resumes a saved observation after narrowing scope for an unrelated host', 
   }
 })
 
-test('verifies both model protocols and produces a zero-finding report with coverage', { tag: '@report-benchmark' }, async ({ page }) => {
+test('validates both model connections and produces a zero-finding Responses report', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: healthyScenes })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
@@ -281,6 +281,72 @@ test('verifies both model protocols and produces a zero-finding report with cove
     await collectReportBenchmark('response-healthy', app.directory, page.url(), exported)
     expect(fixture.unexpected).toEqual([])
     expect(fixture.accepted).toContain('connection:messages:0')
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
+test('resumes a Messages analysis from its saved tool result and verifies the report', async ({ page }) => {
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-referrer', 'response-referrer'], holdModel: 'response-referrer:messages:1',
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const beforeResume = ['connection:messages:0', 'plan-referrer:messages:0', 'response-referrer:messages:0']
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential, 'messages')
+    await reviewScope(page, { project: 'Northstar Messages', seeds: [primaryOrigin], goal: referrerGoal, live: true })
+    await saveScope(page)
+    await fixture.modelWithheld
+    expect(fixture.accepted).toEqual(beforeResume)
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const analysisReceipts = db.prepare("SELECT id FROM evidence WHERE kind = 'analysis'")
+      const originalReceipt = analysisReceipts.all()
+      expect(originalReceipt).toHaveLength(1)
+      const assignment = db.prepare("SELECT session_id FROM assignments WHERE phase = 'analysis'").get()
+      expect(typeof assignment?.session_id).toBe('string')
+      await app.stop('SIGKILL')
+      fixture.dropHeldModel()
+      await app.start()
+
+      const resume = page.getByRole('button', { name: 'Resume', exact: true })
+      await expect(resume).toBeVisible()
+      expect(fixture.accepted).toEqual(beforeResume)
+      expect(fixture.requested).toEqual([primaryOrigin + '/'])
+      await resume.click()
+      await page.getByRole('link', { name: 'Report', exact: true }).click()
+      const report = page.getByRole('article', { name: 'Complete report' })
+      await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
+      await expect(report).toContainText('Planned checks · Referrer policy')
+      await expect(report).toContainText('Referrer policy permits full cross-origin URLs')
+      await expect(report).toContainText('unsafe-url')
+      await report.getByRole('button', { name: 'Response policy verification' }).click()
+      const verification = page.getByRole('dialog', { name: 'Response policy verification' })
+      await expect(verification).toContainText('just-bash 3.6.1')
+      await expect(verification).toContainText('"exitStatus": 0')
+      expect(analysisReceipts.all()).toEqual(originalReceipt)
+      expect(db.prepare("SELECT check_id FROM findings WHERE json_extract(finding, '$.status') = 'confirmed'").all())
+        .toEqual([{ check_id: 'referrer-policy' }])
+
+      const session = new DatabaseSync(join(app.directory, 'agent-sessions', String(assignment?.session_id) + '.sqlite'), { readOnly: true })
+      try {
+        const entries = session.prepare('SELECT count(*) AS n FROM entries WHERE json_extract(record, \'$.kind\') = ?')
+        expect(entries.get('pi.user')?.n).toBe(1)
+        expect(entries.get('pi.tool-result')?.n).toBe(1)
+      } finally {
+        session.close()
+      }
+    } finally {
+      db.close()
+    }
+    expect(fixture.accepted).toEqual([...beforeResume, 'response-referrer:messages:1'])
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    expect(fixture.unexpected).toEqual([])
   } finally {
     await app.dispose()
     await fixture.close()

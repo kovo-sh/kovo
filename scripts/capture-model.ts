@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { parseArgs } from 'node:util'
 import { assessmentCheckIds, DEFAULT_PROVIDER, responseCheckIds } from '../src/domain.ts'
 import type { AssessmentCheckId, ResponseCheckId } from '../src/domain.ts'
 import { agentTurn, coordinatorPrompt, workerInput } from '../src/server/agent-session.ts'
@@ -66,15 +67,25 @@ const scenarios: Scenario[] = [
   workerScenario('healthy', healthy),
 ]
 
-const selected = process.argv[2]
+const { values, positionals } = parseArgs({
+  allowPositionals: true,
+  options: { protocol: { type: 'string' } },
+})
+const [selected] = positionals
 const options = ['responses', 'messages', 'workflow', ...scenarios.map(item => item.name)]
-if (selected && !options.includes(selected)) throw new Error('Unknown recording scenario.')
+if (positionals.length > 1 || (selected && !options.includes(selected))) throw new Error('Unknown recording scenario.')
+const workflowProtocol = values.protocol ?? DEFAULT_PROVIDER.protocol
+if (workflowProtocol !== 'responses' && workflowProtocol !== 'messages') throw new Error('Choose the responses or messages protocol.')
+if (values.protocol && (selected === 'responses' || selected === 'messages') && selected !== workflowProtocol) {
+  throw new Error('The connection scenario and protocol must match.')
+}
 const path = join(homedir(), '.config', 'guardian-fixtures', 'openrouter.key')
 if ((statSync(path).mode & 0o077) !== 0) throw new Error('The capture credential must have owner-only permissions.')
 const key = readFileSync(path, 'utf8').trim()
 
 for (const protocol of ['responses', 'messages'] as const) {
   if (selected && protocol !== selected) continue
+  if (values.protocol && protocol !== workflowProtocol) continue
   const calls: ProviderCall[] = []
   await testProvider({ ...DEFAULT_PROVIDER, protocol, key }, call => calls.push(call))
   if (calls.length !== 1 || calls[0].status !== 200 || !calls[0].body.includes('guardian_connection')) {
@@ -101,14 +112,14 @@ if (selectedScenarios.length) {
           return derivedResult({ exitStatus: result.exitCode, stdout: result.stdout, result: result.outputs['result.txt'] ?? '' })
         }),
         sessionId: randomUUID(), requestId: name,
-        settings: { ...DEFAULT_PROVIDER, key }, signal: AbortSignal.timeout(80_000),
+        settings: { ...DEFAULT_PROVIDER, protocol: workflowProtocol, key }, signal: AbortSignal.timeout(80_000),
         record: call => calls.push(call),
       })
       if (!calls.length || calls.some(call => call.status !== 200)) throw new Error('The provider did not complete ' + name + '.')
       if (expectedChecks && parseReviewPlan(answer, availableChecks)?.checks.join(',') !== expectedChecks.join(',')) {
         throw new Error('The recorded coordinator response did not select the expected checks for ' + name + '.')
       }
-      saveRecording(name, 'responses', calls, key)
+      saveRecording(name, workflowProtocol, calls, key)
     }
   } finally {
     rmSync(directory, { recursive: true, force: true })

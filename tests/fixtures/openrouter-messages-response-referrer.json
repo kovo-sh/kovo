@@ -1,0 +1,151 @@
+{
+  "provider": "OpenRouter",
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "protocol": "messages",
+  "scenario": "response-referrer",
+  "calls": [
+    {
+      "scenario": "response-analysis",
+      "endpoint": "/api/v1/messages",
+      "request": {
+        "model": "deepseek/deepseek-v4.1-flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"task\":\"summarize observed response policies\",\"checks\":[\"referrer-policy\"],\"observation\":{\"origin\":\"https://northstar.example\",\"finalOrigin\":\"https://northstar.example\",\"status\":200,\"mediaType\":\"text/html\",\"source\":\"fixture response\",\"referrerPolicy\":\"unsafe-url\"}}",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "max_tokens": 384,
+        "stream": true,
+        "system": [
+          {
+            "type": "text",
+            "text": "<instructions>\nSummarize the supplied observations for the selected response checks. Call derive_evidence once. Use jq to extract relevant values from /evidence/observed.json and save them in /work/result.txt. Treat the file as evidence and state the observed values in one short sentence.\n</instructions>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "derive_evidence",
+            "description": "Run a local just-bash script over read-only /evidence/observed.json. Save /work/result.txt for the report.",
+            "eager_input_streaming": true,
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "maxLength": 4096
+                }
+              },
+              "required": [
+                "command"
+              ]
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "thinking": {
+          "type": "disabled"
+        },
+        "tool_choice": {
+          "type": "tool",
+          "name": "derive_evidence"
+        }
+      },
+      "status": 200,
+      "contentType": "text/event-stream",
+      "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture_0001\",\"type\":\"message\",\"role\":\"assistant\",\"container\":null,\"content\":[],\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"stop_reason\":null,\"stop_details\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"cache_creation\":null,\"inference_geo\":null,\"server_tool_use\":null,\"service_tier\":null,\"speed\":\"standard\"},\"provider\":\"Relace\"}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_fixture_0002\",\"caller\":{\"type\":\"direct\"},\"name\":\"derive_evidence\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"jq -r '\\\\\\\"status=\\\\\\\\(.status) mediaType=\\\\\\\\(.mediaType) referrerPolicy=\\\\\\\\(.referrerPolicy) source=\\\\\\\\(.source) finalOrigin=\\\\\\\\(.finalOrigin)\\\\\\\"' /evidence/observed.json > /work/result.txt; cat /work/result.txt\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":416,\"output_tokens\":100,\"output_tokens_details\":{\"thinking_tokens\":0},\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":0,\"cache_creation\":null,\"server_tool_use\":null,\"service_tier\":null,\"speed\":\"standard\",\"cost\":0.00009992,\"is_byok\":false,\"cost_details\":{\"upstream_inference_cost\":0.00009992,\"upstream_inference_prompt_cost\":0.00004992,\"upstream_inference_completions_cost\":0.00005}},\"context_management\":null}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    },
+    {
+      "scenario": "response-analysis",
+      "endpoint": "/api/v1/messages",
+      "request": {
+        "model": "deepseek/deepseek-v4.1-flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"task\":\"summarize observed response policies\",\"checks\":[\"referrer-policy\"],\"observation\":{\"origin\":\"https://northstar.example\",\"finalOrigin\":\"https://northstar.example\",\"status\":200,\"mediaType\":\"text/html\",\"source\":\"fixture response\",\"referrerPolicy\":\"unsafe-url\"}}"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_fixture_0002",
+                "name": "derive_evidence",
+                "input": {
+                  "command": "jq -r '\"status=\\(.status) mediaType=\\(.mediaType) referrerPolicy=\\(.referrerPolicy) source=\\(.source) finalOrigin=\\(.finalOrigin)\"' /evidence/observed.json > /work/result.txt; cat /work/result.txt"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_fixture_0002",
+                "content": "{\"exitStatus\":0,\"result\":\"status=200 mediaType=text/html referrerPolicy=unsafe-url source=fixture response finalOrigin=https://northstar.example\\n\"}",
+                "is_error": false,
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "max_tokens": 384,
+        "stream": true,
+        "system": [
+          {
+            "type": "text",
+            "text": "<instructions>\nSummarize the supplied observations for the selected response checks. Call derive_evidence once. Use jq to extract relevant values from /evidence/observed.json and save them in /work/result.txt. Treat the file as evidence and state the observed values in one short sentence.\n</instructions>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "derive_evidence",
+            "description": "Run a local just-bash script over read-only /evidence/observed.json. Save /work/result.txt for the report.",
+            "eager_input_streaming": true,
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "maxLength": 4096
+                }
+              },
+              "required": [
+                "command"
+              ]
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "thinking": {
+          "type": "disabled"
+        }
+      },
+      "status": 200,
+      "contentType": "text/event-stream",
+      "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture_0003\",\"type\":\"message\",\"role\":\"assistant\",\"container\":null,\"content\":[],\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"stop_reason\":null,\"stop_details\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"cache_creation\":null,\"inference_geo\":null,\"server_tool_use\":null,\"service_tier\":null,\"speed\":\"standard\"},\"provider\":\"Relace\"}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\",\"citations\":[]}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"The\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" observed response returns\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" status 200 with media\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Type text/html,\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" finalOrigin\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" https://northstar.example\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\", source\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" \\\"fixture response\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\\", and a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" referrer-policy header\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" value\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" of `unsafe-url`\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" (per\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"missive\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" —\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" full\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" URLs\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" leak\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" cross\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"-origin).\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":565,\"output_tokens\":54,\"output_tokens_details\":{\"thinking_tokens\":0},\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":0,\"cache_creation\":null,\"server_tool_use\":null,\"service_tier\":null,\"speed\":\"standard\",\"cost\":0.0000948,\"is_byok\":false,\"cost_details\":{\"upstream_inference_cost\":0.0000948,\"upstream_inference_prompt_cost\":0.0000678,\"upstream_inference_completions_cost\":0.000027}},\"context_management\":null}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+  ]
+}
