@@ -47,13 +47,14 @@ export function RunOverview({ detail, execute, openEvidence, pending }: {
       {workerPhases.map(phase => {
         const nodes = assignments.filter(worker => worker.phase === phase)
         const settled = nodes.length > 0 && nodes.every(worker => ['complete', 'canceled'].includes(worker.status))
+        const active = run.phase === phase && run.status === 'running' && (phase === 'discovery' || detail.hasModel)
         return <Fragment key={phase}>
           <li>
             <div><h2>{phaseNames[phase]}</h2><span className="muted">{nodes.length} {nodes.length === 1 ? 'worker' : 'workers'}</span></div>
             <div className="phase-segments">{nodes.length
               ? nodes.map(node => <i key={node.id} data-status={node.status} />)
               : <i />}</div>
-            <span className="muted">{settled ? 'Complete' : run.phase === phase ? `${phaseNames[phase]} in progress` : 'Queued'}</span>
+            <span className="muted">{settled ? 'Complete' : active ? `${phaseNames[phase]} in progress` : 'Queued'}</span>
           </li>
           {phase === 'discovery' && <li className="approval-gate" data-approved={run.scopeRevision > 0}
             aria-label={run.scopeRevision ? 'Scope reviewed' : 'Scope approval required'}>
@@ -83,7 +84,7 @@ export function RunOverview({ detail, execute, openEvidence, pending }: {
     {afterApproval && <div className="workflow-callout">
       <div>
         <h2>Approved scope</h2><p>{run.approved.length} approved {run.approved.length === 1 ? 'host' : 'hosts'} · Revision {run.scopeRevision}</p>
-        {plan?.status === 'pending' && <p>{run.status === 'running' ? 'Preparing review plan' : 'Review plan pending'}</p>}
+        {plan?.status === 'pending' && <p>{run.status === 'running' && detail.hasModel ? 'Preparing review plan' : 'Review plan pending'}</p>}
         {plan?.status === 'ready' && <p>{plan.source === 'standard' ? 'Standard checks' : 'Planned checks'} · {plan.checks.map(id => assessmentCheckTitles[id]).join(', ')}</p>}
       </div>
       <Button onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>

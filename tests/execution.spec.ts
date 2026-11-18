@@ -345,6 +345,58 @@ test('resumes a saved observation after narrowing scope for an unrelated host', 
   }
 })
 
+test('returns from first-run model setup to the approved run and waits for explicit resume', async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: ['connection', 'plan-referrer', 'response-referrer'] })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await reviewScope(page, { project: 'Northstar', seeds: [primaryOrigin], goal: referrerGoal, live: true })
+    await saveScope(page)
+    const runPath = new URL(page.url()).pathname
+    await expect(page.getByText('Waiting for model', { exact: true })).toBeVisible()
+    await expect(page.getByText('1 approved host · Revision 1')).toBeVisible()
+    await expect(page.getByText('Review plan pending', { exact: true })).toBeVisible()
+    const coordinator = page.getByRole('region', { name: 'Coordinator chat' })
+    const question = coordinator.getByRole('textbox', { name: 'Message coordinator' })
+    await question.fill(statusQuestion)
+    await question.press('Enter')
+    await expect(coordinator).toContainText('This run needs a workspace model.')
+    expect(fixture.requested).toEqual([])
+    expect(fixture.accepted).toEqual([])
+    await page.getByRole('button', { name: 'Pause', exact: true }).click()
+    const resume = page.getByRole('button', { name: 'Resume', exact: true })
+    await expect(resume).toBeVisible()
+
+    await page.getByRole('link', { name: 'Set up model', exact: true }).click()
+    await expect(page.getByRole('link', { name: /Back to run/ })).toHaveAttribute('href', runPath)
+    await page.getByLabel('API key').fill('invalid-fixture-key')
+    await page.getByText('Advanced provider settings', { exact: true }).click()
+    await page.getByLabel('Base URL').fill(fixture.origin + '/api/v1')
+    await page.getByRole('button', { name: 'Test connection', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('The provider rejected the API key.')
+    await page.getByLabel('API key').fill(fixtureCredential)
+    await page.getByRole('button', { name: 'Save model', exact: true }).click()
+    await expect(page).toHaveURL(app.url + runPath)
+    await expect(page.getByText('1 approved host · Revision 1')).toBeVisible()
+    await expect(page.getByRole('link', { name: 'Set up model', exact: true })).toHaveCount(0)
+    expect(fixture.requested).toEqual([])
+    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual([])
+    await resume.click()
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
+    await expect(report).toContainText('Planned checks · Referrer policy')
+    await expect(report).toContainText('Referrer policy permits full cross-origin URLs')
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual(['plan-referrer:responses:0'])
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
 test('validates both model connections and produces a zero-finding Responses report', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: healthyScenes })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })

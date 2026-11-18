@@ -149,7 +149,9 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     pane.scrollTo(0, 0)
   }
 
-  const phaseLabel = ['paused', 'failed', 'stopped'].includes(run.status) ? run.status : phaseNames[run.phase]
+  const needsModel = !detail.hasModel && run.approved.length > 0 && (run.phase === 'analysis' || run.phase === 'verification')
+  const phaseLabel = ['paused', 'failed', 'stopped'].includes(run.status) ? run.status
+    : needsModel ? 'Waiting for model' : phaseNames[run.phase]
 
   return <main className="run-page">
     <header className="run-heading">
@@ -214,6 +216,10 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     {action.error && <div className="run-error"><FormError error={action.error} /></div>}
     <div className="workbench" data-with-chat={chatOpen}>
       <section className="work-surface" aria-label={view === 'report' ? 'Run report' : 'Workflow'}>
+        {view !== 'report' && needsModel && <div className="workflow-callout run-model-callout">
+          <div><h2>Connect a model to continue</h2><p>Model settings will return you to this run.</p></div>
+          <Link className="action-link primary" to="/settings" search={{ runId }}>Set up model</Link>
+        </div>}
         <div hidden={view !== 'overview'}>
           <RunOverview detail={detail} execute={execute} openEvidence={setArtifact} pending={action.pending} />
         </div>

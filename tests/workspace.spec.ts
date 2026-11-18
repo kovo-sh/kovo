@@ -58,8 +58,7 @@ test('persists project, approval, and worker context across production restarts'
     await page.getByRole('button', { name: 'Review scope' }).click()
     await expect(page.getByRole('checkbox', { name: 'Include blog.northstar.example' })).not.toBeChecked()
     await page.getByRole('link', { name: /^Trace/ }).click()
-    await expect(page.getByRole('link', { name: 'Review northstar.example, canceled' })).toHaveCount(1)
-    await expect(page.getByRole('link', { name: 'Review northstar.example, queued' })).toHaveCount(1)
+    await expect(page.getByRole('link', { name: /Review northstar\.example/ })).toHaveCount(0)
     await expect(page.getByRole('link', { name: /Review blog\.northstar\.example/ })).toHaveCount(0)
     await page.getByRole('link', { name: 'Asset inventory, complete' }).click()
     await expect(page.getByRole('region', { name: 'Worker thread' })).toContainText('Supplied asset inventory')
@@ -206,9 +205,11 @@ test('imports attributed DNS candidates and requires their own scope selection',
     await page.getByRole('checkbox', { name: 'I authorize read-only review of the selected hosts.' }).check()
     await page.getByRole('button', { name: 'Approve scope' }).click()
     await expect(page.getByText('2 approved hosts · Revision 1')).toBeVisible()
+    await expect(page.getByRole('row', { name: /api\.northstar\.example/ })).toContainText('approved')
+    await expect(page.getByRole('row', { name: /partner\.northstar\.example/ })).toContainText('excluded')
     await page.getByRole('link', { name: /^Trace/ }).click()
-    await expect(page.getByRole('link', { name: 'Review api.northstar.example, queued' })).toBeVisible()
-    await expect(page.getByRole('link', { name: /^Review partner/ })).toHaveCount(0)
+    await expect(page.getByRole('link', { name: 'Set up model', exact: true })).toBeVisible()
+    await expect(page.getByLabel('Worker graph').getByRole('link', { name: /^Review / })).toHaveCount(0)
   } finally {
     await app.dispose()
   }

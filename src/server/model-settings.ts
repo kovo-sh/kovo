@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { eq } from 'drizzle-orm'
 import type { ProviderSettings } from '../domain.ts'
@@ -21,11 +21,30 @@ export function publicModelSettings() {
   return saved ? { endpoint: saved.endpoint, model: saved.model, protocol: saved.protocol } : null
 }
 
+function credentialPath(credentialId: string) {
+  const path = join(store().directory, 'credentials', credentialId)
+  const file = statSync(path)
+  if ((file.mode & 0o077) !== 0) throw new Error('The workspace credential must have owner-only permissions.')
+  if (!file.isFile() || file.size === 0) throw new Error('The workspace credential is unavailable.')
+  accessSync(path, constants.R_OK)
+  return path
+}
+
+export function modelReady() {
+  const saved = savedConfiguration()
+  if (!saved) return false
+  try {
+    credentialPath(saved.credentialId)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function privateModelSettings(): ProviderSettings | null {
   const saved = savedConfiguration()
   if (!saved) return null
-  const path = join(store().directory, 'credentials', saved.credentialId)
-  if ((statSync(path).mode & 0o077) !== 0) throw new Error('The workspace credential must have owner-only permissions.')
+  const path = credentialPath(saved.credentialId)
   return { endpoint: saved.endpoint, model: saved.model, protocol: saved.protocol, key: readFileSync(path, 'utf8') }
 }
 

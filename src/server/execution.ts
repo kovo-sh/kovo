@@ -132,14 +132,14 @@ class Execution {
     } catch {
       return
     }
+    if (!model) return
     for (const run of this.storage.runnable()) {
       if (run.phase === 'analysis' && run.reviewPlan?.status === 'pending') {
         const available = availableReviewChecks(run.candidates.filter(asset => run.approved.includes(asset.id)), run.sourceMode)
-        if (model && run.approved.length) this.startPlanning(run, model, available)
+        if (run.approved.length) this.startPlanning(run, model, available)
         else this.storage.commitReviewPlan(run, standardChecks(available))
         continue
       }
-      if (!model) continue
       this.startCoordinator(run, model)
       if (run.phase !== 'analysis' && run.phase !== 'verification') continue
       const workers = this.storage.workerList(run.id).filter(item =>

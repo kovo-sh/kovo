@@ -25,6 +25,8 @@ Runs are independent. A new run can start with the project's saved scope and inv
 
 The API key stays on the local server. A connection test can be retried without saving credentials or creating a run.
 
+An operator can create a project, finish discovery, and approve a run before setting up the model. The run shows the setup action and waits to plan. Saving a verified model from that action opens the same run. A paused or stopped run still requires explicit resume.
+
 ## Run lifecycle
 
 | Phase or gate | Behavior |
@@ -158,6 +160,7 @@ Use `npm run compare:reports` for the release comparison. It checks shared input
 ## V1 acceptance criteria
 
 - From a fresh install, connect an OpenRouter key using the preset model, then connect to a test endpoint for each supported protocol. A rejected key or unsupported tool-call response produces a specific setup error.
+- Approve scope before connecting a model. Follow the setup action, save a verified connection, and return to the same run and approval. Check that a paused run waits for explicit resume and that the coordinator plans against the original goal.
 - Complete a report through each supported protocol. For Messages, stop the process after a worker saves its tool result. Reopen the run, resume explicitly, and verify that the saved tool result and source observation lead to one confirmed finding.
 - Create a project with related seed domains. Consent to passive discovery, review the candidates, inspect evidence, and approve scope. Analysis stays gated until approval, and third-party assets are excluded by default.
 - Open the 34-worker synthetic run. Navigate phase groups, find and deep-link to a read-only worker thread, and return from evidence to the scope table without losing draft selections.

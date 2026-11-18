@@ -176,6 +176,7 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .workflow-callout h2 { font-size: 13px; letter-spacing: 0; }
 .workflow-callout p { color: var(--muted); font-size: 12px; }
 .workflow-callout .checkbox { margin-top: 9px; }
+.run-model-callout { margin: 18px 24px 0; flex-wrap: wrap; }
 .inventory { margin-top: 32px; }
 .table-scroll { overflow: auto; }
 .inventory table { width: 100%; border-collapse: collapse; margin-top: 14px; text-align: left; }

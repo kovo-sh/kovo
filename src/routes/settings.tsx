@@ -1,23 +1,27 @@
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { modelData, saveModel, testModel } from '../actions.ts'
 import { FormError, useAction } from '../components/common.tsx'
 import { Button } from '../components/ui/button.tsx'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible.tsx'
 import { Input, NativeSelect } from '../components/ui/input.tsx'
-import { DEFAULT_PROVIDER } from '../domain.ts'
+import { DEFAULT_PROVIDER, id } from '../domain.ts'
 
 export const Route = createFileRoute('/settings')({
+  validateSearch: (search): { runId?: string } => ({ runId: id.safeParse(search.runId).data }),
   loader: () => modelData(),
   component: ModelPage,
 })
 
 function ModelPage() {
   const config = Route.useLoaderData()
+  const { runId } = Route.useSearch()
+  const navigate = useNavigate()
   const action = useAction()
   const [feedback, setFeedback] = useState('')
   return <main className="workspace-page">
-    <Link to="/" className="back-link">← Projects</Link>
+    {runId ? <Link to="/runs/$runId" params={{ runId }} className="back-link">← Back to run</Link>
+      : <Link to="/" className="back-link">← Projects</Link>}
     <div className="page-title"><h1>Model settings</h1></div>
     <form className="form-card" onInput={() => setFeedback('')} onSubmit={event => {
       event.preventDefault()
@@ -30,11 +34,12 @@ function ModelPage() {
         key: String(form.get('key')),
       }
       const element = event.currentTarget
-      void action.submit(() => command === 'test' ? testModel({ data }) : saveModel({ data }), () => {
+      void action.submit(() => command === 'test' ? testModel({ data }) : saveModel({ data }), async () => {
         setFeedback(command === 'test' ? 'Connection verified. The model streamed a valid tool call.' : 'Model saved for this workspace.')
         if (command !== 'test') {
           const input = element.elements.namedItem('key') as HTMLInputElement | null
           if (input) input.value = ''
+          if (runId) await navigate({ to: '/runs/$runId', params: { runId } })
         }
       })
     }}>

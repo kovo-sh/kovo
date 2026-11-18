@@ -578,7 +578,7 @@ export class Store {
       { reportId, version, phase: run.phase, status: run.status })
   }
 
-  command(input: RunCommand) {
+  command(input: RunCommand, canUseModel = true) {
     return this.operate(input, () => {
       const run = this.run(input.runId)
       switch (input.action) {
@@ -611,6 +611,9 @@ export class Store {
             const count = this.workerList(run.id).filter(worker => worker.status === 'complete').length
             this.message(run.id, run.coordinatorId, 'guardian',
               'The run is ' + run.status + '. ' + count + ' assignments are complete. See Workflow for the next available action.', questionId)
+          } else if (!canUseModel) {
+            this.message(run.id, run.coordinatorId, 'guardian',
+              'This run needs a workspace model. Use Set up model in Workflow to continue.', questionId)
           }
           break
         }
