@@ -120,8 +120,9 @@ export default class ReportBenchmarkReporter implements Reporter {
     })
     const comparison = await compareReports(join(this.directory, manifest.path))
     this.writeJson('comparison-scorecard.json', comparison)
-    if (comparison.evidence.status !== 'passed' || !comparison.accuracy.guardian || !comparison.coverage.multiHost) {
-      throw new Error('The Guardian comparison is missing scope, evidence, or recorded cases.')
+    if (comparison.status === 'failed' || comparison.evidence.status !== 'passed' ||
+        !comparison.accuracy.guardian || !comparison.coverage.multiHost) {
+      throw new Error('The Guardian report comparison did not pass its local checks. See comparison-scorecard.json.')
     }
     console.log('Saved Guardian run evidence for ' + comparison.accuracy.guardian.agreeingVerdicts + '/' +
       comparison.accuracy.guardian.cases + ' matched case verdicts. Release comparison is ' + comparison.status + '.')

@@ -261,6 +261,24 @@ async function readScenario(directory: string, entry: Scenario) {
 
 type CheckedScenario = Awaited<ReturnType<typeof readScenario>>
 
+function findSeriousFindingIssues(scenarios: CheckedScenario[]) {
+  return scenarios.flatMap(({ id, guardian }) => {
+    if (guardian?.recordingAudit !== 'verified') return []
+    return guardian.cases.flatMap(row => {
+      if (row.expected !== 'confirmed' || (row.severity !== 'high' && row.severity !== 'critical')) return []
+      if (row.reported === 'confirmed' && row.reportedSeverity === row.severity) return []
+      return [{
+        scenario: id,
+        asset: row.asset,
+        issue: row.issue,
+        expectedSeverity: row.severity,
+        reportedVerdict: row.reported,
+        reportedSeverity: row.reportedSeverity ?? null,
+      }]
+    })
+  })
+}
+
 function scoreProduct(scenarios: CheckedScenario[], product: Product) {
   const reports = scenarios.flatMap(item => {
     const report = item[product]
@@ -341,7 +359,9 @@ export async function compareReports(manifestPath: string) {
   for (const entry of manifest.scenarios) scenarios.push(await readScenario(directory, entry))
   const guardian = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'guardian') : null
   const artex = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'artex') : null
-  const accuracy = { status: compareAccuracy(guardian, artex), guardian, artex }
+  const seriousFindingIssues = manifest.mode === 'assessment' ? findSeriousFindingIssues(scenarios) : []
+  const accuracyStatus: Status = seriousFindingIssues.length ? 'failed' : compareAccuracy(guardian, artex)
+  const accuracy = { status: accuracyStatus, guardian, artex, seriousFindingIssues }
   const evidenceIssues = scenarios.flatMap(item => item.guardian?.evidenceIssues.map(issue => ({ scenario: item.id, ...issue })) ?? [])
   const evidenceStatus: Status = evidenceIssues.some(issue => issue.reason !== 'unreviewed') ? 'failed'
     : scenarios.some(item => !item.guardian) || evidenceIssues.length ? 'pending' : 'passed'

@@ -18,7 +18,7 @@ async function comparison(t: TestContext) {
     await writeFile(join(directory, path), content)
     return { path, sha256: createHash('sha256').update(content).digest('hex') }
   }
-  const cases = [
+  const cases: { asset: string; issue: string; expected: string; severity?: string }[][] = [
     [{ asset: primary, issue: 'export', expected: 'confirmed', severity: 'high' },
       { asset: secondary, issue: 'export', expected: 'confirmed', severity: 'medium' }],
     [{ asset: primary, issue: 'export', expected: 'met' }],
@@ -53,8 +53,8 @@ async function comparison(t: TestContext) {
         inputSha256: input.sha256, reportSha256: report.sha256, recording,
       })
       const verdicts: { asset: string; issue: string; verdict: string; evidence?: string; severity?: string }[] =
-        cases[index].map(({ asset, issue, expected }) => ({
-          asset, issue, verdict: expected, ...(expected === 'confirmed' ? { evidence: 'supported' } : {}),
+        cases[index].map(({ asset, issue, expected, severity }) => ({
+          asset, issue, verdict: expected, ...(expected === 'confirmed' ? { evidence: 'supported', severity } : {}),
         }))
       if (name === 'artex' && !index) verdicts[0] = { asset: primary, issue: 'export', verdict: 'untested' }
       return { version: 'fixture-revision', model: 'fixture-model', report, runRecord, inputSha256: input.sha256, verdicts }
@@ -84,7 +84,7 @@ async function comparison(t: TestContext) {
 test('compares matched reports and counts duplicates and missed finding severity', async t => {
   const fixture = await comparison(t)
   const { guardian, artex } = fixture.manifest.scenarios[0]
-  guardian.verdicts[0].severity = 'high'
+  delete guardian.verdicts[1].severity
   artex.verdicts[1].severity = 'low'
   guardian.verdicts.push({ ...guardian.verdicts[0] })
   const score = await fixture.score()
@@ -98,6 +98,49 @@ test('compares matched reports and counts duplicates and missed finding severity
   assert.deepEqual(score.accuracy.artex?.severityRatings, { correct: 0, incorrect: 1, ungraded: 0 })
   assert.equal(score.readers.pairs, 4)
   assert.deepEqual(score.readers.results.coverage, { guardian: 4, artex: 4 })
+  assert.deepEqual(score.accuracy.seriousFindingIssues, [])
+})
+
+test('fails the scorecard for a missed or incorrectly rated serious finding', async t => {
+  const fixture = await comparison(t)
+  const { cases, guardian } = fixture.manifest.scenarios[0]
+  const confirmed = guardian.verdicts[0]
+  const issue = { scenario: 'multi-host', asset: primary, issue: 'export' }
+
+  guardian.verdicts[0] = { asset: primary, issue: 'export', verdict: 'untested' }
+  const missed = await fixture.score()
+  assert.equal(missed.accuracy.guardian?.precision, missed.accuracy.artex?.precision)
+  assert.equal(missed.accuracy.guardian?.recall, missed.accuracy.artex?.recall)
+  assert.equal(missed.status, 'failed')
+  assert.deepEqual(missed.accuracy.seriousFindingIssues, [{
+    ...issue, expectedSeverity: 'high', reportedVerdict: 'untested', reportedSeverity: null,
+  }])
+
+  guardian.verdicts[0] = { ...confirmed, severity: undefined }
+  const ungraded = await fixture.score()
+  assert.equal(ungraded.accuracy.status, 'failed')
+  assert.deepEqual(ungraded.accuracy.seriousFindingIssues, [{
+    ...issue, expectedSeverity: 'high', reportedVerdict: 'confirmed', reportedSeverity: null,
+  }])
+
+  cases[0].severity = 'critical'
+  guardian.verdicts[0] = confirmed
+  const path = 'guardian-only.json'
+  await fixture.write(path, {
+    ...fixture.manifest,
+    scenarios: fixture.manifest.scenarios.map(({ artex, ...scenario }) => ({ ...scenario, reviews: [] })),
+  })
+  const downgraded = await compareReports(join(fixture.directory, path))
+  assert.equal(downgraded.accuracy.artex, null)
+  assert.equal(downgraded.status, 'failed')
+  assert.deepEqual(downgraded.accuracy.seriousFindingIssues, [{
+    ...issue, expectedSeverity: 'critical', reportedVerdict: 'confirmed', reportedSeverity: 'high',
+  }])
+
+  guardian.verdicts[0].severity = 'critical'
+  const corrected = await fixture.score()
+  assert.equal(corrected.status, 'passed')
+  assert.deepEqual(corrected.accuracy.seriousFindingIssues, [])
 })
 
 test('keeps assessment pending for renderer-only data or missing reader reviews', async t => {
