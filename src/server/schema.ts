@@ -1,5 +1,5 @@
 import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
-import type { Candidate, Finding, Phase, ReportBody, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
+import type { Candidate, EvidenceSummary, Finding, Phase, PreparedObservation, ReportBody, RunStatus, WorkerPhase, WorkerStatus } from '../domain.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -32,6 +32,7 @@ export const projectAssets = sqliteTable('project_assets', {
   origin: text('origin').notNull(),
   source: text('source').notNull(),
   thirdParty: integer('third_party', { mode: 'boolean' }).notNull(),
+  prepared: text('prepared', { mode: 'json' }).$type<PreparedObservation>(),
 }, table => [uniqueIndex('project_assets_origin').on(table.projectId, table.origin)])
 
 export const runs = sqliteTable('runs', {
@@ -45,6 +46,7 @@ export const runs = sqliteTable('runs', {
   coordinatorId: text('coordinator_id').notNull(),
   phase: text('phase').$type<Phase>().notNull(),
   status: text('status').$type<RunStatus>().notNull(),
+  sourceMode: text('source_mode').$type<'prepared' | 'public'>().default('prepared').notNull(),
   candidates: text('candidates', { mode: 'json' }).$type<Candidate[]>().notNull(),
   approved: text('approved', { mode: 'json' }).$type<string[]>().notNull(),
   createdAt: integer('created_at').notNull(),
@@ -59,6 +61,8 @@ export const assignments = sqliteTable('assignments', {
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   sessionId: text('session_id').notNull(),
+  lease: text('lease'),
+  attempt: integer('attempt').default(0).notNull(),
   title: text('title').notNull(),
   objective: text('objective').notNull(),
   outcome: text('outcome'),
@@ -72,9 +76,10 @@ export const evidence = sqliteTable('evidence', {
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   title: text('title').notNull(),
-  kind: text('kind').$type<'inventory' | 'observation' | 'verification'>().notNull(),
+  kind: text('kind').$type<EvidenceSummary['kind']>().notNull(),
+  operationId: text('operation_id'),
   createdAt: integer('created_at').notNull(),
-}, table => [index('evidence_run').on(table.runId)])
+}, table => [index('evidence_run').on(table.runId), uniqueIndex('evidence_operation').on(table.assignmentId, table.operationId)])
 
 export const findings = sqliteTable('findings', {
   id: text('id').primaryKey().notNull(),
@@ -99,8 +104,9 @@ export const messages = sqliteTable('messages', {
   threadId: text('thread_id').notNull(),
   role: text('role').$type<'operator' | 'coordinator' | 'worker' | 'guardian'>().notNull(),
   content: text('content').notNull(),
+  replyTo: text('reply_to'),
   createdAt: integer('created_at').notNull(),
-}, table => [index('thread_messages').on(table.runId, table.threadId)])
+}, table => [index('thread_messages').on(table.runId, table.threadId), uniqueIndex('run_replies').on(table.runId, table.replyTo)])
 
 export const events = sqliteTable('events', {
   id: integer('id').primaryKey({ autoIncrement: true }),

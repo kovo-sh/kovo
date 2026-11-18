@@ -1,9 +1,22 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
-import { id, newProject, newRun, projectAsset, runCommand } from './domain.ts'
+import { id, newProject, newRun, projectAsset, providerSettings, runCommand } from './domain.ts'
+import { execution } from './server/execution.ts'
+import { checkModelConnection, publicModelSettings, saveModelSettings } from './server/model-settings.ts'
 import { store } from './server/store.ts'
 
-export const workspaceData = createServerFn({ method: 'GET' }).handler(() => store().listWorkspace())
+export const workspaceData = createServerFn({ method: 'GET' }).handler(() => ({
+  ...store().listWorkspace(),
+  hasModel: Boolean(publicModelSettings()),
+}))
+
+export const modelData = createServerFn({ method: 'GET' }).handler(() => publicModelSettings())
+
+export const testModel = createServerFn({ method: 'POST' }).validator(providerSettings)
+  .handler(({ data }) => checkModelConnection(data))
+
+export const saveModel = createServerFn({ method: 'POST' }).validator(providerSettings)
+  .handler(({ data }) => saveModelSettings(data))
 
 export const projectData = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id }))
@@ -23,7 +36,11 @@ export const addProjectAsset = createServerFn({ method: 'POST' }).validator(proj
   .handler(({ data }) => store().addProjectAsset(data))
 
 export const commandRun = createServerFn({ method: 'POST' }).validator(runCommand)
-  .handler(({ data }) => store().command(data))
+  .handler(({ data }) => {
+    const result = store().command(data)
+    execution().wake()
+    return result
+  })
 
 export const readArtifact = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id, artifactId: id }))

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from '@tanstack/react-router'
 import { readArtifact } from '../actions.ts'
 
 export function EvidenceDialog({ runId, artifactId, close }: {
@@ -27,6 +28,8 @@ export function EvidenceDialog({ runId, artifactId, close }: {
     {error ? <p role="alert">{error}</p> : !artifact ? <p role="status">Loading evidence…</p> : <>
       <p className="muted">Scope revision {artifact.scopeRevision}</p>
       <pre>{artifact.content}</pre>
+      <Link className="text-button" to="/runs/$runId/workers/$workerId"
+        params={{ runId, workerId: artifact.assignmentId }} search={{ view: 'trace' }} onClick={close}>Open worker thread ↗</Link>
     </>}
   </dialog>
 }

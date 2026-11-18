@@ -1,0 +1,56 @@
+{
+  "provider": "OpenRouter",
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "protocol": "responses",
+  "scenario": "connection",
+  "calls": [
+    {
+      "scenario": "connection",
+      "endpoint": "/api/v1/responses",
+      "request": {
+        "model": "deepseek/deepseek-v4.1-flash-1017",
+        "input": [
+          {
+            "role": "system",
+            "content": "Guardian connection test. Call guardian_connection with status ready. Do not add prose."
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Check the Guardian connection."
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "store": false,
+        "max_output_tokens": 384,
+        "tools": [
+          {
+            "type": "function",
+            "name": "guardian_connection",
+            "description": "Return status ready to confirm this synthetic connection test.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "additionalProperties": false
+            }
+          }
+        ],
+        "tool_choice": "required"
+      },
+      "status": 200,
+      "contentType": "text/event-stream",
+      "body": "data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen-1794989079-OSvSjPaqwr57RZVbVv8i\",\"object\":\"response\",\"created_at\":1760000000,\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"status\":\"in_progress\",\"completed_at\":null,\"output\":[],\"error\":null,\"incomplete_details\":null,\"access_programs\":null,\"tools\":[{\"type\":\"function\",\"name\":\"guardian_connection\",\"description\":\"Return status ready to confirm this synthetic connection test.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"string\"}},\"required\":[\"status\"],\"additionalProperties\":false},\"strict\":null}],\"tool_choice\":\"required\",\"parallel_tool_calls\":true,\"max_output_tokens\":384,\"temperature\":1,\"top_p\":1,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"max_tool_calls\":null,\"metadata\":{},\"background\":false,\"previous_response_id\":null,\"service_tier\":\"auto\",\"truncation\":\"disabled\",\"store\":false,\"instructions\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"reasoning\":null,\"prompt_cache_options\":null,\"usage\":null},\"sequence_number\":0}\n\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"gen-1794989079-OSvSjPaqwr57RZVbVv8i\",\"object\":\"response\",\"created_at\":1760000000,\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"status\":\"in_progress\",\"completed_at\":null,\"output\":[],\"error\":null,\"incomplete_details\":null,\"access_programs\":null,\"tools\":[{\"type\":\"function\",\"name\":\"guardian_connection\",\"description\":\"Return status ready to confirm this synthetic connection test.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"string\"}},\"required\":[\"status\"],\"additionalProperties\":false},\"strict\":null}],\"tool_choice\":\"required\",\"parallel_tool_calls\":true,\"max_output_tokens\":384,\"temperature\":1,\"top_p\":1,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"max_tool_calls\":null,\"metadata\":{},\"background\":false,\"previous_response_id\":null,\"service_tier\":\"auto\",\"truncation\":\"disabled\",\"store\":false,\"instructions\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"reasoning\":null,\"prompt_cache_options\":null,\"usage\":null},\"sequence_number\":1}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_fixture_0001\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\"call_fixture_0002\",\"name\":\"guardian_connection\",\"arguments\":\"\"},\"sequence_number\":2}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\"{\",\"sequence_number\":3}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\"\\\"status\\\"\",\"sequence_number\":4}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\": \",\"sequence_number\":5}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\"\\\"\",\"sequence_number\":6}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\"ready\",\"sequence_number\":7}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\"\\\"\",\"sequence_number\":8}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"delta\":\"}\",\"sequence_number\":9}\n\ndata: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"fc_fixture_0001\",\"name\":\"guardian_connection\",\"arguments\":\"{\\\"status\\\": \\\"ready\\\"}\",\"sequence_number\":10}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_fixture_0001\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_fixture_0002\",\"name\":\"guardian_connection\",\"arguments\":\"{\\\"status\\\": \\\"ready\\\"}\"},\"sequence_number\":11}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"gen-1794989079-OSvSjPaqwr57RZVbVv8i\",\"object\":\"response\",\"created_at\":1760000000,\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"status\":\"completed\",\"completed_at\":1794989079,\"output\":[{\"id\":\"fc_fixture_0001\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_fixture_0002\",\"name\":\"guardian_connection\",\"arguments\":\"{\\\"status\\\": \\\"ready\\\"}\"}],\"error\":null,\"incomplete_details\":null,\"access_programs\":null,\"tools\":[{\"type\":\"function\",\"name\":\"guardian_connection\",\"description\":\"Return status ready to confirm this synthetic connection test.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"string\"}},\"required\":[\"status\"],\"additionalProperties\":false},\"strict\":null}],\"tool_choice\":\"required\",\"parallel_tool_calls\":true,\"max_output_tokens\":384,\"temperature\":1,\"top_p\":1,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"max_tool_calls\":null,\"metadata\":{},\"background\":false,\"previous_response_id\":null,\"service_tier\":\"auto\",\"truncation\":\"disabled\",\"store\":false,\"instructions\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"reasoning\":{\"effort\":\"high\"},\"prompt_cache_options\":null,\"usage\":{\"input_tokens\":321,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":41,\"output_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":362,\"cost\":0.00009283,\"is_byok\":false,\"cost_details\":{\"upstream_inference_cost\":0.00009283,\"upstream_inference_input_cost\":0.00006741,\"upstream_inference_output_cost\":0.00002542}}},\"sequence_number\":12}\n\ndata: [DONE]\n\n"
+    }
+  ]
+}

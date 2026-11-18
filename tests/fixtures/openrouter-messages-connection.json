@@ -1,0 +1,68 @@
+{
+  "provider": "OpenRouter",
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "protocol": "messages",
+  "scenario": "connection",
+  "calls": [
+    {
+      "scenario": "connection",
+      "endpoint": "/api/v1/messages",
+      "request": {
+        "model": "deepseek/deepseek-v4.1-flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Check the Guardian connection.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "max_tokens": 384,
+        "stream": true,
+        "system": [
+          {
+            "type": "text",
+            "text": "Guardian connection test. Call guardian_connection with status ready. Do not add prose.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "guardian_connection",
+            "description": "Return status ready to confirm this synthetic connection test.",
+            "eager_input_streaming": true,
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "tool",
+          "name": "guardian_connection"
+        }
+      },
+      "status": 200,
+      "contentType": "text/event-stream",
+      "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture_0001\",\"type\":\"message\",\"role\":\"assistant\",\"container\":null,\"content\":[],\"model\":\"deepseek/deepseek-v4.1-flash-1017\",\"stop_reason\":null,\"stop_details\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"cache_creation\":null,\"inference_geo\":null,\"server_tool_use\":null,\"service_tier\":null,\"speed\":\"standard\"},\"provider\":\"InferenceNet\"}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Call\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" the tool with\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" status ready.\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"chatcmpl-tool-96a1af87f7c6a766\",\"caller\":{\"type\":\"direct\"},\"name\":\"guardian_connection\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"status\\\": \\\"ready\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":291,\"output_tokens\":48,\"output_tokens_details\":{\"thinking_tokens\":7},\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":0,\"cache_creation\":null,\"server_tool_use\":null,\"service_tier\":null,\"speed\":\"standard\",\"cost\":0.00005232,\"is_byok\":false,\"cost_details\":{\"upstream_inference_cost\":0.00005232,\"upstream_inference_prompt_cost\":0.00002328,\"upstream_inference_completions_cost\":0.00002904}},\"context_management\":null}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+  ]
+}

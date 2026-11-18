@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as ProjectsProjectIdRouteImport } from './routes/projects.$projectId'
 import { Route as RunsRunIdRouteImport } from './routes/runs.$runId'
 import { Route as ApiRunsRunIdEventsRouteImport } from './routes/api.runs.$runId.events'
@@ -18,6 +19,11 @@ import { Route as RunsRunIdWorkersWorkerIdRouteImport } from './routes/runs.$run
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectsProjectIdRoute = ProjectsProjectIdRouteImport.update({
@@ -44,6 +50,7 @@ const RunsRunIdWorkersWorkerIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/projects/$projectId': typeof ProjectsProjectIdRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/api/runs/$runId/events': typeof ApiRunsRunIdEventsRoute
@@ -51,6 +58,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/projects/$projectId': typeof ProjectsProjectIdRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/api/runs/$runId/events': typeof ApiRunsRunIdEventsRoute
@@ -59,6 +67,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/projects/$projectId': typeof ProjectsProjectIdRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/api/runs/$runId/events': typeof ApiRunsRunIdEventsRoute
@@ -68,6 +77,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/settings'
     | '/projects/$projectId'
     | '/runs/$runId'
     | '/api/runs/$runId/events'
@@ -75,6 +85,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/settings'
     | '/projects/$projectId'
     | '/runs/$runId'
     | '/api/runs/$runId/events'
@@ -82,6 +93,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/settings'
     | '/projects/$projectId'
     | '/runs/$runId'
     | '/api/runs/$runId/events'
@@ -90,6 +102,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  SettingsRoute: typeof SettingsRoute
   ProjectsProjectIdRoute: typeof ProjectsProjectIdRoute
   RunsRunIdRoute: typeof RunsRunIdRouteWithChildren
   ApiRunsRunIdEventsRoute: typeof ApiRunsRunIdEventsRoute
@@ -102,6 +115,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/projects/$projectId': {
@@ -149,6 +169,7 @@ const RunsRunIdRouteWithChildren = RunsRunIdRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  SettingsRoute: SettingsRoute,
   ProjectsProjectIdRoute: ProjectsProjectIdRoute,
   RunsRunIdRoute: RunsRunIdRouteWithChildren,
   ApiRunsRunIdEventsRoute: ApiRunsRunIdEventsRoute,

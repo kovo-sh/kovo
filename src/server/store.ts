@@ -10,8 +10,8 @@ import type { Candidate, ReportBody, RunCommand, WorkerPhase, newProject, newRun
 import * as tables from './schema.ts'
 import { redact } from './redact.ts'
 
-type Run = typeof tables.runs.$inferSelect
-type Assignment = typeof tables.assignments.$inferSelect
+export type Run = typeof tables.runs.$inferSelect
+export type Assignment = typeof tables.assignments.$inferSelect
 type Project = typeof tables.projects.$inferSelect
 
 export const dataDirectory = () => resolve(process.env.GUARDIAN_DATA_DIR ?? '.guardian')
@@ -20,11 +20,19 @@ export class Store {
   readonly db
   readonly workspace
   readonly directory: string
+  private readonly processLock: DatabaseSync
 
   constructor(directory: string) {
     this.directory = directory
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     mkdirSync(join(directory, 'artifacts'), { recursive: true, mode: 0o700 })
+    this.processLock = new DatabaseSync(join(directory, 'process-lock.sqlite'))
+    try {
+      this.processLock.exec('BEGIN EXCLUSIVE')
+    } catch {
+      this.processLock.close()
+      throw new Error('Another Guardian server is using this data directory.')
+    }
     const path = join(directory, 'guardian.sqlite')
     if (!existsSync(path)) {
       try {
@@ -66,10 +74,12 @@ export class Store {
     }).run()
   }
 
-  message(runId: string, threadId: string, role: typeof tables.messages.$inferSelect.role, content: string) {
+  message(runId: string, threadId: string, role: typeof tables.messages.$inferSelect.role, content: string, replyTo?: string) {
+    const id = randomUUID()
     this.db.insert(tables.messages).values({
-      id: randomUUID(), runId, threadId, role, content: redact(content), createdAt: Date.now(),
-    }).run()
+      id, runId, threadId, role, content: redact(content), replyTo, createdAt: Date.now(),
+    }).onConflictDoNothing().run()
+    return id
   }
 
   eventsAfter(runId: string, after: number) {
@@ -139,6 +149,25 @@ export class Store {
       .orderBy(asc(tables.assignments.createdAt), asc(tables.assignments.title)).all()
   }
 
+  runnable() {
+    return this.db.select().from(tables.runs).where(and(
+      eq(tables.runs.workspaceId, this.workspace.id), eq(tables.runs.status, 'running'),
+    )).orderBy(asc(tables.runs.createdAt)).all()
+  }
+
+  worker(workerId: string) {
+    const assignment = this.db.select().from(tables.assignments).where(eq(tables.assignments.id, workerId)).get()
+    if (!assignment) throw new Error('Assignment not found.')
+    this.run(assignment.runId)
+    return assignment
+  }
+
+  assignmentEvidence(assignmentId: string, operationId: string) {
+    return this.db.select().from(tables.evidence).where(and(
+      eq(tables.evidence.assignmentId, assignmentId), eq(tables.evidence.operationId, operationId),
+    )).get()
+  }
+
   artifact(runId: string, artifactId: string) {
     this.run(runId)
     const item = this.db.select().from(tables.evidence).where(and(
@@ -148,12 +177,16 @@ export class Store {
     return { ...item, content: readFileSync(join(this.directory, 'artifacts', item.id + '.txt'), 'utf8') }
   }
 
-  addArtifact(run: Run, assignment: Assignment, kind: typeof tables.evidence.$inferSelect.kind, title: string, content: string) {
+  addArtifact(run: Run, assignment: Assignment, kind: typeof tables.evidence.$inferSelect.kind, title: string, content: string, operationId?: string) {
+    if (operationId) {
+      const existing = this.assignmentEvidence(assignment.id, operationId)
+      if (existing) return existing
+    }
     const id = randomUUID()
-    writeFileSync(join(this.directory, 'artifacts', id + '.txt'), redact(content), { flag: 'wx', mode: 0o600 })
+    writeFileSync(join(this.directory, 'artifacts', id + '.txt'), redact(content), { flag: 'wx', mode: 0o600, flush: true })
     return this.db.insert(tables.evidence).values({
       id, runId: run.id, assignmentId: assignment.id, scopeRevision: run.scopeRevision,
-      goalRevision: assignment.goalRevision, title: redact(title), kind, createdAt: Date.now(),
+      goalRevision: assignment.goalRevision, title: redact(title), kind, operationId, createdAt: Date.now(),
     }).returning().get()
   }
 
@@ -196,6 +229,7 @@ export class Store {
       const run = this.db.insert(tables.runs).values({
         id: randomUUID(), projectId: project.id, workspaceId: this.workspace.id, coordinatorId: randomUUID(),
         originalGoal: goal, goal, goalRevision: 0, scopeRevision: 0, phase: 'consent', status: 'waiting',
+        sourceMode: input.sourceMode,
         candidates: [], approved: [], createdAt: Date.now(),
       }).returning().get()
       this.event(run.id, 'run.created', 'Run created.')
@@ -213,11 +247,14 @@ export class Store {
   }
 
   private saveCandidate(projectId: string, input: Omit<Candidate, 'id'>, replace = true) {
-    const candidate = { id: randomUUID(), projectId, origin: input.origin, source: redact(input.source), thirdParty: input.thirdParty }
+    const candidate = {
+      id: randomUUID(), projectId, origin: input.origin, source: redact(input.source),
+      thirdParty: input.thirdParty, prepared: input.prepared ?? null,
+    }
     const insert = this.db.insert(tables.projectAssets).values(candidate)
     if (replace) return insert.onConflictDoUpdate({
       target: [tables.projectAssets.projectId, tables.projectAssets.origin],
-      set: { source: candidate.source, thirdParty: candidate.thirdParty },
+      set: { source: candidate.source, thirdParty: candidate.thirdParty, ...(input.prepared === undefined ? {} : { prepared: input.prepared }) },
     }).returning().get()
     insert.onConflictDoNothing().run()
     return this.db.select().from(tables.projectAssets).where(and(
@@ -226,11 +263,16 @@ export class Store {
   }
 
   makeWorker(run: Run, phase: WorkerPhase, candidate: Candidate | undefined, title: string, objective: string): Assignment {
-    return this.db.insert(tables.assignments).values({
+    const assignment = this.db.insert(tables.assignments).values({
       id: randomUUID(), runId: run.id, assetId: candidate?.id ?? null, title, objective, phase, status: 'queued',
       scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, sessionId: randomUUID(),
       outcome: null, createdAt: Date.now(),
     }).returning().get()
+    const target = candidate?.origin ?? 'Supplied project records'
+    this.addArtifact(run, assignment, 'handoff', 'assignment.md',
+      ['# Assignment', '', objective, '', 'Input: ' + target, 'Goal: ' + run.goal,
+        'Goal revision: ' + run.goalRevision, 'Scope revision: ' + run.scopeRevision].join('\n'), 'assignment')
+    return assignment
   }
 
   updateRun(runId: string, state: Partial<Run>) {
@@ -243,15 +285,15 @@ export class Store {
     return this.db.update(tables.assignments).set(state).where(eq(tables.assignments.id, assignmentId)).returning().get()
   }
 
-  private setStatus(run: Run, status: Run['status']) {
+  setStatus(run: Run, status: Run['status']) {
     this.updateRun(run.id, { status })
     if (status === 'paused' || status === 'stopped' || status === 'failed') {
-      this.db.update(tables.assignments).set({ status: 'paused' }).where(and(
+      this.db.update(tables.assignments).set({ status: 'paused', lease: null }).where(and(
         eq(tables.assignments.runId, run.id), inArray(tables.assignments.status, ['queued', 'running']),
       )).run()
     }
     if (status === 'running') {
-      this.db.update(tables.assignments).set({ status: 'queued' }).where(and(
+      this.db.update(tables.assignments).set({ status: 'queued', lease: null }).where(and(
         eq(tables.assignments.runId, run.id), inArray(tables.assignments.status, ['paused', 'failed']),
       )).run()
     }
@@ -295,7 +337,7 @@ export class Store {
     }
     for (const assignment of this.workerList(run.id)) {
       if (assignment.assetId && removed.includes(assignment.assetId) && assignment.status !== 'complete') {
-        this.updateWorker(assignment.id, { status: 'canceled', outcome: 'Scope revoked.' })
+        this.updateWorker(assignment.id, { status: 'canceled', outcome: 'Scope revoked.', lease: null })
       }
     }
     for (const asset of updated.candidates.filter(asset => added.includes(asset.id))) {
@@ -320,7 +362,7 @@ export class Store {
     if (phase === 'analysis') {
       for (const assignment of this.workerList(run.id)) {
         if (assignment.phase !== 'discovery' && assignment.status !== 'complete') {
-          this.updateWorker(assignment.id, { status: 'canceled', outcome: 'Superseded by a goal revision.' })
+          this.updateWorker(assignment.id, { status: 'canceled', outcome: 'Superseded by a goal revision.', lease: null })
         }
       }
       for (const asset of updated.candidates.filter(item => run.approved.includes(item.id))) {
@@ -341,12 +383,19 @@ export class Store {
       const workers = snapshot.assignments.filter(worker => worker.assetId === asset.id && worker.goalRevision === run.goalRevision)
       const complete = [...workers].reverse().find(worker => worker.phase === 'verification' && worker.status === 'complete')
       const done = complete ?? [...workers].reverse().find(worker => worker.status === 'complete')
-      const artifact = snapshot.evidence.find(item => item.assignmentId === done?.id)
-      return { origin: asset.origin, status: done?.outcome ?? 'Pending review', evidenceId: artifact?.id ?? null }
+      const artifact = snapshot.evidence.find(item => item.assignmentId === done?.id &&
+        ['verification', 'observation', 'analysis'].includes(item.kind))
+      const analyzed = [...workers].reverse().find(worker => worker.phase === 'analysis' && worker.status === 'complete')
+      const derived = snapshot.evidence.find(item => item.assignmentId === analyzed?.id && item.kind === 'analysis')
+      return {
+        origin: asset.origin, status: done?.outcome ?? 'Pending review',
+        evidenceId: artifact?.id ?? null, analysisEvidenceId: derived?.id,
+      }
     })
     const body: ReportBody = {
       goal: run.goal, scope, scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results,
-      gaps: coverage.filter(item => !item.evidenceId).map(item => `${item.origin}: no evidence committed.`),
+      gaps: coverage.filter(item => !item.evidenceId || item.status.startsWith('Inconclusive'))
+        .map(item => item.origin + ': ' + item.status),
     }
     if (!scope.length) body.gaps.push('No approved hosts in this report.')
     this.db.insert(tables.reports).values({
@@ -378,10 +427,16 @@ export class Store {
         case 'revise':
           this.revise(run, input.goal)
           break
-        case 'message':
-          this.message(run.id, run.coordinatorId, 'operator', input.message)
+        case 'message': {
+          const questionId = this.message(run.id, run.coordinatorId, 'operator', input.message)
           this.event(run.id, 'coordinator.message', 'Coordinator message received.')
+          if (run.status !== 'running') {
+            const count = this.workerList(run.id).filter(worker => worker.status === 'complete').length
+            this.message(run.id, run.coordinatorId, 'guardian',
+              'The run is ' + run.status + '. ' + count + ' assignments are complete. See Workflow for the next available action.', questionId)
+          }
           break
+        }
         case 'pause':
           if (run.status !== 'running') throw new Error('Only running work can be paused.')
           this.setStatus(run, 'paused')

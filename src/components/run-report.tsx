@@ -18,7 +18,8 @@ export function RunReport({ detail, openEvidence }: {
       `Guardian ${report.partial ? 'partial report' : 'complete report'} • Version ${report.version}`,
       '', body.goal, '', `Scope revision ${body.scopeRevision} · Goal revision ${body.goalRevision}`,
       ...body.scope.map(asset => asset.origin), '', 'Coverage',
-      ...body.coverage.map(item => `${item.origin} · ${item.status}${item.evidenceId ? ` · evidence ${item.evidenceId}` : ''}`),
+      ...body.coverage.map(item => [item.origin, item.status, item.evidenceId && `Evidence ${item.evidenceId}`,
+        item.analysisEvidenceId && `Derived evidence ${item.analysisEvidenceId}`].filter(Boolean).join(' · ')),
       '', 'Findings',
       ...body.findings.flatMap(item => [
         `${item.title} · ${item.origin} · ${item.severity} · ${item.status}`,
@@ -34,10 +35,10 @@ export function RunReport({ detail, openEvidence }: {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  return <article className="report-body">
+  return <article className="report-body" aria-labelledby="report-title">
     <div className="section-heading report-top">
       <div><p className="eyebrow">Report · {timeText(report.createdAt)}</p>
-        <h2>{report.partial ? 'Partial report' : 'Complete report'}</h2>
+        <h2 id="report-title">{report.partial ? 'Partial report' : 'Complete report'}</h2>
       </div>
       <div className="toolbar">
         <label>Version <select value={report.version} onChange={event => setVersion(Number(event.target.value))}>
@@ -53,7 +54,10 @@ export function RunReport({ detail, openEvidence }: {
       <h3>Coverage</h3>
       <ul className="project-list">{body.coverage.map(item => <li key={item.origin}><div className="list-row">
         <span><strong>{new URL(item.origin).hostname}</strong><small>{item.status}</small></span>
-        {item.evidenceId && <button onClick={() => openEvidence(item.evidenceId!)}>Open evidence</button>}
+        <div className="toolbar">
+          {item.evidenceId && <button onClick={() => openEvidence(item.evidenceId!)}>Open evidence</button>}
+          {item.analysisEvidenceId && <button onClick={() => openEvidence(item.analysisEvidenceId!)}>Derived evidence</button>}
+        </div>
       </div></li>)}</ul>
     </section>
     <section className="stacked-section">

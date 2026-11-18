@@ -25,13 +25,22 @@ export const newProject = z.object({
   name: shortText,
   seeds: z.array(assetOrigin).min(1).max(24),
 })
-export const newRun = z.object({ requestId: id, projectId: id, goal: goalText })
+export const newRun = z.object({
+  requestId: id, projectId: id, goal: goalText,
+  sourceMode: z.enum(['prepared', 'public']).default('prepared'),
+})
+const preparedObservation = z.object({
+  status: z.number().int().min(100).max(599),
+  mediaType: z.string().regex(/^[a-z0-9.+-]{1,40}\/[a-z0-9.+-]{1,60}$/),
+  transportMaxAge: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+  includeSubDomains: z.boolean(),
+})
 export const addCandidate = z.object({
   origin: assetOrigin,
   source: shortText,
   thirdParty: z.boolean(),
 })
-export const projectAsset = addCandidate.extend({ requestId: id, projectId: id })
+export const projectAsset = addCandidate.extend({ requestId: id, projectId: id, prepared: preparedObservation.optional() })
 const commandBase = z.object({ requestId: id, runId: id })
 export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({ action: z.literal('discover'), consent: z.literal(true) }),
@@ -53,14 +62,17 @@ export interface Candidate {
   origin: string
   source: string
   thirdParty: boolean
+  prepared?: PreparedObservation | null
 }
+
+export type PreparedObservation = z.output<typeof preparedObservation>
 
 export interface EvidenceSummary {
   id: string
   assignmentId: string
   scopeRevision: number
   title: string
-  kind: 'inventory' | 'observation' | 'verification'
+  kind: 'inventory' | 'observation' | 'analysis' | 'verification' | 'handoff'
   createdAt: number
 }
 
@@ -81,7 +93,7 @@ export interface ReportBody {
   scope: Candidate[]
   scopeRevision: number
   goalRevision: number
-  coverage: { origin: string; status: string; evidenceId: string | null }[]
+  coverage: { origin: string; status: string; evidenceId: string | null; analysisEvidenceId?: string }[]
   findings: Finding[]
   gaps: string[]
 }
@@ -91,3 +103,22 @@ export const DEFAULT_PROVIDER = {
   model: 'deepseek/deepseek-v4.1-flash-1017',
   protocol: 'responses' as const,
 }
+
+export const providerSettings = z.object({
+  endpoint: z.string().trim().min(1).max(300).transform((input, ctx) => {
+    try {
+      const url = new URL(input)
+      const local = url.protocol === 'http:' && url.hostname === '127.0.0.1' && Boolean(url.port)
+      if ((!local && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash) throw new Error()
+      return url.origin + url.pathname.replace(/\/+$/, '')
+    } catch {
+      ctx.addIssue({ code: 'custom', message: 'Enter an HTTPS provider base URL or a local model endpoint on 127.0.0.1.' })
+      return z.NEVER
+    }
+  }),
+  model: z.string().trim().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,127}$/),
+  protocol: z.enum(['responses', 'messages']),
+  key: z.string().trim().min(8).max(512).regex(/^[\x21-\x7e]+$/),
+})
+
+export type ProviderSettings = z.output<typeof providerSettings>

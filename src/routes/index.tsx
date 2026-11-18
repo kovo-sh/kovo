@@ -9,7 +9,7 @@ export const Route = createFileRoute('/')({
 })
 
 function Workspace() {
-  const { workspace, projects } = Route.useLoaderData()
+  const { workspace, projects, hasModel } = Route.useLoaderData()
   const navigate = useNavigate()
   const [creating, setCreating] = useState(projects.length === 0)
   const action = useAction()
@@ -19,6 +19,10 @@ function Workspace() {
       <div><p className="eyebrow">{workspace.name}</p><h1>Projects</h1></div>
       {!creating && <button type="button" className="primary" onClick={() => setCreating(true)}>New project</button>}
     </div>
+    {!hasModel && <div className="model-callout">
+      <div><h2>Connect a model</h2><p className="muted">Set up OpenRouter or a compatible provider for coordinator and worker reviews.</p></div>
+      <Link className="action-link primary" to="/settings">Set up model</Link>
+    </div>}
     {creating && <form className="form-card" onSubmit={event => {
       event.preventDefault()
       const form = new FormData(event.currentTarget)

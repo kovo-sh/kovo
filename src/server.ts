@@ -1,8 +1,8 @@
 import handler, { createServerEntry } from '@tanstack/react-start/server-entry'
-import { store } from './server/store.ts'
+import { execution } from './server/execution.ts'
 
 export function initialize() {
-  store()
+  execution().start()
 }
 
 export default createServerEntry({

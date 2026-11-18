@@ -10,7 +10,7 @@ export interface PublicObservation {
   mediaType: string
   transportMaxAge: number | null
   includeSubDomains: boolean
-  source: 'public response' | 'fixture response'
+  source: 'public response' | 'fixture response' | 'supplied observation'
 }
 
 type HeadersRead = { status: number; headers: IncomingHttpHeaders }

@@ -1,0 +1,59 @@
+import { createFileRoute, Link } from '@tanstack/react-router'
+import { useState } from 'react'
+import { modelData, saveModel, testModel } from '../actions.ts'
+import { FormError, useAction } from '../components/common.tsx'
+import { DEFAULT_PROVIDER } from '../domain.ts'
+
+export const Route = createFileRoute('/settings')({
+  loader: () => modelData(),
+  component: ModelPage,
+})
+
+function ModelPage() {
+  const config = Route.useLoaderData()
+  const action = useAction()
+  const [feedback, setFeedback] = useState('')
+  return <main className="workspace-page">
+    <Link to="/" className="back-link">← Projects</Link>
+    <div className="page-title"><h1>Model settings</h1></div>
+    <form className="form-card" onInput={() => setFeedback('')} onSubmit={event => {
+      event.preventDefault()
+      const form = new FormData(event.currentTarget)
+      const command = (event.nativeEvent as SubmitEvent).submitter?.getAttribute('value')
+      const data = {
+        endpoint: String(form.get('endpoint')), model: String(form.get('model')),
+        protocol: form.get('protocol') === 'messages' ? 'messages' as const : 'responses' as const,
+        key: String(form.get('key')),
+      }
+      const element = event.currentTarget
+      void action.submit(() => command === 'test' ? testModel({ data }) : saveModel({ data }), () => {
+        setFeedback(command === 'test' ? 'Connection verified. The model streamed a valid tool call.' : 'Model saved for this workspace.')
+        if (command !== 'test') {
+          const input = element.elements.namedItem('key') as HTMLInputElement | null
+          if (input) input.value = ''
+        }
+      })
+    }}>
+      <h2>{config ? 'Workspace model' : 'Connect OpenRouter'}</h2>
+      {config && <p className="muted">Active model <strong>{config.model}</strong></p>}
+      <label>API key<input name="key" type="password" required minLength={8} maxLength={512} autoComplete="off"
+        placeholder={config ? 'Enter a replacement key' : 'Enter your provider key'} /></label>
+      <details className="provider-advanced">
+        <summary>Advanced provider settings</summary>
+        <label>Model ID<input name="model" required defaultValue={(config ?? DEFAULT_PROVIDER).model} /></label>
+        <label>Base URL<input name="endpoint" type="url" required defaultValue={(config ?? DEFAULT_PROVIDER).endpoint} /></label>
+        <label>Protocol<select name="protocol" defaultValue={(config ?? DEFAULT_PROVIDER).protocol}>
+          <option value="responses">OpenAI Responses</option>
+          <option value="messages">Anthropic Messages</option>
+        </select></label>
+      </details>
+      <p className="muted">The provider receives sanitized context and selected evidence excerpts. The connection test uses synthetic input.</p>
+      <FormError error={action.error} />
+      {feedback && <p role="status">{feedback}</p>}
+      <div className="form-actions">
+        <button type="submit" value="test" disabled={action.pending}>Test connection</button>
+        <button type="submit" value="save" className="primary" disabled={action.pending}>Save model</button>
+      </div>
+    </form>
+  </main>
+}

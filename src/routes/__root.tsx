@@ -71,7 +71,7 @@ function Shell() {
     <header className="app-nav">
       <Brand />
       <nav aria-label="Workspace"><Link to="/">Projects</Link></nav>
-      <div className="nav-right"><ViewPreferences /></div>
+      <div className="nav-right"><Link to="/settings">Model settings</Link><ViewPreferences /></div>
     </header>
     <Outlet />
   </>

@@ -30,7 +30,7 @@ export async function createApp(env: NodeJS.ProcessEnv = {}) {
       output = ''
       const child = spawn(process.execPath, ['scripts/serve.ts'], {
         cwd: process.cwd(),
-        env: { ...process.env, GUARDIAN_PUBLIC_ORIGIN: '', ...env, PORT: String(port), GUARDIAN_DATA_DIR: directory },
+        env: { ...process.env, GUARDIAN_OFFLINE: '1', GUARDIAN_PUBLIC_ORIGIN: '', ...env, PORT: String(port), GUARDIAN_DATA_DIR: directory },
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       processHandle = child

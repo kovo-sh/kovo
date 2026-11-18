@@ -63,6 +63,22 @@ export function RunWorkspace({ detail, view, workerId }: {
         search.current.focus()
       }
       if (event.key === 'Escape' && !artifact && chatOpen && workerId) closeWorker()
+      if (view !== 'trace' || !(event.target instanceof HTMLElement)) return
+      const searchFocused = event.target === search.current
+      const workerFocused = event.target.matches('.trace-node')
+      if (!searchFocused && !workerFocused) return
+      const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('.trace-node[data-match=true]'))
+      if (!links.length) return
+      if (event.key === 'Enter' && searchFocused) {
+        event.preventDefault()
+        links[0].click()
+      } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        const current = links.indexOf(event.target as HTMLAnchorElement)
+        const next = current < 0 ? (event.key === 'ArrowUp' ? links.length - 1 : 0)
+          : (current + (event.key === 'ArrowUp' ? -1 : 1) + links.length) % links.length
+        links[next].focus()
+      }
     }
     window.addEventListener('keydown', keyboard)
     return () => window.removeEventListener('keydown', keyboard)
