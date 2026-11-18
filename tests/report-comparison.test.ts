@@ -40,7 +40,7 @@ async function comparison(t: TestContext) {
       const runRecord = await write(id + '-' + name + '-run.json', {
         inputSha256: input.sha256, reportSha256: report.sha256, recording,
       })
-      const verdicts: { asset: string; issue: string; verdict: string; evidence?: string }[] =
+      const verdicts: { asset: string; issue: string; verdict: string; evidence?: string; severity?: string }[] =
         cases[index].map(({ asset, issue, expected }) => ({
           asset, issue, verdict: expected, ...(expected === 'confirmed' ? { evidence: 'supported' } : {}),
         }))
@@ -69,7 +69,9 @@ async function comparison(t: TestContext) {
 
 test('compares matched reports and counts duplicates and missed finding severity', async t => {
   const fixture = await comparison(t)
-  const { guardian } = fixture.manifest.scenarios[0]
+  const { guardian, artex } = fixture.manifest.scenarios[0]
+  guardian.verdicts[0].severity = 'high'
+  artex.verdicts[1].severity = 'low'
   guardian.verdicts.push({ ...guardian.verdicts[0] })
   const score = await fixture.score()
   assert.equal(score.status, 'passed')
@@ -78,6 +80,8 @@ test('compares matched reports and counts duplicates and missed finding severity
   assert.equal(score.accuracy.guardian?.recall, 1)
   assert.equal(score.accuracy.artex?.recall, 0.5)
   assert.equal(score.accuracy.artex?.missesBySeverity.high, 1)
+  assert.deepEqual(score.accuracy.guardian?.severityRatings, { correct: 1, incorrect: 0, ungraded: 1 })
+  assert.deepEqual(score.accuracy.artex?.severityRatings, { correct: 0, incorrect: 1, ungraded: 0 })
   assert.equal(score.readers.pairs, 1)
 })
 

@@ -9,7 +9,8 @@ import { configureModel, downloadReport, openScopeReview, saveScope } from './br
 import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
 import {
-  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, healthyOrigin, primaryOrigin, secondaryAccessPolicy, unavailableOrigin,
+  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, healthyOrigin, primaryOrigin, secondaryAccessPolicy,
+  severeAccessPolicy, unavailableOrigin,
 } from './scenarios.ts'
 
 test('imports and verifies access policy cases alone and alongside response checks', { tag: '@report-benchmark' }, async ({ page }) => {
@@ -198,7 +199,8 @@ async function importAccessRecords(page: Page, policy: AccessPolicySnapshot) {
   await page.getByRole('button', { name: 'Review records' }).click()
   const review = page.getByRole('region', { name: 'Access policy import preview' })
   await review.getByRole('button', { name: 'Import records' }).click()
-  await expect(page.getByRole('status')).toContainText('Imported 4 access cases for ' + new URL(policy.origin).hostname)
+  await expect(page.getByRole('status')).toContainText('Imported ' + policy.expected.length + ' access cases for ' +
+    new URL(policy.origin).hostname)
 }
 
 test('keeps overlapping access findings and verification tied to each approved host', { tag: '@report-benchmark' }, async ({ page }) => {
@@ -224,6 +226,48 @@ test('keeps overlapping access findings and verification tied to each approved h
     await expect(report.getByRole('heading', { name: 'Recorded access exceeds policy for billing-export' })).toHaveCount(2)
     const exported = await downloadReport(page, 'Markdown with evidence')
     await collectReportBenchmark('policy-multi-host', app.directory, page.url(), exported)
+    expect(fixture.requested).toEqual([])
+    expect(fixture.accepted).toContain('plan-access-policy:responses:0')
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
+test('prioritizes verified serious access grants and attributes their impact', { tag: '@report-benchmark' }, async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy'] })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await page.getByLabel('Project name').fill('Northstar administration')
+    await page.getByLabel('Seed hosts').fill(primaryOrigin)
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await importAccessRecords(page, severeAccessPolicy)
+
+    await openScopeReview(page, accessPolicyGoal, true)
+    await saveScope(page)
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('2 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('1 check met baseline · 2 verified gaps · 1 check inconclusive')
+    const priority = report.getByRole('region', { name: 'Fix first' })
+    await expect(priority).toContainText('northstar.example · critical')
+    await expect(priority).toContainText('Deny manage-organization-owners for team-viewer')
+    const title = 'Recorded access exceeds policy for workspace-ownership'
+    await priority.getByRole('link', { name: title }).press('Enter')
+    const findings = report.locator('.finding')
+    await expect(findings).toHaveCount(2)
+    await expect(findings.first()).toBeFocused()
+    await expect(findings.first()).toContainText('The supplied policy identifies this capability as organization-wide administration.')
+    await expect(findings.first()).toContainText('The expected decision is deny.')
+    await expect(findings.nth(1)).toContainText('northstar.example · high')
+    await expect(findings.nth(1)).toContainText('The supplied policy identifies this capability as access to sensitive records.')
+
+    const exported = await downloadReport(page, 'Markdown with evidence')
+    await collectReportBenchmark('policy-serious-impact', app.directory, page.url(), exported)
     expect(fixture.requested).toEqual([])
     expect(fixture.accepted).toContain('plan-access-policy:responses:0')
     expect(fixture.unexpected).toEqual([])

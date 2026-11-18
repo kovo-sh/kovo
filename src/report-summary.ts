@@ -8,7 +8,9 @@ export const checkLabels: Record<CheckCoverage['status'], string> = {
   'not-applicable': 'Not applicable',
 }
 
-export const findingSeverityOrder: Record<Finding['severity'], number> = { medium: 0, low: 1, informational: 2 }
+export const findingSeverityOrder: Record<Finding['severity'], number> = {
+  critical: 0, high: 1, medium: 2, low: 3, informational: 4,
+}
 export const suppliedResponseLabel = 'Supplied response metadata'
 
 function checkCount(count: number) {

@@ -4,7 +4,7 @@ import type { AssessmentCheckId, Finding, ResponseCheckId } from '../src/domain.
 import type { PublicObservation } from '../src/server/broker.ts'
 import {
   accessPolicy, accessPolicyGoal, allChecksGoal, healthy, healthyOrigin, primary, primaryOrigin,
-  secondaryAccessPolicy, unavailable, unavailableOrigin,
+  secondaryAccessPolicy, severeAccessPolicy, unavailable, unavailableOrigin,
 } from './scenarios.ts'
 
 export const benchmarkSuite = 'northstar-report-v1'
@@ -109,6 +109,20 @@ export const benchmarkScenarios = {
       'modify-schedule': { expected: 'met' },
     })],
   },
+  'policy-serious-impact': {
+    version: 1, partial: false,
+    basis: 'A read-only role can manage organization owners and a support viewer can read sensitive records. A separate administration check correctly denies access, and payroll has no recorded decision.',
+    input: {
+      goal: accessPolicyGoal, scope: [primaryOrigin], stoppingPoint: 'complete',
+      capturedEvidence: { accessDecisions: [severeAccessPolicy] },
+    },
+    cases: accessCases(primaryOrigin, {
+      'workspace-ownership': { expected: 'confirmed', severity: 'critical' },
+      'customer-history': { expected: 'confirmed', severity: 'high' },
+      'security-administration': { expected: 'met' },
+      'payroll-records': { expected: 'inconclusive' },
+    }),
+  },
 } satisfies Record<string, ReportScenario>
 
 export type ScenarioId = keyof typeof benchmarkScenarios
@@ -122,6 +136,7 @@ export type CaseResult = {
   id: string
   reported: Verdict
   visible: boolean
+  reportedSeverity?: Finding['severity']
   linkedEvidence?: boolean
   fixGuidance?: boolean
 }

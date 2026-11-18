@@ -6,11 +6,19 @@ export const maxAccessPolicyCases = 64
 
 export const accessCaseLabel = z.string().trim().regex(/^[a-z0-9][a-z0-9_.-]{0,59}$/i)
 const decision = z.object({ caseId: accessCaseLabel, decision: z.enum(['allow', 'deny']) })
+const expectedDecision = decision.extend({
+  role: accessCaseLabel,
+  capability: accessCaseLabel,
+  impactIfAllowed: z.enum(['sensitive-records', 'organization-admin']).optional(),
+}).refine(item => item.decision === 'deny' || item.impactIfAllowed === undefined, {
+  message: 'Supply the impact of an unintended grant only for an expected deny.',
+  path: ['impactIfAllowed'],
+})
 
 export const accessPolicySnapshot = z.object({
   origin: assetOrigin,
   recordedAt: z.iso.datetime(),
-  expected: z.array(decision.extend({ role: accessCaseLabel, capability: accessCaseLabel })).min(1).max(maxAccessPolicyCases),
+  expected: z.array(expectedDecision).min(1).max(maxAccessPolicyCases),
   observed: z.array(decision).max(maxAccessPolicyCases),
 }).superRefine(({ expected, observed }, context) => {
   const cases = new Set(expected.map(item => item.caseId))

@@ -342,6 +342,15 @@ test('requires unique policy cases and leaves missing access decisions inconclus
   assert.equal(accessPolicySnapshot.safeParse({
     ...accessPolicy, observed: [{ caseId: 'unmatched', decision: 'allow' }],
   }).success, false)
+  assert.equal(accessPolicySnapshot.safeParse({
+    ...accessPolicy,
+    expected: [{ ...accessPolicy.expected[0], decision: 'allow', impactIfAllowed: 'organization-admin' }],
+  }).success, false)
+  const observedWithImpact = accessPolicySnapshot.parse({
+    ...accessPolicy, observed: [{ ...accessPolicy.observed[0], impactIfAllowed: 'organization-admin' }],
+  })
+  assert.equal('impactIfAllowed' in observedWithImpact.observed[0], false)
+  assert.equal(accessPolicyReviews(observedWithImpact)[0].rule.severity, 'medium')
   const reviews = accessPolicyReviews(accessPolicySnapshot.parse(accessPolicy))
   const comparisons = reviews.flatMap(review => review.comparison ? [review.comparison] : [])
   const unexpected = readComparisons('[{"id":"unmatched","outcome":"gap"}]', comparisons)

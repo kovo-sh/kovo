@@ -99,12 +99,14 @@ export interface EvidenceSummary {
   createdAt: number
 }
 
+export const findingSeverities = ['critical', 'high', 'medium', 'low', 'informational'] as const
+
 export interface Finding {
   id: string
   origin: string
   title: string
   status: 'pending' | 'confirmed' | 'dismissed' | 'inconclusive'
-  severity: 'medium' | 'low' | 'informational'
+  severity: typeof findingSeverities[number]
   reason: string
   remediation: string
   evidenceIds: string[]

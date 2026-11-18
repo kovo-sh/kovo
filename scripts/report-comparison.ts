@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
-import { assetOrigin } from '../src/domain.ts'
+import { assetOrigin, findingSeverities } from '../src/domain.ts'
 import { scoreReportCases, verdictSchema } from './report-metrics.ts'
 
 const label = z.string().trim().min(1)
@@ -13,7 +13,7 @@ const runRecordSchema = z.strictObject({
   reportSha256: digest,
   recording: artifact,
 })
-const severity = z.enum(['critical', 'high', 'medium', 'low', 'informational'])
+const severity = z.enum(findingSeverities)
 const caseIdentity = { asset: assetOrigin, issue: label }
 const expectedCase = z.discriminatedUnion('expected', [
   z.strictObject({ ...caseIdentity, expected: z.literal('confirmed'), severity }),
@@ -21,7 +21,7 @@ const expectedCase = z.discriminatedUnion('expected', [
 ])
 const evidenceQuality = z.enum(['supported', 'missing', 'unrelated', 'out-of-scope'])
 const verdict = z.discriminatedUnion('verdict', [
-  z.strictObject({ ...caseIdentity, verdict: z.literal('confirmed'), evidence: evidenceQuality.optional() }),
+  z.strictObject({ ...caseIdentity, verdict: z.literal('confirmed'), evidence: evidenceQuality.optional(), severity: severity.optional() }),
   z.strictObject({ ...caseIdentity, verdict: verdictSchema.exclude(['confirmed']) }),
 ])
 const productReport = z.strictObject({
@@ -143,7 +143,11 @@ async function readProduct(directory: string, entry: Scenario, product: Product,
     const actual = observations.get(key)
     if (!actual) throw new Error(context + ' is missing a labeled case. Use untested for unsupported checks.')
     observations.delete(key)
-    return { ...expected, reported: actual.verdict }
+    return {
+      ...expected,
+      reported: actual.verdict,
+      ...(actual.verdict === 'confirmed' && actual.severity ? { reportedSeverity: actual.severity } : {}),
+    }
   })
   const unexpectedConfirmations = [...observations.values()]
   if (unexpectedConfirmations.some(row => row.verdict !== 'confirmed')) {
@@ -185,13 +189,20 @@ function scoreProduct(scenarios: CheckedScenario[], product: Product) {
   if (reports.length !== scenarios.length || reports.some(report => !report.runRecord)) return null
   const cases = reports.flatMap(report => report.cases)
   const unmatched = reports.reduce((total, report) => total + report.unexpectedConfirmations.length, 0)
-  const misses = cases.filter(row => row.expected === 'confirmed' && row.reported !== 'confirmed')
+  const expectedConfirmations = cases.filter(row => row.expected === 'confirmed')
+  const misses = expectedConfirmations.filter(row => row.reported !== 'confirmed')
+  const matched = expectedConfirmations.filter(row => row.reported === 'confirmed')
   return {
     ...scoreReportCases(cases, unmatched),
     duplicates: reports.reduce((total, report) => total + report.duplicates, 0),
     missesBySeverity: Object.fromEntries(severity.options.map(level => [
       level, misses.filter(row => row.expected === 'confirmed' && row.severity === level).length,
     ])),
+    severityRatings: {
+      correct: matched.filter(row => row.reportedSeverity === row.severity).length,
+      incorrect: matched.filter(row => row.reportedSeverity && row.reportedSeverity !== row.severity).length,
+      ungraded: matched.filter(row => !row.reportedSeverity).length,
+    },
   }
 }
 

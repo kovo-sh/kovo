@@ -49,9 +49,11 @@ export function AccessPolicyImport({ projectId, assets, cancel, imported }: {
   if (preview) {
     const { snapshot, requestId } = preview
     const replacement = assets.some(asset => asset.origin === snapshot.origin && asset.accessPolicy)
+    const ratedCases = snapshot.expected.filter(item => item.impactIfAllowed).length
     return <section className="form-card" aria-label="Access policy import preview">
       <h3>{new URL(snapshot.origin).hostname}</h3>
       <p>{snapshot.expected.length} expected cases · {snapshot.observed.length} recorded decisions</p>
+      {ratedCases > 0 && <p className="muted">Policy impact supplied for {ratedCases} {ratedCases === 1 ? 'case' : 'cases'}.</p>}
       <p className="muted">Recorded {timeText(Date.parse(snapshot.recordedAt))}. Available at the next discovery.</p>
       <FormError error={action.error} />
       <div className="form-actions">

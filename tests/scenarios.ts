@@ -41,6 +41,26 @@ export const secondaryAccessPolicy: AccessPolicySnapshot = {
   ],
 }
 
+export const severeAccessPolicy: AccessPolicySnapshot = {
+  origin: primaryOrigin,
+  recordedAt: '2026-11-17T16:30:00Z',
+  expected: [
+    { caseId: 'customer-history', role: 'support-viewer', capability: 'read-customer-history', decision: 'deny',
+      impactIfAllowed: 'sensitive-records' },
+    { caseId: 'workspace-ownership', role: 'team-viewer', capability: 'manage-organization-owners', decision: 'deny',
+      impactIfAllowed: 'organization-admin' },
+    { caseId: 'security-administration', role: 'audit-viewer', capability: 'manage-security-settings', decision: 'deny',
+      impactIfAllowed: 'organization-admin' },
+    { caseId: 'payroll-records', role: 'team-viewer', capability: 'read-payroll', decision: 'deny',
+      impactIfAllowed: 'sensitive-records' },
+  ],
+  observed: [
+    { caseId: 'customer-history', decision: 'allow' },
+    { caseId: 'workspace-ownership', decision: 'allow' },
+    { caseId: 'security-administration', decision: 'deny' },
+  ],
+}
+
 export function observation(origin: string, status: number, transportMaxAge: number | null): PublicObservation {
   return {
     origin, finalOrigin: origin, status, mediaType: 'text/html',

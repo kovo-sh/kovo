@@ -17,7 +17,7 @@ const artexResults = z.strictObject({
   cases: z.record(z.string(), verdictSchema),
 })
 const scenarioIds = Object.keys(benchmarkScenarios) as ScenarioId[]
-const regressionIds = scenarioIds.filter(id => id !== 'policy-multi-host')
+const regressionIds = ['response-multi-host', 'response-interrupted', 'response-healthy', 'access-policy'] as const
 
 function readArtexResults(path: string, caseIds: string[]) {
   let input: unknown
@@ -106,7 +106,9 @@ export default class ReportBenchmarkReporter implements Reporter {
         if (!row) throw new Error('Missing comparison verdict for ' + id + '.')
         const { asset, issue } = cases[index]
         return { asset, issue, verdict: row.reported,
-          ...(row.reported === 'confirmed' ? { evidence: row.linkedEvidence ? 'supported' : 'missing' } : {}) }
+          ...(row.reported === 'confirmed'
+            ? { severity: row.reportedSeverity, evidence: row.linkedEvidence ? 'supported' : 'missing' }
+            : {}) }
       })
       return { id, input, cases, guardian: {
         version, model: DEFAULT_PROVIDER.model, inputSha256: input.sha256,

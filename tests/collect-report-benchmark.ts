@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { findingSeverities } from '../src/domain.ts'
 import type { CheckCoverage, EvidenceSummary, Finding, ReportBody } from '../src/domain.ts'
 import { checkLabels } from '../src/report-summary.ts'
 import { benchmarkAttachment, benchmarkCaseId, benchmarkScenarios } from './report-benchmark.ts'
@@ -169,13 +170,15 @@ export async function collectReportBenchmark(
     const visible = visibleCoverage && (!finding || (Boolean(block) && check?.status === 'gap'))
     const result = { id: benchmarkCaseId(scenario, expected), reported, visible }
     if (!finding) return result
-    if (expected.expected === 'confirmed') expect.soft(finding.severity).toBe(expected.severity)
     const lines = block?.lines ?? []
+    const reportedSeverity = findingSeverities.find(level => lines.includes('- **Severity** ' + level + ' · **Status** confirmed'))
+    expect.soft(reportedSeverity).toBe(finding.severity)
+    if (expected.expected === 'confirmed') expect.soft(reportedSeverity).toBe(expected.severity)
     const fixGuidance = fields.every(field => {
       const prefix = '- **' + field + '** '
       return lines.some(line => line.startsWith(prefix) && line.slice(prefix.length).trim().length > 0)
     })
-    return { ...result, linkedEvidence: supportsFinding(evidence, lines, finding, expected, report), fixGuidance }
+    return { ...result, reportedSeverity, linkedEvidence: supportsFinding(evidence, lines, finding, expected, report), fixGuidance }
   })
   const unmatchedConfirmations = confirmed.length - cases.filter(row => row.reported === 'confirmed').length
   const result: ReportResult = { scenario, cases, unmatchedConfirmations, recording }

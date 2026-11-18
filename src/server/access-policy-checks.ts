@@ -12,6 +12,17 @@ const baseRule: FindingRule = {
   recheck: 'Rerun the owner’s authorization test for this case and import the new decision.',
 }
 
+const policyImpacts = {
+  'sensitive-records': {
+    severity: 'high',
+    description: 'The supplied policy identifies this capability as access to sensitive records.',
+  },
+  'organization-admin': {
+    severity: 'critical',
+    description: 'The supplied policy identifies this capability as organization-wide administration.',
+  },
+} as const
+
 export function accessPolicyReviews(snapshot: AccessPolicySnapshot | undefined): EvidenceReview[] {
   if (!snapshot) return [{
     rule: baseRule,
@@ -24,23 +35,29 @@ export function accessPolicyReviews(snapshot: AccessPolicySnapshot | undefined):
   const observed = new Map(snapshot.observed.map(item => [item.caseId, item.decision]))
   return snapshot.expected.map(policy => {
     const actual = observed.get(policy.caseId)
+    const expectedDeny = policy.decision === 'deny'
+    const expected = `${expectedDeny ? 'Deny' : 'Allow'} ${policy.capability} for ${policy.role}`
+    const consequence = policy.impactIfAllowed ? policyImpacts[policy.impactIfAllowed] : undefined
+    const impact = expectedDeny
+      ? `The recorded decision grants ${policy.capability} to ${policy.role} beyond the supplied policy.`
+      : `The recorded decision denies ${policy.capability} to ${policy.role}, although the supplied policy permits it.`
     const rule: FindingRule = {
       ...baseRule,
       title: `Access policy · ${policy.caseId}`,
-      findingTitle: policy.decision === 'deny'
+      findingTitle: expectedDeny
         ? `Recorded access exceeds policy for ${policy.caseId}`
         : `Recorded access falls short of policy for ${policy.caseId}`,
-      severity: policy.decision === 'deny' ? 'medium' : 'low',
-      impact: policy.decision === 'deny'
-        ? `The recorded decision grants ${policy.capability} to ${policy.role} beyond the supplied policy.`
-        : `The recorded decision denies ${policy.capability} to ${policy.role}, although the supplied policy permits it.`,
+      severity: consequence?.severity ?? (expectedDeny ? 'medium' : 'low'),
+      impact: consequence ? impact + ' ' + consequence.description : impact,
+      remediation: expected + ' in this host’s server-side authorization policy.',
+      recheck: 'Rerun the owner’s authorization test for this case. The expected decision is ' + policy.decision + '.',
     }
     return {
       rule,
       coverage: {
         id: 'access-policy', caseId: policy.caseId, title: rule.title,
         status: 'inconclusive',
-        expected: `${policy.decision === 'deny' ? 'Deny' : 'Allow'} ${policy.capability} for ${policy.role}.`,
+        expected: expected + '.',
         observed: actual === undefined ? null : actual === 'allow' ? 'Allowed' : 'Denied',
         reason: actual === undefined ? `The supplied records omit a decision for ${policy.caseId}.` : 'Verification is pending.',
       },

@@ -48,6 +48,8 @@ Use **Import access records** on the project. Supply a JSON file for an existing
 
 Use non-sensitive case, role, and capability labels, unique case IDs in each list, and a UTC timestamp. The importer accepts up to 64 cases. Imports are available to the next discovery. Runs that already captured their inventory keep their saved record.
 
+An expected `deny` case can include `"impactIfAllowed": "sensitive-records"` for access to sensitive records or `"impactIfAllowed": "organization-admin"` for organization-wide administration. A verified unintended grant then rates high or critical, respectively. The finding links to the source policy and explains where the impact rating came from.
+
 ## Verify
 
 ```sh
@@ -65,7 +67,7 @@ The separate opt-in command `npm run smoke:live -- --live` runs the production b
 
 ## Benchmark reports
 
-Run `npm run benchmark:reports` to replay the Northstar cases through the production app. The output goes to `test-results/report-benchmark/`. The `summary.json` regression scorecard covers the original four report versions. The `comparison-manifest.json` and `comparison-scorecard.json` include a fifth report in which the same access issue is verified on two approved hosts. Each report has a shared-input packet and an ordered run recording through the event that saved that version. These files link to the exact report export by digest. Copy the directory to a private workspace before adding Artex results or reader scores.
+Run `npm run benchmark:reports` to replay the Northstar cases through the production app. The output goes to `test-results/report-benchmark/`. The `summary.json` regression scorecard covers the original four report versions. The `comparison-manifest.json` and `comparison-scorecard.json` also cover the same access issue on two approved hosts and a run with verified high and critical access discrepancies. Each report has a shared-input packet and an ordered run recording through the event that saved that version. These files link to the exact report export by digest. Copy the directory to a private workspace before adding Artex results or reader scores.
 
 To compare independently reviewed Artex reports for the same cases, set `GUARDIAN_ARTEX_REPORT_RESULTS` to a local JSON file outside `test-results/`. Use the scorecard's `suite` value, the Artex `version` and `model`, an `unmatchedConfirmations` count, and a `cases` object keyed by each case ID in the scorecard. Each case takes one of `confirmed`, `met`, `inconclusive`, or `untested`. Use `untested` for unsupported cases. Keep the source reports with the verdicts so the comparison can be audited.
 
@@ -83,7 +85,7 @@ The manifest has `format` set to `1`, a `suite` name, a `mode` of `assessment` o
 | --- | --- |
 | `input` | Reference to JSON containing the shared `goal`, `scope` as HTTPS origins, `stoppingPoint` as `complete` or `interrupted`, and `capturedEvidence`. Set `overlappingObservations` to true for the multi-host case that uses them. Set `heldOut` on the scenario for a case reserved from tuning. |
 | `cases` | The verdicts established before reading the reports. Each entry has an `asset`, an `issue` identifier, and an `expected` verdict. Include `severity` on expected confirmations. |
-| `guardian` and `artex` | Optional results with the tool `version`, `model`, shared `inputSha256`, a `report` file reference, and reviewed `verdicts`. Each verdict has an `asset`, `issue`, and `verdict`. Enter one row per displayed confirmation, including repeats. For Guardian confirmations, label the `evidence` as `supported`, `missing`, `unrelated`, or `out-of-scope` after checking the original observation and verification. |
+| `guardian` and `artex` | Optional results with the tool `version`, `model`, shared `inputSha256`, a `report` file reference, and reviewed `verdicts`. Each verdict has an `asset`, `issue`, and `verdict`. Enter one row per displayed confirmation, including repeats. Include the reported `severity` to compare it with the expected rating. For Guardian confirmations, label the `evidence` as `supported`, `missing`, `unrelated`, or `out-of-scope` after checking the original observation and verification. |
 | `runRecord` inside each product result | For an assessment, reference a JSON record containing `inputSha256`, `reportSha256`, and a `recording` file reference to the saved run. |
 | `reviews` | Optional paired reviews. Enter a `reader` ID, `guardian` and `artex` answers, and optional `notes`. Each product's answers contain its `reportSha256` and `tasks` with entries for `priority`, `remediation`, `impact`, `evidence`, and `recheck`. Grade each answer as `correct`, `incorrect`, or `unanswered`. |
 
