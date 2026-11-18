@@ -147,7 +147,7 @@ test('shows the source and original timestamp of supplied response evidence', t 
   })
   storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
   const [asset] = storage.run(runId).candidates
-  storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds: [asset.id], consent: true })
+  storage.command({ requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 0, assetIds: [asset.id], consent: true })
   storage.commitReviewPlan(storage.run(runId), standardChecks())
   const analysis = storage.workerList(runId).find(worker => worker.phase === 'analysis')
   assert.ok(analysis)
@@ -183,7 +183,8 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const primary = storage.run(runId).candidates.find(asset => asset.origin === northstar)
   const docs = storage.run(runId).candidates.find(asset => asset.origin === docsOrigin)
   assert.ok(primary && docs)
-  const approve = (assetIds: string[]) => storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true })
+  const approve = (assetIds: string[], expectedScopeRevision = storage.run(runId).scopeRevision) =>
+    storage.command({ requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision, assetIds, consent: true })
   approve([primary.id, docs.id])
   storage.commitReviewPlan(storage.run(runId), standardChecks())
 
@@ -231,6 +232,9 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.ok(!originalMarkdown.includes(otherHost.id))
 
   approve([primary.id])
+  assert.throws(() => approve([primary.id, docs.id], 1), /Scope changed since you opened this review/)
+  assert.deepEqual(storage.run(runId).approved, [primary.id])
+  assert.equal(storage.run(runId).scopeRevision, 2)
   storage.writeReport(storage.run(runId), true)
   const restricted = storage.runDetail(runId).reports[0]
   assert.equal(restricted.body.findings.length, 0)
@@ -256,8 +260,19 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.equal(history.at(-1)?.body.findings[0].id, findingId)
   assert.equal(exportOriginal(), originalMarkdown)
 
-  const otherRun = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Independent run.', sourceMode: 'public' })
-  assert.throws(() => exportReportMarkdown(storage, otherRun.id, original.id), /Report version not found/)
+  const { id: otherRunId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Independent run.', sourceMode: 'public' })
+  assert.throws(() => exportReportMarkdown(storage, otherRunId, original.id), /Report version not found/)
+  storage.command({ requestId: randomUUID(), runId: otherRunId, action: 'discover', consent: true })
+  storage.command({ requestId: randomUUID(), runId: otherRunId, action: 'stop' })
+  const pendingApproval = {
+    requestId: randomUUID(), runId: otherRunId, action: 'scope' as const, expectedScopeRevision: 0,
+    assetIds: [primary.id], consent: true as const,
+  }
+  assert.throws(() => storage.command(pendingApproval), /Scope changes are unavailable in this phase/)
+  assert.equal(storage.run(otherRunId).status, 'stopped')
+  storage.command({ requestId: randomUUID(), runId: otherRunId, action: 'resume' })
+  storage.command(pendingApproval)
+  assert.equal(storage.run(otherRunId).scopeRevision, 1)
   writeFileSync(join(directory, 'artifacts', evidence.id + '.txt'), JSON.stringify({ ...proof, inputEvidence: [otherHost.id] }))
   const unavailable = exportOriginal()
   assert.match(unavailable, /Supporting record unavailable for this report version/)
@@ -329,7 +344,7 @@ test('rejects a finished plan for a superseded approval before it queues assignm
   storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
   const ids = storage.run(runId).candidates.map(asset => asset.id)
   const approve = (assetIds: string[]) => storage.command({
-    requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true,
+    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: storage.run(runId).scopeRevision, assetIds, consent: true,
   })
   approve(ids)
   const earlier = storage.run(runId)

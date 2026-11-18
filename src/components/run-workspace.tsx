@@ -41,7 +41,6 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   const [reconnecting, setReconnecting] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [showCoordinator, setShowCoordinator] = useState(false)
-  const [review, setReview] = useState(false)
   const [revising, setRevising] = useState(false)
   const [draft, setDraft] = useState('')
   const [query, setQuery] = useState('')
@@ -128,7 +127,14 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   }, [workerId, chatOpen, artifact, view])
 
   function execute(command: Command, onSuccess?: () => void) {
-    void action.submit(() => commandRun({ data: { ...command, runId: run.id, requestId: crypto.randomUUID() } }), onSuccess)
+    void action.submit(async () => {
+      try {
+        return await commandRun({ data: { ...command, runId: run.id, requestId: crypto.randomUUID() } })
+      } catch (error) {
+        if (command.action === 'scope') await refreshRun()
+        throw error
+      }
+    }, onSuccess)
   }
 
   function closeWorker() {
@@ -209,8 +215,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     <div className="workbench" data-with-chat={chatOpen}>
       <section className="work-surface" aria-label={view === 'report' ? 'Run report' : 'Workflow'}>
         <div hidden={view !== 'overview'}>
-          <RunOverview detail={detail} execute={execute} openEvidence={setArtifact} pending={action.pending}
-            review={review} setReview={setReview} />
+          <RunOverview detail={detail} execute={execute} openEvidence={setArtifact} pending={action.pending} />
         </div>
         <div className="trace-holder" hidden={view !== 'trace'}>
           <WorkflowTrace detail={detail} workerId={workerId} query={query} zoom={zoom} viewport={viewport} />

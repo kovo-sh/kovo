@@ -7,7 +7,7 @@ import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
-import { assessmentCheckTitles } from '../domain.ts'
+import { assessmentCheckTitles, canReviewScope } from '../domain.ts'
 import type { Candidate, CheckCoverage, EvidenceSummary, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
@@ -454,8 +454,11 @@ export class Store {
     return this.addArtifact(run, worker, 'inventory', title, JSON.stringify(records, null, 2))
   }
 
-  private setScope(run: Run, assetIds: string[], saveProject = false) {
-    if (!['review', 'analysis', 'verification'].includes(run.phase) || ['complete', 'failed'].includes(run.status)) {
+  private setScope(run: Run, { assetIds, expectedScopeRevision, saveProject }: Extract<RunCommand, { action: 'scope' }>) {
+    if (run.scopeRevision !== expectedScopeRevision) {
+      throw new Error('Scope changed since you opened this review.')
+    }
+    if (!canReviewScope(run.phase, run.status)) {
       throw new Error('Scope changes are unavailable in this phase.')
     }
     const approved = [...new Set(assetIds)]
@@ -583,7 +586,7 @@ export class Store {
           this.discover(run)
           break
         case 'scope':
-          this.setScope(run, input.assetIds, input.saveProject)
+          this.setScope(run, input)
           break
         case 'candidate': {
           if (run.phase === 'complete') throw new Error('Add the host to the project for the next run.')

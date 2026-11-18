@@ -58,7 +58,13 @@ export const importDnsInventory = z.object({
 const commandBase = z.object({ requestId: id, runId: id })
 export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({ action: z.literal('discover'), consent: z.literal(true) }),
-  commandBase.extend({ action: z.literal('scope'), assetIds: z.array(id).max(maxScopeHosts), consent: z.literal(true), saveProject: z.boolean().optional() }),
+  commandBase.extend({
+    action: z.literal('scope'),
+    assetIds: z.array(id).max(maxScopeHosts),
+    expectedScopeRevision: z.number().int().nonnegative(),
+    consent: z.literal(true),
+    saveProject: z.boolean().optional(),
+  }),
   commandBase.extend({ action: z.literal('candidate'), candidate: addCandidate }),
   commandBase.extend({ action: z.literal('revise'), goal: goalText }),
   commandBase.extend({ action: z.literal('message'), message: goalText }),
@@ -70,6 +76,11 @@ export type Phase = 'consent' | 'discovery' | 'review' | 'analysis' | 'verificat
 export type RunStatus = 'waiting' | 'running' | 'paused' | 'stopped' | 'failed' | 'complete'
 export type WorkerPhase = 'discovery' | 'analysis' | 'verification'
 export type WorkerStatus = 'queued' | 'running' | 'paused' | 'complete' | 'canceled' | 'failed'
+
+export function canReviewScope(phase: Phase, status: RunStatus) {
+  return phase === 'review' ? status === 'waiting'
+    : (phase === 'analysis' || phase === 'verification') && status !== 'complete' && status !== 'failed'
+}
 
 export interface Candidate {
   id: string

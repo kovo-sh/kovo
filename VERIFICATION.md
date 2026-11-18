@@ -8,7 +8,7 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | `npm run test:e2e` | Eighteen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, scope changes during planning and analysis, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and verification and prioritization of access policy findings. |
 | `npm run test:boundaries` | Twenty-nine tests passed. Fifteen cover scope, evidence, and the worker runtime. Six cover provider streaming and redaction. Eight cover the matched report scorecard, including incorrectly bound recordings, scope revisions, and missing or incorrect coverage grades. |
 | `npm run benchmark:reports` | All 19 regression verdicts matched. The assessment manifest adds eight cases on two approved hosts and four cases with documented access impacts. All 31 verdicts matched. All ten confirmations had the expected severity, scoped observation, and verification. |
-| GitHub Actions | The provider redaction commit passed on a fresh Ubuntu checkout, including the Docker worker build, twenty-six boundary and comparison tests, seventeen production browser tests, and all twenty-seven assessment verdicts. [Hosted verification run for `6ef9008`](https://github.com/wwwillchen/guardian/actions/runs/44289482324) |
+| GitHub Actions | The partial report coverage commit passed on a fresh Ubuntu checkout, including the Docker worker build, twenty-seven boundary and comparison tests, eighteen production browser tests, and all thirty-one assessment verdicts. [Hosted verification run for `dfaa5e1`](https://github.com/wwwillchen/guardian/actions/runs/44290576186) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -24,6 +24,8 @@ The browser replay revoked a previously verified fixture key. The next connectio
 A local synthetic provider split a dummy credential across streaming events for each supported protocol. The Pi Durable sessions and recorded calls contained the replacement and omitted the credential fragments. Focused checks covered valid tool JSON after redaction, event ordering, release at the terminal event, and safe errors for malformed or oversized responses.
 
 The production browser tests use a fresh workspace and local HTTP fixtures. They hold a broker response open while the operator revokes its host, then verify that the pending result never becomes evidence. A second test narrows scope and stops the server with a provider stream pending. Explicit resume reuses the saved response under the current approval, continues the original Pi Durable conversation, and completes the report after one broker request and one saved prompt for that host. Fixture credentials and response cookie values are absent from the matched model requests, saved transcripts, and exported reports.
+
+The scope-narrowing test opened a second browser tab at revision one and disconnected its event stream. The first tab removed a host. The second tab's save was rejected and reopened from revision two with the removed host unchecked and consent cleared. The run completed under revision two after one fixture request per original host. A storage check also verified that a run stopped before its first scope approval waits for explicit resume before it can advance.
 
 The DNS import test verifies candidate provenance, recognition of third-party aliases, explicit scope selection for imported hosts, and omission of raw address and TXT values from the inventory evidence. An offline copy of the Dyad workspace opened the legacy inventory evidence links and exported both reports with all three broker audit entries preserved.
 
@@ -103,7 +105,7 @@ One run used the default OpenRouter Responses preset and explicit approval for `
 
 One initial model turn reached its output limit and the run saved a partial report. After adding and testing local evidence fallback for that condition, the operator resumed the same run. Guardian reused both observations with zero additional Dyad requests. Report version 2 covered both approved origins, linked two derived analysis artifacts, and showed zero confirmed HSTS findings. The browser follow-through opened verification evidence and then its read-only worker thread. The SQLite database, reports, and credentials from this run stay in the local `.guardian/dyad-smoke` directory on the verification machine.
 
-The latest production build reopened the saved complete report and linked worker evidence in offline mode. Both report versions and the three-read audit were preserved.
+The latest production build downloaded both saved report versions from an offline copy and opened verification evidence and its read-only worker thread. The audit retained the original three reads.
 
 ## Dependency audit
 

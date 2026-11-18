@@ -1,5 +1,5 @@
 import { Fragment, useState } from 'react'
-import { assessmentCheckTitles, maxScopeHosts } from '../domain.ts'
+import { assessmentCheckTitles, canReviewScope, maxScopeHosts } from '../domain.ts'
 import type { RunCommand } from '../domain.ts'
 import { Status } from './common.tsx'
 import { phaseNames, workerPhases } from './run-state.ts'
@@ -12,24 +12,35 @@ export type Command = RunCommand extends infer C
   ? C extends RunCommand ? Omit<C, 'requestId' | 'runId'> : never
   : never
 
-export function RunOverview({ detail, execute, openEvidence, pending, review, setReview }: {
+export function RunOverview({ detail, execute, openEvidence, pending }: {
   detail: RunDetail
   execute: (command: Command, onSuccess?: () => void) => void
   openEvidence: (id: string) => void
   pending: boolean
-  review: boolean
-  setReview: (review: boolean) => void
 }) {
   const { run, project, assignments, evidence } = detail
   const plan = run.reviewPlan
   const [adding, setAdding] = useState(false)
-  const initialSelection = () => run.scopeRevision > 0 ? run.approved
-    : run.candidates.filter(asset => !asset.thirdParty && (project.defaultScope.length
-      ? project.defaultScope.includes(asset.origin) : !asset.dnsSource)).map(asset => asset.id)
-  const [selection, setSelection] = useState<string[] | null>(null)
-  const selected = selection ?? initialSelection()
+  const [draft, setDraft] = useState<{ scopeRevision: number; assetIds: string[] }>()
+  const afterApproval = run.phase === 'analysis' || run.phase === 'verification'
+  const canReview = canReviewScope(run.phase, run.status)
+  const review = canReview ? draft : undefined
+  const stale = Boolean(review && review.scopeRevision !== run.scopeRevision)
+  const selected = review?.assetIds ?? []
   const overLimit = selected.length > maxScopeHosts
   const inventoryIds = new Set(evidence.filter(item => item.kind === 'inventory').map(item => item.id))
+
+  function beginReview() {
+    const assetIds = run.scopeRevision > 0 ? run.approved
+      : run.candidates.filter(asset => !asset.thirdParty && (project.defaultScope.length
+        ? project.defaultScope.includes(asset.origin) : !asset.dnsSource)).map(asset => asset.id)
+    setDraft({ scopeRevision: run.scopeRevision, assetIds })
+  }
+
+  function toggleReview() {
+    if (review) setDraft(undefined)
+    else beginReview()
+  }
 
   return <div className="overview-body">
     <ol className="phase-rail" aria-label="Run phases">
@@ -65,28 +76,28 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
     {run.phase === 'review' && <div className="workflow-callout">
       <div><h2>Scope approval</h2>
         <p>{run.candidates.length} candidates · {run.candidates.filter(asset => asset.thirdParty).length} third-party</p></div>
-      <Button variant="default" onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review} disabled={run.status !== 'waiting'}>
+      <Button variant="default" onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>
         {review ? 'Close review' : 'Review scope'}
       </Button>
     </div>}
-    {['analysis', 'verification'].includes(run.phase) && <div className="workflow-callout">
+    {afterApproval && <div className="workflow-callout">
       <div>
         <h2>Approved scope</h2><p>{run.approved.length} approved {run.approved.length === 1 ? 'host' : 'hosts'} · Revision {run.scopeRevision}</p>
         {plan?.status === 'pending' && <p>{run.status === 'running' ? 'Preparing review plan' : 'Review plan pending'}</p>}
         {plan?.status === 'ready' && <p>{plan.source === 'standard' ? 'Standard checks' : 'Planned checks'} · {plan.checks.map(id => assessmentCheckTitles[id]).join(', ')}</p>}
       </div>
-      <Button onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review}>
+      <Button onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>
         {review ? 'Close review' : 'Review scope'}
       </Button>
     </div>}
     {run.candidates.length > 0 && <form className="inventory" onSubmit={event => {
       event.preventDefault()
       const form = new FormData(event.currentTarget)
-      if (!form.has('scopeConsent') || overLimit) return
-      execute({ action: 'scope', assetIds: selected, consent: true, saveProject: form.has('defaultScope') }, () => {
-        setReview(false)
-        setSelection(null)
-      })
+      if (!review || stale || !form.has('scopeConsent') || overLimit) return
+      execute({
+        action: 'scope', assetIds: review.assetIds, expectedScopeRevision: review.scopeRevision,
+        consent: true, saveProject: form.has('defaultScope'),
+      }, () => setDraft(undefined))
     }}>
       <div className="section-heading"><h2>Discovery inventory</h2>
         <span className="muted">{run.candidates.length} discovered</span></div>
@@ -96,8 +107,10 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
           const sourceId = asset.sourceEvidenceId
           return <tr key={asset.id}>
             {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
-              onCheckedChange={checked => setSelection(checked
-                ? [...selected, asset.id] : selected.filter(item => item !== asset.id))} /></td>}
+              disabled={stale || pending} onCheckedChange={checked => setDraft(current => current && {
+                ...current, assetIds: checked
+                  ? [...current.assetIds, asset.id] : current.assetIds.filter(item => item !== asset.id),
+              })} /></td>}
             <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}
               {asset.accessPolicy && <small>Access policy records</small>}</td>
             <td>{sourceId && inventoryIds.has(sourceId)
@@ -108,14 +121,19 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
           </tr>
         })}</tbody>
       </table></div>
-      {review && <div className="scope-footer">
+      {review && <div className="scope-footer" key={review.scopeRevision}>
         {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
-        {run.phase === 'review' && <p className="muted">The coordinator selects checks for your goal from the available evidence.</p>}
-        <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
-        <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
-        <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>
-          {run.phase === 'review' ? 'Approve scope' : 'Save scope revision'}
-        </Button>
+        {stale ? <>
+          <p role="status">This draft uses revision {review.scopeRevision}. The current scope is revision {run.scopeRevision}.</p>
+          <Button type="button" onClick={beginReview} disabled={pending}>Review latest scope</Button>
+        </> : <>
+          {run.phase === 'review' && <p className="muted">The coordinator selects checks for your goal from the available evidence.</p>}
+          <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
+          <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
+          <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>
+            {run.phase === 'review' ? 'Approve scope' : 'Save scope revision'}
+          </Button>
+        </>}
       </div>}
     </form>}
     {run.candidates.length > 0 && run.phase !== 'complete' && <div className="candidate-form">
