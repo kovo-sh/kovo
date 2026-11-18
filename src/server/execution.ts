@@ -136,7 +136,7 @@ class Execution {
       if (run.phase === 'analysis' && run.reviewPlan?.status === 'pending') {
         const available = availableReviewChecks(run.candidates.filter(asset => run.approved.includes(asset.id)), run.sourceMode)
         if (model && run.approved.length) this.startPlanning(run, model, available)
-        else this.storage.commitReviewPlan(run.id, run.goalRevision, standardChecks(available))
+        else this.storage.commitReviewPlan(run, standardChecks(available))
         continue
       }
       if (!model) continue
@@ -441,17 +441,20 @@ class Execution {
   }
 
   private startPlanning(run: Run, model: ProviderSettings, available: readonly AssessmentCheckId[]) {
-    if (this.coordinator.has(run.id) || run.reviewPlan?.status !== 'pending') return
+    const plan = run.reviewPlan
+    if (this.coordinator.has(run.id) || plan?.status !== 'pending') return
     const controller = new AbortController()
-    const task: CoordinatorTask = { controller, goalRevision: run.goalRevision }
+    const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
+    // Reopening an approval revision reuses its planning session. A new approval gets its own request.
+    const sessionId = run.scopeRevision > 1 ? `${plan.goalMessageId}-scope-${run.scopeRevision}` : plan.goalMessageId
     this.coordinator.set(run.id, task)
     void agentTurn({
-      directory: this.storage.directory, sessionId: run.reviewPlan.goalMessageId, requestId: 'plan',
+      directory: this.storage.directory, sessionId, requestId: 'plan',
       settings: model, scenario: 'coordinator-plan', prompt: reviewPlanPrompt(run.goal, run.sourceMode, available),
       signal: controller.signal,
     }).then(answer => parseReviewPlan(answer, available) ?? standardChecks(available), () => standardChecks(available)).then(selection => {
       if (!this.currentCoordinator(run.id, task)) return
-      this.storage.commitReviewPlan(run.id, run.goalRevision, selection)
+      this.storage.commitReviewPlan(run, selection)
     }).catch(() => {
       if (!this.currentCoordinator(run.id, task)) return
       this.storage.db.transaction(() => {

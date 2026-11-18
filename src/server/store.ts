@@ -373,11 +373,12 @@ export class Store {
     }
   }
 
-  commitReviewPlan(runId: string, goalRevision: number, selection: SelectedChecks) {
+  commitReviewPlan(expected: Pick<Run, 'id' | 'goalRevision' | 'scopeRevision'>, selection: SelectedChecks) {
     this.db.transaction(() => {
-      const run = this.run(runId)
+      const run = this.run(expected.id)
       const plan = run.reviewPlan
-      if (run.status !== 'running' || run.phase !== 'analysis' || run.goalRevision !== goalRevision || plan?.status !== 'pending') return
+      if (run.status !== 'running' || run.phase !== 'analysis' || plan?.status !== 'pending' ||
+        run.goalRevision !== expected.goalRevision || run.scopeRevision !== expected.scopeRevision) return
       const updated = this.updateRun(run.id, { reviewPlan: { status: 'ready', goalMessageId: plan.goalMessageId, ...selection } })
       this.queueAnalysis(updated, updated.approved)
       const titles = selection.checks.map(id => assessmentCheckTitles[id]).join(', ')
@@ -385,7 +386,7 @@ export class Store {
       this.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'guardian',
         (planned ? 'I’ll review ' : 'Standard checks selected for this run. Checks include ') + titles + '.', plan.goalMessageId)
       this.event(run.id, 'review.planned', 'Review plan saved.', {
-        goalRevision, scopeRevision: run.scopeRevision, ...selection,
+        goalRevision: run.goalRevision, scopeRevision: run.scopeRevision, ...selection,
       })
     }, { behavior: 'immediate' })
   }

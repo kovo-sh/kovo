@@ -148,7 +148,7 @@ test('shows the source and original timestamp of supplied response evidence', t 
   storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
   const [asset] = storage.run(runId).candidates
   storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds: [asset.id], consent: true })
-  storage.commitReviewPlan(runId, 0, standardChecks())
+  storage.commitReviewPlan(storage.run(runId), standardChecks())
   const analysis = storage.workerList(runId).find(worker => worker.phase === 'analysis')
   assert.ok(analysis)
   const recordedAt = '2026-11-16T08:20:00Z'
@@ -185,7 +185,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.ok(primary && docs)
   const approve = (assetIds: string[]) => storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true })
   approve([primary.id, docs.id])
-  storage.commitReviewPlan(runId, 0, standardChecks())
+  storage.commitReviewPlan(storage.run(runId), standardChecks())
 
   const analysis = storage.workerList(runId).find(worker => worker.assetId === primary.id && worker.phase === 'analysis')
   const docsAnalysis = storage.workerList(runId).find(worker => worker.assetId === docs.id && worker.phase === 'analysis')
@@ -305,6 +305,35 @@ test('accepts only supported check identifiers as a coordinator plan', () => {
   assert.equal(parseReviewPlan('{"checks":[]}'), null)
   assert.equal(parseReviewPlan('{"checks":["hsts"],"hosts":["unapproved.example"]}'), null)
   assert.equal(parseReviewPlan('{"checks":["hsts"],"command":"unexpected operation"}'), null)
+})
+
+test('rejects a finished plan for a superseded approval before it queues assignments', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'guardian-plan-approval-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const storage = new Store(directory)
+  const { id: projectId } = storage.createProject({
+    requestId: randomUUID(), name: 'Northstar', seeds: [northstar, 'https://docs.northstar.example'],
+  })
+  const { id: runId } = storage.createRun({
+    requestId: randomUUID(), projectId, goal: 'Review the approved response records.', sourceMode: 'prepared',
+  })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const ids = storage.run(runId).candidates.map(asset => asset.id)
+  const approve = (assetIds: string[]) => storage.command({
+    requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true,
+  })
+  approve(ids)
+  const earlier = storage.run(runId)
+  approve(ids.slice(1))
+
+  storage.commitReviewPlan(earlier, standardChecks())
+  assert.equal(storage.run(runId).reviewPlan?.status, 'pending')
+  assert.deepEqual(storage.workerList(runId).map(worker => worker.phase), ['discovery'])
+
+  storage.commitReviewPlan(storage.run(runId), standardChecks())
+  assert.equal(storage.run(runId).reviewPlan?.status, 'ready')
+  const reviews = storage.workerList(runId).filter(worker => worker.phase === 'analysis')
+  assert.deepEqual(reviews.map(worker => [worker.assetId, worker.scopeRevision]), [[ids[1], 2]])
 })
 
 test('requires unique policy cases and leaves missing access decisions inconclusive', () => {

@@ -129,6 +129,7 @@ export async function fixtureServer(options: {
     revokeKey() { revoked = true },
     withheld: withheld.promise,
     modelWithheld: modelWithheld.promise,
+    get heldModelClosed() { return heldModelResponse?.destroyed ?? false },
     sensitiveFixtureValue,
     dropHeldModel() {
       holdModel = undefined

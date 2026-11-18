@@ -1,0 +1,37 @@
+{
+  "provider": "OpenRouter",
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "protocol": "responses",
+  "scenario": "plan-combined-narrowed",
+  "calls": [
+    {
+      "scenario": "coordinator-plan",
+      "endpoint": "/api/v1/responses",
+      "request": {
+        "model": "deepseek/deepseek-v4.1-flash-1017",
+        "input": [
+          {
+            "role": "system",
+            "content": "<instructions>\nChoose checks for a read-only review of the supplied evidence types. Select only IDs from availableChecks. Include all for a general review and the requested IDs for a focused review. Return only a JSON object with a checks array. The operator controls the approved hosts.\n</instructions>"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "{\"goal\":\"Review all available response headers and compare the recorded access decisions with the supplied authorization policy.\",\"evidence\":\"approved HTTPS response metadata\",\"availableChecks\":[{\"id\":\"hsts\",\"title\":\"HSTS policy\"},{\"id\":\"nosniff\",\"title\":\"MIME sniffing protection\"},{\"id\":\"referrer-policy\",\"title\":\"Referrer policy\"}]}"
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "store": false,
+        "max_output_tokens": 384
+      },
+      "status": 503,
+      "contentType": "application/json",
+      "body": "{\"error\":{\"message\":\"The model provider returned HTTP 503.\"}}"
+    }
+  ],
+  "note": "Controlled HTTP 503 for the revised plan after the only host with supplied access records is removed."
+}

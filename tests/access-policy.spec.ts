@@ -1,13 +1,15 @@
 import { expect, test } from '@playwright/test'
+import type { Page } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import type { AccessPolicySnapshot } from '../src/access-policy.ts'
 import { createApp } from './app.ts'
 import { configureModel, downloadReport, openScopeReview, saveScope } from './browser-flows.ts'
 import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
 import {
-  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, primaryOrigin, secondaryAccessPolicy, unavailableOrigin,
+  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, healthyOrigin, primaryOrigin, secondaryAccessPolicy, unavailableOrigin,
 } from './scenarios.ts'
 
 test('imports and verifies access policy cases alone and alongside response checks', { tag: '@report-benchmark' }, async ({ page }) => {
@@ -186,6 +188,19 @@ test('imports and verifies access policy cases alone and alongside response chec
   }
 })
 
+async function importAccessRecords(page: Page, policy: AccessPolicySnapshot) {
+  await page.getByRole('button', { name: 'Import access records' }).click()
+  await page.getByLabel('Access policy JSON').setInputFiles({
+    name: 'authorization-decisions.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(policy)),
+  })
+  await page.getByRole('button', { name: 'Review records' }).click()
+  const review = page.getByRole('region', { name: 'Access policy import preview' })
+  await review.getByRole('button', { name: 'Import records' }).click()
+  await expect(page.getByRole('status')).toContainText('Imported 4 access cases for ' + new URL(policy.origin).hostname)
+}
+
 test('keeps overlapping access findings and verification tied to each approved host', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy'] })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
@@ -196,18 +211,8 @@ test('keeps overlapping access findings and verification tied to each approved h
     await page.getByLabel('Project name').fill('Northstar policy overlap')
     await page.getByLabel('Seed hosts').fill([primaryOrigin, unavailableOrigin].join('\n'))
     await page.getByRole('button', { name: 'Create project', exact: true }).click()
-    for (const policy of [accessPolicy, secondaryAccessPolicy]) {
-      await page.getByRole('button', { name: 'Import access records' }).click()
-      await page.getByLabel('Access policy JSON').setInputFiles({
-        name: 'authorization-decisions.json',
-        mimeType: 'application/json',
-        buffer: Buffer.from(JSON.stringify(policy)),
-      })
-      await page.getByRole('button', { name: 'Review records' }).click()
-      const review = page.getByRole('region', { name: 'Access policy import preview' })
-      await review.getByRole('button', { name: 'Import records' }).click()
-      await expect(page.getByRole('status')).toContainText('Imported 4 access cases for ' + new URL(policy.origin).hostname)
-    }
+    await importAccessRecords(page, accessPolicy)
+    await importAccessRecords(page, secondaryAccessPolicy)
 
     await openScopeReview(page, accessPolicyGoal, true)
     await saveScope(page)
@@ -222,6 +227,59 @@ test('keeps overlapping access findings and verification tied to each approved h
     expect(fixture.requested).toEqual([])
     expect(fixture.accepted).toContain('plan-access-policy:responses:0')
     expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
+test('plans again with the remaining approved inputs when scope changes during planning', async ({ page }) => {
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-combined', 'plan-combined-narrowed', 'response-healthy'],
+    holdModel: 'plan-combined:responses:0',
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await page.getByLabel('Project name').fill('Northstar scope revision')
+    await page.getByLabel('Seed hosts').fill([primaryOrigin, healthyOrigin].join('\n'))
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await importAccessRecords(page, accessPolicy)
+    await openScopeReview(page, combinedGoal, true)
+    await saveScope(page)
+    await fixture.modelWithheld
+    await expect(page.getByText('Preparing review plan', { exact: true })).toBeVisible()
+    expect(fixture.requested).toEqual([])
+
+    await page.getByRole('button', { name: 'Review scope' }).click()
+    await page.getByRole('checkbox', { name: 'Include northstar.example' }).uncheck()
+    await saveScope(page, 'Save scope revision')
+    await expect(page.getByText('1 approved host · Revision 2')).toBeVisible()
+    await expect.poll(() => fixture.heldModelClosed).toBe(true)
+
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('3 checks met baseline', { timeout: 18_000 })
+    await expect(report).toContainText('Standard checks · HSTS policy, MIME sniffing protection, Referrer policy')
+    await expect(report).toContainText('Scope revision 2 · Goal revision 0')
+    await expect(report).not.toContainText('Access policy decisions')
+    expect(fixture.requested).toEqual([healthyOrigin + '/'])
+    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual(['plan-combined-narrowed:responses:0'])
+    expect(fixture.unexpected).toEqual([])
+
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const planned = db.prepare("SELECT detail FROM events WHERE kind = 'review.planned'").all()
+      expect(planned.map(row => JSON.parse(String(row.detail)))).toEqual([
+        { goalRevision: 0, scopeRevision: 2, source: 'standard', checks: ['hsts', 'nosniff', 'referrer-policy'] },
+      ])
+      expect(db.prepare("SELECT phase, scope_revision FROM assignments WHERE phase != 'discovery' ORDER BY phase").all())
+        .toEqual([{ phase: 'analysis', scope_revision: 2 }, { phase: 'verification', scope_revision: 2 }])
+    } finally {
+      db.close()
+    }
   } finally {
     await app.dispose()
     await fixture.close()

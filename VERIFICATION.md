@@ -5,10 +5,10 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | Check | Result |
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
-| `npm run test:e2e` | Sixteen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, candidate source evidence and scope changes, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and host-specific verification of overlapping policy decisions. |
-| `npm run test:boundaries` | Nineteen tests passed. Fourteen cover scope, evidence, and the worker runtime. Five cover the matched report scorecard, including incorrect evidence, stale artifact references, and missing review results. |
+| `npm run test:e2e` | Seventeen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, scope changes during planning and analysis, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and host-specific verification of overlapping policy decisions. |
+| `npm run test:boundaries` | Twenty tests passed. Fifteen cover scope, evidence, and the worker runtime. Five cover the matched report scorecard, including incorrect evidence, stale artifact references, and missing review results. |
 | `npm run benchmark:reports` | All 19 regression verdicts matched. The assessment manifest adds eight cases on two approved hosts. All 27 verdicts matched, and all eight confirmations had a scoped observation and verification. |
-| GitHub Actions | The offline scorecard commit passed on a fresh Ubuntu checkout, including the Docker worker build, nineteen boundary and comparison tests, fifteen production browser tests, and all nineteen regression verdicts. [Hosted verification run for `0f1a78c`](https://github.com/wwwillchen/guardian/actions/runs/44287140573) |
+| GitHub Actions | The report recording commit passed on a fresh Ubuntu checkout, including the Docker worker build, nineteen boundary and comparison tests, sixteen production browser tests, and all twenty-seven assessment verdicts. [Hosted verification run for `f38af62`](https://github.com/wwwillchen/guardian/actions/runs/44287827579) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -32,6 +32,10 @@ The browser added a second host while the first approved fixture response was pe
 The browser stops the server while a broad plan is in flight. The run view reconnects and waits for explicit resume. With one saved planner prompt and one committed plan, analysis continues and later resumes from its own saved work. The report preserves the selected checks and goal revision.
 
 A second scenario replaces a pending broad plan with a referrer-only goal. It records one plan for the new revision and one brokered fixture read for the approved host. The worker handoff, verification receipt, and report show only the selected check. A controlled provider failure uses the standard plan, and the worker completes its comparison from the recorded metadata.
+
+The browser removed the sole host supplying access policy records while the original plan request was pending. The old request closed. A controlled HTTP 503 for the revised plan exercised the fallback for the remaining evidence. Scope revision 2 recorded one plan, one analysis and verification pair, and one fixture read for the remaining host. The report showed three response checks that met the baseline. A storage test also submitted an earlier plan directly and verified that it created no assignments.
+
+An upgrade test opened an older run with a saved scope revision and an interrupted planning session. Guardian waited for explicit resume, then saved one revised plan in a session for the current approval and made one approved fixture read.
 
 Both saved Dyad report versions and the linked worker thread reopened from an offline copy after the plan migration. A separate upgrade test interrupted the coordinator on the previous build and resumed its original saved prompt on the new build.
 

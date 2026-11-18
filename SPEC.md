@@ -49,7 +49,7 @@ Access policy decisions can be reviewed from an owner's supplied authorization t
 
 ## Agents and handoffs
 
-**Coordinator.** One coordinator per run. It is the only conversational entry point for the user. After scope approval, it selects applicable checks from the supported catalog for the run goal. Guardian validates and saves the selection before delegating to workers on approved hosts. Use the standard checks for the available evidence if model planning is unavailable. The coordinator tracks phase progress, handles revisions, and assembles the report from recorded results.
+**Coordinator.** One coordinator per run. It is the only conversational entry point for the user. After scope approval, it selects applicable checks from the supported catalog for the run goal. Guardian validates and saves the selection against the goal and approval revisions before delegating to workers on approved hosts. A scope revision made while a plan is pending cancels that planning request and starts a plan for the new approval. Resuming the same approval uses its saved planning session. Use the standard checks for the available evidence if model planning is unavailable. The coordinator tracks phase progress, handles revisions, and assembles the report from recorded results.
 
 **Workers.** Workers take individual assignments, return their work to the coordinator, and have separate read-only threads in the UI. They can access the assignment, its permitted inputs, and the relevant evidence. An assignment identifies its run, phase, objective, scope revision, inputs, and expected output.
 
@@ -160,6 +160,7 @@ Use `npm run compare:reports` for the release comparison. It checks the shared i
 - During analysis, revise the goal, narrow scope, and review a newly found asset. Work linked to changed scope is canceled, while the new asset stays outside scope until approved.
 - Add a host while an approved read is pending. Reopen its source record, approve the expanded scope, and verify that the broker reads the new host after consent. The report covers both hosts under the revised scope.
 - Restart while a coordinator plan is pending. Resume explicitly, then verify that the plan yields one set of assignments. Revise an in-flight goal to focus on one response check and verify that the new worker handoff and report reflect that choice.
+- Narrow scope while the coordinator is planning with a host that supplies access policy records. Verify that the pending request is canceled and that the new plan, assignments, and report use the approved inputs remaining in scope.
 - Stop a run and read its partial report. Restart the app mid-run and confirm that work waits for explicit resume. Resume from the last committed state without duplicate assignments, findings, or reports.
 - Run the TanStack Start production build on loopback. Open a worker thread through its deep link. With a run paused, restart the server and verify that the event stream reconnects from the last event ID and the run stays paused until explicit resume.
 - Finish verification with confirmed response policy gaps and inconclusive fixture results. Follow a confirmed finding to its observed value, expected setting, remediation, and worker verification. Run the zero-finding case and verify that the report shows which checks met the baseline.
