@@ -6,7 +6,7 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | --- | --- |
 | `npm run check` | TypeScript passed. |
 | `npm run test:e2e` | Eight production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, explicit scope approval, goal revisions, new assets awaiting approval, worker deep links, restart and event replay, partial and complete reporting, and output-limit recovery. |
-| `npm run test:boundaries` | Six tests passed. They cover mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, local Docker socket enforcement, read-only evidence, process-level network isolation, and the container's resource configuration. |
+| `npm run test:boundaries` | Eight tests passed. They cover mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and report selection after a scope change, HTTPS policy attribution across redirects, local Docker socket enforcement, read-only evidence, process-level network isolation, and the container's resource configuration. |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -17,9 +17,11 @@ The production browser tests use a fresh workspace and local HTTP fixtures. They
 
 ## Live Dyad smoke run
 
-One run used the default OpenRouter Responses preset and explicit approval for `dyad.sh` and `www.dyad.sh`. The broker recorded three public-page reads. `dyad.sh` responded with `308`, and the approved redirect and direct request to `www.dyad.sh` each responded with `200`.
+One run used the default OpenRouter Responses preset and explicit approval for `dyad.sh` and `www.dyad.sh`. The broker recorded three public-page reads. `dyad.sh` responded with `308`, and the approved redirect and direct request to `www.dyad.sh` each responded with `200`. Both final observations describe `www.dyad.sh`. A later offline regression test verifies that a final response on a different host leaves the initiating host's HTTPS policy inconclusive.
 
 One initial model turn reached its output limit and the run saved a partial report. After adding and testing local evidence fallback for that condition, the operator resumed the same run. Guardian reused both observations with zero additional Dyad requests. Report version 2 covered both approved origins, linked two derived analysis artifacts, and showed zero confirmed HSTS findings. The browser follow-through opened verification evidence and then its read-only worker thread. The SQLite database, reports, and credentials from this run stay in the local `.guardian/dyad-smoke` directory on the verification machine.
+
+The latest production build reopened the saved complete report and linked worker evidence in offline mode. Both report versions and the three-read audit were preserved.
 
 ## Dependency audit
 

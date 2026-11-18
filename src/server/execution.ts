@@ -7,7 +7,7 @@ import type { PublicObservation } from './broker.ts'
 import { privateModelSettings } from './model-settings.ts'
 import { redact } from './redact.ts'
 import { findings, messages } from './schema.ts'
-import { store } from './store.ts'
+import { assessmentAssignments, store } from './store.ts'
 import type { Assignment, Run, Store } from './store.ts'
 import { LinuxWorkerBackend } from './worker-backend.ts'
 
@@ -22,9 +22,9 @@ export function derivedResult(result: { exitStatus: number; result: string; stdo
   return JSON.stringify({ exitStatus: result.exitStatus, result: (result.result || result.stdout).slice(0, 1200) })
 }
 
-const verificationCommand = [
-  "jq '{expected: \"positive HSTS max-age\", observed: .transportMaxAge, result:",
-  '  (if .status >= 200 and .status < 300 then',
+export const verificationCommand = [
+  "jq '{expected: \"positive HSTS max-age\", observed: .transportMaxAge, origin, finalOrigin, result:",
+  '  (if .origin == .finalOrigin and .status >= 200 and .status < 300 then',
   '     if (.transportMaxAge // 0) > 0 then "present" else "missing" end',
   '   else "inconclusive" end)}\' /evidence/observed.json > /work/verification.json',
 ].join('\n')
@@ -140,10 +140,9 @@ class Execution {
     this.storage.db.transaction(() => {
       if (run.phase === 'analysis') {
         const updated = this.storage.updateRun(run.id, { phase: 'verification' })
-        const planned = this.storage.workerList(run.id).filter(item =>
-          item.phase === 'verification' && item.goalRevision === run.goalRevision && item.status !== 'canceled')
+        const workers = this.storage.workerList(run.id)
         for (const asset of run.candidates.filter(asset => run.approved.includes(asset.id))) {
-          if (!planned.some(worker => worker.assetId === asset.id)) {
+          if (!assessmentAssignments(workers, asset.id, run.goalRevision).verification) {
             this.storage.makeWorker(updated, 'verification', asset, `Verify ${new URL(asset.origin).hostname}`,
               'Compare the recorded public response metadata with the transport policy baseline.')
           }
@@ -270,7 +269,8 @@ class Execution {
     const current = this.check(job)
     const observation = capture.observation
     this.storage.db.transaction(() => {
-      if (observation && observation.status >= 200 && observation.status < 300 && !observation.transportMaxAge) {
+      if (observation && observation.origin === observation.finalOrigin && observation.status >= 200 &&
+          observation.status < 300 && !observation.transportMaxAge) {
         this.saveFinding(current, asset, 'pending', 'The recorded response did not show a positive HSTS max-age.', [id])
       }
       this.complete(job, current, summary, id)
@@ -279,9 +279,8 @@ class Execution {
 
   private async verify(job: Active, asset: Candidate) {
     const run = this.check(job)
-    const analysis = this.storage.workerList(run.id).findLast(worker =>
-      worker.phase === 'analysis' && worker.assetId === asset.id && worker.goalRevision === run.goalRevision && worker.status === 'complete')
-    const stored = analysis && this.storage.assignmentObservation(analysis.id)
+    const { analysis } = assessmentAssignments(this.storage.workerList(run.id), asset.id, run.goalRevision)
+    const stored = analysis?.status === 'complete' ? this.storage.assignmentObservation(analysis.id) : undefined
     const record = stored ? JSON.parse(this.storage.artifact(run.id, stored.id).content) as Capture : undefined
     const origins = analysis && record?.observation ? this.observationOrigins(analysis, record.observation) : []
     const observation = [...origins].every(origin => this.permitted(run, origin)) ? record?.observation : null
@@ -308,9 +307,12 @@ class Execution {
     }
 
     const current = this.check(job)
-    const reason = status === 'present' ? 'The recorded response matches the expected transport policy.'
-      : status === 'missing' ? 'The recorded successful HTTPS response did not contain a positive HSTS max-age.'
-        : 'Inconclusive: a successful response with a current evidence source was unavailable.'
+    let reason = 'Inconclusive: a successful response with a current evidence source was unavailable.'
+    if (status === 'present') reason = 'The recorded response matches the expected transport policy.'
+    else if (status === 'missing') reason = 'The recorded successful HTTPS response did not contain a positive HSTS max-age.'
+    else if (observation && observation.finalOrigin !== observation.origin) {
+      reason = `Inconclusive: the requested host redirected to ${new URL(observation.finalOrigin).hostname}. The final response describes that host.`
+    }
     this.storage.db.transaction(() => {
       const evidence = this.storage.addArtifact(current, job.assignment, 'verification', 'Transport policy verification',
         JSON.stringify({ ...transcript, command, exitStatus, inputEvidence: observation && stored ? [stored.id] : [],

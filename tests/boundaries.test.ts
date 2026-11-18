@@ -2,12 +2,18 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
+import { verificationCommand } from '../src/server/execution.ts'
+import { findings } from '../src/server/schema.ts'
+import { assessmentAssignments, Store } from '../src/server/store.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 
 const exec = promisify(execFile)
@@ -100,6 +106,78 @@ test('cancels an unresolved destination without dialing when DNS finishes', asyn
   controller.abort(new Error('scope changed'))
   await read
   lookup.resolve([publicAddress])
+})
+
+test('keeps reports tied to current approval and requires fresh verification after reapproval', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'guardian-approval-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const storage = new Store(directory)
+  const docsOrigin = 'https://docs.northstar.example'
+  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar, docsOrigin] })
+  const { id: runId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Review response metadata.', sourceMode: 'public' })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const primary = storage.run(runId).candidates.find(asset => asset.origin === northstar)
+  const docs = storage.run(runId).candidates.find(asset => asset.origin === docsOrigin)
+  assert.ok(primary && docs)
+  const approve = (assetIds: string[]) => storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true })
+  approve([primary.id, docs.id])
+
+  const analysis = storage.workerList(runId).find(worker => worker.assetId === primary.id && worker.phase === 'analysis')
+  assert.ok(analysis)
+  const run = storage.updateRun(runId, { phase: 'verification' })
+  const observation = storage.addArtifact(run, analysis, 'observation', 'Synthetic response', 'Fixture metadata.')
+  storage.updateWorker(analysis.id, { status: 'complete', outcome: 'Recorded a response.' })
+  storage.event(runId, 'broker.allowed', 'Recorded a fixture redirect.', { assignmentId: analysis.id, origin: docsOrigin })
+  const verification = storage.makeWorker(run, 'verification', primary, 'Verify Northstar', 'Check the synthetic evidence.')
+  const evidence = storage.addArtifact(run, verification, 'verification', 'Fixture verification', 'Missing HSTS.')
+  storage.updateWorker(verification.id, { status: 'complete', outcome: 'Confirmed from scope revision 1.' })
+  const findingId = randomUUID()
+  storage.db.insert(findings).values({
+    id: findingId, runId, assetId: primary.id, goalRevision: 0,
+    finding: { id: findingId, origin: northstar, title: 'Transport policy', status: 'confirmed', severity: 'low',
+      reason: 'Fixture response lacked HSTS.', remediation: 'Review the policy.', evidenceIds: [observation.id, evidence.id], scopeRevision: 1 },
+  }).run()
+  storage.writeReport(storage.run(runId), true)
+
+  approve([primary.id])
+  storage.writeReport(storage.run(runId), true)
+  const restricted = storage.runDetail(runId).reports[0].body
+  assert.equal(restricted.findings.length, 0)
+  assert.match(restricted.coverage[0].status, /redirect chain is no longer approved/)
+
+  approve([docs.id])
+  approve([primary.id, docs.id])
+  const current = assessmentAssignments(storage.workerList(runId), primary.id, 0)
+  assert.equal(current.analysis?.scopeRevision, 4)
+  assert.equal(current.verification, undefined)
+  storage.command({ requestId: randomUUID(), runId, action: 'stop' })
+  const history = storage.runDetail(runId).reports
+  const latest = history[0].body
+  assert.equal(latest.findings.length, 0)
+  assert.deepEqual(latest.coverage.find(item => item.origin === northstar), { origin: northstar, status: 'Pending review', evidenceId: null })
+  assert.equal(history.at(-1)?.body.findings[0].id, findingId)
+})
+
+test('keeps cross-origin redirects inconclusive for the requested host', async () => {
+  const finalOrigin = 'https://docs.northstar.example'
+  const broker = new RequestBroker({
+    resolve: async () => [publicAddress],
+    transport: async url => url.origin === northstar
+      ? { status: 308, headers: { location: finalOrigin + '/' } }
+      : { status: 200, headers: { 'strict-transport-security': 'max-age=31536000' } },
+  })
+  const signal = AbortSignal.timeout(5_000)
+  const observation = await broker.readPublicRoot({ ...allowed, canRead: origin => [northstar, finalOrigin].includes(origin) }, signal)
+  const result = await new LinuxWorkerBackend().run({
+    assignmentId: randomUUID(),
+    files: [{ name: 'observed.json', content: JSON.stringify(observation) }],
+    command: verificationCommand,
+    outputs: ['verification.json'],
+  }, signal)
+  assert.equal(result.exitCode, 0)
+  assert.deepEqual(JSON.parse(result.outputs['verification.json']), {
+    expected: 'positive HSTS max-age', observed: 31_536_000, origin: northstar, finalOrigin, result: 'inconclusive',
+  })
 })
 
 test('requires a local Docker Unix socket before staging worker data', async () => {
