@@ -383,6 +383,50 @@ test('rejects a finished plan for a superseded approval before it queues assignm
   assert.deepEqual(reviews.map(worker => [worker.assetId, worker.scopeRevision]), [[ids[1], 2]])
 })
 
+test('keeps completed assignments when an expanded approval selects the same checks', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'guardian-expanded-plan-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const storage = new Store(directory)
+  const docs = 'https://docs.northstar.example'
+  const { id: projectId } = storage.createProject({
+    requestId: randomUUID(), name: 'Northstar', seeds: [northstar, docs],
+  })
+  storage.importProjectAccessPolicy({
+    requestId: randomUUID(), projectId, snapshot: { ...accessPolicy, origin: docs },
+  })
+  const { id: runId } = storage.createRun({
+    requestId: randomUUID(), projectId, goal: 'Review response settings.', sourceMode: 'public',
+  })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const ids = storage.run(runId).candidates.map(asset => asset.id)
+  const primary = storage.run(runId).candidates.find(asset => asset.origin === northstar)!
+  const approve = (assetIds: string[], expectedScopeRevision: number) => storage.command({
+    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision, assetIds, consent: true,
+  })
+  approve([primary.id], 0)
+  const selection = standardChecks()
+  storage.commitReviewPlan(storage.run(runId), selection)
+  const original = storage.workerList(runId).find(worker => worker.phase === 'analysis')!
+  storage.updateWorker(original.id, { status: 'complete' })
+
+  approve(ids, 1)
+  const pending = storage.run(runId).reviewPlan
+  assert.equal(pending?.status, 'pending')
+  assert.deepEqual(pending?.status === 'pending' && pending.previous, selection)
+  assert.deepEqual(storage.workerList(runId).filter(worker => worker.phase === 'analysis').map(worker => worker.id), [original.id])
+  storage.command({ requestId: randomUUID(), runId, action: 'stop' })
+  const partial = storage.runDetail(runId).reports[0]
+  assert.deepEqual(partial.body.selectedChecks, selection)
+  assert.ok(partial.body.gaps.includes('A revised check plan was pending for this approval.'))
+  storage.command({ requestId: randomUUID(), runId, action: 'resume' })
+  storage.commitReviewPlan(storage.run(runId), selection)
+  const attempts = storage.workerList(runId).filter(worker => worker.phase === 'analysis')
+  assert.equal(attempts.length, 2)
+  assert.deepEqual(attempts.filter(worker => worker.assetId === primary.id).map(worker => [worker.id, worker.status]),
+    [[original.id, 'complete']])
+  assert.equal(attempts.find(worker => worker.assetId !== primary.id)?.scopeRevision, 2)
+})
+
 test('requires unique policy cases and leaves missing access decisions inconclusive', () => {
   const invalid = { ...accessPolicy, observed: [...accessPolicy.observed, accessPolicy.observed[0]] }
   assert.equal(accessPolicySnapshot.safeParse(invalid).success, false)

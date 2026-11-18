@@ -172,7 +172,7 @@ export interface SelectedChecks {
 }
 
 export type ReviewPlan =
-  | { status: 'pending'; goalMessageId: string }
+  | { status: 'pending'; goalMessageId: string; previous?: SelectedChecks }
   | ({ status: 'ready'; goalMessageId: string } & SelectedChecks)
 
 export interface CheckCoverage {

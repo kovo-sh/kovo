@@ -329,3 +329,87 @@ test('plans again with the remaining approved inputs when scope changes during p
     await fixture.close()
   }
 })
+
+test('replans an active run when a newly approved host supplies access records', async ({ page }) => {
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-combined-narrowed', 'plan-combined', 'response-primary', 'response-unavailable'],
+    hold: primaryOrigin + '/',
+    holdModel: 'plan-combined:responses:0',
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await page.getByLabel('Project name').fill('Northstar expanded scope')
+    await page.getByLabel('Seed hosts').fill([primaryOrigin, unavailableOrigin].join('\n'))
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await importAccessRecords(page, secondaryAccessPolicy)
+    await openScopeReview(page, combinedGoal, true)
+    const docs = page.getByRole('checkbox', { name: 'Include docs.northstar.example' })
+    await docs.uncheck()
+    await saveScope(page)
+    await fixture.withheld
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    expect(fixture.accepted).toContain('plan-combined-narrowed:responses:0')
+
+    await page.getByRole('button', { name: 'Review scope' }).click()
+    await docs.check()
+    await saveScope(page, 'Save scope revision')
+    await expect(page.getByText('2 approved hosts · Revision 2')).toBeVisible()
+    await fixture.modelWithheld
+    await expect(page.getByText('Preparing review plan', { exact: true })).toBeVisible()
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    let earlierId: string
+    const before = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const worker = before.prepare("SELECT id, status, scope_revision FROM assignments WHERE phase = 'analysis'").all()
+      expect(worker).toHaveLength(1)
+      expect(worker[0]).toMatchObject({ status: 'running', scope_revision: 1 })
+      earlierId = String(worker[0].id)
+    } finally {
+      before.close()
+    }
+
+    await app.stop('SIGKILL')
+    fixture.dropHeldModel()
+    fixture.release()
+    await app.start()
+    const resume = page.getByRole('button', { name: 'Resume', exact: true })
+    await expect(resume).toBeVisible()
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    await resume.click()
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('4 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('Scope revision 2 · Goal revision 0')
+    await expect(report).toContainText('Planned checks · HSTS policy, MIME sniffing protection, Referrer policy, Access policy decisions')
+    const policy = page.getByRole('heading', { name: 'Recorded access exceeds policy for billing-export', exact: true })
+    await expect(report.locator('.finding').filter({ has: policy })).toContainText('docs.northstar.example')
+    const { content } = await downloadReport(page, 'Markdown with evidence')
+    expect(content).toContain(secondaryAccessPolicy.recordedAt)
+    expect(fixture.requested.toSorted()).toEqual([primaryOrigin + '/', primaryOrigin + '/', unavailableOrigin + '/'].toSorted())
+    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual([
+      'plan-combined-narrowed:responses:0', 'plan-combined:responses:0',
+    ])
+    expect(fixture.unexpected).toEqual([])
+
+    const after = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const attempt = after.prepare('SELECT status, outcome FROM assignments WHERE id = ?').get(earlierId)
+      expect(attempt).toEqual({ status: 'canceled', outcome: 'Superseded by the revised check plan.' })
+      expect(after.prepare("SELECT count(*) AS n FROM evidence WHERE assignment_id = ? AND kind = 'observation'").get(earlierId)?.n).toBe(0)
+      const fresh = after.prepare("SELECT count(*) AS n FROM assignments WHERE scope_revision = 2 AND status = 'complete'").get()
+      expect(fresh?.n).toBe(4)
+    } finally {
+      after.close()
+    }
+  } finally {
+    if (test.info().status !== test.info().expectedStatus) await test.info().attach('fixture activity', {
+      body: JSON.stringify({ requested: fixture.requested, accepted: fixture.accepted, unexpected: fixture.unexpected }),
+      contentType: 'application/json',
+    })
+    await app.dispose()
+    await fixture.close()
+  }
+})

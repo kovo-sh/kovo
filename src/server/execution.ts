@@ -89,9 +89,11 @@ class Execution {
   private authorize(job: Active) {
     const current = this.storage.worker(job.assignment.id)
     const run = this.storage.run(current.runId)
+    const plan = run.reviewPlan
+    const mayFinish = plan?.status === 'pending' && Boolean(plan.previous) && current.scopeRevision < run.scopeRevision
     return current.status === 'running' && current.lease === job.assignment.lease &&
       run.status === 'running' && run.phase === current.phase && current.goalRevision === run.goalRevision &&
-      run.reviewPlan?.status !== 'pending' &&
+      (plan?.status !== 'pending' || mayFinish) &&
       [...job.origins].every(origin => this.permitted(run, origin))
   }
 

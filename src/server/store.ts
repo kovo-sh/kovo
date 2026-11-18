@@ -13,6 +13,7 @@ import { parseDnsInventory } from '../passive-dns.ts'
 import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { responseReview } from './response-checks.ts'
+import { availableReviewChecks } from './review-plan.ts'
 import * as tables from './schema.ts'
 import { redact } from './redact.ts'
 
@@ -446,8 +447,24 @@ export class Store {
       const plan = run.reviewPlan
       if (run.status !== 'running' || run.phase !== 'analysis' || plan?.status !== 'pending' ||
         run.goalRevision !== expected.goalRevision || run.scopeRevision !== expected.scopeRevision) return
+      const previous = plan.previous
+      const sameChecks = previous && previous.checks.length === selection.checks.length &&
+        selection.checks.every(check => previous.checks.includes(check))
+      const workers = previous ? this.workerList(run.id) : []
+      if (previous && !sameChecks) {
+        for (const worker of workers) {
+          if (worker.goalRevision === run.goalRevision && worker.phase !== 'discovery' &&
+              worker.status !== 'complete' && worker.status !== 'canceled') {
+            this.updateWorker(worker.id, { status: 'canceled', lease: null, outcome: 'Superseded by the revised check plan.' })
+          }
+        }
+      }
       const updated = this.updateRun(run.id, { reviewPlan: { status: 'ready', goalMessageId: plan.goalMessageId, ...selection } })
-      this.queueAnalysis(updated, updated.approved)
+      const toQueue = sameChecks ? updated.approved.filter(id => {
+        const { analysis } = assessmentAssignments(workers, id, run.goalRevision)
+        return !analysis || analysis.status === 'canceled' || analysis.status === 'failed'
+      }) : updated.approved
+      this.queueAnalysis(updated, toQueue)
       const titles = selection.checks.map(id => assessmentCheckTitles[id]).join(', ')
       const planned = selection.source === 'coordinator'
       this.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'guardian',
@@ -524,7 +541,17 @@ export class Store {
     const added = approved.filter(id => !run.approved.includes(id))
     const phase = added.length || run.phase === 'review' ? 'analysis' : run.phase
     const status = run.phase === 'review' ? 'running' : run.status
-    const updated = this.updateRun(run.id, { approved, scopeRevision, phase, status })
+    const plan = run.reviewPlan
+    let reviewPlan = plan
+    if (plan?.status === 'ready' && added.length) {
+      const priorAssets = run.candidates.filter(asset => run.approved.includes(asset.id))
+      const priorChecks = priorAssets.length ? availableReviewChecks(priorAssets, run.sourceMode) : []
+      const currentChecks = availableReviewChecks(run.candidates.filter(asset => approved.includes(asset.id)), run.sourceMode)
+      if (currentChecks.some(check => !priorChecks.includes(check))) {
+        reviewPlan = { status: 'pending', goalMessageId: plan.goalMessageId, previous: { checks: plan.checks, source: plan.source } }
+      }
+    }
+    const updated = this.updateRun(run.id, { approved, scopeRevision, phase, status, reviewPlan })
     if (saveProject) {
       this.db.update(tables.projects).set({
         defaultScope: run.candidates.filter(asset => approved.includes(asset.id)).map(asset => asset.origin),
@@ -546,6 +573,9 @@ export class Store {
     })
     this.message(run.id, run.coordinatorId, 'guardian',
       `Scope revision ${scopeRevision} approved for ${approved.length} ${approved.length === 1 ? 'host' : 'hosts'}.`)
+    if (reviewPlan !== plan) {
+      this.event(run.id, 'review.reopened', 'The expanded scope adds an evidence type. A revised check plan is pending.', { scopeRevision })
+    }
   }
 
   private revise(run: Run, input: string) {
@@ -575,8 +605,9 @@ export class Store {
     const approvedOrigins = new Set(scope.map(asset => asset.origin))
     const currentEvidence = new Set<string>()
     const gaps: string[] = []
-    const selection = run.reviewPlan?.status === 'ready'
-      ? { checks: run.reviewPlan.checks, source: run.reviewPlan.source } : undefined
+    const plan = run.reviewPlan
+    const selection = plan?.status === 'ready' ? { checks: plan.checks, source: plan.source } : plan?.previous
+    if (plan?.status === 'pending' && plan.previous) gaps.push('A revised check plan was pending for this approval.')
     const coverage = scope.map(asset => {
       const { analysis, verification } = assessmentAssignments(snapshot.assignments, asset.id, run.goalRevision)
       const analyzed = analysis?.status === 'complete' ? analysis : undefined
