@@ -1,0 +1,11 @@
+{
+  "name": "guardian-evidence-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "just-bash": "3.6.1"
+  },
+  "overrides": {
+    "undici": "7.30.2"
+  }
+}

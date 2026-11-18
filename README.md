@@ -22,9 +22,13 @@ The production app currently supports projects, supplied inventory, discovery co
 npx playwright install chromium
 npm run check
 npm run test:e2e
+npm run worker:build
+npm run test:boundaries
 ```
 
 Playwright runs against the production build with a temporary data directory. The browser tests cover approval, deep links, restart recovery, and the local HTTP trust boundary.
+
+The worker boundary tests require a local Linux Docker daemon. They exercise the real just-bash image, including a derived artifact, read-only evidence, container limits, and blocked direct egress. Broker tests use supplied DNS and HTTP fixtures and exercise scope revocation and redirect handling.
 
 ## Design prototype
 
