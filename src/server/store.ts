@@ -550,11 +550,12 @@ export class Store {
       ...(run.reviewPlan?.status === 'ready'
         ? { selectedChecks: { checks: run.reviewPlan.checks, source: run.reviewPlan.source } } : {}),
     }
-    this.db.insert(tables.reports).values({
-      id: randomUUID(), runId: run.id, partial, body,
-      version: (snapshot.reports[0]?.version ?? 0) + 1, createdAt: Date.now(),
-    }).run()
-    this.event(run.id, partial ? 'report.partial' : 'report.complete', partial ? 'Partial report created.' : 'Complete report created.')
+    const reportId = randomUUID()
+    const version = (snapshot.reports[0]?.version ?? 0) + 1
+    this.db.insert(tables.reports).values({ id: reportId, runId: run.id, partial, body, version, createdAt: Date.now() }).run()
+    this.event(run.id, partial ? 'report.partial' : 'report.complete',
+      partial ? 'Partial report created.' : 'Complete report created.',
+      { reportId, version, phase: run.phase, status: run.status })
   }
 
   command(input: RunCommand) {

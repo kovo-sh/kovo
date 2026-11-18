@@ -30,6 +30,17 @@ export const accessPolicy: AccessPolicySnapshot = {
   ],
 }
 
+export const secondaryAccessPolicy: AccessPolicySnapshot = {
+  ...accessPolicy,
+  origin: unavailableOrigin,
+  recordedAt: '2026-11-17T16:10:00Z',
+  observed: [
+    { caseId: 'billing-export', decision: 'allow' },
+    { caseId: 'audit-summary', decision: 'allow' },
+    { caseId: 'modify-schedule', decision: 'deny' },
+  ],
+}
+
 export function observation(origin: string, status: number, transportMaxAge: number | null): PublicObservation {
   return {
     origin, finalOrigin: origin, status, mediaType: 'text/html',

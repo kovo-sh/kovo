@@ -6,7 +6,9 @@ import { createApp } from './app.ts'
 import { configureModel, downloadReport, openScopeReview, saveScope } from './browser-flows.ts'
 import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
-import { accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, primaryOrigin, unavailableOrigin } from './scenarios.ts'
+import {
+  accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, primaryOrigin, secondaryAccessPolicy, unavailableOrigin,
+} from './scenarios.ts'
 
 test('imports and verifies access policy cases alone and alongside response checks', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy', 'plan-combined', 'response-primary'] })
@@ -178,6 +180,48 @@ test('imports and verifies access policy cases alone and alongside response chec
     expect(historical.content).not.toContain(laterCapture)
     expect(historical.content).not.toContain('Supporting record unavailable')
     await collectReportBenchmark('access-policy', app.directory, page.url(), historical)
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
+test('keeps overlapping access findings and verification tied to each approved host', { tag: '@report-benchmark' }, async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy'] })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await page.getByLabel('Project name').fill('Northstar policy overlap')
+    await page.getByLabel('Seed hosts').fill([primaryOrigin, unavailableOrigin].join('\n'))
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    for (const policy of [accessPolicy, secondaryAccessPolicy]) {
+      await page.getByRole('button', { name: 'Import access records' }).click()
+      await page.getByLabel('Access policy JSON').setInputFiles({
+        name: 'authorization-decisions.json',
+        mimeType: 'application/json',
+        buffer: Buffer.from(JSON.stringify(policy)),
+      })
+      await page.getByRole('button', { name: 'Review records' }).click()
+      const review = page.getByRole('region', { name: 'Access policy import preview' })
+      await review.getByRole('button', { name: 'Import records' }).click()
+      await expect(page.getByRole('status')).toContainText('Imported 4 access cases for ' + new URL(policy.origin).hostname)
+    }
+
+    await openScopeReview(page, accessPolicyGoal, true)
+    await saveScope(page)
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('3 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('3 checks met baseline · 3 verified gaps · 2 checks inconclusive')
+    await expect(report.getByRole('region', { name: 'Fix first' })).toContainText('2 medium-severity findings share top priority.')
+    await expect(report.getByRole('heading', { name: 'Recorded access exceeds policy for billing-export' })).toHaveCount(2)
+    const exported = await downloadReport(page, 'Markdown with evidence')
+    await collectReportBenchmark('policy-multi-host', app.directory, page.url(), exported)
+    expect(fixture.requested).toEqual([])
+    expect(fixture.accepted).toContain('plan-access-policy:responses:0')
+    expect(fixture.unexpected).toEqual([])
   } finally {
     await app.dispose()
     await fixture.close()

@@ -5,10 +5,10 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | Check | Result |
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
-| `npm run test:e2e` | Fifteen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, candidate source evidence and scope changes, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and output-limit recovery. |
+| `npm run test:e2e` | Sixteen production browser tests passed. They cover both provider protocols through complete reports, key rejection after a successful connection test, passive DNS and access policy imports, candidate source evidence and scope changes, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and host-specific verification of overlapping policy decisions. |
 | `npm run test:boundaries` | Nineteen tests passed. Fourteen cover scope, evidence, and the worker runtime. Five cover the matched report scorecard, including incorrect evidence, stale artifact references, and missing review results. |
-| `npm run benchmark:reports` | All 19 case verdicts matched across four report versions. All five confirmed findings supplied scoped evidence, worker comparisons, impact, and a fix check. |
-| GitHub Actions | The report handoff and provenance commit passed on a fresh Ubuntu checkout, including the Docker worker build, fourteen boundary tests, fifteen production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `6c55af9`](https://github.com/wwwillchen/guardian/actions/runs/44286459363) |
+| `npm run benchmark:reports` | All 19 regression verdicts matched. The assessment manifest adds eight cases on two approved hosts. All 27 verdicts matched, and all eight confirmations had a scoped observation and verification. |
+| GitHub Actions | The offline scorecard commit passed on a fresh Ubuntu checkout, including the Docker worker build, nineteen boundary and comparison tests, fifteen production browser tests, and all nineteen regression verdicts. [Hosted verification run for `0f1a78c`](https://github.com/wwwillchen/guardian/actions/runs/44287140573) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -78,6 +78,10 @@ A separate replay used two archived root response captures from the local Artex 
 The comparison command verified the artifacts for a four-case Northstar access policy exercise. The pair used the export from Guardian's production browser replay and the output from Artex's native Markdown renderer. Artex rendered pre-adjudicated findings from the same local policy record. The Guardian export linked the original observation and verification for both confirmations. The local scorecard records evidence as passed and assessment accuracy and reader results as pending. The reader worksheet uses copies with neutral titles.
 
 Tests exercised a matched synthetic suite, including a duplicate confirmation, a high-severity miss, and out-of-scope evidence. They rejected a changed report, results tied to a different input, a mismatched run record, and reader answers for a stale report version. The command also returned exit status 1 with a readable scorecard when a confirmation's evidence was marked unrelated.
+
+The browser benchmark writes a Guardian assessment manifest with input packets, exported reports, and ordered events ending at the save event for each version. The interrupted report's recording ends before verification. The new cross-host case found the same billing policy gap on two hosts with independent evidence links, plus a separate access discrepancy. Offline copies of the two legacy Dyad reports exported byte-for-byte identical Markdown before and after adding the report event details. The three broker audit entries were preserved.
+
+A separate local holdout used two newly prepared access policy snapshots with eight cases labeled before launching the browser. Guardian replayed the recorded connection and planning turns, made zero page reads, and matched all eight verdicts. Each of the three confirmed findings resolved to its host's policy snapshot and successful worker comparison. The local assessment scorecard combines the browser benchmark and holdout. Matched Artex assessments and independent reader judgments remain pending.
 
 ## Live Dyad smoke run
 

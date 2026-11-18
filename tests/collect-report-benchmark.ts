@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { CheckCoverage, EvidenceSummary, Finding, ReportBody } from '../src/domain.ts'
 import { checkLabels } from '../src/report-summary.ts'
 import { benchmarkAttachment, benchmarkCaseId, benchmarkScenarios } from './report-benchmark.ts'
-import type { ExpectedCase, ReportResult, ScenarioId, Verdict } from './report-benchmark.ts'
+import type { BenchmarkInput, ExpectedCase, ReportResult, ScenarioId, Verdict } from './report-benchmark.ts'
 
 type Evidence = {
   artifactId: string
@@ -64,6 +64,41 @@ function supportsFinding(records: ReadonlyMap<string, Evidence>, lines: string[]
   return Boolean(source && proof?.inputEvidence?.includes(source.artifactId))
 }
 
+function readReportRecording(db: DatabaseSync, runId: string, reportId: string, createdAt: number,
+  version: number, report: ReportBody) {
+  const checkpoint = db.prepare(`SELECT id, kind, json_extract(detail, '$.version') AS version,
+      json_extract(detail, '$.phase') AS phase, json_extract(detail, '$.status') AS status
+    FROM events WHERE run_id = ? AND json_extract(detail, '$.reportId') = ?`).get(runId, reportId)
+  if (!checkpoint || typeof checkpoint.id !== 'number' || typeof checkpoint.phase !== 'string' ||
+      typeof checkpoint.status !== 'string' || checkpoint.version !== version) {
+    throw new Error('The benchmark report has no matching run event.')
+  }
+  const approval = db.prepare(`SELECT id, json_extract(detail, '$.approved') AS scope
+    FROM events WHERE run_id = ? AND kind = 'scope.approved' AND id < ?
+      AND json_extract(detail, '$.scopeRevision') = ? ORDER BY id DESC LIMIT 1`)
+    .get(runId, checkpoint.id, report.scopeRevision)
+  if (typeof approval?.id !== 'number' || typeof approval.scope !== 'string') {
+    throw new Error('The benchmark report has no matching scope approval.')
+  }
+  const approvalId = approval.id
+  const scope = JSON.parse(approval.scope) as string[]
+  const events = db.prepare(`SELECT id, kind, created_at AS createdAt,
+      json_extract(detail, '$.origin') AS origin, json_extract(detail, '$.assignmentId') AS assignmentId,
+      json_extract(detail, '$.artifactId') AS artifactId
+    FROM events WHERE run_id = ? AND id <= ? AND kind IN (
+      'run.created', 'discovery.consented', 'discovery.complete', 'scope.approved', 'review.planned',
+      'evidence.committed', 'broker.allowed', 'broker.observed', 'interrupted', 'run.resumed',
+      'worker.started', 'worker.complete', 'verification.started', 'report.partial', 'report.complete'
+    ) ORDER BY id`).all(runId, checkpoint.id) as ReportResult['recording']['events']
+  expect(events.at(-1)?.id).toBe(checkpoint.id)
+  expect(events.filter(row => row.kind === 'broker.allowed')
+    .every(row => Number(row.id) > approvalId && scope.includes(String(row.origin)))).toBe(true)
+  return {
+    runId, reportId, reportVersion: version, createdAt, scopeRevision: report.scopeRevision, goalRevision: report.goalRevision,
+    approval: { eventId: approvalId, scope }, phase: checkpoint.phase, status: checkpoint.status, events,
+  }
+}
+
 export async function collectReportBenchmark(
   scenario: ScenarioId,
   directory: string,
@@ -71,23 +106,36 @@ export async function collectReportBenchmark(
   exportFile: { name: string; content: string },
 ) {
   const fixture = benchmarkScenarios[scenario]
+  const input: BenchmarkInput = fixture.input
   const runId = new URL(url).pathname.split('/')[2]
   const db = new DatabaseSync(join(directory, 'guardian.sqlite'), { readOnly: true })
-  let saved
+  let report: ReportBody
+  let recording: ReportResult['recording']
   try {
-    saved = db.prepare('SELECT body, partial FROM reports WHERE run_id = ? AND version = ?').get(runId, fixture.version)
+    const saved = db.prepare('SELECT id, body, partial, created_at AS createdAt FROM reports WHERE run_id = ? AND version = ?')
+      .get(runId, fixture.version)
+    if (typeof saved?.body !== 'string' || typeof saved.id !== 'string' || typeof saved.createdAt !== 'number') {
+      throw new Error('The benchmark report version is missing.')
+    }
+    expect(saved.partial).toBe(fixture.partial ? 1 : 0)
+    report = JSON.parse(saved.body) as ReportBody
+    recording = readReportRecording(db, runId, saved.id, saved.createdAt, fixture.version, report)
   } finally {
     db.close()
   }
-  if (typeof saved?.body !== 'string') throw new Error('The benchmark report version is missing.')
-  expect(saved.partial).toBe(fixture.partial ? 1 : 0)
-  const report = JSON.parse(saved.body) as ReportBody
+  const lastEvent = recording.events.at(-1)
+  expect(lastEvent?.kind).toBe(fixture.partial ? 'report.partial' : 'report.complete')
+  expect(recording.status).toBe(fixture.partial ? 'stopped' : 'complete')
+  expect(recording.phase).toBe(fixture.partial ? 'analysis' : 'complete')
+  expect(recording.events.some(row => row.kind === 'verification.started')).toBe(!fixture.partial)
   const markdown = exportFile.content
   expect(exportFile.name).toBe('guardian-report-' + runId.slice(0, 8) + '-v' + fixture.version + '.md')
   expect(markdown).toContain('**Run** ' + runId)
   expect(markdown).toContain('**Report version** ' + fixture.version)
   expect(markdown.startsWith('# Guardian ' + (fixture.partial ? 'partial' : 'complete') + ' report\n')).toBe(true)
-  const expectedHosts = [...new Set(fixture.cases.map(row => row.origin))].sort()
+  const expectedHosts = [...fixture.input.scope].sort()
+  expect(report.goal).toBe(fixture.input.goal)
+  expect([...recording.approval.scope].sort()).toEqual(expectedHosts)
   expect(report.scope.map(asset => asset.origin).sort()).toEqual(expectedHosts)
   expect(section(markdown, 'Approved scope').trim().split('\n').sort()).toEqual(expectedHosts.map(origin => '- ' + origin))
 
@@ -95,6 +143,16 @@ export async function collectReportBenchmark(
   const findings = subsections(markdown, 'Findings').filter(block => block.lines.some(line => line.endsWith('**Status** confirmed')))
   const confirmed = report.findings.filter(finding => finding.status === 'confirmed')
   const evidence = readEvidence(markdown)
+  const recordedResponses = [...evidence.values()].filter(row => row.observation)
+  const recordedDecisions = [...evidence.values()].filter(row => row.snapshot)
+  const expectedResponses = input.capturedEvidence.responseObservations ?? []
+  const expectedDecisions = input.capturedEvidence.accessDecisions ?? []
+  for (const row of recordedResponses) expect(row.observation).toEqual(expectedResponses.find(item => item.origin === row.origin))
+  for (const row of recordedDecisions) expect(row.snapshot).toEqual(expectedDecisions.find(item => item.origin === row.origin))
+  expect(recordedResponses.map(row => row.origin).sort()).toEqual(
+    (fixture.partial ? expectedResponses.slice(0, 1) : expectedResponses).map(row => row.origin).sort(),
+  )
+  expect(recordedDecisions.map(row => row.origin).sort()).toEqual(expectedDecisions.map(row => row.origin).sort())
   expect(findings).toHaveLength(confirmed.length)
   const fields = ['Expected', 'Observed', 'Impact', 'Remediation', 'Check the fix']
 
@@ -111,6 +169,7 @@ export async function collectReportBenchmark(
     const visible = visibleCoverage && (!finding || (Boolean(block) && check?.status === 'gap'))
     const result = { id: benchmarkCaseId(scenario, expected), reported, visible }
     if (!finding) return result
+    if (expected.expected === 'confirmed') expect.soft(finding.severity).toBe(expected.severity)
     const lines = block?.lines ?? []
     const fixGuidance = fields.every(field => {
       const prefix = '- **' + field + '** '
@@ -119,7 +178,7 @@ export async function collectReportBenchmark(
     return { ...result, linkedEvidence: supportsFinding(evidence, lines, finding, expected, report), fixGuidance }
   })
   const unmatchedConfirmations = confirmed.length - cases.filter(row => row.reported === 'confirmed').length
-  const result: ReportResult = { scenario, cases, unmatchedConfirmations }
+  const result: ReportResult = { scenario, cases, unmatchedConfirmations, recording }
   await test.info().attach(benchmarkAttachment + scenario + '.json', {
     body: JSON.stringify(result), contentType: 'application/json',
   })
