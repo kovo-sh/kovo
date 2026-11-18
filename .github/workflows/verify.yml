@@ -25,4 +25,4 @@ jobs:
       - run: npm run check
       - run: npm run worker:build
       - run: npm run test:boundaries
-      - run: npm run test:e2e
+      - run: npm run test:e2e -- --reporter=list,./tests/report-benchmark-reporter.ts

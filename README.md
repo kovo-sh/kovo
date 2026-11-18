@@ -61,6 +61,12 @@ Record fresh fixtures explicitly with `npm run fixtures:capture -- responses`, `
 
 The separate opt-in command `npm run smoke:live -- --live` runs the production browser flow against live OpenRouter and the approved Dyad public home pages. It prints the local report path and data directory. Resume that run with `npm run smoke:live -- --live --resume <data-directory>` if it stops early.
 
+## Benchmark reports
+
+Run `npm run benchmark:reports` to replay the Northstar cases through the production app. The four Markdown reports and `summary.json` are written to `test-results/report-benchmark/`. The scorecard includes expected and observed verdicts, confirmed-finding precision and recall, and counts for inconclusive and untested cases. Use the Markdown reports for the reviewer tasks in the spec.
+
+To compare independently reviewed Artex reports for the same cases, set `GUARDIAN_ARTEX_REPORT_RESULTS` to a local JSON file outside `test-results/`. Use the scorecard's `suite` value, the Artex `version` and `model`, an `unmatchedConfirmations` count, and a `cases` object keyed by each case ID in the scorecard. Each case takes one of `confirmed`, `met`, `inconclusive`, or `untested`. Use `untested` for unsupported cases. Keep the source reports with the verdicts so the comparison can be audited.
+
 ## View the sample run
 
 ```sh

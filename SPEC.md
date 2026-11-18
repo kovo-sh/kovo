@@ -134,6 +134,7 @@ Automated browser end-to-end tests in Playwright are the primary regression suit
 - Preserve HTTP status, provider event order, streamed text deltas, tool calls, and finish reasons. Redact credentials and sensitive payloads before writing fixtures to disk. Normalize volatile IDs and timestamps consistently across related requests and responses. Match requests by scenario, conversation, and turn so parallel worker timing does not change which response is replayed.
 - Commit reviewed fixtures and replay them locally and in CI without API keys or outbound network access. Fail on unexpected model requests with a diff of the sanitized request. Capture and refresh fixtures through a separate, explicit command that uses developer credentials and shows the changes for review.
 - Assert user-visible results and durable state, such as approved scope, evidence links, and assignments after restart. Use controlled replay failures for cases such as interrupted streams, rate limits, or malformed responses when a live capture cannot reproduce them reliably. Use focused unit tests for rules that are easier to verify directly.
+
 For local fixture capture, read the OpenRouter key from `~/.config/guardian-fixtures/openrouter.key`. Keep the file outside the repository with owner-only permissions. The development key passed OpenRouter's `GET /api/v1/key` authentication check with HTTP 200. Model inference and fixture capture are separate checks.
 
 ### Report quality benchmark
@@ -143,6 +144,8 @@ Use the same authorized, reproducible defensive assessment cases for Guardian an
 - Guardian should match or exceed Artex on precision and recall for confirmed findings on the agreed suite. Count unsupported cases as uncovered. A missing observation should be visibly inconclusive or untested.
 - Each Guardian confirmation must lead to an approved supporting observation and the verification that substantiates it. The saved export should make this evidence reviewable offline and identify any unavailable records.
 - Have reviewers use each report to identify the highest-priority fix, explain the impact, and describe how to verify the fix. Record whether they can complete those tasks from the report alone.
+
+The Northstar case matrix defines expected verdicts for four report versions from recorded inputs. `npm run benchmark:reports` runs the production browser flows and saves the exported reports and a case-by-case scorecard. Regular end-to-end tests assert the same verdicts and verify the portable evidence links. The scorecard can include separately reviewed Artex verdicts for the same cases. [Northstar case matrix](tests/report-benchmark.ts)
 
 ## V1 acceptance criteria
 
@@ -155,6 +158,7 @@ Use the same authorized, reproducible defensive assessment cases for Guardian an
 - Run the TanStack Start production build on loopback. Open a worker thread through its deep link. With a run paused, restart the server and verify that the event stream reconnects from the last event ID and the run stays paused until explicit resume.
 - Finish verification with confirmed response policy gaps and inconclusive fixture results. Follow a confirmed finding to its observed value, expected setting, remediation, and worker verification. Run the zero-finding case and verify that the report shows which checks met the baseline.
 - Download a partial report and the complete version from the same run. Verify that each Markdown export resolves its evidence links offline within its own approved scope, identifies any unavailable records, and reflects the selected version.
+- Replay the four Northstar benchmark report versions. Verify each expected verdict in the saved export. Check that every confirmation includes the scoped source, its worker verification, the impact, and how to validate the fix.
 - Import recorded access decisions for an existing project host. Verify matching decisions, a decision that differs from policy, and a missing decision. Run access policy alone and with response checks. Confirm that each finding links to its own input and the corresponding worker comparison.
 - Have a worker compose a just-bash pipeline that extracts fields from prepared JSON evidence, compares them with a baseline, and writes a derived artifact. Verify that the report links to the artifact and that the worker record identifies the commands and inputs. Verify that attempts to read files outside the assignment and make direct network requests are denied.
 - Through the broker, verify that an approved read succeeds. Reject redirects out of scope and DNS responses that resolve an approved public hostname to a private address. Remove the approved host while a fixture read is pending. Verify that a subsequent read is denied and the pending result never becomes evidence.

@@ -7,7 +7,8 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
 | `npm run test:e2e` | Twelve production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, passive DNS and access policy imports, explicit scope approval, revised check plans, coordinator chat, new assets awaiting approval, worker deep links, restart and event replay, container cleanup after an abrupt crash, evidence exports, and output-limit recovery. |
 | `npm run test:boundaries` | Twelve tests passed. They cover plan and access case validation, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, process-level network isolation, container resource limits, and the worker's independent deadline. |
-| GitHub Actions | The portable report export commit passed on a fresh Ubuntu checkout, including the Docker worker build, eleven boundary tests, and eleven production browser tests. [Hosted verification run for `3833cac`](https://github.com/wwwillchen/guardian/actions/runs/44278482996) |
+| `npm run benchmark:reports` | All 19 case verdicts matched across four report versions. All five confirmed findings supplied scoped evidence, worker comparisons, impact, and a fix check. |
+| GitHub Actions | The worker recovery commit passed on a fresh Ubuntu checkout, including the Docker worker build, twelve boundary tests, and twelve production browser tests. [Hosted verification run for `e02ae36`](https://github.com/wwwillchen/guardian/actions/runs/44280857942) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -51,6 +52,14 @@ The browser downloaded the partial and complete versions from one stopped and re
 The scope boundary test exported each version after a scope change and reapproval. The restricted version omitted the removed origin and affected evidence. The earlier version preserved its approved scope. A simulated cross-host input reference was marked unavailable. An offline copy of the Dyad workspace exported both original report versions, resolved both legacy verification records, and retained the three-read audit. The export menu was checked in desktop light mode and at 390 pixels in dark mode.
 
 The Artex Markdown renderer and the Guardian app were given the same synthetic access policy case. Artex's renderer received two pre-adjudicated discrepancies. Both exports described those discrepancies and the source timestamp. Guardian's export included the omitted decision as inconclusive and linked the policy snapshot and verification. A read-only aggregate check of the Artex database found 34 pending findings and zero tasks or findings mentioning the Northstar fixture. The matched assessment benchmark remains open.
+
+## Northstar report benchmark
+
+The production browser replay scored 19 pre-labeled cases from four exported reports. Five expected confirmations were found with zero false confirmations, giving 5/5 precision and 5/5 recall on this suite. Four cases met the baseline. Four had insufficient evidence and were shown as inconclusive. The six interrupted cases remained untested.
+
+Every confirmation linked to the scoped source record and the successful worker comparison. All five included expected and observed values, impact, remediation, and a way to check the fix. The access policy report put the medium-severity billing-export issue first and identified the role and policy decision to recheck.
+
+An importer check used synthetic verdicts to verify rejection of missing cases and scoring of a false confirmation, an out-of-suite confirmation, and a missed expected result. Matched Artex results and the comparative reviewer exercise remain open.
 
 ## Live Dyad smoke run
 

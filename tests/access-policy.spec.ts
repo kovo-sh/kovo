@@ -4,10 +4,11 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
 import { configureModel, downloadReport, openScopeReview, saveScope } from './browser-flows.ts'
+import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
 import { accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, primaryOrigin, unavailableOrigin } from './scenarios.ts'
 
-test('imports and verifies access policy cases alone and alongside response checks', async ({ page }) => {
+test('imports and verifies access policy cases alone and alongside response checks', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: ['connection', 'plan-access-policy', 'plan-combined', 'response-primary'] })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   const privateValue = 'inert-access-record-secret-6409'
@@ -168,6 +169,7 @@ test('imports and verifies access policy cases alone and alongside response chec
     expect(historical.content).toContain(accessPolicy.recordedAt)
     expect(historical.content).not.toContain(laterCapture)
     expect(historical.content).not.toContain('Supporting record unavailable')
+    await collectReportBenchmark('access-policy', app.directory, page.url(), historical)
   } finally {
     await app.dispose()
     await fixture.close()

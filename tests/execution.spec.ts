@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
 import { configureModel, downloadReport, reviewScope, saveScope } from './browser-flows.ts'
+import { collectReportBenchmark } from './collect-report-benchmark.ts'
 import { fixtureServer } from './fixture-server.ts'
 import {
   allChecksGoal, excludedOrigin, fixtureCredential, healthyOrigin, primaryOrigin, referrerGoal, statusQuestion, unavailableOrigin,
@@ -13,7 +14,7 @@ const mainScenes = ['connection', 'plan-all', 'response-primary', 'response-unav
 const healthyScenes = ['connection', 'plan-all', 'response-healthy']
 const seeds = [primaryOrigin, unavailableOrigin]
 
-test('replays real provider streams through analysis, restart, explicit resume, and the final report', async ({ page }) => {
+test('replays real provider streams through analysis, restart, explicit resume, and the final report', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({
     scenes: mainScenes, hold: unavailableOrigin + '/', holdModel: 'plan-all:responses:0',
   })
@@ -95,6 +96,7 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     expect(completeExport.content).toContain('The recorded response returned HTTP 503.')
     expect(completeExport.content).not.toContain(fixture.sensitiveFixtureValue)
     expect(completeExport.content).not.toContain('Supporting record unavailable')
+    await collectReportBenchmark('response-multi-host', app.directory, page.url(), completeExport)
     await report.getByLabel('Version').selectOption('1')
     await expect(partial).toContainText('Verification pending')
     const partialExport = await downloadReport(page, 'Markdown with evidence')
@@ -103,6 +105,7 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     expect(partialExport.content).toContain('Verification pending')
     expect(partialExport.content).toContain('"kind": "observation"')
     expect(partialExport.content).not.toContain('"kind": "verification"')
+    await collectReportBenchmark('response-interrupted', app.directory, page.url(), partialExport)
 
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     let planningSession: string
@@ -239,7 +242,7 @@ test('resumes a saved observation after narrowing scope for an unrelated host', 
   }
 })
 
-test('verifies both model protocols and produces a zero-finding report with coverage', async ({ page }) => {
+test('verifies both model protocols and produces a zero-finding report with coverage', { tag: '@report-benchmark' }, async ({ page }) => {
   const fixture = await fixtureServer({ scenes: healthyScenes })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
@@ -268,12 +271,14 @@ test('verifies both model protocols and produces a zero-finding report with cove
     await expect(report).toContainText('nosniff')
     await expect(report).toContainText('strict-origin-when-cross-origin')
     await expect(report).not.toContainText('Coverage gaps')
-    const { content } = await downloadReport(page, 'Markdown with evidence')
+    const exported = await downloadReport(page, 'Markdown with evidence')
+    const { content } = exported
     expect(content).toContain('No findings recorded.')
     expect(content).toContain('"kind": "verification"')
     expect(content).toContain('"kind": "observation"')
     expect(content).toContain('"transportMaxAge": 31536000')
     expect(content).not.toContain('Supporting record unavailable')
+    await collectReportBenchmark('response-healthy', app.directory, page.url(), exported)
     expect(fixture.unexpected).toEqual([])
     expect(fixture.accepted).toContain('connection:messages:0')
   } finally {
