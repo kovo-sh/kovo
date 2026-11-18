@@ -143,7 +143,7 @@ export function provider(settings: ProviderSettings, scenario: string, signal?: 
   const send = transport(settings, scenario, signal, record)
   const connection = scenario === 'connection'
   const chooseEvidenceTool = (transcript: { messages: { role: string }[] }) =>
-    scenario === 'worker-analysis' && transcript.messages.at(-1)?.role === 'user'
+    (scenario === 'worker-analysis' || scenario === 'response-analysis') && transcript.messages.at(-1)?.role === 'user'
   const options = { fetch: send, maxTokens: modelTokenLimit, maxRetries: 0, timeoutMs: 35_000 }
   const implementation: ProviderStreams = api === 'openai-responses' ? {
     stream: (selected, transcript, streamOptions) => responses(selected as Model<'openai-responses'>, transcript, {

@@ -1,7 +1,7 @@
-import { Link, useNavigate, useRouter } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { useEffect, useRef, useState } from 'react'
-import { commandRun } from '../actions.ts'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { commandRun, runData } from '../actions.ts'
 import { FormError, Status, useAction } from './common.tsx'
 import { EvidenceDialog } from './evidence-dialog.tsx'
 import { RunOverview } from './run-overview.tsx'
@@ -18,16 +18,27 @@ import { WorkflowTrace } from './workflow-trace.tsx'
 
 type View = 'overview' | 'trace' | 'report'
 
-export function RunWorkspace({ detail, view, workerId }: {
+export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   detail: RunDetail
   view: View
   workerId?: string
 }) {
+  const [snapshot, setSnapshot] = useState<RunDetail>()
+  const detail = snapshot && snapshot.cursor >= routeDetail.cursor ? snapshot : routeDetail
   const { run, project, assignments } = detail
-  const router = useRouter()
   const navigate = useNavigate()
-  const action = useAction()
+  const runId = run.id
+  const refreshRun = useCallback(async () => {
+    try {
+      const latest = await runData({ data: { runId } })
+      setSnapshot(previous => !previous || latest.cursor >= previous.cursor ? latest : previous)
+    } catch {
+      // Keep the last committed view while the local server is restarting.
+    }
+  }, [runId])
+  const action = useAction(refreshRun)
   const reducedMotion = useReducedMotion()
+  const [reconnecting, setReconnecting] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [showCoordinator, setShowCoordinator] = useState(false)
   const [review, setReview] = useState(false)
@@ -47,14 +58,38 @@ export function RunWorkspace({ detail, view, workerId }: {
   const attachments = detail.evidence.filter(item => item.assignmentId === worker?.id)
 
   useEffect(() => {
-    const events = new EventSource(`/api/runs/${run.id}/events?since=${cursor.current}`)
+    const events = new EventSource(`/api/runs/${runId}/events?since=${cursor.current}`)
+    let refreshing = false
+    let refreshAgain = false
+    let disposed = false
+    function requestRefresh() {
+      if (refreshing) {
+        refreshAgain = true
+        return
+      }
+      refreshing = true
+      void refreshRun().finally(() => {
+        refreshing = false
+        if (disposed || !refreshAgain) return
+        refreshAgain = false
+        requestRefresh()
+      })
+    }
+    events.onopen = () => {
+      setReconnecting(false)
+      requestRefresh()
+    }
+    events.onerror = () => setReconnecting(true)
     events.onmessage = event => {
       if (Number(event.lastEventId) <= cursor.current) return
       cursor.current = Number(event.lastEventId)
-      void router.invalidate()
+      requestRefresh()
     }
-    return () => events.close()
-  }, [router, run.id])
+    return () => {
+      disposed = true
+      events.close()
+    }
+  }, [refreshRun, runId])
   useEffect(() => {
     if (workerId) {
       setChatOpen(true)
@@ -169,6 +204,7 @@ export function RunWorkspace({ detail, view, workerId }: {
         <Button variant="ghost" aria-pressed={chatOpen} onClick={() => setChatOpen(!chatOpen)}>Chat</Button>
       </div>
     </div>
+    {reconnecting && <p className="run-error muted" role="status">Reconnecting to Guardian…</p>}
     {action.error && <div className="run-error"><FormError error={action.error} /></div>}
     <div className="workbench" data-with-chat={chatOpen}>
       <section className="work-surface" aria-label={view === 'report' ? 'Run report' : 'Workflow'}>

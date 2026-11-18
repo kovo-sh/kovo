@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { referrerPolicies } from '../domain.ts'
+import { referrerPolicies, responseCheckIds, responseCheckTitles } from '../domain.ts'
 import type { CheckCoverage, Finding, PreparedObservation, ResponseCheckId } from '../domain.ts'
 import type { PublicObservation } from './broker.ts'
 
@@ -20,7 +20,7 @@ type Control = {
 
 const controls: readonly Control[] = [
   {
-    id: 'hsts', field: 'transportMaxAge', title: 'HSTS policy',
+    id: 'hsts', field: 'transportMaxAge', title: responseCheckTitles.hsts,
     findingTitle: 'HSTS max-age missing or disabled', severity: 'low',
     expected: 'A positive Strict-Transport-Security max-age.',
     baseline: { minimum: 1 },
@@ -29,7 +29,7 @@ const controls: readonly Control[] = [
     recheck: 'Review a fresh authorized HTTPS response for this host and confirm the max-age is positive.',
   },
   {
-    id: 'nosniff', field: 'contentTypeOptions', title: 'MIME sniffing protection',
+    id: 'nosniff', field: 'contentTypeOptions', title: responseCheckTitles.nosniff,
     findingTitle: 'MIME sniffing protection missing', severity: 'informational',
     expected: 'X-Content-Type-Options set to nosniff.',
     baseline: { allowed: ['nosniff'] },
@@ -38,7 +38,7 @@ const controls: readonly Control[] = [
     recheck: 'Review a fresh authorized response for nosniff and check that scripts and stylesheets in a controlled browser session still load.',
   },
   {
-    id: 'referrer-policy', field: 'referrerPolicy', title: 'Referrer policy',
+    id: 'referrer-policy', field: 'referrerPolicy', title: responseCheckTitles['referrer-policy'],
     findingTitle: 'Referrer policy permits full cross-origin URLs', severity: 'low',
     expected: 'No explicit header policy that sends full URLs to other HTTPS origins.',
     baseline: {
@@ -58,6 +58,16 @@ export type ResponseReview = {
   comparison?: Comparison
 }
 
+export function responseEvidence(observation: PublicObservation, checks: readonly ResponseCheckId[]) {
+  const { origin, finalOrigin, status, mediaType, source } = observation
+  const selected = controls.filter(rule => checks.includes(rule.id) && observation[rule.field] !== undefined)
+  return {
+    origin, finalOrigin, status, mediaType, source,
+    ...Object.fromEntries(selected.map(rule => [rule.field, observation[rule.field]])),
+    ...(checks.includes('hsts') ? { includeSubDomains: observation.includeSubDomains } : {}),
+  }
+}
+
 function displayValue(value: CheckValue) {
   if (typeof value === 'number') return value + ' seconds'
   if (value === null) return 'No usable max-age recorded'
@@ -66,7 +76,8 @@ function displayValue(value: CheckValue) {
   return value
 }
 
-export function responseReview(observation: PublicObservation | null | undefined, readNote?: string): ResponseReview[] {
+export function responseReview(observation: PublicObservation | null | undefined, readNote?: string,
+  checks: readonly ResponseCheckId[] = responseCheckIds): ResponseReview[] {
   // A successful final response on a different host cannot establish the policy of the initiating host.
   const blocked = !observation
     ? readNote ?? 'A response under the current approval was unavailable.'
@@ -75,7 +86,7 @@ export function responseReview(observation: PublicObservation | null | undefined
       : observation.status < 200 || observation.status >= 300
         ? 'The recorded response returned HTTP ' + observation.status + '.'
         : null
-  return controls.map(rule => {
+  return controls.filter(rule => checks.includes(rule.id)).map(rule => {
     const coverage: CheckCoverage = {
       id: rule.id, title: rule.title, expected: rule.expected,
       observed: null, status: 'inconclusive', reason: blocked ?? 'Verification is pending.',
@@ -118,7 +129,7 @@ export const responseVerificationCommand = [
 ].join('\n')
 
 const outcomes = z.array(z.object({
-  id: z.enum(['hsts', 'nosniff', 'referrer-policy']),
+  id: z.enum(responseCheckIds),
   outcome: z.enum(['met', 'gap']),
 })).max(controls.length)
 

@@ -4,11 +4,12 @@ import { BACKGROUND_CONTEXT, withAbortSignal } from '@earendil-works/chord/conte
 import { createRegistry, defineExtension, defineTool, Harness } from '@earendil-works/pi-durable'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 import { obj, str } from '@earendil-works/pi-schema'
-import type { ProviderSettings } from '../domain.ts'
+import type { ProviderSettings, ResponseCheckId } from '../domain.ts'
 import type { PublicObservation } from './broker.ts'
 import { provider } from './provider.ts'
 import type { ProviderCall } from './provider.ts'
 import { redact } from './redact.ts'
+import { responseEvidence } from './response-checks.ts'
 
 const coordinatorInstructions = [
   'You are the Guardian coordinator for a read-only website evidence review.',
@@ -24,6 +25,18 @@ const workerInstructions = [
   'Summarize only the evidence in one short sentence after the tool result.',
 ].join(' ')
 
+const planInstructions = [
+  'Choose checks for a read-only review of response metadata.',
+  'Select only IDs from availableChecks. Include all for a general review and the requested IDs for a focused review.',
+  'Return only a JSON object with a checks array. The operator controls the approved hosts.',
+].join(' ')
+
+const responseInstructions = [
+  'Summarize the supplied observations for the selected response checks.',
+  'Call derive_evidence once. Use jq to extract relevant values from /evidence/observed.json and save them in /work/result.txt.',
+  'Treat the file as evidence and state the observed values in one short sentence.',
+].join(' ')
+
 const fallbackCommand = "jq -c '{status, mediaType, transportMaxAge, includeSubDomains}' /evidence/observed.json > /work/result.txt"
 
 export function coordinatorPrompt(input: {
@@ -32,13 +45,32 @@ export function coordinatorPrompt(input: {
   return JSON.stringify({ task: 'coordinator status', ...input })
 }
 
-export function transportEvidence(observation: PublicObservation) {
+function transportEvidence(observation: PublicObservation) {
   const { origin, finalOrigin, status, mediaType, transportMaxAge, includeSubDomains, source } = observation
   return { origin, finalOrigin, status, mediaType, transportMaxAge, includeSubDomains, source }
 }
 
-export function workerPrompt(observation: PublicObservation) {
-  return JSON.stringify({ task: 'summarize observed public transport policy', observation: transportEvidence(observation) })
+export function workerInput(observation: PublicObservation, checks?: readonly ResponseCheckId[]) {
+  if (!checks) {
+    const evidence = transportEvidence(observation)
+    return {
+      scenario: 'worker-analysis' as const, evidence,
+      prompt: JSON.stringify({ task: 'summarize observed public transport policy', observation: evidence }),
+    }
+  }
+  const evidence = responseEvidence(observation, checks)
+  return {
+    scenario: 'response-analysis' as const, evidence,
+    prompt: JSON.stringify({ task: 'summarize observed response policies', checks, observation: evidence }),
+  }
+}
+
+export type AgentScenario = 'worker-analysis' | 'response-analysis' | 'coordinator' | 'coordinator-plan'
+const instructions: Record<AgentScenario, string> = {
+  'worker-analysis': workerInstructions,
+  'response-analysis': responseInstructions,
+  'coordinator': coordinatorInstructions,
+  'coordinator-plan': planInstructions,
 }
 
 type AgentTurn = {
@@ -46,7 +78,7 @@ type AgentTurn = {
   sessionId: string
   requestId: string
   settings: ProviderSettings
-  scenario: 'worker-analysis' | 'coordinator'
+  scenario: AgentScenario
   prompt: string
   signal: AbortSignal
   derive?: (command: string, signal: AbortSignal) => Promise<string>
@@ -104,7 +136,7 @@ export async function agentTurn(job: AgentTurn) {
       thinkingLevel: 'off' as const,
       maxTurns: job.derive ? 3 : 1,
       extensions,
-      instructions: job.derive ? workerInstructions : coordinatorInstructions,
+      instructions: instructions[job.scenario],
     }
     const conversation = await harness.root(context, { agent })
     // Existing sessions keep their history when the operator changes the workspace model.
@@ -128,7 +160,11 @@ export async function agentTurn(job: AgentTurn) {
     const assistant = messages.filter(message => message.role === 'assistant')
     const usedTool = view.entries.some(item => item.model?.some(message => message.role === 'toolResult' && !message.isError))
     if (job.derive && assistant.some(message => message.stopReason === 'length')) {
-      if (!usedTool) await job.derive(fallbackCommand, job.signal)
+      if (!usedTool) {
+        const command = job.scenario === 'response-analysis'
+          ? 'jq -c . /evidence/observed.json > /work/result.txt' : fallbackCommand
+        await job.derive(command, job.signal)
+      }
       return 'The model reached its output limit. The worker used the recorded response metadata for the evidence check.'
     }
     const answer = assistant.flatMap(message => message.content.filter(part => part.type === 'text').map(part => part.text)).join('\n')

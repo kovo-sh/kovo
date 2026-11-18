@@ -1,5 +1,5 @@
 import { Fragment, useState } from 'react'
-import { maxScopeHosts } from '../domain.ts'
+import { maxScopeHosts, responseCheckTitles } from '../domain.ts'
 import type { RunCommand } from '../domain.ts'
 import { Status } from './common.tsx'
 import { phaseNames, workerPhases } from './run-state.ts'
@@ -21,6 +21,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
   setReview: (review: boolean) => void
 }) {
   const { run, project, assignments, evidence } = detail
+  const plan = run.reviewPlan
   const [adding, setAdding] = useState(false)
   const initialSelection = () => run.scopeRevision > 0 ? run.approved
     : run.candidates.filter(asset => !asset.thirdParty && (project.defaultScope.length
@@ -69,7 +70,11 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
       </Button>
     </div>}
     {['analysis', 'verification'].includes(run.phase) && <div className="workflow-callout">
-      <div><h2>Approved scope</h2><p>{run.approved.length} approved hosts · Revision {run.scopeRevision}</p></div>
+      <div>
+        <h2>Approved scope</h2><p>{run.approved.length} approved hosts · Revision {run.scopeRevision}</p>
+        {plan?.status === 'pending' && <p>{run.status === 'running' ? 'Preparing review plan' : 'Review plan pending'}</p>}
+        {plan?.status === 'ready' && <p>{plan.source === 'standard' ? 'Standard checks' : 'Planned checks'} · {plan.checks.map(id => responseCheckTitles[id]).join(', ')}</p>}
+      </div>
       <Button onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review}>
         {review ? 'Close review' : 'Review scope'}
       </Button>
@@ -99,7 +104,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
       </table></div>
       {review && <div className="scope-footer">
         {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
-        <p className="muted">Review HSTS, MIME sniffing protection, and referrer policy on the selected hosts.</p>
+        {run.phase === 'review' && <p className="muted">The review uses HSTS, MIME sniffing protection, and referrer policy checks selected for the run goal.</p>}
         <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
         <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
         <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>

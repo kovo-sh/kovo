@@ -40,14 +40,14 @@ Discovery finishes before analysis. Analysis finishes before verification. If a 
 
 ### Steering and recovery
 
-- The coordinator answers status questions, accepts goal revisions, and handles pause and stop requests. Use explicit controls for actions that change run state. Keep the original goal and timestamp each revision. Flag assignments and evidence affected by a change.
+- The coordinator answers status questions, accepts goal revisions, and handles pause and stop requests. Use explicit controls for actions that change run state. Keep the original goal and timestamp each revision. Flag assignments and evidence affected by a change. A revised goal can select a new check plan within the approved hosts.
 - A user can narrow scope during a run. Apply the new scope to subsequent work immediately, cancel affected assignments, and retain the revision and prior evidence for the audit history. An expansion requires separate recorded consent.
 - A user can explicitly resume a paused or stopped run. After an unexpected process shutdown, show the last committed state and wait for **Resume**. Restore the coordinator thread, worker threads, assignments, approvals, and evidence. Skip completed sessions and committed work on recovery.
 - Record a partial report at a stop or terminal failure with available evidence. Resuming the run can produce a later report version. A complete run with zero confirmed findings still produces a report with coverage and gaps.
 
 ## Agents and handoffs
 
-**Coordinator.** One coordinator per run. It is the only conversational entry point for the user. It interprets the goal within the approved scope, delegates bounded assignments, tracks phase progress, handles revisions, and assembles the report from recorded results.
+**Coordinator.** One coordinator per run. It is the only conversational entry point for the user. After scope approval, it selects applicable checks from the supported catalog for the run goal. Guardian validates and saves the selection before delegating to workers on approved hosts. Use the standard response checks if model planning is unavailable. The coordinator tracks phase progress, handles revisions, and assembles the report from recorded results.
 
 **Workers.** Workers take individual assignments, return their work to the coordinator, and have separate read-only threads in the UI. They can access the assignment, its permitted inputs, and the relevant evidence. An assignment identifies its run, phase, objective, scope revision, inputs, and expected output.
 
@@ -61,7 +61,7 @@ The run has a compact header with its title, target, state, and primary action. 
 - **Workflow Trace** is a left-to-right DAG with phase groups, worker nodes, branch and merge points, and zoom and pan controls. Build the diagram without React Flow. Distinguish queued, running, paused, complete, and failed work. Give active work and the selected path the strongest visual emphasis. Opening or switching threads preserves graph context.
 - **Worker pane** opens on the right with the assignment name, state, and outcome first. Switch to Coordinator from the same pane while retaining the worker selection. Chronological messages follow, with evidence attachments under the corresponding turn. The pane is read-only and includes a stable link to the worker. Worker search supports `/`, arrows, and Enter. Escape closes the active pane or menu.
 - **Coordinator Chat** opens beside the workflow in a collapsible right pane. It is the run's interactive conversation and shows goal revisions, progress updates, and links to actions that require an explicit decision. Collapsing the pane or switching to a worker retains the chat and its draft.
-- **Report** is written for the operator. Start with the outcome and required follow-up. Include approved scope and revisions, the evidence source, check outcomes for each approved host, and unresolved work. Show what was observed and expected for confirmed findings, why it matters, what to fix, and how to validate that fix. Link each finding to supporting evidence and its worker thread. Use clear labels for partial reports and inconclusive findings.
+- **Report** is written for the operator. Start with the outcome and required follow-up. Include approved scope and revisions, the selected checks, the evidence source, check outcomes for each approved host, and unresolved work. Show what was observed and expected for confirmed findings, why it matters, what to fix, and how to validate that fix. Link each finding to supporting evidence and its worker thread. Use clear labels for partial reports and inconclusive findings.
 
 **Studio** is the default interface style. Appearance defaults to **System** and follows device brightness changes live, using **Porcelain** in light mode and **Studio dark** in dark mode. Explicit choices in **View** are saved in the browser. **Light** and **Dark** override the device setting.
 
@@ -141,6 +141,7 @@ For local fixture capture, read the OpenRouter key from `~/.config/guardian-fixt
 - Create a project with related seed domains. Consent to passive discovery, review the candidates, inspect evidence, and approve scope. Analysis stays gated until approval, and third-party assets are excluded by default.
 - Open the 34-worker synthetic run. Navigate phase groups, find and deep-link to a read-only worker thread, and return from evidence to the scope table without losing draft selections.
 - During analysis, revise the goal, narrow scope, and review a newly found asset. Work linked to changed scope is canceled, while the new asset stays outside scope until approved.
+- Restart while a coordinator plan is pending. Resume explicitly, then verify that the plan yields one set of assignments. Revise an in-flight goal to focus on one response check and verify that the new worker handoff and report reflect that choice.
 - Stop a run and read its partial report. Restart the app mid-run and confirm that work waits for explicit resume. Resume from the last committed state without duplicate assignments, findings, or reports.
 - Run the TanStack Start production build on loopback. Open a worker thread through its deep link. With a run paused, restart the server and verify that the event stream reconnects from the last event ID and the run stays paused until explicit resume.
 - Finish verification with confirmed response policy gaps and inconclusive fixture results. Follow a confirmed finding to its observed value, expected setting, remediation, and worker verification. Run the zero-finding case and verify that the report shows which checks met the baseline.

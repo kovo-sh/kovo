@@ -110,7 +110,22 @@ export interface Finding {
   check?: Pick<CheckCoverage, 'id' | 'expected' | 'observed'>
 }
 
-export type ResponseCheckId = 'hsts' | 'nosniff' | 'referrer-policy'
+export const responseCheckIds = ['hsts', 'nosniff', 'referrer-policy'] as const
+export type ResponseCheckId = typeof responseCheckIds[number]
+export const responseCheckTitles: Record<ResponseCheckId, string> = {
+  hsts: 'HSTS policy',
+  nosniff: 'MIME sniffing protection',
+  'referrer-policy': 'Referrer policy',
+}
+
+export interface SelectedChecks {
+  checks: ResponseCheckId[]
+  source: 'coordinator' | 'standard'
+}
+
+export type ReviewPlan =
+  | { status: 'pending'; goalMessageId: string }
+  | ({ status: 'ready'; goalMessageId: string } & SelectedChecks)
 
 export interface CheckCoverage {
   id: ResponseCheckId
@@ -126,6 +141,7 @@ export interface ReportBody {
   scope: Candidate[]
   scopeRevision: number
   goalRevision: number
+  selectedChecks?: SelectedChecks
   coverage: {
     origin: string
     status: string

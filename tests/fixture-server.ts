@@ -14,25 +14,12 @@ const recordings = readdirSync(captures)
   .map(file => JSON.parse(readFileSync(new URL(file, captures), 'utf8')) as Recording)
 const sensitiveFixtureValue = 'private-synthetic-cookie-value-8347'
 
-function withOutputLimit(body: string) {
-  const events = body.split('\n\n').flatMap(frame => {
-    const data = frame.split('\n').find(line => line.startsWith('data: {'))
-    return data ? [{ frame, event: JSON.parse(data.slice(6)) }] : []
-  })
-  const toolIndex = events.findIndex(({ event }) => event.type === 'response.output_item.added' && event.item?.type === 'function_call')
-  const completed = events.find(({ event }) => event.type === 'response.completed')?.event
-  if (toolIndex < 0 || !completed) throw new Error('The output-limit scenario requires a recorded tool turn.')
-  const { response, sequence_number } = completed
-  return [...events.slice(0, toolIndex).map(({ frame }) => frame), 'data: ' + JSON.stringify({
-    type: 'response.incomplete', sequence_number,
-    response: {
-      ...response, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
-      output: response.output.filter((item: { type: string }) => item.type === 'reasoning'),
-    },
-  })].join('\n\n')
-}
-
-export async function fixtureServer(options: { hold?: string; holdModel?: string; scenes: string[]; truncate?: string }) {
+export async function fixtureServer(options: {
+  hold?: string
+  holdModel?: string
+  scenes: string[]
+  failModel?: string
+}) {
   const requested: string[] = []
   const accepted: string[] = []
   const unexpected: string[] = []
@@ -89,12 +76,15 @@ export async function fixtureServer(options: { hold?: string; holdModel?: string
         modelWithheld.resolve()
         return
       }
-      const body = options.truncate && match.name === `${options.truncate}:responses:0` ? withOutputLimit(match.body) : match.body
       match.seen = true
       accepted.push(match.name)
+      if (match.name === options.failModel) {
+        response.writeHead(503, { 'Content-Type': 'application/json' }).end('{"error":{"message":"Fixture service unavailable"}}')
+        return
+      }
       response.writeHead(match.status, { 'Content-Type': match.contentType })
       // Keep streaming boundaries even when multiple calls are replayed in parallel.
-      for (const event of body.split('\n\n').filter(Boolean)) {
+      for (const event of match.body.split('\n\n').filter(Boolean)) {
         if (response.destroyed) return
         response.write(event + '\n\n')
         await new Promise(resolve => setImmediate(resolve))

@@ -6,7 +6,8 @@ import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
-import type { Candidate, ReportBody, RunCommand, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
+import { responseCheckTitles } from '../domain.ts'
+import type { Candidate, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import * as tables from './schema.ts'
 import { redact } from './redact.ts'
@@ -258,7 +259,8 @@ export class Store {
         candidates: [], approved: [], createdAt: Date.now(),
       }).returning().get()
       this.event(run.id, 'run.created', 'Run created.')
-      this.message(run.id, run.coordinatorId, 'operator', goal)
+      const goalMessageId = this.message(run.id, run.coordinatorId, 'operator', goal)
+      this.updateRun(run.id, { reviewPlan: { status: 'pending', goalMessageId } })
       return { id: run.id }
     })
   }
@@ -314,10 +316,36 @@ export class Store {
       outcome: null, createdAt: Date.now(),
     }).returning().get()
     const target = candidate?.origin ?? 'Supplied project records'
+    const checks = run.reviewPlan?.status === 'ready' && phase !== 'discovery'
+      ? ['Checks: ' + run.reviewPlan.checks.map(id => responseCheckTitles[id]).join(', ')] : []
     this.addArtifact(run, assignment, 'handoff', 'assignment.md',
       ['# Assignment', '', objective, '', 'Input: ' + target, 'Goal: ' + run.goal,
-        'Goal revision: ' + run.goalRevision, 'Scope revision: ' + run.scopeRevision].join('\n'), 'assignment')
+        'Goal revision: ' + run.goalRevision, 'Scope revision: ' + run.scopeRevision, ...checks].join('\n'), 'assignment')
     return assignment
+  }
+
+  private queueAnalysis(run: Run, assetIds: string[]) {
+    for (const asset of run.candidates.filter(asset => assetIds.includes(asset.id))) {
+      this.makeWorker(run, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
+        'Record the approved response metadata and identify gaps in the planned checks.')
+    }
+  }
+
+  commitReviewPlan(runId: string, goalRevision: number, selection: SelectedChecks) {
+    this.db.transaction(() => {
+      const run = this.run(runId)
+      const plan = run.reviewPlan
+      if (run.status !== 'running' || run.phase !== 'analysis' || run.goalRevision !== goalRevision || plan?.status !== 'pending') return
+      const updated = this.updateRun(run.id, { reviewPlan: { status: 'ready', goalMessageId: plan.goalMessageId, ...selection } })
+      this.queueAnalysis(updated, updated.approved)
+      const titles = selection.checks.map(id => responseCheckTitles[id]).join(', ')
+      const planned = selection.source === 'coordinator'
+      this.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'guardian',
+        (planned ? 'I’ll review ' : 'Standard checks selected for this run. Checks include ') + titles + '.', plan.goalMessageId)
+      this.event(run.id, 'review.planned', 'Review plan saved.', {
+        goalRevision, scopeRevision: run.scopeRevision, ...selection,
+      })
+    }, { behavior: 'immediate' })
   }
 
   updateRun(runId: string, state: Partial<Run>) {
@@ -385,9 +413,8 @@ export class Store {
         this.updateWorker(assignment.id, { status: 'canceled', outcome: 'Scope revoked.', lease: null })
       }
     }
-    for (const asset of updated.candidates.filter(asset => added.includes(asset.id))) {
-      this.makeWorker(updated, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
-        'Record the response metadata for the approved host and identify candidate control gaps.')
+    if (updated.reviewPlan?.status !== 'pending') {
+      this.queueAnalysis(updated, added)
     }
     this.event(run.id, 'scope.approved', `Recorded scope revision ${scopeRevision}.`, {
       actorId: this.workspace.actorId, scopeRevision,
@@ -403,19 +430,19 @@ export class Store {
     const goal = redact(input)
     const revision = run.goalRevision + 1
     const phase = run.phase === 'verification' ? 'analysis' : run.phase
-    const updated = this.updateRun(run.id, { goal, goalRevision: revision, phase })
+    if (run.reviewPlan?.status === 'pending') {
+      this.message(run.id, run.coordinatorId, 'guardian', 'This goal was superseded by a revision.', run.reviewPlan.goalMessageId)
+    }
+    const goalMessageId = this.message(run.id, run.coordinatorId, 'operator', `Revised goal: ${goal}`)
+    this.updateRun(run.id, { goal, goalRevision: revision, phase, reviewPlan: { status: 'pending', goalMessageId } })
     if (phase === 'analysis') {
       for (const assignment of this.workerList(run.id)) {
-        if (assignment.phase !== 'discovery' && assignment.status !== 'complete') {
+        if (assignment.goalRevision === run.goalRevision && assignment.phase !== 'discovery' &&
+            !['complete', 'canceled'].includes(assignment.status)) {
           this.updateWorker(assignment.id, { status: 'canceled', outcome: 'Superseded by a goal revision.', lease: null })
         }
       }
-      for (const asset of updated.candidates.filter(item => run.approved.includes(item.id))) {
-        this.makeWorker(updated, 'analysis', asset, `Review ${new URL(asset.origin).hostname}`,
-          'Record the response metadata for the approved host and identify candidate control gaps.')
-      }
     }
-    this.message(run.id, run.coordinatorId, 'operator', `Revised goal: ${goal}`)
     this.event(run.id, 'goal.revised', `Goal revision ${revision} recorded.`, { actorId: this.workspace.actorId, revision, goal })
   }
 
@@ -467,6 +494,8 @@ export class Store {
     if (!scope.length) gaps.push('No approved hosts in this report.')
     const body: ReportBody = {
       goal: run.goal, scope, scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results, gaps,
+      ...(run.reviewPlan?.status === 'ready'
+        ? { selectedChecks: { checks: run.reviewPlan.checks, source: run.reviewPlan.source } } : {}),
     }
     this.db.insert(tables.reports).values({
       id: randomUUID(), runId: run.id, partial, body,

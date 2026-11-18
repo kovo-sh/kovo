@@ -1,13 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { and, asc, eq } from 'drizzle-orm'
 import type { Candidate, CheckCoverage, Finding, ProviderSettings, ResponseCheckId } from '../domain.ts'
-import { agentTurn, coordinatorPrompt, transportEvidence, workerPrompt } from './agent-session.ts'
+import { agentTurn, coordinatorPrompt, workerInput } from './agent-session.ts'
 import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { PublicObservation } from './broker.ts'
 import { privateModelSettings } from './model-settings.ts'
 import { redact } from './redact.ts'
 import { checkCoverage, meetsBaseline, readComparisons, responseReview, responseVerificationCommand } from './response-checks.ts'
 import type { ResponseReview } from './response-checks.ts'
+import { parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { findings, messages } from './schema.ts'
 import { assessmentAssignments, store } from './store.ts'
 import type { Assignment, Run, Store } from './store.ts'
@@ -19,6 +20,7 @@ type Active = {
   controller: AbortController
 }
 type Capture = { observation: PublicObservation | null; note: string }
+type CoordinatorTask = { controller: AbortController; goalRevision: number; scopeRevision?: number }
 
 export function derivedResult(result: { exitStatus: number; result: string; stdout: string }) {
   return JSON.stringify({ exitStatus: result.exitStatus, result: (result.result || result.stdout).slice(0, 1200) })
@@ -51,7 +53,7 @@ class Execution {
   private readonly broker = createBroker()
   private readonly backend = new LinuxWorkerBackend()
   private readonly active = new Map<string, Active>()
-  private readonly coordinator = new Map<string, AbortController>()
+  private readonly coordinator = new Map<string, CoordinatorTask>()
   private timer?: NodeJS.Timeout
 
   constructor(storage: Store) {
@@ -77,6 +79,7 @@ class Execution {
     const run = this.storage.run(current.runId)
     return current.status === 'running' && current.lease === job.assignment.lease &&
       run.status === 'running' && run.phase === current.phase && current.goalRevision === run.goalRevision &&
+      run.reviewPlan?.status !== 'pending' &&
       [...job.origins].every(origin => this.permitted(run, origin))
   }
 
@@ -84,6 +87,12 @@ class Execution {
     job.controller.signal.throwIfAborted()
     if (!this.authorize(job)) throw new BrokerDenied('The assignment is no longer authorized.')
     return this.storage.run(job.assignment.runId)
+  }
+
+  private currentCoordinator(runId: string, task: CoordinatorTask) {
+    const run = this.storage.run(runId)
+    return run.status === 'running' && run.goalRevision === task.goalRevision &&
+      (task.scopeRevision === undefined || run.scopeRevision === task.scopeRevision) && !task.controller.signal.aborted
   }
 
   // Called after durable state changes and periodically while the local server is up.
@@ -102,8 +111,8 @@ class Execution {
         })
       }
     }
-    for (const [runId, controller] of this.coordinator) {
-      if (this.storage.run(runId).status !== 'running') controller.abort()
+    for (const [runId, task] of this.coordinator) {
+      if (!this.currentCoordinator(runId, task)) task.controller.abort()
     }
     let model: ProviderSettings | null
     try {
@@ -111,8 +120,13 @@ class Execution {
     } catch {
       return
     }
-    if (!model) return
     for (const run of this.storage.runnable()) {
+      if (run.phase === 'analysis' && run.reviewPlan?.status === 'pending') {
+        if (model && run.approved.length) this.startPlanning(run, model)
+        else this.storage.commitReviewPlan(run.id, run.goalRevision, standardChecks)
+        continue
+      }
+      if (!model) continue
       this.startCoordinator(run, model)
       if (run.phase !== 'analysis' && run.phase !== 'verification') continue
       const workers = this.storage.workerList(run.id).filter(item =>
@@ -232,14 +246,15 @@ class Execution {
   private async analyze(job: Active, asset: Candidate, model: ProviderSettings) {
     const { capture, id } = await this.capture(job, asset)
     const run = this.check(job)
+    const selectedChecks = run.reviewPlan?.status === 'ready' ? run.reviewPlan.checks : undefined
     let summary = capture.note
     if (capture.observation) {
-      const transport = transportEvidence(capture.observation)
-      const inputs = [{ name: 'observed.json', content: JSON.stringify(transport) }]
+      const input = workerInput(capture.observation, selectedChecks)
+      const inputs = [{ name: 'observed.json', content: JSON.stringify(input.evidence) }]
       summary = await agentTurn({
         directory: this.storage.directory, sessionId: job.assignment.sessionId,
         requestId: 'analysis:' + job.assignment.attempt + ':' + id,
-        settings: model, scenario: 'worker-analysis', prompt: workerPrompt(capture.observation),
+        settings: model, scenario: input.scenario, prompt: input.prompt,
         signal: job.controller.signal,
         derive: async (command, signal) => {
           const operation = 'derive:' + createHash('sha256').update(id).update(command).digest('hex')
@@ -253,7 +268,7 @@ class Execution {
           const receipt = this.storage.db.transaction(() => this.storage.addArtifact(
             current, job.assignment, 'analysis', 'Derived evidence',
             JSON.stringify({
-              command: redact(command), inputEvidence: [id], inputFields: Object.keys(transport), interpreter: 'just-bash 3.6.1',
+              command: redact(command), inputEvidence: [id], inputFields: Object.keys(input.evidence), interpreter: 'just-bash 3.6.1',
               exitStatus: result.exitCode, stdout: result.stdout, stderr: result.stderr,
               result: result.outputs['result.txt'] ?? '',
             }, null, 2), operation))
@@ -264,7 +279,7 @@ class Execution {
 
     const current = this.check(job)
     this.storage.db.transaction(() => {
-      for (const review of responseReview(capture.observation, capture.note)) {
+      for (const review of responseReview(capture.observation, capture.note, selectedChecks)) {
         if (review.comparison && !meetsBaseline(review.comparison)) {
           const reason = 'The recorded value falls outside the response baseline. Verification is pending.'
           const earlier = this.finding(current, asset, review.rule.id)
@@ -284,7 +299,8 @@ class Execution {
     const authorized = [...origins].every(origin => this.permitted(run, origin))
     const observation = authorized ? record?.observation : null
     const note = authorized ? record?.note : 'The saved observation includes a host outside the current approval.'
-    const reviews = responseReview(observation, note)
+    const selectedChecks = run.reviewPlan?.status === 'ready' ? run.reviewPlan.checks : undefined
+    const reviews = responseReview(observation, note, selectedChecks)
     const comparisons = reviews.flatMap(review => review.comparison ? [review.comparison] : [])
     if (authorized) for (const origin of origins) job.origins.add(origin)
     const result = comparisons.length ? await this.backend.run({
@@ -364,6 +380,32 @@ class Execution {
     this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', { assignmentId: worker.id, artifactId })
   }
 
+  private startPlanning(run: Run, model: ProviderSettings) {
+    if (this.coordinator.has(run.id) || run.reviewPlan?.status !== 'pending') return
+    const controller = new AbortController()
+    const task: CoordinatorTask = { controller, goalRevision: run.goalRevision }
+    this.coordinator.set(run.id, task)
+    void agentTurn({
+      directory: this.storage.directory, sessionId: run.reviewPlan.goalMessageId, requestId: 'plan',
+      settings: model, scenario: 'coordinator-plan', prompt: reviewPlanPrompt(run.goal, run.sourceMode),
+      signal: controller.signal,
+    }).then(answer => parseReviewPlan(answer) ?? standardChecks, () => standardChecks).then(selection => {
+      if (!this.currentCoordinator(run.id, task)) return
+      this.storage.commitReviewPlan(run.id, run.goalRevision, selection)
+    }).catch(() => {
+      if (!this.currentCoordinator(run.id, task)) return
+      this.storage.db.transaction(() => {
+        const current = this.storage.run(run.id)
+        this.storage.setStatus(current, 'failed')
+        this.storage.event(run.id, 'review.plan_failed', 'The review plan could not be saved. Resume to retry.')
+        this.storage.writeReport(this.storage.run(run.id), true)
+      })
+    }).finally(() => {
+      this.coordinator.delete(run.id)
+      this.wake()
+    })
+  }
+
   private startCoordinator(run: Run, model: ProviderSettings) {
     if (this.coordinator.has(run.id)) return
     const thread = this.storage.db.select().from(messages).where(and(
@@ -373,7 +415,11 @@ class Execution {
     const next = thread.find(item => item.role === 'operator' && !answered.has(item.id))
     if (!next) return
     const controller = new AbortController()
-    this.coordinator.set(run.id, controller)
+    const task: CoordinatorTask = {
+      controller, goalRevision: run.goalRevision,
+      scopeRevision: run.reviewPlan ? run.scopeRevision : undefined,
+    }
+    this.coordinator.set(run.id, task)
     const workers = this.storage.workerList(run.id)
     const prompt = coordinatorPrompt({
       phase: run.phase, status: run.status, approved: run.approved.length,
@@ -381,16 +427,17 @@ class Execution {
       complete: workers.filter(worker => worker.status === 'complete').length, question: next.content,
     })
     void agentTurn({
-      directory: this.storage.directory, sessionId: run.coordinatorId, requestId: next.id,
+      directory: this.storage.directory, sessionId: run.coordinatorId,
+      requestId: run.reviewPlan ? `${next.id}:${run.goalRevision}:${run.scopeRevision}` : next.id,
       settings: model, scenario: 'coordinator', prompt, signal: controller.signal,
     }).then(answer => {
-      if (controller.signal.aborted || this.storage.run(run.id).status !== 'running') return
+      if (!this.currentCoordinator(run.id, task)) return
       this.storage.db.transaction(() => {
         this.storage.message(run.id, run.coordinatorId, 'coordinator', answer, next.id)
         this.storage.event(run.id, 'coordinator.reply', 'The coordinator replied.')
       })
     }).catch(() => {
-      if (controller.signal.aborted || this.storage.run(run.id).status !== 'running') return
+      if (!this.currentCoordinator(run.id, task)) return
       this.storage.db.transaction(() => {
         this.storage.message(run.id, run.coordinatorId, 'guardian', 'The coordinator could not reach the model. Review the workflow for current progress.', next.id)
         this.storage.event(run.id, 'coordinator.unavailable', 'The coordinator could not complete its reply.')

@@ -5,21 +5,35 @@ import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
 import { configureModel, reviewScope, saveScope } from './browser-flows.ts'
 import { fixtureServer } from './fixture-server.ts'
-import { excludedOrigin, fixtureCredential, healthyGoal, healthyOrigin, mainGoal, primaryOrigin, unavailableOrigin } from './scenarios.ts'
+import {
+  allChecksGoal, excludedOrigin, fixtureCredential, healthyOrigin, primaryOrigin, referrerGoal, statusQuestion, unavailableOrigin,
+} from './scenarios.ts'
 
-const mainScenes = ['connection', 'coordinator-main', 'primary', 'unavailable']
+const mainScenes = ['connection', 'plan-all', 'response-primary', 'response-unavailable']
+const healthyScenes = ['connection', 'plan-all', 'response-healthy']
 const seeds = [primaryOrigin, unavailableOrigin]
 
 test('replays real provider streams through analysis, restart, explicit resume, and the final report', async ({ page }) => {
-  const fixture = await fixtureServer({ scenes: mainScenes, hold: unavailableOrigin + '/' })
+  const fixture = await fixtureServer({
+    scenes: mainScenes, hold: unavailableOrigin + '/', holdModel: 'plan-all:responses:0',
+  })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
     await app.start()
     await page.goto(app.url)
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
-    await reviewScope(page, { project: 'Northstar', seeds, goal: mainGoal, thirdParty: excludedOrigin, live: true })
+    await reviewScope(page, { project: 'Northstar', seeds, goal: allChecksGoal, thirdParty: excludedOrigin, live: true })
     await expect(page.getByRole('checkbox', { name: 'Include help.vendor.example' })).not.toBeChecked()
+    expect(fixture.requested).toEqual([])
     await saveScope(page)
+    await fixture.modelWithheld
+    await app.stop('SIGKILL')
+    fixture.dropHeldModel()
+    await app.start()
+    const resume = page.getByRole('button', { name: 'Resume', exact: true })
+    await expect(resume).toBeVisible()
+    expect(fixture.requested).toEqual([])
+    await resume.click()
     await page.getByRole('link', { name: /^Trace/ }).click()
     await page.getByRole('link', { name: 'Review northstar.example, complete' }).click()
     await expect(page.getByRole('button', { name: /Derived evidence/ })).toBeVisible()
@@ -38,6 +52,7 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     const partial = page.getByRole('article', { name: 'Partial report' })
     await expect(partial).toContainText('No confirmed findings')
     await expect(partial).toContainText('Verification pending')
+    await expect(partial).toContainText('Planned checks · HSTS policy, MIME sniffing protection, Referrer policy')
     await page.getByRole('button', { name: 'Resume', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 })
     const report = page.getByRole('article', { name: 'Complete report' })
@@ -76,7 +91,9 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     expect(mark).toContain('Check the fix:')
 
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    let planningSession: string
     try {
+      planningSession = String(db.prepare("SELECT json_extract(review_plan, '$.goalMessageId') AS id FROM runs").get()?.id)
       expect(db.prepare("SELECT count(*) AS n FROM assignments WHERE phase = 'analysis' AND status = 'complete'").get()?.n).toBe(2)
       expect(db.prepare("SELECT count(*) AS n FROM reports").get()?.n).toBe(2)
       const confirmed = db.prepare(`SELECT check_id, json_extract(finding, '$.evidenceIds') AS evidence
@@ -94,10 +111,17 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     } finally {
       db.close()
     }
+    const plan = new DatabaseSync(join(app.directory, 'agent-sessions', planningSession + '.sqlite'), { readOnly: true })
+    try {
+      expect(plan.prepare("SELECT count(*) AS n FROM entries WHERE json_extract(record, '$.kind') = 'pi.user'").get()?.n).toBe(1)
+    } finally {
+      plan.close()
+    }
     expect(readdirSync(join(app.directory, 'agent-sessions')).filter(file => file.endsWith('.sqlite')).length).toBe(3)
     expect(fixture.requested.filter(url => url === primaryOrigin + '/')).toHaveLength(1)
     expect(fixture.requested.filter(url => url === unavailableOrigin + '/')).toHaveLength(2)
     expect(fixture.requested).not.toContain(excludedOrigin + '/')
+    expect(fixture.accepted.filter(name => name.startsWith('plan-all:'))).toEqual(['plan-all:responses:0'])
     expect(fixture.unexpected).toEqual([])
   } finally {
     await app.dispose()
@@ -112,7 +136,7 @@ test('revokes a host while its real fixture connection is pending and discards t
     await app.start()
     await page.goto(app.url)
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
-    await reviewScope(page, { project: 'Northstar', seeds, goal: mainGoal, live: true })
+    await reviewScope(page, { project: 'Northstar', seeds, goal: allChecksGoal, live: true })
     await saveScope(page)
     await fixture.withheld
     await page.getByRole('button', { name: 'Review scope' }).click()
@@ -140,16 +164,24 @@ test('revokes a host while its real fixture connection is pending and discards t
 })
 
 test('resumes a saved observation after narrowing scope for an unrelated host', async ({ page }) => {
-  const fixture = await fixtureServer({ scenes: mainScenes, holdModel: 'primary:responses:0' })
+  const fixture = await fixtureServer({
+    scenes: [...mainScenes, 'coordinator-status'], holdModel: 'response-primary:responses:0', hold: unavailableOrigin + '/',
+  })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
     await app.start()
     await page.goto(app.url)
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
-    await reviewScope(page, { project: 'Northstar', seeds, goal: mainGoal, live: true })
+    await reviewScope(page, { project: 'Northstar', seeds, goal: allChecksGoal, live: true })
     await saveScope(page)
     await fixture.modelWithheld
-    await expect(page.getByRole('region', { name: 'Coordinator chat' }).locator('[data-role=coordinator]').first()).toBeVisible()
+    await fixture.withheld
+    const chat = page.getByRole('region', { name: 'Coordinator chat' })
+    const question = chat.getByRole('textbox', { name: 'Message coordinator' })
+    await question.fill(statusQuestion)
+    await question.press('Enter')
+    await expect(chat.locator('[data-role=coordinator]')).toHaveCount(2)
+    expect(fixture.accepted).toContain('coordinator-status:responses:0')
     await page.getByRole('button', { name: 'Review scope' }).click()
     await page.getByRole('checkbox', { name: 'Include docs.northstar.example' }).uncheck()
     await saveScope(page, 'Save scope revision')
@@ -194,7 +226,7 @@ test('resumes a saved observation after narrowing scope for an unrelated host', 
 })
 
 test('verifies both model protocols and produces a zero-finding report with coverage', async ({ page }) => {
-  const fixture = await fixtureServer({ scenes: ['connection', 'coordinator-healthy', 'healthy'] })
+  const fixture = await fixtureServer({ scenes: healthyScenes })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
     await app.start()
@@ -208,7 +240,7 @@ test('verifies both model protocols and produces a zero-finding report with cove
     await page.goto(app.url)
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential, 'messages')
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential, 'responses')
-    await reviewScope(page, { project: 'Healthy Northstar', seeds: [healthyOrigin], goal: healthyGoal, live: true })
+    await reviewScope(page, { project: 'Healthy Northstar', seeds: [healthyOrigin], goal: allChecksGoal, live: true })
     await saveScope(page)
     await page.getByRole('link', { name: 'Report', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 })
@@ -230,14 +262,14 @@ test('verifies both model protocols and produces a zero-finding report with cove
   }
 })
 
-test('continues through the local evidence check when a model turn reaches its output limit', async ({ page }) => {
-  const fixture = await fixtureServer({ scenes: ['connection', 'coordinator-healthy', 'healthy'], truncate: 'healthy' })
+test('uses standard checks after planning fails and continues through an output-limited analysis', async ({ page }) => {
+  const fixture = await fixtureServer({ scenes: healthyScenes, failModel: 'plan-all:responses:0' })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
   try {
     await app.start()
     await page.goto(app.url)
     await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
-    await reviewScope(page, { project: 'Healthy Northstar', seeds: [healthyOrigin], goal: healthyGoal, live: true })
+    await reviewScope(page, { project: 'Healthy Northstar', seeds: [healthyOrigin], goal: allChecksGoal, live: true })
     await saveScope(page)
     await page.getByRole('link', { name: /^Trace/ }).click()
     const node = page.getByRole('link', { name: 'Review healthy.northstar.example, complete' })
@@ -249,9 +281,69 @@ test('continues through the local evidence check when a model turn reaches its o
     await expect(page.getByRole('dialog', { name: 'Derived evidence' })).toContainText('transportMaxAge')
     await page.getByRole('button', { name: 'Close', exact: true }).click()
     await page.getByRole('link', { name: 'Report', exact: true }).click()
-    await expect(page.getByRole('article', { name: 'Complete report' })).toContainText('No confirmed findings')
-    expect(fixture.accepted.filter(name => name.startsWith('healthy:'))).toEqual(['healthy:responses:0'])
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('No confirmed findings')
+    await expect(report).toContainText('Standard checks · HSTS policy, MIME sniffing protection, Referrer policy')
+    expect(fixture.accepted.filter(name => name.startsWith('response-healthy:'))).toEqual(['response-healthy:responses:0'])
     expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
+test('replaces an in-flight plan after a goal revision and delegates only the selected checks', async ({ page }) => {
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-all', 'plan-referrer', 'response-referrer'],
+    holdModel: 'plan-all:responses:0',
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await reviewScope(page, { project: 'Northstar', seeds: [primaryOrigin], goal: allChecksGoal, thirdParty: excludedOrigin, live: true })
+    await saveScope(page)
+    await fixture.modelWithheld
+    await expect(page.getByText('Preparing review plan', { exact: true })).toBeVisible()
+    expect(fixture.requested).toEqual([])
+    await page.getByRole('button', { name: 'Run actions', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'Revise goal' }).click()
+    await page.getByRole('textbox', { name: 'Revise goal' }).fill(referrerGoal)
+    await page.getByRole('button', { name: 'Save goal' }).click()
+
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('1 confirmed finding', { timeout: 18_000 })
+    await expect(report).toContainText('Planned checks · Referrer policy')
+    await expect(report).toContainText('Scope revision 1 · Goal revision 1')
+    await expect(report).toContainText('Referrer policy permits full cross-origin URLs')
+    await expect(report).not.toContainText('HSTS max-age missing or disabled')
+    await expect(report).not.toContainText('MIME sniffing protection missing')
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual(['plan-referrer:responses:0'])
+    expect(fixture.unexpected).toEqual([])
+
+    await report.getByRole('button', { name: 'Response policy verification' }).click()
+    const receipt = page.getByRole('dialog', { name: 'Response policy verification' })
+    await expect(receipt).toContainText('"id": "referrer-policy"')
+    await expect(receipt).not.toContainText('"id": "hsts"')
+    await receipt.getByRole('link', { name: /Open worker thread/ }).click()
+    const worker = page.getByRole('region', { name: 'Worker thread' })
+    await worker.getByRole('button', { name: 'assignment.md', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: 'assignment.md' })).toContainText('Checks: Referrer policy')
+
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const planned = db.prepare("SELECT detail FROM events WHERE kind = 'review.planned'").all()
+      expect(planned.map(row => JSON.parse(String(row.detail)))).toEqual([
+        { goalRevision: 1, scopeRevision: 1, source: 'coordinator', checks: ['referrer-policy'] },
+      ])
+      expect(db.prepare('SELECT phase, goal_revision FROM assignments WHERE phase != ? ORDER BY phase').all('discovery'))
+        .toMatchObject([{ phase: 'analysis', goal_revision: 1 }, { phase: 'verification', goal_revision: 1 }])
+    } finally {
+      db.close()
+    }
   } finally {
     await app.dispose()
     await fixture.close()

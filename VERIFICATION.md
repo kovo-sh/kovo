@@ -5,18 +5,26 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | Check | Result |
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
-| `npm run test:e2e` | Nine production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, passive DNS import, explicit scope approval, goal revisions, new assets awaiting approval, worker deep links, restart and event replay, partial and complete reporting, response policy evidence and remediation, and output-limit recovery. |
-| `npm run test:boundaries` | Nine tests passed. They cover mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and report selection after a scope change, cross-host attribution, older and ambiguous observations, local Docker socket enforcement, read-only evidence, process-level network isolation, and container resource limits. |
-| GitHub Actions | The preceding DNS import commit passed the workflow on a fresh Ubuntu checkout, including the Docker worker build, eight boundary tests, and nine production browser tests. [Hosted verification run for `e8dfb5a`](https://github.com/wwwillchen/guardian/actions/runs/44272421359) |
+| `npm run test:e2e` | Ten production browser tests passed. They cover workspace onboarding, both provider protocols, a rejected key, passive DNS import, explicit scope approval, revised check plans, coordinator chat, new assets awaiting approval, worker deep links, restart and event replay, partial and complete reporting, response policy evidence and remediation, and output-limit recovery. |
+| `npm run test:boundaries` | Ten tests passed. They cover plan validation, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and report selection after a scope change, cross-host attribution, older and ambiguous observations, local Docker socket enforcement, read-only evidence, process-level network isolation, and container resource limits. |
+| GitHub Actions | The response policy commit passed the workflow on a fresh Ubuntu checkout, including the Docker worker build, nine boundary tests, and nine production browser tests. [Hosted verification run for `a1b83f2`](https://github.com/wwwillchen/guardian/actions/runs/44273705697) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
 
-Seven checked-in OpenRouter recordings contain twelve HTTP responses from `deepseek/deepseek-v4.1-flash-1017`. The connection tests replay both Responses and Messages. The larger Responses scenarios exercise a coordinator reply, parallel analysis, real recorded tool arguments, Docker-based verification, a confirmed and inconclusive report, and a separate zero-finding report. One regression case uses a controlled incomplete event based on a recorded worker stream.
+Fourteen checked-in OpenRouter recordings contain twenty HTTP responses from `deepseek/deepseek-v4.1-flash-1017`. The connection tests replay both Responses and Messages. The Responses workflow exercises broad and focused plans, a coordinator status reply, parallel analysis, recorded tool arguments, Docker-based verification, and reports with confirmed findings, coverage gaps, or zero findings. Three worker recordings include an actual provider output limit.
 
 The production browser tests use a fresh workspace and local HTTP fixtures. They hold a broker response open while the operator revokes its host, then verify that the pending result never becomes evidence. A second test narrows scope and stops the server with a provider stream pending. Explicit resume reuses the saved response under the current approval, continues the original Pi Durable conversation, and completes the report after one broker request and one saved prompt for that host. Fixture credentials and response cookie values are absent from the matched model requests, saved transcripts, and exported reports.
 
 The DNS import test verifies candidate provenance, recognition of third-party aliases, explicit scope selection for imported hosts, and omission of raw address and TXT values from the inventory evidence. An offline copy of the existing Dyad workspace also migrated successfully and reopened its prior report and evidence.
+
+## Coordinator planning and recovery
+
+The browser stops the server while a broad plan is in flight. The run view reconnects and waits for explicit resume. With one saved planner prompt and one committed plan, analysis continues and later resumes from its own saved work. The report preserves the selected checks and goal revision.
+
+A second scenario replaces a pending broad plan with a referrer-only goal. It records one plan for the new revision and one brokered fixture read for the approved host. The worker handoff, verification receipt, and report show only the selected check. A controlled provider failure uses the standard plan, and the worker completes its comparison from the recorded metadata.
+
+Both saved Dyad report versions and the linked worker thread reopened from an offline copy after the plan migration. A separate upgrade test interrupted the coordinator on the previous build and resumed its original saved prompt on the new build.
 
 ## Response policy reports
 

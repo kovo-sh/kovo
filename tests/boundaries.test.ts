@@ -12,6 +12,7 @@ import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
 import { checkCoverage, responseReview } from '../src/server/response-checks.ts'
+import { parseReviewPlan, standardChecks } from '../src/server/review-plan.ts'
 import { findings } from '../src/server/schema.ts'
 import { assessmentAssignments, Store } from '../src/server/store.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
@@ -121,6 +122,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.ok(primary && docs)
   const approve = (assetIds: string[]) => storage.command({ requestId: randomUUID(), runId, action: 'scope', assetIds, consent: true })
   approve([primary.id, docs.id])
+  storage.commitReviewPlan(runId, 0, standardChecks)
 
   const analysis = storage.workerList(runId).find(worker => worker.assetId === primary.id && worker.phase === 'analysis')
   assert.ok(analysis)
@@ -193,6 +195,16 @@ test('keeps older observations and ambiguous header values from confirming unsup
   assert.equal(ambiguity[2].comparison, undefined)
   const json = responseReview({ ...oldObservation, mediaType: 'application/json', referrerPolicy: 'unsafe-url' })
   assert.equal(json[2].coverage.status, 'not-applicable')
+})
+
+test('accepts only supported check identifiers as a coordinator plan', () => {
+  assert.deepEqual(parseReviewPlan('{"checks":["referrer-policy","hsts","hsts"]}'), {
+    source: 'coordinator', checks: ['hsts', 'referrer-policy'],
+  })
+  assert.equal(parseReviewPlan('{"checks":["other-check"]}'), null)
+  assert.equal(parseReviewPlan('{"checks":[]}'), null)
+  assert.equal(parseReviewPlan('{"checks":["hsts"],"hosts":["unapproved.example"]}'), null)
+  assert.equal(parseReviewPlan('{"checks":["hsts"],"command":"unexpected operation"}'), null)
 })
 
 test('requires a local Docker Unix socket before staging worker data', async () => {

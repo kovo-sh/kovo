@@ -5,7 +5,7 @@ export const timeText = (value: number) => new Date(value).toLocaleString(undefi
   month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
 })
 
-export function useAction() {
+export function useAction(refresh?: () => Promise<void>) {
   const router = useRouter()
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
@@ -15,7 +15,8 @@ export function useAction() {
     setPending(true)
     try {
       const result = await action()
-      await router.invalidate()
+      if (refresh) await refresh()
+      else await router.invalidate()
       await onSuccess?.(result)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : 'Guardian could not complete the action.')

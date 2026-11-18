@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { responseCheckTitles } from '../domain.ts'
 import type { CheckCoverage } from '../domain.ts'
 import { Status, timeText } from './common.tsx'
 import type { RunDetail } from './run-state.ts'
@@ -24,12 +25,16 @@ export function RunReport({ detail, openEvidence }: {
   const confirmed = body.findings.filter(item => item.status === 'confirmed').length
   const approvedHosts = body.scope.length === 1 ? '1 approved host' : body.scope.length + ' approved hosts'
   const evidenceSource = detail.run.sourceMode === 'prepared' ? 'Supplied response metadata' : 'Approved HTTPS root responses'
+  const plan = body.selectedChecks
+  const plannedChecks = plan && (plan.source === 'standard' ? 'Standard checks' : 'Planned checks') +
+    ' · ' + plan.checks.map(id => responseCheckTitles[id]).join(', ')
   const evidenceTitles = new Map(detail.evidence.map(item => [item.id, item.title]))
 
   function exportText() {
     const lines = [
       `Guardian ${report.partial ? 'partial report' : 'complete report'} • Version ${report.version}`,
       '', body.goal, '', evidenceSource, `Scope revision ${body.scopeRevision} · Goal revision ${body.goalRevision}`,
+      ...(plannedChecks ? [plannedChecks] : []),
       ...body.scope.map(asset => asset.origin), '', 'Coverage',
       ...body.coverage.flatMap(item => [
         [item.origin, item.status, item.evidenceId && `Evidence ${item.evidenceId}`,
@@ -77,6 +82,7 @@ export function RunReport({ detail, openEvidence }: {
     <p>{body.goal}</p>
     <p className="muted">{approvedHosts} · Scope revision {body.scopeRevision} · Goal revision {body.goalRevision}</p>
     <p className="muted">{evidenceSource}</p>
+    {plannedChecks && <p className="muted">{plannedChecks}</p>}
     {body.findings.length > 0 && <section className="stacked-section">
       <h3>Findings</h3>
       {body.findings.map(item => <div key={item.id} className="finding">
