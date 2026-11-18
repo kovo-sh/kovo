@@ -1,6 +1,10 @@
-# Guardian prototype
+# Guardian
 
-Local TypeScript prototype of the Guardian run workspace. Requires Node.js 22.18 or newer.
+Local defensive evidence review for websites the operator owns or has permission to assess. See [SPEC.md](SPEC.md) for the v1 design and acceptance criteria.
+
+## Run locally
+
+Use Node.js 24.13.1 or newer.
 
 ```sh
 npm ci
@@ -8,14 +12,25 @@ npm run build
 npm start
 ```
 
-Open http://localhost:8000. Set `PORT` to use a different port.
+Open http://127.0.0.1:8000. The server binds to loopback. Set `PORT` to use a different port. Guardian stores the workspace and evidence under `.guardian/` by default. Set `GUARDIAN_DATA_DIR` to use another private directory.
 
-The demo opens at the post-discovery scope gate. In **Overview**, select **Review scope** to approve hosts directly in the discovery inventory. You can inspect the discovery evidence and return to the form with your selections intact. Approve the hosts to open the execution trace with the first two Analysis workers running. Select **Show first result** to record a simulated evidence return.
+The production app currently supports projects, supplied inventory, discovery consent, scope approval, worker threads, run controls, and partial reports. The analysis and verification execution integrations are under development.
 
-The **Coordinator** conversation sits next to the workflow in a collapsible right pane. Select a worker to open its read-only thread in the same pane. Use the two tabs to switch between the run conversation and the selected worker. **Chat** in the toolbar toggles the pane.
+## Verify
 
-Select **Trace** for all 34 threads, or press `/` to search. Use arrow keys to navigate search results and worker nodes, **Enter** to open a thread, and **Escape** to close it. **Copy link** creates a URL for the selected demo thread. Use **View** to change navigation, layout, palette, or appearance. **System** follows your device’s light/dark setting.
+```sh
+npx playwright install chromium
+npm run check
+npm run test:e2e
+```
 
-Stop the run to see a partial case file, or finish verification to see the complete report. Use **New demo run** to start with electronic discovery consent. In coordinator chat, send `Revise: <goal>` to record a goal revision.
+Playwright runs against the production build with a temporary data directory. The browser tests cover approval, deep links, restart recovery, and the local HTTP trust boundary.
 
-The model connection, coordinator, and workers are simulated. Verification compares fictional evidence with a prepared control fixture in the scripted demo. Run state resets with the page. The prototype contains no Artex records.
+## Design prototype
+
+```sh
+npm run demo:build
+PORT=8001 npm run demo
+```
+
+The design demo uses synthetic records and scripted worker activity. Its data is separate from the production app.

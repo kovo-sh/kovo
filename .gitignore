@@ -1,2 +1,10 @@
 node_modules/
 dist/app.js
+
+/build/
+/.guardian/
+/playwright-report/
+/test-results/
+/node_modules/
+/.env
+/.env.*

@@ -79,6 +79,7 @@ Use compact navigation, restrained borders, and emphasis that follows the curren
 
 - Build the React UI with TanStack Start and Vite. Serve the production build from one local Node.js server bound to loopback. Use TanStack Router for project, run, and worker thread URLs. Render the interactive workflow and chat on the client.
 - Use TanStack Start server functions for reads and actions such as scope approval, pause, resume, and opening a report. Stream run events through a server route using server-sent events (SSE). On reconnect, replay committed events after the client's last event ID.
+- Validate the expected host on every request and require a valid local session for actions, evidence, and event streams. Check the origin on state-changing browser requests. Render imported pages, evidence, transcripts, and model output as escaped text or sanitized markup, including in report exports.
 - Initialize one Guardian service per server process. It owns SQLite, Pi Durable, and run recovery. Server functions and routes call the service. Opening a page or reconnecting the stream leaves a paused run paused.
 
 ### Runtime and persistence
@@ -92,14 +93,22 @@ Use compact navigation, restrained borders, and emphasis that follows the curren
 ### Authorization and execution
 
 - Record consent with the actor, run, approved seeds or hosts, exclusions, and timestamp. Worker permissions follow the current approved scope. Apply authorization in application-managed tools outside the agent.
-- The worker sandbox has no direct network access or arbitrary shell execution. If a defensive check needs to read an approved asset, route that read through a restricted service that enforces current scope, checks destinations and redirects, and records the action. Use OS or sandbox controls to prevent bypassing this boundary. Discovery uses only its permitted passive inputs.
+- Use just-bash as the v1 worker shell for offline evidence analysis. Workers can compose shell commands, pipelines, and scripts with built-in tools such as `jq`, `rg`, and `diff`. Run the interpreter inside the OS-isolated worker with a virtual filesystem that presents the assignment's evidence as read-only files and gives it writable scratch space. Bound runtime, memory, disk usage, and output. Leave native process execution, optional language runtimes, and just-bash networking disabled. Record the command, input artifact IDs, exit status, and any resulting evidence artifacts so a reviewer can repeat the analysis.
+- Block direct worker network access at the OS boundary. Route bounded reads of approved assets through Guardian's request broker, which applies current scope to destinations and redirects and records each read. Discovery uses only its permitted passive inputs.
+- Bind each broker request to the server's run and assignment records. Check the assignment's permitted inputs and current scope before serving a fixture or opening a connection. For live public-page reads, validate the resolved destination and connect only to a validated public address. Repeat these checks at every redirect. Cancel affected in-flight reads when the user narrows scope and reject late results at commit time.
 - Keep agent testing focused on defensive evidence checks. Workers can validate configuration, compare prepared observations with controls, and record enough detail to repeat an evidence check. Live exploit generation, exploit execution, and automated intrusion are outside Guardian v1.
-- Verify sandbox isolation and scope enforcement independently of the model. A goal revision, a model message, or content retrieved from an asset cannot grant new permissions.
+- Verify sandbox isolation and scope enforcement independently of the model. Treat instructions in retrieved pages, evidence, and model output as untrusted data. Only explicit user actions can grant scope. A confirmed finding requires a recorded verification result linked to the supporting evidence.
+
+### Worker execution backend
+
+- V1 supports local, unprivileged Linux containers with outbound networking disabled. Give each assignment its own isolated execution environment, read-only inputs, and writable scratch space. Keep host files, credentials, and the container runtime control socket outside the worker. Enforce CPU, memory, process, and scratch-space limits within the container runtime.
+- Define a backend interface for staging assignment inputs, executing just-bash, collecting outputs, and canceling work. Pass assignment IDs, evidence references, and execution limits through this interface. Guardian owns scope decisions, request brokering, durable session state, and whether an assignment can still commit results.
+- A future remote backend must pass the same isolation and cancellation checks as the local backend. Require explicit workspace opt-in before transferring evidence to a remote sandbox. Transfer only the evidence needed for that assignment and keep provider credentials on the Guardian server.
 
 ### Credentials and evidence
 
 - Store model credentials in a workspace-scoped local secret store. Give only the provider adapter access to the key for authentication. Keep credentials out of agent sessions, Markdown handoffs, logs, and reports.
-- Redact authorization headers, cookies, session identifiers, passwords, private keys, and sensitive request values before evidence is sent to a provider or written to transcripts, handoffs, and exports. Use consistent placeholders within a run when repetition matters to the analysis.
+- Redact authorization headers, cookies, session identifiers, passwords, private keys, and sensitive request values before evidence is sent to a provider or written to transcripts, handoffs, fixture recordings, browser event streams, and exports. Use consistent placeholders within a run when repetition matters to the analysis.
 - Send the smallest sanitized excerpt that supports the task. Keep raw user-supplied evidence local and outside model context and report exports by default. Reports and transcripts link to the sanitized evidence they cite.
 
 ## Testing strategy
@@ -122,11 +131,17 @@ For local fixture capture, read the OpenRouter key from `~/.config/guardian-fixt
 - Stop a run and read its partial report. Restart the app mid-run and confirm that work waits for explicit resume. Resume from the last committed state without duplicate assignments, findings, or reports.
 - Run the TanStack Start production build on loopback. Open a worker thread through its deep link. With a run paused, restart the server and verify that the event stream reconnects from the last event ID and the run stays paused until explicit resume.
 - Finish verification with both confirmed and inconclusive fixture results. Open the complete report and follow the evidence back to a worker thread. Run the zero-finding case and verify that coverage remains visible.
-- Verify that secrets and raw evidence do not reach model calls or exported reports, and that workers cannot reach assets outside their current authorization.
+- Have a worker compose a just-bash pipeline that extracts fields from prepared JSON evidence, compares them with a baseline, and writes a derived artifact. Verify that the report links to the artifact and that the worker record identifies the commands and inputs. Verify that attempts to read files outside the assignment and make direct network requests are denied.
+- Through the broker, verify that an approved read succeeds. Reject redirects out of scope and DNS responses that resolve an approved public hostname to a private address. Remove the approved host while a fixture read is pending. Verify that a subsequent read is denied and the pending result never becomes evidence.
+- Verify that untrusted evidence cannot grant scope, confirm a finding, or execute markup in the UI or report. Verify that the loopback API rejects unexpected hosts, cross-origin actions, and event streams without a valid local session.
+- Verify that the production worker container cannot read host files or credentials, access the runtime control socket, or connect directly to a healthy test endpoint. Verify that the container enforces its resource limits.
+- Seed test credentials and sensitive raw evidence. Verify that neither appears in model inputs, transcripts, fixture recordings, event streams, or report exports.
 - Check the approval flow and worker pane in light and dark at desktop and narrow viewport sizes. Verify keyboard navigation and system appearance changes.
+- Complete one opt-in live smoke run for `dyad.sh` using the production build, from explicit scope approval through opening the final report. Use live DeepSeek V4.1 Flash calls through OpenRouter and bounded read-only requests to public pages through Guardian's request broker. Approve any subdomain individually before reading it and enforce the approved scope on every redirect. Verify that the report links to evidence from the run. Routine local and CI end-to-end tests replay model and network fixtures offline.
 
 ## Deferred
 
 - Shared workspaces, multiple users, and role-based access enforcement.
 - Cross-run finding comparisons, automatic trend analysis, and attribution of findings as new, recurring, or resolved.
 - Public hosting and unattended recurring runs.
+- Remote worker execution backends such as Daytona.
