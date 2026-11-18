@@ -1,16 +1,18 @@
 import { useRef } from 'react'
+import type { RefObject } from 'react'
 import { Link } from '@tanstack/react-router'
 import { Status } from './common.tsx'
 import { phaseNames, workerPhases } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
+import { TraceIcon, TraceLine, TraceTitle } from './ui/trace.tsx'
 
-export function WorkflowTrace({ detail, workerId, query, zoom }: {
+export function WorkflowTrace({ detail, workerId, query, zoom, viewport }: {
   detail: RunDetail
   workerId?: string
   query: string
   zoom: number
+  viewport: RefObject<HTMLDivElement | null>
 }) {
-  const scroll = useRef<HTMLDivElement>(null)
   const drag = useRef<{ pointer: number; x: number; y: number; left: number; top: number } | null>(null)
   const groups = workerPhases.map(phase => {
     const workers = detail.assignments.filter(worker => worker.phase === phase)
@@ -20,26 +22,26 @@ export function WorkflowTrace({ detail, workerId, query, zoom }: {
   return <div className="trace-workspace">
     <div className="trace-topline">
       <span><strong>Scope</strong> {detail.run.scopeRevision ? `Revision ${detail.run.scopeRevision} · ${detail.run.approved.length} approved` : 'Awaiting approval'}</span>
-      <span><strong>Run status</strong> {phaseNames[detail.run.phase]}</span>
     </div>
-    <div ref={scroll} className="trace-viewport" aria-label="Worker graph" tabIndex={0}
+    <div ref={viewport} className="trace-viewport" aria-label="Worker graph" tabIndex={0}
       onPointerDown={event => {
-        if (event.button !== 0 || (event.target as HTMLElement).closest('a, button, input') || !scroll.current) return
+        if (event.pointerType === 'touch' || event.button !== 0 || (event.target as Element).closest('a, button, input')) return
         drag.current = {
           pointer: event.pointerId, x: event.clientX, y: event.clientY,
-          left: scroll.current.scrollLeft, top: scroll.current.scrollTop,
+          left: event.currentTarget.scrollLeft, top: event.currentTarget.scrollTop,
         }
         event.currentTarget.setPointerCapture(event.pointerId)
       }}
       onPointerMove={event => {
-        if (!drag.current || drag.current.pointer !== event.pointerId || !scroll.current) return
-        scroll.current.scrollLeft = drag.current.left + drag.current.x - event.clientX
-        scroll.current.scrollTop = drag.current.top + drag.current.y - event.clientY
+        if (!drag.current || drag.current.pointer !== event.pointerId) return
+        event.currentTarget.scrollLeft = drag.current.left + drag.current.x - event.clientX
+        event.currentTarget.scrollTop = drag.current.top + drag.current.y - event.clientY
       }}
       onLostPointerCapture={() => { drag.current = null }}>
       <div className="trace-groups" style={{ zoom }}>
         {groups.map(({ phase, workers, columns, rowCount }, index) => {
           const completed = workers.filter(worker => worker.status === 'complete').length
+          const canceled = workers.filter(worker => worker.status === 'canceled').length
           const rows = Math.max(1, rowCount)
           const colWidth = 218
           const rowHeight = 38
@@ -47,7 +49,7 @@ export function WorkflowTrace({ detail, workerId, query, zoom }: {
           const height = rows * rowHeight + 28
           return <section className="trace-group" key={phase} style={{ width }}
             data-active={detail.run.phase === phase} aria-label={phaseNames[phase]}>
-            <header><h2>{phaseNames[phase]}</h2><small>{completed} of {workers.length} complete</small></header>
+            <header><h2>{phaseNames[phase]}</h2><small>{completed} of {workers.length} complete{canceled > 0 && ` · ${canceled} canceled`}</small></header>
             {index < groups.length - 1 && <span className="phase-arrow" aria-hidden="true">→</span>}
             <div className="trace-lane" style={{ height }}>
               <svg className="trace-lines" width={width} height={height} aria-hidden="true">
@@ -65,11 +67,10 @@ export function WorkflowTrace({ detail, workerId, query, zoom }: {
                 return <Link key={worker.id} to="/runs/$runId/workers/$workerId"
                   params={{ runId: detail.run.id, workerId: worker.id }} search={{ view: 'trace' }}
                   className="trace-node" aria-label={`${worker.title}, ${worker.status}`}
-                  aria-current={workerId === worker.id ? 'true' : undefined}
-                  data-match={match} data-status={worker.status}
+                  data-match={match} data-selected={workerId === worker.id} data-worker-status={worker.status}
                   style={{ left: Math.floor(i / rows) * colWidth + 18, top: (i % rows) * rowHeight + 15 }}
                   tabIndex={match ? 0 : -1}>
-                  <span>{worker.title}</span><i aria-hidden="true" />
+                  <TraceLine><TraceTitle>{worker.title}</TraceTitle><TraceIcon><i /></TraceIcon></TraceLine>
                 </Link>
               })}
               {workers.length === 0 && <p className="trace-empty">Awaiting assignments</p>}

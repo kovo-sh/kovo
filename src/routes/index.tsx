@@ -2,6 +2,8 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { createProject, workspaceData } from '../actions.ts'
 import { FormError, useAction } from '../components/common.tsx'
+import { Button } from '../components/ui/button.tsx'
+import { Input, Textarea } from '../components/ui/input.tsx'
 
 export const Route = createFileRoute('/')({
   loader: () => workspaceData(),
@@ -17,7 +19,7 @@ function Workspace() {
   return <main className="workspace-page">
     <div className="page-title">
       <div><p className="eyebrow">{workspace.name}</p><h1>Projects</h1></div>
-      {!creating && <button type="button" className="primary" onClick={() => setCreating(true)}>New project</button>}
+      {!creating && <Button variant="default" onClick={() => setCreating(true)}>New project</Button>}
     </div>
     {!hasModel && <div className="model-callout">
       <div><h2>Connect a model</h2><p className="muted">Set up OpenRouter or a compatible provider for coordinator and worker reviews.</p></div>
@@ -33,15 +35,15 @@ function Workspace() {
       } }), async project => { await navigate({ to: '/projects/$projectId', params: { projectId: project.id } }) })
     }}>
       <h2>Create a project</h2>
-      <label>Project name<input name="name" placeholder="Product website" required maxLength={120} /></label>
+      <label>Project name<Input name="name" placeholder="Product website" required maxLength={120} /></label>
       <label>Seed hosts
-        <textarea name="seeds" rows={3} placeholder={'example.com\ndocs.example.com'} required />
+        <Textarea name="seeds" rows={3} placeholder={'example.com\ndocs.example.com'} required />
         <span className="muted">Enter related hosts you own or have permission to review.</span>
       </label>
       <FormError error={action.error} />
       <div className="form-actions">
-        {projects.length > 0 && <button type="button" onClick={() => setCreating(false)}>Cancel</button>}
-        <button className="primary" disabled={action.pending}>Create project</button>
+        {projects.length > 0 && <Button onClick={() => setCreating(false)}>Cancel</Button>}
+        <Button type="submit" variant="default" disabled={action.pending}>Create project</Button>
       </div>
     </form>}
     {projects.length > 0 && <ul className="project-list">

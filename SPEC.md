@@ -2,7 +2,7 @@
 
 Guardian is a local defensive security assessment workspace for websites and related assets the operator owns or is explicitly authorized to assess. It turns a run goal into an inventory, evidence-backed findings, and a report that explains what Guardian checked, what it confirmed, and what remains open.
 
-Guardian is an independent TypeScript implementation licensed under Apache-2.0. Artex informed the product design. The current Guardian prototype uses synthetic records and simulated model and worker activity. This specification describes the intended product.
+Guardian is an independent TypeScript implementation licensed under Apache-2.0. Artex informed the product design. The original design demo uses synthetic records and scripted worker activity. The production app runs against local workspace data.
 
 ## Workspace, projects, and runs
 
@@ -78,6 +78,7 @@ Use compact navigation, restrained borders, and emphasis that follows the curren
 ### Web application
 
 - Build the React UI with TanStack Start and Vite. Serve the production build from one local Node.js server bound to loopback. Use TanStack Router for project, run, and worker thread URLs. Render the interactive workflow and chat on the client.
+- Use shadcn/ui's Base UI components for shared controls, menus, and dialogs. Style the installed source with Guardian's Studio and Porcelain tokens. Compose the right pane with shadcn AI Elements' Chat pattern, including Message Scroller, Message, Bubble, and Input Group. Use shadcn Trace for worker activity and evidence rows alongside the horizontal workflow DAG. [Chat](https://ui.shadcn.com/docs/ai-elements/base/chat) · [Trace](https://ui.shadcn.com/docs/components/base/trace)
 - Use TanStack Start server functions for reads and actions such as scope approval, pause, resume, and opening a report. Stream run events through a server route using server-sent events (SSE). On reconnect, replay committed events after the client's last event ID.
 - Validate the expected host on every request and require a valid local session for actions, evidence, and event streams. Check the origin on state-changing browser requests. Render imported pages, evidence, transcripts, and model output as escaped text or sanitized markup, including in report exports.
 - Initialize one Guardian service per server process. It owns SQLite, Pi Durable, and run recovery. Server functions and routes call the service. Opening a page or reconnecting the stream leaves a paused run paused.
@@ -110,6 +111,17 @@ Use compact navigation, restrained borders, and emphasis that follows the curren
 - Store model credentials in a workspace-scoped local secret store. Give only the provider adapter access to the key for authentication. Keep credentials out of agent sessions, Markdown handoffs, logs, and reports.
 - Redact authorization headers, cookies, session identifiers, passwords, private keys, and sensitive request values before evidence is sent to a provider or written to transcripts, handoffs, fixture recordings, browser event streams, and exports. Use consistent placeholders within a run when repetition matters to the analysis.
 - Send the smallest sanitized excerpt that supports the task. Keep raw user-supplied evidence local and outside model context and report exports by default. Reports and transcripts link to the sanitized evidence they cite.
+
+### Threat model
+
+| Priority | Risk | V1 controls and remaining exposure |
+| --- | --- | --- |
+| Critical | A worker reaches the host, credentials, or a destination outside scope. | Unprivileged local containers have no network, runtime socket, or host filesystem mounts. The broker enforces host authorization before DNS, on redirects, and again before recording evidence. Guardian trusts the operator's host, Docker daemon, and worker image. |
+| High | Imported evidence or a model reply is treated as authority. | Scope and run changes require explicit operator actions. Workers receive selected metadata and can use just-bash on staged files. Confirmation comes from a recorded verification check. Model summaries can still be misleading and should be read alongside the evidence. |
+| High | Another browser origin uses the local app to read workspace data or change a run. | The app binds to loopback, checks the host and action origin, and requires a local session for server functions and event streams. Users with access to the same OS account can read the workspace. |
+| High | A credential or sensitive record leaks through a model call, artifact, or fixture. | Owner-only files hold workspace keys. Target responses contribute selected metadata. Transcripts, handoffs, and exports use redacted text. Review fixture changes before committing them. Treat the configured model provider as a recipient of the excerpts it processes. |
+| High | A restarted or revoked assignment continues under stale approval. | Persist effective scope revisions and lease each assignment. Cancel affected in-flight work, reject late commits, and require explicit resume after an interruption. Keep prior evidence and report versions for audit. |
+| Medium | An operator mistakes a report for proof of ownership or complete coverage. | Consent is recorded electronic authorization. Reports name the approved hosts, checks, evidence, and coverage gaps. |
 
 ## Testing strategy
 

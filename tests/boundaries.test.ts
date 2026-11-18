@@ -89,6 +89,32 @@ test('checks approved scope before reading a healthy fixture and before acceptin
   }
 })
 
+test('cancels an unresolved destination without dialing when DNS finishes', async () => {
+  const lookup = Promise.withResolvers<{ address: string; family: number }[]>()
+  const broker = new RequestBroker({
+    resolve: () => lookup.promise,
+    transport: async () => { throw new Error('Unexpected connection.') },
+  })
+  const controller = new AbortController()
+  const read = assert.rejects(broker.readPublicRoot(allowed, controller.signal), /scope changed/)
+  controller.abort(new Error('scope changed'))
+  await read
+  lookup.resolve([publicAddress])
+})
+
+test('requires a local Docker Unix socket before staging worker data', async () => {
+  const previous = process.env.DOCKER_HOST
+  try {
+    process.env.DOCKER_HOST = 'tcp://docker.example:2376'
+    await assert.rejects(new LinuxWorkerBackend().run({
+      assignmentId: randomUUID(), files: [], command: 'true', outputs: [],
+    }, new AbortController().signal), /local Docker Unix socket/)
+  } finally {
+    if (previous === undefined) delete process.env.DOCKER_HOST
+    else process.env.DOCKER_HOST = previous
+  }
+})
+
 test('runs pipelines in the production just-bash image with read-only evidence and bounded output', async () => {
   const backend = new LinuxWorkerBackend()
   const job = {

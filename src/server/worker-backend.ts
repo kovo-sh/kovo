@@ -27,12 +27,16 @@ export interface WorkerBackend {
 
 function docker(args: string[], signal: AbortSignal, input?: string) {
   signal.throwIfAborted()
+  const host = process.env.DOCKER_HOST || 'unix:///var/run/docker.sock'
   return new Promise<string>((resolve, reject) => {
+    if (!/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
+      throw new Error('Guardian requires a local Docker Unix socket.')
+    }
     const cli = spawn('docker', args, {
       signal,
       env: {
         PATH: process.env.PATH,
-        DOCKER_HOST: process.env.DOCKER_HOST,
+        DOCKER_HOST: host,
         XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
       },
       stdio: ['pipe', 'pipe', 'ignore'],

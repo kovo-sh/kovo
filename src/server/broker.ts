@@ -18,6 +18,20 @@ type PublicAddress = { address: string; family: number }
 type Resolver = (host: string) => Promise<PublicAddress[]>
 type Transport = (url: URL, address: PublicAddress, signal: AbortSignal) => Promise<HeadersRead>
 
+async function resolveBeforeDeadline(resolve: Resolver, hostname: string, signal: AbortSignal) {
+  let cancel = () => {}
+  try {
+    const aborted = new Promise<never>((_resolve, reject) => {
+      cancel = () => reject(signal.reason)
+      signal.addEventListener('abort', cancel, { once: true })
+      if (signal.aborted) cancel()
+    })
+    return await Promise.race([aborted, resolve(hostname)])
+  } finally {
+    signal.removeEventListener('abort', cancel)
+  }
+}
+
 export class BrokerDenied extends Error {
   constructor(message: string) {
     super(message)
@@ -116,7 +130,7 @@ export class RequestBroker {
     }
     for (let redirect = 0; redirect <= 3; redirect += 1) {
       check()
-      const addresses = await resolve(url.hostname)
+      const addresses = await resolveBeforeDeadline(resolve, url.hostname, deadline)
       check()
       if (addresses.length === 0 || addresses.some(address => !isPublic(address))) {
         deny('The public hostname did not resolve exclusively to public addresses.')

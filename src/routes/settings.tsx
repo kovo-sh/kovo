@@ -2,6 +2,9 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { useState } from 'react'
 import { modelData, saveModel, testModel } from '../actions.ts'
 import { FormError, useAction } from '../components/common.tsx'
+import { Button } from '../components/ui/button.tsx'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible.tsx'
+import { Input, NativeSelect } from '../components/ui/input.tsx'
 import { DEFAULT_PROVIDER } from '../domain.ts'
 
 export const Route = createFileRoute('/settings')({
@@ -36,23 +39,25 @@ function ModelPage() {
     }}>
       <h2>{config ? 'Workspace model' : 'Connect OpenRouter'}</h2>
       {config && <p className="muted">Active model <strong>{config.model}</strong></p>}
-      <label>API key<input name="key" type="password" required minLength={8} maxLength={512} autoComplete="off"
+      <label>API key<Input name="key" type="password" required minLength={8} maxLength={512} autoComplete="off"
         placeholder={config ? 'Enter a replacement key' : 'Enter your provider key'} /></label>
-      <details className="provider-advanced">
-        <summary>Advanced provider settings</summary>
-        <label>Model ID<input name="model" required defaultValue={(config ?? DEFAULT_PROVIDER).model} /></label>
-        <label>Base URL<input name="endpoint" type="url" required defaultValue={(config ?? DEFAULT_PROVIDER).endpoint} /></label>
-        <label>Protocol<select name="protocol" defaultValue={(config ?? DEFAULT_PROVIDER).protocol}>
-          <option value="responses">OpenAI Responses</option>
-          <option value="messages">Anthropic Messages</option>
-        </select></label>
-      </details>
+      <Collapsible className="provider-advanced">
+        <CollapsibleTrigger render={<Button variant="ghost" />}>Advanced provider settings</CollapsibleTrigger>
+        <CollapsibleContent keepMounted>
+          <label>Model ID<Input name="model" required defaultValue={(config ?? DEFAULT_PROVIDER).model} /></label>
+          <label>Base URL<Input name="endpoint" type="url" required defaultValue={(config ?? DEFAULT_PROVIDER).endpoint} /></label>
+          <label>Protocol<NativeSelect name="protocol" defaultValue={(config ?? DEFAULT_PROVIDER).protocol}>
+            <option value="responses">OpenAI Responses</option>
+            <option value="messages">Anthropic Messages</option>
+          </NativeSelect></label>
+        </CollapsibleContent>
+      </Collapsible>
       <p className="muted">The provider receives sanitized context and selected evidence excerpts. The connection test uses synthetic input.</p>
       <FormError error={action.error} />
       {feedback && <p role="status">{feedback}</p>}
       <div className="form-actions">
-        <button type="submit" value="test" disabled={action.pending}>Test connection</button>
-        <button type="submit" value="save" className="primary" disabled={action.pending}>Save model</button>
+        <Button type="submit" value="test" disabled={action.pending}>Test connection</Button>
+        <Button type="submit" value="save" variant="default" disabled={action.pending}>Save model</Button>
       </div>
     </form>
   </main>

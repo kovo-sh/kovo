@@ -29,19 +29,19 @@ export async function reviewScope(page: Page, options: {
     await page.getByRole('button', { name: 'Add candidate' }).click()
     await page.getByLabel('Host', { exact: true }).fill(options.thirdParty)
     await page.getByLabel('Source', { exact: true }).fill('Supplier inventory')
-    await page.getByLabel('Third-party service').check()
+    await page.getByRole('checkbox', { name: 'Third-party service' }).check()
     await page.getByRole('button', { name: 'Add to project' }).click()
     await page.getByRole('button', { name: 'Add to project' }).waitFor({ state: 'hidden' })
   }
   await page.getByLabel('Run goal').fill(options.goal)
-  if (options.live) await page.getByLabel('Read approved public pages during this run').check()
+  if (options.live) await page.getByRole('checkbox', { name: 'Read approved public pages during this run' }).check()
   await page.getByRole('button', { name: 'Create run', exact: true }).click()
-  await page.getByLabel('I authorize discovery for these assets.').check()
+  await page.getByRole('checkbox', { name: 'I authorize discovery for these assets.' }).check()
   await page.getByRole('button', { name: 'Start discovery' }).click()
   await page.getByRole('button', { name: 'Review scope' }).click()
 }
 
 export async function saveScope(page: Page, label = 'Approve scope') {
-  await page.getByLabel('I authorize read-only review of the selected hosts.').check()
+  await page.getByRole('checkbox', { name: 'I authorize read-only review of the selected hosts.' }).check()
   await page.getByRole('button', { name: label, exact: true }).click()
 }

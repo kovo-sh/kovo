@@ -2,6 +2,11 @@ import { createRootRoute, HeadContent, Link, Outlet, Scripts } from '@tanstack/r
 import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { Brand } from '../components/common.tsx'
+import { Button } from '../components/ui/button.tsx'
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuLabel,
+  DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu.tsx'
 import styles from '../app.css?url'
 
 export const Route = createRootRoute({
@@ -38,32 +43,33 @@ function ViewPreferences() {
     document.documentElement.dataset.appLayout = layout
   }, [appearance, layout])
 
-  return <details className="top-menu">
-    <summary>View</summary>
-    <div className="menu-surface">
-      <label>Appearance
-        <select value={appearance} onChange={event => {
-          const choice = event.target.value as Appearance
+  return <DropdownMenu>
+    <DropdownMenuTrigger render={<Button variant="ghost" />}>View</DropdownMenuTrigger>
+    <DropdownMenuContent>
+      <DropdownMenuGroup>
+        <DropdownMenuLabel>Appearance</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={appearance} onValueChange={(choice: Appearance) => {
           localStorage.setItem('guardian-appearance', choice)
           setAppearance(choice)
         }}>
-          <option value="system">System</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
-      </label>
-      <label>Layout
-        <select value={layout} onChange={event => {
-          localStorage.setItem('guardian-app-layout', event.target.value)
-          setLayout(event.target.value)
+          <DropdownMenuRadioItem value="system">System</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="light">Light</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="dark">Dark</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuGroup>
+      <DropdownMenuGroup>
+        <DropdownMenuLabel>Layout</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={layout} onValueChange={(choice: string) => {
+          localStorage.setItem('guardian-app-layout', choice)
+          setLayout(choice)
         }}>
-          <option value="workspace">Workspace</option>
-          <option value="canvas">Canvas</option>
-          <option value="review">Review</option>
-        </select>
-      </label>
-    </div>
-  </details>
+          <DropdownMenuRadioItem value="workspace">Workspace</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="canvas">Canvas</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="review">Review</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuGroup>
+    </DropdownMenuContent>
+  </DropdownMenu>
 }
 
 function Shell() {

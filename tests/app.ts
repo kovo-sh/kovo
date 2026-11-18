@@ -16,8 +16,8 @@ async function availablePort() {
   return address.port
 }
 
-export async function createApp(env: NodeJS.ProcessEnv = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'guardian-e2e-'))
+export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?: string) {
+  const directory = existingDirectory ?? await mkdtemp(join(tmpdir(), 'guardian-e2e-'))
   const port = await availablePort()
   const url = `http://127.0.0.1:${port}`
   let processHandle: ChildProcess | undefined
@@ -58,7 +58,7 @@ export async function createApp(env: NodeJS.ProcessEnv = {}) {
     },
     async dispose() {
       await this.stop()
-      await rm(directory, { recursive: true, force: true })
+      if (!existingDirectory) await rm(directory, { recursive: true, force: true })
     },
   }
 }

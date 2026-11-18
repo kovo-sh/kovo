@@ -23,6 +23,8 @@ const workerInstructions = [
   'Summarize only the evidence in one short sentence after the tool result.',
 ].join(' ')
 
+const fallbackCommand = "jq -c '{status, mediaType, transportMaxAge, includeSubDomains}' /evidence/observed.json > /work/result.txt"
+
 export function coordinatorPrompt(input: {
   phase: string; status: string; approved: number; queued: number; complete: number; question: string
 }) {
@@ -58,6 +60,7 @@ export async function agentTurn(job: AgentTurn) {
 
   const context = withAbortSignal(job.signal, BACKGROUND_CONTEXT)
   const { models, model } = provider(job.settings, job.scenario, job.signal, job.record)
+  const scrub = (value: string) => redact(value.split(job.settings.key).join('[redacted]'))
   const registry = createRegistry()
   const extensions = []
   if (job.derive) {
@@ -70,8 +73,8 @@ export async function agentTurn(job: AgentTurn) {
       outputLimits: { maxBytes: 2048 },
       async execute(args, _api, ctx) {
         const signal = AbortSignal.any([job.signal, ...(ctx.abortSignal ? [ctx.abortSignal] : [])])
-        const result = await derive(args.command, signal)
-        return { output: [{ type: 'text', text: redact(result).slice(0, 2048) }] }
+        const result = await derive(scrub(args.command), signal)
+        return { output: [{ type: 'text', text: scrub(result).slice(0, 2048) }] }
       },
     })
     const extension = defineExtension({ name: 'guardian-evidence', tools: [tool] })
@@ -101,12 +104,12 @@ export async function agentTurn(job: AgentTurn) {
     // Existing sessions keep their history when the operator changes the workspace model.
     await conversation.configure(agent, context)
     let submission = await conversation.submit({
-      type: 'input', content: redact(job.prompt), requestId: job.requestId,
+      type: 'input', content: scrub(job.prompt), requestId: job.requestId,
     }, context)
     const previous = await submission.status(context)
     if (previous.status === 'unanswered' && previous.reason === 'aborted') {
       submission = await conversation.submit({
-        type: 'input', content: redact(job.prompt), requestId: job.requestId + ':resume:' + previous.id,
+        type: 'input', content: scrub(job.prompt), requestId: job.requestId + ':resume:' + previous.id,
       }, context)
     }
     const result = await submission.wait(context)
@@ -114,17 +117,19 @@ export async function agentTurn(job: AgentTurn) {
       throw new Error('The model did not finish the requested evidence turn.')
     }
     const view = await conversation.context(context, { at: result.answer })
-    const answer = view.entries.find(item => item.id === result.answer)?.model
-      ?.flatMap(message => message.role === 'assistant'
-        ? message.content.filter(part => part.type === 'text').map(part => part.text)
-        : []).join('\n')
+    const messages = view.entries.find(item => item.id === result.answer)?.model ?? []
+    const assistant = messages.filter(message => message.role === 'assistant')
+    const usedTool = view.entries.some(item => item.model?.some(message => message.role === 'toolResult' && !message.isError))
+    if (job.derive && assistant.some(message => message.stopReason === 'length')) {
+      if (!usedTool) await job.derive(fallbackCommand, job.signal)
+      return 'The model reached its output limit. The worker used the recorded response metadata for the evidence check.'
+    }
+    const answer = assistant.flatMap(message => message.content.filter(part => part.type === 'text').map(part => part.text)).join('\n')
     if (!answer?.trim()) {
-      const recordedToolResult = job.derive && view.entries.some(item =>
-        item.model?.some(message => message.role === 'toolResult' && !message.isError))
-      if (recordedToolResult) return 'The worker recorded its analysis of the supplied response metadata.'
+      if (job.derive && usedTool) return 'The worker recorded its analysis of the supplied response metadata.'
       throw new Error('The model returned an empty evidence summary.')
     }
-    return redact(answer).split(job.settings.key).join('[redacted]').slice(0, 2200)
+    return scrub(answer).slice(0, 2200)
   } finally {
     await harness.close(BACKGROUND_CONTEXT)
   }

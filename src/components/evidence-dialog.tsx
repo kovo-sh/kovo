@@ -1,17 +1,17 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { readArtifact } from '../actions.ts'
+import { Button } from './ui/button.tsx'
+import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog.tsx'
 
 export function EvidenceDialog({ runId, artifactId, close }: {
   runId: string
   artifactId: string
   close: () => void
 }) {
-  const dialog = useRef<HTMLDialogElement>(null)
   const [artifact, setArtifact] = useState<Awaited<ReturnType<typeof readArtifact>>>()
   const [error, setError] = useState('')
   useEffect(() => {
-    dialog.current?.showModal()
     let active = true
     readArtifact({ data: { runId, artifactId } }).then(value => {
       if (active) setArtifact(value)
@@ -21,15 +21,17 @@ export function EvidenceDialog({ runId, artifactId, close }: {
     return () => { active = false }
   }, [runId, artifactId])
 
-  return <dialog ref={dialog} className="artifact-dialog" aria-labelledby="artifact-title" onClose={close}>
-    <div className="section-heading"><h2 id="artifact-title">{artifact?.title ?? 'Evidence'}</h2>
-      <button onClick={() => dialog.current?.close()}>Close</button>
-    </div>
-    {error ? <p role="alert">{error}</p> : !artifact ? <p role="status">Loading evidence…</p> : <>
-      <p className="muted">Scope revision {artifact.scopeRevision}</p>
-      <pre>{artifact.content}</pre>
-      <Link className="text-button" to="/runs/$runId/workers/$workerId"
-        params={{ runId, workerId: artifact.assignmentId }} search={{ view: 'trace' }} onClick={close}>Open worker thread ↗</Link>
-    </>}
-  </dialog>
+  return <Dialog open onOpenChange={open => { if (!open) close() }}>
+    <DialogContent className="artifact-dialog">
+      <div className="section-heading"><DialogTitle>{artifact?.title ?? 'Evidence'}</DialogTitle>
+        <DialogClose render={<Button />}>Close</DialogClose>
+      </div>
+      {error ? <p role="alert">{error}</p> : !artifact ? <p role="status">Loading evidence…</p> : <>
+        <p className="muted">Scope revision {artifact.scopeRevision}</p>
+        <pre>{artifact.content}</pre>
+        <Link className="text-button" to="/runs/$runId/workers/$workerId"
+          params={{ runId, workerId: artifact.assignmentId }} search={{ view: 'trace' }} onClick={close}>Open worker thread ↗</Link>
+      </>}
+    </DialogContent>
+  </Dialog>
 }

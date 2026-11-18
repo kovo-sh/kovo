@@ -1,8 +1,11 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import type { RunCommand } from '../domain.ts'
 import { Status } from './common.tsx'
 import { phaseNames, workerPhases } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
+import { Button } from './ui/button.tsx'
+import { Checkbox } from './ui/checkbox.tsx'
+import { Input } from './ui/input.tsx'
 
 export type Command = RunCommand extends infer C
   ? C extends RunCommand ? Omit<C, 'requestId' | 'runId'> : never
@@ -29,43 +32,50 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
     <ol className="phase-rail" aria-label="Run phases">
       {workerPhases.map(phase => {
         const nodes = assignments.filter(worker => worker.phase === phase)
-        const done = nodes.filter(worker => worker.status === 'complete').length
-        return <li key={phase}>
-          <div><h2>{phaseNames[phase]}</h2><span className="muted">{nodes.length} {nodes.length === 1 ? 'worker' : 'workers'}</span></div>
-          <div className="phase-segments">{nodes.length
-            ? nodes.map(node => <i key={node.id} data-status={node.status} />)
-            : <i />}</div>
-          <span className="muted">{nodes.length && done === nodes.length ? 'Complete' : run.phase === phase ? phaseNames[phase] + ' in progress' : 'Queued'}</span>
-        </li>
+        const settled = nodes.length > 0 && nodes.every(worker => ['complete', 'canceled'].includes(worker.status))
+        return <Fragment key={phase}>
+          <li>
+            <div><h2>{phaseNames[phase]}</h2><span className="muted">{nodes.length} {nodes.length === 1 ? 'worker' : 'workers'}</span></div>
+            <div className="phase-segments">{nodes.length
+              ? nodes.map(node => <i key={node.id} data-status={node.status} />)
+              : <i />}</div>
+            <span className="muted">{settled ? 'Complete' : run.phase === phase ? `${phaseNames[phase]} in progress` : 'Queued'}</span>
+          </li>
+          {phase === 'discovery' && <li className="approval-gate" data-approved={run.scopeRevision > 0}
+            aria-label={run.scopeRevision ? 'Scope reviewed' : 'Scope approval required'}>
+            <span aria-hidden="true">{run.scopeRevision ? '✓' : '◇'}</span>
+          </li>}
+        </Fragment>
       })}
     </ol>
     {run.phase === 'consent' && <form className="workflow-callout" onSubmit={event => {
       event.preventDefault()
-      execute({ action: 'discover', consent: true })
+      if (new FormData(event.currentTarget).has('discoveryConsent')) execute({ action: 'discover', consent: true })
     }}>
       <div>
         <h2>Discovery consent</h2>
         <p>Review supplied project records for {project.seeds.map(seed => new URL(seed).hostname).join(', ')}.</p>
-        <label className="checkbox"><input type="checkbox" required /> I authorize discovery for these assets.</label>
+        <label className="checkbox"><Checkbox name="discoveryConsent" required aria-label="I authorize discovery for these assets." /> I authorize discovery for these assets.</label>
       </div>
-      <button className="primary" disabled={pending || run.status !== 'waiting'}>Start discovery</button>
+      <Button type="submit" variant="default" disabled={pending || run.status !== 'waiting'}>Start discovery</Button>
     </form>}
     {run.phase === 'review' && <div className="workflow-callout">
       <div><h2>Scope approval</h2>
         <p>{run.candidates.length} candidates · {run.candidates.filter(asset => asset.thirdParty).length} third-party</p></div>
-      <button className="primary" onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review} disabled={run.status !== 'waiting'}>
+      <Button variant="default" onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review} disabled={run.status !== 'waiting'}>
         {review ? 'Close review' : 'Review scope'}
-      </button>
+      </Button>
     </div>}
     {['analysis', 'verification'].includes(run.phase) && <div className="workflow-callout">
       <div><h2>Approved scope</h2><p>{run.approved.length} approved hosts · Revision {run.scopeRevision}</p></div>
-      <button onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review}>
+      <Button onClick={() => { setSelection(initialSelection()); setReview(!review) }} aria-expanded={review}>
         {review ? 'Close review' : 'Review scope'}
-      </button>
+      </Button>
     </div>}
     {run.candidates.length > 0 && <form className="inventory" onSubmit={event => {
       event.preventDefault()
       const form = new FormData(event.currentTarget)
+      if (!form.has('scopeConsent')) return
       execute({ action: 'scope', assetIds: selected, consent: true, saveProject: form.has('defaultScope') }, () => {
         setReview(false)
         setSelection(null)
@@ -76,25 +86,25 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
       <div className="table-scroll"><table>
         <thead><tr>{review && <th scope="col">Include</th>}<th scope="col">Host</th><th scope="col">Ownership evidence</th><th scope="col">Scope</th></tr></thead>
         <tbody>{run.candidates.map(asset => <tr key={asset.id}>
-          {review && <td><input type="checkbox" aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
-            onChange={event => setSelection(event.target.checked
+          {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
+            onCheckedChange={checked => setSelection(checked
               ? [...selected, asset.id] : selected.filter(item => item !== asset.id))} /></td>}
           <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}</td>
-          <td>{inventory ? <button type="button" className="text-button" onClick={() => openEvidence(inventory.id)}>{asset.source} ↗</button> : asset.source}</td>
+          <td>{inventory ? <Button variant="ghost" className="text-button" onClick={() => openEvidence(inventory.id)}>{asset.source} ↗</Button> : asset.source}</td>
           <td><Status status={run.approved.includes(asset.id) ? 'approved'
             : !run.scopeRevision && !asset.thirdParty ? 'proposed' : 'excluded'} /></td>
         </tr>)}</tbody>
       </table></div>
       {review && <div className="scope-footer">
-        <label className="checkbox"><input required type="checkbox" /> I authorize read-only review of the selected hosts.</label>
-        <label className="checkbox"><input name="defaultScope" type="checkbox" /> Save selected hosts as the project default</label>
-        <button className="primary" disabled={pending || (run.phase === 'review' && selected.length === 0)}>
+        <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize read-only review of the selected hosts." /> I authorize read-only review of the selected hosts.</label>
+        <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
+        <Button type="submit" variant="default" disabled={pending || (run.phase === 'review' && selected.length === 0)}>
           {run.phase === 'review' ? 'Approve scope' : 'Save scope revision'}
-        </button>
+        </Button>
       </div>}
     </form>}
     {run.candidates.length > 0 && run.phase !== 'complete' && <div className="candidate-form">
-      <button type="button" onClick={() => setAdding(!adding)} aria-expanded={adding}>Add candidate</button>
+      <Button onClick={() => setAdding(!adding)} aria-expanded={adding}>Add candidate</Button>
       {adding && <form className="form-card" onSubmit={event => {
         event.preventDefault()
         const form = new FormData(event.currentTarget)
@@ -102,10 +112,10 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
           origin: String(form.get('origin')), source: String(form.get('source')), thirdParty: form.has('thirdParty'),
         } }, () => setAdding(false))
       }}>
-        <label>Host<input name="origin" required placeholder="docs.example.com" /></label>
-        <label>Source<input name="source" maxLength={120} required placeholder="Service inventory record" /></label>
-        <label className="checkbox"><input name="thirdParty" type="checkbox" /> Third-party service</label>
-        <div className="form-actions"><button className="primary" disabled={pending}>Add for review</button></div>
+        <label>Host<Input name="origin" required placeholder="docs.example.com" /></label>
+        <label>Source<Input name="source" maxLength={120} required placeholder="Service inventory record" /></label>
+        <label className="checkbox"><Checkbox name="thirdParty" aria-label="Third-party service" /> Third-party service</label>
+        <div className="form-actions"><Button type="submit" variant="default" disabled={pending}>Add for review</Button></div>
       </form>}
     </div>}
   </div>

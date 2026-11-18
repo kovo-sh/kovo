@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { Status, timeText } from './common.tsx'
 import type { RunDetail } from './run-state.ts'
+import { Button } from './ui/button.tsx'
+import { NativeSelect } from './ui/input.tsx'
 
 export function RunReport({ detail, openEvidence }: {
   detail: RunDetail
@@ -41,10 +43,10 @@ export function RunReport({ detail, openEvidence }: {
         <h2 id="report-title">{report.partial ? 'Partial report' : 'Complete report'}</h2>
       </div>
       <div className="toolbar">
-        <label>Version <select value={report.version} onChange={event => setVersion(Number(event.target.value))}>
+        <label>Version <NativeSelect value={report.version} onChange={event => setVersion(Number(event.target.value))}>
           {detail.reports.map(item => <option key={item.id} value={item.version}>{item.version}</option>)}
-        </select></label>
-        <button onClick={exportText}>Export text</button>
+        </NativeSelect></label>
+        <Button variant="ghost" onClick={exportText}>Export text</Button>
       </div>
     </div>
     <p className="report-summary">{confirmed ? `${confirmed} confirmed ${confirmed === 1 ? 'finding' : 'findings'}` : 'No confirmed findings'}</p>
@@ -55,8 +57,8 @@ export function RunReport({ detail, openEvidence }: {
       <ul className="project-list">{body.coverage.map(item => <li key={item.origin}><div className="list-row">
         <span><strong>{new URL(item.origin).hostname}</strong><small>{item.status}</small></span>
         <div className="toolbar">
-          {item.evidenceId && <button onClick={() => openEvidence(item.evidenceId!)}>Open evidence</button>}
-          {item.analysisEvidenceId && <button onClick={() => openEvidence(item.analysisEvidenceId!)}>Derived evidence</button>}
+          {item.evidenceId && <Button variant="ghost" onClick={() => openEvidence(item.evidenceId!)}>Open evidence</Button>}
+          {item.analysisEvidenceId && <Button variant="ghost" onClick={() => openEvidence(item.analysisEvidenceId!)}>Derived evidence</Button>}
         </div>
       </div></li>)}</ul>
     </section>
@@ -68,7 +70,7 @@ export function RunReport({ detail, openEvidence }: {
         <p className="muted">{new URL(item.origin).hostname} · {item.severity}</p>
         <p>{item.reason}</p>
         <p>{item.remediation}</p>
-        {item.evidenceIds.map(id => <button key={id} onClick={() => openEvidence(id)}>Open finding evidence</button>)}
+        {item.evidenceIds.map(id => <Button key={id} onClick={() => openEvidence(id)}>Open finding evidence</Button>)}
       </div>)}
     </section>
     {body.gaps.length > 0 && <section className="stacked-section">
