@@ -4,6 +4,7 @@ import { importAccessPolicy } from './access-policy.ts'
 import { id, importDnsInventory, newProject, newRun, projectAsset, providerSettings, runCommand } from './domain.ts'
 import { execution } from './server/execution.ts'
 import { checkModelConnection, publicModelSettings, saveModelSettings } from './server/model-settings.ts'
+import { exportReportMarkdown } from './server/report-export.ts'
 import { store } from './server/store.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => ({
@@ -52,3 +53,7 @@ export const commandRun = createServerFn({ method: 'POST' }).validator(runComman
 export const readArtifact = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id, artifactId: id }))
   .handler(({ data }) => store().artifact(data.runId, data.artifactId))
+
+export const downloadReportMarkdown = createServerFn({ method: 'GET' })
+  .validator(z.object({ runId: id, reportId: id }))
+  .handler(({ data }) => exportReportMarkdown(store(), data.runId, data.reportId))

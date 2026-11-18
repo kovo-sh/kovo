@@ -49,3 +49,13 @@ export async function saveScope(page: Page, label = 'Approve scope') {
   await page.getByRole('checkbox', { name: 'I authorize read-only review of the selected hosts.' }).check()
   await page.getByRole('button', { name: label, exact: true }).click()
 }
+
+export async function downloadReport(page: Page, format: 'Markdown with evidence' | 'Plain text') {
+  await page.getByRole('button', { name: 'Export', exact: true }).click()
+  const pending = page.waitForEvent('download')
+  await page.getByRole('menuitem', { name: format, exact: true }).click()
+  const download = await pending
+  let content = ''
+  for await (const chunk of await download.createReadStream()) content += String(chunk)
+  return { name: download.suggestedFilename(), content }
+}

@@ -19,6 +19,8 @@ Create a project with the authorized hosts and start a run. Review and approve s
 
 In **Supply prepared evidence**, enter the observed fields for the host. Use `absent` in `contentTypeOptions` or `referrerPolicy` when the header was absent from a captured response. Leave fields out when the source did not record them.
 
+In **Report**, choose a version and open **Export**. **Markdown with evidence** includes sanitized source observations and worker comparisons for offline review. **Plain text** is also available.
+
 Use **Import DNS export** to bring in candidates from a local, self-contained zone file. The preview shows hosts from A, AAAA, and CNAME records and flags aliases to outside the zone. Guardian records host and source information, then puts the imported candidates into the next run's scope review for selection. [DNS master-file syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-5.1)
 
 The server binds to loopback. Set `PORT` to use a different port. Set `GUARDIAN_DATA_DIR` to choose a private data directory. Its default is `.guardian/`.

@@ -1,16 +1,19 @@
 import { useState } from 'react'
-import { assessmentCheckTitles } from '../domain.ts'
-import type { CheckCoverage } from '../domain.ts'
-import { Status, timeText } from './common.tsx'
+import { downloadReportMarkdown } from '../actions.ts'
+import { checkLabels, reportEvidenceSource, reportPlanLabel } from '../report-summary.ts'
+import { FormError, Status, timeText } from './common.tsx'
 import type { RunDetail } from './run-state.ts'
 import { Button } from './ui/button.tsx'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/dropdown-menu.tsx'
 import { NativeSelect } from './ui/input.tsx'
 
-const checkLabels: Record<CheckCoverage['status'], string> = {
-  met: 'Meets baseline',
-  gap: 'Gap found',
-  inconclusive: 'Inconclusive',
-  'not-applicable': 'Not applicable',
+function download(content: string, filename: string, type: string) {
+  const url = URL.createObjectURL(new Blob([content], { type }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 export function RunReport({ detail, openEvidence }: {
@@ -18,23 +21,33 @@ export function RunReport({ detail, openEvidence }: {
   openEvidence: (id: string) => void
 }) {
   const [version, setVersion] = useState<number>()
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
   const report = detail.reports.find(item => item.version === version) ?? detail.reports[0]
   if (!report) return <div className="report-body"><h2>Report</h2><p className="muted">The report will appear here when the run ends.</p></div>
 
   const { body } = report
   const confirmed = body.findings.filter(item => item.status === 'confirmed').length
   const approvedHosts = body.scope.length === 1 ? '1 approved host' : body.scope.length + ' approved hosts'
-  const plan = body.selectedChecks
-  const evidenceSource = [
-    ...(!plan || plan.checks.some(id => id !== 'access-policy')
-      ? [detail.run.sourceMode === 'prepared' ? 'Supplied response metadata' : 'Approved HTTPS root responses'] : []),
-    ...(plan?.checks.includes('access-policy') ? ['Supplied access policy records'] : []),
-  ].join(' · ')
-  const plannedChecks = plan && (plan.source === 'standard' ? 'Standard checks' : 'Planned checks') +
-    ' · ' + plan.checks.map(id => assessmentCheckTitles[id]).join(', ')
+  const evidenceSource = reportEvidenceSource(detail.run.sourceMode, body.selectedChecks)
+  const plannedChecks = reportPlanLabel(body.selectedChecks)
   const evidenceTitles = new Map(detail.evidence.map(item => [item.id, item.title]))
 
+  async function exportMarkdown(reportId: string) {
+    setExportError('')
+    setExporting(true)
+    try {
+      const result = await downloadReportMarkdown({ data: { runId: detail.run.id, reportId } })
+      download(result.content, result.filename, 'text/markdown; charset=utf-8')
+    } catch {
+      setExportError('Guardian could not export this report. Try again.')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   function exportText() {
+    setExportError('')
     const lines = [
       `Guardian ${report.partial ? 'partial report' : 'complete report'} • Version ${report.version}`,
       '', body.goal, '', evidenceSource, `Scope revision ${body.scopeRevision} · Goal revision ${body.goalRevision}`,
@@ -65,12 +78,7 @@ export function RunReport({ detail, openEvidence }: {
       ]),
       'Coverage gaps', ...body.gaps,
     ]
-    const url = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/plain' }))
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `guardian-report-${report.version}.txt`
-    link.click()
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    download(lines.join('\n'), `guardian-report-${report.version}.txt`, 'text/plain')
   }
 
   return <article className="report-body" aria-labelledby="report-title">
@@ -79,12 +87,24 @@ export function RunReport({ detail, openEvidence }: {
         <h2 id="report-title">{report.partial ? 'Partial report' : 'Complete report'}</h2>
       </div>
       <div className="toolbar">
-        <label>Version <NativeSelect value={report.version} onChange={event => setVersion(Number(event.target.value))}>
+        <label>Version <NativeSelect value={report.version} onChange={event => {
+          setVersion(Number(event.target.value))
+          setExportError('')
+        }}>
           {detail.reports.map(item => <option key={item.id} value={item.version}>{item.version}</option>)}
         </NativeSelect></label>
-        <Button variant="ghost" onClick={exportText}>Export text</Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="ghost" />} disabled={exporting}>
+            {exporting ? 'Exporting…' : 'Export'}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem onClick={() => void exportMarkdown(report.id)}>Markdown with evidence</DropdownMenuItem>
+            <DropdownMenuItem onClick={exportText}>Plain text</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
     </div>
+    <FormError error={exportError} />
     <p className="report-summary">{confirmed ? `${confirmed} confirmed ${confirmed === 1 ? 'finding' : 'findings'}` : 'No confirmed findings'}</p>
     <p>{body.goal}</p>
     <p className="muted">{approvedHosts} · Scope revision {body.scopeRevision} · Goal revision {body.goalRevision}</p>

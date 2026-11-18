@@ -37,7 +37,7 @@ export const referrerPolicies = [
   'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url',
 ] as const
 
-const preparedObservation = z.object({
+export const preparedObservation = z.object({
   status: z.number().int().min(100).max(599),
   mediaType: z.string().regex(/^[a-z0-9.+-]{1,40}\/[a-z0-9.+-]{1,60}$/),
   transportMaxAge: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),

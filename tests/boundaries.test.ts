@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -16,6 +16,7 @@ import { assessmentCheckIds } from '../src/domain.ts'
 import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
 import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
 import { responseReview } from '../src/server/response-checks.ts'
+import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { parseReviewPlan, standardChecks } from '../src/server/review-plan.ts'
 import { findings } from '../src/server/schema.ts'
 import { assessmentAssignments, Store } from '../src/server/store.ts'
@@ -120,7 +121,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const storage = new Store(directory)
   const docsOrigin = 'https://docs.northstar.example'
   const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar, docsOrigin] })
-  const { id: runId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Review response metadata.', sourceMode: 'public' })
+  const { id: runId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Review <em>response metadata</em>.', sourceMode: 'public' })
   storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
   const primary = storage.run(runId).candidates.find(asset => asset.origin === northstar)
   const docs = storage.run(runId).candidates.find(asset => asset.origin === docsOrigin)
@@ -130,13 +131,26 @@ test('keeps reports tied to current approval and requires fresh verification aft
   storage.commitReviewPlan(runId, 0, standardChecks())
 
   const analysis = storage.workerList(runId).find(worker => worker.assetId === primary.id && worker.phase === 'analysis')
-  assert.ok(analysis)
+  const docsAnalysis = storage.workerList(runId).find(worker => worker.assetId === docs.id && worker.phase === 'analysis')
+  assert.ok(analysis && docsAnalysis)
   const run = storage.updateRun(runId, { phase: 'verification' })
-  const observation = storage.addArtifact(run, analysis, 'observation', 'Synthetic response', 'Fixture metadata.')
+  const response = {
+    origin: northstar, finalOrigin: northstar, status: 200, mediaType: 'text/html', transportMaxAge: null,
+    includeSubDomains: false, source: 'fixture response', extraField: 'private fixture annotation',
+  }
+  const observation = storage.addArtifact(run, analysis, 'observation', 'Synthetic response', JSON.stringify({ observation: response }))
+  const otherHost = storage.addArtifact(run, docsAnalysis, 'observation', 'Synthetic docs response',
+    JSON.stringify({ observation: { ...response, origin: docsOrigin, finalOrigin: docsOrigin } }))
   storage.updateWorker(analysis.id, { status: 'complete', outcome: 'Recorded a response.' })
   storage.event(runId, 'broker.allowed', 'Recorded a fixture redirect.', { assignmentId: analysis.id, origin: docsOrigin })
   const verification = storage.makeWorker(run, 'verification', primary, 'Verify Northstar', 'Check the synthetic evidence.')
-  const evidence = storage.addArtifact(run, verification, 'verification', 'Fixture verification', 'Missing HSTS.')
+  const proof = {
+    origin: northstar, checks: [{ id: 'hsts', status: 'gap' }],
+    comparisons: [{ id: 'hsts', observed: null, baseline: { minimum: 1 } }],
+    inputEvidence: [observation.id], interpreter: 'just-bash 3.6.1', exitStatus: 0,
+    stdout: 'private fixture annotation',
+  }
+  const evidence = storage.addArtifact(run, verification, 'verification', 'Fixture verification', JSON.stringify(proof))
   storage.updateWorker(verification.id, { status: 'complete', outcome: 'Confirmed from scope revision 1.' })
   const findingId = randomUUID()
   storage.db.insert(findings).values({
@@ -145,12 +159,22 @@ test('keeps reports tied to current approval and requires fresh verification aft
       reason: 'Fixture response lacked HSTS.', remediation: 'Review the policy.', evidenceIds: [observation.id, evidence.id], scopeRevision: 1 },
   }).run()
   storage.writeReport(storage.run(runId), true)
+  const original = storage.runDetail(runId).reports[0]
+  const exportOriginal = () => exportReportMarkdown(storage, runId, original.id).content
+  const originalMarkdown = exportOriginal()
+  assert.match(originalMarkdown, /Review &lt;em&gt;response metadata&lt;\/em&gt;/)
+  assert.ok(originalMarkdown.includes(observation.id) && originalMarkdown.includes(evidence.id))
+  assert.ok(!originalMarkdown.includes('private fixture annotation'))
+  assert.ok(!originalMarkdown.includes(otherHost.id))
 
   approve([primary.id])
   storage.writeReport(storage.run(runId), true)
-  const restricted = storage.runDetail(runId).reports[0].body
-  assert.equal(restricted.findings.length, 0)
-  assert.match(restricted.coverage[0].status, /redirect chain is no longer approved/)
+  const restricted = storage.runDetail(runId).reports[0]
+  assert.equal(restricted.body.findings.length, 0)
+  assert.match(restricted.body.coverage[0].status, /redirect chain is no longer approved/)
+  const restrictedMarkdown = exportReportMarkdown(storage, runId, restricted.id).content
+  for (const removed of [docsOrigin, observation.id, evidence.id]) assert.ok(!restrictedMarkdown.includes(removed))
+  assert.equal(exportOriginal(), originalMarkdown)
 
   approve([docs.id])
   approve([primary.id, docs.id])
@@ -163,6 +187,15 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.equal(latest.findings.length, 0)
   assert.deepEqual(latest.coverage.find(item => item.origin === northstar), { origin: northstar, status: 'Pending review', evidenceId: null })
   assert.equal(history.at(-1)?.body.findings[0].id, findingId)
+  assert.equal(exportOriginal(), originalMarkdown)
+
+  const otherRun = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Independent run.', sourceMode: 'public' })
+  assert.throws(() => exportReportMarkdown(storage, otherRun.id, original.id), /Report version not found/)
+  writeFileSync(join(directory, 'artifacts', evidence.id + '.txt'), JSON.stringify({ ...proof, inputEvidence: [otherHost.id] }))
+  const unavailable = exportOriginal()
+  assert.match(unavailable, /Supporting record unavailable for this report version/)
+  assert.ok(!unavailable.includes(otherHost.id))
+  assert.ok(!unavailable.includes(evidence.id))
 })
 
 test('keeps cross-origin redirects inconclusive for the requested host', async () => {

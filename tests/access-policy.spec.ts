@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
-import { configureModel, openScopeReview, saveScope } from './browser-flows.ts'
+import { configureModel, downloadReport, openScopeReview, saveScope } from './browser-flows.ts'
 import { fixtureServer } from './fixture-server.ts'
 import { accessPolicy, accessPolicyGoal, combinedGoal, fixtureCredential, primaryOrigin, unavailableOrigin } from './scenarios.ts'
 
@@ -101,13 +102,42 @@ test('imports and verifies access policy cases alone and alongside response chec
     expect(fixture.accepted).toContain('plan-combined:responses:0')
     expect(fixture.unexpected).toEqual([])
 
-    const download = page.waitForEvent('download')
-    await report.getByRole('button', { name: 'Export text' }).click()
-    let exported = ''
-    for await (const chunk of await (await download).createReadStream()) exported += String(chunk)
+    const { content: exported } = await downloadReport(page, 'Plain text')
     expect(exported).toContain('Deny export-statements for billing-viewer.')
     expect(exported).toContain('Recorded ' + laterCapture)
     expect(exported).not.toContain(privateValue)
+
+    const { name, content: markdown } = await downloadReport(page, 'Markdown with evidence')
+    expect(name).toMatch(/^guardian-report-[a-f0-9]{8}-v1\.md$/)
+    expect(markdown).toContain('# Guardian complete report')
+    expect(markdown).toContain('Deny export-statements for billing-viewer.')
+    expect(markdown).toContain('The supplied records omit a decision for modify-schedule.')
+    expect(markdown).toContain(laterCapture)
+    expect(markdown).not.toContain(accessPolicy.recordedAt)
+    expect(markdown).not.toContain('docs.northstar.example')
+    expect(markdown).not.toContain(privateValue)
+    expect(markdown).not.toContain(fixtureCredential)
+    expect(markdown).not.toMatch(/"(?:command|stdout|stderr|rawAuditDetail|credentials)"/)
+    const linked = [...markdown.matchAll(/\]\(#evidence-(\d+)\)/g)].map(match => match[1])
+    const sections = [...markdown.matchAll(/^### Evidence (\d+)$/gm)].map(match => match[1])
+    expect([...new Set(linked)].sort()).toEqual(sections.sort())
+    const attachments = [...markdown.matchAll(/\*\*SHA-256 of the JSON below\*\* `([a-f0-9]{64})`\n\n~~~json\n([\s\S]*?)\n~~~/g)]
+      .map(([, digest, json]) => {
+        expect(createHash('sha256').update(json).digest('hex')).toBe(digest)
+        return JSON.parse(json)
+      })
+    expect(attachments).toHaveLength(sections.length)
+    const access = attachments.find(record => record.kind === 'access-policy')
+    const response = attachments.find(record => record.kind === 'observation')
+    const verificationRecord = attachments.find(record => record.kind === 'verification')
+    expect(access.snapshot.recordedAt).toBe(laterCapture)
+    expect(response.observation.origin).toBe(primaryOrigin)
+    expect(verificationRecord).toMatchObject({
+      interpreter: 'just-bash 3.6.1', exitStatus: 0, inputEvidence: [response.artifactId, access.artifactId],
+    })
+    expect(verificationRecord.comparisons).toContainEqual({
+      id: 'access-policy:billing-export', observed: 'allow', baseline: { allowed: ['deny'] },
+    })
 
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     try {
@@ -133,6 +163,11 @@ test('imports and verifies access policy cases alone and alongside response chec
       lines: Math.round(status.getBoundingClientRect().height / Number.parseFloat(getComputedStyle(status).lineHeight)),
     }))
     expect(layout).toEqual({ width: 390, lines: 1 })
+    const historical = await downloadReport(page, 'Markdown with evidence')
+    expect(historical.content).toContain('2 confirmed findings')
+    expect(historical.content).toContain(accessPolicy.recordedAt)
+    expect(historical.content).not.toContain(laterCapture)
+    expect(historical.content).not.toContain('Supporting record unavailable')
   } finally {
     await app.dispose()
     await fixture.close()

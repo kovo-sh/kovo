@@ -3,7 +3,7 @@ import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
-import { configureModel, reviewScope, saveScope } from './browser-flows.ts'
+import { configureModel, downloadReport, reviewScope, saveScope } from './browser-flows.ts'
 import { fixtureServer } from './fixture-server.ts'
 import {
   allChecksGoal, excludedOrigin, fixtureCredential, healthyOrigin, primaryOrigin, referrerGoal, statusQuestion, unavailableOrigin,
@@ -78,17 +78,31 @@ test('replays real provider streams through analysis, restart, explicit resume, 
     await verification.getByRole('link', { name: /Open worker thread/ }).click()
     await expect(page.getByRole('region', { name: 'Worker thread' })).toContainText('Verify northstar.example')
     await page.getByRole('link', { name: 'Report', exact: true }).click()
-    const download = page.waitForEvent('download')
-    await report.getByRole('button', { name: 'Export text' }).click()
-    const exported = await (await download).createReadStream()
-    let mark = ''
-    for await (const chunk of exported) mark += String(chunk)
+    const { content: mark } = await downloadReport(page, 'Plain text')
     expect(mark).not.toContain(fixtureCredential)
     expect(mark).not.toContain(fixture.sensitiveFixtureValue)
     expect(mark).toContain('Guardian complete report')
     expect(mark).toContain('Referrer policy · Gap found')
     expect(mark).toContain('Observed: unsafe-url')
     expect(mark).toContain('Check the fix:')
+
+    const completeExport = await downloadReport(page, 'Markdown with evidence')
+    expect(completeExport.name).toMatch(/-v2\.md$/)
+    expect(completeExport.content).toContain('# Guardian complete report')
+    expect(completeExport.content).toContain('## Coverage gaps')
+    expect(completeExport.content).toContain('"kind": "verification"')
+    expect(completeExport.content).toContain('"status": 503')
+    expect(completeExport.content).toContain('The recorded response returned HTTP 503.')
+    expect(completeExport.content).not.toContain(fixture.sensitiveFixtureValue)
+    expect(completeExport.content).not.toContain('Supporting record unavailable')
+    await report.getByLabel('Version').selectOption('1')
+    await expect(partial).toContainText('Verification pending')
+    const partialExport = await downloadReport(page, 'Markdown with evidence')
+    expect(partialExport.name).toMatch(/-v1\.md$/)
+    expect(partialExport.content).toContain('# Guardian partial report')
+    expect(partialExport.content).toContain('Verification pending')
+    expect(partialExport.content).toContain('"kind": "observation"')
+    expect(partialExport.content).not.toContain('"kind": "verification"')
 
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     let planningSession: string
@@ -254,6 +268,12 @@ test('verifies both model protocols and produces a zero-finding report with cove
     await expect(report).toContainText('nosniff')
     await expect(report).toContainText('strict-origin-when-cross-origin')
     await expect(report).not.toContainText('Coverage gaps')
+    const { content } = await downloadReport(page, 'Markdown with evidence')
+    expect(content).toContain('No findings recorded.')
+    expect(content).toContain('"kind": "verification"')
+    expect(content).toContain('"kind": "observation"')
+    expect(content).toContain('"transportMaxAge": 31536000')
+    expect(content).not.toContain('Supporting record unavailable')
     expect(fixture.unexpected).toEqual([])
     expect(fixture.accepted).toContain('connection:messages:0')
   } finally {
