@@ -12,6 +12,24 @@ const runRecordSchema = z.strictObject({
   inputSha256: digest,
   reportSha256: digest,
   recording: artifact,
+  audit: artifact.optional(),
+})
+const eventId = z.number().int().positive()
+const recordingScope = z.array(assetOrigin)
+const recordingAuditSchema = z.object({
+  runId: label,
+  reportId: label.optional(),
+  reportVersion: z.number().int().positive().optional(),
+  status: z.enum(['complete', 'stopped', 'paused', 'failed']),
+  approval: z.object({ eventId, scope: recordingScope }),
+  events: z.array(z.object({
+    id: eventId,
+    kind: label,
+    origin: assetOrigin.nullish(),
+    scope: recordingScope.nullish(),
+    reportId: label.nullish(),
+    reportVersion: z.number().int().positive().nullish(),
+  })).min(3),
 })
 const severity = z.enum(findingSeverities)
 const caseIdentity = { asset: assetOrigin, issue: label }
@@ -70,6 +88,8 @@ type Verdict = z.infer<typeof verdict>
 type Scenario = z.infer<typeof scenario>
 type Product = 'guardian' | 'artex'
 type Status = 'passed' | 'failed' | 'pending'
+type RecordingAudit = z.infer<typeof recordingAuditSchema>
+type StoppingPoint = z.infer<typeof inputSchema>['stoppingPoint']
 
 function caseKey({ asset, issue }: { asset: string; issue: string }) {
   return JSON.stringify([asset, issue])
@@ -79,9 +99,13 @@ function sha256(bytes: Buffer) {
   return createHash('sha256').update(bytes).digest('hex')
 }
 
+function parseJson(data: Buffer): unknown {
+  try { return JSON.parse(data.toString('utf8')) } catch { return undefined }
+}
+
 function readJson<T>(schema: z.ZodType<T>, data: Buffer, name: string): T {
-  let value: unknown
-  try { value = JSON.parse(data.toString('utf8')) } catch { throw new Error(name + ' is not valid JSON.') }
+  const value = parseJson(data)
+  if (value === undefined) throw new Error(name + ' is not valid JSON.')
   const parsed = schema.safeParse(value)
   if (parsed.success) return parsed.data
   const fields = parsed.error.issues.map(issue => issue.path.join('.') || 'document')
@@ -109,20 +133,72 @@ async function readArtifact(directory: string, ref: Artifact) {
   return bytes
 }
 
-async function readProduct(directory: string, entry: Scenario, product: Product, scope: Set<string>) {
+function sameScope(origins: string[], scope: ReadonlySet<string>) {
+  return origins.length === scope.size && new Set(origins).size === scope.size && origins.every(origin => scope.has(origin))
+}
+
+function validateRecording(audit: RecordingAudit, scope: ReadonlySet<string>, stoppingPoint: StoppingPoint, context: string) {
+  const complete = stoppingPoint === 'complete'
+  const checkpoint = audit.events.at(-1)!
+  if (audit.events[0].kind !== 'run.created' || checkpoint.kind !== (complete ? 'report.complete' : 'report.partial') ||
+      (audit.status === 'complete') !== complete ||
+      (checkpoint.reportId != null && checkpoint.reportId !== audit.reportId) ||
+      (checkpoint.reportVersion != null && checkpoint.reportVersion !== audit.reportVersion)) {
+    throw new Error(context + ' has a recording with a different stopping point or report checkpoint.')
+  }
+  let previous = 0
+  let approval: number | undefined
+  let effectiveScope = new Set<string>()
+  for (const event of audit.events) {
+    if (event.id <= previous) throw new Error(context + ' has run events out of order.')
+    previous = event.id
+    if (event.kind === 'scope.approved') {
+      approval = event.id
+      const origins = event.scope ?? (approval === audit.approval.eventId ? audit.approval.scope : [])
+      effectiveScope = new Set(origins)
+      if (effectiveScope.size !== origins.length) throw new Error(context + ' has a scope approval with duplicate hosts.')
+    }
+    if ((event.kind === 'broker.allowed' || event.kind === 'broker.observed') &&
+        (!event.origin || !effectiveScope.has(event.origin))) {
+      throw new Error(context + ' has a recorded read outside its approved scope.')
+    }
+  }
+  if (approval !== audit.approval.eventId || !sameScope(audit.approval.scope, scope) ||
+      !sameScope([...effectiveScope], scope)) {
+    throw new Error(context + ' has a recording for a different approved scope.')
+  }
+}
+
+async function readProduct(directory: string, entry: Scenario, product: Product, scope: Set<string>, stoppingPoint: StoppingPoint) {
   const result = entry[product]
   if (!result) return null
   const context = product + ' report for ' + JSON.stringify(entry.id)
   if (result.inputSha256 !== entry.input.sha256) throw new Error(context + ' references different inputs.')
-  await readArtifact(directory, result.report)
+  const report = await readArtifact(directory, result.report)
   let recording: Artifact | undefined
+  let recordingAudit: 'missing' | 'unreviewed' | 'verified' = 'missing'
   if (result.runRecord) {
     const record = readJson(runRecordSchema, await readArtifact(directory, result.runRecord), 'run record')
     if (record.inputSha256 !== entry.input.sha256 || record.reportSha256 !== result.report.sha256) {
       throw new Error(context + ' is linked to a run record with different inputs or report.')
     }
     recording = record.recording
-    await readArtifact(directory, recording)
+    const raw = await readArtifact(directory, recording)
+    const audit = record.audit
+      ? readJson(recordingAuditSchema, await readArtifact(directory, record.audit), 'run audit')
+      : recordingAuditSchema.safeParse(parseJson(raw)).data
+    recordingAudit = 'unreviewed'
+    if (audit) {
+      validateRecording(audit, scope, stoppingPoint, context)
+      if (product === 'guardian') {
+        const lines = report.toString('utf8').split(/\r?\n/)
+        if (!audit.reportVersion || !lines.includes('- **Run** ' + audit.runId) ||
+            !lines.includes('- **Report version** ' + audit.reportVersion)) {
+          throw new Error(context + ' has a recording for a different Guardian report version.')
+        }
+      }
+      recordingAudit = 'verified'
+    }
   }
 
   const observations = new Map<string, Verdict>()
@@ -158,7 +234,7 @@ async function readProduct(directory: string, entry: Scenario, product: Product,
     throw new Error(context + ' has an unmatched case without a confirmed finding.')
   }
   const { verdicts, ...metadata } = result
-  return { ...metadata, recording, cases, duplicates, unexpectedConfirmations, evidenceIssues }
+  return { ...metadata, recording, recordingAudit, cases, duplicates, unexpectedConfirmations, evidenceIssues }
 }
 
 async function readScenario(directory: string, entry: Scenario) {
@@ -168,8 +244,8 @@ async function readScenario(directory: string, entry: Scenario) {
       entry.cases.some(row => !scope.has(row.asset))) {
     throw new Error('Invalid scope or duplicate case labels for ' + JSON.stringify(entry.id) + '.')
   }
-  const guardian = await readProduct(directory, entry, 'guardian', scope)
-  const artex = await readProduct(directory, entry, 'artex', scope)
+  const guardian = await readProduct(directory, entry, 'guardian', scope, input.stoppingPoint)
+  const artex = await readProduct(directory, entry, 'artex', scope, input.stoppingPoint)
   const readers = new Set<string>()
   for (const review of entry.reviews) {
     if (readers.has(review.reader)) throw new Error('Duplicate reader for ' + JSON.stringify(entry.id) + '.')
@@ -190,7 +266,7 @@ function scoreProduct(scenarios: CheckedScenario[], product: Product) {
     const report = item[product]
     return report ? [report] : []
   })
-  if (reports.length !== scenarios.length || reports.some(report => !report.runRecord)) return null
+  if (reports.length !== scenarios.length || reports.some(report => report.recordingAudit !== 'verified')) return null
   const cases = reports.flatMap(report => report.cases)
   const unmatched = reports.reduce((total, report) => total + report.unexpectedConfirmations.length, 0)
   const expectedConfirmations = cases.filter(row => row.expected === 'confirmed')

@@ -83,17 +83,24 @@ function readReportRecording(db: DatabaseSync, runId: string, reportId: string, 
   }
   const approvalId = approval.id
   const scope = JSON.parse(approval.scope) as string[]
-  const events = db.prepare(`SELECT id, kind, created_at AS createdAt,
+  const rows = db.prepare(`SELECT id, kind, created_at AS createdAt,
       json_extract(detail, '$.origin') AS origin, json_extract(detail, '$.assignmentId') AS assignmentId,
-      json_extract(detail, '$.artifactId') AS artifactId
+      json_extract(detail, '$.artifactId') AS artifactId,
+      CASE WHEN kind = 'scope.approved' THEN json_extract(detail, '$.approved') END AS approved,
+      CASE WHEN kind IN ('report.partial', 'report.complete') THEN json_extract(detail, '$.reportId') END AS reportId,
+      CASE WHEN kind IN ('report.partial', 'report.complete') THEN json_extract(detail, '$.version') END AS reportVersion
     FROM events WHERE run_id = ? AND id <= ? AND kind IN (
       'run.created', 'discovery.consented', 'discovery.complete', 'scope.approved', 'review.planned',
       'evidence.committed', 'broker.allowed', 'broker.observed', 'interrupted', 'run.resumed',
       'worker.started', 'worker.complete', 'verification.started', 'report.partial', 'report.complete'
-    ) ORDER BY id`).all(runId, checkpoint.id) as ReportResult['recording']['events']
+    ) ORDER BY id`).all(runId, checkpoint.id) as (Omit<ReportResult['recording']['events'][number], 'scope'> & {
+      approved: string | null
+    })[]
+  const events = rows.map(({ approved, ...event }) => ({
+    ...event,
+    ...(approved === null ? {} : { scope: JSON.parse(approved) as string[] }),
+  }))
   expect(events.at(-1)?.id).toBe(checkpoint.id)
-  expect(events.filter(row => row.kind === 'broker.allowed')
-    .every(row => Number(row.id) > approvalId && scope.includes(String(row.origin)))).toBe(true)
   return {
     runId, reportId, reportVersion: version, createdAt, scopeRevision: report.scopeRevision, goalRevision: report.goalRevision,
     approval: { eventId: approvalId, scope }, phase: checkpoint.phase, status: checkpoint.status, events,

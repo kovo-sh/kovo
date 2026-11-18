@@ -153,7 +153,7 @@ Use end-to-end runs or matched run recordings to score finding accuracy. A compa
 
 The Northstar case matrix defines expected verdicts for four report versions from recorded inputs, overlapping access decisions on two hosts, and a run with verified high and critical policy discrepancies. `npm run benchmark:reports` runs the production browser flows and saves the exported reports, the exact input packets, and the run events through each report's save event. Regular end-to-end tests assert the exported verdicts and severity ratings and verify the portable evidence links. The regression scorecard can include separately reviewed Artex verdicts for the original four versions. [Northstar case matrix](tests/report-benchmark.ts)
 
-Use `npm run compare:reports` for the release comparison. It checks the shared input digests, report and run-record references, and the report versions reviewed by readers. Its scorecard shows the distinct findings, duplicates, missed findings by severity, and reader results. The release scorecard stays pending until paired assessments and reader judgments are available across the required scenarios. [Comparison format](README.md#compare-matched-reports)
+Use `npm run compare:reports` for the release comparison. It checks shared input digests, the scope in effect for each recorded read, the final approved scope, and the report save event at the selected stopping point. It verifies the report versions reviewed by readers. Its scorecard shows distinct findings, duplicates, missed findings by severity, and reader results. The release scorecard stays pending until paired assessments and reader judgments are available across the required scenarios. [Comparison format](README.md#compare-matched-reports)
 
 ## V1 acceptance criteria
 

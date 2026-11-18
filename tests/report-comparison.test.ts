@@ -27,16 +27,28 @@ async function comparison(t: TestContext) {
   ]
   const scenarios = []
   for (const [index, id] of ['multi-host', 'healthy', 'missing', 'stopped'].entries()) {
+    const scope = index ? [primary] : [primary, secondary]
+    const partial = id === 'stopped'
     const input = await write(id + '-input.json', {
       goal: 'Compare the supplied owner policy records.',
-      scope: index ? [primary] : [primary, secondary],
-      stoppingPoint: id === 'stopped' ? 'interrupted' : 'complete',
+      scope,
+      stoppingPoint: partial ? 'interrupted' : 'complete',
       overlappingObservations: !index,
       capturedEvidence: { fixture: id },
     })
     async function product(name: 'guardian' | 'artex') {
-      const report = await write(id + '-' + name + '.md', '# Synthetic ' + name + ' report\n' + id)
-      const recording = await write(id + '-' + name + '-transcript.json', { scenario: id, result: 'simulated' })
+      const runId = id + '-' + name
+      const reportId = runId + '-report'
+      const report = await write(runId + '.md', '# Synthetic report\n- **Run** ' + runId + '\n- **Report version** 1\n')
+      const recording = await write(runId + '-transcript.json', {
+        runId, reportId, reportVersion: 1, status: partial ? 'stopped' : 'complete',
+        approval: { eventId: 2, scope },
+        events: [
+          { id: 1, kind: 'run.created' },
+          { id: 2, kind: 'scope.approved', scope },
+          { id: 3, kind: partial ? 'report.partial' : 'report.complete', reportId, reportVersion: 1 },
+        ],
+      })
       const runRecord = await write(id + '-' + name + '-run.json', {
         inputSha256: input.sha256, reportSha256: report.sha256, recording,
       })
@@ -160,6 +172,79 @@ test('rejects a different input, an inconsistent run record, and a stale reader 
   reviews[0].artex.reportSha256 = artex.report.sha256
   artex.verdicts.shift()
   await assert.rejects(fixture.score(), /missing a labeled case/)
+})
+
+test('validates scopes at the time of each recorded read', async t => {
+  const fixture = await comparison(t)
+  const { input, artex } = fixture.manifest.scenarios[1]
+  const recording = await fixture.write('native-artex.log', 'Synthetic archive from an external report runner.')
+  const runRecord = { inputSha256: input.sha256, reportSha256: artex.report.sha256, recording }
+  artex.runRecord = await fixture.write('artex-reviewed-run.json', runRecord)
+  const opaque = await fixture.score()
+  assert.equal(opaque.scenarios[1].artex?.recordingAudit, 'unreviewed')
+  assert.equal(opaque.accuracy.status, 'pending')
+
+  const events = [
+    { id: 1, kind: 'run.created' },
+    { id: 2, kind: 'scope.approved', scope: [secondary] },
+    { id: 3, kind: 'broker.allowed', origin: secondary },
+    { id: 4, kind: 'broker.observed', origin: secondary },
+    { id: 5, kind: 'scope.approved', scope: [primary] },
+    { id: 6, kind: 'report.complete' },
+  ]
+  const record = async () => {
+    const audit = await fixture.write('artex-reviewed-audit.json', {
+      runId: 'healthy-artex', status: 'complete', approval: { eventId: 5, scope: [primary] }, events,
+    })
+    artex.runRecord = await fixture.write('artex-reviewed-run.json', { ...runRecord, audit })
+  }
+  await record()
+  const approved = await fixture.score()
+  assert.equal(approved.scenarios[1].artex?.recordingAudit, 'verified')
+  assert.equal(approved.status, 'passed')
+
+  events[3] = { id: 4, kind: 'scope.approved', scope: [primary] }
+  events[4] = { id: 5, kind: 'broker.observed', origin: secondary }
+  await record()
+  await assert.rejects(fixture.score(), /recorded read outside its approved scope/)
+})
+
+test('rejects a correctly hashed recording from another scope, report version, or stopping point', async t => {
+  const fixture = await comparison(t)
+  const { input, guardian } = fixture.manifest.scenarios[3]
+  const events = [
+    { id: 1, kind: 'run.created' },
+    { id: 2, kind: 'scope.approved', scope: [primary] },
+    { id: 3, kind: 'report.partial', reportVersion: 1, reportId: 'stopped-guardian-report' },
+  ]
+  const audit = {
+    runId: 'stopped-guardian', reportVersion: 1, reportId: 'stopped-guardian-report',
+    status: 'stopped', approval: { eventId: 2, scope: [primary] }, events,
+  }
+  const record = async () => {
+    const recording = await fixture.write('guardian-recording.json', audit)
+    guardian.runRecord = await fixture.write('guardian-reviewed-run.json', {
+      inputSha256: input.sha256, reportSha256: guardian.report.sha256, recording,
+    })
+  }
+  await record()
+  assert.equal((await fixture.score()).scenarios[3].guardian?.recordingAudit, 'verified')
+  events[1].scope = [secondary]
+  await record()
+  await assert.rejects(fixture.score(), /recording for a different approved scope/)
+  events[1].scope = [primary]
+  events[1].id = 1
+  await record()
+  await assert.rejects(fixture.score(), /run events out of order/)
+  events[1].id = 2
+  audit.reportVersion = events[2].reportVersion = 2
+  await record()
+  await assert.rejects(fixture.score(), /recording for a different Guardian report version/)
+  audit.reportVersion = events[2].reportVersion = 1
+  audit.status = 'complete'
+  events[2].kind = 'report.complete'
+  await record()
+  await assert.rejects(fixture.score(), /different stopping point or report checkpoint/)
 })
 
 test('rejects modified artifacts and report paths outside the comparison directory', async t => {

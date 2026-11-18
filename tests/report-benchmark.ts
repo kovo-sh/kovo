@@ -155,6 +155,16 @@ export type ReportResult = {
     approval: { eventId: number; scope: string[] }
     phase: string
     status: string
-    events: Record<string, string | number | null>[]
+    events: {
+      id: number
+      kind: string
+      createdAt: number
+      origin: string | null
+      assignmentId: string | null
+      artifactId: string | null
+      reportId: string | null
+      reportVersion: number | null
+      scope?: string[]
+    }[]
   }
 }
