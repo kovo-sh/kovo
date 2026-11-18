@@ -161,11 +161,9 @@ export async function collectReportBenchmark(
     const check = report.coverage.find(row => row.origin === expected.origin)?.checks?.find(item => matchingCheck(item, expected))
     const finding = confirmed.find(item => item.origin === expected.origin && matchingCheck(item.check, expected))
     const reported: Verdict = finding ? 'confirmed' : check?.status === 'met' ? 'met'
-      : check?.status === 'inconclusive' || check?.status === 'gap' ? 'inconclusive' : 'untested'
+      : !check || check.status === 'untested' ? 'untested' : 'inconclusive'
     const coverageLines = coverage.find(block => block.title === expected.origin)?.lines ?? []
-    const visibleCoverage = check
-      ? coverageLines.includes('- **' + check.title + '** · ' + checkLabels[check.status])
-      : coverageLines.some(line => /Verification pending|Pending review/.test(line))
+    const visibleCoverage = Boolean(check && coverageLines.includes('- **' + check.title + '** · ' + checkLabels[check.status]))
     const block = finding && findings.find(item => item.title === finding.title && item.lines.includes('- **Host** ' + expected.origin))
     const visible = visibleCoverage && (!finding || (Boolean(block) && check?.status === 'gap'))
     const result = { id: benchmarkCaseId(scenario, expected), reported, visible }

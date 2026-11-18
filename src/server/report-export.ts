@@ -141,7 +141,7 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     for (const check of row.checks ?? []) {
       lines.push(
         `- **${inline(check.title)}** · ${checkLabels[check.status]}`,
-        `  - **Observed** ${inline(check.observed ?? 'Unavailable')}`,
+        ...(check.status === 'untested' ? [] : [`  - **Observed** ${inline(check.observed ?? 'Unavailable')}`]),
         `  - **Expected** ${inline(check.expected)}`,
         `  - ${inline(check.reason)}`,
       )

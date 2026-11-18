@@ -140,7 +140,7 @@ export interface CheckCoverage {
   id: AssessmentCheckId
   caseId?: string
   title: string
-  status: 'met' | 'gap' | 'inconclusive' | 'not-applicable'
+  status: 'met' | 'gap' | 'inconclusive' | 'not-applicable' | 'untested'
   expected: string
   observed: string | null
   reason: string

@@ -49,10 +49,12 @@ async function comparison(t: TestContext) {
     }
     const guardian = await product('guardian')
     const artex = await product('artex')
-    const correct = { priority: 'correct', remediation: 'correct', impact: 'correct', evidence: 'correct', recheck: 'correct' }
+    const correct: Record<string, string> = index ? { coverage: 'correct' } : {
+      priority: 'correct', remediation: 'correct', impact: 'correct', evidence: 'correct', recheck: 'correct', coverage: 'correct',
+    }
     scenarios.push({
       id, input, cases: cases[index], guardian, artex, heldOut: id === 'multi-host',
-      reviews: index ? [] : [{
+      reviews: [{
         reader: 'fixture-reader',
         guardian: { reportSha256: guardian.report.sha256, tasks: { ...correct } },
         artex: { reportSha256: artex.report.sha256, tasks: { ...correct } },
@@ -82,7 +84,8 @@ test('compares matched reports and counts duplicates and missed finding severity
   assert.equal(score.accuracy.artex?.missesBySeverity.high, 1)
   assert.deepEqual(score.accuracy.guardian?.severityRatings, { correct: 1, incorrect: 0, ungraded: 1 })
   assert.deepEqual(score.accuracy.artex?.severityRatings, { correct: 0, incorrect: 1, ungraded: 0 })
-  assert.equal(score.readers.pairs, 1)
+  assert.equal(score.readers.pairs, 4)
+  assert.deepEqual(score.readers.results.coverage, { guardian: 4, artex: 4 })
 })
 
 test('keeps assessment pending for renderer-only data or missing reader reviews', async t => {
@@ -117,6 +120,27 @@ test('fails a scope claim, unsupported evidence, and a lower reader score', asyn
   assert.deepEqual(score.evidence.issues.map(issue => issue.reason), ['missing', 'out-of-scope'])
   assert.equal(score.readers.status, 'failed')
   assert.deepEqual(score.readers.results.recheck, { guardian: 0, artex: 1 })
+})
+
+test('requires a paired coverage grade on an interrupted report', async t => {
+  const fixture = await comparison(t)
+  const entry = fixture.manifest.scenarios[3]
+  const reviews = entry.reviews
+  entry.reviews = []
+  const missing = await fixture.score()
+  assert.equal(missing.accuracy.status, 'passed')
+  assert.equal(missing.readers.status, 'pending')
+  assert.deepEqual(missing.readers.awaitingReview, ['stopped'])
+
+  entry.reviews = reviews
+  reviews[0].guardian.tasks.coverage = 'incorrect'
+  const failed = await fixture.score()
+  assert.equal(failed.readers.status, 'failed')
+  assert.deepEqual(failed.readers.results.coverage, { guardian: 3, artex: 4 })
+  assert.deepEqual(failed.readers.byScenario[3].tasks, [{ task: 'coverage', pairs: 1, guardian: 0, artex: 1 }])
+
+  reviews[0].guardian.tasks.priority = 'correct'
+  await assert.rejects(fixture.score(), /Invalid comparison manifest/)
 })
 
 test('rejects a different input, an inconsistent run record, and a stale reader score', async t => {

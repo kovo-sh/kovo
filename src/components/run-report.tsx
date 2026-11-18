@@ -68,7 +68,7 @@ export function RunReport({ detail, openEvidence }: {
         ].filter(Boolean).join(' · '),
         ...(item.checks ?? []).flatMap(check => [
           `  ${check.title} · ${checkLabels[check.status]}`,
-          `    Observed: ${check.observed ?? 'Unavailable'}`,
+          ...(check.status === 'untested' ? [] : [`    Observed: ${check.observed ?? 'Unavailable'}`]),
           `    Expected: ${check.expected}`,
           `    ${check.reason}`,
         ]),
@@ -167,7 +167,7 @@ export function RunReport({ detail, openEvidence }: {
           <ul>{item.checks.map(check => <li key={check.caseId ? check.id + ':' + check.caseId : check.id}>
             <div className="section-heading"><strong>{check.title}</strong><span>{checkLabels[check.status]}</span></div>
             <dl className="finding-details">
-              <dt>Observed</dt><dd>{check.observed ?? 'Unavailable'}</dd>
+              {check.status !== 'untested' && <><dt>Observed</dt><dd>{check.observed ?? 'Unavailable'}</dd></>}
               <dt>Expected</dt><dd>{check.expected}</dd>
             </dl>
             <p className="muted">{check.reason}</p>

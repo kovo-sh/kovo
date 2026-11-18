@@ -32,12 +32,16 @@ const productReport = z.strictObject({
   runRecord: artifact.optional(),
   verdicts: z.array(verdict),
 })
-const tasks = z.enum(['priority', 'remediation', 'impact', 'evidence', 'recheck'])
+const tasks = z.enum(['priority', 'remediation', 'impact', 'evidence', 'recheck', 'coverage'])
+const grade = z.enum(['correct', 'incorrect', 'unanswered'])
 const answer = z.strictObject({
   reportSha256: digest,
-  tasks: z.record(tasks, z.enum(['correct', 'incorrect', 'unanswered'])),
+  tasks: z.partialRecord(tasks, grade).refine(value => Object.keys(value).length > 0),
 })
-const review = z.strictObject({ reader: label, guardian: answer, artex: answer, notes: label.optional() })
+const review = z.strictObject({ reader: label, guardian: answer, artex: answer, notes: label.optional() }).refine(
+  ({ guardian, artex }) => tasks.options.every(task => (guardian.tasks[task] === undefined) === (artex.tasks[task] === undefined)),
+  { message: 'Provide a grade for the same tasks in both reports.' },
+)
 const scenario = z.strictObject({
   id: label,
   input: artifact,
@@ -214,21 +218,39 @@ function compareAccuracy(guardian: ReturnType<typeof scoreProduct>, artex: Retur
 }
 
 function compareReaders(scenarios: CheckedScenario[]) {
-  const actionable = scenarios.filter(item => item.cases.some(row => row.expected === 'confirmed'))
-  const reviews = actionable.flatMap(item => item.reviews)
-  const results = Object.fromEntries(tasks.options.map(task => [task, {
-    guardian: reviews.filter(review => review.guardian.tasks[task] === 'correct').length,
-    artex: reviews.filter(review => review.artex.tasks[task] === 'correct').length,
-  }]))
-  const missedPriority = actionable.some(item => item.reviews.length &&
-    !item.reviews.some(review => review.guardian.tasks.priority === 'correct'))
-  const remaining = actionable.filter(item => !item.reviews.length).map(item => item.id)
+  const byScenario = scenarios.map(item => {
+    const relevant = item.cases.some(row => row.expected === 'confirmed') ? tasks.options : ['coverage'] as const
+    const reviews = item.reviews.filter(review => relevant.some(task => review.guardian.tasks[task] !== undefined))
+    return {
+      id: item.id,
+      pairs: reviews.length,
+      tasks: relevant.map(task => {
+        const graded = reviews.filter(review => review.guardian.tasks[task] !== undefined)
+        return {
+          task, pairs: graded.length,
+          guardian: graded.filter(review => review.guardian.tasks[task] === 'correct').length,
+          artex: graded.filter(review => review.artex.tasks[task] === 'correct').length,
+        }
+      }),
+    }
+  })
+  const scores = byScenario.flatMap(item => item.tasks)
+  const results = Object.fromEntries(tasks.options.map(task => {
+    const rows = scores.filter(row => row.task === task)
+    return [task, {
+      guardian: rows.reduce((total, row) => total + row.guardian, 0),
+      artex: rows.reduce((total, row) => total + row.artex, 0),
+    }]
+  }))
+  const missedEssentialTask = scores.some(row =>
+    row.pairs && (row.task === 'priority' || row.task === 'coverage') && !row.guardian)
+  const remaining = byScenario.filter(item => item.tasks.some(task => !task.pairs)).map(item => item.id)
   let status: Status = 'pending'
-  if (missedPriority) status = 'failed'
-  else if (actionable.length && !remaining.length) {
+  if (missedEssentialTask) status = 'failed'
+  else if (!remaining.length) {
     status = Object.values(results).some(row => row.guardian < row.artex) ? 'failed' : 'passed'
   }
-  return { status, pairs: reviews.length, results, awaitingReview: remaining }
+  return { status, pairs: byScenario.reduce((total, row) => total + row.pairs, 0), results, byScenario, awaitingReview: remaining }
 }
 
 export async function compareReports(manifestPath: string) {

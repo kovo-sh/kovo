@@ -208,7 +208,10 @@ test('keeps reports tied to current approval and requires fresh verification aft
     stdout: 'private fixture annotation',
   }
   const evidence = storage.addArtifact(run, verification, 'verification', 'Fixture verification', JSON.stringify(proof))
-  storage.updateWorker(verification.id, { status: 'complete', outcome: 'Confirmed from scope revision 1.' })
+  storage.updateWorker(verification.id, {
+    status: 'complete', outcome: 'Confirmed from scope revision 1.',
+    checks: [{ ...responseReview(null)[0].coverage, status: 'gap', reason: 'The response lacked HSTS.' }],
+  })
   const findingId = randomUUID()
   storage.db.insert(findings).values({
     id: findingId, runId, assetId: primary.id, goalRevision: 0,
@@ -217,6 +220,9 @@ test('keeps reports tied to current approval and requires fresh verification aft
   }).run()
   storage.writeReport(storage.run(runId), true)
   const original = storage.runDetail(runId).reports[0]
+  assert.deepEqual(original.body.coverage.find(item => item.origin === northstar)?.checks?.map(check => check.status), ['gap'])
+  assert.deepEqual(original.body.coverage.find(item => item.origin === docsOrigin)?.checks?.map(check => check.status),
+    ['untested', 'untested', 'untested'])
   const exportOriginal = () => exportReportMarkdown(storage, runId, original.id).content
   const originalMarkdown = exportOriginal()
   assert.match(originalMarkdown, /Review &lt;em&gt;response metadata&lt;\/em&gt;/)
@@ -243,7 +249,10 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const history = storage.runDetail(runId).reports
   const latest = history[0].body
   assert.equal(latest.findings.length, 0)
-  assert.deepEqual(latest.coverage.find(item => item.origin === northstar), { origin: northstar, status: 'Pending review', evidenceId: null })
+  const pending = latest.coverage.find(item => item.origin === northstar)
+  assert.equal(pending?.status, 'Pending review')
+  assert.equal(pending?.evidenceId, null)
+  assert.deepEqual(pending?.checks?.map(check => check.status), ['untested', 'untested', 'untested'])
   assert.equal(history.at(-1)?.body.findings[0].id, findingId)
   assert.equal(exportOriginal(), originalMarkdown)
 

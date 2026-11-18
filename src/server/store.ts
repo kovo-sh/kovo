@@ -8,9 +8,11 @@ import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
 import { assessmentCheckTitles } from '../domain.ts'
-import type { Candidate, EvidenceSummary, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
+import type { Candidate, CheckCoverage, EvidenceSummary, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
+import { accessPolicyReviews } from './access-policy-checks.ts'
+import { responseReview } from './response-checks.ts'
 import * as tables from './schema.ts'
 import { redact } from './redact.ts'
 
@@ -33,6 +35,17 @@ export function assessmentAssignments(assignments: readonly Assignment[], assetI
   const verification = ordered.find(worker => worker.phase === 'verification' && worker.status !== 'canceled' &&
     worker.scopeRevision >= (analysis?.scopeRevision ?? 0))
   return { analysis, verification }
+}
+
+function untestedCoverage(asset: Candidate, selection: SelectedChecks): CheckCoverage[] {
+  const reviews = responseReview(null, undefined, selection.checks.filter(id => id !== 'access-policy'))
+  if (selection.checks.includes('access-policy')) {
+    reviews.push(...accessPolicyReviews(asset.accessPolicy?.origin === asset.origin ? asset.accessPolicy : undefined))
+  }
+  return reviews.map(({ coverage }) => ({
+    ...coverage, observed: null, status: 'untested',
+    reason: 'Verification had no saved result when this report was created.',
+  }))
 }
 
 export class Store {
@@ -504,6 +517,8 @@ export class Store {
     const approvedOrigins = new Set(scope.map(asset => asset.origin))
     const currentEvidence = new Set<string>()
     const gaps: string[] = []
+    const selection = run.reviewPlan?.status === 'ready'
+      ? { checks: run.reviewPlan.checks, source: run.reviewPlan.source } : undefined
     const coverage = scope.map(asset => {
       const { analysis, verification } = assessmentAssignments(snapshot.assignments, asset.id, run.goalRevision)
       const analyzed = analysis?.status === 'complete' ? analysis : undefined
@@ -520,7 +535,9 @@ export class Store {
         (verified ? item.kind === 'verification' : ['observation', 'access-policy'].includes(item.kind)))
       const derived = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'analysis')
       const access = evidence.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'access-policy')
-      const status = verified?.outcome ?? (analyzed ? 'Analysis complete. Verification pending.' : 'Pending review')
+      const status = verified?.outcome ?? (analyzed ? 'Analysis complete. Verification pending.'
+        : run.reviewPlan?.status === 'pending' ? 'Check plan pending' : 'Pending review')
+      const checks = verified ? verified.checks : selection && untestedCoverage(asset, selection)
       if (!verified || !artifact) {
         gaps.push(asset.origin + ' · ' + status)
       } else if (verified.checks) {
@@ -533,7 +550,7 @@ export class Store {
         origin: asset.origin, status,
         evidenceId: artifact?.id ?? null, analysisEvidenceId: derived?.id,
         ...(access ? { accessEvidence: { id: access.id, recordedAt: asset.accessPolicy?.recordedAt } } : {}),
-        ...(verified?.checks ? { checks: verified.checks } : {}),
+        ...(checks ? { checks } : {}),
       }
     })
     const results = this.db.select().from(tables.findings).where(and(
@@ -548,8 +565,7 @@ export class Store {
     const body: ReportBody = {
       goal: run.goal, scope: scope.map(({ accessPolicy, ...asset }) => asset),
       scopeRevision: run.scopeRevision, goalRevision: run.goalRevision, coverage, findings: results, gaps,
-      ...(run.reviewPlan?.status === 'ready'
-        ? { selectedChecks: { checks: run.reviewPlan.checks, source: run.reviewPlan.source } } : {}),
+      ...(selection ? { selectedChecks: selection } : {}),
     }
     const reportId = randomUUID()
     const version = (snapshot.reports[0]?.version ?? 0) + 1

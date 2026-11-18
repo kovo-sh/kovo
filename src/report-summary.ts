@@ -6,6 +6,7 @@ export const checkLabels: Record<CheckCoverage['status'], string> = {
   gap: 'Gap found',
   inconclusive: 'Inconclusive',
   'not-applicable': 'Not applicable',
+  untested: 'Untested',
 }
 
 export const findingSeverityOrder: Record<Finding['severity'], number> = {
@@ -20,7 +21,7 @@ function checkCount(count: number) {
 export function reportHighlights(body: ReportBody) {
   const scope = new Set(body.scope.map(asset => asset.origin))
   const rows = new Map(body.coverage.map(row => [row.origin, row.checks]))
-  const counts: Record<CheckCoverage['status'], number> = { met: 0, gap: 0, inconclusive: 0, 'not-applicable': 0 }
+  const counts: Record<CheckCoverage['status'], number> = { met: 0, gap: 0, inconclusive: 0, 'not-applicable': 0, untested: 0 }
   let missingDetails = 0
   for (const origin of scope) {
     const checks = rows.get(origin)
@@ -32,6 +33,7 @@ export function reportHighlights(body: ReportBody) {
     counts.gap && counts.gap + (counts.gap === 1 ? ' verified gap' : ' verified gaps'),
     counts.inconclusive && checkCount(counts.inconclusive) + ' inconclusive',
     counts['not-applicable'] && checkCount(counts['not-applicable']) + ' not applicable',
+    counts.untested && checkCount(counts.untested) + ' untested',
     missingDetails && 'Check details unavailable for ' + missingDetails + (missingDetails === 1 ? ' approved host' : ' approved hosts'),
   ].filter(Boolean).join(' · ')
 
