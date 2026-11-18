@@ -16,6 +16,7 @@ import { redact } from './redact.ts'
 export type Run = typeof tables.runs.$inferSelect
 export type Assignment = typeof tables.assignments.$inferSelect
 type Project = typeof tables.projects.$inferSelect
+const inventoryTitle = 'Supplied asset inventory'
 
 export const dataDirectory = () => resolve(process.env.GUARDIAN_DATA_DIR ?? '.guardian')
 
@@ -142,17 +143,32 @@ export class Store {
     const run = this.run(runId)
     const streamHead = this.db.select({ id: tables.events.id }).from(tables.events)
       .where(eq(tables.events.runId, run.id)).orderBy(desc(tables.events.id)).limit(1).get()
+    const evidence = this.db.select().from(tables.evidence).where(eq(tables.evidence.runId, runId))
+      .orderBy(asc(tables.evidence.createdAt)).all()
+    const initialInventory = evidence.find(item => item.kind === 'inventory' && item.title === inventoryTitle)
     return {
-      run,
+      run: { ...run, candidates: this.linkLegacySources(run, initialInventory?.id) },
       project: this.project(run.projectId),
       assignments: this.workerList(runId),
       messages: this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
         .orderBy(asc(tables.messages.createdAt), asc(tables.messages.id)).all(),
-      evidence: this.db.select().from(tables.evidence).where(eq(tables.evidence.runId, runId))
-        .orderBy(asc(tables.evidence.createdAt)).all(),
+      evidence,
       reports: this.db.select().from(tables.reports).where(eq(tables.reports.runId, runId))
         .orderBy(desc(tables.reports.version)).all(),
       cursor: streamHead?.id ?? 0,
+    }
+  }
+
+  private linkLegacySources(run: Run, inventoryId: string | undefined) {
+    if (!inventoryId || run.candidates.every(asset => asset.sourceEvidenceId)) return run.candidates
+    try {
+      const records: unknown = JSON.parse(this.artifact(run.id, inventoryId).content)
+      if (!Array.isArray(records)) return run.candidates
+      const origins = new Set(records.map(record => record?.origin))
+      return run.candidates.map(asset => !asset.sourceEvidenceId && origins.has(asset.origin)
+        ? { ...asset, sourceEvidenceId: inventoryId } : asset)
+    } catch {
+      return run.candidates
     }
   }
 
@@ -398,15 +414,23 @@ export class Store {
       actorId: this.workspace.actorId, seeds: project.seeds,
     })
     const inventory = this.db.select().from(tables.projectAssets).where(eq(tables.projectAssets.projectId, run.projectId)).all()
-    this.updateRun(run.id, { candidates: inventory, phase: 'discovery', status: 'running' })
+    this.updateRun(run.id, { phase: 'discovery', status: 'running' })
     const worker = this.makeWorker(run, 'discovery', undefined, 'Asset inventory', 'Review supplied project records and attribute the candidate origins.')
-    this.addArtifact(run, worker, 'inventory', 'Supplied asset inventory', JSON.stringify(inventory.map(({ origin, thirdParty, source, dnsSource }) =>
-      ({ origin, thirdParty, source, ...(dnsSource ? { dnsSource } : {}) })), null, 2))
+    const initial = this.recordInventory(run, worker, inventoryTitle, inventory)
     this.updateWorker(worker.id, { status: 'complete', outcome: 'Reviewed supplied project records.' })
     this.message(run.id, worker.id, 'worker', `Recorded ${inventory.length} candidates from supplied project records.`)
-    this.updateRun(run.id, { phase: 'review', status: 'waiting' })
+    this.updateRun(run.id, {
+      phase: 'review', status: 'waiting',
+      candidates: inventory.map(asset => ({ ...asset, sourceEvidenceId: initial.id })),
+    })
     this.event(run.id, 'discovery.complete', 'Discovery complete. Review scope to continue.')
     this.message(run.id, run.coordinatorId, 'guardian', 'Review the candidate hosts before approving analysis.')
+  }
+
+  private recordInventory(run: Run, worker: Assignment, title: string, assets: readonly Candidate[]) {
+    const records = assets.map(({ origin, thirdParty, source, dnsSource }) =>
+      ({ origin, thirdParty, source, ...(dnsSource ? { dnsSource } : {}) }))
+    return this.addArtifact(run, worker, 'inventory', title, JSON.stringify(records, null, 2))
   }
 
   private setScope(run: Run, assetIds: string[], saveProject = false) {
@@ -541,8 +565,13 @@ export class Store {
           if (run.phase === 'complete') throw new Error('Add the host to the project for the next run.')
           if (run.candidates.some(candidate => candidate.origin === input.candidate.origin)) throw new Error('This host is already in the inventory.')
           const asset = this.saveCandidate(run.projectId, input.candidate, false)
-          this.updateRun(run.id, { candidates: [...run.candidates, asset] })
-          this.event(run.id, 'asset.candidate', 'Added a candidate host awaiting scope review.', { id: asset.id, origin: asset.origin })
+          const discovery = this.workerList(run.id).find(worker => worker.phase === 'discovery' && worker.assetId === null)
+          const source = discovery && this.recordInventory(run, discovery, 'Candidate source', [asset])
+          const candidate = source ? { ...asset, sourceEvidenceId: source.id } : asset
+          this.updateRun(run.id, { candidates: [...run.candidates, candidate] })
+          this.event(run.id, 'asset.candidate', 'Added a candidate host awaiting scope review.', {
+            id: asset.id, origin: asset.origin, actorId: this.workspace.actorId, sourceEvidenceId: source?.id,
+          })
           break
         }
         case 'revise':

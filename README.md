@@ -25,6 +25,8 @@ In **Report**, choose a version and open **Export**. **Markdown with evidence** 
 
 Use **Import DNS export** to bring in candidates from a local, self-contained zone file. The preview shows hosts from A, AAAA, and CNAME records and flags aliases to outside the zone. Guardian records host and source information, then puts the imported candidates into the next run's scope review for selection. [DNS master-file syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-5.1)
 
+For a host found during a run, use **Add candidate** and enter its source. Open the source record from the inventory row, then select the host in **Review scope** and save a new approval to include it in the run.
+
 The server binds to loopback. Set `PORT` to use a different port. Set `GUARDIAN_DATA_DIR` to choose a private data directory. Its default is `.guardian/`.
 
 ## Review access policy records

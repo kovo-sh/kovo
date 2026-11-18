@@ -75,6 +75,7 @@ export interface Candidate {
   origin: string
   source: string
   thirdParty: boolean
+  sourceEvidenceId?: string
   prepared?: PreparedObservation | null
   dnsSource?: DnsSource | null
   accessPolicy?: AccessPolicySnapshot | null

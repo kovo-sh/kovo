@@ -180,6 +180,69 @@ test('revokes a host while its real fixture connection is pending and discards t
   }
 })
 
+test('keeps candidate evidence with its host and starts its review after explicit approval', async ({ page }) => {
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-all', 'response-primary', 'response-healthy'], hold: primaryOrigin + '/',
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await reviewScope(page, { project: 'Northstar', seeds: [primaryOrigin], goal: allChecksGoal, live: true })
+    await saveScope(page)
+    await fixture.withheld
+
+    await page.getByRole('button', { name: 'Add candidate' }).click()
+    await page.getByLabel('Host', { exact: true }).fill(healthyOrigin)
+    await page.getByLabel('Source', { exact: true }).fill('Reviewed service inventory')
+    await page.getByRole('button', { name: 'Add for review' }).click()
+    const candidate = page.getByRole('row', { name: /healthy\.northstar\.example/ })
+    await expect(candidate).toContainText('excluded')
+    await page.reload()
+    await candidate.getByRole('button', { name: 'Reviewed service inventory ↗' }).click()
+    const source = page.getByRole('dialog')
+    await expect(source).toContainText(healthyOrigin)
+    await expect(source).toContainText('Reviewed service inventory')
+    await expect(source).toContainText('Scope revision 1')
+    await expect(source).not.toContainText(primaryOrigin)
+    await source.getByRole('button', { name: 'Close', exact: true }).click()
+
+    await page.getByRole('button', { name: 'Review scope' }).click()
+    const include = page.getByRole('checkbox', { name: 'Include healthy.northstar.example' })
+    await expect(include).not.toBeChecked()
+    await include.check()
+    await page.getByRole('button', { name: 'Save scope revision', exact: true }).click()
+    await expect(page.getByText('1 approved host · Revision 1')).toBeVisible()
+    expect(fixture.requested).toEqual([primaryOrigin + '/'])
+    await saveScope(page, 'Save scope revision')
+    await expect(page.getByText('2 approved hosts · Revision 2')).toBeVisible()
+    const requested = [primaryOrigin + '/', healthyOrigin + '/']
+    await expect.poll(() => fixture.requested).toEqual(requested)
+    fixture.release()
+
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('3 confirmed findings', { timeout: 18_000 })
+    await expect(report).toContainText('2 approved hosts · Scope revision 2')
+    await report.getByText('Checks for healthy.northstar.example', { exact: true }).click()
+    await expect(report.getByText('Meets baseline', { exact: true })).toHaveCount(3)
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const approvals = db.prepare("SELECT detail FROM events WHERE kind = 'scope.approved' ORDER BY id").all()
+        .map(row => JSON.parse(String(row.detail)).approved)
+      expect(approvals).toEqual([[primaryOrigin], [primaryOrigin, healthyOrigin]])
+    } finally {
+      db.close()
+    }
+    expect(fixture.requested).toEqual(requested)
+    expect(fixture.unexpected).toEqual([])
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
 test('resumes a saved observation after narrowing scope for an unrelated host', async ({ page }) => {
   const fixture = await fixtureServer({
     scenes: [...mainScenes, 'coordinator-status'], holdModel: 'response-primary:responses:0', hold: unavailableOrigin + '/',

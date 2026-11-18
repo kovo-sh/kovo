@@ -115,6 +115,28 @@ test('cancels an unresolved destination without dialing when DNS finishes', asyn
   lookup.resolve([publicAddress])
 })
 
+test('links legacy candidates only to inventory that contains their origin', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'guardian-candidate-sources-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const storage = new Store(directory)
+  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar] })
+  const { id: runId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Review the supplied inventory.', sourceMode: 'prepared' })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const [original] = storage.run(runId).candidates
+  const { id: laterId } = storage.addProjectAsset({
+    requestId: randomUUID(), projectId, origin: 'https://docs.northstar.example',
+    source: 'Later operator record', thirdParty: false,
+  })
+  const later = storage.projectDetail(projectId).assets.find(asset => asset.id === laterId)
+  assert.ok(later)
+  const { sourceEvidenceId, ...legacy } = original
+  assert.ok(sourceEvidenceId)
+  storage.updateRun(runId, { candidates: [legacy, later] })
+
+  assert.deepEqual(storage.runDetail(runId).run.candidates.map(asset => asset.sourceEvidenceId), [sourceEvidenceId, undefined])
+  assert.deepEqual(storage.run(runId).candidates, [legacy, later])
+})
+
 test('keeps reports tied to current approval and requires fresh verification after reapproval', t => {
   const directory = mkdtempSync(join(tmpdir(), 'guardian-approval-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))

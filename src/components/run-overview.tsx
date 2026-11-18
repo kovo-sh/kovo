@@ -29,7 +29,7 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
   const [selection, setSelection] = useState<string[] | null>(null)
   const selected = selection ?? initialSelection()
   const overLimit = selected.length > maxScopeHosts
-  const inventory = evidence.find(item => item.kind === 'inventory')
+  const inventoryIds = new Set(evidence.filter(item => item.kind === 'inventory').map(item => item.id))
 
   return <div className="overview-body">
     <ol className="phase-rail" aria-label="Run phases">
@@ -92,16 +92,21 @@ export function RunOverview({ detail, execute, openEvidence, pending, review, se
         <span className="muted">{run.candidates.length} discovered</span></div>
       <div className="table-scroll"><table>
         <thead><tr>{review && <th scope="col">Include</th>}<th scope="col">Host</th><th scope="col">Ownership evidence</th><th scope="col">Scope</th></tr></thead>
-        <tbody>{run.candidates.map(asset => <tr key={asset.id}>
-          {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
-            onCheckedChange={checked => setSelection(checked
-              ? [...selected, asset.id] : selected.filter(item => item !== asset.id))} /></td>}
-          <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}
-            {asset.accessPolicy && <small>Access policy records</small>}</td>
-          <td>{inventory ? <Button variant="ghost" className="text-button" onClick={() => openEvidence(inventory.id)}>{asset.source} ↗</Button> : asset.source}</td>
-          <td><Status status={run.approved.includes(asset.id) ? 'approved'
-            : !run.scopeRevision && !asset.thirdParty ? 'proposed' : 'excluded'} /></td>
-        </tr>)}</tbody>
+        <tbody>{run.candidates.map(asset => {
+          const sourceId = asset.sourceEvidenceId
+          return <tr key={asset.id}>
+            {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
+              onCheckedChange={checked => setSelection(checked
+                ? [...selected, asset.id] : selected.filter(item => item !== asset.id))} /></td>}
+            <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}
+              {asset.accessPolicy && <small>Access policy records</small>}</td>
+            <td>{sourceId && inventoryIds.has(sourceId)
+              ? <Button variant="ghost" className="text-button" onClick={() => openEvidence(sourceId)}>{asset.source} ↗</Button>
+              : asset.source}</td>
+            <td><Status status={run.approved.includes(asset.id) ? 'approved'
+              : !run.scopeRevision && !asset.thirdParty ? 'proposed' : 'excluded'} /></td>
+          </tr>
+        })}</tbody>
       </table></div>
       {review && <div className="scope-footer">
         {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}

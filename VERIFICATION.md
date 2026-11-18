@@ -5,10 +5,10 @@ Verified on November 18, 2026 using the TanStack Start production build, Chromiu
 | Check | Result |
 | --- | --- |
 | `npm run check` | TypeScript passed on Node.js 24.22.3. |
-| `npm run test:e2e` | Thirteen production browser tests passed. They cover both provider protocols through complete reports, a rejected key, passive DNS and access policy imports, scope approval and revision, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and output-limit recovery. |
-| `npm run test:boundaries` | Twelve tests passed. They cover plan and access case validation, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, process-level network isolation, container resource limits, and the worker's independent deadline. |
+| `npm run test:e2e` | Fourteen production browser tests passed. They cover both provider protocols through complete reports, a rejected key, passive DNS and access policy imports, candidate source evidence and scope changes, coordinator chat, worker deep links, recovery from interrupted calls, container cleanup after a crash, evidence exports, and output-limit recovery. |
+| `npm run test:boundaries` | Thirteen tests passed. They cover plan and access case validation, legacy inventory links, mixed DNS results, out-of-scope redirects, overlapping revocation, canceled resolution, verifier and export selection after a scope change, cross-host attribution, older observations, local Docker socket enforcement, read-only evidence, network isolation, resource limits, and the worker's independent deadline. |
 | `npm run benchmark:reports` | All 19 case verdicts matched across four report versions. All five confirmed findings supplied scoped evidence, worker comparisons, impact, and a fix check. |
-| GitHub Actions | The report benchmark commit passed on a fresh Ubuntu checkout, including the Docker worker build, twelve boundary tests, twelve production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `c63e140`](https://github.com/wwwillchen/guardian/actions/runs/44281999341) |
+| GitHub Actions | The Messages workflow commit passed on a fresh Ubuntu checkout, including the Docker worker build, twelve boundary tests, thirteen production browser tests, and all nineteen benchmark verdicts. [Hosted verification run for `746c032`](https://github.com/wwwillchen/guardian/actions/runs/44283178932) |
 | `npm run sample` | The 34-worker graph opened in light and dark at wide and narrow widths. Browser checks verified keyboard worker search, menu and dialog behavior, worker selection, read-only chat, and preservation of the scope and coordinator drafts. |
 
 ## Recorded provider and network fixtures
@@ -21,7 +21,9 @@ The production browser test replayed those streams and killed Guardian while the
 
 The production browser tests use a fresh workspace and local HTTP fixtures. They hold a broker response open while the operator revokes its host, then verify that the pending result never becomes evidence. A second test narrows scope and stops the server with a provider stream pending. Explicit resume reuses the saved response under the current approval, continues the original Pi Durable conversation, and completes the report after one broker request and one saved prompt for that host. Fixture credentials and response cookie values are absent from the matched model requests, saved transcripts, and exported reports.
 
-The DNS import test verifies candidate provenance, recognition of third-party aliases, explicit scope selection for imported hosts, and omission of raw address and TXT values from the inventory evidence. An offline copy of the existing Dyad workspace also migrated successfully and reopened its prior report and evidence.
+The DNS import test verifies candidate provenance, recognition of third-party aliases, explicit scope selection for imported hosts, and omission of raw address and TXT values from the inventory evidence. An offline copy of the Dyad workspace opened the legacy inventory evidence links and exported both reports with all three broker audit entries preserved.
+
+The browser added a second host while the first approved fixture response was pending. After a reload, the inventory row opened the second host's own source record. Selecting the host left the first approval in effect until the operator consented to the new scope. Each host was read once. The report covered both under revision 2, and the audit retained both approvals. A storage test verified that older candidates link to the original inventory only when their origin appears in it.
 
 ## Coordinator planning and recovery
 
