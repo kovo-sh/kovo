@@ -186,6 +186,11 @@ test('revokes a host while its real fixture connection is pending and discards t
     await expect(page.getByRole('heading', { name: 'Complete report' })).toBeVisible({ timeout: 18_000 })
     const report = page.getByRole('article', { name: 'Complete report' })
     await expect(report).not.toContainText('docs.northstar.example')
+    await page.getByRole('link', { name: 'Workflow', exact: true }).click()
+    await page.getByRole('link', { name: /^Trace/ }).click()
+    await page.getByRole('link', { name: 'Review docs.northstar.example, canceled, Host removed from scope' }).click()
+    await expect(page.getByRole('region', { name: 'Worker thread' })).toContainText('Host removed from scope')
+    await expect(page.getByRole('region', { name: 'Analysis', exact: true })).toContainText('1 of 1 complete · 1 earlier')
     const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
     try {
       expect(db.prepare(`SELECT count(*) AS n FROM evidence JOIN assignments ON evidence.assignment_id = assignments.id
@@ -610,6 +615,78 @@ test('replaces an in-flight plan after a goal revision and delegates only the se
     } finally {
       db.close()
     }
+  } finally {
+    await app.dispose()
+    await fixture.close()
+  }
+})
+
+test('keeps a superseded worker and its evidence available after a goal revision', async ({ page }) => {
+  const fixture = await fixtureServer({
+    scenes: ['connection', 'plan-all', 'response-primary', 'plan-referrer', 'response-referrer'],
+    holdModel: 'response-primary:responses:1',
+  })
+  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  try {
+    await app.start()
+    await page.goto(app.url)
+    await configureModel(page, fixture.origin + '/api/v1', fixtureCredential)
+    await reviewScope(page, { project: 'Northstar', seeds: [primaryOrigin], goal: allChecksGoal, live: true })
+    await saveScope(page)
+    await fixture.modelWithheld
+    await page.getByRole('link', { name: /^Trace/ }).click()
+    await page.getByRole('link', { name: 'Review northstar.example, running' }).click()
+    const worker = page.getByRole('region', { name: 'Worker thread' })
+    const derived = worker.getByRole('group', { name: 'Turn evidence' }).getByRole('button', { name: 'Derived evidence' })
+    await expect(derived).toBeVisible()
+    const originalLink = page.url()
+    const originalWorkerId = new URL(originalLink).pathname.split('/').at(-1)!
+
+    await page.getByRole('button', { name: 'Run actions', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'Revise goal' }).click()
+    await page.getByRole('textbox', { name: 'Revise goal' }).fill(referrerGoal)
+    await page.getByRole('button', { name: 'Save goal' }).click()
+    await expect.poll(() => fixture.heldModelClosed).toBe(true)
+    await expect(worker).toContainText('Earlier goal · Revision 0')
+    await expect(worker).toContainText('Superseded by a goal revision.')
+    await expect(derived).toBeVisible()
+
+    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    const report = page.getByRole('article', { name: 'Complete report' })
+    await expect(report).toContainText('Scope revision 1 · Goal revision 1', { timeout: 18_000 })
+    await expect(report).toContainText('1 confirmed finding')
+    await expect(report).toContainText('Planned checks · Referrer policy')
+    await expect(report).not.toContainText('HSTS max-age missing or disabled')
+    await expect(report).not.toContainText('MIME sniffing protection missing')
+    const { content } = await downloadReport(page, 'Markdown with evidence')
+    const db = new DatabaseSync(join(app.directory, 'guardian.sqlite'), { readOnly: true })
+    try {
+      const earlier = db.prepare('SELECT id FROM evidence WHERE assignment_id = ? AND kind = ?').get(originalWorkerId, 'analysis')
+      expect(typeof earlier?.id).toBe('string')
+      expect(content).not.toContain(String(earlier?.id))
+    } finally {
+      db.close()
+    }
+    expect(fixture.requested).toEqual([primaryOrigin + '/', primaryOrigin + '/'])
+    expect(fixture.accepted.filter(name => name.startsWith('plan-'))).toEqual(['plan-all:responses:0', 'plan-referrer:responses:0'])
+    expect(fixture.unexpected).toEqual([])
+
+    await app.stop('SIGKILL')
+    await app.start()
+    await page.goto(originalLink)
+    const earlierLink = page.getByRole('link', { name: 'Review northstar.example, canceled, Earlier goal · Revision 0' })
+    await expect(earlierLink).toHaveAttribute('data-historical', 'true')
+    await expect(earlierLink).toHaveAttribute('title', /Earlier goal · Revision 0/)
+    await expect(page.getByRole('region', { name: 'Analysis', exact: true })).toContainText('1 of 1 complete · 1 earlier')
+    await derived.click()
+    const evidence = page.getByRole('dialog', { name: 'Derived evidence' })
+    await expect(evidence).toContainText('Earlier goal · Revision 0')
+    await expect(evidence).toContainText('"exitStatus": 0')
+    await evidence.getByRole('button', { name: 'Close', exact: true }).click()
+    await page.getByRole('link', { name: 'Workflow', exact: true }).click()
+    const analysis = page.getByRole('list', { name: 'Run phases' }).getByRole('listitem')
+      .filter({ has: page.getByRole('heading', { name: 'Analysis', exact: true }) })
+    await expect(analysis).toContainText('1 worker')
   } finally {
     await app.dispose()
     await fixture.close()

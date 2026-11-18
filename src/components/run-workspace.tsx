@@ -1,7 +1,8 @@
 import { Link, useNavigate } from '@tanstack/react-router'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { commandRun, runData } from '../actions.ts'
+import { workerHistory } from '../domain.ts'
 import { FormError, Status, useAction } from './common.tsx'
 import { EvidenceDialog } from './evidence-dialog.tsx'
 import { RunOverview } from './run-overview.tsx'
@@ -26,6 +27,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   const [snapshot, setSnapshot] = useState<RunDetail>()
   const detail = snapshot && snapshot.cursor >= routeDetail.cursor ? snapshot : routeDetail
   const { run, project, assignments } = detail
+  const history = useMemo(() => workerHistory(run, assignments), [run, assignments])
   const navigate = useNavigate()
   const runId = run.id
   const refreshRun = useCallback(async () => {
@@ -55,6 +57,8 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   const threadId = worker?.id ?? run.coordinatorId
   const messages = detail.messages.filter(item => item.threadId === threadId)
   const attachments = detail.evidence.filter(item => item.assignmentId === worker?.id)
+  const workerHistoryLabel = worker && history.get(worker.id)
+  const artifactWorkerId = artifact && detail.evidence.find(item => item.id === artifact)?.assignmentId
 
   useEffect(() => {
     const events = new EventSource(`/api/runs/${runId}/events?since=${cursor.current}`)
@@ -221,10 +225,10 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
           <Link className="action-link primary" to="/settings" search={{ runId }}>Set up model</Link>
         </div>}
         <div hidden={view !== 'overview'}>
-          <RunOverview detail={detail} execute={execute} openEvidence={setArtifact} pending={action.pending} />
+          <RunOverview detail={detail} history={history} execute={execute} openEvidence={setArtifact} pending={action.pending} />
         </div>
         <div className="trace-holder" hidden={view !== 'trace'}>
-          <WorkflowTrace detail={detail} workerId={workerId} query={query} zoom={zoom} viewport={viewport} />
+          <WorkflowTrace detail={detail} history={history} workerId={workerId} query={query} zoom={zoom} viewport={viewport} />
         </div>
         {view === 'report' && <RunReport detail={detail} openEvidence={setArtifact} />}
       </section>
@@ -244,6 +248,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
               transition={{ duration: reducedMotion ? 0 : 0.18 }}>
               {worker && <header className="worker-intro">
                 <h2>{worker.title}</h2><p className="muted">{phaseNames[worker.phase]} · <Status status={worker.status} /></p>
+                {workerHistoryLabel && <p className="muted">{workerHistoryLabel}</p>}
                 {worker.outcome && <p className="outcome">{worker.outcome}</p>}
               </header>}
               <ThreadTranscript messages={messages} worker={worker} attachments={attachments} openEvidence={setArtifact} />
@@ -267,6 +272,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
         </motion.section>}
       </AnimatePresence>
     </div>
-    {artifact && <EvidenceDialog runId={run.id} artifactId={artifact} close={() => setArtifact(undefined)} />}
+    {artifact && <EvidenceDialog runId={run.id} artifactId={artifact}
+      historyLabel={artifactWorkerId ? history.get(artifactWorkerId) : undefined} close={() => setArtifact(undefined)} />}
   </main>
 }

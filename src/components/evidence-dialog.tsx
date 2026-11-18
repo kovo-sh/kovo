@@ -4,9 +4,10 @@ import { readArtifact } from '../actions.ts'
 import { Button } from './ui/button.tsx'
 import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog.tsx'
 
-export function EvidenceDialog({ runId, artifactId, close }: {
+export function EvidenceDialog({ runId, artifactId, historyLabel, close }: {
   runId: string
   artifactId: string
+  historyLabel?: string
   close: () => void
 }) {
   const [artifact, setArtifact] = useState<Awaited<ReturnType<typeof readArtifact>>>()
@@ -27,7 +28,7 @@ export function EvidenceDialog({ runId, artifactId, close }: {
         <DialogClose render={<Button />}>Close</DialogClose>
       </div>
       {error ? <p role="alert">{error}</p> : !artifact ? <p role="status">Loading evidence…</p> : <>
-        <p className="muted">Scope revision {artifact.scopeRevision}</p>
+        <p className="muted">Scope revision {artifact.scopeRevision}{historyLabel && ` · ${historyLabel}`}</p>
         <pre>{artifact.content}</pre>
         <Link className="text-button" to="/runs/$runId/workers/$workerId"
           params={{ runId, workerId: artifact.assignmentId }} search={{ view: 'trace' }} onClick={close}>Open worker thread ↗</Link>

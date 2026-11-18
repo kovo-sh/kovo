@@ -7,7 +7,7 @@ import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
-import { assessmentCheckTitles, canReviewScope } from '../domain.ts'
+import { assessmentCheckTitles, canReviewScope, workerHistory } from '../domain.ts'
 import type { Candidate, CheckCoverage, EvidenceSummary, ReportBody, RunCommand, SelectedChecks, WorkerPhase, importDnsInventory, newProject, newRun, projectAsset } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
@@ -610,9 +610,12 @@ export class Store {
           const questionId = this.message(run.id, run.coordinatorId, 'operator', input.message)
           this.event(run.id, 'coordinator.message', 'Coordinator message received.')
           if (run.status !== 'running') {
-            const count = this.workerList(run.id).filter(worker => worker.status === 'complete').length
+            const workers = this.workerList(run.id)
+            const history = workerHistory(run, workers)
+            const count = workers.filter(worker => worker.status === 'complete' && !history.has(worker.id)).length
+            const complete = count === 1 ? '1 assignment is complete.' : `${count} assignments are complete.`
             this.message(run.id, run.coordinatorId, 'guardian',
-              'The run is ' + run.status + '. ' + count + ' assignments are complete. See Workflow for the next available action.', questionId)
+              `The run is ${run.status}. ${complete} See Workflow for the next available action.`, questionId)
           } else if (!canUseModel) {
             this.message(run.id, run.coordinatorId, 'guardian',
               'This run needs a workspace model. Use Set up model in Workflow to continue.', questionId)

@@ -77,6 +77,34 @@ export type RunStatus = 'waiting' | 'running' | 'paused' | 'stopped' | 'failed' 
 export type WorkerPhase = 'discovery' | 'analysis' | 'verification'
 export type WorkerStatus = 'queued' | 'running' | 'paused' | 'complete' | 'canceled' | 'failed'
 
+export function workerHistory(
+  run: { goalRevision: number; scopeRevision: number; approved: readonly string[] },
+  workers: readonly { id: string; assetId: string | null; phase: WorkerPhase; goalRevision: number; scopeRevision: number }[],
+) {
+  const approved = new Set(run.approved)
+  const analysisRevisions = new Map<string, number>()
+  const history = new Map<string, string>()
+  for (const worker of workers) {
+    if (worker.phase === 'analysis' && worker.assetId && worker.goalRevision === run.goalRevision) {
+      const latest = analysisRevisions.get(worker.assetId) ?? 0
+      analysisRevisions.set(worker.assetId, Math.max(latest, worker.scopeRevision))
+    }
+  }
+  for (const worker of workers) {
+    if (worker.phase === 'discovery') continue
+    if (worker.goalRevision !== run.goalRevision) {
+      history.set(worker.id, `Earlier goal · Revision ${worker.goalRevision}`)
+    } else if (worker.assetId && run.scopeRevision > 0) {
+      if (!approved.has(worker.assetId)) {
+        history.set(worker.id, 'Host removed from scope')
+      } else if (worker.scopeRevision < (analysisRevisions.get(worker.assetId) ?? 0)) {
+        history.set(worker.id, `Earlier scope approval · Revision ${worker.scopeRevision}`)
+      }
+    }
+  }
+  return history
+}
+
 export function canReviewScope(phase: Phase, status: RunStatus) {
   return phase === 'review' ? status === 'waiting'
     : (phase === 'analysis' || phase === 'verification') && status !== 'complete' && status !== 'failed'

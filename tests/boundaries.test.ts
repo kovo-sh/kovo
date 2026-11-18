@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import { promisify } from 'node:util'
 import { RequestBroker } from '../src/server/broker.ts'
 import { accessPolicySnapshot } from '../src/access-policy.ts'
-import { assessmentCheckIds, preparedObservation } from '../src/domain.ts'
+import { assessmentCheckIds, preparedObservation, workerHistory } from '../src/domain.ts'
 import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
 import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
 import { responseEvidence, responseReview } from '../src/server/response-checks.ts'
@@ -235,6 +235,7 @@ test('keeps reports tied to current approval and requires fresh verification aft
   assert.throws(() => approve([primary.id, docs.id], 1), /Scope changed since you opened this review/)
   assert.deepEqual(storage.run(runId).approved, [primary.id])
   assert.equal(storage.run(runId).scopeRevision, 2)
+  assert.equal(workerHistory(storage.run(runId), storage.workerList(runId)).get(docsAnalysis.id), 'Host removed from scope')
   storage.writeReport(storage.run(runId), true)
   const restricted = storage.runDetail(runId).reports[0]
   assert.equal(restricted.body.findings.length, 0)
@@ -249,7 +250,13 @@ test('keeps reports tied to current approval and requires fresh verification aft
   const current = assessmentAssignments(storage.workerList(runId), primary.id, 0)
   assert.equal(current.analysis?.scopeRevision, 4)
   assert.equal(current.verification, undefined)
+  const earlierWork = workerHistory(storage.run(runId), storage.workerList(runId))
+  assert.equal(earlierWork.get(analysis.id), 'Earlier scope approval · Revision 1')
+  assert.equal(earlierWork.get(verification.id), 'Earlier scope approval · Revision 1')
+  assert.ok(current.analysis && !earlierWork.has(current.analysis.id))
   storage.command({ requestId: randomUUID(), runId, action: 'stop' })
+  storage.command({ requestId: randomUUID(), runId, action: 'message', message: 'Which assignments are complete?' })
+  assert.match(storage.runDetail(runId).messages.at(-1)?.content ?? '', /1 assignment is complete\./)
   const history = storage.runDetail(runId).reports
   const latest = history[0].body
   assert.equal(latest.findings.length, 0)

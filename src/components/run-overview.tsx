@@ -12,8 +12,9 @@ export type Command = RunCommand extends infer C
   ? C extends RunCommand ? Omit<C, 'requestId' | 'runId'> : never
   : never
 
-export function RunOverview({ detail, execute, openEvidence, pending }: {
+export function RunOverview({ detail, history, execute, openEvidence, pending }: {
   detail: RunDetail
+  history: ReadonlyMap<string, string>
   execute: (command: Command, onSuccess?: () => void) => void
   openEvidence: (id: string) => void
   pending: boolean
@@ -45,7 +46,7 @@ export function RunOverview({ detail, execute, openEvidence, pending }: {
   return <div className="overview-body">
     <ol className="phase-rail" aria-label="Run phases">
       {workerPhases.map(phase => {
-        const nodes = assignments.filter(worker => worker.phase === phase)
+        const nodes = assignments.filter(worker => worker.phase === phase && !history.has(worker.id))
         const settled = nodes.length > 0 && nodes.every(worker => ['complete', 'canceled'].includes(worker.status))
         const active = run.phase === phase && run.status === 'running' && (phase === 'discovery' || detail.hasModel)
         return <Fragment key={phase}>

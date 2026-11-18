@@ -227,6 +227,8 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .trace-node[data-worker-status=failed] i { background: var(--danger); }
 .trace-node[data-worker-status=paused] i { background: var(--attention); }
 .trace-node[data-worker-status=canceled] [data-slot=trace-title] { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--edge); }
+.trace-node[data-historical=true] [data-slot=trace-title] { color: var(--muted); }
+.trace-node [data-slot=trace-icon].trace-history { flex: 0 0 12px; color: var(--muted); font-size: 14px; line-height: 1; }
 .trace-empty { padding: 18px; color: var(--muted); font-size: 11px; }
 .chat-pane { display: flex; flex-direction: column; min-width: 0; padding: 0 10px 10px 20px; position: relative; max-height: 77dvh; }
 .chat-header { display: flex; gap: 12px; align-items: center; min-height: 44px; }

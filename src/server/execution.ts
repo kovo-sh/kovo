@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { and, asc, eq } from 'drizzle-orm'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
-import { responseCheckIds } from '../domain.ts'
+import { responseCheckIds, workerHistory } from '../domain.ts'
 import type { AssessmentCheckId, Candidate, CheckCoverage, Finding, ProviderSettings, ResponseCheckId } from '../domain.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
@@ -492,10 +492,12 @@ class Execution {
     }
     this.coordinator.set(run.id, task)
     const workers = this.storage.workerList(run.id)
+    const history = workerHistory(run, workers)
+    const current = workers.filter(worker => !history.has(worker.id))
     const prompt = coordinatorPrompt({
       phase: run.phase, status: run.status, approved: run.approved.length,
-      queued: workers.filter(worker => worker.status === 'queued').length,
-      complete: workers.filter(worker => worker.status === 'complete').length, question: next.content,
+      queued: current.filter(worker => worker.status === 'queued').length,
+      complete: current.filter(worker => worker.status === 'complete').length, question: next.content,
     })
     void agentTurn({
       directory: this.storage.directory, sessionId: run.coordinatorId,
