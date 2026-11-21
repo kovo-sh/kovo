@@ -1,4 +1,5 @@
 import { containsDestructivePayload } from '../replay-spec.ts'
+import type { BrowserBuiltinCheck } from '../replay-spec.ts'
 import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, Grant } from './broker.ts'
 import { personaSecrets } from './persona-vault.ts'
@@ -12,6 +13,29 @@ export interface BrowserSameSiteFetchRequest {
   credentials?: 'include' | 'same-origin' | 'omit'
 }
 
+export type BrowserInteractiveAction =
+  | { type: 'fill'; selector: string; value: string }
+  | { type: 'click'; selector: string }
+  | { type: 'select_option'; selector: string; value: string }
+  | { type: 'wait_for_selector'; selector: string; timeoutMs?: number }
+  | { type: 'wait_for_xhr'; urlPattern?: string; timeoutMs?: number }
+  | { type: 'evaluate_builtin'; builtinCheck: BrowserBuiltinCheck }
+  | { type: 'dom_xss_sink_hook' }
+
+export interface BrowserDomSinkTrace {
+  sink: 'innerHTML' | 'outerHTML' | 'document.write' | 'eval' | 'Function' | 'location.href' | 'postMessage'
+  preview: string
+  containsCanary: boolean
+  timestamp: number
+}
+
+export interface BrowserActionOutcome {
+  type: BrowserInteractiveAction['type']
+  ok: boolean
+  detail?: string
+  data?: Record<string, unknown>
+}
+
 export interface BrowserVisitRequest {
   origin: string
   pathAndQuery: string
@@ -22,6 +46,8 @@ export interface BrowserVisitRequest {
   postMessageOrigin?: string
   postMessagePayload?: unknown
   sameSiteFetch?: BrowserSameSiteFetchRequest
+  actions?: BrowserInteractiveAction[]
+  enableSinkHook?: boolean
   timeoutMs?: number
   waitAfterLoadMs?: number
   secrets?: readonly NamedSecret[]
@@ -100,6 +126,9 @@ export interface BrowserVisitResult {
     triggered: boolean
     detail: string | null
   }
+  domSinkTraces: BrowserDomSinkTrace[]
+  actionResults?: BrowserActionOutcome[]
+  builtinResults?: Record<string, Record<string, unknown>>
   selectorResult?: BrowserSelectorResult | null
   fetchResult?: BrowserFetchResult | null
   redirectSummary?: BrowserRedirectSummary
@@ -130,6 +159,10 @@ interface PlaywrightPage {
   on(event: 'pageerror', listener: (err: Error) => void): void
   goto(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }): Promise<{ status(): number } | null>
   waitForTimeout(ms: number): Promise<void>
+  fill?(selector: string, value: string, options?: { timeout?: number }): Promise<void>
+  click?(selector: string, options?: { timeout?: number }): Promise<void>
+  selectOption?(selector: string, values: string, options?: { timeout?: number }): Promise<string[]>
+  waitForSelector?(selector: string, options?: { timeout?: number }): Promise<unknown>
   url(): string
   title(): Promise<string>
   evaluate<T, A = undefined>(fn: (arg: A) => T | Promise<T>, arg?: A): Promise<T>
@@ -154,13 +187,13 @@ export interface ScopedBrowserOptions {
 
 const maxBrowserTimeoutMs = 30_000
 const maxDomSnippetChars = 16_384
+const maxInteractiveActions = 20
 const forbiddenBrowserForwardHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|connection|accept-encoding|sec-fetch-.*|sec-ch-.*)$/i
-const allowedMethods = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH'])
+const allowedMethods = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'])
 const safeReadOnlyFetchMethods = new Set(['GET', 'HEAD', 'OPTIONS'])
 const unsafeSelectorPattern = /[<>{};`\\]|javascript:/i
 
 async function launchChromium(): Promise<PlaywrightBrowserLike> {
-  // Prefer playwright-core if present, falling back cleanly to @playwright/test.
   try {
     const coreName = 'playwright-core'
     const coreMod = await import(/* @vite-ignore */ coreName) as { chromium?: { launch: (opts: Record<string, unknown>) => Promise<PlaywrightBrowserLike> } }
@@ -188,6 +221,7 @@ const postMessageInstrumentationScript = `
     observedEvents: 0,
     canaryObserved: false,
     domCanaryTriggered: false,
+    sinkTraces: [],
   };
   Object.defineProperty(window, '__guardianBrowserProbe', {
     value: state,
@@ -243,6 +277,119 @@ const postMessageInstrumentationScript = `
 })();
 `
 
+function buildDomSinkHookScript(canaryToken: string | null): string {
+  const tokenJson = JSON.stringify(canaryToken ?? '')
+  return `
+(() => {
+  const probe = window.__guardianBrowserProbe;
+  if (!probe || probe.__sinkHookInstalled) return;
+  probe.__sinkHookInstalled = true;
+  const canary = ${tokenJson};
+
+  const recordSink = (sink, raw) => {
+    try {
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+      const preview = String(text).slice(0, 400);
+      const containsCanary = Boolean(canary && preview.includes(canary)) || Boolean(canary && String(text).includes(canary));
+      if (probe.sinkTraces.length < 80) {
+        probe.sinkTraces.push({ sink, preview, containsCanary, timestamp: Date.now() });
+      }
+      if (containsCanary) {
+        probe.domCanaryTriggered = true;
+      }
+    } catch {}
+  };
+
+  const wrapSetter = (proto, prop, sinkName) => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(proto, prop);
+      if (d && d.set && d.configurable) {
+        Object.defineProperty(proto, prop, {
+          configurable: true,
+          enumerable: d.enumerable,
+          get() { return d.get ? d.get.call(this) : ''; },
+          set(val) {
+            recordSink(sinkName, val);
+            return d.set.call(this, val);
+          },
+        });
+      }
+    } catch {}
+  };
+
+  wrapSetter(Element.prototype, 'innerHTML', 'innerHTML');
+  wrapSetter(Element.prototype, 'outerHTML', 'outerHTML');
+
+  try {
+    const origWrite = document.write;
+    document.write = function(...args) {
+      recordSink('document.write', args.join(''));
+      return origWrite.apply(this, args);
+    };
+    const origWriteln = document.writeln;
+    document.writeln = function(...args) {
+      recordSink('document.write', args.join(''));
+      return origWriteln.apply(this, args);
+    };
+  } catch {}
+
+  try {
+    const origEval = window.eval;
+    window.eval = function(code) {
+      recordSink('eval', code);
+      return origEval.call(window, code);
+    };
+  } catch {}
+
+  try {
+    const OrigFunction = window.Function;
+    const WrappedFunction = function(...args) {
+      recordSink('Function', args.join(','));
+      return OrigFunction.apply(this, args);
+    };
+    WrappedFunction.prototype = OrigFunction.prototype;
+    window.Function = WrappedFunction;
+  } catch {}
+
+  try {
+    const origAssign = Location.prototype.assign;
+    if (typeof origAssign === 'function') {
+      Location.prototype.assign = function(url) {
+        recordSink('location.href', url);
+        return origAssign.call(this, url);
+      };
+    }
+    const origReplace = Location.prototype.replace;
+    if (typeof origReplace === 'function') {
+      Location.prototype.replace = function(url) {
+        recordSink('location.href', url);
+        return origReplace.call(this, url);
+      };
+    }
+    const hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+    if (hrefDesc && hrefDesc.set && hrefDesc.configurable) {
+      Object.defineProperty(Location.prototype, 'href', {
+        configurable: true,
+        get() { return hrefDesc.get ? hrefDesc.get.call(this) : ''; },
+        set(val) {
+          recordSink('location.href', val);
+          return hrefDesc.set.call(this, val);
+        },
+      });
+    }
+  } catch {}
+
+  try {
+    const origPostMessage = window.postMessage;
+    window.postMessage = function(message, targetOrigin, transfer) {
+      recordSink('postMessage', { message, targetOrigin });
+      return origPostMessage.apply(this, arguments);
+    };
+  } catch {}
+})();
+`
+}
+
 function collectSecrets(req: BrowserVisitRequest, grant: Grant): NamedSecret[] {
   const out: NamedSecret[] = []
   if (grant.personas) out.push(...personaSecrets(grant.personas))
@@ -271,6 +418,13 @@ function hasDestructiveInput(text: string): boolean {
     if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
   }
   return false
+}
+
+function validateSafeSelector(selector: string, origin: string, grant: Grant) {
+  if (!selector.trim() || selector.length > 256 || unsafeSelectorPattern.test(selector)) {
+    grant.audit('denied', origin)
+    throw new BrokerDenied('Browser selector must be a safe CSS selector.')
+  }
 }
 
 export class ScopedBrowser {
@@ -302,14 +456,25 @@ export class ScopedBrowser {
     }
 
     if (req.selector !== undefined) {
-      if (!req.selector.trim() || req.selector.length > 256 || unsafeSelectorPattern.test(req.selector)) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Browser selector must be a safe read-only CSS selector.')
-      }
+      validateSafeSelector(req.selector, initialOrigin, grant)
     }
     if (req.postMessagePayload !== undefined && hasDestructiveInput(JSON.stringify(req.postMessagePayload))) {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Browser postMessage payload blocked by destructive-payload denylist.')
+    }
+
+    // Validate all interactive actions up-front
+    const actions = (req.actions ?? []).slice(0, maxInteractiveActions)
+    for (const action of actions) {
+      if (action.type === 'fill' || action.type === 'select_option') {
+        validateSafeSelector(action.selector, initialOrigin, grant)
+        if (action.value.length > 2048 || hasDestructiveInput(action.value)) {
+          grant.audit('denied', initialOrigin)
+          throw new BrokerDenied(`Browser ${action.type} value blocked by destructive-payload denylist or length limit.`)
+        }
+      } else if (action.type === 'click' || action.type === 'wait_for_selector') {
+        validateSafeSelector(action.selector, initialOrigin, grant)
+      }
     }
 
     let validatedFetch: { url: string; origin: string; method: 'GET' | 'HEAD' | 'OPTIONS'; credentials: 'include' | 'same-origin' | 'omit' } | null = null
@@ -351,6 +516,7 @@ export class ScopedBrowser {
     const allRequests: BrowserXhrRecord[] = []
     const blockedOrigins = new Set<string>()
     const consoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
+    const xhrWaiters: Array<(rec: BrowserXhrRecord) => void> = []
 
     const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
     let context: PlaywrightContext | undefined
@@ -375,9 +541,18 @@ export class ScopedBrowser {
         javaScriptEnabled: true,
         bypassCSP: false,
         serviceWorkers: 'block',
-        userAgent: 'Guardian/2 scoped headless inspector',
+        userAgent: 'Guardian/3 scoped headless inspector',
       })
       await context.addInitScript(postMessageInstrumentationScript)
+
+      const shouldInstallSinkHook = Boolean(
+        req.enableSinkHook ||
+        req.checkKind === 'dom_xss' ||
+        actions.some(a => a.type === 'dom_xss_sink_hook'),
+      )
+      if (shouldInstallSinkHook) {
+        await context.addInitScript(buildDomSinkHookScript(req.canaryToken ?? null))
+      }
 
       // 100% network interception: every document, script, stylesheet, iframe, XHR, fetch, image, and redirect
       // is routed strictly through RequestBroker or aborted with blockedbyclient. Zero direct network egress!
@@ -423,8 +598,6 @@ export class ScopedBrowser {
         }
 
         const resourceType = request.resourceType()
-        // Never leak persona credentials to other origins unless explicitly authorized for a
-        // validated sameSiteFetch (credentials: 'include') AND present in persona.originAllowlist.
         let personaForRequest: string | undefined
         if (req.persona) {
           if (parsedUrl.origin === initialOrigin) {
@@ -442,7 +615,7 @@ export class ScopedBrowser {
         try {
           const exchange = await this.broker.executeHttp({
             origin: parsedUrl.origin,
-            method: method as 'GET' | 'HEAD' | 'OPTIONS' | 'POST' | 'PUT' | 'PATCH',
+            method: method as 'GET' | 'HEAD' | 'OPTIONS' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
             pathAndQuery: parsedUrl.pathname + parsedUrl.search,
             headers: forwardedHeaders,
             body: request.postData() ?? undefined,
@@ -466,6 +639,7 @@ export class ScopedBrowser {
           if (allRequests.length < 150) allRequests.push(reqRecord)
           if (resourceType === 'xhr' || resourceType === 'fetch') {
             xhrRequests.push(reqRecord)
+            for (const notify of xhrWaiters) notify(reqRecord)
           }
 
           await route.fulfill({
@@ -485,6 +659,7 @@ export class ScopedBrowser {
           if (allRequests.length < 150) allRequests.push(failedRecord)
           if (resourceType === 'xhr' || resourceType === 'fetch') {
             xhrRequests.push(failedRecord)
+            for (const notify of xhrWaiters) notify(failedRecord)
           }
           await route.abort('blockedbyclient').catch(() => undefined)
         }
@@ -515,6 +690,160 @@ export class ScopedBrowser {
       })
       deadline.throwIfAborted()
 
+      // Execute safe interactive actions (still 100% broker-proxied)
+      const actionResults: BrowserActionOutcome[] = []
+      const builtinResults: Record<string, Record<string, unknown>> = {}
+
+      for (const action of actions) {
+        deadline.throwIfAborted()
+        const remainingMs = Math.max(500, timeoutMs - (Date.now() - started))
+        try {
+          if (action.type === 'dom_xss_sink_hook') {
+            actionResults.push({ type: 'dom_xss_sink_hook', ok: true, detail: 'DOM XSS sink hook active.' })
+          } else if (action.type === 'fill') {
+            if (typeof page.fill === 'function') {
+              await page.fill(action.selector, action.value, { timeout: Math.min(5_000, remainingMs) })
+            } else {
+              await page.evaluate(({ selector, value }) => {
+                const el = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null
+                if (!el) throw new Error(`Element not found: ${selector}`)
+                el.value = value
+                el.dispatchEvent(new Event('input', { bubbles: true }))
+                el.dispatchEvent(new Event('change', { bubbles: true }))
+              }, { selector: action.selector, value: action.value })
+            }
+            actionResults.push({ type: 'fill', ok: true, detail: `Filled ${action.selector}` })
+          } else if (action.type === 'click') {
+            if (typeof page.click === 'function') {
+              await page.click(action.selector, { timeout: Math.min(5_000, remainingMs) })
+            } else {
+              await page.evaluate((selector) => {
+                const el = document.querySelector(selector) as HTMLElement | null
+                if (!el) throw new Error(`Element not found: ${selector}`)
+                el.click()
+              }, action.selector)
+            }
+            actionResults.push({ type: 'click', ok: true, detail: `Clicked ${action.selector}` })
+          } else if (action.type === 'select_option') {
+            if (typeof page.selectOption === 'function') {
+              await page.selectOption(action.selector, action.value, { timeout: Math.min(5_000, remainingMs) })
+            } else {
+              await page.evaluate(({ selector, value }) => {
+                const el = document.querySelector(selector) as HTMLSelectElement | null
+                if (!el) throw new Error(`Element not found: ${selector}`)
+                el.value = value
+                el.dispatchEvent(new Event('change', { bubbles: true }))
+              }, { selector: action.selector, value: action.value })
+            }
+            actionResults.push({ type: 'select_option', ok: true, detail: `Selected option on ${action.selector}` })
+          } else if (action.type === 'wait_for_selector') {
+            const waitTimeout = Math.min(action.timeoutMs ?? 5_000, remainingMs)
+            if (typeof page.waitForSelector === 'function') {
+              await page.waitForSelector(action.selector, { timeout: waitTimeout })
+            } else {
+              const found = await page.evaluate((selector) => Boolean(document.querySelector(selector)), action.selector)
+              if (!found) throw new Error(`Selector not found: ${action.selector}`)
+            }
+            actionResults.push({ type: 'wait_for_selector', ok: true, detail: `Matched ${action.selector}` })
+          } else if (action.type === 'wait_for_xhr') {
+            const waitTimeout = Math.min(action.timeoutMs ?? 5_000, remainingMs)
+            const matches = (r: BrowserXhrRecord) => !action.urlPattern || r.url.includes(action.urlPattern)
+            const existing = xhrRequests.find(matches)
+            if (existing) {
+              actionResults.push({ type: 'wait_for_xhr', ok: true, detail: `Matched XHR ${existing.method} ${existing.url}` })
+            } else {
+              const matched = await new Promise<BrowserXhrRecord | null>((resolve) => {
+                const timer = setTimeout(() => {
+                  const idx = xhrWaiters.indexOf(onXhr)
+                  if (idx >= 0) xhrWaiters.splice(idx, 1)
+                  resolve(null)
+                }, waitTimeout)
+                const onXhr = (rec: BrowserXhrRecord) => {
+                  if (matches(rec)) {
+                    clearTimeout(timer)
+                    const idx = xhrWaiters.indexOf(onXhr)
+                    if (idx >= 0) xhrWaiters.splice(idx, 1)
+                    resolve(rec)
+                  }
+                }
+                xhrWaiters.push(onXhr)
+              })
+              actionResults.push({
+                type: 'wait_for_xhr',
+                ok: Boolean(matched),
+                detail: matched ? `Observed XHR ${matched.method} ${matched.url}` : 'Timed out waiting for matching XHR.',
+              })
+            }
+          } else if (action.type === 'evaluate_builtin') {
+            // Strictly Guardian-authored read-only DOM/sink inspectors (never arbitrary JS!)
+            const data = await page.evaluate((opts: { check: BrowserBuiltinCheck; canaryToken: string | null }) => {
+              const probe = (window as unknown as {
+                __guardianBrowserProbe?: {
+                  handlers: Array<{ preview: string; checksOrigin: boolean }>
+                  hasOnMessage: boolean
+                  observedEvents: number
+                  sinkTraces?: BrowserDomSinkTrace[]
+                }
+              }).__guardianBrowserProbe
+
+              if (opts.check === 'dom_sinks') {
+                return {
+                  sinkTraces: (probe?.sinkTraces ?? []).slice(0, 50),
+                  inlineScriptsCount: document.querySelectorAll('script:not([src])').length,
+                  eventHandlerAttrsCount: document.querySelectorAll('[onclick],[onerror],[onload],[onmouseover]').length,
+                }
+              }
+              if (opts.check === 'forms_inventory') {
+                return {
+                  forms: Array.from(document.querySelectorAll('form')).slice(0, 30).map(form => ({
+                    action: form.getAttribute('action') || '',
+                    method: (form.getAttribute('method') || 'GET').toUpperCase(),
+                    hasCsrfInput: Boolean(form.querySelector('input[name*="csrf" i], input[name*="token" i], input[name*="nonce" i]')),
+                  })),
+                }
+              }
+              if (opts.check === 'storage_keys') {
+                let ls: string[] = []
+                let ss: string[] = []
+                try { ls = Object.keys(window.localStorage).slice(0, 64) } catch { /* ignore */ }
+                try { ss = Object.keys(window.sessionStorage).slice(0, 64) } catch { /* ignore */ }
+                return { localStorageKeys: ls, sessionStorageKeys: ss }
+              }
+              if (opts.check === 'postmessage_audit') {
+                return {
+                  count: probe?.handlers.length ?? 0,
+                  hasOnMessage: Boolean(probe?.hasOnMessage),
+                  uncheckedCount: (probe?.handlers ?? []).filter(h => !h.checksOrigin).length,
+                }
+              }
+              if (opts.check === 'canary_presence') {
+                const token = opts.canaryToken ?? ''
+                const html = document.documentElement?.outerHTML ?? ''
+                return {
+                  canaryToken: token || null,
+                  presentInHtml: Boolean(token && html.includes(token)),
+                  presentInSinkTraces: Boolean(token && (probe?.sinkTraces ?? []).some(t => t.containsCanary)),
+                }
+              }
+              return {
+                title: document.title.slice(0, 300),
+                readyState: document.readyState,
+                iframeCount: document.querySelectorAll('iframe').length,
+              }
+            }, { check: action.builtinCheck, canaryToken: req.canaryToken ?? null })
+            const safeData = JSON.parse(redact(JSON.stringify(data), secrets)) as Record<string, unknown>
+            builtinResults[action.builtinCheck] = safeData
+            actionResults.push({ type: 'evaluate_builtin', ok: true, detail: action.builtinCheck, data: safeData })
+          }
+        } catch (err) {
+          actionResults.push({
+            type: action.type,
+            ok: false,
+            detail: redact(err instanceof Error ? err.message : String(err), secrets).slice(0, 300),
+          })
+        }
+      }
+
       const settleMs = Math.min(req.waitAfterLoadMs ?? 800, Math.max(100, timeoutMs - (Date.now() - started) - 1000))
       if (settleMs > 0) {
         await page.waitForTimeout(settleMs)
@@ -537,6 +866,8 @@ export class ScopedBrowser {
             hasOnMessage: boolean
             observedEvents: number
             canaryObserved: boolean
+            domCanaryTriggered?: boolean
+            sinkTraces?: BrowserDomSinkTrace[]
           }
         }).__guardianBrowserProbe
 
@@ -603,8 +934,16 @@ export class ScopedBrowser {
           }
         }
 
+        const sinkTraces = (probe?.sinkTraces ?? []).slice(0, 80)
+        const sinkCanaryHit = sinkTraces.find(t => t.containsCanary)
+        if (sinkCanaryHit || probe?.domCanaryTriggered) {
+          canaryTriggered = true
+          canaryDetail = sinkCanaryHit
+            ? `Canary reached executable DOM sink "${sinkCanaryHit.sink}".`
+            : 'Canary triggered DOM XSS sink hook.'
+        }
+
         if (!canaryTriggered && opts.canaryToken) {
-          // Check for unescaped DOM sink injection (element attribute/tag matching canary) or explicit DOM canary flag.
           const markerEl = document.querySelector(`[data-guardian-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
           const globalFlag = Boolean((window as unknown as Record<string, unknown>).__guardianDomCanary === opts.canaryToken)
           if (markerEl || globalFlag) {
@@ -683,6 +1022,7 @@ export class ScopedBrowser {
           },
           canaryTriggered,
           canaryDetail,
+          sinkTraces,
           selectorResult,
           fetchResult,
         }
@@ -729,6 +1069,11 @@ export class ScopedBrowser {
           }
         : null
 
+      const safeSinkTraces: BrowserDomSinkTrace[] = (snapshot.sinkTraces ?? []).map(t => ({
+        ...t,
+        preview: redact(t.preview, secrets).slice(0, 400),
+      }))
+
       return {
         origin: initialOrigin,
         finalUrl,
@@ -756,6 +1101,9 @@ export class ScopedBrowser {
           triggered: snapshot.canaryTriggered,
           detail: snapshot.canaryDetail,
         },
+        domSinkTraces: safeSinkTraces,
+        ...(actionResults.length > 0 ? { actionResults } : {}),
+        ...(Object.keys(builtinResults).length > 0 ? { builtinResults } : {}),
         selectorResult: safeSelectorResult,
         fetchResult: safeFetchResult,
         redirectSummary,

@@ -1,0 +1,18 @@
+id: django-debug-mode-enabled
+name: "Django DEBUG=True technical 404 page"
+severity: medium
+description: "A nonexistent route renders Django's debug 404 page listing URL patterns, indicating DEBUG=True in a reachable deployment."
+tech: [django]
+tags: [debug, misconfig]
+cwe: CWE-489
+request:
+  method: GET
+  path: "/guardian-none-{{rand}}/"
+control:
+  path: /
+matchers-condition: and
+matchers:
+  - type: word
+    part: body
+    words: ["DEBUG = True", "URLconf defined in"]
+    condition: or

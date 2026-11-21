@@ -251,7 +251,11 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
           if (targetHost === 'https://northstar.example') {
             calls.push({
               name: 'propose_chain_finding',
-              args: { replaySpec: cveReplaySpec },
+              args: {
+                replaySpec: cveReplaySpec,
+                counterevidence: 'An upstream WAF or reverse proxy could strip x-middleware-subrequest before Next.js processes the request, or /api/admin/bypass could enforce secondary route-handler auth.',
+                confidenceRationale: 'Control request without x-middleware-subrequest returns HTTP 401 while the probe with x-middleware-subrequest returns HTTP 200 with admin_bypass_confirmed, and SPA catch-all control returns HTTP 404.',
+              },
             })
           }
           calls.push({

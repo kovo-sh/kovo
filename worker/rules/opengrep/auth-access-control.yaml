@@ -1,0 +1,132 @@
+rules:
+  - id: guardian.js.jwt-none-or-unverified
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "Insecure JWT verification: alg=none allowed or jwt.decode used without signature verification."
+    metadata:
+      cwe: "CWE-347"
+    pattern-either:
+      - pattern: |
+          jwt.verify($TOK, $KEY, { ..., algorithms: [..., "none", ...], ... })
+      - pattern: |
+          jwt.verify($TOK, $KEY, { ..., algorithms: [..., 'none', ...], ... })
+
+  - id: guardian.py.jwt-unverified
+    languages: [python]
+    severity: ERROR
+    message: "JWT signature verification disabled in PyJWT decode()."
+    metadata:
+      cwe: "CWE-347"
+    pattern-either:
+      - pattern: |
+          jwt.decode($TOK, ..., options={..., "verify_signature": False, ...}, ...)
+      - pattern: |
+          jwt.decode($TOK, ..., verify=False, ...)
+
+  - id: guardian.js.cors-reflect-credentials
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "Insecure CORS configuration reflecting arbitrary Origin with credentials enabled."
+    metadata:
+      cwe: "CWE-942"
+    pattern-either:
+      - pattern: |
+          $RES.setHeader("Access-Control-Allow-Origin", $REQ.headers.origin)
+      - pattern: |
+          $RES.setHeader('Access-Control-Allow-Origin', $REQ.headers.origin)
+      - pattern: |
+          $RES.header("Access-Control-Allow-Origin", $REQ.headers.origin)
+      - pattern: |
+          cors({ ..., origin: true, credentials: true, ... })
+
+  - id: guardian.js.open-redirect
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "Potential open redirect: unvalidated request parameter passed to res.redirect()."
+    metadata:
+      cwe: "CWE-601"
+    pattern-either:
+      - pattern: |
+          $RES.redirect($REQ.query.$PARAM)
+      - pattern: |
+          $RES.redirect($REQ.body.$PARAM)
+
+  - id: guardian.js.ssrf-fetch-req
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "Potential SSRF: user-controlled request parameter passed directly to outbound HTTP client."
+    metadata:
+      cwe: "CWE-918"
+    pattern-either:
+      - pattern: |
+          fetch($REQ.query.$PARAM, ...)
+      - pattern: |
+          fetch($REQ.body.$PARAM, ...)
+      - pattern: |
+          axios.get($REQ.query.$PARAM, ...)
+      - pattern: |
+          axios.get($REQ.body.$PARAM, ...)
+      - pattern: |
+          axios.post($REQ.body.$PARAM, ...)
+
+  - id: guardian.py.ssrf-requests
+    languages: [python]
+    severity: ERROR
+    message: "Potential SSRF: dynamic request parameter passed to outbound requests call."
+    metadata:
+      cwe: "CWE-918"
+    pattern-either:
+      - pattern: |
+          requests.get(request.args.get(...), ...)
+      - pattern: |
+          requests.get(request.json.get(...), ...)
+      - pattern: |
+          requests.post(request.json.get(...), ...)
+
+  - id: guardian.js.mass-assignment
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "Potential mass assignment: raw req.body passed directly into model create/update."
+    metadata:
+      cwe: "CWE-915"
+    pattern-either:
+      - pattern: |
+          $MODEL.create($REQ.body)
+      - pattern: |
+          $MODEL.update($REQ.body, ...)
+      - pattern: |
+          $MODEL.findByIdAndUpdate($ID, $REQ.body, ...)
+
+  - id: guardian.js.header-auth-bypass
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "Suspicious client-controlled bypass header checked in authentication/authorization logic."
+    metadata:
+      cwe: "CWE-287"
+    pattern-either:
+      - pattern: |
+          $REQ.headers["x-internal-bypass"]
+      - pattern: |
+          $REQ.headers['x-internal-bypass']
+      - pattern: |
+          $REQ.headers["x-middleware-subrequest"]
+      - pattern: |
+          $REQ.headers['x-middleware-subrequest']
+      - pattern: |
+          $REQ.headers["x-forwarded-user"]
+      - pattern: |
+          $REQ.headers['x-forwarded-user']
+
+  - id: guardian.js.tls-reject-unauthorized-false
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "TLS certificate verification disabled (rejectUnauthorized: false)."
+    metadata:
+      cwe: "CWE-295"
+    pattern-either:
+      - pattern: |
+          { ..., rejectUnauthorized: false, ... }
+      - pattern: |
+          process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+      - pattern: |
+          process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'

@@ -7,6 +7,7 @@ import {
   id,
   importDnsInventory,
   importProjectSpec,
+  labConfigSchema,
   newProject,
   newRun,
   projectAsset,
@@ -30,6 +31,7 @@ import {
   listProjectPersonas,
 } from './server/persona-vault.ts'
 import { exportReportMarkdown } from './server/report-export.ts'
+import { exportReportSarif } from './server/sarif-export.ts'
 import { store } from './server/store.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => ({
@@ -197,3 +199,26 @@ export const readGraphDigest = createServerFn({ method: 'GET' })
 export const downloadReportMarkdown = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id, reportId: id }))
   .handler(({ data }) => exportReportMarkdown(store(), data.runId, data.reportId))
+
+export const exportSarifAction = createServerFn({ method: 'GET' })
+  .validator(z.object({ runId: id, reportId: id.optional() }))
+  .handler(({ data }) => {
+    const res = exportReportSarif(store(), data.runId, data.reportId)
+    return { filename: res.filename, content: res.content }
+  })
+
+export const generatePatchAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    runId: id,
+    findingId: id,
+    repo: z.string().trim().min(1).max(200).optional(),
+  }))
+  .handler(async ({ data }) => execution().runPatchWorkflow(data.runId, data.findingId, data.repo))
+
+export const updateProjectLabConfigAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    labConfig: labConfigSchema.nullable(),
+  }))
+  .handler(({ data }) => store().updateProjectLabConfig(data))

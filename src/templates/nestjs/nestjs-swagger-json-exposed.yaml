@@ -1,0 +1,21 @@
+id: nestjs-swagger-json-exposed
+name: "NestJS Swagger JSON exposed"
+severity: low
+description: "The NestJS Swagger document is reachable at /api-json."
+tech: [nestjs, swagger]
+tags: [exposure, api-docs]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /api-json
+control:
+  path: "/api-json-guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"openapi"', '"swagger"']
+    condition: or

@@ -1,0 +1,18 @@
+id: nginx-status-exposed
+name: "nginx stub_status exposed"
+severity: low
+description: "The nginx status page is publicly reachable and discloses connection counters."
+tech: [nginx]
+tags: [exposure, status]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /nginx_status
+control:
+  path: "/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: word
+    part: body
+    words: ["Active connections"]

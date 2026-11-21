@@ -1,0 +1,20 @@
+id: git-config-exposed
+name: "Git repository metadata exposed"
+severity: high
+description: "The .git/config file is publicly reachable, indicating the repository directory is served."
+tech: [generic]
+tags: [exposure, vcs]
+cwe: CWE-527
+request:
+  method: GET
+  path: /.git/config
+control:
+  path: "/.git/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["[core]", "repositoryformatversion"]
+    condition: or

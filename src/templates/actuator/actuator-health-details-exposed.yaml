@@ -1,0 +1,18 @@
+id: actuator-health-details-exposed
+name: "Actuator health details exposed"
+severity: low
+description: "The health endpoint discloses component details such as database and disk status."
+tech: [springboot]
+tags: [actuator, exposure]
+cwe: CWE-200
+request:
+  method: GET
+  path: /actuator/health
+control:
+  path: "/actuator/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: word
+    part: body
+    words: ['"components"', '"diskSpace"', '"db"']
+    condition: or

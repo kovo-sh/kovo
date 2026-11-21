@@ -1,0 +1,21 @@
+id: phpinfo-exposed
+name: "phpinfo() page exposed"
+severity: medium
+description: "A phpinfo page discloses PHP configuration, modules and environment details."
+tech: [php]
+tags: [exposure, debug]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /phpinfo.php
+control:
+  path: "/guardian-none-{{rand}}.php"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["PHP Version", "phpinfo()"]
+    condition: or

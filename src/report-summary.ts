@@ -1,5 +1,16 @@
 import { assessmentCheckTitles } from './domain.ts'
-import type { CapabilityTier, CheckCoverage, Finding, OwaspCategory, ReportBody, SelectedChecks } from './domain.ts'
+import type {
+  CallerCompatibility,
+  CapabilityTier,
+  CheckCoverage,
+  DynamicRetestVerdict,
+  Finding,
+  OwaspCategory,
+  PatchProposalStatus,
+  ReportBody,
+  SelectedChecks,
+  VerificationTier,
+} from './domain.ts'
 
 export const checkLabels: Record<CheckCoverage['status'], string> = {
   met: 'Meets baseline',
@@ -31,7 +42,43 @@ export const findingSeverityOrder: Record<Finding['severity'], number> = {
 }
 
 export const findingStatusOrder: Record<Finding['status'], number> = {
-  confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3,
+  confirmed: 0, static_verified: 1, pending: 2, inconclusive: 3, dismissed: 4,
+}
+
+export const verificationTierLabels: Record<VerificationTier, string> = {
+  runtime_confirmed: 'Runtime Confirmed',
+  static_verified: 'Static Verified',
+  baseline_confirmed: 'Baseline Confirmed',
+}
+
+export const patchStatusLabels: Record<PatchProposalStatus, string> = {
+  draft: 'Draft',
+  approved: 'Approved',
+  rejected: 'Rejected',
+  withheld: 'Withheld',
+}
+
+export const callerCompatibilityLabels: Record<CallerCompatibility, string> = {
+  attacker_only: 'Refuses attacker only',
+  needs_operator_step: 'Needs operator step',
+  breaks_callers: 'Breaks legitimate callers',
+}
+
+export const dynamicRetestLabels: Record<DynamicRetestVerdict, string> = {
+  fixed: 'Dynamic retest: Fixed',
+  reproduced: 'Dynamic retest: Reproduced',
+  skipped: 'Dynamic retest: Skipped',
+}
+
+export function findingVerificationTier(
+  finding: Pick<Finding, 'status' | 'verificationTier' | 'findingKind'>,
+): VerificationTier | undefined {
+  if (finding.verificationTier) return finding.verificationTier
+  if (finding.status === 'static_verified') return 'static_verified'
+  if (finding.status === 'confirmed') {
+    return finding.findingKind === 'baseline_check' ? 'baseline_confirmed' : 'runtime_confirmed'
+  }
+  return undefined
 }
 
 export const HEADER_HYGIENE_CHECK_IDS = [
@@ -95,11 +142,13 @@ export function mergeChainFindings(existing: Finding, incoming: Finding): Findin
   const existingRank = findingStatusOrder[existing.status]
   const incomingRank = findingStatusOrder[incoming.status]
   const preferIncoming = incomingRank < existingRank ||
-    (incomingRank === existingRank && existing.status !== 'confirmed')
+    (incomingRank === existingRank && existing.status !== 'confirmed' && existing.status !== 'static_verified')
   const primary = preferIncoming ? incoming : existing
   const secondary = preferIncoming ? existing : incoming
+  const primaryVerified = primary.status === 'confirmed' || primary.status === 'static_verified'
+  const secondaryVerified = secondary.status === 'confirmed' || secondary.status === 'static_verified'
   const bestSeverity: Finding['severity'] =
-    primary.status === 'confirmed' && secondary.status !== 'confirmed'
+    primaryVerified && !secondaryVerified
       ? primary.severity
       : findingSeverityOrder[incoming.severity] < findingSeverityOrder[existing.severity]
         ? incoming.severity
@@ -108,6 +157,7 @@ export function mergeChainFindings(existing: Finding, incoming: Finding): Findin
   const evidenceIds = [...new Set([...existing.evidenceIds, ...incoming.evidenceIds])]
   const exchangeIds = [...new Set([...(existing.exchangeIds ?? []), ...(incoming.exchangeIds ?? [])])]
   const chainFactIds = [...new Set([...(existing.chainFactIds ?? []), ...(incoming.chainFactIds ?? [])])]
+  const codeLocations = primary.codeLocations?.length ? primary.codeLocations : secondary.codeLocations
 
   return {
     ...secondary,
@@ -116,6 +166,14 @@ export function mergeChainFindings(existing: Finding, incoming: Finding): Findin
     severity: bestSeverity,
     findingKind: 'multi_step_chain',
     replaySpecId: primary.replaySpecId ?? secondary.replaySpecId,
+    verificationTier: primary.verificationTier ?? secondary.verificationTier,
+    fingerprintHash: primary.fingerprintHash ?? secondary.fingerprintHash,
+    supersededByFindingId: primary.supersededByFindingId ?? secondary.supersededByFindingId,
+    counterevidence: primary.counterevidence ?? secondary.counterevidence,
+    confidenceRationale: primary.confidenceRationale ?? secondary.confidenceRationale,
+    severityChangeConditions: primary.severityChangeConditions ?? secondary.severityChangeConditions,
+    runtimeProofGap: primary.runtimeProofGap ?? secondary.runtimeProofGap,
+    ...(codeLocations?.length ? { codeLocations } : {}),
     evidenceIds,
     ...(exchangeIds.length ? { exchangeIds } : {}),
     ...(chainFactIds.length ? { chainFactIds } : {}),
@@ -291,13 +349,16 @@ export function reportHighlights(body: ReportBody) {
   const coverage = coverageParts.join(' · ')
 
   const scopedFindings = collapseBaselineHeaderFindings(
-    deduplicateChainFindings(body.findings.filter(item => scope.has(item.origin))),
+    deduplicateChainFindings(body.findings.filter(item =>
+      scope.has(item.origin) || item.status === 'static_verified' || item.verificationTier === 'static_verified',
+    )),
   ).findings
   const confirmed = scopedFindings.filter(item => item.status === 'confirmed')
+  const staticVerified = scopedFindings.filter(item => item.status === 'static_verified')
   const chainConfirmed = confirmed.filter(item => item.findingKind === 'multi_step_chain').length
   const headerPostureCount = confirmed.filter(item => isConsolidatedHeaderPostureFinding(item)).length
   const prominentConfirmed = confirmed.filter(item => !isConsolidatedHeaderPostureFinding(item))
-  const priorityPool = prominentConfirmed.length ? prominentConfirmed : confirmed
+  const priorityPool = prominentConfirmed.length ? prominentConfirmed : (confirmed.length ? confirmed : staticVerified)
   const first = priorityPool.reduce<Finding | undefined>((highest, finding) => {
     if (!highest || findingSeverityOrder[finding.severity] < findingSeverityOrder[highest.severity]) return finding
     return highest
@@ -310,11 +371,17 @@ export function reportHighlights(body: ReportBody) {
           ' findings share top priority. Start with ' + first.title + '.',
         finding: first,
       })
+  const openProofGapsCount = body.openProofGaps?.length ??
+    (body.owaspCoverage?.filter(entry => entry.status === 'needs_follow_up').length ?? 0)
+  const approvedPatchesCount = body.patchProposals?.filter(p => p.status === 'approved').length ?? 0
   return {
     coverage,
     confirmed: confirmed.length,
+    staticVerified: staticVerified.length,
     chainConfirmed,
     headerPostureCount,
+    openProofGapsCount,
+    approvedPatchesCount,
     threatModelHosts: body.threatModel?.length ?? 0,
     owaspTracked: owaspCount,
     priority,

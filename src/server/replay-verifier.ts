@@ -3,6 +3,7 @@ import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import { diffResponse, dnsTakeoverAnalyze } from '../../worker/analyzers.ts'
+import type { VerificationTier } from '../domain.ts'
 import {
   containsDestructivePayload,
   declarativeReplaySpecSchema,
@@ -10,14 +11,16 @@ import {
   replaySpecOrigins,
 } from '../replay-spec.ts'
 import type { DeclarativeReplaySpec, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
-import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from './broker.ts'
+import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker, websocketResultToExchange } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
+import type { BrowserDomSinkTrace, BrowserInteractiveAction } from './scoped-browser.ts'
+import { responseSimilarity } from './surface-engine.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
-export type ReplayVerdict = 'confirmed' | 'dismissed' | 'inconclusive'
+export type ReplayVerdict = 'confirmed' | 'static_verified' | 'dismissed' | 'inconclusive'
 export type RetestVerdict = 'reproduced' | 'fixed' | 'inconclusive'
 
 export interface VerifyReplaySpecParams {
@@ -26,6 +29,8 @@ export interface VerifyReplaySpecParams {
   browser?: ScopedBrowser
   canaryBroker?: CanaryBroker
   backend: WorkerBackend
+  /** Host path of the read-only repo mount; required for static_ast_proof. */
+  reposDir?: string
   grant: Grant
   signal: AbortSignal
   storage?: Store
@@ -36,6 +41,8 @@ export interface VerifyReplaySpecParams {
 
 export interface ReplayVerificationResult {
   verdict: ReplayVerdict
+  /** 'runtime_confirmed' only for runtime-confirmed verdicts; 'static_verified' for static_ast_proof; never both. */
+  verificationTier?: VerificationTier
   outcome: ReplayAssertionOutcome
   exchangeIds: string[]
   exchanges: BrokerExchangeResult[]
@@ -206,7 +213,7 @@ function inconclusiveResult(
 }
 
 interface EphemeralCanarySession {
-  mint(purpose: string): { token: string; url: string }
+  mint(purpose: string): { token: string; url: string; dnsHost: string }
   check(token: string): { triggered: boolean; detail: Record<string, unknown> | null }
   close(): Promise<void>
 }
@@ -233,6 +240,7 @@ async function openCanarySession(
         return {
           token: minted.token,
           url: minted.httpUrl || `${baseUrl}/c/${minted.token}`,
+          dnsHost: minted.dnsHost,
         }
       },
       check(token: string) {
@@ -268,7 +276,7 @@ async function openCanarySession(
   return {
     mint() {
       const token = `guardian-canary-${randomBytes(12).toString('hex')}`
-      return { token, url: `${baseUrl}/c/${token}` }
+      return { token, url: `${baseUrl}/c/${token}`, dnsHost: `${token}.canary.guardian.invalid` }
     },
     check(token: string) {
       const detail = callbacks.get(token) ?? null
@@ -329,7 +337,52 @@ async function sleepAbortable(ms: number, signal: AbortSignal) {
   })
 }
 
-export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<ReplayVerificationResult> {
+const postureCwes = new Set([
+  'CWE-16', 'CWE-200', 'CWE-209', 'CWE-284', 'CWE-285', 'CWE-287', 'CWE-288', 'CWE-306', 'CWE-319', 'CWE-326',
+  'CWE-346', 'CWE-523', 'CWE-538', 'CWE-540', 'CWE-614', 'CWE-639', 'CWE-693', 'CWE-862', 'CWE-863', 'CWE-942',
+  'CWE-1004', 'CWE-1021',
+])
+const postureCategoryPattern = /access|auth|bypass|cors|header|posture|misconfig|exposure|session|cookie|transport|tls|csp|policy|idor|bola|bfla/i
+
+/** requireControlNonError defaults to true for posture / auth-bypass style specs. */
+function defaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
+  if (spec.kind === 'static_ast_proof' || spec.kind === 'sql_boolean_diff') return false
+  return postureCwes.has(spec.cwe) || postureCategoryPattern.test(spec.category)
+}
+
+function statusMatchesExpected(expected: number | number[] | undefined, status: number): boolean {
+  if (expected === undefined) return false
+  return Array.isArray(expected) ? expected.includes(status) : expected === status
+}
+
+function isUnexpectedErrorStatus(status: number, ...expected: Array<number | number[] | undefined>): boolean {
+  if (status !== 404 && status < 500) return false
+  return !expected.some(e => statusMatchesExpected(e, status))
+}
+
+function setJsonPath(target: Record<string, unknown>, dotPath: string, value: unknown) {
+  const parts = dotPath.split('.')
+  let cur = target
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    const next = cur[parts[i]]
+    if (!next || typeof next !== 'object' || Array.isArray(next)) cur[parts[i]] = {}
+    cur = cur[parts[i]] as Record<string, unknown>
+  }
+  cur[parts[parts.length - 1]] = value
+}
+
+function lightSummary(ex: BrokerExchangeResult) {
+  return {
+    status: ex.status,
+    mediaType: ex.mediaType,
+    bodySha256: ex.bodySha256,
+    bodyBytes: ex.bodyBytes,
+    bodyPreview: ex.body.slice(0, 2000),
+    headers: ex.respHeaders,
+  }
+}
+
+async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<ReplayVerificationResult> {
   const { broker, backend, grant, signal } = params
   const assignmentId = params.assignmentId ?? randomUUID()
   const exchanges: BrokerExchangeResult[] = []
@@ -348,6 +401,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
   const spec = parsed.data
 
   // 2. Policy & scope validation
+  const isStatic = spec.kind === 'static_ast_proof'
   const origins = replaySpecOrigins(spec)
   for (const origin of origins) {
     if (!grant.canRead(origin)) {
@@ -355,31 +409,35 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
       return inconclusiveResult(`Replay spec origin ${origin} is not in approved scope.`, exchanges, exchangeIds, { kind: spec.kind, origins })
     }
   }
-  if (hasDestructiveContent(JSON.stringify(spec))) {
+  if (!isStatic && hasDestructiveContent(JSON.stringify(spec))) {
     grant.audit('denied', spec.origin)
     return inconclusiveResult('Replay spec rejected by Guardian destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
   }
   const tier = grant.tier ?? 1
-  if (tier === 0) {
+  if (tier === 0 && !isStatic) {
     return inconclusiveResult('Live replay verification is disabled in Tier 0.', exchanges, exchangeIds, { kind: spec.kind })
   }
 
-  // Hard Tier 3 + HITL approval gate for rce_proof
-  if (spec.kind === 'rce_proof') {
+  // Hard Tier 3 + HITL approval gate for rce_proof and upload_probe
+  if (spec.kind === 'rce_proof' || spec.kind === 'upload_probe') {
+    const gateRequest = spec.kind === 'rce_proof'
+      ? spec.probeStep.request
+      : { origin: spec.uploadStep.origin, method: spec.uploadStep.method, pathAndQuery: spec.uploadStep.pathAndQuery }
     if (tier < 3) {
-      grant.audit('denied', spec.probeStep.request.origin)
-      return inconclusiveResult('rce_proof replay specs are blocked below Tier 3.', exchanges, exchangeIds, { kind: spec.kind, proofMode: spec.proofMode })
+      grant.audit('denied', gateRequest.origin)
+      return inconclusiveResult(`${spec.kind} replay specs are blocked below Tier 3.`, exchanges, exchangeIds, { kind: spec.kind })
     }
     const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
     const approvalFn = grant.isStateChangeApproved
     const approved = approvalFn
-      ? approvalFn(spec.probeStep.request.origin, spec.probeStep.request.method, spec.probeStep.request.pathAndQuery)
+      ? approvalFn(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery)
       : localLab
     if (!approved) {
-      grant.audit('denied', spec.probeStep.request.origin)
-      return inconclusiveResult('rce_proof requires explicit Tier 3 HITL operator approval.', exchanges, exchangeIds, { kind: spec.kind, proofMode: spec.proofMode })
+      grant.audit('denied', gateRequest.origin)
+      return inconclusiveResult(`${spec.kind} requires explicit Tier 3 HITL operator approval.`, exchanges, exchangeIds, { kind: spec.kind })
     }
   }
+  const guardControlErrors = spec.requireControlNonError ?? defaultRequireControlNonError(spec)
 
   // 3. Fresh Replay Execution
   let evidencePayload: Record<string, unknown> = {
@@ -388,7 +446,8 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
     replayedAt: new Date().toISOString(),
   }
   let forcedInconclusiveReason: string | null = null
-  let rceCryptoProofPassed = true
+  let deterministicProofPassed = true
+  let proofFailureReason = ''
 
   try {
     if (spec.kind === 'http_chain') {
@@ -435,6 +494,17 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
           if (step.role === 'probe') {
             if (!firstProbeStep) firstProbeStep = stepEntry
             probeStepExchanges.push({ id: step.id, exchange: ex })
+          }
+        }
+      }
+
+      if (guardControlErrors) {
+        for (const step of spec.steps) {
+          if (step.role !== 'control' && step.role !== 'probe') continue
+          const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
+          if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
+            forcedInconclusiveReason = `Unexpected HTTP ${status} on ${step.role} step "${step.id}" (requireControlNonError); declare expectedStatus ${status} to test error behavior.`
+            break
           }
         }
       }
@@ -570,6 +640,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
       const pages: Record<string, unknown>[] = []
       const consoleMessages: Array<{ stepId: string; role: string; type: 'error' | 'warning'; text: string }> = []
       const requests: Array<{ stepId: string; role: string; method: string; url: string; origin: string; resourceType: string; status: number | null }> = []
+      const domSinkTraces: Array<{ stepId: string; role: string } & BrowserDomSinkTrace> = []
       const domResults: Record<string, unknown>[] = []
       const probeSnapshots: Array<{
         id: string
@@ -589,8 +660,29 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
           : undefined
         const resolvedCheckKind = step.checkKind
           ?? (step.action === 'postmessage_probe' ? 'postmessage'
-            : step.action === 'dom_check' ? 'dom_xss'
+            : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
               : undefined)
+        const enableSinkHook = Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook')
+        const stepActions: BrowserInteractiveAction[] = []
+        if (step.action === 'fill' && step.selector) {
+          stepActions.push({ type: 'fill', selector: step.selector, value: interpolateString(step.value ?? '', vars) })
+        } else if (step.action === 'click' && step.selector) {
+          stepActions.push({ type: 'click', selector: step.selector })
+        } else if (step.action === 'select_option' && step.selector) {
+          stepActions.push({ type: 'select_option', selector: step.selector, value: interpolateString(step.value ?? '', vars) })
+        } else if (step.action === 'wait_for_selector' && step.selector) {
+          stepActions.push({ type: 'wait_for_selector', selector: step.selector, timeoutMs: step.waitAfterLoadMs })
+        } else if (step.action === 'wait_for_xhr') {
+          stepActions.push({
+            type: 'wait_for_xhr',
+            urlPattern: step.urlPattern ? interpolateString(step.urlPattern, vars) : undefined,
+            timeoutMs: step.waitAfterLoadMs,
+          })
+        } else if (step.action === 'evaluate_builtin' && step.builtinCheck) {
+          stepActions.push({ type: 'evaluate_builtin', builtinCheck: step.builtinCheck })
+        } else if (step.action === 'dom_xss_sink_hook') {
+          stepActions.push({ type: 'dom_xss_sink_hook' })
+        }
 
         const visit = await scopedBrowser.visitPage({
           origin: step.origin,
@@ -604,6 +696,8 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
             : step.postMessageOrigin,
           postMessagePayload,
           sameSiteFetch: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
+          actions: stepActions.length > 0 ? stepActions : undefined,
+          enableSinkHook,
           waitAfterLoadMs: step.waitAfterLoadMs,
           onExchange: ex => {
             exchanges.push(ex)
@@ -638,6 +732,9 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
           sessionStorageKeys: visit.sessionStorageKeys,
           postMessageListeners: visit.postMessageListeners,
           canaryCheck: visit.canaryCheck,
+          domSinkTraces: visit.domSinkTraces,
+          actionResults: visit.actionResults ?? [],
+          builtinResults: visit.builtinResults ?? {},
           selectorResult: visit.selectorResult ?? null,
           fetchResult: visit.fetchResult ?? null,
           redirectSummary: visit.redirectSummary ?? null,
@@ -649,6 +746,9 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
         for (const r of (visit.allRequests ?? visit.xhrRequests)) {
           requests.push({ stepId: step.id, role: step.role, ...r })
         }
+        for (const trace of visit.domSinkTraces) {
+          domSinkTraces.push({ stepId: step.id, role: step.role, ...trace })
+        }
         domResults.push({
           stepId: step.id,
           role: step.role,
@@ -659,6 +759,9 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
           title: visit.title,
           selectorResult: visit.selectorResult ?? null,
           canaryCheck: visit.canaryCheck,
+          domSinkTraces: visit.domSinkTraces,
+          actionResults: visit.actionResults ?? [],
+          builtinResults: visit.builtinResults ?? {},
           postMessageListeners: visit.postMessageListeners,
           fetchResult: visit.fetchResult ?? null,
           redirectSummary: visit.redirectSummary ?? null,
@@ -669,6 +772,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
           if (!firstProbeStep) firstProbeStep = stepEntry
           const hadDynamicSignal = Boolean(
             visit.canaryCheck.triggered ||
+            visit.domSinkTraces.some(t => t.containsCanary) ||
             visit.selectorResult?.matched ||
             visit.postMessageListeners.canaryHandledWithoutOriginCheck ||
             visit.fetchResult !== null ||
@@ -729,6 +833,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
         pages,
         consoleMessages,
         requests,
+        domSinkTraces,
         domResults,
         ...(firstControlStep ? { control: firstControlStep } : {}),
         ...(firstProbeStep ? { probe: firstProbeStep } : {}),
@@ -828,8 +933,10 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
         probeCanaryToken = probeCanary.token
         controlVars.canary_token = controlCanary.token
         controlVars.canary_url = controlCanary.url
+        controlVars.canary_dns_host = controlCanary.dnsHost
         probeVars.canary_token = probeCanary.token
         probeVars.canary_url = probeCanary.url
+        probeVars.canary_dns_host = probeCanary.dnsHost
         proofMeta.controlCanaryToken = controlCanary.token
         proofMeta.probeCanaryToken = probeCanary.token
       }
@@ -858,16 +965,16 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
           const inProbe = probeEx.body.includes(expectedNonceProduct)
           const inControl = controlEx.body.includes(expectedNonceProduct)
           const inOutbound = serializedProbeReq.includes(expectedNonceProduct)
-          rceCryptoProofPassed = inProbe && !inControl && !inOutbound
-          proofMeta.mathVerified = rceCryptoProofPassed
+          deterministicProofPassed = inProbe && !inControl && !inOutbound
+          proofMeta.mathVerified = deterministicProofPassed
           proofMeta.productInProbe = inProbe
           proofMeta.productInControl = inControl
         } else if (spec.proofMode === 'split_echo' && expectedSplitAssembled) {
           const inProbe = probeEx.body.includes(expectedSplitAssembled)
           const inControl = controlEx.body.includes(expectedSplitAssembled)
           const inOutbound = serializedProbeReq.includes(expectedSplitAssembled)
-          rceCryptoProofPassed = inProbe && !inControl && !inOutbound
-          proofMeta.splitEchoVerified = rceCryptoProofPassed
+          deterministicProofPassed = inProbe && !inControl && !inOutbound
+          proofMeta.splitEchoVerified = deterministicProofPassed
           proofMeta.assembledInProbe = inProbe
           proofMeta.assembledInControl = inControl
         } else if (spec.proofMode === 'oob_canary' && canarySession && controlCanaryToken && probeCanaryToken) {
@@ -878,14 +985,14 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
             probeCheck = canarySession.check(probeCanaryToken)
           }
           const controlCheck = canarySession.check(controlCanaryToken)
-          rceCryptoProofPassed = probeCheck.triggered && !controlCheck.triggered
+          deterministicProofPassed = probeCheck.triggered && !controlCheck.triggered
           proofMeta.canaryProbeTriggered = probeCheck.triggered
           proofMeta.canaryProbeDetail = probeCheck.detail
           proofMeta.canaryControlTriggered = controlCheck.triggered
           proofMeta.canaryControlDetail = controlCheck.detail
         }
 
-        proofMeta.cryptographicProofPassed = rceCryptoProofPassed
+        proofMeta.cryptographicProofPassed = deterministicProofPassed
         evidencePayload = {
           ...evidencePayload,
           proofMode: spec.proofMode,
@@ -895,6 +1002,281 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
         }
       } finally {
         await canarySession?.close()
+      }
+    } else if (spec.kind === 'sql_boolean_diff') {
+      const roundCount = 3
+      const usedKs = new Set<number>()
+      const baseValue = spec.baselineValue
+      const makeValue = (k: number, kind: 'true' | 'false'): string => {
+        const expr = `${k}=${kind === 'true' ? k : k + 1}`
+        if (spec.valueTemplate) {
+          return spec.valueTemplate.replaceAll('{{baseline}}', baseValue).replaceAll('{{sql_expr}}', expr)
+        }
+        if (spec.quoteStyle === 'numeric') return `${baseValue} AND ${expr}`
+        if (spec.quoteStyle === 'double') return `${baseValue}" AND ${expr}-- -`
+        return `${baseValue}' AND ${expr}-- -`
+      }
+      const buildRequest = (value: string): BrokerHttpRequest => {
+        const headers: Record<string, string> = { ...(spec.headers ?? {}) }
+        if (spec.paramLocation === 'json') {
+          const body: Record<string, unknown> = structuredClone((spec.jsonBody ?? {}) as Record<string, unknown>)
+          setJsonPath(body, spec.paramName, value)
+          headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
+          return {
+            origin: spec.targetOrigin, method: 'POST', pathAndQuery: spec.pathAndQuery, headers,
+            body: JSON.stringify(body), persona: spec.persona, followRedirects: false,
+          }
+        }
+        const url = new URL(spec.pathAndQuery, 'http://guardian.invalid')
+        url.searchParams.set(spec.paramName, value)
+        const hasJson = spec.method === 'POST' && spec.jsonBody !== undefined
+        if (hasJson) headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
+        return {
+          origin: spec.targetOrigin, method: spec.method, pathAndQuery: url.pathname + url.search, headers,
+          body: hasJson ? JSON.stringify(spec.jsonBody) : undefined, persona: spec.persona, followRedirects: false,
+        }
+      }
+
+      let controlSummary: Record<string, unknown> | null = null
+      let controlHealthy = true
+      if (spec.controlStep) {
+        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}), grant, signal)
+        recordExchange(controlEx)
+        controlSummary = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(controlEx) }
+        if (isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) controlHealthy = false
+      }
+
+      const rounds: Array<Record<string, unknown>> = []
+      let firstBaseline: BrokerExchangeResult | undefined
+      let allPass = true
+      let unstable = false
+      let baselineDrift = false
+      for (let r = 0; r < roundCount; r += 1) {
+        signal.throwIfAborted()
+        let k = randomInt(1000, 90_000)
+        while (usedKs.has(k)) k = randomInt(1000, 90_000)
+        usedKs.add(k)
+        // Interleaved baseline / true / false triplet through RequestBroker.
+        const baseEx = await broker.executeHttp(buildRequest(baseValue), grant, signal)
+        recordExchange(baseEx)
+        const trueEx = await broker.executeHttp(buildRequest(makeValue(k, 'true')), grant, signal)
+        recordExchange(trueEx)
+        const falseEx = await broker.executeHttp(buildRequest(makeValue(k, 'false')), grant, signal)
+        recordExchange(falseEx)
+        firstBaseline ??= baseEx
+        const simBaselineTrue = responseSimilarity(baseEx.body, trueEx.body)
+        const simTrueFalse = responseSimilarity(trueEx.body, falseEx.body)
+        const statusDivergence = baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500
+        const anyServerError = [baseEx, trueEx, falseEx].some(e => e.status >= 500)
+        if (anyServerError) unstable = true
+        if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(trueEx.status, spec.expectedStatus)) {
+          controlHealthy = false
+        }
+        if (responseSimilarity(firstBaseline.body, baseEx.body) < 0.9) baselineDrift = true
+        const pass = !anyServerError && simBaselineTrue >= 0.9 && (simTrueFalse <= 0.75 || statusDivergence)
+        if (!pass) allPass = false
+        rounds.push({
+          round: r + 1, k,
+          trueExpression: `${k}=${k}`, falseExpression: `${k}=${k + 1}`,
+          baseline: lightSummary(baseEx), true: lightSummary(trueEx), false: lightSummary(falseEx),
+          similarityBaselineTrue: simBaselineTrue, similarityTrueFalse: simTrueFalse, statusDivergence, pass,
+        })
+      }
+      const controlPassed = controlHealthy && !unstable && !baselineDrift
+      deterministicProofPassed = controlPassed && allPass
+      if (!deterministicProofPassed) {
+        proofFailureReason = !controlPassed
+          ? 'sql_boolean_diff control unstable (5xx, unexpected 404 or drifting baseline).'
+          : 'Boolean differential did not hold across all 3 randomized rounds.'
+      }
+      evidencePayload = {
+        ...evidencePayload,
+        targetOrigin: spec.targetOrigin,
+        paramName: spec.paramName,
+        quoteStyle: spec.quoteStyle,
+        sqlDiff: {
+          passed: deterministicProofPassed,
+          controlPassed,
+          thresholds: { trueVsBaselineMin: 0.9, trueVsFalseMax: 0.75 },
+          rounds,
+        },
+        control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
+        probe: rounds[0] ? { role: 'probe', ...(rounds[0].true as Record<string, unknown>) } : null,
+      }
+    } else if (spec.kind === 'ws_chain') {
+      const stepsOut: Record<string, unknown> = {}
+      let firstControl: Record<string, unknown> | undefined
+      let firstProbe: Record<string, unknown> | undefined
+      for (const step of spec.steps) {
+        signal.throwIfAborted()
+        const result = await broker.probeWebsocket({
+          origin: step.origin,
+          pathAndQuery: step.pathAndQuery,
+          originHeader: step.originHeader,
+          headers: step.headers,
+          persona: step.persona,
+          subprotocols: step.subprotocols,
+          sendMessages: step.sendMessages,
+          maxFrames: step.maxFrames,
+          timeoutMs: Math.max(1500, step.waitMs + 1000),
+        }, grant, signal)
+        recordExchange(websocketResultToExchange(result))
+        const received = result.frames.filter(f => f.direction === 'received')
+        const messages = received.map(f => f.data)
+        let firstJson: unknown = null
+        if (messages[0]) {
+          try { firstJson = JSON.parse(messages[0]) } catch { firstJson = null }
+        }
+        const entry: Record<string, unknown> = {
+          id: step.id,
+          role: step.role,
+          status: result.upgradeStatus ?? 0,
+          connected: result.connected,
+          upgradeStatus: result.upgradeStatus,
+          upgradeHeaders: result.upgradeHeaders,
+          subprotocol: result.subprotocol,
+          originHeader: result.originHeader,
+          persona: result.personaHandle,
+          sentFrames: result.sentFrames,
+          receivedFrames: result.receivedFrames,
+          messages,
+          firstMessage: messages[0] ?? null,
+          body: messages.join('\n'),
+          ...(firstJson !== null ? { json: firstJson } : {}),
+          closeCode: result.closeCode,
+          closeReason: result.closeReason,
+          error: result.error,
+        }
+        stepsOut[step.id] = entry
+        if (step.role === 'control' && !firstControl) firstControl = entry
+        if (step.role === 'probe' && !firstProbe) firstProbe = entry
+        if (
+          guardControlErrors && (step.role === 'control' || step.role === 'probe') && result.upgradeStatus !== null &&
+          isUnexpectedErrorStatus(result.upgradeStatus, spec.expectedStatus)
+        ) {
+          forcedInconclusiveReason ??= `Unexpected HTTP ${result.upgradeStatus} on WebSocket ${step.role} step "${step.id}" (requireControlNonError).`
+        }
+      }
+      evidencePayload = {
+        ...evidencePayload,
+        steps: stepsOut,
+        ...(firstControl ? { control: firstControl } : {}),
+        ...(firstProbe ? { probe: firstProbe } : {}),
+      }
+    } else if (spec.kind === 'upload_probe') {
+      const vars: Record<string, string> = { upload_nonce: `gup${randomAlphaToken(18)}` }
+      const nonce = vars.upload_nonce
+      const stepsOut: Record<string, unknown> = {}
+      let controlLeak = false
+      if (spec.controlStep) {
+        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, vars), grant, signal)
+        recordExchange(controlEx)
+        extractVariables(spec.controlStep, controlEx, vars)
+        controlLeak = controlEx.body.includes(nonce)
+        stepsOut[spec.controlStep.id] = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(controlEx) }
+        if (guardControlErrors && isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) {
+          forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on upload_probe control step (requireControlNonError).`
+        }
+      }
+      const up = spec.uploadStep
+      const uploadHeaders: Record<string, string> = {}
+      for (const [k, v] of Object.entries(up.headers ?? {})) uploadHeaders[k] = interpolateString(v, vars)
+      const parts = [
+        {
+          name: up.fieldName,
+          filename: interpolateString(up.filename, vars),
+          contentType: up.contentType,
+          content: interpolateString(up.contentTemplate, vars),
+        },
+        ...Object.entries(up.extraFields ?? {}).map(([name, value]) => ({
+          name, contentType: 'text/plain', content: interpolateString(value, vars),
+        })),
+      ]
+      let fetchExchange: BrokerExchangeResult | undefined
+      try {
+        const uploadEx = await broker.executeHttp({
+          origin: up.origin, method: up.method, pathAndQuery: interpolateString(up.pathAndQuery, vars),
+          headers: uploadHeaders, multipartParts: parts, persona: up.persona, followRedirects: false,
+        }, grant, signal)
+        recordExchange(uploadEx)
+        extractVariables({ ...up, request: undefined as never, extract: up.extract } as unknown as ReplayStep, uploadEx, vars)
+        stepsOut[up.id] = { id: up.id, role: up.role, ...summarizeExchange(uploadEx) }
+
+        fetchExchange = await broker.executeHttp(stepToBrokerRequest(spec.fetchStep, vars), grant, signal)
+        recordExchange(fetchExchange)
+        stepsOut[spec.fetchStep.id] = { id: spec.fetchStep.id, role: spec.fetchStep.role, ...summarizeExchange(fetchExchange) }
+      } finally {
+        if (spec.cleanupStep) {
+          try {
+            const cleanupEx = await broker.executeHttp(stepToBrokerRequest(spec.cleanupStep, vars), grant, signal)
+            recordExchange(cleanupEx)
+            stepsOut[spec.cleanupStep.id] = { id: spec.cleanupStep.id, role: 'cleanup', ...summarizeExchange(cleanupEx) }
+          } catch (cleanupErr) {
+            stepsOut[spec.cleanupStep.id] = { id: spec.cleanupStep.id, role: 'cleanup', error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }
+          }
+        }
+      }
+      const fetched = fetchExchange
+      const contentType = (fetched?.respHeaders['content-type'] ?? fetched?.mediaType ?? '').toLowerCase()
+      const disposition = fetched?.respHeaders['content-disposition'] ?? null
+      const attachment = Boolean(disposition && /^\s*attachment/i.test(disposition))
+      const unsafeType = /text\/html|image\/svg\+xml|application\/xhtml\+xml/.test(contentType)
+      const nonceInFetch = Boolean(fetched && fetched.body.includes(nonce))
+      const fetchOk = Boolean(fetched && fetched.status >= 200 && fetched.status < 300)
+      deterministicProofPassed = nonceInFetch && fetchOk && !controlLeak
+      if (!deterministicProofPassed) proofFailureReason = 'Verifier-minted upload nonce was not retrievable from the fetch step (or leaked on control).'
+      if (guardControlErrors && fetched && isUnexpectedErrorStatus(fetched.status, spec.fetchStep.expectedStatus, spec.expectedStatus)) {
+        forcedInconclusiveReason ??= `Unexpected HTTP ${fetched.status} on upload_probe fetch step (requireControlNonError).`
+      }
+      evidencePayload = {
+        ...evidencePayload,
+        uploadNonce: nonce,
+        steps: stepsOut,
+        extractedVars: vars,
+        uploadProof: {
+          nonceInFetchBody: nonceInFetch,
+          fetchStatus: fetched?.status ?? null,
+          fetchContentType: contentType || null,
+          contentDisposition: disposition,
+          hasAttachmentDisposition: attachment,
+          unsafeInlineRender: unsafeType && !attachment,
+          controlLeak,
+        },
+        ...(spec.controlStep ? { control: stepsOut[spec.controlStep.id] } : {}),
+        probe: stepsOut[spec.fetchStep.id],
+      }
+    } else if (spec.kind === 'static_ast_proof') {
+      if (!params.reposDir) {
+        return inconclusiveResult('static_ast_proof requires the read-only /repos mount (reposDir).', exchanges, exchangeIds, { kind: spec.kind })
+      }
+      const astResult = await backend.verifyStaticAst(assignmentId, {
+        repo: spec.repo,
+        file: spec.file,
+        startLine: spec.startLine,
+        endLine: spec.endLine,
+        engine: spec.engine,
+        ruleOrPattern: spec.ruleOrPattern,
+      }, signal, { reposDir: params.reposDir })
+      deterministicProofPassed = Boolean(astResult.verified)
+      if (!deterministicProofPassed) proofFailureReason = `Static AST re-verification failed: ${astResult.reason ?? 'pattern not found in the cited range.'}`
+      evidencePayload = {
+        ...evidencePayload,
+        repo: spec.repo,
+        file: spec.file,
+        startLine: spec.startLine,
+        endLine: spec.endLine,
+        engine: spec.engine,
+        ruleOrPattern: spec.ruleOrPattern,
+        sourceToSinkTrace: spec.sourceToSinkTrace ?? null,
+        runtimeProofGap: spec.runtimeProofGap,
+        verificationTier: 'static_verified',
+        astVerify: astResult,
+        static: {
+          verified: astResult.verified,
+          matchCount: astResult.matchCount,
+          matchedLines: astResult.matchedLines,
+          controlPassed: astResult.verified,
+        },
       }
     }
   } catch (err) {
@@ -994,13 +1376,13 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
     }
   }
 
-  if (spec.kind === 'rce_proof' && !rceCryptoProofPassed) {
+  if (!deterministicProofPassed) {
     return {
       verdict: outcome.controlPassed ? 'dismissed' : 'inconclusive',
       outcome: {
         ...outcome,
         confirmed: false,
-        reason: 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).',
+        reason: proofFailureReason || 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).',
       },
       exchangeIds,
       exchanges,
@@ -1011,7 +1393,8 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
 
   let verdict: ReplayVerdict
   if (outcome.controlPassed && outcome.confirmed) {
-    verdict = 'confirmed'
+    // Strict tier separation: static_ast_proof can only ever reach 'static_verified'.
+    verdict = spec.kind === 'static_ast_proof' ? 'static_verified' : 'confirmed'
   } else if (outcome.controlPassed && !outcome.confirmed) {
     verdict = 'dismissed'
   } else {
@@ -1028,9 +1411,17 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
   }
 }
 
+export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<ReplayVerificationResult> {
+  const result = await verifyReplaySpecInner(params)
+  const verificationTier: VerificationTier | undefined = result.verdict === 'static_verified'
+    ? 'static_verified'
+    : result.verdict === 'confirmed' ? 'runtime_confirmed' : undefined
+  return { ...result, ...(verificationTier ? { verificationTier } : {}) }
+}
+
 export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<RetestReplayResult> {
   const replay = await verifyReplaySpec(params)
-  const verdict: RetestVerdict = replay.verdict === 'confirmed'
+  const verdict: RetestVerdict = replay.verdict === 'confirmed' || replay.verdict === 'static_verified'
     ? 'reproduced'
     : replay.verdict === 'dismissed'
       ? 'fixed'

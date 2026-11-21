@@ -69,6 +69,25 @@ export function skillsByTag(tag: string): SkillSummary[] {
   return listSkills().filter(skill => skill.tags.some(t => t.toLowerCase() === needle))
 }
 
+export function listSkillTags(): string[] {
+  const tags = new Set<string>()
+  for (const skill of loadAll().values()) {
+    for (const tag of skill.tags) tags.add(tag.toLowerCase())
+  }
+  return [...tags].sort()
+}
+
+export function searchSkills(query: string): SkillSummary[] {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return listSkills()
+  return listSkills().filter(skill =>
+    skill.name.toLowerCase().includes(needle) ||
+    skill.title.toLowerCase().includes(needle) ||
+    skill.summary.toLowerCase().includes(needle) ||
+    skill.tags.some(t => t.toLowerCase().includes(needle)),
+  )
+}
+
 export function loadSkill(name: string): LoadedSkill | null {
   const normalized = name.trim().toLowerCase().replace(/\.md$/, '')
   if (!safeSkillName.test(normalized)) return null

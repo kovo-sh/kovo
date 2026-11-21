@@ -1,0 +1,21 @@
+id: swagger-json-exposed
+name: "Swagger 2.0 document exposed at /swagger.json"
+severity: low
+description: "The Swagger 2.0 document is reachable and lists all API routes."
+tech: [swagger, generic]
+tags: [exposure, api-docs]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /swagger.json
+control:
+  path: "/guardian-none-{{rand}}.json"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"swagger"', '"paths"']
+    condition: and

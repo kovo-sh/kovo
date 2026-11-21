@@ -1,0 +1,20 @@
+id: prometheus-metrics-exposed
+name: "Prometheus metrics endpoint exposed"
+severity: low
+description: "A /metrics endpoint exposes internal operational metrics without authentication."
+tech: [generic]
+tags: [metrics, exposure]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /metrics
+control:
+  path: "/metrics-guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: regex
+    part: body
+    regex: ['^# (?:HELP|TYPE) [a-z_:]+']

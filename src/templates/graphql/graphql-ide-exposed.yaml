@@ -1,0 +1,21 @@
+id: graphql-ide-exposed
+name: "GraphQL IDE (GraphiQL/Playground) exposed"
+severity: low
+description: "An interactive GraphQL IDE is served to unauthenticated browsers."
+tech: [graphql]
+tags: [graphql, exposure]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /graphql
+  headers:
+    Accept: "text/html"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: regex
+    part: body
+    regex: ['graphiql', 'GraphQL Playground', 'apollo-sandbox']
+    condition: or

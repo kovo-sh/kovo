@@ -1,0 +1,20 @@
+id: dotenv-file-exposed
+name: "Environment file exposed at /.env"
+severity: critical
+description: "A dotenv file with KEY=VALUE assignments is publicly reachable and typically contains credentials."
+tech: [generic]
+tags: [exposure, secrets]
+cwe: CWE-538
+spaExclusion: true
+request:
+  method: GET
+  path: /.env
+control:
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: regex
+    part: body
+    regex: ['^[A-Z][A-Z0-9_]{2,}=.+$']

@@ -1,0 +1,20 @@
+id: cra-main-js-source-map-exposed
+name: "Create React App source map exposed"
+severity: medium
+description: "A production JavaScript source map embeds original sources via sourcesContent."
+tech: [react, generic]
+tags: [source-maps, exposure]
+cwe: CWE-540
+request:
+  method: GET
+  path: /static/js/main.js.map
+control:
+  path: "/static/js/guardian-none-{{rand}}.js.map"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"sourcesContent"', '"mappings"']
+    condition: or

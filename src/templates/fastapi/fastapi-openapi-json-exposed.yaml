@@ -1,0 +1,21 @@
+id: fastapi-openapi-json-exposed
+name: "FastAPI OpenAPI schema exposed"
+severity: low
+description: "The OpenAPI document is served without authentication and lists all routes and schemas."
+tech: [fastapi, swagger]
+tags: [exposure, api-docs]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /openapi.json
+control:
+  path: "/guardian-none-{{rand}}.json"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"openapi"', '"paths"']
+    condition: and

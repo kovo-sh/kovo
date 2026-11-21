@@ -1,0 +1,16 @@
+id: nextjs-image-optimizer-ssrf-canary
+name: "Next.js image optimizer fetches attacker-chosen remote URLs (canary callback)"
+severity: medium
+description: "The /_next/image endpoint requested a Guardian-minted canary URL, proving server-side fetching of arbitrary remote image URLs (SSRF lead)."
+tech: [nextjs]
+tags: [ssrf, oob]
+cwe: CWE-918
+request:
+  method: GET
+  path: "/_next/image?url={{guardian_canary_http}}&w=64&q=75"
+control:
+  path: "/_next/image?url=%2Fguardian-none-{{rand}}.png&w=64&q=75"
+matchers-condition: and
+matchers:
+  - type: canary
+    protocol: any

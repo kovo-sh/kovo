@@ -1,14 +1,19 @@
 import { useState } from 'react'
-import { downloadReportMarkdown } from '../actions.ts'
+import { downloadReportMarkdown, exportSarifAction, generatePatchAction } from '../actions.ts'
 import {
+  callerCompatibilityLabels,
   capabilityTierLabel,
   checkLabels,
+  dynamicRetestLabels,
+  findingVerificationTier,
   owaspCategoryTitles,
   owaspStatusLabels,
+  patchStatusLabels,
   reportEvidenceSource,
   reportHighlights,
   reportPlanLabel,
   retestVerdictLabels,
+  verificationTierLabels,
 } from '../report-summary.ts'
 import { FormError, Status, timeText } from './common.tsx'
 import type { Command } from './run-overview.tsx'
@@ -34,8 +39,48 @@ function replayKindLabel(spec: unknown): string | undefined {
   if (kind === 'dns_takeover') return 'DNS takeover replay'
   if (kind === 'tls_audit') return 'TLS audit replay'
   if (kind === 'browser_dom') return 'Browser DOM replay'
+  if (kind === 'browser_chain') return 'Interactive browser chain'
+  if (kind === 'race_burst') return 'Race-condition burst'
   if (kind === 'rce_proof') return 'Non-destructive RCE proof'
+  if (kind === 'sql_boolean_diff') return 'SQLi boolean differential'
+  if (kind === 'ws_chain') return 'WebSocket chain replay'
+  if (kind === 'upload_probe') return 'Upload pipeline probe'
+  if (kind === 'static_ast_proof') return 'Deterministic Static AST proof'
   return undefined
+}
+
+function verificationTierBadgeClass(tier: string) {
+  if (tier === 'runtime_confirmed') return 'badge badge-complete'
+  if (tier === 'static_verified') return 'badge badge-trace'
+  return 'badge badge-accent'
+}
+
+function patchStatusBadgeClass(status: string) {
+  if (status === 'approved') return 'badge badge-complete'
+  if (status === 'withheld') return 'badge badge-attention'
+  if (status === 'rejected') return 'badge badge-danger'
+  return 'badge'
+}
+
+function callerCompatBadgeClass(compat: string) {
+  if (compat === 'attacker_only') return 'badge badge-complete'
+  if (compat === 'needs_operator_step') return 'badge badge-attention'
+  return 'badge badge-danger'
+}
+
+function dynamicRetestBadgeClass(verdict: string) {
+  if (verdict === 'fixed') return 'badge badge-complete'
+  if (verdict === 'reproduced') return 'badge badge-danger'
+  return 'badge'
+}
+
+function safeHostLabel(origin: string) {
+  try {
+    const url = new URL(origin)
+    return url.port ? `${url.hostname}:${url.port}` : url.hostname
+  } catch {
+    return origin
+  }
 }
 
 function severityBadgeClass(severity: string) {
@@ -53,13 +98,17 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
 }) {
   const [version, setVersion] = useState<number>()
   const [exporting, setExporting] = useState(false)
+  const [patchingId, setPatchingId] = useState<string | null>(null)
   const [exportError, setExportError] = useState('')
   const report = detail.reports.find(item => item.version === version) ?? detail.reports[0]
   if (!report) return <div className="report-body"><h2>Report</h2><p className="muted">The report will appear here once verification or a partial checkpoint completes.</p></div>
 
   const { body } = report
-  const { coverage, confirmed, chainConfirmed, priority } = reportHighlights(body)
-  const findingCount = confirmed ? confirmed + (confirmed === 1 ? ' confirmed finding' : ' confirmed findings') : 'No confirmed findings'
+  const { coverage, confirmed, staticVerified, chainConfirmed, priority } = reportHighlights(body)
+  const findingCount = [
+    confirmed ? confirmed + (confirmed === 1 ? ' runtime/baseline confirmed finding' : ' runtime/baseline confirmed findings') : 'No runtime confirmed findings',
+    ...(staticVerified ? [staticVerified + (staticVerified === 1 ? ' static-verified finding' : ' static-verified findings')] : []),
+  ].join(' · ')
   const approvedHosts = body.scope.length === 1 ? '1 approved host' : body.scope.length + ' approved hosts'
   const evidenceSource = reportEvidenceSource(detail.run.sourceMode, body.selectedChecks, body.capabilityTier)
   const plannedChecks = reportPlanLabel(body.selectedChecks)
@@ -79,12 +128,25 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
   )
 
   const confirmedFindings = body.findings.filter(item => item.status === 'confirmed')
+  const staticVerifiedFindings = body.findings.filter(item => item.status === 'static_verified')
   const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
     const count = confirmedFindings.filter(item => item.severity === severity).length
     return count ? [`${count} ${severity}`] : []
   })
   const threatEntries = body.threatModel?.length ? body.threatModel : (detail.threatModel?.entries ?? [])
   const owaspRows = body.owaspCoverage?.length ? body.owaspCoverage : detail.coverageEntries
+  const openProofGaps = body.openProofGaps?.length
+    ? body.openProofGaps
+    : (detail.openProofGaps ?? []).map(g => ({
+        origin: g.origin,
+        category: g.category,
+        summary: g.summary,
+        proofGapReason: g.proofGapReason || g.summary,
+      }))
+  const patchProposals = body.patchProposals?.length
+    ? body.patchProposals
+    : (detail.patchProposals ?? [])
+  const findingTitleById = new Map(body.findings.map(f => [f.id, f.title]))
 
   async function exportMarkdown(reportId: string) {
     setExportError('')
@@ -96,6 +158,31 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
       setExportError('Guardian could not export this report. Try again.')
     } finally {
       setExporting(false)
+    }
+  }
+
+  async function exportSarif(reportId: string) {
+    setExportError('')
+    setExporting(true)
+    try {
+      const result = await exportSarifAction({ data: { runId: detail.run.id, reportId } })
+      download(result.content, result.filename, 'application/sarif+json; charset=utf-8')
+    } catch {
+      setExportError('Guardian could not export SARIF 2.1.0 for this report. Try again.')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  async function triggerPatch(findingId: string, repo?: string) {
+    setExportError('')
+    setPatchingId(findingId)
+    try {
+      await generatePatchAction({ data: { runId: detail.run.id, findingId, repo } })
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : 'Guardian could not generate a verified patch.')
+    } finally {
+      setPatchingId(null)
     }
   }
 
@@ -171,12 +258,16 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
         }}>
           {detail.reports.map(item => <option key={item.id} value={item.version}>{item.version}</option>)}
         </NativeSelect></label>
+        <Button variant="ghost" disabled={exporting} onClick={() => void exportSarif(report.id)}>
+          Download SARIF 2.1.0
+        </Button>
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="ghost" />} disabled={exporting}>
             {exporting ? 'Exporting…' : 'Export'}
           </DropdownMenuTrigger>
           <DropdownMenuContent>
             <DropdownMenuItem onClick={() => void exportMarkdown(report.id)}>Markdown with evidence</DropdownMenuItem>
+            <DropdownMenuItem onClick={() => void exportSarif(report.id)}>SARIF 2.1.0 (.sarif.json)</DropdownMenuItem>
             <DropdownMenuItem onClick={exportText}>Plain text</DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -235,14 +326,22 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
         const latestRetest = retests[0]
         const retestQueued = [...activeRetestFindingIds].some(obj => obj.includes(item.id))
         const canRetest = Boolean(execute && item.status === 'confirmed' && (item.replaySpecId || replayRow))
+        const tier = findingVerificationTier(item)
+        const canPatch = Boolean(
+          (item.status === 'confirmed' || item.status === 'static_verified') &&
+          item.codeLocations && item.codeLocations.length > 0,
+        )
 
         return <div key={item.id} className="finding" id={'report-finding-' + item.id} tabIndex={-1}>
           <div className="section-heading">
             <h4>{item.title}</h4>
-            <Status status={item.status} />
+            <div className="inline-badges">
+              {tier && <span className={verificationTierBadgeClass(tier)}>{verificationTierLabels[tier]}</span>}
+              <Status status={item.status} />
+            </div>
           </div>
           <div className="inline-badges">
-            <span className="finding-meta">{new URL(item.origin).hostname}</span>
+            <span className="finding-meta">{safeHostLabel(item.origin)}</span>
             <span className={severityBadgeClass(item.severity)}>{item.severity}</span>
             {item.findingKind === 'multi_step_chain' && <span className="badge badge-trace">Multi-step chain</span>}
             {replayLabel && <span className="badge badge-accent">{replayLabel}</span>}
@@ -252,14 +351,20 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
           </div>
           <dl className="finding-details">
             {item.category && <><dt>Class</dt><dd>{item.category}{item.cwe && <> · {item.cwe}</>}</dd></>}
-            {item.confidence && <><dt>Confidence</dt><dd>{item.confidence}</dd></>}
+            {item.confidence && <><dt>Confidence</dt><dd>{item.confidence}{item.confidenceRationale ? ` — ${item.confidenceRationale}` : ''}</dd></>}
             {item.check && <>
               <dt>Observed</dt><dd>{item.check.observed ?? 'Unavailable'}</dd>
               <dt>Expected</dt><dd>{item.check.expected}</dd>
             </>}
             {item.impact && <><dt>Impact</dt><dd>{item.impact}</dd></>}
+            {item.counterevidence && <><dt>Counterevidence</dt><dd>{item.counterevidence}</dd></>}
+            {item.runtimeProofGap && <><dt>Runtime proof gap</dt><dd>{item.runtimeProofGap}</dd></>}
+            {item.codeLocations && item.codeLocations.length > 0 && <>
+              <dt>Code locations</dt>
+              <dd>{item.codeLocations.map(loc => `${loc.repo}/${loc.file}:${loc.startLine}${loc.endLine > loc.startLine ? `-${loc.endLine}` : ''}`).join(', ')}</dd>
+            </>}
             {item.verification && <><dt>Verification</dt><dd>{item.verification}</dd></>}
-            <dt>{item.status === 'confirmed' ? 'Remediation' : 'Follow-up'}</dt><dd>{item.remediation}</dd>
+            <dt>{item.status === 'confirmed' || item.status === 'static_verified' ? 'Remediation' : 'Follow-up'}</dt><dd>{item.remediation}</dd>
             {item.recheck && <><dt>Check the fix</dt><dd>{item.recheck}</dd></>}
           </dl>
           {(!item.check || item.status !== 'confirmed') && <p>{item.reason}</p>}
@@ -267,6 +372,9 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
             {item.evidenceIds.map(id => <Button key={id} variant="ghost" onClick={() => openEvidence(id)}>
               {evidenceTitles.get(id) ?? 'Open finding evidence'}
             </Button>)}
+            {canPatch && <Button variant="ghost" disabled={patchingId === item.id} onClick={() => {
+              void triggerPatch(item.id, item.codeLocations?.[0]?.repo)
+            }}>{patchingId === item.id ? 'Generating patch…' : 'Generate Verified Patch'}</Button>}
           </div>
           {(canRetest || latestRetest) && <div className="retest-bar">
             <div className="inline-badges">
@@ -287,11 +395,63 @@ export function RunReport({ detail, execute, pending, openEvidence }: {
       })}
     </section>}
 
-    {confirmedFindings.length > 0 && <section className="stacked-section">
+    {(confirmedFindings.length > 0 || staticVerifiedFindings.length > 0) && <section className="stacked-section">
       <h3>Remediation plan</h3>
-      <ol>{confirmedFindings.map(item => <li key={item.id}>
-        <strong>{item.title}</strong><p>{item.remediation}</p>{item.recheck && <p className="muted">Recheck · {item.recheck}</p>}
-      </li>)}</ol>
+      <ol>{[...confirmedFindings, ...staticVerifiedFindings].map(item => {
+        const tier = findingVerificationTier(item)
+        return <li key={item.id}>
+          <strong>{item.title}</strong>{tier && <> <span className={verificationTierBadgeClass(tier)}>{verificationTierLabels[tier]}</span></>}
+          <p>{item.remediation}</p>
+          {item.recheck && <p className="muted">Recheck · {item.recheck}</p>}
+        </li>
+      })}</ol>
+    </section>}
+
+    {patchProposals.length > 0 && <section className="stacked-section" aria-label="Verified Patch Diffs">
+      <h3>Verified Patch Diffs</h3>
+      <div className="threat-grid">
+        {patchProposals.map(patch => <article key={patch.id} className="threat-card">
+          <div className="threat-card-head">
+            <strong>{findingTitleById.get(patch.findingId) ?? patch.findingId} · {patch.repo}</strong>
+            <div className="inline-badges">
+              <span className={patchStatusBadgeClass(patch.status)}>{patchStatusLabels[patch.status]}</span>
+              <span className={callerCompatBadgeClass(patch.callerCompatibility)}>{callerCompatibilityLabels[patch.callerCompatibility]}</span>
+              <span className={dynamicRetestBadgeClass(patch.dynamicRetestVerdict)}>{dynamicRetestLabels[patch.dynamicRetestVerdict]}</span>
+            </div>
+          </div>
+          {patch.codeLocations.length > 0 && <p className="muted">
+            {patch.codeLocations.map(l => `${l.file}:${l.startLine}-${l.endLine}`).join(', ')}
+          </p>}
+          {patch.reviewNotes && <p className="muted">{patch.reviewNotes}</p>}
+          {patch.status === 'approved' && patch.diff.trim()
+            ? <pre className="approval-preview">{patch.diff}</pre>
+            : patch.status === 'withheld' && <p className="muted">Diff withheld automatically because the independent patch reviewer flagged caller compatibility or gate failure.</p>}
+        </article>)}
+      </div>
+    </section>}
+
+    {openProofGaps.length > 0 && <section className="stacked-section" aria-label="Open Proof Gaps">
+      <h3>Open Proof Gaps</h3>
+      <div className="table-scroll">
+        <table className="owasp-table">
+          <thead>
+            <tr>
+              <th scope="col">Host</th>
+              <th scope="col">Category</th>
+              <th scope="col">Proof Gap Reason</th>
+              <th scope="col">Summary</th>
+            </tr>
+          </thead>
+          <tbody>
+            {openProofGaps.map((gap, index) => <tr key={`${gap.origin}-${gap.category}-${index}`}>
+              <td><strong>{safeHostLabel(gap.origin)}</strong></td>
+              <td>{owaspCategoryTitles[gap.category as keyof typeof owaspCategoryTitles] ?? gap.category}</td>
+              <td><span className="badge badge-attention">{gap.proofGapReason}</span></td>
+              <td className="muted">{gap.summary}</td>
+            </tr>)}
+          </tbody>
+        </table>
+      </div>
     </section>}
 
     {owaspRows.length > 0 && <section className="stacked-section" aria-label="OWASP and API Top 10 coverage">

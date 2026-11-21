@@ -1,0 +1,21 @@
+id: supabase-env-js-config
+name: "Runtime environment config exposes Supabase service key marker"
+severity: high
+description: "A public env/config JSON mentions a Supabase service-role key variable, which would bypass row-level security if populated."
+tech: [supabase]
+tags: [supabase, secrets]
+cwe: CWE-798
+spaExclusion: true
+request:
+  method: GET
+  path: /env.json
+control:
+  path: "/guardian-none-{{rand}}.json"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: regex
+    part: body
+    regex: ['SERVICE_ROLE_KEY', 'service_role']
+    condition: or

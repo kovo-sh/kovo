@@ -1,0 +1,20 @@
+id: springboot-actuator-env-exposed
+name: "Spring Boot actuator /env exposed"
+severity: high
+description: "The actuator environment endpoint is unauthenticated and lists configuration property sources."
+tech: [springboot]
+tags: [actuator, exposure]
+cwe: CWE-215
+request:
+  method: GET
+  path: /actuator/env
+control:
+  path: "/actuator/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["propertySources", "activeProfiles"]
+    condition: or

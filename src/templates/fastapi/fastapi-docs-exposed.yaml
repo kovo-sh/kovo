@@ -1,0 +1,21 @@
+id: fastapi-docs-exposed
+name: "FastAPI interactive docs exposed"
+severity: low
+description: "FastAPI Swagger UI is reachable at /docs, exposing the complete API surface."
+tech: [fastapi, swagger]
+tags: [exposure, api-docs]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /docs
+control:
+  path: "/guardian-none-{{rand}}/docs"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["swagger-ui", "FastAPI"]
+    condition: or

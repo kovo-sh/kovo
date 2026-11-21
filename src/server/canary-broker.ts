@@ -1,4 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto'
+import { createSocket } from 'node:dgram'
+import type { RemoteInfo, Socket as DgramSocket } from 'node:dgram'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { IncomingHttpHeaders, Server } from 'node:http'
@@ -13,6 +15,17 @@ export interface CanaryListenerOptions {
   port?: number
   publicBaseUrl?: string
   dnsDomain?: string
+  enableDns?: boolean
+  dnsHost?: string
+  dnsPort?: number
+  dnsSinkIp?: string
+}
+
+export interface CanaryDnsListenerOptions {
+  dnsHost?: string
+  dnsPort?: number
+  dnsDomain?: string
+  dnsSinkIp?: string
 }
 
 export interface CanaryListenerInfo {
@@ -23,13 +36,19 @@ export interface CanaryListenerInfo {
   publicBaseUrl: string | null
   effectiveBaseUrl: string | null
   dnsDomain: string
+  dnsRunning: boolean
+  dnsHost: string | null
+  dnsPort: number | null
 }
 
 export interface CanaryHit {
+  protocol: 'http' | 'dns'
   token: string
   method: string
   path: string
   query: string
+  queryType?: string
+  dnsHost?: string
   remoteIp: string
   userAgent: string
   headers: Record<string, string>
@@ -47,6 +66,7 @@ export interface MintedCanary {
   url: string
   dnsHost: string
   listenerActive: boolean
+  dnsListenerActive: boolean
   synthetic: boolean
 }
 
@@ -71,6 +91,19 @@ const tokenPattern = /guardian-canary-[a-f0-9]{24}/i
 const maxHitsPerToken = 50
 const maxTrackedTokens = 5_000
 const defaultDnsDomain = 'canary.guardian.invalid'
+
+const dnsTypeNames: Record<number, string> = {
+  1: 'A',
+  2: 'NS',
+  5: 'CNAME',
+  6: 'SOA',
+  12: 'PTR',
+  15: 'MX',
+  16: 'TXT',
+  28: 'AAAA',
+  33: 'SRV',
+  255: 'ANY',
+}
 
 function normalizePublicBaseUrl(raw: string | undefined): string | null {
   if (!raw) return null
@@ -99,16 +132,126 @@ function inferDnsDomain(explicit: string | undefined, publicBaseUrl: string | nu
   return defaultDnsDomain
 }
 
-function parsePort(explicit: number | undefined): number {
+function parsePort(explicit: number | undefined, envKey = 'GUARDIAN_CANARY_PORT'): number {
   if (typeof explicit === 'number' && Number.isInteger(explicit) && explicit >= 0 && explicit <= 65_535) {
     return explicit
   }
-  const envRaw = process.env.GUARDIAN_CANARY_PORT?.trim()
+  const envRaw = process.env[envKey]?.trim()
   if (envRaw !== undefined && envRaw !== '') {
     const parsed = Number(envRaw)
     if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 65_535) return parsed
   }
   return 0
+}
+
+function parseIpv4Bytes(ip: string): Buffer {
+  const parts = ip.trim().split('.').map(Number)
+  if (parts.length === 4 && parts.every(n => Number.isInteger(n) && n >= 0 && n <= 255)) {
+    return Buffer.from(parts)
+  }
+  return Buffer.from([127, 0, 0, 1])
+}
+
+interface ParsedDnsQuestion {
+  id: number
+  flags: number
+  qname: string
+  qtype: number
+  qclass: number
+  questionEndOffset: number
+}
+
+function parseDnsQuery(msg: Buffer): ParsedDnsQuestion | null {
+  if (msg.length < 12) return null
+  const id = msg.readUInt16BE(0)
+  const flags = msg.readUInt16BE(2)
+  const qr = (flags >> 15) & 1
+  if (qr !== 0) return null // Not a query
+  const qdcount = msg.readUInt16BE(4)
+  if (qdcount < 1) return null
+
+  const labels: string[] = []
+  let offset = 12
+  let safety = 0
+  while (offset < msg.length && safety < 128) {
+    safety += 1
+    const len = msg[offset]
+    if (len === 0) {
+      offset += 1
+      break
+    }
+    if ((len & 0xc0) !== 0) {
+      // Compression pointers should not appear in the first question QNAME; reject malformed packets.
+      return null
+    }
+    if (offset + 1 + len > msg.length) return null
+    labels.push(msg.subarray(offset + 1, offset + 1 + len).toString('ascii'))
+    offset += 1 + len
+  }
+  if (offset + 4 > msg.length) return null
+  const qtype = msg.readUInt16BE(offset)
+  const qclass = msg.readUInt16BE(offset + 2)
+  const questionEndOffset = offset + 4
+  const qname = labels.join('.').toLowerCase()
+  return { id, flags, qname, qtype, qclass, questionEndOffset }
+}
+
+function buildDnsResponse(
+  rawQuery: Buffer,
+  parsed: ParsedDnsQuestion,
+  hasValidToken: boolean,
+  sinkIp: string,
+): Buffer {
+  const rd = parsed.flags & 0x0100
+  const questionSection = rawQuery.subarray(12, parsed.questionEndOffset)
+
+  if (!hasValidToken) {
+    // Authoritative NXDOMAIN (QR=1, AA=1, RCODE=3)
+    const header = Buffer.alloc(12)
+    header.writeUInt16BE(parsed.id, 0)
+    header.writeUInt16BE(0x8403 | rd, 2)
+    header.writeUInt16BE(1, 4) // QDCOUNT
+    header.writeUInt16BE(0, 6) // ANCOUNT
+    header.writeUInt16BE(0, 8)
+    header.writeUInt16BE(0, 10)
+    return Buffer.concat([header, questionSection])
+  }
+
+  let rdata: Buffer | null = null
+  let answerType = parsed.qtype
+  if (parsed.qtype === 1 || parsed.qtype === 255) {
+    // A record -> 127.0.0.1 (or configured sink IP)
+    answerType = 1
+    rdata = parseIpv4Bytes(sinkIp)
+  } else if (parsed.qtype === 16) {
+    // TXT record -> "guardian-canary-ok"
+    const txt = Buffer.from('guardian-canary-ok', 'utf8')
+    rdata = Buffer.concat([Buffer.from([txt.length]), txt])
+  } else if (parsed.qtype === 28) {
+    // AAAA record -> ::1
+    rdata = Buffer.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+  }
+
+  const header = Buffer.alloc(12)
+  header.writeUInt16BE(parsed.id, 0)
+  header.writeUInt16BE(0x8400 | rd, 2) // QR=1, AA=1, RCODE=0
+  header.writeUInt16BE(1, 4) // QDCOUNT
+  header.writeUInt16BE(rdata ? 1 : 0, 6) // ANCOUNT
+  header.writeUInt16BE(0, 8)
+  header.writeUInt16BE(0, 10)
+
+  if (!rdata) {
+    return Buffer.concat([header, questionSection])
+  }
+
+  // Answer RR using compression pointer 0xc00c to QNAME at offset 12
+  const answerPrefix = Buffer.alloc(12)
+  answerPrefix.writeUInt16BE(0xc00c, 0)
+  answerPrefix.writeUInt16BE(answerType, 2)
+  answerPrefix.writeUInt16BE(1, 4) // CLASS IN
+  answerPrefix.writeUInt32BE(60, 6) // TTL 60s
+  answerPrefix.writeUInt16BE(rdata.length, 10)
+  return Buffer.concat([header, questionSection, answerPrefix, rdata])
 }
 
 function normalizeIncomingHeaders(headers: IncomingHttpHeaders): Record<string, string> {
@@ -146,11 +289,17 @@ function detailToCanaryHit(token: string, detail: Record<string, unknown>): Cana
     : {}
   const receivedAt = typeof detail.receivedAt === 'string' ? detail.receivedAt : new Date().toISOString()
   const parsedTs = typeof detail.timestamp === 'number' ? detail.timestamp : Date.parse(receivedAt)
+  const protocol: 'http' | 'dns' = detail.protocol === 'dns' || String(detail.method ?? '').toUpperCase() === 'DNS'
+    ? 'dns'
+    : 'http'
   return {
+    protocol,
     token,
-    method: String(detail.method ?? 'GET').toUpperCase().slice(0, 16),
-    path: redact(String(detail.path ?? `/c/${token}`)).slice(0, 512),
-    query: redact(String(detail.query ?? '')).slice(0, 512),
+    method: String(detail.method ?? (protocol === 'dns' ? 'DNS' : 'GET')).toUpperCase().slice(0, 16),
+    path: redact(String(detail.path ?? (protocol === 'dns' ? (detail.dnsHost ?? token) : `/c/${token}`))).slice(0, 512),
+    query: redact(String(detail.query ?? (detail.queryType ?? ''))).slice(0, 512),
+    ...(detail.queryType ? { queryType: String(detail.queryType).slice(0, 16) } : {}),
+    ...(detail.dnsHost ? { dnsHost: redact(String(detail.dnsHost)).slice(0, 256) } : {}),
     remoteIp: String(detail.remoteIp ?? '').slice(0, 128),
     userAgent: redact(String(detail.userAgent ?? '')).slice(0, 200),
     headers: redactHeaders(rawHeaders),
@@ -163,8 +312,11 @@ export class CanaryBroker {
   private readonly secret = randomBytes(32)
   private readonly defaultStorage?: Store
   private server?: Server
+  private dnsSocket?: DgramSocket
   private boundHost: string | null = null
   private boundPort: number | null = null
+  private dnsBoundHost: string | null = null
+  private dnsBoundPort: number | null = null
   private localBaseUrl: string | null = null
   private publicBaseUrl: string | null = null
   private dnsDomain: string
@@ -192,7 +344,84 @@ export class CanaryBroker {
       publicBaseUrl: this.publicBaseUrl,
       effectiveBaseUrl: this.effectiveBaseUrl(),
       dnsDomain: this.dnsDomain,
+      dnsRunning: Boolean(this.dnsSocket),
+      dnsHost: this.dnsBoundHost,
+      dnsPort: this.dnsBoundPort,
     }
+  }
+
+  async startDnsListener(options: CanaryDnsListenerOptions = {}): Promise<CanaryListenerInfo> {
+    if (options.dnsDomain) {
+      this.dnsDomain = inferDnsDomain(options.dnsDomain, this.publicBaseUrl)
+    }
+    if (this.dnsSocket) {
+      return this.listenerInfo()
+    }
+
+    const host = (options.dnsHost ?? process.env.GUARDIAN_CANARY_DNS_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
+    const port = parsePort(options.dnsPort, 'GUARDIAN_CANARY_DNS_PORT')
+    const sinkIp = (options.dnsSinkIp ?? process.env.GUARDIAN_CANARY_DNS_SINK_IP ?? '127.0.0.1').trim() || '127.0.0.1'
+
+    const socket = createSocket('udp4')
+    socket.on('message', (msg: Buffer, rinfo: RemoteInfo) => {
+      try {
+        const parsed = parseDnsQuery(msg)
+        if (!parsed) return
+        const match = tokenPattern.exec(parsed.qname)
+        const token = match ? match[0].toLowerCase() : null
+        const queryType = dnsTypeNames[parsed.qtype] ?? `TYPE${parsed.qtype}`
+        const isValid = Boolean(token)
+        if (token) {
+          const now = Date.now()
+          const hit: CanaryHit = {
+            protocol: 'dns',
+            token,
+            method: 'DNS',
+            path: redact(parsed.qname).slice(0, 512),
+            query: queryType,
+            queryType,
+            dnsHost: redact(parsed.qname).slice(0, 256),
+            remoteIp: (rinfo.address ?? '').slice(0, 128),
+            userAgent: '',
+            headers: {},
+            receivedAt: new Date(now).toISOString(),
+            timestamp: now,
+          }
+          this.appendHit(hit)
+        }
+        const response = buildDnsResponse(msg, parsed, isValid, sinkIp)
+        socket.send(response, rinfo.port, rinfo.address, () => {
+          // Best-effort UDP reply
+        })
+      } catch {
+        // Drop malformed UDP packets silently
+      }
+    })
+
+    socket.bind(port, host)
+    await once(socket, 'listening')
+    socket.unref()
+
+    const addr = socket.address()
+    this.dnsSocket = socket
+    this.dnsBoundHost = addr.address
+    this.dnsBoundPort = addr.port
+    return this.listenerInfo()
+  }
+
+  async stopDnsListener(): Promise<void> {
+    const sock = this.dnsSocket
+    this.dnsSocket = undefined
+    this.dnsBoundHost = null
+    this.dnsBoundPort = null
+    if (!sock) return
+    await new Promise<void>(resolve => {
+      try {
+        sock.close(() => resolve())
+      } catch {
+        resolve()
+      }
+    })
   }
 
   async startListener(options: CanaryListenerOptions = {}): Promise<CanaryListenerInfo> {
@@ -202,61 +431,79 @@ export class CanaryBroker {
     if (resolvedPublic) this.publicBaseUrl = resolvedPublic
     this.dnsDomain = inferDnsDomain(options.dnsDomain, this.publicBaseUrl)
 
-    if (this.server) {
-      return this.listenerInfo()
-    }
+    const shouldStartDns = Boolean(
+      options.enableDns ||
+      options.dnsHost !== undefined ||
+      options.dnsPort !== undefined ||
+      process.env.GUARDIAN_CANARY_DNS_HOST ||
+      process.env.GUARDIAN_CANARY_DNS_PORT,
+    )
 
-    const host = (options.host ?? process.env.GUARDIAN_CANARY_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
-    const port = parsePort(options.port)
+    if (!this.server) {
+      const host = (options.host ?? process.env.GUARDIAN_CANARY_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
+      const port = parsePort(options.port, 'GUARDIAN_CANARY_PORT')
 
-    const server = createServer((req, res) => {
-      // Drain inbound request body without buffering untrusted payloads.
-      req.resume()
-      try {
-        const url = new URL(req.url ?? '/', `http://${formatHostForUrl(host)}`)
-        const token = extractTokenFromRequest(url, req.headers.host)
-        if (token) {
-          const now = Date.now()
-          const hit: CanaryHit = {
-            token,
-            method: (req.method ?? 'GET').toUpperCase().slice(0, 16),
-            path: redact(url.pathname).slice(0, 512),
-            query: redact(url.search).slice(0, 512),
-            remoteIp: (req.socket?.remoteAddress ?? '').slice(0, 128),
-            userAgent: redact(String(req.headers['user-agent'] ?? '')).slice(0, 200),
-            headers: normalizeIncomingHeaders(req.headers),
-            receivedAt: new Date(now).toISOString(),
-            timestamp: now,
+      const server = createServer((req, res) => {
+        // Drain inbound request body without buffering untrusted payloads.
+        req.resume()
+        try {
+          const url = new URL(req.url ?? '/', `http://${formatHostForUrl(host)}`)
+          const token = extractTokenFromRequest(url, req.headers.host)
+          if (token) {
+            const now = Date.now()
+            const hit: CanaryHit = {
+              protocol: 'http',
+              token,
+              method: (req.method ?? 'GET').toUpperCase().slice(0, 16),
+              path: redact(url.pathname).slice(0, 512),
+              query: redact(url.search).slice(0, 512),
+              remoteIp: (req.socket?.remoteAddress ?? '').slice(0, 128),
+              userAgent: redact(String(req.headers['user-agent'] ?? '')).slice(0, 200),
+              headers: normalizeIncomingHeaders(req.headers),
+              receivedAt: new Date(now).toISOString(),
+              timestamp: now,
+            }
+            this.appendHit(hit)
           }
-          this.appendHit(hit)
+        } catch {
+          // Ignore malformed URLs on callback listener; still return benign 200.
         }
-      } catch {
-        // Ignore malformed URLs on callback listener; still return benign 200.
+        res.writeHead(200, {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+          connection: 'close',
+        }).end('guardian-canary-ok')
+      })
+
+      server.listen(port, host)
+      await once(server, 'listening')
+      server.unref()
+
+      const addr = server.address()
+      if (!addr || typeof addr === 'string') {
+        server.close()
+        throw new Error('Could not bind local canary listener.')
       }
-      res.writeHead(200, {
-        'content-type': 'text/plain; charset=utf-8',
-        'cache-control': 'no-store',
-        connection: 'close',
-      }).end('guardian-canary-ok')
-    })
-
-    server.listen(port, host)
-    await once(server, 'listening')
-    server.unref()
-
-    const addr = server.address()
-    if (!addr || typeof addr === 'string') {
-      server.close()
-      throw new Error('Could not bind local canary listener.')
+      this.server = server
+      this.boundHost = addr.address
+      this.boundPort = addr.port
+      this.localBaseUrl = `http://${formatHostForUrl(addr.address)}:${addr.port}`
     }
-    this.server = server
-    this.boundHost = addr.address
-    this.boundPort = addr.port
-    this.localBaseUrl = `http://${formatHostForUrl(addr.address)}:${addr.port}`
+
+    if (shouldStartDns && !this.dnsSocket) {
+      await this.startDnsListener({
+        dnsHost: options.dnsHost,
+        dnsPort: options.dnsPort,
+        dnsDomain: options.dnsDomain,
+        dnsSinkIp: options.dnsSinkIp,
+      })
+    }
+
     return this.listenerInfo()
   }
 
   async stopListener(): Promise<void> {
+    await this.stopDnsListener()
     const srv = this.server
     this.server = undefined
     this.boundHost = null
@@ -376,6 +623,7 @@ export class CanaryBroker {
       url: httpUrl,
       dnsHost,
       listenerActive: Boolean(this.server),
+      dnsListenerActive: Boolean(this.dnsSocket),
       synthetic: !effective,
     }
   }

@@ -1,0 +1,23 @@
+id: graphql-introspection-post-tier3
+name: "GraphQL introspection over POST (Tier 3 approval)"
+severity: low
+description: "POST-based introspection of the GraphQL schema; requires Tier 3 operator approval because it uses a mutating HTTP method."
+tech: [graphql]
+tags: [graphql, exposure]
+cwe: CWE-200
+requiresTier3: true
+request:
+  method: POST
+  path: /graphql
+  headers:
+    Content-Type: "application/json"
+  body: '{"query":"{__schema{queryType{name}}}"}'
+control:
+  headers:
+    Content-Type: "application/json"
+  body: '{"query":"{__typename}"}'
+matchers-condition: and
+matchers:
+  - type: word
+    part: body
+    words: ['"queryType"']

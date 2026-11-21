@@ -1,0 +1,18 @@
+id: clerk-frontend-api-proxy-environment
+name: "Clerk Frontend API proxy environment exposed"
+severity: info
+description: "The Clerk proxy path returns auth environment configuration, revealing enabled strategies and sign-up settings."
+tech: [clerk]
+tags: [auth, fingerprint]
+spaExclusion: true
+request:
+  method: GET
+  path: /__clerk/v1/environment
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["auth_config", "user_settings"]
+    condition: or

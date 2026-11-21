@@ -10,25 +10,36 @@ import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
 import {
   assessmentCheckTitles,
+  assetOriginForEnvironment,
   canReviewScope,
   defaultBudgetRequests,
   defaultBudgetUsd,
+  defaultLabBudgetRequests,
   defaultMaxRpsPerOrigin,
+  defaultPublicBudgetRequests,
   defaultWorkerConcurrency,
   defaultWorkerMaxTurns,
+  isLocalLabEnvEnabled,
   workerHistory,
 } from '../domain.ts'
 import type {
+  CallerCompatibility,
   Candidate,
   CapabilityTier,
   CheckCoverage,
+  CodeLocation,
+  DynamicRetestVerdict,
   EvidenceSummary,
   Finding,
+  LabConfig,
   OwaspCategory,
+  PatchProposalStatus,
+  PatchProposalSummary,
   ReportBody,
   RunCommand,
   SelectedChecks,
   ThreatModelSummary,
+  VerificationTier,
   WorkerPhase,
   importDnsInventory,
   importProjectSpec,
@@ -70,6 +81,10 @@ export type ApprovalRequest = typeof tables.approvalRequests.$inferSelect
 export type ReplaySpecRow = typeof tables.replaySpecs.$inferSelect
 export type RetestRun = typeof tables.retestRuns.$inferSelect
 export type CoverageEntry = typeof tables.coverageEntries.$inferSelect
+export type CanaryRow = typeof tables.canaries.$inferSelect
+export type SastRun = typeof tables.sastRuns.$inferSelect
+export type SurfaceProbe = typeof tables.surfaceProbes.$inferSelect
+export type PatchProposal = typeof tables.patchProposals.$inferSelect
 export type ReportRow = typeof tables.reports.$inferSelect
 export type MessageRow = typeof tables.messages.$inferSelect
 
@@ -230,6 +245,7 @@ export class Store {
     this.db = drizzle({ client: this.client })
     const result = migrate(this.db, { migrationsFolder: resolve('drizzle') })
     if (result && 'exitCode' in result) throw new Error('Guardian database migration failed.')
+    this.initV3Schema()
     this.initFts()
     const current = this.db.select().from(tables.workspaces).limit(1).get()
     this.workspace = current ?? this.db.insert(tables.workspaces).values({
@@ -239,6 +255,88 @@ export class Store {
       createdAt: Date.now(),
     }).returning().get()
     this.recover()
+  }
+
+  private initV3Schema() {
+    const existingColumns = (table: string): Set<string> => {
+      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    }
+    const ensureColumn = (table: string, column: string, definition: string) => {
+      if (!existingColumns(table).has(column)) {
+        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+      }
+    }
+
+    // projects v3 columns
+    ensureColumn('projects', 'lab_config', 'TEXT')
+
+    // findings v3 columns
+    ensureColumn('findings', 'verification_tier', 'TEXT')
+    ensureColumn('findings', 'fingerprint_hash', 'TEXT')
+    ensureColumn('findings', 'superseded_by_finding_id', 'TEXT')
+    ensureColumn('findings', 'counterevidence', 'TEXT')
+    ensureColumn('findings', 'confidence_rationale', 'TEXT')
+    ensureColumn('findings', 'severity_change_conditions', 'TEXT')
+    ensureColumn('findings', 'code_locations', 'TEXT')
+
+    // coverage_entries v3 columns
+    ensureColumn('coverage_entries', 'enforcing_control', 'TEXT')
+    ensureColumn('coverage_entries', 'proof_gap_reason', 'TEXT')
+    ensureColumn('coverage_entries', 'linked_finding_id', 'TEXT')
+
+    // canaries v3 columns
+    ensureColumn('canaries', 'protocol', `TEXT NOT NULL DEFAULT 'http'`)
+    ensureColumn('canaries', 'dns_host', 'TEXT')
+    ensureColumn('canaries', 'hit_count', 'INTEGER NOT NULL DEFAULT 0')
+
+    // v3 tables & indexes
+    this.client.exec(`
+      CREATE INDEX IF NOT EXISTS findings_fingerprint ON findings (run_id, fingerprint_hash);
+
+      CREATE TABLE IF NOT EXISTS sast_runs (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        assignment_id TEXT NOT NULL REFERENCES assignments(id),
+        repo TEXT NOT NULL,
+        engine TEXT NOT NULL,
+        raw_artifact_id TEXT,
+        finding_count INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS sast_runs_run ON sast_runs (run_id);
+
+      CREATE TABLE IF NOT EXISTS surface_probes (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        assignment_id TEXT NOT NULL REFERENCES assignments(id),
+        scope_revision INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        probe_kind TEXT NOT NULL,
+        requests_sent INTEGER NOT NULL DEFAULT 0,
+        anomalies_found INTEGER NOT NULL DEFAULT 0,
+        baseline_signature TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS surface_probes_run ON surface_probes (run_id, origin);
+
+      CREATE TABLE IF NOT EXISTS patch_proposals (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        finding_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        caller_compatibility TEXT NOT NULL DEFAULT 'attacker_only',
+        diff TEXT NOT NULL,
+        code_locations TEXT NOT NULL,
+        review_notes TEXT NOT NULL DEFAULT '',
+        dynamic_retest_verdict TEXT NOT NULL DEFAULT 'skipped',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS patch_proposals_run ON patch_proposals (run_id, finding_id);
+    `)
   }
 
   private initFts() {
@@ -543,6 +641,10 @@ export class Store {
       .orderBy(desc(tables.brokerExchanges.createdAt)).limit(500).all()
       .map(ex => ({ ...ex, bodyPreview: ex.bodyPreview.slice(0, 320) }))
     const coverageEntries = this.listCoverageEntries(runId)
+    const openProofGaps = this.listOpenProofGaps(runId, run.goalRevision)
+    const sastRuns = this.listSastRuns(runId)
+    const surfaceProbes = this.listSurfaceProbes(runId)
+    const patchProposals = this.listPatchProposals(runId)
     const replaySpecs = this.listReplaySpecs(runId)
     const retestRuns = this.db.select().from(tables.retestRuns).where(eq(tables.retestRuns.runId, runId))
       .orderBy(desc(tables.retestRuns.createdAt)).all()
@@ -551,6 +653,13 @@ export class Store {
       ...row.finding,
       findingKind: row.findingKind,
       replaySpecId: row.replaySpecId ?? row.finding.replaySpecId,
+      verificationTier: row.verificationTier ?? row.finding.verificationTier,
+      fingerprintHash: row.fingerprintHash ?? row.finding.fingerprintHash,
+      supersededByFindingId: row.supersededByFindingId ?? row.finding.supersededByFindingId,
+      counterevidence: row.counterevidence ?? row.finding.counterevidence,
+      confidenceRationale: row.confidenceRationale ?? row.finding.confidenceRationale,
+      severityChangeConditions: row.severityChangeConditions ?? row.finding.severityChangeConditions,
+      ...(row.codeLocations?.length ? { codeLocations: row.codeLocations } : row.finding.codeLocations?.length ? { codeLocations: row.finding.codeLocations } : {}),
     }))
     return {
       run,
@@ -566,6 +675,10 @@ export class Store {
       approvals,
       exchangesSummary,
       coverageEntries,
+      openProofGaps,
+      sastRuns,
+      surfaceProbes,
+      patchProposals,
       replaySpecs: replaySpecs as unknown as SerializableReplaySpecRow[],
       retestRuns,
       findings,
@@ -1295,13 +1408,258 @@ export class Store {
     return row
   }
 
+  // --- v3 SAST Runs, Surface Probes, Patch Proposals, Open Proof Gaps ---
+
+  recordSastRun(input: {
+    runId: string
+    assignmentId: string
+    repo: string
+    engine: string
+    rawArtifactId?: string | null
+    findingCount: number
+    durationMs: number
+  }): SastRun {
+    const row = this.db.insert(tables.sastRuns).values({
+      id: randomUUID(),
+      runId: input.runId,
+      assignmentId: input.assignmentId,
+      repo: redact(input.repo.slice(0, 200)),
+      engine: input.engine.slice(0, 64),
+      rawArtifactId: input.rawArtifactId ?? null,
+      findingCount: Math.max(0, Math.round(input.findingCount)),
+      durationMs: Math.max(0, Math.round(input.durationMs)),
+      createdAt: Date.now(),
+    }).returning().get()
+    this.event(input.runId, 'sast.run', `SAST (${row.engine}) on ${row.repo}: ${row.findingCount} findings (${row.durationMs}ms).`, {
+      sastRunId: row.id,
+      assignmentId: row.assignmentId,
+      repo: row.repo,
+      engine: row.engine,
+      findingCount: row.findingCount,
+      rawArtifactId: row.rawArtifactId,
+    })
+    return row
+  }
+
+  listSastRuns(runId: string): SastRun[] {
+    return this.db.select().from(tables.sastRuns).where(eq(tables.sastRuns.runId, runId))
+      .orderBy(desc(tables.sastRuns.createdAt)).all()
+  }
+
+  recordSurfaceProbe(input: {
+    runId: string
+    assignmentId: string
+    scopeRevision: number
+    origin: string
+    probeKind: string
+    requestsSent: number
+    anomaliesFound: number
+    baselineSignature?: string | null
+  }): SurfaceProbe {
+    const row = this.db.insert(tables.surfaceProbes).values({
+      id: randomUUID(),
+      runId: input.runId,
+      assignmentId: input.assignmentId,
+      scopeRevision: input.scopeRevision,
+      origin: input.origin,
+      probeKind: input.probeKind.slice(0, 64),
+      requestsSent: Math.max(0, Math.round(input.requestsSent)),
+      anomaliesFound: Math.max(0, Math.round(input.anomaliesFound)),
+      baselineSignature: input.baselineSignature ? redact(input.baselineSignature.slice(0, 500)) : null,
+      createdAt: Date.now(),
+    }).returning().get()
+    this.event(input.runId, 'surface.probe', `Surface probe (${row.probeKind}) on ${row.origin}: ${row.requestsSent} reqs, ${row.anomaliesFound} anomalies.`, {
+      surfaceProbeId: row.id,
+      assignmentId: row.assignmentId,
+      origin: row.origin,
+      probeKind: row.probeKind,
+      requestsSent: row.requestsSent,
+      anomaliesFound: row.anomaliesFound,
+    })
+    return row
+  }
+
+  listSurfaceProbes(runId: string): SurfaceProbe[] {
+    return this.db.select().from(tables.surfaceProbes).where(eq(tables.surfaceProbes.runId, runId))
+      .orderBy(desc(tables.surfaceProbes.createdAt)).all()
+  }
+
+  savePatchProposal(input: {
+    id?: string
+    runId: string
+    findingId: string
+    repo: string
+    status: PatchProposalStatus
+    callerCompatibility: CallerCompatibility
+    diff: string
+    codeLocations: CodeLocation[]
+    reviewNotes: string
+    dynamicRetestVerdict?: DynamicRetestVerdict
+    secrets?: readonly NamedSecret[]
+  }): PatchProposal {
+    const now = Date.now()
+    const secrets = input.secrets ?? []
+    const cleanDiff = redact(input.diff, secrets)
+    const cleanNotes = redact(input.reviewNotes, secrets)
+    const cleanLocations = input.codeLocations.map(loc => ({
+      ...loc,
+      ...(loc.snippet ? { snippet: redact(loc.snippet, secrets) } : {}),
+      ...(loc.label ? { label: redact(loc.label, secrets) } : {}),
+    }))
+
+    const existing = input.id
+      ? this.db.select().from(tables.patchProposals).where(and(
+          eq(tables.patchProposals.runId, input.runId), eq(tables.patchProposals.id, input.id),
+        )).get()
+      : undefined
+
+    const saved = existing
+      ? this.db.update(tables.patchProposals).set({
+          status: input.status,
+          callerCompatibility: input.callerCompatibility,
+          diff: cleanDiff,
+          codeLocations: cleanLocations,
+          reviewNotes: cleanNotes,
+          dynamicRetestVerdict: input.dynamicRetestVerdict ?? existing.dynamicRetestVerdict,
+          updatedAt: now,
+        }).where(eq(tables.patchProposals.id, existing.id)).returning().get()!
+      : this.db.insert(tables.patchProposals).values({
+          id: input.id ?? randomUUID(),
+          runId: input.runId,
+          findingId: input.findingId,
+          repo: redact(input.repo.slice(0, 200)),
+          status: input.status,
+          callerCompatibility: input.callerCompatibility,
+          diff: cleanDiff,
+          codeLocations: cleanLocations,
+          reviewNotes: cleanNotes,
+          dynamicRetestVerdict: input.dynamicRetestVerdict ?? 'skipped',
+          createdAt: now,
+          updatedAt: now,
+        }).returning().get()
+
+    this.event(input.runId, 'patch.saved', `Patch proposal [${saved.status}] for finding ${saved.findingId} (${saved.callerCompatibility}).`, {
+      patchId: saved.id,
+      findingId: saved.findingId,
+      repo: saved.repo,
+      status: saved.status,
+      callerCompatibility: saved.callerCompatibility,
+      dynamicRetestVerdict: saved.dynamicRetestVerdict,
+    })
+    return saved
+  }
+
+  listPatchProposals(runId: string, findingId?: string): PatchProposal[] {
+    const where = findingId
+      ? and(eq(tables.patchProposals.runId, runId), eq(tables.patchProposals.findingId, findingId))
+      : eq(tables.patchProposals.runId, runId)
+    return this.db.select().from(tables.patchProposals).where(where)
+      .orderBy(desc(tables.patchProposals.updatedAt)).all()
+  }
+
+  getPatchProposal(runId: string, patchId: string): PatchProposal {
+    const row = this.db.select().from(tables.patchProposals).where(and(
+      eq(tables.patchProposals.runId, runId), eq(tables.patchProposals.id, patchId),
+    )).get()
+    if (!row) throw new Error('Patch proposal not found.')
+    return row
+  }
+
+  listOpenProofGaps(runId: string, goalRevision?: number): CoverageEntry[] {
+    const where = goalRevision !== undefined
+      ? and(
+          eq(tables.coverageEntries.runId, runId),
+          eq(tables.coverageEntries.goalRevision, goalRevision),
+          eq(tables.coverageEntries.status, 'needs_follow_up'),
+        )
+      : and(
+          eq(tables.coverageEntries.runId, runId),
+          eq(tables.coverageEntries.status, 'needs_follow_up'),
+        )
+    return this.db.select().from(tables.coverageEntries).where(where)
+      .orderBy(asc(tables.coverageEntries.origin), asc(tables.coverageEntries.category)).all()
+  }
+
+  updateProposedFinding(
+    run: Run,
+    findingId: string,
+    patch: {
+      finding?: Partial<Finding>
+      replaySpecId?: string
+      sourceOrigins?: string[]
+      verificationTier?: VerificationTier | null
+      fingerprintHash?: string | null
+      supersededByFindingId?: string | null
+      counterevidence?: string | null
+      confidenceRationale?: string | null
+      severityChangeConditions?: string | null
+      codeLocations?: CodeLocation[] | null
+    },
+  ): Finding {
+    const existing = this.db.select().from(tables.findings).where(and(
+      eq(tables.findings.runId, run.id), eq(tables.findings.id, findingId),
+    )).get()
+    if (!existing) throw new Error('Finding not found.')
+
+    const mergedFinding: Finding = {
+      ...existing.finding,
+      ...(patch.finding ?? {}),
+      id: existing.id,
+      ...(patch.replaySpecId !== undefined ? { replaySpecId: patch.replaySpecId } : {}),
+      ...(patch.verificationTier !== undefined ? { verificationTier: patch.verificationTier ?? undefined } : {}),
+      ...(patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
+      ...(patch.supersededByFindingId !== undefined ? { supersededByFindingId: patch.supersededByFindingId } : {}),
+      ...(patch.counterevidence !== undefined ? { counterevidence: patch.counterevidence } : {}),
+      ...(patch.confidenceRationale !== undefined ? { confidenceRationale: patch.confidenceRationale } : {}),
+      ...(patch.severityChangeConditions !== undefined ? { severityChangeConditions: patch.severityChangeConditions } : {}),
+      ...(patch.codeLocations !== undefined ? { codeLocations: patch.codeLocations ?? undefined } : {}),
+      evidenceIds: [...new Set([...existing.finding.evidenceIds, ...(patch.finding?.evidenceIds ?? [])])],
+      exchangeIds: [...new Set([...(existing.finding.exchangeIds ?? []), ...(patch.finding?.exchangeIds ?? [])])],
+      chainFactIds: [...new Set([...(existing.finding.chainFactIds ?? []), ...(patch.finding?.chainFactIds ?? [])])],
+      scopeRevision: Math.max(existing.finding.scopeRevision, run.scopeRevision),
+    }
+
+    const cleanOrigins = [...new Set([
+      ...existing.sourceOrigins,
+      ...(patch.sourceOrigins ?? []),
+      ...(mergedFinding.origin ? [mergedFinding.origin] : []),
+    ])]
+
+    this.db.update(tables.findings).set({
+      replaySpecId: patch.replaySpecId ?? existing.replaySpecId,
+      sourceOrigins: cleanOrigins,
+      verificationTier: patch.verificationTier !== undefined ? patch.verificationTier : (mergedFinding.verificationTier ?? existing.verificationTier),
+      fingerprintHash: patch.fingerprintHash !== undefined ? patch.fingerprintHash : (mergedFinding.fingerprintHash ?? existing.fingerprintHash),
+      supersededByFindingId: patch.supersededByFindingId !== undefined ? patch.supersededByFindingId : (mergedFinding.supersededByFindingId ?? existing.supersededByFindingId),
+      counterevidence: patch.counterevidence !== undefined ? patch.counterevidence : (mergedFinding.counterevidence ?? existing.counterevidence),
+      confidenceRationale: patch.confidenceRationale !== undefined ? patch.confidenceRationale : (mergedFinding.confidenceRationale ?? existing.confidenceRationale),
+      severityChangeConditions: patch.severityChangeConditions !== undefined ? patch.severityChangeConditions : (mergedFinding.severityChangeConditions ?? existing.severityChangeConditions),
+      codeLocations: patch.codeLocations !== undefined ? patch.codeLocations : (mergedFinding.codeLocations ?? existing.codeLocations),
+      finding: mergedFinding,
+    }).where(eq(tables.findings.id, existing.id)).run()
+
+    this.event(run.id, 'finding.updated', `Updated finding "${mergedFinding.title}" (${mergedFinding.status}).`, {
+      findingId: mergedFinding.id,
+      status: mergedFinding.status,
+      severity: mergedFinding.severity,
+      verificationTier: mergedFinding.verificationTier ?? null,
+    })
+    return mergedFinding
+  }
+
   upsertCoverageEntry(run: Run, assignmentId: string, input: {
     origin: string
     category: OwaspCategory
     status: CoverageEntry['status']
     summary: string
+    enforcingControl?: string | null
+    proofGapReason?: string | null
+    linkedFindingId?: string | null
   }): CoverageEntry {
     const now = Date.now()
+    const cleanControl = input.enforcingControl?.trim() ? redact(input.enforcingControl.trim().slice(0, 600)) : null
+    const cleanGapReason = input.proofGapReason?.trim() ? redact(input.proofGapReason.trim().slice(0, 600)) : null
+    const linkedFindingId = input.linkedFindingId?.trim() || null
     const existing = this.db.select().from(tables.coverageEntries).where(and(
       eq(tables.coverageEntries.runId, run.id),
       eq(tables.coverageEntries.goalRevision, run.goalRevision),
@@ -1313,6 +1671,9 @@ export class Store {
         scopeRevision: run.scopeRevision,
         status: input.status,
         summary: redact(input.summary.slice(0, 600)),
+        enforcingControl: cleanControl ?? (input.status === 'ruled_out' ? existing.enforcingControl : null),
+        proofGapReason: cleanGapReason ?? (input.status === 'needs_follow_up' ? existing.proofGapReason : null),
+        linkedFindingId: linkedFindingId ?? (input.status === 'reported' ? existing.linkedFindingId : null),
         assignmentId,
         updatedAt: now,
       }).where(eq(tables.coverageEntries.id, existing.id)).returning().get()!
@@ -1326,6 +1687,9 @@ export class Store {
       category: input.category,
       status: input.status,
       summary: redact(input.summary.slice(0, 600)),
+      enforcingControl: cleanControl,
+      proofGapReason: cleanGapReason,
+      linkedFindingId,
       assignmentId,
       updatedAt: now,
     }).returning().get()
@@ -1353,8 +1717,10 @@ export class Store {
     )).all()
     const matches = rows.filter(row => row.id !== excludeId && chainFindingDedupKey(row.finding) === key)
     if (!matches.length) return undefined
-    // Prefer confirmed duplicate first, then pending, then others
-    const order = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
+    // Prefer confirmed duplicate first, then static_verified, then pending, then others
+    const order: Record<Finding['status'], number> = {
+      confirmed: 0, static_verified: 1, pending: 2, inconclusive: 3, dismissed: 4,
+    }
     matches.sort((a, b) => order[a.finding.status] - order[b.finding.status])
     return matches[0]
   }
@@ -1401,11 +1767,27 @@ export class Store {
       ...sourceOrigins,
     ])]
 
+    const verificationTier: VerificationTier | null = storedFinding.verificationTier ??
+      (storedFinding.status === 'static_verified'
+        ? 'static_verified'
+        : storedFinding.status === 'confirmed'
+          ? 'runtime_confirmed'
+          : targetRow?.verificationTier ?? null)
+
+    if (verificationTier) storedFinding.verificationTier = verificationTier
+
     this.transaction(() => {
       if (targetRow) {
         this.db.update(tables.findings).set({
           replaySpecId: canonicalSpecId,
           sourceOrigins: cleanOrigins,
+          verificationTier,
+          fingerprintHash: storedFinding.fingerprintHash ?? targetRow.fingerprintHash ?? null,
+          supersededByFindingId: storedFinding.supersededByFindingId ?? targetRow.supersededByFindingId ?? null,
+          counterevidence: storedFinding.counterevidence ?? targetRow.counterevidence ?? null,
+          confidenceRationale: storedFinding.confidenceRationale ?? targetRow.confidenceRationale ?? null,
+          severityChangeConditions: storedFinding.severityChangeConditions ?? targetRow.severityChangeConditions ?? null,
+          codeLocations: storedFinding.codeLocations ?? targetRow.codeLocations ?? null,
           finding: storedFinding,
         }).where(eq(tables.findings.id, targetRow.id)).run()
       } else {
@@ -1419,6 +1801,13 @@ export class Store {
           findingKind: 'multi_step_chain',
           replaySpecId: canonicalSpecId,
           sourceOrigins: cleanOrigins,
+          verificationTier,
+          fingerprintHash: storedFinding.fingerprintHash ?? null,
+          supersededByFindingId: storedFinding.supersededByFindingId ?? null,
+          counterevidence: storedFinding.counterevidence ?? null,
+          confidenceRationale: storedFinding.confidenceRationale ?? null,
+          severityChangeConditions: storedFinding.severityChangeConditions ?? null,
+          codeLocations: storedFinding.codeLocations ?? null,
           finding: storedFinding,
         }).run()
       }
@@ -1500,13 +1889,22 @@ export class Store {
 
   createProject(input: z.output<typeof newProject>) {
     return this.operate(input, () => {
+      const environment = input.environment ?? 'public'
+      const originValidator = assetOriginForEnvironment(environment)
+      const validatedSeeds = [...new Set(input.seeds.map(seed => originValidator.parse(seed)))]
+      const labConfig = environment === 'local-lab' && input.labConfig
+        ? (input.labConfig.enabled && !isLocalLabEnvEnabled()
+            ? (() => { throw new Error('Enabling local-lab execution requires GUARDIAN_ALLOW_LOCAL_LAB=1.') })()
+            : input.labConfig)
+        : null
       const project = this.db.insert(tables.projects).values({
         id: randomUUID(),
         workspaceId: this.workspace.id,
         name: redact(input.name),
-        environment: input.environment ?? 'public',
-        seeds: [...new Set(input.seeds)],
+        environment,
+        seeds: validatedSeeds,
         defaultScope: [],
+        labConfig,
         createdAt: Date.now(),
       }).returning().get()
       this.db.insert(tables.projectAssets).values(project.seeds.map(origin => ({
@@ -1517,11 +1915,33 @@ export class Store {
     })
   }
 
+  updateProjectLabConfig(input: { requestId: string; projectId: string; labConfig: LabConfig | null }) {
+    return this.operate(input, () => {
+      const project = this.project(input.projectId)
+      if (input.labConfig?.enabled) {
+        if (project.environment !== 'local-lab') {
+          throw new Error('Local-lab app execution is forbidden on public projects.')
+        }
+        if (!isLocalLabEnvEnabled()) {
+          throw new Error('Local-lab app execution requires GUARDIAN_ALLOW_LOCAL_LAB=1 on the server.')
+        }
+      }
+      const nextConfig = project.environment === 'local-lab' ? input.labConfig : null
+      this.db.update(tables.projects).set({ labConfig: nextConfig }).where(eq(tables.projects.id, project.id)).run()
+      this.event(null, 'project.lab_config_updated', 'Project lab configuration updated.', {
+        projectId: project.id,
+        enabled: Boolean(nextConfig?.enabled),
+      })
+      return { id: project.id, labConfig: nextConfig }
+    })
+  }
+
   createRun(input: z.output<typeof newRun>) {
     return this.operate(input, () => {
       const project = this.project(input.projectId)
       const goal = redact(input.goal)
       const capabilityTier: CapabilityTier = input.sourceMode === 'prepared' ? 0 : (input.capabilityTier ?? 1)
+      const defaultReqs = project.environment === 'local-lab' ? defaultLabBudgetRequests : defaultPublicBudgetRequests
       const run = this.db.insert(tables.runs).values({
         id: randomUUID(),
         projectId: project.id,
@@ -1538,7 +1958,7 @@ export class Store {
         approvedPersonaIds: [],
         roundNo: 0,
         budgetUsd: input.budgetUsd ?? defaultBudgetUsd,
-        budgetRequests: input.budgetRequests ?? defaultBudgetRequests,
+        budgetRequests: input.budgetRequests ?? defaultReqs ?? defaultBudgetRequests,
         spentUsd: 0,
         spentTokens: 0,
         spentRequests: 0,
@@ -1560,7 +1980,8 @@ export class Store {
   addProjectAsset(input: z.output<typeof projectAsset>) {
     return this.operate(input, () => {
       const project = this.project(input.projectId)
-      const candidate = this.saveCandidate(project.id, input)
+      const origin = assetOriginForEnvironment(project.environment).parse(input.origin)
+      const candidate = this.saveCandidate(project.id, { ...input, origin })
       return { id: candidate.id }
     })
   }
@@ -1913,6 +2334,12 @@ export class Store {
     if (approved.some(id => !run.candidates.some(asset => asset.id === id))) {
       throw new Error('Select assets from this run’s inventory.')
     }
+    const project = this.project(run.projectId)
+    const originValidator = assetOriginForEnvironment(project.environment)
+    for (const id of approved) {
+      const asset = run.candidates.find(c => c.id === id)
+      if (asset) originValidator.parse(asset.origin)
+    }
     if (run.phase === 'review' && approved.length === 0) {
       throw new Error('Approve at least one host to start assessment.')
     }
@@ -2139,9 +2566,27 @@ export class Store {
     // Filter findings strictly by current approved scope & non-tainted provenance
     const results = this.db.select().from(tables.findings).where(and(
       eq(tables.findings.runId, run.id), eq(tables.findings.goalRevision, run.goalRevision),
-    )).all().flatMap(({ assetId, finding, checkId, caseId, findingKind, sourceOrigins, replaySpecId }) => {
-      if (!run.approved.includes(assetId) || !approvedOrigins.has(finding.origin)) return []
-      if (sourceOrigins.some(o => !approvedOrigins.has(o))) return []
+    )).all().flatMap(row => {
+      const { assetId, checkId, caseId, findingKind, sourceOrigins, replaySpecId } = row
+      const finding: Finding = {
+        ...row.finding,
+        verificationTier: row.verificationTier ?? row.finding.verificationTier,
+        fingerprintHash: row.fingerprintHash ?? row.finding.fingerprintHash,
+        supersededByFindingId: row.supersededByFindingId ?? row.finding.supersededByFindingId,
+        counterevidence: row.counterevidence ?? row.finding.counterevidence,
+        confidenceRationale: row.confidenceRationale ?? row.finding.confidenceRationale,
+        severityChangeConditions: row.severityChangeConditions ?? row.finding.severityChangeConditions,
+        ...(row.codeLocations?.length ? { codeLocations: row.codeLocations } : row.finding.codeLocations?.length ? { codeLocations: row.finding.codeLocations } : {}),
+      }
+      const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
+      if (!isStaticVerified) {
+        if (!run.approved.includes(assetId) || !approvedOrigins.has(finding.origin)) return []
+        if (sourceOrigins.some(o => !approvedOrigins.has(o))) return []
+      } else {
+        // Static-verified findings may reference approved origins or synthetic 'https://static-analysis.invalid'
+        const nonSynthetic = sourceOrigins.filter(o => o !== 'https://static-analysis.invalid')
+        if (nonSynthetic.some(o => !approvedOrigins.has(o))) return []
+      }
       if (finding.chainFactIds?.some(fid => taintedFactIds.has(fid))) return []
       if (!finding.evidenceIds.length && !(finding.exchangeIds?.length)) return []
       if (findingKind === 'multi_step_chain') {
@@ -2176,7 +2621,39 @@ export class Store {
     const threatModelEntries = snapshot.threatModel?.entries.filter(e => approvedOrigins.has(e.origin))
     const owaspCoverage = snapshot.coverageEntries
       .filter(c => c.goalRevision === run.goalRevision && approvedOrigins.has(c.origin))
-      .map(c => ({ origin: c.origin, category: c.category, status: c.status, summary: c.summary }))
+      .map(c => ({
+        origin: c.origin,
+        category: c.category,
+        status: c.status,
+        summary: c.summary,
+        ...(c.enforcingControl ? { enforcingControl: c.enforcingControl } : {}),
+        ...(c.proofGapReason ? { proofGapReason: c.proofGapReason } : {}),
+        ...(c.linkedFindingId ? { linkedFindingId: c.linkedFindingId } : {}),
+      }))
+    const openProofGaps = snapshot.openProofGaps
+      .filter(c => approvedOrigins.has(c.origin))
+      .map(c => ({
+        origin: c.origin,
+        category: c.category,
+        summary: c.summary,
+        proofGapReason: c.proofGapReason || c.summary,
+      }))
+    const includedFindingIds = new Set(finalFindings.map(f => f.id))
+    const patchProposals: PatchProposalSummary[] = snapshot.patchProposals
+      .filter(p => includedFindingIds.has(p.findingId))
+      .map(p => ({
+        id: p.id,
+        findingId: p.findingId,
+        repo: p.repo,
+        status: p.status,
+        callerCompatibility: p.callerCompatibility,
+        diff: p.diff,
+        codeLocations: p.codeLocations,
+        reviewNotes: p.reviewNotes,
+        dynamicRetestVerdict: p.dynamicRetestVerdict,
+        createdAt: p.createdAt,
+        updatedAt: p.updatedAt,
+      }))
 
     const body: ReportBody = {
       goal: run.goal,
@@ -2187,6 +2664,8 @@ export class Store {
       ...(selection ? { selectedChecks: selection } : {}),
       ...(threatModelEntries?.length ? { threatModel: threatModelEntries } : {}),
       ...(owaspCoverage.length ? { owaspCoverage } : {}),
+      ...(openProofGaps.length ? { openProofGaps } : {}),
+      ...(patchProposals.length ? { patchProposals } : {}),
       metrics: {
         turnsUsed: run.turnsUsed,
         requestsUsed: run.spentRequests,

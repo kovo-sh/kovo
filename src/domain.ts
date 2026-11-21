@@ -14,7 +14,9 @@ export const maxWorkerMaxTurns = 300
 export const defaultRunMaxTurns = 2000
 export const defaultBudgetUsd = 25
 export const defaultBudgetRequests = 2500
-export const maxBudgetRequests = 10_000
+export const defaultPublicBudgetRequests = 4000
+export const defaultLabBudgetRequests = 10_000
+export const maxBudgetRequests = 25_000
 export const defaultMaxRpsPerOrigin = 5
 export const maxRpsPerOriginCeiling = 20
 export const defaultWorkerConcurrency = 6
@@ -26,7 +28,64 @@ export type CapabilityTier = typeof capabilityTiers[number]
 export const thinkingLevels = ['off', 'low', 'medium', 'high'] as const
 export type ThinkingLevel = typeof thinkingLevels[number]
 
-export const assetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
+export const httpMethods = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
+export type HttpMethod = typeof httpMethods[number]
+
+export const verificationTiers = ['runtime_confirmed', 'static_verified', 'baseline_confirmed'] as const
+export type VerificationTier = typeof verificationTiers[number]
+
+export const findingStatuses = ['pending', 'confirmed', 'static_verified', 'dismissed', 'inconclusive'] as const
+export type FindingStatus = typeof findingStatuses[number]
+
+export const coverageClosureStatuses = ['reported', 'no_issue_found', 'ruled_out', 'not_applicable', 'needs_follow_up'] as const
+export type CoverageClosureStatus = typeof coverageClosureStatuses[number]
+
+export const patchProposalStatuses = ['draft', 'approved', 'rejected', 'withheld'] as const
+export type PatchProposalStatus = typeof patchProposalStatuses[number]
+
+export const callerCompatibilities = ['attacker_only', 'needs_operator_step', 'breaks_callers'] as const
+export type CallerCompatibility = typeof callerCompatibilities[number]
+
+export const dynamicRetestVerdicts = ['fixed', 'reproduced', 'skipped'] as const
+export type DynamicRetestVerdict = typeof dynamicRetestVerdicts[number]
+
+export const codeLocationSchema = z.object({
+  repo: z.string().trim().min(1).max(200),
+  file: z.string().trim().min(1).max(500),
+  startLine: z.number().int().min(1),
+  endLine: z.number().int().min(1),
+  snippet: z.string().max(4000).optional(),
+  label: z.string().max(200).optional(),
+})
+export type CodeLocation = z.output<typeof codeLocationSchema>
+
+export const labConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  repo: z.string().trim().min(1).max(200).optional(),
+  startCommand: z.string().trim().min(1).max(500).optional(),
+  dockerfile: z.string().trim().min(1).max(300).optional(),
+  dockerComposeFile: z.string().trim().min(1).max(300).optional(),
+  healthPath: z.string().trim().startsWith('/').max(256).default('/'),
+  internalPort: z.number().int().min(1).max(65_535).optional(),
+})
+export type LabConfig = z.output<typeof labConfigSchema>
+
+export function isLocalLabEnvEnabled(): boolean {
+  return typeof process !== 'undefined' && process.env?.GUARDIAN_ALLOW_LOCAL_LAB === '1'
+}
+
+function isAllowedLabIpv4(hostname: string): boolean {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname)
+  if (!match) return false
+  const octets = match.slice(1).map(Number)
+  if (octets.some(o => !Number.isInteger(o) || o < 0 || o > 255)) return false
+  const [a, b] = octets
+  // Loopback (127.0.0.0/8) or RFC1918 private Docker lab subnets (10/8, 172.16/12, 192.168/16).
+  // Explicitly excludes 169.254.0.0/16 cloud metadata link-local range.
+  return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+}
+
+function parsePublicOrigin(input: string): string | null {
   try {
     const url = new URL(input.includes('://') ? input : 'https://' + input)
     if (
@@ -34,19 +93,116 @@ export const assetOrigin = z.string().trim().min(1).max(253).transform((input, c
       url.pathname !== '/' || url.search || url.hash ||
       !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(url.hostname) ||
       /^[\d.]+$/.test(url.hostname)
-    ) throw new Error()
+    ) return null
     return url.origin
   } catch {
+    return null
+  }
+}
+
+function parseLabOrigin(input: string): string | null {
+  try {
+    const url = new URL(input.includes('://') ? input : 'http://' + input)
+    if (
+      (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      url.username || url.password ||
+      url.pathname !== '/' || url.search || url.hash
+    ) return null
+    const host = url.hostname.toLowerCase()
+    if (!host) return null
+    if (host === 'localhost' || host === '[::1]' || host === '::1') {
+      return url.origin
+    }
+    if (/^[\d.]+$/.test(host)) {
+      return isAllowedLabIpv4(host) ? url.origin : null
+    }
+    // Reject metadata hostnames even in local-lab mode.
+    if (host === 'metadata.google.internal' || host === 'metadata') return null
+    if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/.test(host)) {
+      return url.origin
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+export const publicAssetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
+  const parsed = parsePublicOrigin(input)
+  if (!parsed) {
     ctx.addIssue({ code: 'custom', message: 'Enter a hostname or HTTPS origin, such as example.com.' })
     return z.NEVER
   }
+  return parsed
 })
+
+export const labAssetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
+  if (!isLocalLabEnvEnabled()) {
+    // Without GUARDIAN_ALLOW_LOCAL_LAB=1 only strict public HTTPS hostnames are accepted
+    // (backwards compatible with v2 local-lab projects); http/port/IP origins stay rejected.
+    const pub = parsePublicOrigin(input)
+    if (pub) return pub
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Local-lab http/port/IP origins are blocked unless GUARDIAN_ALLOW_LOCAL_LAB=1.',
+    })
+    return z.NEVER
+  }
+  const parsed = parseLabOrigin(input)
+  if (!parsed) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Enter an allowed local-lab HTTP/HTTPS origin (localhost, 127.0.0.1, private Docker subnet, or hostname with optional port).',
+    })
+    return z.NEVER
+  }
+  return parsed
+})
+
+/** Backwards-compatible public origin schema (strict HTTPS hostname, no port, no IP). */
+export const assetOrigin = publicAssetOrigin
+
+/** Accepts public HTTPS origins always, and lab HTTP/port origins ONLY when GUARDIAN_ALLOW_LOCAL_LAB=1. */
+export const scopedAssetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
+  const pub = parsePublicOrigin(input)
+  if (pub) return pub
+  if (isLocalLabEnvEnabled()) {
+    const lab = parseLabOrigin(input)
+    if (lab) return lab
+  }
+  ctx.addIssue({ code: 'custom', message: 'Enter a hostname or HTTPS origin, such as example.com.' })
+  return z.NEVER
+})
+
+export function assetOriginForEnvironment(env: 'public' | 'local-lab') {
+  return env === 'local-lab' ? labAssetOrigin : publicAssetOrigin
+}
 
 export const newProject = z.object({
   requestId: id,
   name: shortText,
-  seeds: z.array(assetOrigin).min(1).max(maxProjectSeeds),
+  seeds: z.array(z.string().trim().min(1).max(253)).min(1).max(maxProjectSeeds),
   environment: z.enum(['public', 'local-lab']).default('public'),
+  labConfig: labConfigSchema.optional(),
+}).transform((data, ctx) => {
+  const originSchema = assetOriginForEnvironment(data.environment)
+  const normalizedSeeds: string[] = []
+  for (let i = 0; i < data.seeds.length; i += 1) {
+    const parsed = originSchema.safeParse(data.seeds[i])
+    if (!parsed.success) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['seeds', i],
+        message: parsed.error.issues[0]?.message ?? 'Invalid project seed origin.',
+      })
+      return z.NEVER
+    }
+    normalizedSeeds.push(parsed.data)
+  }
+  return {
+    ...data,
+    seeds: normalizedSeeds,
+  }
 })
 
 export const newRun = z.object({
@@ -214,17 +370,31 @@ export interface EvidenceSummary {
   assignmentId: string
   scopeRevision: number
   title: string
-  kind: 'inventory' | 'observation' | 'access-policy' | 'analysis' | 'verification' | 'handoff' | 'exchange' | 'replay' | 'dns' | 'tls' | 'browser' | 'threat-model' | 'digest'
+  kind: 'inventory' | 'observation' | 'access-policy' | 'analysis' | 'verification' | 'handoff' | 'exchange' | 'replay' | 'dns' | 'tls' | 'browser' | 'threat-model' | 'digest' | 'sast' | 'surface' | 'patch' | 'ws'
   createdAt: number
 }
 
 export const findingSeverities = ['critical', 'high', 'medium', 'low', 'informational'] as const
 
+export interface PatchProposalSummary {
+  id: string
+  findingId: string
+  repo: string
+  status: PatchProposalStatus
+  callerCompatibility: CallerCompatibility
+  diff: string
+  codeLocations: CodeLocation[]
+  reviewNotes: string
+  dynamicRetestVerdict: DynamicRetestVerdict
+  createdAt: number
+  updatedAt: number
+}
+
 export interface Finding {
   id: string
   origin: string
   title: string
-  status: 'pending' | 'confirmed' | 'dismissed' | 'inconclusive'
+  status: FindingStatus
   severity: typeof findingSeverities[number]
   reason: string
   remediation: string
@@ -236,10 +406,18 @@ export interface Finding {
   cwe?: string
   confidence?: 'high' | 'medium' | 'low'
   verification?: string
+  verificationTier?: VerificationTier
   findingKind?: 'baseline_check' | 'multi_step_chain'
   replaySpecId?: string
   chainFactIds?: string[]
   exchangeIds?: string[]
+  fingerprintHash?: string | null
+  supersededByFindingId?: string | null
+  counterevidence?: string | null
+  confidenceRationale?: string | null
+  severityChangeConditions?: string | null
+  codeLocations?: CodeLocation[]
+  runtimeProofGap?: string | null
   check?: Pick<CheckCoverage, 'id' | 'caseId' | 'expected' | 'observed'>
 }
 
@@ -327,9 +505,19 @@ export interface ReportBody {
   owaspCoverage?: {
     origin: string
     category: OwaspCategory
-    status: 'reported' | 'no_issue_found' | 'ruled_out' | 'not_applicable' | 'needs_follow_up'
+    status: CoverageClosureStatus
     summary: string
+    enforcingControl?: string | null
+    proofGapReason?: string | null
+    linkedFindingId?: string | null
   }[]
+  openProofGaps?: {
+    origin: string
+    category: string
+    summary: string
+    proofGapReason: string
+  }[]
+  patchProposals?: PatchProposalSummary[]
   metrics?: {
     turnsUsed: number
     requestsUsed: number

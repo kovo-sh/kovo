@@ -1,0 +1,18 @@
+id: express-stack-trace-disclosure
+name: "Express verbose stack trace on malformed URI"
+severity: low
+description: "A malformed percent-encoded path produces a framework error page that discloses stack frames and internal file paths."
+tech: [express, node]
+tags: [error-disclosure]
+cwe: CWE-209
+request:
+  method: GET
+  path: "/%E0%A4%A"
+control:
+  path: "/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: regex
+    part: body
+    regex: ['URIError: Failed to decode', 'at\s+\S+\s+\(.*node_modules[/\\]express']
+    condition: or

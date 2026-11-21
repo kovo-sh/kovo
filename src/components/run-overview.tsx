@@ -1,4 +1,5 @@
 import { Fragment, useState } from 'react'
+import { exportSarifAction } from '../actions.ts'
 import {
   assessmentCheckTitles,
   canReviewScope,
@@ -7,6 +8,12 @@ import {
   maxScopeHosts,
 } from '../domain.ts'
 import type { CapabilityTier, RunCommand } from '../domain.ts'
+import {
+  callerCompatibilityLabels,
+  dynamicRetestLabels,
+  owaspCategoryTitles,
+  patchStatusLabels,
+} from '../report-summary.ts'
 import { Status } from './common.tsx'
 import { capabilityTierMeta, formatUsd, phaseNames, workerPhaseNames, workerPhases } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
@@ -35,6 +42,24 @@ function riskBadgeClass(riskTier: 'critical' | 'high' | 'medium' | 'low') {
   return 'badge'
 }
 
+function downloadSarifBlob(content: string, filename: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: 'application/sarif+json; charset=utf-8' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+function safeHost(origin: string) {
+  try {
+    const url = new URL(origin)
+    return url.port ? `${url.hostname}:${url.port}` : url.hostname
+  } catch {
+    return origin
+  }
+}
+
 export function RunOverview({ detail, history, execute, openEvidence, pending }: {
   detail: RunDetail
   history: ReadonlyMap<string, string>
@@ -46,6 +71,22 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
   const plan = run.reviewPlan
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState<ScopeDraft>()
+  const [exportingSarif, setExportingSarif] = useState(false)
+  const runtimeConfirmedCount = detail.findings.filter(f => f.status === 'confirmed').length
+  const staticVerifiedCount = detail.findings.filter(f => f.status === 'static_verified').length
+  const openProofGaps = detail.openProofGaps ?? []
+  const patchProposals = detail.patchProposals ?? []
+  const findingTitleById = new Map(detail.findings.map(f => [f.id, f.title]))
+
+  async function handleDownloadSarif() {
+    setExportingSarif(true)
+    try {
+      const res = await exportSarifAction({ data: { runId: run.id, reportId: detail.reports[0]?.id } })
+      downloadSarifBlob(res.content, res.filename)
+    } finally {
+      setExportingSarif(false)
+    }
+  }
   const afterApproval = ['threat_model', 'investigation', 'verification'].includes(run.phase)
   const canReview = canReviewScope(run.phase, run.status)
   const review = canReview ? draft : undefined
@@ -206,7 +247,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       <div className="threat-grid">
         {threatModel.entries.slice(0, 8).map(entry => <div key={entry.origin} className="threat-card">
           <div className="threat-card-head">
-            <strong>{new URL(entry.origin).hostname}</strong>
+            <strong>{safeHost(entry.origin)}</strong>
             <div className="inline-badges">
               {entry.surfaceTags.map(tag => <span key={tag} className="badge">{tag}</span>)}
               <span className={riskBadgeClass(entry.riskTier)}>{entry.riskTier}</span>
@@ -214,6 +255,65 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
           </div>
           <p className="muted">{entry.rationale}</p>
         </div>)}
+      </div>
+    </section>}
+
+    {(runtimeConfirmedCount > 0 || staticVerifiedCount > 0 || openProofGaps.length > 0 || patchProposals.length > 0) && <section className="workflow-callout" aria-label="Verification tiers and exports">
+      <div>
+        <h2>Verification summary</h2>
+        <div className="inline-badges">
+          <span className="badge badge-complete">Runtime Confirmed: {runtimeConfirmedCount}</span>
+          <span className="badge badge-trace">Static Verified: {staticVerifiedCount}</span>
+          {openProofGaps.length > 0 && <span className="badge badge-attention">Open Proof Gaps: {openProofGaps.length}</span>}
+          {patchProposals.length > 0 && <span className="badge badge-accent">Patch Proposals: {patchProposals.length}</span>}
+        </div>
+      </div>
+      <Button variant="ghost" disabled={exportingSarif} onClick={() => void handleDownloadSarif()}>
+        {exportingSarif ? 'Exporting SARIF…' : 'Download SARIF 2.1.0'}
+      </Button>
+    </section>}
+
+    {openProofGaps.length > 0 && <section className="stacked-section" aria-label="Open Proof Gaps">
+      <div className="section-heading">
+        <h2>Open Proof Gaps</h2>
+        <span className="muted">{openProofGaps.length} {openProofGaps.length === 1 ? 'lead' : 'leads'} awaiting follow-up</span>
+      </div>
+      <div className="threat-grid">
+        {openProofGaps.slice(0, 8).map(gap => <div key={gap.id} className="threat-card">
+          <div className="threat-card-head">
+            <strong>{safeHost(gap.origin)}</strong>
+            <span className="badge badge-attention">{owaspCategoryTitles[gap.category] ?? gap.category}</span>
+          </div>
+          <p>{gap.proofGapReason || gap.summary}</p>
+          {gap.proofGapReason && gap.summary !== gap.proofGapReason && <p className="muted">{gap.summary}</p>}
+        </div>)}
+      </div>
+    </section>}
+
+    {patchProposals.length > 0 && <section className="stacked-section" aria-label="Verified Patch Diffs">
+      <div className="section-heading">
+        <h2>Verified Patch Diffs</h2>
+        <span className="muted">{patchProposals.length} {patchProposals.length === 1 ? 'patch' : 'patches'}</span>
+      </div>
+      <div className="threat-grid">
+        {patchProposals.slice(0, 6).map(patch => <article key={patch.id} className="threat-card">
+          <div className="threat-card-head">
+            <strong>{findingTitleById.get(patch.findingId) ?? patch.findingId}</strong>
+            <div className="inline-badges">
+              <span className={patch.status === 'approved' ? 'badge badge-complete' : patch.status === 'withheld' ? 'badge badge-attention' : 'badge badge-danger'}>
+                {patchStatusLabels[patch.status]}
+              </span>
+              <span className={patch.callerCompatibility === 'attacker_only' ? 'badge badge-complete' : patch.callerCompatibility === 'needs_operator_step' ? 'badge badge-attention' : 'badge badge-danger'}>
+                {callerCompatibilityLabels[patch.callerCompatibility]}
+              </span>
+              <span className={patch.dynamicRetestVerdict === 'fixed' ? 'badge badge-complete' : patch.dynamicRetestVerdict === 'reproduced' ? 'badge badge-danger' : 'badge'}>
+                {dynamicRetestLabels[patch.dynamicRetestVerdict]}
+              </span>
+            </div>
+          </div>
+          {patch.reviewNotes && <p className="muted">{patch.reviewNotes}</p>}
+          {patch.status === 'approved' && patch.diff.trim() && <pre className="approval-preview">{patch.diff}</pre>}
+        </article>)}
       </div>
     </section>}
 

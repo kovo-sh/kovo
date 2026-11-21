@@ -1,0 +1,18 @@
+id: apache-server-status-exposed
+name: "Apache mod_status exposed"
+severity: medium
+description: "The Apache server-status page is publicly reachable and lists worker and request details."
+tech: [apache]
+tags: [exposure, status]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /server-status
+control:
+  path: "/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: word
+    part: body
+    words: ["Apache Server Status"]

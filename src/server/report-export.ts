@@ -3,18 +3,23 @@ import { and, desc, eq } from 'drizzle-orm'
 import { id as evidenceId } from '../domain.ts'
 import type { EvidenceSummary } from '../domain.ts'
 import {
+  callerCompatibilityLabels,
   capabilityTierLabel,
   checkLabels,
   collapseBaselineHeaderFindings,
   deduplicateChainFindings,
+  dynamicRetestLabels,
+  findingVerificationTier,
   isConsolidatedHeaderPostureFinding,
   owaspCategoryTitles,
   owaspStatusLabels,
+  patchStatusLabels,
   reportEvidenceSource,
   reportHighlights,
   reportPlanLabel,
   retestVerdictLabels,
   suppliedResponseLabel,
+  verificationTierLabels,
 } from '../report-summary.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import { redact, redactHeaders } from './redact.ts'
@@ -44,6 +49,10 @@ const evidenceLabels: Partial<Record<EvidenceSummary['kind'], string>> = {
   browser: 'Scoped browser capture',
   'threat-model': 'Round-0 threat model',
   digest: 'Cold-graph digest',
+  sast: 'Offline SAST scan',
+  surface: 'Brokered surface probe',
+  patch: 'Air-gapped patch verification',
+  ws: 'Brokered WebSocket probe',
 }
 
 function inline(value: string, secrets: readonly NamedSecret[]) {
@@ -180,22 +189,46 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     return links.join(' · ')
   }
 
-  const rawFindings = body.findings.filter(item => approved.has(item.origin))
+  const rawFindings = body.findings.filter(item =>
+    approved.has(item.origin) || item.status === 'static_verified' || item.verificationTier === 'static_verified',
+  )
   const { findings } = collapseBaselineHeaderFindings(deduplicateChainFindings(rawFindings))
   const prominentFindings = findings.filter(item => !isConsolidatedHeaderPostureFinding(item))
   const headerPostureFindings = findings.filter(item => isConsolidatedHeaderPostureFinding(item))
-  const { coverage, confirmed, chainConfirmed, priority } = reportHighlights(body)
+  const { coverage, confirmed, staticVerified, chainConfirmed, priority } = reportHighlights(body)
   const plan = reportPlanLabel(body.selectedChecks)
   const confirmedFindings = findings.filter(item => item.status === 'confirmed')
+  const staticVerifiedFindings = findings.filter(item => item.status === 'static_verified')
   const confirmedProminent = prominentFindings.filter(item => item.status === 'confirmed')
   const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
     const count = confirmedFindings.filter(item => item.severity === severity).length
     return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)}** ${count}`] : []
   })
+  const staticSeverityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
+    const count = staticVerifiedFindings.filter(item => item.severity === severity).length
+    return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)} (static verified)** ${count}`] : []
+  })
+
+  const openProofGaps = body.openProofGaps?.length
+    ? body.openProofGaps.filter(g => approved.has(g.origin))
+    : storage.listOpenProofGaps(run.id, body.goalRevision)
+        .filter(g => approved.has(g.origin))
+        .map(g => ({
+          origin: g.origin,
+          category: g.category,
+          summary: g.summary,
+          proofGapReason: g.proofGapReason || g.summary,
+        }))
+
+  const patchProposals = body.patchProposals?.length
+    ? body.patchProposals
+    : storage.listPatchProposals(run.id).filter(p => findings.some(f => f.id === p.findingId))
 
   const lines = [
-    `# Guardian v2 ${report.partial ? 'partial' : 'complete'} report`, '',
-    `**${confirmed} confirmed ${confirmed === 1 ? 'finding' : 'findings'}**${chainConfirmed ? ` (${chainConfirmed} multi-step ${chainConfirmed === 1 ? 'chain' : 'chains'})` : ''}`, '',
+    `# Guardian v3 ${report.partial ? 'partial' : 'complete'} report`, '',
+    `**${confirmed} runtime/baseline confirmed ${confirmed === 1 ? 'finding' : 'findings'}**` +
+      `${chainConfirmed ? ` (${chainConfirmed} multi-step ${chainConfirmed === 1 ? 'chain' : 'chains'})` : ''}` +
+      `${staticVerified ? ` · **${staticVerified} static-verified ${staticVerified === 1 ? 'finding' : 'findings'}**` : ''}`, '',
     ...(coverage ? [inline(coverage, secrets), ''] : []),
     `- **Run** ${run.id}`,
     `- **Report version** ${report.version}`,
@@ -209,10 +242,16 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
       `- **Execution metrics** ${body.metrics.turnsUsed} turns · ${body.metrics.requestsUsed} brokered requests · ${body.metrics.factsRecorded} facts · ${body.metrics.chainStepsCompleted} chain steps completed (${body.metrics.chainStepsUntested} untested) · $${body.metrics.spentUsd.toFixed(2)} USD`,
     ] : []),
     '', '## Executive summary', '',
-    ...(confirmedFindings.length ? [
-      `${confirmedFindings.length} evidence-backed ${confirmedFindings.length === 1 ? 'finding was' : 'findings were'} confirmed within the approved scope via Zero-LLM deterministic verification. ` +
-        `${severityCounts.length ? 'The confirmed severity distribution is listed below.' : ''}`, '',
-      ...severityCounts, '',
+    ...(confirmedFindings.length || staticVerifiedFindings.length ? [
+      ...(confirmedFindings.length ? [
+        `${confirmedFindings.length} evidence-backed ${confirmedFindings.length === 1 ? 'finding was' : 'findings were'} confirmed within the approved scope via Zero-LLM deterministic verification. ` +
+          `${severityCounts.length ? 'The confirmed severity distribution is listed below.' : ''}`, '',
+        ...severityCounts, '',
+      ] : []),
+      ...(staticVerifiedFindings.length ? [
+        `${staticVerifiedFindings.length} additional white-box ${staticVerifiedFindings.length === 1 ? 'finding was' : 'findings were'} verified statically via deterministic offline AST/SAST re-execution (\`static_verified\` tier — distinct from runtime confirmation).`, '',
+        ...staticSeverityCounts, '',
+      ] : []),
     ] : ['No evidence-backed security gap was confirmed in the completed checks. This does not mean the approved assets are free of vulnerabilities.', '']),
     ...(priority ? [
       '## Fix first', '',
@@ -244,22 +283,29 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     const links = evidenceLinks(finding.origin, finding.evidenceIds, finding.exchangeIds ?? [])
     const specRow = finding.replaySpecId ? runSpecs.get(finding.replaySpecId) : undefined
     const retests = retestsByFinding.get(finding.id) ?? []
+    const tier = findingVerificationTier(finding)
     lines.push(
       `### ${inline(finding.title, secrets)}`, '',
       `- **Host** ${inline(finding.origin, secrets)}`,
-      `- **Severity** ${inline(finding.severity, secrets)} · **Status** ${inline(finding.status, secrets)}${finding.findingKind === 'multi_step_chain' ? ' · **Type** Multi-step chain' : ''}`,
+      `- **Severity** ${inline(finding.severity, secrets)} · **Status** ${inline(finding.status, secrets)}${tier ? ` · **Verification tier** ${inline(verificationTierLabels[tier], secrets)}` : ''}${finding.findingKind === 'multi_step_chain' ? ' · **Type** Multi-step chain' : ''}`,
       ...(finding.category ? [`- **Class** ${inline(finding.category, secrets)}${finding.cwe ? ` · ${inline(finding.cwe, secrets)}` : ''}`] : []),
-      ...(finding.confidence ? [`- **Confidence** ${inline(finding.confidence, secrets)}`] : []),
+      ...(finding.confidence ? [`- **Confidence** ${inline(finding.confidence, secrets)}${finding.confidenceRationale ? ` — ${inline(finding.confidenceRationale, secrets)}` : ''}`] : []),
       ...(finding.check ? [
         `- **Observed** ${inline(finding.check.observed ?? 'Unavailable', secrets)}`,
         `- **Expected** ${inline(finding.check.expected, secrets)}`,
       ] : []),
       `- **Result** ${inline(finding.reason, secrets)}`,
       ...(finding.impact ? [`- **Impact** ${inline(finding.impact, secrets)}`] : []),
+      ...(finding.counterevidence ? [`- **Counterevidence** ${inline(finding.counterevidence, secrets)}`] : []),
+      ...(finding.severityChangeConditions ? [`- **Severity change conditions** ${inline(finding.severityChangeConditions, secrets)}`] : []),
+      ...(finding.runtimeProofGap ? [`- **Runtime proof gap** ${inline(finding.runtimeProofGap, secrets)}`] : []),
+      ...(finding.codeLocations?.length ? [
+        `- **Code locations** ${finding.codeLocations.map(loc => `\`${loc.repo}/${loc.file}:${loc.startLine}${loc.endLine > loc.startLine ? `-${loc.endLine}` : ''}\``).join(', ')}`,
+      ] : []),
       ...(finding.verification ? [`- **Verification** ${inline(finding.verification, secrets)}`] : []),
       ...(specRow ? [`- **Replay spec** \`${specRow.spec.kind}\` · SHA-256 \`${specRow.specSha256}\``] : []),
       ...(retests.length ? [`- **Latest Verify Fix retest** ${inline(retestVerdictLabels[retests[0].verdict], secrets)} (${new Date(retests[0].createdAt).toISOString()}) — ${inline(retests[0].summary, secrets)}`] : []),
-      `- **${finding.status === 'confirmed' ? 'Remediation' : 'Follow-up'}** ${inline(finding.remediation, secrets)}`,
+      `- **${finding.status === 'confirmed' || finding.status === 'static_verified' ? 'Remediation' : 'Follow-up'}** ${inline(finding.remediation, secrets)}`,
       ...(finding.recheck ? [`- **Check the fix** ${inline(finding.recheck, secrets)}`] : []),
       ...(links ? ['- **Evidence** ' + links] : []), '',
     )
@@ -293,6 +339,16 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
         } else if (specRow.spec.kind === 'rce_proof') {
           lines.push(`${stepNum++}. **[Replay · control]** \`${specRow.spec.controlStep.request.method}\` ${inline(specRow.spec.controlStep.request.origin + specRow.spec.controlStep.request.pathAndQuery, secrets)} — ${inline(specRow.spec.controlStep.description, secrets)}`)
           lines.push(`${stepNum++}. **[Replay · ${inline(specRow.spec.proofMode, secrets)} probe]** \`${specRow.spec.probeStep.request.method}\` ${inline(specRow.spec.probeStep.request.origin + specRow.spec.probeStep.request.pathAndQuery, secrets)} — ${inline(specRow.spec.probeStep.description, secrets)}`)
+        } else if (specRow.spec.kind === 'sql_boolean_diff') {
+          lines.push(`${stepNum++}. **[Replay · sql_boolean_diff]** \`${specRow.spec.method}\` ${inline(specRow.spec.targetOrigin + specRow.spec.pathAndQuery, secrets)} (3 randomized boolean pairs)`)
+        } else if (specRow.spec.kind === 'ws_chain') {
+          for (const step of specRow.spec.steps) {
+            lines.push(`${stepNum++}. **[Replay · ws_chain · ${inline(step.role, secrets)}]** ${inline(step.origin + step.pathAndQuery, secrets)} — ${inline(step.description, secrets)}`)
+          }
+        } else if (specRow.spec.kind === 'upload_probe') {
+          lines.push(`${stepNum++}. **[Replay · upload_probe]** \`${specRow.spec.uploadStep.method}\` ${inline(specRow.spec.uploadStep.origin + specRow.spec.uploadStep.pathAndQuery, secrets)} (${inline(specRow.spec.uploadStep.filename, secrets)}) → fetch ${inline(specRow.spec.fetchStep.request.origin + specRow.spec.fetchStep.request.pathAndQuery, secrets)}`)
+        } else if (specRow.spec.kind === 'static_ast_proof') {
+          lines.push(`${stepNum++}. **[Static AST · ${inline(specRow.spec.engine, secrets)}]** \`${specRow.spec.repo}/${specRow.spec.file}:${specRow.spec.startLine}-${specRow.spec.endLine}\` — ${inline(specRow.spec.runtimeProofGap, secrets)}`)
         } else {
           const target = 'targetOrigin' in specRow.spec && typeof specRow.spec.targetOrigin === 'string'
             ? specRow.spec.targetOrigin
@@ -320,23 +376,61 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     lines.push('')
   }
 
-  if (confirmedFindings.length) {
+  if (confirmedFindings.length || staticVerifiedFindings.length) {
     lines.push('## Remediation plan', '')
     const orderedRemediation = [
       ...confirmedProminent,
+      ...staticVerifiedFindings,
       ...headerPostureFindings.filter(item => item.status === 'confirmed'),
     ]
     for (const [index, finding] of orderedRemediation.entries()) {
-      lines.push(`${index + 1}. **${inline(finding.title, secrets)}** — ${inline(finding.remediation, secrets)} Recheck: ${inline(finding.recheck ?? 'repeat the verified replay check after the change.', secrets)}`)
+      const tier = findingVerificationTier(finding)
+      lines.push(`${index + 1}. **${inline(finding.title, secrets)}**${tier ? ` [${verificationTierLabels[tier]}]` : ''} — ${inline(finding.remediation, secrets)} Recheck: ${inline(finding.recheck ?? 'repeat the verified replay check after the change.', secrets)}`)
+    }
+    lines.push('')
+  }
+
+  if (patchProposals.length) {
+    lines.push('## Verified Patch Diffs', '')
+    for (const patch of patchProposals) {
+      const finding = findings.find(f => f.id === patch.findingId)
+      const title = finding ? finding.title : patch.findingId
+      lines.push(
+        `### ${inline(title, secrets)} · ${inline(patch.repo, secrets)}`, '',
+        `- **Patch status** ${inline(patchStatusLabels[patch.status], secrets)} · **Caller compatibility** ${inline(callerCompatibilityLabels[patch.callerCompatibility], secrets)} · **Dynamic retest** ${inline(dynamicRetestLabels[patch.dynamicRetestVerdict], secrets)}`,
+        ...(patch.codeLocations.length ? [`- **Locations** ${patch.codeLocations.map(l => `\`${l.file}:${l.startLine}-${l.endLine}\``).join(', ')}`] : []),
+        ...(patch.reviewNotes ? [`- **Review notes** ${inline(patch.reviewNotes, secrets)}`] : []),
+        '',
+      )
+      if (patch.status === 'approved' && patch.diff.trim()) {
+        lines.push('~~~diff', redact(patch.diff, secrets), '~~~', '')
+      } else if (patch.status === 'withheld') {
+        lines.push('_Patch diff withheld automatically by independent Patch Reviewer because it may break legitimate callers or failed a verification gate._', '')
+      }
+    }
+  }
+
+  if (openProofGaps.length) {
+    lines.push('## Open Proof Gaps', '', '| Host | Category | Proof Gap Reason | Summary |', '| :--- | :--- | :--- | :--- |')
+    for (const gap of openProofGaps) {
+      const catLabel = owaspCategoryTitles[gap.category as keyof typeof owaspCategoryTitles] ?? gap.category
+      lines.push(
+        `| ${inline(gap.origin, secrets)} | ${inline(catLabel, secrets)} | ${inline(gap.proofGapReason, secrets)} | ${inline(gap.summary, secrets)} |`,
+      )
     }
     lines.push('')
   }
 
   if (body.owaspCoverage?.length) {
-    lines.push('## OWASP & API Top 10 coverage matrix', '', '| Host | Category | Status | Summary |', '| :--- | :--- | :--- | :--- |')
+    lines.push('## OWASP & API Top 10 coverage matrix', '', '| Host | Category | Status | Enforcing Control / Proof Gap | Summary |', '| :--- | :--- | :--- | :--- | :--- |')
     for (const entry of body.owaspCoverage.filter(e => approved.has(e.origin))) {
+      const detail = entry.enforcingControl
+        ? `Control: ${entry.enforcingControl}`
+        : entry.proofGapReason
+          ? `Gap: ${entry.proofGapReason}`
+          : '—'
       lines.push(
-        `| ${inline(entry.origin, secrets)} | ${inline(owaspCategoryTitles[entry.category] ?? entry.category, secrets)} | ${inline(owaspStatusLabels[entry.status] ?? entry.status, secrets)} | ${inline(entry.summary, secrets)} |`,
+        `| ${inline(entry.origin, secrets)} | ${inline(owaspCategoryTitles[entry.category] ?? entry.category, secrets)} | ${inline(owaspStatusLabels[entry.status] ?? entry.status, secrets)} | ${inline(detail, secrets)} | ${inline(entry.summary, secrets)} |`,
       )
     }
     lines.push('')

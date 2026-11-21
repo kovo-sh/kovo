@@ -1,0 +1,57 @@
+id: guardian-ast-py-shell-true
+language: Python
+severity: error
+message: "subprocess call with shell=True can enable OS command injection."
+metadata:
+  cwe: "CWE-78"
+rule:
+  any:
+    - pattern: subprocess.run($$$, shell=True, $$$)
+    - pattern: subprocess.Popen($$$, shell=True, $$$)
+    - pattern: subprocess.call($$$, shell=True, $$$)
+    - pattern: subprocess.check_output($$$, shell=True, $$$)
+---
+id: guardian-ast-py-pickle-loads
+language: Python
+severity: error
+message: "Unsafe pickle deserialization."
+metadata:
+  cwe: "CWE-502"
+rule:
+  any:
+    - pattern: pickle.loads($X)
+    - pattern: pickle.load($X)
+---
+id: guardian-ast-py-yaml-load
+language: Python
+severity: error
+message: "Unsafe yaml.load without SafeLoader."
+metadata:
+  cwe: "CWE-502"
+rule:
+  any:
+    - pattern: yaml.load($X)
+    - pattern: yaml.unsafe_load($X)
+---
+id: guardian-ast-py-ssti
+language: Python
+severity: error
+message: "Potential SSTI via render_template_string."
+metadata:
+  cwe: "CWE-1336"
+rule:
+  any:
+    - pattern: render_template_string($$$)
+    - pattern: flask.render_template_string($$$)
+---
+id: guardian-ast-py-sqli-fstring
+language: Python
+severity: error
+message: "Potential SQL injection via f-string in cursor.execute."
+metadata:
+  cwe: "CWE-89"
+rule:
+  pattern: $CURSOR.execute($ARG)
+  has:
+    kind: interpolation
+    stopBy: end

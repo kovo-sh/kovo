@@ -1,0 +1,39 @@
+rules:
+  - id: guardian.iac.k8s-privileged-container
+    languages: [yaml]
+    severity: ERROR
+    message: "Kubernetes container runs in privileged mode."
+    metadata:
+      cwe: "CWE-250"
+    pattern: |
+      securityContext:
+        ...
+        privileged: true
+
+  - id: guardian.iac.k8s-run-as-root
+    languages: [yaml]
+    severity: WARNING
+    message: "Kubernetes workload explicitly sets runAsUser: 0 (root)."
+    metadata:
+      cwe: "CWE-250"
+    pattern: |
+      runAsUser: 0
+
+  - id: guardian.iac.k8s-host-network
+    languages: [yaml]
+    severity: WARNING
+    message: "Kubernetes pod uses hostNetwork: true."
+    metadata:
+      cwe: "CWE-284"
+    pattern: |
+      hostNetwork: true
+
+  - id: guardian.ci.gha-pull-request-target
+    languages: [yaml]
+    severity: WARNING
+    message: "GitHub Actions workflow triggers on pull_request_target; verify untrusted PR head is never checked out and executed."
+    metadata:
+      cwe: "CWE-829"
+    pattern: |
+      pull_request_target:
+        ...

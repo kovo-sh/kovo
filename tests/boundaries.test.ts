@@ -563,10 +563,10 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
   assert.equal(hostConfig.NetworkMode, 'none')
   assert.equal(hostConfig.Privileged, false)
   assert.equal(hostConfig.ReadonlyRootfs, true)
-  assert.ok(hostConfig.Memory >= 1 && hostConfig.Memory <= 512 * 1024 * 1024)
-  assert.ok(hostConfig.NanoCpus >= 1 && hostConfig.NanoCpus <= 1_000_000_000)
-  assert.ok(hostConfig.PidsLimit >= 1 && hostConfig.PidsLimit <= 96)
-  assert.match(hostConfig.Tmpfs['/tmp'], /size=64m/)
+  assert.ok(hostConfig.Memory >= 1 && hostConfig.Memory <= 1024 * 1024 * 1024)
+  assert.ok(hostConfig.NanoCpus >= 1 && hostConfig.NanoCpus <= 2_000_000_000)
+  assert.ok(hostConfig.PidsLimit >= 1 && hostConfig.PidsLimit <= 192)
+  assert.match(hostConfig.Tmpfs['/tmp'], /size=128m/)
   assert.equal(hostConfig.Binds, null)
 
   const probe = [

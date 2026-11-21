@@ -1,0 +1,21 @@
+id: openapi-v3-docs-exposed
+name: "OpenAPI v3 document exposed at /v3/api-docs"
+severity: low
+description: "The OpenAPI document is served without authentication."
+tech: [swagger, springboot]
+tags: [exposure, api-docs]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /v3/api-docs
+control:
+  path: "/v3/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"openapi"', '"paths"']
+    condition: and

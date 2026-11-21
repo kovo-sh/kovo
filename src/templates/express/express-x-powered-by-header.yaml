@@ -1,0 +1,16 @@
+id: express-x-powered-by-header
+name: "Express X-Powered-By technology disclosure"
+severity: info
+description: "The response discloses the Express framework through the X-Powered-By header."
+tech: [express, node]
+tags: [fingerprint, headers]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /
+matchers-condition: and
+matchers:
+  - type: regex
+    part: header
+    regex: ['^x-powered-by:\s*express']

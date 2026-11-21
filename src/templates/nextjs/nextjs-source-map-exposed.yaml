@@ -1,0 +1,20 @@
+id: nextjs-source-map-exposed
+name: "Next.js production source map exposed"
+severity: medium
+description: "A client chunk source map is publicly reachable and exposes original source via sourcesContent."
+tech: [nextjs]
+tags: [source-maps, exposure]
+cwe: CWE-540
+request:
+  method: GET
+  path: /_next/static/chunks/main.js.map
+control:
+  path: "/_next/static/chunks/guardian-none-{{rand}}.js.map"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"sources"', '"mappings"']
+    condition: and

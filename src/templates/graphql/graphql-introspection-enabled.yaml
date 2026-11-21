@@ -1,0 +1,17 @@
+id: graphql-introspection-enabled
+name: "GraphQL introspection enabled over GET"
+severity: low
+description: "A minimal read-only introspection query returned schema metadata, exposing the full API surface."
+tech: [graphql]
+tags: [graphql, exposure]
+cwe: CWE-200
+request:
+  method: GET
+  path: "/graphql?query=%7B__schema%7BqueryType%7Bname%7D%7D%7D"
+control:
+  path: "/graphql?query=%7B__typename%7D"
+matchers-condition: and
+matchers:
+  - type: word
+    part: body
+    words: ['"queryType"']

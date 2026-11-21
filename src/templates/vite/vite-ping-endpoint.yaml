@@ -1,0 +1,18 @@
+id: vite-ping-endpoint
+name: "Vite HMR ping endpoint reachable"
+severity: info
+description: "The Vite __vite_ping endpoint responds, confirming a Vite dev server fingerprint."
+tech: [vite]
+tags: [fingerprint, dev-mode]
+request:
+  method: GET
+  path: /__vite_ping
+control:
+  path: "/__vite_ping-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["pong"]

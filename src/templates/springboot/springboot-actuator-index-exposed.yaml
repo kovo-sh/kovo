@@ -1,0 +1,20 @@
+id: springboot-actuator-index-exposed
+name: "Spring Boot actuator index exposed"
+severity: low
+description: "The actuator discovery document is reachable and lists enabled management endpoints."
+tech: [springboot]
+tags: [actuator, exposure]
+cwe: CWE-215
+request:
+  method: GET
+  path: /actuator
+control:
+  path: "/actuator-guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"_links"', '"self"']
+    condition: and

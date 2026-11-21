@@ -1,0 +1,18 @@
+id: django-admin-login-exposed
+name: "Django admin login reachable"
+severity: info
+description: "The Django administration login page is reachable from the public internet."
+tech: [django]
+tags: [exposure, admin]
+cwe: CWE-419
+spaExclusion: true
+request:
+  method: GET
+  path: /admin/login/
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["Django administration"]

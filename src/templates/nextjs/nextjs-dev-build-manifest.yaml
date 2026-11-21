@@ -1,0 +1,19 @@
+id: nextjs-dev-build-manifest
+name: "Next.js development build artifacts exposed"
+severity: low
+description: "The Next.js development build manifest is served, suggesting a dev server or dev build is exposed."
+tech: [nextjs]
+tags: [exposure, dev-mode]
+cwe: CWE-489
+request:
+  method: GET
+  path: /_next/static/development/_buildManifest.js
+control:
+  path: "/_next/static/development/guardian-none-{{rand}}.js"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["__BUILD_MANIFEST"]

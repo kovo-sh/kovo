@@ -1,0 +1,20 @@
+id: vite-dev-server-exposed
+name: "Vite development server exposed"
+severity: medium
+description: "The Vite dev client is served from the target, indicating a development server is reachable instead of a production build."
+tech: [vite]
+tags: [exposure, dev-mode]
+cwe: CWE-489
+request:
+  method: GET
+  path: /@vite/client
+control:
+  path: "/@vite/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["createHotContext", "vite/client"]
+    condition: or

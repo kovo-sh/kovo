@@ -1,0 +1,20 @@
+id: wordpress-rest-user-enumeration
+name: "WordPress REST API user enumeration"
+severity: low
+description: "The WordPress users REST route lists author slugs without authentication."
+tech: [wordpress]
+tags: [wordpress, enumeration]
+cwe: CWE-203
+spaExclusion: true
+request:
+  method: GET
+  path: /wp-json/wp/v2/users
+control:
+  path: "/wp-json/wp/v2/guardian-none-{{rand}}"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"slug"']

@@ -1,0 +1,109 @@
+id: guardian-ast-ts-innerhtml
+language: TypeScript
+severity: warning
+message: "Direct assignment to innerHTML may introduce DOM XSS."
+metadata:
+  cwe: "CWE-79"
+rule:
+  pattern: $EL.innerHTML = $VAL
+---
+id: guardian-ast-js-innerhtml
+language: JavaScript
+severity: warning
+message: "Direct assignment to innerHTML may introduce DOM XSS."
+metadata:
+  cwe: "CWE-79"
+rule:
+  pattern: $EL.innerHTML = $VAL
+---
+id: guardian-ast-tsx-dangerous-html
+language: Tsx
+severity: warning
+message: "React dangerouslySetInnerHTML sink requires strict sanitization."
+metadata:
+  cwe: "CWE-79"
+rule:
+  kind: jsx_attribute
+  regex: '^dangerouslySetInnerHTML\s*='
+---
+id: guardian-ast-ts-eval
+language: TypeScript
+severity: error
+message: "Dynamic code execution via eval()."
+metadata:
+  cwe: "CWE-95"
+rule:
+  pattern: eval($ARG)
+---
+id: guardian-ast-js-eval
+language: JavaScript
+severity: error
+message: "Dynamic code execution via eval()."
+metadata:
+  cwe: "CWE-95"
+rule:
+  pattern: eval($ARG)
+---
+id: guardian-ast-ts-sqli-query
+language: TypeScript
+severity: error
+message: "Interpolated template literal passed to database query/execute."
+metadata:
+  cwe: "CWE-89"
+rule:
+  any:
+    - pattern: $DB.query(`$$$`)
+    - pattern: $DB.execute(`$$$`)
+    - pattern: $DB.prepare(`$$$`)
+  has:
+    kind: template_substitution
+    stopBy: end
+---
+id: guardian-ast-js-sqli-query
+language: JavaScript
+severity: error
+message: "Interpolated template literal passed to database query/execute."
+metadata:
+  cwe: "CWE-89"
+rule:
+  any:
+    - pattern: $DB.query(`$$$`)
+    - pattern: $DB.execute(`$$$`)
+    - pattern: $DB.prepare(`$$$`)
+  has:
+    kind: template_substitution
+    stopBy: end
+---
+id: guardian-ast-ts-exec-template
+language: TypeScript
+severity: error
+message: "Interpolated template literal passed to exec/execSync."
+metadata:
+  cwe: "CWE-78"
+rule:
+  any:
+    - pattern: exec(`$$$`)
+    - pattern: execSync(`$$$`)
+    - pattern: $CP.exec(`$$$`)
+    - pattern: $CP.execSync(`$$$`)
+  has:
+    kind: template_substitution
+    stopBy: end
+---
+id: guardian-ast-ts-postmessage-wildcard
+language: TypeScript
+severity: warning
+message: "window.postMessage called with wildcard '*' targetOrigin."
+metadata:
+  cwe: "CWE-345"
+rule:
+  pattern: $TARGET.postMessage($DATA, '*')
+---
+id: guardian-ast-js-postmessage-wildcard
+language: JavaScript
+severity: warning
+message: "window.postMessage called with wildcard '*' targetOrigin."
+metadata:
+  cwe: "CWE-345"
+rule:
+  pattern: $TARGET.postMessage($DATA, '*')

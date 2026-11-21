@@ -1,0 +1,20 @@
+id: swagger-ui-exposed
+name: "Swagger UI exposed"
+severity: low
+description: "Swagger UI is publicly reachable and documents the API surface."
+tech: [swagger, springboot]
+tags: [exposure, api-docs]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /swagger-ui/index.html
+control:
+  path: "/swagger-ui/guardian-none-{{rand}}.html"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ["swagger-ui"]

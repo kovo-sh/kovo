@@ -1,0 +1,19 @@
+id: cors-null-origin-allowed
+name: "CORS allows the null origin"
+severity: low
+description: "Access-Control-Allow-Origin accepts the opaque null origin, enabling sandboxed-iframe cross-origin reads."
+tech: [generic]
+tags: [cors, misconfig]
+cwe: CWE-942
+request:
+  method: GET
+  path: /
+  headers:
+    Origin: "null"
+control:
+  headers: {}
+matchers-condition: and
+matchers:
+  - type: regex
+    part: header
+    regex: ['^access-control-allow-origin:\s*null\s*$']

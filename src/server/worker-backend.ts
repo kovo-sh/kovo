@@ -8,6 +8,14 @@ import type { AnalyzerName } from '../../worker/analyzers.ts'
 
 const pathSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/)
 const outputNameSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/)
+const repoIdentifierSchema = z.string().refine(
+  v => v === '.' || (/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}){0,3}$/.test(v) && !v.split('/').includes('..')),
+  'Invalid repository identifier.',
+)
+const repoRelativePathSchema = z.string().min(1).max(512).refine(
+  v => !v.startsWith('/') && !v.startsWith('\\') && !/[\0\r\n]/.test(v) && !v.split(/[\\/]+/).includes('..'),
+  'Invalid repository-relative path.',
+)
 const workerNamespace = 'dev.guardian.workspace'
 const workerName = /^guardian-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 
@@ -26,23 +34,124 @@ const resultSchema = z.object({
   outputs: z.record(outputNameSchema, z.string().max(256 * 1024)),
 })
 
+export const sastEngineSchema = z.enum(['opengrep', 'ast-grep', 'gitleaks', 'trufflehog', 'trivy-fs', 'bandit'])
+export const sastSeveritySchema = z.enum(['critical', 'high', 'medium', 'low', 'info'])
+
+export const sastFindingSchema = z.object({
+  engine: sastEngineSchema,
+  ruleId: z.string().min(1).max(256),
+  severity: sastSeveritySchema,
+  file: z.string().max(512),
+  line: z.number().int().min(0),
+  endLine: z.number().int().min(0).optional(),
+  message: z.string().max(1024),
+  maskedPreview: z.string().max(1024),
+  cwe: z.string().max(32).optional(),
+})
+
+export const sastScanRequestSchema = z.object({
+  repo: repoIdentifierSchema,
+  engines: z.array(sastEngineSchema).min(1).max(6),
+  paths: z.array(repoRelativePathSchema).max(32).optional(),
+  ruleFilter: z.string().min(1).max(128).optional(),
+  timeoutMs: z.number().int().min(5_000).max(120_000).optional(),
+})
+
+export const sastScanResultSchema = z.object({
+  repo: z.string(),
+  enginesRun: z.array(sastEngineSchema),
+  engineStatus: z.record(z.string(), z.object({
+    ok: z.boolean(),
+    count: z.number().int().min(0),
+    durationMs: z.number().int().min(0),
+    toolVersion: z.string().optional(),
+    note: z.string().optional(),
+  })),
+  findings: z.array(sastFindingSchema),
+  totalFindings: z.number().int().min(0),
+  truncated: z.boolean(),
+  evidencePath: z.string().optional(),
+  durationMs: z.number().int().min(0),
+})
+
+export const offlineScriptRequestSchema = z.object({
+  runtime: z.enum(['python', 'node']),
+  code: z.string().min(1).max(256 * 1024),
+  timeoutMs: z.number().int().min(1_000).max(60_000).optional(),
+})
+
+export const offlineScriptResultSchema = z.object({
+  runtime: z.enum(['python', 'node']),
+  exitCode: z.number().int(),
+  stdout: z.string().max(256 * 1024),
+  stderr: z.string().max(256 * 1024),
+  durationMs: z.number().int().min(0),
+  timedOut: z.boolean(),
+})
+
+export const astVerifyRequestSchema = z.object({
+  repo: repoIdentifierSchema,
+  file: repoRelativePathSchema,
+  startLine: z.number().int().min(1),
+  endLine: z.number().int().min(1),
+  engine: z.enum(['opengrep', 'ast-grep']),
+  ruleOrPattern: z.string().min(1).max(32 * 1024),
+  timeoutMs: z.number().int().min(5_000).max(60_000).optional(),
+}).refine(v => v.endLine >= v.startLine, 'endLine must be >= startLine.')
+
+export const astVerifyResultSchema = z.object({
+  verified: z.boolean(),
+  engine: z.enum(['opengrep', 'ast-grep']),
+  repo: z.string(),
+  file: z.string(),
+  startLine: z.number().int().min(1),
+  endLine: z.number().int().min(1),
+  matchedLines: z.array(z.number().int().min(1)),
+  codeExcerpt: z.string().max(4096),
+  matchCount: z.number().int().min(0),
+  durationMs: z.number().int().min(0),
+  reason: z.string().optional(),
+})
+
 export type WorkerJob = z.input<typeof jobSchema>
 export type WorkerResult = z.output<typeof resultSchema>
+export type SastEngine = z.infer<typeof sastEngineSchema>
+export type SastSeverity = z.infer<typeof sastSeveritySchema>
+export type SastFinding = z.infer<typeof sastFindingSchema>
+export type SastScanRequest = z.input<typeof sastScanRequestSchema>
+export type SastScanResult = z.output<typeof sastScanResultSchema>
+export type OfflineScriptRequest = z.input<typeof offlineScriptRequestSchema>
+export type OfflineScriptResult = z.output<typeof offlineScriptResultSchema>
+export type AstVerifyRequest = z.input<typeof astVerifyRequestSchema>
+export type AstVerifyResult = z.output<typeof astVerifyResultSchema>
 
 export interface WorkerSession {
   stage(name: string, content: string, signal: AbortSignal): Promise<string>
   exec(command: string, outputs: string[], signal: AbortSignal, timeoutMs?: number): Promise<WorkerResult>
   analyze(tool: AnalyzerName, args: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>>
+  sast(req: SastScanRequest, signal: AbortSignal): Promise<SastScanResult>
+  runScript(req: OfflineScriptRequest, signal: AbortSignal): Promise<OfflineScriptResult>
+  verifyStaticAst(req: AstVerifyRequest, signal: AbortSignal): Promise<AstVerifyResult>
   close(): Promise<void>
 }
 
 export interface WorkerSessionOptions {
   reposDir?: string
+  memoryMb?: number
+  cpus?: number
+  pidsLimit?: number
+  tmpfsMb?: number
 }
 
 export interface WorkerBackend {
   run(job: WorkerJob, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerResult>
   openSession(assignmentId: string, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerSession>
+  verifyStaticAst(assignmentId: string, req: AstVerifyRequest, signal: AbortSignal, options?: WorkerSessionOptions): Promise<AstVerifyResult>
+}
+
+function clamp(val: number | undefined, fallback: number, min: number, max: number): number {
+  if (val === undefined || !Number.isFinite(val)) return fallback
+  return Math.max(min, Math.min(max, val))
 }
 
 function dockerHost() {
@@ -151,12 +260,18 @@ export class LinuxWorkerBackend implements WorkerBackend {
   }
 
   private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions) {
+    const memoryMb = Math.round(clamp(options?.memoryMb, 1024, 512, 2048))
+    const cpus = Number(clamp(options?.cpus, 2.0, 0.5, 4.0).toFixed(2))
+    const pidsLimit = Math.round(clamp(options?.pidsLimit, 192, 64, 256))
+    const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 256))
     return [
       'container', 'create', '--name', name, '--interactive', '--rm', '--pull', 'never',
       '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
-      '--security-opt', 'no-new-privileges', '--pids-limit', '96', '--cpus', '1.0',
-      '--memory', '512m', '--memory-swap', '512m',
-      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
+      '--security-opt', 'no-new-privileges',
+      '--pids-limit', String(pidsLimit),
+      '--cpus', String(cpus),
+      '--memory', `${memoryMb}m`, '--memory-swap', `${memoryMb}m`,
+      '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
       ...this.resolveReposMountArgs(options?.reposDir),
       '--label', 'dev.guardian.assignment=' + assignmentId,
       ...(this.owner ? ['--label', `${workerNamespace}=${this.owner}`] : []),
@@ -180,6 +295,31 @@ export class LinuxWorkerBackend implements WorkerBackend {
       await docker(this.containerCreateArgs(name, job.assignmentId, [], options), deadline)
       const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       return resultSchema.parse(JSON.parse(result))
+    } finally {
+      await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+      this.activeContainers.delete(name)
+    }
+  }
+
+  async verifyStaticAst(
+    assignmentId: string,
+    rawReq: AstVerifyRequest,
+    signal: AbortSignal,
+    options?: WorkerSessionOptions,
+  ): Promise<AstVerifyResult> {
+    signal.throwIfAborted()
+    const req = astVerifyRequestSchema.parse(rawReq)
+    const payload = JSON.stringify({ op: 'ast_verify', ...req })
+    await this.reclaimInactive()
+    signal.throwIfAborted()
+    const name = 'guardian-' + randomUUID()
+    const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+    this.activeContainers.add(name)
+    try {
+      await docker(this.containerCreateArgs(name, assignmentId, [], options), deadline)
+      const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
+      return astVerifyResultSchema.parse(JSON.parse(result))
     } finally {
       await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
       this.activeContainers.delete(name)
@@ -313,6 +453,24 @@ export class LinuxWorkerBackend implements WorkerBackend {
       async analyze(tool, args, opSignal) {
         const res = await request({ op: 'analyze', tool, args }, opSignal, 30_000)
         return (res.result as Record<string, unknown>) ?? {}
+      },
+      async sast(rawReq, opSignal) {
+        const parsed = sastScanRequestSchema.parse(rawReq)
+        const timeoutMs = (parsed.timeoutMs ?? 60_000) + 15_000
+        const res = await request({ op: 'sast', ...parsed }, opSignal, timeoutMs)
+        return sastScanResultSchema.parse(res.result)
+      },
+      async runScript(rawReq, opSignal) {
+        const parsed = offlineScriptRequestSchema.parse(rawReq)
+        const timeoutMs = (parsed.timeoutMs ?? 30_000) + 10_000
+        const res = await request({ op: 'script', ...parsed }, opSignal, timeoutMs)
+        return offlineScriptResultSchema.parse(res.result)
+      },
+      async verifyStaticAst(rawReq, opSignal) {
+        const parsed = astVerifyRequestSchema.parse(rawReq)
+        const timeoutMs = (parsed.timeoutMs ?? 30_000) + 10_000
+        const res = await request({ op: 'ast_verify', ...parsed }, opSignal, timeoutMs)
+        return astVerifyResultSchema.parse(res.result)
       },
       async close() {
         signal.removeEventListener('abort', onAbort)

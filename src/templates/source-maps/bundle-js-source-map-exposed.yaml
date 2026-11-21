@@ -1,0 +1,20 @@
+id: bundle-js-source-map-exposed
+name: "Bundle source map exposed at /bundle.js.map"
+severity: medium
+description: "A bundler source map is publicly reachable."
+tech: [generic]
+tags: [source-maps, exposure]
+cwe: CWE-540
+request:
+  method: GET
+  path: /bundle.js.map
+control:
+  path: "/guardian-none-{{rand}}.js.map"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"sources"', '"mappings"']
+    condition: and

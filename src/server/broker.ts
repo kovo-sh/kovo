@@ -1,15 +1,17 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { lookup, resolve4, resolve6, resolveCname, resolveNs, resolveTxt } from 'node:dns/promises'
 import { request as httpRequest } from 'node:http'
 import type { IncomingHttpHeaders } from 'node:http'
 import { request as httpsRequest } from 'node:https'
+import { connect as netConnect } from 'node:net'
+import type { Socket as NetSocket } from 'node:net'
 import { connect as tlsConnect, TLSSocket } from 'node:tls'
 import type { DetailedPeerCertificate } from 'node:tls'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import { referrerPolicies } from '../domain.ts'
-import type { CapabilityTier, PreparedObservation } from '../domain.ts'
-import { containsDestructivePayload } from '../replay-spec.ts'
+import type { CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
+import { containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders } from './redact.ts'
@@ -46,12 +48,20 @@ export interface SetCookieSummary {
   sameSite: string | null
 }
 
+export interface BrokerMultipartPart {
+  name: string
+  filename?: string
+  contentType: string
+  content: string
+}
+
 export interface BrokerHttpRequest {
   origin: string
-  method: 'GET' | 'HEAD' | 'OPTIONS' | 'POST' | 'PUT' | 'PATCH'
+  method: HttpMethod
   pathAndQuery: string
   headers?: Record<string, string>
   body?: string
+  multipartParts?: BrokerMultipartPart[]
   persona?: string
   personaHandle?: string
   personaHeaders?: Record<string, string>
@@ -59,6 +69,49 @@ export interface BrokerHttpRequest {
   secrets?: readonly NamedSecret[]
   maxBodyBytes?: number
   timeoutMs?: number
+}
+
+export interface BrokerWebsocketRequest {
+  origin: string
+  pathAndQuery: string
+  originHeader?: string
+  headers?: Record<string, string>
+  persona?: string
+  personaHandle?: string
+  personaHeaders?: Record<string, string>
+  subprotocols?: string[]
+  sendMessages?: string[]
+  maxFrames?: number
+  maxBytes?: number
+  timeoutMs?: number
+  secrets?: readonly NamedSecret[]
+}
+
+export interface BrokerWebsocketFrame {
+  direction: 'sent' | 'received'
+  opcode: 'text' | 'binary'
+  data: string
+  bytes: number
+  timestamp: number
+}
+
+export interface BrokerWebsocketResult {
+  origin: string
+  pathAndQuery: string
+  personaHandle: string | null
+  originHeader: string | null
+  connected: boolean
+  upgradeStatus: number | null
+  upgradeHeaders: Record<string, string>
+  subprotocol: string | null
+  sentFrames: number
+  receivedFrames: number
+  totalBytes: number
+  frames: BrokerWebsocketFrame[]
+  closeCode: number | null
+  closeReason: string | null
+  error: string | null
+  durationMs: number
 }
 
 export interface BrokerExchangeResult {
@@ -179,9 +232,34 @@ export type Grant = {
   audit: (outcome: 'allowed' | 'denied' | 'observed' | 'circuit_open', origin: string, status?: number) => void
 }
 
+export type WebsocketTransport = (
+  url: URL,
+  address: PublicAddress,
+  signal: AbortSignal,
+  options: {
+    headers: Record<string, string>
+    subprotocols?: string[]
+    sendMessages: string[]
+    maxFrames: number
+    maxBytes: number
+    timeoutMs: number
+    rejectUnauthorized: boolean
+  },
+) => Promise<{
+  connected: boolean
+  upgradeStatus: number | null
+  upgradeHeaders: Record<string, string>
+  subprotocol: string | null
+  frames: BrokerWebsocketFrame[]
+  closeCode: number | null
+  closeReason: string | null
+  error: string | null
+}>
+
 export type BrokerOptions = {
   resolve?: Resolver
   transport?: Transport
+  wsTransport?: WebsocketTransport
   dnsResolver?: DnsRecordResolver
   tlsInspector?: TlsInspector
   source?: PublicObservation['source']
@@ -195,9 +273,17 @@ const maxPathLength = 8192
 const maxRedirects = 8
 const defaultMaxBodyBytes = 1024 * 1024
 const hardMaxBodyBytes = 2 * 1024 * 1024
+const maxMultipartBytes = 256 * 1024
+const maxMultipartParts = 16
+const defaultWsMaxFrames = 10
+const hardWsMaxFrames = 25
+const defaultWsMaxBytes = 64 * 1024
+const defaultWsTimeoutMs = 10_000
+const hardWsTimeoutMs = 20_000
 const bodyPreviewLimit = 8192
 const defaultRequestTimeoutMs = 30_000
 const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding)$/i
+const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 const danglingCnameProviders: Array<{ provider: string; cname: RegExp }> = [
   { provider: 'GitHub Pages', cname: /\.github\.io\.?$/i },
@@ -372,9 +458,353 @@ function sessionCookiePolicy(headers: IncomingHttpHeaders): PublicObservation['s
 function safeUrl(url: URL, allowQuery: boolean, localLab: boolean): boolean {
   const validProtocol = url.protocol === 'https:' || (localLab && url.protocol === 'http:')
   if (!validProtocol || url.username || url.password || url.hash) return false
-  if (!allowQuery && !localLab && (url.port || url.search)) return false
+  if (!localLab && url.port) return false
+  if (!allowQuery && !localLab && url.search) return false
   const full = url.pathname + url.search
   return full.length <= maxPathLength && !url.pathname.startsWith('//') && !/[\r\n\0]/.test(full)
+}
+
+function encodeMultipartParts(parts: readonly BrokerMultipartPart[]): { contentType: string; body: string } {
+  if (parts.length === 0 || parts.length > maxMultipartParts) {
+    throw new BrokerDenied(`multipartParts must contain between 1 and ${maxMultipartParts} parts.`)
+  }
+  let totalBytes = 0
+  for (const part of parts) {
+    if (!part.name || /[\r\n\0"]/.test(part.name) || part.name.length > 128) {
+      throw new BrokerDenied('Invalid multipart part name.')
+    }
+    if (part.filename && (/[\r\n\0"]/.test(part.filename) || part.filename.length > 256)) {
+      throw new BrokerDenied('Invalid multipart filename.')
+    }
+    if (!part.contentType || /[\r\n\0]/.test(part.contentType) || part.contentType.length > 128) {
+      throw new BrokerDenied('Invalid multipart contentType.')
+    }
+    const serialized = `${part.name}\n${part.filename ?? ''}\n${part.contentType}\n${part.content}`
+    if (hasDestructiveContent(serialized)) {
+      throw new BrokerDenied('Multipart upload blocked by Guardian destructive-payload denylist.')
+    }
+    if (containsWebshellSignature(serialized)) {
+      throw new BrokerDenied('Multipart upload blocked by Guardian webshell signature filter.')
+    }
+    totalBytes += Buffer.byteLength(part.content, 'utf8')
+    if (totalBytes > maxMultipartBytes) {
+      throw new BrokerDenied(`Multipart upload exceeds Guardian 256 KiB limit (${totalBytes} bytes).`)
+    }
+  }
+
+  const boundary = `----GuardianBoundary${randomBytes(12).toString('hex')}`
+  const chunks: string[] = []
+  for (const part of parts) {
+    chunks.push(`--${boundary}\r\n`)
+    const disposition = part.filename
+      ? `Content-Disposition: form-data; name="${part.name}"; filename="${part.filename}"\r\n`
+      : `Content-Disposition: form-data; name="${part.name}"\r\n`
+    chunks.push(disposition)
+    chunks.push(`Content-Type: ${part.contentType}\r\n\r\n`)
+    chunks.push(part.content)
+    chunks.push('\r\n')
+  }
+  chunks.push(`--${boundary}--\r\n`)
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: chunks.join(''),
+  }
+}
+
+function encodeWsClientFrame(opcode: number, payload: Buffer): Buffer {
+  const mask = randomBytes(4)
+  const len = payload.length
+  let header: Buffer
+  if (len < 126) {
+    header = Buffer.alloc(2)
+    header[0] = 0x80 | (opcode & 0x0f)
+    header[1] = 0x80 | len
+  } else if (len < 65_536) {
+    header = Buffer.alloc(4)
+    header[0] = 0x80 | (opcode & 0x0f)
+    header[1] = 0x80 | 126
+    header.writeUInt16BE(len, 2)
+  } else {
+    header = Buffer.alloc(10)
+    header[0] = 0x80 | (opcode & 0x0f)
+    header[1] = 0x80 | 127
+    header.writeBigUInt64BE(BigInt(len), 2)
+  }
+  const masked = Buffer.alloc(len)
+  for (let i = 0; i < len; i += 1) {
+    masked[i] = payload[i] ^ mask[i & 3]
+  }
+  return Buffer.concat([header, mask, masked])
+}
+
+function defaultWsTransport(
+  url: URL,
+  address: PublicAddress,
+  signal: AbortSignal,
+  options: {
+    headers: Record<string, string>
+    subprotocols?: string[]
+    sendMessages: string[]
+    maxFrames: number
+    maxBytes: number
+    timeoutMs: number
+    rejectUnauthorized: boolean
+  },
+): Promise<{
+  connected: boolean
+  upgradeStatus: number | null
+  upgradeHeaders: Record<string, string>
+  subprotocol: string | null
+  frames: BrokerWebsocketFrame[]
+  closeCode: number | null
+  closeReason: string | null
+  error: string | null
+}> {
+  return new Promise((resolve) => {
+    const isSecure = url.protocol === 'https:'
+    const port = url.port ? Number(url.port) : (isSecure ? 443 : 80)
+    const wsKey = randomBytes(16).toString('base64')
+    const expectedAccept = createHash('sha1').update(wsKey + wsGuid).digest('base64')
+
+    const reqLines = [
+      `GET ${url.pathname + url.search} HTTP/1.1`,
+      `Host: ${url.host}`,
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Key: ${wsKey}`,
+      'Sec-WebSocket-Version: 13',
+      'User-Agent: Guardian/3 defensive websocket probe',
+    ]
+    if (options.subprotocols && options.subprotocols.length > 0) {
+      reqLines.push(`Sec-WebSocket-Protocol: ${options.subprotocols.join(', ')}`)
+    }
+    for (const [k, v] of Object.entries(options.headers)) {
+      if (/^(?:host|upgrade|connection|sec-websocket-key|sec-websocket-version|sec-websocket-protocol)$/i.test(k)) continue
+      reqLines.push(`${k}: ${v}`)
+    }
+    reqLines.push('', '')
+
+    const frames: BrokerWebsocketFrame[] = []
+    let upgradeDone = false
+    let connected = false
+    let upgradeStatus: number | null = null
+    let upgradeHeaders: Record<string, string> = {}
+    let subprotocol: string | null = null
+    let closeCode: number | null = null
+    let closeReason: string | null = null
+    let errorMsg: string | null = null
+    let receivedCount = 0
+    let totalBytes = 0
+    let buf: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+    let settled = false
+
+    const socket: NetSocket | TLSSocket = isSecure
+      ? tlsConnect({
+          host: address.address,
+          port,
+          servername: url.hostname,
+          rejectUnauthorized: options.rejectUnauthorized,
+        })
+      : netConnect({
+          host: address.address,
+          port,
+        })
+
+    const idleTimer = setTimeout(() => {
+      finish()
+    }, options.timeoutMs)
+
+    let settleWaitTimer: ReturnType<typeof setTimeout> | undefined
+
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(idleTimer)
+      if (settleWaitTimer) clearTimeout(settleWaitTimer)
+      signal.removeEventListener('abort', onAbort)
+      try {
+        if (connected && !socket.destroyed) {
+          socket.write(encodeWsClientFrame(0x8, Buffer.alloc(0)))
+        }
+      } catch { /* ignore */ }
+      socket.destroy()
+      resolve({
+        connected,
+        upgradeStatus,
+        upgradeHeaders,
+        subprotocol,
+        frames,
+        closeCode,
+        closeReason,
+        error: errorMsg,
+      })
+    }
+
+    const onAbort = () => {
+      errorMsg = errorMsg ?? 'WebSocket probe aborted.'
+      finish()
+    }
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    const sendHandshake = () => {
+      socket.write(reqLines.join('\r\n'))
+    }
+
+    if (isSecure) {
+      socket.once('secureConnect', sendHandshake)
+    } else {
+      socket.once('connect', sendHandshake)
+    }
+
+    const processFrames = () => {
+      while (buf.length >= 2) {
+        const b0 = buf[0]
+        const b1 = buf[1]
+        const opcode = b0 & 0x0f
+        const masked = (b1 & 0x80) !== 0
+        let payloadLen = b1 & 0x7f
+        let offset = 2
+        if (payloadLen === 126) {
+          if (buf.length < 4) return
+          payloadLen = buf.readUInt16BE(2)
+          offset = 4
+        } else if (payloadLen === 127) {
+          if (buf.length < 10) return
+          const bigLen = buf.readBigUInt64BE(2)
+          if (bigLen > BigInt(options.maxBytes)) {
+            errorMsg = 'WebSocket frame exceeded byte limit.'
+            finish()
+            return
+          }
+          payloadLen = Number(bigLen)
+          offset = 10
+        }
+        const maskBytes = masked ? 4 : 0
+        if (buf.length < offset + maskBytes + payloadLen) return
+        let payload = buf.subarray(offset + maskBytes, offset + maskBytes + payloadLen)
+        if (masked) {
+          const maskKey = buf.subarray(offset, offset + 4)
+          const unmasked = Buffer.alloc(payloadLen)
+          for (let i = 0; i < payloadLen; i += 1) {
+            unmasked[i] = payload[i] ^ maskKey[i & 3]
+          }
+          payload = unmasked
+        }
+        buf = buf.subarray(offset + maskBytes + payloadLen)
+
+        if (opcode === 0x8) {
+          // Close frame
+          if (payload.length >= 2) {
+            closeCode = payload.readUInt16BE(0)
+            closeReason = payload.subarray(2).toString('utf8').slice(0, 256)
+          }
+          finish()
+          return
+        }
+        if (opcode === 0x9) {
+          // Ping -> Pong
+          try { socket.write(encodeWsClientFrame(0xa, payload.subarray(0, 125))) } catch { /* ignore */ }
+          continue
+        }
+        if (opcode === 0xa) continue // Pong
+
+        if (opcode === 0x1 || opcode === 0x2 || opcode === 0x0) {
+          const remaining = options.maxBytes - totalBytes
+          const slice = payload.length > remaining ? payload.subarray(0, Math.max(0, remaining)) : payload
+          totalBytes += slice.length
+          receivedCount += 1
+          frames.push({
+            direction: 'received',
+            opcode: opcode === 0x2 ? 'binary' : 'text',
+            data: opcode === 0x2 ? slice.toString('base64') : slice.toString('utf8'),
+            bytes: slice.length,
+            timestamp: Date.now(),
+          })
+          if (receivedCount >= options.maxFrames || totalBytes >= options.maxBytes) {
+            finish()
+            return
+          }
+        }
+      }
+    }
+
+    socket.on('data', (chunk: Buffer) => {
+      if (settled) return
+      buf = Buffer.concat([buf, chunk])
+      if (!upgradeDone) {
+        const headerEnd = buf.indexOf('\r\n\r\n')
+        if (headerEnd === -1) {
+          if (buf.length > 32 * 1024) {
+            errorMsg = 'WebSocket upgrade response headers exceeded 32 KiB.'
+            finish()
+          }
+          return
+        }
+        upgradeDone = true
+        const headerText = buf.subarray(0, headerEnd).toString('latin1')
+        buf = buf.subarray(headerEnd + 4)
+        const lines = headerText.split('\r\n')
+        const statusLine = lines[0] ?? ''
+        const statusMatch = /^HTTP\/1\.[01]\s+(\d{3})/i.exec(statusLine)
+        upgradeStatus = statusMatch ? Number(statusMatch[1]) : null
+        const parsedHeaders: Record<string, string> = {}
+        for (const line of lines.slice(1)) {
+          const colon = line.indexOf(':')
+          if (colon <= 0) continue
+          const k = line.slice(0, colon).trim().toLowerCase()
+          const v = line.slice(colon + 1).trim()
+          parsedHeaders[k] = parsedHeaders[k] ? `${parsedHeaders[k]}, ${v}` : v
+        }
+        upgradeHeaders = parsedHeaders
+        subprotocol = parsedHeaders['sec-websocket-protocol'] ?? null
+
+        if (upgradeStatus !== 101 || parsedHeaders['sec-websocket-accept'] !== expectedAccept) {
+          connected = false
+          if (upgradeStatus === 101) {
+            errorMsg = 'Invalid Sec-WebSocket-Accept header during handshake.'
+          }
+          finish()
+          return
+        }
+
+        connected = true
+        // Send bounded client messages (up to maxFrames and maxBytes)
+        for (const msg of options.sendMessages.slice(0, options.maxFrames)) {
+          const payload = Buffer.from(msg, 'utf8')
+          if (totalBytes + payload.length > options.maxBytes) break
+          totalBytes += payload.length
+          socket.write(encodeWsClientFrame(0x1, payload))
+          frames.push({
+            direction: 'sent',
+            opcode: 'text',
+            data: msg,
+            bytes: payload.length,
+            timestamp: Date.now(),
+          })
+        }
+
+        // Wait briefly for server replies even if server keeps socket open
+        const waitMs = Math.min(options.timeoutMs, options.sendMessages.length > 0 ? 1200 : 800)
+        settleWaitTimer = setTimeout(() => finish(), waitMs)
+      }
+
+      if (connected) {
+        processFrames()
+      }
+    })
+
+    socket.once('error', (err) => {
+      errorMsg = err.message
+      finish()
+    })
+    socket.once('close', () => {
+      finish()
+    })
+  })
 }
 
 function certObjectToRecord(obj: unknown): Record<string, string> {
@@ -887,6 +1317,7 @@ export class RequestBroker {
     personaHandle: string | undefined
     resolvedPersonaHeaders: Record<string, string> | undefined
     cleanHeaders: Record<string, string>
+    preparedBody: string | undefined
     secrets: NamedSecret[]
     followRedirects: boolean
     maxRps: number
@@ -919,7 +1350,7 @@ export class RequestBroker {
       throw new BrokerDenied('Destination is outside the current assignment scope.')
     }
 
-    // Destructive payload denylist check across path (raw + URL-decoded), headers, and body
+    // Destructive payload denylist check across path (raw + URL-decoded), headers, body, and multipartParts
     const serializedHeaders = Object.entries(req.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n')
     if (
       hasDestructiveContent(req.pathAndQuery) ||
@@ -928,6 +1359,12 @@ export class RequestBroker {
     ) {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Request blocked by Guardian destructive-payload denylist.')
+    }
+
+    const hasMultipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
+    if (hasMultipart && req.body !== undefined) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('Specify either body or multipartParts, not both.')
     }
 
     const personaHandle = req.persona ?? req.personaHandle
@@ -958,15 +1395,22 @@ export class RequestBroker {
     }
 
     const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS'
-    if (!isReadOnlyMethod) {
-      const idempotentPostAllowed = req.method === 'POST' && tier >= 2 &&
+    if (!isReadOnlyMethod || hasMultipart) {
+      const idempotentPostAllowed = !hasMultipart && req.method === 'POST' && tier >= 2 &&
         Boolean(grant.isIdempotentPostAllowed?.(initialOrigin, req.pathAndQuery, req.body))
       if (!idempotentPostAllowed) {
         if (tier < 3) {
           grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(`Method ${req.method} requires Tier 3 (approval-gated state validation).`)
+          throw new BrokerDenied(
+            hasMultipart
+              ? 'Multipart uploads require Tier 3 (approval-gated state validation).'
+              : `Method ${req.method} requires Tier 3 (approval-gated state validation).`,
+          )
         }
-        if (!grant.isStateChangeApproved?.(initialOrigin, req.method, req.pathAndQuery)) {
+        const approved = grant.isStateChangeApproved
+          ? grant.isStateChangeApproved(initialOrigin, req.method, req.pathAndQuery)
+          : localLab
+        if (!approved) {
           throw new BrokerApprovalRequired(initialOrigin, req.method, req.pathAndQuery)
         }
       }
@@ -985,6 +1429,21 @@ export class RequestBroker {
       cleanHeaders[k] = v
     }
 
+    let preparedBody = req.body
+    if (hasMultipart) {
+      try {
+        const encoded = encodeMultipartParts(req.multipartParts!)
+        preparedBody = encoded.body
+        for (const existingKey of Object.keys(cleanHeaders)) {
+          if (existingKey.toLowerCase() === 'content-type') delete cleanHeaders[existingKey]
+        }
+        cleanHeaders['Content-Type'] = encoded.contentType
+      } catch (err) {
+        grant.audit('denied', initialOrigin)
+        throw err
+      }
+    }
+
     const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? defaultRequestTimeoutMs, 60_000))
     const secrets = collectSecrets(req, grant)
     const followRedirects = req.followRedirects ?? true
@@ -998,6 +1457,7 @@ export class RequestBroker {
       personaHandle,
       resolvedPersonaHeaders,
       cleanHeaders,
+      preparedBody,
       secrets,
       followRedirects,
       maxRps,
@@ -1031,7 +1491,7 @@ export class RequestBroker {
 
     const redirectOrigins = new Set<string>([url.origin])
     let activeMethod: BrokerHttpRequest['method'] = req.method
-    let activeBody = req.body
+    let activeBody = prepared.preparedBody
     let includePersona = Boolean(resolvedPersonaHeaders && Object.keys(resolvedPersonaHeaders).length > 0)
 
     const deny = (message: string): never => {
@@ -1351,5 +1811,202 @@ export class RequestBroker {
       tls,
       durationMs: Date.now() - started,
     }
+  }
+
+  async probeWebsocket(
+    req: BrokerWebsocketRequest,
+    grant: Grant,
+    signal: AbortSignal,
+  ): Promise<BrokerWebsocketResult> {
+    const tier = grant.tier ?? 1
+    if (tier === 0) throw new BrokerDenied('Live WebSocket probing is disabled in Tier 0 (offline prepared mode).')
+
+    const localLab = allowLocalLab(grant)
+    let initialOrigin: string
+    let url: URL
+    try {
+      const normalizedOrigin = req.origin.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+      initialOrigin = new URL(normalizedOrigin).origin
+      url = new URL(req.pathAndQuery, initialOrigin)
+    } catch {
+      throw new BrokerDenied('WebSocket origin or path is malformed.')
+    }
+
+    if (
+      !req.pathAndQuery.startsWith('/') ||
+      req.pathAndQuery.startsWith('//') ||
+      req.pathAndQuery.length > maxPathLength ||
+      /[\r\n\0]/.test(req.pathAndQuery)
+    ) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('WebSocket path is invalid or exceeds Guardian 8 KiB limit.')
+    }
+    if (url.origin !== initialOrigin || !safeUrl(url, true, localLab) || !grant.canRead(initialOrigin)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('WebSocket destination is outside the current assignment scope.')
+    }
+
+    const sendMessages = (req.sendMessages ?? []).slice(0, hardWsMaxFrames)
+    const serializedInputs = [
+      req.pathAndQuery,
+      req.originHeader ?? '',
+      ...Object.entries(req.headers ?? {}).map(([k, v]) => `${k}: ${v}`),
+      ...sendMessages,
+    ].join('\n')
+    if (hasDestructiveContent(serializedInputs)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('WebSocket probe blocked by Guardian destructive-payload denylist.')
+    }
+
+    const personaHandle = req.persona ?? req.personaHandle
+    let resolvedPersonaHeaders: Record<string, string> | undefined
+    if (personaHandle) {
+      if (tier < 2) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Persona-authenticated WebSocket probes require Tier 2 or higher.')
+      }
+      if (grant.personas) {
+        const persona = grant.personas.get(personaHandle)
+        if (!persona) {
+          grant.audit('denied', initialOrigin)
+          throw new BrokerDenied(`Persona "${personaHandle}" is not approved for this run.`)
+        }
+        const injected = buildPersonaHeader(persona, initialOrigin)
+        if (!injected) {
+          grant.audit('denied', initialOrigin)
+          throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+        }
+        resolvedPersonaHeaders = injected
+      } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
+        resolvedPersonaHeaders = req.personaHeaders
+      } else {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied(`Persona "${personaHandle}" could not be resolved from run grant.`)
+      }
+    }
+
+    const cleanHeaders: Record<string, string> = {}
+    for (const [k, v] of Object.entries(req.headers ?? {})) {
+      if (forbiddenCallerHeaders.test(k)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
+      }
+      if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Invalid WebSocket request header.')
+      }
+      cleanHeaders[k] = v
+    }
+    const effectiveOriginHeader = req.originHeader ?? cleanHeaders.Origin ?? cleanHeaders.origin ?? initialOrigin
+    if (/[\r\n\0]/.test(effectiveOriginHeader)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('Invalid WebSocket Origin header.')
+    }
+    cleanHeaders.Origin = effectiveOriginHeader
+
+    const maxFrames = Math.max(1, Math.min(req.maxFrames ?? defaultWsMaxFrames, hardWsMaxFrames))
+    const maxBytes = Math.max(1024, Math.min(req.maxBytes ?? defaultWsMaxBytes, defaultWsMaxBytes))
+    const timeoutMs = Math.max(500, Math.min(req.timeoutMs ?? defaultWsTimeoutMs, hardWsTimeoutMs))
+    const started = Date.now()
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs + 2_000)])
+    const secrets: NamedSecret[] = [
+      ...(grant.personas ? personaSecrets(grant.personas) : []),
+      ...(grant.secrets ?? []),
+      ...(req.secrets ?? []),
+    ]
+
+    const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin)
+    const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
+    const maxRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
+    const release = await this.acquireSlot(initialOrigin, maxRps, deadline)
+
+    const wsTransport = this.options.wsTransport ?? defaultWsTransport
+    let raw
+    try {
+      grant.audit('allowed', initialOrigin)
+      raw = await wsTransport(url, chosen, deadline, {
+        headers: {
+          ...cleanHeaders,
+          ...(resolvedPersonaHeaders ?? {}),
+        },
+        subprotocols: req.subprotocols,
+        sendMessages: sendMessages.slice(0, maxFrames),
+        maxFrames,
+        maxBytes,
+        timeoutMs,
+        rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+      })
+    } finally {
+      release()
+    }
+
+    grant.audit('observed', initialOrigin, raw.upgradeStatus ?? undefined)
+    if (raw.upgradeStatus !== null) {
+      this.recordStatus(initialOrigin, raw.upgradeStatus, grant.audit)
+    }
+
+    const safeFrames: BrokerWebsocketFrame[] = raw.frames.slice(0, maxFrames * 2).map(frame => ({
+      ...frame,
+      data: redact(frame.data, secrets).slice(0, 8192),
+    }))
+    const sentFrames = safeFrames.filter(f => f.direction === 'sent').length
+    const receivedFrames = safeFrames.filter(f => f.direction === 'received').length
+    const totalBytes = safeFrames.reduce((sum, f) => sum + f.bytes, 0)
+
+    return {
+      origin: initialOrigin,
+      pathAndQuery: req.pathAndQuery,
+      personaHandle: personaHandle ?? null,
+      originHeader: redact(effectiveOriginHeader, secrets),
+      connected: raw.connected,
+      upgradeStatus: raw.upgradeStatus,
+      upgradeHeaders: redactHeaders(normalizeHeaders(raw.upgradeHeaders), secrets),
+      subprotocol: raw.subprotocol ? redact(raw.subprotocol, secrets) : null,
+      sentFrames,
+      receivedFrames,
+      totalBytes,
+      frames: safeFrames,
+      closeCode: raw.closeCode,
+      closeReason: raw.closeReason ? redact(raw.closeReason, secrets) : null,
+      error: raw.error ? redact(raw.error, secrets) : null,
+      durationMs: Date.now() - started,
+    }
+  }
+}
+
+
+/** Adapts a WebSocket probe result into a BrokerExchangeResult so it can be logged as a `WS` broker exchange. */
+export function websocketResultToExchange(result: BrokerWebsocketResult): BrokerExchangeResult {
+  const received = result.frames.filter(f => f.direction === 'received').map(f => f.data).join('\n')
+  const sent = result.frames.filter(f => f.direction === 'sent').map(f => f.data).join('\n')
+  const body = received.slice(0, 64 * 1024)
+  const status = result.upgradeStatus ?? 0
+  return {
+    origin: result.origin,
+    finalOrigin: result.origin,
+    redirectOrigins: [result.origin],
+    method: 'WS',
+    pathAndQuery: result.pathAndQuery,
+    personaHandle: result.personaHandle,
+    status,
+    mediaType: 'text/plain',
+    reqHeaders: { origin: result.originHeader ?? '', ...(sent ? { 'x-guardian-ws-sent-frames': String(result.sentFrames) } : {}) },
+    respHeaders: result.upgradeHeaders,
+    setCookies: [],
+    bodyPreview: body.slice(0, bodyPreviewLimit),
+    body,
+    bodySha256: createHash('sha256').update(body).digest('hex'),
+    bodyBytes: Buffer.byteLength(body),
+    bodyTruncated: received.length > body.length,
+    durationMs: result.durationMs,
+    observation: {
+      origin: result.origin,
+      finalOrigin: result.origin,
+      status,
+      mediaType: 'text/plain',
+      transportMaxAge: null,
+      includeSubDomains: false,
+      source: 'public response',
+    },
   }
 }

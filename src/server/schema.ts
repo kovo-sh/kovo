@@ -1,9 +1,10 @@
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import type {
-  AssessmentCheckId, Candidate, CapabilityTier, CheckCoverage, DnsSource, EvidenceSummary,
-  Finding, OwaspCategory, Phase, PreparedObservation, ReportBody, ReviewPlan, RunStatus,
-  ThinkingLevel, ThreatModelSummary, WorkerPhase, WorkerStatus,
+  AssessmentCheckId, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
+  CodeLocation, DnsSource, DynamicRetestVerdict, EvidenceSummary, Finding, LabConfig,
+  OwaspCategory, PatchProposalStatus, Phase, PreparedObservation, ReportBody, ReviewPlan,
+  RunStatus, ThinkingLevel, ThreatModelSummary, VerificationTier, WorkerPhase, WorkerStatus,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 
@@ -42,6 +43,7 @@ export const projects = sqliteTable('projects', {
   environment: text('environment').$type<'public' | 'local-lab'>().default('public').notNull(),
   seeds: text('seeds', { mode: 'json' }).$type<string[]>().notNull(),
   defaultScope: text('default_scope', { mode: 'json' }).$type<string[]>().notNull(),
+  labConfig: text('lab_config', { mode: 'json' }).$type<LabConfig | null>(),
   createdAt: integer('created_at').notNull(),
 })
 
@@ -286,6 +288,9 @@ export const coverageEntries = sqliteTable('coverage_entries', {
   category: text('category').$type<OwaspCategory>().notNull(),
   status: text('status').$type<'reported' | 'no_issue_found' | 'ruled_out' | 'not_applicable' | 'needs_follow_up'>().notNull(),
   summary: text('summary').notNull(),
+  enforcingControl: text('enforcing_control'),
+  proofGapReason: text('proof_gap_reason'),
+  linkedFindingId: text('linked_finding_id'),
   assignmentId: text('assignment_id').notNull(),
   updatedAt: integer('updated_at').notNull(),
 }, table => [uniqueIndex('coverage_origin_cat').on(table.runId, table.goalRevision, table.origin, table.category)])
@@ -296,6 +301,9 @@ export const canaries = sqliteTable('canaries', {
   assignmentId: text('assignment_id').notNull(),
   token: text('token').notNull().unique(),
   purpose: text('purpose').notNull(),
+  protocol: text('protocol').$type<'http' | 'dns' | 'both'>().default('http').notNull(),
+  dnsHost: text('dns_host'),
+  hitCount: integer('hit_count').default(0).notNull(),
   triggered: integer('triggered', { mode: 'boolean' }).default(false).notNull(),
   triggerDetail: text('trigger_detail', { mode: 'json' }).$type<Record<string, unknown>>(),
   createdAt: integer('created_at').notNull(),
@@ -324,11 +332,59 @@ export const findings = sqliteTable('findings', {
   findingKind: text('finding_kind').$type<'baseline_check' | 'multi_step_chain'>().default('baseline_check').notNull(),
   replaySpecId: text('replay_spec_id'),
   sourceOrigins: text('source_origins', { mode: 'json' }).$type<string[]>().notNull(),
+  verificationTier: text('verification_tier').$type<VerificationTier | null>(),
+  fingerprintHash: text('fingerprint_hash'),
+  supersededByFindingId: text('superseded_by_finding_id'),
+  counterevidence: text('counterevidence'),
+  confidenceRationale: text('confidence_rationale'),
+  severityChangeConditions: text('severity_change_conditions'),
+  codeLocations: text('code_locations', { mode: 'json' }).$type<CodeLocation[] | null>(),
   finding: text('finding', { mode: 'json' }).$type<Finding>().notNull(),
 }, table => [
   index('findings_run').on(table.runId),
+  index('findings_fingerprint').on(table.runId, table.fingerprintHash),
   uniqueIndex('findings_check_case').on(table.runId, table.assetId, table.goalRevision, table.checkId, table.caseId),
 ])
+
+export const sastRuns = sqliteTable('sast_runs', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  repo: text('repo').notNull(),
+  engine: text('engine').notNull(),
+  rawArtifactId: text('raw_artifact_id'),
+  findingCount: integer('finding_count').default(0).notNull(),
+  durationMs: integer('duration_ms').default(0).notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [index('sast_runs_run').on(table.runId)])
+
+export const surfaceProbes = sqliteTable('surface_probes', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  scopeRevision: integer('scope_revision').notNull(),
+  origin: text('origin').notNull(),
+  probeKind: text('probe_kind').notNull(),
+  requestsSent: integer('requests_sent').default(0).notNull(),
+  anomaliesFound: integer('anomalies_found').default(0).notNull(),
+  baselineSignature: text('baseline_signature'),
+  createdAt: integer('created_at').notNull(),
+}, table => [index('surface_probes_run').on(table.runId, table.origin)])
+
+export const patchProposals = sqliteTable('patch_proposals', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  findingId: text('finding_id').notNull(),
+  repo: text('repo').notNull(),
+  status: text('status').$type<PatchProposalStatus>().default('draft').notNull(),
+  callerCompatibility: text('caller_compatibility').$type<CallerCompatibility>().default('attacker_only').notNull(),
+  diff: text('diff').notNull(),
+  codeLocations: text('code_locations', { mode: 'json' }).$type<CodeLocation[]>().notNull(),
+  reviewNotes: text('review_notes').default('').notNull(),
+  dynamicRetestVerdict: text('dynamic_retest_verdict').$type<DynamicRetestVerdict>().default('skipped').notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, table => [index('patch_proposals_run').on(table.runId, table.findingId)])
 
 export const reports = sqliteTable('reports', {
   id: text('id').primaryKey().notNull(),

@@ -1,0 +1,137 @@
+{
+  "version": "2026-01",
+  "advisories": [
+    {
+      "id": "CVE-2025-29927",
+      "ecosystem": "npm",
+      "package": "next",
+      "affectedBelow": "14.2.25",
+      "affectedRanges": [
+        { "min": "11.1.4", "maxExclusive": "12.3.5" },
+        { "min": "13.0.0", "maxExclusive": "13.5.9" },
+        { "min": "14.0.0", "maxExclusive": "14.2.25" },
+        { "min": "15.0.0", "maxExclusive": "15.2.3" }
+      ],
+      "severity": "critical",
+      "cwe": "CWE-287",
+      "message": "Next.js middleware authorization bypass via x-middleware-subrequest header (CVE-2025-29927)."
+    },
+    {
+      "id": "CVE-2024-29041",
+      "ecosystem": "npm",
+      "package": "express",
+      "affectedRanges": [{ "min": "4.0.0", "maxExclusive": "4.19.2" }],
+      "severity": "medium",
+      "cwe": "CWE-601",
+      "message": "Express.js open redirect in res.location / res.redirect (CVE-2024-29041)."
+    },
+    {
+      "id": "CVE-2024-33883",
+      "ecosystem": "npm",
+      "package": "ejs",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "3.1.10" }],
+      "severity": "high",
+      "cwe": "CWE-1321",
+      "message": "EJS prototype pollution / template injection risk (CVE-2024-33883)."
+    },
+    {
+      "id": "CVE-2022-23529",
+      "ecosystem": "npm",
+      "package": "jsonwebtoken",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "9.0.0" }],
+      "severity": "high",
+      "cwe": "CWE-20",
+      "message": "jsonwebtoken insecure secretOrPublicKey handling (CVE-2022-23529)."
+    },
+    {
+      "id": "CVE-2021-23337",
+      "ecosystem": "npm",
+      "package": "lodash",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "4.17.21" }],
+      "severity": "high",
+      "cwe": "CWE-78",
+      "message": "Lodash command injection / prototype pollution in versions < 4.17.21 (CVE-2021-23337)."
+    },
+    {
+      "id": "CVE-2024-4068",
+      "ecosystem": "npm",
+      "package": "braces",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "3.0.3" }],
+      "severity": "medium",
+      "cwe": "CWE-400",
+      "message": "braces uncontrolled resource consumption (CVE-2024-4068)."
+    },
+    {
+      "id": "CVE-2023-45857",
+      "ecosystem": "npm",
+      "package": "axios",
+      "affectedRanges": [{ "min": "0.8.1", "maxExclusive": "1.6.0" }],
+      "severity": "medium",
+      "cwe": "CWE-352",
+      "message": "Axios XSRF-TOKEN cookie leakage to third-party hosts (CVE-2023-45857)."
+    },
+    {
+      "id": "CVE-2024-21538",
+      "ecosystem": "npm",
+      "package": "cross-spawn",
+      "affectedRanges": [{ "min": "7.0.0", "maxExclusive": "7.0.5" }],
+      "severity": "high",
+      "cwe": "CWE-1333",
+      "message": "cross-spawn ReDoS vulnerability (CVE-2024-21538)."
+    },
+    {
+      "id": "CVE-2024-34064",
+      "ecosystem": "pypi",
+      "package": "jinja2",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "3.1.4" }],
+      "severity": "medium",
+      "cwe": "CWE-79",
+      "message": "Jinja2 XSS via xmlattr filter keys (CVE-2024-34064)."
+    },
+    {
+      "id": "CVE-2024-35195",
+      "ecosystem": "pypi",
+      "package": "requests",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "2.32.0" }],
+      "severity": "medium",
+      "cwe": "CWE-295",
+      "message": "Python requests verify=False session reuse bypass (CVE-2024-35195)."
+    },
+    {
+      "id": "CVE-2024-24762",
+      "ecosystem": "pypi",
+      "package": "fastapi",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "0.109.1" }],
+      "severity": "high",
+      "cwe": "CWE-1333",
+      "message": "FastAPI/python-multipart ReDoS in Content-Type parsing (CVE-2024-24762)."
+    },
+    {
+      "id": "CVE-2024-45231",
+      "ecosystem": "pypi",
+      "package": "django",
+      "affectedRanges": [{ "min": "4.0.0", "maxExclusive": "4.2.16" }, { "min": "5.0.0", "maxExclusive": "5.0.9" }],
+      "severity": "medium",
+      "cwe": "CWE-200",
+      "message": "Django PasswordResetForm email enumeration (CVE-2024-45231)."
+    },
+    {
+      "id": "CVE-2020-14343",
+      "ecosystem": "pypi",
+      "package": "pyyaml",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "5.4" }],
+      "severity": "critical",
+      "cwe": "CWE-502",
+      "message": "PyYAML arbitrary code execution via full_load/load (CVE-2020-14343)."
+    },
+    {
+      "id": "CVE-2024-51744",
+      "ecosystem": "go",
+      "package": "github.com/golang-jwt/jwt/v4",
+      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "4.5.1" }],
+      "severity": "high",
+      "cwe": "CWE-287",
+      "message": "golang-jwt/jwt v4 ambiguous error handling in ParseWithClaims (CVE-2024-51744)."
+    }
+  ]
+}

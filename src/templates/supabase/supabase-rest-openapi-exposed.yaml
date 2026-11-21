@@ -1,0 +1,21 @@
+id: supabase-rest-openapi-exposed
+name: "Supabase PostgREST OpenAPI schema exposed"
+severity: medium
+description: "The PostgREST root returns an OpenAPI schema without an API key, exposing table and column names."
+tech: [supabase]
+tags: [supabase, exposure]
+cwe: CWE-200
+spaExclusion: true
+request:
+  method: GET
+  path: /rest/v1/
+  headers:
+    Accept: "application/openapi+json"
+matchers-condition: and
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    part: body
+    words: ['"swagger"', '"definitions"']
+    condition: and
