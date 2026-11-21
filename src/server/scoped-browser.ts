@@ -1,0 +1,547 @@
+import { containsDestructivePayload } from '../replay-spec.ts'
+import { BrokerDenied, RequestBroker } from './broker.ts'
+import type { BrokerExchangeResult, Grant } from './broker.ts'
+import { personaSecrets } from './persona-vault.ts'
+import { redact } from './redact.ts'
+import type { NamedSecret } from './redact.ts'
+
+export interface BrowserVisitRequest {
+  origin: string
+  pathAndQuery: string
+  persona?: string
+  checkKind?: 'dom_xss' | 'postmessage' | 'client_storage' | 'xhr_leak'
+  canaryToken?: string
+  timeoutMs?: number
+  waitAfterLoadMs?: number
+  secrets?: readonly NamedSecret[]
+  onExchange?: (exchange: BrokerExchangeResult) => string | void
+}
+
+export interface BrowserFormSummary {
+  action: string
+  method: string
+  inputNames: string[]
+}
+
+export interface BrowserXhrRecord {
+  method: string
+  url: string
+  origin: string
+  resourceType: string
+  status: number | null
+}
+
+export interface BrowserPostMessageSummary {
+  count: number
+  hasOnMessage: boolean
+  handlers: Array<{ preview: string; checksOrigin: boolean }>
+  observedEvents: number
+  canaryHandledWithoutOriginCheck: boolean
+}
+
+export interface BrowserVisitResult {
+  origin: string
+  finalUrl: string
+  title: string
+  status: number | null
+  domSnippet: string
+  links: string[]
+  forms: BrowserFormSummary[]
+  xhrRequests: BrowserXhrRecord[]
+  blockedOrigins: string[]
+  consoleMessages: Array<{ type: 'error' | 'warning'; text: string }>
+  postMessageListeners: BrowserPostMessageSummary
+  cookieNames: string[]
+  localStorageKeys: string[]
+  sessionStorageKeys: string[]
+  canaryCheck: {
+    token: string | null
+    triggered: boolean
+    detail: string | null
+  }
+  exchangeIds: string[]
+  exchanges: BrokerExchangeResult[]
+  durationMs: number
+}
+
+interface PlaywrightRoute {
+  request(): {
+    url(): string
+    method(): string
+    headers(): Record<string, string>
+    postData(): string | null
+    resourceType(): string
+  }
+  abort(errorCode?: string): Promise<void>
+  fulfill(response: {
+    status?: number
+    headers?: Record<string, string>
+    contentType?: string
+    body?: string | Buffer
+  }): Promise<void>
+}
+
+interface PlaywrightPage {
+  on(event: 'console', listener: (msg: { type(): string; text(): string }) => void): void
+  on(event: 'pageerror', listener: (err: Error) => void): void
+  goto(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }): Promise<{ status(): number } | null>
+  waitForTimeout(ms: number): Promise<void>
+  url(): string
+  title(): Promise<string>
+  evaluate<T, A = undefined>(fn: (arg: A) => T, arg?: A): Promise<T>
+  close(): Promise<void>
+}
+
+interface PlaywrightContext {
+  addInitScript(script: string | (() => void)): Promise<void>
+  route(url: string, handler: (route: PlaywrightRoute) => Promise<void> | void): Promise<void>
+  newPage(): Promise<PlaywrightPage>
+  close(): Promise<void>
+}
+
+export interface PlaywrightBrowserLike {
+  newContext(options?: Record<string, unknown>): Promise<PlaywrightContext>
+  close(): Promise<void>
+}
+
+export interface ScopedBrowserOptions {
+  launchBrowser?: () => Promise<PlaywrightBrowserLike>
+}
+
+const maxBrowserTimeoutMs = 30_000
+const maxDomSnippetChars = 16_384
+const forbiddenBrowserForwardHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|connection|accept-encoding|sec-fetch-.*|sec-ch-.*)$/i
+const allowedMethods = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH'])
+
+async function launchChromium(): Promise<PlaywrightBrowserLike> {
+  // Prefer playwright-core if present, falling back cleanly to @playwright/test.
+  try {
+    const coreName = 'playwright-core'
+    const coreMod = await import(/* @vite-ignore */ coreName) as { chromium?: { launch: (opts: Record<string, unknown>) => Promise<PlaywrightBrowserLike> } }
+    if (coreMod.chromium) {
+      return await coreMod.chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking'],
+      })
+    }
+  } catch {
+    // Fallback to @playwright/test
+  }
+  const pw = await import('@playwright/test')
+  return await pw.chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking'],
+  }) as unknown as PlaywrightBrowserLike
+}
+
+const postMessageInstrumentationScript = `
+(() => {
+  const state = {
+    handlers: [],
+    hasOnMessage: false,
+    observedEvents: 0,
+    canaryObserved: false,
+    domCanaryTriggered: false,
+  };
+  Object.defineProperty(window, '__guardianBrowserProbe', {
+    value: state,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+
+  const inspectHandler = (fn) => {
+    try {
+      const src = typeof fn === 'function' ? Function.prototype.toString.call(fn) : String(fn);
+      const preview = src.slice(0, 300);
+      const checksOrigin = /(?:event|evt|e|msg)\\.origin\\s*(?:===|!==|==|!=)|\\.origin\\.endsWith|\\.origin\\.includes|allowedOrigins/i.test(src);
+      state.handlers.push({ preview, checksOrigin });
+    } catch {
+      state.handlers.push({ preview: '[uninspectable handler]', checksOrigin: false });
+    }
+  };
+
+  const origAdd = EventTarget.prototype.addEventListener;
+  EventTarget.prototype.addEventListener = function(type, listener, options) {
+    if (this === window && type === 'message' && listener) {
+      inspectHandler(listener);
+    }
+    return origAdd.call(this, type, listener, options);
+  };
+
+  const desc = Object.getOwnPropertyDescriptor(window, 'onmessage') ||
+               Object.getOwnPropertyDescriptor(Window.prototype, 'onmessage');
+  if (desc && desc.set && desc.configurable) {
+    Object.defineProperty(window, 'onmessage', {
+      configurable: true,
+      get() { return desc.get ? desc.get.call(this) : null; },
+      set(fn) {
+        if (typeof fn === 'function') {
+          state.hasOnMessage = true;
+          inspectHandler(fn);
+        }
+        return desc.set.call(this, fn);
+      },
+    });
+  }
+
+  origAdd.call(window, 'message', (ev) => {
+    state.observedEvents += 1;
+    try {
+      const serialized = typeof ev.data === 'string' ? ev.data : JSON.stringify(ev.data ?? '');
+      if (serialized && serialized.includes('guardian-pm-canary')) {
+        state.canaryObserved = true;
+      }
+    } catch {}
+  }, true);
+})();
+`
+
+function collectSecrets(req: BrowserVisitRequest, grant: Grant): NamedSecret[] {
+  const out: NamedSecret[] = []
+  if (grant.personas) out.push(...personaSecrets(grant.personas))
+  if (grant.secrets) out.push(...grant.secrets)
+  if (req.secrets) out.push(...req.secrets)
+  return out
+}
+
+function safeFulfillHeaders(respHeaders: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(respHeaders)) {
+    const lower = k.toLowerCase()
+    if (/^(?:transfer-encoding|content-encoding|content-length|connection|set-cookie)$/.test(lower)) continue
+    out[k] = v
+  }
+  return out
+}
+
+export class ScopedBrowser {
+  private readonly broker: RequestBroker
+  private readonly options: ScopedBrowserOptions
+
+  constructor(broker: RequestBroker, options: ScopedBrowserOptions = {}) {
+    this.broker = broker
+    this.options = options
+  }
+
+  async visitPage(req: BrowserVisitRequest, grant: Grant, signal: AbortSignal): Promise<BrowserVisitResult> {
+    const tier = grant.tier ?? 1
+    if (tier === 0) throw new BrokerDenied('Scoped browser inspection is disabled in Tier 0 (offline prepared mode).')
+
+    const initialOrigin = new URL(req.origin).origin
+    if (!req.pathAndQuery.startsWith('/') || req.pathAndQuery.startsWith('//') || /[\r\n\0]/.test(req.pathAndQuery)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('Invalid browser visit path.')
+    }
+    let decodedPath = req.pathAndQuery
+    try { decodedPath = decodeURIComponent(req.pathAndQuery.replaceAll('+', ' ')) } catch { decodedPath = req.pathAndQuery.replaceAll('+', ' ') }
+    if (containsDestructivePayload(req.pathAndQuery) || containsDestructivePayload(decodedPath)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('Browser visit blocked by destructive-payload denylist.')
+    }
+    const targetUrl = new URL(req.pathAndQuery, initialOrigin)
+    if (targetUrl.origin !== initialOrigin || !grant.canRead(initialOrigin)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('Browser destination is outside the current assignment scope.')
+    }
+
+    const started = Date.now()
+    const timeoutMs = Math.max(2_000, Math.min(req.timeoutMs ?? maxBrowserTimeoutMs, maxBrowserTimeoutMs))
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+    deadline.throwIfAborted()
+
+    const secrets = collectSecrets(req, grant)
+    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+    const exchanges: BrokerExchangeResult[] = []
+    const exchangeIds: string[] = []
+    const xhrRequests: BrowserXhrRecord[] = []
+    const blockedOrigins = new Set<string>()
+    const consoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
+
+    const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
+    let context: PlaywrightContext | undefined
+    let page: PlaywrightPage | undefined
+    let closed = false
+
+    const forceClose = async () => {
+      if (closed) return
+      closed = true
+      await page?.close().catch(() => undefined)
+      await context?.close().catch(() => undefined)
+      await browser.close().catch(() => undefined)
+    }
+
+    const onAbort = () => { void forceClose() }
+    deadline.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      deadline.throwIfAborted()
+      context = await browser.newContext({
+        ignoreHTTPSErrors: false,
+        javaScriptEnabled: true,
+        bypassCSP: false,
+        serviceWorkers: 'block',
+        userAgent: 'Guardian/2 scoped headless inspector',
+      })
+      await context.addInitScript(postMessageInstrumentationScript)
+
+      // 100% network interception: every document, script, stylesheet, iframe, XHR, fetch, image, and redirect
+      // is routed strictly through RequestBroker or aborted with blockedbyclient. Zero direct network egress!
+      await context.route('**/*', async route => {
+        const request = route.request()
+        const rawUrl = request.url()
+        if (rawUrl.startsWith('about:') || rawUrl.startsWith('data:') || rawUrl.startsWith('blob:')) {
+          await route.fulfill({ status: 200, contentType: 'text/plain', body: '' }).catch(() => undefined)
+          return
+        }
+
+        let parsedUrl: URL
+        try {
+          parsedUrl = new URL(rawUrl)
+        } catch {
+          await route.abort('blockedbyclient').catch(() => undefined)
+          return
+        }
+
+        const validProtocol = parsedUrl.protocol === 'https:' || (allowLocalLab && parsedUrl.protocol === 'http:')
+        if (!validProtocol || !grant.canRead(parsedUrl.origin)) {
+          blockedOrigins.add(parsedUrl.origin)
+          grant.audit('denied', parsedUrl.origin)
+          await route.abort('blockedbyclient').catch(() => undefined)
+          return
+        }
+
+        const method = request.method().toUpperCase()
+        if (!allowedMethods.has(method)) {
+          await route.abort('blockedbyclient').catch(() => undefined)
+          return
+        }
+        const isReadOnly = method === 'GET' || method === 'HEAD' || method === 'OPTIONS'
+        if (!isReadOnly && tier < 3) {
+          await route.abort('blockedbyclient').catch(() => undefined)
+          return
+        }
+
+        const forwardedHeaders: Record<string, string> = {}
+        for (const [k, v] of Object.entries(request.headers())) {
+          if (forbiddenBrowserForwardHeaders.test(k)) continue
+          forwardedHeaders[k] = v
+        }
+
+        const resourceType = request.resourceType()
+        try {
+          const exchange = await this.broker.executeHttp({
+            origin: parsedUrl.origin,
+            method: method as 'GET' | 'HEAD' | 'OPTIONS' | 'POST' | 'PUT' | 'PATCH',
+            pathAndQuery: parsedUrl.pathname + parsedUrl.search,
+            headers: forwardedHeaders,
+            body: request.postData() ?? undefined,
+            persona: parsedUrl.origin === initialOrigin ? req.persona : undefined,
+            followRedirects: true,
+            secrets,
+            timeoutMs: Math.max(2_000, timeoutMs - (Date.now() - started)),
+          }, grant, deadline)
+
+          exchanges.push(exchange)
+          const recordedId = req.onExchange?.(exchange)
+          if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
+
+          if (resourceType === 'xhr' || resourceType === 'fetch') {
+            xhrRequests.push({
+              method,
+              url: parsedUrl.href,
+              origin: parsedUrl.origin,
+              resourceType,
+              status: exchange.status,
+            })
+          }
+
+          await route.fulfill({
+            status: exchange.status,
+            headers: safeFulfillHeaders(exchange.respHeaders),
+            contentType: exchange.mediaType === 'unknown' ? 'application/octet-stream' : exchange.mediaType,
+            body: exchange.body,
+          }).catch(() => undefined)
+        } catch {
+          if (resourceType === 'xhr' || resourceType === 'fetch') {
+            xhrRequests.push({
+              method,
+              url: parsedUrl.href,
+              origin: parsedUrl.origin,
+              resourceType,
+              status: null,
+            })
+          }
+          await route.abort('blockedbyclient').catch(() => undefined)
+        }
+      })
+
+      page = await context.newPage()
+      page.on('console', msg => {
+        const type = msg.type()
+        if ((type === 'error' || type === 'warning') && consoleMessages.length < 50) {
+          consoleMessages.push({
+            type,
+            text: redact(msg.text(), secrets).slice(0, 500),
+          })
+        }
+      })
+      page.on('pageerror', err => {
+        if (consoleMessages.length < 50) {
+          consoleMessages.push({
+            type: 'error',
+            text: redact(err.message || String(err), secrets).slice(0, 500),
+          })
+        }
+      })
+
+      const navResponse = await page.goto(targetUrl.href, {
+        waitUntil: 'domcontentloaded',
+        timeout: Math.max(2_000, timeoutMs - (Date.now() - started)),
+      })
+      deadline.throwIfAborted()
+
+      const settleMs = Math.min(req.waitAfterLoadMs ?? 800, Math.max(100, timeoutMs - (Date.now() - started) - 1000))
+      if (settleMs > 0) {
+        await page.waitForTimeout(settleMs)
+      }
+      deadline.throwIfAborted()
+
+      const canaryToken = req.canaryToken ?? null
+      const snapshot = await page.evaluate((opts: { checkKind?: string; canaryToken: string | null }) => {
+        const domHtml = document.documentElement?.outerHTML ?? ''
+        const links = Array.from(document.querySelectorAll('a[href]'))
+          .map(el => el.getAttribute('href') || '')
+          .filter(Boolean)
+          .slice(0, 120)
+
+        const forms = Array.from(document.querySelectorAll('form')).slice(0, 40).map(form => ({
+          action: form.getAttribute('action') || '',
+          method: (form.getAttribute('method') || 'GET').toUpperCase(),
+          inputNames: Array.from(form.querySelectorAll('input, select, textarea'))
+            .map(el => el.getAttribute('name') || el.getAttribute('id') || '')
+            .filter(Boolean)
+            .slice(0, 30),
+        }))
+
+        // Capture ONLY cookie & storage key names — never raw values!
+        const cookieNames = (document.cookie || '')
+          .split(';')
+          .map(pair => pair.split('=', 1)[0]?.trim() || '')
+          .filter(Boolean)
+          .slice(0, 64)
+
+        let localStorageKeys: string[] = []
+        let sessionStorageKeys: string[] = []
+        try { localStorageKeys = Object.keys(window.localStorage).slice(0, 64) } catch { /* opaque origin */ }
+        try { sessionStorageKeys = Object.keys(window.sessionStorage).slice(0, 64) } catch { /* opaque origin */ }
+
+        const probe = (window as unknown as {
+          __guardianBrowserProbe?: {
+            handlers: Array<{ preview: string; checksOrigin: boolean }>
+            hasOnMessage: boolean
+            observedEvents: number
+            canaryObserved: boolean
+          }
+        }).__guardianBrowserProbe
+
+        const handlers = (probe?.handlers ?? []).slice(0, 30)
+        const hasUncheckedPostMessage = handlers.some(h => !h.checksOrigin)
+
+        let canaryTriggered = false
+        let canaryDetail: string | null = null
+        let canaryHandledWithoutOriginCheck = false
+
+        if (opts.checkKind === 'postmessage' && handlers.length > 0) {
+          const pmToken = opts.canaryToken ?? 'guardian-pm-canary'
+          try {
+            window.dispatchEvent(new MessageEvent('message', {
+              data: { guardianCanary: pmToken, type: 'guardian-probe' },
+              origin: 'https://untrusted-origin.invalid',
+            }))
+          } catch { /* ignore */ }
+          if (hasUncheckedPostMessage) {
+            canaryHandledWithoutOriginCheck = true
+            canaryTriggered = true
+            canaryDetail = `Detected ${handlers.filter(h => !h.checksOrigin).length} postMessage listener(s) without an apparent event.origin validation check.`
+          }
+        } else if (opts.canaryToken) {
+          // Check for unescaped DOM sink injection (element attribute/tag matching canary) or explicit DOM canary flag.
+          const markerEl = document.querySelector(`[data-guardian-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
+          const globalFlag = Boolean((window as unknown as Record<string, unknown>).__guardianDomCanary === opts.canaryToken)
+          if (markerEl || globalFlag) {
+            canaryTriggered = true
+            canaryDetail = globalFlag
+              ? 'DOM execution canary flag observed on window.'
+              : 'Unescaped canary element/attribute observed in rendered DOM.'
+          }
+        }
+
+        return {
+          domHtml,
+          links,
+          forms,
+          cookieNames,
+          localStorageKeys,
+          sessionStorageKeys,
+          postMessageListeners: {
+            count: handlers.length,
+            hasOnMessage: Boolean(probe?.hasOnMessage),
+            handlers,
+            observedEvents: probe?.observedEvents ?? 0,
+            canaryHandledWithoutOriginCheck,
+          },
+          canaryTriggered,
+          canaryDetail,
+        }
+      }, { checkKind: req.checkKind, canaryToken })
+
+      const finalUrl = page.url()
+      const title = redact(await page.title().catch(() => ''), secrets).slice(0, 300)
+
+      return {
+        origin: initialOrigin,
+        finalUrl: redact(finalUrl, secrets),
+        title,
+        status: navResponse ? navResponse.status() : (exchanges[0]?.status ?? null),
+        domSnippet: redact(snapshot.domHtml, secrets).slice(0, maxDomSnippetChars),
+        links: [...new Set(snapshot.links.map(l => redact(l, secrets)))].slice(0, 120),
+        forms: snapshot.forms,
+        xhrRequests: xhrRequests.slice(0, 100),
+        blockedOrigins: [...blockedOrigins].slice(0, 100),
+        consoleMessages,
+        postMessageListeners: {
+          ...snapshot.postMessageListeners,
+          handlers: snapshot.postMessageListeners.handlers.map(h => ({
+            preview: redact(h.preview, secrets),
+            checksOrigin: h.checksOrigin,
+          })),
+        },
+        cookieNames: snapshot.cookieNames,
+        localStorageKeys: snapshot.localStorageKeys,
+        sessionStorageKeys: snapshot.sessionStorageKeys,
+        canaryCheck: {
+          token: canaryToken,
+          triggered: snapshot.canaryTriggered,
+          detail: snapshot.canaryDetail,
+        },
+        exchangeIds,
+        exchanges,
+        durationMs: Date.now() - started,
+      }
+    } finally {
+      deadline.removeEventListener('abort', onAbort)
+      await forceClose()
+    }
+  }
+}
+
+export async function visitPage(
+  broker: RequestBroker,
+  req: BrowserVisitRequest,
+  grant: Grant,
+  signal: AbortSignal,
+  options?: ScopedBrowserOptions,
+): Promise<BrowserVisitResult> {
+  return new ScopedBrowser(broker, options).visitPage(req, grant, signal)
+}

@@ -1,14 +1,22 @@
 import type { ProviderSettings } from '../domain.ts'
 import { redact } from './redact.ts'
+import type { NamedSecret } from './redact.ts'
 
 type Fields = Record<string, unknown>
 type Fragment = { owner: Fields; field: string; text: string }
 type Frame = { lines: string[]; data: Fields | '[DONE]' | undefined }
 type Prepared = WeakMap<Fields, Set<string>>
 
-const responseLimit = 768 * 1024
+export const defaultStreamResponseLimit = 16 * 1024 * 1024
+export const maxStreamResponseLimit = 32 * 1024 * 1024
+
+export interface StreamSanitizeOptions {
+  secrets?: readonly NamedSecret[]
+  responseLimit?: number
+}
+
 const replacement = '[redacted]'
-const credentialField = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|api[_-]?key|token|session[_-]?(?:id|key))$/i
+const credentialField = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|api[_-]?key|token|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)$/i
 const terminalEvents = new Set(['response.completed', 'response.incomplete', 'response.failed', 'message_stop', 'error'])
 const messageEvents = new Set([
   'message_start', 'message_delta', 'message_stop', 'content_block_start', 'content_block_delta', 'content_block_stop',
@@ -32,8 +40,9 @@ function fields(value: unknown): Fields | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Fields : undefined
 }
 
-export function redactProviderText(value: string, key: string) {
-  return redact(key ? value.replaceAll(key, replacement) : value)
+export function redactProviderText(value: string, key: string, secrets: readonly NamedSecret[] = []): string {
+  const withKey = key ? value.replaceAll(key, replacement) : value
+  return redact(withKey, secrets)
 }
 
 function fragment(owner: Fields | undefined, field: string): Fragment | undefined {
@@ -41,23 +50,28 @@ function fragment(owner: Fields | undefined, field: string): Fragment | undefine
   return owner && typeof text === 'string' ? { owner, field, text } : undefined
 }
 
-function redactArguments(value: string, key: string) {
+function redactArguments(value: string, key: string, secrets: readonly NamedSecret[]): string {
   if (!value.trim()) return value
   let parsed: unknown
   try {
     parsed = JSON.parse(value)
   } catch {
-    // Incomplete tool arguments can contain JSON escapes that a partial parser would decode.
     return '{}'
   }
-  const safe = JSON.stringify(sanitizeProviderValue(parsed, key))
+  const safe = JSON.stringify(sanitizeProviderValue(parsed, key, undefined, secrets))
   return safe === JSON.stringify(parsed) ? value : safe
 }
 
-function prepareFragments(items: Fragment[], key: string, prepared: Prepared, json = false) {
+function prepareFragments(
+  items: Fragment[],
+  key: string,
+  prepared: Prepared,
+  secrets: readonly NamedSecret[],
+  json = false,
+) {
   if (!items.length) return
   const joined = items.map(item => item.text).join('')
-  const safe = json ? redactArguments(joined, key) : redactProviderText(joined, key)
+  const safe = json ? redactArguments(joined, key, secrets) : redactProviderText(joined, key, secrets)
   let offset = 0
   for (const [index, item] of items.entries()) {
     const end = index === items.length - 1 ? undefined : offset + item.text.length
@@ -68,33 +82,39 @@ function prepareFragments(items: Fragment[], key: string, prepared: Prepared, js
   }
 }
 
-export function sanitizeProviderValue(value: unknown, key: string, prepared: Prepared = new WeakMap()): unknown {
-  if (typeof value === 'string') return redactProviderText(value, key)
-  if (Array.isArray(value)) return value.map(item => sanitizeProviderValue(item, key, prepared))
+export function sanitizeProviderValue(
+  value: unknown,
+  key: string,
+  prepared: Prepared = new WeakMap(),
+  secrets: readonly NamedSecret[] = [],
+): unknown {
+  if (typeof value === 'string') return redactProviderText(value, key, secrets)
+  if (Array.isArray(value)) return value.map(item => sanitizeProviderValue(item, key, prepared, secrets))
   const record = fields(value)
   if (!record) return value
-  // Responses also supplies completed message snapshots whose text parts are joined by the adapter.
   if (record.type === 'message' && Array.isArray(record.content)) {
     const parts = record.content.flatMap(item => {
       const part = fields(item)
       const text = fragment(part, part?.type === 'refusal' ? 'refusal' : 'text')
       return text ? [text] : []
     })
-    prepareFragments(parts, key, prepared)
+    prepareFragments(parts, key, prepared, secrets)
   }
   return Object.fromEntries(Object.entries(record).map(([name, item]) => {
-    const safeName = redactProviderText(name, key)
+    const safeName = redactProviderText(name, key, secrets)
     if (prepared.get(record)?.has(name)) return [safeName, item]
     if (credentialField.test(name)) return [safeName, replacement]
-    if (name === 'arguments' && typeof item === 'string' &&
-        (record.type === 'function_call' || record.type === 'response.function_call_arguments.done')) {
-      return [safeName, redactArguments(item, key)]
+    if (
+      name === 'arguments' && typeof item === 'string' &&
+      (record.type === 'function_call' || record.type === 'response.function_call_arguments.done')
+    ) {
+      return [safeName, redactArguments(item, key, secrets)]
     }
-    return [safeName, sanitizeProviderValue(item, key, prepared)]
+    return [safeName, sanitizeProviderValue(item, key, prepared, secrets)]
   }))
 }
 
-function prepareDeltas(frames: Frame[], key: string) {
+function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecret[]): Prepared {
   const groups = new Map<string, { json: boolean; parts: Fragment[] }>()
   function add(protocol: 'responses' | 'messages', index: unknown, channel: string, part: Fragment | undefined) {
     if (!part) return
@@ -125,11 +145,11 @@ function prepareDeltas(frames: Frame[], key: string) {
     }
   }
   const prepared: Prepared = new WeakMap()
-  for (const group of groups.values()) prepareFragments(group.parts, key, prepared, group.json)
+  for (const group of groups.values()) prepareFragments(group.parts, key, prepared, secrets, group.json)
   return prepared
 }
 
-function isData(line: string) {
+function isData(line: string): boolean {
   return line === 'data' || line.startsWith('data:')
 }
 
@@ -140,7 +160,11 @@ function readFrame(text: string, protocol: ProviderSettings['protocol']): Frame 
   const raw = values.join('\n')
   if (raw === '[DONE]') return { lines, data: raw }
   let data: Fields | undefined
-  try { data = fields(JSON.parse(raw)) } catch { /* Keep the provider's payload out of parse errors. */ }
+  try {
+    data = fields(JSON.parse(raw))
+  } catch {
+    /* Keep the provider's payload out of parse errors. */
+  }
   if (!data) throw new Error('The model returned invalid streaming data.')
   if (protocol === 'messages') {
     const event = lines.findLast(line => line === 'event' || line.startsWith('event:'))?.slice(6).replace(/^ /, '') ?? ''
@@ -151,7 +175,23 @@ function readFrame(text: string, protocol: ProviderSettings['protocol']): Frame 
   return { lines, data }
 }
 
-export function sanitizeProviderStream(body: ReadableStream<Uint8Array>, key: string, protocol: ProviderSettings['protocol']) {
+function isSecretList(value: readonly NamedSecret[] | StreamSanitizeOptions): value is readonly NamedSecret[] {
+  return Array.isArray(value)
+}
+
+export function sanitizeProviderStream(
+  body: ReadableStream<Uint8Array>,
+  key: string,
+  protocol: ProviderSettings['protocol'],
+  secretsOrOptions: readonly NamedSecret[] | StreamSanitizeOptions = [],
+  responseLimitArg?: number,
+): ReadableStream<Uint8Array> {
+  const secrets = isSecretList(secretsOrOptions) ? secretsOrOptions : (secretsOrOptions.secrets ?? [])
+  const requestedLimit = isSecretList(secretsOrOptions)
+    ? (responseLimitArg ?? defaultStreamResponseLimit)
+    : (secretsOrOptions.responseLimit ?? responseLimitArg ?? defaultStreamResponseLimit)
+  const responseLimit = Math.max(1024, Math.min(maxStreamResponseLimit, Math.floor(requestedLimit)))
+
   let pending = ''
   let size = 0
   let finished = false
@@ -162,12 +202,14 @@ export function sanitizeProviderStream(body: ReadableStream<Uint8Array>, key: st
   type Output = TransformStreamDefaultController<Uint8Array>
 
   function emit(controller: Output) {
-    const prepared = prepareDeltas(frames, key)
+    const prepared = prepareDeltas(frames, key, secrets)
     for (const frame of frames.splice(0)) {
       const first = frame.lines.findIndex(isData)
-      const safe = frame.data === '[DONE]' ? '[DONE]' : JSON.stringify(sanitizeProviderValue(frame.data, key, prepared))
+      const safe = frame.data === '[DONE]'
+        ? '[DONE]'
+        : JSON.stringify(sanitizeProviderValue(frame.data, key, prepared, secrets))
       const lines = frame.lines.flatMap((line, index) => {
-        if (!isData(line)) return [redactProviderText(line, key)]
+        if (!isData(line)) return [redactProviderText(line, key, secrets)]
         return index === first ? ['data: ' + safe] : []
       })
       controller.enqueue(encoder.encode(lines.join('\n') + '\n\n'))
@@ -181,7 +223,6 @@ export function sanitizeProviderStream(body: ReadableStream<Uint8Array>, key: st
     }
     frames.push(frame)
     if (frame.data === '[DONE]' || terminalEvents.has(String(frame.data?.type))) finished = true
-    // The adapter can persist partial output. Release frames after checking the assembled strings.
     if (finished) emit(controller)
   }
 

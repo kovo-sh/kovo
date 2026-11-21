@@ -1,1 +1,0 @@
-ALTER TABLE `runs` ADD `review_plan` text;

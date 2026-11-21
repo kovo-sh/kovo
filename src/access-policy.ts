@@ -1,8 +1,8 @@
 import { z } from 'zod'
 import { assetOrigin, id } from './domain.ts'
 
-export const maxAccessPolicyBytes = 64 * 1024
-export const maxAccessPolicyCases = 64
+export const maxAccessPolicyBytes = 512 * 1024
+export const maxAccessPolicyCases = 512
 
 export const accessCaseLabel = z.string().trim().regex(/^[a-z0-9][a-z0-9_.-]{0,59}$/i)
 const decision = z.object({ caseId: accessCaseLabel, decision: z.enum(['allow', 'deny']) })

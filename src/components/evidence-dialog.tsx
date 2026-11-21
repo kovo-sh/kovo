@@ -14,6 +14,8 @@ export function EvidenceDialog({ runId, artifactId, historyLabel, close }: {
   const [error, setError] = useState('')
   useEffect(() => {
     let active = true
+    setArtifact(undefined)
+    setError('')
     readArtifact({ data: { runId, artifactId } }).then(value => {
       if (active) setArtifact(value)
     }, () => {
@@ -24,7 +26,11 @@ export function EvidenceDialog({ runId, artifactId, historyLabel, close }: {
 
   return <Dialog open onOpenChange={open => { if (!open) close() }}>
     <DialogContent className="artifact-dialog">
-      <div className="section-heading"><DialogTitle>{artifact?.title ?? 'Evidence'}</DialogTitle>
+      <div className="section-heading">
+        <div className="inline-badges">
+          <DialogTitle>{artifact?.title ?? 'Evidence'}</DialogTitle>
+          {artifact && <span className="badge">{artifact.kind}</span>}
+        </div>
         <DialogClose render={<Button />}>Close</DialogClose>
       </div>
       {error ? <p role="alert">{error}</p> : !artifact ? <p role="status">Loading evidence…</p> : <>

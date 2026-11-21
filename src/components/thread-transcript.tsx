@@ -23,9 +23,10 @@ function EvidenceRows({ items, label, openEvidence }: {
   </Trace>
 }
 
-export function ThreadTranscript({ messages, worker, attachments, openEvidence }: {
+export function ThreadTranscript({ messages, worker, workerFacts, attachments, openEvidence }: {
   messages: RunDetail['messages']
   worker?: Worker
+  workerFacts?: RunDetail['facts']
   attachments: RunDetail['evidence']
   openEvidence: (id: string) => void
 }) {
@@ -46,6 +47,18 @@ export function ThreadTranscript({ messages, worker, attachments, openEvidence }
               <TraceCollapsibleContent>
                 <p>{worker.objective}</p>
                 {assignment && <EvidenceRows items={[assignment]} label="Assignment file" openEvidence={openEvidence} />}
+              </TraceCollapsibleContent>
+            </TraceCollapsible>
+          </Trace>}
+          {worker && workerFacts && workerFacts.length > 0 && <Trace aria-label="Recorded facts">
+            <TraceCollapsible>
+              <TraceCollapsibleTrigger>
+                <TraceLine><TraceIcon>◆</TraceIcon><TraceTitle>{workerFacts.length} recorded {workerFacts.length === 1 ? 'fact' : 'facts'}</TraceTitle></TraceLine>
+              </TraceCollapsibleTrigger>
+              <TraceCollapsibleContent>
+                {workerFacts.map(fact => <p key={fact.id}>
+                  <strong>[{fact.kind}]</strong> {fact.summary}{fact.tainted ? ' (tainted)' : ''}
+                </p>)}
               </TraceCollapsibleContent>
             </TraceCollapsible>
           </Trace>}

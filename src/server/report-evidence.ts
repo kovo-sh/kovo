@@ -21,7 +21,7 @@ export const responseCapture = z.object({
 const accessRecord = z.object({ origin: assetOrigin, snapshot: accessPolicySnapshot.nullable() })
 const interpreter = z.string().regex(/^just-bash \d+\.\d+\.\d+$/)
 const receipt = z.object({
-  inputEvidence: z.array(id).max(2),
+  inputEvidence: z.array(id).max(16),
   interpreter: interpreter.optional(),
   exitStatus: z.number().int().min(0).max(255).optional(),
 })
@@ -35,7 +35,7 @@ const values = z.enum([
 ])
 const maxComparisons = maxAccessPolicyCases + responseCheckIds.length
 const comparison = z.object({
-  id: z.string().refine(value => responseCheckIds.some(id => id === value) ||
+  id: z.string().refine(value => responseCheckIds.some(cid => cid === value) ||
     (value.startsWith('access-policy:') && accessCaseLabel.safeParse(value.slice('access-policy:'.length)).success)),
   observed: z.union([minimum, values, z.null()]),
   baseline: z.union([z.object({ minimum }), z.object({ allowed: z.array(values).min(1).max(values.options.length) })]),
@@ -50,15 +50,23 @@ const verification = receipt.extend({
   })).max(maxComparisons),
   comparisons: z.array(comparison).max(maxComparisons),
 })
-const legacyVerification = receipt.extend({
-  expected: z.literal('positive HSTS max-age'),
-  observed: minimum.nullable(),
-  result: z.enum(['present', 'missing', 'inconclusive']),
+const replayReceipt = z.object({
+  replaySpecId: id.optional(),
+  specSha256: z.string().optional(),
+  kind: z.string().optional(),
   origin: assetOrigin.optional(),
-  finalOrigin: assetOrigin.optional(),
-})
-const verificationReceipt = z.union([verification, legacyVerification])
-const analysisReceipt = receipt.extend({ inputEvidence: z.array(id).length(1) })
+  verdict: z.enum(['confirmed', 'dismissed', 'inconclusive', 'reproduced', 'fixed']).optional(),
+  outcome: z.object({
+    confirmed: z.boolean(),
+    controlPassed: z.boolean(),
+    observed: z.string(),
+    expected: z.string(),
+    reason: z.string().optional(),
+  }).optional(),
+  exchangeIds: z.array(z.string()).optional(),
+  sourceOrigins: z.array(assetOrigin).optional(),
+}).passthrough()
+const genericRecord = z.record(z.string(), z.unknown())
 
 function parseEvidence(content: string): unknown {
   try {
@@ -81,11 +89,11 @@ export function restrictAccessVerification(content: string, source: { id: string
 
   const reviews = accessPolicyReviews(access.data.snapshot ?? undefined).filter(review => savedChecks.has(review.coverage.caseId))
   const outcomes = new Map<string, 'met' | 'gap'>()
-  const comparisons = reviews.flatMap(({ coverage, comparison }) => {
-    if (!comparison || !('allowed' in comparison.baseline)) return []
-    const recorded = savedComparisons.get(comparison.id)
-    if (!recorded || recorded.observed !== comparison.observed || !('allowed' in recorded.baseline) ||
-      recorded.baseline.allowed.length !== 1 || recorded.baseline.allowed[0] !== comparison.baseline.allowed[0]) return []
+  const comparisons = reviews.flatMap(({ coverage, comparison: comp }) => {
+    if (!comp || !('allowed' in comp.baseline)) return []
+    const recorded = savedComparisons.get(comp.id)
+    if (!recorded || recorded.observed !== comp.observed || !('allowed' in recorded.baseline) ||
+      recorded.baseline.allowed.length !== 1 || recorded.baseline.allowed[0] !== comp.baseline.allowed[0]) return []
     const outcome = savedChecks.get(coverage.caseId)
     if (saved.data.exitStatus === 0 && (outcome === 'met' || outcome === 'gap')) outcomes.set(recorded.id, outcome)
     return [recorded]
@@ -102,7 +110,7 @@ export function restrictAccessVerification(content: string, source: { id: string
 }
 
 export function isReportSource(kind: EvidenceSummary['kind']) {
-  return kind === 'observation' || kind === 'access-policy'
+  return kind === 'observation' || kind === 'access-policy' || kind === 'exchange' || kind === 'dns' || kind === 'tls' || kind === 'browser'
 }
 
 export function projectReportEvidence(
@@ -127,18 +135,44 @@ export function projectReportEvidence(
       return { data: parsed.data }
     }
     case 'verification': {
-      const parsed = verificationReceipt.safeParse(input)
-      if (!parsed.success) return
-      const { inputEvidence, ...data } = parsed.data
-      if (data.origin && data.origin !== origin) return
-      if ('finalOrigin' in data && data.finalOrigin && !approved.has(data.finalOrigin)) return
-      return { data, sources: inputEvidence }
+      const parsed = verification.safeParse(input)
+      if (parsed.success) {
+        const { inputEvidence, ...data } = parsed.data
+        if (data.origin && data.origin !== origin) return
+        return { data, sources: inputEvidence }
+      }
+      const replay = replayReceipt.safeParse(input)
+      if (replay.success) {
+        if (replay.data.origin && !approved.has(replay.data.origin)) return
+        if (replay.data.sourceOrigins?.some(o => !approved.has(o))) return
+        return { data: replay.data }
+      }
+      return
     }
-    case 'analysis': {
-      const parsed = analysisReceipt.safeParse(input)
+    case 'replay': {
+      const replay = replayReceipt.safeParse(input)
+      if (!replay.success) return
+      if (replay.data.origin && !approved.has(replay.data.origin)) return
+      if (replay.data.sourceOrigins?.some(o => !approved.has(o))) return
+      return { data: replay.data }
+    }
+    case 'analysis':
+    case 'exchange':
+    case 'dns':
+    case 'tls':
+    case 'browser':
+    case 'threat-model':
+    case 'digest': {
+      const parsed = genericRecord.safeParse(input)
       if (!parsed.success) return
-      const { inputEvidence, ...data } = parsed.data
-      return { data, sources: inputEvidence }
+      const rawOrigin = typeof parsed.data.origin === 'string' ? parsed.data.origin : undefined
+      if (rawOrigin && !approved.has(rawOrigin)) return
+      const redirectOrigins = Array.isArray(parsed.data.redirectOrigins) ? parsed.data.redirectOrigins : []
+      if (redirectOrigins.some(item => typeof item === 'string' && !approved.has(item))) return
+      const inputEvidence = Array.isArray(parsed.data.inputEvidence)
+        ? parsed.data.inputEvidence.filter((item): item is string => typeof item === 'string' && id.safeParse(item).success)
+        : undefined
+      return { data: parsed.data, ...(inputEvidence?.length ? { sources: inputEvidence } : {}) }
     }
   }
 }

@@ -1,0 +1,4127 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "3a593f7b-39b2-480b-ac8f-53660827aa85",
+  "prevIds": [
+    "00000000-0000-0000-0000-000000000000"
+  ],
+  "ddl": [
+    {
+      "name": "approval_requests",
+      "entityType": "tables"
+    },
+    {
+      "name": "assignments",
+      "entityType": "tables"
+    },
+    {
+      "name": "broker_exchanges",
+      "entityType": "tables"
+    },
+    {
+      "name": "canaries",
+      "entityType": "tables"
+    },
+    {
+      "name": "chain_steps",
+      "entityType": "tables"
+    },
+    {
+      "name": "coverage_entries",
+      "entityType": "tables"
+    },
+    {
+      "name": "events",
+      "entityType": "tables"
+    },
+    {
+      "name": "evidence",
+      "entityType": "tables"
+    },
+    {
+      "name": "facts",
+      "entityType": "tables"
+    },
+    {
+      "name": "findings",
+      "entityType": "tables"
+    },
+    {
+      "name": "graph_digests",
+      "entityType": "tables"
+    },
+    {
+      "name": "graph_edges",
+      "entityType": "tables"
+    },
+    {
+      "name": "messages",
+      "entityType": "tables"
+    },
+    {
+      "name": "model_profiles",
+      "entityType": "tables"
+    },
+    {
+      "name": "operations",
+      "entityType": "tables"
+    },
+    {
+      "name": "personas",
+      "entityType": "tables"
+    },
+    {
+      "name": "project_assets",
+      "entityType": "tables"
+    },
+    {
+      "name": "project_specs",
+      "entityType": "tables"
+    },
+    {
+      "name": "projects",
+      "entityType": "tables"
+    },
+    {
+      "name": "replay_specs",
+      "entityType": "tables"
+    },
+    {
+      "name": "reports",
+      "entityType": "tables"
+    },
+    {
+      "name": "retest_runs",
+      "entityType": "tables"
+    },
+    {
+      "name": "runs",
+      "entityType": "tables"
+    },
+    {
+      "name": "threat_models",
+      "entityType": "tables"
+    },
+    {
+      "name": "workspaces",
+      "entityType": "tables"
+    },
+    {
+      "table": "approval_requests",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "origin",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "method",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "path_and_query",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "persona_handle",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "rationale",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "request_preview",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "status",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "decided_by",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "decided_at",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "expires_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "asset_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "step_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "input_assignment_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "phase",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "status",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "session_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "lease",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "lease_expires_at",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "attempt",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "max_turns",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "150",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "turns_used",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "requests_used",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "parent_fact_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "source_origins",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "title",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "objective",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "outcome",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "checks",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "assignments",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "origin",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "final_origin",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "redirect_origins",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "method",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "path_and_query",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "persona_handle",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "status",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "media_type",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "req_headers",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "resp_headers",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "body_preview",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "body_artifact_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "body_sha256",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "duration_ms",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "token",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "purpose",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "triggered",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "trigger_detail",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "canaries",
+      "name": "triggered_at",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "seq",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "title",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "hypothesis",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "category",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'misconfig-exposure'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "priority",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "50",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "target_asset_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "skills",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "depends_on_fact_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "depends_on_step_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "status",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "assigned_worker_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "source_origins",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "chain_steps",
+      "name": "updated_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "origin",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "category",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "status",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "summary",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "updated_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "id",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "workspace_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "run_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "message",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "detail",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "events",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "title",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "operation_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "evidence",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "origin",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "summary",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "data",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "source_origins",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "evidence_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "exchange_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "tainted",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "cold_since_round",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "digest_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "facts",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "asset_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "check_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'hsts'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "case_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "''",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "finding_kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'baseline_check'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "replay_spec_id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "source_origins",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "findings",
+      "name": "finding",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "round_no",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "level",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "signature_hash",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "summary",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "covered_fact_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "covered_assignment_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "active",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "true",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_digests",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "from_kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "from_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "to_kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "to_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "edge_kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "graph_edges",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "thread_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "role",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "content",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "reply_to",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "evidence_ids",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "messages",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "workspace_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "name",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "endpoint",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "model",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "protocol",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "credential_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "priority",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "100",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "enabled",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "true",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "context_window",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "131072",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "max_tokens",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "16384",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "thinking_level",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'medium'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "input_cost_per_mtok",
+      "type": "real",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0.25",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "output_cost_per_mtok",
+      "type": "real",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0.9",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "health_state",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'closed'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "cooldown_until",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "last_error",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "model_profiles",
+      "name": "updated_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "operations",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "operations",
+      "name": "workspace_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "operations",
+      "name": "fingerprint",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "operations",
+      "name": "result",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "project_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "workspace_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "handle",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "role_label",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "origin_allowlist",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "auth_kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "header_name",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "credential_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "canary_markers",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "personas",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "project_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "origin",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "source",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "third_party",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "prepared",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "dns_source",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_assets",
+      "name": "access_policy",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "project_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "name",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "kind",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "origin",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "content",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "project_specs",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "workspace_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "name",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "environment",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'public'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "seeds",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "default_scope",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "projects",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "finding_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "assignment_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "spec",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "spec_sha256",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "source_origins",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "replay_specs",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "reports",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "reports",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "reports",
+      "name": "version",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "reports",
+      "name": "partial",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "reports",
+      "name": "body",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "reports",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "project_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "finding_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "replay_spec_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "verdict",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "summary",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "evidence_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "exchange_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "retest_runs",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "project_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "workspace_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "original_goal",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "goal",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "coordinator_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "phase",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "status",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "source_mode",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'public'",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "capability_tier",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "approved_persona_ids",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "round_no",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "budget_usd",
+      "type": "real",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "25",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "budget_requests",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "2500",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "spent_usd",
+      "type": "real",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "spent_tokens",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "spent_requests",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "turns_used",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "max_rps_per_origin",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "5",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "worker_concurrency",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "6",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "worker_max_turns",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "150",
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "review_plan",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "candidates",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "approved",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "runs",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "run_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "scope_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "goal_revision",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "entries",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "summary",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "threat_models",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "workspaces",
+      "name": "id",
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "workspaces",
+      "name": "name",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "workspaces",
+      "name": "actor_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "workspaces",
+      "name": "created_at",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "approval_requests",
+      "name": "approval_requests_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "assignments",
+      "name": "assignments_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "broker_exchanges_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "origin",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "canaries",
+      "name": "canaries_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "chain_steps",
+      "name": "chain_steps_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "coverage_origin_cat",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "goal_revision",
+          "isExpression": false
+        },
+        {
+          "value": "origin",
+          "isExpression": false
+        },
+        {
+          "value": "category",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "events",
+      "name": "events_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "evidence",
+      "name": "evidence_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "evidence",
+      "name": "evidence_operation",
+      "columns": [
+        {
+          "value": "assignment_id",
+          "isExpression": false
+        },
+        {
+          "value": "operation_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "facts",
+      "name": "facts_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "tainted",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "findings",
+      "name": "findings_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "findings",
+      "name": "findings_check_case",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "asset_id",
+          "isExpression": false
+        },
+        {
+          "value": "goal_revision",
+          "isExpression": false
+        },
+        {
+          "value": "check_id",
+          "isExpression": false
+        },
+        {
+          "value": "case_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "graph_digests",
+      "name": "graph_digests_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "active",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "graph_edges",
+      "name": "graph_edges_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "from_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "graph_edges",
+      "name": "graph_edges_to",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "to_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "messages",
+      "name": "thread_messages",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "thread_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "messages",
+      "name": "run_replies",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "reply_to",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "model_profiles",
+      "name": "model_profiles_workspace",
+      "columns": [
+        {
+          "value": "workspace_id",
+          "isExpression": false
+        },
+        {
+          "value": "priority",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "personas",
+      "name": "personas_project_handle",
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "handle",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "project_assets",
+      "name": "project_assets_origin",
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "origin",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "project_specs",
+      "name": "project_specs_project",
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "replay_specs",
+      "name": "replay_specs_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "reports",
+      "name": "report_version",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        },
+        {
+          "value": "version",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "retest_runs",
+      "name": "retest_runs_finding",
+      "columns": [
+        {
+          "value": "finding_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "runs",
+      "name": "runs_project",
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "threat_models",
+      "name": "threat_models_run",
+      "columns": [
+        {
+          "value": "run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "entityType": "indexes"
+    },
+    {
+      "table": "approval_requests",
+      "name": "fk_approval_requests_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "approval_requests",
+      "name": "fk_approval_requests_assignment_id_assignments_id_fk",
+      "columns": [
+        "assignment_id"
+      ],
+      "tableTo": "assignments",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "assignments",
+      "name": "fk_assignments_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "fk_broker_exchanges_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "fk_broker_exchanges_assignment_id_assignments_id_fk",
+      "columns": [
+        "assignment_id"
+      ],
+      "tableTo": "assignments",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "canaries",
+      "name": "fk_canaries_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "chain_steps",
+      "name": "fk_chain_steps_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "fk_coverage_entries_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "events",
+      "name": "fk_events_workspace_id_workspaces_id_fk",
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspaces",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "events",
+      "name": "fk_events_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "evidence",
+      "name": "fk_evidence_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "evidence",
+      "name": "fk_evidence_assignment_id_assignments_id_fk",
+      "columns": [
+        "assignment_id"
+      ],
+      "tableTo": "assignments",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "facts",
+      "name": "fk_facts_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "facts",
+      "name": "fk_facts_assignment_id_assignments_id_fk",
+      "columns": [
+        "assignment_id"
+      ],
+      "tableTo": "assignments",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "findings",
+      "name": "fk_findings_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "graph_digests",
+      "name": "fk_graph_digests_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "graph_edges",
+      "name": "fk_graph_edges_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "messages",
+      "name": "fk_messages_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "model_profiles",
+      "name": "fk_model_profiles_workspace_id_workspaces_id_fk",
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspaces",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "operations",
+      "name": "fk_operations_workspace_id_workspaces_id_fk",
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspaces",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "personas",
+      "name": "fk_personas_project_id_projects_id_fk",
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "projects",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "personas",
+      "name": "fk_personas_workspace_id_workspaces_id_fk",
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspaces",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "project_assets",
+      "name": "fk_project_assets_project_id_projects_id_fk",
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "projects",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "project_specs",
+      "name": "fk_project_specs_project_id_projects_id_fk",
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "projects",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "projects",
+      "name": "fk_projects_workspace_id_workspaces_id_fk",
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspaces",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "replay_specs",
+      "name": "fk_replay_specs_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "replay_specs",
+      "name": "fk_replay_specs_assignment_id_assignments_id_fk",
+      "columns": [
+        "assignment_id"
+      ],
+      "tableTo": "assignments",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "reports",
+      "name": "fk_reports_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "retest_runs",
+      "name": "fk_retest_runs_project_id_projects_id_fk",
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "projects",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "retest_runs",
+      "name": "fk_retest_runs_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "retest_runs",
+      "name": "fk_retest_runs_replay_spec_id_replay_specs_id_fk",
+      "columns": [
+        "replay_spec_id"
+      ],
+      "tableTo": "replay_specs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "runs",
+      "name": "fk_runs_project_id_projects_id_fk",
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "projects",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "runs",
+      "name": "fk_runs_workspace_id_workspaces_id_fk",
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspaces",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "threat_models",
+      "name": "fk_threat_models_run_id_runs_id_fk",
+      "columns": [
+        "run_id"
+      ],
+      "tableTo": "runs",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "entityType": "fks"
+    },
+    {
+      "table": "approval_requests",
+      "name": "approval_requests_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "assignments",
+      "name": "assignments_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "broker_exchanges",
+      "name": "broker_exchanges_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "canaries",
+      "name": "canaries_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "chain_steps",
+      "name": "chain_steps_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "coverage_entries",
+      "name": "coverage_entries_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "events",
+      "name": "events_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "evidence",
+      "name": "evidence_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "facts",
+      "name": "facts_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "findings",
+      "name": "findings_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "graph_digests",
+      "name": "graph_digests_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "graph_edges",
+      "name": "graph_edges_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "messages",
+      "name": "messages_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "model_profiles",
+      "name": "model_profiles_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "operations",
+      "name": "operations_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "personas",
+      "name": "personas_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "project_assets",
+      "name": "project_assets_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "project_specs",
+      "name": "project_specs_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "projects",
+      "name": "projects_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "replay_specs",
+      "name": "replay_specs_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "reports",
+      "name": "reports_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "retest_runs",
+      "name": "retest_runs_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "runs",
+      "name": "runs_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "threat_models",
+      "name": "threat_models_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "workspaces",
+      "name": "workspaces_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "canaries",
+      "name": "canaries_token_unique",
+      "columns": [
+        "token"
+      ],
+      "nameExplicit": false,
+      "entityType": "uniques"
+    }
+  ],
+  "renames": []
+}

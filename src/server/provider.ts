@@ -1,19 +1,25 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { createModels, createProvider } from '@earendil-works/pi-ai/models'
 import { stream as responses, streamSimple as simpleResponses } from '@earendil-works/pi-ai/api/openai-responses'
 import { stream as messages, streamSimple as simpleMessages } from '@earendil-works/pi-ai/api/anthropic-messages'
 import type { Api, Model, ProviderStreams } from '@earendil-works/pi-ai'
 import { obj, str } from '@earendil-works/pi-schema'
 import { DEFAULT_PROVIDER } from '../domain.ts'
-import type { ProviderSettings } from '../domain.ts'
-import { redactProviderText, sanitizeProviderStream, sanitizeProviderValue } from './provider-stream.ts'
+import type { ProviderSettings, ThinkingLevel } from '../domain.ts'
+import type { ResolvedModelProfile } from './model-settings.ts'
+import { defaultStreamResponseLimit, redactProviderText, sanitizeProviderStream, sanitizeProviderValue } from './provider-stream.ts'
 import { redact } from './redact.ts'
+import type { NamedSecret } from './redact.ts'
 
 type Protocol = 'openai-responses' | 'anthropic-messages'
-// Reasoning-capable compatibility models can spend part of this allowance before
-// emitting the short JSON/tool call Guardian requests. Keep the budget bounded,
-// but large enough for the full verified check catalog.
-const modelTokenLimit = 768
+
 const providerId = 'guardian'
+export const defaultMaxRequestBytes = 4 * 1024 * 1024
+export const maxRequestBytesCeiling = 12 * 1024 * 1024
+export const defaultFirstEventTimeoutMs = 120_000
+export const defaultIdleTimeoutMs = 180_000
+export const defaultTotalTimeoutMs = 600_000
+export const defaultMaxCalls = 220
 
 export type ProviderCall = {
   scenario: string
@@ -23,14 +29,163 @@ export type ProviderCall = {
   contentType: string
   body: string
 }
-type CallRecorder = (call: ProviderCall) => void
 
-function transport(settings: ProviderSettings, scenario: string, signal?: AbortSignal, record?: CallRecorder) {
-  const endpoint = settings.protocol === 'responses' ? settings.endpoint + '/responses'
+export type CallRecorder = (call: ProviderCall) => void
+
+export type UsageEvent = {
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+  profileId?: string
+}
+
+export type UsageCallback = (usage: UsageEvent) => void
+
+export class QuotaExhaustedError extends Error {
+  readonly status = 402
+  constructor(message: string) {
+    super(message)
+    this.name = 'QuotaExhaustedError'
+  }
+}
+
+export class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BudgetExceededError'
+  }
+}
+
+export function isQuotaBody(body: string): boolean {
+  const lower = body.toLowerCase()
+  if (
+    /(?:requests? per minute|tokens? per minute|rpm|tpm|rate.?limit.*retry)/i.test(lower) &&
+    !/(?:insufficient|quota|credit|balance|billing|spend.?limit|exceeded your current quota)/i.test(lower)
+  ) {
+    return false
+  }
+  return /(?:insufficient[_\s]?(?:credits?|quota|balance|funds)|exceeded your current quota|billing|spend.?limit|credit.?limit|out of credits)/i.test(lower)
+}
+
+export type ProviderConfig = Pick<ProviderSettings, 'endpoint' | 'model' | 'protocol' | 'key'> & Partial<ProviderSettings>
+
+export type ProviderOptions = {
+  signal?: AbortSignal
+  record?: CallRecorder
+  secrets?: readonly NamedSecret[]
+  maxCalls?: number
+  maxRequestBytes?: number
+  responseLimit?: number
+  firstEventTimeoutMs?: number
+  idleTimeoutMs?: number
+  totalTimeoutMs?: number
+  thinkingLevel?: ThinkingLevel
+  beforeCall?: () => void
+  onUsage?: UsageCallback
+  onProfileSuccess?: (profileId: string) => void
+  onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
+}
+
+function clampContextWindow(value?: number): number {
+  const raw = value ?? DEFAULT_PROVIDER.contextWindow
+  return Math.max(32_000, Math.min(1_000_000, Math.floor(raw)))
+}
+
+function clampMaxTokens(value?: number): number {
+  const raw = value ?? DEFAULT_PROVIDER.maxTokens
+  return Math.max(512, Math.min(65_536, Math.floor(raw)))
+}
+
+function estimateCostUsd(profile: ProviderConfig, inputTokens: number, outputTokens: number): number {
+  const inRate = profile.inputCostPerMtok ?? DEFAULT_PROVIDER.inputCostPerMtok
+  const outRate = profile.outputCostPerMtok ?? DEFAULT_PROVIDER.outputCostPerMtok
+  return (inputTokens * inRate + outputTokens * outRate) / 1_000_000
+}
+
+function extractUsageFromSse(sseText: string): { inputTokens: number; outputTokens: number } {
+  let inputTokens = 0
+  let outputTokens = 0
+  for (const line of sseText.split('\n')) {
+    if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
+    try {
+      const data = JSON.parse(line.slice(6)) as Record<string, unknown>
+      const responseUsage = (data.response as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
+      const topUsage = data.usage as Record<string, unknown> | undefined
+      const msgUsage = (data.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
+      const usage = responseUsage ?? topUsage ?? msgUsage
+      if (!usage) continue
+      const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
+      const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
+      if (Number.isFinite(inp) && inp > inputTokens) inputTokens = inp
+      if (Number.isFinite(out) && out > outputTokens) outputTokens = out
+    } catch {
+      // Ignore unparseable frames.
+    }
+  }
+  return { inputTokens, outputTokens }
+}
+
+async function readStreamWithIdleTimeout(
+  stream: ReadableStream<Uint8Array>,
+  idleTimeoutMs: number,
+  signal: AbortSignal,
+): Promise<string> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  const parts: string[] = []
+  try {
+    for (;;) {
+      signal.throwIfAborted()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const idle = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('The model stream timed out while waiting for data.')), idleTimeoutMs)
+      })
+      const onAbort = () => {
+        if (timer) clearTimeout(timer)
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      let next: ReadableStreamReadResult<Uint8Array>
+      try {
+        next = await Promise.race([reader.read(), idle])
+      } finally {
+        if (timer) clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+      }
+      if (next.done) break
+      parts.push(decoder.decode(next.value, { stream: true }))
+    }
+    parts.push(decoder.decode())
+    return parts.join('')
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+}
+
+function makeFetch(
+  settings: ProviderConfig,
+  scenario: string,
+  options: ProviderOptions,
+  callCounter: { count: number; maxCalls: number },
+  profileId?: string,
+) {
+  const endpoint = settings.protocol === 'responses'
+    ? settings.endpoint + '/responses'
     : settings.endpoint.replace(/\/v1$/, '') + '/v1/messages'
-  let count = 0
+  const maxRequestBytes = Math.max(
+    64 * 1024,
+    Math.min(maxRequestBytesCeiling, options.maxRequestBytes ?? defaultMaxRequestBytes),
+  )
+  const firstEventTimeoutMs = options.firstEventTimeoutMs ?? defaultFirstEventTimeoutMs
+  const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
+  const totalTimeoutMs = options.totalTimeoutMs ?? defaultTotalTimeoutMs
+  const responseLimit = options.responseLimit ?? defaultStreamResponseLimit
+  const secrets = options.secrets ?? []
+
   const send: typeof fetch = async (input, init) => {
-    if (++count > 3) throw new Error('The model call budget for this operation was reached.')
+    options.beforeCall?.()
+    if (++callCounter.count > callCounter.maxCalls) {
+      throw new BudgetExceededError('The model call budget for this operation was reached.')
+    }
     const request = new Request(input, init)
     const actual = new URL(request.url)
     const beta = settings.protocol === 'messages' && actual.search === '?beta=true'
@@ -46,47 +201,96 @@ function transport(settings: ProviderSettings, scenario: string, signal?: AbortS
     }
 
     const raw = await request.text()
-    if (Buffer.byteLength(raw) > 80 * 1024) throw new Error('The model request exceeded Guardian’s size limit.')
+    if (Buffer.byteLength(raw) > maxRequestBytes) {
+      throw new Error('The model request exceeded Guardian’s size limit.')
+    }
     const payload = JSON.parse(raw) as Record<string, unknown>
-    const abort = AbortSignal.any([request.signal, AbortSignal.timeout(35_000), ...(signal ? [signal] : [])])
+    const totalSignal = AbortSignal.any([
+      request.signal,
+      AbortSignal.timeout(totalTimeoutMs),
+      ...(options.signal ? [options.signal] : []),
+    ])
+    const connectSignal = AbortSignal.any([totalSignal, AbortSignal.timeout(firstEventTimeoutMs)])
     const response = await fetch(beta ? endpoint + '?beta=true' : endpoint, {
-      method: 'POST', headers, body: raw, redirect: 'error', signal: abort,
+      method: 'POST',
+      headers,
+      body: raw,
+      redirect: 'error',
+      signal: connectSignal,
     })
+
     const contentType = response.headers.get('content-type') ?? 'application/json'
-    const recordResponse = record && ((body: string) => record({
-      scenario, endpoint: redactProviderText(new URL(endpoint).pathname, settings.key),
-      request: sanitizeProviderValue(payload, settings.key) as Record<string, unknown>,
-      status: response.status, contentType: redactProviderText(contentType, settings.key), body,
+    const recordResponse = options.record && ((body: string) => options.record!({
+      scenario,
+      endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, secrets),
+      request: sanitizeProviderValue(payload, settings.key, undefined, secrets) as Record<string, unknown>,
+      status: response.status,
+      contentType: redactProviderText(contentType, settings.key, secrets),
+      body,
     }))
+
     if (!response.ok) {
-      await response.body?.cancel()
-      const message = response.status === 401 || response.status === 403
-        ? 'The provider rejected the API key.' : response.status === 404
-          ? 'The provider endpoint or model was not found.' : response.status === 429
-            ? 'The provider rate limit was reached.' : `The model provider returned HTTP ${response.status}.`
+      const errText = await response.text().catch(() => '')
+      const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
+      const message = effectiveStatus === 401 || effectiveStatus === 403
+        ? 'The provider rejected the API key.'
+        : effectiveStatus === 402
+          ? 'The provider quota or credit balance was exhausted.'
+          : effectiveStatus === 404
+            ? 'The provider endpoint or model was not found.'
+            : effectiveStatus === 429
+              ? 'The provider rate limit was reached.'
+              : `The model provider returned HTTP ${effectiveStatus}.`
       const error = JSON.stringify({ error: { message } })
       recordResponse?.(error)
-      return new Response(error, { status: response.status, headers: { 'content-type': 'application/json' } })
+      return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
     }
+
     if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
       await response.body?.cancel()
       throw new Error('The provider did not return a streaming response.')
     }
-    const stream = sanitizeProviderStream(response.body, settings.key, settings.protocol)
-    let body: BodyInit = stream
-    if (recordResponse) {
-      body = await new Response(stream).text()
-      recordResponse(body)
+
+    const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
+      secrets,
+      responseLimit,
+    })
+    const text = await readStreamWithIdleTimeout(sanitized, idleTimeoutMs, totalSignal)
+    recordResponse?.(text)
+
+    if (options.onUsage) {
+      const usage = extractUsageFromSse(text)
+      if (usage.inputTokens > 0 || usage.outputTokens > 0) {
+        options.onUsage({
+          ...usage,
+          costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens),
+          profileId,
+        })
+      }
     }
-    return new Response(body, {
-      status: response.status, headers: { 'content-type': 'text/event-stream' },
+
+    return new Response(text, {
+      status: response.status,
+      headers: { 'content-type': 'text/event-stream' },
     })
   }
   return send
 }
 
-export function provider(settings: ProviderSettings, scenario: string, signal?: AbortSignal, record?: CallRecorder) {
+function buildSingleStreamImpl(
+  settings: ProviderConfig,
+  scenario: string,
+  options: ProviderOptions,
+  callCounter: { count: number; maxCalls: number },
+  profileId?: string,
+) {
   const api: Protocol = settings.protocol === 'responses' ? 'openai-responses' : 'anthropic-messages'
+  const maxTokens = clampMaxTokens(settings.maxTokens)
+  const contextWindow = clampContextWindow(settings.contextWindow)
+  const effectiveThinking: ThinkingLevel = scenario === 'connection'
+    ? 'off'
+    : (options.thinkingLevel ?? settings.thinkingLevel ?? DEFAULT_PROVIDER.thinkingLevel)
+  const thinkingEnabled = effectiveThinking !== 'off'
   const model: Model<Protocol> = {
     id: settings.model,
     name: settings.model,
@@ -94,37 +298,71 @@ export function provider(settings: ProviderSettings, scenario: string, signal?: 
     api,
     baseUrl: settings.protocol === 'messages' ? settings.endpoint.replace(/\/v1$/, '') : settings.endpoint,
     input: ['text'],
-    // The Messages adapter sends the disabled setting for reasoning-capable models.
-    reasoning: api === 'anthropic-messages' && settings.model === DEFAULT_PROVIDER.model,
-    contextWindow: 24_000,
-    maxTokens: modelTokenLimit,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    reasoning: api === 'anthropic-messages' ? thinkingEnabled : false,
+    contextWindow,
+    maxTokens,
+    cost: {
+      input: settings.inputCostPerMtok ?? DEFAULT_PROVIDER.inputCostPerMtok,
+      output: settings.outputCostPerMtok ?? DEFAULT_PROVIDER.outputCostPerMtok,
+      cacheRead: 0,
+      cacheWrite: 0,
+    },
   }
-  const send = transport(settings, scenario, signal, record)
+  const send = makeFetch(settings, scenario, options, callCounter, profileId)
   const connection = scenario === 'connection'
   const chooseEvidenceTool = (transcript: { messages: { role: string }[] }) =>
     (scenario === 'worker-analysis' || scenario === 'response-analysis') && transcript.messages.at(-1)?.role === 'user'
-  const options = { fetch: send, maxTokens: modelTokenLimit, maxRetries: 0, timeoutMs: 35_000 }
+  const streamOpts = {
+    fetch: send,
+    maxTokens,
+    maxRetries: 0,
+    timeoutMs: options.idleTimeoutMs ?? defaultIdleTimeoutMs,
+  }
+
   const implementation: ProviderStreams = api === 'openai-responses' ? {
-    stream: (selected, transcript, streamOptions) => responses(selected as Model<'openai-responses'>, transcript, {
-      ...streamOptions, ...options, ...(connection ? { toolChoice: 'required' as const } : {}),
+    stream: (selected, transcript, sOpts) => responses(selected as Model<'openai-responses'>, transcript, {
+      ...sOpts,
+      ...streamOpts,
+      ...(connection ? { toolChoice: 'required' as const } : {}),
     }),
-    streamSimple: (selected, transcript, streamOptions) =>
+    streamSimple: (selected, transcript, sOpts) =>
       chooseEvidenceTool(transcript)
-        ? responses(selected as Model<'openai-responses'>, transcript, { ...streamOptions, ...options, toolChoice: 'required' })
-        : simpleResponses(selected as Model<'openai-responses'>, transcript, { ...streamOptions, ...options }),
+        ? responses(selected as Model<'openai-responses'>, transcript, { ...sOpts, ...streamOpts, toolChoice: 'required' })
+        : simpleResponses(selected as Model<'openai-responses'>, transcript, { ...sOpts, ...streamOpts }),
   } : {
-    stream: (selected, transcript, streamOptions) => messages(selected as Model<'anthropic-messages'>, transcript, {
-      ...streamOptions, ...options, thinkingEnabled: false,
+    stream: (selected, transcript, sOpts) => messages(selected as Model<'anthropic-messages'>, transcript, {
+      ...sOpts,
+      ...streamOpts,
+      thinkingEnabled,
+      ...(thinkingEnabled ? { effort: effectiveThinking } : {}),
       ...(connection ? { toolChoice: { type: 'tool' as const, name: 'guardian_connection' } } : {}),
     }),
-    streamSimple: (selected, transcript, streamOptions) =>
+    streamSimple: (selected, transcript, sOpts) =>
       chooseEvidenceTool(transcript)
         ? messages(selected as Model<'anthropic-messages'>, transcript, {
-          ...streamOptions, ...options, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' },
+          ...sOpts, ...streamOpts, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' },
         })
-        : simpleMessages(selected as Model<'anthropic-messages'>, transcript, { ...streamOptions, ...options }),
+        : simpleMessages(selected as Model<'anthropic-messages'>, transcript, {
+          ...sOpts,
+          ...streamOpts,
+          ...(thinkingEnabled ? { reasoning: effectiveThinking } : {}),
+        }),
   }
+
+  return { model, implementation }
+}
+
+export function provider(
+  settings: ProviderConfig,
+  scenario: string,
+  signalOrOptions?: AbortSignal | ProviderOptions,
+  record?: CallRecorder,
+) {
+  const options: ProviderOptions = signalOrOptions instanceof AbortSignal
+    ? { signal: signalOrOptions, record }
+    : (signalOrOptions ?? { record })
+  const callCounter = { count: 0, maxCalls: options.maxCalls ?? defaultMaxCalls }
+  const { model, implementation } = buildSingleStreamImpl(settings, scenario, options, callCounter, settings.id)
   const models = createModels({ identity: { attribution: null } })
   models.setProvider(createProvider<Api>({
     id: providerId,
@@ -135,8 +373,198 @@ export function provider(settings: ProviderSettings, scenario: string, signal?: 
   return { models, model }
 }
 
-export async function testProvider(settings: ProviderSettings, record?: CallRecorder) {
-  const { models, model } = provider(settings, 'connection', undefined, record)
+let rrCounter = 0
+
+export function classifyFailoverError(message: string): { failover: boolean; hard: boolean } {
+  if (/aborted|cancelled|canceled|budget|exceeded Guardian’s size limit|Unexpected model endpoint/i.test(message)) {
+    return { failover: false, hard: false }
+  }
+  if (/rejected the API key|quota|credit balance|401|402|403|404|not found/i.test(message)) {
+    return { failover: true, hard: true }
+  }
+  if (/rate limit|429|HTTP 5\d\d|timed out|timeout|fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket/i.test(message)) {
+    return { failover: true, hard: false }
+  }
+  return { failover: false, hard: false }
+}
+
+export function orderProfiles(profiles: readonly ResolvedModelProfile[], estimatedTokens: number): ResolvedModelProfile[] {
+  const now = Date.now()
+  const sorted = [...profiles].sort((a, b) => b.priority - a.priority)
+  const fitting = sorted.filter(p => p.contextWindow <= 0 || estimatedTokens <= p.contextWindow * 0.95)
+  const pool = fitting.length ? fitting : sorted
+  const healthy = pool.filter(p => !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > now))
+  const base = healthy.length
+    ? healthy
+    : [...pool].sort((a, b) => (a.cooldownUntil ?? 0) - (b.cooldownUntil ?? 0)).slice(0, 1)
+
+  // Round-robin within equal-priority groups.
+  const tick = rrCounter++
+  const out: ResolvedModelProfile[] = []
+  for (let i = 0; i < base.length;) {
+    let j = i + 1
+    while (j < base.length && base[j].priority === base[i].priority) j++
+    const group = base.slice(i, j)
+    if (group.length > 1) {
+      const offset = tick % group.length
+      for (let k = 0; k < group.length; k++) out.push(group[(k + offset) % group.length])
+    } else {
+      out.push(group[0])
+    }
+    i = j
+  }
+  return out
+}
+
+export function providerPool(
+  profiles: readonly ResolvedModelProfile[],
+  scenario: string,
+  options: ProviderOptions = {},
+) {
+  if (!profiles.length) throw new Error('No enabled workspace model profiles are configured.')
+  const sorted = [...profiles].sort((a, b) => b.priority - a.priority)
+  const primary = sorted[0]
+  const callCounter = { count: 0, maxCalls: options.maxCalls ?? defaultMaxCalls }
+  const primaryBuilt = buildSingleStreamImpl(primary, scenario, options, callCounter, primary.id)
+
+  const wrapMethod = (method: 'stream' | 'streamSimple'): ProviderStreams['stream'] => {
+    return (_selected, transcript, sOpts) => {
+      const estimatedTokens = Math.ceil(JSON.stringify(transcript).length / 3.5)
+      const ordered = orderProfiles(sorted, estimatedTokens)
+
+      // Execute failover strictly inside the safe window (before yielding the first non-error event).
+      const iter = (async function* () {
+        let lastError: unknown
+        let transientAttempts = 0
+        const maxTransientRetries = ordered.length === 1 ? 2 : 1
+
+        for (let idx = 0; idx < ordered.length; idx++) {
+          const candidate = ordered[idx]
+          if (options.signal?.aborted) throw options.signal.reason ?? new Error('Aborted')
+
+          let attempt = 0
+          for (;;) {
+            const built = buildSingleStreamImpl(candidate, scenario, options, callCounter, candidate.id)
+            const stream = built.implementation[method](built.model, transcript, sOpts)
+            let emitted = false
+            let retrySame = false
+            let failedOver = false
+
+            try {
+              for await (const event of stream) {
+                if (event.type === 'error' && !emitted) {
+                  const msg = String((event as { error?: { errorMessage?: string } }).error?.errorMessage ?? 'Model error')
+                  const decision = classifyFailoverError(msg)
+                  if (decision.failover) {
+                    options.onProfileFailure?.(candidate.id, msg, decision.hard)
+                    lastError = new Error(msg)
+                    failedOver = true
+                    if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransientRetries) {
+                      transientAttempts++
+                      attempt++
+                      retrySame = true
+                    }
+                    break
+                  }
+                }
+                emitted = true
+                yield event
+              }
+
+              if (retrySame) {
+                const waitMs = Math.min(4_000, 350 * 2 ** (attempt - 1))
+                await delay(waitMs, undefined, { signal: options.signal })
+                continue
+              }
+              if (failedOver) break
+
+              const res = await stream.result()
+              if (!emitted && res.stopReason === 'error') {
+                const msg = res.errorMessage ?? 'Model error'
+                const decision = classifyFailoverError(msg)
+                if (decision.failover) {
+                  options.onProfileFailure?.(candidate.id, msg, decision.hard)
+                  lastError = new Error(msg)
+                  if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransientRetries) {
+                    transientAttempts++
+                    attempt++
+                    const waitMs = Math.min(4_000, 350 * 2 ** (attempt - 1))
+                    await delay(waitMs, undefined, { signal: options.signal })
+                    continue
+                  }
+                  break
+                }
+              }
+              if (res.stopReason !== 'error') options.onProfileSuccess?.(candidate.id)
+              return res
+            } catch (error) {
+              if (emitted) throw error
+              const msg = error instanceof Error ? error.message : String(error)
+              const decision = classifyFailoverError(msg)
+              if (!decision.failover) throw error
+              options.onProfileFailure?.(candidate.id, msg, decision.hard)
+              lastError = error
+              if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransientRetries) {
+                transientAttempts++
+                attempt++
+                const waitMs = Math.min(4_000, 350 * 2 ** (attempt - 1))
+                await delay(waitMs, undefined, { signal: options.signal })
+                continue
+              }
+              break
+            }
+          }
+        }
+        throw lastError instanceof Error ? lastError : new Error('All configured model profiles failed.')
+      })()
+
+      let cachedResult: Promise<Awaited<ReturnType<ReturnType<ProviderStreams['stream']>['result']>>> | undefined
+      const resolveResult = () => {
+        if (!cachedResult) {
+          cachedResult = (async () => {
+            for (;;) {
+              const step = await iter.next()
+              if (step.done) return step.value
+            }
+          })()
+        }
+        return cachedResult
+      }
+
+      const wrapped = {
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            const step = await iter.next()
+            if (step.done) {
+              cachedResult = Promise.resolve(step.value)
+              return
+            }
+            yield step.value
+          }
+        },
+        result: resolveResult,
+      }
+      return wrapped as unknown as ReturnType<ProviderStreams['stream']>
+    }
+  }
+
+  const implementation: ProviderStreams = {
+    stream: wrapMethod('stream'),
+    streamSimple: wrapMethod('streamSimple'),
+  }
+
+  const models = createModels({ identity: { attribution: null } })
+  models.setProvider(createProvider<Api>({
+    id: providerId,
+    auth: { apiKey: { name: 'Workspace provider pool', resolve: async () => ({ auth: { apiKey: primary.key } }) } },
+    api: implementation,
+    models: [primaryBuilt.model],
+  }))
+  return { models, model: primaryBuilt.model }
+}
+
+export async function testProvider(settings: ProviderConfig, record?: CallRecorder): Promise<{ ok: true }> {
+  const { models, model } = provider(settings, 'connection', { record, maxCalls: 2, firstEventTimeoutMs: 35_000, idleTimeoutMs: 35_000, totalTimeoutMs: 45_000 })
   const stream = models.stream(model, {
     systemPrompt: 'Guardian connection test. Call guardian_connection with status ready. Do not add prose.',
     messages: [{ role: 'user', content: 'Check the Guardian connection.', timestamp: Date.now() }],
@@ -153,11 +581,14 @@ export async function testProvider(settings: ProviderSettings, record?: CallReco
   const result = await stream.result()
   if (result.stopReason === 'error' || result.stopReason === 'aborted') {
     const error = redact(result.errorMessage ?? '').slice(0, 350)
-    const match = error.match(/The (?:provider rejected the API key|provider endpoint or model was not found|provider rate limit was reached|model provider returned HTTP \d+)\./)
+    const match = error.match(/The (?:provider rejected the API key|provider quota or credit balance was exhausted|provider endpoint or model was not found|provider rate limit was reached|model provider returned HTTP \d+)\./)
     throw new Error(match?.[0] ?? 'The provider connection failed. Check the base URL, model, key, and protocol.')
   }
-  if (!toolEvents || !result.content.some(part => part.type === 'toolCall' && part.name === 'guardian_connection' &&
-    part.arguments.status === 'ready')) {
+  if (
+    !toolEvents ||
+    !result.content.some(part => part.type === 'toolCall' && part.name === 'guardian_connection' &&
+      part.arguments.status === 'ready')
+  ) {
     throw new Error('The model did not return the expected streamed tool call.')
   }
   return { ok: true as const }

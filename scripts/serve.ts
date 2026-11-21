@@ -43,7 +43,7 @@ function sessionToken() {
 }
 
 const token = sessionToken()
-const maxBody = 1024 * 1024
+const maxBody = 8 * 1024 * 1024
 
 function authorized(req: IncomingMessage): boolean {
   const cookies = req.headers.cookie?.split(';').map(cookie => cookie.trim()) ?? []

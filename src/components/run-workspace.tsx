@@ -2,13 +2,13 @@ import { Link, useNavigate } from '@tanstack/react-router'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { commandRun, runData } from '../actions.ts'
-import { workerHistory } from '../domain.ts'
+import { maxBudgetRequests, workerHistory } from '../domain.ts'
 import { FormError, Status, useAction } from './common.tsx'
 import { EvidenceDialog } from './evidence-dialog.tsx'
 import { RunOverview } from './run-overview.tsx'
 import type { Command } from './run-overview.tsx'
 import { RunReport } from './run-report.tsx'
-import { phaseNames } from './run-state.ts'
+import { capabilityTierMeta, formatUsd, phaseNames, workerPhaseNames } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
 import { ThreadTranscript } from './thread-transcript.tsx'
 import { Button } from './ui/button.tsx'
@@ -26,7 +26,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
 }) {
   const [snapshot, setSnapshot] = useState<RunDetail>()
   const detail = snapshot && snapshot.cursor >= routeDetail.cursor ? snapshot : routeDetail
-  const { run, project, assignments } = detail
+  const { run, project, assignments, approvals, facts } = detail
   const history = useMemo(() => workerHistory(run, assignments), [run, assignments])
   const navigate = useNavigate()
   const runId = run.id
@@ -60,8 +60,10 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   const threadId = worker?.id ?? run.coordinatorId
   const messages = detail.messages.filter(item => item.threadId === threadId)
   const attachments = detail.evidence.filter(item => item.assignmentId === worker?.id)
+  const workerFacts = worker ? facts.filter(fact => fact.assignmentId === worker.id) : undefined
   const workerHistoryLabel = worker && history.get(worker.id)
   const artifactWorkerId = artifact && detail.evidence.find(item => item.id === artifact)?.assignmentId
+  const pendingApprovals = approvals.filter(item => item.status === 'pending')
 
   useEffect(() => {
     const events = new EventSource(`/api/runs/${runId}/events?since=${cursor.current}`)
@@ -156,41 +158,97 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     pane.scrollTo(0, 0)
   }
 
-  const needsModel = !detail.hasModel && run.approved.length > 0 && (run.phase === 'analysis' || run.phase === 'verification')
-  const phaseLabel = ['paused', 'failed', 'stopped'].includes(run.status) ? run.status
-    : needsModel ? 'Waiting for model' : phaseNames[run.phase]
+  const needsModel = !detail.hasModel && run.approved.length > 0 && ['threat_model', 'investigation', 'verification'].includes(run.phase)
+  const phaseLabel = run.status === 'budget_paused' ? 'budget_paused'
+    : ['paused', 'failed', 'stopped'].includes(run.status) ? run.status
+      : needsModel ? 'Waiting for model' : phaseNames[run.phase]
+
+  const usdRatio = run.budgetUsd > 0 ? Math.min(1, run.spentUsd / run.budgetUsd) : 0
+  const reqRatio = run.budgetRequests > 0 ? Math.min(1, run.spentRequests / run.budgetRequests) : 0
+  const maxRatio = Math.max(usdRatio, reqRatio)
+  const meterLevel = maxRatio >= 0.95 ? 'critical' : maxRatio >= 0.75 ? 'warn' : 'ok'
+  const suggestedBudgetUsd = Math.min(500, Math.max(run.budgetUsd + 10, Math.ceil(run.spentUsd + 10)))
+  const suggestedBudgetReqs = Math.min(maxBudgetRequests, Math.max(run.budgetRequests + 1000, run.spentRequests + 500))
 
   return <main className="run-page">
     <header className="run-heading">
       <div className="run-title">
         <Link to="/projects/$projectId" params={{ projectId: project.id }}>{project.name}</Link>
-        <h1>Website review</h1>
-        <div className="run-meta"><code>{project.seeds.map(seed => new URL(seed).hostname).join(', ')}</code>
-          <Status status={phaseLabel} /></div>
+        <h1>Security assessment</h1>
+        <div className="run-meta">
+          <code>{project.seeds.map(seed => new URL(seed).hostname).join(', ')}</code>
+          <span className="badge badge-trace">{capabilityTierMeta[run.capabilityTier].short}</span>
+          <Status status={phaseLabel} />
+          {pendingApprovals.length > 0 && <span className="badge badge-attention">
+            {pendingApprovals.length} pending {pendingApprovals.length === 1 ? 'approval' : 'approvals'}
+          </span>}
+        </div>
       </div>
-      <div className="toolbar run-actions">
-        {run.status === 'running' && <Button disabled={action.pending} onClick={() => execute({ action: 'pause' })}>Pause</Button>}
-        {['paused', 'stopped', 'failed'].includes(run.status) &&
-          <Button variant="default" disabled={action.pending} onClick={() => execute({ action: 'resume' })}>Resume</Button>}
-        {run.status !== 'complete' && run.status !== 'stopped' && <DropdownMenu>
-          <DropdownMenuTrigger render={<Button size="icon" />} aria-label="Run actions">···</DropdownMenuTrigger>
-          <DropdownMenuContent>
-            <DropdownMenuItem disabled={action.pending} onClick={() => setRevising(true)}>Revise goal</DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" disabled={action.pending} onClick={() => execute({ action: 'stop' }, () => {
-              void navigate({ to: '/runs/$runId', params: { runId: run.id }, search: { view: 'report' } })
-            })}>Stop run</DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>}
+      <div className="run-header-right">
+        <div className="budget-meter" aria-label="Run budget and usage meter">
+          <div className="budget-meter-row">
+            <span>Turns <strong>{run.turnsUsed}</strong></span>
+            <span>Reqs <strong>{run.spentRequests}</strong>/{run.budgetRequests}</span>
+            <span>Spend <strong>{formatUsd(run.spentUsd)}</strong>/{formatUsd(run.budgetUsd)}</span>
+          </div>
+          <div className="meter-track" role="progressbar" aria-label="Budget usage" aria-valuenow={Math.round(maxRatio * 100)} aria-valuemin={0} aria-valuemax={100}>
+            <div className="meter-fill" data-level={meterLevel} style={{ width: `${Math.round(maxRatio * 100)}%` }} />
+          </div>
+        </div>
+        <div className="toolbar run-actions">
+          {run.status === 'running' && <Button disabled={action.pending} onClick={() => execute({ action: 'pause' })}>Pause</Button>}
+          {['paused', 'stopped', 'failed'].includes(run.status) &&
+            <Button variant="default" disabled={action.pending} onClick={() => execute({ action: 'resume' })}>Resume</Button>}
+          {run.status !== 'complete' && run.status !== 'stopped' && <DropdownMenu>
+            <DropdownMenuTrigger render={<Button size="icon" />} aria-label="Run actions">···</DropdownMenuTrigger>
+            <DropdownMenuContent>
+              <DropdownMenuItem disabled={action.pending} onClick={() => setRevising(true)}>Revise goal</DropdownMenuItem>
+              <DropdownMenuItem variant="destructive" disabled={action.pending} onClick={() => execute({ action: 'stop' }, () => {
+                void navigate({ to: '/runs/$runId', params: { runId: run.id }, search: { view: 'report' } })
+              })}>Stop run</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>}
+        </div>
       </div>
     </header>
+
+    {run.status === 'budget_paused' && <section className="budget-banner" aria-label="Budget paused">
+      <div>
+        <h2>Run paused — budget ceiling reached</h2>
+        <p className="muted">
+          Spent {formatUsd(run.spentUsd)} of {formatUsd(run.budgetUsd)} USD and {run.spentRequests} of {run.budgetRequests} requests.
+          A partial report has been saved; raise limits below to resume without repeating completed work.
+        </p>
+      </div>
+      <form className="budget-banner-form" onSubmit={event => {
+        event.preventDefault()
+        const form = new FormData(event.currentTarget)
+        execute({
+          action: 'raise_budget',
+          budgetUsd: Number(form.get('budgetUsd')),
+          budgetRequests: Number(form.get('budgetRequests')),
+          resume: true,
+        })
+      }}>
+        <label>New USD budget
+          <Input name="budgetUsd" type="number" min={0.1} max={500} step="any" required defaultValue={suggestedBudgetUsd} />
+        </label>
+        <label>New request cap
+          <Input name="budgetRequests" type="number" min={1} max={maxBudgetRequests} step={1} required defaultValue={suggestedBudgetReqs} />
+        </label>
+        <Button type="submit" variant="default" disabled={action.pending}>Raise budget &amp; Resume</Button>
+      </form>
+    </section>}
+
     {revising && <form className="revision-form" onSubmit={event => {
       event.preventDefault()
       execute({ action: 'revise', goal: String(new FormData(event.currentTarget).get('goal')) }, () => setRevising(false))
     }}>
-      <label>Revise goal<Textarea name="goal" required maxLength={1500} defaultValue={run.goal} /></label>
+      <label>Revise goal<Textarea name="goal" required maxLength={8000} defaultValue={run.goal} /></label>
       <div className="form-actions"><Button onClick={() => setRevising(false)}>Cancel</Button>
         <Button type="submit" variant="default" disabled={action.pending}>Save goal</Button></div>
     </form>}
+
     <div className="viewbar">
       <nav className="toolbar" aria-label="Run sections">
         <Link to="/runs/$runId" params={{ runId: run.id }} search={{ view: 'overview' }}
@@ -221,6 +279,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     </div>
     {reconnecting && <p className="run-error muted" role="status">Reconnecting to Guardian…</p>}
     {action.error && <div className="run-error"><FormError error={action.error} /></div>}
+
     <div className="workbench" data-with-chat={chatOpen}>
       <section className="work-surface" aria-label={view === 'report' ? 'Run report' : 'Workflow'}>
         {view !== 'report' && needsModel && <div className="workflow-callout run-model-callout">
@@ -233,7 +292,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
         <div className="trace-holder" hidden={view !== 'trace'}>
           <WorkflowTrace detail={detail} history={history} workerId={workerId} query={query} zoom={zoom} viewport={viewport} />
         </div>
-        {view === 'report' && <RunReport detail={detail} openEvidence={setArtifact} />}
+        {view === 'report' && <RunReport detail={detail} execute={execute} pending={action.pending} openEvidence={setArtifact} />}
       </section>
       <AnimatePresence initial={false}>
         {chatOpen && <motion.section className="chat-pane" aria-label={worker ? 'Worker thread' : 'Coordinator chat'}
@@ -245,18 +304,42 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
               <Button variant="ghost" onClick={() => setShowCoordinator(false)}>Worker</Button>}
             <Button variant="ghost" size="icon" className="close-pane" onClick={() => setChatOpen(false)} aria-label="Close chat">×</Button>
           </div>
+          {!worker && pendingApprovals.length > 0 && <div aria-label="Coordinator approval prompts">
+            {pendingApprovals.map(item => <div key={item.id} className="approval-card approval-card-compact">
+              <div className="inline-badges">
+                <strong>Tier 3 approval</strong>
+                <span className="badge badge-attention">{item.method}</span>
+              </div>
+              <p className="approval-target"><code>{item.origin}{item.pathAndQuery}</code></p>
+              <p className="muted">{item.rationale}</p>
+              <div className="approval-actions">
+                <Button className="btn-danger" disabled={action.pending} onClick={() => {
+                  execute({ action: 'decide_approval', approvalId: item.id, decision: 'denied' })
+                }}>Deny</Button>
+                <Button variant="default" disabled={action.pending} onClick={() => {
+                  execute({ action: 'decide_approval', approvalId: item.id, decision: 'approved' })
+                }}>Approve</Button>
+              </div>
+            </div>)}
+          </div>}
           <AnimatePresence initial={false} mode="sync">
             <motion.div className="thread-content" key={threadId}
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, position: 'absolute', visibility: 'hidden' }}
               transition={{ duration: reducedMotion ? 0 : 0.18 }}>
               {worker && <header className="worker-intro">
-                <h2>{worker.title}</h2><p className="muted">{phaseNames[worker.phase]} · <Status status={worker.status} /></p>
+                <h2>{worker.title}</h2>
+                <p className="muted">{workerPhaseNames[worker.phase]} · <Status status={worker.status} /></p>
+                <div className="worker-metrics">
+                  <span>{worker.turnsUsed} / {worker.maxTurns} turns</span>
+                  <span>{worker.requestsUsed} reqs</span>
+                  {workerFacts && workerFacts.length > 0 && <span>{workerFacts.length} facts</span>}
+                </div>
                 {workerHistoryLabel && <p className="muted">{workerHistoryLabel}</p>}
                 {inputWorker && <p className="muted worker-input">Input from <Link to="/runs/$runId/workers/$workerId"
                   params={{ runId, workerId: inputWorker.id }} search={{ view: 'trace' }}>{inputWorker.title}</Link></p>}
                 {worker.outcome && <p className="outcome">{worker.outcome}</p>}
               </header>}
-              <ThreadTranscript messages={messages} worker={worker} attachments={attachments} openEvidence={setArtifact} />
+              <ThreadTranscript messages={messages} worker={worker} workerFacts={workerFacts} attachments={attachments} openEvidence={setArtifact} />
             </motion.div>
           </AnimatePresence>
           {!worker && <form className="composer" onSubmit={event => {
@@ -265,7 +348,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
           }}>
             <InputGroup>
               <InputGroupTextarea rows={1} value={draft} onChange={event => setDraft(event.target.value)} aria-label="Message coordinator"
-                placeholder="Message coordinator…" maxLength={1500} onKeyDown={event => {
+                placeholder="Message coordinator or steer investigation…" maxLength={8000} onKeyDown={event => {
                   if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
                   event.preventDefault()
                   event.currentTarget.form?.requestSubmit()
