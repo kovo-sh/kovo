@@ -4,7 +4,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { asc, eq } from 'drizzle-orm'
 import { isLocalLabEnvEnabled } from '../domain.ts'
 import type { RequestBroker } from './broker.ts'
-import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
+import { PersonaAuthManager } from './persona-auth.ts'
+import { personaSecrets, refreshPersonaSession, resolveRunPersonas } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import * as tables from './schema.ts'
@@ -250,6 +251,7 @@ export async function testPersonaAuth(
   storage: Store,
   broker: RequestBroker,
   input: { projectId: string; personaId: string; origin?: string; path?: string },
+  personaAuth?: PersonaAuthManager,
 ): Promise<{
   ok: boolean
   origin: string
@@ -272,10 +274,32 @@ export async function testPersonaAuth(
     ? input.path.slice(0, 256)
     : '/'
 
-  const secrets = personaSecrets(resolved)
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 12_000)
+  const timeout = setTimeout(() => controller.abort(), 20_000)
   try {
+    let loginAdapterHint: string | null = null
+    if (persona.authKind === 'login') {
+      const authManager = personaAuth ?? new PersonaAuthManager()
+      try {
+        const authRes = await authManager.authenticatePersona(storage, project.id, persona.id, controller.signal)
+        refreshPersonaSession(persona)
+        if (authRes.adapterUsed === 'clerk') {
+          loginAdapterHint = `Clerk (auto-refresh ${authRes.refreshIntervalSec ?? 35}s)`
+        } else if (authRes.adapterUsed === 'supabase') {
+          loginAdapterHint = 'Supabase Auth'
+        } else if (authRes.adapterUsed === 'json') {
+          loginAdapterHint = 'JSON API'
+        } else {
+          loginAdapterHint = 'Browser Form'
+        }
+      } catch (err) {
+        const safeSecrets = personaSecrets(resolved)
+        const safeMsg = redact(err instanceof Error ? err.message : String(err), safeSecrets)
+        throw new Error(safeMsg)
+      }
+    }
+
+    const secrets = personaSecrets(resolved)
     const res = await broker.executeHttp(
       {
         origin,
@@ -304,7 +328,7 @@ export async function testPersonaAuth(
 
     const hints: string[] = []
     if (headersLower['x-clerk-auth-status']) {
-      hints.push(`x-clerk-auth-status: ${redact(headersLower['x-clerk-auth-status'], secrets)}`)
+      hints.push(redact(headersLower['x-clerk-auth-status'], secrets))
     }
     if (headersLower['x-clerk-auth-reason']) {
       hints.push(`reason: ${redact(headersLower['x-clerk-auth-reason'], secrets)}`)
@@ -317,12 +341,15 @@ export async function testPersonaAuth(
     }
     if (!hints.length) {
       if (res.status >= 200 && res.status < 300) {
-        hints.push(`Authenticated GET accepted (${res.mediaType || 'ok'})`)
+        hints.push(loginAdapterHint ? 'signed-in' : `Authenticated GET accepted (${res.mediaType || 'ok'})`)
       } else if (res.status === 401 || res.status === 403) {
-        hints.push('Rejected with auth error — verify cookie/token freshness')
+        hints.push('Rejected with auth error — verify credentials or session freshness')
       } else {
         hints.push(`HTTP ${res.status} (${res.mediaType || 'response'})`)
       }
+    }
+    if (loginAdapterHint) {
+      hints.push(loginAdapterHint)
     }
 
     const ok = res.status >= 200 && res.status < 300 &&

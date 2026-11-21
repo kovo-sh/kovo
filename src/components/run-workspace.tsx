@@ -1,14 +1,15 @@
 import { Link, useNavigate } from '@tanstack/react-router'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { commandRun, runData } from '../actions.ts'
-import { maxBudgetRequests, maxRpsPerOriginCeiling, workerHistory } from '../domain.ts'
+import { approvalPolicies, maxBudgetRequests, maxRpsPerOriginCeiling, workerHistory } from '../domain.ts'
+import type { ApprovalPolicy } from '../domain.ts'
 import { FormError, Status, useAction } from './common.tsx'
 import { EvidenceDialog } from './evidence-dialog.tsx'
 import { RunExchanges } from './run-exchanges.tsx'
 import { RunOverview } from './run-overview.tsx'
 import type { Command } from './run-overview.tsx'
 import { RunReport } from './run-report.tsx'
-import { capabilityTierMeta, formatUsd, phaseNames } from './run-state.ts'
+import { approvalPolicyMeta, capabilityTierMeta, formatUsd, phaseNames } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
 import { ThreadTranscript } from './thread-transcript.tsx'
 import { Button } from './ui/button.tsx'
@@ -67,9 +68,10 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   const [zoom, setZoom] = useState(1)
   const [artifact, setArtifact] = useState<string>()
 
-  // Popovers (Host list + Live Budget editor)
+  // Popovers (Host list + Live Budget editor + Tier 3 Approval Policy switcher)
   const [hostPopoverOpen, setHostPopoverOpen] = useState(false)
   const [budgetPopoverOpen, setBudgetPopoverOpen] = useState(false)
+  const [policyPopoverOpen, setPolicyPopoverOpen] = useState(false)
   const [liveUsd, setLiveUsd] = useState(run.budgetUsd)
   const [liveRps, setLiveRps] = useState(run.maxRpsPerOrigin)
   const [liveReqUnlimited, setLiveReqUnlimited] = useState(run.budgetRequests === 0)
@@ -104,6 +106,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   // Sync budget popover defaults when opening
   function openBudgetPopover() {
     setHostPopoverOpen(false)
+    setPolicyPopoverOpen(false)
     if (!budgetPopoverOpen) {
       setLiveUsd(run.budgetUsd)
       setLiveRps(run.maxRpsPerOrigin)
@@ -115,16 +118,17 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
 
   // Close popovers on outside click
   useEffect(() => {
-    if (!hostPopoverOpen && !budgetPopoverOpen) return
+    if (!hostPopoverOpen && !budgetPopoverOpen && !policyPopoverOpen) return
     const onDown = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
       if (target?.closest('.popover-anchor')) return
       setHostPopoverOpen(false)
       setBudgetPopoverOpen(false)
+      setPolicyPopoverOpen(false)
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
-  }, [hostPopoverOpen, budgetPopoverOpen])
+  }, [hostPopoverOpen, budgetPopoverOpen, policyPopoverOpen])
 
   // Pointer drag for vertical splitter
   useEffect(() => {
@@ -210,9 +214,10 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
         search.current.focus()
       }
       if (event.key === 'Escape') {
-        if (hostPopoverOpen || budgetPopoverOpen) {
+        if (hostPopoverOpen || budgetPopoverOpen || policyPopoverOpen) {
           setHostPopoverOpen(false)
           setBudgetPopoverOpen(false)
+          setPolicyPopoverOpen(false)
           return
         }
         if (chatOpen && workerId) closeWorker()
@@ -220,7 +225,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     }
     window.addEventListener('keydown', keyboard)
     return () => window.removeEventListener('keydown', keyboard)
-  }, [workerId, chatOpen, artifact, hostPopoverOpen, budgetPopoverOpen])
+  }, [workerId, chatOpen, artifact, hostPopoverOpen, budgetPopoverOpen, policyPopoverOpen])
 
   function execute(command: Command, onSuccess?: () => void) {
     void action.submit(async () => {
@@ -268,6 +273,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
     : `${safeHost(approvedHosts[0])} + ${approvedHosts.length - 1} ${approvedHosts.length - 1 === 1 ? 'host' : 'hosts'}`
 
   const canEditBudget = !['complete', 'stopped', 'failed'].includes(run.status)
+  const currentPolicy: ApprovalPolicy = run.approvalPolicy ?? 'auto_review'
 
   return <main className="run-page">
     {/* Unified Run Workspace Header Bar (Midnight-Navy Chrome in D3, Slate-Cobalt in D4) */}
@@ -305,12 +311,55 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
       </div>
 
       <div className="run-chrome-right">
+        {/* Live Tier 3 Approval Policy Switcher Pill */}
+        {run.capabilityTier === 3 && <div className="popover-anchor">
+          <button
+            type="button"
+            className={`chrome-pill policy-pill${policyPopoverOpen ? ' open' : ''}`}
+            onClick={() => {
+              setHostPopoverOpen(false)
+              setBudgetPopoverOpen(false)
+              setPolicyPopoverOpen(v => !v)
+            }}
+            aria-label="Tier 3 approval policy"
+            title="Switch Tier 3 approval policy live mid-run"
+          >
+            <span>Policy: <strong>{approvalPolicyMeta[currentPolicy].short}</strong></span>
+            <span aria-hidden="true">▾</span>
+          </button>
+          {policyPopoverOpen && <div className="chrome-popover policy-popover" role="dialog" aria-label="Tier 3 approval policy switcher">
+            <div className="popover-head">
+              <strong>Tier 3 Approval Policy</strong>
+              <span className="badge badge-complete">{canEditBudget ? 'Live switch' : run.status}</span>
+            </div>
+            <div className="policy-popover-list">
+              {approvalPolicies.map(policy => {
+                const meta = approvalPolicyMeta[policy]
+                const isSelected = currentPolicy === policy
+                return <button
+                  key={policy}
+                  type="button"
+                  className={`policy-popover-item${isSelected ? ' active' : ''}`}
+                  disabled={!canEditBudget || action.pending || isSelected}
+                  onClick={() => execute({ action: 'set_approval_policy', approvalPolicy: policy }, () => setPolicyPopoverOpen(false))}
+                >
+                  <div className="policy-option-head">
+                    <strong>{meta.optionLabel}</strong>
+                    {isSelected && <span className="badge badge-complete">Active</span>}
+                  </div>
+                  <span className="muted xs">{meta.summary}</span>
+                </button>
+              })}
+            </div>
+          </div>}
+        </div>}
+
         {/* Collapsed Host Pill + Popover */}
         <div className="popover-anchor">
           <button
             type="button"
             className={`chrome-pill${hostPopoverOpen ? ' open' : ''}`}
-            onClick={() => { setBudgetPopoverOpen(false); setHostPopoverOpen(v => !v) }}
+            onClick={() => { setBudgetPopoverOpen(false); setPolicyPopoverOpen(false); setHostPopoverOpen(v => !v) }}
             title="Inspect approved scope hosts"
           >
             <span className={`chrome-dot st-${run.status}`} aria-hidden="true" />
@@ -581,6 +630,9 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
                   <Button className="btn-danger" disabled={action.pending} onClick={() => {
                     execute({ action: 'decide_approval', approvalId: item.id, decision: 'denied' })
                   }}>Deny</Button>
+                  <Button variant="ghost" disabled={action.pending} onClick={() => {
+                    execute({ action: 'approve_similar_endpoint', approvalId: item.id })
+                  }}>Approve similar</Button>
                   <Button variant="default" disabled={action.pending} onClick={() => {
                     execute({ action: 'decide_approval', approvalId: item.id, decision: 'approved' })
                   }}>Approve</Button>

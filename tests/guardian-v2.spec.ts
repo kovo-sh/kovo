@@ -29,6 +29,7 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
     await page.getByRole('button', { name: 'Add persona', exact: true }).click()
     await page.getByLabel(/Handle/).fill('tenant_a')
     await page.getByLabel('Role label').fill('Standard Tenant A')
+    await page.getByLabel('Authentication kind').selectOption('bearer')
     await page.getByLabel('Credential secret').fill(personaSecret)
     await page.getByRole('button', { name: 'Save persona', exact: true }).click()
     await expect(page.getByRole('status').filter({ hasText: 'Saved persona "tenant_a"' })).toBeVisible()

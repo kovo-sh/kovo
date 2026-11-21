@@ -158,7 +158,7 @@ export const testPersonaAuthAction = createServerFn({ method: 'POST' })
     origin: z.string().trim().min(1).max(253).optional(),
     path: z.string().trim().startsWith('/').max(256).optional(),
   }))
-  .handler(({ data }) => testPersonaAuth(store(), execution().broker, data))
+  .handler(({ data }) => testPersonaAuth(store(), execution().broker, data, execution().personaAuth))
 
 export const readWorkerSessionAction = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id, workerId: id }))

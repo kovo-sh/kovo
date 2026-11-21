@@ -15,12 +15,13 @@ import { AccessPolicyImport } from '../components/access-policy-import.tsx'
 import { FormError, Status, timeText, useAction } from '../components/common.tsx'
 import { parseCurlOrHeader } from '../components/curl-parser.ts'
 import { DnsInventoryImport } from '../components/dns-inventory-import.tsx'
-import { capabilityTierMeta, formatUsd, phaseNames } from '../components/run-state.ts'
+import { approvalPolicyMeta, capabilityTierMeta, formatUsd, phaseNames } from '../components/run-state.ts'
 import { Button } from '../components/ui/button.tsx'
 import { Checkbox } from '../components/ui/checkbox.tsx'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible.tsx'
 import { Input, NativeSelect, Textarea } from '../components/ui/input.tsx'
 import {
+  approvalPolicies,
   defaultBudgetRequests,
   defaultBudgetUsd,
   defaultMaxRpsPerOrigin,
@@ -32,7 +33,7 @@ import {
   maxWorkerConcurrency,
   maxWorkerMaxTurns,
 } from '../domain.ts'
-import type { CapabilityTier, PublicPersona } from '../domain.ts'
+import type { ApprovalPolicy, CapabilityTier, PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../domain.ts'
 
 export const Route = createFileRoute('/projects/$projectId')({
   loader: ({ params }) => projectData({ data: { projectId: params.projectId } }),
@@ -129,6 +130,23 @@ function safeHost(origin: string) {
   }
 }
 
+const LOGIN_URL_PLACEHOLDERS: Record<PersonaLoginAdapter, string> = {
+  auto: 'Optional — auto-detected for Clerk',
+  clerk: 'Optional — auto-detected for Clerk',
+  json: 'https://app.example.com/api/auth/sign-in/email',
+  supabase: 'Optional — defaults to <origin>/auth/v1/token?grant_type=password',
+  form: 'Optional — defaults to <origin>/login',
+}
+
+function formatPersonaAuthBadge(persona: PublicPersona): string {
+  if (persona.authKind === 'login') {
+    const email = persona.loginConfig?.email
+    const adapter = persona.loginConfig?.adapter ?? 'auto'
+    return email ? `${email} · login (${adapter})` : `login (${adapter})`
+  }
+  return persona.headerName ? `${persona.authKind} · ${persona.headerName}` : persona.authKind
+}
+
 function ProjectPage() {
   const { project, assets, personas, specs, runs, hasGithubPat } = Route.useLoaderData()
   const navigate = useNavigate()
@@ -142,6 +160,7 @@ function ProjectPage() {
   const [selectedPreset, setSelectedPreset] = useState<string>('')
   const [goal, setGoal] = useState('')
   const [tier, setTier] = useState<CapabilityTier>(1)
+  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('auto_review')
   const [budgetUsd, setBudgetUsd] = useState<number>(defaultBudgetUsd)
   const [maxRps, setMaxRps] = useState<number>(defaultMaxRpsPerOrigin)
   const [unlimitedReqs, setUnlimitedReqs] = useState<boolean>(defaultBudgetRequests === 0)
@@ -150,8 +169,11 @@ function ProjectPage() {
   const [maxTurns, setMaxTurns] = useState<number>(defaultWorkerMaxTurns)
   const [selectedPersonaIds, setSelectedPersonaIds] = useState<string[]>(() => personas.map(p => p.id))
 
-  // Persona creation form state (supports Paste cURL auto-parser)
-  const [authKind, setAuthKind] = useState<'cookie' | 'bearer' | 'header'>('bearer')
+  // Persona creation form state (Email + Password default, plus Paste cURL for static tokens)
+  const [authKind, setAuthKind] = useState<PersonaAuthKind>('login')
+  const [loginAdapter, setLoginAdapter] = useState<PersonaLoginAdapter>('auto')
+  const [loginEmail, setLoginEmail] = useState('')
+  const [loginUrl, setLoginUrl] = useState('')
   const [personaHandle, setPersonaHandle] = useState('')
   const [personaRole, setPersonaRole] = useState('')
   const [personaHeaderName, setPersonaHeaderName] = useState('')
@@ -206,7 +228,8 @@ function ProjectPage() {
   function prefillPersonaPair(which: 'user_a' | 'user_b') {
     setPersonaHandle(which)
     setPersonaRole(which === 'user_a' ? 'User A (Control / Owner)' : 'User B (Cross-User Probe)')
-    setAuthKind('cookie')
+    setAuthKind('login')
+    setLoginAdapter('auto')
     setPersonaOrigins(project.seeds.join('\n'))
     setPersonaSecret('')
     setCurlNote('')
@@ -215,7 +238,10 @@ function ProjectPage() {
   async function handleTestPersonaAuth(persona: PublicPersona) {
     setPersonaTests(prev => ({
       ...prev,
-      [persona.id]: { status: 'testing', message: 'Testing safe GET…' },
+      [persona.id]: {
+        status: 'testing',
+        message: persona.authKind === 'login' ? 'Logging in & testing GET…' : 'Testing safe GET…',
+      },
     }))
     try {
       const res = await testPersonaAuthAction({
@@ -264,6 +290,9 @@ function ProjectPage() {
     setPersonaHandle('')
     setPersonaRole('')
     setPersonaHeaderName('')
+    setLoginAdapter('auto')
+    setLoginEmail('')
+    setLoginUrl('')
     setPersonaOrigins(project.seeds.join('\n'))
     setPersonaSecret('')
     setPersonaCanaries('')
@@ -275,6 +304,7 @@ function ProjectPage() {
     const allowlist = personaOrigins.split(/[\s,]+/).filter(Boolean)
     const canaryMarkers = personaCanaries.split(',').map(s => s.trim()).filter(Boolean)
     const headerNameRaw = personaHeaderName.trim()
+    const loginUrlRaw = loginUrl.trim()
     void personaAction.submit(() => registerPersona({ data: {
       requestId: crypto.randomUUID(),
       projectId: project.id,
@@ -283,6 +313,13 @@ function ProjectPage() {
       originAllowlist: allowlist,
       authKind,
       ...(authKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
+      ...(authKind === 'login' ? {
+        loginConfig: {
+          adapter: loginAdapter,
+          email: loginEmail.trim(),
+          ...(loginUrlRaw ? { loginUrl: loginUrlRaw } : {}),
+        },
+      } : {}),
       secret: personaSecret,
       canaryMarkers,
     } }), created => {
@@ -318,6 +355,7 @@ function ProjectPage() {
         goal,
         sourceMode,
         capabilityTier: tier,
+        approvalPolicy,
         approvedPersonaIds: tier >= 2 ? selectedPersonaIds : [],
         budgetUsd,
         budgetRequests: effectiveReqs,
@@ -386,6 +424,38 @@ function ProjectPage() {
         </div>
       </div>
 
+      {/* Tier 3 Approval Policy selector */}
+      {tier === 3 && <div className="policy-selector-box" role="radiogroup" aria-label="Tier 3 Approval Policy">
+        <div className="section-heading">
+          <div>
+            <strong>Tier 3 Approval Policy</strong>
+            <p className="muted">Choose how state-changing probes are gated. You can switch policy live mid-run.</p>
+          </div>
+        </div>
+        <div className="policy-option-grid">
+          {approvalPolicies.map(policy => {
+            const meta = approvalPolicyMeta[policy]
+            const active = approvalPolicy === policy
+            return <button
+              key={policy}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              className={`policy-option${active ? ' active' : ''}`}
+              onClick={() => setApprovalPolicy(policy)}
+            >
+              <div className="policy-option-head">
+                <strong>{meta.optionLabel}</strong>
+                {policy === 'yolo' && <span className="badge badge-attention">Autonomous</span>}
+                {policy === 'auto_review' && <span className="badge badge-complete">Default</span>}
+                {policy === 'strict' && <span className="badge">Manual</span>}
+              </div>
+              <span className="muted xs">{meta.summary}</span>
+            </button>
+          })}
+        </div>
+      </div>}
+
       {/* Integrated Personas for Tier 2/3 */}
       {tier >= 2 && <div className="inline-personas-box">
         <div className="section-heading">
@@ -413,7 +483,7 @@ function ProjectPage() {
                 <span className="inline-badges">
                   <strong>{persona.handle}</strong>
                   <span className="badge badge-trace">{persona.roleLabel}</span>
-                  <span className="badge">{persona.authKind}</span>
+                  <span className="badge">{formatPersonaAuthBadge(persona)}</span>
                 </span>
               </label>
               <div className="inline-badges">
@@ -436,22 +506,24 @@ function ProjectPage() {
               <Button type="button" variant="ghost" onClick={() => prefillPersonaPair('user_b')}>Preset User B</Button>
             </div>
           </div>
-          <div className="curl-parse-row">
-            <Input
-              value={curlPaste}
-              onChange={e => setCurlPaste(e.target.value)}
-              onPaste={e => {
-                const pasted = e.clipboardData.getData('text')
-                if (pasted) {
-                  e.preventDefault()
-                  applyCurlParse(pasted)
-                }
-              }}
-              placeholder="Paste cURL command or Cookie:/Authorization: header (auto-parses & masks secret)"
-            />
-            <Button type="button" onClick={() => applyCurlParse(curlPaste)} disabled={!curlPaste.trim()}>Parse cURL</Button>
-          </div>
-          {curlNote && <p className="muted small-note">{curlNote}</p>}
+          {authKind !== 'login' && <>
+            <div className="curl-parse-row">
+              <Input
+                value={curlPaste}
+                onChange={e => setCurlPaste(e.target.value)}
+                onPaste={e => {
+                  const pasted = e.clipboardData.getData('text')
+                  if (pasted) {
+                    e.preventDefault()
+                    applyCurlParse(pasted)
+                  }
+                }}
+                placeholder="Paste cURL command or Cookie:/Authorization: header (auto-parses & masks secret)"
+              />
+              <Button type="button" onClick={() => applyCurlParse(curlPaste)} disabled={!curlPaste.trim()}>Parse cURL</Button>
+            </div>
+            {curlNote && <p className="muted small-note">{curlNote}</p>}
+          </>}
           <div className="field-grid-2">
             <label>Handle
               <Input value={personaHandle} onChange={e => setPersonaHandle(e.target.value)} placeholder="user_a" />
@@ -460,28 +532,76 @@ function ProjectPage() {
               <Input value={personaRole} onChange={e => setPersonaRole(e.target.value)} placeholder="Standard user" />
             </label>
           </div>
-          <div className="field-grid-2">
-            <label>Auth kind
-              <NativeSelect value={authKind} onChange={e => setAuthKind(e.target.value as 'cookie' | 'bearer' | 'header')}>
-                <option value="cookie">Session cookie (Cookie: …)</option>
-                <option value="bearer">Bearer token (Authorization: Bearer …)</option>
-                <option value="header">Custom request header</option>
-              </NativeSelect>
-            </label>
+          <label>Auth kind
+            <NativeSelect value={authKind} onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}>
+              <option value="login">Email + Password (auto-login &amp; refresh)</option>
+              <option value="cookie">Session cookie (Cookie: …)</option>
+              <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+              <option value="header">Custom request header</option>
+            </NativeSelect>
+          </label>
+          {authKind === 'login' ? <>
+            <div className="field-grid-2">
+              <label>Email
+                <Input
+                  type="email"
+                  value={loginEmail}
+                  onChange={e => setLoginEmail(e.target.value)}
+                  placeholder="guardian-a@dyad.sh"
+                  autoComplete="off"
+                />
+              </label>
+              <label>Password
+                <Input
+                  type="password"
+                  value={personaSecret}
+                  onChange={e => setPersonaSecret(e.target.value)}
+                  placeholder="Account password (stored in local 0600 vault)"
+                  autoComplete="off"
+                />
+              </label>
+            </div>
+            <div className="field-grid-2">
+              <label>Auth method
+                <NativeSelect value={loginAdapter} onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}>
+                  <option value="auto">Auto-detect</option>
+                  <option value="clerk">Clerk (auto-refresh 60s JWT)</option>
+                  <option value="json">JSON API / Better Auth</option>
+                  <option value="supabase">Supabase Auth</option>
+                  <option value="form">Login Form (Browser)</option>
+                </NativeSelect>
+              </label>
+              <label>Login URL (optional)
+                <Input
+                  type="url"
+                  value={loginUrl}
+                  onChange={e => setLoginUrl(e.target.value)}
+                  placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]}
+                  autoComplete="off"
+                />
+              </label>
+            </div>
+          </> : <div className="field-grid-2">
+            {authKind === 'header' && <label>Header name
+              <Input value={personaHeaderName} onChange={e => setPersonaHeaderName(e.target.value)} placeholder="X-Api-Key" />
+            </label>}
             <label>Secret (masked)
               <Input type="password" value={personaSecret} onChange={e => setPersonaSecret(e.target.value)} autoComplete="off" placeholder="Never echoed after save" />
             </label>
-          </div>
-          {authKind === 'header' && <label>Header name
-            <Input value={personaHeaderName} onChange={e => setPersonaHeaderName(e.target.value)} placeholder="X-Api-Key" />
-          </label>}
+          </div>}
           <FormError error={personaAction.error} />
           <div className="form-actions">
             <Button type="button" variant="ghost" onClick={() => setInlinePersonaOpen(false)}>Close</Button>
             <Button
               type="button"
               variant="default"
-              disabled={personaAction.pending || !personaHandle.trim() || !personaRole.trim() || !personaSecret.trim()}
+              disabled={
+                personaAction.pending ||
+                !personaHandle.trim() ||
+                !personaRole.trim() ||
+                !personaSecret ||
+                (authKind === 'login' ? !loginEmail.trim() : !personaSecret.trim())
+              }
               onClick={() => submitPersona(() => setInlinePersonaOpen(false))}
             >
               Save to vault &amp; select
@@ -630,22 +750,24 @@ function ProjectPage() {
             <Button type="button" variant="ghost" onClick={() => prefillPersonaPair('user_b')}>Prefill User B</Button>
           </div>
         </div>
-        <div className="curl-parse-row">
-          <Input
-            value={curlPaste}
-            onChange={e => setCurlPaste(e.target.value)}
-            onPaste={e => {
-              const pasted = e.clipboardData.getData('text')
-              if (pasted) {
-                e.preventDefault()
-                applyCurlParse(pasted)
-              }
-            }}
-            placeholder="Paste cURL or Cookie / Authorization header to auto-extract credentials…"
-          />
-          <Button type="button" onClick={() => applyCurlParse(curlPaste)} disabled={!curlPaste.trim()}>Parse cURL</Button>
-        </div>
-        {curlNote && <p className="muted small-note">{curlNote}</p>}
+        {authKind !== 'login' && <>
+          <div className="curl-parse-row">
+            <Input
+              value={curlPaste}
+              onChange={e => setCurlPaste(e.target.value)}
+              onPaste={e => {
+                const pasted = e.clipboardData.getData('text')
+                if (pasted) {
+                  e.preventDefault()
+                  applyCurlParse(pasted)
+                }
+              }}
+              placeholder="Paste cURL or Cookie / Authorization header to auto-extract credentials…"
+            />
+            <Button type="button" onClick={() => applyCurlParse(curlPaste)} disabled={!curlPaste.trim()}>Parse cURL</Button>
+          </div>
+          {curlNote && <p className="muted small-note">{curlNote}</p>}
+        </>}
         <div className="field-grid-2">
           <label>Handle (lowercase, opaque to workers)
             <Input name="handle" required pattern="[a-z0-9][a-z0-9_-]{0,47}" placeholder="tenant_a"
@@ -661,9 +783,10 @@ function ProjectPage() {
         </label>
         <div className="field-grid-2">
           <label>Authentication kind
-            <NativeSelect name="authKind" value={authKind} onChange={event => setAuthKind(event.target.value as 'cookie' | 'bearer' | 'header')}>
-              <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+            <NativeSelect name="authKind" value={authKind} onChange={event => setAuthKind(event.target.value as PersonaAuthKind)}>
+              <option value="login">Email + Password (auto-login &amp; refresh)</option>
               <option value="cookie">Session cookie (Cookie: …)</option>
+              <option value="bearer">Bearer token (Authorization: Bearer …)</option>
               <option value="header">Custom request header</option>
             </NativeSelect>
           </label>
@@ -672,11 +795,40 @@ function ProjectPage() {
               value={personaHeaderName} onChange={e => setPersonaHeaderName(e.target.value)} />
           </label>}
         </div>
-        <label>Credential secret
+        {authKind === 'login' ? <>
+          <div className="field-grid-2">
+            <label>Email
+              <Input name="loginEmail" type="email" required maxLength={320} autoComplete="off"
+                value={loginEmail} onChange={e => setLoginEmail(e.target.value)}
+                placeholder="guardian-a@dyad.sh" />
+            </label>
+            <label>Password
+              <Input name="secret" type="password" required maxLength={4096} autoComplete="off"
+                value={personaSecret} onChange={e => setPersonaSecret(e.target.value)}
+                placeholder="Account password (stored in local 0600 vault)" />
+            </label>
+          </div>
+          <div className="field-grid-2">
+            <label>Auth method
+              <NativeSelect name="loginAdapter" value={loginAdapter} onChange={event => setLoginAdapter(event.target.value as PersonaLoginAdapter)}>
+                <option value="auto">Auto-detect</option>
+                <option value="clerk">Clerk (auto-refresh 60s JWT)</option>
+                <option value="json">JSON API / Better Auth</option>
+                <option value="supabase">Supabase Auth</option>
+                <option value="form">Login Form (Browser)</option>
+              </NativeSelect>
+            </label>
+            <label>Login URL (optional)
+              <Input name="loginUrl" type="url" maxLength={500} autoComplete="off"
+                value={loginUrl} onChange={e => setLoginUrl(e.target.value)}
+                placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]} />
+            </label>
+          </div>
+        </> : <label>Credential secret
           <Input name="secret" type="password" required maxLength={4096} autoComplete="off"
             value={personaSecret} onChange={e => setPersonaSecret(e.target.value)}
             placeholder="Never displayed back after saving" />
-        </label>
+        </label>}
         <label>Canary markers (optional, comma-separated)
           <Input name="canaryMarkers" value={personaCanaries} onChange={e => setPersonaCanaries(e.target.value)}
             placeholder="tenant-a-canary@example.test, org_alpha_001" />
@@ -696,7 +848,7 @@ function ProjectPage() {
               <span className="inline-badges">
                 <strong>{persona.handle}</strong>
                 <span className="badge badge-trace">{persona.roleLabel}</span>
-                <span className="badge">{persona.authKind}{persona.headerName ? ` · ${persona.headerName}` : ''}</span>
+                <span className="badge">{formatPersonaAuthBadge(persona)}</span>
                 {test && <span className={`badge ${test.status === 'ok' ? 'badge-complete' : test.status === 'warn' ? 'badge-attention' : test.status === 'error' ? 'badge-danger' : ''}`}>
                   {test.message}
                 </span>}

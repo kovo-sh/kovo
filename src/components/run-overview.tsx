@@ -2,13 +2,14 @@ import { Fragment, useMemo, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { exportSarifAction } from '../actions.ts'
 import {
+  approvalPolicies,
   assessmentCheckTitles,
   canReviewScope,
   maxBudgetRequests,
   maxRpsPerOriginCeiling,
   maxScopeHosts,
 } from '../domain.ts'
-import type { CapabilityTier, Finding, RunCommand } from '../domain.ts'
+import type { ApprovalPolicy, CapabilityTier, Finding, RunCommand } from '../domain.ts'
 import {
   callerCompatibilityLabels,
   dynamicRetestLabels,
@@ -18,7 +19,7 @@ import {
   verificationTierLabels,
 } from '../report-summary.ts'
 import { Status } from './common.tsx'
-import { capabilityTierMeta, formatUsd, workerPhaseNames, workerPhases } from './run-state.ts'
+import { approvalPolicyMeta, capabilityTierMeta, formatUsd, workerPhaseNames, workerPhases } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
 import { Button } from './ui/button.tsx'
 import { Checkbox } from './ui/checkbox.tsx'
@@ -32,10 +33,17 @@ interface ScopeDraft {
   scopeRevision: number
   assetIds: string[]
   capabilityTier: CapabilityTier
+  approvalPolicy: ApprovalPolicy
   approvedPersonaIds: string[]
   budgetUsd: number
   budgetRequests: number
   maxRpsPerOrigin: number
+}
+
+function autoApprovalBadge(decidedBy: string | null | undefined): { label: string; className: string } {
+  if (decidedBy === 'auto-review:judge') return { label: 'Safety Judge', className: 'badge badge-trace' }
+  if (decidedBy === 'auto-yolo') return { label: 'YOLO', className: 'badge badge-attention' }
+  return { label: 'Auto-Rule', className: 'badge badge-complete' }
 }
 
 function riskBadgeClass(riskTier: 'critical' | 'high' | 'medium' | 'low') {
@@ -89,6 +97,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
   const [draft, setDraft] = useState<ScopeDraft>()
   const [exportingSarif, setExportingSarif] = useState(false)
   const [hygieneOpen, setHygieneOpen] = useState(false)
+  const [auditLogOpen, setAuditLogOpen] = useState(false)
   const [threatOpen, setThreatOpen] = useState(false)
   const [showAllThreat, setShowAllThreat] = useState(false)
   const [scopeOpenManual, setScopeOpenManual] = useState<boolean | null>(null)
@@ -147,6 +156,11 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
   const overLimit = selected.length > maxScopeHosts
   const inventoryIds = new Set(evidence.filter(item => item.kind === 'inventory').map(item => item.id))
   const pendingApprovals = approvals.filter(item => item.status === 'pending')
+  const autoApprovedApprovals = approvals.filter(item =>
+    item.status === 'approved' &&
+    typeof item.decidedBy === 'string' &&
+    item.decidedBy.startsWith('auto-'),
+  )
   const suggestedCandidates = run.scopeRevision > 0
     ? run.candidates.filter(asset => !run.approved.includes(asset.id) && !asset.thirdParty)
     : []
@@ -163,6 +177,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       scopeRevision: run.scopeRevision,
       assetIds,
       capabilityTier: run.capabilityTier,
+      approvalPolicy: run.approvalPolicy ?? 'auto_review',
       approvedPersonaIds: [...run.approvedPersonaIds],
       budgetUsd: run.budgetUsd,
       budgetRequests: run.budgetRequests,
@@ -228,29 +243,96 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       </div>
     </section>}
 
-    {/* 2. Needs Attention: Blocking Operator Gates + Top Verified Findings Above the Fold */}
+    {/* 2. Needs Attention: Blocking Operator Gates + Auto-Approved Audit Trail + Top Verified Findings */}
     {pendingApprovals.length > 0 && <section className="approval-stack" aria-label="Pending Tier 3 approvals">
+      <div className="section-heading approval-stack-head">
+        <div className="inline-badges">
+          <h2>Pending Tier 3 approvals ({pendingApprovals.length})</h2>
+          <span className="badge badge-trace">Policy: {approvalPolicyMeta[run.approvalPolicy ?? 'auto_review'].label}</span>
+        </div>
+        <Button
+          type="button"
+          variant="default"
+          className="btn-nowrap"
+          disabled={pending}
+          onClick={() => execute({ action: 'approve_all_pending' })}
+        >
+          Approve all pending ({pendingApprovals.length})
+        </Button>
+      </div>
       {pendingApprovals.map(item => <article key={item.id} className="approval-card">
         <div className="section-heading">
           <div className="inline-badges">
             <h3>Tier 3 approval required</h3>
             <span className="badge badge-attention">{item.method}</span>
+            {item.riskLevel && <span className={`badge ${item.riskLevel === 'high' ? 'badge-danger' : item.riskLevel === 'medium' ? 'badge-attention' : ''}`}>
+              risk: {item.riskLevel}
+            </span>}
             {item.personaHandle && <span className="badge badge-trace">persona: {item.personaHandle}</span>}
           </div>
           <Status status="waiting_approval" />
         </div>
         <p className="approval-target"><code>{item.method} {item.origin}{item.pathAndQuery}</code></p>
         <p className="muted">{item.rationale}</p>
+        {item.policyNote && <p className="muted xs"><strong>Gate note:</strong> {item.policyNote}</p>}
         {item.requestPreview && <pre className="approval-preview">{item.requestPreview}</pre>}
         <div className="approval-actions">
           <Button className="btn-danger" disabled={pending} onClick={() => {
             execute({ action: 'decide_approval', approvalId: item.id, decision: 'denied' })
           }}>Deny</Button>
+          <Button variant="ghost" disabled={pending} onClick={() => {
+            execute({ action: 'approve_similar_endpoint', approvalId: item.id })
+          }}>Approve similar</Button>
           <Button variant="default" disabled={pending} onClick={() => {
             execute({ action: 'decide_approval', approvalId: item.id, decision: 'approved' })
           }}>Approve probe</Button>
         </div>
       </article>)}
+    </section>}
+
+    {autoApprovedApprovals.length > 0 && <section className="disclosure-card audit-log-disclosure" aria-label="Auto-approved audit log">
+      <button
+        type="button"
+        className="disclosure-card-trigger"
+        aria-expanded={auditLogOpen}
+        onClick={() => setAuditLogOpen(v => !v)}
+      >
+        <div>
+          <div className="inline-badges">
+            <strong>Auto-approved audit log ({autoApprovedApprovals.length})</strong>
+            <span className="badge badge-complete">{approvalPolicyMeta[run.approvalPolicy ?? 'auto_review'].label}</span>
+          </div>
+          <p className="muted xs" style={{ marginTop: 3 }}>
+            Full transparency log of Tier 3 probes auto-approved by deterministic rules, Safety Judge LLM, or YOLO mode.
+          </p>
+        </div>
+        <span className={`disclosure-chevron${auditLogOpen ? ' open' : ''}`} aria-hidden="true">▾</span>
+      </button>
+      {auditLogOpen && <div className="disclosure-card-body">
+        <div className="table-scroll">
+          <table className="compact-table audit-log-table">
+            <thead>
+              <tr>
+                <th scope="col">Method</th>
+                <th scope="col">Target</th>
+                <th scope="col">Approved By</th>
+                <th scope="col">Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {autoApprovedApprovals.map(item => {
+                const badge = autoApprovalBadge(item.decidedBy)
+                return <tr key={item.id}>
+                  <td><span className="badge">{item.method}</span></td>
+                  <td className="mono xs"><strong>{safeHost(item.origin)}</strong>{item.pathAndQuery}</td>
+                  <td><span className={badge.className}>{badge.label}</span></td>
+                  <td className="muted xs">{item.policyNote || item.rationale}</td>
+                </tr>
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>}
     </section>}
 
     {run.phase === 'consent' && <form className="workflow-callout" onSubmit={event => {
@@ -533,6 +615,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
           consent: true,
           saveProject: form.has('defaultScope'),
           capabilityTier: review.capabilityTier,
+          approvalPolicy: review.approvalPolicy,
           approvedPersonaIds: review.capabilityTier >= 2 ? review.approvedPersonaIds : [],
           budgetUsd: review.budgetUsd,
           budgetRequests: review.budgetRequests,
@@ -591,6 +674,17 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
                 </NativeSelect>
                 <span className="muted">{capabilityTierMeta[review.capabilityTier].summary}</span>
               </label>
+              {review.capabilityTier === 3 && <label>Tier 3 Approval Policy
+                <NativeSelect value={review.approvalPolicy} disabled={pending} onChange={event => {
+                  const nextPolicy = event.target.value as ApprovalPolicy
+                  setDraft(current => current && { ...current, approvalPolicy: nextPolicy })
+                }}>
+                  {approvalPolicies.map(policy => (
+                    <option key={policy} value={policy}>{approvalPolicyMeta[policy].optionLabel}</option>
+                  ))}
+                </NativeSelect>
+                <span className="muted">{approvalPolicyMeta[review.approvalPolicy].summary}</span>
+              </label>}
               <div className="field-grid-3">
                 <label>Budget (USD)
                   <Input type="number" min={0.1} max={500} step="any" disabled={pending}

@@ -1162,6 +1162,38 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 }
 .threat-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
 
+/* Tier 3 Approval Policy Selector, Header Switcher & Audit Trail */
+.policy-selector-box {
+  padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--surface); display: grid; gap: 10px;
+}
+.policy-option-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px;
+}
+.policy-option {
+  appearance: none; text-align: left; border: 1px solid var(--line); background: var(--paper);
+  color: var(--text); border-radius: 8px; padding: 10px 12px; cursor: pointer;
+  display: grid; gap: 5px; align-content: start; white-space: normal;
+}
+.policy-option:hover { border-color: var(--line-strong); background: var(--selection); }
+.policy-option.active {
+  border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent);
+}
+.policy-option-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;
+}
+.policy-popover { width: 340px; }
+.policy-popover-list { display: grid; gap: 6px; }
+.policy-popover-item {
+  appearance: none; text-align: left; border: 1px solid var(--line); background: var(--surface);
+  color: var(--text); border-radius: 8px; padding: 8px 10px; cursor: pointer;
+  display: grid; gap: 4px; white-space: normal;
+}
+.policy-popover-item:hover:not(:disabled) { border-color: var(--line-strong); background: var(--selection); }
+.policy-popover-item.active { border-color: var(--accent); background: var(--accent-soft); cursor: default; }
+.approval-stack-head { padding: 4px 2px 2px; }
+.audit-log-table td, .audit-log-table th { vertical-align: top; }
+
 /* Responsive */
 @media (max-width: 900px) {
   .run-page { height: auto; min-height: calc(100dvh - 48px); overflow: visible; }

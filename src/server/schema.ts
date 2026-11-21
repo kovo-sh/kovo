@@ -1,10 +1,11 @@
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import type {
-  AssessmentCheckId, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
+  ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
   CodeLocation, DnsSource, DynamicRetestVerdict, EvidenceSummary, Finding, LabConfig,
-  OwaspCategory, PatchProposalStatus, Phase, PreparedObservation, ReportBody, ReviewPlan,
-  RunStatus, ThinkingLevel, ThreatModelSummary, VerificationTier, WorkerPhase, WorkerStatus,
+  OwaspCategory, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, Phase,
+  PreparedObservation, ReportBody, ReviewPlan, RunStatus, ThinkingLevel, ThreatModelSummary,
+  VerificationTier, WorkerPhase, WorkerStatus,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 
@@ -76,8 +77,9 @@ export const personas = sqliteTable('personas', {
   handle: text('handle').notNull(),
   roleLabel: text('role_label').notNull(),
   originAllowlist: text('origin_allowlist', { mode: 'json' }).$type<string[]>().notNull(),
-  authKind: text('auth_kind').$type<'cookie' | 'bearer' | 'header'>().notNull(),
+  authKind: text('auth_kind').$type<PersonaAuthKind>().notNull(),
   headerName: text('header_name'),
+  loginConfig: text('login_config', { mode: 'json' }).$type<PersonaLoginConfig | null>(),
   credentialId: text('credential_id').notNull(),
   canaryMarkers: text('canary_markers', { mode: 'json' }).$type<string[]>().notNull(),
   createdAt: integer('created_at').notNull(),
@@ -96,6 +98,8 @@ export const runs = sqliteTable('runs', {
   status: text('status').$type<RunStatus>().notNull(),
   sourceMode: text('source_mode').$type<'prepared' | 'public'>().default('public').notNull(),
   capabilityTier: integer('capability_tier').$type<CapabilityTier>().default(1).notNull(),
+  approvalPolicy: text('approval_policy').$type<ApprovalPolicy>().default('auto_review').notNull(),
+  approvedEndpointPatterns: text('approved_endpoint_patterns', { mode: 'json' }).$type<ApprovedEndpointPattern[]>().notNull(),
   approvedPersonaIds: text('approved_persona_ids', { mode: 'json' }).$type<string[]>().notNull(),
   roundNo: integer('round_no').default(0).notNull(),
   budgetUsd: real('budget_usd').default(25).notNull(),
@@ -249,6 +253,8 @@ export const approvalRequests = sqliteTable('approval_requests', {
   status: text('status').$type<'pending' | 'approved' | 'denied' | 'expired' | 'canceled'>().notNull(),
   decidedBy: text('decided_by'),
   decidedAt: integer('decided_at'),
+  policyNote: text('policy_note'),
+  riskLevel: text('risk_level').$type<'low' | 'medium' | 'high'>(),
   expiresAt: integer('expires_at').notNull(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('approval_requests_run').on(table.runId, table.status)])

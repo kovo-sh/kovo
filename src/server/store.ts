@@ -23,6 +23,8 @@ import {
   workerHistory,
 } from '../domain.ts'
 import type {
+  ApprovalPolicy,
+  ApprovedEndpointPattern,
   CallerCompatibility,
   Candidate,
   CapabilityTier,
@@ -58,6 +60,8 @@ import {
   suppliedResponseLabel,
 } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
+import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-judge.ts'
+import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { listProjectPersonas } from './persona-vault.ts'
 import { redact, redactHeaders } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -273,6 +277,17 @@ export class Store {
 
     // projects v3 columns
     ensureColumn('projects', 'lab_config', 'TEXT')
+
+    // personas v3 columns
+    ensureColumn('personas', 'login_config', 'TEXT')
+
+    // runs v3 Tier 3 approval policy columns
+    ensureColumn('runs', 'approval_policy', "TEXT NOT NULL DEFAULT 'auto_review'")
+    ensureColumn('runs', 'approved_endpoint_patterns', "TEXT NOT NULL DEFAULT '[]'")
+
+    // approval_requests v3 audit trail columns
+    ensureColumn('approval_requests', 'policy_note', 'TEXT')
+    ensureColumn('approval_requests', 'risk_level', 'TEXT')
 
     // findings v3 columns
     ensureColumn('findings', 'verification_tier', 'TEXT')
@@ -601,6 +616,7 @@ export class Store {
         status: tables.runs.status,
         phase: tables.runs.phase,
         capabilityTier: tables.runs.capabilityTier,
+        approvalPolicy: tables.runs.approvalPolicy,
         spentUsd: tables.runs.spentUsd,
         spentRequests: tables.runs.spentRequests,
         turnsUsed: tables.runs.turnsUsed,
@@ -1278,6 +1294,8 @@ export class Store {
     personaHandle?: string | null
     rationale: string
     requestPreview: string
+    policyNote?: string | null
+    riskLevel?: ApprovalRiskLevel | null
     expiresInMs?: number
     secrets?: readonly NamedSecret[]
   }): ApprovalRequest {
@@ -1297,15 +1315,67 @@ export class Store {
       status: 'pending',
       decidedBy: null,
       decidedAt: null,
+      policyNote: input.policyNote ? redact(input.policyNote, secrets) : null,
+      riskLevel: input.riskLevel ?? null,
       expiresAt: now + (input.expiresInMs ?? 15 * 60_000),
       createdAt: now,
     }).returning().get()
     this.updateWorker(assignment.id, { status: 'waiting_approval' })
     this.event(run.id, 'approval.requested', `Tier 3 approval requested for ${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)}.`, {
       approvalId: row.id, assignmentId: assignment.id, origin: row.origin, method: row.method,
+      riskLevel: row.riskLevel, policyNote: row.policyNote,
     })
     this.message(run.id, run.coordinatorId, 'guardian',
       `Tier 3 approval required: ${row.method} ${row.origin}${row.pathAndQuery}\nRationale: ${row.rationale}`)
+    return row
+  }
+
+  recordAutoApprovalDecision(run: Run, assignment: Assignment, input: {
+    origin: string
+    method: string
+    pathAndQuery: string
+    personaHandle?: string | null
+    rationale: string
+    requestPreview: string
+    decision: 'approved' | 'denied'
+    decidedBy: Exclude<ApprovalDecidedBy, 'operator'>
+    riskLevel: ApprovalRiskLevel
+    policyNote: string
+    expiresInMs?: number
+    secrets?: readonly NamedSecret[]
+  }): ApprovalRequest {
+    const secrets = input.secrets ?? []
+    const now = Date.now()
+    const row = this.db.insert(tables.approvalRequests).values({
+      id: randomUUID(),
+      runId: run.id,
+      assignmentId: assignment.id,
+      scopeRevision: run.scopeRevision,
+      origin: input.origin,
+      method: input.method.toUpperCase(),
+      pathAndQuery: redact(input.pathAndQuery, secrets),
+      personaHandle: input.personaHandle ?? null,
+      rationale: redact(input.rationale, secrets),
+      requestPreview: redact(input.requestPreview, secrets),
+      status: input.decision,
+      decidedBy: input.decidedBy,
+      decidedAt: now,
+      policyNote: redact(input.policyNote, secrets),
+      riskLevel: input.riskLevel,
+      expiresAt: now + (input.expiresInMs ?? 15 * 60_000),
+      createdAt: now,
+    }).returning().get()
+    const kind = input.decision === 'approved' ? 'approval.auto_approved' : 'approval.auto_denied'
+    const verb = input.decision === 'approved' ? 'auto-approved' : 'auto-denied'
+    this.event(run.id, kind, `Tier 3 probe ${verb} (${input.decidedBy}) for ${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)}.`, {
+      approvalId: row.id,
+      assignmentId: assignment.id,
+      origin: row.origin,
+      method: row.method,
+      decidedBy: row.decidedBy,
+      riskLevel: row.riskLevel,
+      policyNote: row.policyNote,
+    })
     return row
   }
 
@@ -1335,15 +1405,145 @@ export class Store {
     }
     const updated = this.db.update(tables.approvalRequests).set({
       status: decision,
-      decidedBy: this.workspace.actorId,
+      decidedBy: 'operator',
       decidedAt: Date.now(),
     }).where(eq(tables.approvalRequests.id, approvalId)).returning().get()!
     this.event(run.id, 'approval.decided', `Tier 3 request ${decision} for ${updated.method} ${updated.origin}.`, {
-      approvalId: updated.id, assignmentId: updated.assignmentId, decision,
+      approvalId: updated.id, assignmentId: updated.assignmentId, decision, decidedBy: 'operator',
     })
     this.message(run.id, run.coordinatorId, 'guardian',
       `Tier 3 request ${decision}: ${updated.method} ${updated.origin}${updated.pathAndQuery}`)
     return updated
+  }
+
+  setApprovalPolicy(run: Run, approvalPolicy: ApprovalPolicy) {
+    if (['complete', 'stopped', 'failed'].includes(run.status)) {
+      throw new Error('Cannot change approval policy after a run has ended.')
+    }
+    const previous = run.approvalPolicy ?? 'auto_review'
+    this.updateRun(run.id, { approvalPolicy })
+    let autoApprovedCount = 0
+    if (approvalPolicy === 'yolo') {
+      const now = Date.now()
+      const pending = this.listApprovalRequests(run.id, 'pending')
+      for (const req of pending) {
+        if (req.scopeRevision !== run.scopeRevision) {
+          this.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
+            .where(eq(tables.approvalRequests.id, req.id)).run()
+          continue
+        }
+        this.db.update(tables.approvalRequests).set({
+          status: 'approved',
+          decidedBy: 'auto-yolo',
+          decidedAt: now,
+          riskLevel: 'low',
+          policyNote: 'Auto-approved when operator switched Tier 3 policy to YOLO autonomous mode.',
+        }).where(eq(tables.approvalRequests.id, req.id)).run()
+        autoApprovedCount += 1
+        this.event(run.id, 'approval.auto_approved', `Auto-approved ${req.method} ${req.origin}${req.pathAndQuery.slice(0, 80)} via YOLO policy switch.`, {
+          approvalId: req.id, assignmentId: req.assignmentId, decidedBy: 'auto-yolo',
+        })
+      }
+    }
+    this.event(run.id, 'approval.policy_changed', `Tier 3 approval policy switched from ${previous} to ${approvalPolicy}.`, {
+      previous, approvalPolicy, autoApprovedCount,
+    })
+    this.message(run.id, run.coordinatorId, 'guardian',
+      `Tier 3 approval policy updated to ${approvalPolicy}${autoApprovedCount > 0 ? ` (${autoApprovedCount} pending ${autoApprovedCount === 1 ? 'request' : 'requests'} auto-approved)` : ''}.`)
+  }
+
+  approveSimilarEndpoint(run: Run, approvalId: string) {
+    const existing = this.getApprovalRequest(run.id, approvalId)
+    const now = Date.now()
+    if (existing.status === 'pending') {
+      if (existing.scopeRevision !== run.scopeRevision) {
+        this.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
+          .where(eq(tables.approvalRequests.id, approvalId)).run()
+        throw new Error('Scope changed before this approval could be decided.')
+      }
+      this.db.update(tables.approvalRequests).set({
+        status: 'approved',
+        decidedBy: 'operator',
+        decidedAt: now,
+        policyNote: 'Approved by operator with similar endpoint pattern.',
+      }).where(eq(tables.approvalRequests.id, approvalId)).run()
+    } else if (existing.status !== 'approved') {
+      throw new Error(`Approval request is already ${existing.status}.`)
+    }
+
+    const pathPattern = normalizeApprovalPathPattern(existing.pathAndQuery)
+    const newPattern: ApprovedEndpointPattern = {
+      origin: existing.origin,
+      method: existing.method.toUpperCase(),
+      pathPattern,
+      scopeRevision: run.scopeRevision,
+      createdAt: now,
+    }
+    const currentPatterns = run.approvedEndpointPatterns ?? []
+    const alreadyStored = currentPatterns.some(p =>
+      p.origin === newPattern.origin &&
+      p.method.toUpperCase() === newPattern.method &&
+      p.pathPattern === newPattern.pathPattern &&
+      p.scopeRevision === newPattern.scopeRevision,
+    )
+    const nextPatterns = alreadyStored ? currentPatterns : [...currentPatterns, newPattern]
+    if (!alreadyStored) {
+      this.updateRun(run.id, { approvedEndpointPatterns: nextPatterns })
+    }
+
+    // Also approve any other pending requests matching this exact newly approved pattern
+    let matchedPendingCount = 0
+    for (const req of this.listApprovalRequests(run.id, 'pending')) {
+      if (req.id === approvalId || req.scopeRevision !== run.scopeRevision) continue
+      if (matchesApprovedEndpointPattern({ origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery }, [newPattern])) {
+        this.db.update(tables.approvalRequests).set({
+          status: 'approved',
+          decidedBy: 'auto-review:rule',
+          decidedAt: now,
+          riskLevel: 'low',
+          policyNote: `Auto-approved via operator-approved pattern ${newPattern.method} ${newPattern.pathPattern}.`,
+        }).where(eq(tables.approvalRequests.id, req.id)).run()
+        matchedPendingCount += 1
+      }
+    }
+
+    this.event(run.id, 'approval.pattern_approved', `Approved similar probes matching ${newPattern.method} ${newPattern.origin}${newPattern.pathPattern}.`, {
+      approvalId: existing.id,
+      origin: newPattern.origin,
+      method: newPattern.method,
+      pathPattern: newPattern.pathPattern,
+      matchedPendingCount,
+    })
+    this.message(run.id, run.coordinatorId, 'guardian',
+      `Approved ${existing.method} ${existing.origin}${existing.pathAndQuery} and future probes matching ${newPattern.method} ${newPattern.pathPattern}.`)
+  }
+
+  approveAllPending(run: Run): number {
+    const now = Date.now()
+    const pending = this.listApprovalRequests(run.id, 'pending')
+    let approvedCount = 0
+    for (const req of pending) {
+      if (req.scopeRevision !== run.scopeRevision) {
+        this.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
+          .where(eq(tables.approvalRequests.id, req.id)).run()
+        continue
+      }
+      this.db.update(tables.approvalRequests).set({
+        status: 'approved',
+        decidedBy: 'operator',
+        decidedAt: now,
+        policyNote: 'Batch-approved by operator (Approve all pending).',
+      }).where(eq(tables.approvalRequests.id, req.id)).run()
+      approvedCount += 1
+    }
+    this.event(run.id, 'approval.batch_approved', `Operator batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'request' : 'requests'}.`, {
+      approvedCount,
+    })
+    if (approvedCount > 0) {
+      this.message(run.id, run.coordinatorId, 'guardian',
+        `Batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'probe' : 'probes'}.`)
+    }
+    return approvedCount
   }
 
   // --- Replay Specs, Retests, Coverage, Findings ---
@@ -1939,7 +2139,7 @@ export class Store {
     })
   }
 
-  createRun(input: z.output<typeof newRun>) {
+  createRun(input: Omit<z.output<typeof newRun>, 'approvalPolicy'> & { approvalPolicy?: ApprovalPolicy }) {
     return this.operate(input, () => {
       const project = this.project(input.projectId)
       const goal = redact(input.goal)
@@ -1962,6 +2162,8 @@ export class Store {
         status: 'waiting',
         sourceMode: input.sourceMode,
         capabilityTier,
+        approvalPolicy: input.approvalPolicy ?? 'auto_review',
+        approvedEndpointPatterns: [],
         approvedPersonaIds,
         roundNo: 0,
         budgetUsd: input.budgetUsd ?? defaultBudgetUsd,
@@ -1977,7 +2179,11 @@ export class Store {
         approved: [],
         createdAt: Date.now(),
       }).returning().get()
-      this.event(run.id, 'run.created', 'Run created.', { capabilityTier, sourceMode: input.sourceMode })
+      this.event(run.id, 'run.created', 'Run created.', {
+        capabilityTier,
+        approvalPolicy: run.approvalPolicy,
+        sourceMode: input.sourceMode,
+      })
       const goalMessageId = this.message(run.id, run.coordinatorId, 'operator', goal)
       this.updateRun(run.id, { reviewPlan: { status: 'pending', goalMessageId } })
       return { id: run.id }
@@ -2402,6 +2608,7 @@ export class Store {
       reviewPlan,
       capabilityTier,
       approvedPersonaIds,
+      ...(cmd.approvalPolicy !== undefined ? { approvalPolicy: cmd.approvalPolicy } : {}),
       ...(cmd.budgetUsd !== undefined ? { budgetUsd: cmd.budgetUsd } : {}),
       ...(cmd.budgetRequests !== undefined ? { budgetRequests: cmd.budgetRequests } : {}),
       ...(cmd.maxRpsPerOrigin !== undefined ? { maxRpsPerOrigin: cmd.maxRpsPerOrigin } : {}),
@@ -2764,6 +2971,15 @@ export class Store {
         }
         case 'decide_approval':
           this.decideApproval(run, input.approvalId, input.decision)
+          break
+        case 'set_approval_policy':
+          this.setApprovalPolicy(run, input.approvalPolicy)
+          break
+        case 'approve_similar_endpoint':
+          this.approveSimilarEndpoint(run, input.approvalId)
+          break
+        case 'approve_all_pending':
+          this.approveAllPending(run)
           break
         case 'cancel_step': {
           const step = this.db.select().from(tables.chainSteps).where(and(

@@ -1383,7 +1383,10 @@ export class RequestBroker {
         const injected = buildPersonaHeader(persona, initialOrigin)
         if (!injected) {
           grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+          if (!persona.originAllowlist.includes(initialOrigin)) {
+            throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+          }
+          throw new BrokerDenied(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
         }
         resolvedPersonaHeaders = injected
       } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
@@ -1874,7 +1877,10 @@ export class RequestBroker {
         const injected = buildPersonaHeader(persona, initialOrigin)
         if (!injected) {
           grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+          if (!persona.originAllowlist.includes(initialOrigin)) {
+            throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+          }
+          throw new BrokerDenied(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
         }
         resolvedPersonaHeaders = injected
       } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {

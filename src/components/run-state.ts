@@ -1,5 +1,5 @@
 import type { runData } from '../actions.ts'
-import type { CapabilityTier, OwaspCategory, Phase, WorkerPhase } from '../domain.ts'
+import type { ApprovalPolicy, CapabilityTier, OwaspCategory, Phase, WorkerPhase } from '../domain.ts'
 
 export type RunDetail = Awaited<ReturnType<typeof runData>>
 export type Worker = RunDetail['assignments'][number]
@@ -43,7 +43,33 @@ export const capabilityTierMeta: Record<CapabilityTier, { name: string; short: s
   3: {
     name: 'Tier 3 · Approval-Gated State & Execution',
     short: 'Tier 3 · Approval-Gated',
-    summary: 'Tier 2 plus blocking HITL approval cards for non-idempotent state probes and strictly non-destructive RCE proof-of-execution.',
+    summary: 'Tier 2 plus policy-gated state probes and strictly non-destructive RCE proof-of-execution.',
+  },
+}
+
+export const approvalPolicyMeta: Record<ApprovalPolicy, {
+  label: string
+  short: string
+  optionLabel: string
+  summary: string
+}> = {
+  auto_review: {
+    label: 'Auto-Review',
+    short: 'Auto-Review',
+    optionLabel: 'Auto-Review (Recommended)',
+    summary: 'Fast-paths benign/read-only probes, evaluates grey-area writes via an independent Safety-Judge LLM, and always escalates DELETE, uploads, billing/admin, and RCE probes.',
+  },
+  yolo: {
+    label: 'YOLO',
+    short: 'YOLO',
+    optionLabel: 'YOLO (Autonomous)',
+    summary: 'Auto-approves all in-scope Tier 3 probes with full audit logging. Hard broker invariants (scope, SSRF/RFC1918 block, destructive/webshell denylist, RPS cap, circuit breakers) remain enforced.',
+  },
+  strict: {
+    label: 'Strict',
+    short: 'Strict',
+    optionLabel: 'Strict (Manual HITL)',
+    summary: 'Every Tier 3 state-changing probe pauses and requires explicit manual operator approval.',
   },
 }
 

@@ -26,6 +26,7 @@ import type {
 import { declarativeReplaySpecSchema, replaySpecOrigins } from '../replay-spec.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
+import { evaluateTier3Approval, matchesApprovedEndpointPattern } from './approval-judge.ts'
 import {
   agentTurn,
   chainPlannerPrompt,
@@ -75,6 +76,7 @@ import {
 } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { generateAndReviewPatch } from './patch-workflow.ts'
+import { PersonaAuthManager } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact } from './redact.ts'
@@ -638,6 +640,7 @@ export interface ExecutionOptions {
   browser?: ScopedBrowser
   canaryBroker?: CanaryBroker
   backend?: WorkerBackend
+  personaAuth?: PersonaAuthManager
 }
 
 export class Execution {
@@ -646,6 +649,7 @@ export class Execution {
   readonly browser: ScopedBrowser
   readonly canaryBroker: CanaryBroker
   readonly backend: WorkerBackend
+  readonly personaAuth: PersonaAuthManager
   readonly compactor: ColdGraphCompactor
   private readonly active = new Map<string, Active>()
   private readonly coordinator = new Map<string, CoordinatorTask>()
@@ -657,6 +661,8 @@ export class Execution {
   private readonly synthesizedSignature = new Map<string, string>()
   private readonly recordedPersonaResources = new Map<string, Set<string>>()
   private readonly circuitNotified = new Set<string>()
+  private readonly runAuthStarted = new Map<string, string>()
+  private readonly runAuthInFlight = new Map<string, AbortController>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -670,6 +676,7 @@ export class Execution {
     this.backend = options.backend ?? new LinuxWorkerBackend({
       workspace: { id: storage.workspace.id, directory: storage.directory },
     })
+    this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.compactor = new ColdGraphCompactor({
       onProfileSuccess: id => recordProfileSuccess(id, this.storage),
       onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
@@ -729,6 +736,10 @@ export class Execution {
     for (const task of this.coordinator.values()) task.controller.abort()
     for (const task of this.threatModeling.values()) task.controller.abort()
     for (const task of this.plannerTasks.values()) task.controller.abort()
+    for (const ctrl of this.runAuthInFlight.values()) ctrl.abort()
+    this.runAuthInFlight.clear()
+    this.runAuthStarted.clear()
+    this.personaAuth.stopAll()
     await this.canaryBroker.stopListener().catch(() => undefined)
   }
 
@@ -836,6 +847,12 @@ export class Execution {
         if (allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' && fresh.capabilityTier >= 3) {
           return true
         }
+        const activePatterns = (fresh.approvedEndpointPatterns ?? []).filter(
+          p => p.scopeRevision === undefined || p.scopeRevision === fresh.scopeRevision,
+        )
+        if (matchesApprovedEndpointPattern({ origin, method, pathAndQuery }, activePatterns)) {
+          return true
+        }
         const now = Date.now()
         const rows = this.storage.db.select().from(approvalRequests).where(and(
           eq(approvalRequests.runId, run.id),
@@ -896,18 +913,86 @@ export class Execution {
       personaHandle?: string | null
       rationale: string
       requestPreview: string
+      bodyPreview?: string | null
+      headers?: Record<string, string>
+      hasMultipart?: boolean
+      isRceProof?: boolean
+      isRaceBurst?: boolean
       secrets: readonly NamedSecret[]
     },
     signal: AbortSignal,
-  ): Promise<boolean> {
+  ): Promise<{ approved: boolean; deniedReason?: string }> {
     const run = this.check(job)
     const project = this.storage.project(run.projectId)
     if (project.environment === 'local-lab' && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' && run.capabilityTier >= 3) {
-      return true
+      return { approved: true }
     }
     if (run.capabilityTier < 3) {
       throw new BrokerDenied('This operation requires Capability Tier 3.')
     }
+
+    const activePatterns = (run.approvedEndpointPatterns ?? []).filter(
+      p => p.scopeRevision === undefined || p.scopeRevision === run.scopeRevision,
+    )
+    const evaluation = await evaluateTier3Approval({
+      policy: run.approvalPolicy ?? 'auto_review',
+      origin: input.origin,
+      method: input.method,
+      pathAndQuery: input.pathAndQuery,
+      personaHandle: input.personaHandle ?? null,
+      rationale: input.rationale,
+      bodyPreview: input.bodyPreview ?? null,
+      headers: input.headers,
+      hasMultipart: input.hasMultipart,
+      isRceProof: input.isRceProof,
+      isRaceBurst: input.isRaceBurst,
+      environment: project.environment,
+      approvedPatterns: activePatterns,
+      profiles: privateModelProfiles(),
+      signal,
+      secrets: input.secrets,
+      onUsage: usage => {
+        this.storage.recordLlmSpend(run.id, {
+          usd: usage.costUsd,
+          tokens: usage.inputTokens + usage.outputTokens,
+        })
+      },
+    })
+
+    if (evaluation.decision === 'approve') {
+      this.storage.recordAutoApprovalDecision(run, job.assignment, {
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        personaHandle: input.personaHandle,
+        rationale: input.rationale,
+        requestPreview: input.requestPreview,
+        decision: 'approved',
+        decidedBy: evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy,
+        riskLevel: evaluation.riskLevel,
+        policyNote: evaluation.reason,
+        secrets: input.secrets,
+      })
+      return { approved: true }
+    }
+
+    if (evaluation.decision === 'deny') {
+      this.storage.recordAutoApprovalDecision(run, job.assignment, {
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        personaHandle: input.personaHandle,
+        rationale: input.rationale,
+        requestPreview: input.requestPreview,
+        decision: 'denied',
+        decidedBy: 'auto-review:judge',
+        riskLevel: evaluation.riskLevel,
+        policyNote: evaluation.reason,
+        secrets: input.secrets,
+      })
+      return { approved: false, deniedReason: evaluation.reason }
+    }
+
     const req = this.storage.createApprovalRequest(run, job.assignment, {
       origin: input.origin,
       method: input.method,
@@ -915,6 +1000,8 @@ export class Execution {
       personaHandle: input.personaHandle,
       rationale: input.rationale,
       requestPreview: input.requestPreview,
+      policyNote: evaluation.reason,
+      riskLevel: evaluation.riskLevel,
       secrets: input.secrets,
     })
 
@@ -965,7 +1052,7 @@ export class Execution {
     if (this.authorize(job)) {
       this.storage.updateWorker(job.assignment.id, { status: 'running' })
     }
-    return decision === 'approved'
+    return { approved: decision === 'approved' }
   }
 
   // --- Event-Driven Scheduler ---
@@ -996,6 +1083,30 @@ export class Execution {
       if (!this.currentCoordinator(runId, task)) task.controller.abort()
     }
 
+    // Stop background login-persona session refreshers for any run that paused, stopped, failed, or completed
+    for (const runId of [...this.runAuthStarted.keys()]) {
+      try {
+        const current = this.storage.run(runId)
+        if (current.status !== 'running' || current.phase === 'complete') {
+          this.personaAuth.stopRunRefreshers(runId)
+          this.runAuthStarted.delete(runId)
+        }
+      } catch {
+        this.personaAuth.stopRunRefreshers(runId)
+        this.runAuthStarted.delete(runId)
+      }
+    }
+    for (const [runId, ctrl] of [...this.runAuthInFlight.entries()]) {
+      try {
+        const current = this.storage.run(runId)
+        if (current.status !== 'running') {
+          ctrl.abort()
+        }
+      } catch {
+        ctrl.abort()
+      }
+    }
+
     // 2. Dispatch pending one-click Verify Fix retests (works even on completed runs, Zero-LLM!)
     for (const run of this.storage.runsWithPendingRetests()) {
       const retests = this.storage.workerList(run.id).filter(w => w.phase === 'retest' && w.status === 'queued')
@@ -1012,6 +1123,16 @@ export class Execution {
 
       if (profiles.length) {
         this.startCoordinator(run, profiles)
+      }
+
+      if (
+        run.capabilityTier >= 2 &&
+        run.approvedPersonaIds.length > 0 &&
+        (run.phase === 'threat_model' || run.phase === 'investigation' || run.phase === 'verification') &&
+        this.needsLoginPersonaAuth(run)
+      ) {
+        this.ensureRunPersonasAuthenticated(run)
+        continue
       }
 
       if (run.phase === 'threat_model') {
@@ -1031,6 +1152,78 @@ export class Execution {
         continue
       }
     }
+  }
+
+  private runAuthKey(run: Run): string {
+    return `${run.scopeRevision}:${[...run.approvedPersonaIds].sort().join(',')}`
+  }
+
+  private needsLoginPersonaAuth(run: Run): boolean {
+    const key = this.runAuthKey(run)
+    if (this.runAuthStarted.get(run.id) === key) return false
+    try {
+      const resolved = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
+      return [...resolved.values()].some(p => p.authKind === 'login')
+    } catch {
+      return false
+    }
+  }
+
+  private ensureRunPersonasAuthenticated(run: Run): void {
+    if (this.runAuthInFlight.has(run.id)) return
+    const key = this.runAuthKey(run)
+    const controller = new AbortController()
+    this.runAuthInFlight.set(run.id, controller)
+
+    void this.personaAuth.startRunRefreshers(
+      this.storage,
+      run.id,
+      run.projectId,
+      run.approvedPersonaIds,
+      controller.signal,
+    ).then(() => {
+      try {
+        const current = this.storage.run(run.id)
+        if (current.status === 'running' && this.runAuthKey(current) === key) {
+          this.runAuthStarted.set(run.id, key)
+        } else {
+          this.personaAuth.stopRunRefreshers(run.id)
+        }
+      } catch {
+        this.personaAuth.stopRunRefreshers(run.id)
+      }
+    }).catch(error => {
+      this.personaAuth.stopRunRefreshers(run.id)
+      if (controller.signal.aborted) return
+      let secrets: NamedSecret[] = []
+      try {
+        secrets = personaSecrets(resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds))
+      } catch {
+        secrets = []
+      }
+      const msg = redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 320)
+      try {
+        this.storage.transaction(() => {
+          const current = this.storage.run(run.id)
+          if (current.status !== 'running') return
+          this.storage.setStatus(current, 'paused')
+          this.storage.event(run.id, 'persona.auth_failed', `Persona login failed; run paused: ${msg}`, {
+            error: msg,
+          })
+          this.storage.message(
+            run.id,
+            run.coordinatorId,
+            'guardian',
+            `Paused run because Email + Password persona authentication failed: ${msg}`,
+          )
+        })
+      } catch {
+        // Ignore if run/storage closed
+      }
+    }).finally(() => {
+      this.runAuthInFlight.delete(run.id)
+      this.scheduleWake()
+    })
   }
 
   // --- Phase 1: Round-0 Threat Model & Initial Baseline Checks ---
@@ -2242,7 +2435,7 @@ export class Execution {
           res = await runHttp()
         } catch (err) {
           if (err instanceof BrokerApprovalRequired) {
-            const approved = await this.waitForTier3Approval(job, {
+            const approval = await this.waitForTier3Approval(job, {
               origin: err.origin,
               method: err.method,
               pathAndQuery: err.pathAndQuery,
@@ -2251,10 +2444,20 @@ export class Execution {
               requestPreview: JSON.stringify({
                 method: args.method, origin: args.origin, pathAndQuery: args.pathAndQuery,
                 persona: args.persona, headers, bodyPreview: body?.slice(0, 500),
+                ...(args.multipartParts?.length ? { multipartPartsCount: args.multipartParts.length } : {}),
               }, null, 2),
-              secrets,
+              bodyPreview: body,
+              headers,
+              hasMultipart: Boolean(args.multipartParts?.length),
+              secrets: currentSecrets(),
             }, signal)
-            if (!approved) throw new BrokerDenied('Tier 3 request was denied or expired.')
+            if (!approval.approved) {
+              throw new BrokerDenied(
+                approval.deniedReason
+                  ? `Tier 3 Safety Judge denied probe: ${approval.deniedReason}`
+                  : 'Tier 3 request was denied or expired.',
+              )
+            }
             res = await runHttp()
           } else {
             throw err
@@ -2339,7 +2542,7 @@ export class Execution {
           burst = await this.broker.executeRaceBurst(brokerReqs, grant, signal)
         } catch (err) {
           if (err instanceof BrokerApprovalRequired) {
-            const approved = await this.waitForTier3Approval(job, {
+            const approval = await this.waitForTier3Approval(job, {
               origin: err.origin,
               method: err.method,
               pathAndQuery: err.pathAndQuery,
@@ -2349,9 +2552,18 @@ export class Execution {
                 count: args.requests.length,
                 sample: args.requests[0],
               }, null, 2),
+              bodyPreview: brokerReqs[0]?.body,
+              headers: brokerReqs[0]?.headers,
+              isRaceBurst: true,
               secrets: currentSecrets(),
             }, signal)
-            if (!approved) throw new BrokerDenied('Tier 3 race-burst request was denied or expired.')
+            if (!approval.approved) {
+              throw new BrokerDenied(
+                approval.deniedReason
+                  ? `Tier 3 Safety Judge denied race-burst probe: ${approval.deniedReason}`
+                  : 'Tier 3 race-burst request was denied or expired.',
+              )
+            }
             burst = await this.broker.executeRaceBurst(brokerReqs, grant, signal)
           } else {
             throw err
@@ -3555,16 +3767,26 @@ export class Execution {
               fetchStep: specRow.spec.fetchStep.request.pathAndQuery,
             }, null, 2),
           }
-      const approved = await this.waitForTier3Approval(job, {
+      const approval = await this.waitForTier3Approval(job, {
         ...gateReq,
+        bodyPreview: specRow.spec.kind === 'rce_proof'
+          ? (specRow.spec.probeStep.request.textBody ??
+              (specRow.spec.probeStep.request.jsonBody !== undefined
+                ? JSON.stringify(specRow.spec.probeStep.request.jsonBody)
+                : undefined))
+          : specRow.spec.uploadStep.contentTemplate,
+        hasMultipart: specRow.spec.kind === 'upload_probe',
+        isRceProof: specRow.spec.kind === 'rce_proof',
         secrets,
       }, job.controller.signal)
-      if (!approved) {
+      if (!approval.approved) {
         const current = this.check(job)
         const updatedFinding: Finding = {
           ...findingRow.finding,
           status: 'inconclusive',
-          reason: `Tier 3 approval for ${specRow.spec.kind} verification was denied or expired.`,
+          reason: approval.deniedReason
+            ? `Tier 3 Safety Judge denied ${specRow.spec.kind} verification: ${approval.deniedReason}`
+            : `Tier 3 approval for ${specRow.spec.kind} verification was denied or expired.`,
           confidence: 'low',
         }
         this.storage.upsertChainFinding(current, findingRow.assetId, updatedFinding, specRow.id, specRow.sourceOrigins)

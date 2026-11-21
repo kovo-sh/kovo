@@ -25,6 +25,17 @@ export const maxWorkerConcurrency = 16
 export const capabilityTiers = [0, 1, 2, 3] as const
 export type CapabilityTier = typeof capabilityTiers[number]
 
+export const approvalPolicies = ['auto_review', 'yolo', 'strict'] as const
+export type ApprovalPolicy = typeof approvalPolicies[number]
+
+export interface ApprovedEndpointPattern {
+  origin: string
+  method: string
+  pathPattern: string
+  scopeRevision?: number
+  createdAt?: number
+}
+
 export const thinkingLevels = ['off', 'low', 'medium', 'high'] as const
 export type ThinkingLevel = typeof thinkingLevels[number]
 
@@ -211,6 +222,7 @@ export const newRun = z.object({
   goal: goalText,
   sourceMode: z.enum(['prepared', 'public']).default('public'),
   capabilityTier: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]).default(1),
+  approvalPolicy: z.enum(approvalPolicies).default('auto_review'),
   approvedPersonaIds: z.array(id).max(32).optional(),
   budgetUsd: z.number().min(0.1).max(500).default(defaultBudgetUsd),
   budgetRequests: z.number().int().min(0).max(maxBudgetRequests).default(defaultBudgetRequests),
@@ -270,16 +282,64 @@ export const importProjectSpec = z.object({
 
 export const personaHandle = z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,47}$/)
 
+export const personaAuthKinds = ['login', 'cookie', 'bearer', 'header'] as const
+export type PersonaAuthKind = typeof personaAuthKinds[number]
+
+export const personaLoginAdapters = ['auto', 'clerk', 'supabase', 'json', 'form'] as const
+export type PersonaLoginAdapter = typeof personaLoginAdapters[number]
+
+const personaLoginUrl = z.string().trim().max(500).transform((input, ctx) => {
+  if (!input) return undefined
+  try {
+    const url = new URL(input)
+    if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) {
+      throw new Error()
+    }
+    return url.toString()
+  } catch {
+    ctx.addIssue({ code: 'custom', message: 'Enter a valid HTTP(S) login URL.' })
+    return z.NEVER
+  }
+})
+
+export const personaLoginConfigSchema = z.object({
+  adapter: z.enum(personaLoginAdapters).default('auto'),
+  email: z.string().trim().min(1).max(320),
+  loginUrl: personaLoginUrl.optional(),
+  emailField: z.string().trim().min(1).max(64).optional(),
+  passwordField: z.string().trim().min(1).max(64).optional(),
+  tokenJsonPath: z.string().trim().min(1).max(160).optional(),
+  refreshIntervalSec: z.number().int().min(10).max(3600).optional(),
+})
+export type PersonaLoginConfig = z.output<typeof personaLoginConfigSchema>
+
 export const createPersona = z.object({
   requestId: id,
   projectId: id,
   handle: personaHandle,
   roleLabel: shortText,
-  originAllowlist: z.array(assetOrigin).min(1).max(64),
-  authKind: z.enum(['cookie', 'bearer', 'header']),
+  originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
+  authKind: z.enum(personaAuthKinds),
   headerName: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/).optional(),
-  secret: z.string().trim().min(1).max(4096),
+  loginConfig: personaLoginConfigSchema.optional(),
+  secret: z.string().min(1).max(4096),
   canaryMarkers: z.array(shortText).max(16).default([]),
+}).superRefine((val, ctx) => {
+  if (val.authKind === 'login') {
+    if (!val.loginConfig) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['loginConfig'],
+        message: 'Email and login configuration are required for Email + Password personas.',
+      })
+    }
+  } else if (!val.secret.trim()) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['secret'],
+      message: 'Credential secret is required.',
+    })
+  }
 })
 
 export const deletePersona = z.object({
@@ -298,6 +358,7 @@ export const runCommand = z.discriminatedUnion('action', [
     consent: z.literal(true),
     saveProject: z.boolean().optional(),
     capabilityTier: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]).optional(),
+    approvalPolicy: z.enum(approvalPolicies).optional(),
     approvedPersonaIds: z.array(id).max(32).optional(),
     budgetUsd: z.number().min(0.1).max(500).optional(),
     budgetRequests: z.number().int().min(0).max(maxBudgetRequests).optional(),
@@ -308,6 +369,9 @@ export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({ action: z.literal('message'), message: goalText }),
   commandBase.extend({ action: z.literal('inject_hint'), hint: goalText, targetAssetId: id.optional() }),
   commandBase.extend({ action: z.literal('decide_approval'), approvalId: id, decision: z.enum(['approved', 'denied']) }),
+  commandBase.extend({ action: z.literal('set_approval_policy'), approvalPolicy: z.enum(approvalPolicies) }),
+  commandBase.extend({ action: z.literal('approve_similar_endpoint'), approvalId: id }),
+  commandBase.extend({ action: z.literal('approve_all_pending') }),
   commandBase.extend({ action: z.literal('cancel_step'), stepId: id }),
   commandBase.extend({
     action: z.literal('raise_budget'),
@@ -621,8 +685,9 @@ export interface PublicPersona {
   handle: string
   roleLabel: string
   originAllowlist: string[]
-  authKind: 'cookie' | 'bearer' | 'header'
+  authKind: PersonaAuthKind
   headerName: string | null
+  loginConfig: PersonaLoginConfig | null
   canaryMarkers: string[]
   createdAt: number
 }
