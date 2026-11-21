@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -22,6 +22,7 @@ import type { Grant, PublicAddress } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { ColdGraphCompactor } from '../src/server/compactor.ts'
 import { queryCves } from '../src/server/cve-broker.ts'
+import { cloneGithubRepos, listMountedRepos, projectReposDir, syncGithubRepos } from '../src/server/github-connector.ts'
 import { privateModelProfiles, saveModelProfile } from '../src/server/model-settings.ts'
 import {
   createProjectPersona,
@@ -429,6 +430,37 @@ test('isolates persona secrets at 0600, strips auth on cross-origin redirect, an
   assert.ok(report)
   const markdown = exportReportMarkdown(storage, runId, report.id).content
   assert.ok(!markdown.includes(rawSecret), 'Raw persona secret leaked into Markdown export!')
+
+  // Live on-disk secret rotation (e.g., short-lived Clerk JWT refresh via atomic 0600 temp+rename):
+  // broker must immediately send the rotated token while still scrubbing BOTH old and new tokens!
+  const rotatedSecret = 'guardian-secret-token-rotated-99887766'
+  const { renameSync, writeFileSync } = await import('node:fs')
+  const personaFile = join(credDir, files[0])
+  const tmpFile = personaFile + '.tmp'
+  writeFileSync(tmpFile, rotatedSecret, { mode: 0o600 })
+  renameSync(tmpFile, personaFile)
+
+  let echoedAuth: string | undefined
+  const rotateBroker = new RequestBroker({
+    resolve: async () => [publicAddr],
+    transport: async (_url, _addr, _sig, opts) => {
+      echoedAuth = opts?.headers?.Authorization
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-echo-old': rawSecret, 'x-echo-new': rotatedSecret },
+        body: JSON.stringify({ old: rawSecret, fresh: rotatedSecret }),
+      }
+    },
+  })
+  const rotatedEx = await rotateBroker.executeHttp(
+    { origin: northstar, method: 'GET', pathAndQuery: '/rotated', persona: 'tenant_a' },
+    grant,
+    AbortSignal.timeout(5_000),
+  )
+  assert.equal(echoedAuth, 'Bearer ' + rotatedSecret)
+  const serializedRotated = JSON.stringify(rotatedEx)
+  assert.ok(!serializedRotated.includes(rawSecret), 'Previous persona secret leaked after rotation!')
+  assert.ok(!serializedRotated.includes(rotatedSecret), 'Rotated persona secret leaked!')
 })
 
 // ============================================================================
@@ -1296,4 +1328,224 @@ test('transitively taints downstream graph nodes on scope revocation, compacts c
   storage.command({ requestId: randomUUID(), runId, action: 'raise_budget', budgetUsd: 10.0, resume: true })
   assert.equal(storage.run(runId).status, 'running')
   assert.equal(storage.run(runId).budgetUsd, 10.0)
+})
+
+// ============================================================================
+// 10. Read-Only Cloned GitHub Repos Mounted at /repos Inside Air-Gapped Worker
+// ============================================================================
+
+test('clones full repos without .git/credentials, extracts deep lockfiles, and mounts /repos read-only without symlink escapes in Docker worker', { timeout: 45_000 }, async t => {
+  const workDir = mkdtempSync(join(tmpdir(), 'guardian-repos-test-'))
+  t.after(() => rmSync(workDir, { recursive: true, force: true }))
+
+  // 1. PAT 0600 permission check & invalid owner/repo validation
+  const patPath = join(workDir, 'github.pat')
+  const testPat = 'ghp_testSecretTokenValue1234567890'
+  writeFileSync(patPath, testPat + '\n', { mode: 0o644 })
+  chmodSync(patPath, 0o644)
+  await assert.rejects(
+    cloneGithubRepos(['acme/demo-app'], join(workDir, 'data', 'repos', 'proj-1'), AbortSignal.timeout(10_000), { patPath }),
+    /0600 permissions/,
+  )
+  chmodSync(patPath, 0o600)
+
+  await assert.rejects(
+    cloneGithubRepos(['../etc/passwd'], join(workDir, 'data', 'repos', 'proj-1'), AbortSignal.timeout(10_000), { patPath }),
+    /Invalid GitHub repository name/,
+  )
+
+  // 2. Verify HTTP clone authenticates via Authorization: Basic header (NEVER PAT in URL) and redacts PAT on failure
+  let seenAuthHeader = ''
+  let seenReqUrl = ''
+  const authServer = await httpFixture((req, res) => {
+    seenAuthHeader = String(req.headers.authorization ?? '')
+    seenReqUrl = String(req.url ?? '')
+    res.writeHead(403, { 'content-type': 'text/plain' }).end(`denied for ${testPat}`)
+  })
+  t.after(() => authServer.close())
+
+  await assert.rejects(
+    cloneGithubRepos(['acme/private-repo'], join(workDir, 'data', 'repos', 'proj-auth'), AbortSignal.timeout(10_000), {
+      patPath,
+      gitBaseUrl: authServer.url,
+    }),
+    err => {
+      const msg = err instanceof Error ? err.message : String(err)
+      assert.ok(!msg.includes(testPat), 'Raw PAT must never appear in git error messages.')
+      return /git clone failed/.test(msg)
+    },
+  )
+  const expectedBasic = 'Basic ' + Buffer.from(`x-access-token:${testPat}`, 'utf8').toString('base64')
+  assert.equal(seenAuthHeader, expectedBasic)
+  assert.ok(!seenReqUrl.includes(testPat), 'PAT must never be embedded in remote URL.')
+
+  // 3. Create a real local bare Git repo with >45 files and nested multi-ecosystem manifests/lockfiles
+  const gitOriginParent = join(workDir, 'git-origin')
+  const srcRepo = join(workDir, 'src-repo')
+  const bareRepo = join(gitOriginParent, 'acme', 'demo-app.git')
+  mkdirSync(srcRepo, { recursive: true })
+  mkdirSync(join(gitOriginParent, 'acme'), { recursive: true })
+
+  await exec('git', ['init', '-b', 'main', srcRepo])
+  await exec('git', ['-C', srcRepo, 'config', 'user.email', 'test@guardian.local'])
+  await exec('git', ['-C', srcRepo, 'config', 'user.name', 'Guardian Test'])
+
+  // Create >45 filler files so we prove no 40-file cap applies to full clone / dependency walk
+  mkdirSync(join(srcRepo, 'src', 'routes'), { recursive: true })
+  for (let i = 0; i < 45; i += 1) {
+    writeFileSync(join(srcRepo, 'src', 'routes', `route-${String(i).padStart(2, '0')}.ts`), `export const routeId = ${i}\n`)
+  }
+  mkdirSync(join(srcRepo, 'apps', 'admin', 'api'), { recursive: true })
+  writeFileSync(
+    join(srcRepo, 'apps', 'admin', 'api', 'auth.ts'),
+    'export function checkAdminHeader(req: Request) { return req.headers.get("x-internal-bypass") === "1" }\n',
+  )
+  writeFileSync(
+    join(srcRepo, 'package.json'),
+    JSON.stringify({ name: 'demo-app', dependencies: { next: '^14.2.0', express: '^4.19.0' } }, null, 2),
+  )
+  mkdirSync(join(srcRepo, 'packages', 'web'), { recursive: true })
+  writeFileSync(
+    join(srcRepo, 'packages', 'web', 'pnpm-lock.yaml'),
+    "lockfileVersion: '9.0'\npackages:\n  'next@14.2.20':\n    resolution: {integrity: sha512-x}\n",
+  )
+  mkdirSync(join(srcRepo, 'services', 'yarn-svc'), { recursive: true })
+  writeFileSync(
+    join(srcRepo, 'services', 'yarn-svc', 'yarn.lock'),
+    '"fastify@^4.28.0":\n  version "4.28.1"\n',
+  )
+  mkdirSync(join(srcRepo, 'services', 'py-svc'), { recursive: true })
+  writeFileSync(
+    join(srcRepo, 'services', 'py-svc', 'pyproject.toml'),
+    '[project]\nname = "py-svc"\ndependencies = [\n  "fastapi>=0.115.0",\n  "django==5.1.2",\n]\n',
+  )
+  mkdirSync(join(srcRepo, 'services', 'rust-svc'), { recursive: true })
+  writeFileSync(
+    join(srcRepo, 'services', 'rust-svc', 'Cargo.lock'),
+    '[[package]]\nname = "actix-web"\nversion = "4.9.0"\n',
+  )
+  mkdirSync(join(srcRepo, 'services', 'go-svc'), { recursive: true })
+  writeFileSync(
+    join(srcRepo, 'services', 'go-svc', 'go.sum'),
+    'github.com/gin-gonic/gin v1.10.0 h1:abc=\n',
+  )
+
+  await exec('git', ['-C', srcRepo, 'add', '.'])
+  await exec('git', ['-C', srcRepo, 'commit', '-m', 'initial commit'])
+  await exec('git', ['clone', '--bare', srcRepo, bareRepo])
+
+  // 4. Full shallow read-only clone via syncGithubRepos(..., { cloneDir })
+  const dataDir = join(workDir, 'workspace-data')
+  const projectId = 'proj-greybox-1'
+  const reposDir = projectReposDir(dataDir, projectId)
+  const synced = await syncGithubRepos(['acme/demo-app'], AbortSignal.timeout(20_000), {
+    patPath,
+    cloneDir: reposDir,
+    gitBaseUrl: `file://${gitOriginParent}`,
+  })
+
+  assert.equal(synced.length, 1)
+  const repo = synced[0]
+  assert.equal(repo.fullName, 'acme/demo-app')
+  assert.equal(repo.defaultBranch, 'main')
+  assert.equal(repo.mountPath, '/repos/acme/demo-app')
+  assert.ok(repo.treeCount >= 52, `Expected all >=52 files in full clone, got ${repo.treeCount}`)
+  assert.equal(existsSync(join(reposDir, 'acme', 'demo-app', '.git')), false, '.git must be stripped after checkout.')
+  assert.deepEqual(listMountedRepos(reposDir), ['/repos/acme/demo-app'])
+
+  // Verify ALL lockfiles/manifests across the full tree were parsed (no 40-file cap)
+  const hasDep = (eco: string, pkg: string, ver: string) =>
+    repo.dependencies.some(d => d.ecosystem === eco && d.package === pkg && d.version === ver)
+  assert.equal(hasDep('npm', 'next', '14.2.20'), true, 'Lockfile next@14.2.20 should override package.json range.')
+  assert.equal(hasDep('npm', 'fastify', '4.28.1'), true, 'yarn.lock fastify should be extracted.')
+  assert.equal(hasDep('PyPI', 'fastapi', '0.115.0'), true, 'pyproject.toml fastapi should be extracted.')
+  assert.equal(hasDep('PyPI', 'django', '5.1.2'), true, 'pyproject.toml django should be extracted.')
+  assert.equal(hasDep('crates.io', 'actix-web', '4.9.0'), true, 'Cargo.lock actix-web should be extracted.')
+  assert.equal(hasDep('Go', 'github.com/gin-gonic/gin', '1.10.0'), true, 'go.sum gin should be extracted.')
+
+  // Verify compact inventory spec emitted instead of 512 KB routes blob
+  const inventorySpec = repo.specs.find(s => s.name === 'acme/demo-app:inventory')
+  assert.ok(inventorySpec, 'Expected compact inventory spec.')
+  assert.match(inventorySpec.content, /\/repos\/acme\/demo-app/)
+  assert.match(inventorySpec.content, /Branch: main/)
+  assert.equal(repo.specs.some(s => s.name.endsWith(':routes-and-handlers')), false, 'Clone mode must not cram routes into a text blob.')
+
+  // Plant an out-of-tree symlink on host to verify Docker OverlayFs allowSymlinks: false blocks reading it
+  symlinkSync('/etc/passwd', join(reposDir, 'acme', 'demo-app', 'escape-link'))
+
+  // 5. Mount /repos read-only inside real guardian-worker:local Docker container
+  const backend = new LinuxWorkerBackend()
+
+  // Reject invalid reposDir containing commas
+  await assert.rejects(
+    backend.openSession(randomUUID(), AbortSignal.timeout(5_000), { reposDir: join(workDir, 'bad,dir') }),
+    /Invalid repository mount path/,
+  )
+
+  const assignmentId = randomUUID()
+  const session = await backend.openSession(assignmentId, AbortSignal.timeout(15_000), { reposDir })
+  t.after(() => session.close())
+
+  // Inspect Docker container HostConfig to verify readonly bind mount + --network none
+  let containerId = ''
+  for (let attempt = 0; attempt < 60 && !containerId; attempt += 1) {
+    containerId = (await exec('docker', ['ps', '-q', '--filter', 'label=dev.guardian.assignment=' + assignmentId])).stdout.trim()
+    if (!containerId) await delay(50)
+  }
+  assert.ok(containerId, 'Worker container with /repos mount must be running.')
+  const inspectData = JSON.parse((await exec('docker', ['inspect', '--format', '{{json .}}', containerId])).stdout)
+  assert.equal(inspectData.HostConfig.NetworkMode, 'none')
+  assert.equal(inspectData.HostConfig.ReadonlyRootfs, true)
+  const repoMount = (inspectData.Mounts as Array<{ Destination: string; RW: boolean; Type: string }>)
+    .find(m => m.Destination === '/repos')
+  assert.ok(repoMount, '/repos mount must exist in container.')
+  assert.equal(repoMount.Type, 'bind')
+  assert.equal(repoMount.RW, false, '/repos mount MUST be read-only.')
+
+  // Explore full cloned tree using standard bash tools (find, grep, cat, jq)
+  const findRes = await session.exec(
+    'find /repos/acme/demo-app -type f | wc -l > /work/count.txt && grep -rn "x-internal-bypass" /repos/acme/demo-app > /work/hit.txt && jq -r .dependencies.express /repos/acme/demo-app/package.json > /work/express.txt',
+    ['count.txt', 'hit.txt', 'express.txt'],
+    AbortSignal.timeout(10_000),
+  )
+  assert.equal(findRes.exitCode, 0, `find/grep/jq failed: ${findRes.stderr}`)
+  assert.ok(Number(findRes.outputs['count.txt'].trim()) >= 52)
+  assert.match(findRes.outputs['hit.txt'], /apps\/admin\/api\/auth\.ts:1:.*x-internal-bypass/)
+  assert.equal(findRes.outputs['express.txt'].trim(), '^4.19.0')
+
+  // Verify cat works on nested source files
+  const catRes = await session.exec(
+    'cat /repos/acme/demo-app/apps/admin/api/auth.ts',
+    [],
+    AbortSignal.timeout(10_000),
+  )
+  assert.equal(catRes.exitCode, 0)
+  assert.match(catRes.stdout, /checkAdminHeader/)
+
+  // Verify writes to /repos are strictly rejected (read-only enforced)
+  const touchRes = await session.exec('touch /repos/evil', [], AbortSignal.timeout(10_000))
+  assert.notEqual(touchRes.exitCode, 0, 'touch /repos/evil must fail.')
+  assert.match(touchRes.stderr, /EROFS|read-only/i)
+
+  await assert.rejects(
+    session.exec('echo x > /repos/acme/demo-app/evil.txt', [], AbortSignal.timeout(10_000)),
+    /EROFS|read-only/i,
+  )
+  assert.equal(existsSync(join(reposDir, 'evil')), false)
+  assert.equal(existsSync(join(reposDir, 'acme', 'demo-app', 'evil.txt')), false)
+
+  // Verify out-of-tree symlink cannot be read (allowSymlinks: false)
+  const symRes = await session.exec('cat /repos/acme/demo-app/escape-link', [], AbortSignal.timeout(10_000))
+  assert.notEqual(symRes.exitCode, 0, 'Symlink pointing outside /repos must not be readable.')
+  assert.ok(!symRes.stdout.includes('root:x:0:0'), 'Host /etc/passwd must never be readable via symlink.')
+
+  // Verify one-shot backend.run also mounts /repos read-only
+  const oneShot = await backend.run({
+    assignmentId: randomUUID(),
+    files: [],
+    command: 'grep -rn "checkAdminHeader" /repos/acme/demo-app > /work/out.txt',
+    outputs: ['out.txt'],
+  }, AbortSignal.timeout(15_000), { reposDir })
+  assert.equal(oneShot.exitCode, 0)
+  assert.match(oneShot.outputs['out.txt'], /apps\/admin\/api\/auth\.ts/)
 })

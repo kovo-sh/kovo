@@ -5,12 +5,23 @@ import { personaSecrets } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
+export interface BrowserSameSiteFetchRequest {
+  origin: string
+  pathAndQuery: string
+  method?: 'GET' | 'HEAD' | 'OPTIONS'
+  credentials?: 'include' | 'same-origin' | 'omit'
+}
+
 export interface BrowserVisitRequest {
   origin: string
   pathAndQuery: string
   persona?: string
   checkKind?: 'dom_xss' | 'postmessage' | 'client_storage' | 'xhr_leak'
   canaryToken?: string
+  selector?: string
+  postMessageOrigin?: string
+  postMessagePayload?: unknown
+  sameSiteFetch?: BrowserSameSiteFetchRequest
   timeoutMs?: number
   waitAfterLoadMs?: number
   secrets?: readonly NamedSecret[]
@@ -39,6 +50,35 @@ export interface BrowserPostMessageSummary {
   canaryHandledWithoutOriginCheck: boolean
 }
 
+export interface BrowserSelectorResult {
+  selector: string
+  matched: boolean
+  count: number
+  textPreview: string
+}
+
+export interface BrowserFetchResult {
+  url: string
+  origin: string
+  method: string
+  credentials: string
+  ok: boolean
+  status: number | null
+  contentType: string | null
+  bodyPreview: string
+  bodyBytes: number
+  error: string | null
+}
+
+export interface BrowserRedirectSummary {
+  initialUrl: string
+  finalUrl: string
+  redirected: boolean
+  finalOrigin: string
+  redirectOrigins: string[]
+  blockedRedirectAttempt: boolean
+}
+
 export interface BrowserVisitResult {
   origin: string
   finalUrl: string
@@ -48,6 +88,7 @@ export interface BrowserVisitResult {
   links: string[]
   forms: BrowserFormSummary[]
   xhrRequests: BrowserXhrRecord[]
+  allRequests?: BrowserXhrRecord[]
   blockedOrigins: string[]
   consoleMessages: Array<{ type: 'error' | 'warning'; text: string }>
   postMessageListeners: BrowserPostMessageSummary
@@ -59,6 +100,9 @@ export interface BrowserVisitResult {
     triggered: boolean
     detail: string | null
   }
+  selectorResult?: BrowserSelectorResult | null
+  fetchResult?: BrowserFetchResult | null
+  redirectSummary?: BrowserRedirectSummary
   exchangeIds: string[]
   exchanges: BrokerExchangeResult[]
   durationMs: number
@@ -88,7 +132,7 @@ interface PlaywrightPage {
   waitForTimeout(ms: number): Promise<void>
   url(): string
   title(): Promise<string>
-  evaluate<T, A = undefined>(fn: (arg: A) => T, arg?: A): Promise<T>
+  evaluate<T, A = undefined>(fn: (arg: A) => T | Promise<T>, arg?: A): Promise<T>
   close(): Promise<void>
 }
 
@@ -112,6 +156,8 @@ const maxBrowserTimeoutMs = 30_000
 const maxDomSnippetChars = 16_384
 const forbiddenBrowserForwardHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|connection|accept-encoding|sec-fetch-.*|sec-ch-.*)$/i
 const allowedMethods = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH'])
+const safeReadOnlyFetchMethods = new Set(['GET', 'HEAD', 'OPTIONS'])
+const unsafeSelectorPattern = /[<>{};`\\]|javascript:/i
 
 async function launchChromium(): Promise<PlaywrightBrowserLike> {
   // Prefer playwright-core if present, falling back cleanly to @playwright/test.
@@ -215,6 +261,18 @@ function safeFulfillHeaders(respHeaders: Record<string, string>): Record<string,
   return out
 }
 
+function hasDestructiveInput(text: string): boolean {
+  if (containsDestructivePayload(text)) return true
+  try {
+    const decoded = decodeURIComponent(text.replaceAll('+', ' '))
+    if (decoded !== text && containsDestructivePayload(decoded)) return true
+  } catch {
+    const plusDecoded = text.replaceAll('+', ' ')
+    if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
+  }
+  return false
+}
+
 export class ScopedBrowser {
   private readonly broker: RequestBroker
   private readonly options: ScopedBrowserOptions
@@ -233,9 +291,7 @@ export class ScopedBrowser {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Invalid browser visit path.')
     }
-    let decodedPath = req.pathAndQuery
-    try { decodedPath = decodeURIComponent(req.pathAndQuery.replaceAll('+', ' ')) } catch { decodedPath = req.pathAndQuery.replaceAll('+', ' ') }
-    if (containsDestructivePayload(req.pathAndQuery) || containsDestructivePayload(decodedPath)) {
+    if (hasDestructiveInput(req.pathAndQuery)) {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Browser visit blocked by destructive-payload denylist.')
     }
@@ -243,6 +299,43 @@ export class ScopedBrowser {
     if (targetUrl.origin !== initialOrigin || !grant.canRead(initialOrigin)) {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Browser destination is outside the current assignment scope.')
+    }
+
+    if (req.selector !== undefined) {
+      if (!req.selector.trim() || req.selector.length > 256 || unsafeSelectorPattern.test(req.selector)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Browser selector must be a safe read-only CSS selector.')
+      }
+    }
+    if (req.postMessagePayload !== undefined && hasDestructiveInput(JSON.stringify(req.postMessagePayload))) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('Browser postMessage payload blocked by destructive-payload denylist.')
+    }
+
+    let validatedFetch: { url: string; origin: string; method: 'GET' | 'HEAD' | 'OPTIONS'; credentials: 'include' | 'same-origin' | 'omit' } | null = null
+    if (req.sameSiteFetch) {
+      const fetchOrigin = new URL(req.sameSiteFetch.origin).origin
+      const fetchPath = req.sameSiteFetch.pathAndQuery
+      const fetchMethod = (req.sameSiteFetch.method ?? 'GET').toUpperCase() as 'GET' | 'HEAD' | 'OPTIONS'
+      if (!safeReadOnlyFetchMethods.has(fetchMethod)) {
+        grant.audit('denied', fetchOrigin)
+        throw new BrokerDenied('Browser sameSiteFetch only permits read-only GET/HEAD/OPTIONS methods.')
+      }
+      if (!fetchPath.startsWith('/') || fetchPath.startsWith('//') || /[\r\n\0]/.test(fetchPath) || hasDestructiveInput(fetchPath)) {
+        grant.audit('denied', fetchOrigin)
+        throw new BrokerDenied('Invalid or blocked browser sameSiteFetch path.')
+      }
+      const fetchUrl = new URL(fetchPath, fetchOrigin)
+      if (fetchUrl.origin !== fetchOrigin || !grant.canRead(fetchOrigin)) {
+        grant.audit('denied', fetchOrigin)
+        throw new BrokerDenied('Browser sameSiteFetch target is outside approved scope.')
+      }
+      validatedFetch = {
+        url: fetchUrl.href,
+        origin: fetchOrigin,
+        method: fetchMethod,
+        credentials: req.sameSiteFetch.credentials ?? 'include',
+      }
     }
 
     const started = Date.now()
@@ -255,6 +348,7 @@ export class ScopedBrowser {
     const exchanges: BrokerExchangeResult[] = []
     const exchangeIds: string[] = []
     const xhrRequests: BrowserXhrRecord[] = []
+    const allRequests: BrowserXhrRecord[] = []
     const blockedOrigins = new Set<string>()
     const consoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
 
@@ -329,6 +423,22 @@ export class ScopedBrowser {
         }
 
         const resourceType = request.resourceType()
+        // Never leak persona credentials to other origins unless explicitly authorized for a
+        // validated sameSiteFetch (credentials: 'include') AND present in persona.originAllowlist.
+        let personaForRequest: string | undefined
+        if (req.persona) {
+          if (parsedUrl.origin === initialOrigin) {
+            personaForRequest = req.persona
+          } else if (
+            validatedFetch &&
+            validatedFetch.credentials === 'include' &&
+            parsedUrl.origin === validatedFetch.origin &&
+            Boolean(grant.personas?.get(req.persona)?.originAllowlist.includes(parsedUrl.origin))
+          ) {
+            personaForRequest = req.persona
+          }
+        }
+
         try {
           const exchange = await this.broker.executeHttp({
             origin: parsedUrl.origin,
@@ -336,7 +446,7 @@ export class ScopedBrowser {
             pathAndQuery: parsedUrl.pathname + parsedUrl.search,
             headers: forwardedHeaders,
             body: request.postData() ?? undefined,
-            persona: parsedUrl.origin === initialOrigin ? req.persona : undefined,
+            persona: personaForRequest,
             followRedirects: true,
             secrets,
             timeoutMs: Math.max(2_000, timeoutMs - (Date.now() - started)),
@@ -346,14 +456,16 @@ export class ScopedBrowser {
           const recordedId = req.onExchange?.(exchange)
           if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
 
+          const reqRecord: BrowserXhrRecord = {
+            method,
+            url: redact(parsedUrl.href, secrets),
+            origin: parsedUrl.origin,
+            resourceType,
+            status: exchange.status,
+          }
+          if (allRequests.length < 150) allRequests.push(reqRecord)
           if (resourceType === 'xhr' || resourceType === 'fetch') {
-            xhrRequests.push({
-              method,
-              url: parsedUrl.href,
-              origin: parsedUrl.origin,
-              resourceType,
-              status: exchange.status,
-            })
+            xhrRequests.push(reqRecord)
           }
 
           await route.fulfill({
@@ -363,14 +475,16 @@ export class ScopedBrowser {
             body: exchange.body,
           }).catch(() => undefined)
         } catch {
+          const failedRecord: BrowserXhrRecord = {
+            method,
+            url: redact(parsedUrl.href, secrets),
+            origin: parsedUrl.origin,
+            resourceType,
+            status: null,
+          }
+          if (allRequests.length < 150) allRequests.push(failedRecord)
           if (resourceType === 'xhr' || resourceType === 'fetch') {
-            xhrRequests.push({
-              method,
-              url: parsedUrl.href,
-              origin: parsedUrl.origin,
-              resourceType,
-              status: null,
-            })
+            xhrRequests.push(failedRecord)
           }
           await route.abort('blockedbyclient').catch(() => undefined)
         }
@@ -408,7 +522,124 @@ export class ScopedBrowser {
       deadline.throwIfAborted()
 
       const canaryToken = req.canaryToken ?? null
-      const snapshot = await page.evaluate((opts: { checkKind?: string; canaryToken: string | null }) => {
+      const snapshot = await page.evaluate(async (opts: {
+        checkKind?: string
+        canaryToken: string | null
+        selector: string | null
+        postMessageOrigin: string | null
+        postMessagePayload: unknown
+        hasCustomPostMessage: boolean
+        sameSiteFetch: { url: string; origin: string; method: string; credentials: RequestCredentials } | null
+      }) => {
+        const probe = (window as unknown as {
+          __guardianBrowserProbe?: {
+            handlers: Array<{ preview: string; checksOrigin: boolean }>
+            hasOnMessage: boolean
+            observedEvents: number
+            canaryObserved: boolean
+          }
+        }).__guardianBrowserProbe
+
+        const handlers = (probe?.handlers ?? []).slice(0, 30)
+        const hasUncheckedPostMessage = handlers.some(h => !h.checksOrigin)
+
+        let canaryTriggered = false
+        let canaryDetail: string | null = null
+        let canaryHandledWithoutOriginCheck = false
+
+        if ((opts.checkKind === 'postmessage' || opts.hasCustomPostMessage) && handlers.length > 0) {
+          const pmToken = opts.canaryToken ?? 'guardian-pm-canary'
+          const pmOrigin = opts.postMessageOrigin ?? 'https://untrusted-origin.invalid'
+          const pmData = opts.hasCustomPostMessage && opts.postMessagePayload !== undefined
+            ? opts.postMessagePayload
+            : { guardianCanary: pmToken, type: 'guardian-probe' }
+          try {
+            window.dispatchEvent(new MessageEvent('message', {
+              data: pmData,
+              origin: pmOrigin,
+            }))
+          } catch { /* ignore */ }
+          await new Promise(resolve => setTimeout(resolve, 40))
+          if (hasUncheckedPostMessage) {
+            canaryHandledWithoutOriginCheck = true
+            canaryTriggered = true
+            canaryDetail = `Detected ${handlers.filter(h => !h.checksOrigin).length} postMessage listener(s) without an apparent event.origin validation check.`
+          }
+        }
+
+        let fetchResult: BrowserFetchResult | null = null
+        if (opts.sameSiteFetch) {
+          try {
+            const resp = await window.fetch(opts.sameSiteFetch.url, {
+              method: opts.sameSiteFetch.method,
+              credentials: opts.sameSiteFetch.credentials,
+            })
+            const text = await resp.text().catch(() => '')
+            fetchResult = {
+              url: opts.sameSiteFetch.url,
+              origin: opts.sameSiteFetch.origin,
+              method: opts.sameSiteFetch.method,
+              credentials: opts.sameSiteFetch.credentials,
+              ok: resp.ok,
+              status: resp.status,
+              contentType: resp.headers.get('content-type'),
+              bodyPreview: text.slice(0, 4096),
+              bodyBytes: text.length,
+              error: null,
+            }
+          } catch (err) {
+            fetchResult = {
+              url: opts.sameSiteFetch.url,
+              origin: opts.sameSiteFetch.origin,
+              method: opts.sameSiteFetch.method,
+              credentials: opts.sameSiteFetch.credentials,
+              ok: false,
+              status: null,
+              contentType: null,
+              bodyPreview: '',
+              bodyBytes: 0,
+              error: err instanceof Error ? err.message : String(err),
+            }
+          }
+        }
+
+        if (!canaryTriggered && opts.canaryToken) {
+          // Check for unescaped DOM sink injection (element attribute/tag matching canary) or explicit DOM canary flag.
+          const markerEl = document.querySelector(`[data-guardian-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
+          const globalFlag = Boolean((window as unknown as Record<string, unknown>).__guardianDomCanary === opts.canaryToken)
+          if (markerEl || globalFlag) {
+            canaryTriggered = true
+            canaryDetail = globalFlag
+              ? 'DOM execution canary flag observed on window.'
+              : 'Unescaped canary element/attribute observed in rendered DOM.'
+          }
+        }
+
+        let selectorResult: BrowserSelectorResult | null = null
+        if (opts.selector) {
+          try {
+            const matchedNodes = Array.from(document.querySelectorAll(opts.selector)).slice(0, 50)
+            const preview = matchedNodes
+              .map(node => (node.textContent || node.outerHTML || '').trim())
+              .filter(Boolean)
+              .join(' | ')
+              .slice(0, 1000)
+            selectorResult = {
+              selector: opts.selector,
+              matched: matchedNodes.length > 0,
+              count: matchedNodes.length,
+              textPreview: preview,
+            }
+          } catch {
+            selectorResult = {
+              selector: opts.selector,
+              matched: false,
+              count: 0,
+              textPreview: '',
+            }
+          }
+        }
+
         const domHtml = document.documentElement?.outerHTML ?? ''
         const links = Array.from(document.querySelectorAll('a[href]'))
           .map(el => el.getAttribute('href') || '')
@@ -436,47 +667,6 @@ export class ScopedBrowser {
         try { localStorageKeys = Object.keys(window.localStorage).slice(0, 64) } catch { /* opaque origin */ }
         try { sessionStorageKeys = Object.keys(window.sessionStorage).slice(0, 64) } catch { /* opaque origin */ }
 
-        const probe = (window as unknown as {
-          __guardianBrowserProbe?: {
-            handlers: Array<{ preview: string; checksOrigin: boolean }>
-            hasOnMessage: boolean
-            observedEvents: number
-            canaryObserved: boolean
-          }
-        }).__guardianBrowserProbe
-
-        const handlers = (probe?.handlers ?? []).slice(0, 30)
-        const hasUncheckedPostMessage = handlers.some(h => !h.checksOrigin)
-
-        let canaryTriggered = false
-        let canaryDetail: string | null = null
-        let canaryHandledWithoutOriginCheck = false
-
-        if (opts.checkKind === 'postmessage' && handlers.length > 0) {
-          const pmToken = opts.canaryToken ?? 'guardian-pm-canary'
-          try {
-            window.dispatchEvent(new MessageEvent('message', {
-              data: { guardianCanary: pmToken, type: 'guardian-probe' },
-              origin: 'https://untrusted-origin.invalid',
-            }))
-          } catch { /* ignore */ }
-          if (hasUncheckedPostMessage) {
-            canaryHandledWithoutOriginCheck = true
-            canaryTriggered = true
-            canaryDetail = `Detected ${handlers.filter(h => !h.checksOrigin).length} postMessage listener(s) without an apparent event.origin validation check.`
-          }
-        } else if (opts.canaryToken) {
-          // Check for unescaped DOM sink injection (element attribute/tag matching canary) or explicit DOM canary flag.
-          const markerEl = document.querySelector(`[data-guardian-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
-          const globalFlag = Boolean((window as unknown as Record<string, unknown>).__guardianDomCanary === opts.canaryToken)
-          if (markerEl || globalFlag) {
-            canaryTriggered = true
-            canaryDetail = globalFlag
-              ? 'DOM execution canary flag observed on window.'
-              : 'Unescaped canary element/attribute observed in rendered DOM.'
-          }
-        }
-
         return {
           domHtml,
           links,
@@ -493,21 +683,62 @@ export class ScopedBrowser {
           },
           canaryTriggered,
           canaryDetail,
+          selectorResult,
+          fetchResult,
         }
-      }, { checkKind: req.checkKind, canaryToken })
+      }, {
+        checkKind: req.checkKind,
+        canaryToken,
+        selector: req.selector ?? null,
+        postMessageOrigin: req.postMessageOrigin ?? null,
+        postMessagePayload: req.postMessagePayload,
+        hasCustomPostMessage: req.postMessageOrigin !== undefined || req.postMessagePayload !== undefined,
+        sameSiteFetch: validatedFetch,
+      })
 
-      const finalUrl = page.url()
+      const finalUrlRaw = page.url()
+      const finalUrl = redact(finalUrlRaw, secrets)
       const title = redact(await page.title().catch(() => ''), secrets).slice(0, 300)
+      const primaryExchange = exchanges[0]
+      let finalOrigin = initialOrigin
+      try { finalOrigin = new URL(finalUrlRaw).origin } catch { /* keep initialOrigin */ }
+      const redirectOrigins = primaryExchange?.redirectOrigins ?? [initialOrigin]
+      const initialRedactedUrl = redact(targetUrl.href, secrets)
+      const redirectSummary: BrowserRedirectSummary = {
+        initialUrl: initialRedactedUrl,
+        finalUrl,
+        redirected: finalUrl !== initialRedactedUrl || redirectOrigins.length > 1,
+        finalOrigin,
+        redirectOrigins,
+        blockedRedirectAttempt: blockedOrigins.size > 0,
+      }
+
+      const safeSelectorResult: BrowserSelectorResult | null = snapshot.selectorResult
+        ? {
+            ...snapshot.selectorResult,
+            textPreview: redact(snapshot.selectorResult.textPreview, secrets),
+          }
+        : null
+
+      const safeFetchResult: BrowserFetchResult | null = snapshot.fetchResult
+        ? {
+            ...snapshot.fetchResult,
+            url: redact(snapshot.fetchResult.url, secrets),
+            bodyPreview: redact(snapshot.fetchResult.bodyPreview, secrets),
+            error: snapshot.fetchResult.error ? redact(snapshot.fetchResult.error, secrets) : null,
+          }
+        : null
 
       return {
         origin: initialOrigin,
-        finalUrl: redact(finalUrl, secrets),
+        finalUrl,
         title,
         status: navResponse ? navResponse.status() : (exchanges[0]?.status ?? null),
         domSnippet: redact(snapshot.domHtml, secrets).slice(0, maxDomSnippetChars),
         links: [...new Set(snapshot.links.map(l => redact(l, secrets)))].slice(0, 120),
         forms: snapshot.forms,
         xhrRequests: xhrRequests.slice(0, 100),
+        allRequests: allRequests.slice(0, 150),
         blockedOrigins: [...blockedOrigins].slice(0, 100),
         consoleMessages,
         postMessageListeners: {
@@ -525,6 +756,9 @@ export class ScopedBrowser {
           triggered: snapshot.canaryTriggered,
           detail: snapshot.canaryDetail,
         },
+        selectorResult: safeSelectorResult,
+        fetchResult: safeFetchResult,
+        redirectSummary,
         exchangeIds,
         exchanges,
         durationMs: Date.now() - started,

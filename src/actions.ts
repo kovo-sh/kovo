@@ -14,7 +14,7 @@ import {
   runCommand,
 } from './domain.ts'
 import { execution } from './server/execution.ts'
-import { hasGithubPat, syncGithubRepos } from './server/github-connector.ts'
+import { hasGithubPat, projectReposDir, syncGithubRepos } from './server/github-connector.ts'
 import {
   checkModelConnection,
   deleteModelProfile,
@@ -106,7 +106,9 @@ export const syncGithubRepositories = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     const db = store()
     db.project(data.projectId)
-    const synced = await syncGithubRepos(data.repos)
+    const synced = await syncGithubRepos(data.repos, undefined, {
+      cloneDir: projectReposDir(db.directory, data.projectId),
+    })
     let specsImported = 0
     let dependenciesExtracted = 0
     const warnings: string[] = []

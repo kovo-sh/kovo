@@ -5,6 +5,9 @@ import type { EvidenceSummary } from '../domain.ts'
 import {
   capabilityTierLabel,
   checkLabels,
+  collapseBaselineHeaderFindings,
+  deduplicateChainFindings,
+  isConsolidatedHeaderPostureFinding,
   owaspCategoryTitles,
   owaspStatusLabels,
   reportEvidenceSource,
@@ -177,10 +180,14 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     return links.join(' · ')
   }
 
-  const findings = body.findings.filter(item => approved.has(item.origin))
+  const rawFindings = body.findings.filter(item => approved.has(item.origin))
+  const { findings } = collapseBaselineHeaderFindings(deduplicateChainFindings(rawFindings))
+  const prominentFindings = findings.filter(item => !isConsolidatedHeaderPostureFinding(item))
+  const headerPostureFindings = findings.filter(item => isConsolidatedHeaderPostureFinding(item))
   const { coverage, confirmed, chainConfirmed, priority } = reportHighlights(body)
   const plan = reportPlanLabel(body.selectedChecks)
   const confirmedFindings = findings.filter(item => item.status === 'confirmed')
+  const confirmedProminent = prominentFindings.filter(item => item.status === 'confirmed')
   const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
     const count = confirmedFindings.filter(item => item.severity === severity).length
     return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)}** ${count}`] : []
@@ -230,7 +237,10 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
 
   lines.push('## Findings', '')
   if (!findings.length) lines.push('No findings recorded.', '')
-  for (const finding of findings) {
+  if (findings.length && !prominentFindings.length) {
+    lines.push('No Medium, High, Critical, or non-header findings were recorded. Baseline HTTP security header posture is summarized below.', '')
+  }
+  for (const finding of prominentFindings) {
     const links = evidenceLinks(finding.origin, finding.evidenceIds, finding.exchangeIds ?? [])
     const specRow = finding.replaySpecId ? runSpecs.get(finding.replaySpecId) : undefined
     const retests = retestsByFinding.get(finding.id) ?? []
@@ -267,20 +277,56 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
           for (const step of specRow.spec.steps) {
             lines.push(`${stepNum++}. **[Replay · ${inline(step.role, secrets)}]** \`${step.request.method}\` ${inline(step.request.origin + step.request.pathAndQuery, secrets)} — ${inline(step.description, secrets)}`)
           }
+        } else if (specRow.spec.kind === 'browser_chain') {
+          for (const step of specRow.spec.steps) {
+            lines.push(`${stepNum++}. **[Replay · ${inline(step.role, secrets)} · ${inline(step.action, secrets)}]** ${inline(step.origin + step.pathAndQuery, secrets)} — ${inline(step.description, secrets)}`)
+          }
+        } else if (specRow.spec.kind === 'race_burst') {
+          if (specRow.spec.controlStep) {
+            lines.push(`${stepNum++}. **[Replay · control]** \`${specRow.spec.controlStep.request.method}\` ${inline(specRow.spec.controlStep.request.origin + specRow.spec.controlStep.request.pathAndQuery, secrets)} — ${inline(specRow.spec.controlStep.description, secrets)}`)
+          }
+          const firstReq = specRow.spec.burst[0]
+          lines.push(`${stepNum++}. **[Replay · race_burst (${specRow.spec.burst.length}x concurrent)]** \`${firstReq.method}\` ${inline(firstReq.origin + firstReq.pathAndQuery, secrets)}`)
+          if (specRow.spec.postCheckStep) {
+            lines.push(`${stepNum++}. **[Replay · post-check]** \`${specRow.spec.postCheckStep.request.method}\` ${inline(specRow.spec.postCheckStep.request.origin + specRow.spec.postCheckStep.request.pathAndQuery, secrets)} — ${inline(specRow.spec.postCheckStep.description, secrets)}`)
+          }
         } else if (specRow.spec.kind === 'rce_proof') {
           lines.push(`${stepNum++}. **[Replay · control]** \`${specRow.spec.controlStep.request.method}\` ${inline(specRow.spec.controlStep.request.origin + specRow.spec.controlStep.request.pathAndQuery, secrets)} — ${inline(specRow.spec.controlStep.description, secrets)}`)
           lines.push(`${stepNum++}. **[Replay · ${inline(specRow.spec.proofMode, secrets)} probe]** \`${specRow.spec.probeStep.request.method}\` ${inline(specRow.spec.probeStep.request.origin + specRow.spec.probeStep.request.pathAndQuery, secrets)} — ${inline(specRow.spec.probeStep.description, secrets)}`)
         } else {
-          lines.push(`${stepNum++}. **[Replay · ${inline(specRow.spec.kind, secrets)}]** ${inline(specRow.spec.targetOrigin, secrets)}`)
+          const target = 'targetOrigin' in specRow.spec && typeof specRow.spec.targetOrigin === 'string'
+            ? specRow.spec.targetOrigin
+            : specRow.spec.origin
+          lines.push(`${stepNum++}. **[Replay · ${inline(specRow.spec.kind, secrets)}]** ${inline(target, secrets)}`)
         }
       }
       lines.push('')
     }
   }
 
+  if (headerPostureFindings.length) {
+    lines.push(
+      '### HTTP Security Header Posture (Baseline Hygiene)', '',
+      'Repetitive per-origin missing-header baseline checks (CSP, frame protection, `X-Content-Type-Options`, `Referrer-Policy`, and `Server` disclosure) are consolidated below:', '',
+      '| Host | Severity | Status | Summary | Evidence |',
+      '| :--- | :--- | :--- | :--- | :--- |',
+    )
+    for (const posture of headerPostureFindings) {
+      const links = evidenceLinks(posture.origin, posture.evidenceIds, posture.exchangeIds ?? [])
+      lines.push(
+        `| ${inline(posture.origin, secrets)} | ${inline(posture.severity, secrets)} | ${inline(posture.status, secrets)} | ${inline(posture.reason, secrets)} | ${links || '—'} |`,
+      )
+    }
+    lines.push('')
+  }
+
   if (confirmedFindings.length) {
     lines.push('## Remediation plan', '')
-    for (const [index, finding] of confirmedFindings.entries()) {
+    const orderedRemediation = [
+      ...confirmedProminent,
+      ...headerPostureFindings.filter(item => item.status === 'confirmed'),
+    ]
+    for (const [index, finding] of orderedRemediation.entries()) {
       lines.push(`${index + 1}. **${inline(finding.title, secrets)}** — ${inline(finding.remediation, secrets)} Recheck: ${inline(finding.recheck ?? 'repeat the verified replay check after the change.', secrets)}`)
     }
     lines.push('')

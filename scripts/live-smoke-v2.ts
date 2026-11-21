@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DEFAULT_PROVIDER } from '../src/domain.ts'
 import { Execution } from '../src/server/execution.ts'
-import { DEFAULT_GITHUB_PAT_PATH, syncGithubRepos } from '../src/server/github-connector.ts'
+import { DEFAULT_GITHUB_PAT_PATH, projectReposDir, syncGithubRepos } from '../src/server/github-connector.ts'
 import { saveModelProfile } from '../src/server/model-settings.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { Store } from '../src/server/store.ts'
@@ -95,8 +95,10 @@ async function main() {
     })
 
     stage = 'github repo sync (read-only)'
-    console.log(`[live-smoke-v2] Syncing ${DYAD_REPOS.length} authorized dyad-sh repos read-only...`)
-    const syncedRepos = await syncGithubRepos([...DYAD_REPOS], AbortSignal.timeout(120_000))
+    console.log(`[live-smoke-v2] Cloning ${DYAD_REPOS.length} authorized dyad-sh repos read-only...`)
+    const syncedRepos = await syncGithubRepos([...DYAD_REPOS], AbortSignal.timeout(180_000), {
+      cloneDir: projectReposDir(DATA_DIR, projectId),
+    })
     let totalFiles = 0
     let totalDeps = 0
     let totalSpecs = 0

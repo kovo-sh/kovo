@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync, statSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
@@ -36,9 +36,13 @@ export interface WorkerSession {
   close(): Promise<void>
 }
 
+export interface WorkerSessionOptions {
+  reposDir?: string
+}
+
 export interface WorkerBackend {
-  run(job: WorkerJob, signal: AbortSignal): Promise<WorkerResult>
-  openSession(assignmentId: string, signal: AbortSignal): Promise<WorkerSession>
+  run(job: WorkerJob, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerResult>
+  openSession(assignmentId: string, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerSession>
 }
 
 function dockerHost() {
@@ -129,13 +133,31 @@ export class LinuxWorkerBackend implements WorkerBackend {
     }
   }
 
-  private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = []) {
+  private resolveReposMountArgs(reposDir?: string): string[] {
+    if (!reposDir) return []
+    if (/[\0,\r\n]/.test(reposDir)) {
+      throw new Error('Invalid repository mount path.')
+    }
+    if (!existsSync(reposDir)) return []
+    const st = statSync(reposDir)
+    if (!st.isDirectory()) {
+      throw new Error('Repository mount path must be an existing directory.')
+    }
+    const resolved = realpathSync(reposDir)
+    if (/[\0,\r\n]/.test(resolved)) {
+      throw new Error('Invalid resolved repository mount path.')
+    }
+    return ['--mount', `type=bind,source=${resolved},target=/repos,readonly`]
+  }
+
+  private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions) {
     return [
       'container', 'create', '--name', name, '--interactive', '--rm', '--pull', 'never',
       '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges', '--pids-limit', '96', '--cpus', '1.0',
       '--memory', '512m', '--memory-swap', '512m',
       '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
+      ...this.resolveReposMountArgs(options?.reposDir),
       '--label', 'dev.guardian.assignment=' + assignmentId,
       ...(this.owner ? ['--label', `${workerNamespace}=${this.owner}`] : []),
       this.image,
@@ -143,7 +165,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     ]
   }
 
-  async run(rawJob: WorkerJob, signal: AbortSignal): Promise<WorkerResult> {
+  async run(rawJob: WorkerJob, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerResult> {
     signal.throwIfAborted()
     const job = jobSchema.parse(rawJob)
     const payload = JSON.stringify(job)
@@ -155,7 +177,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
     this.activeContainers.add(name)
     try {
-      await docker(this.containerCreateArgs(name, job.assignmentId), deadline)
+      await docker(this.containerCreateArgs(name, job.assignmentId, [], options), deadline)
       const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       return resultSchema.parse(JSON.parse(result))
     } finally {
@@ -164,14 +186,14 @@ export class LinuxWorkerBackend implements WorkerBackend {
     }
   }
 
-  async openSession(assignmentId: string, signal: AbortSignal): Promise<WorkerSession> {
+  async openSession(assignmentId: string, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerSession> {
     signal.throwIfAborted()
     await this.reclaimInactive()
     signal.throwIfAborted()
     const name = 'guardian-' + randomUUID()
     this.activeContainers.add(name)
     try {
-      await docker(this.containerCreateArgs(name, assignmentId, ['--session']), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+      await docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
     } catch (error) {
       await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
       this.activeContainers.delete(name)

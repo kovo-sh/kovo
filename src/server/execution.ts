@@ -25,14 +25,25 @@ import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
   agentTurn,
   chainPlannerPrompt,
+  classifyHostTier,
+  codeAuditPrompt,
   coordinatorPrompt,
+  crossHostSynthesizerPrompt,
+  defaultCodeAuditMaxTurns,
   listSkills,
   loadSkill,
   runAgentSession,
   threatModelPrompt,
   workerInvestigationPrompt,
 } from './agent-session.ts'
-import type { RequestHttpArgs, WorkerToolHandlers } from './agent-session.ts'
+import type {
+  CodeAuditSuspectData,
+  HostTier,
+  PersonaResourceQueueItem,
+  RequestHttpArgs,
+  RequestHttpRaceArgs,
+  WorkerToolHandlers,
+} from './agent-session.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, Grant, PublicObservation } from './broker.ts'
 import { CanaryBroker } from './canary-broker.ts'
@@ -40,7 +51,7 @@ import { ColdGraphCompactor } from './compactor.ts'
 import { queryCves } from './cve-broker.ts'
 import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
 import type { EvidenceReview } from './evidence-checks.ts'
-import { parseDependenciesFromFile } from './github-connector.ts'
+import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
 import {
   privateModelProfiles,
   recordProfileFailure,
@@ -57,7 +68,7 @@ import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardCheck
 import { approvalRequests, findings, messages } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { assessmentAssignments, store } from './store.ts'
-import type { Assignment, ChainStep, ReplaySpecRow, Run, Store } from './store.ts'
+import type { Assignment, ChainStep, Fact, ReplaySpecRow, Run, Store } from './store.ts'
 import { LinuxWorkerBackend } from './worker-backend.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
@@ -80,6 +91,7 @@ const threatModelResponseSchema = z.object({
   entries: z.array(z.object({
     origin: z.string(),
     riskTier: z.enum(['critical', 'high', 'medium', 'low']),
+    hostTier: z.enum(['crown_jewel', 'standard', 'low_value_static']).optional(),
     surfaceTags: z.array(z.string()).default([]),
     rationale: z.string().min(1).max(500),
   })),
@@ -109,6 +121,29 @@ const plannerResponseSchema = z.object({
   done: z.boolean().default(false),
 })
 
+const crossHostSynthesizerResponseSchema = z.object({
+  summary: z.string().default(''),
+  hypotheses: z.array(z.object({
+    title: z.string().min(1).max(200),
+    sourceOrigins: z.array(z.string()).default([]),
+    factIds: z.array(z.string()).default([]),
+    primitiveA: z.string().default(''),
+    primitiveB: z.string().default(''),
+    combinedImpact: z.string().default(''),
+    severity: z.enum(['critical', 'high', 'medium', 'low', 'informational']).default('high'),
+    recommendedReplayKind: z.string().optional(),
+  })).default([]),
+  chainSteps: z.array(z.object({
+    title: z.string().min(1).max(200),
+    hypothesis: z.string().min(1).max(1200),
+    category: z.string().default('cors-client-side'),
+    priority: z.number().min(0).max(100).default(85),
+    origins: z.array(z.string()).min(1),
+    skills: z.array(z.string()).default(['cross-host-chaining']),
+    dependsOnFactIds: z.array(z.string()).default([]),
+  })).default([]),
+})
+
 export function derivedResult(result: { exitStatus: number; result: string; stdout: string }) {
   return JSON.stringify({ exitStatus: result.exitStatus, result: (result.result || result.stdout).slice(0, 1200) })
 }
@@ -123,27 +158,415 @@ function stripJsonFences(raw: string): string {
   return trimmed
 }
 
+const hostTierOrder: Record<HostTier, number> = {
+  crown_jewel: 0,
+  standard: 1,
+  low_value_static: 2,
+}
+
 function classifyHostHeuristic(asset: Candidate): ThreatModelSummary {
   const host = new URL(asset.origin).hostname.toLowerCase()
   const tags: string[] = []
   let riskTier: ThreatModelSummary['riskTier'] = 'medium'
 
-  if (/(?:auth|login|sso|oauth|clerk|account|id|identity)/.test(host)) { tags.push('auth'); riskTier = 'critical' }
+  if (/(?:auth|login|sso|oauth|clerk|account|accounts|academy|id|identity)/.test(host)) { tags.push('auth'); riskTier = 'critical' }
   if (/(?:api|graphql|trpc|gateway|backend|cloud|app|dash|admin|portal)/.test(host)) { tags.push('api'); riskTier = riskTier === 'critical' ? 'critical' : 'high' }
   if (/(?:upload|media|file|storage|cdn|asset|bucket|blob)/.test(host)) { tags.push('upload'); riskTier = riskTier === 'medium' ? 'high' : riskTier }
   if (/(?:billing|pay|stripe|checkout|webhook|hook)/.test(host)) { tags.push('billing'); riskTier = 'critical' }
   if (/(?:llm|ai|chat|engine|model|prompt|agent|proxy)/.test(host)) { tags.push('llm-proxy'); riskTier = 'critical' }
-  if (/(?:dev|stage|staging|debug|test|beta|preview|sandbox|internal|bundler)/.test(host)) { tags.push('staging-debug'); riskTier = 'high' }
+  if (/(?:dev|stage|staging|debug|test|beta|preview|sandbox|sandpack|internal|bundler)/.test(host)) { tags.push('staging-debug'); riskTier = 'high' }
   if (asset.dnsSource?.externalAliases?.length) { tags.push('external-cname') }
   if (/(?:blog|docs|marketing|www|status|landing|static)/.test(host) && !tags.length) { tags.push('static'); riskTier = 'low' }
   if (!tags.length) tags.push('web')
+
+  const hostTier = classifyHostTier(asset.origin, tags)
+  if (hostTier === 'crown_jewel' && !tags.includes('crown_jewel')) tags.unshift('crown_jewel')
+  if (hostTier === 'low_value_static' && !tags.includes('low_value_static')) tags.push('low_value_static')
 
   return {
     origin: asset.origin,
     riskTier,
     surfaceTags: tags,
-    rationale: `Heuristic surface ranking for ${host} (${tags.join(', ')}).`,
+    rationale: `Heuristic surface ranking for ${host} (${hostTier}; ${tags.join(', ')}).`,
   }
+}
+
+export function computeHostTiers(
+  approvedOrigins: readonly string[],
+  threatModel?: readonly ThreatModelSummary[],
+): Record<string, HostTier> {
+  const map: Record<string, HostTier> = {}
+  for (const origin of approvedOrigins) {
+    const entry = threatModel?.find(e => e.origin === origin)
+    map[origin] = classifyHostTier(origin, entry?.surfaceTags)
+  }
+  return map
+}
+
+export function computeStepMaxTurns(
+  stepOrigins: readonly string[],
+  hostTiers: Record<string, HostTier>,
+  baseMaxTurns: number,
+): number {
+  const hasCrownJewel = Object.values(hostTiers).some(t => t === 'crown_jewel')
+  if (!hasCrownJewel || !stepOrigins.length) return baseMaxTurns
+  const allLowValueStatic = stepOrigins.every(o => (hostTiers[o] ?? classifyHostTier(o)) === 'low_value_static')
+  if (!allLowValueStatic) return baseMaxTurns
+  return Math.max(4, Math.min(baseMaxTurns, 15, Math.floor(baseMaxTurns * 0.2)))
+}
+
+export function applyCrownJewelStepBudget<T extends { title: string; priority: number; origins: string[] }>(
+  candidates: readonly T[],
+  hostTiers: Record<string, HostTier>,
+  existingSteps: readonly Pick<ChainStep, 'title' | 'sourceOrigins' | 'status'>[],
+  maxNewSteps: number,
+): T[] {
+  if (maxNewSteps <= 0 || !candidates.length) return []
+  const hasCrownJewel = Object.values(hostTiers).some(t => t === 'crown_jewel')
+  const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
+
+  const isPureStatic = (origins: readonly string[]) =>
+    origins.length > 0 && origins.every(o => (hostTiers[o] ?? classifyHostTier(o)) === 'low_value_static')
+  const hasCrownOrigin = (origins: readonly string[]) =>
+    origins.some(o => (hostTiers[o] ?? classifyHostTier(o)) === 'crown_jewel')
+
+  const staticStepsByOrigin = new Map<string, number>()
+  let existingActiveSteps = 0
+  let existingStaticSteps = 0
+  for (const step of existingSteps) {
+    if (step.status === 'canceled' || step.status === 'tainted') continue
+    existingActiveSteps += 1
+    if (isPureStatic(step.sourceOrigins)) {
+      existingStaticSteps += 1
+      for (const o of step.sourceOrigins) {
+        staticStepsByOrigin.set(o, (staticStepsByOrigin.get(o) ?? 0) + 1)
+      }
+    }
+  }
+
+  const normalized = candidates
+    .filter(step => step.origins.length > 0 && !existingTitles.has(step.title.trim().toLowerCase()))
+    .map(step => {
+      if (!hasCrownJewel) return { ...step }
+      if (isPureStatic(step.origins)) {
+        return { ...step, priority: Math.min(step.priority, 35) }
+      }
+      if (hasCrownOrigin(step.origins)) {
+        return { ...step, priority: Math.min(100, Math.max(75, step.priority + 10)) }
+      }
+      return { ...step }
+    })
+
+  // Sort crown-jewel first, then standard, then low-value static; tie-break by priority descending
+  normalized.sort((a, b) => {
+    const tierA = hasCrownOrigin(a.origins) ? 0 : isPureStatic(a.origins) ? 2 : 1
+    const tierB = hasCrownOrigin(b.origins) ? 0 : isPureStatic(b.origins) ? 2 : 1
+    return tierA - tierB || b.priority - a.priority
+  })
+
+  if (!hasCrownJewel) {
+    const out: T[] = []
+    const seenTitles = new Set(existingTitles)
+    for (const step of normalized) {
+      if (out.length >= maxNewSteps) break
+      const key = step.title.trim().toLowerCase()
+      if (seenTitles.has(key)) continue
+      seenTitles.add(key)
+      out.push(step)
+    }
+    return out
+  }
+
+  const crownOrStandardPool = normalized.filter(s => !isPureStatic(s.origins))
+  const staticPool = normalized.filter(s => isPureStatic(s.origins))
+
+  const selected: T[] = []
+  const seenTitles = new Set(existingTitles)
+
+  // Target ~80% crown-jewel/standard allocation when crown-jewel hosts are present
+  const projectedTotal = existingActiveSteps + Math.min(maxNewSteps, normalized.length)
+  const maxTotalStaticSteps = Math.max(1, Math.floor(projectedTotal * 0.2))
+  const crownTargetSlots = crownOrStandardPool.length > 0
+    ? Math.max(1, Math.ceil(maxNewSteps * 0.8))
+    : 0
+
+  for (const step of crownOrStandardPool) {
+    if (selected.length >= maxNewSteps) break
+    const key = step.title.trim().toLowerCase()
+    if (seenTitles.has(key)) continue
+    seenTitles.add(key)
+    selected.push(step)
+  }
+
+  let staticAdded = 0
+  for (const step of staticPool) {
+    if (selected.length >= maxNewSteps) break
+    // Cap static marketing hosts to 1 fast step per origin and <= ~20% overall share
+    if (existingStaticSteps + staticAdded >= maxTotalStaticSteps) break
+    if (step.origins.some(o => (staticStepsByOrigin.get(o) ?? 0) >= 1)) continue
+    // Ensure we don't crowd out reserved crown-jewel capacity
+    if (crownTargetSlots > 0 && selected.length < maxNewSteps && staticAdded >= Math.max(1, maxNewSteps - crownTargetSlots) && crownOrStandardPool.length >= crownTargetSlots) {
+      break
+    }
+    const key = step.title.trim().toLowerCase()
+    if (seenTitles.has(key)) continue
+    seenTitles.add(key)
+    selected.push(step)
+    staticAdded += 1
+    for (const o of step.origins) {
+      staticStepsByOrigin.set(o, (staticStepsByOrigin.get(o) ?? 0) + 1)
+    }
+  }
+
+  return selected
+}
+
+function sinkCategoryAndSkills(sinkKind: string): { category: OwaspCategory; skills: string[] } {
+  switch (sinkKind) {
+    case 'server_action':
+    case 'api_route':
+      return { category: 'broken-access-control', skills: ['source-first-audit', 'bola-idor-race', 'false-positive-elimination'] }
+    case 'webhook':
+    case 'auth_config':
+      return { category: 'auth-identity', skills: ['source-first-audit', 'false-positive-elimination'] }
+    case 'outbound_fetch':
+    case 'redirect':
+      return { category: 'ssrf-redirects', skills: ['source-first-audit', 'oob-ssrf-browser-chain', 'false-positive-elimination'] }
+    case 'postmessage_iframe':
+      return { category: 'cors-client-side', skills: ['cross-host-chaining', 'oob-ssrf-browser-chain'] }
+    case 'upload_storage':
+      return { category: 'upload-storage', skills: ['source-first-audit', 'false-positive-elimination'] }
+    case 'db_query':
+      return { category: 'injection-input', skills: ['source-first-audit', 'false-positive-elimination'] }
+    default:
+      return { category: 'broken-access-control', skills: ['source-first-audit', 'false-positive-elimination'] }
+  }
+}
+
+export function convertCodeAuditSuspectsToChainSteps(
+  storage: Store,
+  run: Run,
+  suspects: readonly Fact[],
+  hostTiers?: Record<string, HostTier>,
+): ChainStep[] {
+  const approvedOrigins = new Set(run.candidates.filter(c => run.approved.includes(c.id)).map(c => c.origin))
+  const existingSteps = storage.listChainSteps(run.id, run.goalRevision)
+  const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
+  const coveredFactIds = new Set(existingSteps.flatMap(s => s.dependsOnFactIds))
+  const created: ChainStep[] = []
+  let totalSteps = existingSteps.length
+
+  for (const fact of suspects) {
+    if (totalSteps >= maxChainStepsPerRun || created.length >= 12) break
+    if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
+    if (coveredFactIds.has(fact.id)) continue
+    const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
+    if (!asset) continue
+
+    const data = fact.data as Partial<CodeAuditSuspectData> & Record<string, unknown>
+    const routeOrAction = typeof data.routeOrAction === 'string' && data.routeOrAction.trim()
+      ? data.routeOrAction.trim()
+      : ''
+    const fileLoc = typeof data.file === 'string' && data.file.trim()
+      ? `${data.file.trim()}${typeof data.line === 'number' ? `:${data.line}` : ''}`
+      : ''
+    const sinkKind = typeof data.sinkKind === 'string' ? data.sinkKind : 'api_route'
+    const authCheck = typeof data.authCheck === 'string' ? data.authCheck : 'unknown'
+    const ownershipCheck = typeof data.ownershipCheck === 'string' ? data.ownershipCheck : 'unknown'
+    const hypothesisBody = typeof data.hypothesis === 'string' && data.hypothesis.trim()
+      ? data.hypothesis.trim()
+      : fact.summary
+
+    const host = new URL(fact.origin).hostname
+    const title = routeOrAction
+      ? `Source audit verify · ${routeOrAction.slice(0, 90)} (${host})`
+      : `Source audit verify · ${fact.summary.slice(0, 80)} (${host})`
+    if (existingTitles.has(title.toLowerCase())) continue
+
+    const { category, skills } = sinkCategoryAndSkills(sinkKind)
+    const missingAuthOrOwner = /missing|none|weak|bypass|absent|unverified|no /i.test(`${authCheck} ${ownershipCheck}`)
+    const isCrown = (hostTiers?.[fact.origin] ?? classifyHostTier(fact.origin)) === 'crown_jewel'
+    const priority = missingAuthOrOwner ? (isCrown ? 96 : 92) : (isCrown ? 90 : 85)
+
+    const hypothesis = [
+      `Source-First Code Audit suspect${fileLoc ? ` at ${fileLoc}` : ''}${routeOrAction ? ` targeting ${routeOrAction}` : ''}.`,
+      `Auth check: ${authCheck}; Ownership check: ${ownershipCheck}; Sink: ${sinkKind}.`,
+      hypothesisBody,
+      'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
+    ].join(' ')
+
+    const step = storage.addChainStep(run, {
+      title,
+      hypothesis,
+      category,
+      priority,
+      targetAssetIds: [asset.id],
+      skills,
+      dependsOnFactIds: [fact.id],
+      sourceOrigins: [fact.origin],
+    })
+    existingTitles.add(title.toLowerCase())
+    coveredFactIds.add(fact.id)
+    created.push(step)
+    totalSteps += 1
+  }
+
+  return created
+}
+
+const STATIC_ASSET_PATH_RE = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|pdf)(?:\?|$)/i
+const RESOURCE_ID_KEY_RE = /^(?:id|uuid|user_?id|org_?id|organization_?id|project_?id|account_?id|team_?id|chat_?id|app_?id|order_?id|invoice_?id|document_?id|file_?id|workspace_?id|subscription_?id|record_?id|item_?id|ticket_?id|customer_?id)$/i
+const IGNORED_ID_VALUES = new Set(['true', 'false', 'null', 'undefined', 'default', 'self', 'me', 'current', 'none', 'all', 'new', 'list', 'index', 'health', 'status', 'public'])
+const PATH_RESOURCE_RE = /\/(?:api\/(?:v\d+\/)?)?([a-z][a-z0-9_-]{1,32})\/([0-9]{2,16}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?:usr|org|proj|acct|app|ord|inv|doc|file|chat|team|sub|cus|ws|res)_[a-zA-Z0-9_-]{4,64})(?:\/|$|\?)/i
+
+export function extractPersonaResourcesFromExchange(ex: {
+  origin: string
+  method: string
+  pathAndQuery: string
+  personaHandle?: string | null
+  status: number
+  mediaType: string
+  body: string
+}): Array<{ resourceId: string; endpoint: string; method: string; field: string }> {
+  if (!ex.personaHandle) return []
+  if (ex.status < 200 || ex.status >= 300) return []
+  if (STATIC_ASSET_PATH_RE.test(ex.pathAndQuery) || ex.pathAndQuery.startsWith('/_next/static/')) return []
+
+  const found: Array<{ resourceId: string; endpoint: string; method: string; field: string }> = []
+  const seen = new Set<string>()
+  const push = (resourceId: string, endpoint: string, field: string) => {
+    const clean = resourceId.trim()
+    if (!clean || clean.length < 2 || clean.length > 128) return
+    if (IGNORED_ID_VALUES.has(clean.toLowerCase())) return
+    const key = `${endpoint}|${clean}`
+    if (seen.has(key) || found.length >= 6) return
+    seen.add(key)
+    found.push({ resourceId: clean, endpoint, method: ex.method.toUpperCase(), field })
+  }
+
+  const pathMatch = PATH_RESOURCE_RE.exec(ex.pathAndQuery)
+  if (pathMatch) {
+    push(pathMatch[2], ex.pathAndQuery.split('?')[0], `path:${pathMatch[1]}`)
+  }
+
+  if (ex.mediaType.toLowerCase().includes('json') && ex.body && ex.body.length <= 256 * 1024) {
+    try {
+      const parsed = JSON.parse(ex.body) as unknown
+      const basePath = ex.pathAndQuery.split('?')[0]
+      const walk = (node: unknown, depth: number) => {
+        if (depth > 3 || found.length >= 6 || !node || typeof node !== 'object') return
+        if (Array.isArray(node)) {
+          for (const item of node.slice(0, 5)) walk(item, depth + 1)
+          return
+        }
+        for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+          if (found.length >= 6) break
+          if (RESOURCE_ID_KEY_RE.test(key)) {
+            if (typeof val === 'string' && val.trim().length >= 3) {
+              push(val, basePath, key)
+            } else if (typeof val === 'number' && Number.isInteger(val) && val > 0) {
+              push(String(val), basePath, key)
+            }
+          } else if (val && typeof val === 'object') {
+            walk(val, depth + 1)
+          }
+        }
+      }
+      walk(parsed, 0)
+    } catch {
+      // Ignore non-JSON or truncated bodies
+    }
+  }
+
+  return found
+}
+
+export function buildBolaTestQueue(
+  facts: readonly Fact[],
+  personas: readonly { handle: string; originAllowlist: readonly string[] }[],
+  approvedOrigins: ReadonlySet<string>,
+): PersonaResourceQueueItem[] {
+  if (personas.length < 2) return []
+  const queue: PersonaResourceQueueItem[] = []
+  const seen = new Set<string>()
+
+  for (const fact of facts) {
+    if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
+    const subkind = typeof fact.data?.subkind === 'string' ? fact.data.subkind : ''
+    if (subkind !== 'persona_resource' && fact.kind !== 'object_ref') continue
+
+    const data = fact.data ?? {}
+    const ownerPersona = typeof data.ownerPersona === 'string' ? data.ownerPersona
+      : typeof data.persona === 'string' ? data.persona
+        : typeof data.personaHandle === 'string' ? data.personaHandle : ''
+    const resourceId = typeof data.resourceId === 'string' ? data.resourceId
+      : typeof data.id === 'string' ? data.id
+        : typeof data.resourceId === 'number' ? String(data.resourceId) : ''
+    const endpoint = typeof data.endpoint === 'string' ? data.endpoint
+      : typeof data.path === 'string' ? data.path
+        : typeof data.pathAndQuery === 'string' ? data.pathAndQuery : ''
+    if (!ownerPersona || !resourceId || !endpoint) continue
+
+    const method = typeof data.method === 'string' ? data.method.toUpperCase() : 'GET'
+    const otherPersonas = personas
+      .filter(p => p.handle !== ownerPersona && p.originAllowlist.includes(fact.origin))
+      .map(p => p.handle)
+    const testAsPersonas = [...new Set([...otherPersonas, 'anonymous'])]
+    if (!testAsPersonas.length) continue
+
+    const key = `${fact.origin}|${ownerPersona}|${endpoint}|${resourceId}`
+    if (seen.has(key)) continue
+    seen.add(key)
+
+    queue.push({
+      factId: fact.id,
+      origin: fact.origin,
+      ownerPersona,
+      resourceId,
+      endpoint,
+      method,
+      testAsPersonas,
+      summary: fact.summary,
+    })
+    if (queue.length >= 25) break
+  }
+
+  return queue
+}
+
+const CROSS_HOST_LEVERAGE_PATTERNS: ReadonlyArray<{ label: string; kindMatch?: string[]; pattern: RegExp }> = [
+  { label: 'credentialed-cors-or-wildcard', kindMatch: ['cors'], pattern: /access-control-allow-credentials|wildcard|allow-origin|reflected origin|cors|subdomain trust/i },
+  { label: 'dangling-cname-or-takeover', kindMatch: ['dns'], pattern: /dangling|cname|takeover|nxdomain|unclaimed/i },
+  { label: 'oauth-redirect-or-sso', kindMatch: ['redirect', 'auth'], pattern: /oauth|oidc|redirect_uri|callback|sso|clerk|token|session|cross-origin/i },
+  { label: 'sandboxed-user-js-or-postmessage', kindMatch: ['dom'], pattern: /sandpack|sandbox|postmessage|iframe|user js|script execution|xss|bundler/i },
+]
+
+export function shouldRunCrossHostSynthesizer(
+  facts: readonly Fact[],
+  approvedOrigins: ReadonlySet<string>,
+): { trigger: boolean; reason: string; distinctOrigins: string[]; leverageSignals: string[] } {
+  const validFacts = facts.filter(f => !f.tainted && approvedOrigins.has(f.origin))
+  if (!validFacts.length) {
+    return { trigger: false, reason: 'No untainted facts in approved scope.', distinctOrigins: [], leverageSignals: [] }
+  }
+  const distinctOrigins = [...new Set(validFacts.map(f => f.origin))].sort()
+  const signalSet = new Set<string>()
+  for (const fact of validFacts) {
+    const text = `${fact.summary} ${JSON.stringify(fact.data ?? {})}`
+    for (const rule of CROSS_HOST_LEVERAGE_PATTERNS) {
+      if ((rule.kindMatch?.includes(fact.kind) && rule.pattern.test(text)) || rule.pattern.test(text)) {
+        signalSet.add(rule.label)
+      }
+    }
+  }
+  const leverageSignals = [...signalSet]
+  const trigger = distinctOrigins.length >= 2 || leverageSignals.length > 0
+  const reason = distinctOrigins.length >= 2
+    ? `Facts span ${distinctOrigins.length} distinct approved origins${leverageSignals.length ? ` with signals: ${leverageSignals.join(', ')}` : ''}.`
+    : leverageSignals.length > 0
+      ? `High-leverage cross-origin signals detected: ${leverageSignals.join(', ')}.`
+      : 'Single-origin facts without cross-origin leverage signals.'
+  return { trigger, reason, distinctOrigins, leverageSignals }
 }
 
 function isSafeIdempotentPost(pathAndQuery: string, body?: string): boolean {
@@ -213,6 +636,8 @@ export class Execution {
   private readonly plannerTimers = new Map<string, NodeJS.Timeout>()
   private readonly plannerDirty = new Set<string>()
   private readonly plannerDoneRound = new Map<string, number>()
+  private readonly synthesizedSignature = new Map<string, string>()
+  private readonly recordedPersonaResources = new Map<string, Set<string>>()
   private readonly circuitNotified = new Set<string>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
@@ -223,7 +648,7 @@ export class Execution {
     this.storage = storage
     this.broker = options.broker ?? createBroker()
     this.browser = options.browser ?? new ScopedBrowser(this.broker)
-    this.canaryBroker = options.canaryBroker ?? new CanaryBroker()
+    this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
     this.backend = options.backend ?? new LinuxWorkerBackend({
       workspace: { id: storage.workspace.id, directory: storage.directory },
     })
@@ -233,8 +658,20 @@ export class Execution {
     })
   }
 
+  private isCanaryListenerConfigured(): boolean {
+    return Boolean(
+      process.env.GUARDIAN_CANARY_PUBLIC_URL ||
+      process.env.GUARDIAN_CANARY_BASE_URL ||
+      process.env.GUARDIAN_CANARY_PORT ||
+      process.env.GUARDIAN_CANARY_ENABLE === '1',
+    )
+  }
+
   start() {
     if (this.safetyTimer) return
+    if (this.isCanaryListenerConfigured()) {
+      void this.canaryBroker.startListener().catch(() => undefined)
+    }
     this.unsubWake = this.storage.onWake(() => this.scheduleWake())
     this.safetyTimer = setInterval(() => this.wake(), 2_000)
     this.safetyTimer.unref()
@@ -260,7 +697,7 @@ export class Execution {
     for (const task of this.coordinator.values()) task.controller.abort()
     for (const task of this.threatModeling.values()) task.controller.abort()
     for (const task of this.plannerTasks.values()) task.controller.abort()
-    await this.canaryBroker.stop().catch(() => undefined)
+    await this.canaryBroker.stopListener().catch(() => undefined)
   }
 
   private scheduleWake() {
@@ -278,6 +715,16 @@ export class Execution {
 
   private approvedOriginsSet(run: Run): Set<string> {
     return new Set(run.candidates.filter(asset => run.approved.includes(asset.id)).map(asset => asset.origin))
+  }
+
+  private projectReposMount(projectId: string): { reposDir?: string; mountedRepos: string[] } {
+    try {
+      const dir = projectReposDir(this.storage.directory, projectId)
+      const mountedRepos = listMountedRepos(dir)
+      return mountedRepos.length > 0 ? { reposDir: dir, mountedRepos } : { mountedRepos: [] }
+    } catch {
+      return { mountedRepos: [] }
+    }
   }
 
   private authorize(job: Active): boolean {
@@ -321,10 +768,23 @@ export class Execution {
   private buildGrant(job: Active, run: Run, permittedAtAdmission: ReadonlySet<string>): {
     grant: Grant
     secrets: NamedSecret[]
+    currentSecrets: () => NamedSecret[]
   } {
     const project = this.storage.project(run.projectId)
     const personas = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
     const secrets = personaSecrets(personas)
+    const currentSecrets = () => {
+      const latest = personaSecrets(personas)
+      const seen = new Set(secrets.map(s => `${s.placeholder}\0${s.value}`))
+      for (const item of latest) {
+        const key = `${item.placeholder}\0${item.value}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          secrets.push(item)
+        }
+      }
+      return secrets
+    }
     const allowLocalLab = project.environment === 'local-lab'
 
     const grant: Grant = {
@@ -392,7 +852,7 @@ export class Execution {
         }
       },
     }
-    return { grant, secrets }
+    return { grant, secrets, currentSecrets }
   }
 
   private async waitForTier3Approval(
@@ -615,7 +1075,7 @@ export class Execution {
       for (const spec of specs) {
         const deps = parseDependenciesFromFile(spec.name.split(':').pop() ?? spec.name, spec.content)
         // Also parse `:dependencies` note format generated by github-connector
-        for (const match of spec.content.matchAll(/^([a-zA-Z0-9_-]+):([@a-zA-Z0-9_./-]+)@([0-9][0-9A-Za-z.+-]*)/gm)) {
+        for (const match of spec.content.matchAll(/^([a-zA-Z0-9_.-]+):([@a-zA-Z0-9_./-]+)@([0-9][0-9A-Za-z.+-]*)/gm)) {
           deps.push({ ecosystem: match[1], package: match[2], version: match[3], sourceFile: spec.name })
         }
         for (const dep of deps) {
@@ -749,7 +1209,11 @@ export class Execution {
       // 3. Build prioritized Threat Model via LLM (with deterministic fallback)
       const heuristicEntries = approvedAssets.map(classifyHostHeuristic)
       const riskOrder = { critical: 0, high: 1, medium: 2, low: 3 }
-      heuristicEntries.sort((a, b) => riskOrder[a.riskTier] - riskOrder[b.riskTier])
+      heuristicEntries.sort((a, b) =>
+        hostTierOrder[classifyHostTier(a.origin, a.surfaceTags)] - hostTierOrder[classifyHostTier(b.origin, b.surfaceTags)] ||
+        riskOrder[a.riskTier] - riskOrder[b.riskTier],
+      )
+      const initialHostTiers = computeHostTiers([...approvedOrigins], heuristicEntries)
 
       let finalEntries = heuristicEntries
       let tmSummary = `Ranked ${heuristicEntries.length} approved hosts by attack surface.`
@@ -761,6 +1225,8 @@ export class Execution {
         origins: string[]
         skills: string[]
       }> = []
+
+      const { mountedRepos } = this.projectReposMount(freshRun.projectId)
 
       if (profiles.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0) {
         try {
@@ -778,10 +1244,12 @@ export class Execution {
               goal: freshRun.goal,
               capabilityTier: freshRun.capabilityTier,
               approvedOrigins: [...approvedOrigins],
+              hostTiers: initialHostTiers,
               personas: personasPub,
               specs: specs.slice(0, 12).map(s => ({
                 name: s.name, kind: s.kind, origin: s.origin, preview: s.content.slice(0, 1200),
               })),
+              mountedRepos,
               observations: observations.slice(0, 40),
             }),
             signal: task.controller.signal,
@@ -793,13 +1261,24 @@ export class Execution {
           const parsed = threatModelResponseSchema.safeParse(JSON.parse(stripJsonFences(answer)))
           if (parsed.success) {
             tmSummary = parsed.data.summary
-            const validEntries = parsed.data.entries.filter(e => approvedOrigins.has(e.origin))
+            const validEntries: ThreatModelSummary[] = parsed.data.entries
+              .filter(e => approvedOrigins.has(e.origin))
+              .map(e => {
+                const tags = [...new Set(e.surfaceTags)]
+                const tier = e.hostTier ?? classifyHostTier(e.origin, tags)
+                if (tier === 'crown_jewel' && !tags.includes('crown_jewel')) tags.unshift('crown_jewel')
+                if (tier === 'low_value_static' && !tags.includes('low_value_static')) tags.push('low_value_static')
+                return { origin: e.origin, riskTier: e.riskTier, surfaceTags: tags, rationale: e.rationale }
+              })
             if (validEntries.length) {
               const seen = new Set(validEntries.map(e => e.origin))
               finalEntries = [
                 ...validEntries,
                 ...heuristicEntries.filter(h => !seen.has(h.origin)),
-              ]
+              ].sort((a, b) =>
+                hostTierOrder[classifyHostTier(a.origin, a.surfaceTags)] - hostTierOrder[classifyHostTier(b.origin, b.surfaceTags)] ||
+                riskOrder[a.riskTier] - riskOrder[b.riskTier],
+              )
             }
             seededSteps = parsed.data.initialSteps.filter(s => s.origins.some(o => approvedOrigins.has(o)))
           }
@@ -810,31 +1289,72 @@ export class Execution {
 
       if (!this.authorize(job)) return
 
+      const finalHostTiers = computeHostTiers([...approvedOrigins], finalEntries)
+
+      // Save Threat Model before Source-First Code Audit so audit & planner see ranked hosts
+      const savedTm = this.storage.transaction(() => {
+        const current = this.storage.run(freshRun.id)
+        if (current.status !== 'running' || current.phase !== 'threat_model') return null
+        const tm = this.storage.saveThreatModel(current, finalEntries, tmSummary)
+        const tmArtifact = this.storage.addArtifact(current, claimed, 'threat-model', 'Round-0 Threat Model',
+          JSON.stringify({ threatModelId: tm.id, summary: tmSummary, entries: finalEntries, hostTiers: finalHostTiers }, null, 2), 'threat-model', secrets)
+        return { tm, tmArtifact }
+      }, { behavior: 'immediate' })
+      if (!savedTm) return
+
+      // 4. Priority #1: Dedicated Source-First Code Audit Phase BEFORE live HTTP investigation rounds
+      let codeAuditStepsCreated = 0
+      if (mountedRepos.length > 0 && freshRun.capabilityTier > 0 && profiles.length > 0 && this.authorize(job)) {
+        try {
+          const auditResult = await this.runSourceFirstCodeAudit(
+            this.storage.run(freshRun.id),
+            finalEntries,
+            profiles,
+            task.controller.signal,
+          )
+          codeAuditStepsCreated = auditResult.stepsCreated.length
+        } catch {
+          // Code audit failure should not block live investigation rounds
+        }
+      }
+
+      if (!this.authorize(job)) return
+
       // Ensure at least initial investigation steps exist when Tier >= 1
       if (!seededSteps.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0) {
-        const topHosts = finalEntries.slice(0, Math.min(6, finalEntries.length))
-        seededSteps = topHosts.map((entry, idx) => ({
-          title: `Surface & chain investigation · ${new URL(entry.origin).hostname}`,
-          hypothesis: `Harvest JS/API routes, inspect DNS/TLS/CORS/auth headers, fingerprint stack & CVEs, and verify any candidate vulnerabilities on ${entry.origin} (${entry.surfaceTags.join(', ')}).`,
-          category: entry.surfaceTags.includes('auth') ? 'auth-identity'
-            : entry.surfaceTags.includes('api') ? 'broken-access-control'
-              : entry.surfaceTags.includes('upload') ? 'upload-storage'
-                : entry.surfaceTags.includes('llm-proxy') ? 'llm-ai-security'
-                  : 'misconfig-exposure',
-          priority: Math.max(40, 95 - idx * 8),
-          origins: [entry.origin],
-          skills: ['recon-modern-spa', 'cve-runtime-correlation', 'false-positive-elimination'],
-        }))
+        const topHosts = finalEntries.slice(0, Math.min(8, finalEntries.length))
+        seededSteps = topHosts.map((entry, idx) => {
+          const tier = finalHostTiers[entry.origin] ?? classifyHostTier(entry.origin, entry.surfaceTags)
+          return {
+            title: `Surface & chain investigation · ${new URL(entry.origin).hostname}`,
+            hypothesis: `Harvest JS/API routes, inspect DNS/TLS/CORS/auth headers, fingerprint stack & CVEs, and verify any candidate vulnerabilities on ${entry.origin} (${entry.surfaceTags.join(', ')}).`,
+            category: entry.surfaceTags.includes('auth') ? 'auth-identity'
+              : entry.surfaceTags.includes('api') ? 'broken-access-control'
+                : entry.surfaceTags.includes('upload') ? 'upload-storage'
+                  : entry.surfaceTags.includes('llm-proxy') ? 'llm-ai-security'
+                    : 'misconfig-exposure',
+            priority: tier === 'low_value_static' ? 30 : Math.max(55, 95 - idx * 6),
+            origins: [entry.origin],
+            skills: ['recon-modern-spa', 'cve-runtime-correlation', 'false-positive-elimination'],
+          }
+        })
       }
 
       this.storage.transaction(() => {
         const current = this.storage.run(freshRun.id)
         if (current.status !== 'running' || current.phase !== 'threat_model') return
-        const tm = this.storage.saveThreatModel(current, finalEntries, tmSummary)
-        const tmArtifact = this.storage.addArtifact(current, claimed, 'threat-model', 'Round-0 Threat Model',
-          JSON.stringify({ threatModelId: tm.id, summary: tmSummary, entries: finalEntries }, null, 2), 'threat-model', secrets)
 
-        for (const step of seededSteps.slice(0, 12)) {
+        const existingSteps = this.storage.listChainSteps(current.id, current.goalRevision)
+        const remainingInitialSlots = Math.max(0, 12 - existingSteps.length)
+        const budgetedSteps = applyCrownJewelStepBudget(
+          seededSteps.map(step => ({ ...step, origins: step.origins.filter(o => approvedOrigins.has(o)) })),
+          finalHostTiers,
+          existingSteps,
+          remainingInitialSlots,
+        )
+
+        let addedInitial = 0
+        for (const step of budgetedSteps) {
           const validOrigins = step.origins.filter(o => approvedOrigins.has(o))
           const assetIds = current.candidates.filter(c => validOrigins.includes(c.origin) && current.approved.includes(c.id)).map(c => c.id)
           if (!assetIds.length) continue
@@ -847,22 +1367,217 @@ export class Execution {
             skills: step.skills,
             sourceOrigins: validOrigins,
           })
+          addedInitial += 1
         }
 
-        this.completeWorker(claimed, current, tmSummary, [tmArtifact.id])
+        const totalQueued = codeAuditStepsCreated + addedInitial
+        this.completeWorker(claimed, current, tmSummary, [savedTm.tmArtifact.id])
         const nextPhase = current.capabilityTier === 0 || !profiles.length ? 'verification' : 'investigation'
         this.storage.updateRun(current.id, { phase: nextPhase })
         this.storage.event(current.id, `${nextPhase}.started`,
           nextPhase === 'investigation'
-            ? `Threat model complete. Starting closed-loop chain investigation (${seededSteps.length} initial steps).`
+            ? `Threat model complete${codeAuditStepsCreated ? ` (${codeAuditStepsCreated} source-audit steps + ${addedInitial} initial steps)` : ` (${totalQueued} initial steps)`}. Starting closed-loop chain investigation.`
             : 'Baseline captures complete. Starting deterministic Zero-LLM verification.')
         this.storage.message(current.id, current.coordinatorId, 'guardian',
           nextPhase === 'investigation'
-            ? `Threat model ranked ${finalEntries.length} hosts and queued ${Math.min(seededSteps.length, 12)} initial investigation steps.`
+            ? `Threat model ranked ${finalEntries.length} hosts and queued ${totalQueued} initial investigation steps${codeAuditStepsCreated ? ` (including ${codeAuditStepsCreated} from Source-First Code Audit)` : ''}.`
             : 'Baseline capture complete. Deterministic verification is checking the recorded evidence.')
       }, { behavior: 'immediate' })
     } finally {
       this.active.delete(claimed.id)
+    }
+  }
+
+  // --- Phase 1B: Source-First Code Audit (Mounted /repos BEFORE live HTTP rounds) ---
+
+  async runSourceFirstCodeAudit(
+    run: Run,
+    threatModel: readonly ThreatModelSummary[],
+    profiles: readonly ResolvedModelProfile[],
+    signal: AbortSignal,
+  ): Promise<{ suspects: Fact[]; stepsCreated: ChainStep[] }> {
+    const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
+    if (!reposDir || !mountedRepos.length || !profiles.length || run.capabilityTier === 0) {
+      return { suspects: [], stepsCreated: [] }
+    }
+    const approvedAssets = run.candidates.filter(c => run.approved.includes(c.id))
+    const approvedOrigins = new Set(approvedAssets.map(a => a.origin))
+    if (!approvedOrigins.size) return { suspects: [], stepsCreated: [] }
+
+    const auditMaxTurns = Math.max(6, Math.min(run.workerMaxTurns || defaultCodeAuditMaxTurns, defaultCodeAuditMaxTurns))
+    const auditPhase = run.phase === 'investigation' ? 'investigation' : 'threat_model'
+    const auditWorker = this.storage.makeWorker(
+      run,
+      auditPhase,
+      approvedAssets[0],
+      `Source-First Code Audit · ${mountedRepos.slice(0, 2).join(', ')}`,
+      `Inspect read-only mounted source repositories (${mountedRepos.join(', ')}) under /repos before live HTTP probing to build a Route/Server Action/Webhook Authz Matrix and record code_audit_suspect facts.`,
+      { maxTurns: auditMaxTurns, sourceOrigins: [...approvedOrigins] },
+    )
+    const claimed = this.storage.updateWorker(auditWorker.id, {
+      status: 'running',
+      lease: randomUUID(),
+      leaseExpiresAt: Date.now() + 10 * 60_000,
+    })!
+    const controller = new AbortController()
+    const onParentAbort = () => controller.abort(signal.reason)
+    signal.addEventListener('abort', onParentAbort, { once: true })
+    if (signal.aborted) controller.abort(signal.reason)
+
+    const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller }
+    this.active.set(claimed.id, job)
+    this.storage.event(run.id, 'code_audit.started', `Source-First Code Audit started across ${mountedRepos.length} mounted ${mountedRepos.length === 1 ? 'repo' : 'repos'}.`, {
+      assignmentId: claimed.id, mountedRepos,
+    })
+
+    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
+    const session = await this.backend.openSession(claimed.id, controller.signal, { reposDir })
+    const startedAt = Date.now()
+
+    try {
+      const specs = this.storage.listProjectSpecsFull(run.projectId)
+      const stagedSpecs: Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string }> = []
+      for (const [idx, spec] of specs.slice(0, 8).entries()) {
+        try {
+          const stagedPath = await session.stage(`specs/spec-${idx + 1}.txt`, spec.content.slice(0, 1_500_000), controller.signal)
+          stagedSpecs.push({ name: spec.name, kind: spec.kind, origin: spec.origin, stagedPath })
+        } catch { /* skip oversized */ }
+      }
+
+      const handlers: WorkerToolHandlers = {
+        spillOutput: async (id, content, sig) => session.stage(`tool-output/${id}.txt`, content, sig),
+        derive_evidence: async ({ command, outputs, timeoutMs }, sig) => {
+          const curRun = this.check(job)
+          const res = await session.exec(command, outputs ?? ['result.txt'], sig, timeoutMs ?? 60_000)
+          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', 'Code audit analysis',
+            JSON.stringify({
+              command: redact(command, secrets),
+              exitStatus: res.exitCode,
+              stdout: redact(res.stdout, secrets),
+              stderr: redact(res.stderr, secrets),
+              outputs: res.outputs,
+            }, null, 2), undefined, secrets)
+          return { evidenceId: ev.id, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs }
+        },
+        analyze_artifact: async (args, sig) => {
+          this.check(job)
+          const { tool, ...rest } = args
+          return await session.analyze(tool, rest, sig)
+        },
+        query_cves: async (args, sig) => {
+          this.check(job)
+          const advisories = await queryCves(args, sig)
+          return { count: advisories.length, advisories }
+        },
+        load_skill: async ({ name }) => {
+          if (name.trim().toLowerCase() === 'list') return { skills: listSkills() }
+          const skill = loadSkill(name)
+          if (!skill) return { error: `Unknown skill "${name}".`, available: listSkills().map(s => s.name) }
+          return skill
+        },
+        search_facts: async ({ query, origin, kind, limit }) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
+            .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
+        },
+        record_fact: async (args) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          const cleanOrigin = assetOrigin.parse(args.origin)
+          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
+          const fact = this.storage.addFact(curRun, job.assignment, {
+            kind: args.kind,
+            origin: cleanOrigin,
+            summary: args.summary,
+            data: args.data,
+            exchangeIds: args.exchangeIds,
+            evidenceIds: args.evidenceIds,
+            sourceOrigins: args.sourceOrigins,
+            secrets: currentSecrets(),
+          })
+          return { factId: fact.id, kind: args.kind, origin: fact.origin }
+        },
+        record_coverage: async (args) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          const cleanOrigin = assetOrigin.parse(args.origin)
+          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
+          const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
+            origin: cleanOrigin, category: args.category, status: args.status, summary: args.summary,
+          })
+          return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
+        },
+        complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
+      }
+
+      const personasPub = [...grant.personas?.values() ?? []].map(p => ({
+        handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
+      }))
+
+      const sessionResult = await runAgentSession({
+        directory: this.storage.directory,
+        sessionId: claimed.sessionId,
+        requestId: `code-audit:${run.id}:${run.goalRevision}:${run.scopeRevision}`,
+        profiles,
+        scenario: 'code-auditor',
+        prompt: codeAuditPrompt({
+          goal: run.goal,
+          capabilityTier: run.capabilityTier,
+          approvedOrigins: [...approvedOrigins],
+          mountedRepos,
+          personas: personasPub,
+          specsSummary: stagedSpecs,
+          threatModel,
+          maxTurns: auditMaxTurns,
+        }),
+        signal: controller.signal,
+        maxTurns: auditMaxTurns,
+        thinkingLevel: 'medium',
+        compaction: true,
+        enableSettlement: true,
+        requireCompleteIntent: true,
+        shouldSettle: () => (Date.now() - startedAt) >= 8 * 60_000,
+        handlers,
+        secrets,
+        beforeCall: () => {
+          this.check(job)
+          if (this.storage.checkBudgetExceeded(run.id)) {
+            throw new BudgetExceededError('Run spend or request budget exceeded.')
+          }
+        },
+        onUsage: usage => {
+          this.storage.recordLlmSpend(run.id, {
+            usd: usage.costUsd,
+            tokens: usage.inputTokens + usage.outputTokens,
+          })
+        },
+        onTurn: turn => {
+          this.storage.updateWorker(claimed.id, { turnsUsed: turn })
+          this.storage.recordLlmSpend(run.id, { turns: 1 })
+        },
+        onProfileSuccess: id => recordProfileSuccess(id, this.storage),
+        onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+      })
+
+      const latestRun = this.storage.run(run.id)
+      const suspects = this.storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 100 })
+        .filter(f => approvedOrigins.has(f.origin))
+      const hostTiers = computeHostTiers([...approvedOrigins], threatModel)
+      const stepsCreated = convertCodeAuditSuspectsToChainSteps(this.storage, latestRun, suspects, hostTiers)
+
+      const outcomeText = sessionResult.completion
+        ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary} (${suspects.length} suspects → ${stepsCreated.length} targeted chain steps)`
+        : `Code audit finished: ${suspects.length} suspects converted into ${stepsCreated.length} targeted chain steps.`
+      this.completeWorker(claimed, latestRun, outcomeText, [])
+      this.storage.event(run.id, 'code_audit.complete', `Source-First Code Audit recorded ${suspects.length} suspects and queued ${stepsCreated.length} targeted steps.`, {
+        assignmentId: claimed.id, suspectsCount: suspects.length, stepsCreated: stepsCreated.length,
+      })
+      return { suspects, stepsCreated }
+    } finally {
+      signal.removeEventListener('abort', onParentAbort)
+      this.active.delete(claimed.id)
+      await session.close().catch(() => undefined)
     }
   }
 
@@ -939,6 +1654,143 @@ export class Execution {
     })
   }
 
+  // --- Priority #4: Cross-Host Chain Synthesizer Pass ---
+
+  async runCrossHostSynthesizer(
+    run: Run,
+    roundNo: number,
+    profiles: readonly ResolvedModelProfile[],
+    signal: AbortSignal,
+  ): Promise<{ triggered: boolean; stepsCreated: ChainStep[]; hypothesesCount: number; reason: string }> {
+    if (!profiles.length) {
+      return { triggered: false, stepsCreated: [], hypothesesCount: 0, reason: 'No model profiles configured.' }
+    }
+    const approvedOrigins = this.approvedOriginsSet(run)
+    const allValidFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 120 })
+      .filter(f => approvedOrigins.has(f.origin) && f.sourceOrigins.every(o => approvedOrigins.has(o)))
+    const check = shouldRunCrossHostSynthesizer(allValidFacts, approvedOrigins)
+    if (!check.trigger) {
+      return { triggered: false, stepsCreated: [], hypothesesCount: 0, reason: check.reason }
+    }
+
+    const signature = createHash('sha256')
+      .update(`${run.goalRevision}:${run.scopeRevision}:${allValidFacts.map(f => f.id).sort().join(',')}`)
+      .digest('hex')
+    if (this.synthesizedSignature.get(run.id) === signature) {
+      return { triggered: false, stepsCreated: [], hypothesesCount: 0, reason: 'Facts unchanged since last cross-host synthesis.' }
+    }
+
+    const tm = this.storage.latestThreatModel(run.id, run.goalRevision)
+    const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
+      .map(p => ({ handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist }))
+
+    const factsByOrigin: Record<string, Array<{
+      id: string
+      kind: string
+      summary: string
+      data?: Record<string, unknown>
+      exchangeIds?: readonly string[]
+    }>> = {}
+    for (const fact of allValidFacts) {
+      const list = factsByOrigin[fact.origin] ?? (factsByOrigin[fact.origin] = [])
+      list.push({
+        id: fact.id,
+        kind: typeof fact.data?.subkind === 'string' ? fact.data.subkind : fact.kind,
+        summary: fact.summary,
+        data: fact.data,
+        exchangeIds: fact.exchangeIds,
+      })
+    }
+
+    const prompt = crossHostSynthesizerPrompt({
+      goal: run.goal,
+      roundNo,
+      capabilityTier: run.capabilityTier,
+      approvedOrigins: [...approvedOrigins],
+      personas,
+      threatModel: tm?.entries.filter(e => approvedOrigins.has(e.origin)),
+      factsByOrigin,
+      existingSteps: existingSteps.map(s => ({ id: s.id, title: s.title, status: s.status, origins: s.sourceOrigins })),
+    })
+
+    const answer = await agentTurn({
+      directory: this.storage.directory,
+      sessionId: `synth-${run.id}-r${roundNo}`,
+      requestId: `synth:${run.goalRevision}:${roundNo}`,
+      profiles,
+      scenario: 'cross-host-synthesizer',
+      thinkingLevel: 'medium',
+      prompt,
+      signal,
+      onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
+      onProfileSuccess: id => recordProfileSuccess(id, this.storage),
+      onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+    })
+
+    this.synthesizedSignature.set(run.id, signature)
+    let parsedJson: unknown
+    try {
+      parsedJson = JSON.parse(stripJsonFences(answer))
+    } catch {
+      return { triggered: true, stepsCreated: [], hypothesesCount: 0, reason: 'Synthesizer returned non-JSON output.' }
+    }
+    const parsed = crossHostSynthesizerResponseSchema.safeParse(parsedJson)
+    if (!parsed.success) {
+      return { triggered: true, stepsCreated: [], hypothesesCount: 0, reason: 'Synthesizer output did not match schema.' }
+    }
+
+    const currentRun = this.storage.run(run.id)
+    const currentApproved = this.approvedOriginsSet(currentRun)
+    const latestSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
+    const existingTitles = new Set(latestSteps.map(s => s.title.trim().toLowerCase()))
+    const validFactIdSet = new Set(allValidFacts.map(f => f.id))
+    const stepsCreated: ChainStep[] = []
+    let totalSteps = latestSteps.length
+
+    for (const step of parsed.data.chainSteps) {
+      if (totalSteps >= maxChainStepsPerRun || stepsCreated.length >= 6) break
+      const validOrigins = step.origins.filter(o => currentApproved.has(o))
+      const assetIds = currentRun.candidates
+        .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
+        .map(c => c.id)
+      if (!assetIds.length) continue
+      const titleKey = step.title.trim().toLowerCase()
+      if (existingTitles.has(titleKey)) continue
+      const depFacts = step.dependsOnFactIds.filter(fid => validFactIdSet.has(fid))
+      const created = this.storage.addChainStep(currentRun, {
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        priority: Math.max(82, Math.min(100, step.priority)),
+        targetAssetIds: assetIds,
+        skills: [...new Set([...step.skills, 'cross-host-chaining'])],
+        dependsOnFactIds: depFacts,
+        sourceOrigins: validOrigins,
+      })
+      existingTitles.add(titleKey)
+      stepsCreated.push(created)
+      totalSteps += 1
+    }
+
+    this.storage.event(run.id, 'synthesizer.round',
+      `Cross-host synthesizer round ${roundNo}: ${parsed.data.hypotheses.length} hypotheses, ${stepsCreated.length} cross-host steps queued.`, {
+        roundNo,
+        hypothesesCount: parsed.data.hypotheses.length,
+        addedCount: stepsCreated.length,
+        distinctOrigins: check.distinctOrigins,
+        leverageSignals: check.leverageSignals,
+        summary: parsed.data.summary.slice(0, 300),
+      })
+
+    return {
+      triggered: true,
+      stepsCreated,
+      hypothesesCount: parsed.data.hypotheses.length,
+      reason: check.reason,
+    }
+  }
+
   private async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const fresh = this.storage.run(run.id)
     if (fresh.status !== 'running' || fresh.phase !== 'investigation') return
@@ -949,19 +1801,67 @@ export class Execution {
     const afterRound = this.storage.run(run.id)
     const approvedOrigins = this.approvedOriginsSet(afterRound)
 
+    // 2. Priority #4: Cross-Host Chain Synthesizer Pass when facts span >=2 origins or cross-origin primitives exist
+    let synthesizedStepsCount = 0
+    try {
+      const synth = await this.runCrossHostSynthesizer(afterRound, roundRes.roundNo, profiles, task.controller.signal)
+      synthesizedStepsCount = synth.stepsCreated.length
+    } catch {
+      // Cross-host synthesis is best-effort; continue planning cleanly
+    }
+    if (!this.currentCoordinator(run.id, task)) return
+
     const allSteps = this.storage.listChainSteps(run.id, afterRound.goalRevision)
-    const activeFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 80 })
-      .filter(f => !f.digestId && approvedOrigins.has(f.origin))
+    const allUntaintedFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 150 })
+      .filter(f => approvedOrigins.has(f.origin))
+    const activeFacts = allUntaintedFacts.filter(f => !f.digestId).slice(0, 80)
+    const codeAuditSuspects = allUntaintedFacts
+      .filter(f => f.data?.subkind === 'code_audit_suspect')
+      .slice(0, 30)
+      .map(f => ({ factId: f.id, origin: f.origin, summary: f.summary, data: f.data }))
     const coldDigests = this.storage.listDigests(run.id, true)
     const coverageEntries = this.storage.listCoverageEntries(run.id, afterRound.goalRevision)
       .filter(c => approvedOrigins.has(c.origin))
     const tm = this.storage.latestThreatModel(run.id, afterRound.goalRevision)
+    const tmEntries = tm?.entries.filter(e => approvedOrigins.has(e.origin))
+    const hostTiers = computeHostTiers([...approvedOrigins], tmEntries)
     const pendingFindings = this.storage.runDetail(run.id).findings
       .filter(f => approvedOrigins.has(f.origin))
       .slice(0, 30)
 
     const personas = [...resolveRunPersonas(this.storage, afterRound.projectId, afterRound.approvedPersonaIds).values()]
       .map(p => ({ handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist }))
+    const { mountedRepos } = this.projectReposMount(afterRound.projectId)
+
+    // Priority #3: Auto-enqueue cross-persona BOLA/IDOR step if >= 2 personas discovered owned resources not yet tested
+    let bolaAutoSteps = 0
+    if (afterRound.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < maxChainStepsPerRun) {
+      const bolaQueue = buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins)
+      const originsWithResources = [...new Set(bolaQueue.map(item => item.origin))]
+      for (const origin of originsWithResources) {
+        if (allSteps.length + bolaAutoSteps >= maxChainStepsPerRun) break
+        const alreadyPlanned = allSteps.some(s =>
+          s.sourceOrigins.includes(origin) &&
+          (s.skills.includes('bola-idor-race') || /\b(?:bola|idor|cross-persona)\b/i.test(s.title)),
+        )
+        if (alreadyPlanned) continue
+        const asset = afterRound.candidates.find(c => c.origin === origin && afterRound.approved.includes(c.id))
+        if (!asset) continue
+        const itemsForOrigin = bolaQueue.filter(i => i.origin === origin).slice(0, 5)
+        const factIds = itemsForOrigin.map(i => i.factId).filter((fid): fid is string => Boolean(fid))
+        this.storage.addChainStep(afterRound, {
+          title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname}`,
+          hypothesis: `Replay ${itemsForOrigin.length} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(i => `${i.endpoint} [${i.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} to verify tenant isolation and submit a DeclarativeReplaySpec if unauthorized access succeeds.`,
+          category: 'broken-access-control',
+          priority: 92,
+          targetAssetIds: [asset.id],
+          skills: ['bola-idor-race', 'false-positive-elimination'],
+          dependsOnFactIds: factIds,
+          sourceOrigins: [origin],
+        })
+        bolaAutoSteps += 1
+      }
+    }
 
     const prompt = chainPlannerPrompt({
       goal: afterRound.goal,
@@ -969,7 +1869,10 @@ export class Execution {
       capabilityTier: afterRound.capabilityTier,
       approvedOrigins: [...approvedOrigins],
       personas,
-      threatModel: tm?.entries.filter(e => approvedOrigins.has(e.origin)),
+      mountedRepos,
+      threatModel: tmEntries,
+      hostTiers,
+      codeAuditSuspects,
       activeFacts: activeFacts.map(f => ({
         id: f.id,
         kind: typeof f.data?.subkind === 'string' ? f.data.subkind : f.kind,
@@ -980,7 +1883,7 @@ export class Execution {
       coldDigests: coldDigests.map(d => ({
         id: d.id, level: d.level, roundNo: d.roundNo, summary: d.summary, coveredCount: d.coveredFactIds.length,
       })),
-      chainSteps: allSteps.map(s => ({
+      chainSteps: this.storage.listChainSteps(run.id, afterRound.goalRevision).map(s => ({
         id: s.id, seq: s.seq, title: s.title, category: s.category, status: s.status, priority: s.priority, origins: s.sourceOrigins,
       })),
       coverageEntries: coverageEntries.map(c => ({ origin: c.origin, category: c.category, status: c.status, summary: c.summary })),
@@ -1007,34 +1910,48 @@ export class Execution {
 
     if (!this.currentCoordinator(run.id, task)) return
 
-    const parsed = plannerResponseSchema.safeParse(JSON.parse(stripJsonFences(answer)))
-    if (!parsed.success) {
-      this.plannerDoneRound.set(run.id, roundRes.roundNo)
+    let parsedPlanner: ReturnType<typeof plannerResponseSchema.safeParse>
+    try {
+      parsedPlanner = plannerResponseSchema.safeParse(JSON.parse(stripJsonFences(answer)))
+    } catch {
+      if (synthesizedStepsCount === 0 && bolaAutoSteps === 0) {
+        this.plannerDoneRound.set(run.id, roundRes.roundNo)
+      }
+      return
+    }
+    if (!parsedPlanner.success) {
+      if (synthesizedStepsCount === 0 && bolaAutoSteps === 0) {
+        this.plannerDoneRound.set(run.id, roundRes.roundNo)
+      }
       return
     }
 
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
-    let totalSteps = existingSteps.length
-    let addedCount = 0
+    let addedCount = synthesizedStepsCount + bolaAutoSteps
 
-    for (const cancelId of parsed.data.cancelStepIds) {
+    for (const cancelId of parsedPlanner.data.cancelStepIds) {
       const target = existingSteps.find(s => s.id === cancelId)
       if (target && ['pending', 'ready'].includes(target.status)) {
         this.storage.updateChainStep(target.id, { status: 'canceled' })
       }
     }
 
-    for (const step of parsed.data.newSteps) {
-      if (totalSteps >= maxChainStepsPerRun) break
+    const remainingSlots = Math.max(0, maxChainStepsPerRun - existingSteps.length)
+    const budgetedNewSteps = applyCrownJewelStepBudget(
+      parsedPlanner.data.newSteps.map(step => ({ ...step, origins: step.origins.filter(o => currentApproved.has(o)) })),
+      hostTiers,
+      existingSteps,
+      remainingSlots,
+    )
+
+    for (const step of budgetedNewSteps) {
       const validOrigins = step.origins.filter(o => currentApproved.has(o))
       const assetIds = currentRun.candidates
         .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
         .map(c => c.id)
       if (!assetIds.length) continue
-      // Deduplicate identical titles
-      if (existingSteps.some(s => s.title.toLowerCase() === step.title.toLowerCase())) continue
       this.storage.addChainStep(currentRun, {
         title: step.title,
         hypothesis: step.hypothesis,
@@ -1046,15 +1963,14 @@ export class Execution {
         dependsOnStepIds: step.dependsOnStepIds,
         sourceOrigins: validOrigins,
       })
-      totalSteps += 1
       addedCount += 1
     }
 
-    if (parsed.data.done || addedCount === 0) {
+    if ((parsedPlanner.data.done && synthesizedStepsCount === 0 && bolaAutoSteps === 0) || addedCount === 0) {
       this.plannerDoneRound.set(run.id, roundRes.roundNo)
     }
     this.storage.event(run.id, 'planner.round', `Planner round ${roundRes.roundNo}: added ${addedCount} steps.`, {
-      roundNo: roundRes.roundNo, addedCount, done: parsed.data.done, summary: parsed.data.summary.slice(0, 300),
+      roundNo: roundRes.roundNo, addedCount, synthesizedStepsCount, bolaAutoSteps, done: parsedPlanner.data.done, summary: parsedPlanner.data.summary.slice(0, 300),
     })
   }
 
@@ -1069,10 +1985,15 @@ export class Execution {
       return
     }
 
+    const tm = this.storage.latestThreatModel(run.id, run.goalRevision)
+    const approvedOriginsList = [...this.approvedOriginsSet(run)]
+    const hostTiers = computeHostTiers(approvedOriginsList, tm?.entries)
+    const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, run.workerMaxTurns)
+
     const assignment = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {
         stepId: step.id,
-        maxTurns: run.workerMaxTurns,
+        maxTurns: stepMaxTurns,
         parentFactIds: step.dependsOnFactIds,
         sourceOrigins: targetOrigins,
       })
@@ -1121,10 +2042,15 @@ export class Execution {
   ) {
     const run = this.check(job)
     const permittedAtAdmission = this.approvedOriginsSet(run)
-    const { grant, secrets } = this.buildGrant(job, run, permittedAtAdmission)
+    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, permittedAtAdmission)
 
     // Open ONE persistent air-gapped container for the entire intent
-    const session = await this.backend.openSession(job.assignment.id, job.controller.signal)
+    const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
+    const session = await this.backend.openSession(
+      job.assignment.id,
+      job.controller.signal,
+      reposDir ? { reposDir } : undefined,
+    )
     const startedAt = Date.now()
 
     try {
@@ -1145,6 +2071,46 @@ export class Execution {
         : []
       if (parentFacts.length) {
         await session.stage('parent-facts.json', JSON.stringify(parentFacts, null, 2), job.controller.signal).catch(() => undefined)
+      }
+
+      const trackPersonaResources = (curRun: Run, res: BrokerExchangeResult, exchangeId: string) => {
+        if (curRun.capabilityTier < 2 || (grant.personas?.size ?? 0) < 2 || !res.personaHandle) return
+        const observedResources = extractPersonaResourcesFromExchange({
+          origin: res.origin,
+          method: res.method,
+          pathAndQuery: res.pathAndQuery,
+          personaHandle: res.personaHandle,
+          status: res.status,
+          mediaType: res.mediaType,
+          body: res.body,
+        })
+        if (!observedResources.length) return
+        let seenSet = this.recordedPersonaResources.get(curRun.id)
+        if (!seenSet) {
+          seenSet = new Set<string>()
+          this.recordedPersonaResources.set(curRun.id, seenSet)
+        }
+        for (const item of observedResources) {
+          const dedupKey = `${res.origin}|${res.personaHandle}|${item.endpoint}|${item.resourceId}`
+          if (seenSet.has(dedupKey)) continue
+          seenSet.add(dedupKey)
+          this.storage.addFact(curRun, job.assignment, {
+            kind: 'persona_resource',
+            origin: res.origin,
+            summary: `Persona "${res.personaHandle}" observed owned resource ${item.field}=${item.resourceId} at ${item.method} ${item.endpoint} (HTTP ${res.status}).`,
+            data: {
+              ownerPersona: res.personaHandle,
+              resourceId: item.resourceId,
+              endpoint: item.endpoint,
+              method: item.method,
+              field: item.field,
+              status: res.status,
+            },
+            exchangeIds: [exchangeId],
+            sourceOrigins: [res.origin],
+            secrets: currentSecrets(),
+          })
+        }
       }
 
       const executeBrokerRequest = async (args: RequestHttpArgs, signal: AbortSignal): Promise<{
@@ -1215,8 +2181,12 @@ export class Execution {
           respHeaders: res.respHeaders,
           body: res.body,
           durationMs: res.durationMs,
-          secrets,
+          secrets: currentSecrets(),
         })
+
+        // Priority #3: Auto-track persona_resource facts when Tier >= 2 and >= 2 personas are approved
+        trackPersonaResources(curRun, res, saved.id)
+
         let stagedPath: string | null = null
         try {
           stagedPath = await session.stage(`exchanges/${saved.id}.json`, JSON.stringify({
@@ -1236,6 +2206,97 @@ export class Execution {
           }, null, 2), signal)
         } catch { /* ignore stage error */ }
         return { exchangeId: saved.id, stagedPath, result: res }
+      }
+
+      const executeRaceBurstTool = async (args: RequestHttpRaceArgs, signal: AbortSignal) => {
+        const curRun = this.check(job)
+        if (curRun.capabilityTier < 2) {
+          throw new BrokerDenied('Race-condition burst testing requires Capability Tier 2 or Tier 3.')
+        }
+        if (this.storage.checkBudgetExceeded(curRun.id)) {
+          throw new BudgetExceededError('Run spend or request budget exceeded.')
+        }
+        if (curRun.budgetRequests > 0 && curRun.spentRequests + args.requests.length > curRun.budgetRequests) {
+          throw new BudgetExceededError('Race burst would exceed run request budget.')
+        }
+        const brokerReqs = args.requests.map(r => {
+          const headers = { ...(r.headers ?? {}) }
+          let body: string | undefined
+          if (r.textBody !== undefined) body = r.textBody
+          else if (r.jsonBody !== undefined) {
+            body = JSON.stringify(r.jsonBody)
+            if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json'
+          }
+          return {
+            origin: r.origin,
+            method: r.method,
+            pathAndQuery: r.pathAndQuery,
+            headers,
+            body,
+            persona: r.persona,
+            followRedirects: r.followRedirects ?? false,
+          }
+        })
+
+        let burst
+        try {
+          burst = await this.broker.executeRaceBurst(brokerReqs, grant, signal)
+        } catch (err) {
+          if (err instanceof BrokerApprovalRequired) {
+            const approved = await this.waitForTier3Approval(job, {
+              origin: err.origin,
+              method: err.method,
+              pathAndQuery: err.pathAndQuery,
+              personaHandle: args.requests[0]?.persona ?? null,
+              rationale: args.rationale ?? `Tier 3 concurrent race burst (${args.requests.length}x) during step "${step.title}"`,
+              requestPreview: JSON.stringify({
+                count: args.requests.length,
+                sample: args.requests[0],
+              }, null, 2),
+              secrets: currentSecrets(),
+            }, signal)
+            if (!approved) throw new BrokerDenied('Tier 3 race-burst request was denied or expired.')
+            burst = await this.broker.executeRaceBurst(brokerReqs, grant, signal)
+          } else {
+            throw err
+          }
+        }
+
+        const summaries = burst.results.map(res => {
+          const saved = this.storage.recordExchange({
+            runId: curRun.id,
+            assignmentId: job.assignment.id,
+            scopeRevision: curRun.scopeRevision,
+            origin: res.origin,
+            finalOrigin: res.finalOrigin,
+            redirectOrigins: res.redirectOrigins,
+            method: res.method,
+            pathAndQuery: res.pathAndQuery,
+            personaHandle: res.personaHandle,
+            status: res.status,
+            mediaType: res.mediaType,
+            reqHeaders: res.reqHeaders,
+            respHeaders: res.respHeaders,
+            body: res.body,
+            durationMs: res.durationMs,
+            secrets: currentSecrets(),
+          })
+          trackPersonaResources(curRun, res, saved.id)
+          return {
+            exchangeId: saved.id,
+            origin: res.origin,
+            method: res.method,
+            pathAndQuery: res.pathAndQuery,
+            personaHandle: res.personaHandle,
+            status: res.status,
+            durationMs: res.durationMs,
+            bodySha256: res.bodySha256,
+            bodyPreview: res.bodyPreview.slice(0, 800),
+          }
+        })
+        const stagedPath = await session.stage(`exchanges/race-${randomUUID().slice(0, 8)}.json`,
+          JSON.stringify({ summary: burst.summary, results: summaries }, null, 2), signal).catch(() => null)
+        return { count: summaries.length, summary: burst.summary, stagedPath, results: summaries }
       }
 
       const handlers: WorkerToolHandlers = {
@@ -1294,8 +2355,9 @@ export class Execution {
               respHeaders: res.respHeaders,
               body: res.body,
               durationMs: res.durationMs,
-              secrets,
+              secrets: currentSecrets(),
             })
+            trackPersonaResources(curRun, res, saved.id)
             return {
               exchangeId: saved.id, status: res.status, durationMs: res.durationMs,
               bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
@@ -1305,6 +2367,9 @@ export class Execution {
             JSON.stringify(summaries, null, 2), signal).catch(() => null)
           return { count: summaries.length, stagedPath, results: summaries }
         },
+
+        requestHttpRace: executeRaceBurstTool,
+        request_http_race: executeRaceBurstTool,
 
         inspect_dns: async ({ origin }, signal) => {
           const curRun = this.check(job)
@@ -1378,7 +2443,7 @@ export class Execution {
           }
           const ev = this.storage.addArtifact(curRun, job.assignment, 'browser',
             `Browser visit · ${args.origin}${args.pathAndQuery.slice(0, 60)}`,
-            JSON.stringify(summaryObj, null, 2), undefined, secrets)
+            JSON.stringify(summaryObj, null, 2), undefined, currentSecrets())
           const stagedPath = await session.stage(`browser-${ev.id.slice(0, 8)}.json`,
             JSON.stringify(summaryObj, null, 2), signal).catch(() => null)
           return { evidenceId: ev.id, stagedPath, ...summaryObj }
@@ -1430,15 +2495,18 @@ export class Execution {
         mint_canary: async ({ purpose }) => {
           const curRun = this.check(job)
           const project = this.storage.project(curRun.projectId)
-          if (process.env.GUARDIAN_CANARY_BASE_URL || (project.environment === 'local-lab' && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')) {
-            await this.canaryBroker.startLocalListener()
+          if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')) {
+            await this.canaryBroker.startListener()
           }
-          return this.canaryBroker.mint(this.storage, curRun.id, job.assignment.id, purpose)
+          return this.canaryBroker.mintCanary(curRun.id, purpose, targetOrigins[0], {
+            storage: this.storage,
+            assignmentId: job.assignment.id,
+          })
         },
 
         check_canary: async ({ token }) => {
           const curRun = this.check(job)
-          return this.canaryBroker.check(this.storage, curRun.id, token)
+          return this.canaryBroker.checkCanary(token, { storage: this.storage, runId: curRun.id })
         },
 
         search_exchanges: async ({ query, origin, status, limit }) => {
@@ -1517,7 +2585,7 @@ export class Execution {
             exchangeIds: args.exchangeIds,
             evidenceIds: args.evidenceIds,
             sourceOrigins: args.sourceOrigins,
-            secrets,
+            secrets: currentSecrets(),
           })
           this.schedulePlanner(curRun.id)
           return { factId: fact.id, kind: args.kind, origin: fact.origin }
@@ -1548,15 +2616,51 @@ export class Execution {
           const asset = curRun.candidates.find(c => c.origin === parsed.origin && curRun.approved.includes(c.id))
           if (!asset) throw new BrokerDenied(`Primary finding origin ${parsed.origin} is not in approved scope.`)
 
-          const findingId = randomUUID()
           const validFactIds = chainFactIds.filter(fid =>
             this.storage.listFacts(curRun.id, { includeTainted: false, limit: 500 }).some(f => f.id === fid))
           const sourceOrigins = new Set<string>([...specOrigins, ...targetOrigins])
+          const existingDup = this.storage.findDuplicateChainFinding(curRun.id, curRun.goalRevision, {
+            origin: parsed.origin,
+            cwe: parsed.cwe,
+            category: parsed.category,
+            title: parsed.title,
+          })
+
+          // Priority #6B: If an already-confirmed finding exists for the same (origin, cwe), merge evidence cleanly instead of duplicating
+          if (existingDup && existingDup.finding.status === 'confirmed') {
+            const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
+              `Additional corroborating spec · ${parsed.title}`,
+              JSON.stringify({ existingFindingId: existingDup.id, spec: parsed }, null, 2),
+              undefined, currentSecrets())
+            const merged = this.storage.upsertChainFinding(
+              curRun,
+              existingDup.assetId,
+              {
+                ...existingDup.finding,
+                severity: existingDup.finding.severity,
+                chainFactIds: [...new Set([...(existingDup.finding.chainFactIds ?? []), ...validFactIds])],
+                exchangeIds: [...new Set([...(existingDup.finding.exchangeIds ?? []), ...exchangeIds])],
+                evidenceIds: [...new Set([...existingDup.finding.evidenceIds, ev.id])],
+                scopeRevision: curRun.scopeRevision,
+              },
+              existingDup.replaySpecId ?? existingDup.finding.replaySpecId ?? '',
+              [...sourceOrigins],
+            )
+            return {
+              findingId: merged.id,
+              replaySpecId: merged.replaySpecId,
+              status: merged.status,
+              deduplicated: true,
+              note: 'Merged corroborating evidence into existing confirmed finding for this (origin, CWE).',
+            }
+          }
+
+          const findingId = existingDup?.id ?? randomUUID()
           const specRow = this.storage.createReplaySpec(curRun, job.assignment, findingId, parsed, [...sourceOrigins])
           const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
             `Proposed replay spec · ${parsed.title}`,
             JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
-            undefined, secrets)
+            undefined, currentSecrets())
           const finding: Finding = {
             id: findingId,
             origin: parsed.origin,
@@ -1578,16 +2682,17 @@ export class Execution {
             evidenceIds: [ev.id],
             scopeRevision: curRun.scopeRevision,
           }
-          this.storage.upsertChainFinding(curRun, asset.id, finding, specRow.id, [...sourceOrigins])
+          const savedFinding = this.storage.upsertChainFinding(curRun, asset.id, finding, specRow.id, [...sourceOrigins])
           for (const fid of validFactIds) {
-            this.storage.addGraphEdge(curRun.id, { fromKind: 'fact', fromId: fid, toKind: 'finding', toId: findingId, edgeKind: 'proves' })
+            this.storage.addGraphEdge(curRun.id, { fromKind: 'fact', fromId: fid, toKind: 'finding', toId: savedFinding.id, edgeKind: 'proves' })
           }
-          this.storage.addGraphEdge(curRun.id, { fromKind: 'assignment', fromId: job.assignment.id, toKind: 'finding', toId: findingId, edgeKind: 'proves' })
+          this.storage.addGraphEdge(curRun.id, { fromKind: 'assignment', fromId: job.assignment.id, toKind: 'finding', toId: savedFinding.id, edgeKind: 'proves' })
           this.schedulePlanner(curRun.id)
           return {
-            findingId,
+            findingId: savedFinding.id,
             replaySpecId: specRow.id,
-            status: 'pending',
+            status: savedFinding.status,
+            deduplicated: Boolean(existingDup),
             note: 'Candidate finding queued for Zero-LLM Declarative Replay Verification. Only deterministic replay can promote to confirmed.',
           }
         },
@@ -1605,6 +2710,14 @@ export class Execution {
         handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
       }))
 
+      const bolaTestQueue = run.capabilityTier >= 2 && personasPub.length >= 2
+        ? buildBolaTestQueue(
+            this.storage.listFacts(run.id, { includeTainted: false, limit: 200 }),
+            personasPub,
+            permittedAtAdmission,
+          )
+        : []
+
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: job.assignment.sessionId,
@@ -1621,10 +2734,12 @@ export class Execution {
           capabilityTier: run.capabilityTier,
           maxTurns: job.assignment.maxTurns,
           personas: personasPub,
+          ...(bolaTestQueue.length ? { bolaTestQueue } : {}),
           parentFacts: parentFacts.map(f => ({
             id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data,
           })),
           specsSummary: stagedSpecs,
+          mountedRepos,
         }),
         signal: job.controller.signal,
         maxTurns: job.assignment.maxTurns,
@@ -1795,7 +2910,12 @@ export class Execution {
     }
 
     const permittedAtAdmission = this.approvedOriginsSet(run)
-    const { grant, secrets } = this.buildGrant(job, run, permittedAtAdmission)
+    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, permittedAtAdmission)
+
+    // Priority #5: Ensure OOB canary listener is started cleanly when needed or configured
+    if ((specRow.spec.kind === 'rce_proof' && specRow.spec.proofMode === 'oob_canary') || this.isCanaryListenerConfigured()) {
+      await this.canaryBroker.startListener().catch(() => undefined)
+    }
 
     // Tier 3 HITL gate for rce_proof specs on non-local-lab targets
     if (specRow.spec.kind === 'rce_proof') {
@@ -1854,7 +2974,7 @@ export class Execution {
           respHeaders: ex.respHeaders,
           body: ex.body,
           durationMs: ex.durationMs,
-          secrets,
+          secrets: currentSecrets(),
         })
         return saved.id
       },
@@ -1875,7 +2995,7 @@ export class Execution {
           sourceOrigins: specRow.sourceOrigins,
           evidenceSha256: result.evidenceSha256,
           evidencePayload: result.evidencePayload,
-        }, null, 2), 'replay:' + specRow.id, secrets)
+        }, null, 2), 'replay:' + specRow.id, currentSecrets())
 
       const updatedFinding: Finding = {
         ...findingRow.finding,
@@ -1940,12 +3060,13 @@ export class Execution {
     const accessComparisons = access?.reviews.flatMap(r => r.comparison ? [r.comparison] : []) ?? []
     const comparisons = [...responseComparisons, ...accessComparisons]
     const payload = { response: responseComparisons, access: access?.policy ?? null }
+    const { reposDir } = this.projectReposMount(run.projectId)
     const result = comparisons.length ? await this.backend.run({
       assignmentId: job.assignment.id,
       files: [{ name: 'verification-input.json', content: JSON.stringify(payload) }],
       command: verificationCommand,
       outputs: ['verification.json'],
-    }, job.controller.signal) : undefined
+    }, job.controller.signal, reposDir ? { reposDir } : undefined) : undefined
 
     const outcomes = readComparisons(result?.exitCode === 0 ? result.outputs['verification.json'] : undefined, comparisons)
     const verified = inputs.flatMap(({ artifactId, reviews }) =>
@@ -2018,7 +3139,11 @@ export class Execution {
     if (!findingRow?.replaySpecId) throw new Error('Finding has no Declarative Replay Spec.')
     const specRow: ReplaySpecRow = this.storage.getReplaySpec(run.id, findingRow.replaySpecId)
     const permittedAtAdmission = this.approvedOriginsSet(run)
-    const { grant, secrets } = this.buildGrant(job, run, permittedAtAdmission)
+    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, permittedAtAdmission)
+
+    if ((specRow.spec.kind === 'rce_proof' && specRow.spec.proofMode === 'oob_canary') || this.isCanaryListenerConfigured()) {
+      await this.canaryBroker.startListener().catch(() => undefined)
+    }
 
     const retestRes = await retestReplaySpec({
       spec: specRow.spec,
@@ -2048,7 +3173,7 @@ export class Execution {
           respHeaders: ex.respHeaders,
           body: ex.body,
           durationMs: ex.durationMs,
-          secrets,
+          secrets: currentSecrets(),
         })
         return saved.id
       },

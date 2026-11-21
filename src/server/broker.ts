@@ -83,6 +83,21 @@ export interface BrokerExchangeResult {
   observation: PublicObservation
 }
 
+export interface RaceBurstSummary {
+  total: number
+  statuses: number[]
+  statusCounts: Record<string, number>
+  distinctBodies: number
+  minDurationMs: number
+  maxDurationMs: number
+  spreadMs: number
+}
+
+export interface BrokerRaceBurstResult {
+  results: BrokerExchangeResult[]
+  summary: RaceBurstSummary
+}
+
 export interface DnsDanglingHint {
   provider: string
   cname: string
@@ -865,12 +880,18 @@ export class RequestBroker {
     return deny('The public response exceeded the redirect limit.')
   }
 
-  private async executeHttpInternal(
-    req: BrokerHttpRequest,
-    grant: Grant,
-    signal: AbortSignal,
-    bypassConcurrency: boolean,
-  ): Promise<BrokerExchangeResult> {
+  private prepareHttpRequest(req: BrokerHttpRequest, grant: Grant): {
+    initialOrigin: string
+    url: URL
+    localLab: boolean
+    personaHandle: string | undefined
+    resolvedPersonaHeaders: Record<string, string> | undefined
+    cleanHeaders: Record<string, string>
+    secrets: NamedSecret[]
+    followRedirects: boolean
+    maxRps: number
+    timeoutMs: number
+  } {
     const tier = grant.tier ?? 1
     if (tier === 0) throw new BrokerDenied('Live HTTP requests are disabled in Tier 0 (offline prepared mode).')
 
@@ -964,14 +985,49 @@ export class RequestBroker {
       cleanHeaders[k] = v
     }
 
-    const started = Date.now()
     const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? defaultRequestTimeoutMs, 60_000))
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-    const transport = this.options.transport ?? defaultTransport
     const secrets = collectSecrets(req, grant)
     const followRedirects = req.followRedirects ?? true
     const defaultRps = tier === 3 ? 3 : 5
     const maxRps = grant.maxRpsPerOrigin ?? defaultRps
+
+    return {
+      initialOrigin,
+      url,
+      localLab,
+      personaHandle,
+      resolvedPersonaHeaders,
+      cleanHeaders,
+      secrets,
+      followRedirects,
+      maxRps,
+      timeoutMs,
+    }
+  }
+
+  private async executePreparedHttp(
+    prepared: ReturnType<RequestBroker['prepareHttpRequest']>,
+    req: BrokerHttpRequest,
+    grant: Grant,
+    signal: AbortSignal,
+    options: { bypassConcurrency: boolean; preResolvedAddresses?: PublicAddress[] },
+  ): Promise<BrokerExchangeResult> {
+    const {
+      initialOrigin,
+      localLab,
+      personaHandle,
+      resolvedPersonaHeaders,
+      cleanHeaders,
+      secrets,
+      followRedirects,
+      maxRps,
+      timeoutMs,
+    } = prepared
+    let url = new URL(prepared.url.href)
+
+    const started = Date.now()
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+    const transport = this.options.transport ?? defaultTransport
 
     const redirectOrigins = new Set<string>([url.origin])
     let activeMethod: BrokerHttpRequest['method'] = req.method
@@ -995,7 +1051,9 @@ export class RequestBroker {
       // Hard invariant: NEVER forward persona credentials across cross-origin redirects.
       if (url.origin !== initialOrigin) includePersona = false
 
-      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin)
+      const addresses = redirect === 0 && options.preResolvedAddresses
+        ? options.preResolvedAddresses
+        : await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin)
       check()
 
       const outboundHeaders: Record<string, string> = {
@@ -1003,7 +1061,7 @@ export class RequestBroker {
         ...(includePersona ? resolvedPersonaHeaders : {}),
       }
 
-      const release = await this.acquireSlot(url.origin, maxRps, deadline, bypassConcurrency)
+      const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency)
       let response: RawHttpResponse
       try {
         grant.audit('allowed', url.origin)
@@ -1069,6 +1127,16 @@ export class RequestBroker {
     return deny('The response exceeded the redirect limit.')
   }
 
+  private async executeHttpInternal(
+    req: BrokerHttpRequest,
+    grant: Grant,
+    signal: AbortSignal,
+    bypassConcurrency: boolean,
+  ): Promise<BrokerExchangeResult> {
+    const prepared = this.prepareHttpRequest(req, grant)
+    return this.executePreparedHttp(prepared, req, grant, signal, { bypassConcurrency })
+  }
+
   async executeHttp(req: BrokerHttpRequest, grant: Grant, signal: AbortSignal): Promise<BrokerExchangeResult> {
     return this.executeHttpInternal(req, grant, signal, false)
   }
@@ -1110,6 +1178,106 @@ export class RequestBroker {
         const state = this.origins.get(origin)
         if (state) state.batchActive = false
       }
+    }
+  }
+
+  async executeRaceBurst(
+    requests: readonly BrokerHttpRequest[],
+    grant: Grant,
+    signal: AbortSignal,
+  ): Promise<BrokerRaceBurstResult> {
+    const tier = grant.tier ?? 1
+    if (tier < 2) {
+      throw new BrokerDenied('Safe race-condition burst execution (executeRaceBurst) requires Tier 2 or Tier 3.')
+    }
+    if (!Array.isArray(requests) || requests.length < 2 || requests.length > 10) {
+      throw new BrokerDenied('executeRaceBurst requires between 2 and 10 requests.')
+    }
+    signal.throwIfAborted()
+
+    // 1. Validate every request up-front (scope, destructive payload denylist, Tier 2/3 method rules,
+    //    Tier 3 HITL approvals, persona originAllowlist, forbidden headers) before sending any bytes.
+    const preparedList = requests.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant) }))
+
+    const countsByOrigin = new Map<string, number>()
+    const hostsToResolve = new Map<string, string>() // hostname -> originForAudit
+    for (const { prepared } of preparedList) {
+      const origin = prepared.initialOrigin
+      const state = this.health(origin, grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5))
+      if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
+      if (state.batchActive) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
+      countsByOrigin.set(origin, (countsByOrigin.get(origin) ?? 0) + 1)
+      if (!hostsToResolve.has(prepared.url.hostname)) {
+        hostsToResolve.set(prepared.url.hostname, origin)
+      }
+    }
+
+    // 2. Synchronize DNS resolution & public-IP checks before releasing the concurrent burst barrier.
+    const dnsDeadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+    const resolvedByHost = new Map<string, PublicAddress[]>()
+    await Promise.all(
+      [...hostsToResolve.entries()].map(async ([hostname, origin]) => {
+        const addrs = await this.resolveAndCheckAddresses(hostname, grant, dnsDeadline, origin)
+        resolvedByHost.set(hostname, addrs)
+      }),
+    )
+    signal.throwIfAborted()
+
+    // 3. Re-check all origins atomically before mutating state, then reserve burst tokens and lock.
+    const defaultRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
+    for (const origin of countsByOrigin.keys()) {
+      const state = this.health(origin, defaultRps)
+      if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
+      if (state.batchActive) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
+    }
+
+    const markedOrigins: string[] = []
+    let results: BrokerExchangeResult[]
+    try {
+      for (const [origin, count] of countsByOrigin) {
+        const state = this.health(origin, defaultRps)
+        state.batchActive = true
+        markedOrigins.push(origin)
+        state.tokens = Math.max(state.tokens, count)
+      }
+      results = await Promise.all(
+        preparedList.map(({ req, prepared }) =>
+          this.executePreparedHttp(prepared, req, grant, signal, {
+            bypassConcurrency: true,
+            preResolvedAddresses: resolvedByHost.get(prepared.url.hostname),
+          }),
+        ),
+      )
+    } finally {
+      for (const origin of markedOrigins) {
+        const state = this.origins.get(origin)
+        if (state) state.batchActive = false
+      }
+    }
+
+    const statuses = results.map(r => r.status)
+    const statusCounts: Record<string, number> = {}
+    for (const status of statuses) {
+      const key = String(status)
+      statusCounts[key] = (statusCounts[key] ?? 0) + 1
+    }
+    const distinctBodies = new Set(results.map(r => r.bodySha256)).size
+    const durations = results.map(r => r.durationMs)
+    const minDurationMs = durations.length > 0 ? Math.min(...durations) : 0
+    const maxDurationMs = durations.length > 0 ? Math.max(...durations) : 0
+    const spreadMs = Math.max(0, maxDurationMs - minDurationMs)
+
+    return {
+      results,
+      summary: {
+        total: results.length,
+        statuses,
+        statusCounts,
+        distinctBodies,
+        minDurationMs,
+        maxDurationMs,
+        spreadMs,
+      },
     }
   }
 

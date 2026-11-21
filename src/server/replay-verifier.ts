@@ -9,9 +9,9 @@ import {
   replayAssertionOutcomeSchema,
   replaySpecOrigins,
 } from '../replay-spec.ts'
-import type { DeclarativeReplaySpec, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
+import type { DeclarativeReplaySpec, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from './broker.ts'
-import type { BrokerExchangeResult, Grant } from './broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import type { Store } from './store.ts'
@@ -216,23 +216,34 @@ async function openCanarySession(
   storage: Store | undefined,
   runId: string | undefined,
   assignmentId: string,
+  origin?: string,
 ): Promise<EphemeralCanarySession> {
-  if (canaryBroker && storage && runId) {
-    const baseUrl = await canaryBroker.startLocalListener()
+  if (canaryBroker) {
+    const info = await canaryBroker.startListener()
+    const effectiveRunId = runId ?? 'replay-verifier'
+    const baseUrl = info.effectiveBaseUrl ?? ''
     return {
       mint(purpose: string) {
-        const minted = canaryBroker.mint(storage, runId, assignmentId, purpose)
-        return { token: minted.token, url: minted.url ?? `${baseUrl}/c/${minted.token}` }
+        const minted = canaryBroker.mintCanary(
+          effectiveRunId,
+          purpose,
+          origin,
+          storage ? { storage, assignmentId } : undefined,
+        )
+        return {
+          token: minted.token,
+          url: minted.httpUrl || `${baseUrl}/c/${minted.token}`,
+        }
       },
       check(token: string) {
-        const res = canaryBroker.check(storage, runId, token)
-        return { triggered: res.triggered, detail: res.detail }
+        const res = canaryBroker.checkCanary(token, storage ? { storage, runId: effectiveRunId } : undefined)
+        return { triggered: res.hit, detail: res.detail }
       },
       async close() { /* Managed by host CanaryBroker lifecycle */ },
     }
   }
 
-  // Standalone ephemeral loopback canary listener (used in unit tests without a DB Store).
+  // Standalone ephemeral loopback canary listener (used in unit tests without a CanaryBroker).
   const callbacks = new Map<string, Record<string, unknown>>()
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -270,30 +281,37 @@ async function openCanarySession(
   }
 }
 
-function stepToBrokerRequest(step: ReplayStep, vars: Record<string, string>) {
-  const pathAndQuery = interpolateString(step.request.pathAndQuery, vars)
+function requestShapeToBrokerRequest(
+  req: ReplayStep['request'] | RaceBurstRequest,
+  vars: Record<string, string>,
+): BrokerHttpRequest {
+  const pathAndQuery = interpolateString(req.pathAndQuery, vars)
   const headers: Record<string, string> = {}
-  for (const [k, v] of Object.entries(step.request.headers ?? {})) {
+  for (const [k, v] of Object.entries(req.headers ?? {})) {
     headers[k] = interpolateString(v, vars)
   }
   let body: string | undefined
-  if (step.request.textBody !== undefined) {
-    body = interpolateString(step.request.textBody, vars)
-  } else if (step.request.jsonBody !== undefined) {
-    body = JSON.stringify(interpolateValue(step.request.jsonBody, vars))
+  if (req.textBody !== undefined) {
+    body = interpolateString(req.textBody, vars)
+  } else if (req.jsonBody !== undefined) {
+    body = JSON.stringify(interpolateValue(req.jsonBody, vars))
     if (!headers['Content-Type'] && !headers['content-type']) {
       headers['Content-Type'] = 'application/json'
     }
   }
   return {
-    origin: step.request.origin,
-    method: step.request.method,
+    origin: req.origin,
+    method: req.method,
     pathAndQuery,
     headers,
     body,
-    persona: step.request.persona,
-    followRedirects: step.request.followRedirects,
+    persona: req.persona,
+    followRedirects: req.followRedirects,
   }
+}
+
+function stepToBrokerRequest(step: ReplayStep, vars: Record<string, string>): BrokerHttpRequest {
+  return requestShapeToBrokerRequest(step.request, vars)
 }
 
 async function sleepAbortable(ms: number, signal: AbortSignal) {
@@ -544,6 +562,237 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
         control: stripExchanges(control),
         probe: stripExchanges(probe),
       }
+    } else if (spec.kind === 'browser_chain') {
+      const scopedBrowser = params.browser ?? new ScopedBrowser(broker)
+      const canaryToken = `guardian-dom-${randomAlphaToken(10)}`
+      const vars = { canary_token: canaryToken }
+      const stepsOut: Record<string, unknown> = {}
+      const pages: Record<string, unknown>[] = []
+      const consoleMessages: Array<{ stepId: string; role: string; type: 'error' | 'warning'; text: string }> = []
+      const requests: Array<{ stepId: string; role: string; method: string; url: string; origin: string; resourceType: string; status: number | null }> = []
+      const domResults: Record<string, unknown>[] = []
+      const probeSnapshots: Array<{
+        id: string
+        primaryExchange?: BrokerExchangeResult
+        domSnippet: string
+        status: number | null
+        hadDynamicSignal: boolean
+      }> = []
+      let firstControlStep: Record<string, unknown> | undefined
+      let firstProbeStep: Record<string, unknown> | undefined
+
+      for (const step of spec.steps) {
+        signal.throwIfAborted()
+        const pathAndQuery = interpolateString(step.pathAndQuery, vars)
+        const postMessagePayload = step.postMessagePayload !== undefined
+          ? interpolateValue(step.postMessagePayload, vars)
+          : undefined
+        const resolvedCheckKind = step.checkKind
+          ?? (step.action === 'postmessage_probe' ? 'postmessage'
+            : step.action === 'dom_check' ? 'dom_xss'
+              : undefined)
+
+        const visit = await scopedBrowser.visitPage({
+          origin: step.origin,
+          pathAndQuery,
+          persona: step.persona,
+          checkKind: resolvedCheckKind,
+          canaryToken,
+          selector: step.selector,
+          postMessageOrigin: step.action === 'postmessage_probe'
+            ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
+            : step.postMessageOrigin,
+          postMessagePayload,
+          sameSiteFetch: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
+          waitAfterLoadMs: step.waitAfterLoadMs,
+          onExchange: ex => {
+            exchanges.push(ex)
+            const id = params.onExchange?.(ex)
+            if (typeof id === 'string' && id) exchangeIds.push(id)
+            return id
+          },
+        }, grant, signal)
+
+        const { exchanges: visitExchanges, ...visitSummary } = visit
+        const stepEntry: Record<string, unknown> = {
+          id: step.id,
+          role: step.role,
+          action: step.action,
+          ...visitSummary,
+        }
+        stepsOut[step.id] = stepEntry
+        pages.push({
+          stepId: step.id,
+          role: step.role,
+          action: step.action,
+          origin: visit.origin,
+          finalUrl: visit.finalUrl,
+          title: visit.title,
+          status: visit.status,
+          domSnippet: visit.domSnippet,
+          links: visit.links,
+          forms: visit.forms,
+          blockedOrigins: visit.blockedOrigins,
+          cookieNames: visit.cookieNames,
+          localStorageKeys: visit.localStorageKeys,
+          sessionStorageKeys: visit.sessionStorageKeys,
+          postMessageListeners: visit.postMessageListeners,
+          canaryCheck: visit.canaryCheck,
+          selectorResult: visit.selectorResult ?? null,
+          fetchResult: visit.fetchResult ?? null,
+          redirectSummary: visit.redirectSummary ?? null,
+          durationMs: visit.durationMs,
+        })
+        for (const msg of visit.consoleMessages) {
+          consoleMessages.push({ stepId: step.id, role: step.role, ...msg })
+        }
+        for (const r of (visit.allRequests ?? visit.xhrRequests)) {
+          requests.push({ stepId: step.id, role: step.role, ...r })
+        }
+        domResults.push({
+          stepId: step.id,
+          role: step.role,
+          action: step.action,
+          origin: visit.origin,
+          finalUrl: visit.finalUrl,
+          status: visit.status,
+          title: visit.title,
+          selectorResult: visit.selectorResult ?? null,
+          canaryCheck: visit.canaryCheck,
+          postMessageListeners: visit.postMessageListeners,
+          fetchResult: visit.fetchResult ?? null,
+          redirectSummary: visit.redirectSummary ?? null,
+        })
+
+        if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
+        if (step.role === 'probe') {
+          if (!firstProbeStep) firstProbeStep = stepEntry
+          const hadDynamicSignal = Boolean(
+            visit.canaryCheck.triggered ||
+            visit.selectorResult?.matched ||
+            visit.postMessageListeners.canaryHandledWithoutOriginCheck ||
+            visit.fetchResult !== null ||
+            visit.redirectSummary?.redirected,
+          )
+          probeSnapshots.push({
+            id: step.id,
+            primaryExchange: visitExchanges[0],
+            domSnippet: visit.domSnippet,
+            status: visit.status,
+            hadDynamicSignal,
+          })
+        }
+      }
+
+      let spaCatchall: Record<string, unknown> | undefined
+      if (spec.spaCatchallControl) {
+        const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+        const catchallEx = await broker.executeHttp({
+          origin: spec.origin,
+          method: 'GET',
+          pathAndQuery: catchallPath,
+          followRedirects: true,
+        }, grant, signal)
+        recordExchange(catchallEx)
+
+        const comparisons: Record<string, Record<string, unknown>> = {}
+        let allProbesMatchedCatchall = probeSnapshots.length > 0
+        for (const probe of probeSnapshots) {
+          const diff = diffResponse(
+            { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+            {
+              status: probe.primaryExchange?.status ?? (probe.status ?? 0),
+              body: probe.primaryExchange?.body ?? probe.domSnippet,
+              mediaType: probe.primaryExchange?.mediaType ?? 'text/html',
+            },
+          )
+          comparisons[probe.id] = diff
+          if (!diff.likelySpaCatchall || probe.hadDynamicSignal) {
+            allProbesMatchedCatchall = false
+          }
+        }
+        spaCatchall = {
+          path: catchallPath,
+          ...summarizeExchange(catchallEx),
+          comparisons,
+          allProbesMatchedCatchall,
+        }
+        if (allProbesMatchedCatchall) {
+          forcedInconclusiveReason = 'Browser chain probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
+        }
+      }
+
+      evidencePayload = {
+        ...evidencePayload,
+        canaryToken,
+        steps: stepsOut,
+        pages,
+        consoleMessages,
+        requests,
+        domResults,
+        ...(firstControlStep ? { control: firstControlStep } : {}),
+        ...(firstProbeStep ? { probe: firstProbeStep } : {}),
+        ...(spaCatchall ? { spaCatchall } : {}),
+      }
+    } else if (spec.kind === 'race_burst') {
+      if (tier < 2) {
+        grant.audit('denied', spec.origin)
+        return inconclusiveResult('race_burst replay specs require Capability Tier 2 or Tier 3.', exchanges, exchangeIds, { kind: spec.kind })
+      }
+      const vars: Record<string, string> = {}
+      let controlSummary: Record<string, unknown> | null = null
+      let postCheckSummary: Record<string, unknown> | null = null
+
+      if (spec.controlStep) {
+        signal.throwIfAborted()
+        const controlReq = stepToBrokerRequest(spec.controlStep, vars)
+        if (hasDestructiveContent(JSON.stringify(controlReq))) {
+          return inconclusiveResult('Interpolated race_burst controlStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+        }
+        const controlEx = await broker.executeHttp(controlReq, grant, signal)
+        recordExchange(controlEx)
+        extractVariables(spec.controlStep, controlEx, vars)
+        controlSummary = {
+          id: spec.controlStep.id,
+          role: spec.controlStep.role,
+          ...summarizeExchange(controlEx),
+        }
+      }
+
+      const burstReqs = spec.burst.map(req => requestShapeToBrokerRequest(req, vars))
+      if (hasDestructiveContent(JSON.stringify(burstReqs))) {
+        return inconclusiveResult('Interpolated race_burst requests matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+      }
+
+      const burstResult = await broker.executeRaceBurst(burstReqs, grant, signal)
+      for (const ex of burstResult.results) recordExchange(ex)
+
+      if (spec.postCheckStep) {
+        signal.throwIfAborted()
+        const postReq = stepToBrokerRequest(spec.postCheckStep, vars)
+        if (hasDestructiveContent(JSON.stringify(postReq))) {
+          return inconclusiveResult('Interpolated race_burst postCheckStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+        }
+        const postEx = await broker.executeHttp(postReq, grant, signal)
+        recordExchange(postEx)
+        extractVariables(spec.postCheckStep, postEx, vars)
+        postCheckSummary = {
+          id: spec.postCheckStep.id,
+          role: spec.postCheckStep.role,
+          ...summarizeExchange(postEx),
+        }
+      }
+
+      evidencePayload = {
+        ...evidencePayload,
+        control: controlSummary,
+        burst: {
+          summary: burstResult.summary,
+          results: burstResult.results.map(summarizeExchange),
+        },
+        postCheck: postCheckSummary,
+        extractedVars: vars,
+      }
     } else if (spec.kind === 'rce_proof') {
       const controlVars: Record<string, string> = {}
       const probeVars: Record<string, string> = {}
@@ -572,7 +821,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
         probeVars.nonce_part2 = part2
         proofMeta.expectedAssembled = expectedSplitAssembled
       } else {
-        canarySession = await openCanarySession(params.canaryBroker, params.storage, params.runId, assignmentId)
+        canarySession = await openCanarySession(params.canaryBroker, params.storage, params.runId, assignmentId, spec.origin)
         const controlCanary = canarySession.mint(`rce_proof:control:${spec.title}`)
         const probeCanary = canarySession.mint(`rce_proof:probe:${spec.title}`)
         controlCanaryToken = controlCanary.token

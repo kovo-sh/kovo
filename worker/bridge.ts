@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { Bash, InMemoryFs, MountableFs, OverlayFs } from 'just-bash'
@@ -74,18 +74,31 @@ async function createSandbox() {
   const inputDirectory = await mkdtemp(join(tmpdir(), 'guardian-inputs-'))
   const scratch = new InMemoryFs({}, { maxTotalBytes: maxScratchBytes })
   scratch.mkdirSync('/work')
-  const fs = new MountableFs({
-    base: scratch,
-    mounts: [{
-      mountPoint: '/evidence',
+  const mounts = [{
+    mountPoint: '/evidence',
+    filesystem: new OverlayFs({
+      root: inputDirectory,
+      mountPoint: '/',
+      readOnly: true,
+      allowSymlinks: false,
+      maxFileReadSize: maxFileBytes,
+    }),
+  }]
+  if (existsSync('/repos')) {
+    mounts.push({
+      mountPoint: '/repos',
       filesystem: new OverlayFs({
-        root: inputDirectory,
+        root: '/repos',
         mountPoint: '/',
         readOnly: true,
         allowSymlinks: false,
         maxFileReadSize: maxFileBytes,
       }),
-    }],
+    })
+  }
+  const fs = new MountableFs({
+    base: scratch,
+    mounts,
   })
   const shell = new Bash({
     cwd: '/work',

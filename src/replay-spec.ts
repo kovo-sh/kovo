@@ -8,6 +8,16 @@ const safeHeaders = z.record(z.string().min(1).max(64), z.string().max(1024)).re
   'Do not place Authorization or Cookie headers in a replay spec; reference an approved persona handle instead.',
 )
 
+const destructivePatterns = [
+  /\b(?:rm\s+-[a-z]*[rf]|mkfs|dd\s+if=|shred|wipefs|shutdown|reboot|halt|poweroff|killall|iptables\s+-F|drop\s+table|truncate\s+table)\b/i,
+  /(?:\/dev\/tcp\/|bash\s+-i|nc\s+-[a-z]*e|ncat\s+-[a-z]*e|python[23]?\s+-c\s+.*socket|php\s+-r\s+.*fsockopen|powershell\s+-enc)/i,
+  /\/etc\/shadow|169\.254\.169\.254|metadata\.google\.internal/i,
+]
+
+export function containsDestructivePayload(text: string): boolean {
+  return destructivePatterns.some(pattern => pattern.test(text))
+}
+
 export const replayExtractSchema = z.object({
   varName: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]{0,31}$/),
   from: z.enum(['header', 'json', 'status', 'regex']),
@@ -78,15 +88,76 @@ export const browserDomReplaySpecSchema = replayBase.extend({
   checkKind: z.enum(['dom_xss', 'postmessage', 'client_storage', 'xhr_leak']),
 })
 
-const destructivePatterns = [
-  /\b(?:rm\s+-[a-z]*[rf]|mkfs|dd\s+if=|shred|wipefs|shutdown|reboot|halt|poweroff|killall|iptables\s+-F|drop\s+table|truncate\s+table)\b/i,
-  /(?:\/dev\/tcp\/|bash\s+-i|nc\s+-[a-z]*e|ncat\s+-[a-z]*e|python[23]?\s+-c\s+.*socket|php\s+-r\s+.*fsockopen|powershell\s+-enc)/i,
-  /\/etc\/shadow|169\.254\.169\.254|metadata\.google\.internal/i,
-]
+export const browserChainFetchTargetSchema = z.object({
+  origin: assetOrigin,
+  pathAndQuery: z.string().min(1).max(2048).refine(
+    value => value.startsWith('/') && !value.startsWith('//'),
+    'fetchTarget.pathAndQuery must start with a single /.',
+  ),
+  method: z.enum(['GET', 'HEAD', 'OPTIONS']).default('GET'),
+  credentials: z.enum(['include', 'same-origin', 'omit']).default('include'),
+})
 
-export function containsDestructivePayload(text: string): boolean {
-  return destructivePatterns.some(pattern => pattern.test(text))
-}
+export const browserChainStepSchema = z.object({
+  id: z.string().regex(/^[a-z0-9_-]{1,32}$/),
+  role: z.enum(['setup', 'control', 'probe', 'cleanup']),
+  description: z.string().trim().min(1).max(400),
+  origin: assetOrigin,
+  pathAndQuery: z.string().min(1).max(4096).refine(
+    value => value.startsWith('/') && !value.startsWith('//'),
+    'pathAndQuery must start with a single /.',
+  ),
+  persona: personaHandle.optional(),
+  action: z.enum(['navigate', 'dom_check', 'postmessage_probe', 'same_site_fetch', 'redirect_observe']).default('navigate'),
+  checkKind: z.enum(['dom_xss', 'postmessage', 'client_storage', 'xhr_leak']).optional(),
+  selector: z.string().trim().min(1).max(256).refine(
+    value => !/[<>{};`\\]|javascript:/i.test(value),
+    'selector must be a safe read-only CSS selector.',
+  ).optional(),
+  fetchTarget: browserChainFetchTargetSchema.optional(),
+  postMessageOrigin: z.string().trim().min(1).max(256).optional(),
+  postMessagePayload: z.unknown().optional(),
+  waitAfterLoadMs: z.number().int().min(0).max(5000).optional(),
+}).refine(
+  step => step.action !== 'same_site_fetch' || Boolean(step.fetchTarget),
+  'browser_chain steps with action "same_site_fetch" require a fetchTarget.',
+).refine(
+  step => !containsDestructivePayload(JSON.stringify(step)),
+  'browser_chain step rejected by destructive-payload denylist.',
+)
+
+export const browserChainReplaySpecSchema = replayBase.extend({
+  kind: z.literal('browser_chain'),
+  spaCatchallControl: z.boolean().default(false),
+  steps: z.array(browserChainStepSchema).min(2).max(8).refine(
+    steps => steps.some(step => step.role === 'control') && steps.some(step => step.role === 'probe'),
+    'Browser chain replay specs require at least one control step and one probe step.',
+  ),
+})
+
+export const raceBurstRequestSchema = z.object({
+  origin: assetOrigin,
+  method: z.enum(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH']),
+  pathAndQuery: z.string().min(1).max(4096).refine(
+    value => value.startsWith('/') && !value.startsWith('//'),
+    'pathAndQuery must start with a single /.',
+  ),
+  headers: safeHeaders.optional(),
+  persona: personaHandle.optional(),
+  jsonBody: z.unknown().optional(),
+  textBody: z.string().max(32_768).optional(),
+  followRedirects: z.boolean().default(false),
+})
+
+export const raceBurstReplaySpecSchema = replayBase.extend({
+  kind: z.literal('race_burst'),
+  controlStep: replayStepSchema.optional(),
+  burst: z.array(raceBurstRequestSchema).min(2).max(10),
+  postCheckStep: replayStepSchema.optional(),
+}).refine(
+  spec => !containsDestructivePayload(JSON.stringify(spec)),
+  'race_burst replay spec rejected by destructive-payload denylist.',
+)
 
 export const rceProofReplaySpecSchema = replayBase.extend({
   kind: z.literal('rce_proof'),
@@ -107,10 +178,18 @@ export const declarativeReplaySpecSchema = z.discriminatedUnion('kind', [
   dnsTakeoverReplaySpecSchema,
   tlsAuditReplaySpecSchema,
   browserDomReplaySpecSchema,
+  browserChainReplaySpecSchema,
+  raceBurstReplaySpecSchema,
   rceProofReplaySpecSchema,
 ])
 
+export const replaySpecSchema = declarativeReplaySpecSchema
+
 export type ReplayStep = z.output<typeof replayStepSchema>
+export type BrowserChainStep = z.output<typeof browserChainStepSchema>
+export type BrowserChainReplaySpec = z.output<typeof browserChainReplaySpecSchema>
+export type RaceBurstRequest = z.output<typeof raceBurstRequestSchema>
+export type RaceBurstReplaySpec = z.output<typeof raceBurstReplaySpecSchema>
 export type DeclarativeReplaySpec = z.output<typeof declarativeReplaySpecSchema>
 
 export const replayAssertionOutcomeSchema = z.object({
@@ -127,6 +206,15 @@ export function replaySpecOrigins(spec: DeclarativeReplaySpec): string[] {
   const origins = new Set<string>([spec.origin])
   if (spec.kind === 'http_chain') {
     for (const step of spec.steps) origins.add(step.request.origin)
+  } else if (spec.kind === 'browser_chain') {
+    for (const step of spec.steps) {
+      origins.add(step.origin)
+      if (step.fetchTarget) origins.add(step.fetchTarget.origin)
+    }
+  } else if (spec.kind === 'race_burst') {
+    if (spec.controlStep) origins.add(spec.controlStep.request.origin)
+    for (const req of spec.burst) origins.add(req.origin)
+    if (spec.postCheckStep) origins.add(spec.postCheckStep.request.origin)
   } else if (spec.kind === 'rce_proof') {
     origins.add(spec.controlStep.request.origin)
     origins.add(spec.probeStep.request.origin)

@@ -17,15 +17,52 @@ export interface ResolvedPersona {
   headerName: string | null
   secret: string
   canaryMarkers: string[]
+  secretPath?: string
+  secretMtimeMs?: number
+  secretIno?: number
+  secretHistory?: string[]
 }
 
-function secretFile(storage: Store, credentialId: string) {
-  const path = join(storage.directory, 'credentials', credentialId)
+function readVerifiedSecretFile(path: string): { secret: string; mtimeMs: number; ino: number } {
   const stat = statSync(path)
   if ((stat.mode & 0o077) !== 0) throw new Error('Persona credential must have owner-only permissions.')
   if (!stat.isFile() || stat.size === 0) throw new Error('Persona credential is unavailable.')
   accessSync(path, constants.R_OK)
+  const secret = readFileSync(path, 'utf8').replace(/[\r\n]+$/, '')
+  if (!secret) throw new Error('Persona credential is unavailable.')
+  return { secret, mtimeMs: stat.mtimeMs, ino: stat.ino }
+}
+
+function secretFile(storage: Store, credentialId: string) {
+  const path = join(storage.directory, 'credentials', credentialId)
+  readVerifiedSecretFile(path)
   return path
+}
+
+export function refreshPersonaSecret(persona: ResolvedPersona): string {
+  if (!persona.secretPath) return persona.secret
+  let stat: ReturnType<typeof statSync>
+  try {
+    stat = statSync(persona.secretPath)
+  } catch {
+    return persona.secret
+  }
+  if ((stat.mode & 0o077) !== 0) throw new Error('Persona credential must have owner-only permissions.')
+  if (!stat.isFile() || stat.size === 0) return persona.secret
+  if (stat.mtimeMs !== persona.secretMtimeMs || stat.ino !== persona.secretIno) {
+    accessSync(persona.secretPath, constants.R_OK)
+    const fresh = readFileSync(persona.secretPath, 'utf8').replace(/[\r\n]+$/, '')
+    if (fresh) {
+      const history = persona.secretHistory ?? [persona.secret]
+      if (persona.secret && !history.includes(persona.secret)) history.push(persona.secret)
+      if (!history.includes(fresh)) history.push(fresh)
+      persona.secretHistory = history
+      persona.secret = fresh
+      persona.secretMtimeMs = stat.mtimeMs
+      persona.secretIno = stat.ino
+    }
+  }
+  return persona.secret
 }
 
 export function listProjectPersonas(storage: Store, projectId: string): PublicPersona[] {
@@ -94,7 +131,8 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
     .all()
   for (const row of rows) {
     if (!allowed.has(row.id)) continue
-    const secret = readFileSync(secretFile(storage, row.credentialId), 'utf8')
+    const path = secretFile(storage, row.credentialId)
+    const { secret, mtimeMs, ino } = readVerifiedSecretFile(path)
     map.set(row.handle, {
       id: row.id,
       handle: row.handle,
@@ -104,6 +142,10 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
       headerName: row.headerName,
       secret,
       canaryMarkers: row.canaryMarkers,
+      secretPath: path,
+      secretMtimeMs: mtimeMs,
+      secretIno: ino,
+      secretHistory: [secret],
     })
   }
   return map
@@ -111,15 +153,38 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
 
 export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): NamedSecret[] {
   const out: NamedSecret[] = []
+  const seen = new Set<string>()
+  const push = (placeholder: string, value: string) => {
+    if (!value || value.length < 4) return
+    const key = `${placeholder}\0${value}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ value, placeholder })
+  }
   for (const persona of resolved.values()) {
-    out.push({ value: persona.secret, placeholder: `[persona:${persona.handle}:secret]` })
+    try { refreshPersonaSecret(persona) } catch { /* keep cached history if file permissions changed */ }
+    const placeholder = `[persona:${persona.handle}:secret]`
+    const values = new Set<string>([persona.secret, ...(persona.secretHistory ?? [])])
+    for (const raw of values) {
+      push(placeholder, raw)
+      // Also scrub individual cookie values (e.g., rotated JWT inside "__session=<jwt>; __client_uat=...")
+      if (persona.authKind === 'cookie') {
+        for (const pair of raw.split(';')) {
+          const eq = pair.indexOf('=')
+          if (eq <= 0) continue
+          const cookieVal = pair.slice(eq + 1).trim()
+          if (cookieVal.length >= 16) push(placeholder, cookieVal)
+        }
+      }
+    }
   }
   return out
 }
 
 export function buildPersonaHeader(persona: ResolvedPersona, origin: string): Record<string, string> | null {
   if (!persona.originAllowlist.includes(origin)) return null
-  if (persona.authKind === 'bearer') return { Authorization: 'Bearer ' + persona.secret }
-  if (persona.authKind === 'cookie') return { Cookie: persona.secret }
-  return { [persona.headerName ?? 'X-Api-Key']: persona.secret }
+  const secret = refreshPersonaSecret(persona)
+  if (persona.authKind === 'bearer') return { Authorization: 'Bearer ' + secret }
+  if (persona.authKind === 'cookie') return { Cookie: secret }
+  return { [persona.headerName ?? 'X-Api-Key']: secret }
 }

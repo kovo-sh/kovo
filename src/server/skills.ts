@@ -63,6 +63,12 @@ export function listSkills(): SkillSummary[] {
   return [...loadAll().values()].map(({ content: _omit, ...meta }) => meta)
 }
 
+export function skillsByTag(tag: string): SkillSummary[] {
+  const needle = tag.trim().toLowerCase()
+  if (!needle) return []
+  return listSkills().filter(skill => skill.tags.some(t => t.toLowerCase() === needle))
+}
+
 export function loadSkill(name: string): LoadedSkill | null {
   const normalized = name.trim().toLowerCase().replace(/\.md$/, '')
   if (!safeSkillName.test(normalized)) return null

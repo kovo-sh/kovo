@@ -38,7 +38,14 @@ import type {
 } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
-import { findingSeverityOrder, suppliedResponseLabel } from '../report-summary.ts'
+import {
+  chainFindingDedupKey,
+  collapseBaselineHeaderFindings,
+  deduplicateChainFindings,
+  findingSeverityOrder,
+  mergeChainFindings,
+  suppliedResponseLabel,
+} from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { listProjectPersonas } from './persona-vault.ts'
 import { redact, redactHeaders } from './redact.ts'
@@ -66,7 +73,12 @@ export type CoverageEntry = typeof tables.coverageEntries.$inferSelect
 export type ReportRow = typeof tables.reports.$inferSelect
 export type MessageRow = typeof tables.messages.$inferSelect
 
-export type FactKind = Fact['kind'] | 'tech_fingerprint' | 'cve_hypothesis'
+export type FactKind =
+  | Fact['kind']
+  | 'tech_fingerprint'
+  | 'cve_hypothesis'
+  | 'code_audit_suspect'
+  | 'persona_resource'
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 export type SerializableFact = Omit<Fact, 'data'> & { data: Record<string, JsonValue> }
@@ -164,6 +176,8 @@ function inconclusiveReasons(checks: readonly CheckCoverage[]) {
 function normalizeFactKind(kind: FactKind): Fact['kind'] {
   if (kind === 'tech_fingerprint') return 'config'
   if (kind === 'cve_hypothesis') return 'note'
+  if (kind === 'code_audit_suspect') return 'policy_gap'
+  if (kind === 'persona_resource') return 'object_ref'
   return kind
 }
 
@@ -993,7 +1007,9 @@ export class Store {
       }
     }
     const rawData = input.data ?? {}
-    const enrichedData: Record<string, unknown> = (input.kind === 'tech_fingerprint' || input.kind === 'cve_hypothesis')
+    const isSubkind = input.kind === 'tech_fingerprint' || input.kind === 'cve_hypothesis' ||
+      input.kind === 'code_audit_suspect' || input.kind === 'persona_resource'
+    const enrichedData: Record<string, unknown> = isSubkind
       ? { subkind: input.kind, ...rawData }
       : rawData
     const cleanData = JSON.parse(redact(JSON.stringify(enrichedData), secrets)) as Record<string, unknown>
@@ -1323,6 +1339,26 @@ export class Store {
       .orderBy(asc(tables.coverageEntries.origin), asc(tables.coverageEntries.category)).all()
   }
 
+  findDuplicateChainFinding(
+    runId: string,
+    goalRevision: number,
+    candidate: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title'>,
+    excludeId?: string,
+  ) {
+    const key = chainFindingDedupKey(candidate)
+    const rows = this.db.select().from(tables.findings).where(and(
+      eq(tables.findings.runId, runId),
+      eq(tables.findings.goalRevision, goalRevision),
+      eq(tables.findings.findingKind, 'multi_step_chain'),
+    )).all()
+    const matches = rows.filter(row => row.id !== excludeId && chainFindingDedupKey(row.finding) === key)
+    if (!matches.length) return undefined
+    // Prefer confirmed duplicate first, then pending, then others
+    const order = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
+    matches.sort((a, b) => order[a.finding.status] - order[b.finding.status])
+    return matches[0]
+  }
+
   upsertChainFinding(
     run: Run,
     assetId: string,
@@ -1330,36 +1366,75 @@ export class Store {
     replaySpecId: string,
     sourceOrigins: string[],
   ) {
-    const existing = this.db.select().from(tables.findings).where(eq(tables.findings.id, finding.id)).get()
-    const cleanOrigins = [...new Set([finding.origin, ...sourceOrigins])]
-    const storedFinding: Finding = {
+    const byId = this.db.select().from(tables.findings).where(eq(tables.findings.id, finding.id)).get()
+    const dupRow = this.findDuplicateChainFinding(run.id, run.goalRevision, finding, byId?.id)
+
+    // When a finding updates by ID and a separate duplicate row already exists for the same (origin, cwe),
+    // merge into the canonical duplicate row (especially if confirmed) and remove the redundant row.
+    const incoming: Finding = {
       ...finding,
       findingKind: 'multi_step_chain',
       replaySpecId,
     }
-    if (existing) {
-      this.db.update(tables.findings).set({
-        replaySpecId,
-        sourceOrigins: cleanOrigins,
-        finding: storedFinding,
-      }).where(eq(tables.findings.id, finding.id)).run()
-    } else {
-      this.db.insert(tables.findings).values({
-        id: finding.id,
-        runId: run.id,
-        assetId,
-        goalRevision: run.goalRevision,
-        checkId: 'chain',
-        caseId: finding.id,
-        findingKind: 'multi_step_chain',
-        replaySpecId,
-        sourceOrigins: cleanOrigins,
-        finding: storedFinding,
-      }).run()
-    }
-    this.event(run.id, finding.status === 'pending' ? 'finding.proposed' : 'finding.verified',
-      `[${finding.status}] ${finding.severity.toUpperCase()} ${finding.title} (${finding.origin})`, {
-        findingId: finding.id, status: finding.status, severity: finding.severity, origin: finding.origin, replaySpecId,
+
+    const targetRow = (() => {
+      if (byId && dupRow) {
+        // Keep whichever row is confirmed first, otherwise keep dupRow as the canonical earlier record
+        return byId.finding.status === 'confirmed' && dupRow.finding.status !== 'confirmed' ? byId : dupRow
+      }
+      return byId ?? dupRow
+    })()
+
+    const redundantRow = byId && dupRow
+      ? (targetRow?.id === byId.id ? dupRow : byId)
+      : undefined
+
+    const storedFinding: Finding = targetRow
+      ? mergeChainFindings(targetRow.finding, incoming)
+      : incoming
+
+    const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
+    const cleanOrigins = [...new Set([
+      storedFinding.origin,
+      ...(targetRow?.sourceOrigins ?? []),
+      ...(redundantRow?.sourceOrigins ?? []),
+      ...sourceOrigins,
+    ])]
+
+    this.transaction(() => {
+      if (targetRow) {
+        this.db.update(tables.findings).set({
+          replaySpecId: canonicalSpecId,
+          sourceOrigins: cleanOrigins,
+          finding: storedFinding,
+        }).where(eq(tables.findings.id, targetRow.id)).run()
+      } else {
+        this.db.insert(tables.findings).values({
+          id: storedFinding.id,
+          runId: run.id,
+          assetId,
+          goalRevision: run.goalRevision,
+          checkId: 'chain',
+          caseId: storedFinding.id,
+          findingKind: 'multi_step_chain',
+          replaySpecId: canonicalSpecId,
+          sourceOrigins: cleanOrigins,
+          finding: storedFinding,
+        }).run()
+      }
+      if (redundantRow && redundantRow.id !== targetRow?.id) {
+        this.db.delete(tables.findings).where(eq(tables.findings.id, redundantRow.id)).run()
+      }
+    }, { behavior: 'immediate' })
+
+    this.event(run.id, storedFinding.status === 'pending' ? 'finding.proposed' : 'finding.verified',
+      `[${storedFinding.status}] ${storedFinding.severity.toUpperCase()} ${storedFinding.title} (${storedFinding.origin})`, {
+        findingId: storedFinding.id,
+        status: storedFinding.status,
+        severity: storedFinding.severity,
+        origin: storedFinding.origin,
+        replaySpecId: canonicalSpecId,
+        deduplicated: Boolean(dupRow),
       })
     return storedFinding
   }
@@ -2083,10 +2158,8 @@ export class Store {
       return [{ ...finding, evidenceIds: [retained.sourceId, retained.evidenceId] }]
     })
 
-    const statusOrder = { confirmed: 0, pending: 1, inconclusive: 2, dismissed: 3 }
-    results.sort((a, b) => statusOrder[a.status] - statusOrder[b.status] ||
-      findingSeverityOrder[a.severity] - findingSeverityOrder[b.severity] ||
-      a.origin.localeCompare(b.origin) || a.title.localeCompare(b.title))
+    const deduplicated = deduplicateChainFindings(results)
+    const { findings: finalFindings } = collapseBaselineHeaderFindings(deduplicated)
 
     const currentSteps = snapshot.chainSteps.filter(s => s.goalRevision === run.goalRevision)
     const chainStepsCompleted = currentSteps.filter(s => s.status === 'complete').length
@@ -2124,7 +2197,7 @@ export class Store {
         spentTokens: run.spentTokens,
       },
       coverage,
-      findings: results,
+      findings: finalFindings,
       gaps,
     }
 
