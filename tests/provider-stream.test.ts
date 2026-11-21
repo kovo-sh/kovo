@@ -16,6 +16,8 @@ import {
 } from '../src/server/model-settings.ts'
 import {
   classifyFailoverError,
+  estimateCostUsd,
+  extractUsageFromSse,
   isQuotaBody,
   orderProfiles,
   providerPool,
@@ -402,4 +404,90 @@ test('multi-profile LLM failover pool handles 429->402 quota circuit breaking, c
   assert.equal(sawDelta, true)
   assert.equal(finalRes.stopReason, 'error')
   assert.equal(backupCalls, backupBefore, 'Must NOT fail over after emitting stream events (outside safe window).')
+})
+
+test('cached input token pricing and editing a profile without re-entering API key', async t => {
+  // 1. OpenAI Responses / OpenRouter cached token extraction & billing
+  const responsesSse = `data: ${JSON.stringify({
+    type: 'response.completed',
+    response: {
+      usage: {
+        input_tokens: 1_000_000,
+        input_tokens_details: { cached_tokens: 800_000 },
+        output_tokens: 100_000,
+      },
+    },
+  })}\n\n`
+  const rUsage = extractUsageFromSse(responsesSse, 'responses')
+  assert.deepEqual(rUsage, { inputTokens: 1_000_000, cachedInputTokens: 800_000, outputTokens: 100_000 })
+  const rCost = estimateCostUsd({
+    endpoint: 'https://openrouter.ai/api/v1',
+    model: 'deepseek/deepseek-v4.1-flash-1017',
+    protocol: 'responses',
+    key: 'sk-test-placeholder',
+    inputCostPerMtok: 0.15,
+    cachedInputCostPerMtok: 0.003,
+    outputCostPerMtok: 0.60,
+  }, rUsage.inputTokens, rUsage.outputTokens, rUsage.cachedInputTokens)
+  // 200k uncached * $0.15/M = $0.03 + 800k cached * $0.003/M = $0.0024 + 100k out * $0.60/M = $0.06 -> $0.0924
+  assert.ok(Math.abs(rCost - 0.0924) < 1e-9, `Expected $0.0924, got ${rCost}`)
+
+  // 2. Anthropic Messages cached token extraction (input_tokens excludes cache_read_input_tokens)
+  const messagesSse = `data: ${JSON.stringify({
+    type: 'message_start',
+    message: { usage: { input_tokens: 200_000, cache_read_input_tokens: 800_000, output_tokens: 0 } },
+  })}\ndata: ${JSON.stringify({
+    type: 'message_delta',
+    usage: { output_tokens: 100_000 },
+  })}\n\n`
+  const mUsage = extractUsageFromSse(messagesSse, 'messages')
+  assert.deepEqual(mUsage, { inputTokens: 1_000_000, cachedInputTokens: 800_000, outputTokens: 100_000 })
+
+  // 3. Editing an existing profile with blank key preserves the stored 0600 credential & skips redundant check
+  const directory = await mkdtemp(join(tmpdir(), 'guardian-model-edit-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const storage = new Store(directory)
+  t.after(() => storage.close())
+
+  const saved = await saveModelProfile({
+    name: 'OpenRouter DeepSeek V4.1 Flash',
+    endpoint: 'https://openrouter.ai/api/v1',
+    model: 'deepseek/deepseek-v4.1-flash-1017',
+    protocol: 'responses',
+    key: 'sk-or-v1-original-secret-value',
+    priority: 100,
+    enabled: true,
+    contextWindow: 131_072,
+    maxTokens: 16_384,
+    thinkingLevel: 'medium',
+    inputCostPerMtok: 0.25,
+    cachedInputCostPerMtok: 0.003,
+    outputCostPerMtok: 0.90,
+  }, storage, { skipConnectionCheck: true })
+
+  // Update contextWindow & costs WITHOUT re-entering API key (and WITHOUT skipConnectionCheck!)
+  await saveModelProfile({
+    id: saved.id,
+    name: 'OpenRouter DeepSeek V4.1 Flash',
+    endpoint: 'https://openrouter.ai/api/v1',
+    model: 'deepseek/deepseek-v4.1-flash-1017',
+    protocol: 'responses',
+    key: '',
+    priority: 100,
+    enabled: true,
+    contextWindow: 1_048_576,
+    maxTokens: 16_384,
+    thinkingLevel: 'medium',
+    inputCostPerMtok: 0.15,
+    cachedInputCostPerMtok: 0.003,
+    outputCostPerMtok: 0.60,
+  }, storage)
+
+  const priv = privateModelProfiles(storage)
+  assert.equal(priv.length, 1)
+  assert.equal(priv[0].key, 'sk-or-v1-original-secret-value')
+  assert.equal(priv[0].contextWindow, 1_048_576)
+  assert.equal(priv[0].inputCostPerMtok, 0.15)
+  assert.equal(priv[0].cachedInputCostPerMtok, 0.003)
+  assert.equal(priv[0].outputCostPerMtok, 0.60)
 })

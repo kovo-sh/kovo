@@ -1983,7 +1983,9 @@ export class Execution {
       pendingFindings: pendingFindings.map(f => ({ id: f.id, origin: f.origin, title: f.title, status: f.status, severity: f.severity })),
       budgetRemaining: {
         usd: Math.max(0, Number((afterRound.budgetUsd - afterRound.spentUsd).toFixed(4))),
-        requests: Math.max(0, afterRound.budgetRequests - afterRound.spentRequests),
+        requests: afterRound.budgetRequests === 0
+          ? 'unlimited'
+          : Math.max(0, afterRound.budgetRequests - afterRound.spentRequests),
       },
     })
 
@@ -3896,7 +3898,7 @@ export class Execution {
       spentUsd: run.spentUsd,
       budgetUsd: run.budgetUsd,
       spentRequests: run.spentRequests,
-      budgetRequests: run.budgetRequests,
+      budgetRequests: run.budgetRequests === 0 ? 'unlimited' : run.budgetRequests,
       turnsUsed: run.turnsUsed,
     })
 

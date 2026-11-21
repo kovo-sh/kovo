@@ -57,6 +57,7 @@ function toPublicProfile(row: typeof modelProfiles.$inferSelect): PublicModelPro
     maxTokens: row.maxTokens,
     thinkingLevel: row.thinkingLevel,
     inputCostPerMtok: row.inputCostPerMtok,
+    cachedInputCostPerMtok: row.cachedInputCostPerMtok,
     outputCostPerMtok: row.outputCostPerMtok,
     healthState,
     cooldownUntil: healthState === 'half_open' && row.healthState === 'open' ? null : row.cooldownUntil,
@@ -110,6 +111,7 @@ export function privateModelProfiles(storage: Store = store()): ResolvedModelPro
         maxTokens: row.maxTokens,
         thinkingLevel: row.thinkingLevel,
         inputCostPerMtok: row.inputCostPerMtok,
+        cachedInputCostPerMtok: row.cachedInputCostPerMtok,
         outputCostPerMtok: row.outputCostPerMtok,
         healthState,
         cooldownUntil,
@@ -174,12 +176,41 @@ export function recordProfileFailure(
   }).where(and(eq(modelProfiles.id, profileId), eq(modelProfiles.workspaceId, storage.workspace.id))).run()
 }
 
-export async function checkModelConnection(input: z.input<typeof providerSettings>): Promise<{ ok: true }> {
+function findExistingProfile(
+  storage: Store,
+  settings: Pick<ProviderSettings, 'id' | 'name'>,
+) {
+  return settings.id
+    ? storage.db.select().from(modelProfiles).where(and(
+        eq(modelProfiles.id, settings.id), eq(modelProfiles.workspaceId, storage.workspace.id),
+      )).get()
+    : storage.db.select().from(modelProfiles).where(and(
+        eq(modelProfiles.workspaceId, storage.workspace.id), eq(modelProfiles.name, settings.name),
+      )).get()
+}
+
+function resolveEffectiveKey(
+  storage: Store,
+  settings: ProviderSettings,
+  existing: typeof modelProfiles.$inferSelect | undefined,
+): string {
+  if (settings.key) return settings.key
+  if (!existing) throw new Error('API key is required when adding a new model profile.')
+  return readFileSync(credentialPath(storage.directory, existing.credentialId), 'utf8').trim()
+}
+
+export async function checkModelConnection(
+  input: z.input<typeof providerSettings>,
+  storage: Store = store(),
+): Promise<{ ok: true }> {
   const parsed = providerSettings.parse(input)
-  const digest = hash(parsed)
+  const existing = findExistingProfile(storage, parsed)
+  const resolvedKey = resolveEffectiveKey(storage, parsed, existing)
+  const effective = { ...parsed, key: resolvedKey }
+  const digest = hash(effective)
   const attempt = ++latestTestAttempt
   if (lastTest?.digest === digest) lastTest = undefined
-  await testProvider(parsed)
+  await testProvider(effective)
   if (attempt === latestTestAttempt) lastTest = { digest, expires: Date.now() + 5 * 60_000 }
   return { ok: true as const }
 }
@@ -190,25 +221,36 @@ export async function saveModelProfile(
   options: { skipConnectionCheck?: boolean } = {},
 ): Promise<{ ok: true; id: string }> {
   const settings = providerSettings.parse(input)
-  if (!options.skipConnectionCheck && (!lastTest || lastTest.expires < Date.now() || lastTest.digest !== hash(settings))) {
-    await checkModelConnection(settings)
+  const existing = findExistingProfile(storage, settings)
+  const rotatingKey = Boolean(settings.key)
+  const resolvedKey = resolveEffectiveKey(storage, settings, existing)
+  const effective = { ...settings, key: resolvedKey }
+
+  const connectionUnchanged = Boolean(
+    existing &&
+    !rotatingKey &&
+    existing.endpoint === settings.endpoint &&
+    existing.model === settings.model &&
+    existing.protocol === settings.protocol,
+  )
+
+  if (!options.skipConnectionCheck && !connectionUnchanged && (!lastTest || lastTest.expires < Date.now() || lastTest.digest !== hash(effective))) {
+    await checkModelConnection(effective, storage)
   }
 
   const directory = join(storage.directory, 'credentials')
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   chmodSync(directory, 0o700)
 
-  const existing = settings.id
-    ? storage.db.select().from(modelProfiles).where(and(
-        eq(modelProfiles.id, settings.id), eq(modelProfiles.workspaceId, storage.workspace.id),
-      )).get()
-    : storage.db.select().from(modelProfiles).where(and(
-        eq(modelProfiles.workspaceId, storage.workspace.id), eq(modelProfiles.name, settings.name),
-      )).get()
-
-  const credentialId = 'model-' + randomUUID()
-  const path = join(directory, credentialId)
-  writeFileSync(path, settings.key, { mode: 0o600, flag: 'wx' })
+  let credentialId: string
+  let newCredentialPath: string | null = null
+  if (existing && !rotatingKey) {
+    credentialId = existing.credentialId
+  } else {
+    credentialId = 'model-' + randomUUID()
+    newCredentialPath = join(directory, credentialId)
+    writeFileSync(newCredentialPath, resolvedKey, { mode: 0o600, flag: 'wx' })
+  }
   const profileId = existing?.id ?? settings.id ?? randomUUID()
 
   try {
@@ -224,6 +266,7 @@ export async function saveModelProfile(
       maxTokens: settings.maxTokens,
       thinkingLevel: settings.thinkingLevel,
       inputCostPerMtok: settings.inputCostPerMtok,
+      cachedInputCostPerMtok: settings.cachedInputCostPerMtok,
       outputCostPerMtok: settings.outputCostPerMtok,
       healthState: 'closed' as const,
       cooldownUntil: null,
@@ -241,11 +284,13 @@ export async function saveModelProfile(
     }
     transientFailures.delete(profileId)
   } catch {
-    try { unlinkSync(path) } catch { /* ignore */ }
+    if (newCredentialPath) {
+      try { unlinkSync(newCredentialPath) } catch { /* ignore */ }
+    }
     throw new Error('Could not save the workspace model profile.')
   }
 
-  if (existing) {
+  if (existing && newCredentialPath && existing.credentialId !== credentialId) {
     try { unlinkSync(join(directory, existing.credentialId)) } catch { /* ignore */ }
   }
   return { ok: true as const, id: profileId }

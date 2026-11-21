@@ -268,6 +268,9 @@ export class Store {
       }
     }
 
+    // model_profiles v3 columns
+    ensureColumn('model_profiles', 'cached_input_cost_per_mtok', 'REAL NOT NULL DEFAULT 0.003')
+
     // projects v3 columns
     ensureColumn('projects', 'lab_config', 'TEXT')
 
@@ -1941,6 +1944,10 @@ export class Store {
       const project = this.project(input.projectId)
       const goal = redact(input.goal)
       const capabilityTier: CapabilityTier = input.sourceMode === 'prepared' ? 0 : (input.capabilityTier ?? 1)
+      const validPersonaIds = new Set(listProjectPersonas(this, project.id).map(p => p.id))
+      const approvedPersonaIds = capabilityTier >= 2
+        ? [...new Set((input.approvedPersonaIds ?? []).filter(pid => validPersonaIds.has(pid)))]
+        : []
       const defaultReqs = project.environment === 'local-lab' ? defaultLabBudgetRequests : defaultPublicBudgetRequests
       const run = this.db.insert(tables.runs).values({
         id: randomUUID(),
@@ -1955,7 +1962,7 @@ export class Store {
         status: 'waiting',
         sourceMode: input.sourceMode,
         capabilityTier,
-        approvedPersonaIds: [],
+        approvedPersonaIds,
         roundNo: 0,
         budgetUsd: input.budgetUsd ?? defaultBudgetUsd,
         budgetRequests: input.budgetRequests ?? defaultReqs ?? defaultBudgetRequests,
@@ -2771,20 +2778,38 @@ export class Store {
           break
         }
         case 'raise_budget': {
+          if (['complete', 'stopped', 'failed'].includes(run.status)) {
+            throw new Error('Cannot revise budget after a run has ended.')
+          }
           const patch: Partial<Run> = {}
           if (input.budgetUsd !== undefined) {
             if (input.budgetUsd <= run.spentUsd) throw new Error('New USD budget must exceed current spend.')
             patch.budgetUsd = input.budgetUsd
           }
           if (input.budgetRequests !== undefined) {
-            if (input.budgetRequests <= run.spentRequests) throw new Error('New request budget must exceed current requests used.')
+            if (input.budgetRequests !== 0 && input.budgetRequests <= run.spentRequests) {
+              throw new Error('New request cap must be 0 (unlimited) or exceed current requests used.')
+            }
             patch.budgetRequests = input.budgetRequests
           }
-          this.updateRun(run.id, patch)
-          if (input.resume && (run.status === 'budget_paused' || run.status === 'paused')) {
-            this.setStatus(this.run(run.id), 'running')
+          if (input.maxRpsPerOrigin !== undefined) {
+            patch.maxRpsPerOrigin = input.maxRpsPerOrigin
           }
-          this.event(run.id, 'budget.raised', 'Run budget updated.', { ...patch, resumed: Boolean(input.resume) })
+          if (Object.keys(patch).length > 0) {
+            this.updateRun(run.id, patch)
+          }
+          const updated = this.run(run.id)
+          const stillExceeded = updated.spentUsd >= updated.budgetUsd ||
+            (updated.budgetRequests > 0 && updated.spentRequests >= updated.budgetRequests)
+          const resumed = Boolean(
+            input.resume &&
+            !stillExceeded &&
+            (run.status === 'budget_paused' || run.status === 'paused'),
+          )
+          if (resumed) {
+            this.setStatus(updated, 'running')
+          }
+          this.event(run.id, 'budget.raised', 'Run budget updated.', { ...patch, resumed })
           break
         }
         case 'retest_finding': {

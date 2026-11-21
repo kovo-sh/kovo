@@ -1,4 +1,5 @@
-import { Fragment, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
+import { Link } from '@tanstack/react-router'
 import { exportSarifAction } from '../actions.ts'
 import {
   assessmentCheckTitles,
@@ -7,15 +8,17 @@ import {
   maxRpsPerOriginCeiling,
   maxScopeHosts,
 } from '../domain.ts'
-import type { CapabilityTier, RunCommand } from '../domain.ts'
+import type { CapabilityTier, Finding, RunCommand } from '../domain.ts'
 import {
   callerCompatibilityLabels,
   dynamicRetestLabels,
+  findingVerificationTier,
   owaspCategoryTitles,
   patchStatusLabels,
+  verificationTierLabels,
 } from '../report-summary.ts'
 import { Status } from './common.tsx'
-import { capabilityTierMeta, formatUsd, phaseNames, workerPhaseNames, workerPhases } from './run-state.ts'
+import { capabilityTierMeta, formatUsd, workerPhaseNames, workerPhases } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
 import { Button } from './ui/button.tsx'
 import { Checkbox } from './ui/checkbox.tsx'
@@ -42,6 +45,13 @@ function riskBadgeClass(riskTier: 'critical' | 'high' | 'medium' | 'low') {
   return 'badge'
 }
 
+function sevPillClass(severity: string) {
+  if (severity === 'critical') return 'sev-pill sev-critical'
+  if (severity === 'high') return 'sev-pill sev-high'
+  if (severity === 'medium') return 'sev-pill sev-medium'
+  return 'sev-pill sev-low'
+}
+
 function downloadSarifBlob(content: string, filename: string) {
   const url = URL.createObjectURL(new Blob([content], { type: 'application/sarif+json; charset=utf-8' }))
   const link = document.createElement('a')
@@ -60,6 +70,12 @@ function safeHost(origin: string) {
   }
 }
 
+function isHeaderHygiene(f: Finding) {
+  return f.findingKind === 'baseline_check' && (f.severity === 'low' || f.severity === 'informational')
+}
+
+const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, informational: 4 }
+
 export function RunOverview({ detail, history, execute, openEvidence, pending }: {
   detail: RunDetail
   history: ReadonlyMap<string, string>
@@ -72,11 +88,46 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState<ScopeDraft>()
   const [exportingSarif, setExportingSarif] = useState(false)
+  const [hygieneOpen, setHygieneOpen] = useState(false)
+  const [threatOpen, setThreatOpen] = useState(false)
+  const [showAllThreat, setShowAllThreat] = useState(false)
+  const [scopeOpenManual, setScopeOpenManual] = useState<boolean | null>(null)
+
+  const verifiedFindings = useMemo(
+    () => detail.findings
+      .filter(f => (f.status === 'confirmed' || f.status === 'static_verified') && !f.supersededByFindingId)
+      .sort((a, b) => (SEV_RANK[a.severity] ?? 9) - (SEV_RANK[b.severity] ?? 9)),
+    [detail.findings],
+  )
+  const hygieneFindings = useMemo(() => verifiedFindings.filter(isHeaderHygiene), [verifiedFindings])
+  const primaryFindings = useMemo(() => verifiedFindings.filter(f => !isHeaderHygiene(f)), [verifiedFindings])
+
+  const sevCounts = useMemo(() => {
+    const c = { critical: 0, high: 0, medium: 0, low: 0 }
+    for (const f of primaryFindings) {
+      if (f.severity === 'critical') c.critical += 1
+      else if (f.severity === 'high') c.high += 1
+      else if (f.severity === 'medium') c.medium += 1
+      else c.low += 1
+    }
+    return c
+  }, [primaryFindings])
+
   const runtimeConfirmedCount = detail.findings.filter(f => f.status === 'confirmed').length
   const staticVerifiedCount = detail.findings.filter(f => f.status === 'static_verified').length
   const openProofGaps = detail.openProofGaps ?? []
   const patchProposals = detail.patchProposals ?? []
   const findingTitleById = new Map(detail.findings.map(f => [f.id, f.title]))
+  const replaySpecByFinding = new Map(detail.replaySpecs.map(r => [r.findingId, r]))
+  const activeRetestFindingIds = new Set(
+    assignments
+      .filter(a => a.phase === 'retest' && (a.status === 'queued' || a.status === 'running'))
+      .map(a => a.objective),
+  )
+
+  const currentWorkers = assignments.filter(w => !history.has(w.id))
+  const completedWorkers = currentWorkers.filter(w => w.status === 'complete').length
+  const runningWorkers = currentWorkers.filter(w => w.status === 'running' || w.status === 'waiting_approval').length
 
   async function handleDownloadSarif() {
     setExportingSarif(true)
@@ -87,6 +138,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       setExportingSarif(false)
     }
   }
+
   const afterApproval = ['threat_model', 'investigation', 'verification'].includes(run.phase)
   const canReview = canReviewScope(run.phase, run.status)
   const review = canReview ? draft : undefined
@@ -98,6 +150,9 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
   const suggestedCandidates = run.scopeRevision > 0
     ? run.candidates.filter(asset => !run.approved.includes(asset.id) && !asset.thirdParty)
     : []
+
+  // Scope Inventory defaults OPEN during scope review / editing, and COLLAPSED once approved!
+  const scopeInventoryOpen = Boolean(review) || run.phase === 'review' || (scopeOpenManual ?? run.scopeRevision === 0)
 
   function beginReview(extraAssetId?: string) {
     const baseIds = run.scopeRevision > 0 ? [...run.approved]
@@ -121,33 +176,59 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
   }
 
   return <div className="overview-body">
-    <ol className="phase-rail" aria-label="Run phases">
-      {workerPhases.map(phase => {
-        const nodes = assignments.filter(worker => worker.phase === phase && !history.has(worker.id))
-        const settled = nodes.length > 0 && nodes.every(worker => ['complete', 'canceled'].includes(worker.status))
-        const active = run.phase === phase && run.status === 'running' && (phase === 'discovery' || detail.hasModel)
-        const waitingApproval = nodes.some(worker => worker.status === 'waiting_approval')
-        return <Fragment key={phase}>
-          <li>
-            <div>
-              <h2>{workerPhaseNames[phase]}</h2>
-              <span className="muted">{nodes.length} {nodes.length === 1 ? 'worker' : 'workers'}</span>
-            </div>
-            <div className="phase-segments">{nodes.length
-              ? nodes.map(node => <i key={node.id} data-status={node.status} />)
-              : <i />}</div>
-            <span className="muted">
-              {settled ? 'Complete' : waitingApproval ? 'Awaiting approval' : active ? `${workerPhaseNames[phase]} in progress` : 'Queued'}
-            </span>
-          </li>
-          {phase === 'discovery' && <li className="approval-gate" data-approved={run.scopeRevision > 0}
-            aria-label={run.scopeRevision ? 'Scope reviewed' : 'Scope approval required'}>
-            <span aria-hidden="true">{run.scopeRevision ? '✓' : '◇'}</span>
-          </li>}
-        </Fragment>
-      })}
-    </ol>
+    {/* 1. Compact KPI & Severity Strip */}
+    <section className="kpi-strip" aria-label="Run KPI and severity summary">
+      <div className={`kpi-card sev-critical${sevCounts.critical > 0 ? ' has-items' : ''}`}>
+        <span className="kpi-label">Critical</span>
+        <span className="kpi-val tabular mono">{sevCounts.critical}</span>
+      </div>
+      <div className={`kpi-card sev-high${sevCounts.high > 0 ? ' has-items' : ''}`}>
+        <span className="kpi-label">High</span>
+        <span className="kpi-val tabular mono">{sevCounts.high}</span>
+      </div>
+      <div className={`kpi-card sev-medium${sevCounts.medium > 0 ? ' has-items' : ''}`}>
+        <span className="kpi-label">Medium</span>
+        <span className="kpi-val tabular mono">{sevCounts.medium}</span>
+      </div>
+      <div className={`kpi-card sev-low${sevCounts.low > 0 ? ' has-items' : ''}`}>
+        <span className="kpi-label">Low</span>
+        <span className="kpi-val tabular mono">{sevCounts.low}</span>
+      </div>
+      <button
+        type="button"
+        className="kpi-card kpi-hygiene"
+        onClick={() => setHygieneOpen(v => !v)}
+        aria-expanded={hygieneOpen}
+        title="Expand collapsed header hygiene observations"
+      >
+        <span className="kpi-label">Header Hygiene <span className="mono">({hygieneOpen ? 'open' : 'collapsed'})</span></span>
+        <span className="kpi-val-sm tabular">{hygieneFindings.length} info <span className="muted">{hygieneOpen ? '▴' : '▾'}</span></span>
+      </button>
+      <div className="kpi-card kpi-meta">
+        <span className="kpi-label">Activity &amp; Spend</span>
+        <span className="kpi-val-sm tabular mono">
+          {runningWorkers > 0 ? `${runningWorkers} active · ` : ''}{completedWorkers}/{currentWorkers.length} wk · {detail.exchangesSummary.length} ex · {formatUsd(run.spentUsd)}
+        </span>
+      </div>
+    </section>
 
+    {hygieneOpen && hygieneFindings.length > 0 && <section className="overview-card hygiene-drawer">
+      <div className="section-heading">
+        <div>
+          <h3>Header Hygiene &amp; Passive Hardening ({hygieneFindings.length})</h3>
+          <p className="muted">Grouped out of primary triage so Medium/High/Critical findings stay above the fold.</p>
+        </div>
+        <Button type="button" variant="ghost" onClick={() => setHygieneOpen(false)}>Collapse</Button>
+      </div>
+      <div className="hygiene-grid">
+        {hygieneFindings.map(f => <div key={f.id} className="hygiene-item">
+          <strong className="mono xs">{f.title}</strong>
+          <span className="muted xs">{safeHost(f.origin)} · {f.reason}</span>
+        </div>)}
+      </div>
+    </section>}
+
+    {/* 2. Needs Attention: Blocking Operator Gates + Top Verified Findings Above the Fold */}
     {pendingApprovals.length > 0 && <section className="approval-stack" aria-label="Pending Tier 3 approvals">
       {pendingApprovals.map(item => <article key={item.id} className="approval-card">
         <div className="section-heading">
@@ -178,10 +259,10 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
     }}>
       <div>
         <h2>Discovery consent</h2>
-        <p>Review project records, specs, and imported DNS exports for {project.seeds.map(seed => new URL(seed).hostname).join(', ')}.</p>
+        <p>Review project records, specs, and imported DNS exports for {project.seeds.map(safeHost).join(', ')}.</p>
         <label className="checkbox"><Checkbox name="discoveryConsent" required aria-label="I authorize discovery for these assets." /> I authorize discovery for these assets.</label>
       </div>
-      <Button type="submit" variant="default" disabled={pending || run.status !== 'waiting'}>Start discovery</Button>
+      <Button type="submit" variant="default" className="btn-nowrap" disabled={pending || run.status !== 'waiting'}>Start discovery</Button>
     </form>}
 
     {run.phase === 'review' && <div className="workflow-callout">
@@ -189,10 +270,87 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
         <h2>Scope &amp; capability approval</h2>
         <p>{run.candidates.length} candidates · {run.candidates.filter(asset => asset.thirdParty).length} third-party · {capabilityTierMeta[run.capabilityTier].short}</p>
       </div>
-      <Button variant="default" onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>
+      <Button variant="default" className="btn-nowrap" onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>
         {review ? 'Close review' : 'Review scope'}
       </Button>
     </div>}
+
+    {primaryFindings.length > 0 && <section className="overview-card attention-findings-card" aria-label="Top verified findings">
+      <div className="section-heading">
+        <div>
+          <h2>Needs Attention · Top Verified Findings</h2>
+          <p className="muted">Prioritized by exploitability and replay verification. {hygieneFindings.length > 0 ? `${hygieneFindings.length} passive header hygiene items folded above.` : ''}</p>
+        </div>
+        <div className="toolbar">
+          <Button variant="ghost" disabled={exportingSarif} onClick={() => void handleDownloadSarif()}>
+            {exportingSarif ? 'Exporting…' : 'SARIF 2.1.0'}
+          </Button>
+          <Link to="/runs/$runId" params={{ runId: run.id }} search={{ view: 'report' }} className="action-link primary btn-nowrap">
+            Open Report →
+          </Link>
+        </div>
+      </div>
+
+      <div className="findings-stack">
+        {primaryFindings.slice(0, 6).map(finding => {
+          const tier = findingVerificationTier(finding)
+          const replayRow = finding.replaySpecId ? detail.replaySpecs.find(r => r.id === finding.replaySpecId) : replaySpecByFinding.get(finding.id)
+          const canRetest = Boolean(finding.status === 'confirmed' && (finding.replaySpecId || replayRow))
+          const retestQueued = [...activeRetestFindingIds].some(obj => obj.includes(finding.id))
+          return <article key={finding.id} className="finding-summary-row">
+            <div className="finding-summary-main">
+              <div className="inline-badges">
+                <span className={sevPillClass(finding.severity)}>{finding.severity.toUpperCase()}</span>
+                <span className="mono muted xs">{safeHost(finding.origin)}</span>
+                {finding.cwe && <span className="badge">{finding.cwe}</span>}
+                {tier && <span className="badge badge-complete">{verificationTierLabels[tier]}</span>}
+                {finding.findingKind === 'multi_step_chain' && <span className="badge badge-trace">Multi-step chain</span>}
+              </div>
+              <h3 className="finding-summary-title">{finding.title}</h3>
+              <p className="muted finding-summary-desc">{finding.reason}</p>
+            </div>
+            <div className="finding-summary-actions">
+              <Link to="/runs/$runId" params={{ runId: run.id }} search={{ view: 'report' }} className="action-link btn-nowrap">
+                Inspect in Report
+              </Link>
+              {canRetest && <Button variant="ghost" className="btn-nowrap" disabled={pending || retestQueued} onClick={() => {
+                execute({ action: 'retest_finding', findingId: finding.id })
+              }}>
+                {retestQueued ? 'Verifying…' : 'Verify Fix'}
+              </Button>}
+            </div>
+          </article>
+        })}
+      </div>
+    </section>}
+
+    {/* Compact Phase Rail */}
+    <ol className="phase-rail" aria-label="Run phases">
+      {workerPhases.map(phase => {
+        const nodes = assignments.filter(worker => worker.phase === phase && !history.has(worker.id))
+        const settled = nodes.length > 0 && nodes.every(worker => ['complete', 'canceled'].includes(worker.status))
+        const active = run.phase === phase && run.status === 'running' && (phase === 'discovery' || detail.hasModel)
+        const waitingApproval = nodes.some(worker => worker.status === 'waiting_approval')
+        return <Fragment key={phase}>
+          <li>
+            <div>
+              <h2>{workerPhaseNames[phase]}</h2>
+              <span className="muted">{nodes.length} {nodes.length === 1 ? 'worker' : 'workers'}</span>
+            </div>
+            <div className="phase-segments">{nodes.length
+              ? nodes.map(node => <i key={node.id} data-status={node.status} />)
+              : <i />}</div>
+            <span className="muted">
+              {settled ? 'Complete' : waitingApproval ? 'Awaiting approval' : active ? `${workerPhaseNames[phase]} in progress` : 'Queued'}
+            </span>
+          </li>
+          {phase === 'discovery' && <li className="approval-gate" data-approved={run.scopeRevision > 0}
+            aria-label={run.scopeRevision ? 'Scope reviewed' : 'Scope approval required'}>
+            <span aria-hidden="true">{run.scopeRevision ? '✓' : '◇'}</span>
+          </li>}
+        </Fragment>
+      })}
+    </ol>
 
     {afterApproval && <div className="workflow-callout">
       <div>
@@ -200,12 +358,12 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
         <p>
           {run.approved.length} approved {run.approved.length === 1 ? 'host' : 'hosts'} · Revision {run.scopeRevision} · {capabilityTierMeta[run.capabilityTier].short}
           {run.approvedPersonaIds.length > 0 && ` · ${run.approvedPersonaIds.length} ${run.approvedPersonaIds.length === 1 ? 'persona' : 'personas'}`}
-          {` · Budget ${formatUsd(run.budgetUsd)} / ${run.budgetRequests} reqs`}
+          {` · Budget ${formatUsd(run.budgetUsd)} / ${run.budgetRequests === 0 ? '∞ reqs' : `${run.budgetRequests} reqs`}`}
         </p>
         {plan?.status === 'pending' && <p>{run.status === 'running' && detail.hasModel ? 'Preparing review plan' : 'Review plan pending'}</p>}
         {plan?.status === 'ready' && <p>{plan.source === 'standard' ? 'Standard checks' : 'Planned checks'} · {plan.checks.map(id => assessmentCheckTitles[id]).join(', ')}</p>}
       </div>
-      <Button onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>
+      <Button className="btn-nowrap" onClick={toggleReview} aria-expanded={Boolean(review)} disabled={!canReview}>
         {review ? 'Close review' : 'Review scope'}
       </Button>
     </div>}
@@ -220,12 +378,12 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       <ul className="project-list">{suggestedCandidates.slice(0, 8).map(asset => <li key={asset.id}>
         <div className="list-row">
           <span>
-            <strong>{new URL(asset.origin).hostname}</strong>
+            <strong>{safeHost(asset.origin)}</strong>
             <small>{asset.source}</small>
           </span>
           <div className="toolbar">
             <Button variant="ghost" disabled={pending} onClick={() => beginReview(asset.id)}>Review</Button>
-            <Button variant="default" disabled={pending || run.approved.length >= maxScopeHosts} onClick={() => {
+            <Button variant="default" className="btn-nowrap" disabled={pending || run.approved.length >= maxScopeHosts} onClick={() => {
               execute({
                 action: 'scope',
                 assetIds: [...run.approved, asset.id],
@@ -238,27 +396,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       </li>)}</ul>
     </section>}
 
-    {threatModel && threatModel.entries.length > 0 && <section className="stacked-section" aria-label="Threat model ranking">
-      <div className="section-heading">
-        <h2>Threat model ranking</h2>
-        <span className="muted">{threatModel.entries.length} ranked {threatModel.entries.length === 1 ? 'host' : 'hosts'}</span>
-      </div>
-      {threatModel.summary && <p className="muted" style={{ marginTop: 4 }}>{threatModel.summary}</p>}
-      <div className="threat-grid">
-        {threatModel.entries.slice(0, 8).map(entry => <div key={entry.origin} className="threat-card">
-          <div className="threat-card-head">
-            <strong>{safeHost(entry.origin)}</strong>
-            <div className="inline-badges">
-              {entry.surfaceTags.map(tag => <span key={tag} className="badge">{tag}</span>)}
-              <span className={riskBadgeClass(entry.riskTier)}>{entry.riskTier}</span>
-            </div>
-          </div>
-          <p className="muted">{entry.rationale}</p>
-        </div>)}
-      </div>
-    </section>}
-
-    {(runtimeConfirmedCount > 0 || staticVerifiedCount > 0 || openProofGaps.length > 0 || patchProposals.length > 0) && <section className="workflow-callout" aria-label="Verification tiers and exports">
+    {(runtimeConfirmedCount > 0 || staticVerifiedCount > 0 || openProofGaps.length > 0 || patchProposals.length > 0) && primaryFindings.length === 0 && <section className="workflow-callout" aria-label="Verification tiers and exports">
       <div>
         <h2>Verification summary</h2>
         <div className="inline-badges">
@@ -273,7 +411,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       </Button>
     </section>}
 
-    {openProofGaps.length > 0 && <section className="stacked-section" aria-label="Open Proof Gaps">
+    {openProofGaps.length > 0 && <section className="overview-card" aria-label="Open Proof Gaps">
       <div className="section-heading">
         <h2>Open Proof Gaps</h2>
         <span className="muted">{openProofGaps.length} {openProofGaps.length === 1 ? 'lead' : 'leads'} awaiting follow-up</span>
@@ -290,7 +428,7 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       </div>
     </section>}
 
-    {patchProposals.length > 0 && <section className="stacked-section" aria-label="Verified Patch Diffs">
+    {patchProposals.length > 0 && <section className="overview-card" aria-label="Verified Patch Diffs">
       <div className="section-heading">
         <h2>Verified Patch Diffs</h2>
         <span className="muted">{patchProposals.length} {patchProposals.length === 1 ? 'patch' : 'patches'}</span>
@@ -317,28 +455,92 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       </div>
     </section>}
 
-    {run.candidates.length > 0 && <form className="inventory" onSubmit={event => {
-      event.preventDefault()
-      const form = new FormData(event.currentTarget)
-      if (!review || stale || !form.has('scopeConsent') || overLimit) return
-      execute({
-        action: 'scope',
-        assetIds: review.assetIds,
-        expectedScopeRevision: review.scopeRevision,
-        consent: true,
-        saveProject: form.has('defaultScope'),
-        capabilityTier: review.capabilityTier,
-        approvedPersonaIds: review.capabilityTier >= 2 ? review.approvedPersonaIds : [],
-        budgetUsd: review.budgetUsd,
-        budgetRequests: review.budgetRequests,
-        maxRpsPerOrigin: review.maxRpsPerOrigin,
-      }, () => setDraft(undefined))
-    }}>
-      <div className="section-heading">
-        <h2>Discovery inventory</h2>
-        <div className="inline-badges">
-          <span className="muted">{run.candidates.length} discovered</span>
-          {review && <>
+    {/* 3. Collapsible Threat Model */}
+    {threatModel && threatModel.entries.length > 0 && <section className="disclosure-card" aria-label="Threat model ranking">
+      <button
+        type="button"
+        className="disclosure-card-trigger"
+        aria-expanded={threatOpen}
+        onClick={() => setThreatOpen(v => !v)}
+      >
+        <div>
+          <div className="inline-badges">
+            <strong>Threat model ranking</strong>
+            <span className="badge badge-trace">{threatModel.entries.length} ranked {threatModel.entries.length === 1 ? 'host' : 'hosts'}</span>
+          </div>
+          {threatModel.summary && <p className="muted xs" style={{ marginTop: 3 }}>{threatModel.summary}</p>}
+        </div>
+        <span className={`disclosure-chevron${threatOpen ? ' open' : ''}`} aria-hidden="true">▾</span>
+      </button>
+      {threatOpen && <div className="disclosure-card-body">
+        <div className="table-scroll">
+          <table className="compact-table">
+            <thead>
+              <tr>
+                <th scope="col">Host</th>
+                <th scope="col">Risk</th>
+                <th scope="col">Surface tags</th>
+                <th scope="col">Rationale</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(showAllThreat ? threatModel.entries : threatModel.entries.slice(0, 8)).map(entry => <tr key={entry.origin}>
+                <td className="mono"><strong>{safeHost(entry.origin)}</strong></td>
+                <td><span className={riskBadgeClass(entry.riskTier)}>{entry.riskTier}</span></td>
+                <td><div className="inline-badges">{entry.surfaceTags.slice(0, 4).map(t => <span key={t} className="badge">{t}</span>)}</div></td>
+                <td className="muted">{entry.rationale}</td>
+              </tr>)}
+            </tbody>
+          </table>
+        </div>
+        {threatModel.entries.length > 8 && <div style={{ marginTop: 8 }}>
+          <Button type="button" variant="ghost" onClick={() => setShowAllThreat(v => !v)}>
+            {showAllThreat ? 'Show top 8' : `Show all ${threatModel.entries.length} ranked hosts`}
+          </Button>
+        </div>}
+      </div>}
+    </section>}
+
+    {/* 4. Collapsible Scope Inventory (default collapsed once approved; auto-open during review) */}
+    {run.candidates.length > 0 && <section className="disclosure-card inventory-disclosure" aria-label="Scope inventory">
+      <button
+        type="button"
+        className="disclosure-card-trigger"
+        aria-expanded={scopeInventoryOpen}
+        onClick={() => { if (!review) setScopeOpenManual(v => !(v ?? scopeInventoryOpen)) }}
+      >
+        <div>
+          <div className="inline-badges">
+            <strong>Discovery inventory &amp; scope</strong>
+            <span className="badge">{run.candidates.length} discovered</span>
+            {run.scopeRevision > 0 && <span className="badge badge-complete">{run.approved.length} approved · Rev {run.scopeRevision}</span>}
+          </div>
+          <p className="muted xs" style={{ marginTop: 3 }}>
+            {review ? 'Select approved hosts, tier, limits, and personas below.' : 'Click to inspect discovered hosts and ownership evidence.'}
+          </p>
+        </div>
+        <span className={`disclosure-chevron${scopeInventoryOpen ? ' open' : ''}`} aria-hidden="true">▾</span>
+      </button>
+
+      {scopeInventoryOpen && <form className="disclosure-card-body inventory" onSubmit={event => {
+        event.preventDefault()
+        const form = new FormData(event.currentTarget)
+        if (!review || stale || !form.has('scopeConsent') || overLimit) return
+        execute({
+          action: 'scope',
+          assetIds: review.assetIds,
+          expectedScopeRevision: review.scopeRevision,
+          consent: true,
+          saveProject: form.has('defaultScope'),
+          capabilityTier: review.capabilityTier,
+          approvedPersonaIds: review.capabilityTier >= 2 ? review.approvedPersonaIds : [],
+          budgetUsd: review.budgetUsd,
+          budgetRequests: review.budgetRequests,
+          maxRpsPerOrigin: review.maxRpsPerOrigin,
+        }, () => setDraft(undefined))
+      }}>
+        {review && <div className="section-heading" style={{ marginBottom: 8 }}>
+          <div className="inline-badges">
             <span className="badge badge-accent">{selected.length} / {maxScopeHosts} selected</span>
             <Button type="button" variant="ghost" disabled={stale || pending} onClick={() => setDraft(current => current && {
               ...current,
@@ -347,93 +549,93 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
             <Button type="button" variant="ghost" disabled={stale || pending} onClick={() => setDraft(current => current && {
               ...current, assetIds: [],
             })}>Clear</Button>
-          </>}
-        </div>
-      </div>
-      <div className="table-scroll"><table>
-        <thead><tr>{review && <th scope="col">Include</th>}<th scope="col">Host</th><th scope="col">Ownership evidence</th><th scope="col">Scope</th></tr></thead>
-        <tbody>{run.candidates.map(asset => {
-          const sourceId = asset.sourceEvidenceId
-          return <tr key={asset.id}>
-            {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
-              disabled={stale || pending} onCheckedChange={checked => setDraft(current => current && {
-                ...current, assetIds: checked
-                  ? (current.assetIds.includes(asset.id) ? current.assetIds : [...current.assetIds, asset.id])
-                  : current.assetIds.filter(item => item !== asset.id),
-              })} /></td>}
-            <td><strong>{new URL(asset.origin).hostname}</strong>{asset.thirdParty && <small>Third-party service</small>}
-              {asset.accessPolicy && <small>Access policy records</small>}</td>
-            <td>{sourceId && inventoryIds.has(sourceId)
-              ? <Button variant="ghost" className="text-button" onClick={() => openEvidence(sourceId)}>{asset.source} ↗</Button>
-              : asset.source}</td>
-            <td><Status status={run.approved.includes(asset.id) ? 'approved'
-              : !run.scopeRevision && !asset.thirdParty ? 'proposed' : 'excluded'} /></td>
-          </tr>
-        })}</tbody>
-      </table></div>
-      {review && <div className="scope-footer" key={review.scopeRevision}>
-        {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
-        {stale ? <>
-          <p role="status">This draft uses revision {review.scopeRevision}. The current scope is revision {run.scopeRevision}.</p>
-          <Button type="button" onClick={() => beginReview()} disabled={pending}>Review latest scope</Button>
-        </> : <>
-          <div className="scope-config">
-            <label>Capability tier
-              <NativeSelect value={review.capabilityTier} disabled={pending} onChange={event => {
-                const nextTier = Number(event.target.value) as CapabilityTier
-                setDraft(current => current && { ...current, capabilityTier: nextTier })
-              }}>
-                <option value={0}>{capabilityTierMeta[0].name}</option>
-                <option value={1}>{capabilityTierMeta[1].name}</option>
-                <option value={2}>{capabilityTierMeta[2].name}</option>
-                <option value={3}>{capabilityTierMeta[3].name}</option>
-              </NativeSelect>
-              <span className="muted">{capabilityTierMeta[review.capabilityTier].summary}</span>
-            </label>
-            <div className="field-grid-3">
-              <label>Budget (USD)
-                <Input type="number" min={0.1} max={500} step="any" disabled={pending}
-                  value={review.budgetUsd} onChange={e => setDraft(c => c && { ...c, budgetUsd: Number(e.target.value) })} />
-              </label>
-              <label>Max requests
-                <Input type="number" min={0} max={maxBudgetRequests} step={1} disabled={pending}
-                  value={review.budgetRequests} onChange={e => setDraft(c => c && { ...c, budgetRequests: Number(e.target.value) })} />
-              </label>
-              <label>Max RPS / origin
-                <Input type="number" min={1} max={maxRpsPerOriginCeiling} step={1} disabled={pending}
-                  value={review.maxRpsPerOrigin} onChange={e => setDraft(c => c && { ...c, maxRpsPerOrigin: Number(e.target.value) })} />
-              </label>
-            </div>
-            {personas.length > 0 && <div className="persona-binding-list">
-              <strong>Bind test personas {review.capabilityTier < 2 && <span className="muted">(requires Tier 2 or Tier 3)</span>}</strong>
-              {personas.map(persona => <label key={persona.id} className="checkbox persona-binding-item">
-                <span className="inline-badges">
-                  <Checkbox
-                    checked={review.approvedPersonaIds.includes(persona.id)}
-                    disabled={pending || review.capabilityTier < 2}
-                    aria-label={`Bind persona ${persona.handle}`}
-                    onCheckedChange={checked => setDraft(current => current && {
-                      ...current,
-                      approvedPersonaIds: checked
-                        ? [...current.approvedPersonaIds, persona.id]
-                        : current.approvedPersonaIds.filter(id => id !== persona.id),
-                    })}
-                  />
-                  <span><strong>{persona.handle}</strong> · {persona.roleLabel}</span>
-                </span>
-                <span className="muted">{persona.originAllowlist.map(o => new URL(o).hostname).join(', ')}</span>
-              </label>)}
-            </div>}
           </div>
-          {run.phase === 'review' && <p className="muted">The coordinator ranks approved hosts in Threat Model and dispatches multi-step investigation workers.</p>}
-          <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize scoped defensive assessment of the selected hosts." /> I authorize scoped defensive assessment of the selected hosts at {capabilityTierMeta[review.capabilityTier].short}.</label>
-          <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
-          <Button type="submit" variant="default" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>
-            {run.phase === 'review' ? 'Approve scope' : 'Save scope revision'}
-          </Button>
-        </>}
-      </div>}
-    </form>}
+        </div>}
+        <div className="table-scroll"><table>
+          <thead><tr>{review && <th scope="col">Include</th>}<th scope="col">Host</th><th scope="col">Ownership evidence</th><th scope="col">Scope</th></tr></thead>
+          <tbody>{run.candidates.map(asset => {
+            const sourceId = asset.sourceEvidenceId
+            return <tr key={asset.id}>
+              {review && <td><Checkbox aria-label={`Include ${new URL(asset.origin).hostname}`} checked={selected.includes(asset.id)}
+                disabled={stale || pending} onCheckedChange={checked => setDraft(current => current && {
+                  ...current, assetIds: checked
+                    ? (current.assetIds.includes(asset.id) ? current.assetIds : [...current.assetIds, asset.id])
+                    : current.assetIds.filter(item => item !== asset.id),
+                })} /></td>}
+              <td><strong>{safeHost(asset.origin)}</strong>{asset.thirdParty && <small>Third-party service</small>}
+                {asset.accessPolicy && <small>Access policy records</small>}</td>
+              <td>{sourceId && inventoryIds.has(sourceId)
+                ? <Button variant="ghost" className="text-button" onClick={() => openEvidence(sourceId)}>{asset.source} ↗</Button>
+                : asset.source}</td>
+              <td><Status status={run.approved.includes(asset.id) ? 'approved'
+                : !run.scopeRevision && !asset.thirdParty ? 'proposed' : 'excluded'} /></td>
+            </tr>
+          })}</tbody>
+        </table></div>
+        {review && <div className="scope-footer" key={review.scopeRevision}>
+          {overLimit && <p role="alert">Choose up to {maxScopeHosts} hosts for this run.</p>}
+          {stale ? <>
+            <p role="status">This draft uses revision {review.scopeRevision}. The current scope is revision {run.scopeRevision}.</p>
+            <Button type="button" onClick={() => beginReview()} disabled={pending}>Review latest scope</Button>
+          </> : <>
+            <div className="scope-config">
+              <label>Capability tier
+                <NativeSelect value={review.capabilityTier} disabled={pending} onChange={event => {
+                  const nextTier = Number(event.target.value) as CapabilityTier
+                  setDraft(current => current && { ...current, capabilityTier: nextTier })
+                }}>
+                  <option value={0}>{capabilityTierMeta[0].name}</option>
+                  <option value={1}>{capabilityTierMeta[1].name}</option>
+                  <option value={2}>{capabilityTierMeta[2].name}</option>
+                  <option value={3}>{capabilityTierMeta[3].name}</option>
+                </NativeSelect>
+                <span className="muted">{capabilityTierMeta[review.capabilityTier].summary}</span>
+              </label>
+              <div className="field-grid-3">
+                <label>Budget (USD)
+                  <Input type="number" min={0.1} max={500} step="any" disabled={pending}
+                    value={review.budgetUsd} onChange={e => setDraft(c => c && { ...c, budgetUsd: Number(e.target.value) })} />
+                </label>
+                <label>Max requests (0 = ∞)
+                  <Input type="number" min={0} max={maxBudgetRequests} step={1} disabled={pending}
+                    value={review.budgetRequests} onChange={e => setDraft(c => c && { ...c, budgetRequests: Number(e.target.value) })} />
+                </label>
+                <label>Max RPS / origin
+                  <Input type="number" min={1} max={maxRpsPerOriginCeiling} step={1} disabled={pending}
+                    value={review.maxRpsPerOrigin} onChange={e => setDraft(c => c && { ...c, maxRpsPerOrigin: Number(e.target.value) })} />
+                </label>
+              </div>
+              {personas.length > 0 && <div className="persona-binding-list">
+                <strong>Bind test personas {review.capabilityTier < 2 && <span className="muted">(requires Tier 2 or Tier 3)</span>}</strong>
+                {personas.map(persona => <label key={persona.id} className="checkbox persona-binding-item">
+                  <span className="inline-badges">
+                    <Checkbox
+                      checked={review.approvedPersonaIds.includes(persona.id)}
+                      disabled={pending || review.capabilityTier < 2}
+                      aria-label={`Bind persona ${persona.handle}`}
+                      onCheckedChange={checked => setDraft(current => current && {
+                        ...current,
+                        approvedPersonaIds: checked
+                          ? [...current.approvedPersonaIds, persona.id]
+                          : current.approvedPersonaIds.filter(id => id !== persona.id),
+                      })}
+                    />
+                    <span><strong>{persona.handle}</strong> · {persona.roleLabel}</span>
+                  </span>
+                  <span className="muted">{persona.originAllowlist.map(safeHost).join(', ')}</span>
+                </label>)}
+              </div>}
+            </div>
+            {run.phase === 'review' && <p className="muted">The coordinator ranks approved hosts in Threat Model and dispatches multi-step investigation workers.</p>}
+            <label className="checkbox"><Checkbox name="scopeConsent" required aria-label="I authorize scoped defensive assessment of the selected hosts." /> I authorize scoped defensive assessment of the selected hosts at {capabilityTierMeta[review.capabilityTier].short}.</label>
+            <label className="checkbox"><Checkbox name="defaultScope" aria-label="Save selected hosts as the project default" /> Save selected hosts as the project default</label>
+            <Button type="submit" variant="default" className="btn-nowrap" disabled={pending || overLimit || (run.phase === 'review' && selected.length === 0)}>
+              {run.phase === 'review' ? 'Approve scope' : 'Save scope revision'}
+            </Button>
+          </>}
+        </div>}
+      </form>}
+    </section>}
 
     {run.candidates.length > 0 && run.phase !== 'complete' && <div className="candidate-form">
       <Button onClick={() => setAdding(!adding)} aria-expanded={adding}>Add candidate</Button>

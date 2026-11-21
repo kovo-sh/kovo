@@ -568,7 +568,7 @@ export function coordinatorPrompt(input: {
   spentUsd?: number
   budgetUsd?: number
   spentRequests?: number
-  budgetRequests?: number
+  budgetRequests?: number | 'unlimited'
   turnsUsed?: number
 }): string {
   return JSON.stringify({ task: 'coordinator status', ...input })
@@ -741,7 +741,7 @@ export function chainPlannerPrompt(input: {
   }[]
   pendingFindings?: readonly { id: string; origin: string; title: string; status: string; severity: string }[]
   operatorHints?: readonly string[]
-  budgetRemaining?: { usd: number; requests: number }
+  budgetRemaining?: { usd: number; requests: number | 'unlimited' }
   availableSkills?: readonly { name: string; title: string }[]
 }): string {
   const hostTiers: Record<string, HostTier> = {}

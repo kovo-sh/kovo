@@ -33,6 +33,7 @@ import {
 import { exportReportMarkdown } from './server/report-export.ts'
 import { exportReportSarif } from './server/sarif-export.ts'
 import { store } from './server/store.ts'
+import { readWorkerSession, testPersonaAuth } from './server/worker-session-reader.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => ({
   ...store().listWorkspace(),
@@ -149,6 +150,19 @@ export const registerPersona = createServerFn({ method: 'POST' }).validator(crea
 
 export const removePersona = createServerFn({ method: 'POST' }).validator(deletePersona)
   .handler(({ data }) => deleteProjectPersona(store(), data))
+
+export const testPersonaAuthAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    projectId: id,
+    personaId: id,
+    origin: z.string().trim().min(1).max(253).optional(),
+    path: z.string().trim().startsWith('/').max(256).optional(),
+  }))
+  .handler(({ data }) => testPersonaAuth(store(), execution().broker, data))
+
+export const readWorkerSessionAction = createServerFn({ method: 'GET' })
+  .validator(z.object({ runId: id, workerId: id }))
+  .handler(({ data }) => readWorkerSession(store(), data.runId, data.workerId))
 
 // --- Runs, Commands, Exchanges, Artifacts & Reports ---
 

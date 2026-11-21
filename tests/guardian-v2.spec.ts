@@ -65,9 +65,10 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
     await verifyBtn.click()
     await expect(report).toContainText('Verified fixed', { timeout: 25_000 })
 
-    // 6. Inspect Workflow Trace DAG view
-    await page.getByRole('link', { name: 'Workflow', exact: true }).click()
+    // 6. Inspect Workflow Trace (List default + Graph DAG toggle)
     await page.getByRole('link', { name: /^Trace/ }).click()
+    await expect(page.getByLabel('Worker timeline list')).toBeVisible()
+    await page.getByRole('button', { name: 'Graph', exact: true }).click()
     await expect(page.locator('.trace-canvas')).toBeVisible()
 
     // 7. Export portable Markdown with evidence & verify zero secret leaks

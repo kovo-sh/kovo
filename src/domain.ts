@@ -13,9 +13,9 @@ export const defaultWorkerMaxTurns = 150
 export const maxWorkerMaxTurns = 300
 export const defaultRunMaxTurns = 2000
 export const defaultBudgetUsd = 25
-export const defaultBudgetRequests = 2500
-export const defaultPublicBudgetRequests = 4000
-export const defaultLabBudgetRequests = 10_000
+export const defaultBudgetRequests = 0
+export const defaultPublicBudgetRequests = 0
+export const defaultLabBudgetRequests = 0
 export const maxBudgetRequests = 25_000
 export const defaultMaxRpsPerOrigin = 5
 export const maxRpsPerOriginCeiling = 20
@@ -211,6 +211,7 @@ export const newRun = z.object({
   goal: goalText,
   sourceMode: z.enum(['prepared', 'public']).default('public'),
   capabilityTier: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]).default(1),
+  approvedPersonaIds: z.array(id).max(32).optional(),
   budgetUsd: z.number().min(0.1).max(500).default(defaultBudgetUsd),
   budgetRequests: z.number().int().min(0).max(maxBudgetRequests).default(defaultBudgetRequests),
   maxRpsPerOrigin: z.number().int().min(1).max(maxRpsPerOriginCeiling).default(defaultMaxRpsPerOrigin),
@@ -311,8 +312,9 @@ export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({
     action: z.literal('raise_budget'),
     budgetUsd: z.number().min(0.1).max(500).optional(),
-    budgetRequests: z.number().int().min(1).max(maxBudgetRequests).optional(),
-    resume: z.boolean().default(true),
+    budgetRequests: z.number().int().min(0).max(maxBudgetRequests).optional(),
+    maxRpsPerOrigin: z.number().int().min(1).max(maxRpsPerOriginCeiling).optional(),
+    resume: z.boolean().default(false),
   }),
   commandBase.extend({ action: z.literal('retest_finding'), findingId: id }),
   ...(['pause', 'stop', 'resume'] as const).map(action => commandBase.extend({ action: z.literal(action) })),
@@ -544,11 +546,12 @@ export const DEFAULT_PROVIDER = {
   endpoint: 'https://openrouter.ai/api/v1',
   model: 'deepseek/deepseek-v4.1-flash-1017',
   protocol: 'responses' as const,
-  contextWindow: 131_072,
+  contextWindow: 1_048_576,
   maxTokens: 16_384,
   thinkingLevel: 'medium' as ThinkingLevel,
-  inputCostPerMtok: 0.25,
-  outputCostPerMtok: 0.90,
+  inputCostPerMtok: 0.15,
+  cachedInputCostPerMtok: 0.003,
+  outputCostPerMtok: 0.60,
 }
 
 const providerUrl = z.string().trim().min(1).max(300).transform((input, ctx) => {
@@ -569,14 +572,25 @@ export const providerSettings = z.object({
   endpoint: providerUrl,
   model: z.string().trim().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,127}$/),
   protocol: z.enum(['responses', 'messages']),
-  key: z.string().trim().min(8).max(512).regex(/^[\x21-\x7e]+$/),
+  key: z.string().trim().max(512).default(''),
   priority: z.number().int().min(0).max(1000).default(100),
   enabled: z.boolean().default(true),
-  contextWindow: z.number().int().min(32_000).max(1_000_000).default(DEFAULT_PROVIDER.contextWindow),
-  maxTokens: z.number().int().min(512).max(65_536).default(DEFAULT_PROVIDER.maxTokens),
+  contextWindow: z.number().int().min(32_000).max(2_000_000).default(DEFAULT_PROVIDER.contextWindow),
+  maxTokens: z.number().int().min(512).max(393_216).default(DEFAULT_PROVIDER.maxTokens),
   thinkingLevel: z.enum(thinkingLevels).default(DEFAULT_PROVIDER.thinkingLevel),
   inputCostPerMtok: z.number().min(0).max(500).default(DEFAULT_PROVIDER.inputCostPerMtok),
+  cachedInputCostPerMtok: z.number().min(0).max(500).default(DEFAULT_PROVIDER.cachedInputCostPerMtok),
   outputCostPerMtok: z.number().min(0).max(500).default(DEFAULT_PROVIDER.outputCostPerMtok),
+}).superRefine((val, ctx) => {
+  if (!val.key) {
+    if (!val.id) {
+      ctx.addIssue({ code: 'custom', path: ['key'], message: 'API key is required when adding a new model profile.' })
+    }
+    return
+  }
+  if (val.key.length < 8 || !/^[\x21-\x7e]+$/.test(val.key)) {
+    ctx.addIssue({ code: 'custom', path: ['key'], message: 'API key must be 8-512 printable ASCII characters.' })
+  }
 })
 
 export type ProviderSettings = z.output<typeof providerSettings>
@@ -593,6 +607,7 @@ export interface PublicModelProfile {
   maxTokens: number
   thinkingLevel: ThinkingLevel
   inputCostPerMtok: number
+  cachedInputCostPerMtok: number
   outputCostPerMtok: number
   healthState: 'closed' | 'open' | 'half_open'
   cooldownUntil: number | null

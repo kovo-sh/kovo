@@ -28,7 +28,18 @@ function healthLabel(profile: PublicModelProfile) {
 }
 
 function formatK(value: number) {
+  if (value >= 1_000_000) {
+    const m = value / 1_048_576
+    return Number.isInteger(m) ? `${m}M` : `${(value / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`
+  }
   return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value)
+}
+
+function formatRate(value: number) {
+  if (value === 0) return '$0'
+  if (value < 0.01) return `$${Number(value.toFixed(4))}`
+  if (value < 0.1) return `$${Number(value.toFixed(3))}`
+  return `$${value.toFixed(2)}`
 }
 
 function ModelPage() {
@@ -53,6 +64,7 @@ function ModelPage() {
     maxTokens: DEFAULT_PROVIDER.maxTokens,
     thinkingLevel: DEFAULT_PROVIDER.thinkingLevel,
     inputCostPerMtok: DEFAULT_PROVIDER.inputCostPerMtok,
+    cachedInputCostPerMtok: DEFAULT_PROVIDER.cachedInputCostPerMtok,
     outputCostPerMtok: DEFAULT_PROVIDER.outputCostPerMtok,
   }
 
@@ -86,8 +98,14 @@ function ModelPage() {
             <strong>{profile.name}</strong>
             <span className="badge badge-accent">Priority {profile.priority}</span>
             {!profile.enabled && <span className="badge">Disabled</span>}
-            <Status status={profile.healthState} />
-            <span className="muted">{healthLabel(profile)}</span>
+            <span
+              className="state"
+              data-status={profile.healthState}
+              title={profile.healthState === 'closed' ? 'Circuit breaker closed' : healthLabel(profile)}
+            >
+              <i aria-hidden="true" />
+              {healthLabel(profile)}
+            </span>
           </div>
           <div className="toolbar">
             <Button variant="ghost" disabled={poolAction.pending} onClick={() => {
@@ -108,7 +126,7 @@ function ModelPage() {
           <span>Window <strong>{formatK(profile.contextWindow)}</strong></span>
           <span>Max out <strong>{formatK(profile.maxTokens)}</strong></span>
           <span>Thinking <strong>{profile.thinkingLevel}</strong></span>
-          <span>Cost <strong>${profile.inputCostPerMtok.toFixed(2)} / ${profile.outputCostPerMtok.toFixed(2)}</strong> per Mtok</span>
+          <span>Cost <strong>{formatRate(profile.inputCostPerMtok)} in · {formatRate(profile.cachedInputCostPerMtok)} cached · {formatRate(profile.outputCostPerMtok)} out</strong> / Mtok</span>
           <span>Updated {timeText(profile.updatedAt)}</span>
         </div>
         {profile.lastError && <p className="profile-error">Last error: {profile.lastError}</p>}
@@ -137,6 +155,7 @@ function ModelPage() {
         maxTokens: Number(form.get('maxTokens') ?? DEFAULT_PROVIDER.maxTokens),
         thinkingLevel,
         inputCostPerMtok: Number(form.get('inputCostPerMtok') ?? DEFAULT_PROVIDER.inputCostPerMtok),
+        cachedInputCostPerMtok: Number(form.get('cachedInputCostPerMtok') ?? DEFAULT_PROVIDER.cachedInputCostPerMtok),
         outputCostPerMtok: Number(form.get('outputCostPerMtok') ?? DEFAULT_PROVIDER.outputCostPerMtok),
       }
       const element = event.currentTarget
@@ -163,9 +182,9 @@ function ModelPage() {
           <Input name="priority" type="number" min={0} max={1000} step={1} required defaultValue={defaults.priority} />
         </label>
       </div>
-      <label>API key
-        <Input name="key" type="password" required minLength={8} maxLength={512} autoComplete="off"
-          placeholder={editing ? 'Enter a new or replacement API key' : 'Enter your provider key'} />
+      <label>API key {editing && <span className="muted">(optional — leave blank to keep stored key)</span>}
+        <Input name="key" type="password" required={!editing} minLength={editing ? undefined : 8} maxLength={512} autoComplete="off"
+          placeholder={editing ? 'Leave blank to keep existing API key' : 'Enter your provider key'} />
         <span className="muted">Stored locally in 0600 credential files; never returned to the browser or target containers.</span>
       </label>
       <label className="checkbox">
@@ -173,7 +192,7 @@ function ModelPage() {
         Enable this profile in the failover pool
       </label>
       <Collapsible className="provider-advanced" defaultOpen={Boolean(editing)}>
-        <CollapsibleTrigger render={<Button variant="ghost" />}>Advanced provider settings</CollapsibleTrigger>
+        <CollapsibleTrigger render={<Button variant="ghost" className="collapsible-trigger" />}>Advanced provider settings</CollapsibleTrigger>
         <CollapsibleContent keepMounted>
           <div className="field-grid">
             <div className="field-grid-2">
@@ -186,10 +205,10 @@ function ModelPage() {
             <label>Base URL<Input name="endpoint" type="url" required defaultValue={defaults.endpoint} /></label>
             <div className="field-grid-3">
               <label>Context window
-                <Input name="contextWindow" type="number" min={32000} max={1000000} step={1} required defaultValue={defaults.contextWindow} />
+                <Input name="contextWindow" type="number" min={32000} max={2000000} step={1} required defaultValue={defaults.contextWindow} />
               </label>
               <label>Max output tokens
-                <Input name="maxTokens" type="number" min={512} max={65536} step={1} required defaultValue={defaults.maxTokens} />
+                <Input name="maxTokens" type="number" min={512} max={393216} step={1} required defaultValue={defaults.maxTokens} />
               </label>
               <label>Thinking level
                 <NativeSelect name="thinkingLevel" defaultValue={defaults.thinkingLevel}>
@@ -200,9 +219,12 @@ function ModelPage() {
                 </NativeSelect>
               </label>
             </div>
-            <div className="field-grid-2">
+            <div className="field-grid-3">
               <label>Input cost ($ / 1M tokens)
                 <Input name="inputCostPerMtok" type="number" min={0} max={500} step="any" required defaultValue={defaults.inputCostPerMtok} />
+              </label>
+              <label>Cached input ($ / 1M tokens)
+                <Input name="cachedInputCostPerMtok" type="number" min={0} max={500} step="any" required defaultValue={defaults.cachedInputCostPerMtok} />
               </label>
               <label>Output cost ($ / 1M tokens)
                 <Input name="outputCostPerMtok" type="number" min={0} max={500} step="any" required defaultValue={defaults.outputCostPerMtok} />

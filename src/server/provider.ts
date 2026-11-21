@@ -34,6 +34,7 @@ export type CallRecorder = (call: ProviderCall) => void
 
 export type UsageEvent = {
   inputTokens: number
+  cachedInputTokens?: number
   outputTokens: number
   costUsd: number
   profileId?: string
@@ -88,23 +89,36 @@ export type ProviderOptions = {
 
 function clampContextWindow(value?: number): number {
   const raw = value ?? DEFAULT_PROVIDER.contextWindow
-  return Math.max(32_000, Math.min(1_000_000, Math.floor(raw)))
+  return Math.max(32_000, Math.min(2_000_000, Math.floor(raw)))
 }
 
 function clampMaxTokens(value?: number): number {
   const raw = value ?? DEFAULT_PROVIDER.maxTokens
-  return Math.max(512, Math.min(65_536, Math.floor(raw)))
+  return Math.max(512, Math.min(393_216, Math.floor(raw)))
 }
 
-function estimateCostUsd(profile: ProviderConfig, inputTokens: number, outputTokens: number): number {
+export function estimateCostUsd(
+  profile: ProviderConfig,
+  inputTokens: number,
+  outputTokens: number,
+  cachedInputTokens = 0,
+): number {
   const inRate = profile.inputCostPerMtok ?? DEFAULT_PROVIDER.inputCostPerMtok
+  const cachedRate = profile.cachedInputCostPerMtok ?? DEFAULT_PROVIDER.cachedInputCostPerMtok
   const outRate = profile.outputCostPerMtok ?? DEFAULT_PROVIDER.outputCostPerMtok
-  return (inputTokens * inRate + outputTokens * outRate) / 1_000_000
+  const cached = Math.max(0, Math.min(inputTokens, cachedInputTokens))
+  const uncached = Math.max(0, inputTokens - cached)
+  return (uncached * inRate + cached * cachedRate + outputTokens * outRate) / 1_000_000
 }
 
-function extractUsageFromSse(sseText: string): { inputTokens: number; outputTokens: number } {
-  let inputTokens = 0
+export function extractUsageFromSse(
+  sseText: string,
+  protocol: 'responses' | 'messages' = 'responses',
+): { inputTokens: number; cachedInputTokens: number; outputTokens: number } {
+  let rawInputTokens = 0
+  let cachedInputTokens = 0
   let outputTokens = 0
+  let anthropicCacheRead = 0
   for (const line of sseText.split('\n')) {
     if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
     try {
@@ -116,13 +130,28 @@ function extractUsageFromSse(sseText: string): { inputTokens: number; outputToke
       if (!usage) continue
       const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
       const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
-      if (Number.isFinite(inp) && inp > inputTokens) inputTokens = inp
+      const inputDetails = usage.input_tokens_details as Record<string, unknown> | undefined
+      const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined
+      const openaiCached = Number(inputDetails?.cached_tokens ?? promptDetails?.cached_tokens ?? 0)
+      const msgCached = Number(usage.cache_read_input_tokens ?? 0)
+      if (Number.isFinite(inp) && inp > rawInputTokens) rawInputTokens = inp
       if (Number.isFinite(out) && out > outputTokens) outputTokens = out
+      if (Number.isFinite(openaiCached) && openaiCached > cachedInputTokens) cachedInputTokens = openaiCached
+      if (Number.isFinite(msgCached) && msgCached > anthropicCacheRead) anthropicCacheRead = msgCached
     } catch {
       // Ignore unparseable frames.
     }
   }
-  return { inputTokens, outputTokens }
+  if (protocol === 'messages' && anthropicCacheRead > 0) {
+    // Anthropic Messages reports `input_tokens` excluding `cache_read_input_tokens`.
+    return {
+      inputTokens: rawInputTokens + anthropicCacheRead,
+      cachedInputTokens: anthropicCacheRead,
+      outputTokens,
+    }
+  }
+  const effectiveCached = Math.min(rawInputTokens, Math.max(cachedInputTokens, anthropicCacheRead))
+  return { inputTokens: rawInputTokens, cachedInputTokens: effectiveCached, outputTokens }
 }
 
 async function readStreamWithIdleTimeout(
@@ -259,11 +288,11 @@ function makeFetch(
     recordResponse?.(text)
 
     if (options.onUsage) {
-      const usage = extractUsageFromSse(text)
+      const usage = extractUsageFromSse(text, settings.protocol)
       if (usage.inputTokens > 0 || usage.outputTokens > 0) {
         options.onUsage({
           ...usage,
-          costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens),
+          costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens),
           profileId,
         })
       }
@@ -304,7 +333,7 @@ function buildSingleStreamImpl(
     cost: {
       input: settings.inputCostPerMtok ?? DEFAULT_PROVIDER.inputCostPerMtok,
       output: settings.outputCostPerMtok ?? DEFAULT_PROVIDER.outputCostPerMtok,
-      cacheRead: 0,
+      cacheRead: settings.cachedInputCostPerMtok ?? DEFAULT_PROVIDER.cachedInputCostPerMtok,
       cacheWrite: 0,
     },
   }
