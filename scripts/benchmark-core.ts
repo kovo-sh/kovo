@@ -338,12 +338,57 @@ export interface PerTargetOutcome {
   probeClass?: string | null
 }
 
+/**
+ * One isolated patch retest. `id`/`before`/`after`/`fixed` are the stable, report-facing fields;
+ * the rest carry the evidence needed to audit a `fixed` claim without re-running anything.
+ */
+export interface PatchVerificationEntry {
+  /** Challenge (vuln) id; kept as the compact identifier used by reports. */
+  id: string
+  /** Verdict observed before the patch (usually `confirmed`, or `not_confirmed`). */
+  before: string
+  /** Verdict observed after applying only this patch. */
+  after: string
+  fixed: boolean
+  patchId?: string
+  vulnId?: string
+  reproducedBefore?: boolean
+  fixedAfter?: boolean
+  /** Every verdict observed for this target on the patched server, in attempt order. */
+  verdicts?: string[]
+  /** Unrelated baseline findings replayed on the same patched server. */
+  isolationChecked?: number
+  isolationPreserved?: number
+  isolationLost?: string[]
+  notes?: string[]
+}
+
+/** Outcome of the single "all patches applied" pass. */
+export interface AllPatchesVerification {
+  /** Patch ids applied for this pass (deterministically sorted). */
+  patchIds: string[]
+  /** True when the pass actually ran to completion. */
+  attempted: boolean
+  /** Baseline-confirmed vulns that still confirmed with every patch applied. */
+  stillConfirming: string[]
+  /** Vulns confirmed in the all-patches pass that were not confirmed at baseline. */
+  newlyConfirming: string[]
+  decoyFalsePositivesBefore: number
+  decoyFalsePositivesAfter: number
+  verdict: 'fixed' | 'regressed' | 'inconclusive'
+  notes: string[]
+}
+
 export interface PatchVerificationSummary {
   attempted: number
   fixed: number
   reproducedBefore: number
-  perPatch: Array<{ id: string; before: string; after: string; fixed: boolean }>
+  perPatch: PatchVerificationEntry[]
   skippedReason?: string
+  allPatches?: AllPatchesVerification
+  decoyFalsePositivesBefore?: number
+  decoyFalsePositivesAfter?: number
+  durationMs?: number
 }
 
 export interface BenchmarkSuiteResult {
@@ -450,7 +495,32 @@ export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
     lines.push('')
     const pv = result.patchVerification
     lines.push(`- Patches attempted: ${pv.attempted}; reproduced before patch: ${pv.reproducedBefore}; fixed after patch: ${pv.fixed}`)
+    if (pv.decoyFalsePositivesBefore !== undefined) {
+      lines.push(`- Decoy false positives: ${pv.decoyFalsePositivesBefore} before${pv.decoyFalsePositivesAfter === undefined ? '' : `, ${pv.decoyFalsePositivesAfter} after all patches`}`)
+    }
     if (pv.skippedReason) lines.push(`- Note: ${pv.skippedReason}`)
+    if (pv.perPatch.length) {
+      lines.push('')
+      lines.push('| Patch | Vuln | Before | After | Fixed | Isolation |')
+      lines.push('| --- | --- | --- | --- | --- | --- |')
+      for (const p of pv.perPatch) {
+        const isolation = !p.reproducedBefore
+          ? 'n/a'
+          : p.isolationChecked === undefined || p.isolationChecked === 0
+            ? 'n/a (no unrelated findings)'
+            : `${p.isolationPreserved ?? 0}/${p.isolationChecked} preserved${p.isolationLost?.length ? ` (lost: ${p.isolationLost.join(', ')})` : ''}`
+        lines.push(`| ${p.patchId ?? p.id} | ${p.vulnId ?? p.id} | ${p.before} | ${p.after} | ${p.fixed ? 'yes' : 'no'} | ${isolation} |`)
+      }
+    }
+    if (pv.allPatches) {
+      const a = pv.allPatches
+      lines.push('')
+      lines.push(`- All patches applied: **${a.verdict}**${a.attempted ? '' : ' (not run)'}`)
+      if (a.stillConfirming.length) lines.push(`  - Still confirming: ${a.stillConfirming.join(', ')}`)
+      if (a.newlyConfirming.length) lines.push(`  - Newly confirming: ${a.newlyConfirming.join(', ')}`)
+      lines.push(`  - Decoy false positives before/after: ${a.decoyFalsePositivesBefore}/${a.decoyFalsePositivesAfter}`)
+      for (const n of a.notes) lines.push(`  - ${n}`)
+    }
   }
   if (result.perTarget.length) {
     lines.push('')
