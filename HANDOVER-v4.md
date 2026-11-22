@@ -11,6 +11,11 @@
 > held-out, patch-retest and realistic-bench results. The “remaining work” and
 > percentage estimates below describe the pre-M7 state and are kept for history.
 
+> **v5 status (2026-11-22):** v5 is in progress. For the current line read
+> [HANDOVER-v5.md](HANDOVER-v5.md) and the living
+> [VERIFICATION-v5.md](VERIFICATION-v5.md); the v4 material below remains
+> historical.
+
 ---
 
 ## 1. Executive Summary & Current Build Health
