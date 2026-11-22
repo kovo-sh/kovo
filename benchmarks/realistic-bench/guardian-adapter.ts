@@ -142,7 +142,7 @@ export type ExchangeHook = (exchange: unknown) => void
 
 export interface EngineModuleLike {
   profileCaps(mode: ProfileMode): ProfileCapsLike
-  createEngineEnv(handle: EngineHandleLike, caps: ProfileCapsLike, label: string): Promise<EngineEnvLike>
+  createEngineEnv(handle: EngineHandleLike, caps: ProfileCapsLike, label: string, opts?: EngineEnvCreateOptionsLike): Promise<EngineEnvLike>
   discoverEndpoints(env: EngineEnvLike, caps: ProfileCapsLike, onExchange: ExchangeHook): Promise<DiscoveredEndpointLike[]>
   formHypotheses(endpoints: DiscoveredEndpointLike[], caps: ProfileCapsLike): { hypotheses: HypothesisLike[]; encodingSkips: unknown[] }
   runHypothesis(hyp: HypothesisLike, probeEnv: Record<string, unknown>, onExchange: ExchangeHook): Promise<HypothesisOutcomeLike>
@@ -152,6 +152,58 @@ export interface EngineModuleLike {
   verifyReplaySpec(params: Record<string, unknown>): Promise<{ verdict: string }>
   verifyReplaySpecInline?(params: Record<string, unknown>): Promise<{ replay: { verdict: string }; feedback?: { jqError?: boolean } }>
   runLivePipeline?(params: Record<string, unknown>): Promise<{ traces: unknown[]; totalCostUsd: number; verifierBackend: string | null; notes: string[] }>
+}
+
+/** Options forwarded to scripts/benchmark-env.ts so the engine reuses the harness' OOB listener. */
+export interface EngineEnvCreateOptionsLike {
+  canaryBroker?: unknown
+  oobCallbackPorts?: number[]
+}
+
+/**
+ * A Guardian-operated loopback canary listener, started *before* the materialized app so its exact
+ * port can be handed to the app's contained egress allowlist. The broker is passed unchanged into
+ * createEngineEnv, so SSRF/XXE probes, replay verification and the app all share one callback port.
+ */
+export interface OobCanaryHandle {
+  port: number
+  broker: unknown
+  stop(): Promise<void>
+}
+
+interface CanaryListenerInfoLike {
+  running: boolean
+  host: string | null
+  port: number | null
+  effectiveBaseUrl?: string | null
+}
+
+interface CanaryBrokerLike {
+  startListener(opts?: { host?: string; port?: number }): Promise<CanaryListenerInfoLike>
+  listenerInfo(): CanaryListenerInfoLike
+  stopListener(): Promise<void>
+}
+
+export async function startOobCanaryBroker(opts: { repoRootDir?: string } = {}): Promise<OobCanaryHandle> {
+  const repoRootDir = opts.repoRootDir ?? DEFAULT_REPO_ROOT
+  const mod = await importRepoModule(repoRootDir, 'src/server/canary-broker.ts')
+  const Broker = mod.CanaryBroker as (new (options?: { storage?: unknown; dnsDomain?: string }) => CanaryBrokerLike) | undefined
+  if (!Broker) throw new Error('src/server/canary-broker.ts does not export CanaryBroker (Guardian engine API drift)')
+  const broker = new Broker()
+  const info = await broker.startListener({ host: '127.0.0.1', port: 0 })
+  if (!info.running || !info.port || info.host !== '127.0.0.1') {
+    await broker.stopListener().catch(() => undefined)
+    throw new Error('OOB canary listener did not bind a loopback port')
+  }
+  if (info.effectiveBaseUrl) {
+    let baseHost = ''
+    try { baseHost = new URL(info.effectiveBaseUrl).hostname } catch { /* handled below */ }
+    if (baseHost !== '127.0.0.1') {
+      await broker.stopListener().catch(() => undefined)
+      throw new Error('OOB canary listener must use a loopback base URL; unset GUARDIAN_CANARY_PUBLIC_URL for local-lab runs')
+    }
+  }
+  return { port: info.port, broker, stop: () => broker.stopListener() }
 }
 
 async function importRepoModule(repoRootDir: string, rel: string): Promise<Record<string, unknown>> {
@@ -211,6 +263,12 @@ export interface RunGuardianOptions {
   heldOutSalt?: string
   /** Reuse an already-started app (CLI path). When omitted the adapter starts and stops it. */
   started?: MaterializedAppLike
+  /**
+   * Reuse a canary listener that was started before the app (CLI path) so the app's egress
+   * allowlist and the engine's SSRF/XXE verification share one loopback port. When the adapter
+   * starts the app itself it also creates this listener first.
+   */
+  oobCanary?: OobCanaryHandle
   maxRequests?: number
   deadlineMs?: number
   /** Default false: only confirmed/static-verified findings are submitted (like the live pipeline). */
@@ -376,18 +434,38 @@ export async function runGuardianAgainstMaterialized(
     throw new Error(`materialized tree is '${surface.app}' but --app is '${app}'`)
   }
 
+  const notes: string[] = []
   let started = opts.started
   let ownsApp = false
+  let oob = opts.oobCanary
+  let ownsOob = false
   if (!started) {
+    // Canary first: the app must be booted with the exact callback port in its egress allowlist,
+    // otherwise every SSRF/XXE callback is rejected as port_blocked and can never confirm.
+    if (!oob) {
+      oob = await startOobCanaryBroker({ repoRootDir })
+      ownsOob = true
+    }
     const start = deps.startApp ?? (o => startRealisticApp(o))
-    started = await start({ app, seed: opts.seed, ...(opts.heldOutSalt ? { heldOutSalt: opts.heldOutSalt } : {}) })
+    try {
+      started = await start({
+        app, seed: opts.seed,
+        ...(opts.heldOutSalt ? { heldOutSalt: opts.heldOutSalt } : {}),
+        oobCallbackPorts: [oob.port],
+      })
+    } catch (err) {
+      if (ownsOob && oob) await oob.stop().catch(() => undefined)
+      throw err
+    }
     ownsApp = true
+  }
+  if (!oob) {
+    notes.push('no OOB canary listener was supplied; SSRF/XXE callbacks can only confirm if the app already allows the engine listener port')
   }
   if (realpathSync(resolve(opts.treeDir)) !== realpathSync(resolve(started.sourceDir))) {
     throw new Error(`treeDir (${opts.treeDir}) is not the app's materialized sourceDir (${started.sourceDir}); refusing to probe a different tree`)
   }
 
-  const notes: string[] = []
   const engine = deps.loadEngine ? await deps.loadEngine(repoRootDir) : await loadGuardianEngine(repoRootDir)
   const caps = engine.profileCaps(profileMode)
   const briefing = (deps.briefing ?? ((a, m) => briefingFor(a as unknown as Parameters<typeof briefingFor>[0], m)))(started, mode)
@@ -416,7 +494,9 @@ export async function runGuardianAgainstMaterialized(
   const tierBlocked: Array<{ method: string; path: string }> = []
   const assertionFailures: Array<{ findingId?: string; path?: string }> = []
 
-  const env = await engine.createEngineEnv(handle, caps, `realistic-${app}-${opts.seed}`)
+  const env = await engine.createEngineEnv(handle, caps, `realistic-${app}-${opts.seed}`, oob
+    ? { canaryBroker: oob.broker, oobCallbackPorts: [oob.port] }
+    : {})
   try {
     const discovered = await engine.discoverEndpoints(env, caps, () => undefined)
     endpoints = mergeSurfaceEndpoints(discovered, surface, briefing)
@@ -491,6 +571,7 @@ export async function runGuardianAgainstMaterialized(
   } finally {
     await env.cleanup()
     if (ownsApp && started) await started.stop()
+    if (ownsOob && oob) await oob.stop().catch(() => undefined)
   }
 
   const endedAtMs = now()
