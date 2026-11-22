@@ -57,11 +57,13 @@ function jwtBodySpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
     }
     const tokenMints = [
       { name: 'forged_body_token', header: { typ: 'JWT' }, payload: { sub: subject, iat: '{{now}}', exp: '{{now_plus_1h}}' }, signature: 'none' as const },
-      { name: 'bogus_body_token', header: { typ: 'JWT' }, payload: { sub: bogus, iat: '{{now}}', exp: '{{now_plus_1h}}' }, signature: 'none' as const },
+      // Control: a correctly-shaped HS256 token with an empty/invalid signature. Unlike an
+      // alg:none token, this is rejected even by routers that honour the caller's algorithm.
+      { name: 'bogus_body_token', header: { typ: 'JWT' }, payload: { sub: subject, iat: '{{now}}', exp: '{{now_plus_1h}}' }, signature: 'hs256_invalid' as const },
     ]
     const effectPath = typeof a.effectPath === 'string' && a.effectPath.startsWith('/') ? a.effectPath : null
     const steps: Array<Record<string, unknown>> = [
-      stepOf(env, 'c1', 'control', 'Unsigned token for an unknown subject is rejected', {
+      stepOf(env, 'c1', 'control', 'Token with an invalid signature is rejected', {
         method, pathAndQuery: path, ...body('{{bogus_body_token}}'),
       }, null, {}, [400, 401, 403]),
       stepOf(env, 'p1', 'probe', 'Unsigned token for the victim subject is accepted', {

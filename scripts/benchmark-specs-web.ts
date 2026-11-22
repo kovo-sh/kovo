@@ -209,18 +209,21 @@ export function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): Synt
     : 'id'
 
   const steps: Array<Record<string, unknown>> = []
-  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies from the site root', { method: 'GET', pathAndQuery: '/' }, env.owner))
+  const writeExtra = env.caps.sessionAndCsrf ? { csrfBind: true } : {}
+  const csrfPrimePath = typeof hit.csrfPrimePath === 'string' && /^\/(?!\/)[^\s\\]{0,4000}$/.test(hit.csrfPrimePath) ? hit.csrfPrimePath : '/'
+  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies and a CSRF token', { method: 'GET', pathAndQuery: csrfPrimePath }, env.owner))
   if (createPath) {
     const createBody = bodyFor(producerBody, createEncoding)
     steps.push({
       ...stepOf(env, 'c1', 'control', 'Create a fresh object in its initial state', {
         method: 'POST', pathAndQuery: createPath, ...createBody,
-      }, env.owner),
+      }, env.owner, writeExtra),
       extract: [{ varName: extractVar, from: 'json' as const, selector: createSelector }],
     })
   }
   const baselineStepId = readPath ? 'c2' : 'c1'
-  if (readPath) {
+  const useReadSteps = Boolean(readPath) && !repeatTransition
+  if (useReadSteps && readPath) {
     steps.push(stepOf(env, baselineStepId, 'control', 'Read the object before the skipped transition', { method: 'GET', pathAndQuery: readPath }, env.owner))
   }
   if (repeatTransition) {
@@ -228,12 +231,12 @@ export function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): Synt
     // rejected once the object is no longer in the prerequisite state.
     steps.push(stepOf(env, 'c3', 'control', 'Perform the transition once (legal)', {
       method, pathAndQuery: target, ...bodyFor(targetBody, targetEncoding),
-    }, env.owner, {}, [200, 201, 204]))
+    }, env.owner, { ...writeExtra }, [200, 201, 204]))
   }
   steps.push(stepOf(env, 'p1', 'probe', 'Invoke the later transition directly', {
     method, pathAndQuery: target, ...bodyFor(targetBody, targetEncoding),
-  }, env.owner, {}, [200, 201, 204]))
-  if (readPath) {
+  }, env.owner, { ...writeExtra }, [200, 201, 204]))
+  if (useReadSteps && readPath) {
     steps.push(stepOf(env, 'p2', 'probe', 'Read the object after the transition', { method: 'GET', pathAndQuery: readPath }, env.owner))
   }
 
@@ -244,7 +247,7 @@ export function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): Synt
     if (collection && idField && createPath) return `([${base}[${jqStr(collection)}][]? | select((.[${jqStr(idField)}] | tostring) == $rid) | .[${jqStr(stateField)}]][0])`
     return `(${base}[${jqStr(stateField)}])`
   }
-  const finalStateId = readPath ? 'p2' : 'p1'
+  const finalStateId = useReadSteps ? 'p2' : 'p1'
   let controlPassed: string
   let confirmed: string
   if (repeatTransition) {
@@ -587,6 +590,59 @@ export function synthReflectedXss(o: HypothesisOutcome, env: ProbeEnv): Synthesi
       steps: [
         { id: 'c1', role: 'control', description: 'Render the page with a benign parameter value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
         { id: 'p1', role: 'probe', description: 'Render the page with an executable marker payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
+      ],
+    },
+  }]
+}
+
+/**
+ * Aggregate cap: two settled records from the same money mutation. The probe only emits this after
+ * both calls returned a terminal status with distinct ids, so a normal create (pending) or a
+ * correctly capped route (second call rejected) never reaches this builder.
+ */
+export function synthWorkflowRepeatAccepted(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'workflow_repeat_accepted')
+  if (!hit) return []
+  const path = String(hit.path ?? '')
+  if (!/^\/(?!\/)[^\s\\]{0,4000}$/.test(path)) return []
+  const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
+  const bodyRaw = hit.body && typeof hit.body === 'object' && !Array.isArray(hit.body) ? hit.body as Record<string, unknown> : {}
+  if (Object.keys(bodyRaw).length === 0) return []
+  const body = Object.fromEntries(Object.entries(bodyRaw).filter(([k, v]) =>
+    /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(k) && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')))
+  if (Object.keys(body).length === 0) return []
+  const encoding = hit.encoding === 'form' ? 'form' : 'json'
+  const statusField = typeof hit.statusField === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(hit.statusField)
+    ? hit.statusField : 'status'
+  const statusValue = String(hit.statusValue ?? '').toLowerCase()
+  if (!/^[a-z0-9_-]{1,32}$/.test(statusValue)) return []
+  const firstId = typeof hit.firstId === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(hit.firstId) ? hit.firstId : null
+  const secondId = typeof hit.secondId === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(hit.secondId) ? hit.secondId : null
+  const request = encoding === 'form'
+    ? {
+        method, pathAndQuery: path,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        textBody: Object.entries(body).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+      }
+    : { method, pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: body }
+  const fieldLit = jqStr(statusField)
+  const statusExpr = (stepId: string) => `((.steps.${stepId}.json[${fieldLit}] | tostring | ascii_downcase) == ${jqStr(statusValue)})`
+  const distinctIds = firstId && secondId && firstId !== secondId
+    ? ` and ((.steps.c1.json.id | tostring) != (.steps.p1.json.id | tostring))`
+    : ''
+  const jq = `{ controlPassed: ((${is2xx('c1')}) and ${statusExpr('c1')}), ` +
+    `confirmed: ((${is2xx('p1')}) and ${statusExpr('p1')}${distinctIds}), ` +
+    `observed: ("first=" + (.steps.c1.status | tostring) + " second=" + (.steps.p1.status | tostring) + " state=" + ((.steps.p1.json[${fieldLit}]) | tostring)), ` +
+    'expected: "a settled money mutation is accepted at most once per captured total" }'
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...baseFields(env, 'Business logic allows a second settled money record', 'CWE-840', 'business-logic', 'high', jq),
+      kind: 'http_chain',
+      steps: [
+        ...(env.caps.sessionAndCsrf ? [stepOf(env, 's1', 'setup', 'Prime session cookies and a CSRF token', { method: 'GET', pathAndQuery: typeof hit.csrfPrimePath === 'string' && /^\/(?!\/)[^\s\\]{0,4000}$/.test(hit.csrfPrimePath) ? hit.csrfPrimePath : '/' }, env.owner)] : []),
+        stepOf(env, 'c1', 'control', 'First settled money mutation', request, env.owner, env.caps.sessionAndCsrf ? { csrfBind: true } : {}),
+        stepOf(env, 'p1', 'probe', 'Repeat the same money mutation', request, env.owner, env.caps.sessionAndCsrf ? { csrfBind: true } : {}),
       ],
     },
   }]

@@ -171,12 +171,66 @@ export function synthCsrfStateChange(o: HypothesisOutcome, env: ProbeEnv): Synth
   if (!expectedLiteral || !controlLiteral || expectedLiteral === controlLiteral) return []
   if (stateSelector && !SAFE_SELECTOR.test(stateSelector)) return []
   const method = methodRaw as 'POST' | 'PUT' | 'PATCH'
+  // Create-shaped CSRF: both the token-bound control and the tokenless probe create new objects;
+  // each read-back addresses the id returned by that same create.
+  if (hit.create === true && typeof hit.createReadTemplate === 'string' && hit.createReadTemplate.startsWith('/')) {
+    const idSel = typeof hit.createIdSelector === 'string' && /^[A-Za-z_$][A-Za-z0-9_$.[\]-]{0,200}$/.test(hit.createIdSelector)
+      ? hit.createIdSelector : 'id'
+    const createReadTemplate = hit.createReadTemplate as string
+    const readTpl = (varName: string) => createReadTemplate.replace(/:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\]/, `{{${varName}}}`)
+    const encoding = hit.bodyEncoding === 'form' ? 'form' : 'json'
+    const payloadFor = (value: unknown): CsrfBody => {
+      const fields = /(?:amount|value|total|price|cents)/i.test(bodyField)
+        ? ['amount', 'amount_cents', 'amountCents', 'value', 'cents', 'total', 'price']
+        : [bodyField]
+      const body = Object.fromEntries([...new Set(fields)].map(k => [k, value]))
+      return encoding === 'form'
+        ? { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, textBody: Object.entries(body).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&') }
+        : { headers: { 'Content-Type': 'application/json' }, jsonBody: body }
+    }
+    const controlBody = payloadFor(hit.controlValue)
+    const probeBody = payloadFor(hit.expectedValue)
+    const foreign = { Origin: 'https://untrusted.invalid', Referer: 'https://untrusted.invalid/' }
+    const steps: Array<Record<string, unknown>> = []
+    if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies from the site root', { method: 'GET', pathAndQuery: '/' }, env.owner))
+    steps.push({
+      ...stepOf(env, 'c1', 'control', 'Create with the anti-CSRF token bound', {
+        method, pathAndQuery: path, headers: controlBody.headers,
+        ...(controlBody.jsonBody !== undefined ? { jsonBody: controlBody.jsonBody } : {}),
+        ...(controlBody.textBody !== undefined ? { textBody: controlBody.textBody } : {}),
+      }, env.owner, env.caps.sessionAndCsrf ? { csrfBind: true } : {}),
+      extract: [{ varName: 'control_id', from: 'json' as const, selector: idSel }],
+    })
+    steps.push(stepOf(env, 'r1', 'control', 'Read the object created by the control', { method: 'GET', pathAndQuery: readTpl('control_id') }, env.owner))
+    steps.push({
+      ...stepOf(env, 'p1', 'probe', 'Same create without the anti-CSRF token (foreign Origin)', {
+        method, pathAndQuery: path, headers: { ...probeBody.headers, ...foreign },
+        ...(probeBody.jsonBody !== undefined ? { jsonBody: probeBody.jsonBody } : {}),
+        ...(probeBody.textBody !== undefined ? { textBody: probeBody.textBody } : {}),
+      }, env.owner),
+      extract: [{ varName: 'probe_id', from: 'json' as const, selector: idSel }],
+    })
+    steps.push(stepOf(env, 'p2', 'probe', 'Read the object created by the tokenless request', { method: 'GET', pathAndQuery: readTpl('probe_id') }, env.owner))
+    const stateEq = (id: string, value: string) => `(((.steps.${id}.json[${jqStr(stateField)}] // "") | tostring | ascii_downcase) == ${jqStr(value.toLowerCase())})`
+    const jq = `{ controlPassed: ((${is2xx('c1')}) and (${is2xx('r1')}) and ${stateEq('r1', String(hit.controlValue))}), ` +
+      `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and ${stateEq('p2', String(hit.expectedValue))}), ` +
+      `observed: ("control=" + ((.steps.r1.json[${jqStr(stateField)}] // "?") | tostring) + " probe=" + ((.steps.p2.json[${jqStr(stateField)}] // "?") | tostring)), ` +
+      'expected: "state-changing creates must require the anti-CSRF token" }'
+    return [{
+      kind: 'http_chain',
+      spec: {
+        ...baseFields(env, 'CSRF protection missing on a create-shaped request', 'CWE-352', 'csrf', 'high', jq),
+        kind: 'http_chain',
+        steps,
+      },
+    }]
+  }
   const controlBody = csrfBody(o, hit, bodyField, hit.controlValue)
   const probeBody = csrfBody(o, hit, bodyField, hit.expectedValue)
   if (!controlBody || !probeBody) return []
   const read: RequestParts = { method: 'GET', pathAndQuery: readPath }
   const foreign = { Origin: 'https://untrusted.invalid', Referer: 'https://untrusted.invalid/' }
-  const jq = `{ controlPassed: ((${is2xx('c1')}) and (${is2xx('r1')}) and (${stateAbsent('r1', stateField, expectedLiteral, recordId, stateSelector)})), ` +
+  const jq = `{ controlPassed: ((${is2xx('c1')}) and (${is2xx('r1')}) and ((${stateExists('r1', stateField, controlLiteral, recordId, stateSelector)}) or (${stateExists('r1', stateField, expectedLiteral, recordId, stateSelector)}))), ` +
     `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (${stateExists('p2', stateField, expectedLiteral, recordId, stateSelector)})), ` +
     `observed: ("state=" + ((.steps.p2.json[${jqStr(stateField)}] // "collection") | tostring)), expected: "state change must require the anti-CSRF token" }`
   const steps: Array<Record<string, unknown>> = []

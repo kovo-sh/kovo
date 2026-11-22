@@ -343,6 +343,8 @@ export function synthCommandInjection(o: HypothesisOutcome, env: ProbeEnv): Synt
   const templates: Record<string, string> = {
     semicolon_echo: `${base}; echo {{nonce_part1}}$(echo {{nonce_part2}})`,
     subshell_echo: `${base}$(echo {{nonce_part1}})$(echo {{nonce_part2}})`,
+    quote_break: `${base}"; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
+    quote_break_id: `${base}"; id; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
     pipe_echo: `${base} | echo {{nonce_part1}}$(echo {{nonce_part2}})`,
     backtick_echo: `${base}\`echo {{nonce_part1}}$(echo {{nonce_part2}})\``,
   }
@@ -350,7 +352,7 @@ export function synthCommandInjection(o: HypothesisOutcome, env: ProbeEnv): Synt
   const control = requestParts(o, env, base)
   const probe = requestParts(o, env, template)
   if (!control || !probe) return []
-  return [{
+  const out: SynthesizedSpec[] = [{
     kind: 'rce_proof',
     spec: {
       ...baseFields(env, 'Command injection via shell metacharacters (nonce echo proof)', 'CWE-78', 'injection-input', 'critical',
@@ -362,6 +364,32 @@ export function synthCommandInjection(o: HypothesisOutcome, env: ProbeEnv): Synt
       probeStep: stepOf(env, 'p1', 'probe', 'Verifier-minted split echo operands', probe),
     },
   }]
+  // Second proof shape: the observed payload's nonce appears in the response while the payload
+  // itself was not reflected. Rejected by the split-echo verifier when the simulator renders the
+  // substitution on its own line, but an http_chain assertion can still prove execution.
+  const observedPayload = typeof hit.payload === 'string' ? hit.payload : ''
+  const nonce = typeof hit.nonce === 'string' ? hit.nonce : ''
+  if (observedPayload.length > 0 && observedPayload.length <= 200 && !/[\r\n\0]/.test(observedPayload) &&
+      /^[A-Za-z0-9]{8,40}$/.test(nonce)) {
+    const observedProbe = requestParts(o, env, observedPayload)
+    if (observedProbe) {
+      const jq = `{ controlPassed: ((.steps.c1.status < 500) and ((.steps.c1.body | contains(${jqStr(nonce)})) | not)), ` +
+        `confirmed: ((${is2xx('p1')}) and (.steps.p1.body | contains(${jqStr(nonce)})) and ((.steps.p1.body | contains(${jqStr(observedPayload)})) | not)), ` +
+        `observed: ("nonce=" + (${jqStr(nonce)}) + " reflected=" + ((.steps.p1.body | contains(${jqStr(observedPayload)})) | tostring)), expected: "shell metacharacters are inert data" }`
+      out.push({
+        kind: 'http_chain',
+        spec: {
+          ...baseFields(env, 'Command injection via shell metacharacters (observed nonce proof)', 'CWE-78', 'injection-input', 'critical', jq),
+          kind: 'http_chain',
+          steps: [
+            stepOf(env, 'c1', 'control', 'Benign value', control),
+            stepOf(env, 'p1', 'probe', 'Observed metacharacter payload', observedProbe),
+          ],
+        },
+      })
+    }
+  }
+  return out
 }
 
 /**
