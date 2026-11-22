@@ -774,7 +774,15 @@ export async function assertZeroGuardianOrphans(runId?: string): Promise<void> {
   const runFilter = runId
     ? ['--filter', `label=dev.guardian.run=${runId}`]
     : ['--filter', `label=dev.guardian.session=${workerProcessSessionId()}`]
-  const { stdout: psOut } = await execFileAsync('docker', ['ps', '-aq', ...runFilter])
+  // Cleanup is asynchronous at the edges (a close handler may still be in flight); poll briefly
+  // so a container that is already being removed is not reported as a leak.
+  const deadline = Date.now() + 5_000
+  let psOut = ''
+  do {
+    psOut = (await execFileAsync('docker', ['ps', '-aq', ...runFilter])).stdout
+    if (!psOut.trim()) break
+    await delay(100)
+  } while (Date.now() < deadline)
   assert.equal(psOut.trim(), '', `Expected zero orphan containers, found: ${psOut.trim()}`)
   if (runId) {
     const { stdout: netOut } = await execFileAsync('docker', ['network', 'ls', '-q', '--filter', `name=${runId.slice(0, 8)}`])

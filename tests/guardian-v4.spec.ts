@@ -166,7 +166,9 @@ test('configures, displays across reload, and edits roleAffinity across multiple
  */
 test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset and defaults sandbox_write_allowlist to []', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'chain_cve' })
-  const publicApp = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  // Explicitly clear an inherited GUARDIAN_ALLOW_LOCAL_LAB=1 (the release-gate script exports
+  // it for lab suites): this test's contract is the unset environment.
+  const publicApp = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin, GUARDIAN_ALLOW_LOCAL_LAB: '' })
 
   try {
     await publicApp.start()
