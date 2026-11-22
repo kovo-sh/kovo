@@ -185,7 +185,9 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
       spec: {
         ...baseFields(env, 'Web cache deception of a private page', 'CWE-525', 'cache-deception', 'high', jq),
         kind: 'cache_differential', targetOrigin: env.origin, mode: 'deception', method: 'GET',
-        controlPath: appendQuery(path, '_gcb', '{{control_gcb}}', false),
+        // Control is the same deception route with a guaranteed cache miss; the clean verify then
+        // replays the cached URL. This isolates "private body leaked to anonymous" from public content.
+        controlPath: appendQuery(deceptionPath, '_gcb', '{{control_gcb}}', false),
         probePath: appendQuery(deceptionPath, '_gcb', '{{probe_gcb}}', false),
         verifyPath: appendQuery(deceptionPath, '_gcb', '{{probe_gcb}}', false),
         ...(env.owner ? { poisonPersona: env.owner } : {}),
