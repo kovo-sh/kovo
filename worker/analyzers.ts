@@ -2326,7 +2326,13 @@ export function buildCallGraphFromFiles(
         // FastAPI Depends, middleware.ts matchers) are pre-handler by construction,
         // so they dominate the sink even though their text lives in another file.
         if (includeInheritedGuards && (node.kind === 'entrypoint' || node.kind === 'middleware')) {
-          for (const guard of node.guards) set.add(guard)
+          // Guards recorded as framework metadata (mount middleware, decorators, Depends) have no
+          // textual occurrence in this node and dominate by construction. Textual guards still go
+          // through the statement-order check below, so a post-sink check cannot count.
+          const textual = occurrencesFor(node)
+          for (const guard of node.guards) {
+            if (!textual.some(occurrence => occurrence.name === guard)) set.add(guard)
+          }
         }
         if (!includeInheritedGuards) {
           for (const sanitizer of node.sanitizers) set.add(sanitizer)

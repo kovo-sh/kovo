@@ -1931,6 +1931,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
   })()
   const perOriginCap = Math.max(1, Math.min(Math.floor(runBudget * 0.15), 250))
+  // Navigation gets a small overflow lane, but only when the cap is large enough that 16 extra
+  // requests cannot violate a deliberately tight budget.
+  const navOverflow = perOriginCap >= 40 ? 16 : 0
 
   let requestsUsed = 0
   let endpointsDiscovered = 0
@@ -2075,7 +2078,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       },
     ): Promise<BrokerExchangeResult | null> => {
       if (originHalted || signal.aborted) return null
-      const effectiveCap = opts?.exceedCap ? perOriginCap + 16 : perOriginCap
+      const effectiveCap = opts?.exceedCap ? perOriginCap + navOverflow : perOriginCap
       if (originUsed >= effectiveCap) return null
       if (!grant.canRead(origin)) {
         originHalted = true
@@ -2759,8 +2762,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const navGetTemplates = [...new Set(storage.listEndpoints(runId, { origin })
       .filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2)
       .map(ep => ep.pathTemplate))]
-    const navCap = Math.min(28, Math.max(0, perOriginCap + 16 - originUsed))
-    const navOriginCap = perOriginCap + 16
+    const navCap = Math.min(28, Math.max(0, perOriginCap + navOverflow - originUsed))
+    const navOriginCap = perOriginCap + navOverflow
     const attachObservedFields = (baseTemplate: string, body: string) => {
       if (observedFieldAttachments >= 12) return
       const fields = extractJsonFieldNames(body)
