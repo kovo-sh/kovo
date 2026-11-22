@@ -3,7 +3,7 @@ name: "Samba Config - Detect"
 severity: "info"
 description: "Samba configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

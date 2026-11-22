@@ -3,7 +3,7 @@ name: "Forgejo Repositories - Exposure"
 severity: "medium"
 description: "The Forgejo repo is being exposed publically."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "exposure"

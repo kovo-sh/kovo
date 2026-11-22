@@ -3,7 +3,7 @@ name: "Badarg Log File Exposure"
 severity: "low"
 description: "Badarg log file was exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "badarg"

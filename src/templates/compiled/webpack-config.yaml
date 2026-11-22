@@ -3,7 +3,7 @@ name: "Webpack Configuration File - Detect"
 severity: "info"
 description: "Webpack configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

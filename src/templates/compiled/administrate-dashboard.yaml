@@ -3,7 +3,7 @@ name: "Administrate Dashboard Exposure"
 severity: "high"
 description: "Administrate Dashboard was exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "administrate"

@@ -498,6 +498,44 @@ function parseRawHttpRequest(rawText: string): {
   }
 }
 
+const VENDOR_APPLIANCE_HINTS: ReadonlyArray<{ re: RegExp; tag: string }> = [
+  { re: /\bcisco\b|ios[- ]xe|webex|prime infrastructure|small business rv/i, tag: 'cisco' },
+  { re: /\baem\b|adobe experience manager|cq5|granite|crx|experience manager/i, tag: 'aem' },
+  { re: /\bcoldfusion\b|\badobe\b/i, tag: 'adobe' },
+  { re: /\b3cx\b/i, tag: '3cx' },
+  { re: /\bavtech\b/i, tag: 'avtech' },
+  { re: /\bhikvision\b/i, tag: 'hikvision' },
+  { re: /\bdahua\b/i, tag: 'dahua' },
+  { re: /\baxis communications?\b|\baxis camera\b/i, tag: 'axis' },
+  { re: /\bfortinet\b|\bfortigate\b|\bfortios\b|\bfortiweb\b/i, tag: 'fortinet' },
+  { re: /\bcitrix\b|netscaler/i, tag: 'citrix' },
+  { re: /\bvmware\b|\bvcenter\b|\besxi\b|vrealize|workspace one/i, tag: 'vmware' },
+  { re: /\bsonicwall\b|\bsslvpn\b/i, tag: 'sonicwall' },
+  { re: /\bjuniper\b|\bjunos\b/i, tag: 'juniper' },
+  { re: /\bmikrotik\b|routeros/i, tag: 'mikrotik' },
+  { re: /\bzyxel\b|\bzywall\b/i, tag: 'zyxel' },
+  { re: /\bsynology\b|diskstation|\bdsm\b/i, tag: 'synology' },
+  { re: /\bqnap\b|\bqts\b/i, tag: 'qnap' },
+  { re: /\bd-?link\b|\bdir-\d+/i, tag: 'dlink' },
+  { re: /\btp-?link\b|\barcher\b|\bdeco\b/i, tag: 'tplink' },
+  { re: /\bnetgear\b/i, tag: 'netgear' },
+  { re: /\bdraytek\b|\bvigor\b/i, tag: 'draytek' },
+  { re: /\bgrandstream\b/i, tag: 'grandstream' },
+  { re: /\bpolycom\b/i, tag: 'polycom' },
+  { re: /\bf5 networks\b|\bbig-?ip\b/i, tag: 'f5' },
+  { re: /\bpalo ?alto\b|pan-os/i, tag: 'paloalto' },
+  { re: /\bsophos\b|\butm\b/i, tag: 'sophos' },
+]
+
+const UNIVERSAL_EXPOSURE_PATH_RE = /(?:^|\/)(?:\.env(?:\.|$)|\.git(?:\/|$)|\.svn(?:\/|$)|\.ds_store$|swagger(?:-ui)?|openapi|api-docs|v2\/api-docs|v3\/api-docs|metrics$|debug(?:\/|$)|server-status|phpinfo|source[-_.]?map|\.map$|graphiql|actuator(?:\/|$)|trace$|heapdump|config\.json$|backup(?:\.|$)|\.bak$|\.old$|\.sql$|\.htaccess|security\.txt|\.well-known\/)/i
+
+function detectVendorAppliance(haystack: string): string | null {
+  for (const entry of VENDOR_APPLIANCE_HINTS) {
+    if (entry.re.test(haystack)) return entry.tag
+  }
+  return null
+}
+
 function mapTechTags(rawTags: string[], id: string, name: string, path: string): TemplateTechTag[] {
   const pathLower = path.toLowerCase()
   const pathHints: string[] = []
@@ -511,16 +549,29 @@ function mapTechTags(rawTags: string[], id: string, name: string, path: string):
   if (pathLower.includes('.php')) pathHints.push('php')
   if (pathLower.includes('.jsp') || pathLower.includes('/manager/html')) pathHints.push('tomcat', 'java')
   if (pathLower.includes('.aspx') || pathLower.includes('.ashx')) pathHints.push('dotnet', 'iis')
+
+  // Vendor/appliance family detection wins over incidental tokens (e.g. an AEM template
+  // that happens to mention GraphQL or a PHP path must not be treated as a GraphQL app).
+  const haystack = `${rawTags.join(' ')} ${id} ${name} ${path}`.toLowerCase()
+  const vendor = detectVendorAppliance(haystack)
+  if (vendor) return [vendor as TemplateTechTag]
+
   const candidates: string[] = [...rawTags, ...id.split('-'), ...name.toLowerCase().split(/[^a-z0-9]+/), ...pathHints]
   const norm = normalizeTechTagSet(candidates)
   const matched: TemplateTechTag[] = []
   for (const tag of norm) {
-    if (tag !== 'generic' && ALLOWED_TECH_SET.has(tag) && !matched.includes(tag as TemplateTechTag)) {
+    if (tag !== 'generic' && tag !== 'generic-web-exposure' && ALLOWED_TECH_SET.has(tag) && !matched.includes(tag as TemplateTechTag)) {
       matched.push(tag as TemplateTechTag)
       if (matched.length >= 6) break
     }
   }
-  if (matched.length === 0) matched.push('generic')
+  if (matched.length === 0) {
+    // Split the legacy catch-all bucket: universal web exposure checks stay eligible on
+    // every origin; everything else is excluded from consumer-stack runs.
+    const looksUniversal = UNIVERSAL_EXPOSURE_PATH_RE.test(path) ||
+      rawTags.some(t => /^(?:exposure|exposures|misconfig|misconfiguration|config|backup|disclosure|debug)$/i.test(t))
+    matched.push((looksUniversal ? 'generic-web-exposure' : 'generic') as TemplateTechTag)
+  }
   return matched
 }
 
@@ -1015,18 +1066,7 @@ export function transpileNucleiTemplate(
 // ============================================================================
 
 function walkInputYaml(dir: string, out: string[] = []): string[] {
-  const priorityOrder = ['technologies', 'exposures', 'misconfiguration', 'vulnerabilities', 'default-logins', 'cves']
-  const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => {
-    const pa = priorityOrder.indexOf(a.name)
-    const pb = priorityOrder.indexOf(b.name)
-    if (pa !== -1 || pb !== -1) {
-      if (pa === -1) return 1
-      if (pb === -1) return -1
-      return pa - pb
-    }
-    return a.name.localeCompare(b.name)
-  })
-  for (const entry of entries) {
+  for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     const full = join(dir, entry.name)
     if (entry.isDirectory()) {
       if (entry.name === '.git' || entry.name === 'node_modules') continue
@@ -1037,6 +1077,81 @@ function walkInputYaml(dir: string, out: string[] = []): string[] {
     }
   }
   return out
+}
+
+function topLevelCategory(rel: string): string {
+  const parts = rel.replaceAll('\\', '/').split('/')
+  // Only the first segment under the nuclei root is a category (http/cves/2024/...).
+  return parts.find(p => ['cves', 'exposures', 'misconfiguration', 'technologies', 'vulnerabilities', 'default-logins'].includes(p)) ?? ''
+}
+
+function cveYearOf(rel: string): number {
+  const m = rel.match(/CVE-(\d{4})-/i) ?? rel.match(/(?:^|\/)(\d{4})(?:\/|_)/)
+  return m ? Number(m[1]) : 0
+}
+
+/**
+ * Order the nuclei corpus so a bounded compile keeps the highest-value checks:
+ *   1. modern CVEs (year descending, 2026 -> 2021)
+ *   2. universal exposures / misconfiguration
+ *   3. technology fingerprints
+ *   4. vulnerabilities + default logins
+ *   5. legacy CVEs (< 2021) only with leftover capacity
+ */
+export function orderInputYaml(
+  inputDir: string,
+  options: { maxTemplates?: number; modernCveQuota?: number } = {},
+): string[] {
+  const all: string[] = []
+  walkInputYaml(inputDir, all)
+  const modern: string[] = []
+  const legacy: string[] = []
+  const buckets = new Map<string, string[]>()
+  for (const file of all) {
+    const rel = relative(inputDir, file)
+    const category = topLevelCategory(rel)
+    if (category === 'cves') {
+      if (cveYearOf(rel) >= 2021) modern.push(file)
+      else legacy.push(file)
+    } else {
+      const list = buckets.get(category) ?? []
+      list.push(file)
+      buckets.set(category, list)
+    }
+  }
+  modern.sort((a, b) => cveYearOf(relative(inputDir, b)) - cveYearOf(relative(inputDir, a)) || a.localeCompare(b))
+  legacy.sort((a, b) => cveYearOf(relative(inputDir, b)) - cveYearOf(relative(inputDir, a)) || a.localeCompare(b))
+  const byName = (a: string, b: string) => a.localeCompare(b)
+  for (const list of buckets.values()) list.sort(byName)
+
+  const max = options.maxTemplates ?? Number.POSITIVE_INFINITY
+  if (!Number.isFinite(max)) {
+    return [
+      ...modern,
+      ...(buckets.get('') ?? []),
+      ...(buckets.get('exposures') ?? []),
+      ...(buckets.get('technologies') ?? []),
+      ...(buckets.get('misconfiguration') ?? []),
+      ...(buckets.get('vulnerabilities') ?? []),
+      ...(buckets.get('default-logins') ?? []),
+      ...legacy,
+    ]
+  }
+  const modernQuota = Math.max(0, Math.min(options.modernCveQuota ?? Math.floor(max * 0.56), modern.length))
+  const selected: string[] = [...(buckets.get('') ?? []).slice(0, max), ...modern.slice(0, modernQuota)]
+  const sectionQuotas: Array<[string, number]> = [
+    ['exposures', Math.floor(max * 0.30)],
+    ['technologies', Math.floor(max * 0.21)],
+    ['misconfiguration', Math.floor(max * 0.08)],
+    ['vulnerabilities', Math.floor(max * 0.03)],
+    ['default-logins', Math.floor(max * 0.01)],
+  ]
+  for (const [category, quota] of sectionQuotas) {
+    selected.push(...(buckets.get(category) ?? []).slice(0, quota))
+  }
+  const remaining = Math.max(0, max - selected.length)
+  selected.push(...legacy.slice(0, remaining))
+  return selected.slice(0, max)
 }
 
 export function collectExistingNonCompiledTemplateIds(templatesRoot: string): Set<string> {
@@ -1078,7 +1193,7 @@ export async function transpileNucleiDirectory(
 
   const maxTemplates = opts.maxTemplates ?? Number.POSITIVE_INFINITY
   const seenIds = new Set<string>(opts.existingIds ?? [])
-  const files = walkInputYaml(inputDir)
+  const files = orderInputYaml(inputDir, { maxTemplates })
   const rejected: Array<{ file: string; reason: string }> = []
   const rejectionReasons: Record<string, number> = {}
   const outputFiles: string[] = []
@@ -1142,7 +1257,7 @@ async function runCli() {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
   const sourceDirArg = getArg('--source-dir')
   const outDir = resolve(getArg('--out-dir') ?? join(repoRoot, 'src', 'templates', 'compiled'))
-  const maxTemplates = Number(getArg('--max-templates') ?? '1600')
+  const maxTemplates = Number(getArg('--max-templates') ?? '8000')
   const repoUrl = getArg('--repo-url') ?? 'https://github.com/projectdiscovery/nuclei-templates.git'
   const ref = getArg('--ref')
   const cleanOutput = !args.includes('--no-clean')
@@ -1175,7 +1290,7 @@ async function runCli() {
     }
 
     const report = await transpileNucleiDirectory(effectiveSourceDir, outDir, {
-      maxTemplates: Number.isFinite(maxTemplates) && maxTemplates > 0 ? maxTemplates : 1600,
+      maxTemplates: Number.isFinite(maxTemplates) && maxTemplates > 0 ? maxTemplates : 8000,
       cleanOutput,
       existingIds,
     })

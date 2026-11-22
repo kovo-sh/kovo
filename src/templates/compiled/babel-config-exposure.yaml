@@ -3,7 +3,7 @@ name: "Babel Configuration - Detect"
 severity: "info"
 description: "Babel configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

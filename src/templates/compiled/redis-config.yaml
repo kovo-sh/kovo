@@ -3,7 +3,7 @@ name: "Redis Configuration File - Detect"
 severity: "medium"
 description: "Redis configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "redis"
   - "exposure"

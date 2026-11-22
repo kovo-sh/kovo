@@ -3,7 +3,7 @@ name: "Less History - File Disclosure"
 severity: "low"
 description: "LESSHST file is a Less History File. LESSHST file is a Less History File. Less is a terminal pager program on Unix, Windows, and Unix-like systems used to view (but not change) the contents of a text file one screen at a time."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "disclosure"

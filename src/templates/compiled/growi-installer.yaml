@@ -3,7 +3,7 @@ name: "GROWI Installer - Exposure"
 severity: "high"
 description: "Checks for the presence of a GROWI Installer."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "install"
   - "growi"

@@ -3,7 +3,7 @@ name: "Git Metadata Directory Exposure"
 severity: "medium"
 description: "Git Metadata Directory exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "logs"
   - "git"

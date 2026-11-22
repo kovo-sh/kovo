@@ -3,7 +3,7 @@ name: "Snyk Ignore File Disclosure"
 severity: "info"
 description: "Safe check derived from snyk-ignore-file-disclosure: Snyk Ignore File Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

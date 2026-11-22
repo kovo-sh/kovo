@@ -3,7 +3,7 @@ name: "ITMS-Misconfigured"
 severity: "info"
 description: "Detection of misconfigured ServiceNow ITSM instances."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "servicenow"

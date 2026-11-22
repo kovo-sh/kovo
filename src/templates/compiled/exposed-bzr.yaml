@@ -3,7 +3,7 @@ name: "Bazaar Configuration - Detect"
 severity: "info"
 description: "Bazaar configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

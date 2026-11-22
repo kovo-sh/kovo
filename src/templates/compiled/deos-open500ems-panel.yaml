@@ -3,7 +3,7 @@ name: "DEOS OPEN 500EMS Controller - Admin Exposure"
 severity: "high"
 description: "The DEOS OPEN 500EMS controller exposes administrative functions without authentication."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "openv500"
   - "disclosure"

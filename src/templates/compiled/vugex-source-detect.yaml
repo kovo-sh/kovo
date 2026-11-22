@@ -3,7 +3,7 @@ name: "Vugex Framework Source Code - Detect"
 severity: "medium"
 description: "Detects the presence of exposed Vugex Framework source code by identifying common files and directories associated with the framework."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "vugex"
   - "framework"

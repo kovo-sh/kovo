@@ -3,7 +3,7 @@ name: "Darcs Configuration - Detect"
 severity: "info"
 description: "Darcs configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

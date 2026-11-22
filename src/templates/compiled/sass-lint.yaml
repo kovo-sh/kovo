@@ -3,7 +3,7 @@ name: "Sass Lint File Exposure"
 severity: "info"
 description: "Safe check derived from sass-lint: Sass Lint File Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "sass"

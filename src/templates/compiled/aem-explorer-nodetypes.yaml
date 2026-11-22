@@ -3,8 +3,7 @@ name: "Adobe AEM Explorer NodeTypes Exposure"
 severity: "high"
 description: "Adobe AEM Explorer NodeTypes is exposed."
 tech:
-  - "tomcat"
-  - "java"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

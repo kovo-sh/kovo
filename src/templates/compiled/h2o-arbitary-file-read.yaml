@@ -3,7 +3,7 @@ name: "H2O - Arbitrary Path Lookup"
 severity: "medium"
 description: "H2O allows for arbitrary path lookup via it's Typehead API endpoint"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "h2o-3"
   - "h2o"

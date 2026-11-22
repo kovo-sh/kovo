@@ -3,7 +3,7 @@ name: "librechat - Config Exposure"
 severity: "low"
 description: "Detected the `/api/config` endpoint of the LibreChat web application was publicly accessible, potentially exposing internal configuration details."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "librechat"
   - "config"

@@ -3,7 +3,7 @@ name: "Yarn Lock File Disclosure"
 severity: "info"
 description: "The yarn.lock file stores the versions of each Yarn dependency installed. It's a lock file for package.json."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

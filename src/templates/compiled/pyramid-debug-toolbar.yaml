@@ -3,7 +3,7 @@ name: "Pyramid Debug Toolbar"
 severity: "medium"
 description: "Pyramid Debug Toolbar provides a debug toolbar useful while you are developing your Pyramid application."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "pyramid"
   - "logs"

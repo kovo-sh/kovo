@@ -3,7 +3,7 @@ name: "QloApps - Installation"
 severity: "high"
 description: "QloApps Installation Assistant panel exposure."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "install"
   - "qloapps"

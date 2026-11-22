@@ -3,7 +3,7 @@ name: "Zipline - Installer"
 severity: "critical"
 description: "Zipline installer setup was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "setup"

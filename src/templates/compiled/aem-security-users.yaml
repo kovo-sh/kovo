@@ -3,7 +3,7 @@ name: "Adobe AEM Security Users Exposure"
 severity: "medium"
 description: "Adobe AEM Security Users are exposed."
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

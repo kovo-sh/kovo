@@ -3,7 +3,7 @@ name: "Tugboat Configuration File Exposure"
 severity: "critical"
 description: "A Tugboat configuration file was discovered. Tugboat is a command line tool for interacting with DigitalOcean droplets."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "tugboat"
   - "config"

@@ -3,7 +3,7 @@ name: "Dahua Smart Park Management Platform - Arbitary File Read"
 severity: "high"
 description: "Dahua Smart Park Management Platform is vulnerable to Local File Inclusion."
 tech:
-  - "generic"
+  - "dahua"
 tags:
   - "lfi"
   - "dahua"

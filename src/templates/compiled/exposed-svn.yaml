@@ -3,7 +3,7 @@ name: "SVN Configuration - Detect"
 severity: "medium"
 description: "SVN configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

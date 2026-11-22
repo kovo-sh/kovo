@@ -3,7 +3,7 @@ name: "VMware vRealize"
 severity: "info"
 description: "Version of VMware vRealize Operations Manager"
 tech:
-  - "generic"
+  - "vmware"
 tags:
   - "vmware"
   - "vrealize"

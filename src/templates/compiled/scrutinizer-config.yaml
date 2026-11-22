@@ -3,7 +3,7 @@ name: "Scrutinizer Config - Detect"
 severity: "info"
 description: "Scrutinizer configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "scrutinizer"

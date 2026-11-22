@@ -3,7 +3,7 @@ name: "ZoneMinder System Log - Detect"
 severity: "low"
 description: "ZoneMinder system log file exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "logs"
   - "zoneminder"

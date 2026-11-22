@@ -3,7 +3,7 @@ name: "S3CMD Configuration - Detect"
 severity: "info"
 description: "S3CMD configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "amazon"
   - "config"

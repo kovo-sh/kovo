@@ -3,7 +3,7 @@ name: "Cisco Unified Communications Manager - Detect"
 severity: "info"
 description: "Detected the presence of the Cisco Unified Communications User Management portal."
 tech:
-  - "generic"
+  - "cisco"
 tags:
   - "tech"
   - "detect"

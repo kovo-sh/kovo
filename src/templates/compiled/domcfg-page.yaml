@@ -3,7 +3,7 @@ name: "Lotus Domino Configuration Page"
 severity: "low"
 description: "Lotus Domino configuration file is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "lotus"

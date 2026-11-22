@@ -3,7 +3,7 @@ name: "Codeception YAML Configuration File - Detect"
 severity: "low"
 description: "Codeception YAML configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "devops"

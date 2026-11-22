@@ -3,7 +3,7 @@ name: "README.md file disclosure"
 severity: "info"
 description: "Internal documentation file often used in projects which can contain sensitive information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "markdown"

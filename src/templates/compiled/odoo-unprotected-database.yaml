@@ -3,7 +3,7 @@ name: "Odoo - Unprotected Database"
 severity: "critical"
 description: "The system has an Odoo application whose database manager is unprotected, indicating potential unauthorized access."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "odoo"
   - "database"

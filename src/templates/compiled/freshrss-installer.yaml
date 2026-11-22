@@ -3,7 +3,7 @@ name: "FreshRSS - Installation"
 severity: "high"
 description: "FreshRSS Installation panel has been exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "freshrss"
   - "misconfig"

@@ -3,7 +3,7 @@ name: "Svnserve Configuration File - Detect"
 severity: "info"
 description: "Svnserve configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

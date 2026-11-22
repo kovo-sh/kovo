@@ -3,7 +3,7 @@ name: "PHPStan Configuration Page - Detect"
 severity: "info"
 description: "PHPStan configuration page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

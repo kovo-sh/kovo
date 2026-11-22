@@ -3,7 +3,7 @@ name: "Netrc - Config File Discovery"
 severity: "high"
 description: "Netrc configuration file was discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "netrc"
   - "config"

@@ -3,7 +3,7 @@ name: "AzuraCast - Unfinished Installation"
 severity: "high"
 description: "Detected exposed AzuraCast setup wizard that allows unauthorized superuser account creation.An unfinished AzuraCast installation exposes setup endpoints that enable attackers to create administrator accounts and gain full control of the application."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "azuracast"

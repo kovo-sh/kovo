@@ -3,7 +3,7 @@ name: "Artifactory anonymous deploy"
 severity: "high"
 description: "Artifactory anonymous repo is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "artifactory"
   - "misconfig"

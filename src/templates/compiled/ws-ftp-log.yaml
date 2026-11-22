@@ -3,7 +3,7 @@ name: "WS FTP File Disclosure"
 severity: "low"
 description: "WS_FTP software, which is a popular FTP (File Transfer Protocol) client used for transferring files between a local computer and a remote server has its log file exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "ftp"

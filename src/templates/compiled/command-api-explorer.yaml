@@ -3,7 +3,7 @@ name: "Command API Explorer Panel - Detect"
 severity: "info"
 description: "Command API Explorer panel was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "panel"
   - "misconfig"

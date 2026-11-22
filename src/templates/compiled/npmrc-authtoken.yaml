@@ -3,7 +3,7 @@ name: "Hardcoded .npmrc AuthToken"
 severity: "info"
 description: "Safe check derived from npmrc-authtoken: Hardcoded .npmrc AuthToken"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "npm"
   - "exposure"

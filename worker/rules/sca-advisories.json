@@ -1,5 +1,5 @@
 {
-  "version": "2026-01",
+  "version": "2026-02",
   "advisories": [
     {
       "id": "CVE-2025-29927",
@@ -7,10 +7,22 @@
       "package": "next",
       "affectedBelow": "14.2.25",
       "affectedRanges": [
-        { "min": "11.1.4", "maxExclusive": "12.3.5" },
-        { "min": "13.0.0", "maxExclusive": "13.5.9" },
-        { "min": "14.0.0", "maxExclusive": "14.2.25" },
-        { "min": "15.0.0", "maxExclusive": "15.2.3" }
+        {
+          "min": "11.1.4",
+          "maxExclusive": "12.3.5"
+        },
+        {
+          "min": "13.0.0",
+          "maxExclusive": "13.5.9"
+        },
+        {
+          "min": "14.0.0",
+          "maxExclusive": "14.2.25"
+        },
+        {
+          "min": "15.0.0",
+          "maxExclusive": "15.2.3"
+        }
       ],
       "severity": "critical",
       "cwe": "CWE-287",
@@ -20,7 +32,12 @@
       "id": "CVE-2024-29041",
       "ecosystem": "npm",
       "package": "express",
-      "affectedRanges": [{ "min": "4.0.0", "maxExclusive": "4.19.2" }],
+      "affectedRanges": [
+        {
+          "min": "4.0.0",
+          "maxExclusive": "4.19.2"
+        }
+      ],
       "severity": "medium",
       "cwe": "CWE-601",
       "message": "Express.js open redirect in res.location / res.redirect (CVE-2024-29041)."
@@ -29,7 +46,12 @@
       "id": "CVE-2024-33883",
       "ecosystem": "npm",
       "package": "ejs",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "3.1.10" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "3.1.10"
+        }
+      ],
       "severity": "high",
       "cwe": "CWE-1321",
       "message": "EJS prototype pollution / template injection risk (CVE-2024-33883)."
@@ -38,7 +60,12 @@
       "id": "CVE-2022-23529",
       "ecosystem": "npm",
       "package": "jsonwebtoken",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "9.0.0" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "9.0.0"
+        }
+      ],
       "severity": "high",
       "cwe": "CWE-20",
       "message": "jsonwebtoken insecure secretOrPublicKey handling (CVE-2022-23529)."
@@ -47,7 +74,12 @@
       "id": "CVE-2021-23337",
       "ecosystem": "npm",
       "package": "lodash",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "4.17.21" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "4.17.21"
+        }
+      ],
       "severity": "high",
       "cwe": "CWE-78",
       "message": "Lodash command injection / prototype pollution in versions < 4.17.21 (CVE-2021-23337)."
@@ -56,7 +88,12 @@
       "id": "CVE-2024-4068",
       "ecosystem": "npm",
       "package": "braces",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "3.0.3" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "3.0.3"
+        }
+      ],
       "severity": "medium",
       "cwe": "CWE-400",
       "message": "braces uncontrolled resource consumption (CVE-2024-4068)."
@@ -65,7 +102,12 @@
       "id": "CVE-2023-45857",
       "ecosystem": "npm",
       "package": "axios",
-      "affectedRanges": [{ "min": "0.8.1", "maxExclusive": "1.6.0" }],
+      "affectedRanges": [
+        {
+          "min": "0.8.1",
+          "maxExclusive": "1.6.0"
+        }
+      ],
       "severity": "medium",
       "cwe": "CWE-352",
       "message": "Axios XSRF-TOKEN cookie leakage to third-party hosts (CVE-2023-45857)."
@@ -74,7 +116,12 @@
       "id": "CVE-2024-21538",
       "ecosystem": "npm",
       "package": "cross-spawn",
-      "affectedRanges": [{ "min": "7.0.0", "maxExclusive": "7.0.5" }],
+      "affectedRanges": [
+        {
+          "min": "7.0.0",
+          "maxExclusive": "7.0.5"
+        }
+      ],
       "severity": "high",
       "cwe": "CWE-1333",
       "message": "cross-spawn ReDoS vulnerability (CVE-2024-21538)."
@@ -83,7 +130,12 @@
       "id": "CVE-2024-34064",
       "ecosystem": "pypi",
       "package": "jinja2",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "3.1.4" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "3.1.4"
+        }
+      ],
       "severity": "medium",
       "cwe": "CWE-79",
       "message": "Jinja2 XSS via xmlattr filter keys (CVE-2024-34064)."
@@ -92,7 +144,12 @@
       "id": "CVE-2024-35195",
       "ecosystem": "pypi",
       "package": "requests",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "2.32.0" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "2.32.0"
+        }
+      ],
       "severity": "medium",
       "cwe": "CWE-295",
       "message": "Python requests verify=False session reuse bypass (CVE-2024-35195)."
@@ -101,7 +158,12 @@
       "id": "CVE-2024-24762",
       "ecosystem": "pypi",
       "package": "fastapi",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "0.109.1" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "0.109.1"
+        }
+      ],
       "severity": "high",
       "cwe": "CWE-1333",
       "message": "FastAPI/python-multipart ReDoS in Content-Type parsing (CVE-2024-24762)."
@@ -110,7 +172,16 @@
       "id": "CVE-2024-45231",
       "ecosystem": "pypi",
       "package": "django",
-      "affectedRanges": [{ "min": "4.0.0", "maxExclusive": "4.2.16" }, { "min": "5.0.0", "maxExclusive": "5.0.9" }],
+      "affectedRanges": [
+        {
+          "min": "4.0.0",
+          "maxExclusive": "4.2.16"
+        },
+        {
+          "min": "5.0.0",
+          "maxExclusive": "5.0.9"
+        }
+      ],
       "severity": "medium",
       "cwe": "CWE-200",
       "message": "Django PasswordResetForm email enumeration (CVE-2024-45231)."
@@ -119,7 +190,12 @@
       "id": "CVE-2020-14343",
       "ecosystem": "pypi",
       "package": "pyyaml",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "5.4" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "5.4"
+        }
+      ],
       "severity": "critical",
       "cwe": "CWE-502",
       "message": "PyYAML arbitrary code execution via full_load/load (CVE-2020-14343)."
@@ -128,10 +204,527 @@
       "id": "CVE-2024-51744",
       "ecosystem": "go",
       "package": "github.com/golang-jwt/jwt/v4",
-      "affectedRanges": [{ "min": "0.0.0", "maxExclusive": "4.5.1" }],
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "4.5.1"
+        }
+      ],
       "severity": "high",
       "cwe": "CWE-287",
       "message": "golang-jwt/jwt v4 ambiguous error handling in ParseWithClaims (CVE-2024-51744)."
+    },
+    {
+      "id": "CVE-2022-28346",
+      "ecosystem": "pypi",
+      "package": "django",
+      "affectedRanges": [
+        {
+          "min": "2.2.0",
+          "maxExclusive": "2.2.28"
+        },
+        {
+          "min": "3.2.0",
+          "maxExclusive": "3.2.13"
+        },
+        {
+          "min": "4.0.0",
+          "maxExclusive": "4.0.4"
+        }
+      ],
+      "severity": "critical",
+      "cwe": "CWE-89",
+      "message": "Django QuerySet.annotate/subquery SQL injection (CVE-2022-28346)."
+    },
+    {
+      "id": "CVE-2023-46695",
+      "ecosystem": "pypi",
+      "package": "django",
+      "affectedRanges": [
+        {
+          "min": "3.2.0",
+          "maxExclusive": "3.2.23"
+        },
+        {
+          "min": "4.1.0",
+          "maxExclusive": "4.1.13"
+        },
+        {
+          "min": "4.2.0",
+          "maxExclusive": "4.2.7"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-400",
+      "message": "Django UsernameField Unicode truncation DoS (CVE-2023-46695)."
+    },
+    {
+      "id": "CVE-2024-27351",
+      "ecosystem": "pypi",
+      "package": "django",
+      "affectedRanges": [
+        {
+          "min": "3.2.0",
+          "maxExclusive": "3.2.25"
+        },
+        {
+          "min": "4.2.0",
+          "maxExclusive": "4.2.11"
+        },
+        {
+          "min": "5.0.0",
+          "maxExclusive": "5.0.3"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-1333",
+      "message": "Django Truncator/Truncator regex DoS (CVE-2024-27351)."
+    },
+    {
+      "id": "CVE-2023-30861",
+      "ecosystem": "pypi",
+      "package": "flask",
+      "affectedRanges": [
+        {
+          "min": "2.2.0",
+          "maxExclusive": "2.2.5"
+        },
+        {
+          "min": "2.3.0",
+          "maxExclusive": "2.3.3"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-613",
+      "message": "Flask session cookie caching/vary leak (CVE-2023-30861)."
+    },
+    {
+      "id": "CVE-2022-29217",
+      "ecosystem": "pypi",
+      "package": "pyjwt",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "2.4.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-347",
+      "message": "PyJWT algorithm confusion when keys are used across algorithms (CVE-2022-29217)."
+    },
+    {
+      "id": "CVE-2023-32681",
+      "ecosystem": "pypi",
+      "package": "requests",
+      "affectedRanges": [
+        {
+          "min": "2.3.0",
+          "maxExclusive": "2.31.0"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-200",
+      "message": "Requests proxy-authorization header leak on redirect (CVE-2023-32681)."
+    },
+    {
+      "id": "CVE-2023-49083",
+      "ecosystem": "pypi",
+      "package": "cryptography",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "41.0.6"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-476",
+      "message": "cryptography PKCS7 certificate NULL dereference (CVE-2023-49083)."
+    },
+    {
+      "id": "CVE-2024-47874",
+      "ecosystem": "pypi",
+      "package": "starlette",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "0.40.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-770",
+      "message": "Starlette multipart form DoS (CVE-2024-47874)."
+    },
+    {
+      "id": "CVE-2021-32677",
+      "ecosystem": "pypi",
+      "package": "fastapi",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "0.65.2"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-352",
+      "message": "FastAPI CSRF/session cookie handling weakness in older releases (CVE-2021-32677)."
+    },
+    {
+      "id": "CVE-2019-7548",
+      "ecosystem": "pypi",
+      "package": "sqlalchemy",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "1.2.18"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-89",
+      "message": "SQLAlchemy order_by/group_by text clause injection with untrusted input (CVE-2019-7548)."
+    },
+    {
+      "id": "CVE-2022-24858",
+      "ecosystem": "pypi",
+      "package": "werkzeug",
+      "affectedRanges": [
+        {
+          "min": "2.1.0",
+          "maxExclusive": "2.1.2"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-601",
+      "message": "Werkzeug debugger PIN/redirect handling weakness (CVE-2022-24858)."
+    },
+    {
+      "id": "CVE-2021-44228",
+      "ecosystem": "java",
+      "package": "log4j-core",
+      "affectedRanges": [
+        {
+          "min": "2.0.0",
+          "maxExclusive": "2.15.0"
+        }
+      ],
+      "severity": "critical",
+      "cwe": "CWE-502",
+      "message": "Log4Shell JNDI remote code execution in log4j-core (CVE-2021-44228)."
+    },
+    {
+      "id": "CVE-2020-36518",
+      "ecosystem": "java",
+      "package": "jackson-databind",
+      "affectedRanges": [
+        {
+          "min": "2.0.0",
+          "maxExclusive": "2.13.2.1"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-400",
+      "message": "Jackson-databind deep-nesting DoS (CVE-2020-36518)."
+    },
+    {
+      "id": "CVE-2024-22233",
+      "ecosystem": "java",
+      "package": "spring-core",
+      "affectedRanges": [
+        {
+          "min": "6.0.0",
+          "maxExclusive": "6.0.18"
+        },
+        {
+          "min": "6.1.0",
+          "maxExclusive": "6.1.4"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-20",
+      "message": "Spring Framework URL parsing DoS in spring-core (CVE-2024-22233)."
+    },
+    {
+      "id": "CVE-2024-22257",
+      "ecosystem": "java",
+      "package": "spring-security-web",
+      "affectedRanges": [
+        {
+          "min": "5.7.0",
+          "maxExclusive": "5.7.12"
+        },
+        {
+          "min": "6.0.0",
+          "maxExclusive": "6.0.10"
+        },
+        {
+          "min": "6.1.0",
+          "maxExclusive": "6.1.8"
+        },
+        {
+          "min": "6.2.0",
+          "maxExclusive": "6.2.4"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-863",
+      "message": "Spring Security authorization bypass on public paths (CVE-2024-22257)."
+    },
+    {
+      "id": "CVE-2023-46589",
+      "ecosystem": "java",
+      "package": "tomcat-embed-core",
+      "affectedRanges": [
+        {
+          "min": "8.5.0",
+          "maxExclusive": "8.5.96"
+        },
+        {
+          "min": "9.0.0",
+          "maxExclusive": "9.0.83"
+        },
+        {
+          "min": "10.1.0",
+          "maxExclusive": "10.1.16"
+        },
+        {
+          "min": "11.0.0",
+          "maxExclusive": "11.0.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-444",
+      "message": "Tomcat request smuggling via malformed trailer headers (CVE-2023-46589)."
+    },
+    {
+      "id": "CVE-2021-22118",
+      "ecosystem": "java",
+      "package": "spring-web",
+      "affectedRanges": [
+        {
+          "min": "5.2.0",
+          "maxExclusive": "5.2.15"
+        },
+        {
+          "min": "5.3.0",
+          "maxExclusive": "5.3.7"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-22",
+      "message": "Spring Web static resource path traversal through UrlPathHelper (CVE-2021-22118)."
+    },
+    {
+      "id": "CVE-2023-26125",
+      "ecosystem": "go",
+      "package": "github.com/gin-gonic/gin",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "1.9.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-444",
+      "message": "Gin improper input validation / request smuggling exposure (CVE-2023-26125)."
+    },
+    {
+      "id": "CVE-2020-26160",
+      "ecosystem": "go",
+      "package": "github.com/dgrijalva/jwt-go",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "4.0.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-347",
+      "message": "jwt-go audience claim validation bypass (CVE-2020-26160)."
+    },
+    {
+      "id": "CVE-2023-32731",
+      "ecosystem": "go",
+      "package": "google.golang.org/grpc",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "1.53.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-444",
+      "message": "gRPC-Go HTTP/2 request smuggling (CVE-2023-32731)."
+    },
+    {
+      "id": "CVE-2023-44487",
+      "ecosystem": "go",
+      "package": "golang.org/x/net",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "0.17.0"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-400",
+      "message": "HTTP/2 Rapid Reset denial of service (CVE-2023-44487)."
+    },
+    {
+      "id": "CVE-2023-29409",
+      "ecosystem": "go",
+      "package": "github.com/gorilla/websocket",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "1.5.1"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-400",
+      "message": "Gorilla WebSocket excessive memory allocation (CVE-2023-29409)."
+    },
+    {
+      "id": "CVE-2023-28362",
+      "ecosystem": "rubygems",
+      "package": "actionpack",
+      "affectedRanges": [
+        {
+          "min": "7.0.0",
+          "maxExclusive": "7.0.5"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-601",
+      "message": "Rails Action Pack redirect_to open redirect via user input (CVE-2023-28362)."
+    },
+    {
+      "id": "CVE-2022-32224",
+      "ecosystem": "rubygems",
+      "package": "activerecord",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "5.2.8.1"
+        },
+        {
+          "min": "6.0.0",
+          "maxExclusive": "6.0.5.1"
+        },
+        {
+          "min": "6.1.0",
+          "maxExclusive": "6.1.6.1"
+        },
+        {
+          "min": "7.0.0",
+          "maxExclusive": "7.0.3.1"
+        }
+      ],
+      "severity": "critical",
+      "cwe": "CWE-502",
+      "message": "ActiveRecord YAML deserialization RCE on serialized columns (CVE-2022-32224)."
+    },
+    {
+      "id": "CVE-2024-26141",
+      "ecosystem": "rubygems",
+      "package": "rack",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "2.2.8.1"
+        },
+        {
+          "min": "3.0.0",
+          "maxExclusive": "3.0.9.1"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-400",
+      "message": "Rack multipart parsing DoS (CVE-2024-26141)."
+    },
+    {
+      "id": "CVE-2022-24836",
+      "ecosystem": "rubygems",
+      "package": "nokogiri",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "1.13.4"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-1333",
+      "message": "Nokogiri ReDoS in XPath/HTML parsing (CVE-2022-24836)."
+    },
+    {
+      "id": "CVE-2023-22795",
+      "ecosystem": "rubygems",
+      "package": "actionpack",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "6.1.7.1"
+        },
+        {
+          "min": "7.0.0",
+          "maxExclusive": "7.0.4.1"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-1333",
+      "message": "Rails Action Dispatch ReDoS in content-disposition parsing (CVE-2023-22795)."
+    },
+    {
+      "id": "CVE-2022-24434",
+      "ecosystem": "npm",
+      "package": "multer",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "1.4.5-lts.1"
+        }
+      ],
+      "severity": "high",
+      "cwe": "CWE-248",
+      "message": "Multer multipart parser crash/DoS (CVE-2022-24434)."
+    },
+    {
+      "id": "CVE-2022-32224",
+      "ecosystem": "rubygems",
+      "package": "rails",
+      "affectedRanges": [
+        {
+          "min": "0.0.0",
+          "maxExclusive": "5.2.8.1"
+        },
+        {
+          "min": "6.0.0",
+          "maxExclusive": "6.0.5.1"
+        },
+        {
+          "min": "6.1.0",
+          "maxExclusive": "6.1.6.1"
+        },
+        {
+          "min": "7.0.0",
+          "maxExclusive": "7.0.3.1"
+        }
+      ],
+      "severity": "critical",
+      "cwe": "CWE-502",
+      "message": "Rails ActiveRecord YAML deserialization RCE on serialized columns (CVE-2022-32224)."
+    },
+    {
+      "id": "CVE-2023-28362",
+      "ecosystem": "rubygems",
+      "package": "rails",
+      "affectedRanges": [
+        {
+          "min": "7.0.0",
+          "maxExclusive": "7.0.5"
+        }
+      ],
+      "severity": "medium",
+      "cwe": "CWE-601",
+      "message": "Rails Action Pack open redirect via redirect_to (CVE-2023-28362)."
     }
   ]
 }

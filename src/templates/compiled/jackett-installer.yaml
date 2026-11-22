@@ -3,7 +3,7 @@ name: "Jackett - Installer"
 severity: "high"
 description: "Jackett installer exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "install"
   - "jackett"

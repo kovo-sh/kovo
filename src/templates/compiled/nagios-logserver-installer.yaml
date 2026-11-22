@@ -3,7 +3,7 @@ name: "Nagios Log Server - Install"
 severity: "high"
 description: "Detects the presence of a Nagios Log Server installation page, which can expose configuration setup information or initialization steps."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

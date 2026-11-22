@@ -3,7 +3,7 @@ name: "Nomad - Exposed Jobs"
 severity: "medium"
 description: "Nomad jobs were discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "nomad"
   - "devops"

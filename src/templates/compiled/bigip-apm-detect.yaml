@@ -3,7 +3,7 @@ name: "BIGIP APM - Detect"
 severity: "info"
 description: "Safe check derived from bigip-apm-detect: BIGIP APM - Detect"
 tech:
-  - "php"
+  - "f5"
 tags:
   - "bigip"
   - "tech"

@@ -3,7 +3,7 @@ name: "Exposed Core Dump - File Disclosure"
 severity: "medium"
 description: "Exposed Core Dump internal file is disclosed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

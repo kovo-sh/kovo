@@ -3,7 +3,7 @@ name: "CGI Test page"
 severity: "info"
 description: "Safe check derived from cgi-test-page: CGI Test page"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "cgi"
   - "misconfig"

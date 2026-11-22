@@ -3,7 +3,7 @@ name: "AEM QueryBuilder JSON Exposure - Bypass"
 severity: "critical"
 description: "Adobe Experience Manager QueryBuilder endpoint allows unauthenticated attackers to extract sensitive user repository data, including password hashes from the rep:password field in /home/users. This vulnerability bypasses access controls and exposes bcrypt/SHA-256 password hashes through the querybuilder.json API, enabling potential credential compromise and account takeover attacks."
 tech:
-  - "graphql"
+  - "aem"
 tags:
   - "aem"
   - "adobe"

@@ -3,7 +3,7 @@ name: ".buildpath - File Disclosure"
 severity: "low"
 description: "Publicly accessible /.buildpath configuration file was detected, which may expose project structure or sensitive information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

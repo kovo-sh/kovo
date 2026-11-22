@@ -3,7 +3,7 @@ name: "Terraform State - File Exposure"
 severity: "high"
 description: "A Terraform state file was found exposed on the web server. State files map real world infrastructure to configuration and frequently store resource attributes such as passwords, private keys, database connection strings and access tokens in clear text, so public exposure can leak sensitive credentials for the managed infrastructure."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

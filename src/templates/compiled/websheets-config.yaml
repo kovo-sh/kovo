@@ -3,7 +3,7 @@ name: "Websheets Configuration File - Detect"
 severity: "high"
 description: "Websheets configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "websheets"
   - "config"

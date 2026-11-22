@@ -3,7 +3,7 @@ name: "WoWonder Installation Page - Exposure"
 severity: "high"
 description: "Detects exposed WoWonder installation page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

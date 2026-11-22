@@ -3,7 +3,7 @@ name: "Rollup.js Configuration - Detect"
 severity: "info"
 description: "Rollup configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "devops"

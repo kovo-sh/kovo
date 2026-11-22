@@ -3,7 +3,7 @@ name: "Adobe Connect Central Version"
 severity: "info"
 description: "Safe check derived from adobe-connect-version: Adobe Connect Central Version"
 tech:
-  - "generic"
+  - "adobe"
 tags:
   - "adobe"
   - "misconfig"

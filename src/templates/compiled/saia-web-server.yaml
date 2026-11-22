@@ -3,7 +3,7 @@ name: "Saia PCD Web-Server Configuration Page - Detect"
 severity: "info"
 description: "Saia PCD Web-Server configuration page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "edb"
   - "config"

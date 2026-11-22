@@ -3,7 +3,7 @@ name: "AppVeyor Configuration Page - Detect"
 severity: "medium"
 description: "AppVeyor configuration page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

@@ -3,7 +3,7 @@ name: "TastyIgniter Setup Page - Exposure"
 severity: "high"
 description: "Detects exposed TastyIgniter Setup page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"
