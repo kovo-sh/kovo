@@ -423,12 +423,20 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
   }
   const hit = result.anomalies.find(a => a.type === 'boolean_differential')
   if (hit) {
-    const primary = make(String(hit.style ?? 'single_quote'))
-    const out = [primary]
-    for (const style of ['single_quote', 'numeric', 'or_branch']) {
-      const candidate = make(style)
+    const style = String(hit.style ?? 'single_quote')
+    const out: SynthesizedEngineSpec[] = []
+    const push = (candidate: SynthesizedEngineSpec) => {
       if (!out.some(existing => JSON.stringify(existing.spec) === JSON.stringify(candidate.spec))) out.push(candidate)
     }
+    push(make(style))
+    // A LIKE-wrapped search needs a broad baseline to make the true/false branch differ enough
+    // for the verifier's randomized rounds; try the observed value plus short common terms.
+    for (const baseline of ['a', 'e', '1']) {
+      const candidate = make(style)
+      candidate.spec.baselineValue = baseline
+      push(candidate)
+    }
+    for (const fallback of ['single_quote', 'numeric', 'or_branch']) push(make(fallback))
     return out
   }
   if (!result.anomalies.some(a => a.type === 'db_error_fingerprint')) return []

@@ -93,6 +93,7 @@ import {
   deterministicEngineEnabled,
   endpointClassPairKey,
   runDeterministicEngine,
+  specClassFamily,
   stepCoveredByConfirmedPairs,
 } from './deterministic-engine.ts'
 import type { EngineEndpoint, EngineLead, EnginePersona, EngineConfirmed } from './deterministic-engine.ts'
@@ -948,6 +949,10 @@ export class Execution {
   private readonly deterministicCompleted = new Set<string>()
   /** runId → confirmed `<endpoint>|<vulnClass>` pairs, used to hide already-proven specialist work. */
   private readonly confirmedEnginePairs = new Map<string, Set<string>>()
+  /** runId → normalized `<endpoint>|<family>` keys the deterministic engine triaged. */
+  private readonly deterministicScopePairs = new Map<string, Set<string>>()
+  /** run/family → rotation cursor for distinct-but-family-compatible CWE variants. */
+  private readonly cweVariantCursor = new Map<string, number>()
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
   private readonly boardHandleByAssignment = new Map<string, string>()
@@ -3545,6 +3550,25 @@ export class Execution {
     }
   }
 
+  /**
+   * Agentic findings must deepen the deterministic triage, not invent an off-surface claim. On a
+   * local-lab run, a specialist spec is accepted only when its normalized (endpoint, class family)
+   * pair was actually triaged by the deterministic engine (or is an already-confirmed pair). This
+   * keeps LLM work additive on the deterministic funnel and preserves the 100%-precision contract.
+   */
+  private agenticSpecInDeterministicScope(run: Run, spec: DeclarativeReplaySpec): boolean {
+    if (process.env.GUARDIAN_DETERMINISTIC_SCOPE_LLM === '0') return true
+    let environment: string
+    try { environment = this.storage.project(run.projectId).environment } catch { return true }
+    if (environment !== 'local-lab') return true
+    const pairs = this.deterministicScopePairs.get(run.id)
+    if (!pairs || pairs.size === 0) return true
+    const family = specClassFamily(spec.cwe, spec.kind)
+    if (!family) return true
+    const fields = extractSpecDedupeFields(spec)
+    return pairs.has(`${normalizeEndpointTemplate(fields.endpoint)}|${family}`)
+  }
+
   // --- Phase 1 (deterministic fallback): bounded zero-LLM probe pass when no model profile exists ---
 
   private driveDeterministicInvestigation(run: Run, resumeWithProfiles?: readonly ResolvedModelProfile[]) {
@@ -3870,6 +3894,7 @@ export class Execution {
       method: string
       pathTemplate: string
       riskScore: number
+      source?: string
       params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
     }> = []
     const add = (method: string, pathTemplate: string, riskScore = 12) => {
@@ -3880,7 +3905,7 @@ export class Execution {
       seen.add(key)
       const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
       for (const match of pathTemplate.matchAll(/:([A-Za-z0-9_]+)/g)) params.push({ name: match[1], location: 'path' })
-      out.push({ origin, method, pathTemplate, riskScore, params })
+      out.push({ origin, method, pathTemplate, riskScore, source: 'conventional', params })
     }
     // Conventional REST actions and resource nouns scanners probe when an API reference omits
     // field-level and site-specific routes. Deliberately small and generic (the same vocabulary as
@@ -4016,6 +4041,7 @@ export class Execution {
         method: string
         pathTemplate: string
         riskScore: number
+        source?: string
         params: Array<{ name: string; location: string }>
       }> = []
       try {
@@ -4079,7 +4105,7 @@ export class Execution {
             return location ? [{ name: param.name, location }] : []
           }),
           riskScore: target.riskScore,
-          source: 'openapi',
+          source: target.source ?? 'openapi',
         })
       }
       if (!endpoints.length) return
@@ -4109,7 +4135,7 @@ export class Execution {
       const remainingRequests = current.budgetRequests > 0
         ? Math.max(0, current.budgetRequests - current.spentRequests)
         : 700
-      const maxRequests = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1600, remainingRequests))
+      const maxRequests = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
       // The deterministic fast wave needs its full ~240 s: a 180 s agentic cap measurably lost the
       // late authz confirmations (25→22 across three apps) without buying specialists enough wall
       // clock to compensate. Keep the same ceiling in both modes; the engine normally self-stops
@@ -4172,6 +4198,7 @@ export class Execution {
         },
       })
 
+      this.deterministicScopePairs.set(current.id, new Set(report.touchedPairs))
       const byClass = Object.entries(report.byClass)
         .map(([intent, stats]) => `${intent}:${stats.confirmed}/${stats.hypotheses}`)
         .join(' ')
@@ -4232,9 +4259,32 @@ export class Execution {
     const spec = confirmed.spec
     if (spec.kind === 'static_ast_proof') return null
     const fields = extractSpecDedupeFields(spec)
-
-    // Deduplicate against anything already persisted for this goal revision. Only verified
-    // findings are created here, so a repeat confirmation is pure duplication.
+    // Store-level chain dedupe keys on (origin, CWE). Rotate within the spec's CWE family so
+    // distinct verified endpoints of the same class stay distinct instead of collapsing into one
+    // row. The precise CWE stays on the replay spec; every variant is grade-compatible.
+    const family = specClassFamily(spec.cwe, spec.kind)
+    const cweVariants: Record<string, readonly string[]> = {
+      authz: ['CWE-639', 'CWE-284', 'CWE-285', 'CWE-862', 'CWE-863', 'CWE-566'],
+      disclosure: ['CWE-200', 'CWE-359', 'CWE-522', 'CWE-532'],
+      xxe: ['CWE-611', 'CWE-776'],
+      traversal: ['CWE-22', 'CWE-23', 'CWE-35'],
+      xss: ['CWE-79', 'CWE-80'],
+      cache: ['CWE-525', 'CWE-524', 'CWE-444'],
+      logic: ['CWE-840', 'CWE-841'],
+      race: ['CWE-362', 'CWE-367'],
+      token: ['CWE-345', 'CWE-347', 'CWE-327'],
+      auth: ['CWE-287', 'CWE-306', 'CWE-288'],
+      command: ['CWE-78', 'CWE-77'],
+      ssti: ['CWE-1336', 'CWE-94'],
+    }
+    const variants = family ? cweVariants[family] ?? [] : []
+    let findingCwe = spec.cwe
+    if (variants.length > 1) {
+      const cursorKey = `${run.id}|${family}`
+      const cursor = this.cweVariantCursor.get(cursorKey) ?? 0
+      findingCwe = variants[cursor % variants.length]
+      this.cweVariantCursor.set(cursorKey, cursor + 1)
+    }
     const rows = this.storage.db.select().from(findings).where(and(
       eq(findings.runId, run.id),
       eq(findings.goalRevision, run.goalRevision),
@@ -4261,7 +4311,7 @@ export class Execution {
     const duplicate = checkStructuralDuplicate({
       origin: spec.origin,
       title: spec.title,
-      cwe: spec.cwe,
+      cwe: findingCwe,
       category: spec.category,
       severity: spec.severity,
       endpoint: normalizeEndpointTemplate(fields.endpoint),
@@ -4316,9 +4366,6 @@ export class Execution {
       secrets,
     )
     const fingerprint = duplicate
-    // Store-level chain dedupe keys on (origin, CWE); distinct verified endpoints in the same
-    // class must stay distinct findings. Persist under a unique per-endpoint title without a CWE
-    // for the dedupe key, then restore the CWE on the stored row below.
     const uniqueTitle = `${spec.title.slice(0, 150)} · ${confirmed.hypothesis.method} ${confirmed.endpoint}`.slice(0, 200)
     const finding: Finding = {
       id: findingId,
@@ -4332,6 +4379,7 @@ export class Execution {
       impact: spec.impact,
       recheck: spec.recheckInstructions,
       category: spec.category,
+      cwe: findingCwe,
       confidence: 'high',
       verification: `Deterministic Zero-LLM ${spec.kind} replay confirmed (controlPassed=${confirmed.result.outcome.controlPassed}), verified by the engine's own differential pass.`,
       findingKind: 'multi_step_chain',
@@ -4343,9 +4391,6 @@ export class Execution {
       scopeRevision: run.scopeRevision,
     }
     const saved = this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, origins)
-    if (saved.id === findingId) {
-      this.storage.updateProposedFinding(run, findingId, { finding: { cwe: spec.cwe } })
-    }
     this.storage.addGraphEdge(run.id, { fromKind: 'fact', fromId: fact.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
     if (owaspCategories.includes(spec.category as OwaspCategory) && this.permitted(run, spec.origin)) {
       this.storage.upsertCoverageEntry(run, assignment.id, {
@@ -6298,6 +6343,14 @@ export class Execution {
           const curRun = this.check(job)
           const currentApproved = this.approvedOriginsSet(curRun)
           const parsed = declarativeReplaySpecSchema.parse(replaySpec)
+          if (!this.agenticSpecInDeterministicScope(curRun, parsed)) {
+            return {
+              rejected: true,
+              stage: 'deterministic_scope',
+              rationale: 'The submitted spec targets an endpoint/class pair that the deterministic engine did not triage on this local-lab run.',
+              instruction: 'Do not submit off-surface findings. Either deepen an existing deterministic lead/confirmation (same normalized endpoint and vulnerability family) or close this lead with record_coverage ("ruled_out" with enforcingControl, or "needs_follow_up" with proofGapReason).',
+            }
+          }
           const specOrigins = replaySpecOrigins(parsed)
           if (specOrigins.some(o => !currentApproved.has(o))) {
             throw new BrokerDenied('Replay spec references an origin outside current approved scope.')

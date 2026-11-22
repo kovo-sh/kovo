@@ -22,6 +22,7 @@ import type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialReque
 import { verifyReplaySpec } from './replay-verifier.ts'
 import type { ReplayVerificationResult } from './replay-verifier.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
+import { normalizeEndpointTemplate } from './dedupe.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
@@ -29,10 +30,10 @@ import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSp
 
 export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
 
-export const defaultEngineMaxRequests = 1600
+export const defaultEngineMaxRequests = 1800
 export const defaultEngineMaxDurationMs = 240_000
-export const defaultEngineMaxEndpoints = 100
-export const defaultEngineMaxHypotheses = 90
+export const defaultEngineMaxEndpoints = 120
+export const defaultEngineMaxHypotheses = 120
 export const defaultEnginePerProbeRequests = 28
 
 export const engineDisableEnv = 'GUARDIAN_DETERMINISTIC_ENGINE'
@@ -130,6 +131,8 @@ export interface DeterministicEngineReport {
   stoppedReason: 'budget' | 'time' | 'aborted' | 'complete' | 'disabled'
   byClass: Record<string, EngineClassStats>
   confirmedPairs: Array<{ endpoint: string; vulnClass: string }>
+  /** Normalized `<endpoint>|<family>` keys for every hypothesis the engine formed. */
+  touchedPairs: string[]
   notes: string[]
 }
 
@@ -203,6 +206,7 @@ export function endpointRiskScore(endpoint: EngineEndpoint): number {
   if (pathHasRedirectHint(bare)) score += 10
   if (/(?:token|tokens|key|keys|secret|secrets|activity|audit|config|settings)/i.test(bare)) score += 10
   if (/(?:^|\/)(?:login|auth|token|sso|whoami|session)(?:\/|$)/i.test(bare)) score += 6
+  if (endpoint.source === 'conventional') score -= 15
   if ((endpoint.sinkKinds ?? []).length > 0) score += 10
   const depth = bare.split('/').filter(Boolean).length
   if (depth > 5) score -= 5
@@ -378,7 +382,7 @@ export function enumerateHypotheses(
       ...(harvest?.otherIds ?? []),
       ...(originIdPool.get(origin) ?? []),
     ].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id))
-    return [...new Set(ids)].slice(0, 4)
+    return [...new Set(ids)].slice(0, 5)
   }
 
   for (const endpoint of endpoints) {
@@ -800,12 +804,26 @@ export function enumerateHypotheses(
     authz: 100, secret_disclosure: 98, graphql: 95, xxe: 90, ssrf: 88, traversal: 85,
     redirect: 75, xss: 65, mass_assignment: 60, stored_xss: 55, cache: 50, csrf: 45, sqli: 10,
   }
-  return [...all.values()]
-    .sort((a, b) =>
-      (intentPriority[b.intent] ?? 0) - (intentPriority[a.intent] ?? 0) ||
-      b.risk - a.risk ||
-      a.key.localeCompare(b.key))
-    .slice(0, options.maxHypotheses ?? defaultEngineMaxHypotheses)
+  // Quota selection, not a pure global slice: late classes (SQLi in particular) must not be
+  // starved when a richer surface forms more authz/xxe/ssrf hypotheses than the cap.
+  const quotas: Record<string, number> = {
+    authz: 52, secret_disclosure: 4, graphql: 2, xxe: 6, ssrf: 8, traversal: 6, redirect: 6,
+    xss: 5, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 2, webhook: 2,
+    auth_protocol: 2, sqli: 14,
+  }
+  const max = options.maxHypotheses ?? defaultEngineMaxHypotheses
+  const used: Record<string, number> = {}
+  const selected: EngineHypothesis[] = []
+  for (const hyp of [...all.values()].sort((a, b) =>
+    (intentPriority[b.intent] ?? 0) - (intentPriority[a.intent] ?? 0) ||
+    b.risk - a.risk ||
+    a.key.localeCompare(b.key))) {
+    if ((used[hyp.intent] ?? 0) >= (quotas[hyp.intent] ?? 4)) continue
+    used[hyp.intent] = (used[hyp.intent] ?? 0) + 1
+    selected.push(hyp)
+    if (selected.length >= max) break
+  }
+  return selected
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1484,6 +1502,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     stoppedReason: 'complete',
     byClass: {},
     confirmedPairs: [],
+    touchedPairs: [],
     notes: [],
   }
 
@@ -1528,11 +1547,14 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     ...(input.classes ? { classes: input.classes } : {}),
   })
   report.hypothesesFormed = hypotheses.length
+  report.touchedPairs = [...new Set(hypotheses.map(hyp =>
+    `${normalizeEndpointTemplate(hyp.endpoint.pathTemplate)}|${intentFamily(hyp.intent)}`))]
   for (const hyp of hypotheses) classStats(report, hyp.intent).hypotheses += 1
 
   const perProbeRequestFloor = 6
   const intentCaps: Record<string, number> = {
-    authz: 40,
+    authz: 52,
+    secret_disclosure: 4,
     sqli: 14,
     traversal: 6,
     ssrf: 8,
@@ -1541,6 +1563,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     xss: 5,
     graphql: 2,
     mass_assignment: 6,
+    csrf: 4,
   }
   const intentUsed: Record<string, number> = {}
   for (const hyp of hypotheses) {
@@ -1734,4 +1757,52 @@ export function stepCoveredByConfirmedPairs(stepText: string, pairs: Iterable<st
     if (engineClassKeywords(vulnClass).some(keyword => text.includes(keyword))) return true
   }
   return false
+}
+
+// ---------------------------------------------------------------------------------------------
+// Class-family helpers shared with the agentic scope guard
+// ---------------------------------------------------------------------------------------------
+
+export function intentFamily(intent: string): string {
+  switch (intent) {
+    case 'authz': case 'graphql': return 'authz'
+    case 'sqli': return 'sqli'
+    case 'xxe': return 'xxe'
+    case 'ssrf': return 'ssrf'
+    case 'traversal': return 'traversal'
+    case 'redirect': return 'redirect'
+    case 'xss': case 'stored_xss': return 'xss'
+    case 'mass_assignment': return 'mass_assign'
+    case 'csrf': return 'csrf'
+    case 'cache': return 'cache'
+    case 'secret_disclosure': return 'disclosure'
+    case 'workflow': return 'logic'
+    case 'webhook': return 'webhook'
+    case 'auth_protocol': return 'auth'
+    default: return intent
+  }
+}
+
+export function specClassFamily(cwe: string | undefined, kind: string | undefined): string | null {
+  if (kind === 'static_ast_proof') return null
+  const n = Number(/(\d+)/.exec(cwe ?? '')?.[1] ?? NaN)
+  if (!Number.isFinite(n)) return kind === 'http_chain' ? null : null
+  if ([639, 284, 285, 862, 863, 566].includes(n)) return 'authz'
+  if ([89, 564, 943].includes(n)) return 'sqli'
+  if ([79, 80, 83].includes(n)) return 'xss'
+  if (n === 918) return 'ssrf'
+  if ([611, 776].includes(n)) return 'xxe'
+  if ([22, 23, 35, 73].includes(n)) return 'traversal'
+  if (n === 601) return 'redirect'
+  if (n === 915) return 'mass_assign'
+  if (n === 352) return 'csrf'
+  if ([200, 359, 522, 532].includes(n)) return 'disclosure'
+  if ([524, 525, 444, 349].includes(n)) return 'cache'
+  if ([840, 841].includes(n)) return 'logic'
+  if ([362, 367].includes(n)) return 'race'
+  if ([345, 347, 327, 1270].includes(n)) return 'token'
+  if ([287, 306, 288, 290].includes(n)) return 'auth'
+  if ([77, 78, 88].includes(n)) return 'command'
+  if ([1336, 94, 95].includes(n)) return 'ssti'
+  return null
 }
