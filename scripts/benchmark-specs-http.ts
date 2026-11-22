@@ -1,6 +1,6 @@
 /** http_chain / rce_proof spec synthesis: authz, mass assignment, SSRF, XXE, SSTI. */
 import { randomBytes } from 'node:crypto'
-import { baseFields, is2xx, jqStr, requestParts, sameAsControl, stepOf } from './benchmark-specs-common.ts'
+import { baseFields, bogusIdFor, is2xx, jqStr, requestParts, sameAsControl, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
 import { fillPlaceholders, hasPathPlaceholder } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
@@ -8,7 +8,138 @@ import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 const canaryJq = (control: string) =>
   `{ controlPassed: (.steps.${control}.status < 500), confirmed: (.canary.triggered == true), observed: ("probeCallback=" + ((.canary.probeTriggered // false) | tostring)), expected: "no out-of-band callback" }`
 
+interface MatrixRow {
+  resourceId?: unknown
+  actor?: unknown
+  status?: unknown
+  bodyBytes?: unknown
+  bodySha256?: unknown
+  similarityToOwner?: unknown
+  accessible?: unknown
+}
+
+const NEGATIVE_CONTROL_STATUS = [400, 401, 403, 404, 405, 409, 410, 422]
+
+/** Owner and probe must return a non-trivial object, not an empty action acknowledgement. */
+const nonTrivial = (id: string, minBytes = 3) =>
+  `(((${is2xx(id)})) and (((.steps.${id}.body | length) > ${minBytes}) or (((.steps.${id}.json | type) == "object") and (((.steps.${id}.json | keys | length) >= 2)))))`
+
+/**
+ * The negative control must prove the route is actually bound to the identifier. A handler that
+ * ignores the id and operates on the session's own object returns the owner's response unchanged
+ * for a bogus id, so the spec is not submitted. Mutating routes additionally never accept a
+ * nonexistent object id.
+ */
+function negativeControlJq(mutating: boolean): string {
+  if (mutating) return `((.steps.n1.status >= 400) and (.steps.n1.status < 500))`
+  return `(((.steps.n1.status >= 400) and (.steps.n1.status < 500)) or ((${is2xx('n1')}) and (.steps.n1.body != .steps.c1.body) and ((.steps.n1.body | length) > 2)))`
+}
+
+function matrixRows(o: HypothesisOutcome): MatrixRow[] | null {
+  const matrix = o.details.matrix
+  if (!Array.isArray(matrix)) return null
+  return matrix.filter((row): row is MatrixRow => Boolean(row) && typeof row === 'object')
+}
+
+/** Strict, identifier-bound authz chain built from the probe's full actor matrix. */
+function strictAuthzSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const owner = o.pair?.owner ?? env.owner
+  const other = o.pair?.other ?? env.other
+  const rows = matrixRows(o)
+  if (!rows || !owner || !other) return []
+
+  const hits = o.anomalies
+    .filter(a => a.type === 'unauthorized_access' && typeof a.resourceId === 'string')
+    // Strongest evidence first: body-equivalent cross-actor reads, then mutations.
+    .sort((a, b) => {
+      const ga = String(a.method ?? 'GET') === 'GET' ? 0 : 1
+      const gb = String(b.method ?? 'GET') === 'GET' ? 0 : 1
+      if (ga !== gb) return ga - gb
+      return (Number(b.similarityToOwner ?? 0)) - (Number(a.similarityToOwner ?? 0))
+    })
+
+  const out: SynthesizedSpec[] = []
+  const seen = new Set<string>()
+  const rejects = { owner: 0, probe: 0, public: 0, trivial: 0 }
+  for (const hit of hits) {
+    const id = String(hit.resourceId)
+    if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(id)) continue
+    const method = String(hit.method ?? 'GET')
+    const mutating = method !== 'GET'
+    if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) continue
+    const key = `${method}|${id}`
+    if (seen.has(key)) continue
+    seen.add(key)
+
+    const idRows = rows.filter(r => String(r.resourceId ?? '') === id)
+    const ownerRow = idRows.find(r => r.actor === 'owner')
+    const probeActor = hit.actor === 'anonymous' ? 'anonymous' : 'other_persona'
+    const probeRow = idRows.find(r => r.actor === probeActor)
+    // (2) The owner must demonstrably address the resource, and the replay must carry body evidence.
+    if (!ownerRow || ownerRow.accessible !== true || typeof ownerRow.status !== 'number' || ownerRow.status < 200 || ownerRow.status >= 300) { rejects.owner += 1; continue }
+    if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= (mutating ? 12 : 2)) { rejects.trivial += 1; continue }
+    if (!probeRow || probeRow.accessible !== true) { rejects.probe += 1; continue }
+    if (!mutating && Number(probeRow.similarityToOwner ?? hit.similarityToOwner ?? 0) < 0.7) { rejects.probe += 1; continue }
+
+    const anonRow = idRows.find(r => r.actor === 'anonymous')
+    // Public data readable by anonymous callers with the same body is not an authorization failure.
+    if (!mutating && anonRow?.accessible === true) {
+      const sameBody = typeof anonRow.bodySha256 === 'string' && anonRow.bodySha256 === ownerRow.bodySha256
+      const similar = Number(anonRow.similarityToOwner ?? 0) >= 0.7
+      if (sameBody || similar) { rejects.public += 1; continue }
+    }
+
+    const negativeId = bogusIdFor(id)
+    const path = hasPathPlaceholder(o.hyp.endpoint.path)
+      ? fillPlaceholders(o.hyp.endpoint.path, encodeURIComponent(id))
+      : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(id)}`
+    const negativePath = hasPathPlaceholder(o.hyp.endpoint.path)
+      ? fillPlaceholders(o.hyp.endpoint.path, encodeURIComponent(negativeId))
+      : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(negativeId)}`
+    const parts: RequestParts = { method: method as RequestParts['method'], pathAndQuery: path, ...(mutating ? { jsonBody: {} } : {}) }
+    const negativeParts: RequestParts = { method: method as RequestParts['method'], pathAndQuery: negativePath, ...(mutating ? { jsonBody: {} } : {}) }
+    const probePersona = hit.actor === 'anonymous' ? null : other
+    const neg = negativeControlJq(mutating)
+    const ownerOk = nonTrivial('c1', mutating ? 12 : 3)
+    const probeNonTrivial = mutating ? nonTrivial('p1', 12) : `(${is2xx('p1')})`
+    // The probe actor may receive extra fields (e.g. leak markers); every owner field/value must be present.
+    const matchesOwner = `((.steps.p1.body == .steps.c1.body) or (.steps.c1.json as $c | .steps.p1.json as $p | ` +
+      `(($c | type) == "object") and (([$c | keys[]] | length) > 0) and ` +
+      `(([($c | to_entries[]) | select($p[.key] == .value)] | length) == ([$c | keys[]] | length))))`
+    const jq = `{ controlPassed: (${ownerOk} and (${neg})), ` +
+      `confirmed: ((${probeNonTrivial}) and (${neg}) and (${matchesOwner})), ` +
+      `observed: ("probe status=" + (.steps.p1.status | tostring) + " bogus status=" + (.steps.n1.status | tostring)), ` +
+      'expected: "non-owner denied while a nonexistent id stays inaccessible" }'
+    out.push({
+      kind: 'http_chain',
+      spec: {
+        ...baseFields(env, 'Cross-actor object or function access', 'CWE-639', 'broken-access-control', 'high', jq),
+        kind: 'http_chain',
+        steps: [
+          stepOf(env, 'c1', 'control', 'Authorized actor performs the request', parts, owner),
+          stepOf(env, 'n1', 'control', `Authorized actor addresses a nonexistent identifier (${negativeId})`, negativeParts, owner, {}, NEGATIVE_CONTROL_STATUS),
+          stepOf(env, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the same request`, parts, probePersona),
+        ],
+      },
+    })
+  }
+  if (out.length === 0 && process.env.GUARDIAN_BENCH_DEBUG === '1' && hits.length > 0) {
+    process.stderr.write(`[spec-skip] authz_matrix ${o.hyp.endpoint.path}: owner=${rejects.owner} probe=${rejects.probe} public=${rejects.public} trivial=${rejects.trivial}\n`)
+  }
+  return out
+}
+
 export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const strict = strictAuthzSpecs(o, env)
+  if (strict.length > 0) return strict
+  // Legacy fixture path: an outcome without the probe's actor matrix cannot prove identifier binding,
+  // so it is only used by callers that synthesize from hand-built observations.
+  if (matrixRows(o) !== null) return []
+  return legacyAuthzSpecs(o, env)
+}
+
+function legacyAuthzSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+
   const owner = o.pair?.owner ?? env.owner
   const other = o.pair?.other ?? env.other
   if (!owner || !other) return []

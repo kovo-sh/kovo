@@ -31,21 +31,46 @@ export function synthGraphql(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
     const field = typeof anomaly?.field === 'string' ? anomaly.field : 'me'
     const nested = Array.isArray(anomaly?.nestedPath) ? (anomaly?.nestedPath as string[]) : []
     const selection = nested.length > 0 ? `${field}{${nested.join('{')}${'}'.repeat(nested.length)}}` : field
-    const query = `{${selection}}`
-    const jq = `{ controlPassed: ${is2xx('c1')}, ` +
-      `confirmed: (${is2xx('p1')} and (((.steps.p1.json.errors // []) | length) == 0) and ((.steps.p1.json.data // null) != null)), ` +
-      'observed: ("probe status=" + (.steps.p1.status | tostring)), expected: "resolver data reaches a non-owner actor" }'
-    return [{
+    const observedQuery = typeof anomaly?.query === 'string' && anomaly.query.startsWith('{') && anomaly.query.length <= 2000
+      ? anomaly.query
+      : o.ctx?.graphqlQuery && o.ctx.graphqlQuery.startsWith('{') ? o.ctx.graphqlQuery : `{${selection}}`
+    const jq = `{ controlPassed: (${is2xx('c1')} and (((.steps.c1.json.errors // []) | length) == 0) and ((.steps.c1.json.data // null) != null)), ` +
+      `confirmed: ((${is2xx('p1')}) and (((.steps.p1.json.errors // []) | length) == 0) and ((.steps.p1.json.data // null) != null) and ` +
+      `(.steps.p1.json.data == .steps.c1.json.data) and (((.steps.p1.json.data | tostring) | length) > 6)), ` +
+      'observed: ("probe data bytes=" + (((.steps.p1.json.data // {}) | tostring) | length | tostring)), expected: "non-owner resolver returns no owner data" }'
+    const specs: SynthesizedSpec[] = [{
       kind: 'http_chain',
       spec: {
         ...baseFields(env, 'GraphQL resolver missing object authorization', 'CWE-639', 'broken-access-control', 'high', jq),
         kind: 'http_chain',
         steps: [
-          gqlStep('c1', 'control', 'Owner queries the resolver', query, env.owner),
-          gqlStep('p1', 'probe', 'Different actor queries the same resolver', query, env.other),
+          gqlStep('c1', 'control', 'Owner queries the resolver', observedQuery, env.owner),
+          gqlStep('p1', 'probe', 'Different actor queries the same resolver', observedQuery, env.other),
         ],
       },
     }]
+    if (hasAlias && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(field)) {
+      // Alias-batched abuse: repeat the same tenant-resolver selection under three aliases as a
+      // non-owner. Only confirmed when every alias returns the owner's exact data payload.
+      const aliased = `{${['a0', 'a1', 'a2'].map(a => `${a}:${field}{${nested.join('{')}${'}'.repeat(nested.length)}}`).join(' ')}}`
+      const aliasQuery = nested.length > 0 ? aliased : `{a0:${field} a1:${field} a2:${field}}`
+      const aliasJq = `{ controlPassed: (${is2xx('c1')} and ((.steps.c1.json.data // null) != null)), ` +
+        `confirmed: ((${is2xx('p1')}) and ((([.steps.p1.json.data.a0, .steps.p1.json.data.a1, .steps.p1.json.data.a2] | map(select(. != null)) | length) == 3)) and ` +
+        `((.steps.p1.json.data.a0) == (.steps.p1.json.data.a1)) and ((.steps.p1.json.data.a0) == (.steps.p1.json.data.a2))), ` +
+        'observed: ("alias keys=" + (((.steps.p1.json.data // {}) | keys | length) | tostring)), expected: "aliased non-owner queries return no owner data" }'
+      specs.push({
+        kind: 'http_chain',
+        spec: {
+          ...baseFields(env, 'GraphQL alias batching against a tenant resolver', 'CWE-639', 'broken-access-control', 'high', aliasJq),
+          kind: 'http_chain',
+          steps: [
+            gqlStep('c1', 'control', 'Owner runs the single selection', `{${selection}}`, env.owner),
+            gqlStep('p1', 'probe', 'Non-owner batches the selection under aliases', aliasQuery, env.other),
+          ],
+        },
+      })
+    }
+    return specs
   }
 
   if (hasIntrospection) {
@@ -107,6 +132,12 @@ export function synthGraphql(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
 // ---------------------------------------------------------------------------
 
 export function synthWorkflow(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const quantity = synthWorkflowQuantity(o, env)
+  if (quantity.length > 0) return quantity
+  return synthWorkflowStepSkip(o, env)
+}
+
+function synthWorkflowQuantity(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const hit = o.anomalies.find(a => a.type === 'workflow_quantity_invariant')
   if (!hit) return []
   const field = String(hit.field ?? '')
@@ -127,6 +158,40 @@ export function synthWorkflow(o: HypothesisOutcome, env: ProbeEnv): SynthesizedS
       steps: [
         stepOf(env, 'c1', 'control', 'Valid quantity is accepted', request(1), env.owner),
         stepOf(env, 'p1', 'probe', `Boundary quantity ${value} is accepted`, request(value), env.owner),
+      ],
+    },
+  }]
+}
+
+/**
+ * Step-skip evidence: the probe reached a terminal workflow state from an initial state that must
+ * have passed through intermediate steps. Replay submits the observed transition and only confirms
+ * when the live response still reports the skipped-to state (or an explicit `skipped` flag).
+ */
+function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'workflow_step_skip')
+  if (!hit) return []
+  const fromState = String(hit.fromState ?? '').trim().toLowerCase()
+  const toState = String(hit.toState ?? '').trim().toLowerCase()
+  const rawPath = String(hit.path ?? '')
+  const status = Number(hit.status)
+  if (!/^[a-z0-9_-]{1,64}$/.test(fromState) || !/^[a-z0-9_-]{1,64}$/.test(toState)) return []
+  if (fromState === toState || !rawPath.startsWith('/') || !(status >= 200 && status < 300)) return []
+  const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
+  const observedBody = hit.jsonBody && typeof hit.jsonBody === 'object' && !Array.isArray(hit.jsonBody)
+    ? hit.jsonBody as Record<string, unknown>
+    : {}
+  const jq = `{ controlPassed: (.steps.c1.status < 500), ` +
+    `confirmed: ((${is2xx('p1')}) and (((.steps.p1.json.skipped // false) == true) or (((.steps.p1.json.state // .steps.p1.json.status // "") | tostring | ascii_downcase) == ${jqStr(toState)}))), ` +
+    `observed: ("state=" + ((.steps.p1.json.state // .steps.p1.json.status // "") | tostring)), expected: ${jqStr(`must pass through the ${fromState} -> ${toState} transition`)} }`
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...baseFields(env, 'Workflow step-skip state transition', 'CWE-841', 'business-logic', 'high', jq),
+      kind: 'http_chain',
+      steps: [
+        stepOf(env, 'c1', 'control', 'Read the resource before the transition', { method: 'GET', pathAndQuery: rawPath }, env.owner, {}, [200, 400, 404, 405, 409]),
+        stepOf(env, 'p1', 'probe', `Submit the transition directly (expected ${fromState} -> ${toState})`, { method, pathAndQuery: rawPath, jsonBody: observedBody }, env.owner),
       ],
     },
   }]
