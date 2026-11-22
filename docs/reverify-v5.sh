@@ -211,11 +211,8 @@ else
     tests/v4-m7-discovery.test.ts tests/v4-m7-heldout.test.ts tests/v4-m7-heldout2.test.ts \
     tests/v4-m7-orch.test.ts tests/v4-m7-probes2.test.ts tests/v4-m7-spa.test.ts \
     tests/v4-m7-specs.test.ts tests/v4-m7-specs2.test.ts
-  run_node "v5 milestone suites" 3600 \
-    tests/v5-board-store.test.ts tests/v5-m0-realistic-harness.test.ts \
-    tests/v5-m1-static.test.ts tests/v5-m1-wiring-correctness.test.ts \
-    tests/v5-m2-auth.test.ts tests/v5-m2-recon-probing.test.ts \
-    tests/v5-m3-probes.test.ts tests/v5-m4-sast-templates-patch.test.ts
+  V5_SUITES="$(find tests -maxdepth 1 -name 'v5-*.test.ts' ! -name 'v5-board-boundaries.test.ts' ! -name 'v5-gate-worker-lifecycle.test.ts' | sort | tr '\n' ' ')"
+  run_node "v5 suites (all)" 3600 $V5_SUITES
   run_node "v5 gate worker lifecycle" 600 tests/v5-gate-worker-lifecycle.test.ts
   run_node "v4 tiered E2E matrix (322)" 3600 tests/v4-e2e-tiers.test.ts
   run_node "realistic-bench harness" 1800 benchmarks/realistic-bench/tests/
