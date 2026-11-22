@@ -32,6 +32,7 @@ import {
 } from './benchmark-core.ts'
 import type {
   BenchmarkManifest,
+  BenchmarkOrchestrationOverrides,
   BenchmarkProfileMode,
   BenchmarkSuiteName,
   BenchmarkSuiteResult,
@@ -80,6 +81,8 @@ export interface RunBenchmarkOptions {
   manifests?: Partial<Record<BenchmarkSuiteName, BenchmarkManifest>>
   launchers?: Partial<Record<BenchmarkSuiteName, BenchmarkServerLauncher>>
   repoRootDir?: string
+  /** Wall-clock/request/concurrency knobs for the live pipeline (env supplies the rest). */
+  orchestration?: BenchmarkOrchestrationOverrides
 }
 
 export const benchmarkRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -176,6 +179,7 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
       launcher: opts.launchers?.[suite],
       verifierBackend: opts.verifierBackend ?? 'auto',
       repoRootDir: rootDir,
+      ...(opts.orchestration ? { orchestration: opts.orchestration } : {}),
     })
     traces = outcome.traces
     totalCostUsd = outcome.totalCostUsd
@@ -186,6 +190,7 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
         patchVerification = await live.verifyPatchesLive({
           manifest, profileMode, launcher: opts.launchers?.[suite], verifierBackend: opts.verifierBackend ?? 'auto', repoRootDir: rootDir,
           suite, baseline: outcome,
+          ...(opts.orchestration ? { orchestration: opts.orchestration } : {}),
         })
       } else {
         patchVerification = { attempted: 0, fixed: 0, reproducedBefore: 0, perPatch: [], skippedReason: 'Patch verification applies to held-out-saas only.' }
@@ -377,20 +382,36 @@ export function benchmarkCliHelp(): string {
     '  --verify-patches                              held-out-saas: verify reproduced -> fixed patch retests',
     '                                                (20 isolated patches + one all-patches pass)',
     '  --verifier-backend <auto|docker|local-jq>     Zero-LLM verifier backend (default: auto)',
+    '  --max-requests <n>                            Broker audit-unit budget (default: 3800, env GUARDIAN_BENCH_MAX_REQUESTS)',
+    '  --deadline-ms <n>                             Wall-clock budget for the live pipeline (default: 480000)',
+    '  --probe-concurrency <n>                       Parallel read-only hypotheses, 1-8 (default: 4, env GUARDIAN_BENCH_PROBE_CONCURRENCY)',
+    '  --verify-concurrency <n>                      Candidate specs verified in parallel, 1-4 (default: 2)',
+    '  --slow-probes <n>                             Blind time-based SQLi allowance (default: adaptive 12-24)',
     '  --dry-run                                     Capability-model run, no network',
     '  -h, --help',
     '',
     'Live runs require GUARDIAN_ALLOW_LOCAL_LAB=1.',
+    'Orchestration env: GUARDIAN_BENCH_MAX_REQUESTS, GUARDIAN_BENCH_DEADLINE_MS,',
+    'GUARDIAN_BENCH_PROBE_CONCURRENCY, GUARDIAN_BENCH_VERIFY_CONCURRENCY, GUARDIAN_BENCH_SLOW_PROBES,',
+    'GUARDIAN_BENCH_CLASS_CAP / GUARDIAN_BENCH_CLASS_ENDPOINT_CAP (class=limit,...).',
     'Patch-verification bounds: GUARDIAN_BENCH_PATCH_TIMEOUT_MS (per patch, default 90000),',
     'GUARDIAN_BENCH_ALLPATCH_TIMEOUT_MS (all-patches pass, default 600000),',
     'GUARDIAN_BENCH_PATCH_ISOLATION (unrelated findings replayed per patch, default 4).',
   ].join('\n')
 }
 
+function parseCountArg(flag: string, value: string, min: number, max: number): number {
+  const n = Number(value)
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${flag} must be an integer in ${min}..${max}.`)
+  return n
+}
+
 export function parseBenchmarkCliArgs(argv: readonly string[]): BenchmarkCliOptions {
   const out: BenchmarkCliOptions = { suite: 'xben-25', diff: false, help: false }
+  const orchestration: BenchmarkOrchestrationOverrides = {}
   const valueFlags = new Set([
     '--suite', '--profile-mode', '--baseline-sha', '--git-sha', '--out-json', '--out-md', '--out-dir', '--db', '--verifier-backend',
+    '--max-requests', '--deadline-ms', '--probe-concurrency', '--verify-concurrency', '--slow-probes',
   ])
   for (let i = 0; i < argv.length; i += 1) {
     let arg = argv[i]
@@ -428,8 +449,14 @@ export function parseBenchmarkCliArgs(argv: readonly string[]): BenchmarkCliOpti
         if (value !== 'auto' && value !== 'docker' && value !== 'local-jq') throw new Error('--verifier-backend must be auto, docker or local-jq.')
         out.verifierBackend = value
         break
+      case '--max-requests': orchestration.maxRequests = parseCountArg('--max-requests', value, 1, 1_000_000); break
+      case '--deadline-ms': orchestration.deadlineMs = parseCountArg('--deadline-ms', value, 1_000, 24 * 60 * 60_000); break
+      case '--probe-concurrency': orchestration.probeConcurrency = parseCountArg('--probe-concurrency', value, 1, 8); break
+      case '--verify-concurrency': orchestration.verifyConcurrency = parseCountArg('--verify-concurrency', value, 1, 4); break
+      case '--slow-probes': orchestration.slowProbes = parseCountArg('--slow-probes', value, 0, 64); break
     }
   }
+  if (Object.keys(orchestration).length > 0) out.orchestration = orchestration
   return out
 }
 

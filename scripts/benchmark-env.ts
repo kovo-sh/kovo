@@ -49,7 +49,12 @@ function personaSpec(rec: PersonaRecord): { authKind: 'bearer' | 'header' | 'coo
   return null
 }
 
-export async function createEngineEnv(handle: BenchmarkServerHandle, caps: ProfileCaps, assignmentLabel: string): Promise<EngineEnv> {
+export interface EngineEnvOptions {
+  /** Initial blind-SQLi allowance; the live pipeline recomputes it once hypotheses are known. */
+  slowProbes?: number
+}
+
+export async function createEngineEnv(handle: BenchmarkServerHandle, caps: ProfileCaps, assignmentLabel: string, opts: EngineEnvOptions = {}): Promise<EngineEnv> {
   const dir = mkdtempSync(join(tmpdir(), 'guardian-bench-run-'))
   const storage = new Store(dir)
   const origin = new URL(handle.origin).origin
@@ -113,7 +118,7 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
   const probeEnv: ProbeEnv = {
     origin, broker, grant, canaryBroker, storage, runId: run.id, signal: controller.signal, caps,
     owner, other, admin: pick('admin'), viewer: pick('viewer'), jwtPersona, personaUserIds: userIds, session: 'bench',
-    slowProbesLeft: 12,
+    slowProbesLeft: opts.slowProbes ?? 12,
   }
   return {
     storage, broker, canaryBroker, grant, runId: run.id, scopeRevision, probeEnv, controller, requestsUsed: () => used,

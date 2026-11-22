@@ -14,15 +14,27 @@ import { selectVerifierBackend } from './benchmark-backend.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
 import { createEngineEnv, discoverEndpoints } from './benchmark-env.ts'
 import type { EngineEnv } from './benchmark-env.ts'
-import { formHypotheses, profileCaps, runHypothesis } from './benchmark-probes.ts'
+import { formHypotheses, needsCsrf, profileCaps, runHypothesis } from './benchmark-probes.ts'
 import type { Hypothesis, HypothesisOutcome } from './benchmark-probes.ts'
 import { endpointMatches, scoreManifest } from './benchmark-score.ts'
 import type { ScoredOutcome } from './benchmark-score.ts'
 import { synthesizeSpecs } from './benchmark-specs.ts'
+import {
+  applyBenchmarkClassCaps,
+  classifyHypothesisConcurrency,
+  computeSlowProbeAllowance,
+  resolveBenchOrchestrationConfig,
+  runBenchmarkSchedule,
+  selectSlowProbeKeys,
+  verificationBatches,
+} from './benchmark-core.ts'
 import type {
   AllPatchesVerification,
   BenchmarkManifest,
+  BenchmarkOrchestrationConfig,
+  BenchmarkOrchestrationOverrides,
   BenchmarkProfileMode,
+  BenchmarkScheduledTask,
   BenchmarkSuiteName,
   PatchVerificationEntry,
   PatchVerificationSummary,
@@ -37,6 +49,8 @@ export interface LivePipelineArgs {
   launcher?: BenchmarkServerLauncher
   verifierBackend: VerifierBackendChoice
   repoRootDir: string
+  /** Env/CLI orchestration overrides; env vars supply anything omitted. */
+  orchestration?: BenchmarkOrchestrationOverrides
 }
 
 /**
@@ -101,6 +115,8 @@ export interface PatchVerificationArgs {
   baseline?: Pick<LivePipelineOutcome, 'findings'> | null
   /** Max unrelated findings replayed per patch as an isolation check (default 4, 0 disables). */
   isolationSample?: number
+  /** Orchestration knobs forwarded to the baseline/all-patches pipeline runs. */
+  orchestration?: BenchmarkOrchestrationOverrides
   /** Wall-clock bound for one isolated patch retest (default 90s). */
   patchTimeoutMs?: number
   /** Wall-clock bound for the all-patches-applied pipeline pass (default 10 min). */
@@ -207,28 +223,86 @@ async function verifyWithProfile(
 
 type ExecutedOutcome = ScoredOutcome & { spec?: Record<string, unknown> }
 
+interface ClassStat {
+  hypotheses: number
+  skipped: number
+  requests: number
+  signals: number
+  confirmed: number
+  ms: number
+}
+
+interface TaskResult {
+  scored: ExecutedOutcome
+}
+
 async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]): Promise<{ traces: TargetTrace[]; findings: ConfirmedFinding[]; backendKind: string }> {
   const caps = profileCaps(args.profileMode)
-  const deadline = Date.now() + Number(process.env.GUARDIAN_BENCH_DEADLINE_MS ?? 8 * 60_000)
+  const config: BenchmarkOrchestrationConfig = resolveBenchOrchestrationConfig(process.env, args.orchestration ?? {})
+  const executeStarted = Date.now()
+  const deadline = executeStarted + config.deadlineMs
   const verifier = await selectVerifierBackend(args.verifierBackend)
   const onExchange = (_ex: BrokerExchangeResult) => undefined
 
+  const discoveryStarted = Date.now()
   const endpoints = await discoverEndpoints(env, caps, onExchange)
+  const discoveryMs = Date.now() - discoveryStarted
   const plan = formHypotheses(endpoints, caps)
-  notes.push(`Discovered ${endpoints.length} endpoints; formed ${plan.hypotheses.length} hypotheses.`)
+  const discoveredCount = plan.hypotheses.length
+  const capped = applyBenchmarkClassCaps(plan.hypotheses, config.classCaps)
+  const hypotheses = capped.kept
+  notes.push(`Discovered ${endpoints.length} endpoints; formed ${discoveredCount} hypotheses; class caps kept ${hypotheses.length}.`)
+
+  // Blind time-based SQLi is the only probe that deliberately sleeps on the target. Scale its
+  // allowance with the candidate count, ranked by param/path plausibility, but execute the chosen
+  // subset in plan order so stateful writes keep their positions.
+  const slowCandidates = hypotheses.filter(h => h.probeClass === 'sqli_time_diff')
+  const slowAllowance = computeSlowProbeAllowance(slowCandidates.length, config.slowProbes)
+  const slowKeys = selectSlowProbeKeys(
+    slowCandidates.map(h => ({
+      key: h.key, path: h.endpoint.path, ...(h.param ? { param: h.param.name } : {}),
+      ...(h.location ? { location: h.location } : {}), method: h.method,
+    })),
+    slowAllowance,
+  )
+  env.probeEnv.slowProbesLeft = slowAllowance
+
+  const stats = new Map<string, ClassStat>()
+  const statFor = (probeClass: string): ClassStat => {
+    let stat = stats.get(probeClass)
+    if (!stat) {
+      stat = { hypotheses: 0, skipped: 0, requests: 0, signals: 0, confirmed: 0, ms: 0 }
+      stats.set(probeClass, stat)
+    }
+    return stat
+  }
 
   const signalledParams = new Set<string>()
-  const executed: ExecutedOutcome[] = []
   const budgetSkipped = new Set<string>()
-  const maxRequests = 3800
-  for (const hyp of plan.hypotheses) {
-    const paramKey = `${hyp.endpoint.method}|${hyp.endpoint.path}|${hyp.param?.name ?? ''}`
-    const overBudget = Date.now() > deadline || env.requestsUsed() > maxRequests
-    if (overBudget) { budgetSkipped.add(hyp.endpoint.path); continue }
-    if (hyp.probeClass === 'sqli_time_diff' && (signalledParams.has(paramKey) || env.probeEnv.slowProbesLeft <= 0)) continue
-    if (hyp.probeClass === 'sqli_time_diff') env.probeEnv.slowProbesLeft -= 1
+  const verifyTimeoutSignal = AbortSignal.timeout(90_000)
 
-    const outcome: HypothesisOutcome = await runHypothesis(hyp, env.probeEnv, onExchange)
+  const runOne = async (hyp: Hypothesis): Promise<TaskResult | null> => {
+    const stat = statFor(hyp.probeClass)
+    if (Date.now() > deadline || env.requestsUsed() > config.maxRequests) {
+      budgetSkipped.add(hyp.endpoint.path)
+      stat.skipped += 1
+      return null
+    }
+    const paramKey = `${hyp.endpoint.method}|${hyp.endpoint.path}|${hyp.param?.name ?? ''}`
+    if (hyp.probeClass === 'sqli_time_diff') {
+      // Boolean sibling always precedes the time probe in plan order; the scheduler enforces the
+      // dependency, so this read is stable and never races a concurrent boolean probe.
+      if (signalledParams.has(paramKey) || env.probeEnv.slowProbesLeft <= 0) {
+        stat.skipped += 1
+        return null
+      }
+      env.probeEnv.slowProbesLeft -= 1
+    }
+
+    const started = Date.now()
+    const local = { requests: 0 }
+    const watch = (ex: BrokerExchangeResult) => { local.requests += 1; onExchange(ex) }
+    const outcome: HypothesisOutcome = await runHypothesis(hyp, env.probeEnv, watch)
     if (outcome.verdict === 'signal' && hyp.probeClass === 'sqli_boolean') signalledParams.add(paramKey)
     const scored: ExecutedOutcome = {
       path: hyp.endpoint.path, probeClass: hyp.probeClass, signal: outcome.verdict === 'signal', specSubmitted: false, confirmed: false,
@@ -239,30 +313,104 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       notes.push(`[debug] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'}@${hyp.location ?? '-'} -> ${outcome.verdict}: ${(outcome.summary ?? outcome.error ?? '').slice(0, 140)} anomalies=${outcome.anomalies.map(a => String(a.type)).join(',')}`)
       if (outcome.verdict === 'signal') notes.push(`[debugjson] ${hyp.probeClass} ${hyp.endpoint.path} ${JSON.stringify(outcome.anomalies).slice(0, 900)} details=${JSON.stringify(outcome.details).slice(0, 500)}`)
     }
+
     const candidates = synthesizeSpecs(outcome, env.probeEnv).slice(0, 4)
-    for (const synth of candidates) {
-      scored.specSubmitted = true
-      scored.spec = synth.spec
-      try {
-        const res = await verifyWithProfile(env, synth.spec, verifier.backend, caps.inlineRetries, onExchange)
-        scored.jqError = Boolean(res.feedback?.jqError)
-        scored.spaCatchall = Boolean(res.feedback?.spaCatchallMatched)
+    // Batch-verify only read-only hypotheses: their replay specs do not mutate target state and each
+    // replay gets its own broker jar prefix. Confirm-on-first is preserved across ordered batches.
+    const safety = classifyHypothesisConcurrency({
+      probeClass: hyp.probeClass, method: hyp.method,
+      ...(hyp.secondOrder ? { secondOrder: true } : {}),
+      ...(hyp.browserEligible ? { browserEligible: true } : {}),
+      ...(needsCsrf(hyp) ? { csrfBound: true } : {}),
+    })
+    const verifyConcurrency = safety.parallelSafe ? Math.max(1, config.verifyConcurrency) : 1
+    outer:
+    for (const batch of verificationBatches(candidates, verifyConcurrency)) {
+      const settled = await Promise.all(batch.map(async synth => {
+        scored.specSubmitted = true
+        scored.spec = synth.spec
+        try {
+          const res = await verifyWithProfile(env, synth.spec, verifier.backend, caps.inlineRetries, watch, verifyTimeoutSignal)
+          return { synth, res }
+        } catch (err) {
+          notes.push(`verify error on ${hyp.endpoint.path} (${hyp.probeClass}): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`)
+          return { synth, error: err }
+        }
+      }))
+      for (const item of settled) {
+        if ('error' in item) continue
+        const res = item.res
+        scored.jqError = scored.jqError || Boolean(res.feedback?.jqError)
+        scored.spaCatchall = scored.spaCatchall || Boolean(res.feedback?.spaCatchallMatched)
         if (/blocked below Tier 3|requires explicit Tier 3/i.test(res.replay?.outcome.reason ?? '')) scored.tierBlocked = true
-        if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[debugverify] ${synth.kind} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} -> ${res.verdict}: ${(res.replay?.outcome.reason ?? res.replay?.outcome.observed ?? '').slice(0, 160)}`)
-        if (res.verdict === 'confirmed') { scored.confirmed = true; break }
-      } catch (err) {
-        notes.push(`verify error on ${hyp.endpoint.path} (${hyp.probeClass}): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`)
+        if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[debugverify] ${item.synth.kind} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} -> ${res.verdict}: ${(res.replay?.outcome.reason ?? res.replay?.outcome.observed ?? '').slice(0, 160)}`)
+        if (res.verdict === 'confirmed') { scored.confirmed = true; break outer }
       }
     }
-    executed.push(scored)
+
+    stat.requests += local.requests
+    stat.ms += Date.now() - started
+    stat.signals += outcome.verdict === 'signal' ? 1 : 0
+    if (scored.confirmed) {
+      stat.confirmed += 1
+      notes.push(`Confirmed: ${hyp.probeClass} ${hyp.method} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} requests=${local.requests}`)
+    }
+    stat.hypotheses += 1
+    if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[timing] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} ${Date.now() - started}ms requests=${local.requests}`)
+    return { scored }
   }
+
+  const tasks: Array<BenchmarkScheduledTask<TaskResult | null>> = []
+  const taskKeys = new Set(hypotheses.map(h => h.key))
+  for (const hyp of hypotheses) {
+    const stat = statFor(hyp.probeClass)
+    if (hyp.probeClass === 'sqli_time_diff' && !slowKeys.has(hyp.key)) {
+      stat.skipped += 1
+      continue
+    }
+    const safety = classifyHypothesisConcurrency({
+      probeClass: hyp.probeClass, method: hyp.method,
+      ...(hyp.secondOrder ? { secondOrder: true } : {}),
+      ...(hyp.browserEligible ? { browserEligible: true } : {}),
+      ...(needsCsrf(hyp) ? { csrfBound: true } : {}),
+    })
+    const siblingKey = hyp.probeClass === 'sqli_time_diff' ? hyp.key.replace(/^sqli_time_diff\|/, 'sqli_boolean|') : null
+    const dependsOn = siblingKey && taskKeys.has(siblingKey) ? [siblingKey] : undefined
+    tasks.push({
+      key: hyp.key,
+      parallelSafe: safety.parallelSafe && config.probeConcurrency > 1,
+      ...(dependsOn ? { dependsOn } : {}),
+      run: () => runOne(hyp),
+    })
+  }
+
+  const results = await runBenchmarkSchedule(tasks, { concurrency: config.probeConcurrency })
+  const executed = results.filter((r): r is TaskResult => r !== null).map(r => r.scored)
+
+  // Per-class budget telemetry: request counts are per task (exchange-level) so they stay stable
+  // under concurrency; broker audit units (used/cap) double-count allowed+observed.
+  notes.push(`Orchestration: probeConcurrency=${config.probeConcurrency} verifyConcurrency=${config.verifyConcurrency} maxRequests=${config.maxRequests} deadlineMs=${config.deadlineMs} slowProbes=${slowAllowance}/${slowCandidates.length} discoveryMs=${discoveryMs}`)
+  if (capped.dropped.length) {
+    const byClass = new Map<string, number>()
+    for (const d of capped.dropped) byClass.set(d.probeClass, (byClass.get(d.probeClass) ?? 0) + 1)
+    const summary = [...byClass.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([c, n]) => `${c}=${n}`).join(',')
+    notes.push(`Class caps: dropped ${capped.dropped.length} hypotheses (${summary}).`)
+  }
+  for (const probeClass of [...stats.keys()].sort()) {
+    const s = stats.get(probeClass)!
+    notes.push(`Class stat: ${probeClass} hypotheses=${s.hypotheses} skipped=${s.skipped} requests=${s.requests} ms=${s.ms} signals=${s.signals} confirmed=${s.confirmed}`)
+  }
+
   const traces = scoreManifest(args.manifest.challenges, {
     discoveredPaths: endpoints.map(e => e.path),
     outcomes: executed,
     encodingSkipPaths: plan.encodingSkips.map(s => s.path),
     budgetSkippedPaths: [...budgetSkipped],
   })
-  notes.push(`Requests used: ${env.requestsUsed()} / ${maxRequests}; hypotheses=${plan.hypotheses.length}; budgetSkipped=${budgetSkipped.size}`)
+  notes.push(`Requests used: ${env.requestsUsed()} / ${config.maxRequests}; hypotheses=${discoveredCount}; executed=${executed.length}; budgetSkipped=${budgetSkipped.size}`)
+  const executeWallMs = Math.max(1, Date.now() - executeStarted)
+  const httpExchanges = Math.round(env.requestsUsed() / 2)
+  notes.push(`Orchestration utilization: wallMs=${executeWallMs} httpExchanges≈${httpExchanges} effectiveRps=${(httpExchanges / (executeWallMs / 1000)).toFixed(1)}`)
   return { traces, findings: collectConfirmedFindings(args.manifest, executed, traces), backendKind: verifier.kind }
 }
 
@@ -473,6 +621,7 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
   const liveArgs: LivePipelineArgs = {
     suite, manifest: args.manifest, profileMode, verifierBackend, repoRootDir,
     ...(args.launcher ? { launcher: args.launcher } : {}),
+    ...(args.orchestration ? { orchestration: args.orchestration } : {}),
   }
   const defaults = buildDefaultRuntime(liveArgs)
   const hooks = args.hooks ?? {}
