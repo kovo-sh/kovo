@@ -2520,6 +2520,21 @@ async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOutcome> 
     })
     notes.push(`cache deception auth probe ${deceptionUrl.slice(0, 120)} -> ${authEx?.status ?? 'error'}`)
     if (authEx && authEx.status >= 200 && authEx.status < 300) {
+      // Public/static content is legitimately cacheable: if the same base path serves the same body
+      // to an anonymous caller, a static-suffix match is not cache deception of private data.
+      const anonBase = await send({ method: 'GET', pathAndQuery: req.pathAndQuery, headers: req.headers })
+      const publicContent = Boolean(
+        anonBase && anonBase.status >= 200 && anonBase.status < 300 &&
+        responseSimilarity(authEx.body, anonBase.body) >= 0.8,
+      )
+      notes.push(`cache deception public-baseline status=${anonBase?.status ?? 'error'} publicContent=${publicContent}`)
+      if (publicContent) return {
+        verdict: anomalies.length > 0 ? 'signal' : 'no_signal',
+        summary: anomalies.length > 0
+          ? 'Cache poisoning or cache deception differential persisted to a clean unauthenticated fetch; build a cache_differential Replay Spec.'
+          : 'No cache poisoning or cache deception persistence observed.',
+        details: { variants: variantsOut, suggestedReplayKind: 'cache_differential' },
+      }
       const verifyRes = await runner.send({
         origin: ctx.origin,
         method: 'GET',
