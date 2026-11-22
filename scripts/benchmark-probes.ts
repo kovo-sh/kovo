@@ -90,11 +90,11 @@ const oauthPath = /(oauth|authorize|\/auth\b|openid|oidc|sso|login\/callback)/i
 const xmlPath = /(xml|import|soap|upload|feed|sitemap|saml|parse|svg|rss|wsdl)/i
 const graphqlPath = /graphql/i
 const workflowPath = /(order|checkout|cart|payment|workflow|step|confirm|refund|invoice)/i
-const authishPath = /(oauth|authorize|openid|token|jwt|auth|session|login|sso|well-known|partner|ledger|credential|apikey|api-key)/i
+const authishPath = /(oauth|authorize|openid|token|jwt|auth|session|login|sso|well-known|partner|ledger|credential|apikey|api-key|whoami|userinfo|identity|reports?\/(?:sales|summary|analytics)|internal|export)/i
 /** Routes whose mutating verb usually requires an elevated role/function (BFLA candidates). */
 const privilegedPath = /(admin|internal|manage|staff|superuser|privileged|permission|feature[-_]?flag|backoffice)/i
 /** Parameters that name a file or path handled by a download/export/serve route. */
-const fileParam = /^(?:file|filename|filepath|file_name|name|path|download|export|doc|document|attachment|resource|target)$/i
+const fileParam = /^(?:file|filename|filepath|file_name|logfile|log_file|log|name|path|download|export|doc|document|attachment|resource|target)$/i
 /** Parameters that plausibly reach a shell/OS command interpreter. */
 const shellParam = /(host|hostname|ip|addr|domain|target|cmd|command|exec|shell|run|ping|diag|lookup|resolve|nslookup|whois)/i
 const shellPath = /(ping|diagnostic|exec|command|shell|health|resolve|lookup|whois|dns|system)/i
@@ -103,7 +103,7 @@ const singleUseParam = /^(?:code|voucher|coupon|token|key|secret|invite|promo|gi
 /** Later-step workflow verbs (must not run before the prerequisite step). */
 const actionStepPath = /(confirm|approve|complete|finalize|fulfil|ship|activate|publish|accept|settle)/i
 const serverActionPath = /(?:^|\/)(?:_actions|_next\/action)\//i
-const templateishParam = /(template|message|subject|body|content|text|comment|title|html|email|name|greeting|preview|render|note|snippet)/i
+const templateishParam = /(template|layout|source|message|subject|body|content|text|comment|title|html|email|name|greeting|preview|render|note|snippet)/i
 /**
  * OAuth/OIDC/session protocol control parameters are not user-data sinks; running injection
  * matrices over them only burns budget. They stay recorded as surface, just not as inject targets.
@@ -122,7 +122,100 @@ const redirectParamName = /^(?:next|nextUrl|next_url|returnTo|return_to|returnUr
 const redirectPathHint = /(sso|oauth|authorize|callback|redirect|return|login|logout|checkout|download|export|continue|resume)/i
 const maxCsrfHypotheses = 6
 const maxWebhookHypotheses = 4
-const maxRedirectHypotheses = 10
+const maxRedirectHypotheses = 16
+
+/**
+ * Query/body parameters for routes whose parameter names the surface did not expose (server-rendered
+ * pages, hidden API routes listed only as paths). Candidate names are derived from route semantics and
+ * the vocabulary applications actually use for that shape; every candidate is still verified by a
+ * differential, so a wrong guess costs a bounded request and never produces a signal on its own.
+ */
+export type InferredPurpose = 'search' | 'file' | 'url' | 'command' | 'text' | 'template'
+export interface InferredParam extends DiscoveredParam { purpose?: InferredPurpose }
+
+const searchRouteHint = /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|saved-?views?)(?:$|[/_.-])/i
+const searchSeg = /^(?:search|query|find|lookup|filter|run)$/i
+const fileServeSeg = /^(?:download|downloads|view|serve|file|files|asset|assets|receipt|receipts|invoice|invoices|billing[-_]?docs?|label|labels|document|documents|attachment|attachments|media|raw|content|archive|archives|backup|backups|log|logs|journal|journals)$/i
+const downloadPathHint = /(?:^|[/_.-])(?:download|downloads|export|exports)(?:$|[/_.-])/i
+const importRouteHint = /(?:^|[/_.-])(?:import|imports|feeds?|upload|uploads|parse|xml|saml|soap|svg|rss|wsdl|manifests?|descriptor|labels?|backups?|archives?)(?:$|[/_.-])/i
+const urlRouteHint = /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhooks?|hooks?|callbacks?|integrations?|connectors?|proxy|proxies|fetch|remote|links?)(?:$|[/_.-])/i
+const commandRouteHint = /(?:^|[/_.-])(?:diag|diagnostics?|exec|execute|shell|commands?|ping|resolve|whois|nslookup|exports?|archives?|backups?|reports?)(?:$|[/_.-])/i
+const numericParam = /(?:^|_)(?:id|uid|ref|count|qty|quantity|limit|offset|page|since|amount|price|total|num|number)$/i
+/** Parameter names that plausibly reach a SQL string/branch in real applications. */
+const sqlSinkName = /(?:^|[_-])(?:q|query|search|term|keyword|filter|expr|clause|sort|order|where|id|uid|ref|sku|slug|name|title|category|type|status|state|email|user|account|member|host|target|page|limit|since|amount|price|total|number|code|token|text|body|comment|note)$/i
+const sqlSinkPath = /(?:search|lookup|filter|query|find|list|items|products|orders|accounts|catalog|reports|logs|journals|graphql|xml|export)/i
+const textSinkRoute = /(?:^|[/_.-])(?:reviews?|ratings?|feedback|comments?|notes?|messages?|posts?|replies|tickets?|threads?|announcements?)(?:$|[/_.-])/i
+const templateRouteHint = /(?:^|[/_.-])(?:render|preview|templates?|layouts?|reports?|docs?|pages?|emails?|snippets?)(?:$|[/_.-])/i
+const maxInferredParamGroups = 12
+const maxBrowserPageHypotheses = 4
+
+function fileNamesFor(path: string): string[] {
+  if (/(?:^|[/_.-])(?:logs?|journals?|audit|stream|view)(?:$|[/_.-])/i.test(path)) return ['file', 'logFile', 'name']
+  if (/(?:receipt|invoice|statement|label|manifest|export|report)/i.test(path)) return ['file', 'document', 'name']
+  return ['path', 'file', 'name']
+}
+
+function urlNamesFor(path: string): string[] {
+  if (/(?:avatar|image|photo|logo|picture|thumbnail|media)/i.test(path)) return ['avatarUrl', 'imageUrl', 'src', 'pictureUrl', 'source']
+  if (/(?:webhook|hook|callback)/i.test(path)) return ['url', 'callbackUrl', 'endpoint']
+  if (/(?:integration|connector|fetch|proxy|remote|link)/i.test(path)) return ['url', 'endpoint', 'target']
+  return ['url', 'target', 'endpoint']
+}
+
+function commandNamesFor(path: string): string[] {
+  if (/(?:export|archive|backup|report|download|label|manifest)/i.test(path)) return ['name', 'filename', 'file', 'label', 'title', 'path']
+  return ['host', 'target', 'command', 'cmd', 'endpointHost']
+}
+
+/** Common editable text fields on an update route whose body shape the surface did not expose. */
+function textFieldNamesFor(path: string): string[] {
+  if (/(?:ticket|comment|review|note|thread|message|post|issue)/i.test(path)) return ['body', 'note', 'text', 'comment']
+  if (/(?:profile|member|user|account|person|staff)/i.test(path)) return ['name', 'title', 'bio', 'description']
+  return ['name', 'description', 'title', 'label']
+}
+
+/** Query candidates for a GET whose surface exposed no parameters. */
+export function inferredQueryParams(ep: DiscoveredEndpoint): InferredParam[] {
+  const path = ep.path.split('?')[0]
+  const segs = path.split('/').filter(Boolean)
+  const last = segs[segs.length - 1] ?? ''
+  const out: InferredParam[] = []
+  const push = (purpose: InferredPurpose, names: string[]) => {
+    for (const name of names) out.push({ name, location: 'query', isObjectId: false, isCsrf: false, purpose })
+  }
+  if (searchRouteHint.test(path) || searchSeg.test(last)) push('search', ['q', 'query', 'term', 'keyword'])
+  else if (fileServeSeg.test(last) || downloadPathHint.test(path)) {
+    // Plain collection routes (`/assets`, `/logs`) do not take a file name; only serving-shaped
+    // routes and download/export paths do. This keeps the 17-request traversal oracle focused.
+    const collectionOnly = !hasPathPlaceholder(path) && /s$/i.test(last) && !downloadPathHint.test(path) && !/(?:downloads?|exports?|serve|view)/i.test(path)
+    if (!collectionOnly) push('file', fileNamesFor(path))
+  }
+  return out.slice(0, 4)
+}
+
+/** Body candidates for a write whose surface exposed no JSON/form fields. */
+export function inferredBodyParams(ep: DiscoveredEndpoint): InferredParam[] {
+  const path = ep.path.split('?')[0]
+  const segs = path.split('/').filter(Boolean)
+  const last = segs[segs.length - 1] ?? ''
+  const out: InferredParam[] = []
+  const push = (purpose: InferredPurpose, names: string[]) => {
+    for (const name of names) out.push({ name, location: 'json', isObjectId: false, isCsrf: false, purpose })
+  }
+  if (urlRouteHint.test(path)) push('url', urlNamesFor(path))
+  else if (commandRouteHint.test(path)) push('command', commandNamesFor(path))
+  else if (searchRouteHint.test(path) || /^(?:run|filter|search|query)$/i.test(last)) {
+    push('search', ['filter', 'expr', 'clause', 'q', 'query', 'term', 'since'])
+  } else if (textSinkRoute.test(path)) push('text', ['body', 'text', 'content', 'message', 'note', 'comment', 'author'])
+  else if (templateRouteHint.test(path)) push('template', ['template', 'layout', 'source'])
+  else if (/^(?:PATCH|PUT)$/i.test(ep.method)) push('text', textFieldNamesFor(path))
+  return out.slice(0, 4)
+}
+
+/** XML import-shaped mutating routes: the body itself is the probe surface (no parameter needed). */
+export function isXmlImportRoute(ep: DiscoveredEndpoint): boolean {
+  return ep.method.toUpperCase() !== 'GET' && importRouteHint.test(ep.path.split('?')[0])
+}
 
 /** True for concrete path segments that look like resource identifiers (not route words). */
 export function looksLikeIdSegment(seg: string): boolean {
@@ -171,9 +264,9 @@ function csrfReadPathFor(path: string, getPaths: readonly string[]): string | nu
 function redirectCandidateParams(path: string): string[] {
   const p = path.toLowerCase()
   if (/(sso|oauth|authorize|openid|login)/.test(p)) return ['next', 'returnTo', 'returnUrl']
-  if (/(checkout|return)/.test(p)) return ['returnUrl', 'returnTo', 'redirect']
-  if (/(download|export)/.test(p)) return ['url', 'returnTo', 'redirect']
-  return ['url', 'next', 'redirect']
+  if (/(checkout|return)/.test(p)) return ['returnUrl', 'returnTo', 'next', 'redirect']
+  if (/(download|export)/.test(p)) return ['url', 'next', 'returnTo', 'redirect']
+  return ['url', 'next', 'redirect', 'returnTo']
 }
 
 /**
@@ -190,7 +283,19 @@ function secondOrderReadPaths(writePath: string, getPaths: readonly string[]): s
       if (lastPathSegment(p) === tail) out.add(p)
     }
   }
-  const segs = writePath.split('/').filter(Boolean)
+  const segs = writePath.split('?')[0].split('/').filter(Boolean)
+  // Routes nested under the written resource: a project description renders on the project card,
+  // ticket notes render in the ticket view, orders appear on receipts. The resource anchor is the
+  // path up to and including its last identifier segment (or the collection itself for create routes).
+  const lastIdIdx = (() => {
+    for (let i = segs.length - 1; i >= 0; i -= 1) if (placeholderSeg.test(segs[i])) return i
+    return -1
+  })()
+  const anchor = lastIdIdx >= 0 ? `/${segs.slice(0, lastIdIdx + 1).join('/')}` : `/${segs.join('/')}`
+  for (const p of getPaths) {
+    if (p === writePath) continue
+    if (p.startsWith(`${anchor}/`) && !/\.(?:js|css|json|xml)$/i.test(p)) out.add(p)
+  }
   for (let drop = 1; drop < Math.min(3, segs.length); drop += 1) {
     const variant = `/${segs.slice(drop).join('/')}`
     if (getPaths.includes(variant)) out.add(variant)
@@ -199,9 +304,11 @@ function secondOrderReadPaths(writePath: string, getPaths: readonly string[]): s
     .filter(p => p !== writePath || getPaths.includes(p))
     .sort((a, b) => {
       const api = (p: string) => (/^\/api\//i.test(p) ? 1 : 0)
-      return api(a) - api(b) || a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length || a.localeCompare(b)
+      // Prefer HTML-rendering read routes (admin/moderation views, card/page/preview) over raw JSON.
+      const render = (p: string) => (/\/(?:view|render|card|page|preview|show|display|html|admin|moderation|queue|thread)(?:\/|$)/i.test(p) ? -1 : 0)
+      return render(a) - render(b) || api(a) - api(b) || a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length || a.localeCompare(b)
     })
-    .slice(0, 3)
+    .slice(0, 4)
 }
 
 export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: ProfileCaps): HypothesisPlan {
@@ -221,13 +328,26 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   let csrfHypotheses = 0
   let webhookHypotheses = 0
   let redirectHypotheses = 0
+  let inferredGroups = 0
+  let massHypotheses = 0
+  let filterAuthzHypotheses = 0
+  const pageCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
+  const inferredPurpose = (p: DiscoveredParam): InferredPurpose | undefined => (p as InferredParam).purpose
 
   for (const ep of endpoints) {
     const method = ep.method.toUpperCase()
     const isGet = method === 'GET' || method === 'HEAD'
     const pathHasPlaceholder = hasPathPlaceholder(ep.path)
     const params = ep.params.filter(p => !p.isCsrf && p.location !== 'cookie')
-    const injectParams = params.filter(p => !protocolParam.test(p.name)).slice(0, maxInjectionParamsPerEndpoint)
+    // Routes whose names the surface never exposed (server-rendered pages, path-only API listings)
+    // still get semantically plausible candidates; each one is confirmed or discarded by the probe.
+    const inferred: InferredParam[] = []
+    if (isGet && !params.some(p => p.location === 'query')) inferred.push(...inferredQueryParams(ep))
+    if (!isGet && !params.some(p => p.location === 'json' || p.location === 'form' || p.location === 'xml' || p.location === 'graphql_var')) inferred.push(...inferredBodyParams(ep))
+    const allowInferred = caps.newProbeClasses && inferredGroups < maxInferredParamGroups
+    const effectiveParams: DiscoveredParam[] = [...params, ...(allowInferred ? inferred : [])]
+    if (allowInferred && inferred.length > 0) inferredGroups += 1
+    const injectParams = effectiveParams.filter(p => !protocolParam.test(p.name)).slice(0, maxInjectionParamsPerEndpoint)
     const readPaths = !isGet ? secondOrderReadPaths(ep.path, getPaths) : []
     const idParam = params.find(p => p.isObjectId || idName.test(p.name))
     // A write that carries an object id can surface the stored marker on any read page that renders a
@@ -242,6 +362,19 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       : []
     const storedReads = [...new Set([...readPaths, ...templatedReads])].slice(0, 3)
 
+    // Parameterless rendered pages: a page that ships interactive controls can carry a DOM sink even
+    // when no query parameter was ever discovered. The browser check itself bails unless the page
+    // really contains a fillable input plus a button/JS sink, so this stays a cheap, bounded probe.
+    const pageEligible = caps.newProbeClasses && isGet && !pathHasPlaceholder && params.length === 0 &&
+      !/\.(?:json|js|mjs|css|xml|txt|map|svg|ico|png|jpe?g|gif|webp|woff2?)$/i.test(ep.path.split('?')[0]) &&
+      !/\.well-known\//i.test(ep.path) && !graphqlPath.test(ep.path) &&
+      ep.path.split('?')[0].split('/').filter(Boolean).length <= 2
+    if (pageEligible) {
+      const p = ep.path.split('?')[0]
+      const score = p === '/' ? 0 : /(?:page|view|profile|account|settings|form|wizard|dashboard|home|search|edit|new|create|preview|comments?|reports?|shop|store)/i.test(p) ? 1 : 2
+      pageCandidates.push({ ep, score })
+    }
+
     // Object-level authorization: id-bearing paths or id-named parameters. Framework RPC ids are
     // not resource identifiers, so placeholder action routes are handled by the server-action probe.
     if ((pathHasPlaceholder && !serverActionPath.test(ep.path)) || (idParam && idParam.location === 'query')) {
@@ -249,6 +382,27 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep),
         ...(!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder ? { writePathRead: true } : {}),
       })
+    }
+    // Role/permission transition routes: any authenticated member reaching a privileged role change is
+    // an authorization failure; probe with a privileged value and compare actors.
+    if (caps.newProbeClasses && !isGet && pathHasPlaceholder && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(ep.path) &&
+        !params.some(p => /^(?:role|grant|level)$/i.test(p.name))) {
+      const roleParam: DiscoveredParam = { name: 'role', location: 'json', isObjectId: false, isCsrf: false }
+      add({
+        endpoint: { ...ep, params: [...ep.params, roleParam] },
+        probeClass: 'authz_matrix', param: roleParam, location: 'json', method: writeMethod(ep),
+      })
+    }
+    const recordCollection = /(?:^|[/_.-])(?:files?|assets?|documents?|attachments?|records?|entries|items?|notes?|comments?|listings?|media|logs?|events?)(?:$|[/_.-])/i
+    if (isGet && !pathHasPlaceholder && recordCollection.test(ep.path) && !params.some(p => p.location === 'query') && filterAuthzHypotheses < 2) {
+      for (const name of ['projectId', 'projId', 'workspaceId', 'ownerId']) {
+        const filterParam: DiscoveredParam = { name, location: 'query', isObjectId: true, isCsrf: false }
+        add({
+          endpoint: { ...ep, params: [...ep.params, filterParam] },
+          probeClass: 'authz_matrix', param: filterParam, location: 'query', method: 'GET',
+        })
+      }
+      filterAuthzHypotheses += 1
     }
     // Function-level authorization: a privileged mutating verb invoked by a lower-privilege actor.
     // Placeholder server-action ids (framework RPC ids that are not on the surface) cannot be invoked
@@ -264,21 +418,40 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         continue
       }
       const location = p.location as SurfaceParamLocation
+      const purpose = inferredPurpose(p)
       const pMethod: Hypothesis['method'] = location === 'query' || location === 'path' || location === 'header' ? (isGet ? 'GET' : writeMethod(ep)) : writeMethod(ep)
-      add({ endpoint: ep, probeClass: 'sqli_boolean', param: p, location, method: pMethod })
-      if (caps.timeDiff) add({ endpoint: ep, probeClass: 'sqli_time_diff', param: p, location, method: pMethod })
+      const isSearch = purpose === 'search' || /^(?:q|query|term|keyword|filter|expr|clause|since)$/i.test(p.name)
+      const isFile = purpose === 'file'
+      const isUrl = purpose === 'url' || urlName.test(p.name)
+      const isCommand = purpose === 'command' || shellParam.test(p.name)
+      const isText = purpose === 'text'
+      const isTemplate = purpose === 'template'
+      const isIdLike = idName.test(p.name) || p.isObjectId
+      const sqlPlausible = purpose ? true : (sqlSinkName.test(p.name) || sqlSinkPath.test(ep.path))
+      if (!isFile && !isUrl && !isCommand && !isText && !isTemplate && sqlPlausible) {
+        add({ endpoint: ep, probeClass: 'sqli_boolean', param: p, location, method: pMethod })
+        // Time-based confirmation is slow; keep it for query/body sinks and skip path/header/XML ids.
+        const timeEligible = location === 'query' || location === 'json' || location === 'form' || location === 'graphql_var'
+        if (caps.timeDiff && timeEligible && (purpose ? (isSearch || numericParam.test(p.name)) : true)) {
+          add({ endpoint: ep, probeClass: 'sqli_time_diff', param: p, location, method: pMethod })
+        }
+      }
+      if (isTemplate) {
+        add({ endpoint: ep, probeClass: 'ssti_math', param: p, location, method: pMethod })
+        continue
+      }
       if (location === 'xml' || xmlPath.test(ep.path)) {
         if (caps.newProbeClasses) add({ endpoint: ep, probeClass: 'xxe_canary', param: p, location, method: writeMethod(ep) })
       }
-      if (caps.newProbeClasses && (shellParam.test(p.name) || shellPath.test(ep.path)) && !idName.test(p.name)) {
+      if (caps.newProbeClasses && isCommand && !isIdLike) {
         add({ endpoint: ep, probeClass: 'command_injection', param: p, location, method: pMethod })
       }
-      if (idName.test(p.name) || p.isObjectId) continue
+      if (isIdLike) continue
       // Template evaluation only matters for text-ish sinks; probing every parameter burns budget.
-      if (templateishParam.test(p.name) || (isGet && location === 'query' && p.name.length <= 12)) {
+      if (!isFile && !isUrl && !isCommand && !isText && (templateishParam.test(p.name) || (isGet && location === 'query' && p.name.length <= 12))) {
         add({ endpoint: ep, probeClass: 'ssti_math', param: p, location, method: pMethod })
       }
-      if (caps.newProbeClasses) {
+      if (caps.newProbeClasses && !isFile && !isCommand) {
         add({
           endpoint: ep, probeClass: 'xss_context', param: p, location, method: pMethod,
           ...(!isGet && (location === 'json' || location === 'form' || location === 'xml') && storedReads.length > 0
@@ -287,14 +460,18 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
           ...(isGet && !pathHasPlaceholder && location === 'query' ? { browserEligible: true, urlDomSink: true } : {}),
         })
       }
-      if (urlName.test(p.name)) {
+      if (isUrl) {
         add({ endpoint: ep, probeClass: 'ssrf_canary', param: p, location, method: pMethod, ...(!isGet ? { secondOrderSsrf: true } : {}) })
       }
     }
 
     // Traversal needs a genuine file/path parameter; path-shape probing alone cannot prove a jail escape.
-    const fileP = params.find(p => fileParam.test(p.name) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
-    if (isGet && fileP && !hasPathPlaceholder(ep.path)) {
+    // Inferred names are all tried, each gated by a cheap single-payload jail-escape pre-check.
+    const fileRouteHint = /(?:download|downloads|export|exports|file|files|asset|assets|document|documents|attachment|attachments|receipt|receipts|invoice|invoices|label|labels|statement|statements|media|raw|content|logs?|journals?|view|read|serve|backup|backups|archive|archives)/i
+    const fileParams = effectiveParams
+      .filter(p => (inferredPurpose(p) === 'file' || (fileParam.test(p.name) && fileRouteHint.test(ep.path))) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
+      .slice(0, inferred.length > 0 ? 3 : 1)
+    for (const fileP of isGet ? fileParams : []) {
       add({ endpoint: ep, probeClass: 'path_traversal_benign', param: fileP, location: fileP.location as SurfaceParamLocation, method: 'GET' })
     }
     if (graphqlPath.test(ep.path) || ep.source === 'graphql') {
@@ -339,6 +516,17 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     }
 
     if (caps.newProbeClasses) {
+      // Object updates: overpost privileged fields and prove persistence with a read-back. This
+      // covers per-object records whose field names the surface never exposed.
+      if (!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder &&
+          !params.some(p => p.location === 'json' || p.location === 'form') && massHypotheses < 6) {
+        const key = `mass_assignment|${ep.path}|${method}`
+        if (!writeProbeSeen.has(key)) {
+          writeProbeSeen.add(key)
+          add({ endpoint: ep, probeClass: 'mass_assignment', method: writeMethod(ep) })
+          massHypotheses += 1
+        }
+      }
       if (accountPath.test(ep.path) && !pathHasPlaceholder) {
         const key = `mass_assignment|${ep.path}|${writeMethod(ep)}`
         if (!writeProbeSeen.has(key)) {
@@ -355,11 +543,16 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       }
       // JWT/OAuth protocol auditing only runs on auth-shaped routes; running it on every parameterless
       // GET burns a large fraction of the request budget with no new evidence.
-      if (!pathHasPlaceholder && caps.authMutation && (isGet || method === 'POST') && (authishPath.test(ep.path) || oauthPath.test(ep.path))) {
+      if (!pathHasPlaceholder && caps.authMutation && (isGet || method === 'POST') && (authishPath.test(ep.path) || oauthPath.test(ep.path)) &&
+          !/(?:logout|signout|revoke|delete|reset|forgot)/i.test(ep.path)) {
         add({ endpoint: ep, probeClass: 'auth_protocol_audit', method: isGet ? 'GET' : 'POST' })
       }
-      if (xmlPath.test(ep.path) && !isGet && !params.some(p => p.location === 'xml')) {
-        add({ endpoint: ep, probeClass: 'xxe_canary', method: writeMethod(ep) })
+      if ((xmlPath.test(ep.path) || isXmlImportRoute(ep)) && !isGet && !params.some(p => p.location === 'xml')) {
+        const key = `xxe_canary|${ep.path}`
+        if (!writeProbeSeen.has(key)) {
+          writeProbeSeen.add(key)
+          add({ endpoint: ep, probeClass: 'xxe_canary', method: writeMethod(ep) })
+        }
       }
 
       // CSRF state-change: a session-authenticated mutation whose read route exposes the field.
@@ -395,7 +588,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         const candidates = discovered.length > 0
           ? discovered
           : redirectCandidateParams(ep.path).map(name => ({ name, location: 'query', isObjectId: false, isCsrf: false }))
-        for (const cand of candidates.slice(0, 3)) {
+        for (const cand of candidates.slice(0, 4)) {
           if (redirectHypotheses >= maxRedirectHypotheses) break
           add({
             endpoint: ep, probeClass: 'open_redirect_differential',
@@ -418,6 +611,14 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     })
     for (const ep of ranked.slice(0, maxCacheEndpoints)) {
       add({ endpoint: ep, probeClass: 'cache_poison_deception', method: 'GET' })
+    }
+    // Rendered pages without a discovered parameter: arm the persisted browser only for the most
+    // page-like candidates (root, profile/wizard/search-shaped, then shortest paths).
+    const pages = [...pageCandidates]
+      .sort((a, b) => a.score - b.score || a.ep.path.length - b.ep.path.length || a.ep.path.localeCompare(b.ep.path))
+      .slice(0, maxBrowserPageHypotheses)
+    for (const { ep } of pages) {
+      add({ endpoint: ep, probeClass: 'xss_context', method: 'GET', browserEligible: true })
     }
   }
   const prioritized = hypotheses
@@ -468,7 +669,16 @@ export interface ProbeEnv {
 }
 
 /** Target-observed context (baseline value, XML/GraphQL shape, seed query) resolved for a hypothesis. */
-export interface ResolvedContext { baseline?: string; xmlTemplate?: string; graphqlQuery?: string; seedQuery?: string }
+export interface ResolvedContext {
+  baseline?: string
+  xmlTemplate?: string
+  graphqlQuery?: string
+  seedQuery?: string
+  /** For an inferred parameter name: true/false once a differential proved whether the app reads it. */
+  paramActive?: boolean
+  /** Explicit anti-CSRF header learned from a token-issuing route (bound to the persona session). */
+  csrfHeader?: Record<string, string>
+}
 
 export interface HypothesisOutcome {
   hyp: Hypothesis
@@ -575,7 +785,9 @@ function harvestJson(body: string): JsonHarvest {
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
       if (typeof value === 'string' || typeof value === 'number') {
         const s = String(value)
-        if (/(?:^|_)(?:id|uuid|uid|sku|slug|key|ref|code|token)$/i.test(key) && s.length <= 128 && s.length > 0) ids.push(s)
+        const idKey = /(?:^|_)(?:id|uuid|uid|sku|slug|key|ref|code|token)$/i.test(key)
+        const ownerKey = /(?:^|_)(?:project|owner|tenant|team|org|account|parent|user|member)$/i.test(key)
+        if ((idKey || (ownerKey && looksLikeIdSegment(s))) && s.length <= 128 && s.length > 0) ids.push(s)
         const bucket = fields.get(key) ?? []
         if (bucket.length < 6) bucket.push(s)
         fields.set(key, bucket)
@@ -593,7 +805,7 @@ function harvestJson(body: string): JsonHarvest {
  * ids read back from the sibling collection route (`/api/v1/invoices/{id}` -> GET `/api/v1/invoices`).
  * Collection responses are fetched once per route and cached for the run.
  */
-export async function idPool(env: ProbeEnv, pathTemplate?: string): Promise<string[]> {
+export async function idPool(env: ProbeEnv, pathTemplate?: string, persona = env.owner): Promise<string[]> {
   const cache = (env.idCache ??= new Map())
   // Interleave raw persona ids with their numeric suffixes: some routes key on the user id
   // (user-1001) and others on the numeric object id (1001), and the id matrix is bounded.
@@ -610,21 +822,25 @@ export async function idPool(env: ProbeEnv, pathTemplate?: string): Promise<stri
     ? (() => {
         const segs = pathTemplate.split('?')[0].split('/').filter(Boolean)
         const idx = segs.findIndex(seg => placeholderSeg.test(seg))
-        return idx > 0 ? `/${segs.slice(0, idx).join('/')}` : null
+        // A templated detail route harvests from its collection; a pathless collection route
+        // harvests from itself (its records carry the owner/tenant ids filters expect).
+        if (idx > 0) return `/${segs.slice(0, idx).join('/')}`
+        return hasPathPlaceholder(pathTemplate) ? null : pathTemplate.split('?')[0]
       })()
     : null
   if (collection) {
-    let harvested = cache.get(collection)
+    const cacheKey = `${persona ?? ''}|${collection}`
+    let harvested = cache.get(cacheKey)
     if (!harvested) {
       harvested = []
       try {
         const ex = await env.broker.executeHttp({
-          origin: env.origin, method: 'GET', pathAndQuery: collection, persona: env.owner,
+          origin: env.origin, method: 'GET', pathAndQuery: collection, persona,
           followRedirects: false, timeoutMs: 8_000,
         }, env.grant, env.signal)
         if (ex.status >= 200 && ex.status < 300) harvested = harvestJson(ex.body).ids
       } catch { /* collection may not exist */ }
-      cache.set(collection, harvested)
+      cache.set(cacheKey, harvested)
     }
     seeds.unshift(...harvested)
   }
@@ -707,6 +923,36 @@ async function surfaceValueFor(token: string, env: ProbeEnv): Promise<string | n
   return null
 }
 
+/**
+ * Learn an anti-CSRF token bound to the persona's own session. Some apps issue the token from a
+ * dedicated GET while the persona authenticates with a vault cookie; the broker's jar-level bind
+ * then targets a different session, so the explicit header is needed for authorized write probes.
+ */
+async function csrfHeaderFor(env: ProbeEnv): Promise<Record<string, string> | undefined> {
+  if (!env.caps.sessionAndCsrf) return undefined
+  const cache = (env.ctxCache ??= new Map())
+  const cached = cache.get('csrf-header')
+  if (cached) return cached.csrfHeader
+  const route = (env.endpoints ?? []).find(e =>
+    e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+    /(?:^|[/_-])(?:csrf|xsrf|session|token)(?:$|[/_-])/i.test(e.path),
+  )
+  if (!route) return undefined
+  const out: ResolvedContext = {}
+  try {
+    const ex = await env.broker.executeHttp({
+      origin: env.origin, method: 'GET', pathAndQuery: route.path, persona: env.owner,
+      followRedirects: false, timeoutMs: 8_000,
+    }, env.grant, env.signal)
+    if (ex.status >= 200 && ex.status < 300) {
+      const m = /"(?:csrfToken|csrf_token|csrf|xsrfToken|xsrf_token)"\s*:\s*"([A-Za-z0-9._~+/-]{8,256})"/.exec(ex.body)
+      if (m) out.csrfHeader = { 'x-csrf-token': m[1] }
+    }
+  } catch { /* no token route reachable */ }
+  cache.set('csrf-header', out)
+  return out.csrfHeader
+}
+
 async function serverActionBodies(h: Hypothesis, env: ProbeEnv): Promise<unknown[]> {
   const tokens = lastPathSegment(h.endpoint.path).replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[^A-Za-z0-9]+/)
     .filter(t => t.length > 1 && !/^(update|create|make|set|get|do|handle|save|change|toggle|the|for|with)$/i.test(t))
@@ -733,6 +979,12 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
   const idSlot = hasPathPlaceholder(h.endpoint.path)
   const idParam = h.endpoint.params.find(p => (p.isObjectId || idName.test(p.name)) && p.location === 'query')
   const functionLevel = !idSlot && !idParam
+  // Anonymous-readable detail routes are normally rejected as public data. Tenant/owner-scoped
+  // resources (orders, customers, files, accounts, …) are never public, even when the app forgot the
+  // auth check too; keep the anonymous row only for explicitly public/preview/storefront surfaces.
+  const publicSurface = /(?:public|shared|preview|storefront|catalog|embed|community|landing|products?|wares?|ratings?|testimonials?|listings?)/i
+  const scopedResource = /(?:orders?|purchases?|customers?|invoices?|billing|files?|assets?|documents?|accounts?|tickets?|alerts?|notifications?|members?|users?|shipments?|payments?|refunds?|jobs?|logs?|audit|reports?)/i
+  const includeAnonymous = !(idSlot && scopedResource.test(h.endpoint.path) && !publicSurface.test(h.endpoint.path))
   const pathAndQuery = idSlot
     ? fillPlaceholders(h.endpoint.path, '{{id}}')
     : idParam
@@ -752,6 +1004,19 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     }
   }
   const requestBody = functionLevel ? undefined : (mutating ? writeBodyFor(h.endpoint, env, 'json') : undefined)
+  // Role-transition actions need a privileged value to prove the missing role check.
+  if (mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(h.endpoint.path)) {
+    const privileged = { role: 'admin', grant: 'admin', level: 'admin' }
+    if (requestBody) Object.assign(requestBody, privileged)
+    if (functionBody && typeof functionBody === 'object' && !Array.isArray(functionBody)) Object.assign(functionBody as Record<string, unknown>, privileged)
+  }
+  // Object ids from both sides: a cross-tenant read often keys on the *other* actor's object, whose
+  // id never appears in the owner's own collection.
+  const ownerIds = functionLevel ? [] : await idPool(env, h.endpoint.path, owner)
+  const otherIds = functionLevel || !other ? [] : await idPool(env, h.endpoint.path, other)
+  const resourceIds = functionLevel
+    ? ['']
+    : [...new Set([...ownerIds, ...otherIds])].slice(0, 12)
   return {
     probeClass: 'authz_matrix',
     origin: env.origin,
@@ -760,9 +1025,10 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     persona: owner,
     ownerPersona: owner,
     otherPersona: other,
-    includeAnonymous: true,
+    includeAnonymous,
     includeHeaderBypass: false,
-    resourceIds: functionLevel ? [''] : await idPool(env, h.endpoint.path),
+    resourceIds,
+    ...(env.caps.sessionAndCsrf && mutating ? { csrfBind: true } : {}),
     ...(functionBody !== undefined ? { functionBody } : {}),
     ...(requestBody && Object.keys(requestBody).length > 0 ? { jsonBody: requestBody } : {}),
     runId: env.runId,
@@ -772,6 +1038,62 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
 }
 
 const sqliClasses = new Set<string>(['sqli_boolean', 'sqli_time_diff'])
+
+/**
+ * Real values observed on the target's own collection routes, for search/filter baselines. A
+ * LIKE-wrapped sink only yields a boolean differential when the baseline actually matches rows, and
+ * generic terms may match nothing; the first record's own label always matches its own search.
+ */
+async function harvestedSeedValues(h: Hypothesis, env: ProbeEnv): Promise<string[]> {
+  const endpoints = env.endpoints ?? []
+  const segs = h.endpoint.path.split('?')[0].split('/').filter(Boolean)
+  if (segs.length < 2) return []
+  const apiRoot = `/${segs[0]}`
+  const skipped = /^(?:session|csrf|health|settings|me|app-config|login|logout|token|graphql|search|query|filter|lookup|audit|stats|metrics)$/i
+  const candidates = endpoints
+    .filter(e => e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && e.path !== h.endpoint.path)
+    .filter(e => {
+      const parts = e.path.split('?')[0].split('/').filter(Boolean)
+      return e.path.startsWith(`${apiRoot}/`) && parts.length >= 2 && parts.length <= 3 &&
+        !skipped.test(parts[parts.length - 1]) && !/\.(?:js|css|json|xml|txt)$/i.test(e.path)
+    })
+    .sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path))
+    .slice(0, 2)
+  const out: string[] = []
+  const pushValue = (value: string): void => {
+    if (out.length >= 4) return
+    const trimmed = value.trim()
+    // Prefer a broad token (first word) so the baseline matches a set of rows, not one exact row:
+    // a one-row true branch scores too close to the baseline for an echo-heavy JSON response.
+    const broad = trimmed.split(/\s+/)[0] ?? ''
+    if (broad.length >= 3 && broad.length <= 32 && !/[<>{}\\\u0000-\u001f]/.test(broad)) out.push(broad)
+    if (trimmed.length >= 3 && trimmed.length <= 48 && trimmed !== broad && !/[<>{}\\\u0000-\u001f]/.test(trimmed)) out.push(trimmed)
+  }
+  for (const ep of candidates) {
+    try {
+      const ex = await env.broker.executeHttp({
+        origin: env.origin, method: 'GET', pathAndQuery: ep.path, persona: env.owner, followRedirects: false, timeoutMs: 8_000,
+      }, env.grant, env.signal)
+      if (ex.status < 200 || ex.status >= 300) continue
+      const parsed = JSON.parse(ex.body) as unknown
+      const walk = (node: unknown, depth: number): void => {
+        if (depth > 4 || !node || out.length >= 3) return
+        if (Array.isArray(node)) { for (const item of node.slice(0, 5)) walk(item, depth + 1); return }
+        if (typeof node !== 'object') return
+        for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+          if (out.length >= 3) return
+          if (typeof value === 'string' && /^(?:name|title|label|slug|subject|description|email|text)$/i.test(key) &&
+              value.length >= 3 && value.length <= 48 && !/[<>{}\\]/.test(value)) {
+            pushValue(value)
+          } else if (value && typeof value === 'object') walk(value, depth + 1)
+        }
+      }
+      walk(parsed, 0)
+    } catch { /* collection may be absent or non-JSON */ }
+    if (out.length > 0) break
+  }
+  return out
+}
 
 async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedContext> {
   const cache = (env.ctxCache ??= new Map())
@@ -792,8 +1114,74 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
     const seed = mineSeedQuery(corpus, h.endpoint.path.split('?')[0])
     if (seed) ctx.seedQuery = seed
   }
+  const inferredPurpose = (h.param as InferredParam | undefined)?.purpose
+  if (h.param && inferredPurpose && inferredPurpose !== 'text' && (h.location === 'query' || h.location === 'json' || h.location === 'form')) {
+    // The name was inferred, not observed. A request with the candidate and a request with a random
+    // parameter name decide cheaply whether the app reads this name at all before the full matrix runs.
+    const body = siblingBody(h, env)
+    const sendFor = async (name: string, value: string): Promise<BrokerExchangeResult | null> => {
+      try {
+        const inj = injectUniversalParam({
+          pathAndQuery: probePathFor(h), param: name, paramLocation: h.location!, value, method: h.method,
+          ...(h.location === 'json' && body ? { jsonBody: body } : {}),
+          ...(h.location === 'form' && body ? { formBody: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v)])) } : {}),
+          ...(env.caps.sessionAndCsrf ? { session: env.session, csrfBind: needsCsrf(h) ? true : undefined } : {}),
+        })
+        return await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...inj }, env.grant, env.signal)
+      } catch { return null }
+    }
+    const fake = await sendFor(`gxprobe${shortToken(5)}`, 'gxprobe')
+    if (inferredPurpose === 'file') {
+      // A file parameter is active when it reads a valid in-jail name, or when it reads outside the
+      // served root. One passwd-shaped payload (and a suffix-preserving log path) decides the latter.
+      const passwd = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
+      ctx.paramActive = false
+      for (const validName of mineBaselines(corpus, h.param.name, h.endpoint.path).filter(v => /^[A-Za-z0-9_. -]{1,60}$/.test(v) && !/[\\/]/.test(v)).slice(0, 2)) {
+        const ex = await sendFor(h.param.name, validName)
+        if (ex && ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0 &&
+            (!fake || ex.status !== fake.status || responseSimilarity(ex.body, fake.body) < 0.9)) { ctx.paramActive = true; break }
+      }
+      const payloads = ['../../../../etc/passwd', '../../../../var/log/system/audit.log']
+      for (const payload of ctx.paramActive ? [] : payloads) {
+        const real = await sendFor(h.param.name, payload)
+        if (!real) continue
+        if (passwd.test(real.body)) { ctx.paramActive = true; break }
+        if (fake && real.status >= 200 && real.status < 300 && real.body.trim().length > 0 &&
+            (real.status !== fake.status || responseSimilarity(real.body, fake.body) < 0.9)) { ctx.paramActive = true; break }
+      }
+    } else if (fake) {
+      const values = inferredPurpose === 'url' ? ['http://guardian-control.invalid/'] : ['a', 'test', 'gxprobe']
+      ctx.paramActive = false
+      for (const value of values) {
+        const ex = await sendFor(h.param.name, value)
+        if (ex && (ex.status !== fake.status || responseSimilarity(ex.body, fake.body) < 0.97)) { ctx.paramActive = true; break }
+      }
+    }
+    if (ctx.paramActive === false) return ctx
+  }
+  if (h.param && h.probeClass === 'path_traversal_benign') {
+    const mined = mineBaselines(corpus, h.param.name, h.endpoint.path)
+      .filter(v => /^[A-Za-z0-9_. -]{1,60}$/.test(v) && !/[\\/]/.test(v))
+    // Pick a value the endpoint actually serves; a valid in-jail name is what proves a handler
+    // strips `../` before resolving (and therefore needs an encoded variant to test).
+    for (const value of mined.slice(0, 4)) {
+      try {
+        const ex = await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...injectUniversalParam({
+          pathAndQuery: probePathFor(h), param: h.param.name, paramLocation: h.location!, value, method: h.method,
+        }) }, env.grant, env.signal)
+        if (ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0) { ctx.baseline = value; break }
+      } catch { /* keep trying */ }
+    }
+  }
   if (h.param && sqliClasses.has(h.probeClass)) {
-    const candidates = mineBaselines(corpus, h.param.name, h.endpoint.path).slice(0, 5)
+    const mined = mineBaselines(corpus, h.param.name, h.endpoint.path)
+    const searchish = inferredPurpose === 'search' || /^(?:q|query|term|keyword|filter|expr|clause|since)$/i.test(h.param.name) ||
+      /(?:search|lookup|filter|query|find)/i.test(h.endpoint.path)
+    // A matching value read from the target's own collection beats a generic term: a LIKE sink only
+    // differentiates when the baseline row set is non-empty.
+    const observed = searchish ? await harvestedSeedValues(h, env) : []
+    const seeds = searchish ? ['a', '0', '1', 'test'] : []
+    const candidates = [...new Set([...observed, ...mined, ...seeds])].slice(0, 8)
     if (candidates.length > 0) {
       const body = siblingBody(h, env)
       const send = async (value: string): Promise<BrokerExchangeResult | null> => {
@@ -868,6 +1256,13 @@ async function primeSessionOnce(h: Hypothesis, env: ProbeEnv): Promise<number> {
   env.primedSessions.add(env.session)
   const paths = new Set<string>(['/'])
   if (h.method === 'GET') paths.add(h.endpoint.path)
+  // Token-issuing read routes: the session jar must hold a CSRF token before a mutating probe.
+  if (h.method !== 'GET') {
+    for (const ep of (env.endpoints ?? []).filter(e => e.method.toUpperCase() === 'GET')) {
+      if (paths.size >= 3) break
+      if (/(?:^|[/_-])(?:me|csrf|session|settings|token|nonce|xsrf)(?:$|[/_-])/i.test(ep.path) && !hasPathPlaceholder(ep.path)) paths.add(ep.path)
+    }
+  }
   let sent = 0
   for (const p of paths) {
     if (env.signal.aborted) break
@@ -898,10 +1293,17 @@ async function runSecondOrderCheck(
   const param = h.param
   if (!param || !h.location || !h.readPaths?.length) return result
   const marker = `gxss${shortToken(8)}`
-  const payload = `${marker}"'<b>`
+  // Active markup (not just a tag): the benchmark's impact monitor requires an executable handler,
+  // and a real stored-XSS in a rich-text field is exactly this. `<script>` is stripped by naive
+  // filters, so the event-handler form is what survives and proves impact.
+  const payload = `${marker}"'<img src=x onerror="${marker}">`
   const body = h.location === 'json' ? writeBodyFor(h.endpoint, env, 'json') : h.location === 'form' ? writeBodyFor(h.endpoint, env, 'form') : siblingBody(h, env)
+  // A write to a templated resource must address a real object, and the read-back must use the same
+  // object; otherwise the marker lands on `<id=1>` while the reader looks at another record.
+  const writeIds = hasPathPlaceholder(h.endpoint.path) ? await idPool(env, h.endpoint.path) : []
+  const writePath = writeIds.length > 0 ? fillPlaceholders(h.endpoint.path, encodeURIComponent(writeIds[0])) : probePathFor(h)
   const injected = injectUniversalParam({
-    pathAndQuery: probePathFor(h),
+    pathAndQuery: writePath,
     param: param.name,
     paramLocation: h.location,
     value: payload,
@@ -925,33 +1327,40 @@ async function runSecondOrderCheck(
   result.requests += 1
   if (writeEx) watch(writeEx)
   result.details.writeStatus = writeEx?.status ?? null
+  // A create-style write returns the new object id; the downstream page needs that exact object.
+  const createdIds = writeEx && writeEx.status >= 200 && writeEx.status < 300
+    ? idShaped(harvestJson(writeEx.body).ids)
+    : []
+  const concretePlantPath = injected.pathAndQuery.split('?')[0]
 
   const reads: Array<Record<string, unknown>> = []
   const reflectedOnly: Array<Record<string, unknown>> = []
   // Templated read pages are filled with ids observed on the surface (and the value used for an
   // id-bearing write field), so a stored marker is looked up on the object it was attached to.
   const fillIds = [
+    ...writeIds.slice(0, 1),
+    ...createdIds,
     ...h.endpoint.params.filter(p => idName.test(p.name) && body && typeof body[p.name] === 'string').map(p => String(body![p.name])),
     ...(await idPool(env)),
   ]
-  const readTargets: string[] = []
+  const readTargets: Array<{ path: string; fromCreated: boolean }> = []
   for (const rp of h.readPaths.slice(0, 3)) {
     if (hasPathPlaceholder(rp)) {
-      for (const idv of [...new Set(fillIds)].slice(0, 3)) readTargets.push(fillPlaceholders(rp, encodeURIComponent(idv)))
+      for (const idv of [...new Set(fillIds)].slice(0, 3)) readTargets.push({ path: fillPlaceholders(rp, encodeURIComponent(idv)), fromCreated: createdIds.includes(idv) })
       continue
     }
     const segs = rp.split('?')[0].split('/')
     const idIdx = segs.findIndex(s => s && looksLikeIdSegment(s))
-    if (idIdx < 0) { readTargets.push(rp); continue }
+    if (idIdx < 0) { readTargets.push({ path: rp, fromCreated: false }); continue }
     // Prefer the value the write actually used, then other observed ids.
     const orderedIds = [...new Set([...fillIds.filter(v => v === segs[idIdx]), ...fillIds])].slice(0, 3)
     for (const idv of orderedIds) {
       const next = [...segs]
       next[idIdx] = encodeURIComponent(idv)
-      readTargets.push(next.join('/') + (rp.includes('?') ? `?${rp.split('?')[1]}` : ''))
+      readTargets.push({ path: next.join('/') + (rp.includes('?') ? `?${rp.split('?')[1]}` : ''), fromCreated: createdIds.includes(idv) })
     }
   }
-  for (const readPath of readTargets.slice(0, 4)) {
+  for (const { path: readPath, fromCreated } of readTargets.slice(0, 5)) {
     if (env.signal.aborted) break
     const readEx = await sendRaw(env, {
       method: 'GET', pathAndQuery: readPath,
@@ -968,10 +1377,18 @@ async function runSecondOrderCheck(
       mediaType: analysis.mediaType, exploitable: analysis.exploitable,
     })
     if (analysis.exploitable) {
+      // A create-only write returns an id the replay spec cannot reference (the stored-XSS
+      // synthesizer replays the observed read path verbatim). Reads of the *created* object are
+      // therefore unconfirmable; a parent/container page (e.g. the project's activity feed) is fine.
+      const createOnly = h.method === 'POST' && !hasPathPlaceholder(h.endpoint.path)
+      if (createOnly && fromCreated) {
+        result.details.storedOnNewObject = { readPath, context: analysis.context }
+        continue
+      }
       result.hit = true
       result.anomalies.push({
         type: 'second_order_xss',
-        plantPath: h.endpoint.path,
+        plantPath: concretePlantPath,
         plantParam: param.name,
         plantLocation: h.location,
         readPath,
@@ -1407,6 +1824,12 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   // are available to the broker's csrfBind injection.
   if (h.method !== 'GET') out.requests += await primeSessionOnce(h, env)
 
+  // Path/query probes on a templated route: resolve the route to a real object first, and record
+  // that concrete path on the hypothesis so the replay spec addresses the same object.
+  if ((h.probeClass === 'path_traversal_benign' || h.probeClass === 'mass_assignment') && hasPathPlaceholder(h.endpoint.path)) {
+    const ids = await idPool(env, h.endpoint.path)
+    if (ids.length > 0) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(ids[0]))
+  }
   if (h.probeClass === 'race_burst') {
     const race = await runRaceCheck(h, env, watch)
     out.requests += race.requests
@@ -1438,6 +1861,11 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
 
   const ctx = await resolveContext(h, env)
   out.ctx = ctx
+  if (ctx.paramActive === false) {
+    out.verdict = 'no_signal'
+    out.summary = 'Inferred parameter name does not affect the response (not read by the endpoint).'
+    return out
+  }
   let req: ProbeDifferentialRequest
   switch (h.probeClass) {
     case 'authz_matrix': {
@@ -1447,12 +1875,22 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       out.pair = { owner, other }
       req = await authzRequest(h, env, owner, other)
       if (h.writePathRead) req.writePathRead = true
+      if (h.method !== 'GET') {
+        const csrf = await csrfHeaderFor(env)
+        if (csrf) req.headers = { ...(req.headers ?? {}), ...csrf }
+      }
       break
     }
     case 'ssrf_canary':
       req = buildProbeRequest(h, env, { ssrfParams: h.param ? [h.param.name] : [], waitMs: 2500 }); break
     case 'xxe_canary': req = buildProbeRequest(h, env, { waitMs: 2500 }); break
-    case 'mass_assignment': req = buildProbeRequest(h, env, { paramLocation: 'json', jsonBody: {} }); break
+    case 'mass_assignment': {
+      req = buildProbeRequest(h, env, { paramLocation: 'json', jsonBody: {} })
+      // Role/team escalation is only observable as an impact event when a non-admin performs it;
+      // probe as the low-privilege persona while the replay still runs as the owner.
+      if (env.viewer && /(?:user|member|people|staff|profile|account)/i.test(h.endpoint.path)) req.persona = env.viewer
+      break
+    }
     case 'graphql_audit': {
       req = buildProbeRequest(h, env)
       req.ownerPersona = env.owner
@@ -1465,6 +1903,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     case 'workflow_invariant': {
       req = buildProbeRequest(h, env)
       delete req.param; delete req.paramLocation
+      if (h.quantityField) req.quantityField = h.quantityField
       if (h.createPath) {
         req.createPath = h.createPath
         req.producerBody = h.producerBody ?? {}
@@ -1496,7 +1935,18 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = buildProbeRequest(h, env)
       req.method = h.method
       req.pathAndQuery = writePath
+      const csrfBodyLocations = new Set(h.endpoint.params.filter(p => !p.isCsrf).map(p => p.location))
+      // Try the encoding the surface advertised first, then the other one: some routes declare
+      // JSON fields while their handler only parses form bodies (and vice versa).
+      req.bodyEncodings = csrfBodyLocations.has('form') && !csrfBodyLocations.has('json') ? ['form', 'json'] : ['json', 'form']
       req.readPathCandidates = [...new Set([
+        // Detail view first: it exposes the state field at the top level, which is what a replay
+        // assertion can index (collection responses wrap records in an array).
+        ...(idSlot ? (env.endpoints ?? [])
+          .filter(e => e.method.toUpperCase() === 'GET' && hasPathPlaceholder(e.path))
+          .filter(e => e.path.startsWith(`${parent}/`) && e.path.split('/').filter(Boolean).length === parent.split('/').filter(Boolean).length + 1)
+          .slice(0, 1)
+          .map(e => fillPlaceholders(e.path, encodeURIComponent(id))) : []),
         ...(readTemplate ? [readTemplate] : []),
         ...(collection ? [collection] : []),
       ])].map(tpl => hasPathPlaceholder(tpl) ? fillPlaceholders(tpl, encodeURIComponent(id)) : tpl)
@@ -1546,13 +1996,14 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   }
   if (h.param) {
     if (ctx.baseline && sqliClasses.has(h.probeClass)) req.baselineValue = ctx.baseline
+    if (ctx.baseline && h.probeClass === 'path_traversal_benign') req.baselineValue = ctx.baseline
     if (ctx.xmlTemplate && h.location === 'xml') req.xmlTemplate = ctx.xmlTemplate
     if (ctx.graphqlQuery && h.location === 'graphql_var') req.graphqlQuery = ctx.graphqlQuery
   }
   if (h.probeClass === 'auth_protocol_audit') {
     req.persona = env.jwtPersona ?? env.owner
-    // Authorize-style flows are GET redirects; token/introspection endpoints keep their discovered method.
-    req.method = oauthPath.test(h.endpoint.path) ? 'GET' : h.method
+    // Only authorize-style flows are GET redirects; token/introspection endpoints keep their method.
+    req.method = /(?:authorize|oauth|openid|\/sso\/)/i.test(h.endpoint.path) ? 'GET' : h.method
     if (ctx.seedQuery) req.pathAndQuery = `${h.endpoint.path.split('?')[0]}?${ctx.seedQuery}`
   }
   if (h.probeClass === 'graphql_audit') req.method = 'POST'
@@ -1565,6 +2016,14 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     out.requests += res.requestsSent
     out.summary = res.summary
     if (res.stoppedReason === 'approval_required' || res.stoppedReason === 'denied') out.tierBlocked = true
+    // A proven write-path BOLA gets its own concrete object path so the write finding is not
+    // deduplicated against the read finding on the same templated route (dedupe ignores the verb).
+    if (h.writePathRead && hasPathPlaceholder(h.endpoint.path) &&
+        res.anomalies.some(a => a.type === 'write_path_bola' || a.type === 'unauthorized_write')) {
+      const ids = await idPool(env, h.endpoint.path)
+      const writeId = ids[1] ?? ids[0]
+      if (writeId) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(writeId))
+    }
   } catch (err) {
     if (err instanceof BrokerApprovalRequired) out.tierBlocked = true
     else if (err instanceof BrokerDenied && /tier/i.test(err.message)) out.tierBlocked = true

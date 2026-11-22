@@ -987,6 +987,8 @@ export interface ProbeDifferentialRequest {
   csrfPrimePaths?: string[]
   /** Ordered read routes for CSRF state proof (detail page, parent, collection list). */
   readPathCandidates?: string[]
+  /** Body encodings the endpoint actually accepts; the CSRF probe must not send a mismatched one. */
+  bodyEncodings?: Array<'json' | 'form'>
   /** Identifier used to locate the mutated record inside a collection read. */
   stateRecordId?: string
   /** Foreign Origin header for the tokenless CSRF probe (never sent on the control). */
@@ -1107,35 +1109,53 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  // Expanded 9-pattern boolean/syntax matrix (8 boolean styles + UNION NULL check)
+  // Expanded 9-pattern boolean/syntax matrix. LIKE-wrapped sinks are common (search boxes), so the
+  // `%` breakout runs early; the remaining shapes are only worth their requests when the response
+  // has already shown it reacts to syntax.
   const styles: Array<{ name: string; orBranch?: boolean; make: (k: number, truth: boolean) => string }> = [
     { name: 'numeric', make: (k, t) => `${baseValue} AND ${k}=${t ? k : k + 1}` },
     { name: 'single_quote', make: (k, t) => `${baseValue}' AND ${k}=${t ? k : k + 1}-- -` },
+    { name: 'like_breakout', make: (k, t) => `${baseValue}%' AND ${k}=${t ? k : k + 1}-- -` },
+    { name: 'or_branch', orBranch: true, make: (k, t) => `${baseValue}' OR ${k}=${t ? k : k + 1}-- -` },
     { name: 'double_quote', make: (k, t) => `${baseValue}" AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'single_paren', make: (k, t) => `${baseValue}') AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'single_double_paren', make: (k, t) => `${baseValue}')) AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'or_branch', orBranch: true, make: (k, t) => `${baseValue}' OR ${k}=${t ? k : k + 1}-- -` },
-    { name: 'like_breakout', make: (k, t) => `${baseValue}%' AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'order_by', make: (k, t) => `${baseValue} ORDER BY (CASE WHEN (${k}=${t ? k : k + 1}) THEN 1 ELSE 2 END)-- -` },
   ]
   const signals: Array<Record<string, unknown>> = []
+  let divergentStyles = 0
+  let stylesRun = 0
   for (const style of styles) {
     if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
+    // A parameter the app ignores answers every probe with the byte-identical baseline. Four shapes
+    // (including the OR branch, which proves non-LIKE sinks without a baseline) are enough evidence.
+    if (stylesRun >= 4 && divergentStyles === 0) break
+    stylesRun += 1
     const rounds: Array<Record<string, unknown>> = []
     let pass = true
     for (let r = 0; r < 2; r += 1) {
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
       const k = randomInt(1000, 9999)
-      const t = await send(injectParam(req, style.make(k, true)))
+      const tVal = style.make(k, true)
+      const fVal = style.make(k, false)
+      const t = await send(injectParam(req, tVal))
       checkDbError(t)
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
-      const f = await send(injectParam(req, style.make(k, false)))
+      const f = await send(injectParam(req, fVal))
       checkDbError(f)
       if (!t || !f) { pass = false; break }
-      const simBaseTrue = responseSimilarity(baseA.body, t.body)
-      const simBaseFalse = responseSimilarity(baseA.body, f.body)
-      const simTrueFalse = responseSimilarity(t.body, f.body)
+      // JSON sinks often echo the query back. Scrub the injected payload and the baseline value from
+      // both sides so the comparison reflects the returned data, not the echo of differing inputs.
+      const scrub = (body: string, values: string[]): string => {
+        let s = body
+        for (const v of values) if (v) s = s.split(v).join('\u0000')
+        return s
+      }
+      const simBaseTrue = responseSimilarity(scrub(baseA.body, [baseValue]), scrub(t.body, [tVal, baseValue]))
+      const simBaseFalse = responseSimilarity(scrub(baseA.body, [baseValue]), scrub(f.body, [fVal, baseValue]))
+      const simTrueFalse = responseSimilarity(scrub(t.body, [tVal, baseValue]), scrub(f.body, [fVal, baseValue]))
       const statusDiverges = t.status === baseA.status && f.status !== t.status && f.status < 500
+      if (simBaseTrue < 0.98 || simBaseFalse < 0.98 || t.status !== baseA.status || f.status !== baseA.status) divergentStyles += 1
       const roundPass = style.orBranch
         ? (t.status < 500 && f.status < 500 && Math.max(simBaseTrue, simBaseFalse) >= 0.9 && (simTrueFalse <= 0.75 || statusDiverges))
         : (t.status < 500 && f.status < 500 && simBaseTrue >= 0.9 && (simTrueFalse <= 0.75 || statusDiverges))
@@ -1148,7 +1168,8 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   }
 
   let unionSignal: Record<string, unknown> | null = null
-  if (!signals.some(s => s.passed) && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2)) {
+  const interesting = divergentStyles > 0 || Boolean(detectedErrorDialect)
+  if (!signals.some(s => s.passed) && interesting && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2)) {
     const unionResults: Array<{ cols: number; status: number; simToBase: number }> = []
     for (const cols of [1, 2, 3]) {
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
@@ -1168,11 +1189,12 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
+  // A lone quote is the cheapest error-fingerprint probe; keep it even when no style diverged.
   const quoteOne = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
     ? await send(injectParam(req, `${baseValue}'`))
     : null
   checkDbError(quoteOne)
-  const quoteTwo = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+  const quoteTwo = (quoteOne && (interesting || Boolean(detectedErrorDialect)) && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
     ? await send(injectParam(req, `${baseValue}''`))
     : null
   checkDbError(quoteTwo)
@@ -1465,25 +1487,39 @@ async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> {
   const controlOk = controls.length > 0 && controls.every(c => c.status >= 400 || c.body.length === 0)
   const controlBodies = controls.map(c => c.body).join('\n')
   const passwdSignature = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
-  const candidates = [
+  // Generic read oracles: classic passwd, a synthetic app secret, and a well-known log file. The
+  // `.log` variants keep a suffix check satisfied (`name.endsWith('.log')`) while still escaping.
+  const candidates: Array<{ value: string; kind: 'passwd' | 'content' }> = [
     { value: '../../../../etc/passwd', kind: 'passwd' },
     { value: '../../../../../../etc/passwd', kind: 'passwd' },
-    { value: '..%2f..%2f..%2f..%2fetc%2fpasswd', kind: 'passwd' },
-    { value: '..%252f..%252f..%252f..%252fetc%252fpasswd', kind: 'passwd' },
-    { value: '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd', kind: 'passwd' },
-    { value: '../../../../../../etc/hostname', kind: 'content' },
+    { value: '../../../../app/config/secrets.env', kind: 'content' },
+    { value: '../../../../app/.env', kind: 'content' },
+    { value: '../../../../var/log/system/audit.log', kind: 'content' },
+    { value: '../../var/log/system/audit.log', kind: 'content' },
     { value: '../secret.txt', kind: 'content' },
     { value: '../private/secret.txt', kind: 'content' },
-    { value: '..%252fprivate%252fsecret.txt', kind: 'content' },
-    { value: '..%252f..%252fprivate%252fsecret.txt', kind: 'content' },
-    { value: '..%2fprivate%2fsecret.txt', kind: 'content' },
-    { value: '../secrets/secret.txt', kind: 'content' },
-    { value: '../internal/secret.txt', kind: 'content' },
     { value: '../flag.txt', kind: 'content' },
     { value: '../.env', kind: 'content' },
     { value: '../config.json', kind: 'content' },
   ]
   const results: Array<Record<string, unknown>> = []
+  // Filter evidence: when a valid in-jail name still resolves after a literal `../` prefix, the
+  // handler strips traversal syntax before resolving. Only then is an encoded (double-decoded)
+  // variant a legitimate bypass to test; sending it blindly flags hardened single-segment handlers.
+  let filterStripsTraversal = false
+  if (req.baselineValue) {
+    const valid = await send(injectParam({ ...req, param }, req.baselineValue))
+    const stripped = await send(injectParam({ ...req, param }, `../${req.baselineValue}`))
+    filterStripsTraversal = Boolean(valid && stripped && valid.status >= 200 && valid.status < 300 &&
+      stripped.status >= 200 && stripped.status < 300 && responseSimilarity(valid.body, stripped.body) >= 0.95)
+  }
+  if (filterStripsTraversal) {
+    candidates.push(
+      { value: '..%2f..%2f..%2f..%2fetc%2fpasswd', kind: 'passwd' },
+      { value: '..%2fprivate%2fsecret.txt', kind: 'content' },
+      { value: '..%2f..%2fsrv%2fprivate%2fsecret.txt', kind: 'content' },
+    )
+  }
   for (const cand of candidates) {
     const ex = await send(injectParam({ ...req, param }, cand.value))
     if (!ex) continue
@@ -2120,7 +2156,8 @@ async function diffCsrfStateChange(ctx: DiffContext): Promise<DiffOutcome> {
   let probeWrite: BrokerExchangeResult | null = null
   let probeRead: BrokerExchangeResult | null = null
   let mutationEncoding: 'json' | 'form' | null = null
-  for (const encoding of ['json', 'form'] as const) {
+  const encodings = req.bodyEncodings?.length ? req.bodyEncodings : (['json', 'form'] as const)
+  for (const encoding of encodings) {
     const encoded = encodeBody(expectedValue, encoding)
     probeWrite = await send({
       method,
@@ -3448,12 +3485,13 @@ async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome> {
     baseJson = null
   }
 
-  const candidates = req.candidateFields?.length
-    ? req.candidateFields
-    : ['role', 'isAdmin', 'admin', 'is_admin', 'plan', 'tier', 'verified', 'emailVerified', 'permissions', 'orgId', 'tenantId']
+  const baseKeys = baseJson ? Object.keys(baseJson).filter(k => /^(?:tenant_id|owner_id|team_id|org_id|account_id|role|role_id|plan|plan_id|tier|status|state|payment_state|total|amount|price|permissions|is_admin|isAdmin|admin|verified|email_verified|active|enabled|visibility|return_url|avatar_url)$/i.test(k)) : []
+  const defaults = ['role', 'isAdmin', 'admin', 'is_admin', 'plan', 'tier', 'verified', 'emailVerified', 'permissions', 'orgId', 'tenantId', 'tenant_id', 'owner_id', 'team_id', 'teamField', 'orgField', 'grant', 'level', 'status', 'state', 'payment_state', 'total', 'amount', 'visibility']
+  const candidates = req.candidateFields?.length ? req.candidateFields : [...new Set([...baseKeys, ...defaults])]
   const method: 'POST' | 'PUT' | 'PATCH' = req.method === 'PUT' || req.method === 'PATCH' ? req.method : 'POST'
   const location: SurfaceParamLocation = req.paramLocation === 'form' ? 'form' : 'json'
   const results: Array<Record<string, unknown>> = []
+  const suppressed: string[] = []
 
   for (const field of candidates.slice(0, 12)) {
     const isBoolField = /^(?:is|has|verified|admin|emailVerified)/i.test(field)
@@ -3516,6 +3554,13 @@ async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome> {
     })()
     results.push({ field, writeStatus: writeEx.status, persisted })
     if (persisted) {
+      // Classify before submitting: privilege/ownership fields are always meaningful; lifecycle
+      // fields only prove mass assignment on commerce/order-shaped resources.
+      const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|owner|team|org|plan|tier|verified|email_verified)/i
+      const lifecycleField = /^(?:status|state|payment_state|total|amount|price|return_url)$/i
+      const commerceRoute = /(?:order|purchase|checkout|cart|payment|refund|shipment|reversal|disbursement|credit)/i
+      const emit = privilegeField.test(field) || (lifecycleField.test(field) && commerceRoute.test(req.pathAndQuery))
+      if (!emit) { suppressed.push(field); continue }
       anomalies.push({ type: 'mass_assignment', field, writeStatus: writeEx.status, persisted: true })
       if (baseJson && field in baseJson) {
         const restoreVal = location === 'json' && (typeof baseJson[field] === 'boolean' || typeof baseJson[field] === 'number' || typeof baseJson[field] === 'string')
@@ -3543,7 +3588,7 @@ async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome> {
     summary: anomalies.length > 0
       ? `Privileged field "${String(anomalies[0].field)}" persisted after ${method}; confirm via http_chain Replay Spec.`
       : 'No mass assignment persistence observed.',
-    details: { results, suggestedReplayKind: 'http_chain' },
+    details: { results, suppressed, suggestedReplayKind: 'http_chain' },
   }
 }
 
