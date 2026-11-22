@@ -17,6 +17,7 @@ import { arr, bool, int, lit, map, obj, oneOf, opt, str, union, unknown, unsafe 
 import type { AnalyzerName } from '../../worker/analyzers.ts'
 import {
   DEFAULT_PROVIDER,
+  boardMessageKinds,
   defaultWorkerMaxTurns,
   findingSeverities,
   httpMethods,
@@ -38,6 +39,12 @@ import type {
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, universalParamLocations } from '../replay-spec.ts'
 import type { AuthMutation, CsrfBind, DeclarativeReplaySpec, UniversalParamLocation } from '../replay-spec.ts'
+import {
+  boardGuardrailInstructions,
+  boardPostBodyLimit,
+  specialistBoardPostKinds,
+} from './board-tools.ts'
+import type { BoardPostArgs, BoardReadArgs } from './board-tools.ts'
 import type { BrokerMultipartPart, PublicObservation } from './broker.ts'
 import { isProfileHealthy, resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
@@ -460,6 +467,10 @@ export interface WorkerToolHandlers {
     args: VerifyReplaySpecArgs,
     signal: AbortSignal,
   ) => Promise<unknown>
+  /** v5 M5 Swarm Board: post a concise claim/handoff/lead/blocker/status/note (redacted, capped). */
+  board_post?: (args: BoardPostArgs, signal: AbortSignal) => Promise<unknown>
+  /** v5 M5 Swarm Board: read untainted, in-scope, redacted peer posts. */
+  board_read?: (args: BoardReadArgs, signal: AbortSignal) => Promise<unknown>
   suggest_candidate_host?: (
     args: { origin: string; source: string; thirdParty?: boolean },
     signal: AbortSignal,
@@ -480,7 +491,7 @@ export interface SpecialistProfileConfig {
   focusPrompt: string
 }
 
-const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
+export const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
   'spillOutput',
   'verify_replay_spec',
   'propose_chain_finding',
@@ -491,10 +502,28 @@ const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
   'search_exchanges',
   'get_exchange',
   'read_peer_trace',
+  'board_post',
+  'board_read',
   'expand_digest',
   'load_skill',
   'complete_intent',
 ]
+
+/** v5 M5 board tools available to every specialist profile and capability tier. */
+export const boardSpecialistTools = ['board_post', 'board_read'] as const
+
+// Re-exported so execution.ts can wire turn-start deltas/guardrails without a second import site.
+export {
+  buildBoardDelta,
+  createBoardTools,
+  injectBoardTurnInstructions,
+  boardGuardrailInstructions,
+  boardGuardrailInstructions as boardTurnInstructions,
+  boardNoAckInstruction,
+  boardUntrustedDeltaInstruction,
+  WarmSpecialistController,
+  warmSpecialists,
+} from './board-tools.ts'
 
 export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileConfig> = {
   'bola-bfla-specialist': {
@@ -838,6 +867,7 @@ const scenarioInstructions: Record<AgentScenario, string> = {
     '6. Mandatory Counterevidence, Deduplication & Inline Zero-LLM Verification: every propose_chain_finding call MUST include non-empty counterevidence (strongest argument against exploitability), confidenceRationale, optional severityChangeConditions/codeLocations, and a valid DeclarativeReplaySpec across any of the 14 kinds (http_chain, dns_takeover, tls_audit, browser_dom, browser_chain, race_burst, rce_proof, sql_boolean_diff, ws_chain, upload_probe, static_ast_proof, auth_protocol_proof, cache_differential, sql_time_diff). By default verifyNow=true runs deterministic Zero-LLM ReplayVerifier immediately and returns sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). If inline verification returns dismissed/inconclusive, inspect the feedback, repair the spec, and re-verify via verify_replay_spec or update_proposed_finding (up to 2 repair retries = 3 total attempts). Remember static_ast_proof verifies to the separate static_verified tier—NEVER conflate it with runtime confirmed. If submission deduplication returns an existing findingId, call update_proposed_finding to enrich/upgrade it instead of creating duplicates.',
     '7. Never craft destructive payloads, webshells, reverse shells, file writes, or credential exfiltration. Never probe internal IPs or cloud metadata endpoints; use benign signed OOB HTTP/DNS canaries (mint_canary/check_canary) for blind outbound validation. Active rce_proof and upload_probe specs require Tier 3 HITL approval (or local-lab) and strictly non-destructive verifier-minted nonces.',
     '8. When finished (or when entering the 85% settlement phase), commit all unrecorded facts, 3-state coverage entries, and replay specs, then call complete_intent with status (proved | ruled_out | blocked | partial) and a concise evidence-backed summary.',
+    boardGuardrailInstructions(),
   ].join('\n'),
 
   'code-auditor': [
@@ -2476,6 +2506,50 @@ function buildWorkerTools(
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
         return wrapExec('suggest_candidate_host', () => fn(args, signal), signal)
+      },
+    }))
+  }
+
+  if (handlers.board_post) {
+    const fn = handlers.board_post
+    tools.push(defineTool({
+      name: 'board_post',
+      description: 'Post a concise Swarm Board claim/handoff/lead/blocker/status/note for peers (redacted, <=1200 chars, evidence-gated @mentions). Never post just to acknowledge receipt.',
+      parameters: obj({
+        kind: opt(oneOf(specialistBoardPostKinds, { description: 'Coordination kind (default note). brief/approval/verdict are deterministic posters only.' })),
+        body: str({ description: 'Concise redacted coordination text; cite refFactIds/refExchangeIds instead of raw HTTP bodies, headers, tokens, or secrets.', maxLength: boardPostBodyLimit }),
+        mentions: opt(arr(str({ description: 'Roster handle (e.g. bola, coordinator); at most one peer per turn.', maxLength: 25 }), { maxItems: 8 })),
+        refFactIds: opt(arr(str({ maxLength: 64 }), { maxItems: 50, description: 'Fact IDs backing this post (required for a peer handoff/lead).' })),
+        refExchangeIds: opt(arr(str({ maxLength: 64 }), { maxItems: 50, description: 'Exchange IDs backing this post.' })),
+        refFindingIds: opt(arr(str({ maxLength: 64 }), { maxItems: 50 })),
+        refStepId: opt(str({ maxLength: 64, description: 'Chain step ID this post relates to.' })),
+        replyToSeq: opt(int({ minimum: 1, description: 'Optional board sequence number this post replies to.' })),
+      }),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        return wrapExec('board_post', () => fn(args as BoardPostArgs, signal), signal)
+      },
+    }))
+  }
+
+  if (handlers.board_read) {
+    const fn = handlers.board_read
+    tools.push(defineTool({
+      name: 'board_read',
+      description: 'Read untainted, approved-scope, redacted Swarm Board posts (default 20, max 50). Prefer the injected <board_delta> at turn start instead of polling.',
+      parameters: obj({
+        sinceSeq: opt(int({ minimum: 0, description: 'Only return posts after this board sequence.' })),
+        kind: opt(oneOf(boardMessageKinds)),
+        authorHandle: opt(str({ maxLength: 25 })),
+        limit: opt(int({ minimum: 1, maximum: 50 })),
+      }),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        return wrapExec('board_read', () => fn(args as BoardReadArgs, signal), signal)
       },
     }))
   }
