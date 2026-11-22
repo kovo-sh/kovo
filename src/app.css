@@ -631,11 +631,103 @@ button[data-size=icon] { display: inline-grid; place-items: center; flex: none; 
 .panel-mode-btn.active {
   color: var(--text); background: var(--paper); border-color: var(--line); font-weight: 620;
 }
+.panel-mode-badge {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px;
+  margin-left: 5px; padding: 0 4px; border-radius: 999px; background: var(--accent); color: #fff;
+  font-size: 9.5px; font-weight: 700; line-height: 1;
+}
 .close-pane { font-size: 16px; color: var(--muted); }
 .coordinator-pane {
   flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 12px;
 }
 .coord-approvals { flex-shrink: 0; margin-bottom: 8px; }
+
+/* ==========================================================================
+   SWARM MESSAGE BOARD (v5 M5) — ROSTER, FILTERS, TIMELINE & COMPOSER
+   ========================================================================== */
+.board-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 9px; padding: 10px 14px 12px; }
+.board-roster {
+  display: flex; align-items: center; gap: 5px; flex-shrink: 0;
+  overflow-x: auto; padding-bottom: 2px; scrollbar-width: thin;
+}
+.board-member {
+  display: inline-flex; align-items: stretch; flex: none; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+}
+.board-member.active { border-color: var(--accent); background: var(--accent-soft); }
+.board-member-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px 3px 7px;
+  border: 0; background: transparent; color: var(--text); font-size: 11.5px; font-weight: 560; white-space: nowrap;
+}
+.board-member-pill:hover { background: var(--selection); }
+.board-state-symbol { font-size: 9px; line-height: 1; }
+.board-member-state {
+  font-size: 9px; text-transform: uppercase; letter-spacing: .045em; color: var(--muted); font-weight: 650;
+}
+.board-member.state-working .board-state-symbol { color: var(--accent); animation: board-pulse 1.5s ease-in-out infinite; }
+.board-member.state-working { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.board-member.state-waiting .board-state-symbol { color: var(--muted); }
+.board-member.state-paused { border-color: var(--attention-border); background: var(--attention-bg); }
+.board-member.state-paused .board-state-symbol { color: var(--attention); }
+.board-member.state-retired { opacity: .58; }
+.board-member.state-retired .board-state-symbol { color: var(--complete); }
+.board-member-inspect {
+  border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--accent);
+  padding: 3px 7px; font-size: 11px; line-height: 1;
+}
+.board-member-inspect:hover { background: var(--selection); }
+@keyframes board-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+.board-approvals { flex-shrink: 0; display: grid; gap: 6px; max-height: 42%; overflow: auto; }
+.board-section-label {
+  font-size: 9.5px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--attention);
+}
+.board-filters { display: flex; align-items: center; gap: 4px; flex-shrink: 0; overflow-x: auto; padding-bottom: 1px; }
+.board-filter-chip {
+  flex: none; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--muted); font-size: 10.5px; font-weight: 560; white-space: nowrap;
+}
+.board-filter-chip:hover { color: var(--text); border-color: var(--line-strong); }
+.board-filter-chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.board-timeline { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.board-empty { padding: 12px 4px; font-size: 12px; }
+.board-author { color: var(--text); font-weight: 660; }
+.board-kind {
+  padding: 0 5px; border-radius: 4px; border: 1px solid var(--line);
+  font-size: 9px; font-weight: 700; letter-spacing: .05em; color: var(--muted); background: var(--surface);
+}
+.board-kind-brief, .board-kind-status { color: var(--trace); border-color: transparent; background: var(--trace-soft); }
+.board-kind-handoff, .board-kind-lead, .board-kind-claim { color: var(--accent); border-color: transparent; background: var(--accent-soft); }
+.board-kind-verdict { color: var(--complete); border-color: transparent; background: var(--complete-soft); }
+.board-kind-blocker { color: var(--danger); border-color: transparent; background: var(--danger-soft); }
+.board-kind-approval { color: var(--attention); border-color: var(--attention-border); background: var(--attention-bg); }
+.board-meta-row, .board-refs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.board-reply { font-size: 10px; color: var(--muted); }
+.board-mention-chip, .board-ref-chip {
+  padding: 0 6px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+  color: var(--muted); font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; line-height: 1.55;
+}
+.board-mention-chip { color: var(--accent); font-family: inherit; font-weight: 560; }
+.board-mention-chip:hover, .board-ref-chip:hover { border-color: var(--line-strong); color: var(--text); }
+.board-ref-chip.active, .board-mention-chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.board-ref-detail {
+  display: grid; gap: 3px; width: 100%; padding: 7px 9px; border-radius: 7px;
+  border: 1px solid var(--line); border-left: 2px solid var(--trace);
+  background: var(--surface); font-size: 11.5px; overflow-wrap: anywhere;
+}
+.board-approval-inline { width: 100%; margin-top: 3px; }
+.board-composer { position: relative; flex-shrink: 0; }
+.board-mention-popover {
+  position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 25;
+  display: grid; gap: 2px; padding: 4px; max-height: 220px; overflow: auto;
+  border: 1px solid var(--line-strong); border-radius: 9px; background: var(--paper); box-shadow: var(--shadow-md);
+}
+.board-mention-option {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px; width: 100%;
+  padding: 5px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text);
+  text-align: left; font-size: 12px;
+}
+.board-mention-option.active { background: var(--accent-soft); }
 
 /* ==========================================================================
    OVERVIEW — KPI STRIP, NEEDS ATTENTION, DISCLOSURES
