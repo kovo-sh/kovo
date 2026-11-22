@@ -13,7 +13,7 @@
 | **M0** | True E2E realistic-bench harness | Drive real `Execution` loop, baseline scorecard, `benchmark:realistic` CLI | **DONE** (deterministic baseline; agentic run needs model profile) | `m5-m0` / `agents/m0` | — |
 | **M1** | P0 wiring & correctness | broker/browser args, second-order/OOB canaries, dedupe + route templates, specialist routing/skills, `InlineVerifyFeedback` + Phase-3, guard/sanitizer, CVE semver | **PARTIAL** — static DONE; core RUNNING | `m5-m1-core` / `agents/m1-core`; `m5-m1-static` DONE | M0 baseline |
 | **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **PARTIAL** — M2.2/2.3 DONE, M2.4 DONE; M2.1 queued | `m7-spa` DONE; `m5-m2-auth` DONE | M1 for execution/store hooks |
-| **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **QUEUED** | probes partly in `m7-heldout2` (running); verifier kinds after M1 | M1 (replay-verifier), SPA (surface-engine) |
+| **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **RUNNING** | `m5-m3-probes`; spec contracts merged (specs2) | M1-core for verifier/schema additions |
 | **M4** | Templates, AST, SAST→DAST, Patch Gate 6 | 2021–2026 corpus, multi-framework AST, bridge, real patch retest | **QUEUED** | — | M1 (static/analyzers/cve-broker) |
 | **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 DONE**; Phase 1b after M1-core | `m5-board` / `agents/board-ui` DONE | M1 for poster wiring (Phase 1b) |
 | **M6** | Hill-climb + anti-overfitting + v5 gate | dev seeds, salted held-out, `VERIFICATION-v5.md` | **READY** (v4 baseline met; awaits M0–M5) | — | M0–M5 |
@@ -27,6 +27,7 @@
 | heldout2 (merged) | `m7-heldout2` | `scripts/benchmark-probes.ts` | M3 probes complete: IDs/state/race/second-order/BFLA; 20/20 held-out, 25/25 xben |
 | spa (merged) | `m7-spa` | `src/server/phase0-recon.ts`, `src/server/surface-engine.ts` | M2.2/M2.3 done: route maps, soft-404, auth pass, YAML/$ref, tRPC; `normalizeDiscoveryTemplate` |
 | specs2 (merged) | `m7-specs2` | `scripts/benchmark-specs*.ts` | M3 benchmark synthesis + identifier-bound authz: realistic precision 100% (dev 17/172, held-out 15/171), 0 unmatched/decoy FPs |
+| m3-probes | `m5-m3-probes` | `scripts/benchmark-probes.ts`, `src/server/surface-engine.ts` | M3 probes: CSRF state-change, webhook forgery, open redirect, write-BOLA, NoSQLi, noise tolerance |
 | orch | `m7-orch` | `scripts/benchmark-live.ts`, `benchmark-recall.ts`, `benchmark-env.ts`, `benchmark-core.ts`, `benchmark-realistic-matrix.ts` | M6 speed/budget + all-patches attribution |
 | m0 (merged) | `m5-m0` | `scripts/benchmark-realistic.ts` (new), `package.json`, `tests/v5-m0-*.test.ts` | M0 |
 | m1-core | `m5-m1-core` | `src/server/execution.ts`, `canary-broker.ts`, `dedupe.ts`, `agent-session.ts`, `replay-verifier.ts`, `skills.ts`, `src/skills/**`, `tests/v5-m1-*.test.ts` | M1.1, 1.2, 1.3 (dedupe), 1.4, 1.5 |
@@ -72,7 +73,7 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 |---|---|---|
 | xben-25 | **25/25 (100%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed** | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | **17/172 matched, precision 100%**, 0 decoy/unmatched FPs (was 0 matched / 12 unmatched) | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
+| realistic-bench dev | **18/172 matched (10.5%), precision 100%**, 0 decoy/unmatched FPs; 9 cells in ~100 s at concurrency 9 | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
 | realistic-bench held-out | **15/171 matched, precision 100%**, 0 decoy/unmatched FPs (was 3 matched / precision 0.20) | within 10% of dev |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
