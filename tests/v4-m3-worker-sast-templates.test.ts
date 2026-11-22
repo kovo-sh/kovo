@@ -344,7 +344,10 @@ test('M3-T8: buildCallGraphFromFiles & live session.callGraph trace multi-file r
   assert.equal(unguarded.isUnguardedPath, true)
   assert.equal(unguarded.dominatingGuards.length, 0)
   assert.ok(guarded, 'Expected backward taint path for guarded /api/admin/orders')
-  assert.equal(guarded.isUnguardedPath, false)
+  // v5: an auth guard is not an input sanitizer — the SQL sink stays injection-unsanitized.
+  assert.equal(guarded.isAuthUnguarded, false)
+  assert.equal(guarded.isInjectionUnsanitized, true)
+  assert.equal(guarded.isUnguardedPath, true)
   assert.ok(guarded.dominatingGuards.includes('requireOrgMembership'))
 
   if (!(await dockerHasImage('guardian-worker:v4'))) return
@@ -451,7 +454,11 @@ test('M3-T10: Stage-2 path dominance detects partialGuards and rankAndBudgetAudi
   const paths = analyzeSinkBackwardPaths(graph, spec)
   assert.equal(paths.length, 2)
   assert.equal(paths.find(p => p.routeOrAction === '/api/unguarded')?.isUnguardedPath, true)
-  assert.equal(paths.find(p => p.routeOrAction === '/api/guarded')?.isUnguardedPath, false)
+  // v5: requireAuth satisfies authorization but does not sanitize the db_query sink.
+  const guardedPath = paths.find(p => p.routeOrAction === '/api/guarded')
+  assert.equal(guardedPath?.isAuthUnguarded, false)
+  assert.equal(guardedPath?.isInjectionUnsanitized, true)
+  assert.equal(guardedPath?.isUnguardedPath, true)
 
   // Verify 12-cap is lifted (25 -> 25, 100 -> 80)
   const many = Array.from({ length: 100 }, (_, i) => ({
