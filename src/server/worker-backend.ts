@@ -19,17 +19,21 @@ const repoRelativePathSchema = z.string().min(1).max(512).refine(
 const workerNamespace = 'dev.guardian.workspace'
 const liveContainers = new Set<string>()
 let liveExitHookInstalled = false
+function removeLiveContainers() {
+  for (const container of liveContainers) {
+    try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: 5_000 }) } catch { /* best-effort */ }
+  }
+}
 function trackLiveContainer(name: string) {
   liveContainers.add(name)
   if (liveExitHookInstalled) return
   liveExitHookInstalled = true
   // Remove any container this process created but did not get to start/close
-  // (for example an aborted session between `docker create` and `docker start`).
-  process.once('exit', () => {
-    for (const container of liveContainers) {
-      try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: 5_000 }) } catch { /* best-effort */ }
-    }
-  })
+  // (for example an aborted session between `docker create` and `docker start`,
+  // or a Playwright-owned server terminated with SIGTERM).
+  process.once('exit', removeLiveContainers)
+  process.once('SIGTERM', () => { removeLiveContainers(); process.exit(143) })
+  process.once('SIGINT', () => { removeLiveContainers(); process.exit(130) })
 }
 const workerName = /^guardian-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 
