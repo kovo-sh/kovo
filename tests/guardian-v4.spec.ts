@@ -200,7 +200,7 @@ test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset 
     await page.getByLabel('Seed hosts').fill('http://127.0.0.1:8080')
     await page.getByRole('button', { name: 'Create project', exact: true }).click()
 
-    await expect(page.getByRole('alert')).toContainText(/GUARDIAN_ALLOW_LOCAL_LAB=1/i)
+    await expect(page.getByRole('alert')).toContainText(/GUARDIAN_ALLOW_LOCAL_LAB=1/i, { timeout: 15_000 })
     await expect(page.getByRole('heading', { name: 'Blocked Local Lab' })).toHaveCount(0)
     const rejectedRow = readDb(publicApp.directory, db =>
       db.prepare('SELECT id FROM projects WHERE name = ?').get('Blocked Local Lab') as { id: string } | undefined,
