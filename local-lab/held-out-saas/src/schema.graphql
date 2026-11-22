@@ -1,0 +1,36 @@
+# Orbit Workspace GraphQL schema (documentation of src/graphql.mjs)
+type Query {
+  me: User
+  user(id: ID!): User
+  project(id: ID!): Project
+  products(sku: String): [Product]
+}
+
+type User {
+  id: ID!
+  name: String
+  email: String
+  tenantId: ID
+  invoices: [Invoice]
+}
+
+type Project {
+  id: ID!
+  name: String
+  status: String
+  owner: User
+}
+
+type Invoice {
+  id: ID!
+  number: String
+  total: Float
+  memo: String
+}
+
+type Product {
+  id: ID!
+  sku: String
+  name: String
+  price: Float
+}

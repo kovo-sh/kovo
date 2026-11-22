@@ -1,0 +1,5 @@
+--- a/src/config.mjs
++++ b/src/config.mjs
+@@ -29,1 +29,1 @@
+-  'hos-06': false,
++  'hos-06': true,

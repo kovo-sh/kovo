@@ -1,0 +1,124 @@
+{
+  "patches": [
+    {
+      "patchId": "hos-01",
+      "file": "patches/hos-01.patch",
+      "fixes": "Multi-tenant BOLA on invoices (REST)",
+      "cwe": "CWE-639"
+    },
+    {
+      "patchId": "hos-02",
+      "file": "patches/hos-02.patch",
+      "fixes": "GraphQL nested resolver BOLA (User.invoices)",
+      "cwe": "CWE-639"
+    },
+    {
+      "patchId": "hos-03",
+      "file": "patches/hos-03.patch",
+      "fixes": "BFLA: feature-flag admin action callable by any role",
+      "cwe": "CWE-285"
+    },
+    {
+      "patchId": "hos-04",
+      "file": "patches/hos-04.patch",
+      "fixes": "Mass assignment on profile (role / creditLimit)",
+      "cwe": "CWE-915"
+    },
+    {
+      "patchId": "hos-05",
+      "file": "patches/hos-05.patch",
+      "fixes": "Next.js Server Action authorization bypass (updateOrgPlan)",
+      "cwe": "CWE-862"
+    },
+    {
+      "patchId": "hos-06",
+      "file": "patches/hos-06.patch",
+      "fixes": "SQL injection (query string, boolean)",
+      "cwe": "CWE-89"
+    },
+    {
+      "patchId": "hos-07",
+      "file": "patches/hos-07.patch",
+      "fixes": "SQL injection behind CSRF-protected HTML form",
+      "cwe": "CWE-89"
+    },
+    {
+      "patchId": "hos-08",
+      "file": "patches/hos-08.patch",
+      "fixes": "Blind time-based SQL injection (JSON filter)",
+      "cwe": "CWE-89"
+    },
+    {
+      "patchId": "hos-09",
+      "file": "patches/hos-09.patch",
+      "fixes": "GraphQL scalar-argument SQL injection (products.sku)",
+      "cwe": "CWE-89"
+    },
+    {
+      "patchId": "hos-10",
+      "file": "patches/hos-10.patch",
+      "fixes": "XML external entity injection in catalog import",
+      "cwe": "CWE-611"
+    },
+    {
+      "patchId": "hos-11",
+      "file": "patches/hos-11.patch",
+      "fixes": "JWT acceptance of alg:none / stripped signature",
+      "cwe": "CWE-347"
+    },
+    {
+      "patchId": "hos-12",
+      "file": "patches/hos-12.patch",
+      "fixes": "JWT jku header trusted (key-set fetch / OOB callback)",
+      "cwe": "CWE-347"
+    },
+    {
+      "patchId": "hos-13",
+      "file": "patches/hos-13.patch",
+      "fixes": "Checkout workflow step-skip (draft -> confirm without payment)",
+      "cwe": "CWE-841"
+    },
+    {
+      "patchId": "hos-14",
+      "file": "patches/hos-14.patch",
+      "fixes": "Voucher / credit double-spend race",
+      "cwe": "CWE-362"
+    },
+    {
+      "patchId": "hos-15",
+      "file": "patches/hos-15.patch",
+      "fixes": "Second-order stored XSS (comment -> activity feed)",
+      "cwe": "CWE-79"
+    },
+    {
+      "patchId": "hos-16",
+      "file": "patches/hos-16.patch",
+      "fixes": "Second-order SSRF via webhook registration + delivery",
+      "cwe": "CWE-918"
+    },
+    {
+      "patchId": "hos-17",
+      "file": "patches/hos-17.patch",
+      "fixes": "Web cache deception on account page",
+      "cwe": "CWE-524"
+    },
+    {
+      "patchId": "hos-18",
+      "file": "patches/hos-18.patch",
+      "fixes": "DOM-based XSS in search page",
+      "cwe": "CWE-79"
+    },
+    {
+      "patchId": "hos-19",
+      "file": "patches/hos-19.patch",
+      "fixes": "Server-side template injection in notification preview",
+      "cwe": "CWE-1336"
+    },
+    {
+      "patchId": "hos-20",
+      "file": "patches/hos-20.patch",
+      "fixes": "Path traversal in export download (virtual FS)",
+      "cwe": "CWE-22"
+    }
+  ]
+}
