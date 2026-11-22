@@ -41,6 +41,15 @@ export interface Phase0ReconResult {
     params: string[]
   }
   stoppedReason: string | null
+  /** Structural JSON route-map / API-description artifacts expanded into endpoints. */
+  routeMapEndpoints?: number
+  /** Client router-table literals harvested from bundles. */
+  jsRouterRoutes?: number
+  /** Authenticated JSON navigation fetches performed during discovery. */
+  navigationRequests?: number
+  navigationEndpoints?: number
+  /** Discovery fetches that carried approved-persona session material. */
+  authRequests?: number
 }
 
 export interface CrawlStateGraphParams {
@@ -728,6 +737,668 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
   return out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Structural JSON route-map / API-description discovery
+// ---------------------------------------------------------------------------------------------
+
+const HTTP_METHOD_SET = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
+const ROUTE_METHOD_FIELDS: readonly string[] = ['method', 'verb', 'httpMethod', 'http_method', 'type']
+const ROUTE_PATH_FIELDS: readonly string[] = [
+  'path', 'pathTemplate', 'path_template', 'url', 'uri', 'route', 'endpoint', 'href', 'pattern', 'target',
+]
+const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/
+/** Tokens too generic to link a config parameter to a specific route by name. */
+const GENERIC_ROUTE_TOKENS = new Set([
+  'api', 'get', 'list', 'view', 'create', 'update', 'delete', 'remove', 'patch', 'put', 'post', 'run',
+  'new', 'all', 'set', 'the', 'and', 'for', 'with', 'by', 'to', 'from', 'item', 'data', 'field', 'body',
+  'name', 'query', 'value', 'id', 'uuid', 'key', 'ref', 'src', 'page', 'type', 'current', 'accept',
+])
+
+export interface RouteMapParam {
+  name: string
+  location: ParamLocation
+}
+
+export interface RouteMapEntry {
+  key: string | null
+  method: string
+  path: string
+  params: RouteMapParam[]
+}
+
+export interface RouteMapExpansion {
+  entries: RouteMapEntry[]
+  paramHints: string[]
+  /** logical parameter key -> concrete runtime field name */
+  paramMap: Record<string, string>
+}
+
+export interface RouteMapParamBinding {
+  routeKey: string
+  name: string
+  location: 'json' | 'form' | 'query'
+}
+
+export interface ParsedRouteMap {
+  endpoints: number
+  params: number
+  routeKeys: string[]
+  paramHints: string[]
+}
+
+function asHttpMethod(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const upper = value.trim().toUpperCase()
+  return HTTP_METHOD_SET.has(upper) ? upper : null
+}
+
+function asRoutePath(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 240) return null
+  if (!trimmed.startsWith('/') && !/^https?:\/\//i.test(trimmed)) return null
+  if (/[\s\r\n\0]/.test(trimmed)) return null
+  return trimmed
+}
+
+function paramLocationFromToken(raw: string | undefined, fallback: ParamLocation): ParamLocation {
+  switch ((raw ?? '').toLowerCase()) {
+    case 'path': return 'path'
+    case 'query': return 'query'
+    case 'header': return 'header'
+    case 'cookie': return 'cookie'
+    case 'body': return 'json'
+    case 'formdata':
+    case 'form': return 'form'
+    case 'xml': return 'xml'
+    default: return fallback
+  }
+}
+
+function collectRouteRecordParams(rec: Record<string, unknown>, method: string): RouteMapParam[] {
+  const out: RouteMapParam[] = []
+  const seen = new Set<string>()
+  const fallback: ParamLocation = method === 'GET' || method === 'HEAD' ? 'query' : 'json'
+  const push = (name: unknown, location: ParamLocation) => {
+    if (typeof name !== 'string') return
+    const clean = name.trim()
+    if (!PARAM_NAME_RE.test(clean)) return
+    const dedupe = `${clean}|${location}`
+    if (seen.has(dedupe)) return
+    seen.add(dedupe)
+    out.push({ name: clean, location })
+  }
+  const visitList = (value: unknown, location: ParamLocation) => {
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 40)) {
+        if (typeof item === 'string') { push(item, location); continue }
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+        const entry = item as Record<string, unknown>
+        const rawName = typeof entry.name === 'string' ? entry.name : typeof entry.field === 'string' ? entry.field : null
+        push(rawName, paramLocationFromToken(typeof entry.in === 'string' ? entry.in : undefined, location))
+      }
+      return
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') push(key, location)
+      }
+    }
+  }
+  visitList(rec.params, fallback)
+  visitList(rec.parameters, fallback)
+  visitList(rec.query, 'query')
+  visitList(rec.queryParams, 'query')
+  visitList(rec.body, fallback === 'query' ? 'json' : fallback)
+  visitList(rec.formData, 'form')
+  return out
+}
+
+function collectParamHintMap(value: unknown, out: string[], paramMap: Record<string, string>): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof val !== 'string' || !PARAM_NAME_RE.test(val.trim())) continue
+    out.push(val.trim())
+    if (PARAM_NAME_RE.test(key.trim())) paramMap[key.trim()] = val.trim()
+  }
+}
+
+/**
+ * Structurally detect JSON artifacts that describe a route table (SPA runtime config, API index,
+ * manifest, navigation payload). Accepts object maps `{key: {method, path}}`, arrays of route
+ * records, and path->method maps. Returns bounded entries plus any logical->actual parameter map.
+ */
+export function extractRouteMapEntries(doc: unknown): RouteMapExpansion {
+  const entries: RouteMapEntry[] = []
+  const paramHints: string[] = []
+  const paramMap: Record<string, string> = {}
+  const seen = new Set<string>()
+  let visited = 0
+
+  const pushEntry = (key: string | null, method: string, rawPath: string, rec?: Record<string, unknown>) => {
+    if (entries.length >= 120) return
+    // Flatten a nested wrapper such as { route: { path } } before rejecting.
+    const path = asRoutePath(rawPath)
+    if (!path) return
+    const dedupe = `${method} ${path}`
+    if (seen.has(dedupe)) return
+    seen.add(dedupe)
+    entries.push({ key, method, path, params: rec ? collectRouteRecordParams(rec, method) : [] })
+  }
+
+  const walk = (node: unknown, keyHint: string | null, depth: number): void => {
+    if (entries.length >= 120 || depth > 7) return
+    visited += 1
+    if (visited > 900) return
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 120)) walk(item, keyHint, depth + 1)
+      return
+    }
+    if (!node || typeof node !== 'object') return
+    const rec = node as Record<string, unknown>
+
+    let method: string | null = null
+    for (const field of ROUTE_METHOD_FIELDS) {
+      method = asHttpMethod(rec[field])
+      if (method) break
+    }
+    let routePath: string | null = null
+    for (const field of ROUTE_PATH_FIELDS) {
+      routePath = asRoutePath(rec[field])
+      if (routePath) break
+    }
+    if (method && routePath) {
+      pushEntry(keyHint, method, routePath, rec)
+      return
+    }
+
+    for (const [key, value] of Object.entries(rec)) {
+      if (key === 'params' || key === 'parameters' || key === 'paramNames' || key === 'paramMap') {
+        // Only string->string maps look like logical->actual parameter dictionaries.
+        collectParamHintMap(value, paramHints, paramMap)
+        if (Array.isArray(value)) {
+          for (const item of value.slice(0, 40)) {
+            if (typeof item === 'string' && PARAM_NAME_RE.test(item)) paramHints.push(item)
+          }
+        }
+        continue
+      }
+      if (typeof value === 'string') {
+        const mapMethod = asHttpMethod(value)
+        const mapPath = asRoutePath(key)
+        if (mapMethod && mapPath) {
+          pushEntry(null, mapMethod, mapPath)
+          continue
+        }
+      }
+      walk(value, key, depth + 1)
+    }
+  }
+
+  walk(doc, null, 0)
+  return {
+    entries,
+    paramHints: [...new Set(paramHints)].slice(0, 60),
+    paramMap,
+  }
+}
+
+/** Extract runtime parameter names that the SPA binds to a named API client call. */
+export function harvestConfigParamBindings(code: string): RouteMapParamBinding[] {
+  const out: RouteMapParamBinding[] = []
+  const seen = new Set<string>()
+  const aliasRe = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\(?\s*[A-Za-z_$][\w$.]*\.params\s*&&\s*[A-Za-z_$][\w$.]*\.params(?:\.([A-Za-z_$][\w$]*)|\[\s*(['"])([^'"]+)\3\s*\])/g
+  for (const match of code.matchAll(aliasRe)) {
+    const alias = match[1] ?? ''
+    const paramName = (match[2] ?? match[4] ?? '').trim()
+    if (!alias || !PARAM_NAME_RE.test(paramName)) continue
+    const start = match.index ?? 0
+    const declarationWindow = code.slice(start, Math.min(code.length, start + 1600))
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const usage = new RegExp(`\\[\\s*${escaped}\\s*\\]\\s*=`).exec(declarationWindow)
+    if (!usage) continue
+    const window = declarationWindow.slice(usage.index, Math.min(declarationWindow.length, usage.index + 900))
+    const call = /(?:api|call|routePath|request|mutate|send)\s*\(\s*(['"])([A-Za-z0-9_.:-]{1,80})\1/.exec(window)
+    if (!call) continue
+    const routeKey = call[2]
+    const probes = window.slice(0, 500)
+    const location: RouteMapParamBinding['location'] =
+      /URLSearchParams|FormData\s*\(/.test(probes) ? 'form'
+        : /JSON\.stringify\s*\(/.test(probes) ? 'json'
+          : 'form'
+    const dedupe = `${routeKey}|${paramName}|${location}`
+    if (seen.has(dedupe)) continue
+    seen.add(dedupe)
+    out.push({ routeKey, name: paramName, location })
+    if (out.length >= 20) break
+  }
+  return out
+}
+
+function routeKeyTokens(raw: string): string[] {
+  return raw
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map(token => (token.length > 3 && token.endsWith('s') ? token.slice(0, -1) : token))
+    .filter(token => token.length > 2 && !GENERIC_ROUTE_TOKENS.has(token))
+}
+
+/** Parse a JSON route-map document and upsert its endpoints/params into the store. */
+export function parseRouteMapDoc(
+  rawBody: string,
+  origin: string,
+  storage: Store,
+  runId: string,
+  scopeRevision: number,
+  dynamicPaths: Set<string>,
+  dynamicParams: Set<string>,
+  bindings?: ReadonlyMap<string, readonly RouteMapParamBinding[]>,
+): ParsedRouteMap {
+  let doc: unknown
+  try {
+    doc = JSON.parse(rawBody) as unknown
+  } catch {
+    return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
+  }
+  if (!doc || typeof doc !== 'object') return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
+  const root = doc as Record<string, unknown>
+  if (typeof root.openapi === 'string' || typeof root.swagger === 'string') {
+    return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
+  }
+  const expansion = extractRouteMapEntries(doc)
+  if (expansion.entries.length === 0) {
+    return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
+  }
+  let apiPrefix = ''
+  for (const [key, value] of Object.entries(root)) {
+    if (/prefix$/i.test(key) && typeof value === 'string' && value.trim().startsWith('/')) {
+      apiPrefix = value.trim().replace(/\/+$/, '')
+      break
+    }
+  }
+
+  let endpoints = 0
+  let params = 0
+  const created: Array<{ id: string; key: string | null; method: string; path: string }> = []
+  const paramKeys = new Set<string>()
+
+  const addParam = (endpointId: string, method: string, param: RouteMapParam) => {
+    const dedupe = `${endpointId}|${param.name}|${param.location}`
+    if (paramKeys.has(dedupe)) return
+    paramKeys.add(dedupe)
+    storage.upsertEndpointParam({
+      runId,
+      endpointId,
+      name: param.name,
+      location: param.location,
+      isCsrf: CSRF_PARAM_RE.test(param.name),
+      isObjectId: param.location === 'path' || OBJECT_ID_PARAM_RE.test(param.name),
+      source: 'openapi',
+    })
+    dynamicParams.add(param.name)
+    params += 1
+  }
+
+  for (const entry of expansion.entries) {
+    let candidate = entry.path
+    if (!candidate.startsWith('/') && !/^https?:\/\//i.test(candidate) && apiPrefix) {
+      candidate = `${apiPrefix}/${candidate.replace(/^\/+/, '')}`
+    }
+    const clean = sanitizePathCandidate(candidate, origin)
+    if (!clean) continue
+    const barePath = (clean.split('?')[0] ?? '/') || '/'
+    if (barePath === '/' || STATIC_ASSET_RE.test(barePath)) continue
+    const pathTemplate = normalizeRouteTemplate(barePath)
+    const endpoint = storage.upsertEndpoint({
+      runId,
+      scopeRevision,
+      origin,
+      method: entry.method,
+      pathTemplate,
+      source: 'openapi',
+      riskScore: scoreEndpointRisk(entry.method, pathTemplate),
+    })
+    endpoints += 1
+    dynamicPaths.add(pathTemplate)
+    created.push({ id: endpoint.id, key: entry.key, method: entry.method, path: pathTemplate })
+    for (const pathParam of extractDynamicPathParams(barePath)) {
+      addParam(endpoint.id, entry.method, { name: pathParam.name, location: 'path' })
+    }
+    for (const param of entry.params) addParam(endpoint.id, entry.method, param)
+    if (entry.key && bindings) {
+      for (const binding of bindings.get(entry.key) ?? []) {
+        const actual = expansion.paramMap[binding.name] ?? binding.name
+        addParam(endpoint.id, entry.method, { name: actual, location: binding.location })
+      }
+    }
+  }
+
+  // Link logical->actual parameter hints to route keys by shared name tokens (e.g. a `*Body`
+  // hint to the matching `*Create` write route). Bounded: 4 endpoints per hint.
+  for (const hint of expansion.paramHints) {
+    dynamicParams.add(hint)
+    const hintTokens = new Set(routeKeyTokens(hint))
+    if (hintTokens.size === 0) continue
+    const ranked = created
+      .filter(ep => ep.key)
+      .map(ep => {
+        const overlap = routeKeyTokens(ep.key ?? '').filter(token => hintTokens.has(token)).length
+        return { ep, overlap }
+      })
+      .filter(candidate => candidate.overlap > 0)
+      .sort((a, b) =>
+        b.overlap - a.overlap
+        || (a.ep.method === 'GET' ? 1 : 0) - (b.ep.method === 'GET' ? 1 : 0)
+        || a.ep.path.length - b.ep.path.length)
+      .slice(0, 4)
+    for (const { ep } of ranked) {
+      addParam(ep.id, ep.method, { name: hint, location: ep.method === 'GET' || ep.method === 'HEAD' ? 'query' : 'json' })
+    }
+  }
+
+  return {
+    endpoints,
+    params,
+    routeKeys: [...new Set(created.map(ep => ep.key).filter((key): key is string => Boolean(key)))],
+    paramHints: expansion.paramHints,
+  }
+}
+
+/**
+ * Bounded scan of client bundles for router-table literals: `router.get('/path')`,
+ * `.route('/path').post(...)`, and route-object literals carrying path+method.
+ */
+export function parseJsRouterTable(code: string): JsRequestSpec[] {
+  const out: JsRequestSpec[] = []
+  const seen = new Set<string>()
+  const push = (method: string, rawPath: string) => {
+    const path = rawPath.trim()
+    if (!path.startsWith('/') || path.startsWith('//') || path.length > 200 || /[\r\n\0\\]/.test(path)) return
+    const cleanPath = path.split('?')[0] ?? path
+    const methodUpper = asHttpMethod(method) ?? 'GET'
+    const key = `${methodUpper} ${cleanPath}`
+    if (seen.has(key)) return
+    seen.add(key)
+    const params: JsRequestParam[] = []
+    const qIdx = path.indexOf('?')
+    if (qIdx >= 0) {
+      try {
+        for (const name of new URL(path, 'http://guardian.invalid').searchParams.keys()) {
+          if (PARAM_NAME_RE.test(name)) params.push({ name, location: 'query' })
+        }
+      } catch { /* ignore malformed query */ }
+    }
+    out.push({ method: methodUpper, path: cleanPath, params })
+  }
+
+  for (const match of code.matchAll(/(?:^|[^\w$])[A-Za-z_$][\w$]*\s*\.\s*(get|post|put|patch|delete|all)\s*\(\s*(['"`])(\/[^'"`]{0,200})\2/g)) {
+    push(match[1], match[3])
+    if (out.length >= 120) return out
+  }
+  for (const match of code.matchAll(/[{,]\s*(?:path|pattern)\s*:\s*(['"`])(\/[^'"`]{0,200})\1([^{}]{0,240})/g)) {
+    const tail = match[3] ?? ''
+    const method = /(?:method|verb)\s*:\s*(['"`])([A-Za-z]+)\1/.exec(tail)?.[2]
+    if (method) push(method, match[2])
+    else if (/(?:component|element|children|loader|action|exact|name)\s*:/.test(tail)) push('GET', match[2])
+    if (out.length >= 120) return out
+  }
+  for (const match of code.matchAll(/[{,]\s*(?:method|verb)\s*:\s*(['"`])([A-Za-z]+)\1[^{}]{0,240}?(?:path|pattern)\s*:\s*(['"`])(\/[^'"`]{0,200})\3/g)) {
+    push(match[2], match[4])
+    if (out.length >= 120) return out
+  }
+  for (const match of code.matchAll(/\.route\s*\(\s*(['"`])(\/[^'"`]{0,200})\1\s*\)([\s\S]{0,320})/g)) {
+    for (const chained of (match[3] ?? '').matchAll(/\.\s*(get|post|put|patch|delete)\s*\(/g)) {
+      push(chained[1], match[2])
+      if (out.length >= 120) return out
+    }
+  }
+  return out
+}
+
+const JSON_LINK_KEYS = /^(?:href|url|uri|link|links|self|next|prev|first|last|path|endpoint|action|resource|target|location|canonical|_links|@id)$/i
+
+/**
+ * Same-origin ES module specifiers referenced by a bundle (static import/export-from and dynamic
+ * import). SPA bootstrap bundles usually keep their API client in an imported chunk, so following
+ * these is required before request-literal scanning can see config fetches.
+ */
+export function extractJsModuleImports(code: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (specifier: string | undefined) => {
+    if (!specifier || out.length >= 24) return
+    const clean = specifier.trim()
+    if (!clean || /[\r\n\0\\]/.test(clean)) return
+    if (!clean.startsWith('/') && !clean.startsWith('./') && !clean.startsWith('../')) return
+    if (seen.has(clean)) return
+    seen.add(clean)
+    out.push(clean)
+  }
+  for (const match of code.matchAll(/\bimport\s+(?:[^'";]{0,200}?\s+from\s+)?(['"])([^'"]{1,200})\1/g)) push(match[2])
+  for (const match of code.matchAll(/\bexport\s+[^'";]{0,200}?\s+from\s+(['"])([^'"]{1,200})\1/g)) push(match[2])
+  for (const match of code.matchAll(/\bimport\s*\(\s*(['"`])([^'"`]{1,200})\1\s*\)/g)) push(match[2])
+  return out
+}
+
+/** Bounded walk of an authenticated JSON document collecting same-origin navigation targets
+ * (HATEOAS `_links`/`href`, `next`, API paths) without treating arbitrary response fields as routes.
+ */
+export function extractJsonLinkTargets(rawBody: string, origin: string): string[] {
+  let doc: unknown
+  try {
+    doc = JSON.parse(rawBody) as unknown
+  } catch {
+    return []
+  }
+  const out = new Set<string>()
+  let visited = 0
+  const consider = (value: string) => {
+    if (out.size >= 40 || value.length > 240) return
+    if (!value.startsWith('/') && !value.startsWith(origin)) return
+    const clean = sanitizePathCandidate(value, origin)
+    if (!clean || clean === '/' || STATIC_ASSET_RE.test(clean)) return
+    out.add(clean)
+  }
+  const walk = (node: unknown, key: string, depth: number): void => {
+    if (visited > 700 || depth > 6 || out.size >= 40) return
+    visited += 1
+    if (typeof node === 'string') {
+      if (JSON_LINK_KEYS.test(key) || /^\/(?:api|rest|v\d|graphql)\//i.test(node)) consider(node)
+      return
+    }
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 80)) walk(item, key, depth + 1)
+      return
+    }
+    for (const [childKey, value] of Object.entries(node as Record<string, unknown>)) {
+      walk(value, childKey, depth + 1)
+    }
+  }
+  walk(doc, '', 0)
+  return [...out]
+}
+
+/**
+ * Field names visible in an authenticated JSON response. Used to seed request-body parameter
+ * names for sibling write routes on the same resource (schema-observed, never invented).
+ */
+export function extractJsonFieldNames(rawBody: string, max = 24): string[] {
+  let doc: unknown
+  try {
+    doc = JSON.parse(rawBody) as unknown
+  } catch {
+    return []
+  }
+  const names: string[] = []
+  const seen = new Set<string>()
+  const responseOnly = /^(?:html|output|error|errors|message|messages|ok|success|detail|error_description|authenticated)$/i
+  const push = (key: string) => {
+    if (names.length >= max) return
+    if (!PARAM_NAME_RE.test(key) || responseOnly.test(key) || /^(?:__proto__|constructor|prototype)$/.test(key)) return
+    if (seen.has(key)) return
+    seen.add(key)
+    names.push(key)
+  }
+  const isScalar = (value: unknown): boolean =>
+    typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+
+  const collectObject = (obj: Record<string, unknown>, depth: number) => {
+    for (const [key, value] of Object.entries(obj)) {
+      if (isScalar(value)) push(key)
+      else if (depth < 1 && value && typeof value === 'object' && !Array.isArray(value)) {
+        const nested = value as Record<string, unknown>
+        const nestedScalars = Object.values(nested).filter(isScalar).length
+        // A resource wrapper such as {settings:{...}} contributes its leaf fields directly.
+        if (nestedScalars > 0) {
+          for (const [nestedKey, nestedValue] of Object.entries(nested)) if (isScalar(nestedValue)) push(nestedKey)
+        }
+      }
+    }
+  }
+
+  const collectItems = (value: unknown, depth: number) => {
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 3)) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) collectObject(item as Record<string, unknown>, depth)
+      }
+      return
+    }
+    if (value && typeof value === 'object') collectObject(value as Record<string, unknown>, depth)
+  }
+
+  if (Array.isArray(doc)) {
+    collectItems(doc, 0)
+  } else if (doc && typeof doc === 'object') {
+    const root = doc as Record<string, unknown>
+    let sawItems = false
+    for (const envelope of ['items', 'data', 'results', 'rows', 'records']) {
+      if (envelope in root) {
+        sawItems = true
+        collectItems(root[envelope], 0)
+      }
+    }
+    collectObject(root, 0)
+    if (!sawItems) {
+      // Nothing further: root scalars already collected.
+    }
+  }
+  return names
+}
+
+/** Collect stable record identifiers from an API listing so sibling detail routes can be walked. */
+export function extractJsonRecordIds(rawBody: string, max = 4): string[] {
+  let doc: unknown
+  try {
+    doc = JSON.parse(rawBody) as unknown
+  } catch {
+    return []
+  }
+  const rows: Array<Record<string, unknown>> = []
+  const collect = (value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 3)) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) rows.push(item as Record<string, unknown>)
+      }
+    }
+  }
+  if (Array.isArray(doc)) collect(doc)
+  else if (doc && typeof doc === 'object') {
+    const root = doc as Record<string, unknown>
+    for (const envelope of ['items', 'data', 'results', 'rows', 'records', 'list', 'values']) {
+      if (envelope in root) collect(root[envelope])
+    }
+  }
+  const preferred = ['ext_id', 'id', 'uuid', 'uid', 'key', 'ref', 'slug', 'name']
+  const out: string[] = []
+  const seen = new Set<string>()
+  const pushValue = (value: unknown) => {
+    if (out.length >= max) return
+    if (typeof value !== 'string' && typeof value !== 'number') return
+    const clean = String(value).trim()
+    if (!clean || clean.length > 80 || !/^[A-Za-z0-9_.:@-]+$/.test(clean)) return
+    if (seen.has(clean)) return
+    seen.add(clean)
+    out.push(clean)
+  }
+  for (const key of preferred) {
+    for (const row of rows) if (key in row) pushValue(row[key])
+  }
+  for (const row of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      if (!/(?:^|_)(?:id|key|ref|slug)$/i.test(key)) continue
+      pushValue(value)
+    }
+  }
+  return out.slice(0, max)
+}
+
+/** Normalise a concrete request URL/body into endpoint + parameter shape (query/json/form/xml). */
+export function inferXhrRequestShape(input: {
+  url: string
+  method?: string | null
+  body?: string | null
+  contentType?: string | null
+}): JsRequestSpec | null {
+  const trimmedUrl = input.url.trim()
+  if (!trimmedUrl) return null
+  let parsed: URL
+  try {
+    parsed = new URL(trimmedUrl, 'http://guardian.invalid')
+  } catch {
+    return null
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+  const path = parsed.pathname
+  if (!path.startsWith('/') || path.length > 240) return null
+  const params: JsRequestParam[] = []
+  const seen = new Set<string>()
+  const push = (name: string, location: JsRequestParam['location']) => {
+    if (!PARAM_NAME_RE.test(name)) return
+    const dedupe = `${name}|${location}`
+    if (seen.has(dedupe)) return
+    seen.add(dedupe)
+    params.push({ name, location })
+  }
+  for (const name of parsed.searchParams.keys()) push(name, 'query')
+  const body = typeof input.body === 'string' ? input.body.trim() : ''
+  if (body) {
+    const contentType = (input.contentType ?? '').toLowerCase()
+    if (body.startsWith('{') || body.startsWith('[') || contentType.includes('json')) {
+      try {
+        const parsedBody = JSON.parse(body) as unknown
+        if (parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)) {
+          for (const [key, value] of Object.entries(parsedBody as Record<string, unknown>)) {
+            if (value && typeof value === 'object' && !Array.isArray(value)) {
+              for (const [nestedKey, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+                if (nestedValue === null || typeof nestedValue !== 'object') push(`${key}.${nestedKey}`, 'json')
+              }
+            } else {
+              push(key, 'json')
+            }
+          }
+        }
+      } catch { /* not JSON */ }
+    } else if (body.startsWith('<')) {
+      const tags = [...body.matchAll(/<([A-Za-z_][\w.:-]{0,63})[^>]*>/g)]
+        .map(match => match[1])
+        .filter(tag => !/^(?:\?xml|request|root|envelope|body|guardian)$/i.test(tag))
+      const last = tags[tags.length - 1]
+      if (last) push(last, 'xml')
+    } else if (/^[\w.-]+=[\s\S]*$/.test(body)) {
+      try {
+        for (const name of new URLSearchParams(body).keys()) push(name, 'form')
+      } catch { /* ignore */ }
+    }
+    if (contentType.includes('multipart/form-data')) {
+      for (const match of body.matchAll(/name="([^"]{1,64})"/g)) push(match[1], 'form')
+    }
+  }
+  const method = asHttpMethod(input.method ?? '') ?? 'GET'
+  return { method, path, params: params.slice(0, 24) }
+}
+
 /** Record every query-string parameter of a discovered URL onto its endpoint. */
 function recordQueryParamsForEndpoint(input: {
   rawPathAndQuery: string
@@ -788,15 +1459,154 @@ export function parseOpenApiDoc(
   let params = 0
   const validMethods = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
 
-  for (const [rawPath, methodsObj] of Object.entries(pathsObj as Record<string, unknown>)) {
-    if (!methodsObj || typeof methodsObj !== 'object' || Array.isArray(methodsObj)) continue
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+
+  const resolvePointer = (ref: string): unknown => {
+    if (!ref.startsWith('#/')) return undefined
+    let cursor: unknown = doc
+    for (const rawToken of ref.slice(2).split('/')) {
+      const token = rawToken.replace(/~1/g, '/').replace(/~0/g, '~')
+      if (!isRecord(cursor)) return undefined
+      cursor = cursor[token]
+    }
+    return cursor
+  }
+
+  /** Dereference local `$ref` chains; sibling keys of a `$ref` override the target. */
+  const resolveNode = (node: unknown, depth = 0): Record<string, unknown> | null => {
+    if (depth > 8 || !isRecord(node)) return null
+    const ref = typeof node.$ref === 'string' ? node.$ref : null
+    if (!ref) return node
+    const target = resolvePointer(ref)
+    const resolved = resolveNode(target, depth + 1)
+    const merged: Record<string, unknown> = { ...node }
+    delete merged.$ref
+    return resolved ? { ...resolved, ...merged } : (Object.keys(merged).length > 0 ? merged : null)
+  }
+
+  const addParam = (endpointId: string, name: string, location: ParamLocation, inferredType?: string | null) => {
+    const clean = name.trim()
+    if (!clean || !PARAM_NAME_RE.test(clean)) return
+    storage.upsertEndpointParam({
+      runId,
+      endpointId,
+      name: clean,
+      location,
+      inferredType: inferredType ?? null,
+      isCsrf: CSRF_PARAM_RE.test(clean),
+      isObjectId: location === 'path' || OBJECT_ID_PARAM_RE.test(clean),
+      source: 'openapi',
+    })
+    dynamicParams.add(clean)
+    params += 1
+  }
+
+  /** Flatten a schema (through $ref/allOf/oneOf/items) into param names, bounded by depth. */
+  const addSchemaParams = (
+    schemaNode: unknown,
+    location: ParamLocation,
+    endpointId: string,
+    prefix = '',
+    level = 0,
+    refStack: readonly string[] = [],
+  ): void => {
+    if (level > 2) return
+    const ref = isRecord(schemaNode) && typeof schemaNode.$ref === 'string' ? schemaNode.$ref : null
+    if (ref) {
+      if (refStack.includes(ref)) return
+      refStack = [...refStack, ref]
+    }
+    const schema = resolveNode(schemaNode)
+    if (!schema) return
+    const props: Record<string, unknown> = {}
+    const collectProps = (node: Record<string, unknown>, depth: number) => {
+      if (depth > 3) return
+      if (isRecord(node.properties)) Object.assign(props, node.properties)
+      for (const composite of ['allOf']) {
+        const list = node[composite]
+        if (Array.isArray(list)) {
+          for (const branch of list) {
+            const resolved = resolveNode(branch)
+            if (resolved) collectProps(resolved, depth + 1)
+          }
+        }
+      }
+      for (const composite of ['oneOf', 'anyOf']) {
+        const list = node[composite]
+        if (Array.isArray(list) && list.length > 0) {
+          const resolved = resolveNode(list[0])
+          if (resolved) collectProps(resolved, depth + 1)
+        }
+      }
+      const typeName = typeof node.type === 'string' ? node.type.toLowerCase() : ''
+      if (typeName === 'array') {
+        const items = resolveNode(node.items)
+        if (items) collectProps(items, depth + 1)
+      }
+    }
+    collectProps(schema, 0)
+
+    for (const [propName, propNode] of Object.entries(props)) {
+      if (!propName) continue
+      const propSchema = resolveNode(propNode) ?? {}
+      const inferredType = typeof propSchema.type === 'string' ? propSchema.type : null
+      const xmlName = location === 'xml' && typeof propSchema.xml === 'object' && propSchema.xml && typeof (propSchema.xml as Record<string, unknown>).name === 'string'
+        ? String((propSchema.xml as Record<string, unknown>).name).trim()
+        : ''
+      const name = location === 'xml'
+        ? (xmlName || propName)
+        : `${prefix}${propName}`
+      addParam(endpointId, name, location, inferredType)
+      if (location === 'xml') continue
+      const typeName = typeof propSchema.type === 'string' ? propSchema.type.toLowerCase() : ''
+      if (typeName === 'array') {
+        const items = resolveNode(propSchema.items)
+        if (items && isRecord(items.properties)) {
+          addSchemaParams(items, location, endpointId, `${prefix}${propName}.0.`, level + 1, refStack)
+        }
+        continue
+      }
+      if (isRecord(propSchema.properties)) {
+        addSchemaParams(propSchema, location, endpointId, `${prefix}${propName}.`, level + 1, refStack)
+      }
+    }
+  }
+
+  const addParameterRecord = (rawParam: unknown, endpointId: string): string | null => {
+    const rec = resolveNode(rawParam)
+    if (!rec) return null
+    const name = typeof rec.name === 'string' ? rec.name.trim() : ''
+    const inRaw = typeof rec.in === 'string' ? rec.in.toLowerCase() : ''
+    if (inRaw === 'body' || inRaw === 'formdata') {
+      const location: ParamLocation = inRaw === 'body' ? 'json' : 'form'
+      addSchemaParams(rec.schema ?? rec, location, endpointId)
+      if (!rec.schema && name) addParam(endpointId, name, location, typeof rec.type === 'string' ? rec.type : null)
+      return name || null
+    }
+    if (!name) return null
+    const location: ParamLocation =
+      inRaw === 'path' ? 'path'
+        : inRaw === 'header' ? 'header'
+          : inRaw === 'cookie' ? 'cookie'
+            : inRaw === 'query' ? 'query'
+              : 'query'
+    const schemaObj = resolveNode(rec.schema) ?? {}
+    addParam(endpointId, name, location, typeof schemaObj.type === 'string' ? schemaObj.type : null)
+    return name
+  }
+
+  for (const [rawPath, rawPathItem] of Object.entries(pathsObj as Record<string, unknown>)) {
+    const pathItem = resolveNode(rawPathItem)
+    if (!pathItem) continue
     const leading = rawPath.startsWith('/') ? rawPath : `/${rawPath}`
     // Preserve OpenAPI {param} placeholders while still collapsing raw literal IDs if any appear
     const pathTemplate = leading.includes('{')
       ? leading.split('?')[0].replace(/\/{2,}/g, '/')
       : normalizeRouteTemplate(leading)
     dynamicPaths.add(pathTemplate)
-    for (const [mKey, opVal] of Object.entries(methodsObj as Record<string, unknown>)) {
+    const pathLevelParams = Array.isArray(pathItem.parameters) ? pathItem.parameters : []
+    for (const [mKey, opVal] of Object.entries(pathItem)) {
       if (!validMethods.has(mKey.toLowerCase())) continue
       const method = mKey.toUpperCase()
       const ep = storage.upsertEndpoint({
@@ -809,72 +1619,34 @@ export function parseOpenApiDoc(
         riskScore: scoreEndpointRisk(method, pathTemplate),
       })
       endpoints += 1
-      const op = (opVal && typeof opVal === 'object' ? opVal : {}) as Record<string, unknown>
-      const opParams = Array.isArray(op.parameters) ? op.parameters : []
-      for (const p of opParams) {
-        if (!p || typeof p !== 'object') continue
-        const rec = p as Record<string, unknown>
-        const name = typeof rec.name === 'string' ? rec.name.trim() : ''
-        if (!name) continue
-        const locRaw = typeof rec.in === 'string' ? rec.in.toLowerCase() : 'query'
-        const location: ParamLocation =
-          locRaw === 'path' ? 'path'
-            : locRaw === 'header' ? 'header'
-              : locRaw === 'cookie' ? 'cookie'
-                : 'query'
-        const schemaObj = (rec.schema && typeof rec.schema === 'object' ? rec.schema : {}) as Record<string, unknown>
-        storage.upsertEndpointParam({
-          runId,
-          endpointId: ep.id,
-          name,
-          location,
-          inferredType: typeof schemaObj.type === 'string' ? schemaObj.type : null,
-          isCsrf: CSRF_PARAM_RE.test(name),
-          isObjectId: location === 'path' || OBJECT_ID_PARAM_RE.test(name),
-          source: 'openapi',
-        })
-        dynamicParams.add(name)
-        params += 1
+      const op = resolveNode(opVal) ?? {}
+      const opParams = [...pathLevelParams, ...(Array.isArray(op.parameters) ? op.parameters : [])]
+      const declared = new Set<string>()
+      for (const rawParam of opParams) {
+        const name = addParameterRecord(rawParam, ep.id)
+        if (name) declared.add(name)
       }
-      // Extract requestBody properties for JSON, XML and form/multipart content types.
-      type SchemaProp = { type?: string; xml?: { name?: string } }
-      const reqBody = op.requestBody as { content?: Record<string, { schema?: { properties?: Record<string, SchemaProp> } }> } | undefined
-      const addBodyProps = (props: Record<string, SchemaProp> | undefined, location: ParamLocation) => {
-        if (!props || typeof props !== 'object') return
-        for (const [propName, propSchema] of Object.entries(props)) {
-          if (!propName) continue
-          const xmlName = location === 'xml' && typeof propSchema?.xml?.name === 'string' && propSchema.xml.name.trim()
-            ? propSchema.xml.name.trim()
-            : propName
-          storage.upsertEndpointParam({
-            runId,
-            endpointId: ep.id,
-            name: xmlName,
-            location,
-            inferredType: typeof propSchema?.type === 'string' ? propSchema.type : null,
-            isCsrf: CSRF_PARAM_RE.test(xmlName),
-            isObjectId: OBJECT_ID_PARAM_RE.test(xmlName),
-            source: 'openapi',
-          })
-          dynamicParams.add(xmlName)
-          params += 1
-        }
-      }
-      const content = reqBody?.content ?? {}
-      for (const [mediaType, media] of Object.entries(content)) {
+      // OpenAPI 3 requestBody (JSON/XML/form/multipart), resolving local $refs.
+      const reqBody = resolveNode(op.requestBody)
+      const content = isRecord(reqBody?.content) ? reqBody.content as Record<string, unknown> : {}
+      for (const [mediaType, mediaNode] of Object.entries(content)) {
         const lower = mediaType.toLowerCase()
-        const props = media?.schema?.properties
-        if (lower.includes('json')) addBodyProps(props, 'json')
-        else if (lower.includes('xml')) addBodyProps(props, 'xml')
-        else if (lower.includes('x-www-form-urlencoded') || lower.includes('multipart/form-data')) addBodyProps(props, 'form')
+        const location: ParamLocation | null =
+          lower.includes('json') ? 'json'
+            : lower.includes('xml') ? 'xml'
+              : lower.includes('x-www-form-urlencoded') || lower.includes('multipart/form-data') ? 'form'
+                : null
+        if (!location) continue
+        const media = resolveNode(mediaNode)
+        if (!media) continue
+        addSchemaParams(media.schema, location, ep.id)
       }
-      // Swagger 2 style parameters: in: body / formData with a schema.
-      for (const p of opParams) {
-        if (!p || typeof p !== 'object') continue
-        const rec = p as { in?: string; name?: string; schema?: { properties?: Record<string, SchemaProp> }; items?: unknown }
-        const inLoc = typeof rec.in === 'string' ? rec.in.toLowerCase() : ''
-        if (inLoc === 'body') addBodyProps(rec.schema?.properties, 'json')
-        else if (inLoc === 'formdata') addBodyProps(rec.schema?.properties, 'form')
+      // OpenAPI path template placeholders that were not declared as parameters.
+      for (const match of rawPath.matchAll(/\{([A-Za-z_][A-Za-z0-9_-]{0,63})\}/g)) {
+        const name = match[1]
+        if (!name || declared.has(name)) continue
+        declared.add(name)
+        addParam(ep.id, name, 'path')
       }
     }
   }
@@ -906,6 +1678,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let endpointsDiscovered = 0
   let paramsDiscovered = 0
   let stoppedReason: string | null = null
+  let routeMapEndpoints = 0
+  let jsRouterRoutes = 0
+  let navigationRequests = 0
+  let navigationEndpoints = 0
+  let authRequests = 0
   const frameworksDetected = new Set<string>()
   const techFingerprint = new Set<string>()
   const dynamicPaths = new Set<string>()
@@ -959,6 +1736,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
   // Tier 0: zero live HTTP requests
   if (tier === 0) {
+    storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts (static only).', {
+      requestsUsed: 0,
+      perOriginCap,
+      endpointsDiscovered,
+      paramsDiscovered,
+      routeMapEndpoints,
+      jsRouterRoutes,
+      navigationRequests,
+      navigationEndpoints,
+      authRequests,
+    })
     storage.updateRunPhase0Completed(runId, Date.now())
     return {
       requestsUsed: 0,
@@ -972,6 +1760,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         params: [...dynamicParams].slice(0, 80),
       },
       stoppedReason: null,
+      routeMapEndpoints,
+      jsRouterRoutes,
+      navigationRequests,
+      navigationEndpoints,
+      authRequests,
     }
   }
 
@@ -990,11 +1783,25 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const probedPaths = new Set<string>()
     const jsQueue: string[] = []
     const discoveredCandidatePaths: string[] = []
+    const jsonDocCandidates: string[] = []
+    const navSeeds: Array<{ path: string; depth: number }> = []
+    const writeOnlyPaths = new Set<string>()
     let originHalted = false
+    let personaRejected = false
+
+    const personaForOrigin = (handle: string | undefined): string | undefined => {
+      if (!handle || personaRejected) return undefined
+      const persona = grant.personas?.get(handle)
+      if (!persona) return undefined
+      return persona.originAllowlist.includes(origin) ? handle : undefined
+    }
+    // All discovery fetches carry the approved owner session when one is available, so the SPA
+    // shell, /api listings, config documents and OpenAPI specs behind login are visible.
+    let discoveryPersona = personaForOrigin(params.personas?.find((handle): handle is string => Boolean(handle)))
 
     const safeGet = async (
       pathAndQuery: string,
-      opts?: { method?: 'GET' | 'POST'; body?: string; headers?: Record<string, string> },
+      opts?: { method?: 'GET' | 'POST'; body?: string; headers?: Record<string, string>; anonymous?: boolean },
     ): Promise<BrokerExchangeResult | null> => {
       if (originHalted || signal.aborted) return null
       if (originUsed >= perOriginCap) return null
@@ -1004,7 +1811,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         return null
       }
       const method = opts?.method ?? 'GET'
-      const dedupeKey = `${method} ${pathAndQuery}`
+      const persona = opts?.anonymous ? undefined : discoveryPersona
+      const dedupeKey = `${method} ${pathAndQuery}${persona ? ` [${persona}]` : ''}`
       if (probedPaths.has(dedupeKey)) return null
       probedPaths.add(dedupeKey)
       originUsed += 1
@@ -1016,11 +1824,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           pathAndQuery,
           headers: opts?.headers,
           body: opts?.body,
+          ...(persona ? { persona } : {}),
           followRedirects: false,
           runId,
           assignmentId: params.assignmentId,
           timeoutMs: 8_000,
         }, grant, signal)
+        if (persona) authRequests += 1
         params.onExchange?.(ex)
         return ex
       } catch (err) {
@@ -1033,6 +1843,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           if (!grant.canRead(origin) || /scope|revoked/i.test(err.message)) {
             originHalted = true
             stoppedReason = 'scope_revoked'
+            return null
+          }
+          if (persona && /persona|session|credential/i.test(err.message)) {
+            // Persona session unusable for this origin: drop it for the rest of the pass and retry
+            // the same discovery request anonymously so recon never stalls on auth plumbing.
+            personaRejected = true
+            discoveryPersona = undefined
+            return safeGet(pathAndQuery, { ...opts, anonymous: true })
           }
           return null
         }
@@ -1044,7 +1862,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       method: string,
       rawPath: string,
       source: EndpointSource,
-      extra?: { framework?: string | null; riskScore?: number },
+      extra?: { framework?: string | null; riskScore?: number; authRequirement?: string | null },
     ) => {
       const pathTemplate = normalizeRouteTemplate(rawPath)
       const ep = storage.upsertEndpoint({
@@ -1055,11 +1873,32 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         pathTemplate,
         source,
         framework: extra?.framework ?? null,
+        authRequirement: extra?.authRequirement ?? null,
         riskScore: extra?.riskScore ?? scoreEndpointRisk(method, pathTemplate),
       })
       endpointsDiscovered += 1
       dynamicPaths.add(pathTemplate)
       return ep
+    }
+
+    const recordParams = (endpointId: string, paramList: readonly { name: string; location: ParamLocation }[], source: string): number => {
+      let added = 0
+      for (const p of paramList.slice(0, 24)) {
+        if (!p.name || !PARAM_NAME_RE.test(p.name)) continue
+        storage.upsertEndpointParam({
+          runId,
+          endpointId,
+          name: p.name,
+          location: p.location,
+          isCsrf: CSRF_PARAM_RE.test(p.name),
+          isObjectId: p.location === 'path' || OBJECT_ID_PARAM_RE.test(p.name),
+          source,
+        })
+        dynamicParams.add(p.name)
+        added += 1
+      }
+      paramsDiscovered += added
+      return added
     }
 
     // 2a. Standard seed probes
@@ -1093,6 +1932,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             for (const l of html.links.slice(0, 60)) {
               dynamicPaths.add(normalizeRouteTemplate(l))
               if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
+              if (/\.json(?:\?|$)/i.test(l) && jsonDocCandidates.length < 8 && !jsonDocCandidates.includes(l)) jsonDocCandidates.push(l)
             }
             for (const form of html.forms) {
               const ep = recordEndpoint(form.method, form.action, 'surface_probe')
@@ -1127,6 +1967,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         for (const l of html.links.slice(0, 60)) {
           dynamicPaths.add(normalizeRouteTemplate(l))
           if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
+          if (/\.json(?:\?|$)/i.test(l) && jsonDocCandidates.length < 8 && !jsonDocCandidates.includes(l)) jsonDocCandidates.push(l)
         }
         for (const form of html.forms) {
           const ep = recordEndpoint(form.method, form.action, 'surface_probe')
@@ -1175,6 +2016,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
         endpointsDiscovered += parsed.endpoints
         paramsDiscovered += parsed.params
+        if (parsed.endpoints === 0) {
+          // Swagger-less API index documents are handled by the structural route-map expander.
+          const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+          endpointsDiscovered += expanded.endpoints
+          paramsDiscovered += expanded.params
+          routeMapEndpoints += expanded.endpoints
+        }
       } else if (seedPath === '/graphql' && ex.status < 400) {
         recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
         techFingerprint.add('graphql')
@@ -1185,10 +2033,20 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     // 2b. Fetch same-origin JS chunks & optional source maps and feed into AST jsHarvest
     const maxJsChunks = Math.min(12, Math.max(0, perOriginCap - originUsed))
-    for (const jsPath of jsQueue.slice(0, maxJsChunks)) {
+    const configBindings = new Map<string, RouteMapParamBinding[]>()
+    const queueJsonDoc = (cleanPath: string) => {
+      if (jsonDocCandidates.length >= 8) return
+      if (jsonDocCandidates.includes(cleanPath)) return
+      jsonDocCandidates.push(cleanPath)
+    }
+    let jsFetched = 0
+    for (let jsIndex = 0; jsIndex < jsQueue.length && jsFetched < maxJsChunks; jsIndex += 1) {
+      const jsPath = jsQueue[jsIndex]
+      if (!jsPath) continue
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       const ex = await safeGet(jsPath)
       if (!ex || ex.status >= 400 || !ex.body) continue
+      jsFetched += 1
 
       const harvested = jsHarvest(ex.body, `${origin}${jsPath}`) as {
         apiPaths?: string[]
@@ -1209,6 +2067,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (seenJsRoutes.has(key)) return null
         seenJsRoutes.add(key)
         const ep = recordEndpoint(method, tmpl, 'js_ast')
+        if (method.toUpperCase() === 'GET' && (/\.json$/i.test(clean) || /(?:^|\/)(?:config|routes|route-map|manifest|endpoints|links|nav|menu|bootstrap)(?:\.|$)/i.test(clean))) {
+          queueJsonDoc(clean)
+        }
         for (const bk of bodyKeys.slice(0, 20)) {
           if (!bk) continue
           storage.upsertEndpointParam({
@@ -1257,10 +2118,36 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if ((harvested.graphqlDocs?.length ?? 0) > 0) {
         recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
       }
+      // Client router tables (`router.get('/x')`, route-object literals) carry methods and path
+      // templates that request-literal scanning misses.
+      for (const spec of parseJsRouterTable(ex.body).slice(0, 60)) {
+        const epId = addJsEndpoint(spec.method, spec.path)
+        if (!epId) continue
+        jsRouterRoutes += 1
+        recordParams(epId, spec.params, 'js_ast')
+      }
+      // Runtime parameter bindings: `<alias> = config.params.<name>` used as a body field before a
+      // named API call. Lets the route-map expander attach real body field names to write routes.
+      for (const binding of harvestConfigParamBindings(ex.body)) {
+        const list = configBindings.get(binding.routeKey) ?? []
+        if (!list.some(existing => existing.name === binding.name && existing.location === binding.location)) {
+          list.push(binding)
+          configBindings.set(binding.routeKey, list)
+        }
+      }
       for (const act of (harvested.nextActions ?? []).slice(0, 10)) {
         if (act.id) recordEndpoint('POST', `/_next/action/${act.id.slice(0, 40)}`, 'js_ast', { framework: 'nextjs', riskScore: 85 })
       }
 
+      // Follow same-origin module imports (the API client/config loader often lives in an imported
+      // chunk rather than the entry bundle).
+      for (const specifier of extractJsModuleImports(ex.body)) {
+        if (jsQueue.length >= 24) break
+        const clean = sanitizePathCandidate(specifier, `${origin}${jsPath}`)
+        if (!clean || STATIC_ASSET_RE.test(clean)) continue
+        if (!/\.(?:m?js|jsx|ts|tsx)(?:\?|$)/i.test(clean)) continue
+        if (!jsQueue.includes(clean)) jsQueue.push(clean)
+      }
       // Opportunistically fetch same-origin source map if budget permits
       const mapMatch = /\/\/[#@]\s*sourceMappingURL=([^\s'"]+)/.exec(ex.body)
       if (mapMatch && originUsed < perOriginCap) {
@@ -1281,6 +2168,39 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
+    // 2b-bis. Expand JSON route-map / API-description artifacts referenced by the SPA (runtime
+    // config, API index, manifests). Their route tables become endpoints with methods and params,
+    // even when the SPA shell itself exposes no crawlable links.
+    for (const docPath of [...new Set(jsonDocCandidates)].slice(0, 6)) {
+      if (originHalted || originUsed >= perOriginCap - 4 || signal.aborted) break
+      const ex = await safeGet(docPath)
+      if (!ex || ex.status >= 400 || !ex.body) continue
+      if (!/json/i.test(ex.mediaType) && !/^\s*[{[]/.test(ex.body)) continue
+      const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, configBindings)
+      endpointsDiscovered += expanded.endpoints
+      paramsDiscovered += expanded.params
+      routeMapEndpoints += expanded.endpoints
+      try {
+        const mapEntries = extractRouteMapEntries(JSON.parse(ex.body) as unknown)
+        const docGetPaths = new Set(mapEntries.entries.filter(entry => entry.method === 'GET').map(entry => normalizeRouteTemplate(entry.path)))
+        for (const entry of mapEntries.entries) {
+          const template = normalizeRouteTemplate(entry.path)
+          if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(template)) writeOnlyPaths.add(template)
+          if (entry.method !== 'GET') continue
+          if (/:|\{/.test(entry.path)) continue
+          const clean = sanitizePathCandidate(entry.path, origin)
+          if (!clean || STATIC_ASSET_RE.test(clean)) continue
+          navSeeds.push({ path: clean, depth: 0 })
+        }
+        for (const link of extractJsonLinkTargets(ex.body, origin)) {
+          if (writeOnlyPaths.has(normalizeRouteTemplate(link))) continue
+          navSeeds.push({ path: link, depth: 0 })
+        }
+      } catch {
+        for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
+      }
+    }
+
     // 2c. Tech-matched safe templates (strictly bounded by remaining per-origin budget)
     const remainingForTemplates = perOriginCap - originUsed
     if (!originHalted && !signal.aborted && remainingForTemplates >= 4 && techFingerprint.size > 0 && grant.canRead(origin)) {
@@ -1292,6 +2212,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           techFingerprint: [...techFingerprint],
           maxTemplates: Math.max(1, Math.floor(templateBudget / 2)),
           maxRequests: templateBudget,
+          ...(discoveryPersona ? { persona: discoveryPersona } : {}),
           runId,
           assignmentId: params.assignmentId,
           storage,
@@ -1347,6 +2268,93 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           for (const s of parsed.scripts) {
             if (!jsQueue.includes(s)) jsQueue.push(s)
           }
+        }
+      }
+    }
+
+    // 2d-bis. Bounded authenticated JSON navigation: follow HATEOAS links found in API responses
+    // and infer collection->detail reads from ids observed in authenticated listings. Read-only,
+    // depth <= 2, per-origin capped, and only JSON/API responses become endpoints (SPA shell HTML
+    // for unknown client routes is deliberately not recorded).
+    const navVisited = new Set<string>()
+    const navQueue = navSeeds.slice(0, 32)
+    const navGetTemplates = [...new Set(storage.listEndpoints(runId, { origin })
+      .filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2)
+      .map(ep => ep.pathTemplate))]
+    const navCap = Math.min(28, Math.max(0, perOriginCap - originUsed - 4))
+    const attachObservedFields = (baseTemplate: string, body: string) => {
+      if (observedFieldAttachments >= 12) return
+      const fields = extractJsonFieldNames(body)
+        .filter(name => !/^(?:ext_)?id$/i.test(name) && !/(?:_id|Id|_at|_by|uuid|ref)$/.test(name))
+      if (fields.length === 0) return
+      const priority = (name: string): number =>
+        /(url|uri|link|callback|redirect|endpoint|token|role|plan|price|amount|name|query|filter|template)/i.test(name) ? 0 : 1
+      const ranked = [...fields].sort((a, b) => priority(a) - priority(b))
+      const paramsByEndpoint = new Map<string, number>()
+      for (const row of storage.listEndpointParams(runId)) {
+        paramsByEndpoint.set(row.endpointId, (paramsByEndpoint.get(row.endpointId) ?? 0) + 1)
+      }
+      const targets = storage.listEndpoints(runId, { origin }).filter(ep =>
+        ['POST', 'PUT', 'PATCH'].includes(ep.method)
+        && (ep.pathTemplate === baseTemplate || ep.pathTemplate.startsWith(`${baseTemplate}/`))
+        && (paramsByEndpoint.get(ep.id) ?? 0) === 0)
+      for (const target of targets.slice(0, 4)) {
+        if (observedFieldAttachments >= 12) break
+        recordParams(target.id, ranked.slice(0, 4).map(name => ({ name, location: 'json' as const })), 'openapi')
+        observedFieldAttachments += 1
+      }
+    }
+    for (let navIndex = 0; navIndex < navQueue.length && navigationRequests < navCap; navIndex += 1) {
+      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
+      const item = navQueue[navIndex]
+      if (!item) continue
+      const clean = sanitizePathCandidate(item.path, origin)
+      if (!clean || clean === '/' || STATIC_ASSET_RE.test(clean)) continue
+      if (/[:{}]/.test(clean) || navVisited.has(clean)) continue
+      navVisited.add(clean)
+      const ex = await safeGet(clean)
+      if (!ex) continue
+      navigationRequests += 1
+      const isJson = /json/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)
+      const bare = clean.split('?')[0] || '/'
+      const surfaceStatus = ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405
+      if (!surfaceStatus) continue
+      if (!isJson && !/^\/(?:api|rest|v\d)\//i.test(bare) && !/\.json$/i.test(bare)) continue
+      const ep = recordEndpoint('GET', bare, 'spa_crawl', {
+        authRequirement: discoveryPersona ? `persona:${discoveryPersona}` : null,
+        riskScore: 60,
+      })
+      navigationEndpoints += 1
+      paramsDiscovered += recordQueryParamsForEndpoint({
+        rawPathAndQuery: clean, origin, endpointId: ep.id, source: 'spa_crawl',
+        storage, runId, dynamicParams,
+      })
+      if (!isJson || ex.status >= 400) continue
+      const template = normalizeRouteTemplate(bare)
+      const baseTemplate = template.replace(/\/:id$/, '')
+      attachObservedFields(baseTemplate, ex.body)
+      if (item.depth < 2) {
+        for (const link of extractJsonLinkTargets(ex.body, origin)) {
+          if (navQueue.length >= 64) break
+          if (writeOnlyPaths.has(normalizeRouteTemplate(link))) continue
+          navQueue.push({ path: link, depth: item.depth + 1 })
+        }
+      }
+      const ids = extractJsonRecordIds(ex.body)
+      if (ids.length === 0 || item.depth >= 2) continue
+      // Subresource templates (…/:id/view, …/:id/notes) imply the parent detail route; walk it too.
+      const detailTemplates = new Set(navGetTemplates)
+      for (const template of navGetTemplates) {
+        const marker = `${baseTemplate}/:id/`
+        if (!template.startsWith(marker)) continue
+        detailTemplates.add(template.slice(0, template.indexOf(marker) + marker.length - 1))
+      }
+      for (const candidateTemplate of detailTemplates) {
+        if (navQueue.length >= 72) break
+        if (!candidateTemplate.startsWith(`${baseTemplate}/`)) continue
+        if ((candidateTemplate.match(/:id/g) ?? []).length !== 1) continue
+        for (const id of ids.slice(0, 2)) {
+          navQueue.push({ path: candidateTemplate.replace(':id', encodeURIComponent(id)), depth: item.depth + 1 })
         }
       }
     }
@@ -1500,6 +2508,18 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     } catch { /* best-effort static edge inference */ }
   }
 
+  storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts.', {
+    requestsUsed,
+    perOriginCap,
+    endpointsDiscovered,
+    paramsDiscovered,
+    routeMapEndpoints,
+    jsRouterRoutes,
+    navigationRequests,
+    navigationEndpoints,
+    authRequests,
+    stoppedReason,
+  })
   storage.updateRunPhase0Completed(runId, Date.now())
 
   return {
@@ -1514,6 +2534,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       params: [...dynamicParams].slice(0, 80),
     },
     stoppedReason,
+    routeMapEndpoints,
+    jsRouterRoutes,
+    navigationRequests,
+    navigationEndpoints,
+    authRequests,
   }
 }
 
@@ -1694,7 +2719,8 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         }
       }
 
-      // Record intercepted XHR / fetch / WebSocket / GraphQL / Next-Action calls
+      // Record intercepted XHR / fetch / WebSocket / GraphQL / Next-Action calls, including query
+      // parameters and (when the browser record exposes it) the request body shape.
       const intercepted = [...visit.xhrRequests, ...(visit.allRequests ?? [])]
       for (const req of intercepted) {
         if (req.origin !== normalizedOrigin) continue
@@ -1703,19 +2729,63 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         }
         const clean = sanitizePathCandidate(req.url, normalizedOrigin)
         if (!clean || STATIC_ASSET_RE.test(clean)) continue
-        const tmpl = normalizeRouteTemplate(clean)
+        const record = req as { body?: unknown; postData?: unknown }
+        const rawBody = typeof record.body === 'string' ? record.body : typeof record.postData === 'string' ? record.postData : null
+        const shape = inferXhrRequestShape({
+          url: req.url,
+          method: req.method,
+          body: rawBody,
+          contentType: null,
+        })
+        if (!shape) continue
+        const tmpl = normalizeRouteTemplate(shape.path)
         const src: EndpointSource = /graphql/i.test(tmpl) ? 'graphql' : 'spa_crawl'
-        storage.upsertEndpoint({
+        const ep = storage.upsertEndpoint({
           runId,
           scopeRevision,
           origin: normalizedOrigin,
-          method: (req.method || 'GET').toUpperCase(),
+          method: shape.method,
           pathTemplate: tmpl,
           source: src,
           authRequirement: persona ? `persona:${persona}` : null,
-          riskScore: scoreEndpointRisk(req.method || 'GET', tmpl),
+          riskScore: scoreEndpointRisk(shape.method, tmpl),
         })
         endpointsDiscovered += 1
+        for (const p of shape.params) {
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: p.name,
+            location: p.location,
+            isCsrf: CSRF_PARAM_RE.test(p.name),
+            isObjectId: OBJECT_ID_PARAM_RE.test(p.name),
+            source: 'spa_crawl',
+          })
+          paramsDiscovered += 1
+        }
+      }
+      // Broker exchanges expose the concrete query string of every intercepted call even when the
+      // browser record only carries the URL; keep their parameter names too.
+      for (const ex of visit.exchanges) {
+        if (ex.origin !== normalizedOrigin) continue
+        const tmpl = normalizeRouteTemplate(ex.pathAndQuery)
+        const known = storage.listEndpoints(runId, { origin: normalizedOrigin }).find(e => e.method === ex.method.toUpperCase() && e.pathTemplate === tmpl)
+        if (!known) continue
+        const shape = inferXhrRequestShape({ url: ex.pathAndQuery, method: ex.method })
+        if (!shape) continue
+        for (const p of shape.params) {
+          if (p.location !== 'query') continue
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: known.id,
+            name: p.name,
+            location: 'query',
+            isCsrf: CSRF_PARAM_RE.test(p.name),
+            isObjectId: OBJECT_ID_PARAM_RE.test(p.name),
+            source: 'spa_crawl',
+          })
+          paramsDiscovered += 1
+        }
       }
       // Also inspect broker exchanges for Next-Action headers
       for (const ex of visit.exchanges) {

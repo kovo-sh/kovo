@@ -161,13 +161,27 @@ function setQueryParam(pathAndQuery: string, name: string, value: string): strin
 
 function setJsonPath(target: Record<string, unknown>, dotPath: string, value: unknown) {
   const parts = dotPath.split('.')
-  let cur = target
+  let cur: Record<string, unknown> | unknown[] = target
   for (let i = 0; i < parts.length - 1; i += 1) {
-    const next = cur[parts[i]]
-    if (!next || typeof next !== 'object' || Array.isArray(next)) cur[parts[i]] = {}
-    cur = cur[parts[i]] as Record<string, unknown>
+    const part = parts[i]
+    const nextIsIndex = /^\d{1,3}$/.test(parts[i + 1] ?? '')
+    if (Array.isArray(cur)) {
+      const index = /^\d{1,3}$/.test(part) ? Number(part) : 0
+      const existing = cur[index]
+      if (!existing || typeof existing !== 'object') cur[index] = nextIsIndex ? [] : {}
+      cur = cur[index] as Record<string, unknown> | unknown[]
+    } else {
+      const existing = cur[part]
+      if (!existing || typeof existing !== 'object') cur[part] = nextIsIndex ? [] : {}
+      cur = cur[part] as Record<string, unknown> | unknown[]
+    }
   }
-  cur[parts[parts.length - 1]] = value
+  const last = parts[parts.length - 1]
+  if (Array.isArray(cur)) {
+    cur[/^\d{1,3}$/.test(last) ? Number(last) : 0] = value
+  } else {
+    cur[last] = value
+  }
 }
 
 const forbiddenParamHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-guardian-trace-id)$/i
