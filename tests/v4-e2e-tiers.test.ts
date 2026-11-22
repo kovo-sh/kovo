@@ -59,7 +59,7 @@ import {
   selectSafeTemplates,
   TemplateValidationError,
 } from '../src/templates/loader.ts'
-import { determineExitCode, parseCliArgs, runCli } from '../scripts/cli.ts'
+import { parseCliArgs } from '../scripts/cli.ts'
 import { createApp } from './app.ts'
 import { validateSarif21 } from './v3-fullstack-lab/sarif-validate.ts'
 import {
@@ -1690,7 +1690,11 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'high', roleAffinity: 'reasoning',
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
-    const { projectId, runId } = await setupApprovedRun(storage)
+    // A dead seed now trips the v5 origin circuit breaker and pauses the run before the
+    // source audit can run. Serve benign 404s so discovery stays healthy and the test
+    // still exercises the Stage-3 git miner, not the network-failure path.
+    const fixture = await startHttpFixture(t, (_req, _body, res) => { res.statusCode = 404; res.end('not found') })
+    const { projectId, runId } = await setupApprovedRun(storage, { seeds: [fixture.origin] })
     const targetRepo = join(dir, 'repos', projectId, 'local', 'app')
     mkdirSync(join(dir, 'repos', projectId, 'local'), { recursive: true })
     await exec('cp', ['-r', appDir, targetRepo])
@@ -5168,7 +5172,9 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'high', roleAffinity: 'reasoning',
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
-    const { projectId, runId } = await setupApprovedRun(storage)
+    // Benign 404 fixture: see T1-13d. A dead seed pauses the run via the circuit breaker.
+    const fixture = await startHttpFixture(t, (_req, _body, res) => { res.statusCode = 404; res.end('not found') })
+    const { projectId, runId } = await setupApprovedRun(storage, { seeds: [fixture.origin] })
     mkdirSync(join(dataDir, 'repos', projectId, 'local'), { recursive: true })
     await exec('cp', ['-r', dir, join(dataDir, 'repos', projectId, 'local', 'app')])
     const engine = new Execution(storage)
@@ -5636,6 +5642,10 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
 
   test('T2-17a: authz_matrix sweeps SQLite endpoints paired with api_dependencies IDs', async (t) => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
+      // v5's id-selectivity gate compares the real id against a random nonexistent one.
+      // An echo endpoint must 404 unknown ids, otherwise every body is "similar" and the
+      // sweeper correctly refuses to call it id-bound.
+      if (!req.url?.includes('ord_secret_1')) { res.statusCode = 404; res.end('not found'); return }
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ orderId: 'ord_secret_1', owner: 'persona_a', viewer: req.headers.authorization }))
     })
@@ -6582,6 +6592,9 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   // --- Feature 24: Multi-Trial Parallel Branching + Early Stopping ---
 
   test('T2-24a: createMultiTrialSteps spawns 2 distinct trials sharing trialGroupId for crown-jewel lead', async (t) => {
+    // Benign 404 fixture: a dead seed trips the v5 origin circuit breaker and the run pauses
+    // before the crown-jewel lead can be fanned out into trials.
+    const fx = await startHttpFixture(t, (_req, _body, res) => { res.statusCode = 404; res.end('not found') })
     const llm = await startMockLlmServer(t, () => ({
       type: 'tool_call',
       callId: 'c_tm_24a',
@@ -6589,7 +6602,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       argumentsJson: JSON.stringify({
         status: 'proved',
         summary: 'Crown jewel threat model',
-        steps: [{ title: 'Crown Jewel Admin SQLi', hypothesis: 'sqli in /admin/query', category: 'injection-input', priority: 92, origins: ['http://127.0.0.1:9'] }],
+        steps: [{ title: 'Crown Jewel Admin SQLi', hypothesis: 'sqli in /admin/query', category: 'injection-input', priority: 92, origins: [fx.origin] }],
       }),
     }))
     const { storage } = makeStore(t)
@@ -6598,12 +6611,12 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'high', roleAffinity: 'reasoning',
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
-    const { runId } = await setupApprovedRun(storage)
+    const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 3_500
+      const deadline = Date.now() + 12_000
       while (Date.now() < deadline) {
         const trials = storage.client.prepare('SELECT trial_group_id, trial_index FROM chain_steps WHERE run_id = ? AND trial_group_id IS NOT NULL').all(runId) as Array<{ trial_group_id: string; trial_index: number }>
         if (trials.length >= 2) break
@@ -6903,7 +6916,9 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     )
     assert.equal(resolvePool('reasoning', storage)[0].endpoint, reasoningLlm.endpoint)
     assert.equal(resolvePool('fast', storage)[0].endpoint, fastLlm.endpoint)
-    const { runId } = await setupApprovedRun(storage)
+    // A dead seed pauses the run at the circuit breaker before any LLM stage runs.
+    const fx = await startHttpFixture(t, (_req, _body, res) => { res.statusCode = 404; res.end('not found') })
+    await setupApprovedRun(storage, { seeds: [fx.origin] })
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
@@ -8622,16 +8637,31 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     seedStorage.close()
 
     const sarifPath = join(outDir, 'report.sarif')
-    const exitCode = await withEnv({
-      GUARDIAN_ALLOW_LOCAL_LAB: '1',
-      OPENAI_BASE_URL: llm.endpoint,
-      OPENAI_API_KEY: 'sk-cli-mock-12345678',
-    }, () =>
-      runCli([
+    // Run the real CLI as a child process: importing runCli() into the test runner made the
+    // CLI engine's late scheduler tick observable after the test ended (a false async-activity
+    // failure attributed to this file). A subprocess is also the production invocation path,
+    // so the exit-code contract is exercised exactly as shipped.
+    const cliPath = resolve(repoRoot, 'scripts/cli.ts')
+    const exitCode = await new Promise<number>((resolveExit, rejectExit) => {
+      execFile(process.execPath, [
+        cliPath,
         'scan', '--local-lab', '--origin', fx.origin, '--tier', '2',
         '--output-dir', outDir, '--sarif', sarifPath, '--fail-on', 'high', '--timeout-sec', '45',
-      ]),
-    )
+      ], {
+        cwd: repoRoot,
+        timeout: 120_000,
+        env: {
+          ...process.env,
+          GUARDIAN_ALLOW_LOCAL_LAB: '1',
+          OPENAI_BASE_URL: llm.endpoint,
+          OPENAI_API_KEY: 'sk-cli-mock-12345678',
+        },
+      }, (error, _stdout, stderr) => {
+        if (error && typeof (error as { code?: unknown }).code !== 'number') return rejectExit(error)
+        if (stderr && process.env.GUARDIAN_WORKER_DEBUG === '1') process.stderr.write(stderr.slice(0, 2_000))
+        resolveExit(error ? Number((error as { code: number }).code) : 0)
+      })
+    })
     assert.equal(exitCode, 2, `Expected deterministic CLI exit code 2 for confirmed high finding, got ${exitCode}`)
     assert.equal(existsSync(sarifPath), true, 'Expected SARIF file at --sarif path')
     const sarifErrors = validateSarif21(JSON.parse(readFileSync(sarifPath, 'utf8')))
@@ -8924,7 +8954,8 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
 
   test('T4-14: Full zero-trust container escape & resource-exhaustion probe holds containment and leaves 0 orphans', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T4-14')
-    const backend = new LinuxWorkerBackend()
+    const labRunId = randomUUID()
+    const backend = new LinuxWorkerBackend({ runId: labRunId })
     const repoDir = makeTempDir(t, 'guardian-v4-escape-')
     writeLabRepoFixture(join(repoDir, 'app'))
     chmodSync(repoDir, 0o755)
@@ -8977,7 +9008,6 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const hostPort = (hostSrv.address() as { port: number }).port
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const labRunId = randomUUID()
     const labHandle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId: labRunId,
