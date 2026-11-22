@@ -676,6 +676,8 @@ export interface ResolvedContext {
   seedQuery?: string
   /** For an inferred parameter name: true/false once a differential proved whether the app reads it. */
   paramActive?: boolean
+  /** Explicit anti-CSRF header learned from a token-issuing route (bound to the persona session). */
+  csrfHeader?: Record<string, string>
 }
 
 export interface HypothesisOutcome {
@@ -919,6 +921,36 @@ async function surfaceValueFor(token: string, env: ProbeEnv): Promise<string | n
     if (named) return named
   }
   return null
+}
+
+/**
+ * Learn an anti-CSRF token bound to the persona's own session. Some apps issue the token from a
+ * dedicated GET while the persona authenticates with a vault cookie; the broker's jar-level bind
+ * then targets a different session, so the explicit header is needed for authorized write probes.
+ */
+async function csrfHeaderFor(env: ProbeEnv): Promise<Record<string, string> | undefined> {
+  if (!env.caps.sessionAndCsrf) return undefined
+  const cache = (env.ctxCache ??= new Map())
+  const cached = cache.get('csrf-header')
+  if (cached) return cached.csrfHeader
+  const route = (env.endpoints ?? []).find(e =>
+    e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+    /(?:^|[/_-])(?:csrf|xsrf|session|token)(?:$|[/_-])/i.test(e.path),
+  )
+  if (!route) return undefined
+  const out: ResolvedContext = {}
+  try {
+    const ex = await env.broker.executeHttp({
+      origin: env.origin, method: 'GET', pathAndQuery: route.path, persona: env.owner,
+      followRedirects: false, timeoutMs: 8_000,
+    }, env.grant, env.signal)
+    if (ex.status >= 200 && ex.status < 300) {
+      const m = /"(?:csrfToken|csrf_token|csrf|xsrfToken|xsrf_token)"\s*:\s*"([A-Za-z0-9._~+/-]{8,256})"/.exec(ex.body)
+      if (m) out.csrfHeader = { 'x-csrf-token': m[1] }
+    }
+  } catch { /* no token route reachable */ }
+  cache.set('csrf-header', out)
+  return out.csrfHeader
 }
 
 async function serverActionBodies(h: Hypothesis, env: ProbeEnv): Promise<unknown[]> {
@@ -1843,6 +1875,10 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       out.pair = { owner, other }
       req = await authzRequest(h, env, owner, other)
       if (h.writePathRead) req.writePathRead = true
+      if (h.method !== 'GET') {
+        const csrf = await csrfHeaderFor(env)
+        if (csrf) req.headers = { ...(req.headers ?? {}), ...csrf }
+      }
       break
     }
     case 'ssrf_canary':
