@@ -140,3 +140,11 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Accepted:** #1 `secretMatches` (merged `e18a775`); #2–#5 routed to climb2. Recommended gate split (deterministic vs real `Execution`) and the procedural-vs-agentic divergence risk adopted into M6 reporting.
 - **Rejected/deferred:** renegotiating the 65% gate (65% judged achievable without app redesign); business-logic procedural heuristics (assigned to agentic/white-box instead).
 - **Follow-ups filed:** deterministic Phase-1.5 sweep inside `Execution` (exec-hybrid stream); identifier-bound checks for LLM-authored specs.
+
+### 2026-11-22 — negative Phase-1.5 result (agentic divergence)
+
+- **Threshold:** Phase-1.5 sweep-on 3/59 at 60% precision vs same-session sweep-off 3/41 at 60%; `Execution --no-llm` 0/59 while the procedural pipeline scores 50%.
+- **Reviewer root cause:** the 50% loop lives in `scripts/benchmark-*` (deterministic hypothesis enumeration + identifier-bound spec synthesis + ReplayVerifier); inside `Execution`, `surface-engine` only emits anomalies, so `--no-llm` can never submit a spec. The 12-endpoint/90 s half-bridge added noise without closing the loop.
+- **Accepted:** rebuild the deterministic engine in `src/server/` (risk-ranked full surface → probe → spec → verifier), persist only verified findings, hide confirmed pairs from specialists, and treat real `Execution` as the primary product gate.
+- **Rejected:** merging the hybrid Phase-1.5 sweep (no lift, precision regression).
+- **Follow-up:** `engine-port` stream; interim framing = deterministic 50% / agentic 12%, not a shippable gate.
