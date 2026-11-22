@@ -36,7 +36,7 @@ import { declarativeReplaySpecSchema, replaySpecOrigins } from '../replay-spec.t
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
-import { evaluateTier3Approval, matchesApprovedEndpointPattern } from './approval-judge.ts'
+import { evaluateTier3Approval, isLocalLabAutoApprovalOrigin, matchesApprovedEndpointPattern } from './approval-judge.ts'
 import {
   agentTurn,
   buildBoardDelta,
@@ -1173,7 +1173,27 @@ export class Execution {
       isIdempotentPostAllowed: (_origin, pathAndQuery, body) => isSafeIdempotentPost(pathAndQuery, body),
       isStateChangeApproved: (origin, method, pathAndQuery) => {
         const fresh = this.storage.run(run.id)
-        if (allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' && fresh.capabilityTier >= 3) {
+        if (
+          project.environment === 'local-lab' &&
+          allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' &&
+          fresh.capabilityTier >= 3 &&
+          (fresh.approvalPolicy ?? 'auto_review') !== 'strict' &&
+          isLocalLabAutoApprovalOrigin(origin)
+        ) {
+          // Persist the zero-trust audit trail BEFORE the state change leaves the broker:
+          // origin-bound local-lab auto-approval is attributed distinctly from rule/judge/yolo.
+          this.storage.recordAutoApprovalDecision(fresh, job.assignment, {
+            origin,
+            method,
+            pathAndQuery,
+            rationale: `Local-lab Tier-3 state change during step "${job.assignment.stepId ?? 'step'}"`,
+            requestPreview: `${method.toUpperCase()} ${origin}${pathAndQuery}`,
+            decision: 'approved',
+            decidedBy: 'auto-review:local-lab',
+            riskLevel: 'medium',
+            policyNote: 'Authorized local-lab loopback/lab-internal origin; broker destructive-payload, webshell, SSRF metadata and RPS invariants enforced.',
+            secrets: currentSecrets(),
+          })
           return true
         }
         const activePatterns = (fresh.approvedEndpointPatterns ?? []).filter(
@@ -1878,12 +1898,13 @@ export class Execution {
   ): Promise<{ approved: boolean; deniedReason?: string }> {
     const run = this.check(job)
     const project = this.storage.project(run.projectId)
-    if (project.environment === 'local-lab' && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' && run.capabilityTier >= 3) {
-      return { approved: true }
-    }
     if (run.capabilityTier < 3) {
       throw new BrokerDenied('This operation requires Capability Tier 3.')
     }
+
+    // NOTE: local-lab auto-approval is decided exclusively below by evaluateTier3Approval so
+    // that every auto-approved action is origin-bound, respects an explicit `strict` policy,
+    // and is persisted as an audit record attributed to 'auto-review:local-lab'.
 
     const activePatterns = (run.approvedEndpointPatterns ?? []).filter(
       p => p.scopeRevision === undefined || p.scopeRevision === run.scopeRevision,

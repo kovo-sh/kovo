@@ -10,7 +10,12 @@ import type { NamedSecret } from './redact.ts'
 export type { ApprovalPolicy, ApprovedEndpointPattern }
 export type ApprovalPolicyMode = ApprovalPolicy
 export type ApprovalDecisionKind = 'approve' | 'escalate_human' | 'deny'
-export type ApprovalDecidedBy = 'auto-review:rule' | 'auto-review:judge' | 'auto-yolo' | 'operator'
+export type ApprovalDecidedBy =
+  | 'auto-review:rule'
+  | 'auto-review:judge'
+  | 'auto-review:local-lab'
+  | 'auto-yolo'
+  | 'operator'
 export type ApprovalRiskLevel = 'low' | 'medium' | 'high'
 
 export type SafetyJudgeLlmCall = (prompt: {
@@ -50,6 +55,7 @@ export interface Tier3ApprovalEvaluation {
     | 'strict'
     | 'yolo'
     | 'approved_pattern'
+    | 'local_lab'
     | 'hard_escalation'
     | 'benign_fast_path'
     | 'safety_judge'
@@ -139,6 +145,57 @@ function normalizeOriginKey(origin: string): string {
   }
 }
 
+function parseIpv4Host(host: string): [number, number, number, number] | null {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (!match) return null
+  const octets = match.slice(1).map(Number) as [number, number, number, number]
+  if (octets.some(octet => !Number.isInteger(octet) || octet < 0 || octet > 255)) return null
+  return octets
+}
+
+/**
+ * Zero-trust origin binding for local-lab auto-approval (invariant: a project labeled
+ * `local-lab` must still never auto-approve probes against an external hostname).
+ *
+ * Accepted: loopback (127.0.0.0/8, localhost, ::1), RFC1918 lab/container subnets
+ * (10/8, 172.16/12, 192.168/16), and single-label Docker/LabRunner service aliases
+ * such as `app` or `guardian-lab-web-1a2b3c4d5e`.
+ *
+ * Rejected: public hostnames (`EVIL.example.com`), public IPs, link-local/metadata
+ * addresses (169.254.0.0/16, fe80::/10), unspecified/other special-use ranges.
+ */
+export function isLocalLabAutoApprovalOrigin(origin: string): boolean {
+  let url: URL
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(origin) ? origin : `http://${origin}`)
+  } catch {
+    return false
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+  if (url.username || url.password) return false
+  const host = url.hostname.toLowerCase()
+  if (!host) return false
+  if (host === 'localhost' || host === '::1' || host === '[::1]') return true
+
+  const v4 = parseIpv4Host(host)
+  if (v4) {
+    const [a, b] = v4
+    if (a === 127) return true
+    if (a === 10) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 192 && b === 168) return true
+    // 169.254.0.0/16 is link-local (cloud metadata); never an authorized lab target.
+    return false
+  }
+
+  // IPv6 lab containers would be ULA/link-local; only the explicit loopback form is allowed above.
+  if (host.includes(':')) return false
+
+  // Single-label hostname: Docker network alias / LabRunner container name. These are only
+  // resolvable on the isolated lab network, never a public FQDN.
+  return !host.includes('.') && /^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/.test(host)
+}
+
 export function matchesApprovedEndpointPattern(
   target: { origin: string; method: string; pathAndQuery: string },
   patterns: readonly ApprovedEndpointPattern[] | undefined,
@@ -223,7 +280,6 @@ function detectHardEscalationReason(input: {
   headers?: Record<string, string>
   hasMultipart?: boolean
   isRceProof?: boolean
-  localLab?: boolean
 }): string | null {
   if (input.isRceProof) {
     return 'RCE proof-of-execution probe always requires explicit human approval.'
@@ -233,12 +289,6 @@ function detectHardEscalationReason(input: {
   }
   if (input.method === 'DELETE') {
     return 'HTTP DELETE requests always require explicit human approval.'
-  }
-  if (input.localLab) {
-    // In an authorized local-lab the broker still enforces the destructive-payload
-    // denylist, SSRF guards and RPS caps; keyword-only financial/admin escalations
-    // would otherwise stall legitimate /invoices, /refund, /webhooks and /admin proof.
-    return null
   }
 
   const actionHeader =
@@ -366,7 +416,24 @@ export async function evaluateTier3Approval(
 
   // 3. Auto-Review policy (Default — 2-Stage Hybrid Gate)
 
-  // Check operator-approved endpoint pattern first (except RCE proof which always escalates unless explicitly approved)
+  // 3a. Authorized local-lab auto-approval — ONLY for environment === 'local-lab' AND a
+  //     resolved loopback / lab-internal origin. The GUARDIAN_ALLOW_LOCAL_LAB flag alone can
+  //     never relax approvals for public or unspecified environments, and an external hostname
+  //     mislabeled as local-lab falls through to the public hard-escalation rules below.
+  //     Hard broker invariants (destructive denylist, webshell filter, private-IP/metadata SSRF
+  //     guards, RPS/budget caps) stay fully enforced; this gate only replaces the human approval.
+  if (input.environment === 'local-lab' && isLocalLabAutoApprovalOrigin(input.origin)) {
+    return {
+      decision: 'approve',
+      decidedBy: 'auto-review:local-lab',
+      riskLevel: 'medium',
+      reason: 'Authorized local-lab auto-approval for loopback/lab-internal origin (broker destructive-payload, webshell, SSRF metadata and RPS invariants still enforced).',
+      usedLlm: false,
+      stage: 'local_lab',
+    }
+  }
+
+  // Check operator-approved endpoint pattern (except RCE proof which always escalates unless explicitly approved)
   const matchedPattern = !input.isRceProof
     ? matchesApprovedEndpointPattern(
         { origin: input.origin, method, pathAndQuery },
@@ -393,7 +460,6 @@ export async function evaluateTier3Approval(
     headers: input.headers,
     hasMultipart: input.hasMultipart,
     isRceProof: input.isRceProof,
-    localLab: input.environment === 'local-lab',
   })
   if (hardEscalationReason) {
     return {
@@ -403,20 +469,6 @@ export async function evaluateTier3Approval(
       reason: hardEscalationReason,
       usedLlm: false,
       stage: 'hard_escalation',
-    }
-  }
-
-  // Stage 1A-local — authorized local-lab auto-approval for keyword-only escalations.
-  // Broker invariants (destructive denylist, SSRF guards, RPS caps, Tier-3 gating)
-  // remain fully enforced; public environments never take this branch.
-  if (input.environment === 'local-lab') {
-    return {
-      decision: 'approve',
-      decidedBy: 'auto-review:rule',
-      riskLevel: 'medium',
-      reason: 'Local-lab environment auto-approval (hard broker invariants enforced; destructive/RCE/DELETE/multipart still escalate).',
-      usedLlm: false,
-      stage: 'benign_fast_path',
     }
   }
 
