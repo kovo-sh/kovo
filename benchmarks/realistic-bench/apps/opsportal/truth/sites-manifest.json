@@ -1,0 +1,554 @@
+[
+  {
+    "id": "og.graphql-account-bola",
+    "dir": "sites/og.graphql-account-bola",
+    "rootCauseFile": "src/dashboard/graph.ts",
+    "vulnClass": "graphql_bola",
+    "cwe": "CWE-639",
+    "severity": "critical",
+    "routeKeys": [
+      "graphql"
+    ],
+    "triggerRouteKeys": [
+      "graphql"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "oracleRouteKeys": [
+      "graphql"
+    ],
+    "secondOrder": false,
+    "summary": "Dashboard GraphQL nested account resolver crosses the team boundary",
+    "implemented": true
+  },
+  {
+    "id": "og.report-ssti",
+    "dir": "sites/og.report-ssti",
+    "rootCauseFile": "src/reports/render.ts",
+    "vulnClass": "ssti",
+    "cwe": "CWE-1336",
+    "severity": "critical",
+    "routeKeys": [
+      "reportRender"
+    ],
+    "triggerRouteKeys": [
+      "reportRender"
+    ],
+    "oracleKinds": [
+      "template_code_exec"
+    ],
+    "oracleRouteKeys": [
+      "reportRender"
+    ],
+    "secondOrder": false,
+    "summary": "Report builder renders a user-supplied template through the engine",
+    "implemented": true
+  },
+  {
+    "id": "og.ticket-note-xss",
+    "dir": "sites/og.ticket-note-xss",
+    "rootCauseFile": "src/tickets/notes.ts",
+    "vulnClass": "xss_stored",
+    "cwe": "CWE-79",
+    "severity": "high",
+    "routeKeys": [
+      "ticketNoteCreate"
+    ],
+    "triggerRouteKeys": [
+      "ticketView"
+    ],
+    "oracleKinds": [
+      "stored_xss_rendered"
+    ],
+    "oracleRouteKeys": [
+      "ticketView"
+    ],
+    "secondOrder": true,
+    "summary": "Stored ticket note rendered as rich HTML on the ticket viewer",
+    "implemented": true
+  },
+  {
+    "id": "og.diag-cmdi",
+    "dir": "sites/og.diag-cmdi",
+    "rootCauseFile": "src/diagnostics/runner.ts",
+    "vulnClass": "command_injection",
+    "cwe": "CWE-78",
+    "severity": "critical",
+    "routeKeys": [
+      "diagRun"
+    ],
+    "triggerRouteKeys": [
+      "diagRun"
+    ],
+    "oracleKinds": [
+      "command_injection_simulated"
+    ],
+    "oracleRouteKeys": [
+      "diagRun"
+    ],
+    "secondOrder": false,
+    "summary": "Diagnostics runner interpolates a host argument into a shell command",
+    "implemented": true
+  },
+  {
+    "id": "og.webhook-ssrf",
+    "dir": "sites/og.webhook-ssrf",
+    "rootCauseFile": "src/integrations/webhook-test.ts",
+    "vulnClass": "ssrf",
+    "cwe": "CWE-918",
+    "severity": "high",
+    "routeKeys": [
+      "webhookCreate"
+    ],
+    "triggerRouteKeys": [
+      "webhookTest"
+    ],
+    "oracleKinds": [
+      "ssrf_internal_fetch"
+    ],
+    "oracleRouteKeys": [
+      "webhookTest"
+    ],
+    "secondOrder": true,
+    "summary": "Saved webhook target fired by a later test-delivery reaches internal services",
+    "implemented": true
+  },
+  {
+    "id": "og.dashboard-cache-poison",
+    "dir": "sites/og.dashboard-cache-poison",
+    "rootCauseFile": "src/dashboard/cache.ts",
+    "vulnClass": "cache_poisoning",
+    "cwe": "CWE-525",
+    "severity": "high",
+    "routeKeys": [
+      "dashboard"
+    ],
+    "triggerRouteKeys": [
+      "dashboard"
+    ],
+    "oracleKinds": [
+      "cache_poisoned"
+    ],
+    "oracleRouteKeys": [
+      "dashboard"
+    ],
+    "secondOrder": false,
+    "summary": "Shared dashboard cache serves one tenant a cached foreign response",
+    "implemented": true
+  },
+  {
+    "id": "og.log-path-traversal",
+    "dir": "sites/og.log-path-traversal",
+    "rootCauseFile": "src/logs/viewer.ts",
+    "vulnClass": "path_traversal",
+    "cwe": "CWE-22",
+    "severity": "high",
+    "routeKeys": [
+      "logView"
+    ],
+    "triggerRouteKeys": [
+      "logView"
+    ],
+    "oracleKinds": [
+      "path_escape"
+    ],
+    "oracleRouteKeys": [
+      "logView"
+    ],
+    "secondOrder": false,
+    "summary": "Log file viewer resolves a user path outside the jailed log root",
+    "implemented": true
+  },
+  {
+    "id": "og.saml-xxe",
+    "dir": "sites/og.saml-xxe",
+    "rootCauseFile": "src/sso/saml.ts",
+    "vulnClass": "xxe",
+    "cwe": "CWE-611",
+    "severity": "high",
+    "routeKeys": [
+      "samlImport"
+    ],
+    "triggerRouteKeys": [
+      "samlImport"
+    ],
+    "oracleKinds": [
+      "xxe_entity_resolved"
+    ],
+    "oracleRouteKeys": [
+      "samlImport"
+    ],
+    "secondOrder": false,
+    "summary": "SAML/config XML import resolves an external file entity",
+    "implemented": true
+  },
+  {
+    "id": "og.ticket-bola-read",
+    "dir": "sites/og.ticket-bola-read",
+    "rootCauseFile": "src/tickets/fetch.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "ticketGet"
+    ],
+    "triggerRouteKeys": [
+      "ticketGet"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "oracleRouteKeys": [
+      "ticketGet"
+    ],
+    "secondOrder": false,
+    "summary": "Ticket fetch trusts the path id without a team check",
+    "implemented": true
+  },
+  {
+    "id": "og.account-bola-write",
+    "dir": "sites/og.account-bola-write",
+    "rootCauseFile": "src/accounts/update.ts",
+    "vulnClass": "idor",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "accountUpdate"
+    ],
+    "triggerRouteKeys": [
+      "accountUpdate"
+    ],
+    "oracleKinds": [
+      "cross_tenant_write"
+    ],
+    "oracleRouteKeys": [
+      "accountUpdate"
+    ],
+    "secondOrder": false,
+    "summary": "Account update writes across the team boundary",
+    "implemented": true
+  },
+  {
+    "id": "og.viewer-bfla",
+    "dir": "sites/og.viewer-bfla",
+    "rootCauseFile": "src/users/role.ts",
+    "vulnClass": "bfla",
+    "cwe": "CWE-285",
+    "severity": "high",
+    "routeKeys": [
+      "roleChange"
+    ],
+    "triggerRouteKeys": [
+      "roleChange"
+    ],
+    "oracleKinds": [
+      "privilege_escalation"
+    ],
+    "oracleRouteKeys": [
+      "roleChange"
+    ],
+    "secondOrder": false,
+    "summary": "Read-only auditor can perform an admin role change",
+    "implemented": true
+  },
+  {
+    "id": "og.user-mass-assignment",
+    "dir": "sites/og.user-mass-assignment",
+    "rootCauseFile": "src/users/profile.ts",
+    "vulnClass": "mass_assignment",
+    "cwe": "CWE-915",
+    "severity": "high",
+    "routeKeys": [
+      "userUpdate"
+    ],
+    "triggerRouteKeys": [
+      "userUpdate"
+    ],
+    "oracleKinds": [
+      "mass_assignment"
+    ],
+    "oracleRouteKeys": [
+      "userUpdate"
+    ],
+    "secondOrder": false,
+    "summary": "User profile update binds role and team from the request body",
+    "implemented": true
+  },
+  {
+    "id": "og.search-sqli",
+    "dir": "sites/og.search-sqli",
+    "rootCauseFile": "src/search/run.ts",
+    "vulnClass": "sqli",
+    "cwe": "CWE-89",
+    "severity": "high",
+    "routeKeys": [
+      "searchRun"
+    ],
+    "triggerRouteKeys": [
+      "searchRun"
+    ],
+    "oracleKinds": [
+      "sql_structure_change"
+    ],
+    "oracleRouteKeys": [
+      "searchRun"
+    ],
+    "secondOrder": false,
+    "summary": "Saved search run builds raw SQL from the query string",
+    "implemented": true
+  },
+  {
+    "id": "og.api-jwt-forgery",
+    "dir": "sites/og.api-jwt-forgery",
+    "rootCauseFile": "src/tokens/verify.ts",
+    "vulnClass": "jwt",
+    "cwe": "CWE-347",
+    "severity": "high",
+    "routeKeys": [
+      "apiWhoami"
+    ],
+    "triggerRouteKeys": [
+      "apiWhoami"
+    ],
+    "oracleKinds": [
+      "token_forgery"
+    ],
+    "oracleRouteKeys": [
+      "apiWhoami"
+    ],
+    "secondOrder": false,
+    "summary": "Legacy API accepts an alg:none bearer token",
+    "implemented": true
+  },
+  {
+    "id": "og.sso-open-redirect",
+    "dir": "sites/og.sso-open-redirect",
+    "rootCauseFile": "src/sso/redirect.ts",
+    "vulnClass": "open_redirect",
+    "cwe": "CWE-601",
+    "severity": "medium",
+    "routeKeys": [
+      "ssoCallback"
+    ],
+    "triggerRouteKeys": [
+      "ssoCallback"
+    ],
+    "oracleKinds": [
+      "open_redirect"
+    ],
+    "oracleRouteKeys": [
+      "ssoCallback"
+    ],
+    "secondOrder": false,
+    "summary": "SSO callback redirects to an attacker-supplied next url",
+    "implemented": true
+  },
+  {
+    "id": "og.job-csrf",
+    "dir": "sites/og.job-csrf",
+    "rootCauseFile": "src/jobs/trigger.ts",
+    "vulnClass": "csrf",
+    "cwe": "CWE-352",
+    "severity": "medium",
+    "routeKeys": [
+      "jobTrigger"
+    ],
+    "triggerRouteKeys": [
+      "jobTrigger"
+    ],
+    "oracleKinds": [
+      "csrf_state_change"
+    ],
+    "oracleRouteKeys": [
+      "jobTrigger"
+    ],
+    "secondOrder": false,
+    "summary": "Job trigger accepts a cross-site state change without a token",
+    "implemented": true
+  },
+  {
+    "id": "og.integration-secret-disclosure",
+    "dir": "sites/og.integration-secret-disclosure",
+    "rootCauseFile": "src/integrations/list.ts",
+    "vulnClass": "info_disclosure",
+    "cwe": "CWE-200",
+    "severity": "high",
+    "routeKeys": [
+      "integrationList"
+    ],
+    "triggerRouteKeys": [
+      "integrationList"
+    ],
+    "oracleKinds": [
+      "secret_disclosed"
+    ],
+    "oracleRouteKeys": [
+      "integrationList"
+    ],
+    "secondOrder": false,
+    "summary": "Integrations list returns connection secrets to unentitled roles",
+    "implemented": true
+  },
+  {
+    "id": "og.log-filter-sqli",
+    "dir": "sites/og.log-filter-sqli",
+    "rootCauseFile": "src/logs/filter.ts",
+    "vulnClass": "sqli",
+    "cwe": "CWE-89",
+    "severity": "high",
+    "routeKeys": [
+      "logFilter"
+    ],
+    "triggerRouteKeys": [
+      "logFilter"
+    ],
+    "oracleKinds": [
+      "sql_structure_change"
+    ],
+    "oracleRouteKeys": [
+      "logFilter"
+    ],
+    "secondOrder": false,
+    "summary": "Log filter compiles a raw WHERE clause from the filter expression",
+    "implemented": true
+  },
+  {
+    "id": "og.account-search-xss",
+    "dir": "sites/og.account-search-xss",
+    "rootCauseFile": "src/accounts/search.ts",
+    "vulnClass": "xss_reflected",
+    "cwe": "CWE-79",
+    "severity": "medium",
+    "routeKeys": [
+      "accountSearch"
+    ],
+    "triggerRouteKeys": [
+      "accountSearch"
+    ],
+    "oracleKinds": [
+      "reflected_xss_rendered"
+    ],
+    "oracleRouteKeys": [
+      "accountSearch"
+    ],
+    "secondOrder": false,
+    "summary": "Account search reflects the query term as rich HTML",
+    "implemented": true
+  },
+  {
+    "id": "og.flag-bola",
+    "dir": "sites/og.flag-bola",
+    "rootCauseFile": "src/flags/scope.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "medium",
+    "routeKeys": [
+      "flagGet"
+    ],
+    "triggerRouteKeys": [
+      "flagGet"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "oracleRouteKeys": [
+      "flagGet"
+    ],
+    "secondOrder": false,
+    "summary": "Feature flag fetch leaks another team scoped flag value",
+    "implemented": true
+  },
+  {
+    "id": "og.job-workflow-skip",
+    "dir": "sites/og.job-workflow-skip",
+    "rootCauseFile": "src/jobs/complete.ts",
+    "vulnClass": "workflow_bypass",
+    "cwe": "CWE-840",
+    "severity": "medium",
+    "routeKeys": [
+      "jobComplete"
+    ],
+    "triggerRouteKeys": [
+      "jobComplete"
+    ],
+    "oracleKinds": [
+      "workflow_skip"
+    ],
+    "oracleRouteKeys": [
+      "jobComplete"
+    ],
+    "secondOrder": false,
+    "summary": "Job completion skips the required running state",
+    "implemented": true
+  },
+  {
+    "id": "og.backup-webhook-forgery",
+    "dir": "sites/og.backup-webhook-forgery",
+    "rootCauseFile": "src/backups/callback.ts",
+    "vulnClass": "webhook_forgery",
+    "cwe": "CWE-345",
+    "severity": "medium",
+    "routeKeys": [
+      "backupCallback"
+    ],
+    "triggerRouteKeys": [
+      "backupCallback"
+    ],
+    "oracleKinds": [
+      "webhook_forgery"
+    ],
+    "oracleRouteKeys": [
+      "backupCallback"
+    ],
+    "secondOrder": false,
+    "summary": "Backup callback accepts a forged delivery signature",
+    "implemented": true
+  },
+  {
+    "id": "og.ticket-assign-cross-write",
+    "dir": "sites/og.ticket-assign-cross-write",
+    "rootCauseFile": "src/tickets/assign.ts",
+    "vulnClass": "idor",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "ticketAssign"
+    ],
+    "triggerRouteKeys": [
+      "ticketAssign"
+    ],
+    "oracleKinds": [
+      "cross_tenant_write"
+    ],
+    "oracleRouteKeys": [
+      "ticketAssign"
+    ],
+    "secondOrder": false,
+    "summary": "Ticket assignment writes to a ticket in another team",
+    "implemented": true
+  },
+  {
+    "id": "og.integration-ssrf-direct",
+    "dir": "sites/og.integration-ssrf-direct",
+    "rootCauseFile": "src/integrations/fetch.ts",
+    "vulnClass": "ssrf",
+    "cwe": "CWE-918",
+    "severity": "high",
+    "routeKeys": [
+      "integrationFetch"
+    ],
+    "triggerRouteKeys": [
+      "integrationFetch"
+    ],
+    "oracleKinds": [
+      "ssrf_internal_fetch"
+    ],
+    "oracleRouteKeys": [
+      "integrationFetch"
+    ],
+    "secondOrder": false,
+    "summary": "Integration fetch pulls a connector url straight to internal services",
+    "implemented": true
+  }
+]

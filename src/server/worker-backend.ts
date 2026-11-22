@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, realpathSync, statSync } from 'node:fs'
@@ -17,6 +17,24 @@ const repoRelativePathSchema = z.string().min(1).max(512).refine(
   'Invalid repository-relative path.',
 )
 const workerNamespace = 'dev.guardian.workspace'
+const liveContainers = new Set<string>()
+let liveExitHookInstalled = false
+function removeLiveContainers() {
+  for (const container of liveContainers) {
+    try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: 5_000 }) } catch { /* best-effort */ }
+  }
+}
+function trackLiveContainer(name: string) {
+  liveContainers.add(name)
+  if (liveExitHookInstalled) return
+  liveExitHookInstalled = true
+  // Remove any container this process created but did not get to start/close
+  // (for example an aborted session between `docker create` and `docker start`,
+  // or a Playwright-owned server terminated with SIGTERM).
+  process.once('exit', removeLiveContainers)
+  process.once('SIGTERM', () => { removeLiveContainers(); process.exit(143) })
+  process.once('SIGINT', () => { removeLiveContainers(); process.exit(130) })
+}
 const workerName = /^guardian-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 
 const jobSchema = z.object({
@@ -375,6 +393,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const timeoutMs = (job.timeoutMs ?? 60_000) + 10_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
     this.activeContainers.add(name)
+    trackLiveContainer(name)
     try {
       await docker(this.containerCreateArgs(name, job.assignmentId, [], options), deadline)
       const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
@@ -382,6 +401,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     } finally {
       await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
       this.activeContainers.delete(name)
+      liveContainers.delete(name)
     }
   }
 
@@ -400,6 +420,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
     this.activeContainers.add(name)
+    trackLiveContainer(name)
     try {
       await docker(this.containerCreateArgs(name, assignmentId, [], options), deadline)
       const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
@@ -407,6 +428,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     } finally {
       await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
       this.activeContainers.delete(name)
+      liveContainers.delete(name)
     }
   }
 
@@ -416,11 +438,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
     signal.throwIfAborted()
     const name = 'guardian-' + randomUUID()
     this.activeContainers.add(name)
+    trackLiveContainer(name)
     try {
       await docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
     } catch (error) {
       await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
       this.activeContainers.delete(name)
+      liveContainers.delete(name)
       throw error
     }
 
@@ -476,6 +500,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         rl.close()
         await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
         this.activeContainers.delete(name)
+      liveContainers.delete(name)
       })()
       return closing
     }

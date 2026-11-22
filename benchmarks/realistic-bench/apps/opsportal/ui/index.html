@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpsPortal — Internal Operations</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">OpsPortal</span>
+    <nav id="nav" class="nav" hidden>
+      <button data-view="dashboard">Dashboard</button>
+      <button data-view="tickets">Tickets</button>
+      <button data-view="accounts">Accounts</button>
+      <button data-view="reports">Reports</button>
+      <button data-view="logs">Logs</button>
+      <button data-view="diagnostics">Diagnostics</button>
+      <button id="logout">Sign out</button>
+    </nav>
+  </header>
+  <main id="app" class="app">Loading…</main>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

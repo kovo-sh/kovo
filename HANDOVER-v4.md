@@ -118,6 +118,7 @@ Check exact exported signatures expected by Features 26 & 27 + `T4-13` in `tests
 - **Avoid OOM/Swap Thrash:** Always prefix Node/Vite/TypeScript commands with `NODE_OPTIONS=--max-old-space-size=1536`, run heavy suites with `--test-concurrency=1`, and keep concurrent subagents/workers capped at **<= 2** (avoid spawning deep nested subagent trees simultaneously).
 - **Avoid False-Positive Content Filters:** When editing security probe engines (`surface-engine.ts`, `benchmarks/xben-25/`, `local-lab/saas-lab/`), keep each worker focused on small modular files and read targeted line ranges instead of loading entire multi-thousand-line probe files into one context.
 - **Docker Worker Image:** `guardian-worker:v4` (and `guardian-worker:local` alias) is already built locally (`f926ee3ebbd8`). Rebuild via `npm run worker:build` only if `worker/` changes, and run `docker builder prune -f` afterward.
+- **Worker Host Dependencies:** The `tests/v4-m3-*` AST suites import `worker/analyzers.ts` on the host, which requires `@swc/core`/`acorn` from `worker/node_modules`. Run `npm run worker:install` once after checkout (the root `npm install` does not install them); without it those suites fall back to regex parsing and M3-T5/T8 fail.
 - **Secrets / Safety Rules:**
   - Never print, log, or commit credentials from `/home/exedev/.config/guardian-git/` or `/home/exedev/.config/guardian-fixtures/`.
   - Never run active automated probing against external internet domains; run all benchmark/hill-climbing work strictly against loopback `local-lab` targets (`127.0.0.1`).

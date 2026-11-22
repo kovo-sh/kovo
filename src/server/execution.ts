@@ -758,6 +758,7 @@ export class Execution {
   private readonly startedLabHandles = new Map<string, LabTargetHandle>()
   private readonly variantSweptFindings = new Set<string>()
   private readonly variantSweepInFlight = new Set<string>()
+  private readonly pendingTier3ApprovalKeys = new Set<string>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -1096,61 +1097,85 @@ export class Execution {
       return { approved: false, deniedReason: evaluation.reason }
     }
 
-    const req = this.storage.createApprovalRequest(run, job.assignment, {
-      origin: input.origin,
-      method: input.method,
-      pathAndQuery: input.pathAndQuery,
-      personaHandle: input.personaHandle,
-      rationale: input.rationale,
-      requestPreview: input.requestPreview,
-      policyNote: evaluation.reason,
-      riskLevel: evaluation.riskLevel,
-      secrets: input.secrets,
-    })
+    const approvalKey = [
+      run.id,
+      run.scopeRevision,
+      input.origin,
+      input.method.toUpperCase(),
+      input.pathAndQuery,
+      input.personaHandle ?? '',
+      input.isRceProof ? 'rce' : '',
+      input.isRaceBurst ? 'race' : '',
+      input.bodyPreview ?? '',
+    ].join('\0')
+    if (this.pendingTier3ApprovalKeys.has(approvalKey)) {
+      return {
+        approved: false,
+        deniedReason: 'An identical Tier 3 probe is already awaiting operator approval; duplicate parallel trial suppressed.',
+      }
+    }
+    this.pendingTier3ApprovalKeys.add(approvalKey)
 
-    const decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
-      const checkCurrent = () => {
-        try {
-          const latest = this.storage.getApprovalRequest(run.id, req.id)
-          if (latest.status !== 'pending') {
+    let decision: 'approved' | 'denied' | 'canceled' | 'expired'
+    try {
+      const req = this.storage.createApprovalRequest(run, job.assignment, {
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        personaHandle: input.personaHandle,
+        rationale: input.rationale,
+        requestPreview: input.requestPreview,
+        policyNote: evaluation.reason,
+        riskLevel: evaluation.riskLevel,
+        secrets: input.secrets,
+      })
+
+      decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
+        const checkCurrent = () => {
+          try {
+            const latest = this.storage.getApprovalRequest(run.id, req.id)
+            if (latest.status !== 'pending') {
+              cleanup()
+              resolveDecision(latest.status)
+              return true
+            }
+            if (Date.now() >= latest.expiresAt) {
+              this.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: Date.now() })
+                .where(eq(approvalRequests.id, req.id)).run()
+              cleanup()
+              resolveDecision('expired')
+              return true
+            }
+          } catch (err) {
             cleanup()
-            resolveDecision(latest.status)
+            rejectDecision(err)
             return true
           }
-          if (Date.now() >= latest.expiresAt) {
-            this.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: Date.now() })
-              .where(eq(approvalRequests.id, req.id)).run()
-            cleanup()
-            resolveDecision('expired')
-            return true
-          }
-        } catch (err) {
-          cleanup()
-          rejectDecision(err)
-          return true
+          return false
         }
-        return false
-      }
 
-      const unsub = this.storage.onRunEvent(run.id, () => { checkCurrent() })
-      const timer = setInterval(() => { checkCurrent() }, 1_000)
-      timer.unref?.()
-      const onAbort = () => {
-        cleanup()
-        rejectDecision(signal.reason instanceof Error ? signal.reason : new Error('Aborted while waiting for approval.'))
-      }
-      const cleanup = () => {
-        unsub()
-        clearInterval(timer)
-        signal.removeEventListener('abort', onAbort)
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
-      if (signal.aborted) {
-        onAbort()
-        return
-      }
-      checkCurrent()
-    })
+        const unsub = this.storage.onRunEvent(run.id, () => { checkCurrent() })
+        const timer = setInterval(() => { checkCurrent() }, 1_000)
+        timer.unref?.()
+        const onAbort = () => {
+          cleanup()
+          rejectDecision(signal.reason instanceof Error ? signal.reason : new Error('Aborted while waiting for approval.'))
+        }
+        const cleanup = () => {
+          unsub()
+          clearInterval(timer)
+          signal.removeEventListener('abort', onAbort)
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) {
+          onAbort()
+          return
+        }
+        checkCurrent()
+      })
+    } finally {
+      this.pendingTier3ApprovalKeys.delete(approvalKey)
+    }
 
     if (this.authorize(job)) {
       this.storage.updateWorker(job.assignment.id, { status: 'running' })
@@ -2411,8 +2436,9 @@ export class Execution {
 
     if (searchTokens.length > 0) {
       const scanExt = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
-      for (const repoName of mountedRepos) {
-        const repoRoot = join(reposDir, repoName)
+      for (const mountedRepo of mountedRepos) {
+        const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
+        const repoRoot = join(reposDir, repoRel)
         if (!existsSync(repoRoot)) continue
         const stack = [repoRoot]
         while (stack.length > 0 && siblingHits.length < 20) {
@@ -2434,11 +2460,11 @@ export class Execution {
               for (let i = 0; i < lines.length; i += 1) {
                 if (searchTokens.some(tok => lines[i].includes(tok))) {
                   const lineNo = i + 1
-                  if (overlapsOriginal(repoName, relFile, lineNo)) continue
-                  const key = `${repoName}:${relFile}:${lineNo}`
+                  if (overlapsOriginal(repoRel, relFile, lineNo)) continue
+                  const key = `${repoRel}:${relFile}:${lineNo}`
                   if (seenHit.has(key)) continue
                   seenHit.add(key)
-                  siblingHits.push({ repo: repoName, file: relFile, line: lineNo, preview: lines[i].trim().slice(0, 180) })
+                  siblingHits.push({ repo: repoRel, file: relFile, line: lineNo, preview: lines[i].trim().slice(0, 180) })
                 }
               }
             }

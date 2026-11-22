@@ -296,6 +296,9 @@ export async function withEnv<T>(vars: Record<string, string | undefined>, fn: (
 
 export function makeTempDir(t: TestContext, prefix = 'guardian-v4-tier-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
+  // The hardened worker runs as UID 10001 and bind-mounts repo fixtures, so
+  // the mount root must be traversable by that user (mkdtemp defaults to 0700).
+  chmodSync(dir, 0o755)
   t.after(() => {
     try { rmSync(dir, { recursive: true, force: true }) } catch { /* best-effort */ }
   })

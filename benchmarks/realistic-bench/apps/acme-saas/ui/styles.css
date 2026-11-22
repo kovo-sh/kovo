@@ -1,0 +1,33 @@
+:root {
+  --bg: #0f1419; --panel: #1a2029; --ink: #e6edf3; --muted: #8b98a5; --accent: #4c8dff; --line: #2a333f;
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+.topbar { display: flex; align-items: center; gap: 1rem; padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--line); }
+.brand { font-weight: 700; letter-spacing: -0.02em; }
+.brand-dot { color: var(--accent); }
+.nav { display: flex; gap: 0.25rem; margin-left: 1rem; }
+.tab { background: transparent; color: var(--muted); border: 0; padding: 0.4rem 0.7rem; border-radius: 6px; cursor: pointer; }
+.tab:hover { color: var(--ink); background: var(--panel); }
+.ghost { margin-left: auto; background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 0.35rem 0.7rem; cursor: pointer; }
+.hidden { display: none; }
+.view { padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.5rem; }
+.login { max-width: 360px; margin: 3rem auto; display: grid; gap: 0.9rem; }
+.login label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+.login input { padding: 0.55rem; border-radius: 6px; border: 1px solid var(--line); background: #0d1117; color: var(--ink); }
+.login button, .dash button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 0.6rem; cursor: pointer; }
+.error { color: #ff6b6b; font-size: 0.85rem; }
+.dash { display: grid; gap: 1.25rem; grid-template-columns: repeat(3, 1fr); }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem; display: grid; }
+.stat .value { font-size: 1.8rem; font-weight: 700; }
+.stat .label { color: var(--muted); font-size: 0.85rem; }
+.panel { grid-column: 1 / -1; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; }
+.panel h2 { margin: 0 0 0.75rem; font-size: 1rem; }
+.project { padding: 0.6rem 0; border-top: 1px solid var(--line); }
+.project h3 { margin: 0 0 0.2rem; font-size: 0.95rem; }
+.desc { color: var(--muted); font-size: 0.9rem; }
+table { width: 100%; border-collapse: collapse; }
+td { padding: 0.4rem 0.5rem; border-top: 1px solid var(--line); font-size: 0.9rem; }
+.amt { text-align: right; } .st { color: var(--muted); }
+.loading { color: var(--muted); }

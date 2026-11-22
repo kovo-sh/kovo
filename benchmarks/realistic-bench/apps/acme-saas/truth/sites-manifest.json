@@ -1,0 +1,562 @@
+[
+  {
+    "id": "acme.invoice-bola",
+    "dir": "sites/acme.invoice-bola",
+    "rootCauseFile": "billing/invoices.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "getInvoice"
+    ],
+    "triggerRouteKeys": [
+      "getInvoice"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "secondOrder": false,
+    "summary": "Invoice cross-tenant object read",
+    "implemented": true
+  },
+  {
+    "id": "acme.project-search-sqli",
+    "dir": "sites/acme.project-search-sqli",
+    "rootCauseFile": "catalog/search.ts",
+    "vulnClass": "sqli",
+    "cwe": "CWE-89",
+    "severity": "critical",
+    "routeKeys": [
+      "searchProjects"
+    ],
+    "triggerRouteKeys": [
+      "searchProjects"
+    ],
+    "oracleKinds": [
+      "sql_structure_change"
+    ],
+    "secondOrder": false,
+    "summary": "Project search SQL injection",
+    "implemented": true
+  },
+  {
+    "id": "acme.file-path-traversal",
+    "dir": "sites/acme.file-path-traversal",
+    "rootCauseFile": "files/download.ts",
+    "vulnClass": "path_traversal",
+    "cwe": "CWE-22",
+    "severity": "high",
+    "routeKeys": [
+      "downloadFile"
+    ],
+    "triggerRouteKeys": [
+      "downloadFile"
+    ],
+    "oracleKinds": [
+      "path_escape"
+    ],
+    "secondOrder": false,
+    "summary": "File download path traversal",
+    "implemented": true
+  },
+  {
+    "id": "acme.avatar-ssrf",
+    "dir": "sites/acme.avatar-ssrf",
+    "rootCauseFile": "members/avatar.ts",
+    "vulnClass": "ssrf",
+    "cwe": "CWE-918",
+    "severity": "high",
+    "routeKeys": [
+      "updateAvatar"
+    ],
+    "triggerRouteKeys": [
+      "updateAvatar"
+    ],
+    "oracleKinds": [
+      "ssrf_internal_fetch"
+    ],
+    "secondOrder": false,
+    "summary": "Avatar fetch server-side request forgery",
+    "implemented": true
+  },
+  {
+    "id": "acme.member-role-privesc",
+    "dir": "sites/acme.member-role-privesc",
+    "rootCauseFile": "members/roles.ts",
+    "vulnClass": "mass_assignment",
+    "cwe": "CWE-269",
+    "severity": "high",
+    "routeKeys": [
+      "updateMember"
+    ],
+    "triggerRouteKeys": [
+      "updateMember"
+    ],
+    "oracleKinds": [
+      "privilege_escalation"
+    ],
+    "secondOrder": false,
+    "summary": "Member update role privilege escalation",
+    "implemented": true
+  },
+  {
+    "id": "acme.project-mass-assign",
+    "dir": "sites/acme.project-mass-assign",
+    "rootCauseFile": "catalog/create.ts",
+    "vulnClass": "mass_assignment",
+    "cwe": "CWE-915",
+    "severity": "medium",
+    "routeKeys": [
+      "createProject"
+    ],
+    "triggerRouteKeys": [
+      "createProject"
+    ],
+    "oracleKinds": [
+      "mass_assignment"
+    ],
+    "secondOrder": false,
+    "summary": "Project create mass assignment",
+    "implemented": true
+  },
+  {
+    "id": "acme.invoice-write-bola",
+    "dir": "sites/acme.invoice-write-bola",
+    "rootCauseFile": "billing/update.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "updateInvoice"
+    ],
+    "triggerRouteKeys": [
+      "updateInvoice"
+    ],
+    "oracleKinds": [
+      "cross_tenant_write"
+    ],
+    "secondOrder": false,
+    "summary": "Invoice update cross-tenant write",
+    "implemented": true
+  },
+  {
+    "id": "acme.report-ssti",
+    "dir": "sites/acme.report-ssti",
+    "rootCauseFile": "reports/render.ts",
+    "vulnClass": "ssti",
+    "cwe": "CWE-1336",
+    "severity": "high",
+    "routeKeys": [
+      "createReport"
+    ],
+    "triggerRouteKeys": [
+      "renderReport"
+    ],
+    "oracleKinds": [
+      "template_code_exec"
+    ],
+    "secondOrder": true,
+    "summary": "Report template server-side template injection",
+    "implemented": true
+  },
+  {
+    "id": "acme.webhook-forgery",
+    "dir": "sites/acme.webhook-forgery",
+    "rootCauseFile": "webhooks/receive.ts",
+    "vulnClass": "webhook_forgery",
+    "cwe": "CWE-345",
+    "severity": "medium",
+    "routeKeys": [
+      "receiveWebhook"
+    ],
+    "triggerRouteKeys": [
+      "receiveWebhook"
+    ],
+    "oracleKinds": [
+      "webhook_forgery"
+    ],
+    "secondOrder": false,
+    "summary": "Inbound webhook signature forgery",
+    "implemented": true
+  },
+  {
+    "id": "acme.jwt-none",
+    "dir": "sites/acme.jwt-none",
+    "rootCauseFile": "auth/token.ts",
+    "vulnClass": "jwt",
+    "cwe": "CWE-347",
+    "severity": "high",
+    "routeKeys": [
+      "refreshToken"
+    ],
+    "triggerRouteKeys": [
+      "refreshToken"
+    ],
+    "oracleKinds": [
+      "token_forgery"
+    ],
+    "secondOrder": false,
+    "summary": "API token alg:none forgery",
+    "implemented": true
+  },
+  {
+    "id": "acme.sso-open-redirect",
+    "dir": "sites/acme.sso-open-redirect",
+    "rootCauseFile": "auth/sso.ts",
+    "vulnClass": "oauth",
+    "cwe": "CWE-601",
+    "severity": "high",
+    "routeKeys": [
+      "ssoCallback"
+    ],
+    "triggerRouteKeys": [
+      "ssoCallback"
+    ],
+    "oracleKinds": [
+      "open_redirect"
+    ],
+    "secondOrder": false,
+    "summary": "SSO callback open redirect",
+    "implemented": true
+  },
+  {
+    "id": "acme.project-stored-xss",
+    "dir": "sites/acme.project-stored-xss",
+    "rootCauseFile": "catalog/card.ts",
+    "vulnClass": "xss_stored",
+    "cwe": "CWE-79",
+    "severity": "high",
+    "routeKeys": [
+      "updateProject"
+    ],
+    "triggerRouteKeys": [
+      "renderProjectCard"
+    ],
+    "oracleKinds": [
+      "stored_xss_rendered"
+    ],
+    "secondOrder": true,
+    "summary": "Project description stored XSS",
+    "implemented": true
+  },
+  {
+    "id": "acme.reflected-search-xss",
+    "dir": "sites/acme.reflected-search-xss",
+    "rootCauseFile": "legacy/search.ts",
+    "vulnClass": "xss_reflected",
+    "cwe": "CWE-79",
+    "severity": "medium",
+    "routeKeys": [
+      "reflectedSearch"
+    ],
+    "triggerRouteKeys": [
+      "reflectedSearch"
+    ],
+    "oracleKinds": [
+      "reflected_xss_rendered"
+    ],
+    "secondOrder": false,
+    "summary": "Legacy search reflected XSS",
+    "implemented": true
+  },
+  {
+    "id": "acme.import-xxe",
+    "dir": "sites/acme.import-xxe",
+    "rootCauseFile": "integrations/import.ts",
+    "vulnClass": "xxe",
+    "cwe": "CWE-611",
+    "severity": "high",
+    "routeKeys": [
+      "importProjects"
+    ],
+    "triggerRouteKeys": [
+      "importProjects"
+    ],
+    "oracleKinds": [
+      "xxe_entity_resolved"
+    ],
+    "secondOrder": false,
+    "summary": "Project import XML external entity",
+    "implemented": true
+  },
+  {
+    "id": "acme.export-cmd-injection",
+    "dir": "sites/acme.export-cmd-injection",
+    "rootCauseFile": "reports/export.ts",
+    "vulnClass": "command_injection",
+    "cwe": "CWE-78",
+    "severity": "critical",
+    "routeKeys": [
+      "exportReport"
+    ],
+    "triggerRouteKeys": [
+      "exportReport"
+    ],
+    "oracleKinds": [
+      "command_injection_simulated"
+    ],
+    "secondOrder": false,
+    "summary": "Report export command injection",
+    "implemented": true
+  },
+  {
+    "id": "acme.settings-csrf",
+    "dir": "sites/acme.settings-csrf",
+    "rootCauseFile": "members/settings.ts",
+    "vulnClass": "csrf",
+    "cwe": "CWE-352",
+    "severity": "medium",
+    "routeKeys": [
+      "updateSettings"
+    ],
+    "triggerRouteKeys": [
+      "updateSettings"
+    ],
+    "oracleKinds": [
+      "csrf_state_change"
+    ],
+    "secondOrder": false,
+    "summary": "Account settings CSRF",
+    "implemented": true
+  },
+  {
+    "id": "acme.report-cache-poison",
+    "dir": "sites/acme.report-cache-poison",
+    "rootCauseFile": "reports/public.ts",
+    "vulnClass": "cache_poisoning",
+    "cwe": "CWE-524",
+    "severity": "medium",
+    "routeKeys": [
+      "publicReport"
+    ],
+    "triggerRouteKeys": [
+      "publicReport"
+    ],
+    "oracleKinds": [
+      "cache_poisoned"
+    ],
+    "secondOrder": false,
+    "summary": "Public report cache poisoning",
+    "implemented": true
+  },
+  {
+    "id": "acme.apikey-disclosure",
+    "dir": "sites/acme.apikey-disclosure",
+    "rootCauseFile": "members/keys.ts",
+    "vulnClass": "info_disclosure",
+    "cwe": "CWE-200",
+    "severity": "high",
+    "routeKeys": [
+      "listApiKeys"
+    ],
+    "triggerRouteKeys": [
+      "listApiKeys"
+    ],
+    "oracleKinds": [
+      "secret_disclosed"
+    ],
+    "secondOrder": false,
+    "summary": "API key secret disclosure to viewer",
+    "implemented": true
+  },
+  {
+    "id": "acme.seat-invariant",
+    "dir": "sites/acme.seat-invariant",
+    "rootCauseFile": "billing/seats.ts",
+    "vulnClass": "business_logic",
+    "cwe": "CWE-840",
+    "severity": "medium",
+    "routeKeys": [
+      "addSeat"
+    ],
+    "triggerRouteKeys": [
+      "addSeat"
+    ],
+    "oracleKinds": [
+      "invariant_violation"
+    ],
+    "secondOrder": false,
+    "summary": "Seat allocation invariant bypass",
+    "implemented": true
+  },
+  {
+    "id": "acme.credit-double-spend",
+    "dir": "sites/acme.credit-double-spend",
+    "rootCauseFile": "billing/credits.ts",
+    "vulnClass": "race_condition",
+    "cwe": "CWE-362",
+    "severity": "high",
+    "routeKeys": [
+      "applyCredit"
+    ],
+    "triggerRouteKeys": [
+      "applyCredit"
+    ],
+    "oracleKinds": [
+      "race_double_spend"
+    ],
+    "secondOrder": false,
+    "summary": "Credit application double spend",
+    "implemented": true
+  },
+  {
+    "id": "acme.invite-workflow-skip",
+    "dir": "sites/acme.invite-workflow-skip",
+    "rootCauseFile": "members/invites.ts",
+    "vulnClass": "workflow_bypass",
+    "cwe": "CWE-841",
+    "severity": "medium",
+    "routeKeys": [
+      "acceptInvite"
+    ],
+    "triggerRouteKeys": [
+      "acceptInvite"
+    ],
+    "oracleKinds": [
+      "workflow_skip"
+    ],
+    "secondOrder": false,
+    "summary": "Invite acceptance workflow skip",
+    "implemented": true
+  },
+  {
+    "id": "acme.admin-bfla",
+    "dir": "sites/acme.admin-bfla",
+    "rootCauseFile": "admin/users.ts",
+    "vulnClass": "bfla",
+    "cwe": "CWE-285",
+    "severity": "critical",
+    "routeKeys": [
+      "adminDeleteUser"
+    ],
+    "triggerRouteKeys": [
+      "adminDeleteUser"
+    ],
+    "oracleKinds": [
+      "privilege_escalation"
+    ],
+    "secondOrder": false,
+    "summary": "Admin user delete function-level authz bypass",
+    "implemented": true
+  },
+  {
+    "id": "acme.legacy-auth-bypass",
+    "dir": "sites/acme.legacy-auth-bypass",
+    "rootCauseFile": "auth/legacy.ts",
+    "vulnClass": "auth_bypass",
+    "cwe": "CWE-287",
+    "severity": "high",
+    "routeKeys": [
+      "legacyLogin"
+    ],
+    "triggerRouteKeys": [
+      "legacyLogin"
+    ],
+    "oracleKinds": [
+      "auth_bypass"
+    ],
+    "secondOrder": false,
+    "summary": "Legacy login authentication bypass",
+    "implemented": true
+  },
+  {
+    "id": "acme.notification-idor",
+    "dir": "sites/acme.notification-idor",
+    "rootCauseFile": "notifications/read.ts",
+    "vulnClass": "idor",
+    "cwe": "CWE-639",
+    "severity": "medium",
+    "routeKeys": [
+      "getNotification"
+    ],
+    "triggerRouteKeys": [
+      "getNotification"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "secondOrder": false,
+    "summary": "Notification cross-tenant read",
+    "implemented": true
+  },
+  {
+    "id": "acme.file-list-bola",
+    "dir": "sites/acme.file-list-bola",
+    "rootCauseFile": "files/list.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "medium",
+    "routeKeys": [
+      "listFiles"
+    ],
+    "triggerRouteKeys": [
+      "listFiles"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "secondOrder": false,
+    "summary": "File listing cross-tenant exposure",
+    "implemented": true
+  },
+  {
+    "id": "acme.billing-tamper",
+    "dir": "sites/acme.billing-tamper",
+    "rootCauseFile": "billing/plan.ts",
+    "vulnClass": "business_logic",
+    "cwe": "CWE-472",
+    "severity": "high",
+    "routeKeys": [
+      "updatePlan"
+    ],
+    "triggerRouteKeys": [
+      "updatePlan"
+    ],
+    "oracleKinds": [
+      "invariant_violation"
+    ],
+    "secondOrder": false,
+    "summary": "Plan change price tampering",
+    "implemented": true
+  },
+  {
+    "id": "acme.auditlog-secret",
+    "dir": "sites/acme.auditlog-secret",
+    "rootCauseFile": "admin/audit.ts",
+    "vulnClass": "info_disclosure",
+    "cwe": "CWE-532",
+    "severity": "medium",
+    "routeKeys": [
+      "adminAuditLog"
+    ],
+    "triggerRouteKeys": [
+      "adminAuditLog"
+    ],
+    "oracleKinds": [
+      "secret_disclosed"
+    ],
+    "secondOrder": false,
+    "summary": "Admin audit log secret leakage",
+    "implemented": true
+  },
+  {
+    "id": "acme.export-open-redirect",
+    "dir": "sites/acme.export-open-redirect",
+    "rootCauseFile": "legacy/redirect.ts",
+    "vulnClass": "open_redirect",
+    "cwe": "CWE-601",
+    "severity": "low",
+    "routeKeys": [
+      "exportRedirect"
+    ],
+    "triggerRouteKeys": [
+      "exportRedirect"
+    ],
+    "oracleKinds": [
+      "open_redirect"
+    ],
+    "secondOrder": false,
+    "summary": "Export download open redirect",
+    "implemented": true
+  }
+]
