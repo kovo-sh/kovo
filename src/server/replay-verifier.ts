@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
@@ -393,6 +393,39 @@ async function openCanarySession(
   }
 }
 
+/**
+ * Mint a throw-away signing key and a fresh timestamp, then compute the HMAC over the documented
+ * canonical form. Used only for self-signed webhook proof (no real secret ever enters the spec).
+ */
+function applyBodySignature(interpolated: unknown, signable: NonNullable<ReplayStep['request']['bodySignature']>): unknown {
+  const input = interpolated && typeof interpolated === 'object' && !Array.isArray(interpolated)
+    ? { ...(interpolated as Record<string, unknown>) }
+    : {}
+  const key = `guardian_whk_${randomBytes(8).toString('hex')}`
+  const ts = String(Math.floor(Date.now() / 1000))
+  if (signable.timestampField) input[signable.timestampField] = ts
+  input[signable.keyField] = key
+  const withoutSig = { ...input }
+  delete withoutSig[signable.signatureField]
+  const event = signable.eventField
+    ? withoutSig[signable.eventField]
+    : (withoutSig.event ?? withoutSig.payload ?? withoutSig.data ?? withoutSig)
+  const asText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value))
+  const canonical = signable.canonical === 'ts_event'
+    ? `${ts}.${asText(event)}`
+    : signable.canonical === 'ts_body'
+      ? `${ts}.${JSON.stringify(withoutSig)}`
+      : signable.canonical === 'event'
+        ? asText(event)
+        : JSON.stringify(withoutSig)
+  input[signable.signatureField] = createHmac('sha256', key).update(canonical).digest(signable.encoding)
+  return input
+}
+
+function base64urlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
+}
+
 function requestShapeToBrokerRequest(
   req: ReplayStep['request'] | RaceBurstRequest,
   vars: Record<string, string>,
@@ -412,7 +445,10 @@ function requestShapeToBrokerRequest(
   if (req.textBody !== undefined) {
     body = interpolateString(req.textBody, vars)
   } else if (req.jsonBody !== undefined) {
-    body = JSON.stringify(interpolateValue(req.jsonBody, vars))
+    const interpolated = interpolateValue(req.jsonBody, vars)
+    const signable = (req as ReplayStep['request']).bodySignature
+    const signed = signable ? applyBodySignature(interpolated, signable) : interpolated
+    body = JSON.stringify(signed)
     if (!headers['Content-Type'] && !headers['content-type']) {
       headers['Content-Type'] = 'application/json'
     }
@@ -754,12 +790,32 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         }
 
         const bflaImpact = assessBflaImpact(spec, stepsOut)
+        let proofMatches: Record<string, boolean[]> | undefined
+        if (spec.proofPatterns?.length) {
+          proofMatches = {}
+          for (const [id, entry] of Object.entries(stepsOut)) {
+            const body = entry && typeof entry === 'object' && typeof (entry as { body?: unknown }).body === 'string'
+              ? (entry as { body: string }).body
+              : ''
+            proofMatches[id] = spec.proofPatterns.map(pattern => {
+              // Harden the in-process matcher against pathological regexes: bounded length (schema),
+              // no nested quantifiers, and only the first 16 KiB of the body.
+              if (/\((?:\?:)?[^)]*[+*][^)]*\)[+*?]/.test(pattern)) return false
+              try {
+                return new RegExp(pattern).test(body.slice(0, 16 * 1024))
+              } catch {
+                return false
+              }
+            })
+          }
+        }
         evidencePayload = {
           ...evidencePayload,
           steps: stepsOut,
           ...(firstControlStep ? { control: firstControlStep } : {}),
           ...(firstProbeStep ? { probe: firstProbeStep } : {}),
           extractedVars: vars,
+          ...(proofMatches ? { proofMatches } : {}),
           ...(canaryEvidence ?? {}),
           ...(spaCatchall ? { spaCatchall } : {}),
           bflaImpact,
@@ -1155,56 +1211,98 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       const vars: Record<string, string> = {}
       let controlSummary: Record<string, unknown> | null = null
       let postCheckSummary: Record<string, unknown> | null = null
+      const setupSummaries: Array<Record<string, unknown>> = []
+      const cleanupSummaries: Array<Record<string, unknown>> = []
 
-      if (spec.controlStep) {
+      // Ordered prerequisites (create cart, read balance, mint stock) feed the burst through vars.
+      for (const step of spec.setupSteps ?? []) {
         signal.throwIfAborted()
-        const controlReq = stepToBrokerRequest(spec.controlStep, vars)
-        if (hasDestructiveContent(JSON.stringify(controlReq))) {
-          return inconclusiveResult('Interpolated race_burst controlStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+        const setupReq = stepToBrokerRequest(step, vars)
+        if (hasDestructiveContent(JSON.stringify(setupReq))) {
+          return inconclusiveResult('Interpolated race_burst setupStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
         }
-        const controlEx = await broker.executeHttp(controlReq, grant, signal)
-        recordExchange(controlEx)
-        extractVariables(spec.controlStep, controlEx, vars)
-        controlSummary = {
-          id: spec.controlStep.id,
-          role: spec.controlStep.role,
-          ...summarizeExchange(controlEx),
+        const setupEx = await broker.executeHttp(setupReq, grant, signal)
+        recordExchange(setupEx)
+        extractVariables(step, setupEx, vars)
+        setupSummaries.push({ id: step.id, role: step.role, ...summarizeExchange(setupEx) })
+      }
+
+      const runCleanup = async (): Promise<void> => {
+        for (const step of spec.cleanupSteps ?? []) {
+          const cleanupReq = stepToBrokerRequest(step, vars)
+          if (hasDestructiveContent(JSON.stringify(cleanupReq))) {
+            cleanupSummaries.push({ id: step.id, role: step.role, skipped: 'destructive-denylist' })
+            continue
+          }
+          try {
+            const cleanupEx = await broker.executeHttp(cleanupReq, grant, signal)
+            recordExchange(cleanupEx)
+            extractVariables(step, cleanupEx, vars)
+            cleanupSummaries.push({ id: step.id, role: step.role, ...summarizeExchange(cleanupEx) })
+          } catch (err) {
+            cleanupSummaries.push({
+              id: step.id, role: step.role,
+              error: redact(err instanceof Error ? err.message : String(err), grant.secrets ?? []).slice(0, 200),
+            })
+          }
         }
       }
 
-      const burstReqs = spec.burst.map(req => requestShapeToBrokerRequest(req, vars))
-      if (hasDestructiveContent(JSON.stringify(burstReqs))) {
-        return inconclusiveResult('Interpolated race_burst requests matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
-      }
-
-      const burstResult = await broker.executeRaceBurst(burstReqs, grant, signal)
-      for (const ex of burstResult.results) recordExchange(ex)
-
-      if (spec.postCheckStep) {
-        signal.throwIfAborted()
-        const postReq = stepToBrokerRequest(spec.postCheckStep, vars)
-        if (hasDestructiveContent(JSON.stringify(postReq))) {
-          return inconclusiveResult('Interpolated race_burst postCheckStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+      try {
+        if (spec.controlStep) {
+          signal.throwIfAborted()
+          const controlReq = stepToBrokerRequest(spec.controlStep, vars)
+          if (hasDestructiveContent(JSON.stringify(controlReq))) {
+            return inconclusiveResult('Interpolated race_burst controlStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+          }
+          const controlEx = await broker.executeHttp(controlReq, grant, signal)
+          recordExchange(controlEx)
+          extractVariables(spec.controlStep, controlEx, vars)
+          controlSummary = {
+            id: spec.controlStep.id,
+            role: spec.controlStep.role,
+            ...summarizeExchange(controlEx),
+          }
         }
-        const postEx = await broker.executeHttp(postReq, grant, signal)
-        recordExchange(postEx)
-        extractVariables(spec.postCheckStep, postEx, vars)
-        postCheckSummary = {
-          id: spec.postCheckStep.id,
-          role: spec.postCheckStep.role,
-          ...summarizeExchange(postEx),
-        }
-      }
 
-      evidencePayload = {
-        ...evidencePayload,
-        control: controlSummary,
-        burst: {
-          summary: burstResult.summary,
-          results: burstResult.results.map(summarizeExchange),
-        },
-        postCheck: postCheckSummary,
-        extractedVars: vars,
+        const burstReqs = spec.burst.map(req => requestShapeToBrokerRequest(req, vars))
+        if (hasDestructiveContent(JSON.stringify(burstReqs))) {
+          return inconclusiveResult('Interpolated race_burst requests matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+        }
+
+        const burstResult = await broker.executeRaceBurst(burstReqs, grant, signal)
+        for (const ex of burstResult.results) recordExchange(ex)
+
+        if (spec.postCheckStep) {
+          signal.throwIfAborted()
+          const postReq = stepToBrokerRequest(spec.postCheckStep, vars)
+          if (hasDestructiveContent(JSON.stringify(postReq))) {
+            return inconclusiveResult('Interpolated race_burst postCheckStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+          }
+          const postEx = await broker.executeHttp(postReq, grant, signal)
+          recordExchange(postEx)
+          extractVariables(spec.postCheckStep, postEx, vars)
+          postCheckSummary = {
+            id: spec.postCheckStep.id,
+            role: spec.postCheckStep.role,
+            ...summarizeExchange(postEx),
+          }
+        }
+
+        evidencePayload = {
+          ...evidencePayload,
+          ...(setupSummaries.length > 0 ? { setup: setupSummaries } : {}),
+          control: controlSummary,
+          burst: {
+            summary: burstResult.summary,
+            results: burstResult.results.map(summarizeExchange),
+          },
+          postCheck: postCheckSummary,
+          extractedVars: vars,
+        }
+      } finally {
+        await runCleanup()
+        if (cleanupSummaries.length > 0) evidencePayload = { ...evidencePayload, cleanup: cleanupSummaries }
       }
     } else if (spec.kind === 'rce_proof') {
       const controlVars: Record<string, string> = {}
@@ -1617,6 +1715,33 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       let firstControlStep: Record<string, unknown> | undefined
       let firstProbeStep: Record<string, unknown> | undefined
 
+      // Body-token routes never expose the signing credential as a bearer header. Mint unsigned
+      // token material locally from the spec's data-anchored claims, then let the step body carry it.
+      const mintedTokens: Array<{ name: string; alg: string }> = []
+      if (spec.tokenMints?.length) {
+        const nowSeconds = Math.floor(Date.now() / 1000)
+        vars.now = String(nowSeconds)
+        vars.now_plus_1h = String(nowSeconds + 3600)
+        for (const mint of spec.tokenMints) {
+          const header = { alg: mint.signature === 'none' ? 'none' : 'HS256', typ: 'JWT', ...(mint.header ?? {}) }
+          // Time claims stay numeric: `{{now}}`-style placeholders are resolved before generic
+          // string interpolation (which would otherwise emit quoted numbers).
+          const resolveClaims = (value: unknown): unknown => {
+            if (value === '{{now}}') return nowSeconds
+            if (value === '{{now_plus_1h}}') return nowSeconds + 3600
+            if (Array.isArray(value)) return value.map(resolveClaims)
+            if (value && typeof value === 'object') {
+              return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, resolveClaims(v)]))
+            }
+            return value
+          }
+          const headerJson = interpolateValue(resolveClaims(header), vars) as Record<string, unknown>
+          const payloadJson = interpolateValue(resolveClaims(mint.payload), vars) as Record<string, unknown>
+          vars[mint.name] = `${base64urlJson(headerJson)}.${base64urlJson(payloadJson)}.`
+          mintedTokens.push({ name: mint.name, alg: String(headerJson.alg ?? 'none') })
+        }
+      }
+
       const serializedSteps = JSON.stringify(spec.steps)
       const needsCanary = spec.steps.some(s => s.request.authMutation?.kind === 'jku_x5u_canary') ||
         /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps)
@@ -1741,6 +1866,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(firstControlStep ? { control: firstControlStep } : {}),
           ...(firstProbeStep ? { probe: firstProbeStep } : {}),
           extractedVars: vars,
+          ...(mintedTokens.length > 0 ? { mintedTokens } : {}),
           ...(canaryProof ? { canaryProof } : {}),
           ...(spaCatchall ? { spaCatchall } : {}),
         }
@@ -1750,14 +1876,17 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     } else if (spec.kind === 'cache_differential') {
       const controlGcb = randomUUID()
       const probeGcb = randomUUID()
+      const repeatGcb = randomUUID()
       const resolveCachePath = (raw: string, token: string): string =>
         raw.replaceAll('{{control_gcb}}', controlGcb)
           .replaceAll('{{probe_gcb}}', probeGcb)
+          .replaceAll('{{repeat_gcb}}', repeatGcb)
           .replaceAll('{{cache_buster}}', token)
 
       const controlPath = resolveCachePath(spec.controlPath, controlGcb)
       const probePath = resolveCachePath(spec.probePath, probeGcb)
       const verifyPath = spec.verifyPath ? resolveCachePath(spec.verifyPath, probeGcb) : probePath
+      const repeatPath = spec.repeatPath ? resolveCachePath(spec.repeatPath, repeatGcb) : null
 
       const actualCtrlGcb = extractCacheBusterParam(controlPath)
       const actualProbeGcb = extractCacheBusterParam(probePath)
@@ -1768,11 +1897,15 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       if (actualCtrlGcb.toLowerCase() === actualProbeGcb.toLowerCase()) {
         return inconclusiveResult('cache_differential cannot reuse _gcb between control and probe.', exchanges, exchangeIds, { kind: spec.kind })
       }
+      if (spec.proofMode === 'body_repeat' && !repeatPath) {
+        return inconclusiveResult('cache_differential body_repeat proof requires a repeatPath.', exchanges, exchangeIds, { kind: spec.kind })
+      }
 
       const controlEx = await broker.executeHttp({
         origin: spec.targetOrigin,
         method: spec.method,
         pathAndQuery: controlPath,
+        ...(spec.controlPersona ? { persona: spec.controlPersona } : {}),
         probeClass: 'cache_differential',
         followRedirects: false,
         runId: params.runId,
@@ -1797,6 +1930,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         origin: spec.targetOrigin,
         method: spec.method,
         pathAndQuery: verifyPath,
+        ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
         probeClass: 'cache_differential',
         cacheVerify: true,
         followRedirects: false,
@@ -1804,6 +1938,25 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         assignmentId,
       }, grant, signal)
       recordExchange(verifyEx)
+
+      // Header-free persistence: re-fetch the (broken) cache key after a short delay. A fresh
+      // cache-buster is used so a cache that keys on the full query string cannot confirm by accident.
+      let repeatEx: BrokerExchangeResult | null = null
+      if (spec.proofMode === 'body_repeat' && repeatPath) {
+        await sleepAbortable(150, signal)
+        repeatEx = await broker.executeHttp({
+          origin: spec.targetOrigin,
+          method: spec.method,
+          pathAndQuery: repeatPath,
+          ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
+          probeClass: 'cache_differential',
+          cacheVerify: true,
+          followRedirects: false,
+          runId: params.runId,
+          assignmentId,
+        }, grant, signal)
+        recordExchange(repeatEx)
+      }
 
       if (guardControlErrors) {
         if (isUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) {
@@ -1822,18 +1975,54 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         verifyEx.respHeaders['x-proxy-cache'],
         verifyEx.respHeaders['cache-status'],
       ].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
-      const cacheHitObserved = (Number.isFinite(age) && age > 0) || cacheHeaderSignal
       const simControlVsVerify = responseSimilarity(controlEx.body, verifyEx.body)
       const simProbeVsVerify = responseSimilarity(probeEx.body, verifyEx.body)
-      const poisonPersistedToVictim =
-        (simControlVsVerify < 0.95 || verifyEx.status !== controlEx.status) &&
-        (simProbeVsVerify >= 0.85 || verifyEx.status === probeEx.status)
+
+      let cacheHitObserved: boolean
+      let poisonPersistedToVictim: boolean
+      let markerInControl = false
+      let markerInProbe = false
+      let markerInVerify = false
+      let markerInRepeat = false
+      let repeatBodyMatches = false
+      let timingSignal = false
+      if (spec.proofMode === 'body_repeat') {
+        const marker = spec.marker
+        markerInControl = Boolean(marker && controlEx.body.includes(marker))
+        markerInProbe = Boolean(marker && probeEx.body.includes(marker))
+        markerInVerify = Boolean(marker && verifyEx.body.includes(marker))
+        markerInRepeat = Boolean(marker && repeatEx?.body.includes(marker))
+        // Actor differential: the poisoned entry populated by one persona must be served to a
+        // different (or anonymous) client. Same-actor repeats never prove cross-actor exposure.
+        const actorDifferential = Boolean(spec.poisonPersona) &&
+          (spec.verifyPersona ?? null) !== spec.poisonPersona
+        // Cross-actor body equality is the header-free cache signature: a clean client receives the
+        // warm client's exact body (or the warm marker) while the clean control differs.
+        const bodyPersisted = verifyEx.body === probeEx.body && verifyEx.body !== controlEx.body
+        repeatBodyMatches = Boolean(repeatEx && repeatEx.body === verifyEx.body && repeatEx.body !== controlEx.body)
+        const markerPersisted = Boolean(marker) && markerInProbe && markerInVerify && !markerInControl
+        cacheHitObserved = Boolean(marker) ? markerPersisted : bodyPersisted
+        poisonPersistedToVictim = actorDifferential && cacheHitObserved && repeatBodyMatches &&
+          (!marker || markerInRepeat)
+        // Timing is a persistence signal (the poisoned entry survives past the warm request), not a
+        // latency measurement: local caches render in <1 ms and wall-clock deltas are pure noise.
+        timingSignal = Boolean(repeatEx) && repeatBodyMatches
+      } else {
+        cacheHitObserved = (Number.isFinite(age) && age > 0) || cacheHeaderSignal
+        poisonPersistedToVictim =
+          (simControlVsVerify < 0.95 || verifyEx.status !== controlEx.status) &&
+          (simProbeVsVerify >= 0.85 || verifyEx.status === probeEx.status)
+      }
 
       deterministicProofPassed = cacheHitObserved && poisonPersistedToVictim
       if (!deterministicProofPassed) {
-        proofFailureReason = !cacheHitObserved
-          ? 'Verify request did not observe a cache hit (missing HIT header or Age > 0).'
-          : 'Clean unauthenticated verify response matched clean control rather than poisoned probe.'
+        proofFailureReason = spec.proofMode === 'body_repeat'
+          ? (!cacheHitObserved
+            ? 'Header-free cache proof: the clean verify did not receive the warm marker/body.'
+            : 'Header-free cache proof: repeat fetch did not reproduce the poisoned body, or the control did not differ.')
+          : !cacheHitObserved
+            ? 'Verify request did not observe a cache hit (missing HIT header or Age > 0).'
+            : 'Clean unauthenticated verify response matched clean control rather than poisoned probe.'
       }
 
       let spaCatchall: Record<string, unknown> | undefined
@@ -1864,6 +2053,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       const controlSummary = { id: 'control', role: 'control', ...summarizeExchange(controlEx) }
       const probeSummary = { id: 'probe', role: 'probe', ...summarizeExchange(probeEx) }
       const verifySummary = { id: 'verify', role: 'probe', ...summarizeExchange(verifyEx) }
+      const repeatSummary = repeatEx ? { id: 'repeat', role: 'probe', ...summarizeExchange(repeatEx) } : undefined
 
       evidencePayload = {
         ...evidencePayload,
@@ -1872,10 +2062,12 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         control: controlSummary,
         probe: probeSummary,
         verify: verifySummary,
-        steps: { control: controlSummary, probe: probeSummary, verify: verifySummary },
+        ...(repeatSummary ? { repeat: repeatSummary } : {}),
+        steps: { control: controlSummary, probe: probeSummary, verify: verifySummary, ...(repeatSummary ? { repeat: repeatSummary } : {}) },
         ...(spaCatchall ? { spaCatchall } : {}),
         cacheProof: {
           mode: spec.mode,
+          proofMode: spec.proofMode,
           controlGcb: actualCtrlGcb,
           probeGcb: actualProbeGcb,
           cacheHitObserved,
@@ -1883,6 +2075,13 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           simControlVsVerify,
           simProbeVsVerify,
           age: Number.isFinite(age) ? age : null,
+          markerPresent: Boolean(spec.marker),
+          markerInControl,
+          markerInProbe,
+          markerInVerify,
+          markerInRepeat,
+          repeatBodyMatches,
+          timingSignal,
         },
       }
     } else if (spec.kind === 'sql_time_diff') {

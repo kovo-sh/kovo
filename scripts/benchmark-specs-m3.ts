@@ -11,8 +11,10 @@
  * `webhook_signature_bypass` deliberately proves acceptance of an *unsigned/tampered* request; a
  * true HMAC re-signing replay needs verifier support (see report).
  */
+import { createHmac } from 'node:crypto'
 import { baseFields, is2xx, jqStr, requestParts, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
+import { synthInvariantViolation, synthSecretDisclosure } from './benchmark-specs-logic.ts'
 import { fillPlaceholders, hasPathPlaceholder } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
@@ -227,10 +229,11 @@ export function synthWebhookSignature(o: HypothesisOutcome, env: ProbeEnv): Synt
   if (!path.startsWith('/') || !body) return []
   if (!SAFE_HEADER.test(header) || /^(?:authorization|cookie|host)$/i.test(header)) return []
   if (!acceptance && (!readPath.startsWith('/') || !SAFE_FIELD.test(stateField) || !expectedLiteral)) return []
+  const inline = /^inline_key:([A-Za-z0-9_]+)\/([A-Za-z0-9_]+)$/.exec(String(hit.variant ?? ''))
+  const inlineSig = inline && body ? inlineSignaturePlan(body, inline[1], inline[2], String(hit.timestampField ?? 'ts')) : null
   const control = () => {
     // Self-signed deliveries carry the signing key and signature *inside* the body; a header-only
     // tamper would leave the inline signature valid and turn the control into another acceptance.
-    const inline = /^inline_key:([A-Za-z0-9_]+)\/([A-Za-z0-9_]+)$/.exec(String(hit.variant ?? ''))
     if (inline) {
       return stepOf(env, 'c1', 'control', 'Tampered inline signature is rejected', {
         method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: { ...body, [inline[2]]: 'guardian-invalid-signature' },
@@ -240,40 +243,93 @@ export function synthWebhookSignature(o: HypothesisOutcome, env: ProbeEnv): Synt
       method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json', [header]: 'guardian-invalid-signature' }, jsonBody: body,
     }, null, {}, [400, 401, 403, 422])
   }
+  const probeStep = (id: string, role: 'control' | 'probe', description: string, withSignature: boolean) => {
+    const parts: RequestParts = {
+      method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: body,
+    }
+    const extra: Record<string, unknown> = {}
+    if (withSignature && inlineSig) {
+      const eventField = typeof body.event === 'object' ? 'event' : typeof body.payload === 'object' ? 'payload' : undefined
+      extra.bodySignature = {
+        keyField: inlineSig.keyField,
+        signatureField: inlineSig.signatureField,
+        timestampField: inlineSig.timestampField,
+        ...(eventField ? { eventField } : {}),
+        canonical: inlineSig.canonical,
+        encoding: inlineSig.encoding,
+      }
+    }
+    return stepOf(env, id, role, description, parts, null, extra)
+  }
+  const signatureTitle = inlineSig
+    ? 'Webhook trusts an attacker-supplied inline signing key (self-signed delivery accepted)'
+    : 'Webhook signature verification bypass (unsigned delivery accepted)'
   if (acceptance) {
     // No delivery read route: the receiver's explicit processing acknowledgement plus a rejected
     // tampered control is the evidence (matches the probe's acceptance proof).
     const ack = '(((.steps.p1.body // "") | tostring) | test("\\"(?:ok|received|processed|accepted|success)\\"\\\\s*:\\\\s*true"; "i"))'
     const jq = `{ controlPassed: (.steps.c1.status >= 400 and .steps.c1.status < 500), ` +
       `confirmed: ((.steps.c1.status >= 400 and .steps.c1.status < 500) and (${is2xx('p1')}) and (${ack})), ` +
-      `observed: ("unsigned status=" + (.steps.p1.status | tostring)), expected: "unsigned webhook deliveries must be rejected" }`
+      `observed: ("forged status=" + (.steps.p1.status | tostring)), expected: "webhook deliveries must be signed with the endpoint secret" }`
     return [{
       kind: 'http_chain',
       spec: {
-        ...baseFields(env, 'Webhook signature verification bypass (unsigned delivery accepted)', 'CWE-345', 'broken-authentication', 'high', jq),
+        ...baseFields(env, signatureTitle, 'CWE-345', 'broken-authentication', 'high', jq),
         kind: 'http_chain',
         steps: [
           control(),
-          stepOf(env, 'p1', 'probe', 'Same delivery unsigned is accepted and processed', { method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: body }, null),
+          probeStep('p1', 'probe', 'Same delivery self-signed with an attacker key is processed', true),
         ],
       },
     }]
   }
   const jq = `{ controlPassed: (.steps.c1.status >= 400 and .steps.c1.status < 500), ` +
     `confirmed: ((.steps.c1.status >= 400 and .steps.c1.status < 500) and (${is2xx('p1')}) and (${is2xx('p2')}) and (${stateExists('p2', stateField, expectedLiteral!, deriveRecordId({ ...hit, path: readPath }), typeof hit.stateSelector === 'string' ? hit.stateSelector : undefined, typeof hit.expectedValue === 'number')})), ` +
-    `observed: ("unsigned status=" + (.steps.p1.status | tostring) + " state=" + ((.steps.p2.json[${jqStr(stateField)}]) | tostring)), expected: "unsigned webhook deliveries must be rejected" }`
+    `observed: ("forged status=" + (.steps.p1.status | tostring) + " state=" + ((.steps.p2.json[${jqStr(stateField)}]) | tostring)), expected: "webhook deliveries must be signed with the endpoint secret" }`
   return [{
     kind: 'http_chain',
     spec: {
-      ...baseFields(env, 'Webhook signature verification bypass (unsigned delivery accepted)', 'CWE-345', 'broken-authentication', 'high', jq),
+      ...baseFields(env, signatureTitle, 'CWE-345', 'broken-authentication', 'high', jq),
       kind: 'http_chain',
       steps: [
         control(),
-        stepOf(env, 'p1', 'probe', 'Same delivery unsigned is accepted', { method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: body }, null),
+        probeStep('p1', 'probe', 'Same delivery self-signed with an attacker key is accepted', true),
         stepOf(env, 'p2', 'probe', 'Read the delivery side effect', { method: 'GET', pathAndQuery: readPath }, env.owner),
       ],
     },
   }]
+}
+
+/**
+ * Identify which documented canonical form the probe's accepted inline signature used by
+ * recomputing the HMAC with the attacker key the probe itself placed in the body. The replayed
+ * delivery then mints a fresh key + timestamp for the same canonical form.
+ */
+function inlineSignaturePlan(
+  body: Record<string, unknown>, keyField: string, signatureField: string, timestampField: string,
+): { keyField: string; signatureField: string; timestampField: string; canonical: 'ts_event' | 'ts_body' | 'event' | 'body'; encoding: 'hex' | 'base64' } | null {
+  const key = body[keyField]
+  const signature = body[signatureField]
+  if (typeof key !== 'string' || typeof signature !== 'string' || !key || !signature) return null
+  const ts = String(body[timestampField] ?? '')
+  const withoutSig: Record<string, unknown> = { ...body }
+  delete withoutSig[signatureField]
+  const event = withoutSig.event ?? withoutSig.payload ?? withoutSig.data ?? withoutSig
+  const asText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value))
+  const candidates: Array<{ canonical: 'ts_event' | 'ts_body' | 'event' | 'body'; value: string }> = [
+    { canonical: 'ts_event', value: `${ts}.${asText(event)}` },
+    { canonical: 'ts_body', value: `${ts}.${JSON.stringify(withoutSig)}` },
+    { canonical: 'event', value: asText(event) },
+    { canonical: 'body', value: JSON.stringify(withoutSig) },
+  ]
+  for (const candidate of candidates) {
+    for (const encoding of ['hex', 'base64'] as const) {
+      if (createHmac('sha256', key).update(candidate.value).digest(encoding) === signature) {
+        return { keyField, signatureField, timestampField, canonical: candidate.canonical, encoding }
+      }
+    }
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +428,8 @@ export function synthWritePathBola(o: HypothesisOutcome, env: ProbeEnv): Synthes
 /** Dispatch only the v5 M3 anomaly contracts. */
 export function synthM3Contracts(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   return [
+    ...synthInvariantViolation(o, env),
+    ...synthSecretDisclosure(o, env),
     ...synthCsrfStateChange(o, env),
     ...synthWebhookSignature(o, env),
     ...synthOpenRedirect(o, env),

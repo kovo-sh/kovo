@@ -130,6 +130,25 @@ export function extractCacheBusterParam(pathAndQuery: string): string | null {
   }
 }
 
+const signedFieldName = z.string().trim().regex(/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/)
+
+/**
+ * Deterministic self-signed delivery. The verifier mints a throw-away key/timestamp at replay time
+ * and recomputes the HMAC over one of the documented canonical forms, so an inline-key receiver can
+ * be challenged with a freshly signature-valid (but application-issued-never) delivery rather than a
+ * stale probe timestamp. The key is always generated, never supplied by a spec author.
+ */
+export const bodySignatureSchema = z.object({
+  keyField: signedFieldName,
+  signatureField: signedFieldName,
+  timestampField: signedFieldName.optional(),
+  eventField: signedFieldName.optional(),
+  canonical: z.enum(['ts_event', 'ts_body', 'event', 'body']),
+  algorithm: z.literal('hmac-sha256').default('hmac-sha256'),
+  encoding: z.enum(['hex', 'base64']).default('hex'),
+})
+export type BodySignature = z.output<typeof bodySignatureSchema>
+
 export const replayStepSchema = z.object({
   id: z.string().regex(/^[a-z0-9_-]{1,32}$/),
   role: z.enum(['setup', 'control', 'probe', 'cleanup']),
@@ -152,9 +171,13 @@ export const replayStepSchema = z.object({
     textBody: z.string().max(32_768).optional(),
     followRedirects: z.boolean().default(false),
     batchCount: z.number().int().min(2).max(10).optional(),
+    bodySignature: bodySignatureSchema.optional(),
   }).refine(
     req => !req.authMutation || Boolean(req.persona),
     'authMutation requires a persona handle.',
+  ).refine(
+    req => !req.bodySignature || req.textBody === undefined,
+    'bodySignature requires a jsonBody object (not textBody).',
   ),
   extract: z.array(replayExtractSchema).max(8).optional(),
 })
@@ -173,6 +196,23 @@ const replayBase = z.object({
   assertionsJq: z.string().trim().min(1).max(4096),
   requireControlNonError: z.boolean().optional(),
   expectedStatus: expectedStatusSchema.optional(),
+  /**
+   * Non-secret regex shapes used for proof. The verifier reports which step bodies matched each
+   * pattern in `proofMatches` (computed before redaction), so a tenant secret can be proven without
+   * persisting the secret itself in the spec or in the evidence report.
+   */
+  proofPatterns: z.array(z.string().trim().min(4).max(200).refine(
+    value => {
+      if (/[\r\n\0]/.test(value)) return false
+      try {
+        new RegExp(value)
+        return true
+      } catch {
+        return false
+      }
+    },
+    'proofPatterns entries must be valid single-line regular expressions.',
+  )).max(4).optional(),
 })
 
 export const httpChainReplaySpecSchema = replayBase.extend({
@@ -357,9 +397,13 @@ export const raceBurstRequestSchema = z.object({
 
 export const raceBurstReplaySpecSchema = replayBase.extend({
   kind: z.literal('race_burst'),
+  /** Ordered prerequisite steps (create/mint/read) executed before controlStep; their extracts feed vars. */
+  setupSteps: z.array(replayStepSchema).max(6).optional(),
   controlStep: replayStepSchema.optional(),
   burst: z.array(raceBurstRequestSchema).min(2).max(10),
   postCheckStep: replayStepSchema.optional(),
+  /** Best-effort restoration steps executed after the burst/post-check (never in the burst itself). */
+  cleanupSteps: z.array(replayStepSchema).max(4).optional(),
 }).refine(
   spec => !containsDestructivePayload(JSON.stringify(spec)),
   'race_burst replay spec rejected by destructive-payload denylist.',
@@ -514,10 +558,26 @@ export const staticAstProofReplaySpecSchema = replayBase.extend({
   'static_ast_proof endLine must be >= startLine.',
 )
 
+const tokenClaimValue = z.union([z.string().max(256), z.number(), z.boolean()])
+
+/**
+ * Verifier-minted JWT for routes that read the token from a JSON/form body rather than a bearer
+ * header. Claims are data-anchored placeholders (`{{now}}`, `{{now_plus_1h}}`, `{{subject}}`);
+ * nothing here carries a real credential or a signing key.
+ */
+export const tokenMintSchema = z.object({
+  name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]{0,31}$/),
+  header: z.record(z.string().min(1).max(64), tokenClaimValue).optional(),
+  payload: z.record(z.string().min(1).max(64), tokenClaimValue),
+  signature: z.enum(['none', 'strip']).default('none'),
+})
+
 export const authProtocolProofReplaySpecSchema = replayBase.extend({
   kind: z.literal('auth_protocol_proof'),
   protocol: z.enum(['jwt', 'oauth', 'oidc', 'session', 'password_reset']).default('jwt'),
   spaCatchallControl: z.boolean().default(false),
+  /** Unsigned token material minted into vars before the step loop (body-token routes). */
+  tokenMints: z.array(tokenMintSchema).max(4).optional(),
   steps: z.array(replayStepSchema).min(2).max(12).superRefine((steps, ctx) => {
     if (!steps.some(s => s.role === 'control') || !steps.some(s => s.role === 'probe')) {
       ctx.addIssue({
@@ -527,8 +587,8 @@ export const authProtocolProofReplaySpecSchema = replayBase.extend({
     }
   }),
 }).refine(
-  spec => spec.protocol !== 'jwt' || spec.steps.some(s => Boolean(s.request.authMutation)),
-  'auth_protocol_proof with protocol "jwt" requires at least one step with authMutation and persona.',
+  spec => spec.protocol !== 'jwt' || spec.steps.some(s => Boolean(s.request.authMutation)) || Boolean(spec.tokenMints?.length),
+  'auth_protocol_proof with protocol "jwt" requires a step with authMutation or at least one tokenMints entry.',
 )
 
 const cachePathSchema = z.string().min(1).max(4096).refine(
@@ -550,14 +610,22 @@ export const cacheDifferentialReplaySpecSchema = replayBase.extend({
   controlPath: cachePathSchema,
   probePath: cachePathSchema,
   verifyPath: cachePathSchema.optional(),
+  /** Header-free caches: repeat the clean verify after a short delay and compare bodies/actors. */
+  proofMode: z.enum(['header', 'body_repeat']).default('header'),
+  repeatPath: cachePathSchema.optional(),
+  /** An actor-specific marker (tenant canary / personalised value) observed in the warm response. */
+  marker: z.string().min(4).max(256).refine(v => !/[\r\n\0]/.test(v), 'marker must be a single-line token.').optional(),
   poisonHeaders: safeHeaders.optional(),
   poisonPersona: personaHandle.optional(),
+  controlPersona: personaHandle.optional(),
+  verifyPersona: personaHandle.optional(),
   spaCatchallControl: z.boolean().default(false),
 }).superRefine((spec, ctx) => {
   if (containsDestructivePayload(JSON.stringify({
     controlPath: spec.controlPath,
     probePath: spec.probePath,
     verifyPath: spec.verifyPath,
+    repeatPath: spec.repeatPath,
     poisonHeaders: spec.poisonHeaders,
   }))) {
     ctx.addIssue({ code: 'custom', message: 'cache_differential spec rejected by destructive-payload denylist.' })
@@ -594,6 +662,23 @@ export const cacheDifferentialReplaySpecSchema = replayBase.extend({
         message: 'cache_differential verifyPath requires ?_gcb=<16-36 hex/uuid>.',
       })
     }
+  }
+  if (spec.repeatPath) {
+    const repeatGcb = extractCacheBusterParam(spec.repeatPath)
+    if (!isValidGcbTokenOrPlaceholder(repeatGcb, '{{repeat_gcb}}')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['repeatPath'],
+        message: 'cache_differential repeatPath requires ?_gcb=<16-36 hex/uuid>.',
+      })
+    }
+  }
+  if (spec.proofMode === 'body_repeat' && !spec.repeatPath) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['repeatPath'],
+      message: 'cache_differential proofMode "body_repeat" requires repeatPath.',
+    })
   }
 })
 
@@ -691,9 +776,11 @@ export function replaySpecOrigins(spec: DeclarativeReplaySpec): string[] {
       if (step.fetchTarget) origins.add(step.fetchTarget.origin)
     }
   } else if (spec.kind === 'race_burst') {
+    for (const step of spec.setupSteps ?? []) origins.add(step.request.origin)
     if (spec.controlStep) origins.add(spec.controlStep.request.origin)
     for (const req of spec.burst) origins.add(req.origin)
     if (spec.postCheckStep) origins.add(spec.postCheckStep.request.origin)
+    for (const step of spec.cleanupSteps ?? []) origins.add(step.request.origin)
   } else if (spec.kind === 'rce_proof') {
     origins.add(spec.controlStep.request.origin)
     origins.add(spec.probeStep.request.origin)

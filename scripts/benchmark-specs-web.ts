@@ -18,7 +18,7 @@ export function synthGraphql(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
   const hasIntrospection = types.has('introspection_enabled')
   const hasAlias = types.has('alias_batching_allowed')
   const hasSuggestion = types.has('field_suggestion_leak')
-  const hasCrossPersona = types.has('graphql_cross_persona_access') || types.has('graphql_nested_bola')
+  const hasCrossPersona = types.has('graphql_cross_persona_access') || types.has('graphql_nested_bola') || types.has('graphql_bola_differential')
   if (!hasIntrospection && !hasAlias && !hasSuggestion && !hasCrossPersona) return []
 
   const path = probePathFor(o.hyp)
@@ -28,16 +28,24 @@ export function synthGraphql(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
   // Cross-persona resolver exposure is the strongest evidence. The probe records the exact operation
   // and variables it used, so the replay reproduces the same object (id arg) and nested selection.
   if (hasCrossPersona && env.owner && env.other) {
-    const anomaly = o.anomalies.find(a => a.type === 'graphql_cross_persona_access' || a.type === 'graphql_nested_bola')
+    const anomaly = o.anomalies.find(a => a.type === 'graphql_cross_persona_access' || a.type === 'graphql_nested_bola' || a.type === 'graphql_bola_differential')
     const field = typeof anomaly?.field === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(anomaly.field) ? anomaly.field : null
     const nested = Array.isArray(anomaly?.nestedPath)
       ? (anomaly.nestedPath as unknown[]).filter((x): x is string => typeof x === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(x))
       : []
-    const recordedQuery = typeof anomaly?.query === 'string' && anomaly.query.length <= 4000 ? anomaly.query : null
+    // The probe may not have introspection available; it records the nested operation it built from
+    // field-suggestion/error differentials instead. Accept either spelling, but never invent a query.
+    const recordedQueryRaw = typeof anomaly?.query === 'string'
+      ? anomaly.query
+      : typeof anomaly?.nestedQuery === 'string' ? anomaly.nestedQuery
+        : typeof anomaly?.operation === 'string' ? anomaly.operation : null
+    const recordedQuery = recordedQueryRaw && recordedQueryRaw.length <= 4000 &&
+      /^\s*(?:[{(]|query\b|mutation\b|subscription\b|fragment\b)/.test(recordedQueryRaw) ? recordedQueryRaw : null
     const variables = anomaly?.variables && typeof anomaly.variables === 'object' && !Array.isArray(anomaly.variables)
       ? anomaly.variables as Record<string, unknown> : {}
-    if (!field || !recordedQuery) return []
-    const dataPath = ['data', field, ...nested].map(p => `[${jqStr(p)}]`).join('')
+    if (!recordedQuery) return []
+    if (anomaly?.sameRoot === false) return []
+    const dataPath = field ? ['data', field, ...nested].map(p => `[${jqStr(p)}]`).join('') : '.data'
     const nestedLen = (id: string) => `((.steps.${id}.json${dataPath} // []) | length)`
     const errorsClean = (id: string) => `(((.steps.${id}.json.errors // []) | length) == 0)`
     const jq = `{ controlPassed: (${is2xx('c1')} and ${errorsClean('c1')} and (${nestedLen('c1')} >= 1)), ` +
@@ -148,34 +156,123 @@ export function synthWorkflow(o: HypothesisOutcome, env: ProbeEnv): SynthesizedS
 export function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const hit = o.anomalies.find(a => a.type === 'workflow_step_skip')
   if (!hit) return []
+  const safeSelector = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/
+  const safeField = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/
+  const safeId = /^[A-Za-z0-9_.:-]{1,128}$/
   const createPath = typeof hit.createPath === 'string' && hit.createPath.startsWith('/') ? hit.createPath : null
-  const target = typeof hit.targetTemplate === 'string' && hit.targetTemplate.startsWith('/') ? hit.targetTemplate : null
+  let target = typeof hit.targetTemplate === 'string' && hit.targetTemplate.startsWith('/')
+    ? hit.targetTemplate
+    : typeof hit.path === 'string' && hit.path.startsWith('/') ? hit.path : null
+  const targetId = typeof hit.targetId === 'string' && safeId.test(hit.targetId) ? hit.targetId : null
+  const extractVar = typeof hit.extractVar === 'string' && /^[a-zA-Z_][a-zA-Z0-9_]{0,31}$/.test(hit.extractVar) ? hit.extractVar : 'resource_id'
   const fromState = String(hit.fromState ?? '').toLowerCase()
   const toState = String(hit.toState ?? '').toLowerCase()
-  if (!createPath || !target || !/^[a-z0-9_-]{1,32}$/.test(fromState) || !/^[a-z0-9_-]{1,32}$/.test(toState)) return []
-  const producerBody = hit.producerBody && typeof hit.producerBody === 'object' ? hit.producerBody : {}
+  const seeded = typeof hit.seeded === 'boolean' ? hit.seeded : !createPath && Boolean(targetId)
+  const repeatTransition = hit.repeatTransition === true
+  if (!target) return []
+  if (targetId && target.includes('{{id}}')) target = target.replaceAll('{{id}}', encodeURIComponent(targetId))
+  else if (createPath && target.includes('{{id}}')) target = target.replaceAll('{{id}}', `{{${extractVar}}}`)
+  if (!seeded && !createPath) return []
+  const stateField = typeof hit.stateField === 'string' && safeField.test(hit.stateField) ? hit.stateField : ''
+  const readPath = typeof hit.readPath === 'string' && hit.readPath.startsWith('/') ? hit.readPath : null
+  const stateSelector = typeof hit.stateSelector === 'string' && safeSelector.test(hit.stateSelector) ? hit.stateSelector : undefined
+  const collection = typeof hit.collection === 'string' && safeField.test(hit.collection) ? hit.collection : undefined
+  const idField = typeof hit.idField === 'string' && safeField.test(hit.idField) ? hit.idField : undefined
+  const recordId = typeof hit.recordId === 'string' && safeId.test(hit.recordId)
+    ? hit.recordId
+    : targetId
+  const canReadState = Boolean(readPath && stateField)
+  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+    process.stderr.write(`[spec-workflow] from=${fromState || '-'} to=${toState || '-'} create=${createPath ?? '-'} seeded=${seeded} repeat=${repeatTransition} read=${readPath ?? '-'} field=${stateField || '-'} coll=${collection ?? '-'} idField=${idField ?? '-'} recordId=${recordId ?? '-'} target=${target}\n`)
+  }
+  if (!canReadState && !repeatTransition && (!fromState || !toState)) return []
+  if (fromState && !/^[a-z0-9_-]{1,32}$/.test(fromState)) return []
+  if (toState && !/^[a-z0-9_-]{1,32}$/.test(toState)) return []
+  const producerBody = hit.producerBody && typeof hit.producerBody === 'object' && !Array.isArray(hit.producerBody) ? hit.producerBody as Record<string, unknown> : {}
+  const targetBody = hit.targetBody && typeof hit.targetBody === 'object' && !Array.isArray(hit.targetBody) ? hit.targetBody as Record<string, unknown> : {}
   const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
   const prereqs = Array.isArray(hit.falsePrerequisites) ? hit.falsePrerequisites.filter(x => typeof x === 'string' && /^[A-Za-z0-9_]{1,40}$/.test(x)) : []
   const prereqCheck = prereqs.map(k => `(.steps.p1.json[${jqStr(k)}] == false)`).join(' and ')
-  const createStep = {
-    ...stepOf(env, 'c1', 'control', 'Create a fresh object in its initial state', { method: 'POST', pathAndQuery: createPath, jsonBody: producerBody }),
-    extract: [{ varName: 'resource_id', from: 'json' as const, selector: 'id' }],
+  const bodyFor = (body: Record<string, unknown>, encoding: string) => {
+    if (encoding === 'form') {
+      return {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        textBody: Object.entries(body).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+      }
+    }
+    return { headers: { 'Content-Type': 'application/json' }, jsonBody: body }
   }
-  const jq = `{ controlPassed: (${is2xx('c1')} and ((.steps.c1.json.status // .steps.c1.json.state // "") | tostring | ascii_downcase) == ${jqStr(fromState)}), ` +
-    `confirmed: (${is2xx('p1')} and ((.steps.p1.json.status // .steps.p1.json.state // "") | tostring | ascii_downcase) == ${jqStr(toState)}` +
-    `${prereqCheck ? ` and ${prereqCheck}` : ''}), ` +
-    `observed: ("status=" + ((.steps.p1.json.status // .steps.p1.json.state // "") | tostring)), expected: "the prerequisite step must be completed first" }`
+  const createEncoding = String(hit.createEncoding ?? hit.producerEncoding ?? 'json') === 'form' ? 'form' : 'json'
+  const targetEncoding = String(hit.targetEncoding ?? hit.encoding ?? 'json') === 'form' ? 'form' : 'json'
+  const createSelector = typeof hit.createIdSelector === 'string' && /^(?:json:)?[A-Za-z_$][A-Za-z0-9_$.[\]-]{0,200}$/.test(hit.createIdSelector)
+    ? hit.createIdSelector.replace(/^json:/, '')
+    : 'id'
+
+  const steps: Array<Record<string, unknown>> = []
+  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies from the site root', { method: 'GET', pathAndQuery: '/' }, env.owner))
+  if (createPath) {
+    const createBody = bodyFor(producerBody, createEncoding)
+    steps.push({
+      ...stepOf(env, 'c1', 'control', 'Create a fresh object in its initial state', {
+        method: 'POST', pathAndQuery: createPath, ...createBody,
+      }, env.owner),
+      extract: [{ varName: extractVar, from: 'json' as const, selector: createSelector }],
+    })
+  }
+  const baselineStepId = readPath ? 'c2' : 'c1'
+  if (readPath) {
+    steps.push(stepOf(env, baselineStepId, 'control', 'Read the object before the skipped transition', { method: 'GET', pathAndQuery: readPath }, env.owner))
+  }
+  if (repeatTransition) {
+    // Same transition twice: the first establishes the legal from->to transition; the second must be
+    // rejected once the object is no longer in the prerequisite state.
+    steps.push(stepOf(env, 'c3', 'control', 'Perform the transition once (legal)', {
+      method, pathAndQuery: target, ...bodyFor(targetBody, targetEncoding),
+    }, env.owner, {}, [200, 201, 204]))
+  }
+  steps.push(stepOf(env, 'p1', 'probe', 'Invoke the later transition directly', {
+    method, pathAndQuery: target, ...bodyFor(targetBody, targetEncoding),
+  }, env.owner, {}, [200, 201, 204]))
+  if (readPath) {
+    steps.push(stepOf(env, 'p2', 'probe', 'Read the object after the transition', { method: 'GET', pathAndQuery: readPath }, env.owner))
+  }
+
+  const stateExpr = (stepId: string): string => {
+    const base = `.steps.${stepId}.json`
+    if (stateSelector) return `(${base}${stateSelector.split('.').map(p => `[${jqStr(p)}]`).join('')})`
+    if (collection && idField && recordId) return `([${base}[${jqStr(collection)}][]? | select((.[${jqStr(idField)}] | tostring) == ${jqStr(recordId)}) | .[${jqStr(stateField)}]][0])`
+    if (collection && idField && createPath) return `([${base}[${jqStr(collection)}][]? | select((.[${jqStr(idField)}] | tostring) == $rid) | .[${jqStr(stateField)}]][0])`
+    return `(${base}[${jqStr(stateField)}])`
+  }
+  const finalStateId = readPath ? 'p2' : 'p1'
+  let controlPassed: string
+  let confirmed: string
+  if (repeatTransition) {
+    controlPassed = `(${is2xx('c3')})`
+    confirmed = `(${is2xx('p1')})`
+  } else if (canReadState) {
+    const baseline = stateExpr(baselineStepId)
+    const finalState = stateExpr(finalStateId)
+    const createOk = createPath ? is2xx('c1') : 'true'
+    controlPassed = `(${createOk} and ${is2xx(baselineStepId)} and ((${baseline} | tostring | ascii_downcase) == ${jqStr(fromState)}))`
+    confirmed = `(${is2xx('p1')} and ${is2xx(finalStateId)} and ((${finalState} | tostring | ascii_downcase) == ${jqStr(toState)})` +
+      `${prereqCheck ? ` and ${prereqCheck}` : ''})`
+  } else {
+    const createOk = createPath ? is2xx('c1') : 'true'
+    controlPassed = `(${createOk} and ((.steps.c1.json.status // .steps.c1.json.state // "") | tostring | ascii_downcase) == ${jqStr(fromState)})`
+    confirmed = `(${is2xx('p1')} and ((.steps.p1.json.status // .steps.p1.json.state // "") | tostring | ascii_downcase) == ${jqStr(toState)}` +
+      `${prereqCheck ? ` and ${prereqCheck}` : ''})`
+  }
+  const jq = `(.extractedVars[${jqStr(extractVar)}] // "") as $rid | ` +
+    `{ controlPassed: ${controlPassed}, confirmed: ${confirmed}, ` +
+    `observed: ("final=" + (((${canReadState ? stateExpr(finalStateId) : '.steps.p1.json.status'}) // "") | tostring)), ` +
+    `expected: "the prerequisite step must be completed first" }`
   return [{
     kind: 'http_chain',
     spec: {
       ...baseFields(env, 'Workflow step skipped (later transition accepted before prerequisite)', 'CWE-841', 'business-logic', 'high', jq),
       kind: 'http_chain',
-      steps: [
-        createStep,
-        stepOf(env, 'p1', 'probe', 'Invoke the later transition directly', {
-          method, pathAndQuery: target.replace('{{id}}', '{{resource_id}}'), jsonBody: {},
-        }),
-      ],
+      steps,
     },
   }]
 }
@@ -268,18 +365,63 @@ export function synthRace(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
   const consumePath = String(hit.path ?? '')
   const param = String(hit.param ?? '')
   const body = hit.consumeBody
-  if (!producerPath.startsWith('/') || !consumePath.startsWith('/') || !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(param)) return []
-  if (!body || typeof body !== 'object') return []
+  if (!consumePath.startsWith('/') || !body || typeof body !== 'object') return []
+  if (param && !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(param)) return []
   const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
   const headers = { 'Content-Type': 'application/json' }
+  const setupSteps: Array<Record<string, unknown>> = []
+  const cleanupSteps: Array<Record<string, unknown>> = []
+
+  const simplifiedStep = (raw: Record<string, unknown>, role: 'setup' | 'cleanup'): Record<string, unknown> | null => {
+    const path = typeof raw.path === 'string' && raw.path.startsWith('/') ? raw.path : null
+    if (!path) return null
+    const rawMethod = String(raw.method ?? 'GET').toUpperCase()
+    const m = rawMethod === 'POST' || rawMethod === 'PUT' || rawMethod === 'PATCH' ? rawMethod : 'GET'
+    const parts: RequestParts = raw.body && typeof raw.body === 'object'
+      ? { method: m as RequestParts['method'], pathAndQuery: path, jsonBody: raw.body }
+      : { method: m as RequestParts['method'], pathAndQuery: path }
+    const step = stepOf(env, String(raw.id ?? (role === 'setup' ? `s${setupSteps.length + 1}` : `z${cleanupSteps.length + 1}`)), role,
+      String(raw.description ?? (role === 'setup' ? 'Mint/read the resource needed by the burst' : 'Restore the state after the burst')),
+      parts, typeof raw.persona === 'string' ? raw.persona : env.owner)
+    const extracts = Array.isArray(raw.extract) ? raw.extract.filter(e => e && typeof e === 'object' && typeof (e as Record<string, unknown>).varName === 'string') : []
+    return extracts.length > 0 ? { ...step, extract: extracts } : step
+  }
+
+  const setup = Array.isArray(hit.setupSteps) ? hit.setupSteps : []
+  for (const raw of setup) {
+    if (raw && typeof raw === 'object' && setupSteps.length < 4) {
+      const step = simplifiedStep(raw as Record<string, unknown>, 'setup')
+      if (step) setupSteps.push(step)
+    }
+  }
+  // Balance/stock races have no single-use producer: set up by reading the current value the burst
+  // consumes, then read it back afterwards to prove the conservation break.
+  const balancePath = typeof hit.balancePath === 'string' && hit.balancePath.startsWith('/') ? hit.balancePath : null
+  const balanceField = typeof hit.balanceField === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(hit.balanceField) ? hit.balanceField : null
+  if (setupSteps.length === 0 && balancePath && balanceField) {
+    setupSteps.push({
+      ...stepOf(env, 's1', 'setup', 'Read the current balance that the burst will consume', { method: 'GET', pathAndQuery: balancePath }, env.owner),
+      extract: [{ varName: 'balance0', from: 'json' as const, selector: balanceField }],
+    })
+  }
+  const cleanup = Array.isArray(hit.cleanupSteps) ? hit.cleanupSteps : []
+  for (const raw of cleanup) {
+    if (raw && typeof raw === 'object' && cleanupSteps.length < 3) {
+      const step = simplifiedStep(raw as Record<string, unknown>, 'cleanup')
+      if (step) cleanupSteps.push(step)
+    }
+  }
+
   const burst = Array.from({ length: 4 }, () => ({
     origin: env.origin, method, pathAndQuery: consumePath, headers,
     ...(env.owner ? { persona: env.owner } : {}),
     ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
     jsonBody: body as Record<string, unknown>,
   }))
-  const controlStep = stepOf(env, 'm1', 'control', 'Mint one single-use value', { method: 'POST', pathAndQuery: producerPath, jsonBody: {} }, env.owner)
-  const jq = `{ controlPassed: (.control.status >= 200 and .control.status < 300), ` +
+  const controlStep = producerPath.startsWith('/') && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(param)
+    ? { ...stepOf(env, 'm1', 'control', 'Mint one single-use value', { method: 'POST', pathAndQuery: producerPath, jsonBody: {} }, env.owner), extract: [{ varName: 'code', from: 'json' as const, selector: param }] }
+    : undefined
+  const jq = '{ controlPassed: ((.control.status >= 200 and .control.status < 300) or (.setup | length) >= 1), ' +
     'confirmed: (([(.burst.results // [])[] | select(.status >= 200 and .status < 300)] | length) >= 2), ' +
     'observed: ("accepted=" + (([(.burst.results // [])[] | select(.status >= 200 and .status < 300)] | length) | tostring)), expected: "one single-use value is accepted exactly once" }'
   return [{
@@ -287,11 +429,13 @@ export function synthRace(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
     spec: {
       ...baseFields(env, 'Race condition allows a single-use value to be consumed twice', 'CWE-362', 'business-logic', 'high', jq),
       kind: 'race_burst',
-      controlStep: { ...controlStep, extract: [{ varName: 'code', from: 'json' as const, selector: param }] },
+      ...(setupSteps.length > 0 ? { setupSteps } : {}),
+      ...(controlStep ? { controlStep } : {}),
       burst,
       ...(typeof hit.parentPath === 'string' && hit.parentPath.startsWith('/')
         ? { postCheckStep: stepOf(env, 'p1', 'probe', 'Read the balance after the burst', { method: 'GET', pathAndQuery: hit.parentPath }) }
         : {}),
+      ...(cleanupSteps.length > 0 ? { cleanupSteps } : {}),
     },
   }]
 }
