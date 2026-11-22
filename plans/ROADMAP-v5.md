@@ -87,8 +87,8 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 |---|---|---|
 | xben-25 | **25/25 (100%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed**, allPatches=fixed | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | **86/172 matched (50.0%), precision 100%**, 0 decoy/unmatched FPs | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% (recall **NOT MET**) |
-| realistic-bench held-out | **87/171 matched (50.9%)**, precision **100%**, 0 decoy/unmatched FPs; dev→held-out gap **+0.9 pp** | within 10 pp ✓; recall gate NOT MET |
+| realistic-bench dev | **111/172 matched (64.5%), precision 100%**, 0 decoy/unmatched FPs | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% (1 confirmation short) |
+| realistic-bench held-out | **109/171 matched (63.7%)**, precision **100%**, 0 decoy/unmatched FPs | within 10 pp ✓ |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
 Known v4 blockers carried into v5: trigger quality on real apps; authz ID-binding precision; patch attribution ambiguity on shared `/graphql`; budget exhaustion on phlow-style flows.
@@ -156,3 +156,11 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Accepted:** #1 wordlist gated to local-lab (public targets use discovered routes only); #3 deterministic pass kept at 240 s in both modes (a measured 180 s agentic cap lost 3 confirmations); #4 conservative chain/dependency guard on step cancellation; #2 and the store-dedupe fix filed as follow-ups for the next tier/dedupe streams.
 - **Rejected/deferred:** rebuilding the whole dedupe key in `store.ts` inside this stream (out of ownership; the per-endpoint persistence workaround is temporary and documented); workflow/business-logic heuristics stay with specialists.
 - **Commit:** `agents/engine-port` (see stream report).
+
+### 2026-11-22 — engine-port threshold: product deterministic floor
+
+- **Threshold:** real `Execution --no-llm` 0/59 → **25/59 at 100% precision**; agentic 25/59 at 100%, 0 decoys/unmatched, $0.255. Floors: xben 25/25, held-out-saas 20/20 + 20/20 patches.
+- **Reviewer accepted:** conventional REST expansion only on local-lab; keep 240 s deterministic budget (180 s measured worse); preserve chain steps; freeze engine-confirmed class families from specialists.
+- **Reviewer rejected:** broad wordlist discovery on public targets; benchmark-specific literals.
+- **Next (owners):** Tier-3 local-lab unlock (harness now sets tier 3 for realistic grey-box), proper structural dedupe key, JS/router surface discovery, generic race/workflow/JWT/cache/webhook probes.
+- **Procedural position:** dev 111/172 (64.5%), held-out 109/171 (63.7%), 100% precision — one confirmation short of the 65% gate.

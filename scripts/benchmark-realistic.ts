@@ -384,7 +384,10 @@ export function planCell(briefing: Briefing, loginPath: string | null): CellPlan
     loginPath,
     openApi: briefing.apiReference ? briefingToOpenApi(briefing) : null,
     personas,
-    capabilityTier: briefing.mode === 'white-box' ? 3 : 2,
+    // This harness only runs local labs (assertLocalLabAllowed). Tier 3 is required for the
+    // state-changing probes (PATCH/PUT/DELETE, race, benign RCE proofs); local-lab approvals are
+    // auto-reviewed, while public-target Tier-3 HITL rules remain untouched.
+    capabilityTier: 3,
     mission,
   }
 }
