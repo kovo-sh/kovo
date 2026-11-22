@@ -209,7 +209,7 @@ export const DEFAULT_PER_CLASS_CAPS: Readonly<Record<string, number>> = {
   path_traversal_benign: 8,
   auth_protocol_audit: 16,
   cache_poison_deception: 5,
-  authz_matrix: 8,
+  authz_matrix: 16,
   mass_assignment: 8,
   workflow_invariant: 3,
   graphql_audit: 1,

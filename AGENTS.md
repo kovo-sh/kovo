@@ -18,6 +18,8 @@
    git -c credential.helper='!gh auth git-credential' push origin main
    ```
 
+5. **Iterate with the smoke tier, not full matrices.** Use `scripts/hillclimb-loop.sh` (realistic seed 42 + agentic `--smoke` + typecheck, in parallel) between tweaks; run `--full`/`reverify-v5.sh --full` only once per batch or at milestones. Batch 3–5 related fixes before validating.
+
 ## Gemini Coding Guidelines
 
 1. **Never `read_file` or `cat` raw debug dumps or benchmark logs (main session OR sub-agents):**

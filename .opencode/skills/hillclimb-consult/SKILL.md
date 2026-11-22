@@ -20,6 +20,32 @@ reviewer with raw benchmark data.
 
 Do not consult for tiny edits or while a benchmark matrix is still running.
 
+## Acceleration playbook (use this, not full matrices, between tweaks)
+
+- **Two tiers only.** `--smoke` is the iteration tier: realistic seed 42 + agentic
+  `--smoke` (90 s/$0.25 per cell) + typecheck, run in parallel by
+  `scripts/hillclimb-loop.sh`. `--full` is the validation tier (3 dev seeds and
+  600 s agentic) and runs **once per batch**, never per tweak.
+- **Batch 3–5 related fixes** before one validation run. Revert immediately on
+  any decoy/unmatched regression; otherwise keep the batch.
+- **Run independent legs concurrently** (realistic, agentic, held-out, suites)
+  with isolated output/data dirs. 16 cores are idle during a single matrix.
+- **Targeted suites per merge; full `reverify-v5.sh --full` only at milestones.**
+  A full gate is a freeze action, not an iteration action.
+- **One definitive full matrix per batch** is the only number you merge or
+  report. Keep the smoke table separate and label it as such.
+- **Real `Execution` is the primary product gate.** The deterministic
+  `scripts/benchmark-*` pipeline is scaffolding; always report both surfaces.
+- **Caching/warm-pool ideas** (reuse discovery for tuning runs, warm worker
+  containers) are follow-ups, not substitutes for the smoke loop.
+
+Run the loop with:
+
+```bash
+newgrp docker -c 'bash scripts/hillclimb-loop.sh'          # smoke tier
+newgrp docker -c 'bash scripts/hillclimb-loop.sh --full'   # validation tier
+```
+
 ## Workflow
 
 1. **Write a summary-only brief** (≤1200 chars) to a temp file. Include:
