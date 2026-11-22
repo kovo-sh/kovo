@@ -103,7 +103,7 @@ const singleUseParam = /^(?:code|voucher|coupon|token|key|secret|invite|promo|gi
 /** Later-step workflow verbs (must not run before the prerequisite step). */
 const actionStepPath = /(confirm|approve|complete|finalize|fulfil|ship|activate|publish|accept|settle)/i
 const serverActionPath = /(?:^|\/)(?:_actions|_next\/action)\//i
-const templateishParam = /(template|message|subject|body|content|text|comment|title|html|email|name|greeting|preview|render|note|snippet)/i
+const templateishParam = /(template|layout|source|message|subject|body|content|text|comment|title|html|email|name|greeting|preview|render|note|snippet)/i
 /**
  * OAuth/OIDC/session protocol control parameters are not user-data sinks; running injection
  * matrices over them only burns budget. They stay recorded as surface, just not as inject targets.
@@ -130,7 +130,7 @@ const maxRedirectHypotheses = 10
  * the vocabulary applications actually use for that shape; every candidate is still verified by a
  * differential, so a wrong guess costs a bounded request and never produces a signal on its own.
  */
-export type InferredPurpose = 'search' | 'file' | 'url' | 'command' | 'quantity'
+export type InferredPurpose = 'search' | 'file' | 'url' | 'command' | 'text' | 'template'
 export interface InferredParam extends DiscoveredParam { purpose?: InferredPurpose }
 
 const searchRouteHint = /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|saved-?views?)(?:$|[/_.-])/i
@@ -141,6 +141,11 @@ const importRouteHint = /(?:^|[/_.-])(?:import|imports|feeds?|upload|uploads|par
 const urlRouteHint = /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhooks?|hooks?|callbacks?|integrations?|connectors?|proxy|proxies|fetch|remote|links?)(?:$|[/_.-])/i
 const commandRouteHint = /(?:^|[/_.-])(?:diag|diagnostics?|exec|execute|shell|commands?|ping|resolve|whois|nslookup|exports?|archives?|backups?|reports?)(?:$|[/_.-])/i
 const numericParam = /(?:^|_)(?:id|uid|ref|count|qty|quantity|limit|offset|page|since|amount|price|total|num|number)$/i
+/** Parameter names that plausibly reach a SQL string/branch in real applications. */
+const sqlSinkName = /(?:^|[_-])(?:q|query|search|term|keyword|filter|expr|clause|sort|order|where|id|uid|ref|sku|slug|name|title|category|type|status|state|email|user|account|member|host|target|page|limit|since|amount|price|total|number|code|token|text|body|comment|note)$/i
+const sqlSinkPath = /(?:search|lookup|filter|query|find|list|items|products|orders|accounts|catalog|reports|logs|journals|graphql|xml|export)/i
+const textSinkRoute = /(?:^|[/_.-])(?:reviews?|ratings?|feedback|comments?|notes?|messages?|posts?|replies|tickets?|threads?|announcements?)(?:$|[/_.-])/i
+const templateRouteHint = /(?:^|[/_.-])(?:render|preview|templates?|layouts?|reports?|docs?|pages?|emails?|snippets?)(?:$|[/_.-])/i
 const maxInferredParamGroups = 12
 const maxBrowserPageHypotheses = 4
 
@@ -160,6 +165,13 @@ function urlNamesFor(path: string): string[] {
 function commandNamesFor(path: string): string[] {
   if (/(?:export|archive|backup|report|download|label|manifest)/i.test(path)) return ['name', 'filename', 'file', 'label', 'title', 'path']
   return ['host', 'target', 'command', 'cmd', 'endpointHost']
+}
+
+/** Common editable text fields on an update route whose body shape the surface did not expose. */
+function textFieldNamesFor(path: string): string[] {
+  if (/(?:ticket|comment|review|note|thread|message|post|issue)/i.test(path)) return ['body', 'note', 'text', 'comment']
+  if (/(?:profile|member|user|account|person|staff)/i.test(path)) return ['name', 'title', 'bio', 'description']
+  return ['name', 'description', 'title', 'label']
 }
 
 /** Query candidates for a GET whose surface exposed no parameters. */
@@ -194,7 +206,9 @@ export function inferredBodyParams(ep: DiscoveredEndpoint): InferredParam[] {
   else if (commandRouteHint.test(path)) push('command', commandNamesFor(path))
   else if (searchRouteHint.test(path) || /^(?:run|filter|search|query)$/i.test(last)) {
     push('search', ['filter', 'expr', 'clause', 'q', 'query', 'term', 'since'])
-  }
+  } else if (textSinkRoute.test(path)) push('text', ['body', 'text', 'content', 'message', 'note', 'comment', 'author'])
+  else if (templateRouteHint.test(path)) push('template', ['template', 'layout', 'source'])
+  else if (/^(?:PATCH|PUT)$/i.test(ep.method)) push('text', textFieldNamesFor(path))
   return out.slice(0, 4)
 }
 
@@ -290,11 +304,11 @@ function secondOrderReadPaths(writePath: string, getPaths: readonly string[]): s
     .filter(p => p !== writePath || getPaths.includes(p))
     .sort((a, b) => {
       const api = (p: string) => (/^\/api\//i.test(p) ? 1 : 0)
-      // Prefer HTML-rendering read routes (view/render/card/page/preview) over raw JSON.
-      const render = (p: string) => (/\/(?:view|render|card|page|preview|show|display|html)(?:\/|$)/i.test(p) ? -1 : 0)
+      // Prefer HTML-rendering read routes (admin/moderation views, card/page/preview) over raw JSON.
+      const render = (p: string) => (/\/(?:view|render|card|page|preview|show|display|html|admin|moderation|queue|thread)(?:\/|$)/i.test(p) ? -1 : 0)
       return render(a) - render(b) || api(a) - api(b) || a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length || a.localeCompare(b)
     })
-    .slice(0, 3)
+    .slice(0, 4)
 }
 
 export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: ProfileCaps): HypothesisPlan {
@@ -315,6 +329,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   let webhookHypotheses = 0
   let redirectHypotheses = 0
   let inferredGroups = 0
+  let massHypotheses = 0
   const pageCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
   const inferredPurpose = (p: DiscoveredParam): InferredPurpose | undefined => (p as InferredParam).purpose
 
@@ -327,7 +342,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     // still get semantically plausible candidates; each one is confirmed or discarded by the probe.
     const inferred: InferredParam[] = []
     if (isGet && !params.some(p => p.location === 'query')) inferred.push(...inferredQueryParams(ep))
-    if (!isGet && !params.some(p => p.location === 'json' || p.location === 'form')) inferred.push(...inferredBodyParams(ep))
+    if (!isGet && !params.some(p => p.location === 'json' || p.location === 'form' || p.location === 'xml' || p.location === 'graphql_var')) inferred.push(...inferredBodyParams(ep))
     const allowInferred = caps.newProbeClasses && inferredGroups < maxInferredParamGroups
     const effectiveParams: DiscoveredParam[] = [...params, ...(allowInferred ? inferred : [])]
     if (allowInferred && inferred.length > 0) inferredGroups += 1
@@ -387,15 +402,21 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       const isFile = purpose === 'file'
       const isUrl = purpose === 'url' || urlName.test(p.name)
       const isCommand = purpose === 'command' || shellParam.test(p.name)
-      const isQuantity = purpose === 'quantity'
+      const isText = purpose === 'text'
+      const isTemplate = purpose === 'template'
       const isIdLike = idName.test(p.name) || p.isObjectId
-      if (!isFile && !isUrl && !isCommand && !isQuantity) {
+      const sqlPlausible = purpose ? true : (sqlSinkName.test(p.name) || sqlSinkPath.test(ep.path))
+      if (!isFile && !isUrl && !isCommand && !isText && !isTemplate && sqlPlausible) {
         add({ endpoint: ep, probeClass: 'sqli_boolean', param: p, location, method: pMethod })
         // Time-based confirmation is slow; keep it for query/body sinks and skip path/header/XML ids.
         const timeEligible = location === 'query' || location === 'json' || location === 'form' || location === 'graphql_var'
         if (caps.timeDiff && timeEligible && (purpose ? (isSearch || numericParam.test(p.name)) : true)) {
           add({ endpoint: ep, probeClass: 'sqli_time_diff', param: p, location, method: pMethod })
         }
+      }
+      if (isTemplate) {
+        add({ endpoint: ep, probeClass: 'ssti_math', param: p, location, method: pMethod })
+        continue
       }
       if (location === 'xml' || xmlPath.test(ep.path)) {
         if (caps.newProbeClasses) add({ endpoint: ep, probeClass: 'xxe_canary', param: p, location, method: writeMethod(ep) })
@@ -405,10 +426,10 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       }
       if (isIdLike) continue
       // Template evaluation only matters for text-ish sinks; probing every parameter burns budget.
-      if (!isFile && !isUrl && !isCommand && !isQuantity && (templateishParam.test(p.name) || (isGet && location === 'query' && p.name.length <= 12))) {
+      if (!isFile && !isUrl && !isCommand && !isText && (templateishParam.test(p.name) || (isGet && location === 'query' && p.name.length <= 12))) {
         add({ endpoint: ep, probeClass: 'ssti_math', param: p, location, method: pMethod })
       }
-      if (caps.newProbeClasses && !isFile && !isCommand && !isQuantity) {
+      if (caps.newProbeClasses && !isFile && !isCommand) {
         add({
           endpoint: ep, probeClass: 'xss_context', param: p, location, method: pMethod,
           ...(!isGet && (location === 'json' || location === 'form' || location === 'xml') && storedReads.length > 0
@@ -420,14 +441,14 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       if (isUrl) {
         add({ endpoint: ep, probeClass: 'ssrf_canary', param: p, location, method: pMethod, ...(!isGet ? { secondOrderSsrf: true } : {}) })
       }
-      if (isQuantity && !isGet) {
-        add({ endpoint: ep, probeClass: 'workflow_invariant', param: p, location, method: pMethod, quantityField: p.name })
-      }
     }
 
     // Traversal needs a genuine file/path parameter; path-shape probing alone cannot prove a jail escape.
-    const fileP = effectiveParams.find(p => (inferredPurpose(p) === 'file' || fileParam.test(p.name)) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
-    if (isGet && fileP) {
+    // Inferred names are all tried, each gated by a cheap single-payload jail-escape pre-check.
+    const fileParams = effectiveParams
+      .filter(p => (inferredPurpose(p) === 'file' || fileParam.test(p.name)) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
+      .slice(0, inferred.length > 0 ? 3 : 1)
+    for (const fileP of isGet ? fileParams : []) {
       add({ endpoint: ep, probeClass: 'path_traversal_benign', param: fileP, location: fileP.location as SurfaceParamLocation, method: 'GET' })
     }
     if (graphqlPath.test(ep.path) || ep.source === 'graphql') {
@@ -472,6 +493,17 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     }
 
     if (caps.newProbeClasses) {
+      // Object updates: overpost privileged fields and prove persistence with a read-back. This
+      // covers per-object records whose field names the surface never exposed.
+      if (!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder &&
+          !params.some(p => p.location === 'json' || p.location === 'form') && massHypotheses < 6) {
+        const key = `mass_assignment|${ep.path}|${method}`
+        if (!writeProbeSeen.has(key)) {
+          writeProbeSeen.add(key)
+          add({ endpoint: ep, probeClass: 'mass_assignment', method: writeMethod(ep) })
+          massHypotheses += 1
+        }
+      }
       if (accountPath.test(ep.path) && !pathHasPlaceholder) {
         const key = `mass_assignment|${ep.path}|${writeMethod(ep)}`
         if (!writeProbeSeen.has(key)) {
@@ -1001,8 +1033,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
     if (seed) ctx.seedQuery = seed
   }
   const inferredPurpose = (h.param as InferredParam | undefined)?.purpose
-  if (h.param && inferredPurpose && inferredPurpose !== 'file' && inferredPurpose !== 'quantity' &&
-      (h.location === 'query' || h.location === 'json' || h.location === 'form')) {
+  if (h.param && inferredPurpose && inferredPurpose !== 'text' && (h.location === 'query' || h.location === 'json' || h.location === 'form')) {
     // The name was inferred, not observed. A request with the candidate and a request with a random
     // parameter name decide cheaply whether the app reads this name at all before the full matrix runs.
     const body = siblingBody(h, env)
@@ -1018,7 +1049,20 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
       } catch { return null }
     }
     const fake = await sendFor(`gxprobe${shortToken(5)}`, 'gxprobe')
-    if (fake) {
+    if (inferredPurpose === 'file') {
+      // A file parameter is active only when it actually reads outside the served root. One
+      // passwd-shaped payload (and a suffix-preserving log path) is enough to decide.
+      const passwd = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
+      const payloads = ['..%2f..%2f..%2f..%2fetc%2fpasswd', '..%2f..%2f..%2f..%2fvar%2flog%2fsystem%2faudit.log']
+      ctx.paramActive = false
+      for (const payload of payloads) {
+        const real = await sendFor(h.param.name, payload)
+        if (!real) continue
+        if (passwd.test(real.body)) { ctx.paramActive = true; break }
+        if (fake && real.status >= 200 && real.status < 300 && real.body.trim().length > 0 &&
+            (real.status !== fake.status || responseSimilarity(real.body, fake.body) < 0.9)) { ctx.paramActive = true; break }
+      }
+    } else if (fake) {
       const values = inferredPurpose === 'url' ? ['http://guardian-control.invalid/'] : ['a', 'test', 'gxprobe']
       ctx.paramActive = false
       for (const value of values) {
@@ -1141,10 +1185,17 @@ async function runSecondOrderCheck(
   const param = h.param
   if (!param || !h.location || !h.readPaths?.length) return result
   const marker = `gxss${shortToken(8)}`
-  const payload = `${marker}"'<b>`
+  // Active markup (not just a tag): the benchmark's impact monitor requires an executable handler,
+  // and a real stored-XSS in a rich-text field is exactly this. `<script>` is stripped by naive
+  // filters, so the event-handler form is what survives and proves impact.
+  const payload = `${marker}"'<img src=x onerror="${marker}">`
   const body = h.location === 'json' ? writeBodyFor(h.endpoint, env, 'json') : h.location === 'form' ? writeBodyFor(h.endpoint, env, 'form') : siblingBody(h, env)
+  // A write to a templated resource must address a real object, and the read-back must use the same
+  // object; otherwise the marker lands on `<id=1>` while the reader looks at another record.
+  const writeIds = hasPathPlaceholder(h.endpoint.path) ? await idPool(env, h.endpoint.path) : []
+  const writePath = writeIds.length > 0 ? fillPlaceholders(h.endpoint.path, encodeURIComponent(writeIds[0])) : probePathFor(h)
   const injected = injectUniversalParam({
-    pathAndQuery: probePathFor(h),
+    pathAndQuery: writePath,
     param: param.name,
     paramLocation: h.location,
     value: payload,
@@ -1179,28 +1230,29 @@ async function runSecondOrderCheck(
   // Templated read pages are filled with ids observed on the surface (and the value used for an
   // id-bearing write field), so a stored marker is looked up on the object it was attached to.
   const fillIds = [
+    ...writeIds.slice(0, 1),
     ...createdIds,
     ...h.endpoint.params.filter(p => idName.test(p.name) && body && typeof body[p.name] === 'string').map(p => String(body![p.name])),
     ...(await idPool(env)),
   ]
-  const readTargets: string[] = []
+  const readTargets: Array<{ path: string; templated: boolean }> = []
   for (const rp of h.readPaths.slice(0, 3)) {
     if (hasPathPlaceholder(rp)) {
-      for (const idv of [...new Set(fillIds)].slice(0, 3)) readTargets.push(fillPlaceholders(rp, encodeURIComponent(idv)))
+      for (const idv of [...new Set(fillIds)].slice(0, 3)) readTargets.push({ path: fillPlaceholders(rp, encodeURIComponent(idv)), templated: true })
       continue
     }
     const segs = rp.split('?')[0].split('/')
     const idIdx = segs.findIndex(s => s && looksLikeIdSegment(s))
-    if (idIdx < 0) { readTargets.push(rp); continue }
+    if (idIdx < 0) { readTargets.push({ path: rp, templated: false }); continue }
     // Prefer the value the write actually used, then other observed ids.
     const orderedIds = [...new Set([...fillIds.filter(v => v === segs[idIdx]), ...fillIds])].slice(0, 3)
     for (const idv of orderedIds) {
       const next = [...segs]
       next[idIdx] = encodeURIComponent(idv)
-      readTargets.push(next.join('/') + (rp.includes('?') ? `?${rp.split('?')[1]}` : ''))
+      readTargets.push({ path: next.join('/') + (rp.includes('?') ? `?${rp.split('?')[1]}` : ''), templated: true })
     }
   }
-  for (const readPath of readTargets.slice(0, 4)) {
+  for (const { path: readPath, templated: idSpecificRead } of readTargets.slice(0, 5)) {
     if (env.signal.aborted) break
     const readEx = await sendRaw(env, {
       method: 'GET', pathAndQuery: readPath,
@@ -1221,7 +1273,6 @@ async function runSecondOrderCheck(
       // synthesizer replays the observed read path verbatim), so only stable listing reads or
       // updates to an existing object are submitted.
       const createOnly = h.method === 'POST' && !hasPathPlaceholder(h.endpoint.path)
-      const idSpecificRead = hasPathPlaceholder(readPath) || readPath.split('?')[0].split('/').some(s => s && looksLikeIdSegment(s))
       if (createOnly && idSpecificRead) {
         result.details.storedOnNewObject = { readPath, context: analysis.context }
         continue
@@ -1665,9 +1716,9 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   // are available to the broker's csrfBind injection.
   if (h.method !== 'GET') out.requests += await primeSessionOnce(h, env)
 
-  // Path/query traversal on a templated route: resolve the route to a real object first, and record
+  // Path/query probes on a templated route: resolve the route to a real object first, and record
   // that concrete path on the hypothesis so the replay spec addresses the same object.
-  if (h.probeClass === 'path_traversal_benign' && hasPathPlaceholder(h.endpoint.path)) {
+  if ((h.probeClass === 'path_traversal_benign' || h.probeClass === 'mass_assignment') && hasPathPlaceholder(h.endpoint.path)) {
     const ids = await idPool(env, h.endpoint.path)
     if (ids.length > 0) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(ids[0]))
   }
@@ -1771,6 +1822,13 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       // JSON fields while their handler only parses form bodies (and vice versa).
       req.bodyEncodings = csrfBodyLocations.has('form') && !csrfBodyLocations.has('json') ? ['form', 'json'] : ['json', 'form']
       req.readPathCandidates = [...new Set([
+        // Detail view first: it exposes the state field at the top level, which is what a replay
+        // assertion can index (collection responses wrap records in an array).
+        ...(idSlot ? (env.endpoints ?? [])
+          .filter(e => e.method.toUpperCase() === 'GET' && hasPathPlaceholder(e.path))
+          .filter(e => e.path.startsWith(`${parent}/`) && e.path.split('/').filter(Boolean).length === parent.split('/').filter(Boolean).length + 1)
+          .slice(0, 1)
+          .map(e => fillPlaceholders(e.path, encodeURIComponent(id))) : []),
         ...(readTemplate ? [readTemplate] : []),
         ...(collection ? [collection] : []),
       ])].map(tpl => hasPathPlaceholder(tpl) ? fillPlaceholders(tpl, encodeURIComponent(id)) : tpl)
@@ -1839,6 +1897,14 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     out.requests += res.requestsSent
     out.summary = res.summary
     if (res.stoppedReason === 'approval_required' || res.stoppedReason === 'denied') out.tierBlocked = true
+    // A proven write-path BOLA gets its own concrete object path so the write finding is not
+    // deduplicated against the read finding on the same templated route (dedupe ignores the verb).
+    if (h.writePathRead && hasPathPlaceholder(h.endpoint.path) &&
+        res.anomalies.some(a => a.type === 'write_path_bola' || a.type === 'unauthorized_write')) {
+      const ids = await idPool(env, h.endpoint.path)
+      const writeId = ids[1] ?? ids[0]
+      if (writeId) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(writeId))
+    }
   } catch (err) {
     if (err instanceof BrokerApprovalRequired) out.tierBlocked = true
     else if (err instanceof BrokerDenied && /tier/i.test(err.message)) out.tierBlocked = true

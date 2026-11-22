@@ -1110,9 +1110,9 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   let stylesRun = 0
   for (const style of styles) {
     if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
-    // A parameter the app ignores answers every probe with the byte-identical baseline. Two shapes
-    // that produce no reaction at all are enough evidence to stop spending the request budget.
-    if (stylesRun >= 3 && divergentStyles === 0) break
+    // A parameter the app ignores answers every probe with the byte-identical baseline. Four shapes
+    // (including the OR branch, which proves non-LIKE sinks without a baseline) are enough evidence.
+    if (stylesRun >= 4 && divergentStyles === 0) break
     stylesRun += 1
     const rounds: Array<Record<string, unknown>> = []
     let pass = true
@@ -1172,11 +1172,12 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  const quoteOne = (interesting && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+  // A lone quote is the cheapest error-fingerprint probe; keep it even when no style diverged.
+  const quoteOne = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
     ? await send(injectParam(req, `${baseValue}'`))
     : null
   checkDbError(quoteOne)
-  const quoteTwo = (quoteOne && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+  const quoteTwo = (quoteOne && (interesting || Boolean(detectedErrorDialect)) && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
     ? await send(injectParam(req, `${baseValue}''`))
     : null
   checkDbError(quoteTwo)
@@ -3454,12 +3455,13 @@ async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome> {
     baseJson = null
   }
 
-  const candidates = req.candidateFields?.length
-    ? req.candidateFields
-    : ['role', 'isAdmin', 'admin', 'is_admin', 'plan', 'tier', 'verified', 'emailVerified', 'permissions', 'orgId', 'tenantId']
+  const baseKeys = baseJson ? Object.keys(baseJson).filter(k => /^(?:tenant_id|owner_id|team_id|org_id|account_id|role|role_id|plan|plan_id|tier|status|state|payment_state|total|amount|price|permissions|is_admin|isAdmin|admin|verified|email_verified|active|enabled|visibility|return_url|avatar_url)$/i.test(k)) : []
+  const defaults = ['role', 'isAdmin', 'admin', 'is_admin', 'plan', 'tier', 'verified', 'emailVerified', 'permissions', 'orgId', 'tenantId', 'tenant_id', 'owner_id', 'team_id', 'teamField', 'orgField', 'grant', 'level', 'status', 'state', 'payment_state', 'total', 'amount', 'visibility']
+  const candidates = req.candidateFields?.length ? req.candidateFields : [...new Set([...baseKeys, ...defaults])]
   const method: 'POST' | 'PUT' | 'PATCH' = req.method === 'PUT' || req.method === 'PATCH' ? req.method : 'POST'
   const location: SurfaceParamLocation = req.paramLocation === 'form' ? 'form' : 'json'
   const results: Array<Record<string, unknown>> = []
+  const suppressed: string[] = []
 
   for (const field of candidates.slice(0, 12)) {
     const isBoolField = /^(?:is|has|verified|admin|emailVerified)/i.test(field)
@@ -3522,6 +3524,13 @@ async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome> {
     })()
     results.push({ field, writeStatus: writeEx.status, persisted })
     if (persisted) {
+      // Classify before submitting: privilege/ownership fields are always meaningful; lifecycle
+      // fields only prove mass assignment on commerce/order-shaped resources.
+      const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|owner|team|org|plan|tier|verified|email_verified)/i
+      const lifecycleField = /^(?:status|state|payment_state|total|amount|price|return_url)$/i
+      const commerceRoute = /(?:order|purchase|checkout|cart|payment|refund|shipment|reversal|disbursement|credit)/i
+      const emit = privilegeField.test(field) || (lifecycleField.test(field) && commerceRoute.test(req.pathAndQuery))
+      if (!emit) { suppressed.push(field); continue }
       anomalies.push({ type: 'mass_assignment', field, writeStatus: writeEx.status, persisted: true })
       if (baseJson && field in baseJson) {
         const restoreVal = location === 'json' && (typeof baseJson[field] === 'boolean' || typeof baseJson[field] === 'number' || typeof baseJson[field] === 'string')
@@ -3549,7 +3558,7 @@ async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome> {
     summary: anomalies.length > 0
       ? `Privileged field "${String(anomalies[0].field)}" persisted after ${method}; confirm via http_chain Replay Spec.`
       : 'No mass assignment persistence observed.',
-    details: { results, suggestedReplayKind: 'http_chain' },
+    details: { results, suppressed, suggestedReplayKind: 'http_chain' },
   }
 }
 
