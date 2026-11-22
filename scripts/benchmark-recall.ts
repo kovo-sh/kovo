@@ -185,6 +185,7 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
       if (suite === 'held-out-saas') {
         patchVerification = await live.verifyPatchesLive({
           manifest, profileMode, launcher: opts.launchers?.[suite], verifierBackend: opts.verifierBackend ?? 'auto', repoRootDir: rootDir,
+          suite, baseline: outcome,
         })
       } else {
         patchVerification = { attempted: 0, fixed: 0, reproducedBefore: 0, perPatch: [], skippedReason: 'Patch verification applies to held-out-saas only.' }
@@ -374,11 +375,15 @@ export function benchmarkCliHelp(): string {
     '  --db <dir>                                    Data directory holding guardian.sqlite for benchmark_runs',
     '  --diff                                        Print the Markdown diff to stdout',
     '  --verify-patches                              held-out-saas: verify reproduced -> fixed patch retests',
+    '                                                (20 isolated patches + one all-patches pass)',
     '  --verifier-backend <auto|docker|local-jq>     Zero-LLM verifier backend (default: auto)',
     '  --dry-run                                     Capability-model run, no network',
     '  -h, --help',
     '',
     'Live runs require GUARDIAN_ALLOW_LOCAL_LAB=1.',
+    'Patch-verification bounds: GUARDIAN_BENCH_PATCH_TIMEOUT_MS (per patch, default 90000),',
+    'GUARDIAN_BENCH_ALLPATCH_TIMEOUT_MS (all-patches pass, default 600000),',
+    'GUARDIAN_BENCH_PATCH_ISOLATION (unrelated findings replayed per patch, default 4).',
   ].join('\n')
 }
 
@@ -397,9 +402,13 @@ export function parseBenchmarkCliArgs(argv: readonly string[]): BenchmarkCliOpti
     }
     if (arg === '--') continue
     if (arg === '-h' || arg === '--help') { out.help = true; continue }
-    if (arg === '--dry-run') { out.dryRun = true; continue }
-    if (arg === '--diff') { out.diff = true; continue }
-    if (arg === '--verify-patches') { out.verifyPatches = true; continue }
+    if (arg === '--dry-run' || arg === '--diff' || arg === '--verify-patches') {
+      if (inline !== undefined) throw new Error(`Option ${arg} does not take a value.`)
+      if (arg === '--dry-run') out.dryRun = true
+      else if (arg === '--diff') out.diff = true
+      else out.verifyPatches = true
+      continue
+    }
     if (!valueFlags.has(arg)) throw new Error(`Unknown benchmark option: ${argv[i]}`)
     const value = inline ?? argv[++i]
     if (value === undefined || value.startsWith('--')) throw new Error(`Option ${arg} requires a value.`)
@@ -448,6 +457,15 @@ export async function runBenchmarkCli(argv: readonly string[]): Promise<number> 
       `funnel=${JSON.stringify(result.funnelCounts)}`,
     ]
     if (result.recallDelta !== null) summary.push(`recallDelta=${(result.recallDelta * 100).toFixed(1)}pp confirmedDelta=${result.confirmedDelta}`)
+    if (result.patchVerification) {
+      const pv = result.patchVerification
+      summary.push(`patches=${pv.attempted} reproducedBefore=${pv.reproducedBefore} fixed=${pv.fixed}${pv.allPatches ? ` allPatches=${pv.allPatches.verdict}` : ''}`)
+      if (pv.skippedReason) summary.push(`patchVerificationSkipped=${pv.skippedReason}`)
+      const missed = pv.perPatch.filter(p => !p.fixed)
+      for (const p of missed) {
+        summary.push(`patchMiss ${p.patchId ?? p.id} vuln=${p.vulnId ?? p.id} before=${p.before} after=${p.after}${p.notes?.length ? ` notes=${p.notes.join(' | ')}` : ''}`)
+      }
+    }
     process.stdout.write(`${summary.join('\n')}\n`)
     if (diff) process.stdout.write(`\n${formatBenchmarkMarkdown(result)}\n`)
     if (opts.outJson) process.stdout.write(`wrote ${opts.outJson}\n`)
