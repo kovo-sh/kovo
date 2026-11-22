@@ -183,6 +183,7 @@ export interface HypothesisOutcome {
   contextReset: boolean
   tierBlocked: boolean
   requests: number
+  summary?: string
   error?: string
 }
 
@@ -290,6 +291,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     out.anomalies = res.anomalies
     out.details = res.details
     out.requests = res.requestsSent
+    out.summary = res.summary
     if (res.stoppedReason === 'approval_required' || res.stoppedReason === 'denied') out.tierBlocked = true
   } catch (err) {
     if (err instanceof BrokerApprovalRequired) out.tierBlocked = true

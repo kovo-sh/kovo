@@ -115,6 +115,9 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       csrfRejected: outcome.csrfRejected, contextReset: outcome.contextReset, tierBlocked: outcome.tierBlocked,
       jqError: false, spaCatchall: false, skippedForBudget: false,
     }
+    if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+      notes.push(`[debug] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'}@${hyp.location ?? '-'} -> ${outcome.verdict}: ${(outcome.summary ?? outcome.error ?? '').slice(0, 140)} anomalies=${outcome.anomalies.map(a => String(a.type)).join(',')}`)
+    }
     const synth = synthesizeSpec(outcome, env.probeEnv)
     if (synth) {
       scored.specSubmitted = true

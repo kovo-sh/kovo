@@ -92,7 +92,9 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
 
   const canaryBroker = new CanaryBroker({ storage })
   await canaryBroker.startLocalListener()
-  const broker = new RequestBroker({ source: 'fixture response', storage, canaryBroker })
+  // The lab servers intentionally answer SQL-error probes with 5xx; keep the production circuit breaker
+  // from tripping on that expected noise (loopback lab only, never applied to public targets).
+  const broker = new RequestBroker({ source: 'fixture response', storage, canaryBroker, circuit5xxThreshold: 500, circuit429Threshold: 500 })
   let used = 0
   const stateChangesAllowed = caps.tier >= 3
   const grant: Grant = {
