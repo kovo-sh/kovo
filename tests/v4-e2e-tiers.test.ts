@@ -2574,7 +2574,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   })
 
   test('T1-20d: second-order matcher ignores immediate reflection on same endpoint + same persona', async (t) => {
-    const marker = 'gn2o_same01aabb'
+    const marker = 'gn2o_aabbccdd'
     const fx = await startHttpFixture(t, (_req, _b, res) => {
       res.end(`<html><body>${marker}</body></html>`)
     })
@@ -2594,7 +2594,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       runId, assignmentId: aid, marker,
       injectedOrigin: fx.origin, injectedEndpoint: '/search', injectedParam: 'q', injectedPersona: 'user_a',
     })
-    const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
+    const broker = new RequestBroker({ rejectUnauthorized: false, storage }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { personas: personaMap })
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/search', persona: 'user_a', runId, assignmentId: aid }, grant, AbortSignal.timeout(5000))
@@ -6057,7 +6057,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       runId, assignmentId: aid, marker,
       injectedOrigin: fx.origin, injectedEndpoint: '/profile', injectedParam: 'bio', injectedPersona: 'user_a',
     })
-    const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
+    const broker = new RequestBroker({ rejectUnauthorized: false, storage }) as unknown as V4BrokerContract
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/admin/audit', runId, assignmentId: aid }, makeLabGrant(fx.origin), AbortSignal.timeout(5000)),
     )
@@ -6087,7 +6087,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       runId, assignmentId: aid, marker,
       injectedOrigin: fx.origin, injectedEndpoint: '/profile', injectedParam: 'name', injectedPersona: 'user_a',
     })
-    const broker = new RequestBroker({ rejectUnauthorized: false })
+    const broker = new RequestBroker({ rejectUnauthorized: false, storage })
     const browser = new ScopedBrowser(broker)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       browser.visitPage({ origin: fx.origin, pathAndQuery: '/admin/feed', persona: 'admin_b', runId, assignmentId: aid } as never, makeLabGrant(fx.origin, { personas: personaMap }), AbortSignal.timeout(30_000)),
@@ -6137,7 +6137,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       runId, assignmentId: aid, marker,
       injectedOrigin: fx.origin, injectedEndpoint: '/comments', injectedParam: 'body', injectedPersona: 'user_a',
     })
-    const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
+    const broker = new RequestBroker({ rejectUnauthorized: false, storage }) as unknown as V4BrokerContract
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp(
         { origin: fx.origin, method: 'GET', pathAndQuery: '/admin/export', persona: 'admin', runId, assignmentId: aid },
@@ -8658,11 +8658,11 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const aid = randomUUID()
     storage.client.prepare(`INSERT INTO assignments (id, run_id, phase, status, scope_revision, goal_revision, session_id, parent_fact_ids, source_origins, title, objective, created_at) VALUES (?, ?, 'investigation', 'running', 1, 0, ?, '[]', '[]', 't', 'o', ?)`)
       .run(aid, runId, randomUUID(), Date.now())
-    const marker = 'gn2o_sweep_cafe1234'
+    const marker = 'gn2o_cafe1234'
     const v4 = storage as unknown as V4StoreContract
     v4.insertSecondOrderCanary({ runId, assignmentId: aid, marker, injectedOrigin: fx.origin, injectedEndpoint: '/comments', injectedParam: 'text', injectedPersona: 'persona_a' })
 
-    const broker = new RequestBroker({ rejectUnauthorized: false })
+    const broker = new RequestBroker({ rejectUnauthorized: false, storage })
     const browser = new ScopedBrowser(broker)
     const grant = makeLabGrant(fx.origin, { personas: personaMap, isIdempotentPostAllowed: () => true })
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
