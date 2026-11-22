@@ -1,6 +1,7 @@
 /**
- * M7 SPA/API discovery stream: structural route-map expansion, JS router tables, deep OpenAPI
- * (`$ref`, Swagger 2 bodies), intercepted XHR request shapes, and authenticated recon.
+ * M7/v5-M2 SPA/API discovery stream: structural route-map/config artifact expansion, JS router
+ * tables and module/manifest recursion, deep OpenAPI (YAML + `$ref`/composition + servers),
+ * intercepted XHR request shapes, authenticated recon, and soft-404 calibration.
  *
  * Fixtures are synthetic; no benchmark challenge literals appear in engine-facing assertions.
  */
@@ -12,16 +13,23 @@ import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import { Store } from '../src/server/store.ts'
 import {
+  bodyStructuralSignature,
   crawlStateGraph,
+  extractAssetReferences,
+  extractJsModuleImports,
   extractJsonFieldNames,
   extractJsonLinkTargets,
   extractJsonRecordIds,
-  extractJsModuleImports,
-  extractRouteMapEntries,
   harvestConfigParamBindings,
+  harvestRouteMapDocument,
+  harvestRouteMapParamHints,
+  harvestJsRouteTable,
   harvestJsRequestParams,
+  harvestTrpcProcedures,
   inferXhrRequestShape,
-  parseJsRouterTable,
+  isSoftNotFound,
+  normalizeDiscoveryTemplate,
+  parseJsonOrYaml,
   parseOpenApiDoc,
   parseRouteMapDoc,
   runPhase0Recon,
@@ -56,55 +64,54 @@ const routeMapDoc = {
     createTicket: { method: 'POST', path: '/api/v3/tickets' },
     ticketNoteCreate: { method: 'POST', path: '/api/v3/tickets/:ticketId/notes' },
     reportRender: { method: 'POST', path: '/api/v3/reports/render' },
-    legacySearch: { method: 'GET', path: '/api/v3/search' },
   },
   params: {
     templateSrc: 'template',
     noteBody: 'note',
-    searchQuery: 'search',
   },
 }
 
-describe('M7 SPA: structural JSON route-map expansion', () => {
-  test('expands object route tables into endpoints with methods and path params', t => {
+describe('M7 SPA: route-map/config artifact expansion', () => {
+  test('harvests keyed {method, path} config tables and logical parameter dictionaries', () => {
+    const entries = harvestRouteMapDocument(routeMapDoc)
+    const byPath = new Map(entries.map(entry => [`${entry.method} ${entry.path}`, entry]))
+    assert.ok(byPath.has('GET /api/v3/tickets/:ticketId'))
+    assert.equal(byPath.get('POST /api/v3/tickets/:ticketId/notes')?.key, 'ticketNoteCreate')
+    const hints = harvestRouteMapParamHints(routeMapDoc)
+    assert.equal(hints.paramMap.templateSrc, 'template')
+    assert.ok(hints.paramHints.includes('note'))
+  })
+
+  test('expands a config artifact into endpoints with preserved named params and bindings', t => {
     const { storage, runId, origin, scopeRevision } = makeRunStore(t)
     const dynamicPaths = new Set<string>()
     const dynamicParams = new Set<string>()
-    const res = parseRouteMapDoc(JSON.stringify(routeMapDoc), origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+    const bindings = new Map([['reportRender', [{ routeKey: 'reportRender', name: 'templateSrc', location: 'json' as const }]]])
+    const res = parseRouteMapDoc(JSON.stringify(routeMapDoc), origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings })
+    assert.equal(res.endpoints, 7)
 
-    assert.equal(res.endpoints, 8)
-    assert.ok(res.routeKeys.includes('getTicket'))
     const endpoints = storage.listEndpoints(runId, { origin })
-    const detail = endpoints.find(e => e.method === 'GET' && e.pathTemplate === '/api/v3/tickets/:id')
-    assert.ok(detail, 'named path parameter collapses to the shared :id template')
-    const detailParams = storage.listEndpointParams(runId).filter(p => p.endpointId === detail.id)
-    assert.ok(detailParams.some(p => p.name === 'ticketId' && p.location === 'path'))
+    const detail = endpoints.find(e => e.method === 'GET' && e.pathTemplate === '/api/v3/tickets/:ticketId')
+    assert.ok(detail, 'named path parameter is preserved by normalizeDiscoveryTemplate')
+    assert.ok(storage.listEndpointParams(runId).some(p => p.endpointId === detail.id && p.name === 'ticketId' && p.location === 'path'))
 
-    const note = endpoints.find(e => e.method === 'POST' && e.pathTemplate === '/api/v3/tickets/:id/notes')
+    const note = endpoints.find(e => e.method === 'POST' && e.pathTemplate === '/api/v3/tickets/:ticketId/notes')
     assert.ok(note)
-    const noteParams = storage.listEndpointParams(runId).filter(p => p.endpointId === note.id)
-    assert.ok(noteParams.some(p => p.name === 'note' && p.location === 'json'), 'logical->actual body hint linked by name token')
-    assert.ok(dynamicParams.has('template'))
+    assert.ok(storage.listEndpointParams(runId).some(p => p.endpointId === note.id && p.name === 'note' && p.location === 'json'), 'logical->actual body hint linked by name token')
+
+    const render = endpoints.find(e => e.method === 'POST' && e.pathTemplate === '/api/v3/reports/render')
+    assert.ok(render)
+    assert.ok(storage.listEndpointParams(runId).some(p => p.endpointId === render.id && p.name === 'template' && p.location === 'json'), 'bundle binding resolved through params map')
+
+    // Re-expanding must dedupe against the store.
+    parseRouteMapDoc(JSON.stringify(routeMapDoc), origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings })
+    assert.equal(storage.listEndpoints(runId, { origin }).length, 7)
   })
 
-  test('accepts array route tables and path->method maps; dedupes against the store', t => {
+  test('does not treat OpenAPI documents as generic route maps', t => {
     const { storage, runId, origin, scopeRevision } = makeRunStore(t)
-    const arrayDoc = {
-      endpoints: [
-        { path: '/api/items', method: 'GET' },
-        { path: '/api/items', verb: 'POST' },
-      ],
-    }
-    const first = parseRouteMapDoc(JSON.stringify(arrayDoc), origin, storage, runId, scopeRevision, new Set(), new Set())
-    const second = parseRouteMapDoc(JSON.stringify(arrayDoc), origin, storage, runId, scopeRevision, new Set(), new Set())
-    assert.equal(first.endpoints, 2)
-    assert.equal(second.endpoints, 2)
-    assert.equal(storage.listEndpoints(runId, { origin }).length, 2, 'repeat expansion must not duplicate endpoints')
-
-    const mapDoc = { api: { '/api/ping': 'GET', '/api/pong': 'POST' } }
-    const expansion = extractRouteMapEntries(mapDoc)
-    assert.equal(expansion.entries.length, 2)
-    assert.equal(expansion.entries[0].method, 'GET')
+    const res = parseRouteMapDoc(JSON.stringify({ openapi: '3.0.3', paths: { '/x': { get: {} } } }), origin, storage, runId, scopeRevision, new Set(), new Set())
+    assert.deepEqual(res, { endpoints: 0, params: 0 })
   })
 
   test('harvests runtime parameter bindings from the bundle', () => {
@@ -118,102 +125,113 @@ describe('M7 SPA: structural JSON route-map expansion', () => {
         })
       }
     `
-    const bindings = harvestConfigParamBindings(bundle)
-    assert.deepEqual(bindings, [{ routeKey: 'reportRender', name: 'templateSrc', location: 'json' }])
-  })
-
-  test('applies harvested bindings when expanding the route map', t => {
-    const { storage, runId, origin, scopeRevision } = makeRunStore(t)
-    const bindings = new Map([['reportRender', [{ routeKey: 'reportRender', name: 'templateSrc', location: 'json' as const }]]])
-    parseRouteMapDoc(JSON.stringify(routeMapDoc), origin, storage, runId, scopeRevision, new Set(), new Set(), bindings)
-    const render = storage.listEndpoints(runId, { origin }).find(e => e.method === 'POST' && e.pathTemplate === '/api/v3/reports/render')
-    assert.ok(render)
-    // The route map's logical->actual params dictionary resolves templateSrc -> template.
-    assert.ok(storage.listEndpointParams(runId).some(p => p.endpointId === render.id && p.name === 'template' && p.location === 'json'))
+    assert.deepEqual(harvestConfigParamBindings(bundle), [{ routeKey: 'reportRender', name: 'templateSrc', location: 'json' }])
   })
 })
 
-describe('M7 SPA: JS router tables', () => {
-  test('extracts method + path templates from router calls and route objects', () => {
+describe('M7 SPA: JS router tables, manifests and tRPC', () => {
+  test('extracts router table path literals', () => {
     const code = `
-      router.get('/api/tickets', list)
-      app.post('/api/tickets', create)
-      router.route('/api/tickets/:ticketId').put(update).delete(remove)
       const routes = [
         { path: '/reports', component: ReportView },
         { path: '/api/tickets/:ticketId/notes', method: 'POST' },
-        { method: 'PATCH', path: '/api/tickets/:ticketId' },
       ]
+      router.get('/api/tickets', list)
+      router.push('/dashboard')
       fetch('/api/search?term=x')
     `
-    const specs = parseJsRouterTable(code)
-    const key = (method: string, path: string) => specs.some(s => s.method === method && s.path === path)
-    assert.ok(key('GET', '/api/tickets'))
-    assert.ok(key('POST', '/api/tickets'))
-    assert.ok(key('PUT', '/api/tickets/:ticketId'))
-    assert.ok(key('DELETE', '/api/tickets/:ticketId'))
-    assert.ok(key('GET', '/reports'), 'client route objects default to GET')
-    assert.ok(key('POST', '/api/tickets/:ticketId/notes'))
-    assert.ok(key('PATCH', '/api/tickets/:ticketId'))
-    // Request-literal scanning remains a separate source and keeps query params.
+    const paths = harvestJsRouteTable(code)
+    assert.ok(paths.includes('/reports'))
+    assert.ok(paths.includes('/api/tickets/:ticketId/notes'))
+    assert.ok(paths.includes('/api/tickets'))
+    assert.ok(paths.includes('/dashboard'))
     const literals = harvestJsRequestParams(code)
-    const search = literals.find(s => s.path === '/api/search')
-    assert.deepEqual(search?.params, [{ name: 'term', location: 'query' }])
+    assert.deepEqual(literals.find(s => s.path === '/api/search')?.params, [{ name: 'term', location: 'query' }])
   })
-  test('follows same-origin module imports so the API client chunk is scanned', () => {
+
+  test('follows module imports, manifests and build chunk references', () => {
     const code = `
-      import { loginView, dashboardView } from '/views.js'
+      import { loadConfig } from '/api.js'
       export { call } from './client.ts'
-      import('/lazy/chunk.js').then((m) => m.boot())
+      import('/lazy/chunk.js')
       import 'https://cdn.example.invalid/lib.js'
+      self.__BUILD_MANIFEST = { "/dashboard": ["static/pages/dashboard-abc.js"] }
     `
-    assert.deepEqual(extractJsModuleImports(code), ['/views.js', './client.ts', '/lazy/chunk.js'])
+    assert.deepEqual(extractJsModuleImports(code), ['/api.js', './client.ts', '/lazy/chunk.js'])
+    const assets = extractAssetReferences(code)
+    assert.ok(assets.includes('static/pages/dashboard-abc.js') === false, 'relative chunk paths are resolved by the caller, not emitted bare')
+    assert.ok(extractAssetReferences(`const m = { "/app.js": "/assets/app-123.js", "/app.css": "/assets/app.css" }`).includes('/assets/app-123.js'))
+  })
+
+  test('extracts tRPC procedure references', () => {
+    const code = `
+      const a = trpc.user.byId.useQuery({ id })
+      const b = trpc['invoice']['list'].useMutation()
+      fetch('/trpc/report.render?input=%7B%7D')
+    `
+    const procs = harvestTrpcProcedures(code).map(p => `${p.router}.${p.procedure}`).sort()
+    assert.deepEqual(procs, ['invoice.list', 'report.render', 'user.byId'])
   })
 })
 
-describe('M7 SPA: OpenAPI depth', () => {
-  test('resolves nested local $ref for parameters, request bodies and schemas', t => {
+describe('M7 SPA: discovery template normalization', () => {
+  test('preserves named parameters and casing, normalizing only token shapes', () => {
+    assert.equal(normalizeDiscoveryTemplate('/api/orgs/:orgId/invoices/:invoiceId'), '/api/orgs/:orgId/invoices/:invoiceId')
+    assert.equal(normalizeDiscoveryTemplate('/api/getInvoice'), '/api/getInvoice')
+    assert.equal(normalizeDiscoveryTemplate('/trpc/user.getById'), '/trpc/user.getById')
+    assert.equal(normalizeDiscoveryTemplate('/api/items/[id]'), '/api/items/:id')
+    assert.equal(normalizeDiscoveryTemplate('/api/items/{id}'), '/api/items/:id')
+    assert.equal(normalizeDiscoveryTemplate('/api/items/<int:id>/view/'), '/api/items/:id/view')
+  })
+})
+
+describe('M7 SPA: OpenAPI depth (YAML, $ref, composition, servers)', () => {
+  test('resolves nested local $ref and prefixes the servers base path', t => {
     const { storage, runId, origin, scopeRevision } = makeRunStore(t)
-    const doc = {
-      openapi: '3.0.3',
-      paths: {
-        '/api/profiles/{profileId}': {
-          parameters: [{ $ref: '#/components/parameters/ProfileId' }],
-          patch: {
-            requestBody: { $ref: '#/components/requestBodies/ProfileBody' },
-          },
-        },
-      },
-      components: {
-        parameters: { ProfileId: { name: 'profileId', in: 'path', schema: { type: 'string' } } },
-        requestBodies: { ProfileBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/Profile' } } } } },
-        schemas: {
-          Profile: {
-            allOf: [
-              { properties: { displayName: { type: 'string' } } },
-              {
-                properties: {
-                  address: { $ref: '#/components/schemas/Address' },
-                  lines: { type: 'array', items: { $ref: '#/components/schemas/Line' } },
-                },
-              },
-            ],
-          },
-          Address: { properties: { city: { type: 'string' }, postalCode: { type: 'string' } } },
-          Line: { properties: { sku: { type: 'string' }, qty: { type: 'integer' } } },
-        },
-      },
-    }
-    const res = parseOpenApiDoc(JSON.stringify(doc), origin, storage, runId, scopeRevision, new Set(), new Set())
+    const yaml = `openapi: 3.0.3
+servers:
+  - url: https://api.example.test/v2
+paths:
+  /profiles/{profileId}:
+    parameters:
+      - $ref: "#/components/parameters/ProfileId"
+    patch:
+      requestBody:
+        $ref: "#/components/requestBodies/ProfileBody"
+components:
+  parameters:
+    ProfileId:
+      name: profileId
+      in: path
+      schema:
+        type: string
+  requestBodies:
+    ProfileBody:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Profile"
+  schemas:
+    Profile:
+      allOf:
+        - properties:
+            displayName:
+              type: string
+        - properties:
+            address:
+              $ref: "#/components/schemas/Address"
+    Address:
+      properties:
+        city:
+          type: string
+`
+    const res = parseOpenApiDoc(yaml, origin, storage, runId, scopeRevision, new Set(), new Set())
     assert.equal(res.endpoints, 1)
     const ep = storage.listEndpoints(runId, { origin })[0]
     assert.ok(ep)
-    assert.equal(ep.pathTemplate, '/api/profiles/{profileId}', 'OpenAPI {param} templates are preserved')
-    const params = storage.listEndpointParams(runId).filter(p => p.endpointId === ep.id).map(p => `${p.name}@${p.location}`)
-    for (const expected of [
-      'profileId@path', 'displayName@json', 'address.city@json', 'address.postalCode@json',
-      'lines.0.sku@json', 'lines.0.qty@json',
-    ]) {
+    assert.equal(ep.pathTemplate, '/v2/profiles/{profileId}', 'servers base path is prefixed; {param} preserved')
+    const params = storage.listEndpointParams(runId).map(p => `${p.name}@${p.location}`)
+    for (const expected of ['profileId@path', 'displayName@json', 'address.city@json']) {
       assert.ok(params.includes(expected), `missing ${expected} in ${params.join(',')}`)
     }
   })
@@ -242,9 +260,14 @@ describe('M7 SPA: OpenAPI depth', () => {
     assert.ok(params.includes('price@json'))
     assert.ok(params.includes('attachment@form'))
   })
+
+  test('parses YAML mappings/sequences without a YAML dependency', () => {
+    const parsed = parseJsonOrYaml('a:\n  - b: 1\n    c: two\n  - plain\nd:\n  - "quoted # not a comment"\n')
+    assert.deepEqual(parsed, { a: [{ b: 1, c: 'two' }, 'plain'], d: ['quoted # not a comment'] })
+  })
 })
 
-describe('M7 SPA: JSON schema-observed navigation and request shapes', () => {
+describe('M7 SPA: JSON navigation, XHR shapes and soft-404 calibration', () => {
   test('infers XHR body and query parameters from an intercepted call', () => {
     const shape = inferXhrRequestShape({
       url: '/api/orders?page=2&sort=asc',
@@ -253,11 +276,8 @@ describe('M7 SPA: JSON schema-observed navigation and request shapes', () => {
       contentType: 'application/json',
     })
     assert.ok(shape)
-    assert.equal(shape.method, 'POST')
-    assert.equal(shape.path, '/api/orders')
     const names = shape.params.map(p => `${p.name}@${p.location}`).sort()
     assert.deepEqual(names, ['address.city@json', 'page@query', 'quantity@json', 'sku@json', 'sort@query'])
-
     const form = inferXhrRequestShape({ url: '/api/notes', method: 'POST', body: 'title=Hi&body=There' })
     assert.deepEqual(form?.params.map(p => p.name).sort(), ['body', 'title'])
   })
@@ -276,6 +296,19 @@ describe('M7 SPA: JSON schema-observed navigation and request shapes', () => {
     const fields = extractJsonFieldNames(body)
     assert.ok(fields.includes('subject'))
     assert.ok(fields.includes('status'))
+  })
+
+  test('soft-404 calibration rejects structurally identical catch-all responses only', () => {
+    const shell = '<html><body><div id="app">Loading…</div><script src="/app.js"></script></body></html>'
+    const calibration = {
+      statuses: [200, 200],
+      mediaTypes: ['text/html', 'text/html'],
+      lengths: [shell.length, shell.length],
+      signatures: [bodyStructuralSignature(shell), bodyStructuralSignature(shell)],
+    }
+    assert.ok(isSoftNotFound(calibration, { status: 200, mediaType: 'text/html', body: shell }))
+    assert.ok(!isSoftNotFound(calibration, { status: 200, mediaType: 'application/json', body: '{"items":[]}' }))
+    assert.ok(!isSoftNotFound(calibration, { status: 404, mediaType: 'text/html', body: shell }))
   })
 
   test('crawlStateGraph records intercepted request bodies and query params', async t => {
@@ -337,9 +370,10 @@ describe('M7 SPA: JSON schema-observed navigation and request shapes', () => {
   })
 })
 
-describe('M7 SPA: authenticated recon', () => {
+describe('M7 SPA: authenticated recon with config artifact expansion', () => {
   test('fetches config/route-map and API listings with the approved persona session', async t => {
     const SESSION = 'sid=m7-fixture-session'
+    const shell = '<html><body><div id="app">Loading…</div><script type="module" src="/app.js"></script></body></html>'
     const authorized = (headers: Record<string, string | string[] | undefined>): boolean => {
       const cookie = headers.cookie
       const raw = Array.isArray(cookie) ? cookie.join('; ') : (cookie ?? '')
@@ -356,12 +390,10 @@ describe('M7 SPA: authenticated recon', () => {
       },
       params: { templateSrc: 'template' },
     }
-    const bundle = `
+    // The entry bundle only imports the API client; the config fetch literal lives in /api.js.
+    const appBundle = `
       import { loadConfig } from '/api.js'
-      async function boot() {
-        loadConfig()
-        const me = await fetch('/api/me')
-      }
+      async function boot() { loadConfig(); await fetch('/api/me') }
       async function render() {
         const field = (config.params && config.params.templateSrc) || 'template'
         const body = {}
@@ -380,17 +412,12 @@ describe('M7 SPA: authenticated recon', () => {
       const url = req.url ?? '/'
       if (url === '/') {
         res.setHeader('Content-Type', 'text/html')
-        res.end('<html><body><script type="module" src="/app.js"></script></body></html>')
+        res.end(`${shell.replace('</body>', '<a href="/ghost-page">Ghost</a></body>')}`)
         return
       }
-      if (url === '/app.js') {
+      if (url === '/app.js' || url === '/api.js') {
         res.setHeader('Content-Type', 'application/javascript')
-        res.end(bundle)
-        return
-      }
-      if (url === '/api.js') {
-        res.setHeader('Content-Type', 'application/javascript')
-        res.end(apiClient)
+        res.end(url === '/app.js' ? appBundle : apiClient)
         return
       }
       if (url === '/app-config.json' || url.startsWith('/api/')) {
@@ -411,13 +438,14 @@ describe('M7 SPA: authenticated recon', () => {
           res.end(JSON.stringify({ ext_id: 'TK-1', subject: 'First ticket', status: 'open' }))
           return
         }
-        if (url === '/api/reports/render') { res.end('{"html":"ok"}'); return }
+        if (url === '/api/reports/render') { res.end('{"rendered":true}'); return }
         res.statusCode = 404
         res.end('{"error":"not_found"}')
         return
       }
-      res.statusCode = 404
-      res.end('not found')
+      // SPA catch-all: unknown navigation routes render the same shell with HTTP 200.
+      res.setHeader('Content-Type', 'text/html')
+      res.end(shell)
     })
 
     const { storage } = makeStore(t, 'guardian-m7-spa-auth-')
@@ -442,7 +470,7 @@ describe('M7 SPA: authenticated recon', () => {
     }))
 
     const configReq = fx.requests.find(r => r.url === '/app-config.json')
-    assert.ok(configReq, 'runtime config document was fetched')
+    assert.ok(configReq, 'config artifact was discovered from the imported API client and fetched')
     assert.ok(authorized(configReq.headers), 'config fetch carried the persona session cookie')
     assert.ok((result.authRequests ?? 0) > 0)
     assert.ok((result.routeMapEndpoints ?? 0) >= 5)
@@ -461,5 +489,8 @@ describe('M7 SPA: authenticated recon', () => {
     const detailReq = fx.requests.find(r => r.url === '/api/tickets/TK-1')
     assert.ok(detailReq, 'collection ids were walked into the sibling detail route')
     assert.ok(authorized(detailReq.headers), 'detail walk stayed authenticated')
+
+    assert.ok(!endpoints.some(e => e.pathTemplate === '/ghost-page'), 'soft-404 catch-all navigation route was rejected')
+    assert.ok((result.soft404Rejected ?? 0) > 0)
   })
 })

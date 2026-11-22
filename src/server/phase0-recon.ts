@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { extname, join, relative, sep } from 'node:path'
 import { jsHarvest } from '../../worker/analyzers.ts'
@@ -41,15 +41,17 @@ export interface Phase0ReconResult {
     params: string[]
   }
   stoppedReason: string | null
-  /** Structural JSON route-map / API-description artifacts expanded into endpoints. */
+  /** Endpoints expanded from served route-map/config artifacts. */
   routeMapEndpoints?: number
   /** Client router-table literals harvested from bundles. */
   jsRouterRoutes?: number
-  /** Authenticated JSON navigation fetches performed during discovery. */
+  /** JSON navigation fetches performed during discovery. */
   navigationRequests?: number
   navigationEndpoints?: number
   /** Discovery fetches that carried approved-persona session material. */
   authRequests?: number
+  /** Candidate routes rejected by soft-404 / SPA catch-all calibration. */
+  soft404Rejected?: number
 }
 
 export interface CrawlStateGraphParams {
@@ -108,6 +110,18 @@ const PHASE0_SEED_PATHS: readonly string[] = [
   '/openapi.json',
   '/graphql',
   '/swagger.json',
+  // Common servable route-map/config artifacts (SPA route tables, endpoint manifests).
+  '/config.json',
+  '/routes.json',
+  '/manifest.json',
+  '/api/routes',
+  // Framework API-description conventions.
+  '/api-docs',
+  '/v3/api-docs',
+  '/api/openapi.json',
+  '/api/swagger.json',
+  '/api/graphql',
+  '/trpc',
 ]
 
 function sanitizePathCandidate(raw: string, baseOrigin: string): string | null {
@@ -135,8 +149,28 @@ function normalizeRouteTemplate(rawPath: string): string {
     .replace(/\/\[([a-zA-Z0-9_-]+)\]/g, '/:$1')
     .replace(/\/\{([a-zA-Z0-9_-]+)\}/g, '/:$1')
     .replace(/\/<(?:[a-zA-Z0-9_]+:)?([a-zA-Z0-9_-]+)>/g, '/:$1')
-  const normalized = normalizeEndpointTemplate(cleaned)
+  // Request paths are case-sensitive: preserve literal segment case (only built-in token shapes
+  // are collapsed to `:id`). Fingerprinting/dedupe opts back into lowercasing separately.
+  const normalized = normalizeEndpointTemplate(cleaned, { preserveCase: true })
   return normalized.startsWith('/') ? normalized : `/${normalized}`
+}
+
+/**
+ * Discovery-facing route normalizer: preserves named parameter identifiers (`:orgId`, `:invoiceId`)
+ * and literal segment casing (`/trpc/user.getById`, `/api/getInvoice`), normalizing only framework
+ * token forms (`[id]`, `{id}`, `<int:id>`) to `:id`. Aggressive folding stays in `dedupe.ts`.
+ */
+export function normalizeDiscoveryTemplate(rawPath: string): string {
+  const bare = (rawPath.split('?')[0] || '/').split('#')[0] || '/'
+  const segments = bare.split('/').map(seg => {
+    if (!seg) return ''
+    if (/^:[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(seg)) return seg
+    if (/^\[[^\]]{1,64}\]$/.test(seg) || /^\{[^}]{1,64}\}$/.test(seg) || /^<[^>]{1,64}>$/.test(seg)) return ':id'
+    return seg
+  })
+  const joined = segments.join('/').replace(/\/{2,}/g, '/')
+  const trimmed = joined.length > 1 && joined.endsWith('/') ? joined.slice(0, -1) : joined
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
 }
 
 function scoreEndpointRisk(method: string, pathTemplate: string, sinkKinds: readonly string[] = [], authReq?: string | null): number {
@@ -682,6 +716,66 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
     if (out.length < 40) out.push({ method: methodUpper, path: cleanPath, params: deduped.slice(0, 20) })
   }
 
+  /**
+   * Dotted paths for keys in a JS object literal (`{ filter: { name } }` -> filter, filter.name).
+   * Bounded to `maxDepth` and only used to name request parameters, never to execute code.
+   */
+  const objectLiteralPaths = (source: string, maxDepth = 2): string[] => {
+    const out: string[] = []
+    const skipValue = (i: number): number => {
+      let depth = 0
+      while (i < source.length) {
+        const ch = source[i]
+        if (ch === '"' || ch === "'" || ch === '`') {
+          const q = ch
+          i += 1
+          while (i < source.length && source[i] !== q) i += source[i] === '\\' ? 2 : 1
+        } else if (ch === '{' || ch === '[' || ch === '(') depth += 1
+        else if (ch === '}' || ch === ']' || ch === ')') {
+          if (depth === 0) return i
+          depth -= 1
+        } else if ((ch === ',' || ch === '\n') && depth === 0) return i
+        i += 1
+      }
+      return i
+    }
+    const parseObject = (start: number, prefix: string, depth: number): number => {
+      let i = start + 1
+      while (i < source.length) {
+        while (i < source.length && /[\s,]/.test(source[i])) i += 1
+        if (i >= source.length || source[i] === '}') return i + 1
+        const keyMatch = /^[A-Za-z_$][\w$]*/.exec(source.slice(i))
+        if (!keyMatch) return skipValue(i) + 1
+        const key = keyMatch[0]
+        i += key.length
+        while (i < source.length && /\s/.test(source[i])) i += 1
+        if (source[i] !== ':') {
+          // Object shorthand (`{ filter: { name } }`): the identifier itself is the value.
+          if (source[i] === ',' || source[i] === '}' || i >= source.length) {
+            const full = prefix ? `${prefix}.${key}` : key
+            if (depth <= maxDepth) out.push(full)
+            continue
+          }
+          return i + 1
+        }
+        i += 1
+        while (i < source.length && /\s/.test(source[i])) i += 1
+        const full = prefix ? `${prefix}.${key}` : key
+        if (source[i] === '{' && depth < maxDepth) {
+          i = parseObject(i, full, depth + 1)
+        } else {
+          if (depth <= maxDepth) out.push(full)
+          i = skipValue(i) + 1
+        }
+      }
+      return i
+    }
+    // The balanced-call slice includes the wrapping parentheses; start at the first object brace.
+    const objStart = source.indexOf('{')
+    if (objStart >= 0) parseObject(objStart, '', 0)
+    return out
+  }
+
   const scanInit = (defaultMethod: string, path: string, initText: string) => {
     const methodMatch = /\bmethod\s*:\s*['"`]([A-Za-z]+)['"`]/i.exec(initText)
     const method = (methodMatch?.[1] ?? defaultMethod).toUpperCase()
@@ -696,18 +790,28 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
       return
     }
     const params: JsRequestParam[] = []
-    const collect = (block: string, location: 'json' | 'form', skipInitOptions: boolean) => {
+    const collect = (block: string, location: 'json' | 'form', skipInitOptions: boolean, target: JsRequestParam[] = params) => {
       for (const m of block.matchAll(/([A-Za-z_$][\w$]*)\s*:/g)) {
         const name = m[1]
         if (skipInitOptions && JS_RESERVED_BODY_KEYS.test(name)) continue
         if (!skipInitOptions && /^(?:query|variables|operationName)$/i.test(name)) continue
-        params.push({ name, location })
+        target.push({ name, location })
       }
     }
     // Keys inside an explicit serialize call are body fields (a field may legitimately be named "body").
-    for (const m of initText.matchAll(/JSON\.stringify\s*\(\s*\{([^{}]{0,500})\}/g)) collect(m[1], 'json', false)
+    // Nested objects become dotted paths (`filter.name`) so probes can reach the real sink.
+    const dotted: string[] = []
+    for (const m of initText.matchAll(/JSON\.stringify\s*\(/g)) {
+      const openIdx = (m.index ?? 0) + m[0].length - 1
+      const arg = sliceBalancedCall(initText, openIdx)
+      dotted.push(...objectLiteralPaths(arg))
+    }
+    for (const name of dotted) params.push({ name, location: 'json' })
     // Other object-literal keys in the call init (direct axios data object, etc.); skip request options.
-    collect(initText, 'json', true)
+    const nestedLeaf = new Set(dotted.filter(p => p.includes('.')).map(p => p.split('.').at(-1)!))
+    const flatParams: JsRequestParam[] = []
+    collect(initText, 'json', true, flatParams)
+    for (const p of flatParams) if (!nestedLeaf.has(p.name)) params.push(p)
     for (const m of initText.matchAll(/URLSearchParams\s*\(\s*\{([^{}]{0,500})\}/g)) collect(m[1], 'form', false)
     for (const m of initText.matchAll(/\b(new\s+FormData|FormData)\s*\(/g)) {
       const tail = initText.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 400)
@@ -737,41 +841,10 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
   return out
 }
 
+/** Record every query-string parameter of a discovered URL onto its endpoint. */
 // ---------------------------------------------------------------------------------------------
-// Structural JSON route-map / API-description discovery
+// v5 M2 discovery helpers: config bindings, JSON navigation, XHR shapes, JS manifests, YAML.
 // ---------------------------------------------------------------------------------------------
-
-const HTTP_METHOD_SET = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
-const ROUTE_METHOD_FIELDS: readonly string[] = ['method', 'verb', 'httpMethod', 'http_method', 'type']
-const ROUTE_PATH_FIELDS: readonly string[] = [
-  'path', 'pathTemplate', 'path_template', 'url', 'uri', 'route', 'endpoint', 'href', 'pattern', 'target',
-]
-const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/
-/** Tokens too generic to link a config parameter to a specific route by name. */
-const GENERIC_ROUTE_TOKENS = new Set([
-  'api', 'get', 'list', 'view', 'create', 'update', 'delete', 'remove', 'patch', 'put', 'post', 'run',
-  'new', 'all', 'set', 'the', 'and', 'for', 'with', 'by', 'to', 'from', 'item', 'data', 'field', 'body',
-  'name', 'query', 'value', 'id', 'uuid', 'key', 'ref', 'src', 'page', 'type', 'current', 'accept',
-])
-
-export interface RouteMapParam {
-  name: string
-  location: ParamLocation
-}
-
-export interface RouteMapEntry {
-  key: string | null
-  method: string
-  path: string
-  params: RouteMapParam[]
-}
-
-export interface RouteMapExpansion {
-  entries: RouteMapEntry[]
-  paramHints: string[]
-  /** logical parameter key -> concrete runtime field name */
-  paramMap: Record<string, string>
-}
 
 export interface RouteMapParamBinding {
   routeKey: string
@@ -779,169 +852,7 @@ export interface RouteMapParamBinding {
   location: 'json' | 'form' | 'query'
 }
 
-export interface ParsedRouteMap {
-  endpoints: number
-  params: number
-  routeKeys: string[]
-  paramHints: string[]
-}
-
-function asHttpMethod(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-  const upper = value.trim().toUpperCase()
-  return HTTP_METHOD_SET.has(upper) ? upper : null
-}
-
-function asRoutePath(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-  const trimmed = value.trim()
-  if (!trimmed || trimmed.length > 240) return null
-  if (!trimmed.startsWith('/') && !/^https?:\/\//i.test(trimmed)) return null
-  if (/[\s\r\n\0]/.test(trimmed)) return null
-  return trimmed
-}
-
-function paramLocationFromToken(raw: string | undefined, fallback: ParamLocation): ParamLocation {
-  switch ((raw ?? '').toLowerCase()) {
-    case 'path': return 'path'
-    case 'query': return 'query'
-    case 'header': return 'header'
-    case 'cookie': return 'cookie'
-    case 'body': return 'json'
-    case 'formdata':
-    case 'form': return 'form'
-    case 'xml': return 'xml'
-    default: return fallback
-  }
-}
-
-function collectRouteRecordParams(rec: Record<string, unknown>, method: string): RouteMapParam[] {
-  const out: RouteMapParam[] = []
-  const seen = new Set<string>()
-  const fallback: ParamLocation = method === 'GET' || method === 'HEAD' ? 'query' : 'json'
-  const push = (name: unknown, location: ParamLocation) => {
-    if (typeof name !== 'string') return
-    const clean = name.trim()
-    if (!PARAM_NAME_RE.test(clean)) return
-    const dedupe = `${clean}|${location}`
-    if (seen.has(dedupe)) return
-    seen.add(dedupe)
-    out.push({ name: clean, location })
-  }
-  const visitList = (value: unknown, location: ParamLocation) => {
-    if (Array.isArray(value)) {
-      for (const item of value.slice(0, 40)) {
-        if (typeof item === 'string') { push(item, location); continue }
-        if (!item || typeof item !== 'object' || Array.isArray(item)) continue
-        const entry = item as Record<string, unknown>
-        const rawName = typeof entry.name === 'string' ? entry.name : typeof entry.field === 'string' ? entry.field : null
-        push(rawName, paramLocationFromToken(typeof entry.in === 'string' ? entry.in : undefined, location))
-      }
-      return
-    }
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-        if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') push(key, location)
-      }
-    }
-  }
-  visitList(rec.params, fallback)
-  visitList(rec.parameters, fallback)
-  visitList(rec.query, 'query')
-  visitList(rec.queryParams, 'query')
-  visitList(rec.body, fallback === 'query' ? 'json' : fallback)
-  visitList(rec.formData, 'form')
-  return out
-}
-
-function collectParamHintMap(value: unknown, out: string[], paramMap: Record<string, string>): void {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return
-  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof val !== 'string' || !PARAM_NAME_RE.test(val.trim())) continue
-    out.push(val.trim())
-    if (PARAM_NAME_RE.test(key.trim())) paramMap[key.trim()] = val.trim()
-  }
-}
-
-/**
- * Structurally detect JSON artifacts that describe a route table (SPA runtime config, API index,
- * manifest, navigation payload). Accepts object maps `{key: {method, path}}`, arrays of route
- * records, and path->method maps. Returns bounded entries plus any logical->actual parameter map.
- */
-export function extractRouteMapEntries(doc: unknown): RouteMapExpansion {
-  const entries: RouteMapEntry[] = []
-  const paramHints: string[] = []
-  const paramMap: Record<string, string> = {}
-  const seen = new Set<string>()
-  let visited = 0
-
-  const pushEntry = (key: string | null, method: string, rawPath: string, rec?: Record<string, unknown>) => {
-    if (entries.length >= 120) return
-    // Flatten a nested wrapper such as { route: { path } } before rejecting.
-    const path = asRoutePath(rawPath)
-    if (!path) return
-    const dedupe = `${method} ${path}`
-    if (seen.has(dedupe)) return
-    seen.add(dedupe)
-    entries.push({ key, method, path, params: rec ? collectRouteRecordParams(rec, method) : [] })
-  }
-
-  const walk = (node: unknown, keyHint: string | null, depth: number): void => {
-    if (entries.length >= 120 || depth > 7) return
-    visited += 1
-    if (visited > 900) return
-    if (Array.isArray(node)) {
-      for (const item of node.slice(0, 120)) walk(item, keyHint, depth + 1)
-      return
-    }
-    if (!node || typeof node !== 'object') return
-    const rec = node as Record<string, unknown>
-
-    let method: string | null = null
-    for (const field of ROUTE_METHOD_FIELDS) {
-      method = asHttpMethod(rec[field])
-      if (method) break
-    }
-    let routePath: string | null = null
-    for (const field of ROUTE_PATH_FIELDS) {
-      routePath = asRoutePath(rec[field])
-      if (routePath) break
-    }
-    if (method && routePath) {
-      pushEntry(keyHint, method, routePath, rec)
-      return
-    }
-
-    for (const [key, value] of Object.entries(rec)) {
-      if (key === 'params' || key === 'parameters' || key === 'paramNames' || key === 'paramMap') {
-        // Only string->string maps look like logical->actual parameter dictionaries.
-        collectParamHintMap(value, paramHints, paramMap)
-        if (Array.isArray(value)) {
-          for (const item of value.slice(0, 40)) {
-            if (typeof item === 'string' && PARAM_NAME_RE.test(item)) paramHints.push(item)
-          }
-        }
-        continue
-      }
-      if (typeof value === 'string') {
-        const mapMethod = asHttpMethod(value)
-        const mapPath = asRoutePath(key)
-        if (mapMethod && mapPath) {
-          pushEntry(null, mapMethod, mapPath)
-          continue
-        }
-      }
-      walk(value, key, depth + 1)
-    }
-  }
-
-  walk(doc, null, 0)
-  return {
-    entries,
-    paramHints: [...new Set(paramHints)].slice(0, 60),
-    paramMap,
-  }
-}
+const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/
 
 /** Extract runtime parameter names that the SPA binds to a named API client call. */
 export function harvestConfigParamBindings(code: string): RouteMapParamBinding[] {
@@ -975,189 +886,6 @@ export function harvestConfigParamBindings(code: string): RouteMapParamBinding[]
   return out
 }
 
-function routeKeyTokens(raw: string): string[] {
-  return raw
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .map(token => (token.length > 3 && token.endsWith('s') ? token.slice(0, -1) : token))
-    .filter(token => token.length > 2 && !GENERIC_ROUTE_TOKENS.has(token))
-}
-
-/** Parse a JSON route-map document and upsert its endpoints/params into the store. */
-export function parseRouteMapDoc(
-  rawBody: string,
-  origin: string,
-  storage: Store,
-  runId: string,
-  scopeRevision: number,
-  dynamicPaths: Set<string>,
-  dynamicParams: Set<string>,
-  bindings?: ReadonlyMap<string, readonly RouteMapParamBinding[]>,
-): ParsedRouteMap {
-  let doc: unknown
-  try {
-    doc = JSON.parse(rawBody) as unknown
-  } catch {
-    return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
-  }
-  if (!doc || typeof doc !== 'object') return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
-  const root = doc as Record<string, unknown>
-  if (typeof root.openapi === 'string' || typeof root.swagger === 'string') {
-    return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
-  }
-  const expansion = extractRouteMapEntries(doc)
-  if (expansion.entries.length === 0) {
-    return { endpoints: 0, params: 0, routeKeys: [], paramHints: [] }
-  }
-  let apiPrefix = ''
-  for (const [key, value] of Object.entries(root)) {
-    if (/prefix$/i.test(key) && typeof value === 'string' && value.trim().startsWith('/')) {
-      apiPrefix = value.trim().replace(/\/+$/, '')
-      break
-    }
-  }
-
-  let endpoints = 0
-  let params = 0
-  const created: Array<{ id: string; key: string | null; method: string; path: string }> = []
-  const paramKeys = new Set<string>()
-
-  const addParam = (endpointId: string, method: string, param: RouteMapParam) => {
-    const dedupe = `${endpointId}|${param.name}|${param.location}`
-    if (paramKeys.has(dedupe)) return
-    paramKeys.add(dedupe)
-    storage.upsertEndpointParam({
-      runId,
-      endpointId,
-      name: param.name,
-      location: param.location,
-      isCsrf: CSRF_PARAM_RE.test(param.name),
-      isObjectId: param.location === 'path' || OBJECT_ID_PARAM_RE.test(param.name),
-      source: 'openapi',
-    })
-    dynamicParams.add(param.name)
-    params += 1
-  }
-
-  for (const entry of expansion.entries) {
-    let candidate = entry.path
-    if (!candidate.startsWith('/') && !/^https?:\/\//i.test(candidate) && apiPrefix) {
-      candidate = `${apiPrefix}/${candidate.replace(/^\/+/, '')}`
-    }
-    const clean = sanitizePathCandidate(candidate, origin)
-    if (!clean) continue
-    const barePath = (clean.split('?')[0] ?? '/') || '/'
-    if (barePath === '/' || STATIC_ASSET_RE.test(barePath)) continue
-    const pathTemplate = normalizeRouteTemplate(barePath)
-    const endpoint = storage.upsertEndpoint({
-      runId,
-      scopeRevision,
-      origin,
-      method: entry.method,
-      pathTemplate,
-      source: 'openapi',
-      riskScore: scoreEndpointRisk(entry.method, pathTemplate),
-    })
-    endpoints += 1
-    dynamicPaths.add(pathTemplate)
-    created.push({ id: endpoint.id, key: entry.key, method: entry.method, path: pathTemplate })
-    for (const pathParam of extractDynamicPathParams(barePath)) {
-      addParam(endpoint.id, entry.method, { name: pathParam.name, location: 'path' })
-    }
-    for (const param of entry.params) addParam(endpoint.id, entry.method, param)
-    if (entry.key && bindings) {
-      for (const binding of bindings.get(entry.key) ?? []) {
-        const actual = expansion.paramMap[binding.name] ?? binding.name
-        addParam(endpoint.id, entry.method, { name: actual, location: binding.location })
-      }
-    }
-  }
-
-  // Link logical->actual parameter hints to route keys by shared name tokens (e.g. a `*Body`
-  // hint to the matching `*Create` write route). Bounded: 4 endpoints per hint.
-  for (const hint of expansion.paramHints) {
-    dynamicParams.add(hint)
-    const hintTokens = new Set(routeKeyTokens(hint))
-    if (hintTokens.size === 0) continue
-    const ranked = created
-      .filter(ep => ep.key)
-      .map(ep => {
-        const overlap = routeKeyTokens(ep.key ?? '').filter(token => hintTokens.has(token)).length
-        return { ep, overlap }
-      })
-      .filter(candidate => candidate.overlap > 0)
-      .sort((a, b) =>
-        b.overlap - a.overlap
-        || (a.ep.method === 'GET' ? 1 : 0) - (b.ep.method === 'GET' ? 1 : 0)
-        || a.ep.path.length - b.ep.path.length)
-      .slice(0, 4)
-    for (const { ep } of ranked) {
-      addParam(ep.id, ep.method, { name: hint, location: ep.method === 'GET' || ep.method === 'HEAD' ? 'query' : 'json' })
-    }
-  }
-
-  return {
-    endpoints,
-    params,
-    routeKeys: [...new Set(created.map(ep => ep.key).filter((key): key is string => Boolean(key)))],
-    paramHints: expansion.paramHints,
-  }
-}
-
-/**
- * Bounded scan of client bundles for router-table literals: `router.get('/path')`,
- * `.route('/path').post(...)`, and route-object literals carrying path+method.
- */
-export function parseJsRouterTable(code: string): JsRequestSpec[] {
-  const out: JsRequestSpec[] = []
-  const seen = new Set<string>()
-  const push = (method: string, rawPath: string) => {
-    const path = rawPath.trim()
-    if (!path.startsWith('/') || path.startsWith('//') || path.length > 200 || /[\r\n\0\\]/.test(path)) return
-    const cleanPath = path.split('?')[0] ?? path
-    const methodUpper = asHttpMethod(method) ?? 'GET'
-    const key = `${methodUpper} ${cleanPath}`
-    if (seen.has(key)) return
-    seen.add(key)
-    const params: JsRequestParam[] = []
-    const qIdx = path.indexOf('?')
-    if (qIdx >= 0) {
-      try {
-        for (const name of new URL(path, 'http://guardian.invalid').searchParams.keys()) {
-          if (PARAM_NAME_RE.test(name)) params.push({ name, location: 'query' })
-        }
-      } catch { /* ignore malformed query */ }
-    }
-    out.push({ method: methodUpper, path: cleanPath, params })
-  }
-
-  for (const match of code.matchAll(/(?:^|[^\w$])[A-Za-z_$][\w$]*\s*\.\s*(get|post|put|patch|delete|all)\s*\(\s*(['"`])(\/[^'"`]{0,200})\2/g)) {
-    push(match[1], match[3])
-    if (out.length >= 120) return out
-  }
-  for (const match of code.matchAll(/[{,]\s*(?:path|pattern)\s*:\s*(['"`])(\/[^'"`]{0,200})\1([^{}]{0,240})/g)) {
-    const tail = match[3] ?? ''
-    const method = /(?:method|verb)\s*:\s*(['"`])([A-Za-z]+)\1/.exec(tail)?.[2]
-    if (method) push(method, match[2])
-    else if (/(?:component|element|children|loader|action|exact|name)\s*:/.test(tail)) push('GET', match[2])
-    if (out.length >= 120) return out
-  }
-  for (const match of code.matchAll(/[{,]\s*(?:method|verb)\s*:\s*(['"`])([A-Za-z]+)\1[^{}]{0,240}?(?:path|pattern)\s*:\s*(['"`])(\/[^'"`]{0,200})\3/g)) {
-    push(match[2], match[4])
-    if (out.length >= 120) return out
-  }
-  for (const match of code.matchAll(/\.route\s*\(\s*(['"`])(\/[^'"`]{0,200})\1\s*\)([\s\S]{0,320})/g)) {
-    for (const chained of (match[3] ?? '').matchAll(/\.\s*(get|post|put|patch|delete)\s*\(/g)) {
-      push(chained[1], match[2])
-      if (out.length >= 120) return out
-    }
-  }
-  return out
-}
-
-const JSON_LINK_KEYS = /^(?:href|url|uri|link|links|self|next|prev|first|last|path|endpoint|action|resource|target|location|canonical|_links|@id)$/i
-
 /**
  * Same-origin ES module specifiers referenced by a bundle (static import/export-from and dynamic
  * import). SPA bootstrap bundles usually keep their API client in an imported chunk, so following
@@ -1181,7 +909,58 @@ export function extractJsModuleImports(code: string): string[] {
   return out
 }
 
-/** Bounded walk of an authenticated JSON document collecting same-origin navigation targets
+/**
+ * Same-origin build-asset references (JS chunks, source maps, manifest JSON) found in HTML,
+ * bundles or webpack chunk maps. Used to drain the JS queue breadth-first beyond entry scripts.
+ */
+export function extractAssetReferences(code: string, max = 32): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (raw: string) => {
+    if (out.length >= max) return
+    const clean = raw.trim()
+    if (!clean || clean.length > 200 || /[\r\n\0\\]/.test(clean)) return
+    if (!/\.(?:m?js|json)(?:$|[?#])/i.test(clean)) return
+    if (!clean.startsWith('/') && !clean.startsWith('./') && !clean.startsWith('../')) return
+    if (seen.has(clean)) return
+    seen.add(clean)
+    out.push(clean)
+  }
+  for (const match of code.matchAll(/["'`]((?:\/|\.{1,2}\/)[^"'`\s]{1,180}?\.(?:m?js|json))(?:\?[^"'`]*)?["'`]/g)) push(match[1])
+  for (const match of code.matchAll(/\b(?:chunk|asset|file|src|url)\s*[:=]\s*["'`]([^"'`\s]{1,180})["'`]/g)) push(match[1])
+  return out
+}
+
+export interface TrpcProcedure {
+  router: string
+  procedure: string
+}
+
+/** Bounded scan for tRPC procedure references (`trpc.<router>.<proc>.useQuery`, literal paths). */
+export function harvestTrpcProcedures(code: string): TrpcProcedure[] {
+  const out: TrpcProcedure[] = []
+  const seen = new Set<string>()
+  const push = (router: string | undefined, procedure: string | undefined) => {
+    const r = (router ?? '').trim()
+    const p = (procedure ?? '').trim()
+    if (!r || !p || !/^[A-Za-z_$][\w$]{0,63}$/.test(r) || !/^[A-Za-z_$][\w$]{0,63}$/.test(p)) return
+    const key = `${r}.${p}`
+    if (seen.has(key) || out.length >= 40) return
+    seen.add(key)
+    out.push({ router: r, procedure: p })
+  }
+  for (const match of code.matchAll(/\btrpc\s*\.\s*([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\.\s*(?:useQuery|useMutation|useInfiniteQuery|query|mutation|fetch|mutate)\b/g)) {
+    push(match[1], match[2])
+  }
+  for (const match of code.matchAll(/\btrpc\s*\[\s*['"]([\w$]+)['"]\s*\]\s*\[\s*['"]([\w$]+)['"]\s*\]/g)) push(match[1], match[2])
+  for (const match of code.matchAll(/["'`]\/trpc\/([A-Za-z0-9_$]+)\.([A-Za-z0-9_$]+)/g)) push(match[1], match[2])
+  return out
+}
+
+const JSON_LINK_KEYS = /^(?:href|url|uri|link|links|self|next|prev|first|last|path|endpoint|action|resource|target|location|canonical|_links|@id)$/i
+
+/**
+ * Bounded walk of an authenticated JSON document collecting same-origin navigation targets
  * (HATEOAS `_links`/`href`, `next`, API paths) without treating arbitrary response fields as routes.
  */
 export function extractJsonLinkTargets(rawBody: string, origin: string): string[] {
@@ -1204,7 +983,7 @@ export function extractJsonLinkTargets(rawBody: string, origin: string): string[
     if (visited > 700 || depth > 6 || out.size >= 40) return
     visited += 1
     if (typeof node === 'string') {
-      if (JSON_LINK_KEYS.test(key) || /^\/(?:api|rest|v\d|graphql)\//i.test(node)) consider(node)
+      if (JSON_LINK_KEYS.test(key) || /^\/(?:api|rest|v\d|graphql|trpc)\//i.test(node)) consider(node)
       return
     }
     if (!node || typeof node !== 'object') return
@@ -1212,9 +991,7 @@ export function extractJsonLinkTargets(rawBody: string, origin: string): string[
       for (const item of node.slice(0, 80)) walk(item, key, depth + 1)
       return
     }
-    for (const [childKey, value] of Object.entries(node as Record<string, unknown>)) {
-      walk(value, childKey, depth + 1)
-    }
+    for (const [childKey, value] of Object.entries(node as Record<string, unknown>)) walk(value, childKey, depth + 1)
   }
   walk(doc, '', 0)
   return [...out]
@@ -1243,21 +1020,16 @@ export function extractJsonFieldNames(rawBody: string, max = 24): string[] {
   }
   const isScalar = (value: unknown): boolean =>
     typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
-
   const collectObject = (obj: Record<string, unknown>, depth: number) => {
     for (const [key, value] of Object.entries(obj)) {
       if (isScalar(value)) push(key)
       else if (depth < 1 && value && typeof value === 'object' && !Array.isArray(value)) {
         const nested = value as Record<string, unknown>
-        const nestedScalars = Object.values(nested).filter(isScalar).length
         // A resource wrapper such as {settings:{...}} contributes its leaf fields directly.
-        if (nestedScalars > 0) {
-          for (const [nestedKey, nestedValue] of Object.entries(nested)) if (isScalar(nestedValue)) push(nestedKey)
-        }
+        for (const [nestedKey, nestedValue] of Object.entries(nested)) if (isScalar(nestedValue)) push(nestedKey)
       }
     }
   }
-
   const collectItems = (value: unknown, depth: number) => {
     if (Array.isArray(value)) {
       for (const item of value.slice(0, 3)) {
@@ -1267,22 +1039,13 @@ export function extractJsonFieldNames(rawBody: string, max = 24): string[] {
     }
     if (value && typeof value === 'object') collectObject(value as Record<string, unknown>, depth)
   }
-
-  if (Array.isArray(doc)) {
-    collectItems(doc, 0)
-  } else if (doc && typeof doc === 'object') {
+  if (Array.isArray(doc)) collectItems(doc, 0)
+  else if (doc && typeof doc === 'object') {
     const root = doc as Record<string, unknown>
-    let sawItems = false
     for (const envelope of ['items', 'data', 'results', 'rows', 'records']) {
-      if (envelope in root) {
-        sawItems = true
-        collectItems(root[envelope], 0)
-      }
+      if (envelope in root) collectItems(root[envelope], 0)
     }
     collectObject(root, 0)
-    if (!sawItems) {
-      // Nothing further: root scalars already collected.
-    }
   }
   return names
 }
@@ -1322,13 +1085,10 @@ export function extractJsonRecordIds(rawBody: string, max = 4): string[] {
     seen.add(clean)
     out.push(clean)
   }
-  for (const key of preferred) {
-    for (const row of rows) if (key in row) pushValue(row[key])
-  }
+  for (const key of preferred) for (const row of rows) if (key in row) pushValue(row[key])
   for (const row of rows) {
     for (const [key, value] of Object.entries(row)) {
-      if (!/(?:^|_)(?:id|key|ref|slug)$/i.test(key)) continue
-      pushValue(value)
+      if (/(?:^|_)(?:id|key|ref|slug)$/i.test(key)) pushValue(value)
     }
   }
   return out.slice(0, max)
@@ -1395,8 +1155,194 @@ export function inferXhrRequestShape(input: {
       for (const match of body.matchAll(/name="([^"]{1,64})"/g)) push(match[1], 'form')
     }
   }
-  const method = asHttpMethod(input.method ?? '') ?? 'GET'
+  const method = HTTP_METHOD_SET.has((input.method ?? '').toUpperCase()) ? (input.method ?? 'GET').toUpperCase() : 'GET'
   return { method, path, params: params.slice(0, 24) }
+}
+
+const HTTP_METHOD_SET = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
+
+// ---------------------------------------------------------------------------------------------
+// YAML subset parser (OpenAPI/route-map documents; JSON remains the fast path)
+// ---------------------------------------------------------------------------------------------
+
+function stripYamlComment(line: string): string {
+  let quote: string | null = null
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i]
+    if (quote) {
+      if (ch === quote && line[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '#' && (i === 0 || /\s/.test(line[i - 1] ?? ''))) return line.slice(0, i)
+  }
+  return line
+}
+
+function splitYamlKeyValue(text: string): { key: string; rest: string } | null {
+  let quote: string | null = null
+  let depth = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (ch === quote && text[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '{' || ch === '[') depth += 1
+    else if (ch === '}' || ch === ']') depth -= 1
+    else if (ch === ':' && depth === 0 && (i + 1 >= text.length || /\s/.test(text[i + 1] ?? ''))) {
+      const rawKey = text.slice(0, i).trim()
+      const key = rawKey.replace(/^['"]|['"]$/g, '')
+      if (!key) return null
+      return { key, rest: text.slice(i + 1).trim() }
+    }
+  }
+  return null
+}
+
+function parseYamlScalar(raw: string): unknown {
+  const text = raw.trim()
+  if (!text) return null
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1)
+  }
+  if (/^(?:true|false)$/i.test(text)) return text.toLowerCase() === 'true'
+  if (/^(?:null|~)$/i.test(text)) return null
+  if (/^-?\d+(?:\.\d+)?$/.test(text)) return Number(text)
+  if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
+    try { return JSON.parse(text) } catch { return text }
+  }
+  return text
+}
+
+/** Bounded YAML parser for mapping/sequence documents (OpenAPI, route maps). Not a full YAML engine. */
+export function parseYamlLikeDocument(text: string): unknown {
+  interface Line { indent: number; text: string; raw: string }
+  const lines: Line[] = []
+  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+    if (lines.length > 6000) break
+    const stripped = stripYamlComment(rawLine)
+    const body = stripped.trimEnd()
+    const trimmed = body.trim()
+    if (!trimmed || trimmed === '---' || trimmed === '...') continue
+    const indent = body.length - body.trimStart().length
+    lines.push({ indent, text: trimmed, raw: body })
+  }
+  if (lines.length === 0) return null
+  let index = 0
+  const blockScalar = (indent: number): string => {
+    const parts: string[] = []
+    while (index < lines.length && lines[index]!.indent > indent) {
+      parts.push(lines[index]!.text)
+      index += 1
+    }
+    return parts.join('\n')
+  }
+  const parseNode = (indent: number): unknown => {
+    const first = lines[index]
+    if (!first) return null
+    return first.text === '-' || first.text.startsWith('- ') ? parseSequence(indent) : parseMapping(indent)
+  }
+  const parseSequence = (indent: number): unknown[] => {
+    const out: unknown[] = []
+    while (index < lines.length) {
+      const line = lines[index]!
+      if (line.indent < indent) break
+      if (line.indent > indent) { index += 1; continue }
+      if (!(line.text === '-' || line.text.startsWith('- '))) break
+      const afterDash = line.text.slice(1)
+      if (!afterDash.trim()) {
+        index += 1
+        const next = lines[index]
+        out.push(next && next.indent > indent ? parseNode(next.indent) : null)
+        continue
+      }
+      if (splitYamlKeyValue(afterDash.trim())) {
+        // `- key: value` starts a mapping item; re-align the remainder and parse it as a map.
+        const dashes = /^(\s*)-(\s*)/.exec(line.raw)
+        const childIndent = (dashes?.[1]?.length ?? indent) + 1 + (dashes?.[2]?.length ?? 1)
+        lines[index] = { indent: childIndent, text: afterDash.trim(), raw: ' '.repeat(childIndent) + afterDash.trim() }
+        out.push(parseMapping(childIndent))
+        continue
+      }
+      out.push(parseYamlScalar(afterDash))
+      index += 1
+    }
+    return out
+  }
+  const parseMapping = (indent: number): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    while (index < lines.length) {
+      const line = lines[index]!
+      if (line.indent < indent) break
+      if (line.indent > indent) { index += 1; continue }
+      if (line.text === '-' || line.text.startsWith('- ')) break
+      const kv = splitYamlKeyValue(line.text)
+      if (!kv) { index += 1; continue }
+      index += 1
+      if (kv.rest) {
+        if (/^[|>][+-]?$/.test(kv.rest)) { out[kv.key] = blockScalar(indent); continue }
+        out[kv.key] = parseYamlScalar(kv.rest)
+        continue
+      }
+      const next = lines[index]
+      out[kv.key] = next && next.indent > indent ? parseNode(next.indent) : null
+    }
+    return out
+  }
+  return parseNode(lines[0]!.indent)
+}
+
+/** Parse a JSON or YAML document body into an object (null when neither parses). */
+export function parseJsonOrYaml(rawBody: string): unknown {
+  const text = rawBody.replace(/^\uFEFF/, '').trim()
+  if (!text) return null
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try { return JSON.parse(text) as unknown } catch { /* fall through to YAML */ }
+  }
+  const parsed = parseYamlLikeDocument(text)
+  if (parsed !== null && typeof parsed === 'object') return parsed
+  try { return JSON.parse(text) as unknown } catch { return null }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Soft-404 / SPA catch-all calibration
+// ---------------------------------------------------------------------------------------------
+
+export interface SoftNotFoundCalibration {
+  statuses: number[]
+  mediaTypes: string[]
+  lengths: number[]
+  signatures: string[]
+}
+
+/** Structural hash of a response body: strips volatile ids/digits and collapses whitespace. */
+export function bodyStructuralSignature(body: string): string {
+  const normalized = body
+    .slice(0, 64 * 1024)
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>')
+    .replace(/\b[0-9a-f]{16,}\b/gi, '<hex>')
+    .replace(/\d+/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 16)
+}
+
+/** True when a response structurally matches a calibrated soft-404 / SPA catch-all probe. */
+export function isSoftNotFound(calibration: SoftNotFoundCalibration, ex: Pick<BrokerExchangeResult, 'status' | 'mediaType' | 'body'>): boolean {
+  if (calibration.statuses.length === 0) return false
+  const ranked = calibration.statuses
+    .map((status, i) => ({ status, media: calibration.mediaTypes[i] ?? '', len: calibration.lengths[i] ?? 0, sig: calibration.signatures[i] ?? '' }))
+    .filter(entry => entry.status === ex.status && entry.media === ex.mediaType)
+  if (ranked.length === 0) return false
+  const signature = bodyStructuralSignature(ex.body)
+  for (const entry of ranked) {
+    if (entry.sig && entry.sig === signature) return true
+    const tolerance = Math.max(32, Math.round(entry.len * 0.02))
+    if (Math.abs(entry.len - ex.body.length) <= tolerance) return true
+  }
+  return false
 }
 
 /** Record every query-string parameter of a discovered URL onto its endpoint. */
@@ -1436,6 +1382,276 @@ function recordQueryParamsForEndpoint(input: {
   return count
 }
 
+const HTTP_VERBS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
+const ROUTE_COLLECTION_KEYS = /^(?:routes?|paths?|endpoints?|apis?|operations?|handlers?|resources?|navigation|nav|menu|screens?)$/i
+
+export interface RouteMapEntry {
+  method: string
+  path: string
+  params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' }>
+  /** Logical route key from `{key: {method, path}}` map shapes (used for param bindings). */
+  key?: string
+}
+
+/**
+ * Expand configuration/route-map documents served by a single-page app into endpoint candidates.
+ * Recognizes path-keyed method tables (`{"/api/x": {"get": {...}}}`), operation arrays
+ * (`[{path, method, params}]`) and plain path arrays under route-ish keys. Bounded and shape-driven;
+ * no application-specific literals.
+ */
+export function harvestRouteMapDocument(raw: unknown, maxEntries = 200): RouteMapEntry[] {
+  const out: RouteMapEntry[] = []
+  const seen = new Set<string>()
+  const push = (method: string, rawPath: string, params: RouteMapEntry['params'] = [], routeKey?: string): void => {
+    const path = rawPath.trim()
+    if (!path.startsWith('/') || path.startsWith('//') || path.length > 200 || /[\r\n\0\\]/.test(path)) return
+    const m = method.toUpperCase()
+    if (!HTTP_VERBS.has(method.toLowerCase())) return
+    const clean = path.split('?')[0] || '/'
+    const key = `${m} ${clean}`
+    if (seen.has(key) || out.length >= maxEntries) return
+    seen.add(key)
+    const entry: RouteMapEntry = { method: m, path: clean, params: params.slice(0, 20) }
+    if (routeKey && !ROUTE_COLLECTION_KEYS.test(routeKey)) entry.key = routeKey
+    out.push(entry)
+  }
+  const paramList = (node: unknown): RouteMapEntry['params'] => {
+    const params: RouteMapEntry['params'] = []
+    if (Array.isArray(node)) {
+      for (const p of node) {
+        if (typeof p === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(p)) params.push({ name: p, location: 'query' })
+        else if (p && typeof p === 'object') {
+          const rec = p as Record<string, unknown>
+          const name = typeof rec.name === 'string' ? rec.name : typeof rec.key === 'string' ? rec.key : null
+          if (!name || !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) continue
+          const loc = String(rec.in ?? rec.location ?? rec.where ?? '').toLowerCase()
+          params.push({ name, location: loc === 'path' ? 'path' : loc === 'body' ? 'json' : 'query' })
+        }
+      }
+    } else if (node && typeof node === 'object') {
+      for (const [name, value] of Object.entries(node as Record<string, unknown>)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) continue
+        const type = String((value && typeof value === 'object' ? (value as Record<string, unknown>).type : value) ?? '').toLowerCase()
+        params.push({ name, location: type === 'path' ? 'path' : 'json' })
+      }
+    }
+    return params
+  }
+  const operationParams = (node: unknown): RouteMapEntry['params'] => {
+    if (!node || typeof node !== 'object') return []
+    const rec = node as Record<string, unknown>
+    return [
+      ...paramList(rec.parameters ?? rec.params ?? rec.query ?? rec.args ?? rec.fields),
+      ...paramList(rec.body ?? rec.requestBody ?? rec.data ?? rec.payload),
+    ]
+  }
+  const methodFrom = (value: unknown, fallbackKey?: string): string | null => {
+    if (typeof value === 'string' && HTTP_VERBS.has(value.toLowerCase())) return value
+    if (fallbackKey && HTTP_VERBS.has(fallbackKey.toLowerCase())) return fallbackKey
+    return null
+  }
+  const walk = (node: unknown, depth: number, contextKey?: string): void => {
+    if (depth > 6 || out.length >= maxEntries || !node) return
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 100)) {
+        if (typeof item === 'string' && contextKey && ROUTE_COLLECTION_KEYS.test(contextKey) && item.startsWith('/')) {
+          push('GET', item)
+          continue
+        }
+        if (!item || typeof item !== 'object') continue
+        const rec = item as Record<string, unknown>
+        const rawPath = typeof rec.path === 'string' ? rec.path
+          : typeof rec.route === 'string' ? rec.route
+            : typeof rec.url === 'string' ? rec.url
+              : typeof rec.endpoint === 'string' ? rec.endpoint : null
+        if (rawPath) {
+          const method = methodFrom(rec.method ?? rec.verb ?? rec.type) ?? 'GET'
+          push(method, rawPath, operationParams(rec), contextKey)
+          continue
+        }
+        walk(item, depth + 1, contextKey)
+      }
+      return
+    }
+    if (typeof node !== 'object') return
+    const rec = node as Record<string, unknown>
+    // Path-keyed method table.
+    for (const [key, value] of Object.entries(rec)) {
+      if (!key.startsWith('/') || key.startsWith('//')) continue
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const methods = Object.entries(value as Record<string, unknown>).filter(([k]) => HTTP_VERBS.has(k.toLowerCase()))
+        if (methods.length > 0) {
+          for (const [verb, op] of methods) push(verb, key, operationParams(op))
+          continue
+        }
+      }
+      push('GET', key)
+    }
+    for (const [key, value] of Object.entries(rec)) {
+      if (key.startsWith('/')) continue
+      // A single operation object: { path|route, method, params }.
+      if ((key === 'path' || key === 'route' || key === 'url' || key === 'endpoint') && typeof value === 'string' && value.startsWith('/')) {
+        const method = methodFrom(rec.method ?? rec.verb ?? rec.type) ?? 'GET'
+        push(method, value, operationParams(rec), contextKey)
+        continue
+      }
+      walk(value, depth + 1, key)
+    }
+  }
+  walk(raw, 0)
+  return out
+}
+
+export interface RouteMapParamHints {
+  paramHints: string[]
+  /** logical parameter key -> concrete runtime field name */
+  paramMap: Record<string, string>
+}
+
+/** Collect logical->actual parameter dictionaries from a route-map/config document. */
+export function harvestRouteMapParamHints(raw: unknown): RouteMapParamHints {
+  const paramHints: string[] = []
+  const paramMap: Record<string, string> = {}
+  let visited = 0
+  const walk = (node: unknown, depth: number): void => {
+    if (!node || typeof node !== 'object' || depth > 6 || visited > 600) return
+    visited += 1
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 80)) walk(item, depth + 1)
+      return
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (/^(?:params|paramNames|paramMap|parameterNames)$/i.test(key)) {
+        if (Array.isArray(value)) {
+          for (const item of value.slice(0, 40)) {
+            if (typeof item === 'string' && PARAM_NAME_RE.test(item)) paramHints.push(item)
+          }
+        } else if (value && typeof value === 'object') {
+          for (const [logical, actual] of Object.entries(value as Record<string, unknown>)) {
+            if (typeof actual !== 'string' || !PARAM_NAME_RE.test(actual.trim())) continue
+            paramHints.push(actual.trim())
+            if (PARAM_NAME_RE.test(logical.trim())) paramMap[logical.trim()] = actual.trim()
+          }
+        }
+        continue
+      }
+      walk(value, depth + 1)
+    }
+  }
+  walk(raw, 0)
+  return { paramHints: [...new Set(paramHints)].slice(0, 60), paramMap }
+}
+
+function routeKeyTokens(raw: string): string[] {
+  return raw
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map(token => (token.length > 3 && token.endsWith('s') ? token.slice(0, -1) : token))
+    .filter(token => token.length > 2 && !GENERIC_ROUTE_TOKENS.has(token))
+}
+
+const GENERIC_ROUTE_TOKENS = new Set([
+  'api', 'get', 'list', 'view', 'create', 'update', 'delete', 'remove', 'patch', 'put', 'post', 'run',
+  'new', 'all', 'set', 'the', 'and', 'for', 'with', 'by', 'to', 'from', 'item', 'data', 'field', 'body',
+  'name', 'query', 'value', 'id', 'uuid', 'key', 'ref', 'src', 'page', 'type', 'current', 'accept',
+])
+
+export interface RouteMapParseOptions {
+  bindings?: ReadonlyMap<string, readonly RouteMapParamBinding[]>
+  /** Override the discovery template normalizer (defaults to normalizeDiscoveryTemplate). */
+  normalizeTemplate?: (path: string) => string
+}
+
+/** Persist endpoints/params harvested from a served route-map/config document. */
+export function parseRouteMapDoc(
+  rawBody: string,
+  origin: string,
+  storage: Store,
+  runId: string,
+  scopeRevision: number,
+  dynamicPaths: Set<string>,
+  dynamicParams: Set<string>,
+  options?: RouteMapParseOptions,
+): { endpoints: number; params: number } {
+  const doc = parseJsonOrYaml(rawBody)
+  if (doc === null || typeof doc !== 'object') return { endpoints: 0, params: 0 }
+  const root = doc as Record<string, unknown>
+  if (typeof root.openapi === 'string' || typeof root.swagger === 'string') return { endpoints: 0, params: 0 }
+  const entries = harvestRouteMapDocument(doc)
+  const normalize = options?.normalizeTemplate ?? normalizeDiscoveryTemplate
+  const hints = harvestRouteMapParamHints(doc)
+  let endpoints = 0
+  let params = 0
+  const created: Array<{ id: string; key?: string; method: string; path: string }> = []
+  const paramKeys = new Set<string>()
+  const addParam = (endpointId: string, name: string, location: RouteMapEntry['params'][number]['location']) => {
+    if (!PARAM_NAME_RE.test(name)) return
+    const dedupe = `${endpointId}|${name}|${location}`
+    if (paramKeys.has(dedupe)) return
+    paramKeys.add(dedupe)
+    storage.upsertEndpointParam({
+      runId, endpointId, name, location,
+      isCsrf: CSRF_PARAM_RE.test(name),
+      isObjectId: location === 'path' || OBJECT_ID_PARAM_RE.test(name),
+      source: 'route_map',
+    })
+    dynamicParams.add(name)
+    params += 1
+  }
+  for (const entry of entries.slice(0, 120)) {
+    const clean = sanitizePathCandidate(entry.path, origin)
+    if (!clean || STATIC_ASSET_RE.test(clean)) continue
+    const tmpl = normalize(clean)
+    const ep = storage.upsertEndpoint({
+      runId, scopeRevision, origin, method: entry.method, pathTemplate: tmpl,
+      source: 'route_map', riskScore: scoreEndpointRisk(entry.method, tmpl),
+    } as unknown as Parameters<Store['upsertEndpoint']>[0])
+    endpoints += 1
+    dynamicPaths.add(tmpl)
+    created.push({ id: ep.id, ...(entry.key ? { key: entry.key } : {}), method: entry.method, path: tmpl })
+    for (const pathParam of extractDynamicPathParams(entry.path)) addParam(ep.id, pathParam.name, 'path')
+    for (const p of entry.params) addParam(ep.id, p.name, p.location)
+    if (entry.key && options?.bindings) {
+      for (const binding of options.bindings.get(entry.key) ?? []) {
+        const actual = hints.paramMap[binding.name] ?? binding.name
+        addParam(ep.id, actual, binding.location)
+      }
+    }
+  }
+  // Attach logical->actual parameter hints to same-resource write routes by shared name tokens.
+  for (const hint of hints.paramHints) {
+    dynamicParams.add(hint)
+    const hintTokens = new Set(routeKeyTokens(hint))
+    if (hintTokens.size === 0) continue
+    const ranked = created
+      .filter(ep => ep.key)
+      .map(ep => ({ ep, overlap: routeKeyTokens(ep.key ?? '').filter(token => hintTokens.has(token)).length }))
+      .filter(candidate => candidate.overlap > 0)
+      .sort((a, b) =>
+        b.overlap - a.overlap
+        || (a.ep.method === 'GET' ? 1 : 0) - (b.ep.method === 'GET' ? 1 : 0)
+        || a.ep.path.length - b.ep.path.length)
+      .slice(0, 4)
+    for (const { ep } of ranked) addParam(ep.id, hint, ep.method === 'GET' || ep.method === 'HEAD' ? 'query' : 'json')
+  }
+  return { endpoints, params }
+}
+
+/** Bounded scan for client router tables / navigation literals in JS bundles. */
+export function harvestJsRouteTable(code: string): string[] {
+  const out = new Set<string>()
+  const push = (p: string): void => {
+    if (p.startsWith('/') && !p.startsWith('//') && p.length <= 160 && !/[\r\n\0\\]/.test(p) && out.size < 80) out.add(p.split('?')[0] || '/')
+  }
+  for (const m of code.matchAll(/["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]\s*:\s*\{/g)) push(m[1])
+  for (const m of code.matchAll(/\b(?:path|route|to|href)\s*:\s*["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]/g)) push(m[1])
+  for (const m of code.matchAll(/\b(?:navigate|router\.(?:push|replace)|redirect)\s*\(\s*["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]/g)) push(m[1])
+  // Express/Fastify/Koa-style router tables: `router.get('/api/x', handler)`.
+  for (const m of code.matchAll(/\.(?:get|post|put|patch|delete|all|use)\s*\(\s*["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]/g)) push(m[1])
+  return [...out]
+}
+
 export function parseOpenApiDoc(
   rawBody: string,
   origin: string,
@@ -1445,19 +1661,31 @@ export function parseOpenApiDoc(
   dynamicPaths: Set<string>,
   dynamicParams: Set<string>,
 ): { endpoints: number; params: number } {
-  let doc: Record<string, unknown>
-  try {
-    const parsed = JSON.parse(rawBody) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { endpoints: 0, params: 0 }
-    doc = parsed as Record<string, unknown>
-  } catch {
-    return { endpoints: 0, params: 0 }
-  }
+  const parsed = parseJsonOrYaml(rawBody)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { endpoints: 0, params: 0 }
+  const doc = parsed as Record<string, unknown>
   const pathsObj = doc.paths
   if (!pathsObj || typeof pathsObj !== 'object' || Array.isArray(pathsObj)) return { endpoints: 0, params: 0 }
   let endpoints = 0
   let params = 0
   const validMethods = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
+
+  // OpenAPI `servers[].url` / Swagger 2 `basePath` may carry a deployment prefix.
+  let basePrefix = ''
+  if (Array.isArray(doc.servers) && doc.servers.length > 0) {
+    const first = doc.servers[0]
+    if (first && typeof first === 'object') {
+      const rawUrl = (first as Record<string, unknown>).url
+      if (typeof rawUrl === 'string' && !rawUrl.includes('{')) {
+        try {
+          const pathname = rawUrl.startsWith('/') ? rawUrl : new URL(rawUrl, origin).pathname
+          basePrefix = pathname === '/' ? '' : pathname.replace(/\/+$/, '')
+        } catch { /* ignore malformed server url */ }
+      }
+    }
+  } else if (typeof doc.basePath === 'string' && doc.basePath.startsWith('/') && doc.basePath !== '/') {
+    basePrefix = doc.basePath.replace(/\/+$/, '')
+  }
 
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -1502,7 +1730,7 @@ export function parseOpenApiDoc(
     params += 1
   }
 
-  /** Flatten a schema (through $ref/allOf/oneOf/items) into param names, bounded by depth. */
+  /** Flatten a schema (through $ref/allOf/oneOf/anyOf/items) into param names, bounded by depth. */
   const addSchemaParams = (
     schemaNode: unknown,
     location: ParamLocation,
@@ -1548,15 +1776,13 @@ export function parseOpenApiDoc(
     collectProps(schema, 0)
 
     for (const [propName, propNode] of Object.entries(props)) {
-      if (!propName) continue
+      if (!propName || params >= 800) continue
       const propSchema = resolveNode(propNode) ?? {}
       const inferredType = typeof propSchema.type === 'string' ? propSchema.type : null
-      const xmlName = location === 'xml' && typeof propSchema.xml === 'object' && propSchema.xml && typeof (propSchema.xml as Record<string, unknown>).name === 'string'
-        ? String((propSchema.xml as Record<string, unknown>).name).trim()
+      const xmlName = location === 'xml' && isRecord(propSchema.xml) && typeof propSchema.xml.name === 'string'
+        ? String(propSchema.xml.name).trim()
         : ''
-      const name = location === 'xml'
-        ? (xmlName || propName)
-        : `${prefix}${propName}`
+      const name = location === 'xml' ? (xmlName || propName) : `${prefix}${propName}`
       addParam(endpointId, name, location, inferredType)
       if (location === 'xml') continue
       const typeName = typeof propSchema.type === 'string' ? propSchema.type.toLowerCase() : ''
@@ -1599,11 +1825,14 @@ export function parseOpenApiDoc(
   for (const [rawPath, rawPathItem] of Object.entries(pathsObj as Record<string, unknown>)) {
     const pathItem = resolveNode(rawPathItem)
     if (!pathItem) continue
-    const leading = rawPath.startsWith('/') ? rawPath : `/${rawPath}`
+    let leading = rawPath.startsWith('/') ? rawPath : `/${rawPath}`
+    if (basePrefix && leading !== basePrefix && !leading.startsWith(`${basePrefix}/`)) {
+      leading = `${basePrefix}${leading}`
+    }
     // Preserve OpenAPI {param} placeholders while still collapsing raw literal IDs if any appear
     const pathTemplate = leading.includes('{')
       ? leading.split('?')[0].replace(/\/{2,}/g, '/')
-      : normalizeRouteTemplate(leading)
+      : normalizeDiscoveryTemplate(leading)
     dynamicPaths.add(pathTemplate)
     const pathLevelParams = Array.isArray(pathItem.parameters) ? pathItem.parameters : []
     for (const [mKey, opVal] of Object.entries(pathItem)) {
@@ -1683,6 +1912,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let navigationRequests = 0
   let navigationEndpoints = 0
   let authRequests = 0
+  let soft404Rejected = 0
   const frameworksDetected = new Set<string>()
   const techFingerprint = new Set<string>()
   const dynamicPaths = new Set<string>()
@@ -1741,11 +1971,6 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       perOriginCap,
       endpointsDiscovered,
       paramsDiscovered,
-      routeMapEndpoints,
-      jsRouterRoutes,
-      navigationRequests,
-      navigationEndpoints,
-      authRequests,
     })
     storage.updateRunPhase0Completed(runId, Date.now())
     return {
@@ -1765,6 +1990,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       navigationRequests,
       navigationEndpoints,
       authRequests,
+      soft404Rejected,
     }
   }
 
@@ -1782,12 +2008,16 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     let originUsed = 0
     const probedPaths = new Set<string>()
     const jsQueue: string[] = []
+    const jsPageByScript = new Map<string, string>()
     const discoveredCandidatePaths: string[] = []
     const jsonDocCandidates: string[] = []
     const navSeeds: Array<{ path: string; depth: number }> = []
     const writeOnlyPaths = new Set<string>()
+    const configBindings = new Map<string, RouteMapParamBinding[]>()
+    let observedFieldAttachments = 0
     let originHalted = false
     let personaRejected = false
+    let softCalibration: SoftNotFoundCalibration | null = null
 
     const personaForOrigin = (handle: string | undefined): string | undefined => {
       if (!handle || personaRejected) return undefined
@@ -1796,12 +2026,19 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return persona.originAllowlist.includes(origin) ? handle : undefined
     }
     // All discovery fetches carry the approved owner session when one is available, so the SPA
-    // shell, /api listings, config documents and OpenAPI specs behind login are visible.
+    // shell, API listings, config documents and OpenAPI specs behind login are visible.
     let discoveryPersona = personaForOrigin(params.personas?.find((handle): handle is string => Boolean(handle)))
 
     const safeGet = async (
       pathAndQuery: string,
-      opts?: { method?: 'GET' | 'POST'; body?: string; headers?: Record<string, string>; anonymous?: boolean },
+      opts?: {
+        method?: 'GET' | 'POST'
+        body?: string
+        headers?: Record<string, string>
+        persona?: string
+        anonymous?: boolean
+        followRedirects?: boolean
+      },
     ): Promise<BrokerExchangeResult | null> => {
       if (originHalted || signal.aborted) return null
       if (originUsed >= perOriginCap) return null
@@ -1811,8 +2048,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         return null
       }
       const method = opts?.method ?? 'GET'
-      const persona = opts?.anonymous ? undefined : discoveryPersona
-      const dedupeKey = `${method} ${pathAndQuery}${persona ? ` [${persona}]` : ''}`
+      const persona = opts?.anonymous ? undefined : (opts?.persona ?? discoveryPersona)
+      const dedupeKey = `${method} ${persona ?? ''} ${pathAndQuery}`
       if (probedPaths.has(dedupeKey)) return null
       probedPaths.add(dedupeKey)
       originUsed += 1
@@ -1825,7 +2062,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           headers: opts?.headers,
           body: opts?.body,
           ...(persona ? { persona } : {}),
-          followRedirects: false,
+          followRedirects: opts?.followRedirects ?? (method === 'GET'),
           runId,
           assignmentId: params.assignmentId,
           timeoutMs: 8_000,
@@ -1864,7 +2101,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       source: EndpointSource,
       extra?: { framework?: string | null; riskScore?: number; authRequirement?: string | null },
     ) => {
-      const pathTemplate = normalizeRouteTemplate(rawPath)
+      const pathTemplate = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(rawPath)
+        ? normalizeDiscoveryTemplate(rawPath)
+        : normalizeRouteTemplate(rawPath)
       const ep = storage.upsertEndpoint({
         runId,
         scopeRevision,
@@ -1901,8 +2140,46 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return added
     }
 
-    // 2a. Standard seed probes
+    const queueJsonDoc = (cleanPath: string) => {
+      if (jsonDocCandidates.length >= 8 || jsonDocCandidates.includes(cleanPath)) return
+      jsonDocCandidates.push(cleanPath)
+    }
+
+    const queueJsChunk = (specifier: string, fromPath = '/') => {
+      if (jsQueue.length >= 32) return
+      const clean = sanitizePathCandidate(specifier, `${origin}${fromPath}`)
+      if (!clean || STATIC_ASSET_RE.test(clean)) return
+      if (!/\.(?:m?js|jsx|ts|tsx)(?:\?|$)/i.test(clean)) return
+      if (!jsQueue.includes(clean)) jsQueue.push(clean)
+    }
+
+    const softNotFoundResponse = (ex: BrokerExchangeResult): boolean =>
+      ex.status >= 200 && ex.status < 300 && Boolean(softCalibration && isSoftNotFound(softCalibration, ex))
+
+    // 2a. Standard seed probes. Reserve a small slice of the per-origin cap for JS chunk
+    // harvesting, otherwise a long seed list can starve the bundles that carry XHR/route evidence.
+    const jsReserve = perOriginCap > 4 ? Math.min(4, Math.floor(perOriginCap / 3)) : 0
+    const seedBudget = Math.max(1, perOriginCap - jsReserve)
+    let seedFetches = 0
+
+    // 2a-cal. Soft-404 / SPA catch-all calibration before recording discovered routes.
+    if (!originHalted && !signal.aborted && originUsed + 2 <= perOriginCap) {
+      const cal: SoftNotFoundCalibration = { statuses: [], mediaTypes: [], lengths: [], signatures: [] }
+      for (let i = 0; i < 2; i += 1) {
+        const probePath = `/.guardian-cal-${randomUUID().replace(/-/g, '').slice(0, 12)}`
+        const ex = await safeGet(probePath)
+        if (!ex) continue
+        cal.statuses.push(ex.status)
+        cal.mediaTypes.push(ex.mediaType)
+        cal.lengths.push(ex.body.length)
+        cal.signatures.push(bodyStructuralSignature(ex.body))
+      }
+      if (cal.statuses.length > 0) softCalibration = cal
+    }
+
     for (const seedPath of PHASE0_SEED_PATHS) {
+      if (seedFetches >= seedBudget) break
+      seedFetches += 1
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       if (seedPath === '/') {
         // On crash recovery, reuse any already-recorded GET / for this (runId, scopeRevision, origin)
@@ -1927,12 +2204,18 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             if (prior.status < 400) recordEndpoint('GET', '/', 'surface_probe')
             const html = extractHtmlLinksAndScripts(prior.bodyPreview ?? '', origin)
             for (const s of html.scripts) {
-              if (!jsQueue.includes(s)) jsQueue.push(s)
+              queueJsChunk(s, '/')
+              jsPageByScript.set(s, '/')
+            }
+            for (const asset of extractAssetReferences(prior.bodyPreview ?? '')) {
+              if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+              else queueJsChunk(asset, '/')
             }
             for (const l of html.links.slice(0, 60)) {
               dynamicPaths.add(normalizeRouteTemplate(l))
               if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
-              if (/\.json(?:\?|$)/i.test(l) && jsonDocCandidates.length < 8 && !jsonDocCandidates.includes(l)) jsonDocCandidates.push(l)
+              if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
+              else navSeeds.push({ path: l, depth: 0 })
             }
             for (const form of html.forms) {
               const ep = recordEndpoint(form.method, form.action, 'surface_probe')
@@ -1954,7 +2237,12 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           }
         } catch { /* fall through to live GET / */ }
       }
-      const ex = await safeGet(seedPath)
+      let ex = await safeGet(seedPath)
+      // Config/route-map artifacts are often behind auth; retry once with the first approved persona
+      // so authenticated tables are not invisible to recon.
+      if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.[0]) {
+        ex = await safeGet(seedPath, { persona: params.personas[0] })
+      }
       if (!ex) continue
 
       if (seedPath === '/') {
@@ -1962,12 +2250,18 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (ex.status < 400) recordEndpoint('GET', '/', 'surface_probe')
         const html = extractHtmlLinksAndScripts(ex.body, origin)
         for (const s of html.scripts) {
-          if (!jsQueue.includes(s)) jsQueue.push(s)
+          queueJsChunk(s, '/')
+          jsPageByScript.set(s, '/')
+        }
+        for (const asset of extractAssetReferences(ex.body)) {
+          if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+          else queueJsChunk(asset, '/')
         }
         for (const l of html.links.slice(0, 60)) {
           dynamicPaths.add(normalizeRouteTemplate(l))
           if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
-          if (/\.json(?:\?|$)/i.test(l) && jsonDocCandidates.length < 8 && !jsonDocCandidates.includes(l)) jsonDocCandidates.push(l)
+          if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
+          else navSeeds.push({ path: l, depth: 0 })
         }
         for (const form of html.forms) {
           const ep = recordEndpoint(form.method, form.action, 'surface_probe')
@@ -2012,33 +2306,53 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             }
           }
         } catch { /* ignore invalid JSON */ }
-      } else if ((seedPath === '/openapi.json' || seedPath === '/swagger.json') && ex.status < 400) {
+      } else if (/(?:openapi|swagger|api-docs)/i.test(seedPath) && ex.status < 400 && !softNotFoundResponse(ex)) {
         const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
         endpointsDiscovered += parsed.endpoints
         paramsDiscovered += parsed.params
         if (parsed.endpoints === 0) {
           // Swagger-less API index documents are handled by the structural route-map expander.
-          const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+          const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
           endpointsDiscovered += expanded.endpoints
           paramsDiscovered += expanded.params
           routeMapEndpoints += expanded.endpoints
         }
-      } else if (seedPath === '/graphql' && ex.status < 400) {
-        recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
+      } else if ((seedPath === '/graphql' || seedPath === '/api/graphql') && ex.status < 400) {
+        const gqlPath = seedPath.startsWith('/api/') ? seedPath : '/graphql'
+        recordEndpoint('POST', gqlPath, 'graphql', { framework: 'graphql', riskScore: 85 })
         techFingerprint.add('graphql')
       } else if (ex.status >= 200 && ex.status < 300) {
+        if (softNotFoundResponse(ex)) {
+          soft404Rejected += 1
+          continue
+        }
         recordEndpoint('GET', seedPath, 'surface_probe')
+        // Any served JSON/YAML document may be a route map or config with an endpoint table.
+        if (/json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)) {
+          try {
+            const doc = parseJsonOrYaml(ex.body)
+            const parsed = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
+            endpointsDiscovered += parsed.endpoints
+            paramsDiscovered += parsed.params
+            routeMapEndpoints += parsed.endpoints
+            if (doc && typeof doc === 'object') {
+              for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
+              const entries = harvestRouteMapDocument(doc).slice(0, 120)
+              const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
+              for (const entry of entries) {
+                const tmpl = normalizeDiscoveryTemplate(entry.path)
+                if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
+                else if (entry.method === 'GET' && !/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+              }
+            }
+          } catch { /* not a route map */ }
+        }
       }
     }
 
-    // 2b. Fetch same-origin JS chunks & optional source maps and feed into AST jsHarvest
-    const maxJsChunks = Math.min(12, Math.max(0, perOriginCap - originUsed))
-    const configBindings = new Map<string, RouteMapParamBinding[]>()
-    const queueJsonDoc = (cleanPath: string) => {
-      if (jsonDocCandidates.length >= 8) return
-      if (jsonDocCandidates.includes(cleanPath)) return
-      jsonDocCandidates.push(cleanPath)
-    }
+    // 2b. Fetch same-origin JS chunks. The queue is drained breadth-first (imports, manifests,
+    // webpack/Vite chunk maps) within a bounded 32-bundle budget; seed probes reserved jsReserve.
+    const maxJsChunks = Math.min(32, Math.max(0, perOriginCap - originUsed))
     let jsFetched = 0
     for (let jsIndex = 0; jsIndex < jsQueue.length && jsFetched < maxJsChunks; jsIndex += 1) {
       const jsPath = jsQueue[jsIndex]
@@ -2055,18 +2369,24 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         httpCalls?: Array<{ url?: string; method?: string; bodyKeys?: string[] }>
         graphqlDocs?: Array<{ kind?: string; name?: string }>
         nextActions?: Array<{ id?: string }>
+        scriptChunks?: string[]
       }
 
-      const seenJsRoutes = new Set<string>()
+      const seenJsRoutes = new Map<string, string>()
       const addJsEndpoint = (method: string, rawPath: string, bodyKeys: string[] = []): string | null => {
         if (seenJsRoutes.size >= 120) return null
         const clean = sanitizePathCandidate(rawPath, origin)
         if (!clean || STATIC_ASSET_RE.test(clean)) return null
-        const tmpl = normalizeRouteTemplate(clean)
+        const tmpl = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(clean)
+          ? normalizeDiscoveryTemplate(clean)
+          : normalizeRouteTemplate(clean)
         const key = `${method.toUpperCase()} ${tmpl}`
-        if (seenJsRoutes.has(key)) return null
-        seenJsRoutes.add(key)
+        const existingId = seenJsRoutes.get(key)
+        // The same route is often referenced by several sources (harvested calls, regex literal scan,
+        // OpenAPI-derived body keys). Merge parameters instead of dropping later evidence.
+        if (existingId) return existingId
         const ep = recordEndpoint(method, tmpl, 'js_ast')
+        seenJsRoutes.set(key, ep.id)
         if (method.toUpperCase() === 'GET' && (/\.json$/i.test(clean) || /(?:^|\/)(?:config|routes|route-map|manifest|endpoints|links|nav|menu|bootstrap)(?:\.|$)/i.test(clean))) {
           queueJsonDoc(clean)
         }
@@ -2115,19 +2435,19 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           paramsDiscovered += 1
         }
       }
-      if ((harvested.graphqlDocs?.length ?? 0) > 0) {
-        recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
+      // SPA router tables: path literals in router config are navigable endpoints even without hrefs.
+      for (const routePath of harvestJsRouteTable(ex.body).slice(0, 24)) {
+        if (addJsEndpoint('GET', routePath)) jsRouterRoutes += 1
       }
-      // Client router tables (`router.get('/x')`, route-object literals) carry methods and path
-      // templates that request-literal scanning misses.
-      for (const spec of parseJsRouterTable(ex.body).slice(0, 60)) {
-        const epId = addJsEndpoint(spec.method, spec.path)
-        if (!epId) continue
-        jsRouterRoutes += 1
-        recordParams(epId, spec.params, 'js_ast')
+      // tRPC procedures: batched GET uses a query `input`, mutations POST a JSON `input`.
+      for (const proc of harvestTrpcProcedures(ex.body).slice(0, 24)) {
+        const trpcPath = `/trpc/${proc.router}.${proc.procedure}`
+        const getId = addJsEndpoint('GET', trpcPath)
+        if (getId) recordParams(getId, [{ name: 'input', location: 'query' }], 'js_ast')
+        const postId = addJsEndpoint('POST', trpcPath)
+        if (postId) recordParams(postId, [{ name: 'input', location: 'json' }], 'js_ast')
       }
-      // Runtime parameter bindings: `<alias> = config.params.<name>` used as a body field before a
-      // named API call. Lets the route-map expander attach real body field names to write routes.
+      // Runtime config-parameter -> API body-field bindings for route-map expansion.
       for (const binding of harvestConfigParamBindings(ex.body)) {
         const list = configBindings.get(binding.routeKey) ?? []
         if (!list.some(existing => existing.name === binding.name && existing.location === binding.location)) {
@@ -2135,19 +2455,28 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           configBindings.set(binding.routeKey, list)
         }
       }
+      // Module imports + build-asset references (manifest/chunk maps) extend the BFS queue.
+      for (const specifier of extractJsModuleImports(ex.body)) queueJsChunk(specifier, jsPath)
+      for (const chunk of harvested.scriptChunks ?? []) queueJsChunk(chunk, jsPath)
+      for (const asset of extractAssetReferences(ex.body)) {
+        if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+        else queueJsChunk(asset, jsPath)
+      }
+      if ((harvested.graphqlDocs?.length ?? 0) > 0) {
+        recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
+      }
       for (const act of (harvested.nextActions ?? []).slice(0, 10)) {
-        if (act.id) recordEndpoint('POST', `/_next/action/${act.id.slice(0, 40)}`, 'js_ast', { framework: 'nextjs', riskScore: 85 })
+        if (!act.id) continue
+        // Keep the executable synthetic action endpoint and represent the Next Server Action on its
+        // page route with Next-Action metadata so probes can pair action ids with page paths.
+        recordEndpoint('POST', `/_next/action/${act.id.slice(0, 40)}`, 'js_ast', { framework: 'nextjs', riskScore: 85 })
+        const pagePath = jsPageByScript.get(jsPath)
+        if (pagePath) {
+          const pageEp = recordEndpoint('POST', pagePath, 'js_ast', { framework: 'nextjs', riskScore: 88 })
+          recordParams(pageEp.id, [{ name: 'Next-Action', location: 'header' }], 'js_ast')
+        }
       }
 
-      // Follow same-origin module imports (the API client/config loader often lives in an imported
-      // chunk rather than the entry bundle).
-      for (const specifier of extractJsModuleImports(ex.body)) {
-        if (jsQueue.length >= 24) break
-        const clean = sanitizePathCandidate(specifier, `${origin}${jsPath}`)
-        if (!clean || STATIC_ASSET_RE.test(clean)) continue
-        if (!/\.(?:m?js|jsx|ts|tsx)(?:\?|$)/i.test(clean)) continue
-        if (!jsQueue.includes(clean)) jsQueue.push(clean)
-      }
       // Opportunistically fetch same-origin source map if budget permits
       const mapMatch = /\/\/[#@]\s*sourceMappingURL=([^\s'"]+)/.exec(ex.body)
       if (mapMatch && originUsed < perOriginCap) {
@@ -2168,36 +2497,38 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
-    // 2b-bis. Expand JSON route-map / API-description artifacts referenced by the SPA (runtime
-    // config, API index, manifests). Their route tables become endpoints with methods and params,
-    // even when the SPA shell itself exposes no crawlable links.
+    // 2b-bis. Fetch same-origin JSON/YAML route-map & config artifacts referenced by the SPA
+    // (runtime config, API index, Vite/webpack manifests). This is the only way config tables that
+    // are referenced solely from JS become visible before probes run.
     for (const docPath of [...new Set(jsonDocCandidates)].slice(0, 6)) {
       if (originHalted || originUsed >= perOriginCap - 4 || signal.aborted) break
       const ex = await safeGet(docPath)
       if (!ex || ex.status >= 400 || !ex.body) continue
-      if (!/json/i.test(ex.mediaType) && !/^\s*[{[]/.test(ex.body)) continue
-      const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, configBindings)
+      if (softNotFoundResponse(ex)) { soft404Rejected += 1; continue }
+      const isStructured = /json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)
+      if (!isStructured) {
+        // A manifest-like JS body: follow the chunk references it lists.
+        for (const asset of extractAssetReferences(ex.body)) queueJsChunk(asset, docPath)
+        continue
+      }
+      const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
       endpointsDiscovered += expanded.endpoints
       paramsDiscovered += expanded.params
       routeMapEndpoints += expanded.endpoints
-      try {
-        const mapEntries = extractRouteMapEntries(JSON.parse(ex.body) as unknown)
-        const docGetPaths = new Set(mapEntries.entries.filter(entry => entry.method === 'GET').map(entry => normalizeRouteTemplate(entry.path)))
-        for (const entry of mapEntries.entries) {
-          const template = normalizeRouteTemplate(entry.path)
-          if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(template)) writeOnlyPaths.add(template)
-          if (entry.method !== 'GET') continue
-          if (/:|\{/.test(entry.path)) continue
-          const clean = sanitizePathCandidate(entry.path, origin)
-          if (!clean || STATIC_ASSET_RE.test(clean)) continue
-          navSeeds.push({ path: clean, depth: 0 })
-        }
-        for (const link of extractJsonLinkTargets(ex.body, origin)) {
-          if (writeOnlyPaths.has(normalizeRouteTemplate(link))) continue
-          navSeeds.push({ path: link, depth: 0 })
-        }
-      } catch {
+      const doc = parseJsonOrYaml(ex.body)
+      if (doc && typeof doc === 'object') {
         for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
+        const entries = harvestRouteMapDocument(doc).slice(0, 120)
+        const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
+        for (const entry of entries) {
+          const tmpl = normalizeDiscoveryTemplate(entry.path)
+          if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
+          else if (entry.method === 'GET' && !/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+        }
+      }
+      for (const asset of extractAssetReferences(ex.body)) {
+        if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+        else queueJsChunk(asset, docPath)
       }
     }
 
@@ -2243,6 +2574,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (candidate === '/' || STATIC_ASSET_RE.test(candidate)) continue
       const ex = await safeGet(candidate)
       // 401/403/405 means the route exists but is gated or method-restricted: still part of the surface.
+      if (ex && softNotFoundResponse(ex)) {
+        soft404Rejected += 1
+        continue
+      }
       if (ex && (ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405)) {
         const ep = recordEndpoint('GET', candidate, 'surface_probe')
         paramsDiscovered += recordQueryParamsForEndpoint({
@@ -2266,22 +2601,26 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             paramsDiscovered += 1
           }
           for (const s of parsed.scripts) {
-            if (!jsQueue.includes(s)) jsQueue.push(s)
+            queueJsChunk(s, candidate)
+            jsPageByScript.set(s, candidate)
+          }
+          for (const asset of extractAssetReferences(ex.body)) {
+            if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+            else queueJsChunk(asset, candidate)
           }
         }
       }
     }
 
-    // 2d-bis. Bounded authenticated JSON navigation: follow HATEOAS links found in API responses
-    // and infer collection->detail reads from ids observed in authenticated listings. Read-only,
-    // depth <= 2, per-origin capped, and only JSON/API responses become endpoints (SPA shell HTML
-    // for unknown client routes is deliberately not recorded).
+    // 2d-bis. Authenticated JSON navigation: follow HATEOAS links found in API responses and infer
+    // collection->detail reads from ids observed in authenticated listings. Read-only, depth <= 2,
+    // per-origin capped; only JSON/API responses become endpoints (SPA shell HTML is not recorded).
     const navVisited = new Set<string>()
     const navQueue = navSeeds.slice(0, 32)
     const navGetTemplates = [...new Set(storage.listEndpoints(runId, { origin })
       .filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2)
       .map(ep => ep.pathTemplate))]
-    const navCap = Math.min(28, Math.max(0, perOriginCap - originUsed - 4))
+    const navCap = Math.min(28, Math.max(0, perOriginCap - originUsed - 8))
     const attachObservedFields = (baseTemplate: string, body: string) => {
       if (observedFieldAttachments >= 12) return
       const fields = extractJsonFieldNames(body)
@@ -2311,15 +2650,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const clean = sanitizePathCandidate(item.path, origin)
       if (!clean || clean === '/' || STATIC_ASSET_RE.test(clean)) continue
       if (/[:{}]/.test(clean) || navVisited.has(clean)) continue
+      if (writeOnlyPaths.has(normalizeDiscoveryTemplate(clean))) continue
       navVisited.add(clean)
       const ex = await safeGet(clean)
       if (!ex) continue
       navigationRequests += 1
+      if (softNotFoundResponse(ex)) { soft404Rejected += 1; continue }
       const isJson = /json/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)
       const bare = clean.split('?')[0] || '/'
       const surfaceStatus = ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405
       if (!surfaceStatus) continue
-      if (!isJson && !/^\/(?:api|rest|v\d)\//i.test(bare) && !/\.json$/i.test(bare)) continue
+      if (!isJson && !/^\/(?:api|rest|v\d|graphql|trpc)\//i.test(bare) && !/\.json$/i.test(bare)) continue
       const ep = recordEndpoint('GET', bare, 'spa_crawl', {
         authRequirement: discoveryPersona ? `persona:${discoveryPersona}` : null,
         riskScore: 60,
@@ -2330,13 +2671,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         storage, runId, dynamicParams,
       })
       if (!isJson || ex.status >= 400) continue
-      const template = normalizeRouteTemplate(bare)
-      const baseTemplate = template.replace(/\/:id$/, '')
+      const template = normalizeDiscoveryTemplate(bare)
+      const baseTemplate = template.replace(/\/:[A-Za-z_][A-Za-z0-9_-]*$/, '')
       attachObservedFields(baseTemplate, ex.body)
       if (item.depth < 2) {
         for (const link of extractJsonLinkTargets(ex.body, origin)) {
           if (navQueue.length >= 64) break
-          if (writeOnlyPaths.has(normalizeRouteTemplate(link))) continue
+          if (writeOnlyPaths.has(normalizeDiscoveryTemplate(link))) continue
           navQueue.push({ path: link, depth: item.depth + 1 })
         }
       }
@@ -2344,22 +2685,27 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (ids.length === 0 || item.depth >= 2) continue
       // Subresource templates (…/:id/view, …/:id/notes) imply the parent detail route; walk it too.
       const detailTemplates = new Set(navGetTemplates)
-      for (const template of navGetTemplates) {
-        const marker = `${baseTemplate}/:id/`
-        if (!template.startsWith(marker)) continue
-        detailTemplates.add(template.slice(0, template.indexOf(marker) + marker.length - 1))
+      for (const templatePath of navGetTemplates) {
+        if (!templatePath.startsWith(`${baseTemplate}/:`)) continue
+        const rest = templatePath.slice(baseTemplate.length + 1)
+        const slash = rest.indexOf('/')
+        if (slash > 0) detailTemplates.add(`${baseTemplate}/${rest.slice(0, slash)}`)
       }
       for (const candidateTemplate of detailTemplates) {
         if (navQueue.length >= 72) break
         if (!candidateTemplate.startsWith(`${baseTemplate}/`)) continue
-        if ((candidateTemplate.match(/:id/g) ?? []).length !== 1) continue
+        const placeholderHits = candidateTemplate.match(/(^|\/):[A-Za-z_][A-Za-z0-9_-]*/g) ?? []
+        if (placeholderHits.length !== 1) continue
         for (const id of ids.slice(0, 2)) {
-          navQueue.push({ path: candidateTemplate.replace(':id', encodeURIComponent(id)), depth: item.depth + 1 })
+          navQueue.push({
+            path: candidateTemplate.replace(/(^|\/):[A-Za-z_][A-Za-z0-9_-]*/, (_match, prefix: string) => `${prefix}${encodeURIComponent(id)}`),
+            depth: item.depth + 1,
+          })
         }
       }
     }
 
-    // 2d-bis. XML-accepting surface discovery: xml-ish routes frequently only reveal their element
+    // 2d-ter. XML-accepting surface discovery: xml-ish routes frequently only reveal their element
     // schema in a parse-error response. Send a benign probe document and learn the expected element.
     const xmlish = /(?:xml|soap|wsdl|saml|rss|atom|svg|import|upload|feed|sitemap)/i
     if (!originHalted && !signal.aborted && grant.canRead(origin)) {
@@ -2518,6 +2864,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     navigationRequests,
     navigationEndpoints,
     authRequests,
+    soft404Rejected,
     stoppedReason,
   })
   storage.updateRunPhase0Completed(runId, Date.now())
@@ -2539,6 +2886,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     navigationRequests,
     navigationEndpoints,
     authRequests,
+    soft404Rejected,
   }
 }
 
@@ -2562,6 +2910,12 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
   for (const p of params.personas ?? []) {
     if (p && !personaList.includes(p)) personaList.push(p)
   }
+  const authenticatedPersonas = personaList.filter((p): p is string => Boolean(p))
+  // Reserve most of the page budget for authenticated personas so anonymous pagination cannot
+  // starve the views that render authenticated XHR traffic.
+  const anonymousPageCap = authenticatedPersonas.length > 0
+    ? Math.max(1, Math.floor(effectiveMaxPages * 0.4))
+    : effectiveMaxPages
 
   let pagesVisited = 0
   let endpointsDiscovered = 0
@@ -2618,11 +2972,12 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
 
     const queue: Array<{ pathAndQuery: string; depth: number }> = [{ pathAndQuery: '/', depth: 0 }]
     const visitedForPersona = new Set<string>()
+    const templateVisits = new Map<string, number>()
     let personaPages = 0
     // Per-persona budget share when crawling multiple personas while respecting total budgetRemaining if specified
-    const personaPageCap = params.budgetRemaining !== undefined
-      ? Math.max(1, effectiveMaxPages - pagesVisited)
-      : requestedMaxPages
+    const personaPageCap = persona
+      ? (params.budgetRemaining !== undefined ? Math.max(1, effectiveMaxPages - pagesVisited) : requestedMaxPages)
+      : Math.max(1, Math.min(anonymousPageCap, params.budgetRemaining !== undefined ? effectiveMaxPages - pagesVisited : anonymousPageCap))
 
     if (params.budgetRemaining !== undefined && pagesVisited >= effectiveMaxPages) break
 
@@ -2641,6 +2996,11 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       const dedupeKey = next.pathAndQuery
       if (visitedForPersona.has(dedupeKey)) continue
       visitedForPersona.add(dedupeKey)
+      // Cap repeated instances of one normalized route template (pagination/item loops).
+      const routeTemplateKey = normalizeRouteTemplate(next.pathAndQuery)
+      const templateCount = templateVisits.get(routeTemplateKey) ?? 0
+      if (templateCount >= 2) continue
+      templateVisits.set(routeTemplateKey, templateCount + 1)
 
       let visit
       try {
@@ -2720,7 +3080,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       }
 
       // Record intercepted XHR / fetch / WebSocket / GraphQL / Next-Action calls, including query
-      // parameters and (when the browser record exposes it) the request body shape.
+      // parameters and (when the browser record exposes it) request-body shape.
       const intercepted = [...visit.xhrRequests, ...(visit.allRequests ?? [])]
       for (const req of intercepted) {
         if (req.origin !== normalizedOrigin) continue
@@ -2731,15 +3091,10 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         if (!clean || STATIC_ASSET_RE.test(clean)) continue
         const record = req as { body?: unknown; postData?: unknown }
         const rawBody = typeof record.body === 'string' ? record.body : typeof record.postData === 'string' ? record.postData : null
-        const shape = inferXhrRequestShape({
-          url: req.url,
-          method: req.method,
-          body: rawBody,
-          contentType: null,
-        })
+        const shape = inferXhrRequestShape({ url: req.url, method: req.method, body: rawBody })
         if (!shape) continue
         const tmpl = normalizeRouteTemplate(shape.path)
-        const src: EndpointSource = /graphql/i.test(tmpl) ? 'graphql' : 'spa_crawl'
+        const src: EndpointSource = /graphql|trpc/i.test(tmpl) ? 'graphql' : 'spa_crawl'
         const ep = storage.upsertEndpoint({
           runId,
           scopeRevision,
@@ -2765,34 +3120,30 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         }
       }
       // Broker exchanges expose the concrete query string of every intercepted call even when the
-      // browser record only carries the URL; keep their parameter names too.
+      // browser record only carries the URL; keep those parameter names too.
       for (const ex of visit.exchanges) {
         if (ex.origin !== normalizedOrigin) continue
         const tmpl = normalizeRouteTemplate(ex.pathAndQuery)
-        const known = storage.listEndpoints(runId, { origin: normalizedOrigin }).find(e => e.method === ex.method.toUpperCase() && e.pathTemplate === tmpl)
-        if (!known) continue
-        const shape = inferXhrRequestShape({ url: ex.pathAndQuery, method: ex.method })
-        if (!shape) continue
-        for (const p of shape.params) {
-          if (p.location !== 'query') continue
-          storage.upsertEndpointParam({
-            runId,
-            endpointId: known.id,
-            name: p.name,
-            location: 'query',
-            isCsrf: CSRF_PARAM_RE.test(p.name),
-            isObjectId: OBJECT_ID_PARAM_RE.test(p.name),
-            source: 'spa_crawl',
-          })
-          paramsDiscovered += 1
+        const known = storage.listEndpoints(runId, { origin: normalizedOrigin })
+          .find(e => e.method === ex.method.toUpperCase() && e.pathTemplate === tmpl)
+        if (known) {
+          const shape = inferXhrRequestShape({ url: ex.pathAndQuery, method: ex.method })
+          for (const p of shape?.params ?? []) {
+            if (p.location !== 'query') continue
+            storage.upsertEndpointParam({
+              runId,
+              endpointId: known.id,
+              name: p.name,
+              location: 'query',
+              isCsrf: CSRF_PARAM_RE.test(p.name),
+              isObjectId: OBJECT_ID_PARAM_RE.test(p.name),
+              source: 'spa_crawl',
+            })
+            paramsDiscovered += 1
+          }
         }
-      }
-      // Also inspect broker exchanges for Next-Action headers
-      for (const ex of visit.exchanges) {
-        if (ex.origin !== normalizedOrigin) continue
         const nextAction = ex.reqHeaders['next-action']
         if (nextAction) {
-          const tmpl = normalizeRouteTemplate(ex.pathAndQuery)
           storage.upsertEndpoint({
             runId,
             scopeRevision,
@@ -2805,6 +3156,19 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
             riskScore: 88,
           })
           endpointsDiscovered += 1
+          const actionEp = storage.listEndpoints(runId, { origin: normalizedOrigin })
+            .find(e => e.method === ex.method.toUpperCase() && e.pathTemplate === tmpl)
+          if (actionEp) {
+            storage.upsertEndpointParam({
+              runId,
+              endpointId: actionEp.id,
+              name: 'Next-Action',
+              location: 'header',
+              isCsrf: false,
+              isObjectId: false,
+              source: 'spa_crawl',
+            })
+          }
         }
       }
 

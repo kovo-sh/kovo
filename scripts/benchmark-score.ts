@@ -41,7 +41,9 @@ const classCompat: Array<[RegExp, string[]]> = [
   [/cache/i, ['cache_poison_deception']],
   [/graphql/i, ['graphql_audit', 'sqli_boolean', 'authz_matrix']],
   [/second_order|stored/i, ['xss_context', 'ssrf_canary']],
-  [/workflow|race|business/i, ['workflow_invariant']],
+  [/race/i, ['race_burst', 'workflow_invariant']],
+  [/workflow|business/i, ['workflow_invariant', 'race_burst']],
+  [/command|os_command|rce/i, ['command_injection']],
   [/csrf/i, ['sqli_boolean', 'authz_matrix', 'xss_context']],
 ]
 

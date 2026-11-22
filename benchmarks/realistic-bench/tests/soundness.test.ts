@@ -23,8 +23,8 @@ const BENIGN_GET = [
   'integrationList', 'listTokens', 'listApiKeys', 'listMembers', 'listWebhooks',
 ]
 
-async function benignTraffic(mod: AppModule): Promise<{ app: string; events: string[] }> {
-  const plan: VariantPlan = generateVariant(mod.blueprint, 1)
+async function benignTraffic(mod: AppModule, seed: number): Promise<{ app: string; events: string[] }> {
+  const plan: VariantPlan = generateVariant(mod.blueprint, seed)
   const app = await bootForced(mod, plan, 'hardened')
   try {
     const ctx = makeSolverCtx(app, SESSION_COOKIE[mod.name])
@@ -43,9 +43,13 @@ async function benignTraffic(mod: AppModule): Promise<{ app: string; events: str
   }
 }
 
+const SOUNDNESS_SEEDS = [1, 2, 3]
+
 for (const mod of [acme, opsportal, shopflow] as AppModule[]) {
-  test(`${mod.name}: benign browsing produces zero impact events`, async () => {
-    const { events } = await benignTraffic(mod)
-    assert.deepEqual(events, [], `benign traffic unexpectedly tripped the oracle:\n${events.join('\n')}`)
-  })
+  for (const seed of SOUNDNESS_SEEDS) {
+    test(`${mod.name} seed ${seed}: benign browsing produces zero impact events`, async () => {
+      const { events } = await benignTraffic(mod, seed)
+      assert.deepEqual(events, [], `benign traffic unexpectedly tripped the oracle:\n${events.join('\n')}`)
+    })
+  }
 }
