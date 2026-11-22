@@ -124,6 +124,85 @@ const maxCsrfHypotheses = 6
 const maxWebhookHypotheses = 4
 const maxRedirectHypotheses = 10
 
+/**
+ * Query/body parameters for routes whose parameter names the surface did not expose (server-rendered
+ * pages, hidden API routes listed only as paths). Candidate names are derived from route semantics and
+ * the vocabulary applications actually use for that shape; every candidate is still verified by a
+ * differential, so a wrong guess costs a bounded request and never produces a signal on its own.
+ */
+export type InferredPurpose = 'search' | 'file' | 'url' | 'command' | 'quantity'
+export interface InferredParam extends DiscoveredParam { purpose?: InferredPurpose }
+
+const searchRouteHint = /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|saved-?views?)(?:$|[/_.-])/i
+const searchSeg = /^(?:search|query|find|lookup|filter|run)$/i
+const fileServeSeg = /^(?:download|downloads|view|serve|file|files|asset|assets|receipt|receipts|invoice|invoices|label|labels|document|documents|attachment|attachments|media|raw|content|archive|archives|backup|backups|log|logs|journal|journals)$/i
+const downloadPathHint = /(?:^|[/_.-])(?:download|downloads|export|exports)(?:$|[/_.-])/i
+const importRouteHint = /(?:^|[/_.-])(?:import|imports|feeds?|upload|uploads|parse|xml|saml|soap|svg|rss|wsdl|manifests?|descriptor|labels?|backups?|archives?)(?:$|[/_.-])/i
+const urlRouteHint = /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhooks?|hooks?|callbacks?|integrations?|connectors?|proxy|proxies|fetch|remote|links?)(?:$|[/_.-])/i
+const commandRouteHint = /(?:^|[/_.-])(?:diag|diagnostics?|exec|execute|shell|commands?|ping|resolve|whois|nslookup|exports?|archives?|backups?|reports?)(?:$|[/_.-])/i
+const numericParam = /(?:^|_)(?:id|uid|ref|count|qty|quantity|limit|offset|page|since|amount|price|total|num|number)$/i
+const maxInferredParamGroups = 12
+const maxBrowserPageHypotheses = 4
+
+function fileNamesFor(path: string): string[] {
+  if (/(?:^|[/_.-])(?:logs?|journals?|audit|stream|view)(?:$|[/_.-])/i.test(path)) return ['file', 'logFile', 'name']
+  if (/(?:receipt|invoice|statement|label|manifest|export|report)/i.test(path)) return ['file', 'document', 'name']
+  return ['path', 'file', 'name']
+}
+
+function urlNamesFor(path: string): string[] {
+  if (/(?:avatar|image|photo|logo|picture|thumbnail|media)/i.test(path)) return ['avatarUrl', 'imageUrl', 'src', 'pictureUrl', 'source']
+  if (/(?:webhook|hook|callback)/i.test(path)) return ['url', 'callbackUrl', 'endpoint']
+  if (/(?:integration|connector|fetch|proxy|remote|link)/i.test(path)) return ['url', 'endpoint', 'target']
+  return ['url', 'target', 'endpoint']
+}
+
+function commandNamesFor(path: string): string[] {
+  if (/(?:export|archive|backup|report|download|label|manifest)/i.test(path)) return ['name', 'filename', 'file', 'label', 'title', 'path']
+  return ['host', 'target', 'command', 'cmd', 'endpointHost']
+}
+
+/** Query candidates for a GET whose surface exposed no parameters. */
+export function inferredQueryParams(ep: DiscoveredEndpoint): InferredParam[] {
+  const path = ep.path.split('?')[0]
+  const segs = path.split('/').filter(Boolean)
+  const last = segs[segs.length - 1] ?? ''
+  const out: InferredParam[] = []
+  const push = (purpose: InferredPurpose, names: string[]) => {
+    for (const name of names) out.push({ name, location: 'query', isObjectId: false, isCsrf: false, purpose })
+  }
+  if (searchRouteHint.test(path) || searchSeg.test(last)) push('search', ['q', 'query', 'term', 'keyword'])
+  else if (fileServeSeg.test(last) || downloadPathHint.test(path)) {
+    // Plain collection routes (`/assets`, `/logs`) do not take a file name; only serving-shaped
+    // routes and download/export paths do. This keeps the 17-request traversal oracle focused.
+    const collectionOnly = /s$/i.test(last) && !downloadPathHint.test(path) && !/(?:downloads?|exports?|serve|view)/i.test(path)
+    if (!collectionOnly) push('file', fileNamesFor(path))
+  }
+  return out.slice(0, 4)
+}
+
+/** Body candidates for a write whose surface exposed no JSON/form fields. */
+export function inferredBodyParams(ep: DiscoveredEndpoint): InferredParam[] {
+  const path = ep.path.split('?')[0]
+  const segs = path.split('/').filter(Boolean)
+  const last = segs[segs.length - 1] ?? ''
+  const out: InferredParam[] = []
+  const push = (purpose: InferredPurpose, names: string[]) => {
+    for (const name of names) out.push({ name, location: 'json', isObjectId: false, isCsrf: false, purpose })
+  }
+  if (urlRouteHint.test(path)) push('url', urlNamesFor(path))
+  else if (commandRouteHint.test(path)) push('command', commandNamesFor(path))
+  else if (searchRouteHint.test(path) || /^(?:run|filter|search|query)$/i.test(last)) {
+    push('search', ['filter', 'expr', 'clause', 'q', 'query', 'term', 'since'])
+  }
+  return out.slice(0, 4)
+}
+
+/** XML import-shaped mutating routes: the body itself is the probe surface (no parameter needed). */
+export function isXmlImportRoute(ep: DiscoveredEndpoint): boolean {
+  return ep.method.toUpperCase() !== 'GET' && importRouteHint.test(ep.path.split('?')[0])
+}
+
 /** True for concrete path segments that look like resource identifiers (not route words). */
 export function looksLikeIdSegment(seg: string): boolean {
   // Prefixed ids are a short prefix + separator + a value that contains a digit (`p_acme_1`,
@@ -190,7 +269,19 @@ function secondOrderReadPaths(writePath: string, getPaths: readonly string[]): s
       if (lastPathSegment(p) === tail) out.add(p)
     }
   }
-  const segs = writePath.split('/').filter(Boolean)
+  const segs = writePath.split('?')[0].split('/').filter(Boolean)
+  // Routes nested under the written resource: a project description renders on the project card,
+  // ticket notes render in the ticket view, orders appear on receipts. The resource anchor is the
+  // path up to and including its last identifier segment (or the collection itself for create routes).
+  const lastIdIdx = (() => {
+    for (let i = segs.length - 1; i >= 0; i -= 1) if (placeholderSeg.test(segs[i])) return i
+    return -1
+  })()
+  const anchor = lastIdIdx >= 0 ? `/${segs.slice(0, lastIdIdx + 1).join('/')}` : `/${segs.join('/')}`
+  for (const p of getPaths) {
+    if (p === writePath) continue
+    if (p.startsWith(`${anchor}/`) && !/\.(?:js|css|json|xml)$/i.test(p)) out.add(p)
+  }
   for (let drop = 1; drop < Math.min(3, segs.length); drop += 1) {
     const variant = `/${segs.slice(drop).join('/')}`
     if (getPaths.includes(variant)) out.add(variant)
@@ -199,7 +290,9 @@ function secondOrderReadPaths(writePath: string, getPaths: readonly string[]): s
     .filter(p => p !== writePath || getPaths.includes(p))
     .sort((a, b) => {
       const api = (p: string) => (/^\/api\//i.test(p) ? 1 : 0)
-      return api(a) - api(b) || a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length || a.localeCompare(b)
+      // Prefer HTML-rendering read routes (view/render/card/page/preview) over raw JSON.
+      const render = (p: string) => (/\/(?:view|render|card|page|preview|show|display|html)(?:\/|$)/i.test(p) ? -1 : 0)
+      return render(a) - render(b) || api(a) - api(b) || a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length || a.localeCompare(b)
     })
     .slice(0, 3)
 }
@@ -221,13 +314,24 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   let csrfHypotheses = 0
   let webhookHypotheses = 0
   let redirectHypotheses = 0
+  let inferredGroups = 0
+  const pageCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
+  const inferredPurpose = (p: DiscoveredParam): InferredPurpose | undefined => (p as InferredParam).purpose
 
   for (const ep of endpoints) {
     const method = ep.method.toUpperCase()
     const isGet = method === 'GET' || method === 'HEAD'
     const pathHasPlaceholder = hasPathPlaceholder(ep.path)
     const params = ep.params.filter(p => !p.isCsrf && p.location !== 'cookie')
-    const injectParams = params.filter(p => !protocolParam.test(p.name)).slice(0, maxInjectionParamsPerEndpoint)
+    // Routes whose names the surface never exposed (server-rendered pages, path-only API listings)
+    // still get semantically plausible candidates; each one is confirmed or discarded by the probe.
+    const inferred: InferredParam[] = []
+    if (isGet && !params.some(p => p.location === 'query')) inferred.push(...inferredQueryParams(ep))
+    if (!isGet && !params.some(p => p.location === 'json' || p.location === 'form')) inferred.push(...inferredBodyParams(ep))
+    const allowInferred = caps.newProbeClasses && inferredGroups < maxInferredParamGroups
+    const effectiveParams: DiscoveredParam[] = [...params, ...(allowInferred ? inferred : [])]
+    if (allowInferred && inferred.length > 0) inferredGroups += 1
+    const injectParams = effectiveParams.filter(p => !protocolParam.test(p.name)).slice(0, maxInjectionParamsPerEndpoint)
     const readPaths = !isGet ? secondOrderReadPaths(ep.path, getPaths) : []
     const idParam = params.find(p => p.isObjectId || idName.test(p.name))
     // A write that carries an object id can surface the stored marker on any read page that renders a
@@ -241,6 +345,19 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         .slice(0, 3)
       : []
     const storedReads = [...new Set([...readPaths, ...templatedReads])].slice(0, 3)
+
+    // Parameterless rendered pages: a page that ships interactive controls can carry a DOM sink even
+    // when no query parameter was ever discovered. The browser check itself bails unless the page
+    // really contains a fillable input plus a button/JS sink, so this stays a cheap, bounded probe.
+    const pageEligible = caps.newProbeClasses && isGet && !pathHasPlaceholder && params.length === 0 &&
+      !/\.(?:json|js|mjs|css|xml|txt|map|svg|ico|png|jpe?g|gif|webp|woff2?)$/i.test(ep.path.split('?')[0]) &&
+      !/\.well-known\//i.test(ep.path) && !graphqlPath.test(ep.path) &&
+      ep.path.split('?')[0].split('/').filter(Boolean).length <= 2
+    if (pageEligible) {
+      const p = ep.path.split('?')[0]
+      const score = p === '/' ? 0 : /(?:page|view|profile|account|settings|form|wizard|dashboard|home|search|edit|new|create|preview|comments?|reports?|shop|store)/i.test(p) ? 1 : 2
+      pageCandidates.push({ ep, score })
+    }
 
     // Object-level authorization: id-bearing paths or id-named parameters. Framework RPC ids are
     // not resource identifiers, so placeholder action routes are handled by the server-action probe.
@@ -264,21 +381,34 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         continue
       }
       const location = p.location as SurfaceParamLocation
+      const purpose = inferredPurpose(p)
       const pMethod: Hypothesis['method'] = location === 'query' || location === 'path' || location === 'header' ? (isGet ? 'GET' : writeMethod(ep)) : writeMethod(ep)
-      add({ endpoint: ep, probeClass: 'sqli_boolean', param: p, location, method: pMethod })
-      if (caps.timeDiff) add({ endpoint: ep, probeClass: 'sqli_time_diff', param: p, location, method: pMethod })
+      const isSearch = purpose === 'search' || /^(?:q|query|term|keyword|filter|expr|clause|since)$/i.test(p.name)
+      const isFile = purpose === 'file'
+      const isUrl = purpose === 'url' || urlName.test(p.name)
+      const isCommand = purpose === 'command' || shellParam.test(p.name)
+      const isQuantity = purpose === 'quantity'
+      const isIdLike = idName.test(p.name) || p.isObjectId
+      if (!isFile && !isUrl && !isCommand && !isQuantity) {
+        add({ endpoint: ep, probeClass: 'sqli_boolean', param: p, location, method: pMethod })
+        // Time-based confirmation is slow; keep it for query/body sinks and skip path/header/XML ids.
+        const timeEligible = location === 'query' || location === 'json' || location === 'form' || location === 'graphql_var'
+        if (caps.timeDiff && timeEligible && (purpose ? (isSearch || numericParam.test(p.name)) : true)) {
+          add({ endpoint: ep, probeClass: 'sqli_time_diff', param: p, location, method: pMethod })
+        }
+      }
       if (location === 'xml' || xmlPath.test(ep.path)) {
         if (caps.newProbeClasses) add({ endpoint: ep, probeClass: 'xxe_canary', param: p, location, method: writeMethod(ep) })
       }
-      if (caps.newProbeClasses && (shellParam.test(p.name) || shellPath.test(ep.path)) && !idName.test(p.name)) {
+      if (caps.newProbeClasses && isCommand && !isIdLike) {
         add({ endpoint: ep, probeClass: 'command_injection', param: p, location, method: pMethod })
       }
-      if (idName.test(p.name) || p.isObjectId) continue
+      if (isIdLike) continue
       // Template evaluation only matters for text-ish sinks; probing every parameter burns budget.
-      if (templateishParam.test(p.name) || (isGet && location === 'query' && p.name.length <= 12)) {
+      if (!isFile && !isUrl && !isCommand && !isQuantity && (templateishParam.test(p.name) || (isGet && location === 'query' && p.name.length <= 12))) {
         add({ endpoint: ep, probeClass: 'ssti_math', param: p, location, method: pMethod })
       }
-      if (caps.newProbeClasses) {
+      if (caps.newProbeClasses && !isFile && !isCommand && !isQuantity) {
         add({
           endpoint: ep, probeClass: 'xss_context', param: p, location, method: pMethod,
           ...(!isGet && (location === 'json' || location === 'form' || location === 'xml') && storedReads.length > 0
@@ -287,14 +417,17 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
           ...(isGet && !pathHasPlaceholder && location === 'query' ? { browserEligible: true, urlDomSink: true } : {}),
         })
       }
-      if (urlName.test(p.name)) {
+      if (isUrl) {
         add({ endpoint: ep, probeClass: 'ssrf_canary', param: p, location, method: pMethod, ...(!isGet ? { secondOrderSsrf: true } : {}) })
+      }
+      if (isQuantity && !isGet) {
+        add({ endpoint: ep, probeClass: 'workflow_invariant', param: p, location, method: pMethod, quantityField: p.name })
       }
     }
 
     // Traversal needs a genuine file/path parameter; path-shape probing alone cannot prove a jail escape.
-    const fileP = params.find(p => fileParam.test(p.name) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
-    if (isGet && fileP && !hasPathPlaceholder(ep.path)) {
+    const fileP = effectiveParams.find(p => (inferredPurpose(p) === 'file' || fileParam.test(p.name)) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
+    if (isGet && fileP) {
       add({ endpoint: ep, probeClass: 'path_traversal_benign', param: fileP, location: fileP.location as SurfaceParamLocation, method: 'GET' })
     }
     if (graphqlPath.test(ep.path) || ep.source === 'graphql') {
@@ -358,8 +491,12 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       if (!pathHasPlaceholder && caps.authMutation && (isGet || method === 'POST') && (authishPath.test(ep.path) || oauthPath.test(ep.path))) {
         add({ endpoint: ep, probeClass: 'auth_protocol_audit', method: isGet ? 'GET' : 'POST' })
       }
-      if (xmlPath.test(ep.path) && !isGet && !params.some(p => p.location === 'xml')) {
-        add({ endpoint: ep, probeClass: 'xxe_canary', method: writeMethod(ep) })
+      if ((xmlPath.test(ep.path) || isXmlImportRoute(ep)) && !isGet && !params.some(p => p.location === 'xml')) {
+        const key = `xxe_canary|${ep.path}`
+        if (!writeProbeSeen.has(key)) {
+          writeProbeSeen.add(key)
+          add({ endpoint: ep, probeClass: 'xxe_canary', method: writeMethod(ep) })
+        }
       }
 
       // CSRF state-change: a session-authenticated mutation whose read route exposes the field.
@@ -419,6 +556,14 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     for (const ep of ranked.slice(0, maxCacheEndpoints)) {
       add({ endpoint: ep, probeClass: 'cache_poison_deception', method: 'GET' })
     }
+    // Rendered pages without a discovered parameter: arm the persisted browser only for the most
+    // page-like candidates (root, profile/wizard/search-shaped, then shortest paths).
+    const pages = [...pageCandidates]
+      .sort((a, b) => a.score - b.score || a.ep.path.length - b.ep.path.length || a.ep.path.localeCompare(b.ep.path))
+      .slice(0, maxBrowserPageHypotheses)
+    for (const { ep } of pages) {
+      add({ endpoint: ep, probeClass: 'xss_context', method: 'GET', browserEligible: true })
+    }
   }
   const prioritized = hypotheses
     .map((h, i) => ({ h, i }))
@@ -468,7 +613,14 @@ export interface ProbeEnv {
 }
 
 /** Target-observed context (baseline value, XML/GraphQL shape, seed query) resolved for a hypothesis. */
-export interface ResolvedContext { baseline?: string; xmlTemplate?: string; graphqlQuery?: string; seedQuery?: string }
+export interface ResolvedContext {
+  baseline?: string
+  xmlTemplate?: string
+  graphqlQuery?: string
+  seedQuery?: string
+  /** For an inferred parameter name: true/false once a differential proved whether the app reads it. */
+  paramActive?: boolean
+}
 
 export interface HypothesisOutcome {
   hyp: Hypothesis
@@ -773,6 +925,62 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
 
 const sqliClasses = new Set<string>(['sqli_boolean', 'sqli_time_diff'])
 
+/**
+ * Real values observed on the target's own collection routes, for search/filter baselines. A
+ * LIKE-wrapped sink only yields a boolean differential when the baseline actually matches rows, and
+ * generic terms may match nothing; the first record's own label always matches its own search.
+ */
+async function harvestedSeedValues(h: Hypothesis, env: ProbeEnv): Promise<string[]> {
+  const endpoints = env.endpoints ?? []
+  const segs = h.endpoint.path.split('?')[0].split('/').filter(Boolean)
+  if (segs.length < 2) return []
+  const apiRoot = `/${segs[0]}`
+  const skipped = /^(?:session|csrf|health|settings|me|app-config|login|logout|token|graphql|search|query|filter|lookup|audit|stats|metrics)$/i
+  const candidates = endpoints
+    .filter(e => e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && e.path !== h.endpoint.path)
+    .filter(e => {
+      const parts = e.path.split('?')[0].split('/').filter(Boolean)
+      return e.path.startsWith(`${apiRoot}/`) && parts.length >= 2 && parts.length <= 3 &&
+        !skipped.test(parts[parts.length - 1]) && !/\.(?:js|css|json|xml|txt)$/i.test(e.path)
+    })
+    .sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path))
+    .slice(0, 2)
+  const out: string[] = []
+  const pushValue = (value: string): void => {
+    if (out.length >= 4) return
+    const trimmed = value.trim()
+    // Prefer a broad token (first word) so the baseline matches a set of rows, not one exact row:
+    // a one-row true branch scores too close to the baseline for an echo-heavy JSON response.
+    const broad = trimmed.split(/\s+/)[0] ?? ''
+    if (broad.length >= 3 && broad.length <= 32 && !/[<>{}\\\u0000-\u001f]/.test(broad)) out.push(broad)
+    if (trimmed.length >= 3 && trimmed.length <= 48 && trimmed !== broad && !/[<>{}\\\u0000-\u001f]/.test(trimmed)) out.push(trimmed)
+  }
+  for (const ep of candidates) {
+    try {
+      const ex = await env.broker.executeHttp({
+        origin: env.origin, method: 'GET', pathAndQuery: ep.path, persona: env.owner, followRedirects: false, timeoutMs: 8_000,
+      }, env.grant, env.signal)
+      if (ex.status < 200 || ex.status >= 300) continue
+      const parsed = JSON.parse(ex.body) as unknown
+      const walk = (node: unknown, depth: number): void => {
+        if (depth > 4 || !node || out.length >= 3) return
+        if (Array.isArray(node)) { for (const item of node.slice(0, 5)) walk(item, depth + 1); return }
+        if (typeof node !== 'object') return
+        for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+          if (out.length >= 3) return
+          if (typeof value === 'string' && /^(?:name|title|label|slug|subject|description|email|text)$/i.test(key) &&
+              value.length >= 3 && value.length <= 48 && !/[<>{}\\]/.test(value)) {
+            pushValue(value)
+          } else if (value && typeof value === 'object') walk(value, depth + 1)
+        }
+      }
+      walk(parsed, 0)
+    } catch { /* collection may be absent or non-JSON */ }
+    if (out.length > 0) break
+  }
+  return out
+}
+
 async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedContext> {
   const cache = (env.ctxCache ??= new Map())
   // Probe class is part of the key: different classes on the same endpoint need different context
@@ -792,8 +1000,43 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
     const seed = mineSeedQuery(corpus, h.endpoint.path.split('?')[0])
     if (seed) ctx.seedQuery = seed
   }
+  const inferredPurpose = (h.param as InferredParam | undefined)?.purpose
+  if (h.param && inferredPurpose && inferredPurpose !== 'file' && inferredPurpose !== 'quantity' &&
+      (h.location === 'query' || h.location === 'json' || h.location === 'form')) {
+    // The name was inferred, not observed. A request with the candidate and a request with a random
+    // parameter name decide cheaply whether the app reads this name at all before the full matrix runs.
+    const body = siblingBody(h, env)
+    const sendFor = async (name: string, value: string): Promise<BrokerExchangeResult | null> => {
+      try {
+        const inj = injectUniversalParam({
+          pathAndQuery: probePathFor(h), param: name, paramLocation: h.location!, value, method: h.method,
+          ...(h.location === 'json' && body ? { jsonBody: body } : {}),
+          ...(h.location === 'form' && body ? { formBody: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v)])) } : {}),
+          ...(env.caps.sessionAndCsrf ? { session: env.session, csrfBind: needsCsrf(h) ? true : undefined } : {}),
+        })
+        return await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...inj }, env.grant, env.signal)
+      } catch { return null }
+    }
+    const fake = await sendFor(`gxprobe${shortToken(5)}`, 'gxprobe')
+    if (fake) {
+      const values = inferredPurpose === 'url' ? ['http://guardian-control.invalid/'] : ['a', 'test', 'gxprobe']
+      ctx.paramActive = false
+      for (const value of values) {
+        const ex = await sendFor(h.param.name, value)
+        if (ex && (ex.status !== fake.status || responseSimilarity(ex.body, fake.body) < 0.97)) { ctx.paramActive = true; break }
+      }
+    }
+    if (ctx.paramActive === false) return ctx
+  }
   if (h.param && sqliClasses.has(h.probeClass)) {
-    const candidates = mineBaselines(corpus, h.param.name, h.endpoint.path).slice(0, 5)
+    const mined = mineBaselines(corpus, h.param.name, h.endpoint.path)
+    const searchish = inferredPurpose === 'search' || /^(?:q|query|term|keyword|filter|expr|clause|since)$/i.test(h.param.name) ||
+      /(?:search|lookup|filter|query|find)/i.test(h.endpoint.path)
+    // A matching value read from the target's own collection beats a generic term: a LIKE sink only
+    // differentiates when the baseline row set is non-empty.
+    const observed = searchish ? await harvestedSeedValues(h, env) : []
+    const seeds = searchish ? ['a', '0', '1', 'test'] : []
+    const candidates = [...new Set([...observed, ...mined, ...seeds])].slice(0, 8)
     if (candidates.length > 0) {
       const body = siblingBody(h, env)
       const send = async (value: string): Promise<BrokerExchangeResult | null> => {
@@ -925,12 +1168,18 @@ async function runSecondOrderCheck(
   result.requests += 1
   if (writeEx) watch(writeEx)
   result.details.writeStatus = writeEx?.status ?? null
+  // A create-style write returns the new object id; the downstream page needs that exact object.
+  const createdIds = writeEx && writeEx.status >= 200 && writeEx.status < 300
+    ? idShaped(harvestJson(writeEx.body).ids)
+    : []
+  const concretePlantPath = injected.pathAndQuery.split('?')[0]
 
   const reads: Array<Record<string, unknown>> = []
   const reflectedOnly: Array<Record<string, unknown>> = []
   // Templated read pages are filled with ids observed on the surface (and the value used for an
   // id-bearing write field), so a stored marker is looked up on the object it was attached to.
   const fillIds = [
+    ...createdIds,
     ...h.endpoint.params.filter(p => idName.test(p.name) && body && typeof body[p.name] === 'string').map(p => String(body![p.name])),
     ...(await idPool(env)),
   ]
@@ -968,10 +1217,19 @@ async function runSecondOrderCheck(
       mediaType: analysis.mediaType, exploitable: analysis.exploitable,
     })
     if (analysis.exploitable) {
+      // A create-only write returns an id the replay spec cannot reference (the stored-XSS
+      // synthesizer replays the observed read path verbatim), so only stable listing reads or
+      // updates to an existing object are submitted.
+      const createOnly = h.method === 'POST' && !hasPathPlaceholder(h.endpoint.path)
+      const idSpecificRead = hasPathPlaceholder(readPath) || readPath.split('?')[0].split('/').some(s => s && looksLikeIdSegment(s))
+      if (createOnly && idSpecificRead) {
+        result.details.storedOnNewObject = { readPath, context: analysis.context }
+        continue
+      }
       result.hit = true
       result.anomalies.push({
         type: 'second_order_xss',
-        plantPath: h.endpoint.path,
+        plantPath: concretePlantPath,
         plantParam: param.name,
         plantLocation: h.location,
         readPath,
@@ -1407,6 +1665,12 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   // are available to the broker's csrfBind injection.
   if (h.method !== 'GET') out.requests += await primeSessionOnce(h, env)
 
+  // Path/query traversal on a templated route: resolve the route to a real object first, and record
+  // that concrete path on the hypothesis so the replay spec addresses the same object.
+  if (h.probeClass === 'path_traversal_benign' && hasPathPlaceholder(h.endpoint.path)) {
+    const ids = await idPool(env, h.endpoint.path)
+    if (ids.length > 0) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(ids[0]))
+  }
   if (h.probeClass === 'race_burst') {
     const race = await runRaceCheck(h, env, watch)
     out.requests += race.requests
@@ -1438,6 +1702,11 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
 
   const ctx = await resolveContext(h, env)
   out.ctx = ctx
+  if (ctx.paramActive === false) {
+    out.verdict = 'no_signal'
+    out.summary = 'Inferred parameter name does not affect the response (not read by the endpoint).'
+    return out
+  }
   let req: ProbeDifferentialRequest
   switch (h.probeClass) {
     case 'authz_matrix': {
@@ -1465,6 +1734,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     case 'workflow_invariant': {
       req = buildProbeRequest(h, env)
       delete req.param; delete req.paramLocation
+      if (h.quantityField) req.quantityField = h.quantityField
       if (h.createPath) {
         req.createPath = h.createPath
         req.producerBody = h.producerBody ?? {}
@@ -1496,6 +1766,10 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = buildProbeRequest(h, env)
       req.method = h.method
       req.pathAndQuery = writePath
+      const csrfBodyLocations = new Set(h.endpoint.params.filter(p => !p.isCsrf).map(p => p.location))
+      // Try the encoding the surface advertised first, then the other one: some routes declare
+      // JSON fields while their handler only parses form bodies (and vice versa).
+      req.bodyEncodings = csrfBodyLocations.has('form') && !csrfBodyLocations.has('json') ? ['form', 'json'] : ['json', 'form']
       req.readPathCandidates = [...new Set([
         ...(readTemplate ? [readTemplate] : []),
         ...(collection ? [collection] : []),
