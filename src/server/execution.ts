@@ -2850,23 +2850,30 @@ export class Execution {
     this.deterministicInFlight.add(key)
     void this.runDeterministicInvestigation(run)
       .catch(error => {
-        const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
-        this.storage.event(run.id, 'deterministic_probes.failed', `Deterministic probe pass failed: ${msg}`)
+        try {
+          const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+          this.storage.event(run.id, 'deterministic_probes.failed', `Deterministic probe pass failed: ${msg}`)
+        } catch { /* store closed or run removed */ }
       })
       .finally(() => {
         this.deterministicInFlight.delete(key)
         this.deterministicCompleted.add(key)
-        const latest = this.storage.run(run.id)
-        if (latest.status === 'running' && latest.phase === 'investigation') {
-          this.storage.event(
-            latest.id,
-            'deterministic_probes.complete',
-            'Deterministic probe pass complete. Advancing to Zero-LLM verification.',
-            { reuse: key },
-          )
-          this.advanceToVerification(latest)
-        }
-        this.scheduleWake()
+        // The store may already be closed (test teardown / run deletion); never let cleanup throw.
+        try {
+          const latest = this.storage.run(run.id)
+          if (latest.status === 'running' && latest.phase === 'investigation') {
+            this.storage.event(
+              latest.id,
+              'deterministic_probes.complete',
+              'Deterministic probe pass complete. Advancing to Zero-LLM verification.',
+              { reuse: key },
+            )
+            this.advanceToVerification(latest)
+          }
+        } catch { /* store closed or run removed */ }
+        try {
+          this.scheduleWake()
+        } catch { /* scheduler already stopped */ }
       })
   }
 
