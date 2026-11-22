@@ -2,7 +2,7 @@
 
 **Status:** IN PROGRESS — v5 is not released. This page is the rolling evidence record for the M0–M6 line; it is updated as streams merge.
 
-**Snapshot:** 2026-11-22, base `main` @ `175a0a1` (merge recon2 tech-tags wiring), docs branch `agents/docs-v5`.
+**Snapshot:** 2026-11-22, base `main` @ `edcc7f1` (includes `5b4b625`, M2 complete, and the paired realism runs), docs branch `agents/docs-v5`.
 **Plan:** [plans/ROADMAP-v5.md](plans/ROADMAP-v5.md) · [plans/v5.md](plans/v5.md)
 **Prior release:** [VERIFICATION-v4.md](VERIFICATION-v4.md) (v4/M7 closed at 25/25 XBEN, 20/20 held-out, 20/20 patches)
 **Handover:** [HANDOVER-v5.md](HANDOVER-v5.md)
@@ -26,7 +26,7 @@ The surfaces below are reported separately and are **not comparable to each othe
 | :--- | :--- | :--- |
 | `benchmarks/xben-25` | Fixed dev suite used for recall hill-climbing | 25 targets, 0 decoys |
 | `local-lab/held-out-saas` | Anti-overfitting + patch retest | 20 vulns + 6 hard decoys |
-| `benchmarks/realistic-bench` | Multi-tenant realism, dev + salted held-out seeds | 3 apps, 172/171 dev/held-out targets, 6–8 decoys per seed |
+| `benchmarks/realistic-bench` | Multi-tenant realism, paired dev + salted held-out seeds | 3 apps, 172/171 dev/held-out targets, 6–8 decoys per seed |
 | Agentic `Execution` baseline | Real LLM worker loop on realistic apps | 1 app/seed per run, wall-clock capped |
 
 “Confirmed” means a Zero-LLM `ReplayVerifier` reached `confirmed` / `runtime_confirmed`. LLM output is a hypothesis only.
@@ -35,23 +35,23 @@ The surfaces below are reported separately and are **not comparable to each othe
 
 ## 2. Release gates (v5 target vs current)
 
-Targets are copied from the roadmap header; current values are re-derived in §4 unless marked.
+Targets are copied from the roadmap header; current values are re-derived in §4 unless marked. **Held-out/dev parity uses the absolute percentage-point definition: within 10 percentage points.**
 
 | # | Gate | v5 target | Current v5 evidence | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | G1 | XBEN-25 recall | ≥ 23/25 | **24/25 (96%)**, 0 FP | **MET** |
 | G2 | Held-out SaaS recall | ≥ 18/20 | **20/20 (100%)**, 6/6 decoys clean | **MET** |
 | G3 | Held-out patch retest | ≥ 14/20 fixed | **20/20 fixed** (18 clean dismissals, 2 inconclusive counted fixed) | **MET, with caveat** |
-| G4 | Realistic H/C recall — grey-box | ≥ 65% | **16/117 = 13.7%** (all severities: 20/172 = 11.6%) | **NOT MET** |
+| G4 | Realistic H/C recall — grey-box | ≥ 65% | **16/117 = 13.7%** (all severities: **24/172 = 14.0%**) | **NOT MET** |
 | G5 | Realistic H/C recall — white-box | ≥ 80% | not measured | **NOT MEASURED** |
-| G6 | Precision | ≥ 95% | dev **100%** (20/20), held-out **100%** (15/15) | **MET** (small denominators) |
+| G6 | Precision | ≥ 95% | dev **100%** (24/24), held-out **100%** (26/26) | **MET** (small denominators) |
 | G7 | Decoy FP rate | ≤ 5% | **0/62** dev, **0/63** held-out | **MET** |
 | G8 | Chain completion | ≥ 50% | **0/6** dev, **0/6** held-out; XBEN `browser_chain` missed | **NOT MET** |
-| G9 | Held-out within 10% of dev | ≤ 10% | 11.63% dev vs 8.77% held-out: **−2.86 pp / −24.6% relative** | **NOT MET** (strict relative reading; see §6) |
-| G10 | Gate suites | 100% pass, 0 skips | v5 suites **124/124**; realistic harness **142/142**; Board **14/14** + Playwright **1/1** | **MET** for the run set |
-| G11 | Orphan containers/networks | 0 / 0 | **51 created assignment containers, 0 running, 0 run containers, 0 networks** | **NOT MET** |
+| G9 | Held-out within 10 pp of dev | ≤ 10 pp absolute | dev **13.95%** vs held-out **15.20%** = **+1.25 pp (≈ +1.2 pp)** | **MET** |
+| G10 | Gate suites | 100% pass, 0 skips | v5 suites **149/149**; harness **142/142**; Board **14/14** + tools **15/15** + Playwright **1/1** | **MET** for the run set |
+| G11 | Orphan containers/networks | 0 / 0 | **51 leaked `Created` containers found; 50 stale removed**; re-check 0 `Created`, 2 running, 0 networks | **FIX IN PROGRESS** |
 
-**Scorecard:** 5 met, 1 met-with-caveat, 4 not met (G4, G8, G9, G11), 1 not measured (G5). The release is blocked by G4, G5, G8, G9 and container hygiene; G1 is above target but below v4 parity (see §5).
+**Scorecard:** 6 met, 1 met-with-caveat, 2 not met (G4, G8), 1 not measured (G5), 1 fix in progress (G11). The principal release blockers are G4, G5 and G8; container-lifecycle remediation is owned by the gate stream.
 
 ---
 
@@ -59,13 +59,13 @@ Targets are copied from the roadmap header; current values are re-derived in §4
 
 | # | Scope | Status at snapshot | Owner / worktree | Primary commits | What remains |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **M0** | True E2E `realistic-bench` harness, baseline, CLI | **DONE** (deterministic baseline; agentic run requires a model profile) | `m5-m0` / `agents/m0` | `ac5cebd` harness, `795f7c6` per-cell isolation, `36998da` inert-run preflight | Re-baseline after M1–M3; keep baseline artifacts out of `/tmp` |
-| **M1** | P0 wiring: broker/browser args, canaries, dedupe, routing, verify feedback, guard/sanitizer, CVE semver | **DONE** (merged) | `m5-m1-core`, `m5-m1-static` | merge `5dae946`; static `0fd8a9d`; XBEN recovery `4ad4078` | Restore the one XBEN regression vs v4 parity (`xben-16`) |
-| **M2** | State graph, recon, auth/session | **PARTIAL** — 2.2/2.3/2.4 done; **2.1 in flight** | `m7-spa`, `m5-m2-auth`, `m5-m2-state` | merge `51d3b5a`; auth `476e03c`; XHR routes `a747d6e` | 2.1 acceptance: endpoint-param/dependency consumers, coverage updates, cross-persona ID harvest, per-resource budget |
-| **M3** | Real-world probes & verifiers: CSRF state change, webhook forgery, open redirect, write-BOLA, race, noise | **RUNNING** | `m5-m3-probes` | merge `5aa897c`; probes `db9b822` | Finish race/setup and business-logic invariants; dedicated acceptance suite; verify on decoys |
-| **M4** | Templates, multi-framework AST, SAST→DAST, Patch Gate 6 | **DONE** (merged; live execution/recon wiring partly landed) | `m5-m4` / `agents/m4` | merge `c19e98a`; corpus `05f2e39`; wiring `e3202d7`, `0797d70` | More modern CVE coverage; keep appliance templates off modern-stack targets |
-| **M5** | Swarm Message Board + Board UI | **PHASE 1 DONE**; Phase 1b/2/3 pending | `m5-board` / `agents/board-ui` | `4b41388`; merge `344d9b1`; workspace port `ca197a2` | Deterministic posters, warm specialists/handoffs, chain planning, compaction |
-| **M6** | Hill-climb, anti-overfitting, v5 gate | **IN PROGRESS** (this document) | `m5-docs2` / `agents/docs-v5` | `73b11c2` goal/gates | Reach G4/G5/G8/G9; re-run held-out after M1–M3; clean orphans; publish final gate |
+| **M0** | True E2E `realistic-bench` harness, baseline, CLI | **DONE** (deterministic baseline; agentic run requires a model profile) | `m5-m0` / `agents/m0` | `ac5cebd` harness, `795f7c6` per-cell isolation, `36998da` inert-run preflight | Re-baseline after M3/M6; keep baseline artifacts out of `/tmp` |
+| **M1** | P0 wiring: broker/browser args, canaries, dedupe, routing, verify feedback, guard/sanitizer, CVE semver | **DONE** (merged) | `m5-m1-core`, `m5-m1-static` | merge `5dae946`; static `0fd8a9d`; recon halt fix `4ad4078` | Restore the one XBEN regression vs v4 parity (`xben-16`) |
+| **M2** | State graph, recon, auth/session, coverage | **DONE** (merged; M2.1 acceptance 10/10) | `m7-spa`, `m5-m2-auth`, `agents/m2-state` | merge `198cdad`; `e111d29` endpoint graph/coverage/ID harvest; `476e03c` auth | Keep parity as recall rises; no open M2.1 item |
+| **M3** | Real-world probes/verifiers: CSRF, webhook forgery, open redirect, write-BOLA, race, noise | **IN PROGRESS** (probes + spec contracts merged) | `m5-m3-probes`, `specs2` | merge `5aa897c`; probes `db9b822`; contracts `769311c` | Finish race/setup and business-logic invariants; dedicated decoy-negative acceptance |
+| **M4** | Templates, multi-framework AST, SAST→DAST, Patch Gate 6 | **DONE** (merged; live wiring landed) | `m5-m4` / `agents/m4` | merge `c19e98a`; corpus `05f2e39`; wiring `e3202d7`, `0797d70` | More modern CVE coverage; keep appliance templates off modern-stack targets |
+| **M5** | Swarm Message Board, Board UI, board tools | **PHASE 1 + TOOLS DONE**; posters/wakeups in progress | `m5-board` / `agents/board-ui` | `4b41388`, `344d9b1`; workspace `ca197a2`; tools `b0b3cce`, merge `c019295` | Deterministic posters, warm wakeups/handoffs, chain planning, compaction |
+| **M6** | Hill-climb, anti-overfitting, v5 gate | **IN PROGRESS** (this document; agentic matrix added) | `m5-docs2` / `agents/docs-v5` | `73b11c2` goal/gates; `d54b463` agentic matrix | Reach G4/G5/G8; hold G9 parity; close G11; publish final gate |
 
 ---
 
@@ -73,24 +73,25 @@ Targets are copied from the roadmap header; current values are re-derived in §4
 
 ### 4.1 Build and suite gate
 
-Run on this worktree unless noted. `node_modules` was symlinked from the base checkout; host worker deps were linked for AST suites.
+Run on this worktree at `edcc7f1` unless noted. `node_modules` was symlinked from the base checkout; host worker deps were linked for AST suites.
 
 | Check | Command | Result | Notes |
 | :--- | :--- | :--- | :--- |
 | Typecheck | `npm run check` | **PASS (0 errors)** | re-run 2026-11-22 |
-| Production build | `npm run build` | **PASS** | client + SSR, `server.js` 1,742.80 kB |
-| v5 M0–M5 suites | `node --test --test-concurrency=1 tests/v5-*.test.ts` under the Docker group | **124 / 124 PASS, 0 skip** | without Docker: 123 pass + 1 skip (`M4-T9`, image unavailable) |
+| Production build | `npm run build` | **PASS** | client + SSR |
+| v5 M0–M5 suites | `node --test --test-concurrency=1 tests/v5-*.test.ts` under the Docker group | **149 / 149 PASS, 0 skip** | 124 → 149 with M2-state + board-tools |
 | Board unit/boundary | `node --test tests/v5-board-store.test.ts tests/v5-board-boundaries.test.ts` | **14 / 14 PASS** | 8 store + 6 boundary |
-| Board UI (Playwright) | `npx playwright test tests/guardian-v5-board.spec.ts --workers=1` | **1 / 1 PASS** (1.3 s) | requires `npm run build` first |
+| Board tools | `node --test tests/v5-m5-board-tools.test.ts` | **15 / 15 PASS** | board_post/read, deltas, warm lifecycle |
+| Board UI (Playwright) | `npx playwright test tests/guardian-v5-board.spec.ts --workers=1` | **1 / 1 PASS** | requires `npm run build` first |
 | realistic-bench harness | `node --test --test-concurrency=1 benchmarks/realistic-bench/tests/` | **142 / 142 PASS, 0 skip** | re-run |
 | realistic-bench typecheck | `tsc -p benchmarks/realistic-bench/tsconfig.json --noEmit` | **PASS** | re-run |
-| Docker orphans | `docker ps -aq --filter label=dev.guardian.assignment` | **51 created, 0 running** | run containers 0; networks 0; `guardian-worker:v4` present |
+| Docker orphans | `docker ps -a --filter label=dev.guardian.assignment` | **51 leaked `Created` found; 50 removed; 0 `Created` now** | re-check saw 2 running, 0 run containers, 0 networks |
 
-**Caveats:** the full v4 519-case matrix and Playwright v2/v4 specs were **not** re-run by this docs stream. The 51 created containers are stale objects from earlier worker/agentic runs; this snapshot did not remove them (docs stream is read-only outside `docs/`).
+**Caveats:** the full v4 519-case matrix and Playwright v2/v4 specs were **not** re-run by this docs stream. The 51 leaked containers were found by the docs pass; the gate stream removed 50 stale objects. Two running assignment containers were present at re-check and may belong to active work; lifecycle enforcement is still in progress.
 
 ### 4.2 XBEN-25 — 24/25 (G1 met)
 
-Source: `/tmp/guardian-m7-bench/post-m1.json` (suite `xben-25`, `v4-full`, `local-jq`, not simulated).
+Source: `/tmp/opencode/xben-board.json` (suite `xben-25`, `v4-full`, `local-jq`, commit `198cdad`, not simulated).
 
 | Metric | Value |
 | :--- | ---: |
@@ -98,7 +99,7 @@ Source: `/tmp/guardian-m7-bench/post-m1.json` (suite `xben-25`, `v4-full`, `loca
 | Confirmed | **24** |
 | False positives | 0 |
 | Recall / precision | 96% / 100% |
-| Duration / cost | 86.4 s / $0.00 |
+| Duration / cost | 101.1 s / $0.00 |
 | Funnel | 25 → 25 surface → 24 hypothesis → 24 signal → 24 spec → 24 confirmed |
 | Only miss | `xben-16` (`browser_chain`), outcome `hypothesis_miss`, no probe class |
 
@@ -106,7 +107,7 @@ This is above the v5 ≥23 gate but **one below v4 parity** (25/25 at `9793d2d`)
 
 ### 4.3 Held-out SaaS — 20/20, patches 20/20 (G2/G3 met)
 
-Source: `/tmp/guardian-m7-bench/post-m1-heldout.json` (`held-out-saas`, `local-jq`).
+Source: `/tmp/guardian-m7-bench/m2-state-held.json` (`held-out-saas`, `local-jq`, M2-state line).
 
 | Metric | Value |
 | :--- | ---: |
@@ -115,7 +116,7 @@ Source: `/tmp/guardian-m7-bench/post-m1-heldout.json` (`held-out-saas`, `local-j
 | False positives | 0 |
 | Recall / precision | 100% / 100% |
 | Funnel | 20 → 20 → 20 → 20 → 20 → 20 |
-| Scan / patch retest duration | 140.6 s / 16.6 s |
+| Scan / patch retest duration | 140.9 s / 16.8 s |
 | Cost | $0.00 |
 
 Patch retest:
@@ -132,24 +133,24 @@ Patch retest:
 
 **Attribution caveat:** the all-patches verdict replays baseline-attributed specs (the artifact’s own note says a fresh pipeline pass is not used as patch evidence). `hos-04` / `hos-17` were `inconclusive` after patching and counted fixed under patch-retest semantics, not clean dismissals.
 
-### 4.4 realistic-bench dev matrix — 20/172 (G4/G6/G7)
+### 4.4 realistic-bench dev matrix — 24/172 (G4/G6/G7)
 
-Source: `/tmp/rb-post-m1/*.json` (9 scorecards; deterministic replay, `$0`, not agentic).
+Source: `/tmp/rb-m2-state/*.json` (9 scorecards; deterministic replay, `$0`, not agentic). Run report: **9 cells, ~100 s wall at concurrency 9**.
 
 | App | Seed | Confirmed / targets | Recall | Precision | Decoy FP | Unmatched FP | Chains |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| acme-saas | 1 | 2 / 22 | 9.1% | 100% | 0 | 0 | 0/0 |
-| acme-saas | 2 | 2 / 20 | 10.0% | 100% | 0 | 0 | 0/0 |
-| acme-saas | 42 | 3 / 22 | 13.6% | 100% | 0 | 0 | 0/1 |
+| acme-saas | 1 | 3 / 22 | 13.6% | 100% | 0 | 0 | 0/0 |
+| acme-saas | 2 | 3 / 20 | 15.0% | 100% | 0 | 0 | 0/0 |
+| acme-saas | 42 | 5 / 22 | 22.7% | 100% | 0 | 0 | 0/1 |
 | opsportal | 1 | 3 / 18 | 16.7% | 100% | 0 | 0 | 0/1 |
 | opsportal | 2 | 2 / 17 | 11.8% | 100% | 0 | 0 | 0/1 |
 | opsportal | 42 | 2 / 16 | 12.5% | 100% | 0 | 0 | 0/1 |
 | shopflow | 1 | 2 / 19 | 10.5% | 100% | 0 | 0 | 0/1 |
 | shopflow | 2 | 2 / 20 | 10.0% | 100% | 0 | 0 | 0/1 |
 | shopflow | 42 | 2 / 18 | 11.1% | 100% | 0 | 0 | 0/0 |
-| **Total** | | **20 / 172** | **11.63%** | **100%** | **0 / 62** | **0** | **0 / 6** |
+| **Total** | | **24 / 172** | **13.95%** | **100%** | **0 / 62** | **0** | **0 / 6** |
 
-Severity split: Critical **4/26 (15.4%)**, High **12/91 (13.2%)**, Medium 4/52, Low 0/3 → **H/C 16/117 = 13.7%** (G4 target 65%).
+Severity split: Critical **4/26 (15.4%)**, High **12/91 (13.2%)**, Medium 8/52, Low 0/3 → **H/C 16/117 = 13.7%** (G4 target 65%).
 
 Aggregate funnel and loss buckets:
 
@@ -159,38 +160,40 @@ Aggregate funnel and loss buckets:
 | Surface discovered | 139 (80.8%) |
 | Hypothesis formed | 132 |
 | Signal observed | **57 (33.1%)** |
-| Spec submitted / confirmed | 20 / **20** |
-| `replay_spec_miss` | 92 |
+| Spec submitted / confirmed | 24 / **24** |
+| `replay_spec_miss` | 90 |
 | `budget_exhausted` | 23 |
 | `surface_miss` | 16 |
-| `form_encoding_missing` | 10 |
+| `form_encoding_missing` | 8 |
 | `hypothesis_miss` | 8 |
 | `csrf_blocked` | 3 |
 
-Confirmed by class (top): BOLA 8/19, IDOR 6/8, BFLA 3/9, SSTI 1/5, OAuth 1/1, open redirect 1/6. **18 classes have zero confirmations**, including SQLi (0/7), SSRF (0/12), stored/reflected XSS (0/11), XXE (0/7), CSRF (0/7), webhook forgery (0/6), race (0/5), and command injection (0/5).
+Confirmed by class (top): BOLA 8/19, IDOR 6/8, BFLA 3/9, CSRF 2/7, webhook forgery 2/6, SSTI 1/5, OAuth 1/1, open redirect 1/6. **16 classes have zero confirmations**, including SQLi (0/7), SSRF (0/12), stored/reflected XSS (0/11), XXE (0/7), mass assignment (0/11), race (0/5), command injection (0/5), and GraphQL BOLA (0/3).
 
-**Precision definition:** `TP / (TP + decoyFP + unmatchedFP)`. The 100% value is over 20 emitted findings with zero decoy and zero unmatched FPs. It does not yet demonstrate precision at a high-recall operating point.
+**Precision definition:** `TP / (TP + decoyFP + unmatchedFP)`. The 100% value is over 24 emitted findings with zero decoy and zero unmatched FPs. It does not yet demonstrate precision at a high-recall operating point.
 
-### 4.5 realistic-bench held-out matrix — 15/171 (G9)
+### 4.5 realistic-bench held-out matrix — 26/171 (G9)
 
-Source: `/tmp/m7-specs2/rb-held/*.json` (9 salted scorecards, seeds `1000001/2/42`). This artifact predates the post-M1 dev run; it is the latest preserved held-out matrix, not a same-minute A/B.
+Source: `/tmp/rb-heldout-final/*.json` (9 salted scorecards, seeds `1000042/1/2`, salt from environment only). Paired with §4.4 on the same M2 line.
 
-| App | Seed | Confirmed / targets | Precision | Decoy FP | Unmatched FP | Chains |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| acme-saas | 1000001 | 2 / 22 | 100% | 0 | 0 | 0/0 |
-| acme-saas | 1000002 | 2 / 21 | 100% | 0 | 0 | 0/1 |
-| acme-saas | 1000042 | 2 / 22 | 100% | 0 | 0 | 0/1 |
-| opsportal | 1000001 | 1 / 16 | 100% | 0 | 0 | 0/1 |
-| opsportal | 1000002 | 1 / 16 | 100% | 0 | 0 | 0/1 |
-| opsportal | 1000042 | 2 / 17 | 100% | 0 | 0 | 0/1 |
-| shopflow | 1000001 | 2 / 18 | 100% | 0 | 0 | 0/0 |
-| shopflow | 1000002 | 2 / 20 | 100% | 0 | 0 | 0/1 |
-| shopflow | 1000042 | 1 / 19 | 100% | 0 | 0 | 0/0 |
-| **Total** | | **15 / 171** | **100%** | **0 / 63** | **0** | **0 / 6** |
+| App | Seed | Confirmed / targets | Recall | Precision | Decoy FP | Unmatched FP | Chains |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| acme-saas | 1000001 | 4 / 22 | 18.2% | 100% | 0 | 0 | 0/0 |
+| acme-saas | 1000002 | 4 / 21 | 19.0% | 100% | 0 | 0 | 0/1 |
+| acme-saas | 1000042 | 5 / 22 | 22.7% | 100% | 0 | 0 | 0/1 |
+| opsportal | 1000001 | 1 / 16 | 6.3% | 100% | 0 | 0 | 0/1 |
+| opsportal | 1000002 | 2 / 16 | 12.5% | 100% | 0 | 0 | 0/1 |
+| opsportal | 1000042 | 3 / 17 | 17.6% | 100% | 0 | 0 | 0/1 |
+| shopflow | 1000001 | 3 / 18 | 16.7% | 100% | 0 | 0 | 0/0 |
+| shopflow | 1000002 | 2 / 20 | 10.0% | 100% | 0 | 0 | 0/1 |
+| shopflow | 1000042 | 2 / 19 | 10.5% | 100% | 0 | 0 | 0/0 |
+| **Total** | | **26 / 171** | **15.20%** | **100%** | **0 / 63** | **0** | **0 / 6** |
 
-Severity: Critical 3/26, High 9/98 → **H/C 12/124 = 9.7%**. Funnel: 171 → 117 surface → 115 hypothesis → **44 signal** → 15 spec → 15 confirmed. Top buckets: `replay_spec_miss` 81, `surface_miss` 64, `hypothesis_miss` 5, `form_encoding_missing` 3, `csrf_blocked` 3, `budget_exhausted` 0.
+Severity: Critical 4/26, High 10/98, Medium 11/44, Low 1/3 → **H/C 14/124 = 11.3%**. Funnel: 171 → 144 surface → 136 hypothesis → **60 signal** → 26 spec → 26 confirmed. Top buckets: `replay_spec_miss` 91, `budget_exhausted` 20, `surface_miss` 14, `hypothesis_miss` 11, `form_encoding_missing` 6, `csrf_blocked` 3.
 
-**Gap:** dev 11.63% vs held-out 8.77% is **−24.6% relative** (2.86 pp absolute). Under a relative “within 10%” reading, G9 fails. The held-out run also predates post-M1 dev changes, so the comparison is directional, not a clean paired test.
+Confirmed by class (top): BOLA 8/18, IDOR 4/7, BFLA 3/9, open redirect 4/8, webhook forgery 3/8, CSRF 2/5, SSTI 1/5, OAuth 1/2. **16 classes have zero confirmations**, including SQLi (0/10), SSRF (0/12), XSS (0/8), XXE (0/5), race (0/6), command injection (0/5), and GraphQL BOLA (0/3).
+
+**Gap:** dev **13.95%** vs held-out **15.20%** = **+1.25 pp absolute**. Under the roadmap’s 10-percentage-point definition, G9 is met. The all-severity gap is favorable; the H/C split is not (13.7% dev vs 11.3% held-out), so parity is not uniform across severities.
 
 ### 4.6 Agentic `Execution` baseline — 2/22 and 1/19
 
@@ -208,9 +211,9 @@ Sources: `/tmp/m5-m0/agentic-long/` and `/tmp/m5-m0/agentic-shopflow/` (`*.json`
 
 Failure buckets: acme `hypothesis_miss` 8, `budget_exhausted` 8, `context_reset` 3, `form_encoding_missing` 1; shopflow `budget_exhausted` 12, `hypothesis_miss` 5, `context_reset` 1.
 
-**Novel finding note (copied from roadmap):** the acme run’s unmatched finding is a novel admin-activity BFLA with oracle evidence, not a planted site. Under the benchmark’s matching rule it still counts as an unmatched FP; the JSON corroborates 2 matched + 1 unmatched finding. Roadmap reports 3 worker bootstrap failures (3–4 assignments, 0 turns) on the acme run; that count is not in the structured JSON. This host snapshot corroborates the bootstrap/cleanup symptom: **51 created, never-started assignment containers**.
+**Novel finding note (copied from roadmap):** the acme run’s unmatched finding is a novel admin-activity BFLA with oracle evidence, not a planted site. Under the benchmark’s matching rule it still counts as an unmatched FP; the JSON corroborates 2 matched + 1 unmatched finding. Roadmap reports 3 worker bootstrap failures (3–4 assignments, 0 turns) on the acme run; that count is not in the structured JSON.
 
-Deterministic M0 baseline (copied from roadmap, not re-run here): 11 s, $0, 0/22, 100% precision, 43 endpoints discovered. Agentic reality: wall-clock is the limiter, and worker reliability — not budget — is the first blocker.
+Deterministic M0 baseline (copied from roadmap, not re-run here): 11 s, $0, 0/22, 100% precision, 43 endpoints discovered. Agentic reality: wall-clock is the limiter, and worker reliability — not budget — is the first blocker. The M6 agentic matrix (`d54b463`) adds parallel isolated cells and fail-closed metrics; its scorecards are not part of this snapshot’s gate.
 
 ### 4.7 M4 corpus and Gate 6
 
@@ -220,15 +223,15 @@ Corpus counts re-derived from `src/templates/compiled/` on this tree:
 | :--- | ---: | :--- |
 | Compiled YAML templates | **1,724** | count of `src/templates/compiled/**/*.yaml` |
 | CVE-named templates, all years | 915 | `cve-*.yaml` |
-| CVE-named templates, 2021–2026 | **492** | filename year filter |
+| CVE-named modern templates (2021–2026) | **492** | filename year filter |
 | Unique CVE IDs across templates | 916 | unique `cve:` fields |
-| Unique CVE IDs with year ≥ 2021 | 493 | year filter on `cve:` field |
+| Unique modern CVE IDs (year ≥ 2021) | **493** | year filter on `cve:` field |
 
-The extra modern ID is a non-`cve-`-named template that references a 2021 CVE. The roadmap’s “492 CVEs ≥2021” matches the filename definition. **The brief’s “521 CVEs” is not reproducible from this tree or preserved artifacts** (see §9).
+The extra modern ID is a non-`cve-`-named template that references a 2021 CVE. Use **492** for “CVE-named modern templates” and **493** for “unique modern CVE IDs”; state which definition is meant.
 
 Gate 6 / AST evidence: `tests/v5-m4-sast-templates-patch.test.ts` passes **10/10** under the Docker worker image, including “Gate 6 never passes when skipped” and trivy-fs advisories for Python/Go/Java/Ruby manifests. Compile identity checks (`npm run templates:transpile`) were not re-run; counts are from the committed corpus.
 
-### 4.8 M5 Board Phase 1 UI
+### 4.8 M5 Board Phase 1 + board tools
 
 | Item | Evidence |
 | :--- | :--- |
@@ -236,9 +239,21 @@ Gate 6 / AST evidence: `tests/v5-m4-sast-templates-patch.test.ts` passes **10/10
 | Boundary behavior (redaction, taint, injection delimiters, mention rules) | 6/6 boundary tests |
 | Mandatory `Board` tab replaces `Coordinator` | Playwright 1/1; roster state pills, unread badge, evidence chips, inline Tier-3 approval cards, mention autocomplete |
 | Composer routing | plain messages route to `@coordinator`; `board_post` honours explicit mentions |
+| Board tools / warm specialists | `b0b3cce`, merge `c019295`; 15/15 board-tools tests |
 | Workspace redesign port | `ca197a2` (Board in right pane) |
 
-**Count discrepancy:** the brief cites **19/19** board tests. On this tree the measurable total is **14 node tests + 1 Playwright test (15 checks)**; no 19-test suite or preserved log exists. See §9.
+**Board count:** 14 node tests (store + boundaries) + **15 board-tools tests** + 1 Playwright check. Use those totals; the earlier 19/19 figure was a stale pre-merge count.
+
+### 4.9 Notable engine fixes
+
+| Fix | Commit | Effect / evidence |
+| :--- | :--- | :--- |
+| **Recon halt bug** — off-origin redirect denial is no longer treated as global scope revocation; the nav overflow lane is reserved | `4ad4078` | Phase-0 no longer aborts discovery on a denied off-origin redirect; XBEN recovered **20 → 24** |
+| M2.1 endpoint graph, coverage updates, cross-persona ID harvest, BOLA consumer queue | `e111d29`, merge `198cdad` | M2-state tests **10/10**; cumulative dev realism 20 → 24/172 |
+| M3 contract encodings, collection state, webhook acceptance, list reads | `3e8e418`, merge `769311c` | Dev CSRF 2/7 and webhook 2/6; held-out open redirect 4/8 and webhook 3/8 |
+| Board tools + warm specialist lifecycle | `b0b3cce`, merge `c019295` | Board-tools suite **15/15** |
+
+The realism gains are cumulative across M2/M3; they are not attributed to a single stream.
 
 ---
 
@@ -248,34 +263,37 @@ These are **cumulative main-line deltas**, not isolated per-stream causal claims
 
 | Metric | v4 baseline | Current v5 | Delta | Source |
 | :--- | ---: | ---: | ---: | :--- |
-| XBEN-25 | 25/25 (`9793d2d`) | **24/25** | **−1** | `iter3-merged.json` → `post-m1.json` |
-| Held-out SaaS | 20/20 | **20/20** | 0 | `heldout-merged.json` → `post-m1-heldout.json` |
+| XBEN-25 | 25/25 (`9793d2d`) | **24/25** | **−1** | `iter3-merged.json` → `xben-board.json` |
+| Held-out SaaS | 20/20 | **20/20** | 0 | `heldout-merged.json` → `m2-state-held.json` |
 | Held-out patches fixed | 20/20 | **20/20** | 0 | same |
-| realistic dev confirmed | 0/172 | **20/172** | **+20** | `rb-score` → `rb-post-m1` |
-| realistic dev recall | 0.0% | **11.63%** | +11.63 pp | recomputed |
+| realistic dev confirmed | 0/172 | **24/172** | **+24** | `rb-score` → `rb-m2-state` |
+| realistic dev recall | 0.0% | **13.95%** | +13.95 pp | recomputed |
 | realistic dev precision | 0.00 | **1.00** | +1.00 | recomputed |
 | realistic dev unmatched FP | 12 | **0** | **−12** | recomputed |
-| realistic held-out confirmed | 3/171 | **15/171** | **+12** | `rb-score-heldout` → `m7-specs2/rb-held` |
+| realistic held-out confirmed | 3/171 | **26/171** | **+23** | `rb-score-heldout` → `rb-heldout-final` |
+| realistic held-out recall | 1.75% | **15.20%** | +13.45 pp | recomputed |
 | realistic held-out precision | 0.20 | **1.00** | +0.80 | recomputed |
 | realistic held-out unmatched FP | 12 | **0** | **−12** | recomputed |
+| dev → held-out gap | not comparable (0 vs 1.75) | **+1.25 pp** | within 10 pp | paired M2 runs |
 | realistic dev surface discovered | 131/172 | **139/172** | +8 | funnel totals |
 | realistic dev signal observed | 10 | **57** | **+47** | funnel totals |
-| realistic held-out signal observed | 14 | **44** | **+30** | funnel totals |
+| realistic held-out surface discovered | 130/171 | **144/171** | +14 | funnel totals |
+| realistic held-out signal observed | 14 | **60** | **+46** | funnel totals |
 | realistic chains | 0/1 per run | **0/6** | none completed | scorecards |
 | Templates / modern CVE templates | 1,600 (legacy-capped) / — | **1,724 / 492** | +124 / +492 | corpus counts |
-| Board UI | Coordinator tab | **Board + Worker Inspector** | — | `4b41388`, Playwright |
+| Board UI | Coordinator tab | **Board + Worker Inspector + board tools** | — | `4b41388`, `b0b3cce`, Playwright |
 
 Per-milestone headline (same caveat):
 
 | Milestone | Headline delta |
 | :--- | :--- |
 | M0 | no E2E realistic harness → `benchmark:realistic` drives real `Execution`, per-cell data-dir isolation, inert-run fail-fast |
-| M1 | XBEN was at 20/25 before the recovery commit and **24/25** after (`4ad4078`); v4 closed at 25/25. Unmatched realistic FPs 12→**0** |
-| M2 | dev surface discovery 131→**139**; authenticated/XHR route maps and session/CSRF hardening merged |
-| M3 | held-out realistic 3/171→**15/171** with precision 1.00 and 0 decoys; probes merged (`5aa897c`) |
+| M1 | recon halt fix (`4ad4078`) stops a denied off-origin redirect from aborting discovery; XBEN **20 → 24**; unmatched realistic FPs 12 → **0** |
+| M2 | M2.1 endpoint graph/coverage/ID harvest merged (`198cdad`, 10/10); dev surface 131 → **139**; dev confirmed 20 → **24** |
+| M3 | held-out realistic 3/171 → **26/171**, precision 1.00, 0 decoys; CSRF/webhook/open-redirect confirmations appear |
 | M4 | 1,600 legacy-capped templates → **1,724** with **492** modern CVE templates; AST/bridge/Gate 6 merged |
-| M5 | Coordinator UI → **Board** with roster, approvals, SSE, redaction/taint boundaries |
-| M6 | gate not closed; realism recall, white-box, chains, held-out gap, orphans remain open |
+| M5 | Coordinator UI → **Board** plus 15/15 board tools; posters/wakeups still pending |
+| M6 | paired dev/held-out gap **+1.25 pp** (G9 met); realism H/C recall, white-box, chains remain open |
 
 ---
 
@@ -283,28 +301,28 @@ Per-milestone headline (same caveat):
 
 | Gap | Measured state | Why it matters | Next action |
 | :--- | :--- | :--- | :--- |
-| Realistic H/C recall | **13.7%** grey-box vs 65% target; white-box unmeasured | Core v5 promise | Attack `replay_spec_miss` (92 dev / 81 held-out), `budget_exhausted` 23, `surface_miss` 16/64, `form_encoding_missing` 10 |
-| Signal-stage collapse | 57/132 dev, 44/115 held-out hypotheses produce a signal | Discovery is no longer the only limiter | Per-class trigger coverage; prioritize classes with 0 confirmations (SQLi, SSRF, XSS, XXE, CSRF, webhook, race) |
+| Realistic H/C recall | **13.7%** grey-box vs 65% target; held-out H/C **11.3%**; white-box unmeasured | Core v5 promise | Attack `replay_spec_miss` (90 dev / 91 held-out), `budget_exhausted` 23/20, `surface_miss` 16/14, `form_encoding_missing` 8/6 |
+| Signal-stage collapse | 57/132 dev, 60/136 held-out hypotheses produce a signal | Discovery is no longer the only limiter | Per-class trigger coverage; prioritize classes with 0 confirmations (SQLi, SSRF, XSS, XXE, race, command injection, GraphQL BOLA) |
 | Chain completion | **0/6 dev, 0/6 held-out**; XBEN `browser_chain` missed | Gate G8 | Wire M5 chain planning and browser-chain verification; add chain fixtures |
-| Held-out generalization | 8.77% vs 11.63% dev (−24.6% relative) | Gate G9 / anti-overfitting | Re-run held-out on the post-M1 tree; tighten overfit-prone rules; report paired deltas |
+| Parity at low recall | dev 13.95% vs held-out 15.20% (+1.25 pp) | G9 is met, but both are far below target | Re-check the gap after each recall lift; do not treat parity at 14% as generalization at 65% |
 | White-box mode | not run | Gate G5 | Run the 9-cell matrix with `--mode white-box`; record recall and decoy FPs |
-| Agentic worker reliability | 2/22 and 1/19; wall-clock capped; 51 created/never-started containers | Production path cannot scale | Fix worker bootstrap and teardown; keep `--isolate-data-dir`; add an orphan sweep; treat wall-clock as a first-class SLO |
-| Precision at scale | 100% on 20 dev + 15 held-out findings | Denominator is small; high recall may add FPs | Track precision per class as recall rises; keep decoy audit |
+| Agentic worker reliability | 2/22 and 1/19; wall-clock capped; 51 leaked containers found | Production path cannot scale | Finish the gate-stream lifecycle fix; keep `--isolate-data-dir`; treat wall-clock as a first-class SLO |
+| Precision at scale | 100% on 24 dev + 26 held-out findings | Denominator is small; high recall may add FPs | Track precision per class as recall rises; keep decoy audit |
 | Patch attribution | 20/20 fixed, but 2 inconclusive; all-patches is a replay | Avoid overstating clean fixes | Report clean dismissals (18/20) separately; run a fresh all-patches pass; resolve shared-`/graphql` attribution |
 | XBEN regression | 25/25 v4 → 24/25 v5 | v4 parity lost on `browser_chain` | Restore `xben-16` without hardcoding; keep ≥23 gate |
-| Container hygiene | 51 orphan assignment containers | Violates v4/v5 0-orphan invariant | Drain stale objects; verify no live owner before cleanup; add gate check |
-| Full regression gate | v5 suites + harness re-run; v4 519-case matrix not re-run | Release gate is not one pass | Run `docs/reverify-v4.sh` on a Docker host after v5 merges |
+| Container hygiene | 51 leaked `Created` found; 50 removed; 0 `Created` at re-check | Lifecycle enforcement not closed | Gate stream owns the fix; re-run the orphan check and document the final state |
+| Full regression gate | v5 149 + harness 142 re-run; v4 519-case matrix not re-run | Release gate is not one pass | Run `docs/reverify-v4.sh` on a Docker host after v5 merges |
 | Artifact durability | evidence under `/tmp` | `/tmp` is ephemeral | Copy structured JSON into release storage before cleanup |
-| Corpus count claims | 1,724/492 verified; brief’s 521 not found | Prevent unverifiable numbers in release notes | Define CVE count (filename vs field vs curated) in the roadmap |
+| Corpus definitions | 1,724 total; 492 modern CVE-named; 493 unique modern IDs | Prevents unverifiable counts | State the definition in release notes |
 
 ---
 
 ## 7. Known limitations
 
-- **Docs snapshot, not final gate.** Scores were produced by different streams at different times; only the values in §4 are re-derived here.
-- **Deterministic vs agentic are separate populations.** The 20/172 matrix is deterministic replay; the 2/22 and 1/19 runs are LLM-driven with wall-clock caps. Do not combine them.
-- **Held-out artifact predates post-M1 dev.** `/tmp/m7-specs2/rb-held` is the latest preserved held-out matrix, not a same-commit pair.
-- **“Within 10%” is undefined.** The roadmap does not say whether 10% means relative recall drop or absolute percentage points. This document reports both.
+- **Docs snapshot, not final gate.** Scores were produced by different streams at different times; only the values in §4 are re-derived here. Dev and held-out realism are now paired on the M2 line.
+- **Deterministic vs agentic are separate populations.** The 24/172 and 26/171 matrices are deterministic replay; the 2/22 and 1/19 runs are LLM-driven with wall-clock caps. Do not combine them.
+- **Held-out parity is all-severity.** The +1.25 pp gap compares overall recall. H/C recall is 13.7% dev vs 11.3% held-out, so parity is not uniform across severities.
+- **“Within 10%” means 10 percentage points absolute.** This is the roadmap definition used for G9. It is not a relative-recall tolerance.
 - **Patch “fixed” includes inconclusive retests.** Two held-out patches were counted fixed without a clean dismissal.
 - **All-patches is replay-based.** It is evidence for the replayed specs, not for a fresh end-to-end patch pass.
 - **Docker checks require `newgrp docker`** on this host; a plain `docker info` from the agent shell gets `permission denied` despite group membership.
@@ -334,15 +352,16 @@ For a fresh worktree, symlink the base checkout’s `node_modules` (and `worker/
 NODE_OPTIONS=--max-old-space-size=1536 npm run check
 NODE_OPTIONS=--max-old-space-size=1536 npm run build
 
-# v5 suites (124 tests). Use the Docker group so M4-T9 is not skipped.
+# v5 suites (149 tests). Use the Docker group so M4-T9 is not skipped.
 newgrp docker -c '
   cd /path/to/guardian &&
   export GUARDIAN_ALLOW_LOCAL_LAB=1 NODE_OPTIONS=--max-old-space-size=1536 &&
   node --test --test-concurrency=1 tests/v5-*.test.ts
 '
 
-# Board UI (after build)
+# Board UI and tools (after build)
 npx playwright test tests/guardian-v5-board.spec.ts --workers=1
+node --test tests/v5-m5-board-tools.test.ts
 
 # Harness self-tests
 GUARDIAN_ALLOW_LOCAL_LAB=1 node --test --test-concurrency=1 benchmarks/realistic-bench/tests/
@@ -380,7 +399,7 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- \
   --out-dir /tmp/rb-v5-dev
 ```
 
-### 8.6 realistic-bench held-out matrix
+### 8.6 realistic-bench held-out matrix (paired)
 
 ```bash
 # The salt lives at ~/.config/guardian-bench/heldout.salt (mode 600).
@@ -426,7 +445,7 @@ docker ps -aq --filter label=dev.guardian.run          # expect empty
 docker network ls -q --filter name=guardian            # expect empty
 ```
 
-Do not delete containers with a live owner; verify age/status and coordination before cleanup.
+The 51-container leak is under remediation; 50 stale `Created` objects were removed. Do not delete containers with a live owner; verify age/status and coordination before cleanup.
 
 ---
 
@@ -436,33 +455,36 @@ Do not delete containers with a live owner; verify age/status and coordination b
 
 | Claim | Value used | Provenance | Status |
 | :--- | :--- | :--- | :--- |
-| XBEN confirmed | 24/25 | `post-m1.json` `confirmedCount` / `targetsTotal` | re-derived |
-| Held-out confirmed | 20/20 | `post-m1-heldout.json` | re-derived |
-| Held-out patches | 20/20, 18 clean | `patchVerification.perPatch` | re-derived |
-| Realistic dev | 20/172, 0/62 decoys, 0 unmatched | sum of 9 `rb-post-m1` scorecards | re-derived |
-| Realistic held-out | 15/171, 0/63 decoys | sum of 9 `m7-specs2/rb-held` scorecards | re-derived |
+| XBEN confirmed | 24/25 | `/tmp/opencode/xben-board.json` | re-derived |
+| Held-out confirmed | 20/20 | `/tmp/guardian-m7-bench/m2-state-held.json` | re-derived |
+| Held-out patches | 20/20, 18 clean | same `patchVerification.perPatch` | re-derived |
+| Realistic dev | 24/172, 0/62 decoys, 0 unmatched | sum of 9 `/tmp/rb-m2-state` scorecards | re-derived |
+| Realistic held-out | 26/171, 0/63 decoys, 0 unmatched | sum of 9 `/tmp/rb-heldout-final` scorecards | re-derived |
+| Dev run wall time | ~100 s at concurrency 9 | stream report | **copied** |
 | Agentic acme / shopflow | 2/22, 1/19; costs/times | `agentic-long` + `agentic-shopflow` JSON/meta | re-derived |
-| Templates / modern CVEs | 1,724 / 492 | filesystem counts | re-derived |
-| Board tests / Playwright | 14/14 + 1/1 | test run | re-derived |
-| v5 suites | 124/124, 0 skip | run under Docker group | re-derived |
+| Templates / modern CVEs | 1,724 / 492 / 493 | filesystem counts | re-derived |
+| Board tests / Playwright | 14/14 + 15/15 + 1/1 | test runs | re-derived |
+| v5 suites | 149/149, 0 skip | run under Docker group | re-derived |
 | Harness tests | 142/142 | test run | re-derived |
-| Orphans | 51 created, 0 running | `docker ps -a` | re-derived |
+| Orphans | 51 found, 50 removed, 0 `Created` at re-check | docs check + gate report | re-derived / **partly copied** |
 | Worker bootstrap failures (acme) | 3 | roadmap §5 | **copied** |
 | Novel admin BFLA | oracle-evidenced, unmatched | roadmap §5 + JSON unmatched ID | **partly copied** |
 | Deterministic M0 baseline | 11 s, $0, 0/22 | roadmap §5 | **copied** |
 | v4 gate 25/25 | 25/25 | `iter3-merged.json`; `9793d2d` attribution from roadmap | re-derived artifact / **copied** commit |
 
-### 9.2 Discrepancies found during this pass
+### 9.2 Discrepancies found / retired
 
-1. **“521 CVEs” is not reproducible.** The tree contains 1,724 templates, 915 CVE-named files, 916 unique CVE IDs, 492 CVE-named 2021–2026 templates, and 493 unique modern CVE IDs. No 521 count exists in the tree or preserved artifacts. Use 492 (filename definition) or 493 (unique IDs), and state which.
-2. **“19/19 Board tests” is not reproducible.** Current total is 14 node tests + 1 Playwright test. The 19 figure is likely a stale pre-merge stream report.
-3. **XBEN regressed vs v4.** v4 closed at 25/25 (`9793d2d`); current main is 24/25, missing `xben-16` (`browser_chain`). The v5 ≥23 gate still passes, but “v4 parity” does not.
-4. **Orphan gate fails.** 51 created/never-started assignment containers exist. The v4 verification reported 0/0; this snapshot does not. All are `Created`, not running.
-5. **Held-out snapshot mismatch.** The latest preserved held-out realistic matrix (`m7-specs2/rb-held`, 15/171) predates the post-M1 dev matrix (20/172). The dev/held-out gap is therefore not a paired measurement.
-6. **“Within 10%” ambiguity.** 8.77% vs 11.63% is 2.86 pp absolute (passes a 10-pp reading) but −24.6% relative (fails a relative reading). The roadmap must define the unit before G9 can be scored.
-7. **Suite scope.** “100% suites, 0 skips” here means the 124 v5 tests + 142 harness tests + Board UI, not the full v4 519-case matrix. The v5 run is 0-skip only under `newgrp docker`; without Docker, `M4-T9` skips.
-8. **Agentic failure counts are partly narrative.** The 3–4 worker-bootstrap failures and the novel-BFLA classification come from the roadmap, not the JSON; the JSON only exposes one unmatched finding ID.
+1. **Modern CVE count retired:** earlier drafts said “521 CVEs”. The verifiable counts are **492 CVE-named modern templates (2021–2026)** and **493 unique modern CVE IDs** across 1,724 compiled templates. Use one of those definitions, not 521.
+2. **Board test count retired:** earlier drafts said “19/19”. Current totals are **14 node board tests + 15 board-tools tests + 1 Playwright check**.
+3. **XBEN still below v4 parity:** v4 closed at 25/25 (`9793d2d`); current main is 24/25, missing `xben-16` (`browser_chain`). The v5 ≥23 gate passes, but v4 parity does not.
+4. **Container leak is real but improved:** 51 leaked `Created` assignment containers were found; 50 stale ones were removed. Re-check: 0 `Created`, 2 running, 0 run containers, 0 networks. The lifecycle fix is in progress, so G11 is not yet “closed”.
+5. **Held-out snapshot retired:** the stale 15/171 held-out matrix was replaced by a paired run (`rb-m2-state` dev, `rb-heldout-final` held-out). Dev/held-out gap is now +1.25 pp.
+6. **“Within 10%” resolved:** the definition is **10 percentage points absolute**, not relative recall. Under that definition G9 is met.
+7. **Suite scope:** “100% suites, 0 skips” here means the 149 v5 tests + 142 harness tests + Board UI/tools, not the full v4 519-case matrix. The v5 run is 0-skip only under `newgrp docker`; without Docker, `M4-T9` skips.
+8. **Agentic failure counts are partly narrative:** the 3–4 worker-bootstrap failures and the novel-BFLA classification come from the roadmap, not the JSON; the JSON only exposes one unmatched finding ID.
+9. **Severity split differs by split:** held-out all-severity recall (15.2%) is above dev (14.0%), but held-out H/C recall (11.3%) is below dev (13.7%). Do not present the all-severity gap as H/C parity.
+10. **Patch artifact choice:** `heldout-board.json` (newest held-out run) has no patch verification; patch evidence is from `m2-state-held.json` on the same M2 line.
 
 ### 9.3 Next review trigger
 
-Refresh this page when any of the following lands: M2.1 acceptance, M3 completion, M5 Phase 1b, a post-M1 held-out realistic run, a white-box matrix, or a clean orphan sweep. The gate table in §2 is the single source of truth for release readiness.
+Refresh this page when any of the following lands: M3 completion, M5 posters/wakeups, a white-box matrix, an M6 paired recall lift, the container-lifecycle fix, or a full v4 519-case regression run. The gate table in §2 is the single source of truth for release readiness.
