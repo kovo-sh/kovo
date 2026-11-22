@@ -1243,6 +1243,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           origin: spec.targetOrigin,
           persona: spec.persona,
           followRedirects: false,
+          // Share the priming step's jar so session cookies / CSRF tokens bound by it are visible.
+          ...(spec.controlStep && spec.controlStep.role !== 'cleanup' ? { sessionGroupRole: spec.controlStep.role } : {}),
           ...injected,
         }
       }
@@ -1250,7 +1252,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       let controlSummary: Record<string, unknown> | null = null
       let controlHealthy = true
       if (spec.controlStep) {
-        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}), grant, signal)
+        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}, {
+          runId: params.runId,
+          assignmentId,
+        }), grant, signal)
         recordExchange(controlEx)
         controlSummary = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(controlEx) }
         if (isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) controlHealthy = false
@@ -1846,6 +1851,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           persona: spec.persona,
           followRedirects: false,
           timeoutMs: Math.max(10_000, delayMs + 5_000),
+          ...(spec.controlStep && spec.controlStep.role !== 'cleanup' ? { sessionGroupRole: spec.controlStep.role } : {}),
           ...injected,
         }
       }

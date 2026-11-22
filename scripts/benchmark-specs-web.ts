@@ -310,7 +310,9 @@ export function synthReflectedXss(o: HypothesisOutcome, env: ProbeEnv): Synthesi
   if (!basePath.startsWith('/')) return []
   const controlPath = appendQuery(basePath, o.hyp.param.name, 'guardian')
   const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
-  const probePath = appendQuery(basePath, o.hyp.param.name, payload)
+  // Keep the verifier placeholder intact while percent-encoding the rest of the payload.
+  const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
+  const probePath = appendQuery(basePath, o.hyp.param.name, encodedPayload, false)
   const params = { origin: env.origin, ...(env.owner ? { persona: env.owner } : {}), ...sessionFields(env, o.hyp) }
   const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
     'confirmed: ((.steps.p1.status >= 200 and .steps.p1.status < 400) and ((.steps.p1.title == .canaryToken) or (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) >= 1))), ' +

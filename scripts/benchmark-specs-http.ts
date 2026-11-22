@@ -31,9 +31,9 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   // Primary: the probe actor received at least every field/value the owner control received
   // (extra fields such as leak markers are expected). Fallback: byte/shape equality.
   const supersetJq = `{ controlPassed: ${is2xx('c1')}, ` +
-    `confirmed: (${is2xx('p1')} and ((.steps.c1.json | type) == "object") and ((.steps.p1.json | type) == "object") and ` +
-    `(.steps.c1.json as $c | .steps.p1.json as $p | ([($c | to_entries[]) | select($p[.key] == .value)] | length) == ([$c | keys[]] | length)) and ` +
-    `(([$c | keys[]] | length) > 0)), ` +
+    `confirmed: (${is2xx('p1')} and (.steps.c1.json as $c | .steps.p1.json as $p | ` +
+    `(([$c | keys[]] | length) > 0) and ` +
+    `(([($c | to_entries[]) | select($p[.key] == .value)] | length) == ([$c | keys[]] | length)))), ` +
     `observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
   const equalityJq = `{ controlPassed: ${is2xx('c1')}, confirmed: (${is2xx('p1')} and ${sameAsControl('p1', 'c1')}), observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
   const steps = [

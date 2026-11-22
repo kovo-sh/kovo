@@ -340,8 +340,10 @@ function authzIds(env: ProbeEnv, pathTemplate?: string): string[] {
   const derived = env.personaUserIds
     .map(id => id.replace(/^[A-Za-z]+[-_]/, ''))
     .filter((id, i) => id.length > 0 && id !== env.personaUserIds[i])
-  const ids = [...mined, ...derived, ...env.personaUserIds, '1', '2', '3']
-  return [...new Set(ids)].filter(i => /^[A-Za-z0-9_.:-]{1,128}$/.test(i)).slice(0, 10)
+  // Known persona ids first (they are valid on persona-scoped routes), then their numeric variants,
+  // then ids observed in the corpus and small integers.
+  const ids = [...env.personaUserIds, ...derived, ...mined, '1', '2', '3']
+  return [...new Set(ids)].filter(i => /^[A-Za-z0-9_.:-]{1,128}$/.test(i)).slice(0, 12)
 }
 
 export function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.owner, other = env.other): ProbeDifferentialRequest {
