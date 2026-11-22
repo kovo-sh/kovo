@@ -28,7 +28,7 @@
 | **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **PARTIAL** — 2.2/2.3/2.4 DONE; **2.1 RUNNING** | `m7-spa`, `m5-m2-auth`, `m5-m2-state` | — |
 | **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **RUNNING** | `m5-m3-probes`; spec contracts merged (specs2) | M1-core for verifier/schema additions |
 | **M4** | Templates, AST, SAST→DAST, Patch Gate 6 | 2021–2026 corpus, multi-framework AST, bridge, real patch retest | **DONE** (merged; execution/recon wiring pending) | `m5-m4` / `agents/m4` | — |
-| **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 DONE**; Phase 1b after M1-core | `m5-board` / `agents/board-ui` DONE | M1 for poster wiring (Phase 1b) |
+| **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 + TOOLS DONE** (UI, board_post/read, deltas, warm controller); execution wiring next | `m5-board`, `m5-board2` | M1 for poster wiring |
 | **M6** | Hill-climb + anti-overfitting + v5 gate | dev seeds, salted held-out, `VERIFICATION-v5.md` | **READY** (v4 baseline met; awaits M0–M5) | — | M0–M5 |
 
 ---
@@ -87,7 +87,7 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 |---|---|---|
 | xben-25 | **24/25 (96%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed**, allPatches=fixed | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | **20/172 matched (11.6%), precision 100%**, 0 decoy/unmatched FPs; 9 cells in ~100 s at concurrency 9 | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
+| realistic-bench dev | **24/172 matched (14.0%), precision 100%**, 0 decoy/unmatched FPs; 9 cells in ~100 s at concurrency 9 | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
 | realistic-bench held-out | **15/171 matched, precision 100%**, 0 decoy/unmatched FPs (was 3 matched / precision 0.20) | within 10% of dev |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
