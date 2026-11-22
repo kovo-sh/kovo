@@ -145,9 +145,9 @@ describe('M7 held-out: verifyPatchesLive orchestration', () => {
     assert.equal(missing.fixed, false)
     assert.match((missing.notes ?? []).join(' '), /Not confirmed by the baseline/)
 
-    // Baseline is injected above, so the launcher sees only the two reproduced patches here;
-    // the all-patches pass is the fake runFull hook and its id set is asserted below.
-    assert.deepEqual(calls.map(c => c.patchedIds), [['hos-01'], ['hos-02']])
+    // Baseline is injected above, so the launcher sees the two reproduced patches plus the
+    // all-patches baseline-spec replay (the same id set, replayed against one server).
+    assert.deepEqual(calls.map(c => c.patchedIds), [['hos-01'], ['hos-02'], ['hos-01', 'hos-02', 'hos-03']])
     assert.deepEqual(replayCalls.slice(0, 2), [['hos-01'], ['hos-02']])
 
     // Isolation: when hos-01 is patched, hos-02 (still unpatched in that launch) must confirm.
@@ -185,12 +185,13 @@ describe('M7 held-out: verifyPatchesLive orchestration', () => {
     assert.match((first.notes ?? []).join(' '), /Isolation check/)
   })
 
-  test('all-patches pass reports regressions honestly (still confirming + decoy FP)', async () => {
+  test('all-patches pass reports genuine baseline-spec regressions and decoy repeats honestly', async () => {
     const calls: FakeLauncherCall[] = []
     const hooks = runtimeHooks({
-      baselineFindings: [finding('hos-01'), finding('hos-02')],
-      fixedByPatch: () => true,
-      allPatchesFindings: [finding('hos-02'), finding('hos-d1', true)],
+      baselineFindings: [finding('hos-01'), finding('hos-02'), finding('hos-d1', true)],
+      // hos-01 is fixed by its patch; hos-02 still confirms under all patches (a genuine regression);
+      // the decoy has no patch and keeps confirming.
+      fixedByPatch: (id, patchedIds) => id === 'hos-d1' ? false : !(patchedIds.length > 1 && id === 'hos-02'),
     })
     const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
@@ -241,9 +242,12 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
     assert.equal(summary.perPatch[1].after, 'error')
     assert.equal(summary.perPatch[1].fixed, false)
     assert.match((summary.perPatch[1].notes ?? []).join(' '), /Unknown held-out SaaS patch id/)
-    // The first patch still ran and the all-patches pass still executed.
+    // The first patch still ran; the all-patches launch is poisoned by the unknown id, so the pass
+    // reports inconclusive rather than throwing.
     assert.equal(summary.perPatch[0].fixed, true)
-    assert.equal(summary.allPatches?.attempted, true)
+    assert.equal(summary.allPatches?.attempted, false)
+    assert.equal(summary.allPatches?.verdict, 'inconclusive')
+    assert.match((summary.allPatches?.notes ?? []).join(' '), /did not complete/)
     assert.deepEqual(calls.map(c => c.patchedIds), [['hos-01']])
   })
 
@@ -280,6 +284,7 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
       launcher: fakeLauncher(['hos-01', 'hos-02', 'hos-03'], calls),
       hooks,
       patchTimeoutMs: 40,
+      allPatchesTimeoutMs: 80,
     }))
     const elapsed = Date.now() - started
     assert.equal(summary.perPatch[1].after, 'timeout')
@@ -290,11 +295,13 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
 
   test('an all-patches timeout marks the pass inconclusive but keeps per-patch results', async () => {
     const calls: FakeLauncherCall[] = []
+    const base = runtimeHooks({ baselineFindings: [finding('hos-01')], fixedByPatch: () => true })
     const hooks: PatchVerificationHooks = {
-      ...runtimeHooks({ baselineFindings: [finding('hos-01')], fixedByPatch: () => true }),
-      runFull: async patchedIds => {
-        if (patchedIds.length === 0) return { findings: [finding('hos-01')], notes: [] }
-        return await new Promise(() => { /* hang the all-patches pass */ })
+      ...base,
+      replayAll: async ({ findings, patchedIds }) => {
+        // Per-patch retests (one id) settle; the all-patches baseline replay (two ids) hangs.
+        if (patchedIds.length > 1) return await new Promise(() => { /* hang the all-patches replay */ })
+        return await base.replayAll!({ findings, patchedIds, timeoutMs: 2_000, signal: new AbortController().signal })
       },
     }
     const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({

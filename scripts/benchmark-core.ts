@@ -170,6 +170,397 @@ export function countFalsePositives(traces: readonly TargetTrace[]): number {
 }
 
 // ---------------------------------------------------------------------------
+// Orchestration: config knobs, budget maths, safety classification, scheduler
+// ---------------------------------------------------------------------------
+
+/** Default request budget in broker audit units (each HTTP exchange is counted twice: allowed + observed). */
+export const BENCH_MAX_REQUESTS_DEFAULT = 3800
+export const BENCH_DEADLINE_MS_DEFAULT = 8 * 60_000
+export const BENCH_PROBE_CONCURRENCY_DEFAULT = 4
+export const BENCH_PROBE_CONCURRENCY_MAX = 8
+export const BENCH_VERIFY_CONCURRENCY_DEFAULT = 2
+export const BENCH_VERIFY_CONCURRENCY_MAX = 4
+export const BENCH_SLOW_PROBES_MIN = 12
+export const BENCH_SLOW_PROBES_MAX = 24
+
+/** Max hypotheses of one probe class per endpoint (first in deterministic plan order wins). */
+export const DEFAULT_PER_ENDPOINT_CLASS_CAPS: Readonly<Record<string, number>> = {
+  path_traversal_benign: 1,
+  auth_protocol_audit: 1,
+  cache_poison_deception: 1,
+  sqli_time_diff: 3,
+  sqli_boolean: 8,
+  ssti_math: 3,
+  xss_context: 2,
+  authz_matrix: 2,
+  ssrf_canary: 2,
+  xxe_canary: 2,
+  mass_assignment: 1,
+  workflow_invariant: 1,
+  graphql_audit: 1,
+}
+
+/**
+ * Max hypotheses of one probe class across a run. These bound the classes that otherwise grow
+ * with surface size and are the main guard against `budget_exhausted`; the first hypotheses in
+ * plan order are kept so stateful writes are never reordered.
+ */
+export const DEFAULT_PER_CLASS_CAPS: Readonly<Record<string, number>> = {
+  path_traversal_benign: 8,
+  auth_protocol_audit: 16,
+  cache_poison_deception: 5,
+  authz_matrix: 8,
+  mass_assignment: 8,
+  workflow_invariant: 3,
+  graphql_audit: 1,
+}
+
+export interface BenchmarkClassCaps {
+  perEndpoint: Record<string, number>
+  perClass: Record<string, number>
+}
+
+export interface BenchmarkOrchestrationConfig {
+  /** Broker audit units (see BENCH_MAX_REQUESTS_DEFAULT). */
+  maxRequests: number
+  deadlineMs: number
+  probeConcurrency: number
+  verifyConcurrency: number
+  /** Explicit slow-probe allowance; null = adaptive from candidate count. */
+  slowProbes: number | null
+  classCaps: BenchmarkClassCaps
+}
+
+export interface BenchmarkOrchestrationOverrides {
+  maxRequests?: number
+  deadlineMs?: number
+  probeConcurrency?: number
+  verifyConcurrency?: number
+  slowProbes?: number
+  classCaps?: Partial<BenchmarkClassCaps>
+}
+
+type EnvLike = Record<string, string | undefined>
+
+function readInt(raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === '') return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? Math.trunc(n) : null
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.trunc(value)))
+}
+
+/** Parse `class=limit,class=limit` overrides; unknown/malformed entries are ignored. */
+export function parseClassCapSpec(raw: string | undefined): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (!raw) return out
+  for (const part of raw.split(',')) {
+    const [name, limit] = part.split('=').map(s => s.trim())
+    const n = readInt(limit)
+    if (!name || n === null || n < 0) continue
+    out[name] = n
+  }
+  return out
+}
+
+/**
+ * Resolve the orchestration knobs from env + explicit overrides (overrides win).
+ * Invalid env values fall back to the compatibility defaults rather than aborting a run.
+ */
+export function resolveBenchOrchestrationConfig(
+  env: EnvLike = process.env,
+  overrides: BenchmarkOrchestrationOverrides = {},
+): BenchmarkOrchestrationConfig {
+  const maxRequests = overrides.maxRequests
+    ?? readInt(env.GUARDIAN_BENCH_MAX_REQUESTS)
+    ?? BENCH_MAX_REQUESTS_DEFAULT
+  const deadlineMs = overrides.deadlineMs
+    ?? readInt(env.GUARDIAN_BENCH_DEADLINE_MS)
+    ?? BENCH_DEADLINE_MS_DEFAULT
+  const probeConcurrency = clampInt(
+    overrides.probeConcurrency ?? readInt(env.GUARDIAN_BENCH_PROBE_CONCURRENCY) ?? BENCH_PROBE_CONCURRENCY_DEFAULT,
+    1,
+    BENCH_PROBE_CONCURRENCY_MAX,
+  )
+  const verifyConcurrency = clampInt(
+    overrides.verifyConcurrency ?? readInt(env.GUARDIAN_BENCH_VERIFY_CONCURRENCY) ?? BENCH_VERIFY_CONCURRENCY_DEFAULT,
+    1,
+    BENCH_VERIFY_CONCURRENCY_MAX,
+  )
+  const rawSlow = overrides.slowProbes ?? readInt(env.GUARDIAN_BENCH_SLOW_PROBES)
+  return {
+    maxRequests: Math.max(1, maxRequests),
+    deadlineMs: Math.max(1_000, deadlineMs),
+    probeConcurrency,
+    verifyConcurrency,
+    slowProbes: rawSlow === null ? null : clampInt(rawSlow, 0, 64),
+    classCaps: {
+      perEndpoint: { ...DEFAULT_PER_ENDPOINT_CLASS_CAPS, ...(overrides.classCaps?.perEndpoint ?? parseClassCapSpec(env.GUARDIAN_BENCH_CLASS_ENDPOINT_CAP)) },
+      perClass: { ...DEFAULT_PER_CLASS_CAPS, ...(overrides.classCaps?.perClass ?? parseClassCapSpec(env.GUARDIAN_BENCH_CLASS_CAP)) },
+    },
+  }
+}
+
+/**
+ * Adaptive blind-SQLi allowance. Explicit values pass through; otherwise scale with the number of
+ * candidate parameters and bound to [12, 24] so the expensive probe cannot crowd out the matrix.
+ */
+export function computeSlowProbeAllowance(candidateCount: number, explicit?: number | null): number {
+  if (explicit !== undefined && explicit !== null) return clampInt(explicit, 0, 64)
+  return Math.min(BENCH_SLOW_PROBES_MAX, Math.max(BENCH_SLOW_PROBES_MIN, Math.trunc(candidateCount)))
+}
+
+const sqlNameHint = /(^|[_-])(q|query|search|term|filter|sort|order|id|uid|name|category|ref|sku|text|body|comment|invoice|email|user|account|host|type|status|page|limit)$/i
+const blindSinkHint = /(filter|query|search|where|lookup|analytics|report|metric|stat|term)/i
+const sqlPathHint = /(\/api\/|\/search|lookup|query|products|items|orders|accounts?|profile|comments|xm|graphql|login|report|filter|list|\/_actions|server.?action)/i
+const lowSignalLocation = new Set(['header', 'cookie', 'path'])
+
+export interface SlowProbeCandidate {
+  key: string
+  path: string
+  param?: string
+  location?: string
+  method?: string
+}
+
+/**
+ * Plausibility score for a blind time-based SQLi candidate. Used only to pick which parameters
+ * receive the bounded slow budget; execution stays in plan order (writes are never reordered).
+ */
+export function scoreSlowProbePlausibility(c: SlowProbeCandidate): number {
+  let score = 0
+  if (sqlPathHint.test(c.path)) score += 3
+  if (blindSinkHint.test(c.path)) score += 2
+  if (c.param && sqlNameHint.test(c.param)) score += 2
+  if (c.param && blindSinkHint.test(c.param)) score += 2
+  // Dotted paths (`filter.name`) are blind-SQLi sinks in modern JSON APIs.
+  if (c.param?.includes('.')) score += 2
+  if (c.path.split('/').filter(Boolean).length >= 2) score += 1
+  const loc = c.location ?? ''
+  if (loc === 'query' || loc === 'json' || loc === 'form' || loc === 'xml' || loc === 'graphql_var') score += 1
+  if (lowSignalLocation.has(loc)) score -= 1
+  if ((c.method ?? 'GET').toUpperCase() !== 'GET') score += 0
+  return score
+}
+
+/**
+ * Select at most `allowance` slow-probe keys, highest plausibility first with plan order as the
+ * tie-break. The returned set is consumed in original plan order, so writes keep their positions.
+ */
+export function selectSlowProbeKeys(candidates: readonly SlowProbeCandidate[], allowance: number): Set<string> {
+  if (allowance <= 0) return new Set()
+  return new Set(
+    candidates
+      .map((c, index) => ({ c, index, score: scoreSlowProbePlausibility(c) }))
+      .sort((a, b) => b.score - a.score || a.index - b.index)
+      .slice(0, allowance)
+      .map(entry => entry.c.key),
+  )
+}
+
+export interface ClassCapDrop {
+  key: string
+  probeClass: string
+  path: string
+  reason: 'per_class_cap' | 'per_endpoint_cap'
+}
+
+export interface ClassCapResult<T> {
+  kept: T[]
+  dropped: ClassCapDrop[]
+}
+
+/**
+ * Apply per-endpoint and per-class hypothesis caps in deterministic plan order. Kept hypotheses
+ * keep their original relative order; only the tail beyond a cap is dropped.
+ */
+export function applyBenchmarkClassCaps<T extends { key: string; probeClass: string; endpoint: { path: string }; param?: { name: string }; location?: string; method?: string }>(
+  hypotheses: readonly T[],
+  caps: BenchmarkClassCaps,
+): ClassCapResult<T> {
+  // Choose which hypotheses survive a per-class cap by plausibility (high score first, plan order as
+  // tie-break), but emit survivors in original plan order so stateful writes are never reordered.
+  const allowedByClass = new Map<string, Set<number>>()
+  const indicesByClass = new Map<string, number[]>()
+  hypotheses.forEach((h, index) => {
+    const list = indicesByClass.get(h.probeClass) ?? []
+    list.push(index)
+    indicesByClass.set(h.probeClass, list)
+  })
+  for (const [probeClass, indices] of indicesByClass) {
+    const cap = caps.perClass[probeClass]
+    if (cap === undefined || indices.length <= cap) continue
+    const ranked = indices
+      .map(index => {
+        const h = hypotheses[index]
+        return {
+          index,
+          score: scoreSlowProbePlausibility({
+            key: h.key, path: h.endpoint.path,
+            ...(h.param ? { param: h.param.name } : {}),
+            ...(h.location ? { location: h.location } : {}),
+            ...(h.method ? { method: h.method } : {}),
+          }),
+        }
+      })
+      .sort((a, b) => b.score - a.score || a.index - b.index)
+      .slice(0, Math.max(0, cap))
+      .map(entry => entry.index)
+    allowedByClass.set(probeClass, new Set(ranked))
+  }
+
+  const kept: T[] = []
+  const dropped: ClassCapDrop[] = []
+  const perEndpoint = new Map<string, number>()
+  hypotheses.forEach((h, index) => {
+    const allowed = allowedByClass.get(h.probeClass)
+    if (allowed && !allowed.has(index)) {
+      dropped.push({ key: h.key, probeClass: h.probeClass, path: h.endpoint.path, reason: 'per_class_cap' })
+      return
+    }
+    const endpointKey = `${h.probeClass}|${h.endpoint.path}`
+    const endpointCount = perEndpoint.get(endpointKey) ?? 0
+    const endpointCap = caps.perEndpoint[h.probeClass]
+    if (endpointCap !== undefined && endpointCount >= endpointCap) {
+      dropped.push({ key: h.key, probeClass: h.probeClass, path: h.endpoint.path, reason: 'per_endpoint_cap' })
+      return
+    }
+    perEndpoint.set(endpointKey, endpointCount + 1)
+    kept.push(h)
+  })
+  return { kept, dropped }
+}
+
+/** Probe classes that are read-only and independent enough to overlap with peers. */
+export const PARALLEL_SAFE_PROBE_CLASSES: ReadonlySet<string> = new Set([
+  'sqli_boolean',
+  'sqli_time_diff',
+  'ssti_math',
+  'xss_context',
+  'path_traversal_benign',
+  'authz_matrix',
+])
+
+/**
+ * Hypotheses whose replay specs are pure reads and may be verified in parallel. Auth/JWT/cache/XSS
+ * specs can bind sessions, mutate a lab user's role, or touch shared state, so their replays stay
+ * serial even when the probe itself was a read-only GET.
+ */
+export const BATCH_VERIFY_PROBE_CLASSES: ReadonlySet<string> = new Set([
+  'sqli_boolean',
+  'sqli_time_diff',
+  'ssti_math',
+  'path_traversal_benign',
+])
+
+export interface ConcurrencySafety {
+  parallelSafe: boolean
+  /** Why the hypothesis is serialized (empty when parallel-safe). */
+  reason: string
+}
+
+/**
+ * Decide whether one hypothesis may run concurrently with peers.
+ *
+ * Serialized by rule (documented in `docs/benchmark-orchestration.md`):
+ * - any non-GET method (state mutation), second-order plant/read chains;
+ * - browser-eligible XSS (one persisted browser session);
+ * - canary-callback classes (ssrf/xxe) and cache poisoning (shared cache state);
+ * - protocol/write classes (graphql_audit, mass_assignment, workflow_invariant);
+ * - CSRF-bound probes (they share a mutating session jar).
+ */
+export function classifyHypothesisConcurrency(h: {
+  probeClass: string
+  method: string
+  secondOrder?: boolean
+  browserEligible?: boolean
+  urlDomSink?: boolean
+  location?: string
+  csrfBound?: boolean
+}): ConcurrencySafety {
+  if (h.secondOrder) return { parallelSafe: false, reason: 'second_order_write' }
+  if (h.browserEligible || h.urlDomSink) return { parallelSafe: false, reason: 'shared_browser' }
+  if (h.csrfBound) return { parallelSafe: false, reason: 'csrf_session_jar' }
+  if (h.method.toUpperCase() !== 'GET') return { parallelSafe: false, reason: 'stateful_write' }
+  if (h.probeClass === 'cache_poison_deception') return { parallelSafe: false, reason: 'shared_cache_state' }
+  if (h.probeClass === 'ssrf_canary' || h.probeClass === 'xxe_canary') return { parallelSafe: false, reason: 'canary_callback' }
+  if (!PARALLEL_SAFE_PROBE_CLASSES.has(h.probeClass)) return { parallelSafe: false, reason: `class:${h.probeClass}` }
+  return { parallelSafe: true, reason: '' }
+}
+
+export interface BenchmarkScheduledTask<T> {
+  key: string
+  /** May overlap with neighbouring parallel-safe tasks. */
+  parallelSafe: boolean
+  /** Keys that must have completed before this task is allowed to start. */
+  dependsOn?: readonly string[]
+  run: () => Promise<T>
+}
+
+export interface BenchmarkScheduleOptions {
+  /** Max concurrently-running parallel-safe tasks (1 = fully serial). */
+  concurrency: number
+  /** Called as each task starts; lets the caller account for budget deterministically. */
+  onStart?: (task: BenchmarkScheduledTask<unknown>) => void
+}
+
+/**
+ * Deterministic bounded scheduler.
+ *
+ * - Parallel-safe tasks fill up to `concurrency` slots and may overlap.
+ * - A serial task (or one with unmet dependencies) drains every in-flight task first, then runs
+ *   alone, so stateful writes never interleave with reads and their order is unchanged.
+ * - Results are returned in task order, regardless of completion order, so report ordering is
+ *   stable across runs.
+ */
+export async function runBenchmarkSchedule<T>(
+  tasks: readonly BenchmarkScheduledTask<T>[],
+  opts: BenchmarkScheduleOptions,
+): Promise<T[]> {
+  const results = new Array<T>(tasks.length)
+  const concurrency = Math.max(1, Math.trunc(opts.concurrency))
+  const completed = new Set<string>()
+  const inflight = new Set<Promise<void>>()
+  const failure: { current: { index: number; error: unknown } | null } = { current: null }
+  const drain = async (): Promise<void> => {
+    while (inflight.size > 0) {
+      await Promise.all([...inflight])
+    }
+  }
+  for (let index = 0; index < tasks.length; index += 1) {
+    const task = tasks[index]
+    const depsMet = (task.dependsOn ?? []).every(key => completed.has(key))
+    if (!task.parallelSafe || concurrency === 1 || !depsMet) {
+      await drain()
+      opts.onStart?.(task)
+      results[index] = await task.run()
+      completed.add(task.key)
+      continue
+    }
+    opts.onStart?.(task)
+    const promise: Promise<void> = Promise.resolve()
+      .then(() => task.run())
+      .then(value => { results[index] = value }, error => { failure.current ??= { index, error } })
+      .finally(() => { completed.add(task.key); inflight.delete(promise) })
+    inflight.add(promise)
+    if (inflight.size >= concurrency) await Promise.all([[...inflight][0]])
+  }
+  await drain()
+  if (failure.current) throw failure.current.error
+  return results
+}
+
+/** Deterministic batch sizes for candidate-spec verification (confirm-on-first preserved). */
+export function verificationBatches<T>(items: readonly T[], size: number): T[][] {
+  const batch = Math.max(1, Math.trunc(size))
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += batch) out.push(items.slice(i, i + batch))
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Metrics + diff
 // ---------------------------------------------------------------------------
 
@@ -375,6 +766,10 @@ export interface AllPatchesVerification {
   newlyConfirming: string[]
   /** Baseline vulns whose only evidence was a spec shared with another target (not patch evidence). */
   ambiguous?: string[]
+  /** Baseline-attributed specs replayed against the all-patched server. */
+  replayed?: number
+  /** Replayed baseline specs that no longer confirmed (dismissed/inconclusive, no transport error). */
+  dismissed?: number
   decoyFalsePositivesBefore: number
   decoyFalsePositivesAfter: number
   verdict: 'fixed' | 'regressed' | 'inconclusive'
@@ -518,6 +913,7 @@ export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
       const a = pv.allPatches
       lines.push('')
       lines.push(`- All patches applied: **${a.verdict}**${a.attempted ? '' : ' (not run)'}`)
+      if (a.replayed !== undefined) lines.push(`  - Baseline specs replayed: ${a.replayed}; dismissed: ${a.dismissed ?? 0}`)
       if (a.stillConfirming.length) lines.push(`  - Still confirming: ${a.stillConfirming.join(', ')}`)
       if (a.newlyConfirming.length) lines.push(`  - Newly confirming: ${a.newlyConfirming.join(', ')}`)
       lines.push(`  - Decoy false positives before/after: ${a.decoyFalsePositivesBefore}/${a.decoyFalsePositivesAfter}`)
