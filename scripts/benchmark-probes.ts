@@ -330,6 +330,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   let redirectHypotheses = 0
   let inferredGroups = 0
   let massHypotheses = 0
+  let filterAuthzHypotheses = 0
   const pageCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
   const inferredPurpose = (p: DiscoveredParam): InferredPurpose | undefined => (p as InferredParam).purpose
 
@@ -381,6 +382,20 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep),
         ...(!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder ? { writePathRead: true } : {}),
       })
+    }
+    // Collection routes that filter by a foreign object id (e.g. ?projectId=…): the filter must stay
+    // inside the caller's tenant. The surface rarely exposes these filter names, so plausible
+    // owner-ish id parameters are tried as authorization probes.
+    const recordCollection = /(?:^|[/_.-])(?:files?|assets?|documents?|attachments?|records?|entries|items?|notes?|comments?|listings?|media|logs?|events?)(?:$|[/_.-])/i
+    if (isGet && !pathHasPlaceholder && recordCollection.test(ep.path) && !params.some(p => p.location === 'query') && filterAuthzHypotheses < 2) {
+      for (const name of ['projectId', 'projId', 'workspaceId', 'ownerId']) {
+        const filterParam: DiscoveredParam = { name, location: 'query', isObjectId: true, isCsrf: false }
+        add({
+          endpoint: { ...ep, params: [...ep.params, filterParam] },
+          probeClass: 'authz_matrix', param: filterParam, location: 'query', method: 'GET',
+        })
+      }
+      filterAuthzHypotheses += 1
     }
     // Function-level authorization: a privileged mutating verb invoked by a lower-privilege actor.
     // Placeholder server-action ids (framework RPC ids that are not on the surface) cannot be invoked
@@ -759,7 +774,9 @@ function harvestJson(body: string): JsonHarvest {
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
       if (typeof value === 'string' || typeof value === 'number') {
         const s = String(value)
-        if (/(?:^|_)(?:id|uuid|uid|sku|slug|key|ref|code|token)$/i.test(key) && s.length <= 128 && s.length > 0) ids.push(s)
+        const idKey = /(?:^|_)(?:id|uuid|uid|sku|slug|key|ref|code|token)$/i.test(key)
+        const ownerKey = /(?:^|_)(?:project|owner|tenant|team|org|account|parent|user|member)$/i.test(key)
+        if ((idKey || (ownerKey && looksLikeIdSegment(s))) && s.length <= 128 && s.length > 0) ids.push(s)
         const bucket = fields.get(key) ?? []
         if (bucket.length < 6) bucket.push(s)
         fields.set(key, bucket)
@@ -777,7 +794,7 @@ function harvestJson(body: string): JsonHarvest {
  * ids read back from the sibling collection route (`/api/v1/invoices/{id}` -> GET `/api/v1/invoices`).
  * Collection responses are fetched once per route and cached for the run.
  */
-export async function idPool(env: ProbeEnv, pathTemplate?: string): Promise<string[]> {
+export async function idPool(env: ProbeEnv, pathTemplate?: string, persona = env.owner): Promise<string[]> {
   const cache = (env.idCache ??= new Map())
   // Interleave raw persona ids with their numeric suffixes: some routes key on the user id
   // (user-1001) and others on the numeric object id (1001), and the id matrix is bounded.
@@ -794,21 +811,25 @@ export async function idPool(env: ProbeEnv, pathTemplate?: string): Promise<stri
     ? (() => {
         const segs = pathTemplate.split('?')[0].split('/').filter(Boolean)
         const idx = segs.findIndex(seg => placeholderSeg.test(seg))
-        return idx > 0 ? `/${segs.slice(0, idx).join('/')}` : null
+        // A templated detail route harvests from its collection; a pathless collection route
+        // harvests from itself (its records carry the owner/tenant ids filters expect).
+        if (idx > 0) return `/${segs.slice(0, idx).join('/')}`
+        return hasPathPlaceholder(pathTemplate) ? null : pathTemplate.split('?')[0]
       })()
     : null
   if (collection) {
-    let harvested = cache.get(collection)
+    const cacheKey = `${persona ?? ''}|${collection}`
+    let harvested = cache.get(cacheKey)
     if (!harvested) {
       harvested = []
       try {
         const ex = await env.broker.executeHttp({
-          origin: env.origin, method: 'GET', pathAndQuery: collection, persona: env.owner,
+          origin: env.origin, method: 'GET', pathAndQuery: collection, persona,
           followRedirects: false, timeoutMs: 8_000,
         }, env.grant, env.signal)
         if (ex.status >= 200 && ex.status < 300) harvested = harvestJson(ex.body).ids
       } catch { /* collection may not exist */ }
-      cache.set(collection, harvested)
+      cache.set(cacheKey, harvested)
     }
     seeds.unshift(...harvested)
   }
@@ -917,6 +938,12 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
   const idSlot = hasPathPlaceholder(h.endpoint.path)
   const idParam = h.endpoint.params.find(p => (p.isObjectId || idName.test(p.name)) && p.location === 'query')
   const functionLevel = !idSlot && !idParam
+  // Anonymous-readable detail routes are normally rejected as public data. Tenant/owner-scoped
+  // resources (orders, customers, files, accounts, …) are never public, even when the app forgot the
+  // auth check too; keep the anonymous row only for explicitly public/preview/storefront surfaces.
+  const publicSurface = /(?:public|shared|preview|storefront|catalog|embed|community|landing|products?|wares?|ratings?|testimonials?|listings?)/i
+  const scopedResource = /(?:orders?|purchases?|customers?|invoices?|billing|files?|assets?|documents?|accounts?|tickets?|alerts?|notifications?|members?|users?|shipments?|payments?|refunds?|jobs?|logs?|audit|reports?)/i
+  const includeAnonymous = !(idSlot && scopedResource.test(h.endpoint.path) && !publicSurface.test(h.endpoint.path))
   const pathAndQuery = idSlot
     ? fillPlaceholders(h.endpoint.path, '{{id}}')
     : idParam
@@ -936,6 +963,13 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     }
   }
   const requestBody = functionLevel ? undefined : (mutating ? writeBodyFor(h.endpoint, env, 'json') : undefined)
+  // Object ids from both sides: a cross-tenant read often keys on the *other* actor's object, whose
+  // id never appears in the owner's own collection.
+  const ownerIds = functionLevel ? [] : await idPool(env, h.endpoint.path, owner)
+  const otherIds = functionLevel || !other ? [] : await idPool(env, h.endpoint.path, other)
+  const resourceIds = functionLevel
+    ? ['']
+    : [...new Set([...ownerIds, ...otherIds])].slice(0, 12)
   return {
     probeClass: 'authz_matrix',
     origin: env.origin,
@@ -944,9 +978,9 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     persona: owner,
     ownerPersona: owner,
     otherPersona: other,
-    includeAnonymous: true,
+    includeAnonymous,
     includeHeaderBypass: false,
-    resourceIds: functionLevel ? [''] : await idPool(env, h.endpoint.path),
+    resourceIds,
     ...(functionBody !== undefined ? { functionBody } : {}),
     ...(requestBody && Object.keys(requestBody).length > 0 ? { jsonBody: requestBody } : {}),
     runId: env.runId,
