@@ -40,10 +40,64 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   return [{ kind: 'http_chain', spec }]
 }
 
+function massAssignmentValue(field: string, privileged: boolean): string | boolean {
+  if (/^(?:is|has|verified|admin|emailVerified|enabled|active|superuser|staff)/i.test(field)) return privileged
+  if (privileged) {
+    if (/role|admin|permission|privilege|scope/i.test(field)) return 'admin'
+    if (/plan|tier/i.test(field)) return 'enterprise'
+    if (/org|tenant|team|group/i.test(field)) return '1'
+    return 'guardian-privileged'
+  }
+  if (/role|permission|privilege|scope/i.test(field)) return 'user'
+  if (/plan|tier/i.test(field)) return 'free'
+  if (/org|tenant|team|group/i.test(field)) return '0'
+  return 'guardian-low'
+}
+
+/**
+ * Mass assignment proven as a *transition*: write a low-privilege value (control), read it back,
+ * then overpost the privileged value (probe) and read again. Valid even when the account already
+ * holds the privileged value before the replay.
+ */
+function synthMassAssignmentTransition(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'mass_assignment')
+  if (!hit || !env.owner) return []
+  const field = String(hit.field ?? '')
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(field)) return []
+  const lowValue = massAssignmentValue(field, false)
+  const expected = massAssignmentValue(field, true)
+  if (lowValue === expected) return []
+  const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
+  const path = hasPathPlaceholder(o.hyp.endpoint.path) ? fillPlaceholders(o.hyp.endpoint.path, '1') : o.hyp.endpoint.path
+  const read: RequestParts = { method: 'GET', pathAndQuery: path }
+  const write = (value: string | boolean): RequestParts => ({ method, pathAndQuery: path, jsonBody: { [field]: value } })
+  const fieldLit = jqStr(field)
+  const expectedLit = typeof expected === 'boolean' ? String(expected) : jqStr(expected)
+  const lowLit = typeof lowValue === 'boolean' ? String(lowValue) : jqStr(lowValue)
+  const jq = `{ controlPassed: (${is2xx('c1')} and ((.steps.c1.json | type) == "object") and (.steps.c1.json[${fieldLit}] == ${lowLit})), ` +
+    `confirmed: ((${is2xx('p2')} and (.steps.p2.json[${fieldLit}] == ${expectedLit}))), ` +
+    `observed: (("${field}=" + ((.steps.p2.json[${fieldLit}]) | tostring))), expected: "privileged field must not be writable" }`
+  const spec = {
+    ...baseFields(env, 'Mass assignment of a privileged profile field', 'CWE-915', 'mass-assignment', 'high', jq),
+    kind: 'http_chain',
+    steps: [
+      stepOf(env, 'w1', 'control', `Baseline write of a low-privilege "${field}" value`, write(lowValue), env.owner),
+      stepOf(env, 'c1', 'control', 'Read the record to confirm the baseline value', read, env.owner),
+      stepOf(env, 'p1', 'probe', `Overpost the privileged "${field}" field`, write(expected), env.owner),
+      stepOf(env, 'p2', 'probe', 'Re-read the record to observe persistence', read, env.owner),
+    ],
+  }
+  return [{ kind: 'http_chain', spec }]
+}
+
 export function synthMassAssignment(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const hit = o.anomalies.find(a => a.type === 'mass_assignment' && a.persisted === true)
   if (!hit || !env.owner) return []
-  const field = String(hit.field)
+  const field = String(hit.field ?? '')
+  // Field names are replayed inside jq and JSON bodies; reject anything that is not a plain identifier.
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(field)) return []
+  const out = synthMassAssignmentTransition(o, env)
+  if (out.length > 0) return out
   const isBool = /^(?:is|has|verified|admin|emailVerified)/i.test(field)
   const value: string | boolean = isBool ? true : `guardian_ma_${randomBytes(3).toString('hex')}`
   const read: RequestParts = { method: 'GET', pathAndQuery: o.hyp.endpoint.path }

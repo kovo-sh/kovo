@@ -1,6 +1,7 @@
 /** auth_protocol_proof / cache_differential spec synthesis. */
-import { baseFields, is2xx, sameAsControl, stepOf } from './benchmark-specs-common.ts'
+import { appendQuery, baseFields, is2xx, jqStr, sameAsControl, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
+import { probePathFor } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
 type Mutation = Record<string, unknown>
@@ -13,7 +14,7 @@ function mutationFor(name: string): Mutation | null {
     case 'kid_inject': return { kind: 'kid_inject', value: "1' OR '1'='1" }
     case 'rs256_to_hs256_jwks': return { kind: 'rs256_to_hs256_jwks' }
     case 'claim_swap': return { kind: 'claim_swap', claims: { role: 'admin' } }
-    case 'jku_x5u_canary': return { kind: 'jku_x5u_canary', header: 'jku', url: '{{canary_url}}' }
+    case 'jku_x5u_canary': return { kind: 'jku_x5u_canary', header: 'jku' }
     default: return null
   }
 }
@@ -100,32 +101,55 @@ export function synthAuthProtocol(o: HypothesisOutcome, env: ProbeEnv): Synthesi
 }
 
 export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
-  const path = o.hyp.endpoint.path.replace(/\/+$/, '') || '/'
-  const control = `${path}?_gcb={{control_gcb}}`
-  const jq = '{ controlPassed: (.control.status < 400), confirmed: (.cacheProof.cacheHitObserved == true and .cacheProof.poisonPersistedToVictim == true), observed: ("hit=" + (.cacheProof.cacheHitObserved | tostring)), expected: "responses are not cached across callers" }'
+  const poison = o.anomalies.find(a => a.type === 'cache_poisoning')
+  const deception = o.anomalies.find(a => a.type === 'web_cache_deception')
+  if (!poison && !deception) return []
+  const basePath = probePathFor(o.hyp)
+  const path = basePath.replace(/\/+$/, '') || '/'
+  const marker = 'guardian-cache-probe'
   const out: SynthesizedSpec[] = []
-  for (const a of o.anomalies) {
-    if (a.type === 'cache_poisoning') {
-      const header = String(a.header)
-      const value = header === 'X-Forwarded-Scheme' ? 'http' : header.endsWith('URL') ? '/guardian-cache-probe' : 'poison-guardian.guardian.invalid'
-      out.push({
-        kind: 'cache_differential',
-        spec: {
-          ...baseFields(env, `Cache poisoning via unkeyed ${header}`, 'CWE-345', 'cache', 'high', jq),
-          kind: 'cache_differential', targetOrigin: env.origin, mode: 'poison', method: 'GET',
-          controlPath: control, probePath: `${path}?_gcb={{probe_gcb}}`, poisonHeaders: { [header]: value },
-        },
-      })
-    } else if (a.type === 'web_cache_deception' && env.owner) {
-      out.push({
-        kind: 'cache_differential',
-        spec: {
-          ...baseFields(env, 'Web cache deception on authenticated page', 'CWE-524', 'cache', 'high', jq),
-          kind: 'cache_differential', targetOrigin: env.origin, mode: 'deception', method: 'GET',
-          controlPath: control, probePath: `${path}/guardian-static.css?_gcb={{probe_gcb}}`, poisonPersona: env.owner,
-        },
-      })
-    }
+
+  if (poison) {
+    const header = String(poison.header ?? '')
+    if (!/^[A-Za-z0-9-]{1,64}$/.test(header) || /^(?:authorization|cookie|host)$/i.test(header)) return []
+    const value = header === 'X-Forwarded-Scheme' ? 'http' : header.endsWith('URL') ? `/${marker}` : 'poison-guardian.guardian.invalid'
+    const jq = '{ controlPassed: (.cacheProof.cacheHitObserved == true), ' +
+      `confirmed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.poisonPersistedToVictim == true) and (.verify.body | contains(${jqStr(marker)}))), ` +
+      'observed: ("hit=" + (.cacheProof.cacheHitObserved | tostring) + " age=" + ((.cacheProof.age // 0) | tostring)), expected: "poisoned response served from cache to a clean client" }'
+    out.push({
+      kind: 'cache_differential',
+      spec: {
+        ...baseFields(env, 'Web cache poisoning via unkeyed header', 'CWE-525', 'cache-poisoning', 'high', jq),
+        kind: 'cache_differential', targetOrigin: env.origin, mode: 'poison', method: 'GET',
+        controlPath: appendQuery(path, '_gcb', '{{control_gcb}}', false),
+        probePath: appendQuery(path, '_gcb', '{{probe_gcb}}', false),
+        poisonHeaders: { [header]: value },
+        ...(env.owner ? { poisonPersona: env.owner } : {}),
+      },
+    })
+  }
+
+  if (deception) {
+    const observedUrl = typeof deception.deceptionUrl === 'string' ? deception.deceptionUrl : ''
+    let deceptionPath = `${path}/guardian-static.css`
+    try {
+      const parsed = new URL(observedUrl, 'http://guardian.invalid')
+      if (parsed.pathname && parsed.pathname !== '/') deceptionPath = parsed.pathname
+    } catch { /* keep generic static suffix */ }
+    const jq = '{ controlPassed: (.cacheProof.cacheHitObserved == true), ' +
+      'confirmed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.poisonPersistedToVictim == true) and (.steps.verify.status == 200) and (.steps.verify.body != .steps.control.body)), ' +
+      'observed: ("verify status=" + (.steps.verify.status | tostring)), expected: "private response not cacheable by an anonymous client" }'
+    out.push({
+      kind: 'cache_differential',
+      spec: {
+        ...baseFields(env, 'Web cache deception of a private page', 'CWE-525', 'cache-deception', 'high', jq),
+        kind: 'cache_differential', targetOrigin: env.origin, mode: 'deception', method: 'GET',
+        controlPath: appendQuery(path, '_gcb', '{{control_gcb}}', false),
+        probePath: appendQuery(deceptionPath, '_gcb', '{{probe_gcb}}', false),
+        verifyPath: appendQuery(deceptionPath, '_gcb', '{{probe_gcb}}', false),
+        ...(env.owner ? { poisonPersona: env.owner } : {}),
+      },
+    })
   }
   return out
 }

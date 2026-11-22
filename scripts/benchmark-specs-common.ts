@@ -1,5 +1,5 @@
 /** Shared helpers for replay-spec synthesis (target-agnostic; built only from probe observations). */
-import { fillPlaceholders, hasPathPlaceholder, probePathFor } from './benchmark-probes.ts'
+import { fillPlaceholders, hasPathPlaceholder, needsCsrf, probePathFor } from './benchmark-probes.ts'
 import type { Hypothesis, HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
 export interface SynthesizedSpec {
@@ -7,7 +7,7 @@ export interface SynthesizedSpec {
   spec: Record<string, unknown>
 }
 
-export type Severity = 'high' | 'critical' | 'medium'
+export type Severity = 'high' | 'critical' | 'medium' | 'low'
 
 export function baseFields(env: ProbeEnv, title: string, cwe: string, category: string, severity: Severity, jq: string) {
   return {
@@ -30,6 +30,33 @@ export const is2xx = (stepId: string) => `(.steps.${stepId}.status >= 200 and .s
 /** Probe body equals control body, or has the same JSON shape and a non-trivial payload. */
 export const sameAsControl = (probe: string, control: string) =>
   `((.steps.${probe}.body == .steps.${control}.body) or (((.steps.${probe}.json | keys?) // []) == ((.steps.${control}.json | keys?) // []) and ((.steps.${probe}.body | length) > 2)))`
+
+/** Sibling body parameters observed on the same endpoint, for body-located probes. */
+export function siblingBody(h: Hypothesis): Record<string, unknown> | undefined {
+  if (h.location !== 'json' && h.location !== 'form' && h.location !== 'graphql_var') return undefined
+  const body: Record<string, unknown> = {}
+  for (const p of h.endpoint.params) {
+    if (p.name === h.param?.name || p.location !== h.location || p.isCsrf) continue
+    body[p.name] = 'guardian'
+  }
+  return body
+}
+
+/** Session jar + CSRF binding for a replayed request, mirroring the probe environment. */
+export function sessionFields(env: ProbeEnv, h: Hypothesis) {
+  return {
+    ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
+    ...(env.caps.sessionAndCsrf && needsCsrf(h) ? { csrfBind: true } : {}),
+  }
+}
+
+/** Append a query parameter to a path that may already carry a query string. */
+export function appendQuery(pathAndQuery: string, name: string, rawValue: string, encodeValue = true): string {
+  const sep = pathAndQuery.includes('?') ? '&' : '?'
+  const encodedName = encodeURIComponent(name)
+  const encodedValue = encodeValue ? encodeURIComponent(rawValue) : rawValue
+  return `${pathAndQuery}${sep}${encodedName}=${encodedValue}`
+}
 
 export interface RequestParts {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH'

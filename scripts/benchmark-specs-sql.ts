@@ -49,11 +49,9 @@ const fallbackStyles = ['single_quote', 'numeric', 'double_quote', 'or_branch']
 export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   if (!o.hyp.param || !o.hyp.location) return []
   const hit = o.anomalies.find(a => a.type === 'boolean_differential')
-  const hasErrorSignal = o.anomalies.some(a => a.type === 'db_error_fingerprint')
-  const styles = hit ? [String(hit.style ?? 'single_quote')] : hasErrorSignal ? fallbackStyles : []
-  return styles.map(style => {
-    const s = booleanStyle(style)
-    return {
+  if (hit) {
+    const s = booleanStyle(String(hit.style ?? 'single_quote'))
+    return [{
       kind: 'sql_boolean_diff',
       spec: {
         ...baseFields(env, 'Boolean-based SQL injection differential', 'CWE-89', 'injection-input', 'high', jqBoolean),
@@ -62,15 +60,50 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
         quoteStyle: s.quoteStyle,
         ...(s.valueTemplate ? { valueTemplate: s.valueTemplate } : {}),
       },
-    }
-  })
+    }]
+  }
+  const hasErrorSignal = o.anomalies.some(a => a.type === 'db_error_fingerprint')
+  if (!hasErrorSignal) return []
+  if (o.hyp.location === 'xml' || o.hyp.location === 'graphql_var') return []
+  // Error fingerprint proves the value reaches a SQL string literal. A tautology baseline plus the
+  // verifier's randomized `k=k` / `k=k+1` triplet still yields a genuine boolean differential.
+  const out: SynthesizedSpec[] = [{
+    kind: 'sql_boolean_diff',
+    spec: {
+      ...baseFields(env, 'SQL injection via string-literal breakout (error fingerprint)', 'CWE-89', 'injection-input', 'high', jqBoolean),
+      kind: 'sql_boolean_diff',
+      ...injectionFields(o, env),
+      baselineValue: "x' OR 1=1-- -",
+      quoteStyle: 'single',
+      valueTemplate: "x' OR {{sql_expr}}-- -",
+    },
+  }]
+  // Additional observed-shape candidates, tried only when the generic breakout does not confirm.
+  for (const style of fallbackStyles) {
+    const s = booleanStyle(style)
+    out.push({
+      kind: 'sql_boolean_diff',
+      spec: {
+        ...baseFields(env, 'Boolean-based SQL injection differential', 'CWE-89', 'injection-input', 'high', jqBoolean),
+        kind: 'sql_boolean_diff',
+        ...injectionFields(o, env),
+        quoteStyle: s.quoteStyle,
+        ...(s.valueTemplate ? { valueTemplate: s.valueTemplate } : {}),
+      },
+    })
+  }
+  return out
 }
 
 export function synthSqlTime(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const hit = o.anomalies.find(a => a.type === 'sql_time_differential')
   if (!hit || !o.hyp.param || !o.hyp.location) return []
+  // The typed time-diff schema only supports query/path/json/form injection.
+  if (o.hyp.location === 'xml' || o.hyp.location === 'graphql_var' || o.hyp.location === 'header') return []
   const style = String(hit.style ?? 'single_quote')
-  const dialect = ['postgres', 'mysql', 'sqlite', 'mssql'].includes(String(hit.dialect)) ? String(hit.dialect) : 'postgres'
+  const dialectRaw = String(hit.dialect ?? '')
+  if (!['postgres', 'mysql', 'sqlite', 'mssql'].includes(dialectRaw)) return []
+  const dialect = dialectRaw as 'postgres' | 'mysql' | 'sqlite' | 'mssql'
   const delay = Math.max(1500, Math.min(3000, Number(hit.delayMs) || 1500))
   return [{
     kind: 'sql_time_diff',

@@ -374,7 +374,9 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
   if (!corpus) return ctx
   if (h.param && h.location === 'xml') ctx.xmlTemplate = mineXmlTemplate(corpus, h.param.name) ?? undefined
   if (h.param && h.location === 'graphql_var') ctx.graphqlQuery = mineGraphqlQuery(corpus, h.param.name) ?? undefined
-  if (h.probeClass === 'auth_protocol_audit' && oauthPath.test(h.endpoint.path)) {
+  if (h.probeClass === 'auth_protocol_audit') {
+    // OAuth/OIDC authorize URLs are discovered as links/JS literals; the query seed carries the
+    // registered client_id/redirect_uri/scope the endpoint actually expects.
     const seed = mineSeedQuery(corpus, h.endpoint.path.split('?')[0])
     if (seed) ctx.seedQuery = seed
   }
