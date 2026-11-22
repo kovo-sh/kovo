@@ -1005,3 +1005,4 @@
 .rw .pane-h .b-btn{position:relative}
 .rw .b-badge{position:absolute;top:1px;right:0;min-width:15px;height:15px;padding:0 4px;border-radius:8px;background:var(--accent);color:#fff;font-size:9.5px;font-weight:600;display:inline-grid;place-items:center;line-height:1}
 .rw .b-roster,.rw .b-filters{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);padding-right:28px}
+.rw .b-ref-d .linkbtn{display:flex;align-items:flex-start;gap:6px;text-align:left;justify-content:flex-start}

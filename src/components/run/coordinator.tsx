@@ -20,7 +20,7 @@ import { boardKindLabels, boardRoleLabels, boardStateMeta } from '../run-state.t
 import { useRun, useRunModel } from './data.tsx'
 import { ACTIONS, approvalCommand, useDecisions } from './decisions.tsx'
 import { Kbd } from './display.tsx'
-import { capF, fmtDay, fmtTime, host, plural, short, words } from './format.ts'
+import { cap, capF, fmtDay, fmtTime, host, plural, short, words } from './format.ts'
 import { StatusGlyph } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import { useShortcuts } from './keyboard.tsx'
@@ -96,7 +96,7 @@ function ApprovalRow({ a }: { a: Approval }) {
       <span className="verdict"><Icon name={ACTIONS[d.act].icon} />{ACTIONS[d.act].label}{d.state === 'pending' ? ' · sending' : ''}</span>
       {d.state !== 'sent' && <button type="button" className="icon-btn" title="Undo" aria-label="Undo" style={{ height: 24, minWidth: 24 }} onClick={() => q.reopen('ap:' + a.id)}><Icon name="undo" /></button>}
     </> : a.status !== 'pending'
-      ? <span className="verdict"><StatusGlyph status={a.status} />{stLabel(a.status)}</span>
+      ? <span className="verdict"><StatusGlyph status={a.status} />{cap(a.status)}</span>
       : <span className="acts">
         <button type="button" className="icon-btn no" title={`Deny ${a.method} ${host(a.origin)}${a.pathAndQuery}`} aria-label="Deny" onClick={() => decide(a.id, 'deny')}><Icon name="x" /></button>
         <button type="button" className="icon-btn ok" title={`Approve ${a.method} ${host(a.origin)}${a.pathAndQuery}`} aria-label="Approve" onClick={() => decide(a.id, 'approve')}><Icon name="check" /></button>
@@ -205,7 +205,7 @@ function RefDetail({ kind, id }: { kind: RefKind; id: string }) {
 
 function InlineApproval({ a }: { a: Approval }) {
   return <div className="b-apin" data-testid="board-approval-inline">
-    <div className="b-apin-h"><Icon name="shield" /><span>Tier 3 approval</span><span className="muted">· {stLabel(a.status)}</span></div>
+    <div className="b-apin-h"><Icon name="shield" /><span>Tier 3 approval</span><span className="muted">· {cap(a.status)}</span></div>
     <ApprovalRow a={a} />
   </div>
 }
