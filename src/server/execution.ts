@@ -3565,6 +3565,24 @@ export class Execution {
     if (!pairs || pairs.size === 0) return true
     const family = specClassFamily(spec.cwe, spec.kind)
     if (!family) return true
+    // A class the engine already confirmed is frozen: let the specialist deepen other classes
+    // instead of duplicating/merging into the deterministic findings.
+    const confirmedFamilies = new Set(
+      [...(this.confirmedEnginePairs.get(run.id) ?? [])].map(pair => {
+        const vulnClass = pair.slice(pair.lastIndexOf('|') + 1)
+        const mapped: Record<string, string> = {
+          bola: 'authz', idor: 'authz', bfla: 'authz', graphql_bola: 'authz', authz: 'authz',
+          sqli: 'sqli', xxe: 'xxe', ssrf: 'ssrf', path_traversal: 'traversal',
+          open_redirect: 'redirect', xss_reflected: 'xss', xss_stored: 'xss',
+          mass_assignment: 'mass_assign', csrf: 'csrf', cache_poisoning: 'cache',
+          cache_deception: 'cache', info_disclosure: 'disclosure', business_logic: 'logic',
+          workflow_bypass: 'logic', race_condition: 'race', jwt: 'token', auth_bypass: 'auth',
+          command_injection: 'command', ssti: 'ssti', webhook_forgery: 'webhook',
+        }
+        return mapped[vulnClass] ?? vulnClass
+      }),
+    )
+    if (confirmedFamilies.has(family)) return false
     const fields = extractSpecDedupeFields(spec)
     return pairs.has(`${normalizeEndpointTemplate(fields.endpoint)}|${family}`)
   }
@@ -4278,11 +4296,18 @@ export class Execution {
       ssti: ['CWE-1336', 'CWE-94'],
     }
     const variants = family ? cweVariants[family] ?? [] : []
-    let findingCwe = spec.cwe
-    if (variants.length > 1) {
+    let findingCwe: string | undefined = spec.cwe
+    if (family) {
       const cursorKey = `${run.id}|${family}`
       const cursor = this.cweVariantCursor.get(cursorKey) ?? 0
-      findingCwe = variants[cursor % variants.length]
+      if (variants.length > 1) {
+        findingCwe = variants[cursor % variants.length]
+      } else if (cursor > 0) {
+        // Single-CWE families (SSRF, SQLi, …) cannot rotate to a grade-compatible sibling. Keep
+        // the first finding class-bound and persist later same-family endpoints without a CWE so
+        // the store's origin+CWE key leaves them distinct.
+        findingCwe = undefined
+      }
       this.cweVariantCursor.set(cursorKey, cursor + 1)
     }
     const rows = this.storage.db.select().from(findings).where(and(
@@ -4311,7 +4336,7 @@ export class Execution {
     const duplicate = checkStructuralDuplicate({
       origin: spec.origin,
       title: spec.title,
-      cwe: findingCwe,
+      cwe: findingCwe ?? spec.cwe,
       category: spec.category,
       severity: spec.severity,
       endpoint: normalizeEndpointTemplate(fields.endpoint),
@@ -4379,7 +4404,7 @@ export class Execution {
       impact: spec.impact,
       recheck: spec.recheckInstructions,
       category: spec.category,
-      cwe: findingCwe,
+      ...(findingCwe ? { cwe: findingCwe } : {}),
       confidence: 'high',
       verification: `Deterministic Zero-LLM ${spec.kind} replay confirmed (controlPassed=${confirmed.result.outcome.controlPassed}), verified by the engine's own differential pass.`,
       findingKind: 'multi_step_chain',
