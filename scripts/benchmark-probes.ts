@@ -71,6 +71,8 @@ export interface Hypothesis {
   serverAction?: boolean
   /** Test URL-query-driven DOM sinks on a rendered page (no form interaction needed). */
   urlDomSink?: boolean
+  /** Extend authz_matrix with a safe cross-tenant write + owner read-back for PATCH/PUT objects. */
+  writePathRead?: boolean
 }
 
 export interface HypothesisPlan {
@@ -110,6 +112,17 @@ const protocolParam = /^(?:client[_-]?id|client[_-]?secret|redirect[_-]?uri|resp
 const placeholderSeg = /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/
 const maxInjectionParamsPerEndpoint = 8
 const maxCacheEndpoints = 5
+/** Cookie-authenticated state-change candidates (CSRF) and their observable read routes. */
+const csrfActionPath = /(settings|profile|account|tenant|org|team|refund|job|trigger|approve|confirm|transfer|invite|subscribe|billing|payment|grant)/i
+const csrfSkipPath = /(^|\/)(login|logout|2fa|csrf|token|session|oauth|authorize|callback|graphql)(\/|$)/i
+/** Inbound webhook receiver routes (not management/list routes). */
+const webhookReceiverPath = /(^|\/)(?:receive|receive-webhook|callback|callbacks|inbound|deliver|delivery|events)(\/|$)/i
+/** Navigation/callback parameter names used by open-redirect sinks. */
+const redirectParamName = /^(?:next|nextUrl|next_url|returnTo|return_to|returnUrl|return_url|redirect|redirectUri|redirect_uri|url|uri|continue|continueUrl|callback|callbackUrl|dest|destination|target|go)$/i
+const redirectPathHint = /(sso|oauth|authorize|callback|redirect|return|login|logout|checkout|download|export|continue|resume)/i
+const maxCsrfHypotheses = 6
+const maxWebhookHypotheses = 4
+const maxRedirectHypotheses = 10
 
 /** True for concrete path segments that look like resource identifiers (not route words). */
 export function looksLikeIdSegment(seg: string): boolean {
@@ -139,6 +152,28 @@ function writeMethod(ep: DiscoveredEndpoint): 'POST' | 'PUT' | 'PATCH' {
 function lastPathSegment(path: string): string {
   const parts = path.split('?')[0].split('/').filter(Boolean)
   return parts[parts.length - 1] ?? ''
+}
+
+/**
+ * Observable GET route for a CSRF state change: the same route when it is also readable, otherwise
+ * a parent resource route (an action verb such as `/trigger` is stripped).
+ */
+function csrfReadPathFor(path: string, getPaths: readonly string[]): string | null {
+  if (getPaths.includes(path)) return path
+  const segs = path.split('?')[0].split('/').filter(Boolean)
+  if (segs.length < 2) return null
+  const parent = `/${segs.slice(0, -1).join('/')}`
+  if (getPaths.includes(parent)) return parent
+  return null
+}
+
+/** Plausible navigation parameter names for a route shape (no app-specific literals). */
+function redirectCandidateParams(path: string): string[] {
+  const p = path.toLowerCase()
+  if (/(sso|oauth|authorize|openid|login)/.test(p)) return ['next', 'returnTo', 'returnUrl']
+  if (/(checkout|return)/.test(p)) return ['returnUrl', 'returnTo', 'redirect']
+  if (/(download|export)/.test(p)) return ['url', 'returnTo', 'redirect']
+  return ['url', 'next', 'redirect']
 }
 
 /**
@@ -183,6 +218,9 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   const getPaths = [...new Set(endpoints.filter(e => e.method.toUpperCase() === 'GET' || e.method.toUpperCase() === 'HEAD').map(e => e.path))]
   const writeProbeSeen = new Set<string>()
   const cacheCandidates: DiscoveredEndpoint[] = []
+  let csrfHypotheses = 0
+  let webhookHypotheses = 0
+  let redirectHypotheses = 0
 
   for (const ep of endpoints) {
     const method = ep.method.toUpperCase()
@@ -207,7 +245,10 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     // Object-level authorization: id-bearing paths or id-named parameters. Framework RPC ids are
     // not resource identifiers, so placeholder action routes are handled by the server-action probe.
     if ((pathHasPlaceholder && !serverActionPath.test(ep.path)) || (idParam && idParam.location === 'query')) {
-      add({ endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep) })
+      add({
+        endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep),
+        ...(!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder ? { writePathRead: true } : {}),
+      })
     }
     // Function-level authorization: a privileged mutating verb invoked by a lower-privilege actor.
     // Placeholder server-action ids (framework RPC ids that are not on the surface) cannot be invoked
@@ -320,6 +361,50 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       if (xmlPath.test(ep.path) && !isGet && !params.some(p => p.location === 'xml')) {
         add({ endpoint: ep, probeClass: 'xxe_canary', method: writeMethod(ep) })
       }
+
+      // CSRF state-change: a session-authenticated mutation whose read route exposes the field.
+      if (
+        !isGet && method !== 'DELETE' && csrfHypotheses < maxCsrfHypotheses &&
+        !serverActionPath.test(ep.path) && !csrfSkipPath.test(ep.path) && !graphqlPath.test(ep.path) &&
+        csrfActionPath.test(ep.path)
+      ) {
+        const readPath = csrfReadPathFor(ep.path, getPaths)
+        const hasCsrfParam = ep.params.some(p => p.isCsrf)
+        const actionish = /(trigger|approve|confirm|transfer|invite|refund|redeem|accept|settings|profile)/i.test(ep.path)
+        const stateBody = params.some(p =>
+          (p.location === 'json' || p.location === 'form') &&
+          /name|title|label|note|description|status|state|value|amount|tier|plan|enabled|active/i.test(p.name))
+        if (readPath && (hasCsrfParam || actionish) && (hasCsrfParam || stateBody || actionish)) {
+          add({ endpoint: ep, probeClass: 'csrf_state_change', method: writeMethod(ep) })
+          csrfHypotheses += 1
+        }
+      }
+
+      // Inbound webhook signature: receiver-shaped routes only (never management/list verbs).
+      if (
+        !isGet && method !== 'DELETE' && webhookHypotheses < maxWebhookHypotheses &&
+        (webhookReceiverPath.test(lastPathSegment(ep.path)) || /webhook|callback/i.test(ep.path))
+      ) {
+        add({ endpoint: ep, probeClass: 'webhook_signature_bypass', method: writeMethod(ep) })
+        webhookHypotheses += 1
+      }
+
+      // Open redirect: navigation-shaped GET routes plus any discovered URL-ish parameter.
+      if (isGet && redirectHypotheses < maxRedirectHypotheses && (redirectPathHint.test(ep.path) || params.some(p => redirectParamName.test(p.name)))) {
+        const discovered = params.filter(p => redirectParamName.test(p.name))
+        const candidates = discovered.length > 0
+          ? discovered
+          : redirectCandidateParams(ep.path).map(name => ({ name, location: 'query', isObjectId: false, isCsrf: false }))
+        for (const cand of candidates.slice(0, 3)) {
+          if (redirectHypotheses >= maxRedirectHypotheses) break
+          add({
+            endpoint: ep, probeClass: 'open_redirect_differential',
+            param: cand, location: cand.location as SurfaceParamLocation,
+            method: cand.location === 'json' || cand.location === 'form' ? writeMethod(ep) : 'GET',
+          })
+          redirectHypotheses += 1
+        }
+      }
     }
   }
 
@@ -335,7 +420,11 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       add({ endpoint: ep, probeClass: 'cache_poison_deception', method: 'GET' })
     }
   }
-  return { hypotheses, encodingSkips }
+  const prioritized = hypotheses
+    .map((h, i) => ({ h, i }))
+    .sort((a, b) => (a.h.probeClass === 'sqli_time_diff' ? 1 : 0) - (b.h.probeClass === 'sqli_time_diff' ? 1 : 0) || a.i - b.i)
+    .map(x => x.h)
+  return { hypotheses: prioritized, encodingSkips }
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,6 +1332,67 @@ async function runSecondOrderSsrfCheck(h: Hypothesis, env: ProbeEnv, watch: (ex:
   return result
 }
 
+interface WebhookDelivery {
+  body: Record<string, unknown>
+  readPath: string
+  stateField: string
+  stateValue: number
+  header: string
+}
+
+/**
+ * Discover an inbound receiver's sibling management/list route, harvest an endpoint identifier and a
+ * scalar/array state that only advances when a delivery is processed.
+ */
+async function webhookDeliveryFor(h: Hypothesis, env: ProbeEnv): Promise<WebhookDelivery | null> {
+  const getPaths = (env.endpoints ?? []).filter(e => e.method.toUpperCase() === 'GET').map(e => e.path)
+  const segs = h.endpoint.path.split('?')[0].split('/').filter(Boolean)
+  const parent = segs.length > 1 ? `/${segs.slice(0, -1).join('/')}` : null
+  const candidates = [...new Set([
+    parent,
+    ...getPaths.filter(p => !hasPathPlaceholder(p) && /(hook|webhook|event|deliver|callback|audit|log)/i.test(p)),
+  ].filter((p): p is string => Boolean(p)))].slice(0, 3)
+  for (const path of candidates) {
+    const ex = await sendRaw(env, { method: 'GET', pathAndQuery: path, persona: env.owner, session: env.caps.sessionAndCsrf ? env.session : undefined })
+    if (!ex || ex.status < 200 || ex.status >= 300) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(ex.body) } catch { continue }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+    const rec = parsed as Record<string, unknown>
+    const harvest = harvestJson(ex.body)
+    const id = harvest.fields.get('endpoint')?.[0] ?? harvest.fields.get('id')?.[0] ??
+      harvest.fields.get('hookId')?.[0] ?? harvest.fields.get('webhookId')?.[0] ?? harvest.ids[0]
+    if (!id) continue
+    for (const key of ['events', 'items', 'deliveries', 'runs', 'records', 'logs']) {
+      const value = rec[key]
+      if (Array.isArray(value)) {
+        return {
+          body: {
+            endpoint: id, id, hookId: id, webhookId: id,
+            event: { type: 'guardian.probe', id: `gwh${shortToken(8)}` }, type: 'guardian.probe',
+          },
+          readPath: path, stateField: key, stateValue: value.length + 1,
+          header: 'x-webhook-signature',
+        }
+      }
+    }
+    for (const key of ['count', 'total', 'received', 'processed']) {
+      const value = Number(rec[key])
+      if (Number.isFinite(value)) {
+        return {
+          body: {
+            endpoint: id, id, hookId: id, webhookId: id,
+            event: { type: 'guardian.probe', id: `gwh${shortToken(8)}` }, type: 'guardian.probe',
+          },
+          readPath: path, stateField: key, stateValue: value + 1,
+          header: 'x-webhook-signature',
+        }
+      }
+    }
+  }
+  return null
+}
+
 export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (ex: BrokerExchangeResult) => void): Promise<HypothesisOutcome> {
   const out: HypothesisOutcome = {
     hyp: h, verdict: 'inconclusive', anomalies: [], details: {}, csrfRejected: false, contextReset: false, tierBlocked: false, requests: 0,
@@ -1296,6 +1446,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       if ((/(admin|internal|manage|staff|flag|role|permission)/i.test(h.endpoint.path) || serverActionPath.test(h.endpoint.path)) && env.admin && (env.viewer ?? env.other)) { owner = env.admin; other = env.viewer ?? env.other }
       out.pair = { owner, other }
       req = await authzRequest(h, env, owner, other)
+      if (h.writePathRead) req.writePathRead = true
       break
     }
     case 'ssrf_canary':
@@ -1327,6 +1478,70 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = buildProbeRequest(h, env); delete req.param; delete req.paramLocation; break
     case 'path_traversal_benign':
       req = buildProbeRequest(h, env); break
+    case 'csrf_state_change': {
+      const getPaths = (env.endpoints ?? []).filter(e => e.method.toUpperCase() === 'GET').map(e => e.path)
+      const idSlot = hasPathPlaceholder(h.endpoint.path)
+      const ids = idSlot ? await idPool(env, h.endpoint.path) : []
+      const id = ids[0] ?? '1'
+      const writePath = idSlot ? fillPlaceholders(h.endpoint.path, encodeURIComponent(id)) : h.endpoint.path
+      const parent = `/${h.endpoint.path.split('?')[0].split('/').filter(Boolean).slice(0, -1).join('/')}`
+      const segs = h.endpoint.path.split('?')[0].split('/').filter(Boolean)
+      const placeholderIdx = segs.findIndex(s => /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.test(s))
+      const collection = placeholderIdx > 0 ? `/${segs.slice(0, placeholderIdx).join('/')}` : null
+      const readTemplate = getPaths.includes(h.endpoint.path)
+        ? h.endpoint.path
+        : getPaths.includes(parent) || parent !== '/'
+          ? parent
+          : null
+      req = buildProbeRequest(h, env)
+      req.method = h.method
+      req.pathAndQuery = writePath
+      req.readPathCandidates = [...new Set([
+        ...(readTemplate ? [readTemplate] : []),
+        ...(collection ? [collection] : []),
+      ])].map(tpl => hasPathPlaceholder(tpl) ? fillPlaceholders(tpl, encodeURIComponent(id)) : tpl)
+      if (req.readPathCandidates.length > 0) req.readPath = req.readPathCandidates[0]
+      req.stateRecordId = id
+      const bodyNames = h.endpoint.params.filter(p => (p.location === 'json' || p.location === 'form') && !p.isCsrf).map(p => p.name)
+      const stateHint = bodyNames.find(n => /^(?:status|state)$/i.test(n)) ??
+        bodyNames.find(n => /^(?:name|title|label|display_?name)$/i.test(n)) ??
+        (/(trigger|confirm|approve|complete|activate|publish|status|state|workflow)/i.test(h.endpoint.path) ? 'status'
+          : /(settings|profile|account)/i.test(h.endpoint.path) ? 'name' : undefined)
+      if (stateHint) req.stateField = stateHint
+      req.csrfPrimePaths = [
+        ...(env.endpoints ?? [])
+          .filter(e => e.method.toUpperCase() === 'GET' && /(?:^|[/_-])(?:csrf|xsrf|token|session|nonce)(?:$|[/_-])/i.test(e.path))
+          .map(e => e.path)
+          .slice(0, 2),
+        ...(req.readPath ? [req.readPath] : []),
+      ]
+      const bodyParams = h.endpoint.params.filter(p => (p.location === 'json' || p.location === 'form') && !p.isCsrf)
+      if (bodyParams.some(p => /^field$/i.test(p.name)) && bodyParams.some(p => /^value$/i.test(p.name))) {
+        req.writeBody = { field: '', value: '' }
+      }
+      break
+    }
+    case 'webhook_signature_bypass': {
+      req = buildProbeRequest(h, env)
+      const delivery = await webhookDeliveryFor(h, env)
+      if (delivery) {
+        req.webhookBody = delivery.body
+        req.readPath = delivery.readPath
+        req.readStateField = delivery.stateField
+        req.readStateValue = delivery.stateValue
+        req.webhookHeader = delivery.header
+      }
+      break
+    }
+    case 'open_redirect_differential': {
+      req = buildProbeRequest(h, env)
+      if (h.param && env.corpus) {
+        req.redirectBaseTargets = mineBaselines(env.corpus, h.param.name, h.endpoint.path)
+          .filter(v => /^https?:\/\//i.test(v) || v.startsWith('//'))
+          .slice(0, 4)
+      }
+      break
+    }
     default: req = buildProbeRequest(h, env)
   }
   if (h.param) {
