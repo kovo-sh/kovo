@@ -29,8 +29,9 @@
 
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -76,6 +77,8 @@ export interface RealisticArgs {
   concurrency: number
   dataDir?: string
   noLlm: boolean
+  isolateDataDir: boolean
+  keepDataDirs: boolean
   allowInertWorkers: boolean
   verifier: 'auto' | 'docker' | 'local-jq'
   help: boolean
@@ -102,6 +105,11 @@ Flags:
                           (default: $GUARDIAN_DATA_DIR or <out-dir>/data/<cell>)
   --no-llm                force the deterministic/Zero-LLM path; the run uses an
                           isolated data dir and never loads a model profile
+  --isolate-data-dir      per-cell data dir initialized from --data-dir: copies only
+                          enabled model_profiles rows and symlinks credentials/
+                          (default: on when --concurrency > 1)
+  --keep-data-dirs        keep per-cell isolated data dirs after grading (default:
+                          remove them)
   --allow-inert-workers   allow an agentic run even when the verifier backend
                           cannot open worker sessions (records an inert run;
                           diagnostics still show zero completed assignments)
@@ -112,6 +120,11 @@ Environment:
   GUARDIAN_ALLOW_LOCAL_LAB=1   required to boot loopback lab origins
   GUARDIAN_RB_HELDOUT_SALT     required for --held-out (never logged/committed)
   GUARDIAN_DATA_DIR            default Guardian data dir (model profile source)
+
+Parallel agentic matrix:
+  --concurrency 3 --isolate-data-dir  gives each cell its own Store under
+  <out-dir>/data/<cell>/ with copied profile metadata and a credentials symlink,
+  so cells never contend for the source data-dir lock. The key is never copied.
 
 Agentic runs need a worker-session-capable verifier:
   model profile + --verifier local-jq  -> exit 2 (inert workers) unless --no-llm
@@ -177,7 +190,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
 
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
-    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'allow-inert-workers', 'verifier', 'help',
+    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'isolate-data-dir', 'keep-data-dirs',
+    'allow-inert-workers', 'verifier', 'help',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
@@ -188,7 +202,9 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       apps: [...appNames], seeds: [1], mode: 'grey-box', heldOut: false,
       budgetUsd: DEFAULT_BUDGET_USD, maxDurationMs: DEFAULT_MAX_DURATION_MS,
       outDir: resolve('.guardian/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
-      noLlm: Boolean(a['no-llm']), allowInertWorkers: Boolean(a['allow-inert-workers']),
+      noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
+      keepDataDirs: Boolean(a['keep-data-dirs']),
+      allowInertWorkers: Boolean(a['allow-inert-workers']),
       verifier: 'auto', help: true,
     }
   }
@@ -239,6 +255,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     concurrency,
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
     noLlm: a['no-llm'] === true,
+    isolateDataDir: a['isolate-data-dir'] === true,
+    keepDataDirs: a['keep-data-dirs'] === true,
     allowInertWorkers: a['allow-inert-workers'] === true,
     verifier: verifierRaw,
     help: false,
@@ -681,6 +699,19 @@ export interface AssignmentDiagnostics {
   topFailureReasons: string[]
 }
 
+/** An agentic run that never completed an investigation assignment is inert, not a result. */
+export function isInertAgenticRun(input: {
+  agentic: boolean
+  submittedFindings: number
+  facts: number
+  investigationCompleted: number
+}): boolean {
+  return input.agentic
+    && input.submittedFindings === 0
+    && input.facts === 0
+    && input.investigationCompleted === 0
+}
+
 /** Summarize assignment outcomes without leaking secrets or raw payload strings. */
 export function summarizeAssignments(
   assignments: readonly AssignmentDiagnosticInput[],
@@ -744,6 +775,124 @@ function countTableRows(storage: Store, table: string): number {
   }
 }
 
+/** Open a cell Store; turn the source-data-dir lock into an actionable preflight error. */
+export function openCellStore(directory: string): Store {
+  try {
+    return new Store(directory)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (/Another Guardian server is using this data directory/.test(message)) {
+      throw new PreflightError(
+        `${message} Parallel cells need isolated stores: add --isolate-data-dir `
+        + '(it is on by default when --concurrency > 1) or use a distinct --data-dir per cell.',
+      )
+    }
+    throw error
+  }
+}
+
+export interface IsolatedDataDirResult {
+  directory: string
+  source: string
+  profileNames: string[]
+}
+
+/** Per-cell isolation is explicit, or implicit for a parallel matrix with a source data dir. */
+export function shouldIsolateDataDir(args: Pick<RealisticArgs, 'isolateDataDir' | 'concurrency' | 'dataDir' | 'noLlm'>): boolean {
+  return Boolean(!args.noLlm && args.dataDir && (args.isolateDataDir || args.concurrency > 1))
+}
+
+/**
+ * Create a per-cell Guardian Store from a source data dir without copying the key:
+ * only enabled model_profiles rows + the workspace identity are copied; credentials/
+ * becomes a symlink to the source credentials dir.
+ */
+export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir: string }): IsolatedDataDirResult {
+  const source = resolve(input.sourceDataDir)
+  const target = resolve(input.targetDir)
+  const sourceDb = join(source, 'guardian.sqlite')
+  const sourceCredentials = join(source, 'credentials')
+  if (!existsSync(sourceDb)) throw new PreflightError(`--isolate-data-dir source has no guardian.sqlite: ${source}`)
+  if (!existsSync(sourceCredentials)) throw new PreflightError(`--isolate-data-dir source has no credentials dir: ${source}`)
+
+  unlockAndRemove(target)
+  mkdirSync(target, { recursive: true, mode: 0o700 })
+
+  const sourceClient = new DatabaseSync(sourceDb, { readOnly: true })
+  let storage: Store | undefined
+  try {
+    const sourceWorkspace = sourceClient.prepare(
+      'select id, name, actor_id, created_at from workspaces order by created_at asc limit 1',
+    ).get() as { id?: string; name?: string; actor_id?: string; created_at?: number } | undefined
+    if (!sourceWorkspace?.id) throw new PreflightError(`--isolate-data-dir source has no workspace row: ${source}`)
+    const rows = sourceClient.prepare(
+      'select name, endpoint, model, protocol, credential_id, priority, context_window, max_tokens, '
+      + 'thinking_level, role_affinity, input_cost_per_mtok, cached_input_cost_per_mtok, output_cost_per_mtok '
+      + 'from model_profiles where enabled = 1 order by priority desc, updated_at desc',
+    ).all() as Array<Record<string, string | number>>
+    if (!rows.length) throw new PreflightError(`--isolate-data-dir source has no enabled model profile: ${source}`)
+
+    for (const row of rows) {
+      const credentialPath = join(sourceCredentials, String(row.credential_id))
+      let mode: number
+      try {
+        const info = statSync(credentialPath)
+        if (!info.isFile()) throw new Error('not a file')
+        mode = info.mode
+      } catch {
+        throw new PreflightError(`profile '${String(row.name)}' has no readable credential file in the source data dir`)
+      }
+      if ((mode & 0o077) !== 0) {
+        throw new PreflightError(`profile '${String(row.name)}' credential must be owner-only (mode 600)`)
+      }
+    }
+
+    storage = new Store(target)
+    storage.close()
+    storage = undefined
+
+    // Replace the auto-created workspace with the source workspace row, then bind the
+    // copied profile rows to it. Only workspace identity + profile metadata move; keys do not.
+    const targetClient = new DatabaseSync(join(target, 'guardian.sqlite'))
+    try {
+      targetClient.exec('PRAGMA foreign_keys = OFF')
+      targetClient.prepare('delete from workspaces').run()
+      targetClient.prepare('insert into workspaces (id, name, actor_id, created_at) values (?, ?, ?, ?)')
+        .run(String(sourceWorkspace.id), String(sourceWorkspace.name), String(sourceWorkspace.actor_id), Number(sourceWorkspace.created_at ?? Date.now()))
+      const insert = targetClient.prepare(
+        'insert into model_profiles (id, workspace_id, name, endpoint, model, protocol, credential_id, priority, '
+        + 'enabled, context_window, max_tokens, thinking_level, role_affinity, input_cost_per_mtok, '
+        + 'cached_input_cost_per_mtok, output_cost_per_mtok, health_state, cooldown_until, last_error, updated_at) '
+        + 'values (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, null, null, ?)',
+      )
+      for (const row of rows) {
+        insert.run(
+          randomUUID(), String(sourceWorkspace.id), String(row.name), String(row.endpoint), String(row.model),
+          String(row.protocol), String(row.credential_id), Number(row.priority), Number(row.context_window),
+          Number(row.max_tokens), String(row.thinking_level), String(row.role_affinity),
+          Number(row.input_cost_per_mtok), Number(row.cached_input_cost_per_mtok),
+          Number(row.output_cost_per_mtok), 'closed', Date.now(),
+        )
+      }
+    } finally {
+      targetClient.close()
+    }
+
+    // Never copy keys: make the isolated credentials dir a symlink to the source dir.
+    rmSync(join(target, 'credentials'), { recursive: true, force: true })
+    symlinkSync(sourceCredentials, join(target, 'credentials'), 'dir')
+
+    const profileNames = rows.map(row => String(row.name))
+    return { directory: target, source, profileNames }
+  } catch (error) {
+    try { storage?.close() } catch { /* already closed */ }
+    try { unlockAndRemove(target) } catch { /* best-effort */ }
+    throw error
+  } finally {
+    sourceClient.close()
+  }
+}
+
 export interface CellMeta {
   app: AppName
   seed: number
@@ -756,6 +905,10 @@ export interface CellMeta {
   verifierBackend: VerifierBackendKind
   workerSessions: boolean
   workerSessionsDetail: string
+  dataDirIsolated: boolean
+  dataDirSource: string | null
+  isolatedProfileNames: string[]
+  dataDirKept: boolean
   budgetUsd: number
   maxDurationMs: number
   startedAt: number
@@ -890,16 +1043,28 @@ export async function stopEngine(engine: Execution): Promise<number> {
 export async function runCell(args: RealisticArgs, app: AppName, seed: number, log: (line: string) => void): Promise<CellResult> {
   const startedAt = nowMs()
   const slug = cellSlug(app, seed, args.mode)
-  // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
-  const baseDataDir = args.noLlm ? undefined : args.dataDir
   const cellCount = cellKeys(args).length
-  const dataDir = baseDataDir
-    ? cellCount === 1 ? baseDataDir : join(baseDataDir, slug)
-    : join(args.outDir, 'data', slug)
+  // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
+  const sourceDataDir = args.noLlm ? undefined : args.dataDir
+  const isolate = shouldIsolateDataDir(args)
+  let dataDir = join(args.outDir, 'data', slug)
+  let isolated: IsolatedDataDirResult | undefined
+  if (isolate && sourceDataDir) {
+    isolated = prepareIsolatedDataDir({ sourceDataDir, targetDir: dataDir })
+  } else if (sourceDataDir) {
+    dataDir = cellCount === 1 ? sourceDataDir : join(sourceDataDir, slug)
+  }
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
 
-  const storage = new Store(dataDir)
+  const storage = (() => {
+    try {
+      return openCellStore(dataDir)
+    } catch (error) {
+      if (isolated) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
+      throw error
+    }
+  })()
   const canary = new CanaryBroker({ storage })
   let started: StartedApp | undefined
   let engine: Execution | undefined
@@ -909,6 +1074,14 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   let canaryStopped = false
   let whiteBoxRoot: string | undefined
   const notes: string[] = []
+  if (args.isolateDataDir && !sourceDataDir && !args.noLlm) {
+    notes.push('--isolate-data-dir had no --data-dir/GUARDIAN_DATA_DIR source; using a fresh cell data dir')
+  }
+  if (isolated) {
+    notes.push(
+      `isolated data dir from ${isolated.source}; profile(s): ${isolated.profileNames.join(', ')}; credentials symlinked (key not copied)`,
+    )
+  }
 
   const secrets: NamedSecret[] = []
   let runId = ''
@@ -1142,12 +1315,12 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const assignmentDiagnostics = summarizeAssignments(detail.assignments, failureEvents, secrets)
     const factsCount = detail.facts.length
     const boardMessages = countTableRows(storage, 'board_messages')
-    const inert = model.mode === 'agentic'
-      && submitted.length === 0
-      && factsCount === 0
-      && (assignmentDiagnostics.investigationTotal > 0
-        ? assignmentDiagnostics.investigationCompleted === 0
-        : assignmentDiagnostics.total > 0 && assignmentDiagnostics.completed === 0)
+    const inert = isInertAgenticRun({
+      agentic: model.mode === 'agentic',
+      submittedFindings: submitted.length,
+      facts: factsCount,
+      investigationCompleted: assignmentDiagnostics.investigationCompleted,
+    })
     if (inert) {
       notes.push(
         'INERT RUN: agentic mode produced no facts, no submitted findings and no completed investigation assignment; '
@@ -1167,6 +1340,10 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       verifierBackend: backendKind,
       workerSessions: capability.supported,
       workerSessionsDetail: capability.detail,
+      dataDirIsolated: Boolean(isolated),
+      dataDirSource: isolated?.source ?? null,
+      isolatedProfileNames: isolated?.profileNames ?? [],
+      dataDirKept: Boolean(isolated) && args.keepDataDirs,
       budgetUsd: args.budgetUsd,
       maxDurationMs: args.maxDurationMs,
       startedAt,
@@ -1240,6 +1417,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ }
     }
     try { storage.close() } catch { /* already closed */ }
+    if (isolated && !args.keepDataDirs) {
+      try { unlockAndRemove(dataDir) } catch { /* best-effort */ }
+    }
     if (engineBusy > 0) process.stderr.write(`warning: ${engineBusy} execution task(s) still active after stop for ${slug}\n`)
     if (!appStopped && started) process.stderr.write(`warning: realistic app for ${slug} did not report a clean stop\n`)
     // runCell builds meta before teardown, so publish the shutdown result for finalizeCellResult.
