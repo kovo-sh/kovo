@@ -7,6 +7,17 @@
 - **Held-out benchmark salt:** `/home/omarchy/.config/guardian-bench/heldout.salt` (owner-only, mode 600, 48 hex chars). Required as `GUARDIAN_RB_HELDOUT_SALT` for salted realistic-bench seeds (≥1,000,000); never print or commit it.
 - **Legacy fixture key path** (may be absent): `/home/exedev/.config/guardian-fixtures/openrouter.key`. Prefer the Guardian model credential above when it exists.
 
+## Hill-climb consultation & push cadence
+
+1. **Consult after every major hill-climb threshold.** This means a recall move of ≥5 percentage points on any suite, a class milestone flip (e.g. SSRF 0→12, info disclosure 1→7), a capability/release gate status change, or a merged stream that changes the funnel, precision, or worker reliability. Load the `hillclimb-consult` skill and use its helper (`scripts/consult.sh`) — never hardcode the pane number; discover the `agy` pane.
+2. **The reviewer gets summaries, not raw data.** Send current metrics, what changed, per-class gaps, blockers, and specific questions. Explicitly state: do not re-read raw benchmark JSON/logs and do not re-run benchmarks unless the operator asks for a fresh independent measurement. Never include secrets.
+3. **Triage every recommendation.** Record accept/reject/defer with a reason and an owner stream, then log a short entry in the “Consult log” section of `plans/ROADMAP-v5.md`.
+4. **Commit and push after every meaningful progress.** This includes a benchmark metric change, a merged stream, a gate result, or a substantive fix. Use the keyring credential helper and never print or store the token:
+
+   ```bash
+   git -c credential.helper='!gh auth git-credential' push origin main
+   ```
+
 ## Gemini Coding Guidelines
 
 1. **Never `read_file` or `cat` raw debug dumps or benchmark logs (main session OR sub-agents):**

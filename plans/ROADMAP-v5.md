@@ -128,3 +128,15 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **M4:** ≥2021 CVEs prioritized; no appliance templates on Express; NestJS/Express/FastAPI call graph; Gate 6 never `passed` when skipped.
 - **M5:** Board tab replaces Coordinator; redaction/scope-taint/injection-boundary tests; provenance; deterministic posters; warm specialists; A/B vs baseline on cost/confirmed.
 - **M6:** `VERIFICATION-v5.md` with before/after per milestone, dev vs held-out gap ≤10%, 0 unattributed FPs, full gate transcripts.
+
+---
+
+## Consult log (Antigravity second opinions)
+
+### 2026-11-22 — post-50% realistic climb
+
+- **Threshold:** realistic dev 86/172 (50.0%), held-out 87/171 (50.9%), 100% precision; release gate 980/980.
+- **Reviewer top points:** (1) broker pre-redaction secret fingerprints; (2) fresh/non-consuming resources for workflow/race/CSRF; (3) real BFLA DELETE + state/role delta; (4) split-echo command-injection matching; (5) cache two-actor / JWT refresh alg:none / webhook inline-key.
+- **Accepted:** #1 `secretMatches` (merged `e18a775`); #2–#5 routed to climb2. Recommended gate split (deterministic vs real `Execution`) and the procedural-vs-agentic divergence risk adopted into M6 reporting.
+- **Rejected/deferred:** renegotiating the 65% gate (65% judged achievable without app redesign); business-logic procedural heuristics (assigned to agentic/white-box instead).
+- **Follow-ups filed:** deterministic Phase-1.5 sweep inside `Execution` (exec-hybrid stream); identifier-bound checks for LLM-authored specs.
