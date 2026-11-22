@@ -12,11 +12,16 @@ import {
   maxInlineVerifyRetries,
   maxWorkerConcurrency,
   owaspCategories,
+  parseBoardMentions,
   responseCheckIds,
+  specialistHandleByProfile,
+  specialistProfileByHandle,
   workerHistory,
 } from '../domain.ts'
 import type {
   AssessmentCheckId,
+  BoardAuthorRole,
+  BoardMessageKind,
   Candidate,
   CheckCoverage,
   CodeLocation,
@@ -34,13 +39,16 @@ import { accessPolicyReviews } from './access-policy-checks.ts'
 import { evaluateTier3Approval, matchesApprovedEndpointPattern } from './approval-judge.ts'
 import {
   agentTurn,
+  buildBoardDelta,
   chainPlannerPrompt,
   classifyHostTier,
   codeAuditPrompt,
   coordinatorPrompt,
+  createBoardTools,
   crossHostSynthesizerPrompt,
   defaultCodeAuditMaxTurns,
   filterHandlersForSpecialist,
+  injectBoardTurnInstructions,
   listSkills,
   loadSkill,
   resolveSpecialistProfile,
@@ -48,6 +56,7 @@ import {
   selectPreInjectionSkills,
   runAgentSession,
   threatModelPrompt,
+  WarmSpecialistController,
   workerInvestigationPrompt,
 } from './agent-session.ts'
 import type {
@@ -111,6 +120,7 @@ import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepFor
 import { assessmentAssignments, extractResourceRefsFromExchange, isOpaqueResourceId, store } from './store.ts'
 import type {
   Assignment,
+  BoardMessageRow,
   ChainStep,
   ExtractedResourceRef,
   Fact,
@@ -928,6 +938,18 @@ export class Execution {
   private readonly refinementEligible = new Map<string, Set<string>>()
   private readonly deterministicInFlight = new Set<string>()
   private readonly deterministicCompleted = new Set<string>()
+  /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
+  private readonly warm = new WarmSpecialistController()
+  private readonly boardHandleByAssignment = new Map<string, string>()
+  private readonly boardAssignmentTokens = new Map<string, number>()
+  private readonly boardHandleTokens = new Map<string, number>()
+  private readonly wakeHandleByStepId = new Map<string, string>()
+  private readonly routedOperatorBoardSeq = new Map<string, number>()
+  private readonly wokenBoardMessageKeys = new Set<string>()
+  private readonly postedVerdictKeys = new Set<string>()
+  private readonly postedCanaryKeys = new Set<string>()
+  private readonly boardScopeSync = new Map<string, string>()
+  private readonly trackedBoardRuns = new Set<string>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -1167,6 +1189,7 @@ export class Execution {
                 this.circuitNotified.add(notifyKey)
                 this.storage.message(run.id, fresh.coordinatorId, 'guardian',
                   `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Run paused to protect target availability.`)
+                this.postBrokerBlocker(fresh, origin, status)
               }
             } else {
               // Isolate circuit breaker to the affected origin while healthy hosts continue
@@ -1181,6 +1204,7 @@ export class Execution {
                 this.circuitNotified.add(notifyKey)
                 this.storage.message(run.id, fresh.coordinatorId, 'guardian',
                   `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Further traffic to ${origin} is blocked while healthy hosts continue.`)
+                this.postBrokerBlocker(fresh, origin, status)
               }
             }
           }
@@ -1188,6 +1212,436 @@ export class Execution {
       },
     }
     return { grant, secrets, currentSecrets }
+  }
+
+  // --- v5 M5 Swarm Board wiring -------------------------------------------------
+
+  private boardHost(origin: string): string {
+    try { return new URL(origin).hostname } catch { return origin }
+  }
+
+  /** Store-level board writes are advisory: a rejected/malformed post must never break the run. */
+  private postBoard(run: Run, input: {
+    authorHandle: string
+    authorRole: BoardAuthorRole
+    kind: BoardMessageKind
+    body: string
+    mentions?: readonly string[]
+    refFactIds?: readonly string[]
+    refExchangeIds?: readonly string[]
+    refFindingIds?: readonly string[]
+    refStepId?: string | null
+    refApprovalId?: string | null
+    sourceOrigins?: readonly string[]
+  }, secrets: readonly NamedSecret[] = []): BoardMessageRow | null {
+    try {
+      this.trackedBoardRuns.add(run.id)
+      return this.storage.postBoardMessage(run, input, secrets)
+    } catch {
+      return null
+    }
+  }
+
+  private isPeerBoardHandle(handle: string): boolean {
+    return !['all', 'system', 'operator', 'coordinator', 'verifier', 'broker', 'canary'].includes(handle)
+  }
+
+  /** Plain text (or @coordinator) goes to the legacy coordinator thread; @specialist routes to that peer. */
+  private shouldCoordinatorAnswer(content: string): boolean {
+    const mentions = parseBoardMentions(content)
+    const peers = mentions.filter(handle => this.isPeerBoardHandle(handle))
+    return peers.length === 0 || mentions.includes('coordinator')
+  }
+
+  private boardBaseHandle(handle: string): string {
+    return handle.replace(/-(?:\d+|r\d+)$/, '')
+  }
+
+  private boardProfileForHandle(handle: string) {
+    return specialistProfileByHandle[this.boardBaseHandle(handle)] ?? null
+  }
+
+  private boardMemberMentionable(run: Run, handle: string): boolean {
+    const member = this.storage.boardMember(run.id, handle)
+    if (member) return member.state !== 'retired'
+    return Boolean(this.boardProfileForHandle(handle)) ||
+      ['coordinator', 'operator', 'verifier', 'broker', 'canary', 'all'].includes(handle)
+  }
+
+  /** Resolve the roster handle for an assignment (mapped at step start, else derived from its step profile). */
+  private boardHandleForAssignmentId(run: Run, assignmentId: string): string {
+    const mapped = this.boardHandleByAssignment.get(assignmentId)
+    if (mapped) return mapped
+    const existing = this.storage.listBoardMembers(run.id).find(member => member.activeAssignmentId === assignmentId)
+    if (existing) return existing.handle
+    try {
+      const worker = this.storage.worker(assignmentId)
+      const step = worker.stepId
+        ? this.storage.listChainSteps(run.id, run.goalRevision).find(candidate => candidate.id === worker.stepId)
+        : undefined
+      if (step?.specialistProfile) return specialistHandleByProfile[step.specialistProfile]
+    } catch { /* assignment may be gone */ }
+    return 'coordinator'
+  }
+
+  private boardAuthorForAssignmentId(run: Run, assignmentId: string): { handle: string; role: BoardAuthorRole } {
+    const handle = this.boardHandleForAssignmentId(run, assignmentId)
+    const member = this.storage.boardMember(run.id, handle)
+    if (member) return { handle, role: member.role }
+    if (handle === 'coordinator') return { handle, role: 'coordinator' }
+    if (handle === 'verifier') return { handle, role: 'verifier' }
+    return { handle, role: 'specialist' }
+  }
+
+  /** Sharded handle allocation: reuse base while free, then base-2..9, then recycle a waiting shard. */
+  private allocateBoardHandle(run: Run, profile: NonNullable<ChainStep['specialistProfile']>, step: ChainStep): string {
+    const base = specialistHandleByProfile[profile]
+    if (step.trialGroupId) return `${base}-${Math.max(1, step.trialIndex + 1)}`
+    const members = this.storage.listBoardMembers(run.id)
+    if (!members.some(member => member.handle === base)) return base
+    for (let shard = 2; shard <= 9; shard += 1) {
+      const handle = `${base}-${shard}`
+      if (!members.some(member => member.handle === handle)) return handle
+    }
+    const waiting = members
+      .filter(member => member.handle.startsWith(base + '-') && member.state === 'waiting' && !member.activeAssignmentId)
+      .sort((a, b) => a.updatedAt - b.updatedAt)[0]
+    return waiting?.handle ?? `${base}-r${members.filter(member => member.handle.startsWith(base)).length + 1}`
+  }
+
+  /** Deterministic @coordinator brief emitted when a chain step is dispatched. */
+  private postCoordinatorBrief(run: Run, step: ChainStep, handle: string, origins: readonly string[]): BoardMessageRow | null {
+    if (!this.boardMemberMentionable(run, handle)) return null
+    const targets = origins.map(origin => this.boardHost(origin)).join(', ')
+    const body = `Brief · ${step.title} [${step.category}] on ${targets}. Hypothesis: ${step.hypothesis}`.slice(0, 900)
+    return this.postBoard(run, {
+      authorHandle: 'coordinator',
+      authorRole: 'coordinator',
+      kind: 'brief',
+      body,
+      mentions: [handle],
+      refStepId: step.id,
+      sourceOrigins: [...origins],
+    })
+  }
+
+  /** Deterministic @verifier verdict for inline and Phase-3 Zero-LLM verification. */
+  private postVerificationVerdict(run: Run, opts: {
+    replaySpecId: string
+    findingId?: string | null
+    title: string
+    status: Finding['status']
+    verificationTier?: VerificationTier | null
+    feedback?: InlineVerifyFeedback | null
+    assignmentId?: string | null
+    refStepId?: string | null
+    attempt?: number
+    secrets?: readonly NamedSecret[]
+  }): BoardMessageRow | null {
+    const key = `${run.id}:${opts.replaySpecId}:${opts.status}:${opts.findingId ?? ''}:${opts.attempt ?? ''}`
+    if (this.postedVerdictKeys.has(key)) return null
+    this.postedVerdictKeys.add(key)
+    const confirmed = opts.status === 'confirmed' || opts.status === 'static_verified'
+    const authorHandle = opts.assignmentId ? this.boardHandleForAssignmentId(run, opts.assignmentId) : 'coordinator'
+    const feedback = opts.feedback
+    const body = confirmed
+      ? `Verdict · ${opts.title.slice(0, 300)} — ${opts.status}${opts.verificationTier ? ` (${opts.verificationTier})` : ''} [spec: ${opts.replaySpecId}${opts.findingId ? `, finding: ${opts.findingId}` : ''}]`
+      : [
+          `Verdict · spec ${opts.replaySpecId} ${opts.status}:`,
+          feedback?.assertionSummary?.observed ?? 'replay did not confirm',
+          feedback?.assertionSummary?.expected ? `(expected ${feedback.assertionSummary.expected})` : '',
+          feedback?.failedStepId ? `[step: ${feedback.failedStepId}]` : '',
+          feedback?.jqError ? `jq=${feedback.jqError.slice(0, 160)}` : '',
+        ].filter(Boolean).join(' ').slice(0, 900)
+    const mentions = !confirmed && this.boardMemberMentionable(run, authorHandle) ? [authorHandle] : []
+    let authorOrigins: string[] = []
+    if (opts.assignmentId) {
+      try { authorOrigins = this.storage.worker(opts.assignmentId).sourceOrigins } catch { /* assignment may be gone */ }
+    }
+    const sent = this.postBoard(run, {
+      authorHandle: 'verifier',
+      authorRole: 'verifier',
+      kind: 'verdict',
+      body,
+      mentions,
+      ...(opts.findingId ? { refFindingIds: [opts.findingId] } : {}),
+      ...(opts.refStepId ? { refStepId: opts.refStepId } : {}),
+      ...(authorOrigins.length ? { sourceOrigins: authorOrigins } : {}),
+    }, opts.secrets)
+    if (sent) return sent
+    // A retired/unknown author handle must not lose the verdict: post without the mention.
+    if (!mentions.length) return null
+    return this.postBoard(run, {
+      authorHandle: 'verifier',
+      authorRole: 'verifier',
+      kind: 'verdict',
+      body,
+      ...(opts.findingId ? { refFindingIds: [opts.findingId] } : {}),
+      ...(opts.refStepId ? { refStepId: opts.refStepId } : {}),
+    }, opts.secrets)
+  }
+
+  /** Deterministic @broker blocker for circuit-open / repeated 429 conditions. */
+  private postBrokerBlocker(run: Run, origin: string, status?: number): BoardMessageRow | null {
+    const reason = status === 429 ? 'HTTP 429 rate limiting' : 'repeated 5xx/429 responses'
+    return this.postBoard(run, {
+      authorHandle: 'broker',
+      authorRole: 'system',
+      kind: 'blocker',
+      body: `Blocker · circuit open on ${this.boardHost(origin)} after ${reason}; further traffic to this origin is paused while healthy hosts continue.`,
+      mentions: ['all'],
+      sourceOrigins: [origin],
+    })
+  }
+
+  /** Tier-3 gate: pause the warm member and post an approval card linked by refApprovalId. */
+  private postApprovalCard(run: Run, assignmentId: string, input: {
+    approvalId: string
+    origin: string
+    method: string
+    pathAndQuery: string
+    rationale: string
+  }, secrets: readonly NamedSecret[] = []): BoardMessageRow | null {
+    const handle = this.boardHandleForAssignmentId(run, assignmentId)
+    const member = this.storage.boardMember(run.id, handle)
+    if (member && member.role === 'specialist') {
+      try {
+        this.storage.updateBoardMemberState(run.id, handle, { state: 'paused', activeAssignmentId: assignmentId })
+        this.warm.register(handle, { sessionId: member.sessionId, state: 'working', lastReadSeq: member.lastReadSeq })
+        this.warm.pause(handle, assignmentId)
+      } catch { /* roster mirror is best-effort */ }
+    }
+    return this.postBoard(run, {
+      authorHandle: 'broker',
+      authorRole: 'system',
+      kind: 'approval',
+      body: `Approval required · Tier ${run.capabilityTier} ${input.method.toUpperCase()} ${this.boardHost(input.origin)}${input.pathAndQuery} — ${input.rationale.slice(0, 400)}`,
+      mentions: [handle],
+      refApprovalId: input.approvalId,
+      sourceOrigins: [input.origin],
+    }, secrets)
+  }
+
+  private postApprovalResolution(run: Run, assignmentId: string, input: {
+    approvalId: string
+    decision: string
+    origin: string
+    method: string
+    pathAndQuery: string
+  }): void {
+    const handle = this.boardHandleForAssignmentId(run, assignmentId)
+    const member = this.storage.boardMember(run.id, handle)
+    if (member && member.role === 'specialist' && member.state === 'paused') {
+      try {
+        this.storage.updateBoardMemberState(run.id, handle, { state: 'working', activeAssignmentId: assignmentId })
+        this.warm.register(handle, { sessionId: member.sessionId, state: 'paused', lastReadSeq: member.lastReadSeq })
+        this.warm.resume(handle, assignmentId)
+      } catch { /* roster mirror is best-effort */ }
+    }
+    this.postBoard(run, {
+      authorHandle: 'broker',
+      authorRole: 'system',
+      kind: 'status',
+      body: `Tier-3 ${input.decision} · ${input.method.toUpperCase()} ${this.boardHost(input.origin)}${input.pathAndQuery}`,
+      mentions: this.boardMemberMentionable(run, handle) ? [handle] : [],
+      refApprovalId: input.approvalId,
+      sourceOrigins: [input.origin],
+    })
+  }
+
+  /** Deterministic @canary lead on OOB callbacks and second-order surfaces. */
+  private postCanaryLead(run: Run, input: {
+    marker?: string
+    origin: string
+    endpoint?: string
+    persona?: string | null
+    exchangeId?: string | null
+    mediaType?: string | null
+    key?: string
+  }): BoardMessageRow | null {
+    const key = input.key ?? `${run.id}:${input.marker ?? ''}:${input.origin}:${input.endpoint ?? ''}:${input.exchangeId ?? ''}`
+    if (this.postedCanaryKeys.has(key)) return null
+    this.postedCanaryKeys.add(key)
+    const target = /html|render|page|admin/i.test(`${input.endpoint ?? ''} ${input.mediaType ?? ''}`) ? 'browser' : 'injection'
+    const body = [
+      'Lead · canary surfaced',
+      input.endpoint ? `at ${input.endpoint}` : '',
+      input.persona ? `via persona ${input.persona}` : '',
+      input.mediaType ? `(${input.mediaType})` : '',
+      input.exchangeId ? `[exchange: ${input.exchangeId}]` : '',
+      '— second-order/cross-persona evidence; treat as a hypothesis until replay-verified.',
+    ].filter(Boolean).join(' ').slice(0, 900)
+    return this.postBoard(run, {
+      authorHandle: 'canary',
+      authorRole: 'system',
+      kind: 'lead',
+      body,
+      mentions: [target],
+      ...(input.exchangeId ? { refExchangeIds: [input.exchangeId] } : {}),
+      sourceOrigins: [input.origin],
+    })
+  }
+
+  /** Turn-start delta: sanitized peer posts only, plus the cursor to persist atomically. */
+  private boardTurnDelta(run: Run, handle: string, lastReadSeq: number): { text: string; cursor: number } {
+    const delta = buildBoardDelta({ store: this.storage, run: run.id, handle, lastReadSeq })
+    try {
+      this.storage.updateBoardMemberState(run.id, handle, { lastReadSeq: delta.cursor })
+      this.warm.noteBoardCursor(handle, delta.cursor)
+    } catch { /* member may have been retired between turns */ }
+    return { text: delta.text, cursor: delta.cursor }
+  }
+
+  /** Operator/coordinator intervention resets every member's consecutive peer-hop budget. */
+  private resetBoardHops(run: Run): void {
+    for (const member of this.storage.listBoardMembers(run.id)) {
+      if (member.peerHopsUsed === 0) continue
+      try { this.storage.updateBoardMemberState(run.id, member.handle, { peerHopsUsed: 0 }) } catch { /* ignore */ }
+    }
+    this.warm.noteEvidence()
+  }
+
+  /** Retire/sleep warm members on stop, scope revoke, and mirror roster rows into the controller. */
+  private syncBoardRoster(run: Run): void {
+    this.trackedBoardRuns.add(run.id)
+    const signature = `${run.scopeRevision}:${run.status}:${run.phase}`
+    if (this.boardScopeSync.get(run.id) !== signature) {
+      this.boardScopeSync.set(run.id, signature)
+      if (run.status !== 'running' || run.phase === 'complete') {
+        for (const member of this.storage.listBoardMembers(run.id)) {
+          if (member.role !== 'specialist' || member.state === 'retired') continue
+          try { this.storage.retireBoardMember(run, member.handle, `Run ${run.status}.`) } catch { /* ignore */ }
+          this.warm.retire(member.handle, `run_${run.status}`)
+        }
+        this.trackedBoardRuns.delete(run.id)
+        return
+      } else {
+        try {
+          const revoked = this.storage.taintBoardMessagesForRevokedOrigins(run.id, this.approvedOriginsSet(run))
+          for (const handle of revoked.retiredHandles) this.warm.retire(handle, 'scope_revoked')
+        } catch { /* store may be closing */ }
+      }
+    }
+    for (const member of this.storage.listBoardMembers(run.id)) {
+      this.warm.register(member.handle, {
+        sessionId: member.sessionId,
+        state: member.state === 'working' ? 'working' : member.state === 'paused' ? 'paused' : 'waiting',
+        turnsUsed: member.turnsUsed,
+        postsCount: member.postsCount,
+        peerHopsUsed: member.peerHopsUsed,
+        lastReadSeq: member.lastReadSeq,
+      })
+      if (member.state === 'retired') this.warm.retire(member.handle, 'roster_retired')
+    }
+  }
+
+  /** Operator composer: plain text is handled by the legacy coordinator thread; @handle wakes that peer. */
+  private routeOperatorBoardMessages(run: Run): void {
+    this.trackedBoardRuns.add(run.id)
+    const cursor = this.routedOperatorBoardSeq.get(run.id) ?? 0
+    const messages = this.storage.listBoardMessages(run.id, {
+      authorHandle: 'operator', sinceSeq: cursor, limit: 100, includeTainted: false,
+    })
+    if (!messages.length) return
+    this.resetBoardHops(run)
+    for (const message of messages) {
+      const targets = message.mentions.filter(handle => handle !== 'all' && this.isPeerBoardHandle(handle))
+      for (const target of targets) this.wakeBoardMember(run, target, message)
+    }
+    this.routedOperatorBoardSeq.set(run.id, messages[messages.length - 1].seq)
+  }
+
+  /** Queue a chain-scoped follow-up step for a woken member (respects budget + workerConcurrency). */
+  private wakeBoardMember(run: Run, handle: string, message: BoardMessageRow): ChainStep | null {
+    if (run.status !== 'running' || run.phase !== 'investigation') return null
+    if (this.storage.checkBudgetExceeded(run.id)) return null
+    const profile = this.boardProfileForHandle(handle)
+    if (!profile) return null
+    const key = `${run.id}:${message.id}:${handle}`
+    if (this.wokenBoardMessageKeys.has(key)) return null
+    const member = this.storage.boardMember(run.id, handle)
+    if (member?.state === 'paused' || member?.state === 'working') return null
+
+    const approved = this.approvedOriginsSet(run)
+    const origins = [...new Set([
+      ...message.sourceOrigins.filter(origin => approved.has(origin)),
+      ...(member?.sourceOrigins ?? []).filter(origin => approved.has(origin)),
+    ])]
+    if (!origins.length) return null
+    const assetIds = run.candidates
+      .filter(candidate => run.approved.includes(candidate.id) && origins.includes(candidate.origin))
+      .map(candidate => candidate.id)
+    if (!assetIds.length) return null
+
+    const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const pendingWake = steps.some(candidate =>
+      this.wakeHandleByStepId.get(candidate.id) === handle &&
+      (candidate.status === 'ready' || candidate.status === 'pending'))
+    if (pendingWake) return null
+    const dynamicBudget = Math.max(1, Math.min(hardChainStepsCeiling, run.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, run.id)))
+    if (steps.length >= dynamicBudget) return null
+
+    this.wokenBoardMessageKeys.add(key)
+    const step = this.storage.addChainStep(run, {
+      title: `Peer handoff · @${handle}`.slice(0, 200),
+      hypothesis: `Follow up ${message.kind} from @${message.authorHandle}: ${message.body}`.slice(0, 1200),
+      category: 'misconfig-exposure',
+      priority: message.kind === 'blocker' ? 92 : 88,
+      targetAssetIds: assetIds,
+      sourceOrigins: origins,
+      dependsOnFactIds: message.refFactIds,
+      specialistProfile: profile,
+    })
+    this.wakeHandleByStepId.set(step.id, handle)
+    if (!member) {
+      try {
+        this.storage.upsertBoardMember(run, {
+          handle,
+          role: 'specialist',
+          specialistProfile: profile,
+          state: 'waiting',
+          sourceOrigins: origins,
+        })
+        this.warm.register(handle, { state: 'waiting' })
+      } catch { /* roster mirror is best-effort */ }
+    }
+    this.storage.event(run.id, 'board.wakeup', `@${handle} queued from @${message.authorHandle}'s ${message.kind} (board #${message.seq}).`, {
+      handle, messageSeq: message.seq, stepId: step.id,
+    })
+    this.scheduleWake()
+    return step
+  }
+
+  /** Sleep (waiting, same session) or retire a warm member after its assignment finishes. */
+  private finishBoardMember(run: Run, assignmentId: string): void {
+    const handle = this.boardHandleByAssignment.get(assignmentId)
+    if (!handle) return
+    const tokens = this.boardHandleTokens.get(handle) ?? this.boardAssignmentTokens.get(assignmentId) ?? 0
+    this.boardHandleByAssignment.delete(assignmentId)
+    this.boardAssignmentTokens.delete(assignmentId)
+    let worker: Assignment | undefined
+    try { worker = this.storage.worker(assignmentId) } catch { /* deleted */ }
+    const succeeded = worker?.status === 'complete'
+    const completion = this.warm.completeTurn(handle, { tokensUsed: tokens })
+    try {
+      if (!succeeded || completion?.state === 'retired') {
+        this.warm.retire(handle, completion?.retiredReason ?? 'step_failed')
+        this.storage.updateBoardMemberState(run.id, handle, { state: 'retired', activeAssignmentId: null })
+        this.boardHandleTokens.delete(handle)
+      } else {
+        this.storage.updateBoardMemberState(run.id, handle, { state: 'waiting', activeAssignmentId: null })
+      }
+    } catch { /* roster mirror is best-effort */ }
+    if (completion?.closureRequired) {
+      const author = this.boardAuthorForAssignmentId(run, assignmentId)
+      this.postBoard(run, {
+        authorHandle: author.handle,
+        authorRole: author.role,
+        kind: 'status',
+        body: `Closure · @${author.handle}: ${(worker?.outcome ?? 'step complete').slice(0, 700)}`,
+        ...(worker?.stepId ? { refStepId: worker.stepId } : {}),
+      })
+    }
   }
 
   /**
@@ -1294,7 +1748,7 @@ export class Execution {
     const headerText = Object.entries(res.respHeaders ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n')
     const body = typeof res.body === 'string' ? res.body : ''
     if (!body.includes('gn2o_') && !headerText.includes('gn2o_')) return
-    scanSecondOrderMarkers({
+    const surfaced = scanSecondOrderMarkers({
       text: `${headerText}\n${body}`,
       runId: run.id,
       assignmentId,
@@ -1305,6 +1759,16 @@ export class Execution {
       exchangeId,
       storage: this.storage,
     })
+    for (const record of surfaced) {
+      this.postCanaryLead(run, {
+        marker: record.marker,
+        origin: res.origin,
+        endpoint: res.pathAndQuery,
+        persona: res.personaHandle,
+        exchangeId,
+        mediaType: mediaTypeOverride ?? res.mediaType,
+      })
+    }
   }
 
   private markRefinementEligible(runId: string, replaySpecId: string) {
@@ -1482,6 +1946,7 @@ export class Execution {
     this.pendingTier3ApprovalKeys.add(approvalKey)
 
     let decision: 'approved' | 'denied' | 'canceled' | 'expired'
+    let postedApprovalId: string | undefined
     try {
       const req = this.storage.createApprovalRequest(run, job.assignment, {
         origin: input.origin,
@@ -1494,6 +1959,14 @@ export class Execution {
         riskLevel: evaluation.riskLevel,
         secrets: input.secrets,
       })
+      postedApprovalId = req.id
+      this.postApprovalCard(run, job.assignment.id, {
+        approvalId: req.id,
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        rationale: input.rationale,
+      }, input.secrets)
 
       decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
         const checkCurrent = () => {
@@ -1542,6 +2015,15 @@ export class Execution {
       this.pendingTier3ApprovalKeys.delete(approvalKey)
     }
 
+    if (postedApprovalId) {
+      this.postApprovalResolution(run, job.assignment.id, {
+        approvalId: postedApprovalId,
+        decision,
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+      })
+    }
     if (this.authorize(job)) {
       this.storage.updateWorker(job.assignment.id, { status: 'running' })
     }
@@ -1551,6 +2033,11 @@ export class Execution {
   // --- Event-Driven Scheduler ---
 
   wake() {
+    // 0. Mirror roster state and retire warm members on stop/scope revocation.
+    for (const runId of [...this.trackedBoardRuns]) {
+      try { this.syncBoardRoster(this.storage.run(runId)) } catch { this.trackedBoardRuns.delete(runId) }
+    }
+
     // 1. Revoke/abort any active job that lost authorization
     for (const [id, job] of this.active) {
       if (this.authorize(job)) continue
@@ -1630,6 +2117,7 @@ export class Execution {
     for (const run of this.storage.runnable()) {
       if (this.storage.checkBudgetExceeded(run.id)) continue
       this.ensureVariantSweepsForConfirmedFindings(run)
+      this.routeOperatorBoardMessages(run)
 
       if (profiles.length) {
         this.startCoordinator(run, profiles)
@@ -4330,6 +4818,12 @@ export class Execution {
       skills: step.skills,
     })
     const specialistConfig = resolveSpecialistProfile(resolvedSpecialistId)
+    const wakeHandle = this.wakeHandleByStepId.get(step.id)
+    const warmMember = wakeHandle ? this.storage.boardMember(run.id, wakeHandle) : undefined
+    const boardHandle = wakeHandle && warmMember && warmMember.state !== 'retired'
+      ? wakeHandle
+      : this.allocateBoardHandle(run, resolvedSpecialistId, step)
+    const warmSessionId = wakeHandle && warmMember && warmMember.state !== 'retired' ? warmMember.sessionId : undefined
     const baseSpecialistTurns = Math.max(
       25,
       Math.min(specialistConfig.maxTurnsCeiling, run.workerMaxTurns > 0 ? Math.min(run.workerMaxTurns, specialistConfig.defaultMaxTurns) : specialistConfig.defaultMaxTurns),
@@ -4345,6 +4839,7 @@ export class Execution {
       })
       const claimed = this.storage.updateWorker(worker.id, {
         status: 'running',
+        ...(warmSessionId ? { sessionId: warmSessionId } : {}),
         lease: randomUUID(),
         leaseExpiresAt: Date.now() + intentLeaseMs,
       })!
@@ -4365,6 +4860,27 @@ export class Execution {
 
     const job: Active = { assignment, origins: new Set(targetOrigins), controller: new AbortController() }
     this.active.set(assignment.id, job)
+    this.boardHandleByAssignment.set(assignment.id, boardHandle)
+    this.trackedBoardRuns.add(run.id)
+    try {
+      this.storage.upsertBoardMember(run, {
+        handle: boardHandle,
+        role: 'specialist',
+        specialistProfile: resolvedSpecialistId,
+        sessionId: assignment.sessionId,
+        activeAssignmentId: assignment.id,
+        state: 'working',
+        sourceOrigins: targetOrigins,
+      })
+      this.warm.register(boardHandle, {
+        sessionId: assignment.sessionId,
+        state: 'waiting',
+        lastReadSeq: this.storage.boardMember(run.id, boardHandle)?.lastReadSeq ?? 0,
+      })
+      this.warm.wake(boardHandle, assignment.id)
+    } catch { /* roster mirror is best-effort */ }
+
+    this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)
 
     void this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles).catch(error => {
       if (error instanceof BudgetExceededError) {
@@ -4382,6 +4898,7 @@ export class Execution {
       })
     }).finally(() => {
       this.active.delete(assignment.id)
+      try { this.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
       this.schedulePlanner(run.id)
       this.scheduleWake()
     })
@@ -4567,6 +5084,7 @@ export class Execution {
 
         // Priority #3: Auto-track persona_resource facts when Tier >= 2 and >= 2 personas are approved
         trackPersonaResources(curRun, res, saved.id)
+        boardTools.noteEvidence()
         this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
         this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
 
@@ -4698,11 +5216,27 @@ export class Execution {
         })
         const stagedPath = await session.stage(`exchanges/race-${randomUUID().slice(0, 8)}.json`,
           JSON.stringify({ summary: burst.summary, results: summaries }, null, 2), signal).catch(() => null)
+        boardTools.noteEvidence()
         return { count: summaries.length, summary: burst.summary, stagedPath, results: summaries }
       }
 
+      const boardHandle = this.boardHandleByAssignment.get(job.assignment.id) ??
+        this.boardHandleForAssignmentId(run, job.assignment.id)
+      const boardTools = createBoardTools({
+        store: this.storage,
+        run: run.id,
+        handle: boardHandle,
+        redact: (text: string) => redact(text, currentSecrets()),
+        onWakeup: (target, message) => {
+          try { this.wakeBoardMember(this.storage.run(run.id), target, message) } catch { /* advisory */ }
+        },
+      })
+
       const handlers: WorkerToolHandlers = {
         spillOutput: async (id, content, signal) => session.stage(`tool-output/${id}.txt`, content, signal),
+
+        board_post: async (args) => boardTools.board_post(args),
+        board_read: async (args) => boardTools.board_read(args),
 
         request_http: async (args, signal) => {
           const { exchangeId, stagedPath, result } = await executeBrokerRequest(args, signal)
@@ -4773,6 +5307,7 @@ export class Execution {
           })
           const stagedPath = await session.stage(`exchanges/batch-${randomUUID().slice(0, 8)}.json`,
             JSON.stringify(summaries, null, 2), signal).catch(() => null)
+          boardTools.noteEvidence()
           return { count: summaries.length, stagedPath, results: summaries }
         },
 
@@ -4865,6 +5400,7 @@ export class Execution {
             JSON.stringify(summaryObj, null, 2), undefined, currentSecrets())
           const stagedPath = await session.stage(`browser-${ev.id.slice(0, 8)}.json`,
             JSON.stringify(summaryObj, null, 2), signal).catch(() => null)
+          boardTools.noteEvidence()
           return { evidenceId: ev.id, stagedPath, ...summaryObj }
         },
 
@@ -5373,7 +5909,7 @@ export class Execution {
             ...wsRes.frames.map(frame => frame.data),
           ].join('\n')
           if (wsScanText.includes('gn2o_')) {
-            scanSecondOrderMarkers({
+            const surfaced = scanSecondOrderMarkers({
               text: wsScanText,
               runId: curRun.id,
               assignmentId: job.assignment.id,
@@ -5384,6 +5920,16 @@ export class Execution {
               exchangeId: saved.id,
               storage: this.storage,
             })
+            for (const record of surfaced) {
+              this.postCanaryLead(curRun, {
+                marker: record.marker,
+                origin: wsRes.origin,
+                endpoint: wsRes.pathAndQuery,
+                persona: wsRes.personaHandle,
+                exchangeId: saved.id,
+                mediaType: 'websocket',
+              })
+            }
           }
           const ev = this.storage.addArtifact(curRun, job.assignment, 'ws',
             `WebSocket probe · ${wsRes.origin}${wsRes.pathAndQuery.slice(0, 60)}`,
@@ -5450,7 +5996,25 @@ export class Execution {
 
         check_canary: async ({ token }) => {
           const curRun = this.check(job)
-          return this.canaryBroker.checkCanary(token, { storage: this.storage, runId: curRun.id })
+          const result = this.canaryBroker.checkCanary(token, { storage: this.storage, runId: curRun.id })
+          if (result.hit) {
+            const detail = (result.detail ?? {}) as { origin?: unknown; path?: unknown; pathAndQuery?: unknown; persona?: unknown }
+            const origin = typeof detail.origin === 'string' && this.permitted(curRun, detail.origin)
+              ? detail.origin
+              : [...this.approvedOriginsSet(curRun)][0]
+            const endpoint = typeof detail.pathAndQuery === 'string'
+              ? detail.pathAndQuery
+              : typeof detail.path === 'string' ? detail.path : undefined
+            if (origin) {
+              this.postCanaryLead(curRun, {
+                origin,
+                endpoint,
+                persona: typeof detail.persona === 'string' ? detail.persona : null,
+                key: `${curRun.id}:canary:${token}`,
+              })
+            }
+          }
+          return result
         },
 
         mint_second_order_canary: async (args) => {
@@ -5569,6 +6133,7 @@ export class Execution {
             sourceOrigins: args.sourceOrigins,
             secrets: currentSecrets(),
           })
+          boardTools.noteEvidence()
           this.schedulePlanner(curRun.id)
           return { factId: fact.id, kind: args.kind, origin: fact.origin }
         },
@@ -5806,6 +6371,7 @@ export class Execution {
             [...sourceOrigins],
             { initialAttemptCount: canonicalMatchedRow ? priorMaxAttempts : 0 },
           )
+          boardTools.noteEvidence()
           const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
             `Proposed replay spec · ${parsed.title}`,
             JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
@@ -5938,6 +6504,7 @@ export class Execution {
               { initialAttemptCount: priorMaxAttempts },
             )
             createdSpecRowId = specRow.id
+            boardTools.noteEvidence()
             const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
               `Updated replay spec · ${parsed.title}`,
               JSON.stringify({ findingId: existingRow.id, replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
@@ -6115,10 +6682,26 @@ export class Execution {
             usd: usage.costUsd,
             tokens: usage.inputTokens + usage.outputTokens,
           })
+          this.boardAssignmentTokens.set(
+            job.assignment.id,
+            (this.boardAssignmentTokens.get(job.assignment.id) ?? 0) + usage.inputTokens + usage.outputTokens,
+          )
+          this.boardHandleTokens.set(
+            boardHandle,
+            (this.boardHandleTokens.get(boardHandle) ?? 0) + usage.inputTokens + usage.outputTokens,
+          )
         },
         onTurn: turn => {
           this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
           this.storage.recordLlmSpend(run.id, { turns: 1 })
+        },
+        onTurnStart: turn => {
+          const member = this.storage.boardMember(run.id, boardHandle)
+          const delta = this.boardTurnDelta(this.storage.run(run.id), boardHandle, member?.lastReadSeq ?? 0)
+          if (!delta.text) return undefined
+          return {
+            messages: [turn === 1 ? injectBoardTurnInstructions('', delta.text) : delta.text],
+          }
         },
         onProfileSuccess: id => recordProfileSuccess(id, this.storage),
         onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
@@ -6462,6 +7045,7 @@ export class Execution {
     this.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
 
     const current = this.check(job)
+    let phaseFeedback: InlineVerifyFeedback | undefined
     this.storage.transaction(() => {
       // Strict Tier Separation (Invariant #4): static_ast_proof NEVER promotes to 'confirmed' / 'runtime_confirmed'
       const staticSpec = specRow.spec.kind === 'static_ast_proof' ? specRow.spec : null
@@ -6546,6 +7130,7 @@ export class Execution {
           maxInlineVerifyRetries,
           currentSecrets(),
         )
+        phaseFeedback = rawFeedback
         this.storage.db.update(replaySpecs).set({
           lastVerificationDiff: rawFeedback,
         }).where(eq(replaySpecs.id, specRow.id)).run()
@@ -6596,6 +7181,21 @@ export class Execution {
         secretsList,
       )
     }, { behavior: 'immediate' })
+    const refreshed = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, current.id), eq(findings.id, findingRow.id),
+    )).get()
+    if (refreshed) {
+      this.postVerificationVerdict(current, {
+        replaySpecId: specRow.id,
+        findingId: refreshed.id,
+        title: specRow.spec.title,
+        status: refreshed.finding.status,
+        verificationTier: refreshed.verificationTier ?? refreshed.finding.verificationTier ?? null,
+        feedback: phaseFeedback ?? specRow.lastVerificationDiff ?? null,
+        assignmentId: specRow.assignmentId,
+        attempt: specRow.attemptCount,
+      })
+    }
   }
 
   private async executeInlineVerification(params: {
@@ -6928,14 +7528,25 @@ export class Execution {
       }
     }
 
+    const verdictStatus = findingRow && isAlreadyVerified ? findingRow.finding.status : finalStatus
+    const verdictTier = findingRow && isAlreadyVerified ? (findingRow.verificationTier ?? undefined) : verificationTier
+    this.postVerificationVerdict(this.storage.run(params.job.assignment.runId), {
+      replaySpecId: updatedSpec.id,
+      findingId: findingRow?.id ?? params.findingId ?? null,
+      title: parsed.title,
+      status: verdictStatus,
+      verificationTier: verdictTier,
+      feedback: normalizedFeedback,
+      assignmentId: specRow.assignmentId ?? params.job.assignment.id,
+      refStepId: params.job.assignment.stepId,
+      attempt: updatedSpec.attemptCount,
+    })
     return {
       findingId: findingRow?.id,
       replaySpecId: updatedSpec.id,
       attemptCount: updatedSpec.attemptCount,
-      status: findingRow && isAlreadyVerified ? findingRow.finding.status : finalStatus,
-      verificationTier: findingRow && isAlreadyVerified
-        ? (findingRow.verificationTier ?? undefined)
-        : verificationTier,
+      status: verdictStatus,
+      verificationTier: verdictTier,
       feedback: normalizedFeedback,
       artifactId: receipt.id,
     }
@@ -7524,8 +8135,10 @@ export class Execution {
     )).orderBy(asc(messages.createdAt)).all()
     const answered = new Set(thread.map(item => item.replyTo))
     const next = thread.find(item => item.role === 'operator' && !answered.has(item.id) &&
-      item.id !== run.reviewPlan?.goalMessageId && !item.content.startsWith('Steering hint:'))
+      item.id !== run.reviewPlan?.goalMessageId && !item.content.startsWith('Steering hint:') &&
+      this.shouldCoordinatorAnswer(item.content))
     if (!next) return
+    this.resetBoardHops(run)
 
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
