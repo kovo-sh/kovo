@@ -159,7 +159,11 @@ describe('M7 spec synthesis: authz, GraphQL, SSRF, JWT', () => {
       hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined }),
       anomalies: [{ type: 'unauthorized_access', resourceId: '1002', actor: 'other_persona', method: 'GET', status: 200 }],
     }), 'http_chain')
-    assert.equal((built.spec.steps as unknown[]).length, 2)
+    // Negative-control step: owner with a nonexistent id must not return the owner representation.
+    const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string } }>
+    assert.equal(steps.length, 3)
+    assert.equal(steps[0].id, 'c2')
+    assert.match(steps[0].request.pathAndQuery, /guardian-none-/)
   })
 
   test('graphql introspection becomes a schema-exposure http_chain', () => {

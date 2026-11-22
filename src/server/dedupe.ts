@@ -161,7 +161,14 @@ export function normalizeCwe(cwe?: string | null, category?: string | null): str
   return cleanCat || 'unknown'
 }
 
-export function normalizeEndpointTemplate(endpoint?: string | null): string {
+/**
+ * Normalize an endpoint path for fingerprinting. Literal segments are lowercased by default because
+ * fingerprints must be host-case-insensitive; callers that build *request* paths (recon) pass
+ * `preserveCase` so case-sensitive route segments (Next.js server actions, capitalized REST
+ * resources) are not corrupted.
+ */
+export function normalizeEndpointTemplate(endpoint?: string | null, options?: { preserveCase?: boolean }): string {
+  const preserveCase = options?.preserveCase === true
   const raw = (endpoint ?? '').trim()
   if (!raw) return '/'
 
@@ -200,7 +207,7 @@ export function normalizeEndpointTemplate(endpoint?: string | null): string {
     ) {
       return ':id'
     }
-    return seg.toLowerCase()
+    return preserveCase ? seg : seg.toLowerCase()
   })
 
   const normalized = segments.join('/')

@@ -115,6 +115,15 @@ export function synthSqlTime(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
   if (!['postgres', 'mysql', 'sqlite', 'mssql'].includes(dialectRaw)) return []
   const dialect = dialectRaw as 'postgres' | 'mysql' | 'sqlite' | 'mssql'
   const delay = Math.max(1500, Math.min(3000, Number(hit.delayMs) || 1500))
+  // OR-branch payloads keep the delay expression reachable when the caller's baseline value does not
+  // match the stored row; the verifier substitutes fresh timing values into this template.
+  const delayExpr: Partial<Record<string, string>> = {
+    mysql: 'SLEEP({{delay_sec}})',
+    postgres: '(SELECT 1 FROM pg_sleep({{delay_sec}})) IS NULL',
+    sqlite: "1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB({{delay_ms}} * 25000))))",
+  }
+  const orExpr = delayExpr[dialect]
+  const valueTemplate = style === 'or_branch' && orExpr ? `{{baseline}}' OR ${orExpr}-- -` : undefined
   return [{
     kind: 'sql_time_diff',
     spec: {
@@ -125,6 +134,7 @@ export function synthSqlTime(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
       quoteStyle: booleanStyle(style).quoteStyle,
       dialect,
       delayMs: Math.round(delay),
+      ...(valueTemplate ? { valueTemplate } : {}),
     },
   }]
 }

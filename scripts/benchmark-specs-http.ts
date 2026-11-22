@@ -1,8 +1,8 @@
 /** http_chain / rce_proof spec synthesis: authz, mass assignment, SSRF, XXE, SSTI. */
 import { randomBytes } from 'node:crypto'
-import { baseFields, is2xx, jqStr, requestParts, sameAsControl, stepOf } from './benchmark-specs-common.ts'
+import { appendQuery, baseFields, is2xx, jqStr, requestParts, sameAsControl, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
-import { fillPlaceholders, hasPathPlaceholder } from './benchmark-probes.ts'
+import { fillPlaceholders, hasPathPlaceholder, probePathFor, siblingValue } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
 const canaryJq = (control: string) =>
@@ -22,21 +22,45 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   const id = String(hit.resourceId)
   // A resource anonymous callers can read identically is public data, not an object-level authorization failure.
   const matrix = (o.details.matrix as Array<Record<string, unknown>> | undefined) ?? []
-  if (!mutating && matrix.some(m => m.resourceId === id && m.actor === 'anonymous' && m.accessible === true)) return []
-  const path = hasPathPlaceholder(o.hyp.endpoint.path)
-    ? fillPlaceholders(o.hyp.endpoint.path, encodeURIComponent(id))
-    : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(id)}`
-  const parts: RequestParts = { method: method as RequestParts['method'], pathAndQuery: path, ...(mutating ? { jsonBody: {} } : {}) }
+  if (!mutating && id && matrix.some(m => m.resourceId === id && m.actor === 'anonymous' && m.accessible === true)) return []
+  const functionLevel = hit.functionLevel === true ||
+    (!hasPathPlaceholder(o.hyp.endpoint.path) && !o.hyp.endpoint.params.some(p => (p.isObjectId || /(^|[_-])id$/i.test(p.name)) && p.location === 'query'))
+  const path = functionLevel
+    ? o.hyp.endpoint.path
+    : hasPathPlaceholder(o.hyp.endpoint.path)
+      ? fillPlaceholders(o.hyp.endpoint.path, encodeURIComponent(id))
+      : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(id)}`
+  const bodyTemplate = hit.bodyTemplate && typeof hit.bodyTemplate === 'object' ? hit.bodyTemplate : {}
+  const parts: RequestParts = { method: method as RequestParts['method'], pathAndQuery: path, ...(mutating ? { jsonBody: bodyTemplate } : {}) }
   const probePersona = otherHit ? other : null
+  // Negative control (object-level reads only): the identifier must actually select the object. A
+  // random nonexistent id that yields the same owner representation means the route ignores the id
+  // (self-service or sibling action), so the finding must not confirm.
+  const negativeHit = !functionLevel && method === 'GET'
+    ? (() => {
+        const missing = `guardian-none-${randomBytes(5).toString('hex')}`
+        const missingPath = hasPathPlaceholder(o.hyp.endpoint.path)
+          ? fillPlaceholders(o.hyp.endpoint.path, encodeURIComponent(missing))
+          : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(missing)}`
+        return { missingPath }
+      })()
+    : null
+  const negativeStep = negativeHit
+    ? stepOf(env, 'c2', 'control', 'Owner requests a nonexistent identifier (must differ)', {
+        method: 'GET', pathAndQuery: negativeHit.missingPath,
+      }, owner, {}, [400, 403, 404])
+    : null
+  const negativeOk = negativeStep ? ` and ((.steps.c2.status >= 400) or (.steps.c2.body != .steps.c1.body))` : ''
   // Primary: the probe actor received at least every field/value the owner control received
   // (extra fields such as leak markers are expected). Fallback: byte/shape equality.
-  const supersetJq = `{ controlPassed: ${is2xx('c1')}, ` +
+  const supersetJq = `{ controlPassed: (${is2xx('c1')}${negativeOk}), ` +
     `confirmed: (${is2xx('p1')} and (.steps.c1.json as $c | .steps.p1.json as $p | ` +
     `(([$c | keys[]] | length) > 0) and ` +
     `(([($c | to_entries[]) | select($p[.key] == .value)] | length) == ([$c | keys[]] | length)))), ` +
     `observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
-  const equalityJq = `{ controlPassed: ${is2xx('c1')}, confirmed: (${is2xx('p1')} and ${sameAsControl('p1', 'c1')}), observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
+  const equalityJq = `{ controlPassed: (${is2xx('c1')}${negativeOk}), confirmed: (${is2xx('p1')} and ${sameAsControl('p1', 'c1')}), observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
   const steps = [
+    ...(negativeStep ? [negativeStep] : []),
     stepOf(env, 'c1', 'control', 'Authorized actor performs the request', parts, owner),
     stepOf(env, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the same request`, parts, probePersona),
   ]
@@ -127,7 +151,60 @@ export function synthMassAssignment(o: HypothesisOutcome, env: ProbeEnv): Synthe
   return [{ kind: 'http_chain', spec }]
 }
 
+/**
+ * Second-order SSRF: register a benign/canary URL through the write route, then trigger the app's
+ * own fetch step. The verifier mints distinct control/probe canaries so a callback must come from
+ * the probe registration, not from shared infrastructure.
+ */
+export function synthSecondOrderSsrf(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'second_order_ssrf_callback')
+  if (!hit || !o.hyp.param) return []
+  const param = o.hyp.param.name
+  const location = o.hyp.location ?? 'json'
+  const path = probePathFor(o.hyp)
+  const pattern = typeof hit.triggerPattern === 'string' && hit.triggerPattern.startsWith('/') ? hit.triggerPattern : null
+  if (!pattern) return []
+  const siblings: Record<string, unknown> = {}
+  for (const p of o.hyp.endpoint.params) {
+    if (p.name === param || p.isCsrf || p.location !== location) continue
+    siblings[p.name] = siblingValue(p.name, env)
+  }
+  const register = (value: string): RequestParts | null => {
+    switch (location) {
+      case 'query': return { method: o.hyp.method, pathAndQuery: appendQuery(path, param, value, false) }
+      case 'form': {
+        const all = { ...siblings, [param]: value }
+        return {
+          method: o.hyp.method, pathAndQuery: path,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          textBody: Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+        }
+      }
+      case 'json': default: return { method: o.hyp.method, pathAndQuery: path, jsonBody: { ...siblings, [param]: value } }
+    }
+  }
+  const control = register('http://guardian-control.invalid/')
+  const probe = register('{{canary_url}}')
+  if (!control || !probe) return []
+  const registerStep = stepOf(env, 'p1', 'probe', 'Register the canary URL through the write route', probe)
+  const steps = [
+    stepOf(env, 'c1', 'control', 'Register a benign URL (no callback expected)', control),
+    { ...registerStep, extract: [{ varName: 'resource_id', from: 'json' as const, selector: 'id' }] },
+    stepOf(env, 'p2', 'probe', 'Trigger the stored URL fetch', { method: 'POST', pathAndQuery: pattern.replace('{{id}}', '{{resource_id}}'), jsonBody: {} }),
+  ]
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...baseFields(env, 'Second-order server-side request forgery (stored URL fetched later)', 'CWE-918', 'ssrf', 'high', canaryJq('c1')),
+      kind: 'http_chain',
+      steps,
+    },
+  }]
+}
+
 export function synthSsrf(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const secondOrder = synthSecondOrderSsrf(o, env)
+  if (secondOrder.length > 0) return secondOrder
   const hit = o.anomalies.find(a => a.type === 'canary_callback' && a.variant === 'http')
   if (!hit) return []
   const control = requestParts(o, env, 'http://guardian-control.invalid/')
@@ -175,6 +252,82 @@ const sstiTemplates: Record<string, string> = {
   'freemarker/el': '${{{nonce_a}}*{{nonce_b}}}',
   'spel/pebble': '#{{{nonce_a}}*{{nonce_b}}}',
   thymeleaf: '[[${{{nonce_a}}*{{nonce_b}}}]]',
+}
+
+/**
+ * Command injection proven with a split-echo nonce: the assembled nonce only appears when the shell
+ * executes two concatenated echo operands, so plain reflection cannot satisfy the proof.
+ */
+export function synthCommandInjection(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'command_executed')
+  if (!hit || !o.hyp.param) return []
+  const base = String(hit.baseValue ?? '127.0.0.1').slice(0, 64)
+  const variant = String(hit.variant)
+  // The two nonces must be joined by execution syntax, not literal adjacency: the verifier rejects
+  // specs where the assembled token already appears in the outbound request.
+  const templates: Record<string, string> = {
+    semicolon_echo: `${base}; echo {{nonce_part1}}$(echo {{nonce_part2}})`,
+    subshell_echo: `${base}$(echo {{nonce_part1}})$(echo {{nonce_part2}})`,
+    pipe_echo: `${base} | echo {{nonce_part1}}$(echo {{nonce_part2}})`,
+    backtick_echo: `${base}\`echo {{nonce_part1}}$(echo {{nonce_part2}})\``,
+  }
+  const template = templates[variant] ?? templates.semicolon_echo
+  const control = requestParts(o, env, base)
+  const probe = requestParts(o, env, template)
+  if (!control || !probe) return []
+  return [{
+    kind: 'rce_proof',
+    spec: {
+      ...baseFields(env, 'Command injection via shell metacharacters (nonce echo proof)', 'CWE-78', 'injection-input', 'critical',
+        '{ controlPassed: (.control.status < 500), confirmed: (.proof.splitEchoVerified == true), observed: ("splitEcho=" + ((.proof.splitEchoVerified // false) | tostring)), expected: "shell metacharacters are inert data" }'),
+      kind: 'rce_proof',
+      proofMode: 'split_echo',
+      requiresTier3Approval: true,
+      controlStep: stepOf(env, 'c1', 'control', 'Benign value', control),
+      probeStep: stepOf(env, 'p1', 'probe', 'Verifier-minted split echo operands', probe),
+    },
+  }]
+}
+
+/**
+ * Path traversal with a genuine out-of-jail oracle: the probe payload must return content that a
+ * nonexistent sibling traversal cannot, or match a well-known file signature.
+ */
+export function synthTraversal(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'path_traversal_escape')
+  if (!hit || !o.hyp.param) return []
+  const param = o.hyp.param.name
+  const location = o.hyp.location ?? 'query'
+  const raw = String(hit.payload ?? '')
+  if (!raw || raw.length > 200 || /[\r\n\0\\]/.test(raw)) return []
+  const controlValue = `../guardian-none-${randomBytes(4).toString('hex')}.txt`
+  const build = (value: string): RequestParts => {
+    // Reuse the probe's injection encoding (query/form values are URL-encoded exactly once by the
+    // broker), so the replay reproduces the payload the oracle actually accepted.
+    if (location === 'query' || location === 'form') {
+      const parts = requestParts(o, env, value)
+      if (parts) return parts
+    }
+    return { method: o.hyp.method, pathAndQuery: o.hyp.endpoint.path, jsonBody: { [param]: value } }
+  }
+  const needle = typeof hit.contentNeedle === 'string' ? hit.contentNeedle.replace(/[\u0000-\u001f]/g, '').slice(0, 40) : ''
+  const contentCheck = needle
+    ? ` and (.steps.p1.body | contains(${jqStr(needle)}))`
+    : ' and ((.steps.p1.body | length) > 0)'
+  const jq = `{ controlPassed: ((.steps.c1.status < 200) or (.steps.c1.status >= 300)), ` +
+    `confirmed: ((${is2xx('p1')})${contentCheck} and ((.steps.p1.body != .steps.c1.body) or (.steps.p1.status != .steps.c1.status))), ` +
+    `observed: ("traversal status=" + (.steps.p1.status | tostring) + " bytes=" + (.steps.p1.body | length | tostring)), expected: "file names resolve inside the served root" }`
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...baseFields(env, 'Path traversal escapes the served root (jail-escape read)', 'CWE-22', 'path-traversal', 'high', jq),
+      kind: 'http_chain',
+      steps: [
+        stepOf(env, 'c1', 'control', 'Nonexistent sibling traversal control', build(controlValue)),
+        stepOf(env, 'p1', 'probe', 'Traversal payload that resolves outside the served root', build(raw)),
+      ],
+    },
+  }]
 }
 
 export function synthSsti(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
