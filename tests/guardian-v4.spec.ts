@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { DEFAULT_PROVIDER } from '../src/domain.ts'
 import { createApp } from './app.ts'
-import { openScopeReview, saveScope } from './browser-flows.ts'
+import { openScopeReview, openView, saveScope } from './browser-flows.ts'
 import { createV2FixtureServer, E2E_CREDENTIAL } from './v2-fixture-server.ts'
 
 test.setTimeout(90_000)
@@ -463,20 +463,22 @@ test('populates endpoints, endpoint_params, and api_dependencies and renders Sur
     expect(surfaceDb.params.some(p => p.name === 'include' && p.location === 'query')).toBe(true)
     expect(surfaceDb.deps.some(d => /orderId/i.test(d.resourceKey))).toBe(true)
 
-    // Navigate to Surface tab unconditionally and assert rendered Surface Graph content
-    const surfaceTab = page.getByRole('link', { name: /^Surface/i })
-    await expect(surfaceTab).toBeVisible({ timeout: 20_000 })
-    await surfaceTab.click()
-
-    const surfaceRegion = page.getByRole('region', { name: /Surface graph|Application surface/i })
+    // Navigate to Surface unconditionally and assert the rendered endpoint inventory (Surface → Endpoints)
+    await openView(page, 'Surface')
+    await page.getByRole('radio', { name: 'Endpoints', exact: true }).click({ timeout: 20_000 })
+    const surfaceRegion = page.getByRole('region', { name: 'Endpoint inventory' })
     await expect(surfaceRegion).toBeVisible({ timeout: 20_000 })
     await expect(surfaceRegion).toContainText('/api/orders')
     await expect(surfaceRegion).toContainText('/api/orders/{orderId}')
-    await expect(surfaceRegion).toContainText(/\borderId\b/)
-    await expect(surfaceRegion).toContainText(/\binclude\b/)
-    await expect(surfaceRegion).toContainText(/\b(?:query|path)\b/i)
-    await expect(surfaceRegion).toContainText(/API dependencies/i)
-    await expect(surfaceRegion).toContainText(/(?:GET|POST)\s+\/api\/orders[\s\S]*?(?:→|->|consumes|to)[\s\S]*?\/api\/orders\/\{?orderId\}?/i)
+    await expect(surfaceRegion).toContainText(/producer → consumer dependencies/i)
+    // Parameters and producer → consumer edges live in the endpoint inspector
+    await surfaceRegion.getByText('/api/orders/{orderId}', { exact: true }).first().click()
+    const inspector = page.getByRole('complementary', { name: 'Inspector' })
+    await expect(inspector).toContainText(/\borderId\b/)
+    await expect(inspector).toContainText(/\binclude\b/)
+    await expect(inspector).toContainText(/\b(?:query|path)\b/i)
+    await expect(inspector).toContainText(/API dependencies/i)
+    await expect(inspector).toContainText(/Consumes from (?:GET|POST) \/api\/orders\b/)
   } finally {
     await app.dispose()
     await fixture.close()
