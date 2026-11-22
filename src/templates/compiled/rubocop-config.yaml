@@ -1,0 +1,33 @@
+id: "rubocop-config"
+name: "Rubocop Configuration - Detect"
+severity: "info"
+description: "Rubocop configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "config"
+  - "ruby"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://raw.githubusercontent.com/maurosoria/dirsearch/master/db/dicc.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.rubocop.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "AllCops:"
+      - "Include:"
+      - "Exclude:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

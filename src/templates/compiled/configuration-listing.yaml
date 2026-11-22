@@ -1,0 +1,32 @@
+id: "configuration-listing"
+name: "Sensitive Configuration Files Listing - Detect"
+severity: "medium"
+description: "Listing of sensitive configuration files containing items such as usernames, passwords, and IP addresses was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "listing"
+  - "exposure"
+  - "edb"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/7014"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of /config"
+      - "Parent Directory"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "go-mod-disclosure"
+name: "Go.mod Disclosure"
+severity: "low"
+description: "go.mod internal file is exposed."
+tech:
+  - "go"
+tags:
+  - "exposure"
+  - "files"
+  - "go"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/go.mod"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "module"
+      - "go"
+      - "require ("
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

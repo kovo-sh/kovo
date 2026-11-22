@@ -1,0 +1,27 @@
+id: "xenforo-detect"
+name: "XenForo Forum Detection"
+severity: "info"
+description: "Safe check derived from xenforo-detect: XenForo Forum Detection"
+tech:
+  - "php"
+tags:
+  - "tech"
+  - "xenforo"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<html id=\"XenForo\""
+      - "<html id=\"XF\""
+  - type: "status"
+    status:
+      - 200

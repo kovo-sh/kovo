@@ -1,0 +1,31 @@
+id: "tugboat-config-exposure"
+name: "Tugboat Configuration File Exposure"
+severity: "critical"
+description: "A Tugboat configuration file was discovered. Tugboat is a command line tool for interacting with DigitalOcean droplets."
+tech:
+  - "generic"
+tags:
+  - "tugboat"
+  - "config"
+  - "exposure"
+  - "vuln"
+reference: "https://github.com/petems/tugboat"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.tugboat"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "authentication"
+      - "access_token"
+      - "ssh_user"
+    condition: "and"

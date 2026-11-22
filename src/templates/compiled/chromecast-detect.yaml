@@ -1,0 +1,30 @@
+id: "chromecast-detect"
+name: "Google Chromecast - Detect"
+severity: "info"
+description: "Searches for Google Chromecast via their eureka_info route."
+tech:
+  - "generic"
+tags:
+  - "google"
+  - "chromecast"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/thewhiteh4t/killcast/blob/ee81cfa03c963d47d3335770fcea2ca48bddeabf/killcast.py#L100C25-L100C43"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/eureka_info"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"cast_build_revision\":"
+      - "\"ssdp_udn\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

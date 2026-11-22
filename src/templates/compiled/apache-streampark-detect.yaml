@@ -1,0 +1,30 @@
+id: "apache-streampark-detect"
+name: "Apache Streampark - Detect"
+severity: "info"
+description: "Detects a Apache Streampark server, a easy-to-use streaming application development framework and operation platform."
+tech:
+  - "apache"
+tags:
+  - "tech"
+  - "apache"
+  - "streampark"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/apache/streampark"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Apache StreamPark</title>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

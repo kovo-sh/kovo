@@ -1,0 +1,33 @@
+id: "unauthenticated-zipkin"
+name: "Zipkin Discovery"
+severity: "high"
+description: "Unauthenticated access to Zipkin was discovered."
+tech:
+  - "generic"
+tags:
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+reference: "https://zipkin.io/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "word"
+    part: "body"
+    words:
+      - "environment"
+      - "defaultLookback"
+    condition: "and"

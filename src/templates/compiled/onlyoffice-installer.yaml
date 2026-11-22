@@ -1,0 +1,32 @@
+id: "onlyoffice-installer"
+name: "OnlyOffice Wizard Page - Exposure"
+severity: "high"
+description: "Detects exposed OnlyOffice Setup page."
+tech:
+  - "dotnet"
+  - "iis"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "onlyoffice"
+  - "vuln"
+reference: "https://www.onlyoffice.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Wizard.aspx"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Portal Setup"
+      - "onlyoffice"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

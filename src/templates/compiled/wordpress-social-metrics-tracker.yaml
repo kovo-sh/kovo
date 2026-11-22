@@ -1,0 +1,31 @@
+id: "wordpress-social-metrics-tracker"
+name: "Social Metrics Tracker <= 1.6.8 - Unauthorised Data Export"
+severity: "medium"
+description: "The lack of proper authorisation when exporting data from the plugin could allow unauthenticated users to get information about the posts and page of the blog, including their author's username and email."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "wordpress"
+  - "wp-plugin"
+  - "wp"
+  - "unauth"
+  - "wpscan"
+  - "vuln"
+reference: "https://wpscan.com/vulnerability/f4eed3ba-2746-426f-b030-a8c432defeb2"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-admin/admin-ajax.php?page=social-metrics-tracker-export&smt_download_export_file=1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Main URL to Post"
+  - type: "status"
+    status:
+      - 200

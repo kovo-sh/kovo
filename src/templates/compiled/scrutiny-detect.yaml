@@ -1,0 +1,30 @@
+id: "scrutiny-detect"
+name: "Scrutiny - Detect"
+severity: "info"
+description: "Scrutiny, a web interface for monitoring hard drive S.M.A.R.T data, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "scrutiny"
+  - "monitoring"
+  - "detect"
+reference: "https://github.com/AnalogJ/scrutiny"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>scrutiny</title>"
+      - "assets/images/logo/scrutiny-logo-white.svg"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

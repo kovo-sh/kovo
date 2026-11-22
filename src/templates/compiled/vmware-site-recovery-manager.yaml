@@ -1,0 +1,28 @@
+id: "vmware-site-recovery-manager"
+name: "VMware Site Recovery Manager Panel - Detect"
+severity: "info"
+description: "VMware Site Recovery Manger panel was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "vmware"
+  - "tech"
+  - "discovery"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/configure/app/landing/welcome-srm-va.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Welcome to VMware Site Recovery Manager</title>"
+  - type: "status"
+    status:
+      - 200

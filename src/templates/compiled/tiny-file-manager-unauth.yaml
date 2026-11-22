@@ -1,0 +1,31 @@
+id: "tiny-file-manager-unauth"
+name: "Tiny File Manager - Unauthorized Access"
+severity: "medium"
+description: "Unauthenticated Tiny File Manager panel was detected."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "filemanager"
+  - "detect"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Tiny File Manager"
+      - "<th>Actions"
+      - "New Item"
+      - "Upload"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

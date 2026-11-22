@@ -1,0 +1,27 @@
+id: "cx-cloud-upload-detect"
+name: "CX Cloud Unauthenticated Upload - Detect"
+severity: "info"
+description: "CX Cloud unauthenticated upload was detected."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "fileupload"
+  - "misconfig"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/upload.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<HEAD><TITLE>Display file upload form to the user</TITLE></HEAD>"
+    condition: "and"

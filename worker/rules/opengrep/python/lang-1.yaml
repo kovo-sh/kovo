@@ -1,0 +1,4648 @@
+rules:
+- id: multiprocessing-recv
+  languages:
+  - python
+  message: 'The Connection.recv() method automatically unpickles the data it receives,
+    which can be a security risk unless you can trust the process which sent the message.
+    Therefore, unless the connection object was produced using Pipe() you should only
+    use the recv() and send() methods after performing some sort of authentication.
+    See more dettails: https://docs.python.org/3/library/multiprocessing.html?highlight=security#multiprocessing.connection.Connection'
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    references:
+    - https://docs.python.org/3/library/multiprocessing.html?highlight=security#multiprocessing.connection.Connection
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  pattern-either:
+  - pattern: multiprocessing.connection.Connection.recv(...)
+  - pattern: multiprocessing.connection.Client.recv(...)
+  - pattern: '$C = multiprocessing.connection.Client(...)
+
+      ...
+
+      $C.recv(...)
+
+      '
+  severity: WARNING
+- id: dangerous-annotations-usage
+  patterns:
+  - pattern: '$C.__annotations__[$NAME] = $X
+
+      '
+  - pattern-not: '$C.__annotations__[$NAME] = "..."
+
+      '
+  - pattern-not: '$C.__annotations__[$NAME] = typing.$Y
+
+      '
+  - metavariable-regex:
+      metavariable: $X
+      regex: (?!(int|float|complex|list|tuple|range|str|bytes|bytearray|memoryview|set|frozenset|dict))
+  message: Annotations passed to `typing.get_type_hints` are evaluated in `globals`
+    and `locals` namespaces. Make sure that no arbitrary value can be written as the
+    annotation and passed to `typing.get_type_hints` function.
+  severity: INFO
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    references:
+    - https://docs.python.org/3/library/typing.html#typing.get_type_hints
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - python
+- id: dangerous-asyncio-create-exec-audit
+  pattern-either:
+  - patterns:
+    - pattern-not: asyncio.create_subprocess_exec($PROG, "...", ...)
+    - pattern-not: asyncio.create_subprocess_exec($PROG, ["...",...], ...)
+    - pattern: asyncio.create_subprocess_exec(...)
+  - patterns:
+    - pattern-not: asyncio.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", "...", ...)
+    - pattern: asyncio.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c",...)
+  - patterns:
+    - pattern-not: asyncio.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", "...", ...], ...)
+    - pattern: asyncio.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", ...], ...)
+  - patterns:
+    - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, "...", ...)
+    - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, ["...",...], ...)
+    - pattern: asyncio.subprocess.create_subprocess_exec(...)
+  - patterns:
+    - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", "...", ...)
+    - pattern: asyncio.subprocess.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c",...)
+  - patterns:
+    - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", "...", ...], ...)
+    - pattern: asyncio.subprocess.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", ...], ...)
+  message: Detected 'create_subprocess_exec' function without a static string. If
+    this data can be controlled by a malicious actor, it may be an instance of command
+    injection. Audit the use of this call to ensure it is not controllable by an external
+    resource. You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-create-exec-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - pattern-either:
+    - patterns:
+      - pattern-not: asyncio.create_subprocess_exec($PROG, "...", ...)
+      - pattern-not: asyncio.create_subprocess_exec($PROG, ["...",...], ...)
+      - pattern: asyncio.create_subprocess_exec(...)
+    - patterns:
+      - pattern-not: asyncio.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", "...", ...)
+      - pattern: asyncio.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c",...)
+    - patterns:
+      - pattern-not: asyncio.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", "...", ...], ...)
+      - pattern: asyncio.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", ...], ...)
+    - patterns:
+      - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, "...", ...)
+      - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, ["...",...],
+          ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec(...)
+    - patterns:
+      - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", "...", ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c",...)
+    - patterns:
+      - pattern-not: asyncio.subprocess.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", "...", ...], ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", ...], ...)
+  message: Detected 'create_subprocess_exec' function with user controlled data. You
+    may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-exec-audit
+  pattern-either:
+  - patterns:
+    - pattern-not: $LOOP.subprocess_exec($PROTOCOL, "...", ...)
+    - pattern-not: $LOOP.subprocess_exec($PROTOCOL, ["...",...], ...)
+    - pattern: $LOOP.subprocess_exec(...)
+  - patterns:
+    - pattern-not: $LOOP.subprocess_exec($PROTOCOL, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", "...", ...)
+    - pattern: $LOOP.subprocess_exec($PROTOCOL, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c",...)
+  - patterns:
+    - pattern-not: $LOOP.subprocess_exec($PROTOCOL, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", "...", ...], ...)
+    - pattern: $LOOP.subprocess_exec($PROTOCOL, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+        "-c", ...], ...)
+  message: Detected subprocess function '$LOOP.subprocess_exec' without a static string.
+    If this data can be controlled by a malicious actor, it may be an instance of
+    command injection. Audit the use of this call to ensure it is not controllable
+    by an external resource. You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.subprocess_exec
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-exec-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - pattern-either:
+    - patterns:
+      - pattern-not: $LOOP.subprocess_exec($PROTOCOL, "...", ...)
+      - pattern-not: $LOOP.subprocess_exec($PROTOCOL, ["...",...], ...)
+      - pattern: $LOOP.subprocess_exec(...)
+    - patterns:
+      - pattern-not: $LOOP.subprocess_exec($PROTOCOL, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", "...", ...)
+      - pattern: $LOOP.subprocess_exec($PROTOCOL, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c",...)
+    - patterns:
+      - pattern-not: $LOOP.subprocess_exec($PROTOCOL, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", "...", ...], ...)
+      - pattern: $LOOP.subprocess_exec($PROTOCOL, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", ...], ...)
+  message: Detected subprocess function '$LOOP.subprocess_exec' with user controlled
+    data. You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.subprocess_exec
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-shell-audit
+  patterns:
+  - pattern-either:
+    - pattern: $LOOP.subprocess_shell($PROTOCOL, $CMD)
+    - pattern: asyncio.subprocess.create_subprocess_shell($CMD, ...)
+    - pattern: asyncio.create_subprocess_shell($CMD, ...)
+  - pattern-not-inside: '$CMD = "..."
+
+      ...
+
+      '
+  - pattern-not: $LOOP.subprocess_shell($PROTOCOL, "...")
+  - pattern-not: asyncio.subprocess.create_subprocess_shell("...", ...)
+  - pattern-not: asyncio.create_subprocess_shell("...", ...)
+  message: Detected asyncio subprocess function without a static string. If this data
+    can be controlled by a malicious actor, it may be an instance of command injection.
+    Audit the use of this call to ensure it is not controllable by an external resource.
+    You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-subprocess.html
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-shell-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: $LOOP.subprocess_shell($PROTOCOL, $CMD)
+      - pattern-inside: asyncio.subprocess.create_subprocess_shell($CMD, ...)
+      - pattern-inside: asyncio.create_subprocess_shell($CMD, ...)
+    - focus-metavariable: $CMD
+    - pattern-not-inside: '$CMD = "..."
+
+        ...
+
+        '
+    - pattern-not: $LOOP.subprocess_shell($PROTOCOL, "...")
+    - pattern-not: asyncio.subprocess.create_subprocess_shell("...", ...)
+    - pattern-not: asyncio.create_subprocess_shell("...", ...)
+  message: Detected asyncio subprocess function with user controlled data. You may
+    consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-subprocess.html
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-interactive-code-run-audit
+  patterns:
+  - pattern-either:
+    - pattern: '$X.push($PAYLOAD,...)
+
+        '
+    - pattern: '$X.runsource($PAYLOAD,...)
+
+        '
+    - pattern: '$X.runcode(code.compile_command($PAYLOAD),...)
+
+        '
+    - pattern: '$PL = code.compile_command($PAYLOAD,...)
+
+        ...
+
+        $X.runcode($PL,...)
+
+        '
+  - pattern-either:
+    - pattern-inside: '$X = code.InteractiveConsole(...)
+
+        ...
+
+        '
+    - pattern-inside: '$X = code.InteractiveInterpreter(...)
+
+        ...
+
+        '
+  - pattern-not: '$X.push("...",...)
+
+      '
+  - pattern-not: '$X.runsource("...",...)
+
+      '
+  - pattern-not: '$X.runcode(code.compile_command("..."),...)
+
+      '
+  - pattern-not: '$PL = code.compile_command("...",...)
+
+      ...
+
+      $X.runcode($PL,...)
+
+      '
+  message: Found dynamic content inside InteractiveConsole/InteractiveInterpreter
+    method. This is dangerous if external data can reach this function call because
+    it allows a malicious actor to run arbitrary Python code. Ensure no external data
+    reaches here.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-interactive-code-run-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$X = code.InteractiveConsole(...)
+
+          ...
+
+          '
+      - pattern-inside: '$X = code.InteractiveInterpreter(...)
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern-inside: '$X.push($PAYLOAD,...)
+
+          '
+      - pattern-inside: '$X.runsource($PAYLOAD,...)
+
+          '
+      - pattern-inside: '$X.runcode(code.compile_command($PAYLOAD),...)
+
+          '
+      - pattern-inside: '$PL = code.compile_command($PAYLOAD,...)
+
+          ...
+
+          $X.runcode($PL,...)
+
+          '
+    - pattern: $PAYLOAD
+    - pattern-not: '$X.push("...",...)
+
+        '
+    - pattern-not: '$X.runsource("...",...)
+
+        '
+    - pattern-not: '$X.runcode(code.compile_command("..."),...)
+
+        '
+    - pattern-not: '$PL = code.compile_command("...",...)
+
+        ...
+
+        $X.runcode($PL,...)
+
+        '
+  message: Found user controlled data inside InteractiveConsole/InteractiveInterpreter
+    method. This is dangerous if external data can reach this function call because
+    it allows a malicious actor to run arbitrary Python code.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-os-exec-audit
+  message: Found dynamic content when spawning a process. This is dangerous if external
+    data can reach this function call because it allows a malicious actor to execute
+    commands. Ensure no external data reaches here.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+  pattern-either:
+  - patterns:
+    - pattern-not: os.$METHOD("...", ...)
+    - pattern: os.$METHOD(...)
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: (execl|execle|execlp|execlpe|execv|execve|execvp|execvpe)
+  - patterns:
+    - pattern-not: os.$METHOD("...", [$PATH,"...","...",...],...)
+    - pattern: os.$METHOD($BASH,[$PATH,"-c",$CMD,...],...)
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: (execv|execve|execvp|execvpe)
+    - metavariable-regex:
+        metavariable: $BASH
+        regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+  - patterns:
+    - pattern-not: os.$METHOD("...", $PATH, "...", "...",...)
+    - pattern: os.$METHOD($BASH, $PATH, "-c", $CMD,...)
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: (execl|execle|execlp|execlpe)
+    - metavariable-regex:
+        metavariable: $BASH
+        regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+- id: dangerous-os-exec-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-not: os.$METHOD("...", ...)
+        - pattern: os.$METHOD(...)
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (execl|execle|execlp|execlpe|execv|execve|execvp|execvpe)
+      - patterns:
+        - pattern-not: os.$METHOD("...", [$PATH,"...","...",...],...)
+        - pattern-inside: os.$METHOD($BASH,[$PATH,"-c",$CMD,...],...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (execv|execve|execvp|execvpe)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+      - patterns:
+        - pattern-not: os.$METHOD("...", $PATH, "...", "...",...)
+        - pattern-inside: os.$METHOD($BASH, $PATH, "-c", $CMD,...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (execl|execle|execlp|execlpe)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+  message: Found user controlled content when spawning a process. This is dangerous
+    because it allows a malicious actor to execute commands.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    confidence: MEDIUM
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-spawn-process-audit
+  message: Found dynamic content when spawning a process. This is dangerous if external
+    data can reach this function call because it allows a malicious actor to execute
+    commands. Ensure no external data reaches here.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b605_start_process_with_a_shell.html
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+  pattern-either:
+  - patterns:
+    - pattern-not: os.$METHOD($MODE, "...", ...)
+    - pattern: os.$METHOD(...)
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: (spawnl|spawnle|spawnlp|spawnlpe|spawnv|spawnve|spawnvp|spawnvp|spawnvpe|posix_spawn|posix_spawnp|startfile)
+  - patterns:
+    - pattern-not: os.$METHOD($MODE, "...", ["...","...",...], ...)
+    - pattern: os.$METHOD($MODE, $BASH, ["-c",$CMD,...],...)
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: (spawnv|spawnve|spawnvp|spawnvp|spawnvpe|posix_spawn|posix_spawnp)
+    - metavariable-regex:
+        metavariable: $BASH
+        regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+  - patterns:
+    - pattern-not: os.$METHOD($MODE, "...", "...", "...", ...)
+    - pattern: os.$METHOD($MODE, $BASH, "-c", $CMD,...)
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: (spawnl|spawnle|spawnlp|spawnlpe)
+    - metavariable-regex:
+        metavariable: $BASH
+        regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+- id: dangerous-spawn-process-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-not: os.$METHOD($MODE, "...", ...)
+        - pattern-inside: os.$METHOD($MODE, $CMD, ...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (spawnl|spawnle|spawnlp|spawnlpe|spawnv|spawnve|spawnvp|spawnvp|spawnvpe|posix_spawn|posix_spawnp|startfile)
+      - patterns:
+        - pattern-not: os.$METHOD($MODE, "...", ["...","...",...], ...)
+        - pattern-inside: os.$METHOD($MODE, $BASH, ["-c",$CMD,...],...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (spawnv|spawnve|spawnvp|spawnvp|spawnvpe|posix_spawn|posix_spawnp)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+      - patterns:
+        - pattern-not: os.$METHOD($MODE, "...", "...", "...", ...)
+        - pattern-inside: os.$METHOD($MODE, $BASH, "-c", $CMD,...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (spawnl|spawnle|spawnlp|spawnlpe)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+  message: Found user controlled content when spawning a process. This is dangerous
+    because it allows a malicious actor to execute commands.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b605_start_process_with_a_shell.html
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-subinterpreters-run-string-audit
+  patterns:
+  - pattern: '_xxsubinterpreters.run_string($ID, $PAYLOAD, ...)
+
+      '
+  - pattern-not: '_xxsubinterpreters.run_string($ID, "...", ...)
+
+      '
+  message: Found dynamic content in `run_string`. This is dangerous if external data
+    can reach this function call because it allows a malicious actor to run arbitrary
+    Python code. Ensure no external data reaches here.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://bugs.python.org/issue43472
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-subinterpreters-run-string-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-inside: '_xxsubinterpreters.run_string($ID, $PAYLOAD, ...)
+
+        '
+    - pattern-not: '_xxsubinterpreters.run_string($ID, "...", ...)
+
+        '
+    - pattern: $PAYLOAD
+  message: Found user controlled content in `run_string`. This is dangerous because
+    it allows a malicious actor to run arbitrary Python code.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://bugs.python.org/issue43472
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-subprocess-use-audit
+  pattern-either:
+  - patterns:
+    - pattern-not: subprocess.$FUNC("...", ...)
+    - pattern-not: subprocess.$FUNC(["...",...], ...)
+    - pattern-not: subprocess.$FUNC(("...",...), ...)
+    - pattern-not:
+        patterns:
+        - pattern-not-inside: '$ARR = ["=~/(sh|bash|ksh|csh|tcsh|zsh)/", "-c", ...]
+
+            ...
+
+            '
+        - pattern-inside: '$ARR = [...]
+
+            ...
+
+            '
+        - pattern-either:
+          - pattern: subprocess.$FUNC(*$ARR, ...)
+          - pattern: subprocess.$FUNC([*$ARR, ...])
+    - pattern-not: subprocess.CalledProcessError(...)
+    - pattern-not: subprocess.SubprocessError(...)
+    - pattern: subprocess.$FUNC(...)
+  - patterns:
+    - pattern: subprocess.$FUNC("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c",...)
+    - pattern-not: subprocess.$FUNC("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c","...",...)
+  - patterns:
+    - pattern-either:
+      - pattern: subprocess.$FUNC(["=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c",...],...)
+      - pattern: subprocess.$FUNC(("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c",...),...)
+    - pattern-not: subprocess.$FUNC(["=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c","...",...],...)
+    - pattern-not: subprocess.$FUNC(("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c","...",...),...)
+  - patterns:
+    - pattern: subprocess.$FUNC("=~/(python)/",...)
+    - pattern-not: subprocess.$FUNC("=~/(python)/","...",...)
+  - patterns:
+    - pattern-either:
+      - pattern: subprocess.$FUNC(["=~/(python)/",...],...)
+      - pattern: subprocess.$FUNC(("=~/(python)/",...),...)
+    - pattern-not: subprocess.$FUNC(["=~/(python)/","...",...],...)
+    - pattern-not: subprocess.$FUNC(("=~/(python)/","...",...),...)
+  message: Detected subprocess function '$FUNC' without a static string. If this data
+    can be controlled by a malicious actor, it may be an instance of command injection.
+    Audit the use of this call to ensure it is not controllable by an external resource.
+    You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://stackoverflow.com/questions/3172470/actual-meaning-of-shell-true-in-subprocess
+    - https://docs.python.org/3/library/subprocess.html
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-subprocess-use-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sanitizers:
+  - pattern: shlex.quote(...)
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-not: subprocess.$FUNC("...", ...)
+        - pattern-not: subprocess.$FUNC(["...",...], ...)
+        - pattern-not: subprocess.$FUNC(("...",...), ...)
+        - pattern-not: subprocess.CalledProcessError(...)
+        - pattern-not: subprocess.SubprocessError(...)
+        - pattern: subprocess.$FUNC($CMD, ...)
+      - patterns:
+        - pattern-not: subprocess.$FUNC("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c","...",...)
+        - pattern: subprocess.$FUNC("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c", $CMD)
+      - patterns:
+        - pattern-not: subprocess.$FUNC(["=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c","...",...],...)
+        - pattern-not: subprocess.$FUNC(("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c","...",...),...)
+        - pattern-either:
+          - pattern: subprocess.$FUNC(["=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c", $CMD],
+              ...)
+          - pattern: subprocess.$FUNC(("=~/(sh|bash|ksh|csh|tcsh|zsh)/","-c", $CMD),
+              ...)
+      - patterns:
+        - pattern-not: subprocess.$FUNC("=~/(python)/","...",...)
+        - pattern: subprocess.$FUNC("=~/(python)/", $CMD)
+      - patterns:
+        - pattern-not: subprocess.$FUNC(["=~/(python)/","...",...],...)
+        - pattern-not: subprocess.$FUNC(("=~/(python)/","...",...),...)
+        - pattern-either:
+          - pattern: subprocess.$FUNC(["=~/(python)/", $CMD],...)
+          - pattern: subprocess.$FUNC(("=~/(python)/", $CMD),...)
+    - focus-metavariable: $CMD
+  message: Detected subprocess function '$FUNC' with user controlled data. A malicious
+    actor could leverage this to perform command injection. You may consider using
+    'shlex.quote()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://stackoverflow.com/questions/3172470/actual-meaning-of-shell-true-in-subprocess
+    - https://docs.python.org/3/library/subprocess.html
+    - https://docs.python.org/3/library/shlex.html
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-system-call-audit
+  patterns:
+  - pattern-not: os.$W("...", ...)
+  - pattern-either:
+    - pattern: os.system(...)
+    - pattern: getattr(os, "system")(...)
+    - pattern: __import__("os").system(...)
+    - pattern: getattr(__import__("os"), "system")(...)
+    - pattern: '$X = __import__("os")
+
+        ...
+
+        $X.system(...)
+
+        '
+    - pattern: '$X = __import__("os")
+
+        ...
+
+        getattr($X, "system")(...)
+
+        '
+    - pattern: '$X = getattr(os, "system")
+
+        ...
+
+        $X(...)
+
+        '
+    - pattern: '$X = __import__("os")
+
+        ...
+
+        $Y = getattr($X, "system")
+
+        ...
+
+        $Y(...)
+
+        '
+    - pattern: os.popen(...)
+    - pattern: os.popen2(...)
+    - pattern: os.popen3(...)
+    - pattern: os.popen4(...)
+  message: Found dynamic content used in a system call. This is dangerous if external
+    data can reach this function call because it allows a malicious actor to execute
+    commands. Use the 'subprocess' module instead, which is easier to use without
+    accidentally exposing a command injection vulnerability.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b605_start_process_with_a_shell.html
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.2.4 Dyanmic Code Execution Features
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v52-sanitization-and-sandboxing-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-system-call-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-not: os.$W("...", ...)
+    - pattern-either:
+      - pattern: os.system(...)
+      - pattern: '$X = __import__("os")
+
+          ...
+
+          $X.system(...)
+
+          '
+      - pattern: '$X = __import__("os")
+
+          ...
+
+          getattr($X, "system")(...)
+
+          '
+      - pattern: '$X = getattr(os, "system")
+
+          ...
+
+          $X(...)
+
+          '
+      - pattern: '$X = __import__("os")
+
+          ...
+
+          $Y = getattr($X, "system")
+
+          ...
+
+          $Y(...)
+
+          '
+      - pattern: os.popen(...)
+      - pattern: os.popen2(...)
+      - pattern: os.popen3(...)
+      - pattern: os.popen4(...)
+  message: Found user-controlled data used in a system call. This could allow a malicious
+    actor to execute commands. Use the 'subprocess' module instead, which is easier
+    to use without accidentally exposing a command injection vulnerability.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b605_start_process_with_a_shell.html
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.2.4 Dyanmic Code Execution Features
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v52-sanitization-and-sandboxing-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-testcapi-run-in-subinterp-audit
+  patterns:
+  - pattern-either:
+    - pattern: '_testcapi.run_in_subinterp($PAYLOAD, ...)
+
+        '
+    - pattern: 'test.support.run_in_subinterp($PAYLOAD, ...)
+
+        '
+  - pattern-not: '_testcapi.run_in_subinterp("...", ...)
+
+      '
+  - pattern-not: 'test.support.run_in_subinterp("...", ...)
+
+      '
+  message: Found dynamic content in `run_in_subinterp`. This is dangerous if external
+    data can reach this function call because it allows a malicious actor to run arbitrary
+    Python code. Ensure no external data reaches here.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: LOW
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-testcapi-run-in-subinterp-tainted-env-args
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: os.environ
+          - pattern: os.environ.get('$FOO', ...)
+          - pattern: os.environb
+          - pattern: os.environb.get('$FOO', ...)
+          - pattern: os.getenv('$ANYTHING', ...)
+          - pattern: os.getenvb('$ANYTHING', ...)
+      - patterns:
+        - pattern-either:
+          - patterns:
+            - pattern-either:
+              - pattern: sys.argv
+              - pattern: sys.orig_argv
+          - patterns:
+            - pattern-inside: '$PARSER = argparse.ArgumentParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-inside: '$PARSER = optparse.OptionParser(...)
+
+                ...
+
+                '
+            - pattern-inside: '$ARGS = $PARSER.parse_args()
+
+                '
+            - pattern: <... $ARGS ...>
+          - patterns:
+            - pattern-either:
+              - pattern-inside: '$OPTS, $ARGS = getopt.getopt(...)
+
+                  ...
+
+                  '
+              - pattern-inside: '$OPTS, $ARGS = getopt.gnu_getopt(...)
+
+                  ...
+
+                  '
+            - pattern-either:
+              - patterns:
+                - pattern-inside: "for $O, $A in $OPTS:\n  ...\n"
+                - pattern: $A
+              - pattern: $ARGS
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '_testcapi.run_in_subinterp($PAYLOAD, ...)
+
+          '
+      - pattern-inside: 'test.support.run_in_subinterp($PAYLOAD, ...)
+
+          '
+    - pattern: $PAYLOAD
+    - pattern-not: '_testcapi.run_in_subinterp("...", ...)
+
+        '
+    - pattern-not: 'test.support.run_in_subinterp("...", ...)
+
+        '
+  message: Found user controlled content in `run_in_subinterp`. This is dangerous
+    because it allows a malicious actor to run arbitrary Python code.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dynamic-urllib-use-detected
+  patterns:
+  - pattern-not: urllib.$W("...")
+  - pattern-not: urllib.request.$W("...")
+  - pattern-not: $OPENER.$W("...")
+  - pattern-either:
+    - pattern: urllib.urlopen(...)
+    - pattern: urllib.request.urlopen(...)
+    - pattern: urllib.urlretrieve(...)
+    - pattern: urllib.request.urlretrieve(...)
+    - patterns:
+      - pattern-either:
+        - pattern-inside: '$OPENER = urllib.URLopener(...)
+
+            ...
+
+            '
+        - pattern-inside: '$OPENER = urllib.request.URLopener(...)
+
+            ...
+
+            '
+        - pattern-inside: '$OPENER = urllib.FancyURLopener(...)
+
+            ...
+
+            '
+        - pattern-inside: '$OPENER = urllib.request.FancyURLopener(...)
+
+            ...
+
+            '
+      - pattern-either:
+        - pattern: $OPENER.open(...)
+        - pattern: $OPENER.retrieve(...)
+  message: Detected a dynamic value being used with urllib. urllib supports 'file://'
+    schemes, so a dynamic value controlled by a malicious actor may allow them to
+    read arbitrary files. Audit uses of urllib calls to ensure user data cannot control
+    the URLs, or consider using the 'requests' library instead.
+  metadata:
+    cwe:
+    - 'CWE-939: Improper Authorization in Handler for Custom URL Scheme'
+    owasp: A01:2017 - Injection
+    source-rule-url: https://github.com/PyCQA/bandit/blob/b1411bfb43795d3ffd268bef17a839dee954c2b1/bandit/blacklists/calls.py#L163
+    bandit-code: B310
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.2.4 Dynamic Code Execution Features
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v52-sanitization-and-sandboxing-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    references:
+    - https://cwe.mitre.org/data/definitions/939.html
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: exec-detected
+  patterns:
+  - pattern-not: exec("...")
+  - pattern: exec(...)
+  message: Detected the use of exec(). exec() can be dangerous if used to evaluate
+    dynamic content. If this content can be input from outside the program, this may
+    be a code injection vulnerability. Ensure evaluated content is not definable by
+    external sources.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b102_exec_used.html
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.2.4 Dyanmic Code Execution Features
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v52-sanitization-and-sandboxing-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: formatted-sql-query
+  message: Detected possible formatted SQL query. Use parameterized queries instead.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    references:
+    - https://stackoverflow.com/questions/775296/mysql-parameterized-queries
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: $DB.execute("..." % ...)
+  - pattern: $DB.execute("...".format(...))
+  - pattern: $DB.execute(f"...")
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$SQL = "..." % ...
+
+          ...
+
+          '
+      - pattern-inside: '$SQL = "...".format(...)
+
+          ...
+
+          '
+      - pattern-inside: '$SQL = f"...{$X}..."
+
+          ...
+
+          '
+    - pattern: $DB.execute($SQL)
+- id: hardcoded-password-default-argument
+  message: Hardcoded password is used as a default argument to '$FUNC'. This could
+    be dangerous if a real password is not supplied.
+  languages:
+  - python
+  severity: WARNING
+  patterns:
+  - pattern: "def $FUNC(..., password=\"...\", ...):\n  ...\n"
+  - pattern-not: "def $FUNC(..., password=\"\", ...):\n  ...\n"
+  metadata:
+    cwe:
+    - 'CWE-798: Use of Hard-coded Credentials'
+    category: security
+    technology:
+    - python
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    references:
+    - https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+- id: httpsconnection-detected
+  message: The HTTPSConnection API has changed frequently with minor releases of Python.
+    Ensure you are using the API for your version of Python securely. For example,
+    Python 3 versions prior to 3.4.3 will not verify SSL certificates by default.
+    See https://docs.python.org/3/library/http.client.html#http.client.HTTPSConnection
+    for more information.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A07:2021 - Identification and Authentication Failures
+    cwe:
+    - 'CWE-295: Improper Certificate Validation'
+    references:
+    - https://docs.python.org/3/library/http.client.html#http.client.HTTPSConnection
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: httplib.HTTPSConnection(...)
+  - pattern: http.client.HTTPSConnection(...)
+  - pattern: six.moves.http_client.HTTPSConnection(...)
+- id: insecure-file-permissions
+  languages:
+  - python
+  severity: WARNING
+  metadata:
+    category: security
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-276: Incorrect Default Permissions'
+    technology:
+    - python
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: These permissions `$BITS` are widely permissive and grant access to more
+    people than may be necessary. A good default is `0o644` which gives read and write
+    access to yourself and read access to everyone else.
+  patterns:
+  - pattern-inside: os.$METHOD(...)
+  - metavariable-pattern:
+      metavariable: $METHOD
+      patterns:
+      - pattern-either:
+        - pattern: chmod
+        - pattern: lchmod
+        - pattern: fchmod
+  - pattern-either:
+    - patterns:
+      - pattern: os.$METHOD($FILE, $BITS, ...)
+      - metavariable-comparison:
+          metavariable: $BITS
+          comparison: $BITS >= 0o650 and $BITS < 0o100000
+    - patterns:
+      - pattern: os.$METHOD($FILE, $BITS)
+      - metavariable-comparison:
+          metavariable: $BITS
+          comparison: $BITS >= 0o100650
+    - patterns:
+      - pattern: os.$METHOD($FILE, $BITS, ...)
+      - metavariable-pattern:
+          metavariable: $BITS
+          patterns:
+          - pattern-either:
+            - pattern: <... stat.S_IWGRP ...>
+            - pattern: <... stat.S_IXGRP ...>
+            - pattern: <... stat.S_IWOTH ...>
+            - pattern: <... stat.S_IXOTH ...>
+            - pattern: <... stat.S_IRWXO ...>
+            - pattern: <... stat.S_IRWXG ...>
+    - patterns:
+      - pattern: os.$METHOD($FILE, $EXPR | $MOD, ...)
+      - metavariable-comparison:
+          metavariable: $MOD
+          comparison: $MOD == 0o111
+- id: use-ftp-tls
+  patterns:
+  - pattern: ftplib.FTP(...)
+  - pattern-not: ftplib.FTP_TLS(...)
+  fix-regex:
+    regex: FTP(.*)\)
+    replacement: FTP_TLS\1, context=ssl.create_default_context())
+  message: The 'FTP' class sends information unencrypted. Consider using the 'FTP_TLS'
+    class instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/ftplib.html#ftplib.FTP_TLS
+    category: security
+    technology:
+    - ftplib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: INFO
+  languages:
+  - python
+- id: request-session-http-in-with-context
+  options:
+    symbolic_propagation: true
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: '"$URL"
+
+        '
+    - metavariable-pattern:
+        metavariable: $URL
+        language: regex
+        patterns:
+        - pattern-regex: http://
+        - pattern-not-regex: .*://localhost
+        - pattern-not-regex: .*://127\.0\.0\.1
+  pattern-sinks:
+  - patterns:
+    - pattern-inside: "with requests.Session(...) as $SESSION:\n  ...\n"
+    - pattern-either:
+      - pattern: $SESSION.$W($SINK, ...)
+      - pattern: $SESSION.request($METHOD, $SINK, ...)
+    - focus-metavariable: $SINK
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  message: Detected a request using 'http://'. This request will be unencrypted. Use
+    'https://' instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    asvs:
+      section: V9 Communications Verification Requirements
+      control_id: 9.2.1 Weak TLS
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x17-V9-Communications.md#v92-server-communications-security-requirements
+      version: '4'
+    category: security
+    technology:
+    - requests
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: INFO
+- id: request-session-with-http
+  options:
+    symbolic_propagation: true
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: '"$URL"
+
+        '
+    - metavariable-pattern:
+        metavariable: $URL
+        language: regex
+        patterns:
+        - pattern-regex: http://
+        - pattern-not-regex: .*://localhost
+        - pattern-not-regex: .*://127\.0\.0\.1
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: requests.Session(...).$W($SINK, ...)
+      - pattern: requests.Session(...).request($METHOD, $SINK, ...)
+    - focus-metavariable: $SINK
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  message: Detected a request using 'http://'. This request will be unencrypted. Use
+    'https://' instead.
+  languages:
+  - python
+  severity: INFO
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    asvs:
+      section: V9 Communications Verification Requirements
+      control_id: 9.1.1 Weak TLS
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x17-V9-Communications.md#v92-server-communications-security-requirements
+      version: '4'
+    category: security
+    technology:
+    - requests
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+- id: request-with-http
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  message: Detected a request using 'http://'. This request will be unencrypted, and
+    attackers could listen into traffic on the network and be able to obtain sensitive
+    information. Use 'https://' instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    asvs:
+      section: V9 Communications Verification Requirements
+      control_id: 9.1.1 Weak TLS
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x17-V9-Communications.md#v92-server-communications-security-requirements
+      version: '4'
+    category: security
+    technology:
+    - requests
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: INFO
+  options:
+    symbolic_propagation: true
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: '"$URL"
+
+        '
+    - metavariable-pattern:
+        metavariable: $URL
+        language: regex
+        patterns:
+        - pattern-regex: http://
+        - pattern-not-regex: .*://localhost
+        - pattern-not-regex: .*://127\.0\.0\.1
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: requests.$W($SINK, ...)
+      - pattern: requests.request($METHOD, $SINK, ...)
+      - pattern: requests.Request($METHOD, $SINK, ...)
+    - focus-metavariable: $SINK
+- id: no-set-ciphers
+  pattern: $CONTEXT.set_ciphers(...)
+  message: The 'ssl' module disables insecure cipher suites by default. Therefore,
+    use of 'set_ciphers()' should only be used when you have very specialized requirements.
+    Otherwise, you risk lowering the security of the SSL channel.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    asvs:
+      section: V9 Communications Verification Requirements
+      control_id: 9.1.3 Weak TLS
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x17-V9-Communications.md#v91-client-communications-security-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/ssl.html#cipher-selection
+    - https://docs.python.org/3/library/ssl.html#ssl.SSLContext.set_ciphers
+    category: security
+    technology:
+    - ssl
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: insecure-openerdirector-open-ftp
+  message: Detected an unsecured transmission channel. 'OpenerDirector.open(...)'
+    is being used with 'ftp://'. Information sent over this connection will be unencrypted.
+    Consider using SFTP instead. urllib does not support SFTP, so consider a library
+    which supports SFTP.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.OpenerDirector.open
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: urllib.request.OpenerDirector(...).open("=~/^[Ff][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.OpenerDirector(...)
+
+        ...
+
+        '
+    - pattern: $OPENERDIRECTOR.open("=~/^[Ff][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.OpenerDirector(...)
+
+        ...
+
+        '
+    - pattern: '$URL = "=~/^[Ff][Tt][Pp]://.*/"
+
+        ...
+
+        $OPENERDIRECTOR.open($URL, ...)
+
+        '
+  - pattern: '$URL = "=~/^[Ff][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.OpenerDirector(...).open($URL, ...)
+
+      '
+  - patterns:
+    - pattern-inside: "def $FUNC(..., $URL = \"=~/^[Ff][Tt][Pp]://.*/\", ...):\n \
+        \ ...\n"
+    - pattern-either:
+      - pattern: urllib.request.OpenerDirector(...).open($URL, ...)
+      - patterns:
+        - pattern-inside: '$OPENERDIRECTOR = urllib.request.OpenerDirector(...)
+
+            ...
+
+            '
+        - pattern: $OPENERDIRECTOR.open($URL, ...)
+- id: insecure-openerdirector-open
+  message: Detected an unsecured transmission channel. 'OpenerDirector.open(...)'
+    is being used with 'http://'. Use 'https://' instead to secure the channel.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.OpenerDirector.open
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - pattern: urllib.request.OpenerDirector(...).open("=~/[Hh][Tt][Tt][Pp]://.*/",
+      ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.OpenerDirector(...)
+
+        ...
+
+        '
+    - pattern: $OPENERDIRECTOR.open("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.OpenerDirector(...)
+
+        ...
+
+        '
+    - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+        ...
+
+        $OPENERDIRECTOR.open($URL, ...)
+
+        '
+  - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.OpenerDirector(...).open($URL, ...)
+
+      '
+  - patterns:
+    - pattern-inside: "def $FUNC(..., $URL = \"=~/[Hh][Tt][Tt][Pp]://.*/\", ...):\n\
+        \  ...\n"
+    - pattern-either:
+      - pattern: urllib.request.OpenerDirector(...).open($URL, ...)
+      - patterns:
+        - pattern-inside: '$OPENERDIRECTOR = urllib.request.OpenerDirector(...)
+
+            ...
+
+            '
+        - pattern: $OPENERDIRECTOR.open($URL, ...)
+- id: insecure-request-object-ftp
+  message: Detected a 'urllib.request.Request()' object using an insecure transport
+    protocol, 'ftp://'. This connection will not be encrypted. Consider using SFTP
+    instead. urllib does not support SFTP natively, so consider using a library which
+    supports SFTP.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.Request
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: urllib.request.Request("=~/^[Ff][Tt][Pp]://.*/", ...)
+  - pattern: '$URL = "=~/^[Ff][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.Request($URL, ...)
+
+      '
+  - pattern: "def $FUNC(..., $URL = \"=~/^[Ff][Tt][Pp]://.*/\", ...):\n  ...\n  urllib.request.Request($URL,\
+      \ ...)"
+- id: insecure-request-object
+  message: Detected a 'urllib.request.Request()' object using an insecure transport
+    protocol, 'http://'. This connection will not be encrypted. Use 'https://' instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.Request
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - pattern: urllib.request.Request("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.Request($URL, ...)
+
+      '
+  - pattern: "def $FUNC(..., $URL = \"=~/[Hh][Tt][Tt][Pp]://.*/\", ...):\n  ...\n\
+      \  urllib.request.Request($URL, ...)\n"
+- id: insecure-urlopen-ftp
+  message: Detected 'urllib.urlopen()' using 'ftp://'. This request will not be encrypted.
+    Consider using SFTP instead. urllib does not support SFTP, so consider switching
+    to a library which supports SFTP.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.urlopen
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: urllib.request.urlopen("=~/^[Ff][Tt][Pp]://.*/", ...)
+  - pattern: '$URL = "=~/^[Ff][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.urlopen($URL, ...)
+
+      '
+  - pattern: "def $FUNC(..., $URL = \"=~/^[Ff][Tt][Pp]://.*/\", ...):\n  ...\n  urllib.request.urlopen($URL,\
+      \ ...)"
+- id: insecure-urlopen
+  message: Detected 'urllib.urlopen()' using 'http://'. This request will not be encrypted.
+    Use 'https://' instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.urlopen
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+  pattern-either:
+  - pattern: urllib.request.urlopen("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.urlopen($URL, ...)
+
+      '
+  - pattern: "def $FUNC(..., $URL = \"=~/[Hh][Tt][Tt][Pp]://.*/\", ...):\n  ...\n\
+      \  urllib.request.urlopen($URL, ...)\n"
+- id: insecure-urlopener-open-ftp
+  message: Detected an insecure transmission channel. 'URLopener.open(...)' is being
+    used with 'ftp://'. Use SFTP instead. urllib does not support SFTP, so consider
+    using a library which supports SFTP.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.URLopener.open
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: urllib.request.URLopener(...).open("=~/[Ff][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: $OPENERDIRECTOR.open("=~/[Ff][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: '$URL = "=~/[Ff][Tt][Pp]://.*/"
+
+        ...
+
+        $OPENERDIRECTOR.open($URL, ...)
+
+        '
+  - pattern: '$URL = "=~/[Ff][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.URLopener(...).open($URL, ...)
+
+      '
+  - patterns:
+    - pattern-inside: "def $FUNC(..., $URL = \"=~/[Ff][Tt][Pp]://.*/\", ...):\n  ...\n"
+    - pattern-either:
+      - pattern: urllib.request.URLopener(...).open($URL, ...)
+      - patterns:
+        - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+            ...
+
+            '
+        - pattern: $OPENERDIRECTOR.open($URL, ...)
+- id: insecure-urlopener-open
+  message: Detected an unsecured transmission channel. 'URLopener.open(...)' is being
+    used with 'http://'. Use 'https://' instead to secure the channel.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.URLopener.open
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - pattern: urllib.request.URLopener(...).open("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: $OPENERDIRECTOR.open("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+        ...
+
+        $OPENERDIRECTOR.open($URL, ...)
+
+        '
+  - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.URLopener(...).open($URL, ...)
+
+      '
+  - patterns:
+    - pattern-inside: "def $FUNC(..., $URL = \"=~/[Hh][Tt][Tt][Pp]://.*/\", ...):\n\
+        \  ...\n"
+    - pattern-either:
+      - pattern: urllib.request.URLopener(...).open($URL, ...)
+      - patterns:
+        - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+            ...
+
+            '
+        - pattern: $OPENERDIRECTOR.open($URL, ...)
+- id: insecure-urlopener-retrieve-ftp
+  message: Detected an insecure transmission channel. 'URLopener.retrieve(...)' is
+    being used with 'ftp://'. Use SFTP instead. urllib does not support SFTP, so consider
+    using a library which supports SFTP.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.URLopener.retrieve
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: urllib.request.URLopener(...).retrieve("=~/[Ff][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: $OPENERDIRECTOR.retrieve("=~/[Ff][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: '$URL = "=~/[Ff][Tt][Pp]://.*/"
+
+        ...
+
+        $OPENERDIRECTOR.retrieve($URL, ...)
+
+        '
+  - pattern: '$URL = "=~/[Ff][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.URLopener(...).retrieve($URL, ...)
+
+      '
+  - patterns:
+    - pattern-inside: "def $FUNC(..., $URL = \"=~/[Ff][Tt][Pp]://.*/\", ...):\n  ...\n"
+    - pattern-either:
+      - pattern: urllib.request.URLopener(...).retrieve($URL, ...)
+      - patterns:
+        - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+            ...
+
+            '
+        - pattern: $OPENERDIRECTOR.retrieve($URL, ...)
+- id: insecure-urlopener-retrieve
+  message: Detected an unsecured transmission channel. 'URLopener.retrieve(...)' is
+    being used with 'http://'. Use 'https://' instead to secure the channel.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.URLopener.retrieve
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - pattern: urllib.request.URLopener(...).retrieve("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: $OPENERDIRECTOR.retrieve("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - patterns:
+    - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+        ...
+
+        '
+    - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+        ...
+
+        $OPENERDIRECTOR.retrieve($URL, ...)
+
+        '
+  - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.URLopener(...).retrieve($URL, ...)
+
+      '
+  - patterns:
+    - pattern-inside: "def $FUNC(..., $URL = \"=~/[Hh][Tt][Tt][Pp]://.*/\", ...):\n\
+        \  ...\n"
+    - pattern-either:
+      - pattern: urllib.request.URLopener(...).retrieve($URL, ...)
+      - patterns:
+        - pattern-inside: '$OPENERDIRECTOR = urllib.request.URLopener(...)
+
+            ...
+
+            '
+        - pattern: $OPENERDIRECTOR.retrieve($URL, ...)
+- id: insecure-urlretrieve-ftp
+  message: Detected 'urllib.urlretrieve()' using 'ftp://'. This request will not be
+    encrypted. Use SFTP instead. urllib does not support SFTP, so consider switching
+    to a library which supports SFTP.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.urlretrieve
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  pattern-either:
+  - pattern: urllib.request.urlretrieve("=~/^[Ff][Tt][Pp]://.*/", ...)
+  - pattern: '$URL = "=~/^[Ff][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.urlretrieve($URL, ...)
+
+      '
+  - pattern: "def $FUNC(..., $URL = \"=~/^[Ff][Tt][Pp]://.*/\", ...):\n  ...\n  urllib.request.urlretrieve($URL,\
+      \ ...)"
+- id: insecure-urlretrieve
+  message: Detected 'urllib.urlretrieve()' using 'http://'. This request will not
+    be encrypted. Use 'https://' instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://docs.python.org/3/library/urllib.request.html#urllib.request.urlretrieve
+    category: security
+    technology:
+    - urllib
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+  pattern-either:
+  - pattern: urllib.request.urlretrieve("=~/[Hh][Tt][Tt][Pp]://.*/", ...)
+  - pattern: '$URL = "=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      ...
+
+      urllib.request.urlretrieve($URL, ...)
+
+      '
+  - pattern: "def $FUNC(..., $URL = \"=~/[Hh][Tt][Tt][Pp]://.*/\", ...):\n  ...\n\
+      \  urllib.request.urlretrieve($URL, ...)\n"
+- id: listen-eval
+  languages:
+  - python
+  message: Because portions of the logging configuration are passed through eval(),
+    use of this function may open its users to a security risk. While the function
+    only binds to a socket on localhost, and so does not accept connections from remote
+    machines, there are scenarios where untrusted code could be run under the account
+    of the process which calls listen(). To avoid this happening, use the `verify()`
+    argument to `listen()` to prevent unrecognized configurations.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://docs.python.org/3/library/logging.config.html?highlight=security#logging.config.listen
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  pattern: logging.config.listen(...)
+- id: python-logger-credential-disclosure
+  patterns:
+  - pattern: '$LOGGER_OBJ.$LOGGER_CALL($FORMAT_STRING,...)
+
+      '
+  - metavariable-regex:
+      metavariable: $LOGGER_OBJ
+      regex: (?i)(_logger|logger|self.logger|log)
+  - metavariable-regex:
+      metavariable: $LOGGER_CALL
+      regex: (debug|info|warn|warning|error|exception|critical)
+  - metavariable-regex:
+      metavariable: $FORMAT_STRING
+      regex: (?i).*(api.key|secret|credential|token|password).*\%s.*
+  message: Detected a python logger call with a potential hardcoded secret $FORMAT_STRING
+    being logged. This may lead to secret credentials being exposed. Make sure that
+    the logger is not logging  sensitive information.
+  severity: WARNING
+  languages:
+  - python
+  metadata:
+    cwe:
+    - 'CWE-532: Insertion of Sensitive Information into Log File'
+    category: security
+    technology:
+    - python
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    references:
+    - https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: mako-templates-detected
+  pattern: mako.template.Template(...)
+  message: Mako templates do not provide a global HTML escaping mechanism. This means
+    you must escape all sensitive data in your templates using '| u' for URL escaping
+    or '| h' for HTML escaping. If you are using Mako to serve web content, consider
+    using a system such as Jinja2 which enables global escaping.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    source-rule-url: https://github.com/PyCQA/bandit/blob/b1411bfb43795d3ffd268bef17a839dee954c2b1/bandit/plugins/mako_templates.py
+    references:
+    - https://docs.makotemplates.org/en/latest/syntax.html#expression-escaping
+    - https://jinja.palletsprojects.com/en/2.11.x/intro/#
+    category: security
+    technology:
+    - mako
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: INFO
+- id: marshal-usage
+  languages:
+  - python
+  message: 'The marshal module is not intended to be secure against erroneous or maliciously
+    constructed data. Never unmarshal data received from an untrusted or unauthenticated
+    source. See more details: https://docs.python.org/3/library/marshal.html?highlight=security'
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    references:
+    - https://docs.python.org/3/library/marshal.html?highlight=security
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  pattern-either:
+  - pattern: marshal.dump(...)
+  - pattern: marshal.dumps(...)
+  - pattern: marshal.load(...)
+  - pattern: marshal.loads(...)
+  severity: WARNING
+- id: avoid-bind-to-all-interfaces
+  message: Running `socket.bind` to 0.0.0.0, or empty string could unexpectedly expose
+    the server publicly as it binds to all available interfaces. Consider instead
+    getting correct address from an environment variable or configuration file.
+  metadata:
+    cwe:
+    - 'CWE-200: Exposure of Sensitive Information to an Unauthorized Actor'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - python
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  languages:
+  - python
+  severity: INFO
+  pattern-either:
+  - pattern: '$S = socket.socket(...)
+
+      ...
+
+      $S.bind(("0.0.0.0", ...))
+
+      '
+  - pattern: '$S = socket.socket(...)
+
+      ...
+
+      $S.bind(("::", ...))
+
+      '
+  - pattern: '$S = socket.socket(...)
+
+      ...
+
+      $S.bind(("", ...))
+
+      '
+- id: disabled-cert-validation
+  patterns:
+  - pattern-either:
+    - pattern: urllib3.PoolManager(..., cert_reqs=$REQS, ...)
+    - pattern: urllib3.ProxyManager(..., cert_reqs=$REQS, ...)
+    - pattern: urllib3.HTTPSConnectionPool(..., cert_reqs=$REQS, ...)
+    - pattern: urllib3.connectionpool.HTTPSConnectionPool(..., cert_reqs=$REQS, ...)
+    - pattern: urllib3.connection_from_url(..., cert_reqs=$REQS, ...)
+    - pattern: urllib3.proxy_from_url(..., cert_reqs=$REQS, ...)
+    - pattern: $CONTEXT.wrap_socket(..., cert_reqs=$REQS, ...)
+    - pattern: ssl.wrap_socket(..., cert_reqs=$REQS, ...)
+  - metavariable-regex:
+      metavariable: $REQS
+      regex: (NONE|CERT_NONE|CERT_OPTIONAL|ssl\.CERT_NONE|ssl\.CERT_OPTIONAL|\'NONE\'|\"NONE\"|\'OPTIONAL\'|\"OPTIONAL\")
+  message: certificate verification explicitly disabled, insecure connections possible
+  metadata:
+    cwe:
+    - 'CWE-295: Improper Certificate Validation'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - python
+    references:
+    - https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: http-not-https-connection
+  message: Detected HTTPConnectionPool. This will transmit data in cleartext. It is
+    recommended to use HTTPSConnectionPool instead for to encrypt communications.
+  metadata:
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://urllib3.readthedocs.io/en/1.2.1/pools.html#urllib3.connectionpool.HTTPSConnectionPool
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+  pattern-either:
+  - pattern: urllib3.HTTPConnectionPool(...)
+  - pattern: urllib3.connectionpool.HTTPConnectionPool(...)
+- id: non-literal-import
+  patterns:
+  - pattern: 'importlib.import_module($NAME, ...)
+
+      '
+  - pattern-not: 'importlib.import_module("...", ...)
+
+      '
+  message: Untrusted user input in `importlib.import_module()` function allows an
+    attacker to load arbitrary code. Avoid dynamic values in `importlib.import_module()`
+    or use a whitelist to prevent running untrusted code.
+  metadata:
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-706: Use of Incorrectly-Resolved Name or Reference'
+    category: security
+    technology:
+    - python
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: paramiko-exec-command
+  patterns:
+  - pattern-inside: '$CLIENT = paramiko.client.SSHClient(...)
+
+      ...
+
+      '
+  - pattern: $CLIENT.exec_command(...)
+  - pattern-not: $CLIENT.exec_command("...", ...)
+  message: Unverified SSL context detected. This will permit insecure connections
+    without verifying SSL certificates. Use 'ssl.create_default_context()' instead.
+  metadata:
+    source-rule-url: https://github.com/PyCQA/bandit/blob/d5f8fa0d89d7b11442fc6ec80ca42953974354c8/bandit/plugins/injection_paramiko.py
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    references:
+    - http://docs.paramiko.org/en/stable/api/client.html#paramiko.client.SSHClient.exec_command
+    - https://github.com/PyCQA/bandit/blob/d5f8fa0d89d7b11442fc6ec80ca42953974354c8/bandit/plugins/injection_paramiko.py
+    category: security
+    technology:
+    - paramiko
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: ERROR
+  languages:
+  - python
+- id: paramiko-implicit-trust-host-key
+  patterns:
+  - pattern-inside: '$CLIENT = paramiko.client.SSHClient(...)
+
+      ...
+
+      $CLIENT.set_missing_host_key_policy(...)
+
+      '
+  - pattern-either:
+    - pattern: paramiko.client.AutoAddPolicy
+    - pattern: paramiko.client.WarningPolicy
+  message: Detected a paramiko host key policy that implicitly trusts a server's host
+    key. Host keys should be verified to ensure the connection is not to a malicious
+    server. Use RejectPolicy or a custom subclass instead.
+  metadata:
+    cwe:
+    - 'CWE-322: Key Exchange without Entity Authentication'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    source-rule-url: https://github.com/PyCQA/bandit/blob/b1411bfb43795d3ffd268bef17a839dee954c2b1/bandit/plugins/ssh_no_host_key_verification.py
+    references:
+    - http://docs.paramiko.org/en/stable/api/client.html#paramiko.client.AutoAddPolicy
+    category: security
+    technology:
+    - paramiko
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: python-reverse-shell
+  patterns:
+  - pattern-either:
+    - pattern: pty.spawn("$BINPATH",...)
+    - pattern: subprocess.call(["$BINPATH",...],...)
+  - metavariable-regex:
+      metavariable: $BINPATH
+      regex: /bin/.*?sh\b
+  - pattern-inside: 'import socket
+
+      ...
+
+      $S = socket.socket(...)
+
+      ...
+
+      $S.connect(($IP,$PORT),...)
+
+      ...
+
+      '
+  message: Semgrep found a Python reverse shell using $BINPATH to $IP at $PORT
+  metadata:
+    cwe:
+    - 'CWE-553: Command Shell in Externally Accessible Directory'
+    category: security
+    technology:
+    - python
+    references:
+    - https://cwe.mitre.org/data/definitions/553.html
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: regex_dos
+  patterns:
+  - pattern: '$A = re.compile("$B", ...)
+
+      ...
+
+      $A.$METHOD(...)
+
+      '
+  - metavariable-analysis:
+      analyzer: redos
+      metavariable: $B
+  - metavariable-regex:
+      metavariable: $METHOD
+      regex: (?!(escape)|(purge))
+  message: Detected usage of re.compile with an inefficient regular expression. This
+    can lead to regular expression denial of service, which can result in service
+    down time. Instead, check all regexes or use safer alternatives such as pyre2.
+  languages:
+  - python
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    subcategory:
+    - vuln
+    owasp: A06:2017 - Security Misconfiguration
+    cwe: 'CWE-1333: Inefficient Regular Expression Complexity'
+    category: security
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    technology:
+    - python
+    references:
+    - https://docs.python.org/3/library/re.html
+- id: aiopg-sqli
+  languages:
+  - python
+  message: 'Detected string concatenation with a non-literal variable in an aiopg
+    Python SQL statement. This could lead to SQL injection if the variable is user-controlled
+    and not properly sanitized. In order to prevent SQL injection, use parameterized
+    queries instead. You can create parameterized queries like so: ''cur.execute("SELECT
+    %s FROM table", (user_value,))''.'
+  metadata:
+    references:
+    - https://github.com/aio-libs/aiopg
+    category: security
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    technology:
+    - aiopg
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: $CUR.$METHOD(...,$QUERY,...)
+      - pattern-either:
+        - pattern-inside: '$QUERY = $X + $Y
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY += $X
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = ''...''.format(...)
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = ''...'' % (...)
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = f''...{$USERINPUT}...''
+
+            ...
+
+            '
+      - pattern-not-inside: '$QUERY += "..."
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = "..." + "..."
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = ''...''.format()
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = ''...'' % ()
+
+          ...
+
+          '
+    - pattern: $CUR.$METHOD(..., $X + $Y, ...)
+    - pattern: $CUR.$METHOD(..., '...'.format(...), ...)
+    - pattern: $CUR.$METHOD(..., '...' % (...), ...)
+    - pattern: $CUR.$METHOD(..., f'...{$USERINPUT}...', ...)
+  - pattern-either:
+    - pattern-inside: '$CONN = await aiopg.connect(...)
+
+        ...
+
+        $CUR = await $CONN.cursor(...)
+
+        ...
+
+        '
+    - pattern-inside: "$POOL = await aiopg.create_pool(...)\n...\nasync with $POOL.acquire(...)\
+        \ as $CONN:\n  ...\n  async with $CONN.cursor(...) as $CUR:\n    ...\n"
+    - pattern-inside: "$POOL = await aiopg.create_pool(...)\n...\nwith (await $POOL.cursor(...))\
+        \ as $CUR:\n  ...\n"
+    - pattern-inside: "$POOL = await aiopg.create_pool(...)\n...\nasync with $POOL\
+        \ as $CONN:\n  ...\n  $CUR = await $CONN.cursor(...)\n  ...\n"
+    - pattern-inside: "$POOL = await aiopg.create_pool(...)\n...\nasync with $POOL.cursor(...)\
+        \ as $CUR:\n  ...\n"
+  - pattern-not: $CUR.$METHOD(..., "..." + "...", ...)
+  - pattern-not: $CUR.$METHOD(..., '...'.format(), ...)
+  - pattern-not: $CUR.$METHOD(..., '...'%(), ...)
+  - metavariable-regex:
+      metavariable: $METHOD
+      regex: ^(execute)$
+  severity: WARNING
+- id: asyncpg-sqli
+  languages:
+  - python
+  message: 'Detected string concatenation with a non-literal variable in a asyncpg
+    Python SQL statement. This could lead to SQL injection if the variable is user-controlled
+    and not properly sanitized. In order to prevent SQL injection, use parameterized
+    queries or prepared statements instead. You can create parameterized queries like
+    so: ''conn.fetch("SELECT $1 FROM table", value)''. You can also create prepared
+    statements with ''Connection.prepare'': ''stmt = conn.prepare("SELECT $1 FROM
+    table"); await stmt.fetch(user_value)'''
+  metadata:
+    references:
+    - https://github.com/MagicStack/asyncpg
+    - https://magicstack.github.io/asyncpg/current/
+    category: security
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    technology:
+    - asyncpg
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: $CONN.$METHOD(...,$QUERY,...)
+      - pattern-either:
+        - pattern-inside: '$QUERY = $X + $Y
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY += $X
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = ''...''.format(...)
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = ''...'' % (...)
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = f''...{$USERINPUT}...''
+
+            ...
+
+            '
+      - pattern-not-inside: '$QUERY += "..."
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = "..." + "..."
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = ''...''.format()
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = ''...'' % ()
+
+          ...
+
+          '
+    - pattern: $CONN.$METHOD(..., $X + $Y, ...)
+    - pattern: $CONN.$METHOD(..., $Y.format(...), ...)
+    - pattern: $CONN.$METHOD(..., '...'.format(...), ...)
+    - pattern: $CONN.$METHOD(..., '...' % (...), ...)
+    - pattern: $CONN.$METHOD(..., f'...{$USERINPUT}...', ...)
+  - pattern-either:
+    - pattern-inside: '$CONN = await asyncpg.connect(...)
+
+        ...
+
+        '
+    - pattern-inside: "async with asyncpg.create_pool(...) as $CONN:\n    ...\n"
+    - pattern-inside: "async with $POOL.acquire(...) as $CONN:\n    ...\n"
+    - pattern-inside: '$CONN = await $POOL.acquire(...)
+
+        ...
+
+        '
+    - pattern-inside: "def $FUNCNAME(..., $CONN: Connection, ...):\n    ...\n"
+    - pattern-inside: "def $FUNCNAME(..., $CONN: asyncpg.Connection, ...):\n    ...\n"
+  - pattern-not: $CONN.$METHOD(..., "..." + "...", ...)
+  - pattern-not: $CONN.$METHOD(..., '...'.format(), ...)
+  - pattern-not: $CONN.$METHOD(..., '...'%(), ...)
+  - metavariable-regex:
+      metavariable: $METHOD
+      regex: ^(fetch|fetchrow|fetchval|execute|executemany|prepare|cursor|copyfromquery)$
+  severity: WARNING
+- id: pg8000-sqli
+  languages:
+  - python
+  message: 'Detected string concatenation with a non-literal variable in a pg8000
+    Python SQL statement. This could lead to SQL injection if the variable is user-controlled
+    and not properly sanitized. In order to prevent SQL injection, use parameterized
+    queries or prepared statements instead. You can create parameterized queries like
+    so: ''conn.run("SELECT :value FROM table", value=myvalue)''. You can also create
+    prepared statements with ''conn.prepare'': ''conn.prepare("SELECT (:v) FROM table")'''
+  metadata:
+    references:
+    - https://github.com/tlocke/pg8000
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    category: security
+    technology:
+    - pg8000
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: $CONN.$METHOD(...,$QUERY,...)
+      - pattern-either:
+        - pattern-inside: '$QUERY = $X + $Y
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY += $X
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = ''...''.format(...)
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = ''...'' % (...)
+
+            ...
+
+            '
+        - pattern-inside: '$QUERY = f''...{$USERINPUT}...''
+
+            ...
+
+            '
+      - pattern-not-inside: '$QUERY += "..."
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = "..." + "..."
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = ''...''.format()
+
+          ...
+
+          '
+      - pattern-not-inside: '$QUERY = ''...'' % ()
+
+          ...
+
+          '
+    - pattern: $CONN.$METHOD(..., $X + $Y, ...)
+    - pattern: $CONN.$METHOD(..., '...'.format(...), ...)
+    - pattern: $CONN.$METHOD(..., '...' % (...), ...)
+    - pattern: $CONN.$METHOD(..., f'...{$USERINPUT}...', ...)
+  - pattern-either:
+    - pattern-inside: '$CONN = pg8000.native.Connection(...)
+
+        ...
+
+        '
+    - pattern-inside: '$CONN = pg8000.dhapi.connect(...)
+
+        ...
+
+        '
+    - pattern-inside: '$CONN1 = pg8000.connect(...)
+
+        ...
+
+        $CONN = $CONN1.cursor(...)
+
+        ...
+
+        '
+    - pattern-inside: '$CONN = pg8000.connect(...)
+
+        ...
+
+        '
+  - pattern-not: $CONN.$METHOD(..., "..." + "...", ...)
+  - pattern-not: $CONN.$METHOD(..., '...'.format(), ...)
+  - pattern-not: $CONN.$METHOD(..., '...'%(), ...)
+  - metavariable-regex:
+      metavariable: $METHOD
+      regex: ^(run|execute|executemany|prepare)$
+  severity: WARNING
+- id: ssl-wrap-socket-is-deprecated
+  pattern: ssl.wrap_socket(...)
+  message: '''ssl.wrap_socket()'' is deprecated. This function creates an insecure
+    socket without server name indication or hostname matching. Instead, create an
+    SSL context using ''ssl.SSLContext()'' and use that to wrap a socket.'
+  metadata:
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://docs.python.org/3/library/ssl.html#ssl.wrap_socket
+    - https://docs.python.org/3/library/ssl.html#ssl.SSLContext.wrap_socket
+    category: security
+    technology:
+    - python
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: subprocess-shell-true
+  patterns:
+  - pattern: subprocess.$FUNC(..., shell=$TRUE, ...)
+  - metavariable-pattern:
+      metavariable: $TRUE
+      pattern: "True \n"
+  - pattern-not: subprocess.$FUNC("...", shell=True, ...)
+  - focus-metavariable: $TRUE
+  message: Found 'subprocess' function '$FUNC' with 'shell=True'. This is dangerous
+    because this call will spawn the command using a shell process. Doing so propagates
+    current shell settings and variables, which makes it much easier for a malicious
+    actor to execute commands. Use 'shell=False' instead.
+  fix: 'False
+
+    '
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b602_subprocess_popen_with_shell_equals_true.html
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    references:
+    - https://stackoverflow.com/questions/3172470/actual-meaning-of-shell-true-in-subprocess
+    - https://docs.python.org/3/library/subprocess.html
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - secure default
+    likelihood: HIGH
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: system-wildcard-detected
+  patterns:
+  - pattern-either:
+    - pattern-inside: os.system("...")
+    - pattern-inside: os.popen("...")
+    - pattern-inside: os.popen2("...")
+    - pattern-inside: os.popen3("...")
+    - pattern-inside: os.popen4("...")
+    - pattern-inside: subprocess.$W(..., shell=True, ...)
+  - pattern-regex: (tar|chmod|chown|rsync)(.*?)\*
+  message: Detected use of the wildcard character in a system call that spawns a shell.
+    This subjects the wildcard to normal shell expansion, which can have unintended
+    consequences if there exist any non-standard file names. Consider a file named
+    '-e sh script.sh' -- this will execute a script when 'rsync' is called. See https://www.defensecode.com/public/DefenseCode_Unix_WildCards_Gone_Wild.txt
+    for more information.
+  metadata:
+    cwe:
+    - 'CWE-155: Improper Neutralization of Wildcards or Matching Symbols'
+    owasp: A01:2017 - Injection
+    source-url-open: https://github.com/PyCQA/bandit/blob/b1411bfb43795d3ffd268bef17a839dee954c2b1/bandit/plugins/injection_wildcard.py
+    references:
+    - https://www.defensecode.com/public/DefenseCode_Unix_WildCards_Gone_Wild.txt
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: telnetlib
+  pattern: telnetlib.$ANYTHING(...)
+  message: Telnet does not encrypt communications. Use SSH instead.
+  metadata:
+    source-rule-url: https://github.com/PyCQA/bandit/blob/d5f8fa0d89d7b11442fc6ec80ca42953974354c8/bandit/blacklists/calls.py#L208
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    bandit-code: B312
+    references:
+    - https://docs.python.org/3/library/telnetlib.html
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+- id: weak-ssl-version
+  message: An insecure SSL version was detected. TLS versions 1.0, 1.1, and all SSL
+    versions are considered weak encryption and are deprecated. Use 'ssl.PROTOCOL_TLSv1_2'
+    or higher.
+  metadata:
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    source-rule-url: https://github.com/PyCQA/bandit/blob/b1411bfb43795d3ffd268bef17a839dee954c2b1/bandit/plugins/insecure_ssl_tls.py#L30
+    asvs:
+      section: V9 Communications Verification Requirements
+      control_id: 9.1.3 Weak TLS
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x17-V9-Communications.md#v91-client-communications-security-requirements
+      version: '4'
+    references:
+    - https://tools.ietf.org/html/rfc7568
+    - https://tools.ietf.org/id/draft-ietf-tls-oldversions-deprecate-02.html
+    - https://docs.python.org/3/library/ssl.html#ssl.PROTOCOL_TLSv1_2
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+  pattern-either:
+  - pattern: ssl.PROTOCOL_SSLv2
+  - pattern: ssl.PROTOCOL_SSLv3
+  - pattern: ssl.PROTOCOL_TLSv1
+  - pattern: ssl.PROTOCOL_TLSv1_1
+  - pattern: pyOpenSSL.SSL.SSLv2_METHOD
+  - pattern: pyOpenSSL.SSL.SSLv23_METHOD
+  - pattern: pyOpenSSL.SSL.SSLv3_METHOD
+  - pattern: pyOpenSSL.SSL.TLSv1_METHOD
+  - pattern: pyOpenSSL.SSL.TLSv1_1_METHOD
+- id: dangerous-interactive-code-run
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: flask.request.form.get(...)
+          - pattern: flask.request.form[...]
+          - pattern: flask.request.args.get(...)
+          - pattern: flask.request.args[...]
+          - pattern: flask.request.values.get(...)
+          - pattern: flask.request.values[...]
+          - pattern: flask.request.cookies.get(...)
+          - pattern: flask.request.cookies[...]
+          - pattern: flask.request.stream
+          - pattern: flask.request.headers.get(...)
+          - pattern: flask.request.headers[...]
+          - pattern: flask.request.data
+          - pattern: flask.request.full_path
+          - pattern: flask.request.url
+          - pattern: flask.request.json
+          - pattern: flask.request.get_json()
+          - pattern: flask.request.view_args.get(...)
+          - pattern: flask.request.view_args[...]
+          - patterns:
+            - pattern-inside: "@$APP.route(...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+                \  ...\n"
+            - focus-metavariable: $ROUTEVAR
+      - patterns:
+        - pattern-inside: "def $FUNC(request, ...):\n  ...\n"
+        - pattern-either:
+          - pattern: request.$PROPERTY.get(...)
+          - pattern: request.$PROPERTY[...]
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "@rest_framework.decorators.api_view(...)\ndef $FUNC($REQ,\
+              \ ...):\n  ...\n"
+          - patterns:
+            - pattern-either:
+              - pattern-inside: "class $VIEW(..., rest_framework.views.APIView, ...):\n\
+                  \  ...\n"
+              - pattern-inside: "class $VIEW(..., rest_framework.generics.GenericAPIView,\
+                  \ ...):\n  ...                              \n"
+            - pattern-inside: "def $METHOD(self, $REQ, ...):\n  ...\n"
+            - metavariable-regex:
+                metavariable: $METHOD
+                regex: (get|post|put|patch|delete|head)
+        - pattern-either:
+          - pattern: $REQ.POST.get(...)
+          - pattern: $REQ.POST[...]
+          - pattern: $REQ.FILES.get(...)
+          - pattern: $REQ.FILES[...]
+          - pattern: $REQ.DATA.get(...)
+          - pattern: $REQ.DATA[...]
+          - pattern: $REQ.QUERY_PARAMS.get(...)
+          - pattern: $REQ.QUERY_PARAMS[...]
+          - pattern: $REQ.data.get(...)
+          - pattern: $REQ.data[...]
+          - pattern: $REQ.query_params.get(...)
+          - pattern: $REQ.query_params[...]
+          - pattern: $REQ.content_type
+          - pattern: $REQ.content_type
+          - pattern: $REQ.stream
+          - pattern: $REQ.stream
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "class $SERVER(..., http.server.BaseHTTPRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.StreamRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.DatagramRequestHandler,\
+              \ ...):\n  ...\n"
+        - pattern-either:
+          - pattern: self.requestline
+          - pattern: self.path
+          - pattern: self.headers[...]
+          - pattern: self.headers.get(...)
+          - pattern: self.rfile
+      - patterns:
+        - pattern-inside: "@pyramid.view.view_config( ... )\ndef $VIEW($REQ):\n  ...\n"
+        - pattern: $REQ.$ANYTHING
+        - pattern-not: $REQ.dbsession
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$X = code.InteractiveConsole(...)
+
+          ...
+
+          '
+      - pattern-inside: '$X = code.InteractiveInterpreter(...)
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern: '$X.push($PAYLOAD,...)
+
+          '
+      - pattern: '$X.runsource($PAYLOAD,...)
+
+          '
+      - pattern: '$X.runcode(code.compile_command($PAYLOAD),...)
+
+          '
+      - pattern: '$PL = code.compile_command($PAYLOAD,...)
+
+          ...
+
+          $X.runcode($PL,...)
+
+          '
+    - focus-metavariable: $PAYLOAD
+    - pattern-not: '$X.push("...",...)
+
+        '
+    - pattern-not: '$X.runsource("...",...)
+
+        '
+    - pattern-not: '$X.runcode(code.compile_command("..."),...)
+
+        '
+    - pattern-not: '$PL = code.compile_command("...",...)
+
+        ...
+
+        $X.runcode($PL,...)
+
+        '
+  message: Found user controlled data inside InteractiveConsole/InteractiveInterpreter
+    method. This is dangerous if external data can reach this function call because
+    it allows a malicious actor to run arbitrary Python code.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-globals-use
+  patterns:
+  - pattern-either:
+    - pattern: globals().get(...)
+    - pattern: locals().get(...)
+    - pattern: globals()[...]
+    - pattern: locals()[...]
+    - patterns:
+      - pattern-either:
+        - pattern-inside: '$G = globals()
+
+            ...
+
+            '
+        - pattern-inside: '$G = locals()
+
+            ...
+
+            '
+      - pattern-either:
+        - pattern: $G.get(...)
+        - pattern: $G[...]
+    - pattern: $FUNC.__globals__[...]
+  - pattern-not: globals().get("...")
+  - pattern-not: locals().get("...")
+  - pattern-not: globals()["..."]
+  - pattern-not: locals()["..."]
+  - pattern-not: $G.get("...")
+  - pattern-not: $G.get["..."]
+  - pattern-not: $G["..."]
+  - pattern-not: $FUNC.__globals__["..."]
+  - pattern-not-inside: globals()[...] = ...
+  - pattern-not-inside: locals()[...] = ...
+  - pattern-not-inside: $G[...] = ...
+  - pattern-not-inside: $FUNC.__globals__[...] = ...
+  message: Found non static data as an index to 'globals()'. This is extremely dangerous
+    because it allows an attacker to execute arbitrary code on the system. Refactor
+    your code not to use 'globals()'.
+  metadata:
+    cwe:
+    - 'CWE-96: Improper Neutralization of Directives in Statically Saved Code (''Static
+      Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://github.com/mpirnat/lets-be-bad-guys/blob/d92768fb3ade32956abd53bd6bb06e19d634a084/badguys/vulnerable/views.py#L181-L186
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-os-exec
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: flask.request.form.get(...)
+          - pattern: flask.request.form[...]
+          - pattern: flask.request.args.get(...)
+          - pattern: flask.request.args[...]
+          - pattern: flask.request.values.get(...)
+          - pattern: flask.request.values[...]
+          - pattern: flask.request.cookies.get(...)
+          - pattern: flask.request.cookies[...]
+          - pattern: flask.request.stream
+          - pattern: flask.request.headers.get(...)
+          - pattern: flask.request.headers[...]
+          - pattern: flask.request.data
+          - pattern: flask.request.full_path
+          - pattern: flask.request.url
+          - pattern: flask.request.json
+          - pattern: flask.request.get_json()
+          - pattern: flask.request.view_args.get(...)
+          - pattern: flask.request.view_args[...]
+          - patterns:
+            - pattern-inside: "@$APP.route(...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+                \  ...\n"
+            - focus-metavariable: $ROUTEVAR
+      - patterns:
+        - pattern-inside: "def $FUNC(request, ...):\n  ...\n"
+        - pattern-either:
+          - pattern: request.$PROPERTY.get(...)
+          - pattern: request.$PROPERTY[...]
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "@rest_framework.decorators.api_view(...)\ndef $FUNC($REQ,\
+              \ ...):\n  ...\n"
+          - patterns:
+            - pattern-either:
+              - pattern-inside: "class $VIEW(..., rest_framework.views.APIView, ...):\n\
+                  \  ...\n"
+              - pattern-inside: "class $VIEW(..., rest_framework.generics.GenericAPIView,\
+                  \ ...):\n  ...                              \n"
+            - pattern-inside: "def $METHOD(self, $REQ, ...):\n  ...\n"
+            - metavariable-regex:
+                metavariable: $METHOD
+                regex: (get|post|put|patch|delete|head)
+        - pattern-either:
+          - pattern: $REQ.POST.get(...)
+          - pattern: $REQ.POST[...]
+          - pattern: $REQ.FILES.get(...)
+          - pattern: $REQ.FILES[...]
+          - pattern: $REQ.DATA.get(...)
+          - pattern: $REQ.DATA[...]
+          - pattern: $REQ.QUERY_PARAMS.get(...)
+          - pattern: $REQ.QUERY_PARAMS[...]
+          - pattern: $REQ.data.get(...)
+          - pattern: $REQ.data[...]
+          - pattern: $REQ.query_params.get(...)
+          - pattern: $REQ.query_params[...]
+          - pattern: $REQ.content_type
+          - pattern: $REQ.content_type
+          - pattern: $REQ.stream
+          - pattern: $REQ.stream
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "class $SERVER(..., http.server.BaseHTTPRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.StreamRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.DatagramRequestHandler,\
+              \ ...):\n  ...\n"
+        - pattern-either:
+          - pattern: self.requestline
+          - pattern: self.path
+          - pattern: self.headers[...]
+          - pattern: self.headers.get(...)
+          - pattern: self.rfile
+      - patterns:
+        - pattern-inside: "@pyramid.view.view_config( ... )\ndef $VIEW($REQ):\n  ...\n"
+        - pattern: $REQ.$ANYTHING
+        - pattern-not: $REQ.dbsession
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-not: os.$METHOD("...", ...)
+        - pattern: os.$METHOD(...)
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (execl|execle|execlp|execlpe|execv|execve|execvp|execvpe)
+      - patterns:
+        - pattern-not: os.$METHOD("...", [$PATH,"...","...",...],...)
+        - pattern-inside: os.$METHOD($BASH,[$PATH,"-c",$CMD,...],...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (execv|execve|execvp|execvpe)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+      - patterns:
+        - pattern-not: os.$METHOD("...", $PATH, "...", "...",...)
+        - pattern-inside: os.$METHOD($BASH, $PATH, "-c", $CMD,...)
+        - pattern: $CMD
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (execl|execle|execlp|execlpe)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+  message: Found user controlled content when spawning a process. This is dangerous
+    because it allows a malicious actor to execute commands.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    confidence: MEDIUM
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-subinterpreters-run-string
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: flask.request.form.get(...)
+          - pattern: flask.request.form[...]
+          - pattern: flask.request.args.get(...)
+          - pattern: flask.request.args[...]
+          - pattern: flask.request.values.get(...)
+          - pattern: flask.request.values[...]
+          - pattern: flask.request.cookies.get(...)
+          - pattern: flask.request.cookies[...]
+          - pattern: flask.request.stream
+          - pattern: flask.request.headers.get(...)
+          - pattern: flask.request.headers[...]
+          - pattern: flask.request.data
+          - pattern: flask.request.full_path
+          - pattern: flask.request.url
+          - pattern: flask.request.json
+          - pattern: flask.request.get_json()
+          - pattern: flask.request.view_args.get(...)
+          - pattern: flask.request.view_args[...]
+          - patterns:
+            - pattern-inside: "@$APP.route(...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+                \  ...\n"
+            - focus-metavariable: $ROUTEVAR
+      - patterns:
+        - pattern-inside: "def $FUNC(request, ...):\n  ...\n"
+        - pattern-either:
+          - pattern: request.$PROPERTY.get(...)
+          - pattern: request.$PROPERTY[...]
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "@rest_framework.decorators.api_view(...)\ndef $FUNC($REQ,\
+              \ ...):\n  ...\n"
+          - patterns:
+            - pattern-either:
+              - pattern-inside: "class $VIEW(..., rest_framework.views.APIView, ...):\n\
+                  \  ...\n"
+              - pattern-inside: "class $VIEW(..., rest_framework.generics.GenericAPIView,\
+                  \ ...):\n  ...                              \n"
+            - pattern-inside: "def $METHOD(self, $REQ, ...):\n  ...\n"
+            - metavariable-regex:
+                metavariable: $METHOD
+                regex: (get|post|put|patch|delete|head)
+        - pattern-either:
+          - pattern: $REQ.POST.get(...)
+          - pattern: $REQ.POST[...]
+          - pattern: $REQ.FILES.get(...)
+          - pattern: $REQ.FILES[...]
+          - pattern: $REQ.DATA.get(...)
+          - pattern: $REQ.DATA[...]
+          - pattern: $REQ.QUERY_PARAMS.get(...)
+          - pattern: $REQ.QUERY_PARAMS[...]
+          - pattern: $REQ.data.get(...)
+          - pattern: $REQ.data[...]
+          - pattern: $REQ.query_params.get(...)
+          - pattern: $REQ.query_params[...]
+          - pattern: $REQ.content_type
+          - pattern: $REQ.content_type
+          - pattern: $REQ.stream
+          - pattern: $REQ.stream
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "class $SERVER(..., http.server.BaseHTTPRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.StreamRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.DatagramRequestHandler,\
+              \ ...):\n  ...\n"
+        - pattern-either:
+          - pattern: self.requestline
+          - pattern: self.path
+          - pattern: self.headers[...]
+          - pattern: self.headers.get(...)
+          - pattern: self.rfile
+      - patterns:
+        - pattern-inside: "@pyramid.view.view_config( ... )\ndef $VIEW($REQ):\n  ...\n"
+        - pattern: $REQ.$ANYTHING
+        - pattern-not: $REQ.dbsession
+  pattern-sinks:
+  - patterns:
+    - pattern: '_xxsubinterpreters.run_string($ID, $PAYLOAD, ...)
+
+        '
+    - pattern-not: '_xxsubinterpreters.run_string($ID, "...", ...)
+
+        '
+    - focus-metavariable: $PAYLOAD
+  message: Found user controlled content in `run_string`. This is dangerous because
+    it allows a malicious actor to run arbitrary Python code.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://bugs.python.org/issue43472
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: dangerous-testcapi-run-in-subinterp
+  mode: taint
+  options:
+    symbolic_propagation: true
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-either:
+          - pattern: flask.request.form.get(...)
+          - pattern: flask.request.form[...]
+          - pattern: flask.request.args.get(...)
+          - pattern: flask.request.args[...]
+          - pattern: flask.request.values.get(...)
+          - pattern: flask.request.values[...]
+          - pattern: flask.request.cookies.get(...)
+          - pattern: flask.request.cookies[...]
+          - pattern: flask.request.stream
+          - pattern: flask.request.headers.get(...)
+          - pattern: flask.request.headers[...]
+          - pattern: flask.request.data
+          - pattern: flask.request.full_path
+          - pattern: flask.request.url
+          - pattern: flask.request.json
+          - pattern: flask.request.get_json()
+          - pattern: flask.request.view_args.get(...)
+          - pattern: flask.request.view_args[...]
+          - patterns:
+            - pattern-inside: "@$APP.route(...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+                \  ...\n"
+            - focus-metavariable: $ROUTEVAR
+      - patterns:
+        - pattern-inside: "def $FUNC(request, ...):\n  ...\n"
+        - pattern-either:
+          - pattern: request.$PROPERTY.get(...)
+          - pattern: request.$PROPERTY[...]
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "@rest_framework.decorators.api_view(...)\ndef $FUNC($REQ,\
+              \ ...):\n  ...\n"
+          - patterns:
+            - pattern-either:
+              - pattern-inside: "class $VIEW(..., rest_framework.views.APIView, ...):\n\
+                  \  ...\n"
+              - pattern-inside: "class $VIEW(..., rest_framework.generics.GenericAPIView,\
+                  \ ...):\n  ...                              \n"
+            - pattern-inside: "def $METHOD(self, $REQ, ...):\n  ...\n"
+            - metavariable-regex:
+                metavariable: $METHOD
+                regex: (get|post|put|patch|delete|head)
+        - pattern-either:
+          - pattern: $REQ.POST.get(...)
+          - pattern: $REQ.POST[...]
+          - pattern: $REQ.FILES.get(...)
+          - pattern: $REQ.FILES[...]
+          - pattern: $REQ.DATA.get(...)
+          - pattern: $REQ.DATA[...]
+          - pattern: $REQ.QUERY_PARAMS.get(...)
+          - pattern: $REQ.QUERY_PARAMS[...]
+          - pattern: $REQ.data.get(...)
+          - pattern: $REQ.data[...]
+          - pattern: $REQ.query_params.get(...)
+          - pattern: $REQ.query_params[...]
+          - pattern: $REQ.content_type
+          - pattern: $REQ.content_type
+          - pattern: $REQ.stream
+          - pattern: $REQ.stream
+      - patterns:
+        - pattern-either:
+          - pattern-inside: "class $SERVER(..., http.server.BaseHTTPRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.StreamRequestHandler,\
+              \ ...):\n  ...\n"
+          - pattern-inside: "class $SERVER(..., http.server.DatagramRequestHandler,\
+              \ ...):\n  ...\n"
+        - pattern-either:
+          - pattern: self.requestline
+          - pattern: self.path
+          - pattern: self.headers[...]
+          - pattern: self.headers.get(...)
+          - pattern: self.rfile
+      - patterns:
+        - pattern-inside: "@pyramid.view.view_config( ... )\ndef $VIEW($REQ):\n  ...\n"
+        - pattern: $REQ.$ANYTHING
+        - pattern-not: $REQ.dbsession
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: '_testcapi.run_in_subinterp($PAYLOAD, ...)
+
+          '
+      - pattern: 'test.support.run_in_subinterp($PAYLOAD, ...)
+
+          '
+    - focus-metavariable: $PAYLOAD
+    - pattern-not: '_testcapi.run_in_subinterp("...", ...)
+
+        '
+    - pattern-not: 'test.support.run_in_subinterp("...", ...)
+
+        '
+  message: Found user controlled content in `run_in_subinterp`. This is dangerous
+    because it allows a malicious actor to run arbitrary Python code.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://semgrep.dev/docs/cheat-sheets/python-command-injection/
+    category: security
+    technology:
+    - python
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: avoid-jsonpickle
+  patterns:
+  - pattern: 'jsonpickle.decode($PAYLOAD,...)
+
+      '
+  - pattern-not: 'jsonpickle.decode("...",...)
+
+      '
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://github.com/jsonpickle/jsonpickle#jsonpickle
+    - https://www.exploit-db.com/exploits/49585
+    category: security
+    technology:
+    - jsonpickle
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Avoid using `jsonpickle`, which is known to lead to code execution vulnerabilities.
+    When unpickling, the serialized data could be manipulated to run arbitrary code.
+    Instead, consider serializing the relevant data using `json` module.
+  languages:
+  - python
+  severity: WARNING
+- id: avoid-pyyaml-load
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://github.com/yaml/pyyaml/wiki/PyYAML-yaml.load(input)-Deprecation
+    - https://nvd.nist.gov/vuln/detail/CVE-2017-18342
+    category: security
+    technology:
+    - pyyaml
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  message: Detected a possible YAML deserialization vulnerability. `yaml.unsafe_load`,
+    `yaml.Loader`, `yaml.CLoader`, and `yaml.UnsafeLoader` are all known to be unsafe
+    methods of deserializing YAML. An attacker with control over the YAML input could
+    create special YAML input that allows the attacker to run arbitrary Python code.
+    This would allow the attacker to steal files, download and install malware, or
+    otherwise take over the machine. Use `yaml.safe_load` or `yaml.SafeLoader` instead.
+  fix-regex:
+    regex: unsafe_load
+    replacement: safe_load
+    count: 1
+  severity: ERROR
+  patterns:
+  - pattern-inside: 'import yaml
+
+      ...
+
+      '
+  - pattern-not-inside: '$YAML = ruamel.yaml.YAML(...)
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern: yaml.unsafe_load(...)
+    - pattern: yaml.load(..., Loader=yaml.Loader, ...)
+    - pattern: yaml.load(..., Loader=yaml.UnsafeLoader, ...)
+    - pattern: yaml.load(..., Loader=yaml.CLoader, ...)
+    - pattern: yaml.load_all(..., Loader=yaml.Loader, ...)
+    - pattern: yaml.load_all(..., Loader=yaml.UnsafeLoader, ...)
+    - pattern: yaml.load_all(..., Loader=yaml.CLoader, ...)
+- id: avoid-unsafe-ruamel
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://yaml.readthedocs.io/en/latest/basicuse.html?highlight=typ
+    category: security
+    technology:
+    - ruamel.yaml
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  message: Avoid using unsafe `ruamel.yaml.YAML()`. `ruamel.yaml.YAML` can create
+    arbitrary Python objects. A malicious actor could exploit this to run arbitrary
+    code. Use `YAML(typ='rt')` or `YAML(typ='safe')` instead.
+  severity: ERROR
+  pattern-either:
+  - pattern: ruamel.yaml.YAML(..., typ='unsafe', ...)
+  - pattern: ruamel.yaml.YAML(..., typ='base', ...)
+- id: avoid-pickle
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://docs.python.org/3/library/pickle.html
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  message: Avoid using `pickle`, which is known to lead to code execution vulnerabilities.
+    When unpickling, the serialized data could be manipulated to run arbitrary code.
+    Instead, consider serializing the relevant data as JSON or a similar text-based
+    serialization format.
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: pickle.$FUNC(...)
+    - pattern: _pickle.$FUNC(...)
+  - pattern-not: pickle.$FUNC("...")
+  - pattern-not: _pickle.$FUNC("...")
+- id: avoid-cPickle
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://docs.python.org/3/library/pickle.html
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  message: Avoid using `cPickle`, which is known to lead to code execution vulnerabilities.
+    When unpickling, the serialized data could be manipulated to run arbitrary code.
+    Instead, consider serializing the relevant data as JSON or a similar text-based
+    serialization format.
+  severity: WARNING
+  patterns:
+  - pattern: cPickle.$FUNC(...)
+  - pattern-not: cPickle.$FUNC("...")
+- id: avoid-dill
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://docs.python.org/3/library/pickle.html
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  message: Avoid using `dill`, which uses `pickle`, which is known to lead to code
+    execution vulnerabilities. When unpickling, the serialized data could be manipulated
+    to run arbitrary code. Instead, consider serializing the relevant data as JSON
+    or a similar text-based serialization format.
+  severity: WARNING
+  patterns:
+  - pattern: dill.$FUNC(...)
+  - pattern-not: dill.$FUNC("...")
+- id: avoid-shelve
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://docs.python.org/3/library/pickle.html
+    category: security
+    technology:
+    - python
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  message: Avoid using `shelve`, which uses `pickle`, which is known to lead to code
+    execution vulnerabilities. When unpickling, the serialized data could be manipulated
+    to run arbitrary code. Instead, consider serializing the relevant data as JSON
+    or a similar text-based serialization format.
+  severity: WARNING
+  pattern: shelve.$FUNC(...)
+- id: insecure-hash-function
+  message: Detected use of an insecure MD4 or MD5 hash function. These functions have
+    known vulnerabilities and are considered deprecated. Consider using 'SHA256' or
+    a similar function instead.
+  metadata:
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    source-rule-url: https://github.com/PyCQA/bandit/blob/b1411bfb43795d3ffd268bef17a839dee954c2b1/bandit/plugins/hashlib_new_insecure_functions.py
+    asvs:
+      section: V6 Stored Cryptography Verification Requirements
+      control_id: 6.2.2 Insecure Custom Algorithm
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x14-V6-Cryptography.md#v62-algorithms
+      version: '4'
+    references:
+    - https://tools.ietf.org/html/rfc6151
+    - https://crypto.stackexchange.com/questions/44151/how-does-the-flame-malware-take-advantage-of-md5-collision
+    - https://pycryptodome.readthedocs.io/en/latest/src/hash/sha3_256.html
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+  pattern-either:
+  - pattern: hashlib.new("=~/[M|m][D|d][4|5]/", ...)
+  - pattern: hashlib.new(..., name="=~/[M|m][D|d][4|5]/", ...)
+- id: insecure-uuid-version
+  patterns:
+  - pattern: uuid.uuid1(...)
+  message: Using UUID version 1 for UUID generation can lead to predictable UUIDs
+    based on system information (e.g., MAC address, timestamp). This may lead to security
+    risks such as the sandwich attack. Consider using `uuid.uuid4()` instead for better
+    randomness and security.
+  metadata:
+    references:
+    - https://www.landh.tech/blog/20230811-sandwich-attack/
+    cwe:
+    - 'CWE-330: Use of Insufficiently Random Values'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    asvs:
+      section: V6 Stored Cryptography Verification Requirements
+      control_id: 6.3.2 Insecure UUID Generation
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x14-V6-Cryptography.md#v63-random-values
+      version: '4'
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+  fix-regex:
+    regex: uuid1
+    replacement: uuid4
+- id: unverified-ssl-context
+  patterns:
+  - pattern-either:
+    - pattern: ssl._create_unverified_context(...)
+    - pattern: ssl._create_default_https_context = ssl._create_unverified_context
+  fix-regex:
+    regex: _create_unverified_context
+    replacement: create_default_context
+  message: Unverified SSL context detected. This will permit insecure connections
+    without verifying SSL certificates. Use 'ssl.create_default_context' instead.
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A07:2021 - Identification and Authentication Failures
+    cwe:
+    - 'CWE-295: Improper Certificate Validation'
+    references:
+    - https://docs.python.org/3/library/ssl.html#ssl-security
+    - https://docs.python.org/3/library/http.client.html#http.client.HTTPSConnection
+    category: security
+    technology:
+    - python
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  severity: ERROR
+  languages:
+  - python

@@ -1,0 +1,38 @@
+id: "alibaba-canal-info-leak"
+name: "Alibaba Canal Config - Detect"
+severity: "info"
+description: "Alibaba Canal configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "alibaba"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/alibaba/canal/issues/632"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/canal/config/1/1"
+  headers:
+    "Content-Type": "application/json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "ncanal.aliyun.accessKey"
+      - "ncanal.aliyun.secretKey"
+    condition: "and"

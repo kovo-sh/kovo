@@ -1,0 +1,34 @@
+id: "milesight-system-log"
+name: "Milesight Industrial Cellular Routers - Information Disclosure"
+severity: "high"
+description: "A critical security vulnerability has been identified in Milesight Industrial Cellular Routers, compromising the security discovered that it was publicly disclosing system logs, which included internal information."
+tech:
+  - "generic"
+tags:
+  - "milesight"
+  - "log"
+  - "exposure"
+  - "vuln"
+reference: "https://medium.com/@win3zz/inside-the-router-how-i-accessed-industrial-routers-and-reported-the-flaws-29c34213dfdf"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/lang/log/system.log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "daemon.info"
+      - "authpriv.info"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

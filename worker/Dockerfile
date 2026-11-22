@@ -1,4 +1,4 @@
-# Guardian v3 Hardened Air-Gapped Worker Image (guardian-worker:local / guardian-worker:v3)
+# Guardian v4 Hardened Air-Gapped Worker Image (guardian-worker:v4 / guardian-worker:local)
 # Runs strictly with --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001
 
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS tools-downloader
@@ -68,9 +68,30 @@ COPY --from=tools-downloader /out/bin/trufflehog /usr/local/bin/trufflehog
 COPY --from=tools-downloader /out/bin/trivy /usr/local/bin/trivy
 COPY --from=tools-downloader /out/bin/opengrep /usr/local/bin/opengrep
 
+# Pre-bake offline Trivy vulnerability DB, Java DB, and Rego misconfig checks in a single pruned layer
+ARG INCLUDE_TRIVY_JAVA_DB=1
+RUN mkdir -p /opt/trivy-cache /tmp/trivy-tmp \
+  && TRIVY_CACHE_DIR=/opt/trivy-cache TMPDIR=/tmp/trivy-tmp trivy fs --download-db-only --no-progress /tmp \
+  && (TRIVY_CACHE_DIR=/opt/trivy-cache TMPDIR=/tmp/trivy-tmp trivy fs --scanners misconfig --skip-db-update --no-progress /etc/hostname || true) \
+  && if [ "${INCLUDE_TRIVY_JAVA_DB}" = "1" ]; then \
+       TRIVY_CACHE_DIR=/opt/trivy-cache TMPDIR=/tmp/trivy-tmp trivy image --download-java-db-only --no-progress; \
+     fi \
+  && chmod -R a+rX /opt/trivy-cache \
+  && test -f /opt/trivy-cache/db/trivy.db \
+  && test -d /opt/trivy-cache/policy/content \
+  && rm -rf /tmp/trivy-tmp /root/.cache
+
 WORKDIR /opt/guardian-worker
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+  && mkdir -p /tmp/swc-out && chmod 0700 /tmp/swc-out \
+  && SWC_NATIVE_BINDING_CACHE=/tmp/swc-out node -e 'require("@swc/core")' \
+  && SWC_NODE_BIN="$(find /tmp/swc-out -name '*.node' | head -n1)" \
+  && SWC_TARGET="$(find /opt/guardian-worker/node_modules/@swc -name 'swc.*.node' | head -n1)" \
+  && test -n "${SWC_NODE_BIN}" && test -n "${SWC_TARGET}" \
+  && cp "${SWC_NODE_BIN}" "${SWC_TARGET}" \
+  && chmod 0755 "${SWC_TARGET}" \
+  && rm -rf /tmp/swc-out \
   && chmod -R a+rX /opt/guardian-worker/node_modules \
   && AST_GREP_BIN="$(find /opt/guardian-worker/node_modules/@ast-grep -maxdepth 2 -type f -name ast-grep | head -n1)" \
   && test -n "${AST_GREP_BIN}" \
@@ -81,16 +102,24 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
 COPY rules /opt/guardian-rules
 RUN chmod -R a+rX /opt/guardian-rules \
   && mkdir -p /tmp/.config /tmp/.cache /tmp/rule-check \
-  && printf 'const x = 1; el.innerHTML = x;\n' > /tmp/rule-check/a.js \
-  && printf 'const x: number = 1; el.innerHTML = String(x);\n' > /tmp/rule-check/a.ts \
+  && printf 'const x = req.query.id; el.innerHTML = x;\n' > /tmp/rule-check/a.js \
+  && printf 'const x: string = req.query.id; el.innerHTML = String(x);\n' > /tmp/rule-check/a.ts \
   && printf 'export const C = () => <div dangerouslySetInnerHTML={{ __html: x }} />;\n' > /tmp/rule-check/a.tsx \
   && printf 'import subprocess\nsubprocess.run(x, shell=True)\n' > /tmp/rule-check/a.py \
   && printf 'package main\nfunc f() { db.Query(fmt.Sprintf("%s", x)) }\n' > /tmp/rule-check/a.go \
+  && printf 'class A { void f(java.sql.Statement s, String x) throws Exception { s.executeQuery("SELECT " + x); } }\n' > /tmp/rule-check/a.java \
+  && printf '<?php eval($_GET["x"]); ?>\n' > /tmp/rule-check/a.php \
+  && printf 'system(params[:cmd])\n' > /tmp/rule-check/a.rb \
+  && printf 'resource "aws_s3_bucket" "b" { bucket = "x" }\n' > /tmp/rule-check/a.tf \
   && printf 'hostNetwork: true\n' > /tmp/rule-check/a.yaml \
+  && printf 'FROM ubuntu:latest\nUSER root\n' > /tmp/rule-check/Dockerfile \
   && HOME=/tmp XDG_CONFIG_HOME=/tmp/.config XDG_CACHE_HOME=/tmp/.cache opengrep scan --config /opt/guardian-rules/opengrep --json --no-git-ignore /tmp/rule-check \
      | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if ((d.errors||[]).length || (d.skipped_rules||[]).length) { console.error(JSON.stringify(d, null, 2)); process.exit(1); } if (!(d.results||[]).length) { console.error("No opengrep matches on fixture"); process.exit(1); }' \
   && ast-grep scan --config /opt/guardian-rules/ast-grep/sgconfig.yml --json=compact /tmp/rule-check \
      | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if (!Array.isArray(d) || !d.some(m => m.ruleId === "guardian-ast-tsx-dangerous-html")) { console.error("Missing ast-grep tsx match", d); process.exit(1); }' \
+  && TRIVY_CACHE_DIR=/opt/trivy-cache trivy fs --scanners vuln,misconfig --offline-scan --skip-db-update --skip-java-db-update --skip-check-update --cache-dir /opt/trivy-cache --format json --quiet /tmp/rule-check \
+     | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if (!Array.isArray(d.Results)) { console.error("Trivy offline failed"); process.exit(1); }' \
+  && XDG_CACHE_HOME=/nonexistent node -e 'const swc = require("@swc/core"); const m = swc.parseSync("export const x: number = 1;", { syntax: "typescript" }); if (m.type !== "Module") process.exit(1);' \
   && rm -rf /tmp/rule-check /tmp/.config /tmp/.cache
 
 COPY analyzers.ts bridge.ts ./
@@ -100,11 +129,11 @@ ENV PATH="/opt/guardian-venv/bin:/opt/guardian-worker/node_modules/.bin:/usr/loc
     HOME="/tmp" \
     XDG_CACHE_HOME="/tmp/.cache" \
     XDG_CONFIG_HOME="/tmp/.config" \
-    TRIVY_CACHE_DIR="/tmp/.trivy-cache" \
+    TRIVY_CACHE_DIR="/opt/trivy-cache" \
     TRIVY_DISABLE_TELEMETRY="true" \
     SEMGREP_SEND_METRICS="off" \
     OPENGREP_SEND_METRICS="off" \
     PYTHONDONTWRITEBYTECODE="1"
 
 USER 10001:10001
-ENTRYPOINT ["node", "--max-old-space-size=384", "/opt/guardian-worker/bridge.ts"]
+ENTRYPOINT ["node", "--max-old-space-size=512", "/opt/guardian-worker/bridge.ts"]

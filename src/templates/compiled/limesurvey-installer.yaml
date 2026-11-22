@@ -1,0 +1,34 @@
+id: "limesurvey-installer"
+name: "Limesurvey Installer Exposure"
+severity: "high"
+description: "Limesurvey is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "limesurvey"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?r=installer/welcome"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "LimeSurvey installer"
+      - "Progress"
+      - "Your preferred language will be used through out the installation process"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

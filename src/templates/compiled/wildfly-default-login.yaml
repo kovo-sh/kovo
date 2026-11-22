@@ -1,0 +1,33 @@
+id: "wildfly-default-login"
+name: "Wildfly - Default Admin Login"
+severity: "high"
+description: "Wildfly default admin login credentials were successful."
+tech:
+  - "generic"
+tags:
+  - "wildfly"
+  - "default-login"
+  - "vuln"
+reference: "https://docs.wildfly.org/26.1/#administrator-guides"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/management"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "management-major-version"
+      - "product-version"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,32 @@
+id: "rails-database-config"
+name: "Ruby on Rails Database Configuration File - Detect"
+severity: "high"
+description: "Ruby on Rails database configuration file was detected, which may contain database credentials."
+tech:
+  - "rails"
+tags:
+  - "config"
+  - "exposure"
+  - "rails"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://guides.rubyonrails.org/configuring.html#configuring-a-database"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config/database.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "adapter:"
+      - "database:"
+      - "production:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

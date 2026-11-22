@@ -1,0 +1,34 @@
+id: "jenkins-script"
+name: "Jenkins - Remote Code Execution"
+severity: "critical"
+description: "Jenkins is susceptible to a remote code execution vulnerability due to accessible script functionality."
+tech:
+  - "jenkins"
+tags:
+  - "devops"
+  - "hackerone"
+  - "jenkins"
+  - "rce"
+  - "vuln"
+reference: "https://hackerone.com/reports/403402"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/script/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "println(Jenkins.instance.pluginManager.plugins)"
+  - type: "word"
+    part: "body"
+    words:
+      - "Script Console"
+      - "Scriptconsole"
+  - type: "status"
+    status:
+      - 200

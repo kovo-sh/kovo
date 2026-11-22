@@ -1,0 +1,37 @@
+id: "laravel-horizon-unauth"
+name: "Laravel Horizon Dashboard - Unauthenticated"
+severity: "medium"
+description: "Laravel Horizon Dashboard unauthenticated was detected."
+tech:
+  - "laravel"
+tags:
+  - "laravel"
+  - "unauth"
+  - "dashboard"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/laravel/horizon"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/stats"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "queueWithMaxRuntime"
+      - "recentJobs"
+      - "status"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

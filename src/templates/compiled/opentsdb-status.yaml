@@ -1,0 +1,35 @@
+id: "opentsdb-status"
+name: "OpenTSDB - Detect"
+severity: "low"
+description: "OpenTSDB stats exposed which is commonly used in monitoring and observability scenarios where tracking and analyzing the performance of systems, applications, and infrastructure over time is essential."
+tech:
+  - "generic"
+tags:
+  - "opentsdb"
+  - "exposure"
+  - "logs"
+  - "vuln"
+reference: "http://opentsdb.net/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/stats?json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "tsd.connectionmgr.connections"
+      - "tsd.http"
+      - "host"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

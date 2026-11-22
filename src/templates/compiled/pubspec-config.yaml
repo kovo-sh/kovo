@@ -1,0 +1,34 @@
+id: "pubspec-config"
+name: "Pubspec YAML Configuration File - Detect"
+severity: "info"
+description: "Pubspec YAML configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "devops"
+  - "pubsec"
+  - "config"
+  - "cicd"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://docs.flutter.dev/development/tools/pubspec"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pubspec.yaml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "version:"
+      - "environment:"
+      - "dependencies:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

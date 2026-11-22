@@ -1,0 +1,32 @@
+id: "alibaba-mongoshake-unauth"
+name: "Alibaba Mongoshake Unauth"
+severity: "info"
+description: "Safe check derived from alibaba-mongoshake-unauth: Alibaba Mongoshake Unauth"
+tech:
+  - "generic"
+tags:
+  - "mongoshake"
+  - "unauth"
+  - "alibaba"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "{\"Uri\":\"/worker\",\"Method\":\"GET\"}"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

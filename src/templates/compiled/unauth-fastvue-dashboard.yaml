@@ -1,0 +1,35 @@
+id: "unauth-fastvue-dashboard"
+name: "Fastvue Dashboard Panel - Unauthenticated Detect"
+severity: "medium"
+description: "Fastvue Dashboard panel was detected without authentication."
+tech:
+  - "dotnet"
+  - "iis"
+tags:
+  - "panel"
+  - "fastvue"
+  - "unauth"
+  - "misconfig"
+  - "discovery"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/dashboard.aspx"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Fastvue Sophos Reporter</title>"
+      - "<title>Fastvue Reporter for SonicWall</title>"
+  - type: "word"
+    part: "body"
+    words:
+      - "Dashboard"
+  - type: "status"
+    status:
+      - 200

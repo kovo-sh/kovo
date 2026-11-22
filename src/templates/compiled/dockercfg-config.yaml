@@ -1,0 +1,33 @@
+id: "dockercfg-config"
+name: "Detect .dockercfg"
+severity: "high"
+description: "Docker registry authentication data"
+tech:
+  - "docker"
+tags:
+  - "docker"
+  - "exposure"
+  - "config"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.dockercfg"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"email\":"
+      - "\"auth\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

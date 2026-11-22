@@ -1,0 +1,30 @@
+id: "prefect-api-exposure"
+name: "Prefect Server Unauthenticated API Exposure"
+severity: "medium"
+description: "Prefect Server was a self-hosted workflow orchestration server that exposed its API and web UI without authentication by default. Unauthenticated users could access the OpenAPI specification, which identified the Prefect REST API and its endpoints, potentially exposing flow, deployment, and flow-run data."
+tech:
+  - "swagger"
+tags:
+  - "prefect"
+  - "exposure"
+  - "misconfig"
+cwe: "CWE-200"
+reference: "https://github.com/PrefectHQ/prefect"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/openapi.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Prefect REST API"
+      - "\"openapi\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

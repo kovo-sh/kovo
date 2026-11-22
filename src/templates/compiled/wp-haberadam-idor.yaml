@@ -1,0 +1,38 @@
+id: "wp-haberadam-idor"
+name: "WordPress Themes Haberadam JSON API - IDOR and Path Disclosure"
+severity: "low"
+description: "This template is designed to detect a misconfiguration vulnerability in WordPress themes that use the Haberadam JSON API. This vulnerability can lead to an Insecure Direct Object Reference (IDOR) and path disclosure, potentially exposing sensitive information."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "wordpress"
+  - "idor"
+  - "wp-theme"
+  - "disclosure"
+  - "vuln"
+reference: "https://cxsecurity.com/issue/WLB-2021090078"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/themes/haberadam/api/mobile-info.php?id="
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"status\""
+      - "\"hava\""
+      - "\"degree\""
+      - "\"icon\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"

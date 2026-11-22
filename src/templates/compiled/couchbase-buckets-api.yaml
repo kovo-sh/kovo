@@ -1,0 +1,35 @@
+id: "couchbase-buckets-api"
+name: "Couchbase Buckets Unauthenticated REST API - Detect"
+severity: "medium"
+description: "Couchbase Buckets REST API without authentication was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "couchbase"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://docs.couchbase.com/server/current/rest-api/rest-bucket-intro.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pools/default/buckets"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "\"couchbase\":"
+      - "\"bucket\":"
+      - "\"data\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"

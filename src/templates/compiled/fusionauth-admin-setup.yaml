@@ -1,0 +1,29 @@
+id: "fusionauth-admin-setup"
+name: "FusionAuth Exposed Admin Setup"
+severity: "high"
+description: "FusionAuth Admin Setup is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "fusionauth"
+  - "admin"
+  - "setup"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/setup-wizard"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>FusionAuth Setup Wizard"
+      - "FusionAuth is now installed and running"
+  - type: "status"
+    status:
+      - 200

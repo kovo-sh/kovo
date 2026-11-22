@@ -1,0 +1,31 @@
+id: "freshrss-unauth"
+name: "Freshrss Admin Dashboard - Exposed"
+severity: "high"
+description: "Freshrss Admin Dashboard has been exposed."
+tech:
+  - "generic"
+tags:
+  - "freshrss"
+  - "misconfig"
+  - "unauth"
+  - "exposed"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/i/?a=logs"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "a=logout"
+      - "FreshRSS"
+      - "c=user&amp;a=profile"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

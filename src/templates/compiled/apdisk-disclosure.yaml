@@ -1,0 +1,32 @@
+id: "apdisk-disclosure"
+name: "Apdisk - File Disclosure"
+severity: "low"
+description: "Apdisk internal file is exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "apdisk"
+  - "vuln"
+reference: "https://discussions.apple.com/thread/250354761"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.apdisk"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<plist version="
+      - "<key>"
+      - "<string>"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/xml"

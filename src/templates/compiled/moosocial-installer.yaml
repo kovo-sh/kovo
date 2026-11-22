@@ -1,0 +1,28 @@
+id: "moosocial-installer"
+name: "mooSocial Installation - Exposure"
+severity: "high"
+description: "Safe check derived from moosocial-installer: mooSocial Installation - Exposure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "moosocial"
+  - "misconfig"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Welcome to mooSocial Installation"
+  - type: "status"
+    status:
+      - 200

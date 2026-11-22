@@ -1,0 +1,30 @@
+id: "apache-storm-unauth"
+name: "Apache Storm Unauth"
+severity: "medium"
+description: "Apache Storm instance is exposed."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+reference: "https://storm.apache.org/releases/current/STORM-UI-REST-API.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/cluster/summary"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"totalMem\":"
+      - "\"stormVersion\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

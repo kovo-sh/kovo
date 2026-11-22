@@ -1,0 +1,30 @@
+id: "slurm-hpc-dashboard"
+name: "Slurm HPC Dashboard - Detect"
+severity: "medium"
+description: "Slurm HPC Dashboard was detected."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "slurm"
+  - "dashboard"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://grafana.com/grafana/dashboards/4323-slurm-dashboard/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/slurm/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Slurm HPC Dashboard</title>"
+      - "content=\"Slurm HPC dashboard"
+  - type: "status"
+    status:
+      - 200

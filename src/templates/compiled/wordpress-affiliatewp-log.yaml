@@ -1,0 +1,32 @@
+id: "wordpress-affiliatewp-log"
+name: "WordPress Plugin \"AffiliateWP -- Allowed Products\" Log Disclosure"
+severity: "low"
+description: "Exposed debug log in AffiliateWP Wordpress Plugin"
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "log"
+  - "plugin"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/uploads/affwp-debug.log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Referral could not be retrieved"
+      - "Affiliate CSV"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

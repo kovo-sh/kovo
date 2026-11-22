@@ -1,0 +1,28 @@
+id: "ntfy-web-exposure"
+name: "NTFY Web - Exposure"
+severity: "medium"
+description: "Publicly exposed NTFY web interface allowing unauthorized publish or subscribe access."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "ntfy"
+  - "web"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/settings"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>ntfy web</title>"
+  - type: "status"
+    status:
+      - 200

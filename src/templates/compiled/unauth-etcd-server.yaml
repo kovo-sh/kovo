@@ -1,0 +1,38 @@
+id: "unauth-etcd-server"
+name: "Etcd Server - Unauthenticated Access"
+severity: "high"
+description: "A Kubernetes etcd server stores the cluster secrets and configurations files. Anonymous access on etcd allows unauthenticated access the data without providing any authentication credentials."
+tech:
+  - "kubernetes"
+tags:
+  - "tech"
+  - "k8s"
+  - "kubernetes"
+  - "devops"
+  - "etcd"
+  - "unauth"
+  - "anonymous"
+  - "misconfig"
+reference: "https://www.optiv.com/insights/source-zero/blog/kubernetes-attack-surface"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/v2/keys/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"node\":"
+      - "\"key\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

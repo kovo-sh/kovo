@@ -1,0 +1,36 @@
+id: "springboot-flyway"
+name: "Springboot Flyway API"
+severity: "low"
+description: "This endpoint to retrieve the migrations"
+tech:
+  - "springboot"
+tags:
+  - "misconfig"
+  - "springboot"
+  - "exposure"
+  - "flyway"
+  - "vuln"
+reference: "https://docs.spring.io/spring-boot/docs/current/actuator-api/htmlsingle/#flyway"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/flyway"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "flywayBeans"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+      - "application/vnd.spring-boot.actuator"
+      - "application/vnd.spring-boot.actuator.v1+json"
+      - "application/vnd.spring-boot.actuator.v2+json"
+  - type: "status"
+    status:
+      - 200

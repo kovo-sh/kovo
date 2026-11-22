@@ -1,0 +1,33 @@
+id: "discourse-installer"
+name: "Discourse Installer Exposure"
+severity: "high"
+description: "Discourse is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "discourse"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/finish-installation/register"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Discourse Setup"
+      - "Register Admin Account"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

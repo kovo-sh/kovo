@@ -1,0 +1,30 @@
+id: "erp-nc-directory-traversal"
+name: "ERP-NC - Local File Inclusion"
+severity: "high"
+description: "ERP-NC is vulnerable to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "lfi"
+  - "erp-nc"
+  - "vuln"
+reference: "https://mp.weixin.qq.com/s/wH5luLISE_G381W2ssv93g"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/NCFindWeb?service=IPreAlertConfigService&filename="
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Client"
+      - "ncwslogin.jsp"
+      - "admin.jsp"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

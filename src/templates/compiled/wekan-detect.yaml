@@ -1,0 +1,30 @@
+id: "wekan-detect"
+name: "Wekan - Detect"
+severity: "info"
+description: "Wekan, an open-source Kanban board application, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "wekan"
+  - "detect"
+  - "discovery"
+reference: "https://wekan.fi/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Wekan</title>"
+      - "/packages/wekan-"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

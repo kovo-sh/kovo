@@ -1,0 +1,35 @@
+id: "protractor-config"
+name: "Protractor Configuration Exposure"
+severity: "low"
+description: "Protractor configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "protractor"
+  - "config"
+  - "vuln"
+reference: "https://www.protractortest.org/#/api-overview"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/protractor.conf.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "exports.config"
+      - "capabilities:"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/javascript"
+  - type: "status"
+    status:
+      - 200

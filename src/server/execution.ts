@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { extname, join, relative, sep } from 'node:path'
 import { and, asc, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
@@ -7,6 +9,7 @@ import {
   assetOriginForEnvironment,
   defaultWorkerConcurrency,
   isLocalLabEnvEnabled,
+  maxInlineVerifyRetries,
   maxWorkerConcurrency,
   owaspCategories,
   responseCheckIds,
@@ -18,12 +21,14 @@ import type {
   CheckCoverage,
   CodeLocation,
   Finding,
+  InlineVerifyFeedback,
   OwaspCategory,
   ResponseCheckId,
   ThreatModelSummary,
   VerificationTier,
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins } from '../replay-spec.ts'
+import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { evaluateTier3Approval, matchesApprovedEndpointPattern } from './approval-judge.ts'
@@ -35,8 +40,11 @@ import {
   coordinatorPrompt,
   crossHostSynthesizerPrompt,
   defaultCodeAuditMaxTurns,
+  filterHandlersForSpecialist,
   listSkills,
   loadSkill,
+  resolveSpecialistProfile,
+  routeStepToSpecialist,
   runAgentSession,
   threatModelPrompt,
   workerInvestigationPrompt,
@@ -64,28 +72,38 @@ import {
   createProviderLlmCall,
   evaluateSubmissionDedupe,
   extractSpecDedupeFields,
+  normalizeEndpointTemplate,
 } from './dedupe.ts'
 import type { ExistingFindingRef } from './dedupe.ts'
 import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
 import type { EvidenceReview } from './evidence-checks.ts'
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
+import { LabRunner } from './lab-runner.ts'
 import {
   privateModelProfiles,
   recordProfileFailure,
   recordProfileSuccess,
+  resolveProfilePoolForRole,
 } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { generateAndReviewPatch } from './patch-workflow.ts'
 import { PersonaAuthManager } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
+import { crawlStateGraph, runPhase0Recon } from './phase0-recon.ts'
 import { BudgetExceededError } from './provider.ts'
-import { redact } from './redact.ts'
+import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
-import { retestReplaySpec, verifyReplaySpec } from './replay-verifier.ts'
+import {
+  buildInlineVerifyFeedback,
+  retestReplaySpec,
+  verifyReplaySpec,
+  verifyReplaySpecInline,
+} from './replay-verifier.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
-import { approvalRequests, findings, messages } from './schema.ts'
+import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
+import { runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
 import { assessmentAssignments, store } from './store.ts'
 import type { Assignment, ChainStep, Fact, PatchProposal, ReplaySpecRow, Run, Store } from './store.ts'
 import { probeDifferential, probeSurface, runSafeTemplates } from './surface-engine.ts'
@@ -102,9 +120,64 @@ type Capture = { observation: PublicObservation | null; note: string }
 type ReviewInput = { artifactId?: string; reviews: EvidenceReview[]; policy?: AccessPolicySnapshot }
 type CoordinatorTask = { controller: AbortController; goalRevision: number; scopeRevision?: number }
 
-const maxChainStepsPerRun = 32
+const hardChainStepsCeiling = 300
+const diminishingReturnsDryThreshold = 6
 const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
+
+export function computeDynamicStepBudget(storage: Store, runId: string): number {
+  const endpoints = storage.listEndpoints(runId)
+  const crownJewels = endpoints.filter(e => e.riskScore >= 80).length
+  const suspects = storage.listFacts(runId, { includeTainted: false, kind: 'code_audit_suspect', limit: 500 }).length
+  return Math.max(24, Math.min(200, crownJewels * 2 + suspects))
+}
+
+export function computeMultiTrialFanout(
+  run: Pick<Run, 'multiTrialEnabled' | 'workerConcurrency'>,
+  step: Pick<ChainStep, 'priority' | 'dependsOnFactIds' | 'trialGroupId'>,
+  highSignalFactIds?: ReadonlySet<string>,
+): number {
+  if (step.trialGroupId) return 1
+  if (run.multiTrialEnabled === false) return 1
+  const concurrencyCap = Math.max(1, run.workerConcurrency || defaultWorkerConcurrency)
+  const linkedHighSignal = step.dependsOnFactIds.some(id => highSignalFactIds?.has(id))
+  if (step.priority >= 96) return Math.min(3, concurrencyCap)
+  if (step.priority >= 88 || linkedHighSignal) return Math.min(2, concurrencyCap)
+  return 1
+}
+
+export function countConsecutiveDrySteps(storage: Store, run: Pick<Run, 'id' | 'goalRevision'>): number {
+  const completedSteps = storage.listChainSteps(run.id, run.goalRevision)
+    .filter(s => s.status === 'complete')
+    .sort((a, b) => b.updatedAt - a.updatedAt || b.seq - a.seq)
+  if (completedSteps.length === 0) return 0
+
+  const productiveWorkerIds = new Set<string>()
+  const runFacts = storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+  for (const f of runFacts) {
+    if (f.assignmentId) productiveWorkerIds.add(f.assignmentId)
+  }
+  const runFindings = storage.db.select().from(findings).where(and(
+    eq(findings.runId, run.id),
+    eq(findings.goalRevision, run.goalRevision),
+  )).all()
+  const runSpecs = storage.listReplaySpecs(run.id)
+  for (const sp of runSpecs) {
+    if (runFindings.some(f => f.id === sp.findingId && f.finding.status !== 'dismissed')) {
+      if (sp.assignmentId) productiveWorkerIds.add(sp.assignmentId)
+    }
+  }
+
+  let dry = 0
+  for (const st of completedSteps) {
+    if (!st.assignedWorkerId || !productiveWorkerIds.has(st.assignedWorkerId)) {
+      dry += 1
+    } else {
+      break
+    }
+  }
+  return dry
+}
 
 const threatModelResponseSchema = z.object({
   summary: z.string().min(1).max(2000),
@@ -377,7 +450,7 @@ export function convertCodeAuditSuspectsToChainSteps(
   let totalSteps = existingSteps.length
 
   for (const fact of suspects) {
-    if (totalSteps >= maxChainStepsPerRun || created.length >= 12) break
+    if (totalSteps >= hardChainStepsCeiling) break
     if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
     if (coveredFactIds.has(fact.id)) continue
     const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
@@ -387,6 +460,9 @@ export function convertCodeAuditSuspectsToChainSteps(
     const routeOrAction = typeof data.routeOrAction === 'string' && data.routeOrAction.trim()
       ? data.routeOrAction.trim()
       : ''
+    const endpointHint = typeof data.endpoint === 'string' && data.endpoint.trim()
+      ? data.endpoint.trim()
+      : routeOrAction
     const fileLoc = typeof data.file === 'string' && data.file.trim()
       ? `${data.file.trim()}${typeof data.line === 'number' ? `:${data.line}` : ''}`
       : ''
@@ -403,13 +479,24 @@ export function convertCodeAuditSuspectsToChainSteps(
       : `Source audit verify · ${fact.summary.slice(0, 80)} (${host})`
     if (existingTitles.has(title.toLowerCase())) continue
 
-    const { category, skills } = sinkCategoryAndSkills(sinkKind)
+    const mapped = sinkCategoryAndSkills(sinkKind)
+    const explicitCategory = typeof data.category === 'string' && data.category.trim()
+      ? data.category.trim()
+      : mapped.category
+    const specialistProfile = routeStepToSpecialist({
+      title: `${fact.summary} ${title}`,
+      hypothesis: hypothesisBody,
+      category: explicitCategory,
+      skills: mapped.skills,
+      endpoint: endpointHint,
+      sinkKind,
+    })
     const missingAuthOrOwner = /missing|none|weak|bypass|absent|unverified|no /i.test(`${authCheck} ${ownershipCheck}`)
     const isCrown = (hostTiers?.[fact.origin] ?? classifyHostTier(fact.origin)) === 'crown_jewel'
     const priority = missingAuthOrOwner ? (isCrown ? 96 : 92) : (isCrown ? 90 : 85)
 
     const hypothesis = [
-      `Source-First Code Audit suspect${fileLoc ? ` at ${fileLoc}` : ''}${routeOrAction ? ` targeting ${routeOrAction}` : ''}.`,
+      `Source-First Code Audit suspect${fileLoc ? ` at ${fileLoc}` : ''}${endpointHint ? ` targeting ${endpointHint}` : ''}.`,
       `Auth check: ${authCheck}; Ownership check: ${ownershipCheck}; Sink: ${sinkKind}.`,
       hypothesisBody,
       'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
@@ -418,12 +505,13 @@ export function convertCodeAuditSuspectsToChainSteps(
     const step = storage.addChainStep(run, {
       title,
       hypothesis,
-      category,
+      category: explicitCategory,
       priority,
       targetAssetIds: [asset.id],
-      skills,
+      skills: mapped.skills,
       dependsOnFactIds: [fact.id],
       sourceOrigins: [fact.origin],
+      specialistProfile,
     })
     existingTitles.add(title.toLowerCase())
     coveredFactIds.add(fact.id)
@@ -435,7 +523,7 @@ export function convertCodeAuditSuspectsToChainSteps(
 }
 
 const STATIC_ASSET_PATH_RE = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|pdf)(?:\?|$)/i
-const RESOURCE_ID_KEY_RE = /^(?:id|uuid|user_?id|org_?id|organization_?id|project_?id|account_?id|team_?id|chat_?id|app_?id|order_?id|invoice_?id|document_?id|file_?id|workspace_?id|subscription_?id|record_?id|item_?id|ticket_?id|customer_?id)$/i
+const RESOURCE_ID_KEY_RE = /^(?:id|uuid|[a-z][a-z0-9]*Id|[a-z][a-z0-9_]*_id)$/
 const IGNORED_ID_VALUES = new Set(['true', 'false', 'null', 'undefined', 'default', 'self', 'me', 'current', 'none', 'all', 'new', 'list', 'index', 'health', 'status', 'public'])
 const PATH_RESOURCE_RE = /\/(?:api\/(?:v\d+\/)?)?([a-z][a-z0-9_-]{1,32})\/([0-9]{2,16}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?:usr|org|proj|acct|app|ord|inv|doc|file|chat|team|sub|cus|ws|res)_[a-zA-Z0-9_-]{4,64})(?:\/|$|\?)/i
 
@@ -459,7 +547,7 @@ export function extractPersonaResourcesFromExchange(ex: {
     if (!clean || clean.length < 2 || clean.length > 128) return
     if (IGNORED_ID_VALUES.has(clean.toLowerCase())) return
     const key = `${endpoint}|${clean}`
-    if (seen.has(key) || found.length >= 6) return
+    if (seen.has(key) || found.length >= 12) return
     seen.add(key)
     found.push({ resourceId: clean, endpoint, method: ex.method.toUpperCase(), field })
   }
@@ -474,13 +562,13 @@ export function extractPersonaResourcesFromExchange(ex: {
       const parsed = JSON.parse(ex.body) as unknown
       const basePath = ex.pathAndQuery.split('?')[0]
       const walk = (node: unknown, depth: number) => {
-        if (depth > 3 || found.length >= 6 || !node || typeof node !== 'object') return
+        if (depth > 8 || found.length >= 12 || !node || typeof node !== 'object') return
         if (Array.isArray(node)) {
           for (const item of node.slice(0, 5)) walk(item, depth + 1)
           return
         }
         for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
-          if (found.length >= 6) break
+          if (found.length >= 12) break
           if (RESOURCE_ID_KEY_RE.test(key)) {
             if (typeof val === 'string' && val.trim().length >= 3) {
               push(val, basePath, key)
@@ -492,7 +580,7 @@ export function extractPersonaResourcesFromExchange(ex: {
           }
         }
       }
-      walk(parsed, 0)
+      walk(parsed, 1)
     } catch {
       // Ignore non-JSON or truncated bodies
     }
@@ -641,6 +729,7 @@ export interface ExecutionOptions {
   canaryBroker?: CanaryBroker
   backend?: WorkerBackend
   personaAuth?: PersonaAuthManager
+  labRunner?: LabRunner
 }
 
 export class Execution {
@@ -651,6 +740,7 @@ export class Execution {
   readonly backend: WorkerBackend
   readonly personaAuth: PersonaAuthManager
   readonly compactor: ColdGraphCompactor
+  readonly labRunner: LabRunner
   private readonly active = new Map<string, Active>()
   private readonly coordinator = new Map<string, CoordinatorTask>()
   private readonly threatModeling = new Map<string, CoordinatorTask>()
@@ -663,6 +753,9 @@ export class Execution {
   private readonly circuitNotified = new Set<string>()
   private readonly runAuthStarted = new Map<string, string>()
   private readonly runAuthInFlight = new Map<string, AbortController>()
+  private readonly startedLabRuns = new Set<string>()
+  private readonly variantSweptFindings = new Set<string>()
+  private readonly variantSweepInFlight = new Set<string>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -677,6 +770,7 @@ export class Execution {
       workspace: { id: storage.workspace.id, directory: storage.directory },
     })
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
+    this.labRunner = options.labRunner ?? new LabRunner()
     this.compactor = new ColdGraphCompactor({
       onProfileSuccess: id => recordProfileSuccess(id, this.storage),
       onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
@@ -740,6 +834,8 @@ export class Execution {
     this.runAuthInFlight.clear()
     this.runAuthStarted.clear()
     this.personaAuth.stopAll()
+    await this.labRunner.stopAll().catch(() => undefined)
+    this.startedLabRuns.clear()
     await this.canaryBroker.stopListener().catch(() => undefined)
   }
 
@@ -948,7 +1044,7 @@ export class Execution {
       isRaceBurst: input.isRaceBurst,
       environment: project.environment,
       approvedPatterns: activePatterns,
-      profiles: privateModelProfiles(),
+      profiles: resolveProfilePoolForRole('fast', this.storage),
       signal,
       secrets: input.secrets,
       onUsage: usage => {
@@ -1107,6 +1203,20 @@ export class Execution {
       }
     }
 
+    // Tear down LabRunner containers for any runs no longer active
+    for (const runId of [...this.startedLabRuns]) {
+      try {
+        const current = this.storage.run(runId)
+        if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped') {
+          this.startedLabRuns.delete(runId)
+          void this.labRunner.stopLabTarget(runId).catch(() => undefined)
+        }
+      } catch {
+        this.startedLabRuns.delete(runId)
+        void this.labRunner.stopLabTarget(runId).catch(() => undefined)
+      }
+    }
+
     // 2. Dispatch pending one-click Verify Fix retests (works even on completed runs, Zero-LLM!)
     for (const run of this.storage.runsWithPendingRetests()) {
       const retests = this.storage.workerList(run.id).filter(w => w.phase === 'retest' && w.status === 'queued')
@@ -1120,6 +1230,7 @@ export class Execution {
     const profiles = privateModelProfiles(this.storage)
     for (const run of this.storage.runnable()) {
       if (this.storage.checkBudgetExceeded(run.id)) continue
+      this.ensureVariantSweepsForConfirmedFindings(run)
 
       if (profiles.length) {
         this.startCoordinator(run, profiles)
@@ -1261,8 +1372,10 @@ export class Execution {
             directory: this.storage.directory,
             sessionId: `${run.reviewPlan.goalMessageId}-plan-${run.scopeRevision}`,
             requestId: 'plan',
-            profiles,
+            profiles: resolveProfilePoolForRole('fast', profiles),
             scenario: 'coordinator-plan',
+            roleAffinity: 'fast',
+            thinkingLevel: 'off',
             prompt: reviewPlanPrompt(run.goal, run.sourceMode, available),
             signal: task.controller.signal,
             onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
@@ -1293,6 +1406,83 @@ export class Execution {
     try {
       const { grant, secrets } = this.buildGrant(job, freshRun, approvedOrigins)
       const specs = this.storage.listProjectSpecsFull(freshRun.projectId)
+      const { reposDir, mountedRepos } = this.projectReposMount(freshRun.projectId)
+
+      // 0a. Optional LabRunner boot when local-lab project has labConfig.enabled
+      try {
+        const project = this.storage.project(freshRun.projectId)
+        if (
+          project.environment === 'local-lab' &&
+          project.labConfig?.enabled &&
+          isLocalLabEnvEnabled() &&
+          !this.startedLabRuns.has(freshRun.id) &&
+          reposDir &&
+          (project.labConfig.dockerComposeFile || project.labConfig.dockerfile || project.labConfig.image)
+        ) {
+          const primaryRepoDir = mountedRepos[0] ? join(reposDir, mountedRepos[0]) : reposDir
+          if (existsSync(primaryRepoDir)) {
+            await this.labRunner.startLabTarget({
+              runId: freshRun.id,
+              environment: project.environment,
+              repoDir: primaryRepoDir,
+              labConfig: project.labConfig,
+              signal: task.controller.signal,
+            })
+            this.startedLabRuns.add(freshRun.id)
+          }
+        }
+      } catch {
+        // Best-effort lab boot; proceed cleanly if target is externally managed
+      }
+
+      // 0b. Persist initial dynamic step budget from pre-existing endpoints + suspects
+      this.storage.updateRunDynamicStepBudget(freshRun.id, computeDynamicStepBudget(this.storage, freshRun.id))
+
+      // 0c. Zero-LLM Phase-0 deterministic surface mapper (runs before LLM Turn 1)
+      if (!freshRun.phase0CompletedAt && approvedOrigins.size > 0 && this.authorize(job)) {
+        try {
+          await runPhase0Recon({
+            storage: this.storage,
+            runId: freshRun.id,
+            scopeRevision: freshRun.scopeRevision,
+            tier: freshRun.capabilityTier,
+            origins: [...approvedOrigins],
+            budgetRequests: freshRun.budgetRequests,
+            reposDir,
+            personas: [...(grant.personas?.keys() ?? [])],
+            broker: this.broker,
+            browser: freshRun.capabilityTier >= 2 ? this.browser : undefined,
+            canaryBroker: this.canaryBroker,
+            grant,
+            signal: task.controller.signal,
+            assignmentId: claimed.id,
+            onExchange: ex => {
+              const saved = this.storage.recordExchange({
+                runId: freshRun.id,
+                assignmentId: claimed.id,
+                scopeRevision: freshRun.scopeRevision,
+                origin: ex.origin,
+                finalOrigin: ex.finalOrigin,
+                redirectOrigins: ex.redirectOrigins,
+                method: ex.method,
+                pathAndQuery: ex.pathAndQuery,
+                personaHandle: ex.personaHandle,
+                status: ex.status,
+                mediaType: ex.mediaType,
+                reqHeaders: ex.reqHeaders,
+                respHeaders: ex.respHeaders,
+                body: ex.body,
+                durationMs: ex.durationMs,
+                secrets,
+              })
+              return saved.id
+            },
+          })
+          this.storage.updateRunDynamicStepBudget(freshRun.id, computeDynamicStepBudget(this.storage, freshRun.id))
+        } catch {
+          // Phase-0 failure must not block threat model progression
+        }
+      }
 
       // 1. Correlate dependencies from uploaded/synced specs via CVE broker
       const seenDeps = new Set<string>()
@@ -1451,8 +1641,6 @@ export class Execution {
         skills: string[]
       }> = []
 
-      const { mountedRepos } = this.projectReposMount(freshRun.projectId)
-
       if (profiles.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0) {
         try {
           const personasPub = [...grant.personas?.values() ?? []].map(p => ({
@@ -1462,9 +1650,9 @@ export class Execution {
             directory: this.storage.directory,
             sessionId: `tm-${freshRun.id}-${freshRun.goalRevision}-${freshRun.scopeRevision}`,
             requestId: 'threat-model',
-            profiles,
+            profiles: resolveProfilePoolForRole('tactical', profiles),
             scenario: 'threat-model',
-            thinkingLevel: 'medium',
+            roleAffinity: 'tactical',
             prompt: threatModelPrompt({
               goal: freshRun.goal,
               capabilityTier: freshRun.capabilityTier,
@@ -1583,6 +1771,12 @@ export class Execution {
           const validOrigins = step.origins.filter(o => approvedOrigins.has(o))
           const assetIds = current.candidates.filter(c => validOrigins.includes(c.origin) && current.approved.includes(c.id)).map(c => c.id)
           if (!assetIds.length) continue
+          const specialistProfile = routeStepToSpecialist({
+            title: step.title,
+            hypothesis: step.hypothesis,
+            category: step.category,
+            skills: step.skills,
+          })
           this.storage.addChainStep(current, {
             title: step.title,
             hypothesis: step.hypothesis,
@@ -1591,12 +1785,15 @@ export class Execution {
             targetAssetIds: assetIds,
             skills: step.skills,
             sourceOrigins: validOrigins,
+            specialistProfile,
           })
           addedInitial += 1
         }
+        this.expandEligibleMultiTrialSteps(current)
+        this.storage.updateRunDynamicStepBudget(current.id, computeDynamicStepBudget(this.storage, current.id))
 
         const totalQueued = codeAuditStepsCreated + addedInitial
-        this.completeWorker(claimed, current, tmSummary, [savedTm.tmArtifact.id])
+        this.completeWorker(claimed, current, tmSummary, [savedTm.tmArtifact.id], undefined, secrets)
         const nextPhase = current.capabilityTier === 0 || !profiles.length ? 'verification' : 'investigation'
         this.storage.updateRun(current.id, { phase: nextPhase })
         this.storage.event(current.id, `${nextPhase}.started`,
@@ -1785,12 +1982,51 @@ export class Execution {
         handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
       }))
 
+      // Stage 1-3 deterministic + semantic code audit pipeline (IRIS + call-graph + git history)
+      try {
+        const hostTiersForAudit = computeHostTiers([...approvedOrigins], threatModel)
+        const semanticRes = await runThreeStageSemanticAudit({
+          storage: this.storage,
+          run,
+          assignment: claimed,
+          backend: this.backend,
+          session,
+          reposDir,
+          mountedRepos,
+          approvedOrigins: [...approvedOrigins],
+          hostTiers: hostTiersForAudit,
+          modelProfiles: resolveProfilePoolForRole('reasoning', profiles),
+          signal: controller.signal,
+          secrets: currentSecrets(),
+          onUsage: usage => {
+            this.storage.recordLlmSpend(run.id, {
+              usd: usage.costUsd,
+              tokens: usage.inputTokens + usage.outputTokens,
+            })
+          },
+        }, {
+          enableStage1Llm: false,
+          persistToStore: true,
+        })
+        const semanticSteps = toChainStepInputs(run, semanticRes.rankedSuspects, hostTiersForAudit)
+        const existingTitles = new Set(this.storage.listChainSteps(run.id, run.goalRevision).map(s => s.title.trim().toLowerCase()))
+        for (const stInput of semanticSteps) {
+          const key = stInput.title.trim().toLowerCase()
+          if (existingTitles.has(key)) continue
+          this.storage.addChainStep(run, stInput)
+          existingTitles.add(key)
+        }
+      } catch {
+        // Semantic audit is additive; continue with interactive code auditor session
+      }
+
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: claimed.sessionId,
         requestId: `code-audit:${run.id}:${run.goalRevision}:${run.scopeRevision}`,
-        profiles,
+        profiles: resolveProfilePoolForRole('reasoning', profiles),
         scenario: 'code-auditor',
+        roleAffinity: 'reasoning',
         prompt: codeAuditPrompt({
           goal: run.goal,
           capabilityTier: run.capabilityTier,
@@ -1803,7 +2039,6 @@ export class Execution {
         }),
         signal: controller.signal,
         maxTurns: auditMaxTurns,
-        thinkingLevel: 'medium',
         compaction: true,
         enableSettlement: true,
         requireCompleteIntent: true,
@@ -1839,7 +2074,7 @@ export class Execution {
       const outcomeText = sessionResult.completion
         ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary} (${suspects.length} suspects → ${stepsCreated.length} targeted chain steps)`
         : `Code audit finished: ${suspects.length} suspects converted into ${stepsCreated.length} targeted chain steps.`
-      this.completeWorker(claimed, latestRun, outcomeText, [])
+      this.completeWorker(claimed, latestRun, outcomeText, [], undefined, currentSecrets())
       this.storage.event(run.id, 'code_audit.complete', `Source-First Code Audit recorded ${suspects.length} suspects and queued ${stepsCreated.length} targeted steps.`, {
         assignmentId: claimed.id, suspectsCount: suspects.length, stepsCreated: stepsCreated.length,
       })
@@ -1853,15 +2088,297 @@ export class Execution {
 
   // --- Phase 2: Closed-Loop Investigation & Debounced Stateless Planner ---
 
+  private expandEligibleMultiTrialSteps(run: Run) {
+    if (run.multiTrialEnabled === false) return
+    const conc = Math.max(1, run.workerConcurrency || defaultWorkerConcurrency)
+    if (conc <= 1) return
+
+    const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const highSignalFacts = new Set(
+      this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+        .filter(f => {
+          const kind = String(f.kind)
+          const subkind = typeof f.data?.subkind === 'string' ? f.data.subkind : ''
+          return kind === 'code_audit_suspect' || kind === 'cve_hypothesis' || subkind === 'code_audit_suspect' || subkind === 'cve_hypothesis'
+        })
+        .map(f => f.id),
+    )
+
+    for (const step of steps) {
+      if (step.status !== 'pending' && step.status !== 'ready') continue
+      if (step.trialGroupId) continue
+      const fanout = computeMultiTrialFanout(run, step, highSignalFacts)
+      if (fanout <= 1) continue
+
+      const trialGroupId = randomUUID()
+      this.storage.updateChainStep(step.id, { trialGroupId, trialIndex: 0 })
+      for (let idx = 1; idx < fanout; idx += 1) {
+        this.storage.addChainStep(run, {
+          title: `${step.title.slice(0, 180)} [trial ${idx + 1}]`,
+          hypothesis: step.hypothesis,
+          category: step.category,
+          priority: step.priority,
+          targetAssetIds: step.targetAssetIds,
+          skills: step.skills,
+          dependsOnFactIds: step.dependsOnFactIds,
+          dependsOnStepIds: step.dependsOnStepIds,
+          sourceOrigins: step.sourceOrigins,
+          specialistProfile: step.specialistProfile,
+          trialGroupId,
+          trialIndex: idx,
+        })
+      }
+    }
+  }
+
+  private cancelSiblingTrialsOnConfirmation(run: Run, winningStepId: string | null, findingId?: string) {
+    if (!winningStepId) return
+    const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const winningStep = steps.find(s => s.id === winningStepId)
+    if (!winningStep?.trialGroupId) return
+
+    const siblings = steps.filter(s =>
+      s.trialGroupId === winningStep.trialGroupId &&
+      s.id !== winningStep.id &&
+      ['pending', 'ready', 'running'].includes(s.status),
+    )
+    if (!siblings.length) return
+
+    const canceledStepIds: string[] = []
+    for (const sib of siblings) {
+      this.storage.updateChainStep(sib.id, { status: 'canceled' })
+      canceledStepIds.push(sib.id)
+      if (sib.assignedWorkerId) {
+        const activeSib = this.active.get(sib.assignedWorkerId)
+        if (activeSib) {
+          activeSib.controller.abort('trial.early_stopped')
+        }
+        try {
+          const w = this.storage.worker(sib.assignedWorkerId)
+          if (w.status === 'running' || w.status === 'queued' || w.status === 'waiting_approval') {
+            this.storage.updateWorker(w.id, {
+              status: 'canceled',
+              lease: null,
+              leaseExpiresAt: null,
+              outcome: 'Canceled via multi-trial early stopping after sibling confirmation.',
+            })
+          }
+        } catch { /* ignore */ }
+      }
+    }
+
+    if (canceledStepIds.length > 0) {
+      this.storage.event(
+        run.id,
+        'trial.early_stopped',
+        `Early-stopped ${canceledStepIds.length} sibling trial(s) in group ${winningStep.trialGroupId} after Zero-LLM confirmation.`,
+        {
+          trialGroupId: winningStep.trialGroupId,
+          winningStepId: winningStep.id,
+          findingId: findingId ?? null,
+          canceledStepIds,
+        },
+      )
+    }
+  }
+
+  private ensureVariantSweepsForConfirmedFindings(run: Run) {
+    const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
+    if (!reposDir || mountedRepos.length === 0) return
+
+    const confirmedRows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+    )).all().filter(row =>
+      (row.finding.status === 'confirmed' || row.finding.status === 'static_verified') &&
+      (row.finding.codeLocations?.length ?? 0) > 0 &&
+      !this.variantSweptFindings.has(row.id) &&
+      !this.variantSweepInFlight.has(row.id),
+    )
+
+    for (const row of confirmedRows) {
+      this.scheduleVariantSweepForFinding(run, row)
+    }
+  }
+
+  private scheduleVariantSweepForFinding(
+    run: Run,
+    findingRow: typeof findings.$inferSelect,
+  ) {
+    if (this.variantSweptFindings.has(findingRow.id) || this.variantSweepInFlight.has(findingRow.id)) return
+    const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
+    if (!reposDir || mountedRepos.length === 0) return
+    const locs = findingRow.finding.codeLocations ?? []
+    if (locs.length === 0) return
+
+    this.variantSweepInFlight.add(findingRow.id)
+    void this.runPostConfirmationVariantSweep(run, findingRow, reposDir, mountedRepos)
+      .catch(() => { /* best-effort variant sweep */ })
+      .finally(() => {
+        this.variantSweepInFlight.delete(findingRow.id)
+        this.variantSweptFindings.add(findingRow.id)
+        this.scheduleWake()
+      })
+  }
+
+  private async runPostConfirmationVariantSweep(
+    run: Run,
+    findingRow: typeof findings.$inferSelect,
+    reposDir: string,
+    mountedRepos: readonly string[],
+  ) {
+    const locs = findingRow.finding.codeLocations ?? []
+    const primaryLoc = locs[0]
+    if (!primaryLoc) return
+
+    const approvedOrigins = this.approvedOriginsSet(run)
+    const targetOrigin = approvedOrigins.has(findingRow.finding.origin)
+      ? findingRow.finding.origin
+      : [...approvedOrigins][0]
+    if (!targetOrigin) return
+    const asset = run.candidates.find(c => c.origin === targetOrigin && run.approved.includes(c.id))
+      ?? run.candidates.find(c => run.approved.includes(c.id))
+    if (!asset) return
+
+    const siblingHits: Array<{ repo: string; file: string; line: number; preview: string }> = []
+    const seenHit = new Set<string>()
+    const overlapsOriginal = (repo: string, file: string, line: number) =>
+      locs.some(l => l.repo === repo && l.file === file && line >= l.startLine - 1 && line <= l.endLine + 1)
+
+    // 1. Fast deterministic sibling pattern sweep over mounted /repos (matches static_ast_proof ruleOrPattern or primary call signature)
+    let searchTokens: string[] = []
+    if (findingRow.replaySpecId) {
+      try {
+        const sp = this.storage.getReplaySpec(run.id, findingRow.replaySpecId)
+        if (sp.spec.kind === 'static_ast_proof' && sp.spec.ruleOrPattern.trim()) {
+          searchTokens.push(sp.spec.ruleOrPattern.trim())
+        }
+      } catch { /* ignore */ }
+    }
+    const primaryFilePath = join(reposDir, primaryLoc.repo, primaryLoc.file)
+    if (existsSync(primaryFilePath)) {
+      try {
+        const lines = readFileSync(primaryFilePath, 'utf8').split('\n')
+        const lineText = lines[Math.max(0, primaryLoc.startLine - 1)] ?? ''
+        const callSig = /[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*\s*\([^)]*\)/.exec(lineText)
+        if (callSig && !searchTokens.includes(callSig[0])) searchTokens.push(callSig[0])
+      } catch { /* ignore */ }
+    }
+
+    if (searchTokens.length > 0) {
+      const scanExt = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
+      for (const repoName of mountedRepos) {
+        const repoRoot = join(reposDir, repoName)
+        if (!existsSync(repoRoot)) continue
+        const stack = [repoRoot]
+        while (stack.length > 0 && siblingHits.length < 20) {
+          const dir = stack.pop()!
+          let entries: string[]
+          try { entries = readdirSync(dir) } catch { continue }
+          for (const entry of entries) {
+            if (entry === 'node_modules' || entry === '.git' || entry === 'dist' || entry === 'build') continue
+            const full = join(dir, entry)
+            let st
+            try { st = statSync(full) } catch { continue }
+            if (st.isDirectory()) {
+              stack.push(full)
+            } else if (st.isFile() && st.size <= 256 * 1024 && scanExt.has(extname(entry).toLowerCase())) {
+              const relFile = relative(repoRoot, full).split(sep).join('/')
+              let content: string
+              try { content = readFileSync(full, 'utf8') } catch { continue }
+              const lines = content.split('\n')
+              for (let i = 0; i < lines.length; i += 1) {
+                if (searchTokens.some(tok => lines[i].includes(tok))) {
+                  const lineNo = i + 1
+                  if (overlapsOriginal(repoName, relFile, lineNo)) continue
+                  const key = `${repoName}:${relFile}:${lineNo}`
+                  if (seenHit.has(key)) continue
+                  seenHit.add(key)
+                  siblingHits.push({ repo: repoName, file: relFile, line: lineNo, preview: lines[i].trim().slice(0, 180) })
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Also invoke runVariantSweepForFinding (semantic-audit.ts) when no direct deterministic sibling hits were found
+    if (siblingHits.length === 0) {
+      try {
+        const currentRun = this.storage.run(run.id)
+        const profiles = privateModelProfiles(this.storage)
+        const sweepRes = await runVariantSweepForFinding({
+          storage: this.storage,
+          run: currentRun,
+          backend: this.backend,
+          reposDir,
+          mountedRepos,
+          approvedOrigins: [...approvedOrigins],
+          modelProfiles: resolveProfilePoolForRole('reasoning', profiles),
+          signal: AbortSignal.timeout(15_000),
+        }, {
+          finding: findingRow.finding,
+          mountedRepos,
+        })
+        for (const s of sweepRes.newSuspects) {
+          const key = `${s.repo}:${s.file}:${s.line}`
+          if (seenHit.has(key)) continue
+          seenHit.add(key)
+          siblingHits.push({ repo: s.repo, file: s.file, line: s.line, preview: s.hypothesis.slice(0, 180) })
+        }
+      } catch { /* best-effort */ }
+    }
+
+    if (siblingHits.length === 0) return
+
+    const currentRun = this.storage.run(run.id)
+    const existingSteps = this.storage.listChainSteps(currentRun.id, currentRun.goalRevision)
+    const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
+    for (const hit of siblingHits.slice(0, 12)) {
+      const title = `Variant sweep · ${hit.file}:${hit.line} (sibling of ${findingRow.finding.title.slice(0, 60)})`
+      if (existingTitles.has(title.toLowerCase())) continue
+      const specialistProfile = routeStepToSpecialist({
+        title: `${title} ${findingRow.finding.title}`,
+        hypothesis: hit.preview,
+        category: findingRow.finding.category,
+      })
+      this.storage.addChainStep(currentRun, {
+        title,
+        hypothesis: `Post-confirmation Variant Sweep matched sibling pattern of confirmed finding ${findingRow.id} (${findingRow.finding.title}) at ${hit.repo}/${hit.file}:${hit.line}: ${hit.preview}`,
+        category: findingRow.finding.category ?? 'broken-access-control',
+        priority: 92,
+        targetAssetIds: [asset.id],
+        skills: ['source-first-audit', 'bola-idor-race', 'false-positive-elimination'],
+        sourceOrigins: [targetOrigin],
+        specialistProfile,
+      })
+      existingTitles.add(title.toLowerCase())
+    }
+    this.storage.event(
+      currentRun.id,
+      'variant_sweep.complete',
+      `Variant sweep for finding "${findingRow.finding.title}" discovered ${siblingHits.length} sibling target(s).`,
+      { findingId: findingRow.id, siblingsFound: siblingHits.length },
+    )
+  }
+
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (!profiles.length) return
+    // Always compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
+    const computedBudget = computeDynamicStepBudget(this.storage, run.id)
+    if (run.dynamicStepBudget === null || run.dynamicStepBudget < computedBudget) {
+      this.storage.updateRunDynamicStepBudget(run.id, computedBudget)
+    }
+
+    // Fan out eligible crown-jewel leads into parallel multi-trial branches before scheduling
+    this.expandEligibleMultiTrialSteps(run)
+
     this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
     const readySteps = steps
       .filter(s => s.status === 'ready')
       .sort((a, b) => b.priority - a.priority || a.seq - b.seq)
-    const runningSteps = steps.filter(s => s.status === 'running')
-    const pendingSteps = steps.filter(s => s.status === 'pending')
 
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
     const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
@@ -1878,10 +2395,32 @@ export class Execution {
       slots -= 1
     }
 
-    // If nothing is running/ready/pending, trigger final planner review or advance to verification
+    // If nothing is running/ready/pending, check K=6 diminishing returns or trigger final planner review
     const updatedSteps = this.storage.listChainSteps(run.id, run.goalRevision)
     const anyActive = updatedSteps.some(s => ['pending', 'ready', 'running'].includes(s.status))
     if (!anyActive && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
+      const consecutiveDry = countConsecutiveDrySteps(this.storage, run)
+      if (consecutiveDry >= diminishingReturnsDryThreshold) {
+        this.storage.event(
+          run.id,
+          'planner.diminishing_returns',
+          `Halted dynamic queueing after ${consecutiveDry} consecutive dry steps (K=${diminishingReturnsDryThreshold}).`,
+          { consecutiveDrySteps: consecutiveDry, threshold: diminishingReturnsDryThreshold },
+        )
+        this.advanceToVerification(run)
+        return
+      }
+      const hasCanceledSibling = updatedSteps.some(s => Boolean(s.trialGroupId) && s.status === 'canceled')
+      if (hasCanceledSibling) {
+        const hasUntestedWork =
+          this.storage.listFacts(run.id, { includeTainted: false, limit: 1 }).length > 0 ||
+          this.storage.listEndpoints(run.id).length > 0 ||
+          this.storage.listOpenProofGaps(run.id, run.goalRevision).length > 0
+        if (!hasUntestedWork) {
+          this.advanceToVerification(run)
+          return
+        }
+      }
       const doneAt = this.plannerDoneRound.get(run.id)
       if (doneAt !== undefined && doneAt === run.roundNo && !this.plannerDirty.has(run.id)) {
         this.advanceToVerification(run)
@@ -1988,9 +2527,9 @@ export class Execution {
       directory: this.storage.directory,
       sessionId: `synth-${run.id}-r${roundNo}`,
       requestId: `synth:${run.goalRevision}:${roundNo}`,
-      profiles,
+      profiles: resolveProfilePoolForRole('reasoning', profiles),
       scenario: 'cross-host-synthesizer',
-      thinkingLevel: 'medium',
+      roleAffinity: 'reasoning',
       prompt,
       signal,
       onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
@@ -2018,8 +2557,9 @@ export class Execution {
     const stepsCreated: ChainStep[] = []
     let totalSteps = latestSteps.length
 
+    const dynamicBudget = Math.min(hardChainStepsCeiling, currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id))
     for (const step of parsed.data.chainSteps) {
-      if (totalSteps >= maxChainStepsPerRun || stepsCreated.length >= 6) break
+      if (totalSteps >= dynamicBudget || stepsCreated.length >= 6) break
       const validOrigins = step.origins.filter(o => currentApproved.has(o))
       const assetIds = currentRun.candidates
         .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
@@ -2028,6 +2568,12 @@ export class Execution {
       const titleKey = step.title.trim().toLowerCase()
       if (existingTitles.has(titleKey)) continue
       const depFacts = step.dependsOnFactIds.filter(fid => validFactIdSet.has(fid))
+      const specialistProfile = routeStepToSpecialist({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        skills: step.skills,
+      })
       const created = this.storage.addChainStep(currentRun, {
         title: step.title,
         hypothesis: step.hypothesis,
@@ -2037,6 +2583,7 @@ export class Execution {
         skills: [...new Set([...step.skills, 'cross-host-chaining'])],
         dependsOnFactIds: depFacts,
         sourceOrigins: validOrigins,
+        specialistProfile,
       })
       existingTitles.add(titleKey)
       stepsCreated.push(created)
@@ -2065,6 +2612,23 @@ export class Execution {
     const fresh = this.storage.run(run.id)
     if (fresh.status !== 'running' || fresh.phase !== 'investigation') return
     if (this.storage.checkBudgetExceeded(run.id)) return
+
+    // Compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
+    const dynamicStepBudget = Math.min(hardChainStepsCeiling, computeDynamicStepBudget(this.storage, fresh.id))
+    this.storage.updateRunDynamicStepBudget(fresh.id, dynamicStepBudget)
+
+    // Diminishing-returns stop: K=6 consecutive dry steps halts dynamic planning cleanly
+    const consecutiveDry = countConsecutiveDrySteps(this.storage, fresh)
+    if (consecutiveDry >= diminishingReturnsDryThreshold) {
+      this.storage.event(
+        fresh.id,
+        'planner.diminishing_returns',
+        `Planner halted after ${consecutiveDry} consecutive dry steps (K=${diminishingReturnsDryThreshold}).`,
+        { consecutiveDrySteps: consecutiveDry, threshold: diminishingReturnsDryThreshold },
+      )
+      this.advanceToVerification(fresh)
+      return
+    }
 
     // 1. Advance roundNo & trigger background LSM cold-graph compaction
     const roundRes = this.compactor.onPlannerRound(this.storage, run.id, profiles, task.controller.signal)
@@ -2105,11 +2669,11 @@ export class Execution {
 
     // Priority #3: Auto-enqueue cross-persona BOLA/IDOR step if >= 2 personas discovered owned resources not yet tested
     let bolaAutoSteps = 0
-    if (afterRound.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < maxChainStepsPerRun) {
+    if (afterRound.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const bolaQueue = buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins)
       const originsWithResources = [...new Set(bolaQueue.map(item => item.origin))]
       for (const origin of originsWithResources) {
-        if (allSteps.length + bolaAutoSteps >= maxChainStepsPerRun) break
+        if (allSteps.length + bolaAutoSteps >= dynamicStepBudget) break
         const alreadyPlanned = allSteps.some(s =>
           s.sourceOrigins.includes(origin) &&
           (s.skills.includes('bola-idor-race') || /\b(?:bola|idor|cross-persona)\b/i.test(s.title)),
@@ -2128,10 +2692,23 @@ export class Execution {
           skills: ['bola-idor-race', 'false-positive-elimination'],
           dependsOnFactIds: factIds,
           sourceOrigins: [origin],
+          specialistProfile: 'bola-bfla-specialist',
         })
         bolaAutoSteps += 1
       }
     }
+
+    const uncoveredEndpoints = this.storage.listEndpoints(run.id, { orderBy: 'coverage', limit: 25 })
+      .filter(ep => approvedOrigins.has(ep.origin))
+      .map(ep => ({
+        id: ep.id,
+        origin: ep.origin,
+        method: ep.method,
+        pathTemplate: ep.pathTemplate,
+        riskScore: ep.riskScore,
+        coveragePct: ep.coveragePct ?? 0,
+        testedClasses: ep.testedClasses,
+      }))
 
     const prompt = chainPlannerPrompt({
       goal: afterRound.goal,
@@ -2174,6 +2751,8 @@ export class Execution {
           proofGapReason: g.proofGapReason ?? g.summary,
         })),
       pendingFindings: pendingFindings.map(f => ({ id: f.id, origin: f.origin, title: f.title, status: f.status, severity: f.severity })),
+      uncoveredEndpoints,
+      dynamicStepBudget,
       budgetRemaining: {
         usd: Math.max(0, Number((afterRound.budgetUsd - afterRound.spentUsd).toFixed(4))),
         requests: afterRound.budgetRequests === 0
@@ -2186,9 +2765,9 @@ export class Execution {
       directory: this.storage.directory,
       sessionId: `planner-${run.id}-r${roundRes.roundNo}`,
       requestId: `planner:${afterRound.goalRevision}:${roundRes.roundNo}`,
-      profiles,
+      profiles: resolveProfilePoolForRole('tactical', profiles),
       scenario: 'chain-planner',
-      thinkingLevel: 'medium',
+      roleAffinity: 'tactical',
       prompt,
       signal: task.controller.signal,
       onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
@@ -2226,7 +2805,7 @@ export class Execution {
       }
     }
 
-    const remainingSlots = Math.max(0, maxChainStepsPerRun - existingSteps.length)
+    const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
     const budgetedNewSteps = applyCrownJewelStepBudget(
       parsedPlanner.data.newSteps.map(step => ({ ...step, origins: step.origins.filter(o => currentApproved.has(o)) })),
       hostTiers,
@@ -2240,6 +2819,12 @@ export class Execution {
         .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
         .map(c => c.id)
       if (!assetIds.length) continue
+      const specialistProfile = routeStepToSpecialist({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        skills: step.skills,
+      })
       this.storage.addChainStep(currentRun, {
         title: step.title,
         hypothesis: step.hypothesis,
@@ -2250,6 +2835,7 @@ export class Execution {
         dependsOnFactIds: step.dependsOnFactIds,
         dependsOnStepIds: step.dependsOnStepIds,
         sourceOrigins: validOrigins,
+        specialistProfile,
       })
       addedCount += 1
     }
@@ -2276,7 +2862,18 @@ export class Execution {
     const tm = this.storage.latestThreatModel(run.id, run.goalRevision)
     const approvedOriginsList = [...this.approvedOriginsSet(run)]
     const hostTiers = computeHostTiers(approvedOriginsList, tm?.entries)
-    const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, run.workerMaxTurns)
+    const resolvedSpecialistId = step.specialistProfile ?? routeStepToSpecialist({
+      title: step.title,
+      hypothesis: step.hypothesis,
+      category: step.category,
+      skills: step.skills,
+    })
+    const specialistConfig = resolveSpecialistProfile(resolvedSpecialistId)
+    const baseSpecialistTurns = Math.max(
+      25,
+      Math.min(specialistConfig.maxTurnsCeiling, run.workerMaxTurns > 0 ? Math.min(run.workerMaxTurns, specialistConfig.defaultMaxTurns) : specialistConfig.defaultMaxTurns),
+    )
+    const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, baseSpecialistTurns)
 
     const assignment = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {
@@ -2290,18 +2887,25 @@ export class Execution {
         lease: randomUUID(),
         leaseExpiresAt: Date.now() + intentLeaseMs,
       })!
-      this.storage.updateChainStep(step.id, { status: 'running', assignedWorkerId: claimed.id })
+      this.storage.updateChainStep(step.id, {
+        status: 'running',
+        assignedWorkerId: claimed.id,
+        specialistProfile: resolvedSpecialistId,
+      })
       this.storage.addGraphEdge(run.id, {
         fromKind: 'step', fromId: step.id, toKind: 'assignment', toId: claimed.id, edgeKind: 'spawns',
       })
-      this.storage.event(run.id, 'worker.started', `${step.title} started.`, { assignmentId: claimed.id, stepId: step.id })
+      this.storage.event(run.id, 'worker.started', `${step.title} started.`, {
+        assignmentId: claimed.id, stepId: step.id, specialistProfile: resolvedSpecialistId,
+      })
       return claimed
     }, { behavior: 'immediate' })
+    const effectiveStep: ChainStep = { ...step, specialistProfile: resolvedSpecialistId }
 
     const job: Active = { assignment, origins: new Set(targetOrigins), controller: new AbortController() }
     this.active.set(assignment.id, job)
 
-    void this.runInvestigationWorker(job, step, targetOrigins, profiles).catch(error => {
+    void this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles).catch(error => {
       if (error instanceof BudgetExceededError) {
         this.storage.checkBudgetExceeded(run.id)
         return
@@ -2362,7 +2966,7 @@ export class Execution {
       }
 
       const trackPersonaResources = (curRun: Run, res: BrokerExchangeResult, exchangeId: string) => {
-        if (curRun.capabilityTier < 2 || (grant.personas?.size ?? 0) < 2 || !res.personaHandle) return
+        if (!res.personaHandle) return
         const observedResources = extractPersonaResourcesFromExchange({
           origin: res.origin,
           method: res.method,
@@ -2373,6 +2977,44 @@ export class Execution {
           body: res.body,
         })
         if (!observedResources.length) return
+
+        // Always infer producer -> consumer edges in SQLite api_dependencies (hashed sample ID, never raw secret)
+        try {
+          const producerPath = normalizeEndpointTemplate(res.pathAndQuery.split('?')[0] || '/')
+          const producerEp = this.storage.upsertEndpoint({
+            runId: curRun.id,
+            scopeRevision: curRun.scopeRevision,
+            origin: res.origin,
+            method: res.method.toUpperCase(),
+            pathTemplate: producerPath,
+            source: 'surface_probe',
+          })
+          const originEndpoints = this.storage.listEndpoints(curRun.id, { origin: res.origin })
+          const basePrefix = producerPath.replace(/\/+$/, '')
+          for (const item of observedResources) {
+            const sampleHash = `sha256:${createHash('sha256').update(item.resourceId).digest('hex').slice(0, 16)}`
+            for (const cand of originEndpoints) {
+              if (cand.id === producerEp.id) continue
+              const tmpl = cand.pathTemplate
+              const extendsBase = basePrefix && basePrefix !== '/' &&
+                tmpl.startsWith(`${basePrefix}/`) &&
+                /(?::[a-zA-Z0-9_-]+|\{[a-zA-Z0-9_-]+\})/.test(tmpl.slice(basePrefix.length))
+              const matchesKey = item.field && !item.field.startsWith('path:') &&
+                (tmpl.includes(`:${item.field}`) || tmpl.includes(`{${item.field}}`))
+              if (!extendsBase && !matchesKey) continue
+              this.storage.recordApiDependency({
+                runId: curRun.id,
+                producerEndpointId: producerEp.id,
+                consumerEndpointId: cand.id,
+                resourceKey: item.field.replace(/^path:/, ''),
+                sampleResourceIdHash: sampleHash,
+                personaHandle: res.personaHandle,
+              })
+            }
+          }
+        } catch { /* best-effort dependency edge inference */ }
+
+        if (curRun.capabilityTier < 2 || (grant.personas?.size ?? 0) < 2) return
         let seenSet = this.recordedPersonaResources.get(curRun.id)
         if (!seenSet) {
           seenSet = new Set<string>()
@@ -2763,6 +3405,75 @@ export class Execution {
           return { evidenceId: ev.id, stagedPath, ...summaryObj }
         },
 
+        browser_session: async ({ steps }, signal) => {
+          const curRun = this.check(job)
+          if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Budget exceeded.')
+          const visits = await this.browser.runBrowserSession(
+            steps.map(s => ({
+              ...s,
+              runId: curRun.id,
+              assignmentId: job.assignment.id,
+              secrets: currentSecrets(),
+              onExchange: ex => {
+                const saved = this.storage.recordExchange({
+                  runId: curRun.id,
+                  assignmentId: job.assignment.id,
+                  scopeRevision: curRun.scopeRevision,
+                  origin: ex.origin,
+                  finalOrigin: ex.finalOrigin,
+                  redirectOrigins: ex.redirectOrigins,
+                  method: ex.method,
+                  pathAndQuery: ex.pathAndQuery,
+                  personaHandle: ex.personaHandle,
+                  status: ex.status,
+                  mediaType: ex.mediaType,
+                  reqHeaders: ex.reqHeaders,
+                  respHeaders: ex.respHeaders,
+                  body: ex.body,
+                  durationMs: ex.durationMs,
+                  secrets: currentSecrets(),
+                })
+                trackPersonaResources(curRun, ex, saved.id)
+                return saved.id
+              },
+            })),
+            grant,
+            signal,
+          )
+          const summarized = visits.map(({ exchanges: _ex, ...rest }) => ({
+            ...rest,
+            domSnippet: rest.domSnippet.slice(0, 2000),
+          }))
+          const ev = this.storage.addArtifact(curRun, job.assignment, 'browser',
+            `Browser session (${steps.length} steps)`,
+            JSON.stringify(summarized, null, 2), undefined, currentSecrets())
+          return { evidenceId: ev.id, stepsCount: visits.length, visits: summarized }
+        },
+
+        crawl_state_graph: async (args, signal) => {
+          const curRun = this.check(job)
+          if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Budget exceeded.')
+          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
+          const remainingReqs = curRun.budgetRequests > 0
+            ? Math.max(0, curRun.budgetRequests - curRun.spentRequests)
+            : undefined
+          const crawlRes = await crawlStateGraph({
+            storage: this.storage,
+            runId: curRun.id,
+            scopeRevision: curRun.scopeRevision,
+            origin: cleanOrigin,
+            personas: args.personas,
+            maxPages: args.maxPages,
+            maxDepth: args.maxDepth,
+            budgetRemaining: remainingReqs,
+            browser: this.browser,
+            grant,
+            signal,
+            assignmentId: job.assignment.id,
+          })
+          return crawlRes
+        },
+
         run_sast_scan: async (args, signal) => {
           const curRun = this.check(job)
           const res = await session.sast(args, signal)
@@ -3142,6 +3853,27 @@ export class Execution {
           return this.canaryBroker.checkCanary(token, { storage: this.storage, runId: curRun.id })
         },
 
+        mint_second_order_canary: async (args) => {
+          const curRun = this.check(job)
+          const cleanOrigin = this.parseOriginForRun(curRun, args.injectedOrigin)
+          const marker = `gn2o_${randomUUID().replaceAll('-', '').slice(0, 8)}`
+          const row = this.storage.insertSecondOrderCanary({
+            runId: curRun.id,
+            assignmentId: job.assignment.id,
+            marker,
+            injectedOrigin: cleanOrigin,
+            injectedEndpoint: args.injectedEndpoint,
+            injectedParam: args.injectedParam,
+            injectedPersona: args.injectedPersona ?? null,
+          })
+          return { id: row.id, marker }
+        },
+
+        list_second_order_canaries: async ({ status }) => {
+          const curRun = this.check(job)
+          return this.storage.listSecondOrderCanaries(curRun.id, status)
+        },
+
         search_exchanges: async ({ query, origin, status, limit }) => {
           const curRun = this.check(job)
           const currentApproved = this.approvedOriginsSet(curRun)
@@ -3347,30 +4079,44 @@ export class Execution {
             }
           }
 
+          const dbDupRow = this.storage.findDuplicateChainFinding(curRun.id, curRun.goalRevision, {
+            origin: parsed.origin,
+            cwe: parsed.cwe,
+            category: parsed.category,
+            title: parsed.title,
+          })
+          const matchedCandidates = [matchedRow, dbDupRow].filter(
+            (row, idx, arr): row is NonNullable<typeof row> =>
+              Boolean(row) && arr.findIndex(other => other?.id === row!.id) === idx,
+          )
+          const verifiedMatch = matchedCandidates.find(
+            r => r.finding.status === 'confirmed' || r.finding.status === 'static_verified',
+          )
+
           // Preserve Zero-LLM invariant: if upgrading/merging into an already-confirmed finding, keep confirmed severity
           // until a new replay spec independently verifies higher impact.
-          if (matchedRow && (matchedRow.finding.status === 'confirmed' || matchedRow.finding.status === 'static_verified')) {
+          if (verifiedMatch) {
             const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
               `Additional corroborating spec · ${parsed.title}`,
-              JSON.stringify({ existingFindingId: matchedRow.id, dedupeStage: dedupeDecision.stage, spec: parsed }, null, 2),
+              JSON.stringify({ existingFindingId: verifiedMatch.id, dedupeStage: dedupeDecision.stage, spec: parsed }, null, 2),
               undefined, currentSecrets())
             const merged = this.storage.upsertChainFinding(
               curRun,
-              matchedRow.assetId,
+              verifiedMatch.assetId,
               {
-                ...matchedRow.finding,
-                severity: matchedRow.finding.severity,
-                fingerprintHash: matchedRow.fingerprintHash ?? dedupeDecision.fingerprintHash,
-                counterevidence: ext.counterevidence ?? matchedRow.counterevidence ?? matchedRow.finding.counterevidence,
-                confidenceRationale: ext.confidenceRationale ?? matchedRow.confidenceRationale ?? matchedRow.finding.confidenceRationale,
-                severityChangeConditions: ext.severityChangeConditions ?? matchedRow.severityChangeConditions ?? matchedRow.finding.severityChangeConditions,
+                ...verifiedMatch.finding,
+                severity: verifiedMatch.finding.severity,
+                fingerprintHash: verifiedMatch.fingerprintHash ?? dedupeDecision.fingerprintHash,
+                counterevidence: ext.counterevidence ?? verifiedMatch.counterevidence ?? verifiedMatch.finding.counterevidence,
+                confidenceRationale: ext.confidenceRationale ?? verifiedMatch.confidenceRationale ?? verifiedMatch.finding.confidenceRationale,
+                severityChangeConditions: ext.severityChangeConditions ?? verifiedMatch.severityChangeConditions ?? verifiedMatch.finding.severityChangeConditions,
                 ...(ext.codeLocations?.length ? { codeLocations: ext.codeLocations } : {}),
-                chainFactIds: [...new Set([...(matchedRow.finding.chainFactIds ?? []), ...validFactIds])],
-                exchangeIds: [...new Set([...(matchedRow.finding.exchangeIds ?? []), ...exchangeIds])],
-                evidenceIds: [...new Set([...matchedRow.finding.evidenceIds, ev.id])],
+                chainFactIds: [...new Set([...(verifiedMatch.finding.chainFactIds ?? []), ...validFactIds])],
+                exchangeIds: [...new Set([...(verifiedMatch.finding.exchangeIds ?? []), ...exchangeIds])],
+                evidenceIds: [...new Set([...verifiedMatch.finding.evidenceIds, ev.id])],
                 scopeRevision: curRun.scopeRevision,
               },
-              matchedRow.replaySpecId ?? matchedRow.finding.replaySpecId ?? '',
+              verifiedMatch.replaySpecId ?? verifiedMatch.finding.replaySpecId ?? '',
               [...sourceOrigins],
             )
             return {
@@ -3380,6 +4126,40 @@ export class Execution {
               deduplicated: true,
               stage: dedupeDecision.stage,
               note: `Merged corroborating evidence into existing verified finding ${merged.id}. Call update_proposed_finding if you need to replace its Replay Spec.`,
+            }
+          }
+
+          const canonicalMatchedRow = matchedRow ?? dbDupRow
+          const maxAttempts = 1 + maxInlineVerifyRetries
+          const priorMaxAttempts = canonicalMatchedRow
+            ? Math.max(
+                0,
+                ...matchedCandidates.flatMap(r =>
+                  this.storage.listReplaySpecsForFinding(curRun.id, r.id).map(s => s.attemptCount),
+                ),
+              )
+            : 0
+          if (canonicalMatchedRow && priorMaxAttempts >= maxAttempts) {
+            return {
+              findingId: canonicalMatchedRow.id,
+              replaySpecId: canonicalMatchedRow.replaySpecId,
+              status: canonicalMatchedRow.finding.status,
+              ...(canonicalMatchedRow.verificationTier ? { verificationTier: canonicalMatchedRow.verificationTier } : {}),
+              severity: canonicalMatchedRow.finding.severity,
+              deduplicated: true,
+              rejected: true,
+              isError: true,
+              inlineVerifyFeedback: {
+                verdict: 'inconclusive',
+                controlPassed: false,
+                assertionSummary: {
+                  observed: 'retry_limit_exceeded',
+                  expected: `<= ${maxAttempts} verification attempts`,
+                  reason: `Inline verification retry limit reached for existing finding ${canonicalMatchedRow.id} (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
+                },
+                stepStatuses: [],
+                retriesRemaining: 0,
+              } satisfies InlineVerifyFeedback,
             }
           }
 
@@ -3395,8 +4175,16 @@ export class Execution {
                 }]
               : undefined
 
-          const findingId = matchedRow?.id ?? randomUUID()
-          const specRow = this.storage.createReplaySpec(curRun, job.assignment, findingId, parsed, [...sourceOrigins])
+          const findingId = canonicalMatchedRow?.id ?? randomUUID()
+          const verifyNow = args.verifyNow ?? true
+          const specRow = this.storage.createReplaySpec(
+            curRun,
+            job.assignment,
+            findingId,
+            parsed,
+            [...sourceOrigins],
+            { initialAttemptCount: canonicalMatchedRow ? priorMaxAttempts : 0 },
+          )
           const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
             `Proposed replay spec · ${parsed.title}`,
             JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
@@ -3434,11 +4222,37 @@ export class Execution {
           }
           this.storage.addGraphEdge(curRun.id, { fromKind: 'assignment', fromId: job.assignment.id, toKind: 'finding', toId: savedFinding.id, edgeKind: 'proves' })
           this.schedulePlanner(curRun.id)
+
+          if (verifyNow) {
+            const inline = await this.executeInlineVerification({
+              job,
+              grant,
+              currentSecrets,
+              reposDir,
+              spec: parsed,
+              findingId: savedFinding.id,
+              replaySpecId: specRow.id,
+              onExchangeObserved: trackPersonaResources,
+            })
+            return {
+              findingId: savedFinding.id,
+              replaySpecId: inline.replaySpecId,
+              status: inline.status,
+              verificationTier: inline.verificationTier,
+              inlineVerifyFeedback: inline.feedback,
+              deduplicated: Boolean(canonicalMatchedRow),
+              upgraded: dedupeDecision.action === 'upgrade_existing',
+              note: inline.status === 'confirmed' || inline.status === 'static_verified'
+                ? `Inline Zero-LLM verification succeeded (${inline.status}).`
+                : `Inline Zero-LLM verification returned ${inline.status}. Inspect inlineVerifyFeedback and call verify_replay_spec or update_proposed_finding to repair (${inline.feedback.retriesRemaining} retries remaining).`,
+            }
+          }
+
           return {
             findingId: savedFinding.id,
             replaySpecId: specRow.id,
             status: savedFinding.status,
-            deduplicated: Boolean(matchedRow),
+            deduplicated: Boolean(canonicalMatchedRow),
             upgraded: dedupeDecision.action === 'upgrade_existing',
             note: isStaticAst
               ? 'Candidate static_ast_proof queued for deterministic offline AST/SAST verification (can promote to static_verified only, never runtime confirmed).'
@@ -3458,6 +4272,8 @@ export class Execution {
           let nextReplaySpecId = existingRow.replaySpecId ?? undefined
           let nextSourceOrigins = existingRow.sourceOrigins
           const extraEvidenceIds: string[] = []
+          let parsedUpdatedSpec: DeclarativeReplaySpec | undefined
+          let createdSpecRowId: string | undefined
 
           if (args.replaySpec) {
             const parsed = declarativeReplaySpecSchema.parse(args.replaySpec)
@@ -3465,8 +4281,42 @@ export class Execution {
             if (specOrigins.some(o => !currentApproved.has(o))) {
               throw new BrokerDenied('Updated replay spec references an origin outside current approved scope.')
             }
+            parsedUpdatedSpec = parsed
             nextSourceOrigins = [...new Set([...existingRow.sourceOrigins, ...specOrigins])]
-            const specRow = this.storage.createReplaySpec(curRun, job.assignment, existingRow.id, parsed, nextSourceOrigins)
+            const priorSpecs = this.storage.listReplaySpecsForFinding(curRun.id, existingRow.id)
+            const priorMaxAttempts = priorSpecs.length ? Math.max(...priorSpecs.map(r => r.attemptCount)) : 0
+            const maxAttempts = 1 + maxInlineVerifyRetries
+            if (!isAlreadyVerified && priorMaxAttempts >= maxAttempts) {
+              return {
+                findingId: existingRow.id,
+                replaySpecId: existingRow.replaySpecId,
+                status: existingRow.finding.status,
+                ...(existingRow.verificationTier ? { verificationTier: existingRow.verificationTier } : {}),
+                severity: existingRow.finding.severity,
+                inlineVerifyFeedback: {
+                  verdict: 'inconclusive',
+                  controlPassed: false,
+                  assertionSummary: {
+                    observed: 'retry_limit_exceeded',
+                    expected: `<= ${maxAttempts} verification attempts`,
+                    reason: `Inline verification retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
+                  },
+                  stepStatuses: [],
+                  retriesRemaining: 0,
+                } satisfies InlineVerifyFeedback,
+                updated: false,
+                isError: true,
+              }
+            }
+            const specRow = this.storage.createReplaySpec(
+              curRun,
+              job.assignment,
+              existingRow.id,
+              parsed,
+              nextSourceOrigins,
+              { initialAttemptCount: priorMaxAttempts },
+            )
+            createdSpecRowId = specRow.id
             const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
               `Updated replay spec · ${parsed.title}`,
               JSON.stringify({ findingId: existingRow.id, replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
@@ -3495,12 +4345,58 @@ export class Execution {
               ...(extraEvidenceIds.length ? { evidenceIds: extraEvidenceIds } : {}),
             },
           })
+
+          const shouldVerifyNow = Boolean(parsedUpdatedSpec && (args.verifyNow ?? true) && !isAlreadyVerified)
+          if (shouldVerifyNow && parsedUpdatedSpec) {
+            const inline = await this.executeInlineVerification({
+              job,
+              grant,
+              currentSecrets,
+              reposDir,
+              spec: parsedUpdatedSpec,
+              findingId: existingRow.id,
+              replaySpecId: createdSpecRowId ?? nextReplaySpecId,
+              onExchangeObserved: trackPersonaResources,
+            })
+            return {
+              findingId: updated.id,
+              replaySpecId: inline.replaySpecId,
+              status: inline.status,
+              verificationTier: inline.verificationTier,
+              severity: updated.severity,
+              inlineVerifyFeedback: inline.feedback,
+              updated: true,
+            }
+          }
+
           return {
             findingId: updated.id,
             replaySpecId: updated.replaySpecId,
             status: updated.status,
             severity: updated.severity,
             updated: true,
+          }
+        },
+
+        verify_replay_spec: async (args) => {
+          const spec = args.spec ?? args.replaySpec
+          if (!spec) throw new Error('verify_replay_spec requires spec or replaySpec.')
+          const inline = await this.executeInlineVerification({
+            job,
+            grant,
+            currentSecrets,
+            reposDir,
+            spec,
+            findingId: args.findingId,
+            replaySpecId: args.replaySpecId,
+            onExchangeObserved: trackPersonaResources,
+          })
+          return {
+            findingId: inline.findingId ?? args.findingId ?? null,
+            replaySpecId: inline.replaySpecId,
+            status: inline.status,
+            ...(inline.verificationTier ? { verificationTier: inline.verificationTier } : {}),
+            inlineVerifyFeedback: inline.feedback,
           }
         },
 
@@ -3525,17 +4421,28 @@ export class Execution {
           )
         : []
 
+      const specialistProfileId = step.specialistProfile ?? routeStepToSpecialist({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        skills: step.skills,
+      })
+      const specialistConfig = resolveSpecialistProfile(specialistProfileId)
+      const scopedHandlers = filterHandlersForSpecialist(handlers, specialistConfig)
+
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: job.assignment.sessionId,
         requestId: `investigate:${step.id}:attempt-${job.assignment.attempt}`,
-        profiles,
+        profiles: resolveProfilePoolForRole(specialistConfig.roleAffinity, profiles),
         scenario: 'worker-investigation',
+        roleAffinity: specialistConfig.roleAffinity,
         prompt: workerInvestigationPrompt({
           goal: run.goal,
           step: {
             id: step.id, title: step.title, hypothesis: step.hypothesis,
-            category: step.category, skills: step.skills,
+            category: step.category, skills: [...new Set([...step.skills, ...specialistConfig.skills])],
+            specialistProfile: specialistProfileId,
           },
           origins: targetOrigins,
           capabilityTier: run.capabilityTier,
@@ -3550,12 +4457,11 @@ export class Execution {
         }),
         signal: job.controller.signal,
         maxTurns: job.assignment.maxTurns,
-        thinkingLevel: 'medium',
         compaction: true,
         enableSettlement: true,
         requireCompleteIntent: true,
         shouldSettle: () => (Date.now() - startedAt) >= intentLeaseMs * 0.85,
-        handlers,
+        handlers: scopedHandlers,
         secrets,
         beforeCall: () => {
           this.check(job)
@@ -3582,7 +4488,7 @@ export class Execution {
         ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary}`
         : sessionResult.answer
       this.storage.transaction(() => {
-        this.completeWorker(job.assignment, latestRun, outcomeText, [])
+        this.completeWorker(job.assignment, latestRun, outcomeText, [], undefined, currentSecrets())
         this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
     } finally {
@@ -3634,7 +4540,29 @@ export class Execution {
       f.sourceOrigins.every(o => approvedOrigins.has(o)),
     )
 
+    const ownedRefineSpecIds = new Set<string>()
+    for (const w of workers) {
+      if (w.phase === 'verification' && w.stepId?.startsWith('refine:') &&
+          w.status !== 'complete' && w.status !== 'canceled' && w.status !== 'failed') {
+        ownedRefineSpecIds.add(w.stepId.slice('refine:'.length))
+      }
+    }
+    for (const activeJob of this.active.values()) {
+      if (activeJob.assignment.runId === run.id &&
+          activeJob.assignment.phase === 'verification' &&
+          activeJob.assignment.stepId?.startsWith('refine:')) {
+        ownedRefineSpecIds.add(activeJob.assignment.stepId.slice('refine:'.length))
+      }
+    }
+    const refinedFindingIds = new Set<string>()
+    if (ownedRefineSpecIds.size > 0) {
+      for (const s of this.storage.listReplaySpecs(run.id)) {
+        if (ownedRefineSpecIds.has(s.id)) refinedFindingIds.add(s.findingId)
+      }
+    }
+
     for (const row of pendingFindings) {
+      if (refinedFindingIds.has(row.id)) continue
       const existing = workers.find(w => w.phase === 'verification' && w.stepId === row.replaySpecId && w.status !== 'canceled')
       if (!existing) {
         const asset = run.candidates.find(c => c.id === row.assetId)
@@ -3703,7 +4631,9 @@ export class Execution {
     this.active.set(claimed.id, job)
 
     const work = claimed.stepId
-      ? this.verifyReplaySpecJob(job, claimed.stepId)
+      ? (claimed.stepId.startsWith('refine:')
+          ? this.runPhase3RefinementJob(job, claimed.stepId.slice('refine:'.length))
+          : this.verifyReplaySpecJob(job, claimed.stepId))
       : this.verifyBaselineJob(job)
 
     void work.catch(error => {
@@ -3790,7 +4720,7 @@ export class Execution {
           confidence: 'low',
         }
         this.storage.upsertChainFinding(current, findingRow.assetId, updatedFinding, specRow.id, specRow.sourceOrigins)
-        this.completeWorker(job.assignment, current, 'Inconclusive: Tier 3 approval denied.', [])
+        this.completeWorker(job.assignment, current, 'Inconclusive: Tier 3 approval denied.', [], undefined, secrets)
         return
       }
     }
@@ -3872,39 +4802,816 @@ export class Execution {
           }]
         : findingRow.finding.codeLocations
 
+      const secretsList = currentSecrets()
+      const cleanReason = redact(result.outcome.reason || result.outcome.observed || findingRow.finding.reason, secretsList)
+      const cleanObserved = redact(result.outcome.observed, secretsList)
       const updatedFinding: Finding = {
         ...findingRow.finding,
         status: finalStatus,
         verificationTier,
-        reason: result.outcome.reason || result.outcome.observed || findingRow.finding.reason,
+        reason: cleanReason,
         confidence: (finalStatus === 'confirmed' || finalStatus === 'static_verified')
           ? 'high'
           : finalStatus === 'dismissed'
             ? 'medium'
             : 'low',
-        verification: `${isStaticAst ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${specRow.spec.kind} replay`} verdict: ${finalStatus} (controlPassed=${result.outcome.controlPassed}, observed: ${result.outcome.observed}).`,
+        verification: `${isStaticAst ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${specRow.spec.kind} replay`} verdict: ${finalStatus} (controlPassed=${result.outcome.controlPassed}, observed: ${cleanObserved}).`,
         ...(staticSpec ? { runtimeProofGap: staticSpec.runtimeProofGap } : {}),
         ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
         evidenceIds: [...new Set([...findingRow.finding.evidenceIds, receipt.id])],
         exchangeIds: [...new Set([...(findingRow.finding.exchangeIds ?? []), ...result.exchangeIds])],
         scopeRevision: current.scopeRevision,
       }
-      this.storage.upsertChainFinding(current, findingRow.assetId, updatedFinding, specRow.id, specRow.sourceOrigins)
+      if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
+        this.storage.upsertChainFinding(current, findingRow.assetId, updatedFinding, specRow.id, specRow.sourceOrigins)
+        if (owaspCategories.includes(specRow.spec.category as OwaspCategory) &&
+            this.permitted(current, specRow.spec.origin)) {
+          this.storage.upsertCoverageEntry(current, job.assignment.id, {
+            origin: specRow.spec.origin,
+            category: specRow.spec.category as OwaspCategory,
+            status: 'reported',
+            summary: `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${specRow.spec.title}`,
+            linkedFindingId: findingRow.id,
+          })
+        }
+        const refreshedRow = this.storage.db.select().from(findings).where(and(
+          eq(findings.runId, current.id), eq(findings.id, findingRow.id),
+        )).get()
+        if (refreshedRow) this.scheduleVariantSweepForFinding(current, refreshedRow)
+      } else {
+        const rawFeedback = buildInlineVerifyFeedback(
+          specRow.spec,
+          result,
+          Math.max(1, specRow.attemptCount),
+          maxInlineVerifyRetries,
+          currentSecrets(),
+        )
+        this.storage.db.update(replaySpecs).set({
+          lastVerificationDiff: rawFeedback,
+        }).where(eq(replaySpecs.id, specRow.id)).run()
+        this.storage.updateProposedFinding(current, findingRow.id, {
+          verificationTier: null,
+          finding: updatedFinding,
+        })
 
-      if ((finalStatus === 'confirmed' || finalStatus === 'static_verified') &&
-          owaspCategories.includes(specRow.spec.category as OwaspCategory) &&
-          this.permitted(current, specRow.spec.origin)) {
-        this.storage.upsertCoverageEntry(current, job.assignment.id, {
-          origin: specRow.spec.origin,
-          category: specRow.spec.category as OwaspCategory,
-          status: 'reported',
-          summary: `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${specRow.spec.title}`,
-          linkedFindingId: findingRow.id,
+        const refineStepId = `refine:${specRow.id}`
+        const alreadyQueuedRefine = this.storage.workerList(current.id).some(w =>
+          w.phase === 'verification' && w.stepId === refineStepId,
+        )
+        const canRefine =
+          current.capabilityTier > 0 &&
+          !this.storage.checkBudgetExceeded(current.id) &&
+          privateModelProfiles(this.storage).length > 0 &&
+          !alreadyQueuedRefine &&
+          specRow.sourceOrigins.every(o => permittedAtAdmission.has(o))
+        if (canRefine) {
+          const asset = current.candidates.find(c => c.id === findingRow.assetId)
+          this.storage.makeWorker(
+            current,
+            'verification',
+            asset,
+            `Refine replay · ${specRow.spec.title.slice(0, 75)}`,
+            `Bounded 8-turn Phase-3 refinement for failed ${specRow.spec.kind} spec ${specRow.id}.`,
+            {
+              stepId: refineStepId,
+              input: job.assignment,
+              maxTurns: 8,
+              sourceOrigins: specRow.sourceOrigins,
+            },
+          )
+        }
+      }
+      this.completeWorker(
+        job.assignment,
+        current,
+        `Replay verdict: ${finalStatus} (${cleanObserved.slice(0, 160)})`,
+        [receipt.id],
+        undefined,
+        secretsList,
+      )
+    }, { behavior: 'immediate' })
+  }
+
+  private async executeInlineVerification(params: {
+    job: Active
+    grant: Grant
+    currentSecrets: () => readonly NamedSecret[]
+    reposDir?: string
+    spec: DeclarativeReplaySpec
+    findingId?: string
+    replaySpecId?: string
+    phase3RefinementAttempt?: number
+    onExchangeObserved?: (curRun: Run, ex: BrokerExchangeResult, exchangeId: string) => void
+  }): Promise<{
+    findingId?: string
+    replaySpecId: string
+    attemptCount: number
+    status: Finding['status']
+    verificationTier?: VerificationTier
+    feedback: InlineVerifyFeedback
+    artifactId?: string
+  }> {
+    const curRun = this.check(params.job)
+    if (this.storage.checkBudgetExceeded(curRun.id)) {
+      throw new BudgetExceededError('Run spend or request budget exceeded.')
+    }
+    const parsed = declarativeReplaySpecSchema.parse(params.spec)
+    const specOrigins = replaySpecOrigins(parsed)
+    const currentApproved = this.approvedOriginsSet(curRun)
+    if (specOrigins.some(o => !currentApproved.has(o))) {
+      throw new BrokerDenied('Replay spec references an origin outside current approved scope.')
+    }
+
+    const findingRow = params.findingId
+      ? this.storage.db.select().from(findings).where(and(
+          eq(findings.runId, curRun.id), eq(findings.id, params.findingId),
+        )).get()
+      : undefined
+    const isAlreadyVerified = Boolean(
+      findingRow && (findingRow.finding.status === 'confirmed' || findingRow.finding.status === 'static_verified'),
+    )
+
+    const standaloneKey = !params.findingId
+      ? 'inline:' + params.job.assignment.id + ':' + createHash('sha256')
+          .update(`${parsed.kind}|${parsed.origin}|${parsed.cwe}|${parsed.title.trim().toLowerCase()}`)
+          .digest('hex').slice(0, 16)
+      : undefined
+    const trackingFindingId = findingRow?.id ?? params.findingId ?? standaloneKey!
+
+    let specRow: ReplaySpecRow | undefined
+    if (params.replaySpecId) {
+      specRow = this.storage.getReplaySpec(curRun.id, params.replaySpecId)
+    }
+    const existingForFinding = this.storage.listReplaySpecsForFinding(curRun.id, trackingFindingId)
+    if (!specRow) {
+      specRow = existingForFinding[0]
+    }
+    if (!specRow) {
+      specRow = this.storage.createReplaySpec(
+        curRun,
+        params.job.assignment,
+        trackingFindingId,
+        parsed,
+        specOrigins.length ? specOrigins : [parsed.origin],
+        { initialAttemptCount: 0 },
+      )
+    }
+
+    const currentAttempts = Math.max(
+      specRow.attemptCount,
+      ...existingForFinding.map(r => r.attemptCount),
+      0,
+    )
+    const nextAttempt = params.phase3RefinementAttempt ?? (currentAttempts + 1)
+    const maxAttempts = 1 + maxInlineVerifyRetries
+
+    if (nextAttempt <= maxAttempts) {
+      if ((parsed.kind === 'rce_proof' && parsed.proofMode === 'oob_canary') || this.isCanaryListenerConfigured()) {
+        await this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() }).catch(() => undefined)
+      }
+      if (parsed.kind === 'rce_proof' || parsed.kind === 'upload_probe') {
+        const gateReq = parsed.kind === 'rce_proof'
+          ? {
+              origin: parsed.probeStep.request.origin,
+              method: parsed.probeStep.request.method,
+              pathAndQuery: parsed.probeStep.request.pathAndQuery,
+              personaHandle: parsed.probeStep.request.persona ?? null,
+              rationale: `[rce_proof:${parsed.proofMode}] Inline Zero-LLM verification for "${parsed.title}"`,
+              requestPreview: JSON.stringify({
+                proofMode: parsed.proofMode,
+                controlStep: parsed.controlStep,
+                probeStep: parsed.probeStep,
+              }, null, 2),
+              bodyPreview: parsed.probeStep.request.textBody ??
+                (parsed.probeStep.request.jsonBody !== undefined
+                  ? JSON.stringify(parsed.probeStep.request.jsonBody)
+                  : undefined),
+              hasMultipart: false,
+              isRceProof: true,
+            }
+          : {
+              origin: parsed.uploadStep.origin,
+              method: parsed.uploadStep.method,
+              pathAndQuery: parsed.uploadStep.pathAndQuery,
+              personaHandle: parsed.uploadStep.persona ?? null,
+              rationale: `[upload_probe] Inline Zero-LLM verification for "${parsed.title}"`,
+              requestPreview: JSON.stringify({
+                filename: parsed.uploadStep.filename,
+                contentType: parsed.uploadStep.contentType,
+                uploadStep: parsed.uploadStep.pathAndQuery,
+                fetchStep: parsed.fetchStep.request.pathAndQuery,
+              }, null, 2),
+              bodyPreview: parsed.uploadStep.contentTemplate,
+              hasMultipart: true,
+              isRceProof: false,
+            }
+        const approval = await this.waitForTier3Approval(params.job, {
+          ...gateReq,
+          secrets: params.currentSecrets(),
+        }, params.job.controller.signal)
+        if (!approval.approved) {
+          const deniedReason = approval.deniedReason
+            ? `Tier 3 Safety Judge denied ${parsed.kind} verification: ${approval.deniedReason}`
+            : `Tier 3 approval for ${parsed.kind} verification was denied or expired.`
+          const deniedFeedback = redactJsonValue({
+            verdict: 'inconclusive',
+            controlPassed: false,
+            assertionSummary: {
+              observed: 'tier3_approval_denied',
+              expected: 'Tier 3 approval granted',
+              reason: deniedReason,
+            },
+            stepStatuses: [],
+            retriesRemaining: Math.max(0, maxAttempts - nextAttempt),
+          } satisfies InlineVerifyFeedback, params.currentSecrets())
+          const updatedSpec = this.storage.incrementReplaySpecAttempt(specRow.id, deniedFeedback, {
+            spec: parsed,
+            sourceOrigins: [...new Set([...specRow.sourceOrigins, ...specOrigins])],
+            secrets: params.currentSecrets(),
+          })
+          if (findingRow && !isAlreadyVerified) {
+            const latestRun = this.check(params.job)
+            this.storage.updateProposedFinding(latestRun, findingRow.id, {
+              replaySpecId: updatedSpec.id,
+              verificationTier: null,
+              finding: { status: 'inconclusive', verificationTier: undefined, reason: deniedReason, confidence: 'low' },
+            })
+          }
+          return {
+            findingId: findingRow?.id,
+            replaySpecId: updatedSpec.id,
+            attemptCount: updatedSpec.attemptCount,
+            status: findingRow && isAlreadyVerified ? findingRow.finding.status : 'inconclusive',
+            feedback: deniedFeedback,
+          }
+        }
+      }
+    }
+
+    const { feedback, replay } = await verifyReplaySpecInline({
+      spec: parsed,
+      broker: this.broker,
+      browser: this.browser,
+      canaryBroker: this.canaryBroker,
+      backend: this.backend,
+      reposDir: params.reposDir,
+      grant: params.grant,
+      signal: params.job.controller.signal,
+      storage: this.storage,
+      runId: curRun.id,
+      assignmentId: params.job.assignment.id,
+      findingId: findingRow?.id,
+      attemptCount: nextAttempt,
+      maxRetries: maxInlineVerifyRetries,
+      secrets: params.currentSecrets(),
+      onExchange: ex => {
+        const latest = this.check(params.job)
+        const saved = this.storage.recordExchange({
+          runId: latest.id,
+          assignmentId: params.job.assignment.id,
+          scopeRevision: latest.scopeRevision,
+          origin: ex.origin,
+          finalOrigin: ex.finalOrigin,
+          redirectOrigins: ex.redirectOrigins,
+          method: ex.method,
+          pathAndQuery: ex.pathAndQuery,
+          personaHandle: ex.personaHandle,
+          status: ex.status,
+          mediaType: ex.mediaType,
+          reqHeaders: ex.reqHeaders,
+          respHeaders: ex.respHeaders,
+          body: ex.body,
+          durationMs: ex.durationMs,
+          secrets: params.currentSecrets(),
+        })
+        params.onExchangeObserved?.(latest, ex, saved.id)
+        return saved.id
+      },
+    })
+
+    if (nextAttempt > maxAttempts) {
+      return {
+        findingId: findingRow?.id,
+        replaySpecId: specRow.id,
+        attemptCount: currentAttempts,
+        status: findingRow?.finding.status ?? 'inconclusive',
+        verificationTier: findingRow?.verificationTier ?? undefined,
+        feedback,
+      }
+    }
+
+    const isStaticAst = parsed.kind === 'static_ast_proof'
+    const rawVerdict = replay.verdict as Finding['status']
+    const finalStatus: Finding['status'] = isStaticAst
+      ? (rawVerdict === 'confirmed' || rawVerdict === 'static_verified' ? 'static_verified' : rawVerdict)
+      : rawVerdict
+    const verificationTier: VerificationTier | undefined = finalStatus === 'static_verified'
+      ? 'static_verified'
+      : finalStatus === 'confirmed'
+        ? 'runtime_confirmed'
+        : undefined
+    const normalizedFeedback: InlineVerifyFeedback = {
+      ...feedback,
+      verdict: finalStatus as InlineVerifyFeedback['verdict'],
+      ...(verificationTier ? { verificationTier } : {}),
+    }
+
+    const latestRun = this.check(params.job)
+    const updatedSpec = this.storage.incrementReplaySpecAttempt(specRow.id, normalizedFeedback, {
+      spec: parsed,
+      sourceOrigins: [...new Set([...specRow.sourceOrigins, ...specOrigins])],
+      secrets: params.currentSecrets(),
+    })
+
+    const receipt = this.storage.addArtifact(
+      latestRun,
+      params.job.assignment,
+      'replay',
+      `Inline ${isStaticAst ? 'Static AST' : 'Zero-LLM replay'} attempt #${updatedSpec.attemptCount} · ${parsed.title}`,
+      JSON.stringify({
+        replaySpecId: updatedSpec.id,
+        attemptCount: updatedSpec.attemptCount,
+        specSha256: updatedSpec.specSha256,
+        kind: parsed.kind,
+        origin: parsed.origin,
+        verdict: finalStatus,
+        verificationTier: verificationTier ?? null,
+        outcome: replay.outcome,
+        feedback: normalizedFeedback,
+        exchangeIds: replay.exchangeIds,
+        evidenceSha256: replay.evidenceSha256,
+        evidencePayload: replay.evidencePayload,
+      }, null, 2),
+      undefined,
+      params.currentSecrets(),
+    )
+
+    if (findingRow && !isAlreadyVerified) {
+      const staticCodeLocations: CodeLocation[] | undefined = parsed.kind === 'static_ast_proof'
+        ? [{
+            repo: parsed.repo,
+            file: parsed.file,
+            startLine: parsed.startLine,
+            endLine: parsed.endLine,
+            label: parsed.sourceToSinkTrace?.slice(0, 180),
+          }]
+        : findingRow.finding.codeLocations
+      const mergedOrigins = [...new Set([...findingRow.sourceOrigins, ...specOrigins])]
+      const secretsList = params.currentSecrets()
+      const cleanReason = redact(replay.outcome.reason || replay.outcome.observed || findingRow.finding.reason, secretsList)
+      const cleanObserved = redact(replay.outcome.observed, secretsList)
+      const nextFindingPatch: Partial<Finding> = {
+        status: finalStatus,
+        verificationTier,
+        reason: cleanReason,
+        confidence: (finalStatus === 'confirmed' || finalStatus === 'static_verified')
+          ? 'high'
+          : finalStatus === 'dismissed'
+            ? 'medium'
+            : 'low',
+        verification: `${isStaticAst ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${parsed.kind} inline replay`} verdict: ${finalStatus} (controlPassed=${replay.outcome.controlPassed}, observed: ${cleanObserved}).`,
+        ...(parsed.kind === 'static_ast_proof' ? { runtimeProofGap: parsed.runtimeProofGap } : {}),
+        ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
+        evidenceIds: [receipt.id],
+        exchangeIds: replay.exchangeIds,
+      }
+      if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
+        this.storage.upsertChainFinding(
+          latestRun,
+          findingRow.assetId,
+          { ...findingRow.finding, ...nextFindingPatch, replaySpecId: updatedSpec.id, scopeRevision: latestRun.scopeRevision },
+          updatedSpec.id,
+          mergedOrigins,
+        )
+        if (owaspCategories.includes(parsed.category as OwaspCategory) && this.permitted(latestRun, parsed.origin)) {
+          this.storage.upsertCoverageEntry(latestRun, params.job.assignment.id, {
+            origin: parsed.origin,
+            category: parsed.category as OwaspCategory,
+            status: 'reported',
+            summary: `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${parsed.title}`,
+            linkedFindingId: findingRow.id,
+          })
+        }
+        // Multi-Trial Early Stopping: cancel sibling trials immediately on first Zero-LLM confirmation
+        this.cancelSiblingTrialsOnConfirmation(latestRun, params.job.assignment.stepId, findingRow.id)
+        const refreshedRow = this.storage.db.select().from(findings).where(and(
+          eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
+        )).get()
+        if (refreshedRow) this.scheduleVariantSweepForFinding(latestRun, refreshedRow)
+      } else {
+        this.storage.updateProposedFinding(latestRun, findingRow.id, {
+          replaySpecId: updatedSpec.id,
+          sourceOrigins: mergedOrigins,
+          verificationTier: null,
+          finding: nextFindingPatch,
         })
       }
-      this.completeWorker(job.assignment, current,
-        `Replay verdict: ${finalStatus} (${result.outcome.observed.slice(0, 160)})`, [receipt.id])
-    }, { behavior: 'immediate' })
+    }
+
+    return {
+      findingId: findingRow?.id,
+      replaySpecId: updatedSpec.id,
+      attemptCount: updatedSpec.attemptCount,
+      status: findingRow && isAlreadyVerified ? findingRow.finding.status : finalStatus,
+      verificationTier: findingRow && isAlreadyVerified
+        ? (findingRow.verificationTier ?? undefined)
+        : verificationTier,
+      feedback: normalizedFeedback,
+      artifactId: receipt.id,
+    }
+  }
+
+  private async runPhase3RefinementJob(job: Active, replaySpecId: string) {
+    const run = this.check(job)
+    const specRow = this.storage.getReplaySpec(run.id, replaySpecId)
+    const findingRow = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id), eq(findings.id, specRow.findingId),
+    )).get()
+    if (!findingRow) {
+      this.completeWorker(job.assignment, run, 'Finding no longer exists.', [])
+      return
+    }
+    if (findingRow.finding.status === 'confirmed' || findingRow.finding.status === 'static_verified') {
+      this.completeWorker(job.assignment, run, `Finding already ${findingRow.finding.status}.`, [])
+      return
+    }
+
+    const permittedAtAdmission = this.approvedOriginsSet(run)
+    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, permittedAtAdmission)
+    const { reposDir } = this.projectReposMount(run.projectId)
+    const allProfiles = privateModelProfiles(this.storage)
+    const reasoningPool = resolveProfilePoolForRole('reasoning', allProfiles)
+    if (!reasoningPool.length) {
+      this.completeWorker(job.assignment, run, 'No model profiles configured for Phase-3 refinement.', [])
+      return
+    }
+
+    const session = await this.backend.openSession(
+      job.assignment.id,
+      job.controller.signal,
+      reposDir ? { reposDir } : undefined,
+    )
+
+    let lastInlineFeedback: InlineVerifyFeedback | null = specRow.lastVerificationDiff ?? null
+    let lastExchangeIds: string[] = [...(findingRow.finding.exchangeIds ?? [])]
+    const collectedArtifactIds: string[] = []
+    let refinementVerifyAttempts = 0
+    const maxRefinementAttempts = 1 + maxInlineVerifyRetries
+
+    try {
+      const refinementHandlers: WorkerToolHandlers = {
+        spillOutput: async (id, content, signal) => session.stage(`tool-output/${id}.txt`, content, signal),
+        verify_replay_spec: async (args) => {
+          const spec = args.spec ?? args.replaySpec
+          if (!spec) throw new Error('verify_replay_spec requires spec or replaySpec.')
+          refinementVerifyAttempts += 1
+          const inline = await this.executeInlineVerification({
+            job,
+            grant,
+            currentSecrets,
+            reposDir,
+            spec,
+            findingId: args.findingId ?? findingRow.id,
+            replaySpecId: args.replaySpecId ?? specRow.id,
+            phase3RefinementAttempt: refinementVerifyAttempts,
+          })
+          lastInlineFeedback = inline.feedback
+          if (inline.artifactId) collectedArtifactIds.push(inline.artifactId)
+          return {
+            findingId: inline.findingId ?? findingRow.id,
+            replaySpecId: inline.replaySpecId,
+            status: inline.status,
+            ...(inline.verificationTier ? { verificationTier: inline.verificationTier } : {}),
+            inlineVerifyFeedback: inline.feedback,
+          }
+        },
+        update_proposed_finding: async (args) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          const latestFinding = this.storage.db.select().from(findings).where(and(
+            eq(findings.runId, curRun.id), eq(findings.id, args.findingId),
+          )).get()
+          if (!latestFinding) throw new Error(`Finding ${args.findingId} not found in this run.`)
+          const isAlreadyVerified = latestFinding.finding.status === 'confirmed' || latestFinding.finding.status === 'static_verified'
+          let parsedUpdatedSpec: DeclarativeReplaySpec | undefined
+          let nextReplaySpecId = latestFinding.replaySpecId ?? undefined
+          let nextSourceOrigins = latestFinding.sourceOrigins
+          const extraEvidenceIds: string[] = []
+          let createdSpecRowId: string | undefined
+
+          if (args.replaySpec) {
+            const parsed = declarativeReplaySpecSchema.parse(args.replaySpec)
+            const specOrigins = replaySpecOrigins(parsed)
+            if (specOrigins.some(o => !currentApproved.has(o))) {
+              throw new BrokerDenied('Updated replay spec references an origin outside current approved scope.')
+            }
+            if (!isAlreadyVerified && refinementVerifyAttempts >= maxRefinementAttempts) {
+              return {
+                findingId: latestFinding.id,
+                replaySpecId: latestFinding.replaySpecId,
+                status: latestFinding.finding.status,
+                ...(latestFinding.verificationTier ? { verificationTier: latestFinding.verificationTier } : {}),
+                inlineVerifyFeedback: {
+                  verdict: 'inconclusive',
+                  controlPassed: false,
+                  assertionSummary: {
+                    observed: 'retry_limit_exceeded',
+                    expected: `<= ${maxRefinementAttempts} verification attempts`,
+                    reason: `Phase-3 refinement verification retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
+                  },
+                  stepStatuses: [],
+                  retriesRemaining: 0,
+                } satisfies InlineVerifyFeedback,
+                updated: false,
+                isError: true,
+              }
+            }
+            parsedUpdatedSpec = parsed
+            nextSourceOrigins = [...new Set([...latestFinding.sourceOrigins, ...specOrigins])]
+            const createdSpec = this.storage.createReplaySpec(
+              curRun,
+              job.assignment,
+              latestFinding.id,
+              parsed,
+              nextSourceOrigins,
+              { initialAttemptCount: 0 },
+            )
+            createdSpecRowId = createdSpec.id
+            const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
+              `Refined replay spec · ${parsed.title}`,
+              JSON.stringify({ findingId: latestFinding.id, replaySpecId: createdSpec.id, specSha256: createdSpec.specSha256, spec: parsed }, null, 2),
+              undefined, currentSecrets())
+            extraEvidenceIds.push(ev.id)
+            collectedArtifactIds.push(ev.id)
+            if (!isAlreadyVerified) {
+              nextReplaySpecId = createdSpec.id
+            }
+          }
+          const updated = this.storage.updateProposedFinding(curRun, latestFinding.id, {
+            replaySpecId: nextReplaySpecId,
+            sourceOrigins: nextSourceOrigins,
+            ...(args.counterevidence !== undefined ? { counterevidence: args.counterevidence } : {}),
+            ...(args.confidenceRationale !== undefined ? { confidenceRationale: args.confidenceRationale } : {}),
+            ...(args.severityChangeConditions !== undefined ? { severityChangeConditions: args.severityChangeConditions } : {}),
+            ...(args.codeLocations !== undefined ? { codeLocations: args.codeLocations } : {}),
+            finding: {
+              ...(args.title ? { title: args.title } : {}),
+              ...(args.summary ? { reason: args.summary } : {}),
+              ...(!isAlreadyVerified && args.severity ? { severity: args.severity } : {}),
+              ...(!isAlreadyVerified && parsedUpdatedSpec ? { status: 'pending' as const } : {}),
+              ...(extraEvidenceIds.length ? { evidenceIds: extraEvidenceIds } : {}),
+            },
+          })
+          if (parsedUpdatedSpec && (args.verifyNow ?? true) && !isAlreadyVerified) {
+            refinementVerifyAttempts += 1
+            const inline = await this.executeInlineVerification({
+              job,
+              grant,
+              currentSecrets,
+              reposDir,
+              spec: parsedUpdatedSpec,
+              findingId: latestFinding.id,
+              replaySpecId: createdSpecRowId ?? nextReplaySpecId ?? specRow.id,
+              phase3RefinementAttempt: refinementVerifyAttempts,
+            })
+            lastInlineFeedback = inline.feedback
+            if (inline.artifactId) collectedArtifactIds.push(inline.artifactId)
+            return {
+              findingId: updated.id,
+              replaySpecId: inline.replaySpecId,
+              status: inline.status,
+              verificationTier: inline.verificationTier,
+              inlineVerifyFeedback: inline.feedback,
+              updated: true,
+            }
+          }
+          return {
+            findingId: updated.id,
+            replaySpecId: updated.replaySpecId,
+            status: updated.status,
+            updated: true,
+          }
+        },
+        record_coverage: async (args) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
+          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
+          const ext = args as typeof args & { enforcingControl?: string; proofGapReason?: string; linkedFindingId?: string }
+          const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
+            origin: cleanOrigin,
+            category: args.category,
+            status: args.status,
+            summary: args.summary,
+            enforcingControl: ext.enforcingControl,
+            proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
+            linkedFindingId: ext.linkedFindingId,
+          })
+          return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
+        },
+        get_exchange: async ({ exchangeId, includeBody }, signal) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          const ex = this.storage.getExchange(curRun.id, exchangeId)
+          if ([ex.origin, ex.finalOrigin, ...ex.redirectOrigins].some(o => !currentApproved.has(o))) {
+            throw new BrokerDenied('Exchange touches an origin outside current approved scope.')
+          }
+          let stagedPath: string | null = null
+          if (includeBody) {
+            stagedPath = await session.stage(`exchanges/${ex.id}.json`, JSON.stringify(ex, null, 2), signal).catch(() => null)
+          }
+          return { ...ex, body: includeBody ? ex.body.slice(0, 12_000) : undefined, stagedPath }
+        },
+        search_exchanges: async ({ query, origin, status, limit }) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          return this.storage.searchExchanges(curRun.id, query, { approvedOrigins: currentApproved, origin, limit })
+            .filter(ex => status === undefined || ex.status === status)
+            .map(ex => ({
+              id: ex.id, origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery,
+              status: ex.status, mediaType: ex.mediaType, bodyPreview: ex.bodyPreview.slice(0, 600),
+            }))
+        },
+        search_facts: async ({ query, origin, kind, limit }) => {
+          const curRun = this.check(job)
+          const currentApproved = this.approvedOriginsSet(curRun)
+          return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
+            .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
+        },
+        derive_evidence: async ({ command, outputs, timeoutMs }, signal) => {
+          const curRun = this.check(job)
+          const res = await session.exec(command, outputs ?? ['result.txt'], signal, timeoutMs ?? 60_000)
+          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', 'Refinement derived evidence',
+            JSON.stringify({
+              command: redact(command, secrets),
+              exitStatus: res.exitCode,
+              stdout: redact(res.stdout, secrets),
+              stderr: redact(res.stderr, secrets),
+              outputs: res.outputs,
+            }, null, 2), undefined, secrets)
+          return { evidenceId: ev.id, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs }
+        },
+        analyze_artifact: async (args, signal) => {
+          this.check(job)
+          const { tool, ...rest } = args
+          return await session.analyze(tool, rest, signal)
+        },
+        complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
+      }
+
+      const maxRefineTurns = Math.max(1, Math.min(8, job.assignment.maxTurns || 8))
+      const refineInstructions = [
+        'You are Guardian v4’s Phase-3 Replay Spec Refinement specialist (strictly bounded 8-turn pass).',
+        'A submitted DeclarativeReplaySpec failed deterministic Zero-LLM verification. Inspect the sanitized InlineVerifyFeedback, prior exchanges, and facts.',
+        'If the vulnerability is real and the failure was a replay-spec bug (e.g. jq path/syntax error, missing extraction, wrong expectedStatus, or step ordering), call verify_replay_spec (or update_proposed_finding with verifyNow=true) with a repaired DeclarativeReplaySpec.',
+        'If the control genuinely blocks the exploit or the signal cannot be reproduced deterministically, close coverage cleanly via record_coverage ("ruled_out" with enforcingControl or "needs_follow_up" with proofGapReason) and call complete_intent.',
+        'You CANNOT mark a finding confirmed directly—only deterministic ReplayVerifier passing can confirm a finding.',
+      ].join('\n')
+
+      const refinePrompt = JSON.stringify({
+        finding: {
+          id: findingRow.id,
+          origin: findingRow.finding.origin,
+          title: findingRow.finding.title,
+          status: findingRow.finding.status,
+          category: findingRow.finding.category,
+          cwe: findingRow.finding.cwe,
+          severity: findingRow.finding.severity,
+        },
+        replaySpecId: specRow.id,
+        replaySpec: specRow.spec,
+        lastVerificationDiff: lastInlineFeedback,
+        maxTurns: maxRefineTurns,
+      }, null, 2)
+
+      const sessionResult = await runAgentSession({
+        directory: this.storage.directory,
+        sessionId: job.assignment.sessionId,
+        requestId: `refine:${specRow.id}:${run.goalRevision}:${run.scopeRevision}`,
+        profiles: reasoningPool,
+        scenario: 'worker-investigation',
+        roleAffinity: 'reasoning',
+        instructions: refineInstructions,
+        prompt: refinePrompt,
+        signal: job.controller.signal,
+        maxTurns: maxRefineTurns,
+        compaction: false,
+        enableSettlement: false,
+        requireCompleteIntent: true,
+        handlers: refinementHandlers,
+        secrets,
+        beforeCall: () => {
+          this.check(job)
+          if (this.storage.checkBudgetExceeded(run.id)) {
+            throw new BudgetExceededError('Run spend or request budget exceeded.')
+          }
+        },
+        onUsage: usage => {
+          this.storage.recordLlmSpend(run.id, {
+            usd: usage.costUsd,
+            tokens: usage.inputTokens + usage.outputTokens,
+          })
+        },
+        onTurn: turn => {
+          this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
+          this.storage.recordLlmSpend(run.id, { turns: 1 })
+        },
+        onProfileSuccess: id => recordProfileSuccess(id, this.storage),
+        onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+      })
+
+      // Mandatory Post-Refinement Zero-LLM Gate
+      const latestRun = this.check(job)
+      let currentFinding = this.storage.db.select().from(findings).where(and(
+        eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
+      )).get()
+      const activeSpecId = currentFinding?.replaySpecId ?? specRow.id
+      const currentSpec = this.storage.getReplaySpec(latestRun.id, activeSpecId)
+
+      if (currentFinding && currentFinding.finding.status === 'pending') {
+        const nextAttempt = refinementVerifyAttempts + 1
+        refinementVerifyAttempts = nextAttempt
+        const inline = await this.executeInlineVerification({
+          job,
+          grant,
+          currentSecrets,
+          reposDir,
+          spec: currentSpec.spec,
+          findingId: currentFinding.id,
+          replaySpecId: currentSpec.id,
+          phase3RefinementAttempt: nextAttempt,
+        })
+        lastInlineFeedback = inline.feedback
+        if (inline.artifactId) collectedArtifactIds.push(inline.artifactId)
+        currentFinding = this.storage.db.select().from(findings).where(and(
+          eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
+        )).get()
+        if (currentFinding && currentFinding.finding.status === 'pending') {
+          const fallbackStatus: Finding['status'] =
+            lastInlineFeedback?.verdict === 'dismissed' ? 'dismissed' : 'inconclusive'
+          this.storage.updateProposedFinding(latestRun, currentFinding.id, {
+            verificationTier: null,
+            finding: {
+              status: fallbackStatus,
+              verificationTier: undefined,
+              confidence: fallbackStatus === 'dismissed' ? 'medium' : 'low',
+              reason: redact(
+                inline.feedback.assertionSummary?.reason ||
+                currentFinding.finding.reason ||
+                `Phase-3 refinement retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
+                currentSecrets(),
+              ),
+            },
+          })
+          currentFinding = this.storage.db.select().from(findings).where(and(
+            eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
+          )).get()
+        }
+      }
+
+      const finalStatus = currentFinding?.finding.status ?? 'inconclusive'
+      lastExchangeIds = [...(currentFinding?.finding.exchangeIds ?? lastExchangeIds)]
+
+      if (finalStatus !== 'confirmed' && finalStatus !== 'static_verified') {
+        const latestDiff = currentSpec.lastVerificationDiff ?? lastInlineFeedback
+        const targetCategory = currentSpec.spec.category as OwaspCategory
+        if (owaspCategories.includes(targetCategory) && this.permitted(latestRun, currentSpec.spec.origin)) {
+          const existingCov = this.storage.listCoverageEntries(latestRun.id, latestRun.goalRevision)
+            .find(c => c.origin === currentSpec.spec.origin && c.category === targetCategory)
+          const alreadyClosed = existingCov &&
+            (existingCov.status === 'reported' || existingCov.status === 'ruled_out' || existingCov.status === 'needs_follow_up')
+          if (!alreadyClosed) {
+            if (finalStatus === 'dismissed' && latestDiff?.controlPassed) {
+              this.storage.upsertCoverageEntry(latestRun, job.assignment.id, {
+                origin: currentSpec.spec.origin,
+                category: targetCategory,
+                status: 'ruled_out',
+                summary: `Ruled out after Phase-3 refinement: ${currentSpec.spec.title}`,
+                enforcingControl: lastExchangeIds[0] || `replay:${currentSpec.id}`,
+              })
+            } else {
+              this.storage.upsertCoverageEntry(latestRun, job.assignment.id, {
+                origin: currentSpec.spec.origin,
+                category: targetCategory,
+                status: 'needs_follow_up',
+                summary: `Unconfirmed after Phase-3 8-turn refinement: ${currentSpec.spec.title}`,
+                proofGapReason: latestDiff?.assertionSummary?.reason ||
+                  latestDiff?.assertionSummary?.observed ||
+                  currentFinding?.finding.reason ||
+                  'Phase-3 refinement could not confirm finding deterministically.',
+              })
+            }
+          }
+        }
+      }
+
+      const summary = sessionResult.completion
+        ? `[${sessionResult.completion.status}] Phase-3 refinement (${finalStatus}): ${sessionResult.completion.summary}`
+        : `Phase-3 refinement finished (${finalStatus}): ${sessionResult.answer.slice(0, 160)}`
+      this.completeWorker(job.assignment, this.check(job), summary, collectedArtifactIds, undefined, currentSecrets())
+    } finally {
+      await session.close().catch(() => undefined)
+    }
   }
 
   private async verifyBaselineJob(job: Active) {
@@ -4068,6 +5775,8 @@ export class Execution {
 
     const current = this.storage.run(run.id)
     this.storage.transaction(() => {
+      const secretsList = currentSecrets()
+      const cleanObserved = redact(retestRes.replay.outcome.observed, secretsList)
       const ev = this.storage.addArtifact(current, job.assignment, 'replay',
         `Verify Fix retest · ${findingRow.finding.title}`,
         JSON.stringify({
@@ -4077,12 +5786,12 @@ export class Execution {
           outcome: retestRes.replay.outcome,
           exchangeIds: retestRes.replay.exchangeIds,
           evidenceSha256: retestRes.replay.evidenceSha256,
-        }, null, 2), 'retest:' + job.assignment.id, secrets)
-      const summary = `${retestRes.verdict}: ${retestRes.replay.outcome.observed}`
+        }, null, 2), 'retest:' + job.assignment.id, secretsList)
+      const summary = `${retestRes.verdict}: ${cleanObserved}`
       this.storage.recordRetestRun(current, findingId, specRow.id, retestRes.verdict, summary, [ev.id], retestRes.replay.exchangeIds)
-      this.completeWorker(job.assignment, current, `Verify Fix verdict: ${retestRes.verdict}`, [ev.id])
+      this.completeWorker(job.assignment, current, `Verify Fix verdict: ${retestRes.verdict}`, [ev.id], undefined, secretsList)
       this.storage.message(current.id, current.coordinatorId, 'guardian',
-        `Verify Fix retest for "${findingRow.finding.title}": ${retestRes.verdict}. ${retestRes.replay.outcome.observed}`)
+        `Verify Fix retest for "${findingRow.finding.title}": ${retestRes.verdict}. ${cleanObserved}`, undefined, undefined, secretsList)
     }, { behavior: 'immediate' })
   }
 
@@ -4128,8 +5837,10 @@ export class Execution {
       directory: this.storage.directory,
       sessionId: run.coordinatorId,
       requestId: `${next.id}:${run.goalRevision}:${run.scopeRevision}`,
-      profiles,
+      profiles: resolveProfilePoolForRole('fast', profiles),
       scenario: 'coordinator',
+      roleAffinity: 'fast',
+      thinkingLevel: 'off',
       prompt,
       signal: controller.signal,
       onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
@@ -4301,13 +6012,20 @@ export class Execution {
     }
   }
 
-  private completeWorker(worker: Assignment, run: Run, summary: string, artifactIds: string[], checks?: CheckCoverage[]) {
-    const outcome = redact(summary)
+  private completeWorker(
+    worker: Assignment,
+    run: Run,
+    summary: string,
+    artifactIds: string[],
+    checks?: CheckCoverage[],
+    secrets: readonly NamedSecret[] = [],
+  ) {
+    const outcome = redact(summary, secrets)
     const result = this.storage.addArtifact(run, worker, 'handoff', 'result.md', [
       '# Result', '', outcome, '', 'Evidence: ' + artifactIds.join(', '),
-    ].join('\n'), 'result')
+    ].join('\n'), 'result', secrets)
     this.storage.updateWorker(worker.id, { status: 'complete', lease: null, leaseExpiresAt: null, outcome, checks })
-    this.storage.message(run.id, worker.id, 'worker', outcome, undefined, [...artifactIds, result.id])
+    this.storage.message(run.id, worker.id, 'worker', outcome, undefined, [...artifactIds, result.id], secrets)
     this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', {
       assignmentId: worker.id, artifactId: artifactIds[0] ?? result.id,
     })

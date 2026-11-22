@@ -1,0 +1,42 @@
+id: "auth-json"
+name: "Auth.json File - Disclosure"
+severity: "high"
+description: "auth.json file is exposed."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "files"
+  - "auth"
+  - "config"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/auth.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"http-basic\": {"
+      - "\"username\":"
+      - "\"password\":"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "\"github-oauth\": {"
+      - "\"github.com\":"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "\"bitbucket-oauth\":"
+      - "\"consumer-key\":"
+      - "\"consumer-secret\":"
+    condition: "and"

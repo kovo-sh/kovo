@@ -1,0 +1,503 @@
+rules:
+- id: misconfigured-lockout-option
+  message: A misconfigured lockout mechanism allows an attacker to execute brute-force
+    attacks. Account lockout must be correctly configured and enabled to prevent these
+    attacks.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-307: Improper Restriction of Excessive Authentication Attempts'
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    references:
+    - https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures
+    - https://cwe.mitre.org/data/definitions/307.html
+    subcategory:
+    - audit
+    technology:
+    - dotnet
+  languages:
+  - csharp
+  patterns:
+  - pattern-either:
+    - pattern: '$SIGNIN.PasswordSignInAsync(...,lockoutOnFailure: false,...);
+
+        '
+    - pattern: '$SIGNIN.CheckPasswordSignInAsync(...,lockoutOnFailure: false,...);
+
+        '
+  - pattern-inside: "public async $TYPE<IActionResult> $METHOD(...) {\n  ...\n}\n"
+- id: missing-or-broken-authorization
+  message: Anonymous access shouldn't be allowed unless explicit by design. Access
+    control checks are missing and potentially can be bypassed. This finding violates
+    the principle of least privilege or deny by default, where access should only
+    be permitted for a specific set of roles or conforms to a custom policy or users.
+  severity: INFO
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe:
+    - 'CWE-862: Missing Authorization'
+    cwe2021-top25: true
+    cwe2022-top25: true
+    cwe2023-top25: true
+    owasp:
+    - A01:2021 - Broken Access Control
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    - https://cwe.mitre.org/data/definitions/862.html
+    - https://docs.microsoft.com/en-us/aspnet/core/security/authorization/simple?view=aspnetcore-7.0
+    subcategory:
+    - vuln
+    technology:
+    - .net
+    - mvc
+  languages:
+  - csharp
+  patterns:
+  - pattern: "public class $CLASS : Controller {\n  ...\n}\n"
+  - pattern-inside: 'using Microsoft.AspNetCore.Mvc;
+
+      ...
+
+      '
+  - pattern-not: "[AllowAnonymous]\npublic class $CLASS : Controller {\n  ...\n}\n"
+  - pattern-not: "[Authorize]\npublic class $CLASS : Controller {\n  ...\n}\n"
+  - pattern-not: "[Authorize(Roles = ...)]\npublic class $CLASS : Controller {\n \
+      \ ...\n}\n"
+  - pattern-not: "[Authorize(Policy = ...)]\npublic class $CLASS : Controller {\n\
+      \  ...\n}\n"
+- id: open-directory-listing
+  message: An open directory listing is potentially exposed, potentially revealing
+    sensitive information to attackers.
+  severity: INFO
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe:
+    - 'CWE-548: Exposure of Information Through Directory Listing'
+    owasp:
+    - A06:2017 - Security Misconfiguration
+    - A01:2021 - Broken Access Control
+    references:
+    - https://cwe.mitre.org/data/definitions/548.html
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration/
+    - https://docs.microsoft.com/en-us/aspnet/core/fundamentals/static-files?view=aspnetcore-7.0#directory-browsing
+    subcategory:
+    - vuln
+    technology:
+    - .net
+    - mvc
+  languages:
+  - csharp
+  patterns:
+  - pattern-either:
+    - pattern: (IApplicationBuilder $APP).UseDirectoryBrowser(...);
+    - pattern: $BUILDER.Services.AddDirectoryBrowser(...);
+  - pattern-inside: "public void Configure(...) {\n  ...\n}\n"
+- id: razor-use-of-htmlstring
+  message: ASP.NET Core MVC provides an HtmlString class which isn't automatically
+    encoded upon output. This should never be used in combination with untrusted input
+    as this will expose an XSS vulnerability.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-116: Improper Encoding or Escaping of Output'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://cwe.mitre.org/data/definitions/116.html
+    - https://owasp.org/Top10/A03_2021-Injection/
+    - https://docs.microsoft.com/en-us/aspnet/core/security/cross-site-scripting?view=aspnetcore-6.0#html-encoding-using-razor
+    subcategory:
+    - audit
+    technology:
+    - .net
+  languages:
+  - generic
+  paths:
+    include:
+    - '*.cshtml'
+  patterns:
+  - pattern-either:
+    - pattern: new ...HtmlString(...)
+    - pattern: '@(new ...HtmlString(...))'
+  - pattern-not-inside: '@(new ...HtmlString(...HtmlEncode(...)))'
+  - pattern-not-inside: '@(new ...HtmlString(...Encode(...)))'
+  - pattern-not-inside: new ...HtmlString(...HtmlEncode(...))
+  - pattern-not-inside: new ...HtmlString(...Encode(...))
+- id: xpath-injection
+  message: XPath queries are constructed dynamically on user-controlled input. This
+    vulnerability in code could lead to an XPath Injection exploitation.
+  severity: ERROR
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe:
+    - 'CWE-643: Improper Neutralization of Data within XPath Expressions (''XPath
+      Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection/
+    - https://cwe.mitre.org/data/definitions/643.html
+    subcategory:
+    - vuln
+    technology:
+    - .net
+  languages:
+  - csharp
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: $T $M($INPUT,...) {...}
+    - pattern: "$T $M(...) {\n  ...\n  string $INPUT;\n}\n"
+  pattern-sinks:
+  - pattern-either:
+    - pattern: XPathExpression $EXPR = $NAV.Compile("..." + $INPUT + "...");
+    - pattern: var $EXPR = $NAV.Compile("..." + $INPUT + "...");
+    - pattern: XPathNodeIterator $NODE = $NAV.Select("..." + $INPUT + "...");
+    - pattern: var $NODE = $NAV.Select("..." + $INPUT + "...");
+    - pattern: Object $OBJ = $NAV.Evaluate("..." + $INPUT + "...");
+    - pattern: var $OBJ = $NAV.Evaluate("..." + $INPUT + "...");
+- id: mvc-missing-antiforgery
+  message: $METHOD is a state-changing MVC method that does not validate the antiforgery
+    token or do strict content-type checking. State-changing controller methods should
+    either enforce antiforgery tokens or do strict content-type checking to prevent
+    simple HTTP request types from bypassing CORS preflight controls.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    cwe2021-top25: true
+    cwe2022-top25: true
+    owasp:
+    - A01:2021 - Broken Access Control
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/DotNet_Security_Cheat_Sheet.html#cross-site-request-forgery
+    - https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#simple_requests
+    subcategory:
+    - audit
+    technology:
+    - .net
+    - mvc
+  languages:
+  - csharp
+  patterns:
+  - pattern: "[$HTTPMETHOD]\npublic IActionResult $METHOD(...){\n    ...\n}\n"
+  - pattern-inside: 'using Microsoft.AspNetCore.Mvc;
+
+      ...
+
+      '
+  - pattern-not: "[ValidateAntiForgeryToken]\npublic IActionResult $METHOD(...){\n\
+      \    ...\n}\n"
+  - pattern-not: "[Consumes(...)]\npublic IActionResult $METHOD(...){\n  ...\n}\n"
+  - metavariable-regex:
+      metavariable: $HTTPMETHOD
+      regex: Http(Post|Put|Delete|Patch)
+- id: net-webconfig-debug
+  message: ASP.NET applications built with `debug` set to true in production may leak
+    debug information to attackers. Debug mode also affects performance and reliability.
+    Set `debug` to `false` or remove it from `<compilation ... />`
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-11: ASP.NET Misconfiguration: Creating Debug Binary'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://web.archive.org/web/20190919105353/https://blogs.msdn.microsoft.com/prashant_upadhyay/2011/07/14/why-debugfalse-in-asp-net-applications-in-production-environment/
+    - https://msdn.microsoft.com/en-us/library/e8z01xdh.aspx
+    subcategory:
+    - audit
+    technology:
+    - .net
+  languages:
+  - generic
+  paths:
+    include:
+    - '*web.config*'
+  patterns:
+  - pattern: '<compilation ... debug = "true" ... />
+
+      '
+  - pattern-inside: "<system.web>\n  ...\n</system.web>\n"
+- id: net-webconfig-trace-enabled
+  message: OWASP guidance recommends disabling tracing for production applications
+    to prevent accidental leakage of sensitive application information.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-1323: Improper Management of Sensitive Trace Data'
+    owasp: A05:2021 - Security Misconfiguration
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/DotNet_Security_Cheat_Sheet.html#asp-net-web-forms-guidance
+    - https://msdn.microsoft.com/en-us/library/e8z01xdh.aspx
+    subcategory:
+    - audit
+    technology:
+    - .net
+  languages:
+  - generic
+  paths:
+    include:
+    - '*web.config*'
+  patterns:
+  - pattern: '<trace ... enabled = "true" ... />
+
+      '
+  - pattern-inside: "<system.web>\n  ...\n</system.web>\n"
+- id: razor-template-injection
+  message: User-controllable string passed to Razor.Parse. This leads directly to
+    code execution in the context of the process.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    cwe2022-top25: true
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://clement.notin.org/blog/2020/04/15/Server-Side-Template-Injection-(SSTI)-in-ASP.NET-Razor/
+    subcategory:
+    - vuln
+    technology:
+    - .net
+    - razor
+    - asp
+  languages:
+  - csharp
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - focus-metavariable: $ARG
+    - pattern-inside: 'public ActionResult $METHOD(..., string $ARG,...){...}
+
+        '
+  pattern-sinks:
+  - pattern: 'Razor.Parse(...)
+
+      '
+  pattern-sanitizers:
+  - not_conflicting: true
+    pattern: $F(...)
+- id: use_deprecated_cipher_algorithm
+  message: Usage of deprecated cipher algorithm detected. Use Aes or ChaCha20Poly1305
+    instead.
+  severity: ERROR
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.des?view=net-6.0#remarks
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.rc2?view=net-6.0#remarks
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.aes?view=net-6.0
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.chacha20poly1305?view=net-6.0
+    subcategory:
+    - vuln
+    technology:
+    - .net
+  languages:
+  - csharp
+  patterns:
+  - pattern: $KEYTYPE.Create(...);
+  - metavariable-pattern:
+      metavariable: $KEYTYPE
+      pattern-either:
+      - pattern: DES
+      - pattern: RC2
+- id: use_ecb_mode
+  message: Usage of the insecure ECB mode detected. You should use an authenticated
+    encryption mode instead, which is implemented by the classes AesGcm or ChaCha20Poly1305.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+    category: security
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.chacha20poly1305?view=net-6.0
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.aesgcm?view=net-6.0
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.ciphermode?view=net-6.0
+    - https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html#cipher-modes
+    subcategory:
+    - vuln
+    technology:
+    - .net
+  languages:
+  - csharp
+  patterns:
+  - pattern-either:
+    - pattern: ($KEYTYPE $KEY).EncryptEcb(...);
+    - pattern: ($KEYTYPE $KEY).DecryptEcb(...);
+    - pattern: ($KEYTYPE $KEY).Mode = CipherMode.ECB;
+  - metavariable-pattern:
+      metavariable: $KEYTYPE
+      pattern-either:
+      - pattern: SymmetricAlgorithm
+      - pattern: Aes
+      - pattern: Rijndael
+      - pattern: DES
+      - pattern: TripleDES
+      - pattern: RC2
+- id: use_weak_rng_for_keygeneration
+  message: You are using an insecure random number generator (RNG) to create a cryptographic
+    key. System.Random must never be used for cryptographic purposes. Use System.Security.Cryptography.RandomNumberGenerator
+    instead.
+  severity: ERROR
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+    category: security
+    cwe:
+    - 'CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://learn.microsoft.com/en-us/dotnet/api/system.random?view=net-6.0#remarks
+    - https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.randomnumbergenerator?view=net-6.0
+    - https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.aesgcm?view=net-6.0#constructors
+    - https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.symmetricalgorithm.key?view=net-6.0#system-security-cryptography-symmetricalgorithm-key
+    subcategory:
+    - vuln
+    technology:
+    - .net
+  languages:
+  - csharp
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-inside: (System.Random $RNG).NextBytes($KEY); ...
+    - pattern: $KEY
+  pattern-sinks:
+  - pattern-either:
+    - patterns:
+      - pattern: ($KEYTYPE $CIPHER).Key = $SINK;
+      - focus-metavariable: $SINK
+      - metavariable-pattern:
+          metavariable: $KEYTYPE
+          pattern-either:
+          - pattern: SymmetricAlgorithm
+          - pattern: Aes
+          - pattern: Rijndael
+          - pattern: DES
+          - pattern: TripleDES
+          - pattern: RC2
+    - pattern: new AesGcm(...)
+    - pattern: new AesCcm(...)
+    - pattern: new ChaCha20Poly1305(...)
+- id: use_weak_rsa_encryption_padding
+  message: You are using the outdated PKCS#1 v1.5 encryption padding for your RSA
+    key. Use the OAEP padding instead.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe:
+    - 'CWE-780: Use of RSA Algorithm without OAEP'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.rsapkcs1keyexchangeformatter
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.rsaoaepkeyexchangeformatter
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.rsapkcs1keyexchangedeformatter
+    - https://learn.microsoft.com/en-gb/dotnet/api/system.security.cryptography.rsaoaepkeyexchangedeformatter
+    subcategory:
+    - vuln
+    technology:
+    - .net
+  languages:
+  - csharp
+  pattern-either:
+  - pattern: (RSAPKCS1KeyExchangeFormatter $FORMATER).CreateKeyExchange(...);
+  - pattern: (RSAPKCS1KeyExchangeDeformatter $DEFORMATER).DecryptKeyExchange(...);
+- id: web-config-insecure-cookie-settings
+  message: Cookie Secure flag is explicitly disabled. You should enforce this value
+    to avoid accidentally presenting sensitive cookie values over plaintext HTTP connections.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://docs.microsoft.com/en-us/aspnet/web-api/overview/advanced/http-cookies
+    - https://docs.microsoft.com/en-us/dotnet/api/system.web.security.formsauthentication.requiressl?redirectedfrom=MSDN&view=netframework-4.8#System_Web_Security_FormsAuthentication_RequireSSL
+    - https://docs.microsoft.com/en-us/dotnet/api/system.web.security.roles.cookierequiressl?redirectedfrom=MSDN&view=netframework-4.8#System_Web_Security_Roles_CookieRequireSSL
+    subcategory:
+    - audit
+    technology:
+    - .net
+    - asp
+    - webforms
+  languages:
+  - generic
+  paths:
+    include:
+    - '*web.config'
+  patterns:
+  - pattern-either:
+    - pattern: 'requireSSL="false"
+
+        '
+    - pattern: 'cookieRequireSSL="false"
+
+        '
+  - pattern-either:
+    - pattern-inside: '<httpCookies ...>
+
+        '
+    - pattern-inside: '<forms ...>
+
+        '
+    - pattern-inside: '<roleManager ...>
+
+        '

@@ -1,0 +1,33 @@
+id: "pre-commit-config"
+name: "Pre-commit Configuration File - Detect"
+severity: "info"
+description: "Pre-commit configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "devops"
+  - "config"
+  - "cicd"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://pre-commit.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.pre-commit-config.yaml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "repos:"
+      - "hooks:"
+      - "rev:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

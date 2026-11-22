@@ -1,0 +1,31 @@
+id: "npm-debug-log"
+name: "NPM Debug Log Disclosure"
+severity: "low"
+description: "NPM Debug log file exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "npm"
+  - "logs"
+  - "debug"
+  - "vuln"
+reference: "https://github.com/maurosoria/dirsearch/blob/master/db/dicc.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/npm-debug.log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "verbose cli"
+      - "verbose stack"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "s3cmd-config"
+name: "S3CMD Configuration - Detect"
+severity: "info"
+description: "S3CMD configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "amazon"
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/s3cmd.ini"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[default]"
+      - "access_key"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

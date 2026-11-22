@@ -1,0 +1,31 @@
+id: "mysqld-exporter-metrics"
+name: "MySQL Exporter Panel - Detect"
+severity: "info"
+description: "MYSQL Exporter panel was detected."
+tech:
+  - "generic"
+tags:
+  - "mysqld"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "mysqld"
+      - "# HELP"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

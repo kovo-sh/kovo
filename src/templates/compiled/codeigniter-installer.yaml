@@ -1,0 +1,28 @@
+id: "codeigniter-installer"
+name: "Codeigniter Application Installer Exposure"
+severity: "high"
+description: "Codeigniter Application is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "codeigniter"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Codeigniter Application Installer"
+  - type: "status"
+    status:
+      - 200

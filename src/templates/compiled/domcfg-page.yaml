@@ -1,0 +1,31 @@
+id: "domcfg-page"
+name: "Lotus Domino Configuration Page"
+severity: "low"
+description: "Lotus Domino configuration file is exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "lotus"
+  - "files"
+  - "vuln"
+reference: "https://twitter.com/Wh11teW0lf/status/1295594085445709824"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/domcfg.nsf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Web Server Configuration"
+      - "Mapping"
+      - "Mappings"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

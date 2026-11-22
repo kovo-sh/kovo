@@ -1,0 +1,32 @@
+id: "shopware-detect"
+name: "Shopware CMS detect"
+severity: "info"
+description: "Detects Shopware CMS"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "shopware"
+  - "cms"
+  - "discovery"
+reference: "https://github.com/shopware/shopware"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Realisiert mit Shopware"
+      - "Realised with Shopware"
+      - "Shopware Administration (c) shopware AG"
+      - "<title>Shopware 5 - Backend (c) shopware AG</title>"
+      - "Shopware.Application.start"
+  - type: "status"
+    status:
+      - 200

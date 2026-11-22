@@ -1,0 +1,32 @@
+id: "4d-detect"
+name: "4D Detection"
+severity: "info"
+description: "4D technology was detected."
+tech:
+  - "generic"
+tags:
+  - "4d"
+  - "detect"
+  - "tech"
+  - "discovery"
+reference: "https://us.4d.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/4DACTION/"
+      - "/4DSTATS"
+      - "/4DHTMLSTATS"
+      - "/4DCACHECLEAR"
+      - "/4DWEBTEST"
+  - type: "status"
+    status:
+      - 200

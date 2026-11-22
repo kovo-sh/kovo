@@ -1,0 +1,24 @@
+id: "hashicorp-vault-detect"
+name: "HashiCorp Vault Detect"
+severity: "info"
+description: "Detects HashiCorp Vault"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "hashicorp"
+  - "discovery"
+reference: "https://developer.hashicorp.com/vault"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/v1/sys/seal-status"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<meta name=\"vault/config/environment\""

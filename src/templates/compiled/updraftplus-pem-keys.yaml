@@ -1,0 +1,31 @@
+id: "updraftplus-pem-keys"
+name: "UpdraftPlus Plugin Pem Key"
+severity: "info"
+description: "UpdraftPlus wordpress plugin private key leaked with directory listing."
+tech:
+  - "wordpress"
+tags:
+  - "wp-plugin"
+  - "edb"
+  - "wordpress"
+  - "vuln"
+reference: "https://www.exploit-db.com/ghdb/6437"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/updraftplus/includes/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of /"
+      - ".pem"
+      - "updraftplus"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

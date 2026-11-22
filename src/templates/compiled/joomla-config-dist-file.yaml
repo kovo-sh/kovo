@@ -1,0 +1,34 @@
+id: "joomla-config-dist-file"
+name: "Joomla! Configuration File - Detect"
+severity: "low"
+description: "Joomla! configuration.php-dist file was detected."
+tech:
+  - "php"
+tags:
+  - "config"
+  - "exposure"
+  - "joomla"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/configuration.php-dist"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Joomla"
+      - "JConfig"
+      - "@package"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

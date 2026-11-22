@@ -1,0 +1,30 @@
+id: "buildpath-file-disclosure"
+name: ".buildpath - File Disclosure"
+severity: "low"
+description: "Publicly accessible /.buildpath configuration file was detected, which may expose project structure or sensitive information."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "buildpath"
+  - "config"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.buildpath"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "</buildpath>"
+      - "<?xml"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

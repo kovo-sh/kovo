@@ -1,0 +1,38 @@
+id: "meilisearch-unauth"
+name: "Meilisearch - Unauthenticated Index Exposure"
+severity: "medium"
+description: "Meilisearch ships without a master key by default. Instances deployed without one expose the index API to any network-reachable client: an unauthenticated GET /indexes returns the full index listing, and the same unauthenticated access allows searching the documents inside those indexes."
+tech:
+  - "generic"
+tags:
+  - "meilisearch"
+  - "exposure"
+  - "misconfig"
+  - "unauth"
+  - "search"
+cwe: "CWE-306"
+reference: "https://www.meilisearch.com/docs/reference/api/overview"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/indexes"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"results\":"
+      - "\"offset\":"
+      - "\"limit\":"
+      - "\"total\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

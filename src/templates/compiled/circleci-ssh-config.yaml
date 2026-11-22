@@ -1,0 +1,31 @@
+id: "circleci-ssh-config"
+name: "CircleCI SSH Configuration - Detect"
+severity: "medium"
+description: "CircleCI ssh-config file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "circleci"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.circleci/ssh-config"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Host"
+      - "HostName"
+      - "IdentityFile"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

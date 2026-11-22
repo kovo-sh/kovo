@@ -1,0 +1,28 @@
+id: "ruoyi-detect"
+name: "RuoYi Detect"
+severity: "info"
+description: "RuoYi (若依) admin framework was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "ruoyi"
+  - "detect"
+reference: "https://github.com/yangzongzhuan/RuoYi"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "若依管理系统"
+      - "/static/ruoyi"
+  - type: "status"
+    status:
+      - 200

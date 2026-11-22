@@ -1,0 +1,31 @@
+id: "shopware-installer"
+name: "Shopware Installer"
+severity: "high"
+description: "Shopware is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "shopware"
+  - "install"
+  - "exposure"
+  - "vuln"
+reference: "https://www.shopware.com/en/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/public/recovery/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Setup | Shopware"
+      - "install"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

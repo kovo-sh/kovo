@@ -1,0 +1,29 @@
+id: "pandora-fms-installer"
+name: "Pandora FMS Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed Pandora FMS installation page."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "pandora-fms"
+  - "vuln"
+reference: "https://pandorafms.com/en/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Pandora FMS - Installation Wizard"
+  - type: "status"
+    status:
+      - 200

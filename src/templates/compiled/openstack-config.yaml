@@ -1,0 +1,34 @@
+id: "openstack-config"
+name: "Openstack - Infomation Disclosure"
+severity: "low"
+description: "Openstack exposing Configuration or settings related to the Swift object storage system."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "misconfig"
+  - "openstack"
+  - "vuln"
+reference: "https://docs.openstack.org/python-cloudkittyclient/stein/api_reference/info.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/info"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "{\"formpost\""
+      - "\"bulk_"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

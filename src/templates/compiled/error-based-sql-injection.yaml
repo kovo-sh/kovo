@@ -1,0 +1,35 @@
+id: "error-based-sql-injection"
+name: "Error based SQL injection"
+severity: "critical"
+description: "A SQL injection vulnerability was identified based on an error message returned by the server."
+tech:
+  - "generic"
+tags:
+  - "sqli"
+  - "generic"
+  - "error"
+  - "vuln"
+cwe: "CWE-89"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/'"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Adminer"
+    negative: true
+  - type: "regex"
+    part: "body"
+    regex:
+      - "SQL syntax.{0,200}?MySQL"
+      - "Warning.{0,200}?\\Wmysqli?_"
+      - "MySQLSyntaxErrorException"
+      - "valid MySQL result"
+      - "check the manual that (corresponds to|fits) your MySQL server version"
+      - "Unknown column '[^ ]+' in 'field list'"

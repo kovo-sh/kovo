@@ -1,0 +1,31 @@
+id: "postal-detect"
+name: "Postal - Detect"
+severity: "info"
+description: "Postal, an open-source mail delivery platform, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "postal"
+  - "mail"
+  - "detect"
+reference: "https://postalserver.io/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Login - Postal</title>"
+      - "Welcome to Postal"
+      - "class=\"loginForm\" action=\"/login\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

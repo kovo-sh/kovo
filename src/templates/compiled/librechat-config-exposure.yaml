@@ -1,0 +1,30 @@
+id: "librechat-config-exposure"
+name: "librechat - Config Exposure"
+severity: "low"
+description: "Detected the `/api/config` endpoint of the LibreChat web application was publicly accessible, potentially exposing internal configuration details."
+tech:
+  - "generic"
+tags:
+  - "librechat"
+  - "config"
+  - "exposure"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/config"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "LibreChat"
+      - "serverDomain"
+      - "registrationEnabled"
+      - "passwordResetEnabled"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

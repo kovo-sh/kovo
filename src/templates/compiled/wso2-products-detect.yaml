@@ -1,0 +1,26 @@
+id: "wso2-products-detect"
+name: "WSO2 Products - Detect"
+severity: "info"
+description: "Try to detect the presence of a WSO2 products instance via the version endpoint"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "wso2"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/services/Version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "version.services.core.carbon.wso2.org"
+  - type: "status"
+    status:
+      - 200

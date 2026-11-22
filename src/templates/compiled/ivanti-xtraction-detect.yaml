@@ -1,0 +1,31 @@
+id: "ivanti-xtraction-detect"
+name: "Ivanti Xtraction - Detect"
+severity: "info"
+description: "Detects Ivanti Xtraction, a reporting and dashboard platform used with Ivanti products."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "ivanti"
+  - "xtraction"
+  - "detect"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/xtraction"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Xtraction</title>"
+      - "application-name\" content=\"Xtraction"
+      - "dev-extreme-ivanti.css"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

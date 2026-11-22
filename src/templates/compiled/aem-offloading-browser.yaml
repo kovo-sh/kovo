@@ -1,0 +1,34 @@
+id: "aem-offloading-browser"
+name: "Adobe AEM Offloading Browser"
+severity: "medium"
+description: "Adobe AEM Offloading Browser is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "aem"
+  - "adobe"
+  - "vuln"
+reference: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/aem2.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/libs/granite/offloading/content/view.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Offloading Browser"
+      - ">CLUSTER</th>"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

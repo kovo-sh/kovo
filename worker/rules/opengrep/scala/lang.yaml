@@ -1,0 +1,738 @@
+rules:
+- id: dangerous-seq-run
+  patterns:
+  - pattern: Seq($CMD, ...)
+  - pattern-not: Seq("...", ...)
+  - pattern-inside: 'import sys.process
+
+      ...
+
+      '
+  - pattern-not-inside: '$CMD = "..."
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern-inside: Seq(...).!
+    - pattern-inside: Seq(...).!!
+    - pattern-inside: Seq(...).lazyLines
+  message: Found dynamic content used for the external process. This is dangerous
+    if arbitrary data can reach this function call because it allows a malicious actor
+    to execute commands. Ensure your variables are not controlled by users or sufficiently
+    sanitized.
+  languages:
+  - scala
+  severity: ERROR
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    technology:
+    - scala
+    confidence: LOW
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+- id: dangerous-shell-run
+  patterns:
+  - pattern: Seq($SH, "-c", $CMD, ...)
+  - pattern-not: Seq($SH, "-c", "...", ...)
+  - pattern-inside: 'import sys.process
+
+      ...
+
+      '
+  - pattern-not-inside: '$CMD = "..."
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern-inside: Seq(...).!
+    - pattern-inside: Seq(...).!!
+    - pattern-inside: Seq(...).lazyLines
+  - metavariable-regex:
+      metavariable: $SH
+      regex: '"(sh|bash|ksh|csh|tcsh|zsh)"'
+  message: Found dynamic content used for the external process. This is dangerous
+    if arbitrary data can reach this function call because it allows a malicious actor
+    to execute commands. Ensure your variables are not controlled by users or sufficiently
+    sanitized.
+  languages:
+  - scala
+  severity: ERROR
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    technology:
+    - scala
+    confidence: LOW
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+- id: dispatch-ssrf
+  patterns:
+  - pattern: url($URL)
+  - pattern-inside: 'import dispatch._
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = $A {\n  ...\n}\n"
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = {\n  ...\n}\n"
+  message: A parameter being passed directly into `url` most likely lead to SSRF.
+    This could allow an attacker to send data to their own server, potentially exposing
+    sensitive data sent with this request. They could also probe internal servers
+    or other resources that the server running this code can access. Do not allow
+    arbitrary hosts. Instead, create an allowlist for approved hosts, or hardcode
+    the correct host.
+  metadata:
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    owasp:
+    - A10:2021 - Server-Side Request Forgery (SSRF)
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    - https://dispatchhttp.org/Dispatch.html
+    category: security
+    technology:
+    - scala
+    - dispatch
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - scala
+  severity: WARNING
+- id: documentbuilder-dtd-enabled
+  patterns:
+  - pattern-either:
+    - pattern: '$DF = DocumentBuilderFactory.newInstance(...)
+
+        ...
+
+        $DB = $DF.newDocumentBuilder(...)
+
+        '
+    - patterns:
+      - pattern: $DB = DocumentBuilderFactory.newInstance(...)
+      - pattern-not-inside: '...
+
+          $X = $DB.newDocumentBuilder(...)
+
+          '
+    - pattern: $DB = DocumentBuilderFactory.newInstance(...).newDocumentBuilder(...)
+  - pattern-not-inside: '...
+
+      $DB.setXIncludeAware(true)
+
+      ...
+
+      $DB.setNamespaceAware(true)
+
+      ...
+
+      $DB.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      '
+  - pattern-not-inside: '...
+
+      $DB.setXIncludeAware(true)
+
+      ...
+
+      $DB.setNamespaceAware(true)
+
+      ...
+
+      $DB.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      '
+  - pattern-not-inside: '...
+
+      $DB.setXIncludeAware(true)
+
+      ...
+
+      $DB.setNamespaceAware(true)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      ...
+
+      $DB.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      '
+  - pattern-not-inside: '...
+
+      $DB.setXIncludeAware(true)
+
+      ...
+
+      $DB.setNamespaceAware(true)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      ...
+
+      $DB.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      ...
+
+      $DB.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      '
+  message: Document Builder being instantiated without calling the `setFeature` functions
+    that are generally used for disabling entity processing. User controlled data
+    in XML Document builder can result in XML Internal Entity Processing vulnerabilities
+    like the disclosure of confidential data, denial of service, Server Side Request
+    Forgery (SSRF), port scanning. Make sure to disable entity processing functionality.
+  languages:
+  - scala
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    owasp:
+    - A04:2017 - XML External Entities (XXE)
+    - A05:2021 - Security Misconfiguration
+    source-rule-url: https://cheatsheetseries.owasp.org//cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+    category: security
+    technology:
+    - scala
+    confidence: HIGH
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+- id: insecure-random
+  metadata:
+    cwe:
+    - 'CWE-330: Use of Insufficiently Random Values'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    category: security
+    technology:
+    - scala
+    - cryptography
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    resources:
+    - https://find-sec-bugs.github.io/bugs.htm
+    confidence: LOW
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+  message: Flags the use of a predictable random value from `scala.util.Random`. This
+    can lead to vulnerabilities when used in security contexts, such as in a CSRF
+    token, password reset token, or any other secret value. To fix this, use java.security.SecureRandom
+    instead.
+  severity: WARNING
+  languages:
+  - scala
+  patterns:
+  - pattern: 'import scala.util.Random
+
+      '
+- id: io-source-ssrf
+  patterns:
+  - pattern-either:
+    - pattern: Source.fromURL($URL,...)
+    - pattern: Source.fromURI($URL,...)
+  - pattern-inside: 'import scala.io.$SOURCE
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = $A {\n  ...\n}\n"
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = {\n  ...\n}\n"
+  message: A parameter being passed directly into `fromURL` most likely lead to SSRF.
+    This could allow an attacker to send data to their own server, potentially exposing
+    sensitive data sent with this request. They could also probe internal servers
+    or other resources that the server running this code can access. Do not allow
+    arbitrary hosts. Instead, create an allowlist for approved hosts, or hardcode
+    the correct host.
+  metadata:
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    owasp:
+    - A10:2021 - Server-Side Request Forgery (SSRF)
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    - https://www.scala-lang.org/api/current/scala/io/Source$.html#fromURL(url:java.net.URL)(implicitcodec:scala.io.Codec):scala.io.BufferedSource
+    category: security
+    technology:
+    - scala
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - scala
+  severity: WARNING
+- id: path-traversal-fromfile
+  metadata:
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - scala
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    resources:
+    - https://find-sec-bugs.github.io/bugs.htm
+    confidence: LOW
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+  message: Flags cases of possible path traversal. If an unfiltered parameter is passed
+    into 'fromFile', file from an arbitrary filesystem location could be read. This
+    could lead to sensitive data exposure and other provles. Instead, sanitize the
+    user input instead of performing direct string concatenation.
+  severity: WARNING
+  languages:
+  - scala
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-either:
+        - pattern-inside: '$FILENAME = "..." + $VAR
+
+            ...
+
+            '
+        - pattern-inside: '$FILENAME = $VAR + "..."
+
+            ...
+
+            '
+        - pattern-inside: '$FILENAME = $STR.concat($VAR)
+
+            ...
+
+            '
+        - pattern-inside: '$FILENAME = "...".format(..., $VAR, ...)
+
+            ...
+
+            '
+      - pattern: Source.fromFile($FILENAME, ...)
+    - patterns:
+      - pattern-either:
+        - pattern: Source.fromFile("..." + $VAR, ...)
+        - pattern: Source.fromFile($VAR + "...", ...)
+        - pattern: Source.fromFile($STR.concat($VAR), ...)
+        - pattern: Source.fromFile("...".format(..., $VAR, ...), ...)
+  - pattern-inside: "def $FUNC(..., $VAR: $TYPE, ...) = Action {\n  ...\n}\n"
+- id: rsa-padding-set
+  metadata:
+    cwe:
+    - 'CWE-780: Use of RSA Algorithm without OAEP'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    category: security
+    technology:
+    - scala
+    - cryptography
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    resources:
+    - https://blog.codacy.com/9-scala-security-issues/
+    confidence: HIGH
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: MEDIUM
+  message: Usage of RSA without OAEP (Optimal Asymmetric Encryption Padding) may weaken
+    encryption. This could lead to sensitive data exposure. Instead, use RSA with
+    `OAEPWithMD5AndMGF1Padding` instead.
+  severity: WARNING
+  languages:
+  - scala
+  patterns:
+  - pattern: '$VAR = $CIPHER.getInstance($MODE)
+
+      '
+  - metavariable-regex:
+      metavariable: $MODE
+      regex: .*RSA/.*/NoPadding.*
+- id: sax-dtd-enabled
+  patterns:
+  - pattern-either:
+    - pattern: $SR = new SAXReader(...)
+    - pattern: '$SF = SAXParserFactory.newInstance(...)
+
+        ...
+
+        $SR = $SF.newSAXParser(...)
+
+        '
+    - patterns:
+      - pattern: $SR = SAXParserFactory.newInstance(...)
+      - pattern-not-inside: '...
+
+          $X = $SR.newSAXParser(...)
+
+          '
+    - pattern: $SR = SAXParserFactory.newInstance(...).newSAXParser(...)
+    - pattern: $SR = new SAXBuilder(...)
+  - pattern-not-inside: '...
+
+      $SR.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      ...
+
+      $SR.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      ...
+
+      $SR.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      '
+  - pattern-not-inside: '...
+
+      $SR.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      ...
+
+      $SR.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      ...
+
+      $SR.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      '
+  - pattern-not-inside: '...
+
+      $SR.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      ...
+
+      $SR.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      ...
+
+      $SR.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      '
+  - pattern-not-inside: '...
+
+      $SR.setFeature("http://xml.org/sax/features/external-general-entities", false)
+
+      ...
+
+      $SR.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+
+      ...
+
+      $SR.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+
+      '
+  message: XML processor being instantiated without calling the `setFeature` functions
+    that are generally used for disabling entity processing. User controlled data
+    in XML Parsers can result in XML Internal Entity Processing vulnerabilities like
+    the disclosure of confidential data, denial of service, Server Side Request Forgery
+    (SSRF), port scanning. Make sure to disable entity processing functionality.
+  languages:
+  - scala
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    owasp:
+    - A04:2017 - XML External Entities (XXE)
+    - A05:2021 - Security Misconfiguration
+    source-rule-url: https://cheatsheetseries.owasp.org//cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+    category: security
+    technology:
+    - scala
+    confidence: HIGH
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: MEDIUM
+- id: scala-dangerous-process-run
+  patterns:
+  - pattern-either:
+    - pattern: $X.!
+    - pattern: $X.!!
+    - pattern: $X.lazyLines
+  - pattern-inside: 'import sys.process
+
+      ...
+
+      '
+  - pattern-not: '"...".!
+
+      '
+  - pattern-not: '"...".!!
+
+      '
+  - pattern-not: '"...".lazyLines
+
+      '
+  - pattern-not: 'Seq(...).!
+
+      '
+  - pattern-not: 'Seq(...).!!
+
+      '
+  - pattern-not: 'Seq(...).lazyLines
+
+      '
+  - pattern-not-inside: 'val $X = "..."
+
+      ...
+
+      '
+  - pattern-not-inside: 'val $X = Seq(...)
+
+      ...
+
+      '
+  message: Found dynamic content used for the external process. This is dangerous
+    if arbitrary data can reach this function call because it allows a malicious actor
+    to execute commands. Use `Seq(...)` for dynamically generated commands.
+  languages:
+  - scala
+  severity: ERROR
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    technology:
+    - scala
+    confidence: LOW
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+- id: scalac-debug
+  patterns:
+  - pattern-either:
+    - pattern: scalacOptions ... "-Vdebug"
+    - pattern: scalacOptions ... "-Ydebug"
+  message: Scala applications built with `debug` set to true in production may leak
+    debug information to attackers. Debug mode also affects performance and reliability.
+    Remove it from configuration.
+  languages:
+  - generic
+  severity: WARNING
+  paths:
+    include:
+    - '*.sbt*'
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    owasp: A05:2021 - Security Misconfiguration
+    technology:
+    - scala
+    - sbt
+    references:
+    - https://docs.scala-lang.org/overviews/compiler-options/index.html
+    confidence: MEDIUM
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+- id: scalaj-http-ssrf
+  patterns:
+  - pattern: Http($URL)
+  - pattern-inside: 'import scalaj.http.$HTTP
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = $A {\n  ...\n}\n"
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = {\n  ...\n}\n"
+  message: A parameter being passed directly into `Http` can likely lead to SSRF.
+    This could allow an attacker to send data to their own server, potentially exposing
+    sensitive data sent with this request. They could also probe internal servers
+    or other resources that the server running this code can access. Do not allow
+    arbitrary hosts. Instead, create an allowlist for approved hosts, or hardcode
+    the correct host.
+  metadata:
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    owasp:
+    - A10:2021 - Server-Side Request Forgery (SSRF)
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    - https://github.com/scalaj/scalaj-http#simplified-http
+    category: security
+    technology:
+    - scala
+    - scalaj-http
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - scala
+  severity: WARNING
+- id: scalajs-eval
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: $PARAM
+    - pattern-either:
+      - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = {\n  ...\n}\n"
+      - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = $A {\n  ...\n}\n"
+      - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = $A(...) {\n  ...\n}\n"
+  pattern-sinks:
+  - patterns:
+    - pattern: $JS.eval(...)
+    - pattern-inside: 'import scala.scalajs.$X
+
+        ...
+
+        '
+  message: '`eval()` function evaluates JavaScript code represented as a string. Executing
+    JavaScript from a string is an enormous security risk. It is far too easy for
+    a bad actor to run arbitrary code when you use `eval()`. Do not use eval(). Alternatively:
+    Ensure evaluated content is not definable by external sources. If it’s not possible,
+    strip everything except alphanumeric characters from an input provided for the
+    command string and arguments.'
+  metadata:
+    references:
+    - https://www.scala-js.org/doc/
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - scala
+    - scala-js
+    confidence: LOW
+    cwe2022-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - scala
+  severity: WARNING
+- id: xmlinputfactory-dtd-enabled
+  patterns:
+  - pattern-not-inside: '...
+
+      $XMLFACTORY.setProperty("javax.xml.stream.isSupportingExternalEntities", false)
+
+      '
+  - pattern-either:
+    - pattern: $XMLFACTORY = XMLInputFactory.newFactory(...)
+    - pattern: $XMLFACTORY = XMLInputFactory.newInstance(...)
+    - pattern: $XMLFACTORY = new XMLInputFactory(...)
+  message: XMLInputFactory being instantiated without calling the setProperty functions
+    that are generally used for disabling entity processing. User controlled data
+    in XML Document builder can result in XML Internal Entity Processing vulnerabilities
+    like the disclosure of confidential data, denial of service, Server Side Request
+    Forgery (SSRF), port scanning. Make sure to disable entity processing functionality.
+  languages:
+  - scala
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    owasp:
+    - A04:2017 - XML External Entities (XXE)
+    - A05:2021 - Security Misconfiguration
+    source-rule-url: https://cheatsheetseries.owasp.org//cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+    category: security
+    technology:
+    - scala
+    confidence: HIGH
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM

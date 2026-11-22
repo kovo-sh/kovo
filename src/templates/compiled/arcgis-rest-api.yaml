@@ -1,0 +1,31 @@
+id: "arcgis-rest-api"
+name: "ArcGIS Exposed REST API documentation"
+severity: "info"
+description: "ArcGIS REST API documentation was discovered."
+tech:
+  - "generic"
+tags:
+  - "api"
+  - "arcgis"
+  - "cms"
+  - "tech"
+  - "esri"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://enterprise.arcgis.com/en/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/server/sdk/rest/index.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "ArcGIS REST API"
+  - type: "status"
+    status:
+      - 200

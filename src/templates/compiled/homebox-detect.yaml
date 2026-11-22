@@ -1,0 +1,35 @@
+id: "homebox-detect"
+name: "Homebox - Detect"
+severity: "info"
+description: "Homebox, a self-hosted home inventory and organization system, was detected via its unauthenticated /api/v1/status endpoint."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "homebox"
+  - "inventory"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/sysadminsmedia/homebox"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/status"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"title\":\"Homebox\""
+      - "\"build\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

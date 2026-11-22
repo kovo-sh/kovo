@@ -1,0 +1,28 @@
+id: "dolphin-installer"
+name: "Dolphin Installer - Exposure"
+severity: "high"
+description: "Dolphin is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "dolphin"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Dolphin Installation"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,29 @@
+id: "glitchtip-public-signup"
+name: "Gitea Public Registration Enabled"
+severity: "medium"
+description: "A misconfiguration in GlitchTip allows arbitrary users to sign up."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "glitchtip"
+  - "vuln"
+reference: "https://glitchtip.com/documentation/install"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/settings/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"enableUserRegistration\": true"
+      - "enableSocialAppsUserRegistration"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

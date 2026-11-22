@@ -6,8 +6,8 @@ import { Button } from '../components/ui/button.tsx'
 import { Checkbox } from '../components/ui/checkbox.tsx'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../components/ui/collapsible.tsx'
 import { Input, NativeSelect } from '../components/ui/input.tsx'
-import { DEFAULT_PROVIDER, id, thinkingLevels } from '../domain.ts'
-import type { PublicModelProfile, ThinkingLevel } from '../domain.ts'
+import { DEFAULT_PROVIDER, id, roleAffinities, thinkingLevels } from '../domain.ts'
+import type { PublicModelProfile, RoleAffinity, ThinkingLevel } from '../domain.ts'
 
 export const Route = createFileRoute('/settings')({
   validateSearch: (search): { runId?: string } => ({ runId: id.safeParse(search.runId).data }),
@@ -63,6 +63,7 @@ function ModelPage() {
     contextWindow: DEFAULT_PROVIDER.contextWindow,
     maxTokens: DEFAULT_PROVIDER.maxTokens,
     thinkingLevel: DEFAULT_PROVIDER.thinkingLevel,
+    roleAffinity: DEFAULT_PROVIDER.roleAffinity,
     inputCostPerMtok: DEFAULT_PROVIDER.inputCostPerMtok,
     cachedInputCostPerMtok: DEFAULT_PROVIDER.cachedInputCostPerMtok,
     outputCostPerMtok: DEFAULT_PROVIDER.outputCostPerMtok,
@@ -125,7 +126,8 @@ function ModelPage() {
           <span>Protocol <strong>{profile.protocol === 'messages' ? 'Anthropic Messages' : 'OpenAI Responses'}</strong></span>
           <span>Window <strong>{formatK(profile.contextWindow)}</strong></span>
           <span>Max out <strong>{formatK(profile.maxTokens)}</strong></span>
-          <span>Thinking <strong>{profile.thinkingLevel}</strong></span>
+          <span>Thinking <strong>{profile.thinkingLevel}</strong>{' '}</span>
+          <span>Role <strong>{profile.roleAffinity ?? 'any'}</strong>{' '}</span>
           <span>Cost <strong>{formatRate(profile.inputCostPerMtok)} in · {formatRate(profile.cachedInputCostPerMtok)} cached · {formatRate(profile.outputCostPerMtok)} out</strong> / Mtok</span>
           <span>Updated {timeText(profile.updatedAt)}</span>
         </div>
@@ -142,6 +144,9 @@ function ModelPage() {
       const thinkingRaw = String(form.get('thinkingLevel') ?? DEFAULT_PROVIDER.thinkingLevel)
       const thinkingLevel = (thinkingLevels as readonly string[]).includes(thinkingRaw)
         ? thinkingRaw as ThinkingLevel : DEFAULT_PROVIDER.thinkingLevel
+      const roleRaw = String(form.get('roleAffinity') ?? DEFAULT_PROVIDER.roleAffinity)
+      const roleAffinity = (roleAffinities as readonly string[]).includes(roleRaw)
+        ? roleRaw as RoleAffinity : DEFAULT_PROVIDER.roleAffinity
       const data = {
         ...(editing ? { id: editing.id } : {}),
         name: String(form.get('name') ?? '').trim() || DEFAULT_PROVIDER.name,
@@ -154,6 +159,7 @@ function ModelPage() {
         contextWindow: Number(form.get('contextWindow') ?? DEFAULT_PROVIDER.contextWindow),
         maxTokens: Number(form.get('maxTokens') ?? DEFAULT_PROVIDER.maxTokens),
         thinkingLevel,
+        roleAffinity,
         inputCostPerMtok: Number(form.get('inputCostPerMtok') ?? DEFAULT_PROVIDER.inputCostPerMtok),
         cachedInputCostPerMtok: Number(form.get('cachedInputCostPerMtok') ?? DEFAULT_PROVIDER.cachedInputCostPerMtok),
         outputCostPerMtok: Number(form.get('outputCostPerMtok') ?? DEFAULT_PROVIDER.outputCostPerMtok),
@@ -176,10 +182,18 @@ function ModelPage() {
         <h2>{editing ? `Edit profile · ${editing.name}` : profiles.length ? 'Add failover profile' : 'Connect OpenRouter'}</h2>
         {editing && <Button variant="ghost" onClick={cancelEdit}>Cancel edit</Button>}
       </div>
-      <div className="field-grid-2">
+      <div className="field-grid-3">
         <label>Profile name<Input name="name" required maxLength={160} defaultValue={defaults.name} /></label>
         <label>Priority (higher tried first)
           <Input name="priority" type="number" min={0} max={1000} step={1} required defaultValue={defaults.priority} />
+        </label>
+        <label>Role affinity
+          <NativeSelect name="roleAffinity" defaultValue={defaults.roleAffinity}>
+            <option value="any">Any (all roles)</option>
+            <option value="reasoning">Reasoning (audit, repair, patch)</option>
+            <option value="tactical">Tactical (specialists, planner)</option>
+            <option value="fast">Fast (triage, dedupe)</option>
+          </NativeSelect>
         </label>
       </div>
       <label>API key {editing && <span className="muted">(optional — leave blank to keep stored key)</span>}

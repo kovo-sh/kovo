@@ -1,0 +1,32 @@
+id: "bigip-apm-detect"
+name: "BIGIP APM - Detect"
+severity: "info"
+description: "Safe check derived from bigip-apm-detect: BIGIP APM - Detect"
+tech:
+  - "php"
+tags:
+  - "bigip"
+  - "tech"
+  - "f5"
+  - "detect"
+  - "discovery"
+reference: "https://my.f5.com/manage/s/article/K000138683"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pre/config.php?version=2.0"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "F5 Networks"
+      - "<PROFILE VERSION="
+      - "<VERSION>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

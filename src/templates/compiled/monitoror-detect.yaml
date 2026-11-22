@@ -1,0 +1,31 @@
+id: "monitoror-detect"
+name: "Monitoror - Detect"
+severity: "info"
+description: "Monitoror, a self-hosted unified monitoring wallboard, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "monitoror"
+  - "monitoring"
+  - "observability"
+  - "detect"
+reference: "https://monitoror.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "content=\"Monitoror — Unified monitoring wallboard\""
+      - "Monitoror doesn't work properly without JavaScript enabled"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

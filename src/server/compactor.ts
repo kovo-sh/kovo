@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { and, desc, eq, inArray, isNotNull, isNull } from 'drizzle-orm'
+import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { providerPool } from './provider.ts'
 import type { UsageCallback } from './provider.ts'
@@ -238,11 +239,13 @@ export class ColdGraphCompactor {
     ]
     if (!profiles.length) return redact(fallback, secrets)
     try {
-      const { models, model } = providerPool(profiles, 'compactor', {
+      const routed = resolveProfilePoolForRole('fast', profiles)
+      const { models, model } = providerPool(routed, 'compactor', {
         signal,
         secrets: this.options.secrets,
         maxCalls: 3,
         thinkingLevel: 'low',
+        roleAffinity: 'fast',
         onUsage: this.options.onUsage,
         onProfileSuccess: this.options.onProfileSuccess,
         onProfileFailure: this.options.onProfileFailure,

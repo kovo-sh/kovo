@@ -1,0 +1,28 @@
+id: "qloapps-installer"
+name: "QloApps - Installation"
+severity: "high"
+description: "QloApps Installation Assistant panel exposure."
+tech:
+  - "generic"
+tags:
+  - "install"
+  - "qloapps"
+  - "misconfig"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>QloApps Installation"
+  - type: "status"
+    status:
+      - 200

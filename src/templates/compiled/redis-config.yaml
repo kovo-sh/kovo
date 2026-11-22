@@ -1,0 +1,36 @@
+id: "redis-config"
+name: "Redis Configuration File - Detect"
+severity: "medium"
+description: "Redis configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "redis"
+  - "exposure"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://redis.io/docs/manual/config/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/redis.conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "bind"
+      - "protected-mode"
+      - "port "
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+  - type: "status"
+    status:
+      - 200

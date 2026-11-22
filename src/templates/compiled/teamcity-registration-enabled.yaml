@@ -1,0 +1,28 @@
+id: "teamcity-registration-enabled"
+name: "JetBrains TeamCity - Registration Enabled"
+severity: "high"
+description: "JetBrains TeamCity allows all visitors to register due to a misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "auth-bypass"
+  - "teamcity"
+  - "jetbrains"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://ph33r.medium.com/misconfig-in-teamcity-panel-lead-to-auth-bypass-in-apache-org-0day-146f6a1a4e2b"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/registerUser.html?init=1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Register a New User Account ? TeamCity</title>"

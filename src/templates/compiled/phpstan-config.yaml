@@ -1,0 +1,34 @@
+id: "phpstan-config"
+name: "PHPStan Configuration Page - Detect"
+severity: "info"
+description: "PHPStan configuration page was detected."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://phpstan.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/phpstan.neon"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "parameters:"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+      - "application/javascript"
+    negative: true
+  - type: "status"
+    status:
+      - 200

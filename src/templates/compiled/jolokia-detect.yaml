@@ -1,0 +1,29 @@
+id: "jolokia-detect"
+name: "Jolokia Detection"
+severity: "info"
+description: "Safe check derived from jolokia-detect: Jolokia Detection"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "jolokia"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/jolokia/version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"timestamp\":"
+      - "\"protocol\":"
+      - "\"agent\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

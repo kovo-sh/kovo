@@ -1,0 +1,29 @@
+id: "sabnzbd-installer"
+name: "SABnzbd Quick-Start Wizard - Exposure"
+severity: "high"
+description: "Default installation wizard page of SABnzbd was discovered."
+tech:
+  - "generic"
+tags:
+  - "sabnzbd"
+  - "wizard"
+  - "installer"
+  - "misconfig"
+  - "vuln"
+reference: "https://www.sabnzbd.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/sabnzbd/wizard/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "SABnzbd Quick-Start Wizard"
+  - type: "status"
+    status:
+      - 200

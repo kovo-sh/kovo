@@ -1,0 +1,30 @@
+id: "bitbucket-public-repository"
+name: "Atlassian Bitbucket Public Repository Exposure"
+severity: "low"
+description: "Bitbucket Public Repository is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "bitbucket"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/repos?visibility=public"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Public Repositories - Bitbucket"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

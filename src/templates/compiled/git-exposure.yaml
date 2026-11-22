@@ -1,0 +1,29 @@
+id: "git-exposure"
+name: "Git Metadata Directory Exposure"
+severity: "medium"
+description: "Git Metadata Directory exposed."
+tech:
+  - "generic"
+tags:
+  - "logs"
+  - "git"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.git/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "403 Forbidden"
+      - "You do not have permission to access /.git/"
+    condition: "and"
+  - type: "status"
+    status:
+      - 403

@@ -1,0 +1,32 @@
+id: "freepbx-cleanup-backdoor"
+name: "FreePBX - CVE-2025-57819 Backdoor"
+severity: "high"
+description: "FreePBX backdoor cleanup script used in 0-day exploitation of CVE-2025-57819 was detected."
+tech:
+  - "generic"
+tags:
+  - "backdoor"
+  - "sangoma"
+  - "freepbx"
+  - "vuln"
+reference: "https://community.freepbx.org/t/security-advisory-please-lock-down-your-administrator-access/107203"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.clean.sh"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "LOGS"
+      - "Processing file"
+      - "sed -i --follow-symlinks"
+      - "/var/log/asterisk/freepbx_security.log"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

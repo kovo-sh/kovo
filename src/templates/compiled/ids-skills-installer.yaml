@@ -1,0 +1,28 @@
+id: "ids-skills-installer"
+name: "IDP Skills Installer - Exposure"
+severity: "high"
+description: "Checks for the presence of an IDS Skills Installer page."
+tech:
+  - "generic"
+tags:
+  - "install"
+  - "ids"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/#/install/main"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>IDP Skills Installer</title>"
+  - type: "status"
+    status:
+      - 200

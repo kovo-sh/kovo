@@ -1,0 +1,29 @@
+id: "pyproject-disclosure"
+name: "Pyproject Disclosure"
+severity: "info"
+description: "Safe check derived from pyproject-disclosure: Pyproject Disclosure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "vuln"
+reference: "https://github.com/detectify/ugly-duckling/blob/master/modules/crowdsourced/pyproject-disclosure.json"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pyproject.toml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[build-system]"
+      - "[tool.poetry]"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

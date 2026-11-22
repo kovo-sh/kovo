@@ -1,0 +1,32 @@
+id: "badarg-log"
+name: "Badarg Log File Exposure"
+severity: "low"
+description: "Badarg log file was exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "badarg"
+  - "log"
+  - "debug"
+  - "vuln"
+reference: "https://github.com/maurosoria/dirsearch/blob/master/db/dicc.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.badarg.log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Special kernel symbols:"
+      - "Kernel executable memory footprint:"
+      - "badarg"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

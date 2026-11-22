@@ -1,0 +1,23 @@
+id: "cloudflare-external-image-resize"
+name: "Cloudflare External Image Resizing Misconfiguration"
+severity: "info"
+description: "Cloudflare Image Resizing defaults to restricting resizing to the same domain. This prevents third parties from resizing any image at any origin. However, you can enable this option if you check Resize images from any origin."
+tech:
+  - "cloudflare"
+tags:
+  - "cloudflare"
+  - "misconfig"
+  - "oast"
+  - "vuln"
+reference: "https://support.cloudflare.com/hc/en-us/articles/360028146432-Understanding-Cloudflare-Image-Resizing#12345684"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cdn-cgi/image/width/{{guardian_canary_http}}"
+control:
+  method: "GET"
+  path: "/cdn-cgi/image/width/guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "canary"
+    protocol: "http"

@@ -1,0 +1,30 @@
+id: "contentify-installer"
+name: "Contentify Installer Exposure"
+severity: "high"
+description: "Contentify is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "contentify"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Contentify - Step 1"
+      - "start the installation"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

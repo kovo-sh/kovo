@@ -1,0 +1,24 @@
+id: "oob-param-based-interaction"
+name: "Parameter Based Generic OOB Interaction"
+severity: "info"
+description: "The remote server fetched a spoofed URL from the request parameters."
+tech:
+  - "generic"
+tags:
+  - "oast"
+  - "ssrf"
+  - "generic"
+  - "vuln"
+cwe: "CWE-918"
+reference: "https://github.com/PortSwigger/collaborator-everywhere"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?u={{guardian_canary_http}}/&href={{guardian_canary_http}}/&action={{guardian_canary_http}}/&host={{guardian_canary_http}}&http_host={{guardian_canary_http}}&email=root@{{guardian_canary_http}}&url={{guardian_canary_http}}/&load={{guardian_canary_http}}/&preview={{guardian_canary_http}}/&target={{guardian_canary_http}}/&proxy={{guardian_canary_http}}/&from={{guardian_canary_http}}/&src={{guardian_canary_http}}/&ref={{guardian_canary_http}}/&referrer={{guardian_canary_http}}/"
+control:
+  method: "GET"
+  path: "/?u=guardian-none-{{rand}}/&href=guardian-none-{{rand}}/&action=guardian-none-{{rand}}/&host=guardian-none-{{rand}}&http_host=guardian-none-{{rand}}&email=root@guardian-none-{{rand}}&url=guardian-none-{{rand}}/&load=guardian-none-{{rand}}/&preview=guardian-none-{{rand}}/&target=guardian-none-{{rand}}/&proxy=guardian-none-{{rand}}/&from=guardian-none-{{rand}}/&src=guardian-none-{{rand}}/&ref=guardian-none-{{rand}}/&referrer=guardian-none-{{rand}}/"
+matchers-condition: "or"
+matchers:
+  - type: "canary"
+    protocol: "http"

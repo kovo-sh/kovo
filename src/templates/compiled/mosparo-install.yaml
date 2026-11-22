@@ -1,0 +1,27 @@
+id: "mosparo-install"
+name: "mosparo Exposed Installation"
+severity: "high"
+description: "mosparo is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "mosparo"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Setup - mosparo"
+  - type: "status"
+    status:
+      - 200

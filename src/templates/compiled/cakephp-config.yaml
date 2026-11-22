@@ -1,0 +1,33 @@
+id: "cakephp-config"
+name: "CakePHP Configuration File - Detect"
+severity: "medium"
+description: "CakePHP configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "files"
+  - "exposure"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://book.cakephp.org/phinx/0/en/configuration.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/phinx.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "host:"
+      - "name:"
+      - "pass:"
+      - "adapter:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,34 @@
+id: "servicenow-title-injection"
+name: "Service Now - Title Injection"
+severity: "high"
+description: "Safe check derived from servicenow-title-injection: Service Now - Title Injection"
+tech:
+  - "generic"
+tags:
+  - "cve"
+  - "cve2024"
+  - "servicenow"
+  - "injection"
+  - "vuln"
+cwe: "CWE-79"
+reference: "https://www.assetnote.io/resources/research/chaining-three-bugs-to-access-all-your-servicenow-data"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login.do?jvar_page_title=<style><foo>Injected Title</foo></style>"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title><style><foo>Injected Title</foo></style></title>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

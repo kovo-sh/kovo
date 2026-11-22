@@ -1,0 +1,29 @@
+id: "wordpress-db-backup-listing"
+name: "WordPress DB Backup"
+severity: "medium"
+description: "WordPress DB Backup plugin exposes db file along with directory listing."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "backup"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/uploads/database-backups/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of /"
+      - "wp-content/uploads/database-backups"
+      - ".sql"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,34 @@
+id: "go-pprof-debug"
+name: "Go pprof Debug Page"
+severity: "low"
+description: "go pprof debug page was exposed."
+tech:
+  - "go"
+tags:
+  - "logs"
+  - "exposure"
+  - "go"
+  - "pprof"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/debug/pprof/heap?debug=1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "heap profile:"
+      - "Alloc"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

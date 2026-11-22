@@ -1,0 +1,31 @@
+id: "langflow-detect"
+name: "Langflow - Detect"
+severity: "info"
+description: "Langflow was detected. Langflow is an open-source visual LLM flow builder built on LangChain, providing a drag-and-drop interface for building AI pipelines and agents. Exposed instances may allow access to AI workflow configurations and API keys."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "langflow"
+  - "llm"
+  - "ai"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/langflow-ai/langflow"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"package\":\"Langflow\""
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Langflow</title>"

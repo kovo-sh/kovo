@@ -1,0 +1,30 @@
+id: "apache-livy-detect"
+name: "Apache Livy - Detect"
+severity: "info"
+description: "Detects a Apache Livy, a open source REST interface for interacting with Apache Spark from anywhere."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "livy"
+  - "detect"
+reference: "https://github.com/apache/livy"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ui"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Livy"
+      - "livy-"
+      - "livy-ui"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "gatus-detect"
+name: "Gatus - Detect"
+severity: "info"
+description: "Gatus, an automated status page for monitoring service health, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "gatus"
+  - "monitoring"
+  - "detect"
+reference: "https://github.com/TwiN/gatus"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Health Dashboard | Gatus</title>"
+      - "content=\"Gatus is an advanced automated status page"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

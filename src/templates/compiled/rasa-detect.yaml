@@ -1,0 +1,30 @@
+id: "rasa-detect"
+name: "Rasa Open Source - Detect"
+severity: "info"
+description: "Rasa Open Source, an open-source conversational AI framework used to build chatbots and voice assistants that exposes a REST server (default port 5005) for intent parsing and webhook-driven conversations, was detected. Exposed unauthenticated instances may have allowed interaction with the assistant's conversation endpoints and disclosed internal version and configuration information."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "rasa"
+  - "ai"
+  - "chatbot"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/RasaHQ/rasa"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"minimum_compatible_version\""
+  - type: "status"
+    status:
+      - 200

@@ -4,6 +4,9 @@
   "type": "module",
   "dependencies": {
     "@ast-grep/cli": "0.51.3",
+    "@swc/core": "1.16.22",
+    "acorn": "8.19.0",
+    "acorn-walk": "8.3.5",
     "just-bash": "3.6.1"
   },
   "overrides": {

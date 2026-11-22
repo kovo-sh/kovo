@@ -1,0 +1,32 @@
+id: "laravel-pulse-unauth"
+name: "Laravel Pulse - Unauthenticated Dashboard Access"
+severity: "medium"
+description: "Laravel Pulse monitoring dashboard is accessible without authentication. Pulse displays server performance metrics, slow queries, user activity, cache hit rates, and exception logs that could aid attackers in reconnaissance."
+tech:
+  - "laravel"
+tags:
+  - "laravel"
+  - "pulse"
+  - "monitoring"
+  - "misconfig"
+  - "unauth"
+cwe: "CWE-306"
+reference: "https://laravel.com/docs/11.x/pulse#dashboard-authorization"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pulse"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Laravel Pulse"
+      - "livewire"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

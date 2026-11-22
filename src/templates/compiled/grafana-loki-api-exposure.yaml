@@ -1,0 +1,29 @@
+id: "grafana-loki-api-exposure"
+name: "Grafana Loki - Unauthenticated API Access"
+severity: "medium"
+description: "Grafana Loki API is accessible without authentication, allowing unauthorized access to log streams."
+tech:
+  - "grafana"
+tags:
+  - "exposure"
+  - "loki"
+  - "grafana"
+  - "unauth"
+  - "misconfig"
+reference: "https://grafana.com/docs/loki/latest/operations/authentication/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/loki/api/v1/labels"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"status\":\"success\""
+  - type: "status"
+    status:
+      - 200

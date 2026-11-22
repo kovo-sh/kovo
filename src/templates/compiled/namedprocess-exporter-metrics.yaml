@@ -1,0 +1,30 @@
+id: "namedprocess-exporter-metrics"
+name: "Named Process Exporter"
+severity: "low"
+description: "Named process exporter is exposed."
+tech:
+  - "generic"
+tags:
+  - "namedprocess"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "namedprocess"
+      - "# HELP"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

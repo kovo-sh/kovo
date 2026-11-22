@@ -1,0 +1,425 @@
+rules:
+- id: alias-path-traversal
+  patterns:
+  - pattern: "location $...LOCATION {\n  ...\n  alias .../;\n  ...\n}\n"
+  - metavariable-pattern:
+      metavariable: $...LOCATION
+      pattern-regex: ^.*[^/]$
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  fix-regex:
+    regex: location\s+([A-Za-z0-9/-_\.]+)
+    replacement: location \1/
+  languages:
+  - generic
+  severity: WARNING
+  message: The alias in this location block is subject to a path traversal because
+    the location path does not end in a path separator (e.g., '/'). To fix, add a
+    path separator to the end of the path.
+  metadata:
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    source-rule-url: https://github.com/yandex/gixy/blob/master/docs/en/plugins/aliastraversal.md
+    category: security
+    technology:
+    - nginx
+    confidence: LOW
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    - https://www.acunetix.com/vulnerabilities/web/path-traversal-via-misconfigured-nginx-alias/
+    - https://www.youtube.com/watch?v=CIhHpkybYsY
+    - https://github.com/orangetw/My-Presentation-Slides/blob/main/data/2018-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out.pdf
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+- id: dynamic-proxy-host
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: The host for this proxy URL is dynamically determined. This can be dangerous
+    if the host can be injected by an attacker because it may forcibly alter destination
+    of the proxy. Consider hardcoding acceptable destinations and retrieving them
+    with 'map' or something similar.
+  metadata:
+    source-rule-url: https://github.com/yandex/gixy/blob/master/docs/en/plugins/ssrf.md
+    references:
+    - https://nginx.org/en/docs/http/ngx_http_map_module.html
+    category: security
+    technology:
+    - nginx
+    confidence: MEDIUM
+    cwe:
+    - 'CWE-441: Unintended Proxy or Intermediary (''Confused Deputy'')'
+    owasp:
+    - A01:2021 - Broken Access Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+  pattern-either:
+  - pattern: proxy_pass $SCHEME://$$HOST ...;
+  - pattern: proxy_pass $$SCHEME://$$HOST ...;
+- id: dynamic-proxy-scheme
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: The protocol scheme for this proxy is dynamically determined. This can
+    be dangerous if the scheme can be injected by an attacker because it may forcibly
+    alter the connection scheme. Consider hardcoding a scheme for this proxy.
+  metadata:
+    cwe:
+    - 'CWE-16: CWE CATEGORY: Configuration'
+    references:
+    - https://github.com/yandex/gixy/blob/master/docs/en/plugins/ssrf.md
+    category: security
+    technology:
+    - nginx
+    confidence: MEDIUM
+    owasp:
+    - A06:2017 - Security Misconfiguration
+    - A05:2021 - Security Misconfiguration
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+  pattern: proxy_pass $$SCHEME:// ...;
+- id: header-injection
+  pattern: "location ... <$VARIABLE> ... {\n  ...\n  add_header ... $$VARIABLE\n \
+    \ ...\n}\n"
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: ERROR
+  message: 'The $$VARIABLE path parameter is added as a header in the response. This
+    could allow an attacker to inject a newline and add a new header into the response.
+    This is called HTTP response splitting. To fix, do not allow whitespace in the
+    path parameter: ''[^\s]+''.'
+  metadata:
+    cwe:
+    - 'CWE-113: Improper Neutralization of CRLF Sequences in HTTP Headers (''HTTP
+      Request/Response Splitting'')'
+    references:
+    - https://github.com/yandex/gixy/blob/master/docs/en/plugins/httpsplitting.md
+    - https://owasp.org/www-community/attacks/HTTP_Response_Splitting
+    category: security
+    technology:
+    - nginx
+    confidence: MEDIUM
+    owasp:
+    - A03:2021 - Injection
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+- id: header-redefinition
+  patterns:
+  - pattern-inside: "server {\n  ...\n  add_header ...;\n  ...\n  ...\n}\n"
+  - pattern-inside: "location ... {\n  ...\n  ...\n}\n"
+  - pattern: add_header ...;
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: The 'add_header' directive is called in a 'location' block after headers
+    have been set at the server block. Calling 'add_header' in the location block
+    will actually overwrite the headers defined in the server block, no matter which
+    headers are set. To fix this, explicitly set all headers or set all headers in
+    the server block.
+  metadata:
+    cwe:
+    - 'CWE-16: CWE CATEGORY: Configuration'
+    references:
+    - https://github.com/yandex/gixy/blob/master/docs/en/plugins/addheaderredefinition.md
+    category: security
+    technology:
+    - nginx
+    confidence: LOW
+    owasp:
+    - A06:2017 - Security Misconfiguration
+    - A05:2021 - Security Misconfiguration
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+- id: insecure-redirect
+  patterns:
+  - pattern-either:
+    - pattern: rewrite ... redirect
+    - pattern: rewrite ... permanent
+  - pattern-not-inside: rewrite ... https ... $host ... redirect
+  - pattern-not-inside: rewrite ... https ... $host ... permanent
+  - pattern-not-regex: (?i)https:\/\/
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  message: Detected an insecure redirect in this nginx configuration. If no scheme
+    is specified, nginx will forward the request with the incoming scheme. This could
+    result in unencrypted communications. To fix this, include the 'https' scheme.
+  languages:
+  - generic
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    category: security
+    technology:
+    - nginx
+    confidence: LOW
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+- id: insecure-ssl-version
+  patterns:
+  - pattern-not: ssl_protocols TLSv1.2 TLSv1.3;
+  - pattern-not: ssl_protocols TLSv1.3 TLSv1.2;
+  - pattern-not: ssl_protocols TLSv1.2;
+  - pattern-not: ssl_protocols TLSv1.3;
+  - pattern: ssl_protocols ...;
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: Detected use of an insecure SSL version. Secure SSL versions are TLSv1.2
+    and TLS1.3; older versions are known to be broken and are susceptible to attacks.
+    Prefer use of TLSv1.2 or later.
+  metadata:
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    references:
+    - https://www.acunetix.com/blog/web-security-zone/hardening-nginx/
+    - https://www.acunetix.com/blog/articles/tls-ssl-cipher-hardening/
+    category: security
+    technology:
+    - nginx
+    confidence: HIGH
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: MEDIUM
+- id: missing-internal
+  options:
+    generic_ellipsis_max_span: 0
+    generic_engine: aliengrep
+  patterns:
+  - pattern-inside: "location ... {\n  ....\n  ....\n}\n"
+  - pattern-not-inside: "location ... {\n  ....\n  internal;\n  ....\n}\n"
+  - pattern: proxy_pass $...URL;
+  - metavariable-regex:
+      metavariable: $...URL
+      regex: (.*\$.*)
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: This location block contains a 'proxy_pass' directive but does not contain
+    the 'internal' directive. The 'internal' directive restricts access to this location
+    to internal requests. Without 'internal', an attacker could use your server for
+    server-side request forgeries (SSRF). Include the 'internal' directive in this
+    block to limit exposure.
+  metadata:
+    cwe:
+    - 'CWE-16: CWE CATEGORY: Configuration'
+    references:
+    - https://github.com/yandex/gixy/blob/master/docs/en/plugins/ssrf.md
+    - https://nginx.org/en/docs/http/ngx_http_core_module.html#internal
+    category: security
+    technology:
+    - nginx
+    confidence: LOW
+    owasp:
+    - A06:2017 - Security Misconfiguration
+    - A05:2021 - Security Misconfiguration
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+- id: missing-ssl-version
+  patterns:
+  - pattern: server { ... listen $PORT ssl; ... }
+  - pattern-not-inside: server { ... ssl_protocols ... }
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: This server configuration is missing the 'ssl_protocols' directive. By
+    default, this server will use 'ssl_protocols TLSv1 TLSv1.1 TLSv1.2', and versions
+    older than TLSv1.2 are known to be broken. Explicitly specify 'ssl_protocols TLSv1.2
+    TLSv1.3' to use secure TLS versions.
+  metadata:
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    references:
+    - https://www.acunetix.com/blog/web-security-zone/hardening-nginx/
+    - https://nginx.org/en/docs/http/configuring_https_servers.html
+    category: security
+    technology:
+    - nginx
+    confidence: MEDIUM
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+- id: possible-nginx-h2c-smuggling
+  patterns:
+  - pattern-either:
+    - pattern: 'proxy_http_version 1.1 ...;
+
+        ...
+
+        proxy_set_header Upgrade ...;
+
+        ...
+
+        proxy_set_header Connection ...;
+
+        '
+    - pattern: 'proxy_set_header Upgrade ...;
+
+        ...
+
+        proxy_set_header Connection ...;
+
+        ...
+
+        proxy_http_version 1.1 ...;
+
+        '
+    - pattern: 'proxy_set_header Upgrade ...;
+
+        ...
+
+        proxy_http_version 1.1 ...;
+
+        ...
+
+        proxy_set_header Connection ...;
+
+        '
+  - pattern-inside: "location ... {\n  ...\n}\n"
+  languages:
+  - generic
+  severity: WARNING
+  message: 'Conditions for Nginx H2C smuggling identified. H2C smuggling allows upgrading
+    HTTP/1.1 connections to lesser-known HTTP/2 over cleartext (h2c) connections which
+    can allow a bypass of reverse proxy access controls, and lead to long-lived, unrestricted
+    HTTP traffic directly to back-end servers. To mitigate: WebSocket support required:
+    Allow only the value websocket for HTTP/1.1 upgrade headers (e.g., Upgrade: websocket).
+    WebSocket support not required: Do not forward Upgrade headers.'
+  paths:
+    include:
+    - '*.conf'
+    - '*.vhost'
+    - sites-available/*
+    - sites-enabled/*
+  metadata:
+    cwe:
+    - 'CWE-444: Inconsistent Interpretation of HTTP Requests (''HTTP Request/Response
+      Smuggling'')'
+    references:
+    - https://labs.bishopfox.com/tech-blog/h2c-smuggling-request-smuggling-via-http/2-cleartext-h2c
+    category: security
+    technology:
+    - nginx
+    confidence: MEDIUM
+    owasp:
+    - A04:2021 - Insecure Design
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+- id: request-host-used
+  pattern-either:
+  - pattern: $http_host
+  - pattern: $host
+  paths:
+    include:
+    - '*conf*'
+    - '*nginx*'
+    - '*vhost*'
+    - sites-available/*
+    - sites-enabled/*
+  languages:
+  - generic
+  severity: WARNING
+  message: '''$http_host'' and ''$host'' variables may contain a malicious value from
+    attacker controlled ''Host'' request header. Use an explicitly configured host
+    value or a allow list for validation.'
+  metadata:
+    cwe:
+    - 'CWE-290: Authentication Bypass by Spoofing'
+    references:
+    - https://github.com/yandex/gixy/blob/master/docs/en/plugins/hostspoofing.md
+    - https://portswigger.net/web-security/host-header
+    category: security
+    technology:
+    - nginx
+    confidence: MEDIUM
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW

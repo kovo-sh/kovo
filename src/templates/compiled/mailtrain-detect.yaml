@@ -1,0 +1,33 @@
+id: "mailtrain-detect"
+name: "Mailtrain - Detect"
+severity: "info"
+description: "Mailtrain, an open-source self-hosted newsletter application, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "mailtrain"
+  - "newsletter"
+  - "marketing"
+  - "mail"
+  - "detect"
+reference: "https://github.com/Mailtrain-org/mailtrain"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "content=\"Self hosted email newsletter app\""
+      - "window.mailtrainConfig"
+      - "/client/mailtrain.css"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

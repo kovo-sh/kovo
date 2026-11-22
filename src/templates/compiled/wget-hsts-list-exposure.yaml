@@ -1,0 +1,28 @@
+id: "wget-hsts-list-exposure"
+name: "WGET HSTS List Exposure"
+severity: "info"
+description: "Safe check derived from wget-hsts-list-exposure: WGET HSTS List Exposure"
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "wget"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.wget-hsts"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "HSTS 1.0 Known Hosts database for GNU Wget"
+  - type: "status"
+    status:
+      - 200

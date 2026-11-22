@@ -1,0 +1,32 @@
+id: "aem-userinfo-servlet"
+name: "AEM UserInfo Servlet Credentials Exposure"
+severity: "info"
+description: "Adobe Experience Manager UserInfoServlet is exposed which allows an attacker to bruteforce credentials. You can get valid usernames from jcr:createdBy, jcr:lastModifiedBy, cq:LastModifiedBy attributes of any JCR node."
+tech:
+  - "generic"
+tags:
+  - "aem"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/libs/cq/security/userinfo.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "\"userID\":"
+      - "\"userName\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"

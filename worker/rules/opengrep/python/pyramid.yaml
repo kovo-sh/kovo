@@ -1,0 +1,681 @@
+rules:
+- id: pyramid-authtkt-cookie-httponly-unsafe-default
+  patterns:
+  - pattern: pyramid.authentication.$FUNC($...PARAMS)
+  - metavariable-pattern:
+      metavariable: $FUNC
+      pattern-either:
+      - pattern: AuthTktCookieHelper
+      - pattern: AuthTktAuthenticationPolicy
+  - pattern-not: pyramid.authentication.$FUNC(..., httponly=$HTTPONLY, ...)
+  - pattern-not: pyramid.authentication.$FUNC(..., **$PARAMS, ...)
+  - focus-metavariable: $...PARAMS
+  fix: '$...PARAMS, httponly=True
+
+    '
+  message: Found a Pyramid Authentication Ticket cookie without the httponly option
+    correctly set. Pyramid cookies should be handled securely by setting httponly=True.
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1004: Sensitive Cookie Without ''HttpOnly'' Flag'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-authtkt-cookie-httponly-unsafe-value
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-not: pyramid.authentication.AuthTktCookieHelper(..., **$PARAMS)
+      - pattern: pyramid.authentication.AuthTktCookieHelper(..., httponly=$HTTPONLY,
+          ...)
+    - patterns:
+      - pattern-not: pyramid.authentication.AuthTktAuthenticationPolicy(..., **$PARAMS)
+      - pattern: pyramid.authentication.AuthTktAuthenticationPolicy(..., httponly=$HTTPONLY,
+          ...)
+  - pattern: $HTTPONLY
+  - metavariable-pattern:
+      metavariable: $HTTPONLY
+      pattern: 'False
+
+        '
+  fix: 'True
+
+    '
+  message: Found a Pyramid Authentication Ticket cookie without the httponly option
+    correctly set. Pyramid cookies should be handled securely by setting httponly=True.
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1004: Sensitive Cookie Without ''HttpOnly'' Flag'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-authtkt-cookie-samesite
+  patterns:
+  - pattern-either:
+    - pattern: pyramid.authentication.AuthTktCookieHelper(..., samesite=$SAMESITE,
+        ...)
+    - pattern: pyramid.authentication.AuthTktAuthenticationPolicy(..., samesite=$SAMESITE,
+        ...)
+  - pattern: $SAMESITE
+  - metavariable-regex:
+      metavariable: $SAMESITE
+      regex: (?!'Lax')
+  fix: '''Lax''
+
+    '
+  message: Found a Pyramid Authentication Ticket without the samesite option correctly
+    set. Pyramid cookies should be handled securely by setting samesite='Lax'. If
+    this parameter is not properly set, your cookies are not properly protected and
+    are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1275: Sensitive Cookie with Improper SameSite Attribute'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-authtkt-cookie-secure-unsafe-default
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-not: pyramid.authentication.AuthTktCookieHelper(..., secure=$SECURE,
+          ...)
+      - pattern-not: pyramid.authentication.AuthTktCookieHelper(..., **$PARAMS)
+      - pattern: pyramid.authentication.AuthTktCookieHelper(...)
+    - patterns:
+      - pattern-not: pyramid.authentication.AuthTktAuthenticationPolicy(..., secure=$SECURE,
+          ...)
+      - pattern-not: pyramid.authentication.AuthTktAuthenticationPolicy(..., **$PARAMS)
+      - pattern: pyramid.authentication.AuthTktAuthenticationPolicy(...)
+  fix-regex:
+    regex: (.*)\)
+    replacement: \1, secure=True)
+  message: Found a Pyramid Authentication Ticket cookie using an unsafe default for
+    the secure option. Pyramid cookies should be handled securely by setting secure=True.
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-authtkt-cookie-secure-unsafe-value
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-not: pyramid.authentication.AuthTktCookieHelper(..., **$PARAMS)
+      - pattern: pyramid.authentication.AuthTktCookieHelper(..., secure=$SECURE, ...)
+    - patterns:
+      - pattern-not: pyramid.authentication.AuthTktAuthenticationPolicy(..., **$PARAMS)
+      - pattern: pyramid.authentication.AuthTktAuthenticationPolicy(..., secure=$SECURE,
+          ...)
+  - pattern: $SECURE
+  - metavariable-pattern:
+      metavariable: $SECURE
+      pattern: 'False
+
+        '
+  fix: 'True
+
+    '
+  message: Found a Pyramid Authentication Ticket cookie without the secure option
+    correctly set. Pyramid cookies should be handled securely by setting secure=True.
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-csrf-check-disabled
+  message: CSRF protection is disabled for this view. This is a security risk.
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    asvs:
+      section: V4 Access Control
+      control_id: 4.2.2 CSRF
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x12-V4-Access-Control.md#v42-operation-level-access-control
+      version: '4'
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - python
+  patterns:
+  - pattern-inside: "from pyramid.view import view_config\n...\n@view_config(...,\
+      \ require_csrf=$REQUIRE_CSRF, ...)\ndef $VIEW(...):\n  ...\n"
+  - pattern: $REQUIRE_CSRF
+  - metavariable-comparison:
+      metavariable: $REQUIRE_CSRF
+      comparison: $REQUIRE_CSRF == False
+  fix: 'True
+
+    '
+- id: pyramid-csrf-origin-check-disabled-globally
+  patterns:
+  - pattern-inside: '$CONFIG.set_default_csrf_options(..., check_origin=$CHECK_ORIGIN,
+      ...)
+
+      '
+  - pattern: $CHECK_ORIGIN
+  - metavariable-comparison:
+      metavariable: $CHECK_ORIGIN
+      comparison: $CHECK_ORIGIN == False
+  message: Automatic check of the referrer for cross-site request forgery tokens has
+    been explicitly disabled globally, which might leave views unprotected when an
+    unsafe CSRF storage policy is used. Use 'pyramid.config.Configurator.set_default_csrf_options(check_origin=True)'
+    to turn the automatic check for all unsafe methods (per RFC2616).
+  languages:
+  - python
+  severity: ERROR
+  fix: 'True
+
+    '
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+- id: pyramid-csrf-origin-check-disabled
+  message: Origin check for the CSRF token is disabled for this view. This might represent
+    a security risk if the CSRF storage policy is not known to be secure.
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    asvs:
+      section: V4 Access Control
+      control_id: 4.2.2 CSRF
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x12-V4-Access-Control.md#v42-operation-level-access-control
+      version: '4'
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  severity: WARNING
+  languages:
+  - python
+  patterns:
+  - pattern-inside: "from pyramid.view import view_config\n...\n@view_config(...,\
+      \ check_origin=$CHECK_ORIGIN, ...)\ndef $VIEW(...):\n  ...\n"
+  - pattern: $CHECK_ORIGIN
+  - metavariable-comparison:
+      metavariable: $CHECK_ORIGIN
+      comparison: $CHECK_ORIGIN == False
+  fix: 'True
+
+    '
+- id: pyramid-set-cookie-httponly-unsafe-default
+  patterns:
+  - pattern-either:
+    - pattern-inside: "@pyramid.view.view_config(...)\ndef $VIEW($REQUEST):\n    ...\n\
+        \    $RESPONSE = $REQUEST.response\n    ...\n"
+    - pattern-inside: "def $VIEW(...):\n    ...\n    $RESPONSE = pyramid.httpexceptions.HTTPFound(...)\n\
+        \    ...\n"
+  - pattern-not: $RESPONSE.set_cookie(..., httponly=$HTTPONLY, ...)
+  - pattern-not: $RESPONSE.set_cookie(..., **$PARAMS)
+  - pattern: $RESPONSE.set_cookie(...)
+  fix-regex:
+    regex: (.*)\)
+    replacement: \1, httponly=True)
+  message: Found a Pyramid cookie using an unsafe default for the httponly option.
+    Pyramid cookies should be handled securely by setting httponly=True in response.set_cookie(...).
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1004: Sensitive Cookie Without ''HttpOnly'' Flag'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-set-cookie-httponly-unsafe-value
+  patterns:
+  - pattern-either:
+    - pattern-inside: "@pyramid.view.view_config(...)\ndef $VIEW($REQUEST):\n    ...\n\
+        \    $RESPONSE = $REQUEST.response\n    ...\n"
+    - pattern-inside: "def $VIEW(...):\n    ...\n    $RESPONSE = pyramid.httpexceptions.HTTPFound(...)\n\
+        \    ...\n"
+  - pattern-not: $RESPONSE.set_cookie(..., **$PARAMS)
+  - pattern: $RESPONSE.set_cookie(..., httponly=$HTTPONLY, ...)
+  - pattern: $HTTPONLY
+  - metavariable-pattern:
+      metavariable: $HTTPONLY
+      pattern: 'False
+
+        '
+  fix: 'True
+
+    '
+  message: Found a Pyramid cookie without the httponly option correctly set. Pyramid
+    cookies should be handled securely by setting httponly=True in response.set_cookie(...).
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1004: Sensitive Cookie Without ''HttpOnly'' Flag'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://owasp.org/www-community/controls/SecureCookieAttribute
+    - https://owasp.org/www-community/HttpOnly
+    - https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#httponly-attribute
+    category: security
+    technology:
+    - pyramid
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-set-cookie-samesite-unsafe-default
+  patterns:
+  - pattern-either:
+    - pattern-inside: "@pyramid.view.view_config(...)\ndef $VIEW($REQUEST):\n    ...\n\
+        \    $RESPONSE = $REQUEST.response\n    ...\n"
+    - pattern-inside: "def $VIEW(...):\n    ...\n    $RESPONSE = pyramid.httpexceptions.HTTPFound(...)\n\
+        \    ...\n"
+  - pattern-not: $RESPONSE.set_cookie(..., samesite=$SAMESITE, ...)
+  - pattern-not: $RESPONSE.set_cookie(..., **$PARAMS)
+  - pattern: $RESPONSE.set_cookie(...)
+  fix-regex:
+    regex: (.*)\)
+    replacement: \1, samesite='Lax')
+  message: Found a Pyramid cookie using an unsafe value for the samesite option. Pyramid
+    cookies should be handled securely by setting samesite='Lax' in response.set_cookie(...).
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1275: Sensitive Cookie with Improper SameSite Attribute'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-set-cookie-samesite-unsafe-value
+  patterns:
+  - pattern-either:
+    - pattern-inside: "@pyramid.view.view_config(...)\ndef $VIEW($REQUEST):\n    ...\n\
+        \    $RESPONSE = $REQUEST.response\n    ...\n"
+    - pattern-inside: "def $VIEW(...):\n    ...\n    $RESPONSE = pyramid.httpexceptions.HTTPFound(...)\n\
+        \    ...\n"
+  - pattern-not: $RESPONSE.set_cookie(..., **$PARAMS)
+  - pattern: $RESPONSE.set_cookie(..., samesite=$SAMESITE, ...)
+  - pattern: $SAMESITE
+  - metavariable-regex:
+      metavariable: $SAMESITE
+      regex: (?!'Lax')
+  fix: '''Lax''
+
+    '
+  message: Found a Pyramid cookie without the samesite option correctly set. Pyramid
+    cookies should be handled securely by setting samesite='Lax' in response.set_cookie(...).
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-1275: Sensitive Cookie with Improper SameSite Attribute'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-set-cookie-secure-unsafe-default
+  patterns:
+  - pattern-either:
+    - pattern-inside: "@pyramid.view.view_config(...)\ndef $VIEW($REQUEST):\n    ...\n\
+        \    $RESPONSE = $REQUEST.response\n    ...\n"
+    - pattern-inside: "def $VIEW(...):\n    ...\n    $RESPONSE = pyramid.httpexceptions.HTTPFound(...)\n\
+        \    ...\n"
+  - pattern-not: $RESPONSE.set_cookie(..., secure=$SECURE, ...)
+  - pattern-not: $RESPONSE.set_cookie(..., **$PARAMS)
+  - pattern: $RESPONSE.set_cookie(...)
+  fix-regex:
+    regex: (.*)\)
+    replacement: \1, secure=True)
+  message: Found a Pyramid cookie using an unsafe default for the secure option. Pyramid
+    cookies should be handled securely by setting secure=True in response.set_cookie(...).
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-set-cookie-secure-unsafe-value
+  patterns:
+  - pattern-either:
+    - pattern-inside: "@pyramid.view.view_config(...)\ndef $VIEW($REQUEST):\n    ...\n\
+        \    $RESPONSE = $REQUEST.response\n    ...\n"
+    - pattern-inside: "def $VIEW(...):\n    ...\n    $RESPONSE = pyramid.httpexceptions.HTTPFound(...)\n\
+        \    ...\n"
+  - pattern-not: $RESPONSE.set_cookie(..., **$PARAMS)
+  - pattern: $RESPONSE.set_cookie(..., secure=$SECURE, ...)
+  - pattern: $SECURE
+  - metavariable-pattern:
+      metavariable: $SECURE
+      pattern: 'False
+
+        '
+  fix: 'True
+
+    '
+  message: Found a Pyramid cookie without the secure option correctly set. Pyramid
+    cookies should be handled securely by setting secure=True in response.set_cookie(...).
+    If this parameter is not properly set, your cookies are not properly protected
+    and are at risk of being stolen by an attacker.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A05_2021-Security_Misconfiguration
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: pyramid-csrf-check-disabled-globally
+  patterns:
+  - pattern-inside: '$CONFIG.set_default_csrf_options(..., require_csrf=$REQUIRE_CSRF,
+      ...)
+
+      '
+  - pattern: $REQUIRE_CSRF
+  - metavariable-comparison:
+      metavariable: $REQUIRE_CSRF
+      comparison: $REQUIRE_CSRF == False
+  message: Automatic check of cross-site request forgery tokens has been explicitly
+    disabled globally, which might leave views unprotected. Use 'pyramid.config.Configurator.set_default_csrf_options(require_csrf=True)'
+    to turn the automatic check for all unsafe methods (per RFC2616).
+  languages:
+  - python
+  severity: ERROR
+  fix: 'True
+
+    '
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+- id: pyramid-direct-use-of-response
+  message: Detected data rendered directly to the end user via 'Response'. This bypasses
+    Pyramid's built-in cross-site scripting (XSS) defenses and could result in an
+    XSS vulnerability. Use Pyramid's template engines to safely render HTML.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - pyramid
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-inside: "@pyramid.view.view_config( ... )\ndef $VIEW($REQ):\n  ...\n"
+    - pattern: $REQ.$ANYTHING
+    - pattern-not: $REQ.dbsession
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: 'pyramid.request.Response.text($SINK)
+
+          '
+      - pattern: 'pyramid.request.Response($SINK)
+
+          '
+      - pattern: '$REQ.response.body = $SINK
+
+          '
+      - pattern: '$REQ.response.text = $SINK
+
+          '
+      - pattern: '$REQ.response.ubody = $SINK
+
+          '
+      - pattern: '$REQ.response.unicode_body = $SINK
+
+          '
+    - pattern: $SINK
+- id: pyramid-sqlalchemy-sql-injection
+  message: Distinct, Having, Group_by, Order_by, and Filter in SQLAlchemy can cause
+    sql injections if the developer inputs raw SQL into the before-mentioned clauses.
+    This pattern captures relevant cases in which the developer inputs raw SQL into
+    the distinct, having, group_by, order_by or filter clauses and injects user-input
+    into the raw SQL with any function besides "bindparams". Use bindParams to securely
+    bind user-input to SQL statements.
+  languages:
+  - python
+  severity: ERROR
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://docs.sqlalchemy.org/en/14/tutorial/data_select.html#tutorial-selecting-data
+    technology:
+    - pyramid
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-inside: "from pyramid.view import view_config\n...\n@view_config( ...\
+        \ )\ndef $VIEW($REQ):\n  ...\n"
+    - pattern: $REQ.$ANYTHING
+    - pattern-not: $REQ.dbsession
+  pattern-sinks:
+  - patterns:
+    - pattern-inside: '$QUERY = $REQ.dbsession.query(...)
+
+        ...
+
+        '
+    - pattern-either:
+      - pattern: '$QUERY.$SQLFUNC("...".$FORMATFUNC(..., $SINK, ...))
+
+          '
+      - pattern: '$QUERY.join(...).$SQLFUNC("...".$FORMATFUNC(..., $SINK, ...))
+
+          '
+    - pattern: $SINK
+    - metavariable-regex:
+        metavariable: $SQLFUNC
+        regex: (group_by|order_by|distinct|having|filter)
+    - metavariable-regex:
+        metavariable: $FORMATFUNC
+        regex: (?!bindparams)
+  fix-regex:
+    regex: format
+    replacement: bindparams

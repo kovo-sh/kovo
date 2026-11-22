@@ -1,0 +1,28 @@
+id: "drupal-jsonapi-user-listing"
+name: "Drupal JSON:API Username Listing - Detect"
+severity: "medium"
+description: "Drupal JSON:API username listing was detected via the /user/user endpoint."
+tech:
+  - "drupal"
+tags:
+  - "drupal"
+  - "exposure"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://www.drupal.org/project/drupal/issues/3240913"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/jsonapi/user/user"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "\\{\"display_name\":\"([A-Sa-z0-9-_]+)\"\\}"
+  - type: "status"
+    status:
+      - 200

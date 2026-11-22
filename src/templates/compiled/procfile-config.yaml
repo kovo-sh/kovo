@@ -1,0 +1,28 @@
+id: "procfile-config"
+name: "Procfile Config - Detect"
+severity: "info"
+description: "Procfile configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Procfile"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "^web:"
+  - type: "status"
+    status:
+      - 200

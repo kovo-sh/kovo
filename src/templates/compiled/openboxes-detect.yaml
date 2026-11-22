@@ -1,0 +1,31 @@
+id: "openboxes-detect"
+name: "OpenBoxes - Detect"
+severity: "info"
+description: "OpenBoxes open-source supply chain management system for healthcare organisations was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "openboxes"
+  - "scm"
+  - "healthcare"
+  - "detect"
+reference: "https://openboxes.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/openboxes/auth/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "openboxes.css"
+      - "id=\"loginContainer\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

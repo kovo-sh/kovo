@@ -1,0 +1,30 @@
+id: "sonarqube-public-projects"
+name: "Sonarqube with public projects"
+severity: "low"
+description: "Sonarqube public projects detected."
+tech:
+  - "generic"
+tags:
+  - "sonarqube"
+  - "misconfig"
+  - "vuln"
+reference: "https://next.sonarqube.com/sonarqube/web_api/api/components/suggestions?internal=true"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/components/suggestions?recentlyBrowsed="
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "\"results\":"
+      - "\"items\":"
+      - "\"more\":"
+    condition: "and"

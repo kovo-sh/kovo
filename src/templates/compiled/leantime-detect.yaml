@@ -1,0 +1,31 @@
+id: "leantime-detect"
+name: "Leantime - Detect"
+severity: "info"
+description: "Detects a Leantime server, a project management system for non-project managers."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "leantime"
+  - "detect"
+reference: "https://github.com/Leantime/leantime"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/auth/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "content=\"Leantime"
+      - "name=\"leantime-version"
+      - "window.leantime.currentProject"
+      - ".leantimeLogo {"
+      - "class=\"leantimeLogo"
+  - type: "status"
+    status:
+      - 200

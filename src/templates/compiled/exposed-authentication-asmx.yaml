@@ -1,0 +1,29 @@
+id: "exposed-authentication-asmx"
+name: "Authentication.asmx - Detect"
+severity: "info"
+description: "Authentication Web Service authentication.asmx file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "edb"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/6604"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/_vti_bin/Authentication.asmx?op=Mode"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Authentication Web Service"
+  - type: "status"
+    status:
+      - 200

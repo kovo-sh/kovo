@@ -70,7 +70,7 @@ function eventsResponse(request: Request, runId: string) {
     cancel() {
       stop()
     },
-  })
+  }, { highWaterMark: 64 })
   return new Response(stream, {
     headers: {
       'content-type': 'text/event-stream',

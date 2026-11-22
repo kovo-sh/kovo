@@ -1,0 +1,23 @@
+id: "wordpress-xmlrpc-detect"
+name: "WordPress XMLRPC"
+severity: "info"
+description: "Safe check derived from wordpress-xmlrpc-detect: WordPress XMLRPC"
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "wordpress"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/xmlrpc.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "XML-RPC server accepts POST requests only."

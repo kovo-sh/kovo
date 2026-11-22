@@ -1,0 +1,29 @@
+id: "sitecore-cms"
+name: "Sitecore CMS - Detect"
+severity: "info"
+description: "Detect Sitecore Content Management System (CMS) websites based on a redirect from the sitecore media handler URL pattern to the notfound.aspx page."
+tech:
+  - "dotnet"
+  - "iis"
+tags:
+  - "cms"
+  - "sitecore"
+  - "tech"
+  - "discovery"
+reference: "https://www.sitecore.com"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/-/media/doo-doo.ashx"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "header"
+    regex:
+      - "Location: /sitecore/service/notfound.aspx"
+  - type: "status"
+    status:
+      - 302

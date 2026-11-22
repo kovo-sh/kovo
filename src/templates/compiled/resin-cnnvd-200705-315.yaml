@@ -1,0 +1,30 @@
+id: "resin-cnnvd-200705-315"
+name: "Caucho Resin Information Disclosure"
+severity: "high"
+description: "Sensitive info disclosed in Caucho Resin."
+tech:
+  - "generic"
+tags:
+  - "resin"
+  - "caucho"
+  - "lfr"
+  - "vuln"
+reference: "http://www.cnnvd.org.cn/web/xxk/ldxqById.tag?CNNVD=CNNVD-200705-315"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/%20../web-inf/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "/ ../web-inf/"
+      - "Directory of /"
+    condition: "and"

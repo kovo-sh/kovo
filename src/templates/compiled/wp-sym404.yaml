@@ -1,0 +1,29 @@
+id: "wp-sym404"
+name: "Wordpress sym404 directory"
+severity: "high"
+description: "Searches for sensitive directories present in the sym404."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "listing"
+  - "wp"
+  - "exposure"
+  - "vuln"
+reference: "https://twitter.com/momika233/status/1540325055280070656"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-includes/sym404/root/etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+  - type: "status"
+    status:
+      - 200

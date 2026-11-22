@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, createPublicKey, randomBytes } from 'node:crypto'
 import { lookup, resolve4, resolve6, resolveCname, resolveNs, resolveTxt } from 'node:dns/promises'
 import { request as httpRequest } from 'node:http'
 import type { IncomingHttpHeaders } from 'node:http'
@@ -10,8 +10,11 @@ import type { DetailedPeerCertificate } from 'node:tls'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import { referrerPolicies } from '../domain.ts'
-import type { CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
-import { containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
+import type { ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
+import { cacheBusterValueRegex, containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
+import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
+import { scanSecondOrderMarkers } from './canary-broker.ts'
+import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders } from './redact.ts'
@@ -65,6 +68,16 @@ export interface BrokerHttpRequest {
   persona?: string
   personaHandle?: string
   personaHeaders?: Record<string, string>
+  session?: string
+  sessionGroupRole?: 'setup' | 'control' | 'probe' | 'cleanup'
+  csrfBind?: CsrfBind
+  authMutation?: AuthMutation
+  probeClass?: string
+  cacheVerify?: boolean
+  traceId?: string
+  runId?: string
+  assignmentId?: string
+  scopeRevision?: number
   followRedirects?: boolean
   secrets?: readonly NamedSecret[]
   maxBodyBytes?: number
@@ -226,6 +239,11 @@ export type Grant = {
   allowLocalLab?: boolean
   personas?: ReadonlyMap<string, ResolvedPersona>
   secrets?: readonly NamedSecret[]
+  sandboxWriteAllowlist?: ApprovedEndpointPattern[]
+  scopeRevision?: number
+  storage?: SecondOrderStore
+  canaryBroker?: CanaryBroker
+  mintCanary?: (purpose: string, origin?: string) => { httpUrl?: string; url?: string } | null
   canRead: (origin: string) => boolean
   isIdempotentPostAllowed?: (origin: string, pathAndQuery: string, body?: string) => boolean
   isStateChangeApproved?: (origin: string, method: string, pathAndQuery: string) => boolean
@@ -267,6 +285,10 @@ export type BrokerOptions = {
   circuit429Threshold?: number
   circuitWindowMs?: number
   rejectUnauthorized?: boolean
+  storage?: SecondOrderStore
+  canaryBroker?: CanaryBroker
+  maxJarsPerAssignment?: number
+  maxCookiesPerJar?: number
 }
 
 const maxPathLength = 8192
@@ -282,8 +304,289 @@ const defaultWsTimeoutMs = 10_000
 const hardWsTimeoutMs = 20_000
 const bodyPreviewLimit = 8192
 const defaultRequestTimeoutMs = 30_000
-const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding)$/i
+const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-guardian-trace-id)$/i
 const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
+const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
+const csrfInputNameRegex = /^(?:_csrf|csrf[_-]?token|csrfmiddlewaretoken|__RequestVerificationToken|authenticity_token|_token)$/i
+const canaryUrlRegex = /^\/c\/guardian-canary-[a-f0-9]{24}$/i
+
+interface JarCookieEntry {
+  key: string
+  origin: string
+  name: string
+  value: string
+  path: string
+  secure: boolean
+  httpOnly: boolean
+  sameSite: string | null
+  expiresAt?: number
+}
+
+interface StoredCsrfToken {
+  value: string
+  sourceKind: 'cookie' | 'meta' | 'hidden_input' | 'json'
+  detectedName?: string
+  updatedAt: number
+}
+
+interface SessionJar {
+  jarKey: string
+  assignmentKey: string
+  runId: string
+  assignmentId: string
+  role: string
+  session: string
+  scopeRevision: number
+  cookies: Map<string, JarCookieEntry>
+  csrfTokens: Map<string, StoredCsrfToken>
+  lastUsedAt: number
+}
+
+function normalizeCookiePath(rawPath: string | undefined, requestPathname: string): string {
+  if (rawPath && rawPath.startsWith('/')) {
+    return rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath
+  }
+  const idx = requestPathname.lastIndexOf('/')
+  if (idx <= 0) return '/'
+  return requestPathname.slice(0, idx)
+}
+
+function cookiePathMatches(requestPath: string, cookiePath: string): boolean {
+  if (cookiePath === '/') return true
+  if (requestPath === cookiePath) return true
+  const prefix = cookiePath.endsWith('/') ? cookiePath : `${cookiePath}/`
+  return requestPath.startsWith(prefix)
+}
+
+function parseSetCookieHeaderEntries(
+  headers: IncomingHttpHeaders,
+  requestUrl: URL,
+): Array<{ action: 'set' | 'delete'; entry: JarCookieEntry }> {
+  const raw = headers['set-cookie']
+  if (!raw) return []
+  const items = Array.isArray(raw) ? raw : [raw]
+  const out: Array<{ action: 'set' | 'delete'; entry: JarCookieEntry }> = []
+  const now = Date.now()
+  for (const cookieStr of items) {
+    const parts = cookieStr.split(';')
+    const nameVal = parts[0] ?? ''
+    const eqIdx = nameVal.indexOf('=')
+    if (eqIdx <= 0) continue
+    const name = nameVal.slice(0, eqIdx).trim()
+    const value = nameVal.slice(eqIdx + 1).trim()
+    if (!name || /[\r\n\0;]/.test(name) || /[\r\n\0]/.test(value)) continue
+
+    let pathAttr: string | undefined
+    let domainAttr: string | undefined
+    let secure = false
+    let httpOnly = false
+    let sameSite: string | null = null
+    let expiresAt: number | undefined
+    let deleteCookie = false
+
+    for (const rawAttr of parts.slice(1)) {
+      const attr = rawAttr.trim()
+      if (!attr) continue
+      const attrEq = attr.indexOf('=')
+      const k = (attrEq >= 0 ? attr.slice(0, attrEq) : attr).trim().toLowerCase()
+      const v = attrEq >= 0 ? attr.slice(attrEq + 1).trim() : ''
+      if (k === 'secure') secure = true
+      else if (k === 'httponly') httpOnly = true
+      else if (k === 'path') pathAttr = v
+      else if (k === 'domain') domainAttr = v.replace(/^\.+/, '').toLowerCase()
+      else if (k === 'samesite') sameSite = v || null
+      else if (k === 'max-age') {
+        const secs = Number(v)
+        if (Number.isFinite(secs)) {
+          if (secs <= 0) deleteCookie = true
+          else expiresAt = now + secs * 1000
+        }
+      } else if (k === 'expires') {
+        const parsedTs = Date.parse(v)
+        if (Number.isFinite(parsedTs)) {
+          if (parsedTs <= now) deleteCookie = true
+          else if (expiresAt === undefined) expiresAt = parsedTs
+        }
+      }
+    }
+
+    if (domainAttr) {
+      const host = requestUrl.hostname.toLowerCase()
+      if (domainAttr !== host && !host.endsWith(`.${domainAttr}`)) {
+        // Reject cross-origin Domain attribute
+        continue
+      }
+    }
+
+    const path = normalizeCookiePath(pathAttr, requestUrl.pathname)
+    const key = `${requestUrl.origin}\0${path}\0${name}`
+    out.push({
+      action: deleteCookie ? 'delete' : 'set',
+      entry: {
+        key,
+        origin: requestUrl.origin,
+        name,
+        value,
+        path,
+        secure,
+        httpOnly,
+        sameSite,
+        expiresAt,
+      },
+    })
+  }
+  return out
+}
+
+function parseCookieHeaderPairs(headerValue: string): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const part of headerValue.split(';')) {
+    const trimmed = part.trim()
+    if (!trimmed) continue
+    const eq = trimmed.indexOf('=')
+    if (eq <= 0) continue
+    const k = trimmed.slice(0, eq).trim()
+    const v = trimmed.slice(eq + 1).trim()
+    if (k) out.set(k, v)
+  }
+  return out
+}
+
+function extractHtmlAttr(tag: string, attrName: string): string | null {
+  const re = new RegExp(`\\b${attrName}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i')
+  const m = re.exec(tag)
+  if (!m) return null
+  return (m[1] ?? m[2] ?? m[3] ?? '').trim()
+}
+
+function extractCsrfFromBody(mediaType: string, body: string): Omit<StoredCsrfToken, 'updatedAt'> | null {
+  if (!body) return null
+  const lowerMedia = mediaType.toLowerCase()
+  const looksHtml = lowerMedia.includes('html') || /^\s*</.test(body)
+  if (looksHtml) {
+    const metaTags = body.match(/<meta\b[^>]*>/gi) ?? []
+    for (const tag of metaTags) {
+      const name = extractHtmlAttr(tag, 'name')
+      if (name && /^(?:csrf-token|xsrf-token|_csrf|csrf_token)$/i.test(name)) {
+        const content = extractHtmlAttr(tag, 'content')
+        if (content) {
+          return { value: content, sourceKind: 'meta', detectedName: name }
+        }
+      }
+    }
+    const inputTags = body.match(/<input\b[^>]*>/gi) ?? []
+    for (const tag of inputTags) {
+      const name = extractHtmlAttr(tag, 'name')
+      const type = extractHtmlAttr(tag, 'type')?.toLowerCase()
+      if (name && (csrfInputNameRegex.test(name) || (type === 'hidden' && /csrf|xsrf|token/i.test(name)))) {
+        const value = extractHtmlAttr(tag, 'value')
+        if (value) {
+          return { value, sourceKind: 'hidden_input', detectedName: name }
+        }
+      }
+    }
+  }
+  const looksJson = lowerMedia.includes('json') || /^\s*\{/.test(body)
+  if (looksJson) {
+    try {
+      const parsed = JSON.parse(body) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const rec = parsed as Record<string, unknown>
+        const candidateKeys = ['csrfToken', 'csrf_token', 'xsrfToken', 'xsrf_token', '_csrf', 'csrf']
+        for (const k of candidateKeys) {
+          const v = rec[k]
+          if (typeof v === 'string' && v.trim()) {
+            return { value: v.trim(), sourceKind: 'json', detectedName: k }
+          }
+        }
+        if (rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)) {
+          const dataRec = rec.data as Record<string, unknown>
+          for (const k of candidateKeys) {
+            const v = dataRec[k]
+            if (typeof v === 'string' && v.trim()) {
+              return { value: v.trim(), sourceKind: 'json', detectedName: k }
+            }
+          }
+        }
+      }
+    } catch {
+      // Not valid JSON
+    }
+  }
+  return null
+}
+
+function matchesSandboxWriteAllowlist(
+  origin: string,
+  pathname: string,
+  rawPathAndQuery: string,
+  patterns: readonly ApprovedEndpointPattern[],
+): boolean {
+  const rawPathOnly = rawPathAndQuery.split('?')[0] ?? rawPathAndQuery
+  if (
+    rawPathOnly.includes('..') ||
+    /%2e/i.test(rawPathOnly) ||
+    /%25/i.test(rawPathOnly) ||
+    pathname.includes('..') ||
+    /[\r\n\0\\]/.test(rawPathOnly)
+  ) {
+    return false
+  }
+  // Iteratively decode up to 3 passes to catch double/triple-encoded path traversal
+  let decoded = rawPathOnly
+  for (let pass = 0; pass < 3; pass += 1) {
+    let next: string
+    try {
+      next = decodeURIComponent(decoded)
+    } catch {
+      return false
+    }
+    if (next.includes('..') || /[\r\n\0\\]/.test(next)) return false
+    if (next === decoded) break
+    decoded = next
+  }
+  for (const pattern of patterns) {
+    let patOrigin: string
+    try {
+      patOrigin = new URL(pattern.origin).origin
+    } catch {
+      continue
+    }
+    if (patOrigin !== origin) continue
+    const patMethod = (pattern.method || 'POST').toUpperCase()
+    if (patMethod !== 'POST' && patMethod !== '*') continue
+
+    const rawPat = (pattern.pathPattern || '').trim()
+    if (!rawPat || !rawPat.startsWith('/')) continue
+    if (rawPat === '/*') return true
+    if (rawPat.endsWith('/*')) {
+      const prefix = rawPat.slice(0, -2)
+      if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return true
+    } else if (rawPat.endsWith('*')) {
+      const prefix = rawPat.slice(0, -1)
+      if (pathname.startsWith(prefix)) return true
+    } else if (pathname === rawPat) {
+      return true
+    }
+  }
+  return false
+}
+
+function decodeJwtSegmentJson(seg: string): Record<string, unknown> | null {
+  try {
+    const raw = Buffer.from(seg, 'base64url').toString('utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    return parsed as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+function encodeJwtJson(obj: Record<string, unknown>): string {
+  return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url')
+}
 
 const danglingCnameProviders: Array<{ provider: string; cname: RegExp }> = [
   { provider: 'GitHub Pages', cname: /\.github\.io\.?$/i },
@@ -1140,9 +1443,180 @@ type OriginHealth = {
 export class RequestBroker {
   private readonly options: BrokerOptions
   private readonly origins = new Map<string, OriginHealth>()
+  private readonly sessionJars = new Map<string, SessionJar>()
+  private readonly redactedSecrets = new Map<string, NamedSecret>()
+  private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
+  private latestScopeRevision = 0
 
   constructor(options: BrokerOptions = {}) {
     this.options = options
+  }
+
+  getStorage(): SecondOrderStore | undefined {
+    return this.options.storage
+  }
+
+  getRegisteredSecrets(): NamedSecret[] {
+    return [...this.redactedSecrets.values()]
+  }
+
+  private registerSecret(label: string, value: string | undefined) {
+    if (!value || value.length < 4) return
+    if (this.redactedSecrets.has(value)) return
+    if (this.redactedSecrets.size >= 5_000) {
+      const oldest = this.redactedSecrets.keys().next().value
+      if (oldest !== undefined) this.redactedSecrets.delete(oldest)
+    }
+    this.redactedSecrets.set(value, { placeholder: `[redacted:${label}]`, value })
+  }
+
+  revokeOrigin(origin: string, scopeRevision?: number) {
+    let normalized: string
+    try {
+      normalized = new URL(origin).origin
+    } catch {
+      normalized = origin
+    }
+    if (scopeRevision !== undefined && scopeRevision > this.latestScopeRevision) {
+      this.latestScopeRevision = scopeRevision
+    }
+    this.purgeSessionJars(undefined, normalized)
+  }
+
+  revokeScope(scopeRevision: number) {
+    if (scopeRevision > this.latestScopeRevision) {
+      this.latestScopeRevision = scopeRevision
+    }
+    for (const [key, jar] of this.sessionJars.entries()) {
+      if (jar.scopeRevision < scopeRevision) {
+        this.sessionJars.delete(key)
+      }
+    }
+  }
+
+  purgeSessionJars(runId?: string, origin?: string) {
+    if (!runId && !origin) {
+      this.sessionJars.clear()
+      return
+    }
+    for (const [key, jar] of this.sessionJars.entries()) {
+      if (runId && jar.runId !== runId) continue
+      if (!origin) {
+        this.sessionJars.delete(key)
+        continue
+      }
+      for (const [ck, c] of jar.cookies.entries()) {
+        if (c.origin === origin) jar.cookies.delete(ck)
+      }
+      jar.csrfTokens.delete(origin)
+    }
+  }
+
+  private getOrCreateSessionJar(
+    req: BrokerHttpRequest,
+    grant: Grant,
+  ): SessionJar | undefined {
+    if (req.session === undefined) return undefined
+    const runId = req.runId ?? 'default'
+    const assignmentId = req.assignmentId ?? 'default'
+    const role = req.sessionGroupRole ?? 'default'
+    const assignmentKey = `${runId}\0${assignmentId}`
+    const jarKey = `${assignmentKey}\0${role}\0${req.session}`
+    const effectiveRevision = Math.max(this.latestScopeRevision, req.scopeRevision ?? grant.scopeRevision ?? 0)
+
+    const existing = this.sessionJars.get(jarKey)
+    if (existing) {
+      existing.lastUsedAt = Date.now()
+      // Refresh LRU order
+      this.sessionJars.delete(jarKey)
+      this.sessionJars.set(jarKey, existing)
+      return existing
+    }
+
+    const maxJars = Math.max(1, Math.min(this.options.maxJarsPerAssignment ?? 4, 8))
+    const assignmentJars = [...this.sessionJars.values()].filter(j => j.assignmentKey === assignmentKey)
+    if (assignmentJars.length >= maxJars) {
+      assignmentJars.sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+      const toEvict = assignmentJars.length - maxJars + 1
+      for (let i = 0; i < toEvict; i += 1) {
+        const victim = assignmentJars[i]
+        if (victim) this.sessionJars.delete(victim.jarKey)
+      }
+    }
+
+    const cookies = new Map<string, JarCookieEntry>()
+    const csrfTokens = new Map<string, StoredCsrfToken>()
+
+    // Only `setup` jars may seed `control` or `probe` via deep-clone on first access;
+    // `control` and `probe` remain strictly isolated from each other.
+    if (role === 'control' || role === 'probe') {
+      const setupKey = `${assignmentKey}\0setup\0${req.session}`
+      const setupJar = this.sessionJars.get(setupKey)
+      if (setupJar) {
+        for (const [k, v] of setupJar.cookies.entries()) cookies.set(k, { ...v })
+        for (const [k, v] of setupJar.csrfTokens.entries()) csrfTokens.set(k, { ...v })
+      }
+    }
+
+    const created: SessionJar = {
+      jarKey,
+      assignmentKey,
+      runId,
+      assignmentId,
+      role,
+      session: req.session,
+      scopeRevision: effectiveRevision,
+      cookies,
+      csrfTokens,
+      lastUsedAt: Date.now(),
+    }
+    this.sessionJars.set(jarKey, created)
+    return created
+  }
+
+  private storeJarCookiesAndCsrf(
+    jar: SessionJar,
+    url: URL,
+    response: RawHttpResponse,
+    mediaType: string,
+  ) {
+    const maxCookies = Math.max(1, Math.min(this.options.maxCookiesPerJar ?? 32, 64))
+    const parsedEntries = parseSetCookieHeaderEntries(response.headers, url)
+    for (const item of parsedEntries) {
+      if (item.action === 'delete') {
+        jar.cookies.delete(item.entry.key)
+        continue
+      }
+      if (jar.cookies.has(item.entry.key)) {
+        jar.cookies.delete(item.entry.key)
+      } else if (jar.cookies.size >= maxCookies) {
+        while (jar.cookies.size >= maxCookies) {
+          const oldest = jar.cookies.keys().next().value
+          if (oldest === undefined) break
+          jar.cookies.delete(oldest)
+        }
+      }
+      jar.cookies.set(item.entry.key, item.entry)
+      this.registerSecret(`jar:${jar.session}:${item.entry.name}`, item.entry.value)
+
+      if (csrfCookieNameRegex.test(item.entry.name) && item.entry.value) {
+        jar.csrfTokens.set(url.origin, {
+          value: item.entry.value,
+          sourceKind: 'cookie',
+          detectedName: item.entry.name,
+          updatedAt: Date.now(),
+        })
+      }
+    }
+
+    const bodyCsrf = extractCsrfFromBody(mediaType, response.body ?? '')
+    if (bodyCsrf) {
+      this.registerSecret(`csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`, bodyCsrf.value)
+      jar.csrfTokens.set(url.origin, {
+        ...bodyCsrf,
+        updatedAt: Date.now(),
+      })
+    }
   }
 
   private health(origin: string, capacity = 5): OriginHealth {
@@ -1326,6 +1800,19 @@ export class RequestBroker {
     const tier = grant.tier ?? 1
     if (tier === 0) throw new BrokerDenied('Live HTTP requests are disabled in Tier 0 (offline prepared mode).')
 
+    if (req.session !== undefined && !sessionHandleRegex.test(req.session)) {
+      throw new BrokerDenied('Invalid session handle; expected /^[a-z0-9_-]{1,32}$/.')
+    }
+    const reqScopeRev = req.scopeRevision ?? grant.scopeRevision
+    if (reqScopeRev !== undefined) {
+      if (reqScopeRev < this.latestScopeRevision) {
+        throw new BrokerDenied('Request scopeRevision is stale relative to the current scope revision.')
+      }
+      if (reqScopeRev > this.latestScopeRevision) {
+        this.revokeScope(reqScopeRev)
+      }
+    }
+
     const localLab = allowLocalLab(grant)
     let initialOrigin: string
     let url: URL
@@ -1346,8 +1833,32 @@ export class RequestBroker {
       throw new BrokerDenied('Request path escaped the requested origin.')
     }
     if (!safeUrl(url, true, localLab) || !grant.canRead(initialOrigin)) {
+      this.purgeSessionJars(undefined, initialOrigin)
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Destination is outside the current assignment scope.')
+    }
+
+    if (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential') {
+      const gcb = url.searchParams.get('_gcb')
+      if (!gcb || !cacheBusterValueRegex.test(gcb)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Cache probes require a unique ?_gcb=<16-36 hex/uuid> cache-buster query parameter.')
+      }
+      const seen = this.seenGcbTokens.get(gcb.toLowerCase())
+      if (seen) {
+        if (req.probeClass === 'cache_differential' && req.cacheVerify === true && !seen.verifyUsed) {
+          seen.verifyUsed = true
+        } else {
+          grant.audit('denied', initialOrigin)
+          throw new BrokerDenied('Reusing an already-used _gcb cache-buster token is forbidden.')
+        }
+      } else {
+        if (this.seenGcbTokens.size >= 10_000) {
+          const oldest = this.seenGcbTokens.keys().next().value
+          if (oldest !== undefined) this.seenGcbTokens.delete(oldest)
+        }
+        this.seenGcbTokens.set(gcb.toLowerCase(), { probeClass: req.probeClass, verifyUsed: false })
+      }
     }
 
     // Destructive payload denylist check across path (raw + URL-decoded), headers, body, and multipartParts
@@ -1360,6 +1871,17 @@ export class RequestBroker {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Request blocked by Guardian destructive-payload denylist.')
     }
+    if (req.authMutation?.kind === 'kid_inject' && hasDestructiveContent(req.authMutation.value)) {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('authMutation kid_inject blocked by Guardian destructive-payload denylist.')
+    }
+    if (req.authMutation?.kind === 'jku_x5u_canary') {
+      const candidateUrl = req.authMutation.url ?? req.authMutation.value
+      if (candidateUrl && (hasDestructiveContent(candidateUrl) || /[\r\n\0]/.test(candidateUrl))) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('authMutation jku_x5u_canary blocked by Guardian destructive-payload denylist.')
+      }
+    }
 
     const hasMultipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
     if (hasMultipart && req.body !== undefined) {
@@ -1368,6 +1890,17 @@ export class RequestBroker {
     }
 
     const personaHandle = req.persona ?? req.personaHandle
+    if (req.authMutation) {
+      if (tier < 2) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Broker authMutation primitives require Tier 2 or higher.')
+      }
+      if (!personaHandle) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('authMutation requires an approved persona handle.')
+      }
+    }
+
     let resolvedPersonaHeaders: Record<string, string> | undefined
     if (personaHandle) {
       if (tier < 2) {
@@ -1388,9 +1921,9 @@ export class RequestBroker {
           }
           throw new BrokerDenied(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
         }
-        resolvedPersonaHeaders = injected
+        resolvedPersonaHeaders = { ...injected }
       } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
-        resolvedPersonaHeaders = req.personaHeaders
+        resolvedPersonaHeaders = { ...req.personaHeaders }
       } else {
         grant.audit('denied', initialOrigin)
         throw new BrokerDenied(`Persona "${personaHandle}" could not be resolved from run grant.`)
@@ -1398,14 +1931,23 @@ export class RequestBroker {
     }
 
     const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS'
+    const callerContentType = Object.entries(req.headers ?? {})
+      .find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? ''
+    const hasMultipartContentType = /^\s*multipart\//i.test(callerContentType)
     if (!isReadOnlyMethod || hasMultipart) {
-      const idempotentPostAllowed = !hasMultipart && req.method === 'POST' && tier >= 2 &&
+      const idempotentPostAllowed = !hasMultipart && !hasMultipartContentType && req.method === 'POST' && tier >= 2 &&
         Boolean(grant.isIdempotentPostAllowed?.(initialOrigin, req.pathAndQuery, req.body))
-      if (!idempotentPostAllowed) {
+      const sandboxPostAllowed = !idempotentPostAllowed && !hasMultipart && !hasMultipartContentType &&
+        req.method === 'POST' && tier === 2 && (
+          grant.sandboxWriteAllowlist !== undefined
+            ? matchesSandboxWriteAllowlist(initialOrigin, url.pathname, req.pathAndQuery, grant.sandboxWriteAllowlist)
+            : localLab
+        )
+      if (!idempotentPostAllowed && !sandboxPostAllowed) {
         if (tier < 3) {
           grant.audit('denied', initialOrigin)
           throw new BrokerDenied(
-            hasMultipart
+            hasMultipart || hasMultipartContentType
               ? 'Multipart uploads require Tier 3 (approval-gated state validation).'
               : `Method ${req.method} requires Tier 3 (approval-gated state validation).`,
           )
@@ -1468,6 +2010,252 @@ export class RequestBroker {
     }
   }
 
+  private async applyAuthMutationIfNeeded(
+    prepared: ReturnType<RequestBroker['prepareHttpRequest']>,
+    req: BrokerHttpRequest,
+    grant: Grant,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!req.authMutation || !prepared.resolvedPersonaHeaders) return
+    const mutation = req.authMutation
+    const hdrs = prepared.resolvedPersonaHeaders
+
+    // Locate JWT in Authorization: Bearer <jwt> or Cookie header value
+    let jwtSource: { kind: 'header'; key: string } | { kind: 'cookie'; key: string; cookieName: string } | null = null
+    let originalJwt = ''
+    for (const [k, v] of Object.entries(hdrs)) {
+      if (k.toLowerCase() === 'authorization') {
+        const m = /^Bearer\s+(\S+)$/i.exec(v.trim())
+        if (m && m[1].split('.').length === 3) {
+          jwtSource = { kind: 'header', key: k }
+          originalJwt = m[1]
+          break
+        }
+      }
+    }
+    if (!jwtSource) {
+      for (const [k, v] of Object.entries(hdrs)) {
+        if (k.toLowerCase() === 'cookie') {
+          for (const [cName, cVal] of parseCookieHeaderPairs(v).entries()) {
+            if (cVal.split('.').length === 3 && cVal.startsWith('eyJ')) {
+              jwtSource = { kind: 'cookie', key: k, cookieName: cName }
+              originalJwt = cVal
+              break
+            }
+          }
+        }
+        if (jwtSource) break
+      }
+    }
+    if (!jwtSource || !originalJwt) {
+      grant.audit('denied', prepared.initialOrigin)
+      throw new BrokerDenied('authMutation requires a persona with a 3-segment JWT credential.')
+    }
+
+    const parts = originalJwt.split('.')
+    if (parts.length !== 3) {
+      grant.audit('denied', prepared.initialOrigin)
+      throw new BrokerDenied('Persona credential is not a valid 3-part JWT.')
+    }
+    const [headerB64, payloadB64, sigB64] = parts
+    const header = decodeJwtSegmentJson(headerB64)
+    const payload = decodeJwtSegmentJson(payloadB64)
+    if (!header || !payload) {
+      grant.audit('denied', prepared.initialOrigin)
+      throw new BrokerDenied('Persona JWT header or payload could not be decoded.')
+    }
+
+    this.registerSecret(`jwt:original:${prepared.personaHandle ?? 'persona'}`, originalJwt)
+    this.registerSecret(`jwt:original_hp:${prepared.personaHandle ?? 'persona'}`, `${headerB64}.${payloadB64}`)
+    this.registerSecret(`jwt:original_payload:${prepared.personaHandle ?? 'persona'}`, payloadB64)
+
+    let mutatedJwt = originalJwt
+    if (mutation.kind === 'alg_none') {
+      const nextHeader = { ...header, alg: 'none' }
+      mutatedJwt = `${encodeJwtJson(nextHeader)}.${payloadB64}.`
+    } else if (mutation.kind === 'strip_signature') {
+      mutatedJwt = `${headerB64}.${payloadB64}.`
+    } else if (mutation.kind === 'expired_replay') {
+      const nowSec = Math.floor(Date.now() / 1000)
+      const skew = Math.max(1, Math.min(mutation.skewSeconds ?? 3600, 31_536_000))
+      const curExp = typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp : nowSec
+      const nextPayload = { ...payload, exp: Math.min(curExp, nowSec) - skew }
+      mutatedJwt = `${headerB64}.${encodeJwtJson(nextPayload)}.${sigB64}`
+    } else if (mutation.kind === 'kid_inject') {
+      if (/[\r\n\0]/.test(mutation.value) || hasDestructiveContent(mutation.value)) {
+        grant.audit('denied', prepared.initialOrigin)
+        throw new BrokerDenied('kid_inject value rejected.')
+      }
+      const nextHeader = { ...header, kid: mutation.value }
+      mutatedJwt = `${encodeJwtJson(nextHeader)}.${payloadB64}.${sigB64}`
+    } else if (mutation.kind === 'jku_x5u_canary') {
+      const hdrField = mutation.header ?? 'jku'
+      let canaryUrl = mutation.url ?? mutation.value
+      const cb = this.options.canaryBroker ?? grant.canaryBroker
+      if (canaryUrl) {
+        if (/[\r\n\0]/.test(canaryUrl) || hasDestructiveContent(canaryUrl)) {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL rejected.')
+        }
+        let parsedCanary: URL
+        try {
+          parsedCanary = new URL(canaryUrl)
+        } catch {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL is malformed.')
+        }
+        if (parsedCanary.protocol !== 'http:' && parsedCanary.protocol !== 'https:') {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL must use http: or https: protocol.')
+        }
+        if (parsedCanary.search || parsedCanary.hash || parsedCanary.username || parsedCanary.password) {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL must not contain query, fragment, or userinfo.')
+        }
+        if (!canaryUrlRegex.test(parsedCanary.pathname)) {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL must target a Guardian CanaryBroker endpoint.')
+        }
+        const canaryHost = parsedCanary.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+        if (
+          canaryHost === '169.254.169.254' ||
+          canaryHost === 'metadata.google.internal' ||
+          canaryHost === 'metadata.goog' ||
+          canaryHost.startsWith('169.254.') ||
+          canaryHost.startsWith('fe80:')
+        ) {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL cannot target cloud metadata or link-local endpoints.')
+        }
+        if (ipaddr.isValid(canaryHost)) {
+          const range = ipaddr.process(canaryHost).range()
+          if (range === 'linkLocal') {
+            grant.audit('denied', prepared.initialOrigin)
+            throw new BrokerDenied('jku_x5u_canary URL cannot target link-local IP addresses.')
+          }
+          if (!prepared.localLab && range !== 'unicast') {
+            grant.audit('denied', prepared.initialOrigin)
+            throw new BrokerDenied('jku_x5u_canary URL cannot target private or loopback IPs on public projects.')
+          }
+        } else if (
+          !prepared.localLab &&
+          (canaryHost === 'localhost' || canaryHost.endsWith('.localhost') || canaryHost.endsWith('.local') || canaryHost.endsWith('.internal'))
+        ) {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary URL cannot target local/internal hostnames on public projects.')
+        }
+        if (cb) {
+          const info = cb.listenerInfo()
+          const allowedOrigins = new Set<string>()
+          for (const base of [info.effectiveBaseUrl, info.localBaseUrl, info.publicBaseUrl]) {
+            if (base) {
+              try { allowedOrigins.add(new URL(base).origin) } catch { /* ignore */ }
+            }
+          }
+          if (allowedOrigins.size > 0 && !allowedOrigins.has(parsedCanary.origin)) {
+            grant.audit('denied', prepared.initialOrigin)
+            throw new BrokerDenied('jku_x5u_canary URL origin does not match the active Guardian CanaryBroker.')
+          }
+        }
+      } else {
+        if (cb) {
+          if (!cb.listenerInfo().running) await cb.startListener()
+          const minted = cb.mintCanary(
+            req.runId ?? 'auth-mutation',
+            `jwt-${hdrField}-canary`,
+            prepared.initialOrigin,
+          )
+          canaryUrl = minted.httpUrl
+        } else if (grant.mintCanary) {
+          const minted = grant.mintCanary(`jwt-${hdrField}-canary`, prepared.initialOrigin)
+          canaryUrl = minted?.httpUrl ?? minted?.url
+        }
+        if (!canaryUrl) {
+          grant.audit('denied', prepared.initialOrigin)
+          throw new BrokerDenied('jku_x5u_canary requires an explicit CanaryBroker URL or active CanaryBroker.')
+        }
+      }
+      const nextHeader = { ...header, [hdrField]: canaryUrl }
+      mutatedJwt = `${encodeJwtJson(nextHeader)}.${payloadB64}.${sigB64}`
+    } else if (mutation.kind === 'rs256_to_hs256_jwks') {
+      const jwksTarget = mutation.jwksUrl ?? `${prepared.initialOrigin}/.well-known/jwks.json`
+      let parsedJwks: URL
+      try {
+        parsedJwks = new URL(jwksTarget)
+      } catch {
+        grant.audit('denied', prepared.initialOrigin)
+        throw new BrokerDenied('rs256_to_hs256_jwks jwksUrl is malformed.')
+      }
+      const jwksEx = await this.executeHttp({
+        origin: parsedJwks.origin,
+        method: 'GET',
+        pathAndQuery: parsedJwks.pathname + parsedJwks.search,
+        headers: { accept: 'application/json' },
+        followRedirects: false,
+        runId: req.runId,
+        assignmentId: req.assignmentId,
+        traceId: req.traceId,
+      }, grant, signal)
+      if (jwksEx.status < 200 || jwksEx.status >= 300) {
+        grant.audit('denied', prepared.initialOrigin)
+        throw new BrokerDenied(`Failed to fetch JWKS (${jwksEx.status}) for rs256_to_hs256_jwks.`)
+      }
+      let keys: Array<Record<string, unknown>> = []
+      try {
+        const parsed = JSON.parse(jwksEx.body) as { keys?: Array<Record<string, unknown>> }
+        if (Array.isArray(parsed.keys)) keys = parsed.keys
+      } catch {
+        keys = []
+      }
+      const targetKid = typeof header.kid === 'string' ? header.kid : undefined
+      const selectedJwk =
+        (targetKid ? keys.find(k => k.kid === targetKid) : undefined) ??
+        keys.find(k => k.kty === 'RSA') ??
+        keys[0]
+      if (!selectedJwk) {
+        grant.audit('denied', prepared.initialOrigin)
+        throw new BrokerDenied('No usable RSA key found in JWKS for rs256_to_hs256_jwks.')
+      }
+      let pem: string
+      try {
+        pem = createPublicKey({ key: selectedJwk as never, format: 'jwk' })
+          .export({ type: 'spki', format: 'pem' })
+          .toString()
+      } catch {
+        grant.audit('denied', prepared.initialOrigin)
+        throw new BrokerDenied('JWKS key could not be exported as SPKI PEM.')
+      }
+      const nextHeader = { ...header, alg: 'HS256' }
+      const signingInput = `${encodeJwtJson(nextHeader)}.${payloadB64}`
+      const hmacSig = createHmac('sha256', pem).update(signingInput).digest('base64url')
+      mutatedJwt = `${signingInput}.${hmacSig}`
+    } else if (mutation.kind === 'claim_swap') {
+      const isUnsigned = String(header.alg ?? '').toLowerCase() === 'none' || sigB64 === ''
+      if (!prepared.localLab && !isUnsigned) {
+        grant.audit('denied', prepared.initialOrigin)
+        throw new BrokerDenied('claim_swap on signed tokens is restricted to local-lab or unsigned tokens.')
+      }
+      const nextPayload = { ...payload, ...mutation.claims }
+      mutatedJwt = `${headerB64}.${encodeJwtJson(nextPayload)}.${sigB64}`
+    }
+
+    this.registerSecret(`jwt:mutated:${mutation.kind}`, mutatedJwt)
+    const mutatedParts = mutatedJwt.split('.')
+    if (mutatedParts.length >= 2 && mutatedParts[0] && mutatedParts[1]) {
+      this.registerSecret(`jwt:mutated_hp:${mutation.kind}`, `${mutatedParts[0]}.${mutatedParts[1]}`)
+      if (mutatedParts[1] !== payloadB64) {
+        this.registerSecret(`jwt:mutated_payload:${mutation.kind}`, mutatedParts[1])
+      }
+    }
+    if (jwtSource.kind === 'header') {
+      hdrs[jwtSource.key] = `Bearer ${mutatedJwt}`
+    } else {
+      const pairs = parseCookieHeaderPairs(hdrs[jwtSource.key] ?? '')
+      pairs.set(jwtSource.cookieName, mutatedJwt)
+      hdrs[jwtSource.key] = [...pairs.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
+    }
+  }
+
   private async executePreparedHttp(
     prepared: ReturnType<RequestBroker['prepareHttpRequest']>,
     req: BrokerHttpRequest,
@@ -1475,6 +2263,7 @@ export class RequestBroker {
     signal: AbortSignal,
     options: { bypassConcurrency: boolean; preResolvedAddresses?: PublicAddress[] },
   ): Promise<BrokerExchangeResult> {
+    await this.applyAuthMutationIfNeeded(prepared, req, grant, signal)
     const {
       initialOrigin,
       localLab,
@@ -1487,6 +2276,7 @@ export class RequestBroker {
       timeoutMs,
     } = prepared
     let url = new URL(prepared.url.href)
+    const jar = this.getOrCreateSessionJar(req, grant)
 
     const started = Date.now()
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
@@ -1504,6 +2294,7 @@ export class RequestBroker {
     const check = () => {
       deadline.throwIfAborted()
       if (!safeUrl(url, true, localLab) || !grant.canRead(url.origin)) {
+        this.purgeSessionJars(undefined, url.origin)
         deny('Destination is outside the current assignment scope.')
       }
     }
@@ -1511,8 +2302,9 @@ export class RequestBroker {
     for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
       check()
       redirectOrigins.add(url.origin)
+      const isCrossOriginHop = url.origin !== initialOrigin
       // Hard invariant: NEVER forward persona credentials across cross-origin redirects.
-      if (url.origin !== initialOrigin) includePersona = false
+      if (isCrossOriginHop) includePersona = false
 
       const addresses = redirect === 0 && options.preResolvedAddresses
         ? options.preResolvedAddresses
@@ -1521,7 +2313,112 @@ export class RequestBroker {
 
       const outboundHeaders: Record<string, string> = {
         ...cleanHeaders,
-        ...(includePersona ? resolvedPersonaHeaders : {}),
+      }
+      let personaCookieRaw: string | undefined
+      if (includePersona && resolvedPersonaHeaders) {
+        for (const [k, v] of Object.entries(resolvedPersonaHeaders)) {
+          if (k.toLowerCase() === 'cookie') {
+            personaCookieRaw = v
+          } else {
+            outboundHeaders[k] = v
+          }
+        }
+      }
+
+      if (localLab && req.traceId && !/[\r\n\0]/.test(req.traceId)) {
+        outboundHeaders['X-Guardian-Trace-Id'] = req.traceId.slice(0, 128)
+      }
+
+      // Merge session jar cookies with Persona Vault cookies (Persona Vault always takes strict precedence).
+      const mergedCookies = new Map<string, string>()
+      if (jar) {
+        const now = Date.now()
+        for (const entry of jar.cookies.values()) {
+          if (entry.origin !== url.origin) continue
+          if (entry.expiresAt !== undefined && entry.expiresAt <= now) continue
+          if (entry.secure && url.protocol !== 'https:') continue
+          if (!cookiePathMatches(url.pathname, entry.path)) continue
+          const sameSiteLower = entry.sameSite?.toLowerCase()
+          if (isCrossOriginHop && sameSiteLower === 'strict') continue
+          if (isCrossOriginHop && sameSiteLower === 'lax' && activeMethod !== 'GET' && activeMethod !== 'HEAD') continue
+          mergedCookies.set(entry.name, entry.value)
+        }
+      }
+      if (personaCookieRaw) {
+        for (const [k, v] of parseCookieHeaderPairs(personaCookieRaw).entries()) {
+          mergedCookies.set(k, v)
+        }
+      }
+      if (mergedCookies.size > 0) {
+        outboundHeaders.Cookie = [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
+      }
+
+      // Automatic CSRF token binding (same-origin only)
+      let hopBody = activeBody
+      let injectedCsrfHeaderName: string | undefined
+      if (jar && req.csrfBind && !isCrossOriginHop) {
+        const cfg = req.csrfBind === true ? {} : req.csrfBind
+        let csrfToken: StoredCsrfToken | undefined
+        if (cfg.cookieName) {
+          const nowTs = Date.now()
+          for (const entry of jar.cookies.values()) {
+            if (
+              entry.origin === url.origin &&
+              entry.name === cfg.cookieName &&
+              cookiePathMatches(url.pathname, entry.path) &&
+              !(entry.secure && url.protocol !== 'https:') &&
+              !(entry.expiresAt !== undefined && entry.expiresAt <= nowTs)
+            ) {
+              csrfToken = {
+                value: entry.value,
+                sourceKind: 'cookie',
+                detectedName: entry.name,
+                updatedAt: nowTs,
+              }
+              break
+            }
+          }
+        }
+        csrfToken ??= jar.csrfTokens.get(url.origin)
+        if (csrfToken) {
+          this.registerSecret(`csrf:${jar.session}:${csrfToken.detectedName ?? 'token'}`, csrfToken.value)
+          const headerName = cfg.headerName ?? (
+            csrfToken.sourceKind === 'cookie' && csrfToken.detectedName?.toLowerCase() === 'xsrf-token'
+              ? 'X-XSRF-TOKEN'
+              : 'X-CSRF-Token'
+          )
+          const hasHeaderAlready = Object.keys(outboundHeaders).some(k => k.toLowerCase() === headerName.toLowerCase())
+          if (!hasHeaderAlready && !/[\r\n\0]/.test(headerName)) {
+            outboundHeaders[headerName] = csrfToken.value
+            injectedCsrfHeaderName = headerName.toLowerCase()
+          }
+          if (activeMethod === 'POST' || activeMethod === 'PUT' || activeMethod === 'PATCH' || activeMethod === 'DELETE') {
+            const ct = Object.entries(outboundHeaders)
+              .find(([k]) => k.toLowerCase() === 'content-type')?.[1]?.toLowerCase() ?? ''
+            if (ct.includes('application/x-www-form-urlencoded')) {
+              const fieldName = cfg.fieldName ?? csrfToken.detectedName ?? '_csrf'
+              const params = new URLSearchParams(hopBody ?? '')
+              if (!params.has(fieldName)) {
+                params.set(fieldName, csrfToken.value)
+                hopBody = params.toString()
+              }
+            } else if (ct.includes('application/json') && (cfg.fieldName || csrfToken.sourceKind === 'json')) {
+              const fieldName = cfg.fieldName ?? csrfToken.detectedName ?? 'csrfToken'
+              try {
+                const parsed = hopBody ? JSON.parse(hopBody) as unknown : {}
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                  const rec = parsed as Record<string, unknown>
+                  if (!(fieldName in rec)) {
+                    rec[fieldName] = csrfToken.value
+                    hopBody = JSON.stringify(rec)
+                  }
+                }
+              } catch {
+                // Leave malformed JSON body untouched
+              }
+            }
+          }
+        }
       }
 
       const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency)
@@ -1531,7 +2428,7 @@ export class RequestBroker {
         response = await transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
           method: activeMethod,
           headers: outboundHeaders,
-          body: activeBody,
+          body: hopBody,
           maxBodyBytes: Math.min(req.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes),
           readBody: true,
           rejectUnauthorized: this.options.rejectUnauthorized ?? true,
@@ -1542,6 +2439,12 @@ export class RequestBroker {
       check()
       grant.audit('observed', url.origin, response.status)
       this.recordStatus(url.origin, response.status, grant.audit)
+
+      const requestOriginHeader = cleanHeaders['Origin'] ?? cleanHeaders['origin']
+      const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
+      if (jar) {
+        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType)
+      }
 
       if (followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.location
@@ -1560,22 +2463,41 @@ export class RequestBroker {
         continue
       }
 
-      const requestOriginHeader = cleanHeaders['Origin'] ?? cleanHeaders['origin']
-      const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
       const rawBody = response.body ?? ''
-      const safeBody = redact(rawBody, secrets)
+      const secondOrderStorage = this.options.storage ?? grant.storage
+      if (secondOrderStorage && req.runId && rawBody) {
+        scanSecondOrderMarkers({
+          text: rawBody,
+          runId: req.runId,
+          assignmentId: req.assignmentId,
+          origin: url.origin,
+          endpoint: url.pathname + url.search,
+          persona: personaHandle ?? null,
+          storage: secondOrderStorage,
+        })
+      }
+
+      const effectiveSecrets: NamedSecret[] = [
+        ...secrets,
+        ...this.redactedSecrets.values(),
+      ]
+      const safeBody = redact(rawBody, effectiveSecrets)
       const bodySha256 = createHash('sha256').update(safeBody).digest('hex')
+      const scrubbedReqHeaders = redactHeaders(normalizeHeaders(outboundHeaders), effectiveSecrets)
+      if (injectedCsrfHeaderName && injectedCsrfHeaderName in scrubbedReqHeaders) {
+        scrubbedReqHeaders[injectedCsrfHeaderName] = '[redacted]'
+      }
       return {
         origin: initialOrigin,
         finalOrigin: url.origin,
         redirectOrigins: [...redirectOrigins],
         method: req.method,
-        pathAndQuery: req.pathAndQuery,
+        pathAndQuery: redact(req.pathAndQuery, effectiveSecrets),
         personaHandle: personaHandle ?? null,
         status: response.status,
         mediaType: obs.mediaType,
-        reqHeaders: redactHeaders(normalizeHeaders(outboundHeaders), secrets),
-        respHeaders: redactHeaders(normalizeHeaders(response.headers), secrets),
+        reqHeaders: scrubbedReqHeaders,
+        respHeaders: redactHeaders(normalizeHeaders(response.headers), effectiveSecrets),
         setCookies: parseSetCookies(response.headers),
         bodyPreview: safeBody.slice(0, bodyPreviewLimit),
         body: safeBody,

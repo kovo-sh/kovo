@@ -46,6 +46,90 @@ export const replayExtractSchema = z.object({
   selector: z.string().min(1).max(256),
 })
 
+export const sessionHandleSchema = z.string().regex(/^[a-z0-9_-]{1,32}$/, 'session handle must match /^[a-z0-9_-]{1,32}$/.')
+
+export const csrfBindObjectSchema = z.object({
+  headerName: z.string().trim().min(1).max(64).refine(v => !/[\r\n\0]/.test(v), 'Invalid CSRF headerName.').optional(),
+  fieldName: z.string().trim().min(1).max(64).refine(v => !/[\r\n\0]/.test(v), 'Invalid CSRF fieldName.').optional(),
+  cookieName: z.string().trim().min(1).max(64).refine(v => !/[\r\n\0]/.test(v), 'Invalid CSRF cookieName.').optional(),
+})
+
+export const csrfBindSchema = z.union([z.boolean(), csrfBindObjectSchema])
+export type CsrfBind = z.output<typeof csrfBindSchema>
+
+export const authMutationSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('alg_none') }),
+  z.object({ kind: z.literal('strip_signature') }),
+  z.object({ kind: z.literal('expired_replay'), skewSeconds: z.number().int().min(1).max(31_536_000).optional() }),
+  z.object({ kind: z.literal('rs256_to_hs256_jwks'), jwksUrl: z.string().url().max(512).optional() }),
+  z.object({
+    kind: z.literal('kid_inject'),
+    value: z.string().min(1).max(256).refine(
+      v => !/[\r\n\0]/.test(v) && !containsDestructivePayload(v),
+      'kid_inject value rejected.',
+    ),
+  }),
+  z.object({
+    kind: z.literal('jku_x5u_canary'),
+    header: z.enum(['jku', 'x5u']).default('jku'),
+    url: z.string().max(512).refine(
+      v => {
+        if (/[\r\n\0]/.test(v) || containsDestructivePayload(v)) return false
+        if (/\{\{canary_url\}\}/.test(v)) return true
+        try {
+          const parsed = new URL(v)
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+          const host = parsed.hostname.toLowerCase()
+          if (host === '169.254.169.254' || host === 'metadata.google.internal' || host.startsWith('169.254.')) return false
+          return /^\/c\/guardian-canary-[a-f0-9]{24}$/i.test(parsed.pathname) && !parsed.search && !parsed.hash
+        } catch {
+          return false
+        }
+      },
+      'jku_x5u_canary url must be a safe http/https Guardian CanaryBroker URL.',
+    ).optional(),
+    value: z.string().max(512).refine(
+      v => {
+        if (/[\r\n\0]/.test(v) || containsDestructivePayload(v)) return false
+        if (/\{\{canary_url\}\}/.test(v)) return true
+        try {
+          const parsed = new URL(v)
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+          const host = parsed.hostname.toLowerCase()
+          if (host === '169.254.169.254' || host === 'metadata.google.internal' || host.startsWith('169.254.')) return false
+          return /^\/c\/guardian-canary-[a-f0-9]{24}$/i.test(parsed.pathname) && !parsed.search && !parsed.hash
+        } catch {
+          return false
+        }
+      },
+      'jku_x5u_canary value must be a safe http/https Guardian CanaryBroker URL.',
+    ).optional(),
+  }),
+  z.object({
+    kind: z.literal('claim_swap'),
+    claims: z.record(
+      z.string().min(1).max(64),
+      z.union([z.string().max(256), z.number(), z.boolean()]),
+    ),
+    unsigned: z.boolean().optional(),
+  }),
+])
+export type AuthMutation = z.output<typeof authMutationSchema>
+
+export const universalParamLocations = ['query', 'json', 'form', 'path', 'header', 'xml', 'graphql_var'] as const
+export type UniversalParamLocation = typeof universalParamLocations[number]
+export const universalParamLocationSchema = z.enum(universalParamLocations)
+
+export const cacheBusterValueRegex = /^[a-f0-9-]{16,36}$/i
+
+export function extractCacheBusterParam(pathAndQuery: string): string | null {
+  try {
+    return new URL(pathAndQuery, 'http://guardian.invalid').searchParams.get('_gcb')
+  } catch {
+    return null
+  }
+}
+
 export const replayStepSchema = z.object({
   id: z.string().regex(/^[a-z0-9_-]{1,32}$/),
   role: z.enum(['setup', 'control', 'probe', 'cleanup']),
@@ -60,11 +144,18 @@ export const replayStepSchema = z.object({
     ),
     headers: safeHeaders.optional(),
     persona: personaHandle.optional(),
+    session: sessionHandleSchema.optional(),
+    csrfBind: csrfBindSchema.optional(),
+    authMutation: authMutationSchema.optional(),
+    traceId: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/).optional(),
     jsonBody: z.unknown().optional(),
     textBody: z.string().max(32_768).optional(),
     followRedirects: z.boolean().default(false),
     batchCount: z.number().int().min(2).max(10).optional(),
-  }),
+  }).refine(
+    req => !req.authMutation || Boolean(req.persona),
+    'authMutation requires a persona handle.',
+  ),
   extract: z.array(replayExtractSchema).max(8).optional(),
 })
 
@@ -156,8 +247,13 @@ export const browserChainStepSchema = z.object({
   pathAndQuery: z.string().min(1).max(4096).refine(
     value => value.startsWith('/') && !value.startsWith('//'),
     'pathAndQuery must start with a single /.',
-  ),
+  ).optional(),
+  reusePage: z.boolean().optional(),
+  resetContext: z.boolean().optional(),
   persona: personaHandle.optional(),
+  session: sessionHandleSchema.optional(),
+  csrfBind: csrfBindSchema.optional(),
+  traceId: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/).optional(),
   action: z.enum(browserChainActionTypes).default('navigate'),
   checkKind: z.enum(['dom_xss', 'postmessage', 'client_storage', 'xhr_leak']).optional(),
   selector: z.string().trim().min(1).max(256).refine(
@@ -183,10 +279,64 @@ export const browserChainStepSchema = z.object({
 export const browserChainReplaySpecSchema = replayBase.extend({
   kind: z.literal('browser_chain'),
   spaCatchallControl: z.boolean().default(false),
-  steps: z.array(browserChainStepSchema).min(2).max(8).refine(
-    steps => steps.some(step => step.role === 'control') && steps.some(step => step.role === 'probe'),
-    'Browser chain replay specs require at least one control step and one probe step.',
-  ),
+  steps: z.array(browserChainStepSchema).min(2).max(8).superRefine((steps, ctx) => {
+    if (!steps.some(step => step.role === 'control') || !steps.some(step => step.role === 'probe')) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Browser chain replay specs require at least one control step and one probe step.',
+      })
+    }
+    if (!steps[0]?.pathAndQuery) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [0, 'pathAndQuery'],
+        message: 'First browser_chain step must specify pathAndQuery.',
+      })
+    }
+    let activeRole: 'control' | 'probe' | null =
+      steps[0]?.role === 'control' ? 'control' : steps[0]?.role === 'probe' ? 'probe' : null
+
+    for (let i = 1; i < steps.length; i += 1) {
+      const prev = steps[i - 1]
+      const cur = steps[i]
+      if (cur.resetContext === true) {
+        activeRole = null
+      }
+      if (!cur.pathAndQuery) {
+        if (cur.resetContext === true) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [i, 'pathAndQuery'],
+            message: 'browser_chain step with resetContext: true must specify pathAndQuery.',
+          })
+        }
+        if (cur.reusePage === false) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [i, 'pathAndQuery'],
+            message: 'browser_chain step omitting pathAndQuery cannot set reusePage: false.',
+          })
+        }
+        if (cur.origin !== prev.origin || (cur.persona ?? undefined) !== (prev.persona ?? undefined)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [i, 'pathAndQuery'],
+            message: 'browser_chain step omitting pathAndQuery must keep the same origin and persona as the previous step.',
+          })
+        }
+        if ((cur.role === 'control' && activeRole === 'probe') || (cur.role === 'probe' && activeRole === 'control')) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [i, 'pathAndQuery'],
+            message: 'browser_chain step omitting pathAndQuery cannot cross a control/probe context reset boundary.',
+          })
+        }
+      }
+      if (cur.role === 'control' || cur.role === 'probe') {
+        activeRole = cur.role
+      }
+    }
+  }),
 })
 
 export const raceBurstRequestSchema = z.object({
@@ -198,6 +348,8 @@ export const raceBurstRequestSchema = z.object({
   ),
   headers: safeHeaders.optional(),
   persona: personaHandle.optional(),
+  session: sessionHandleSchema.optional(),
+  csrfBind: csrfBindSchema.optional(),
   jsonBody: z.unknown().optional(),
   textBody: z.string().max(32_768).optional(),
   followRedirects: z.boolean().default(false),
@@ -232,17 +384,21 @@ export const rceProofReplaySpecSchema = replayBase.extend({
 export const sqlBooleanDiffReplaySpecSchema = replayBase.extend({
   kind: z.literal('sql_boolean_diff'),
   targetOrigin: scopedAssetOrigin,
-  method: z.enum(['GET', 'POST']).default('GET'),
+  method: z.enum(['GET', 'POST', 'PUT', 'PATCH']).default('GET'),
   pathAndQuery: z.string().min(1).max(4096).refine(
     value => value.startsWith('/') && !value.startsWith('//'),
     'pathAndQuery must start with a single /.',
   ),
   headers: safeHeaders.optional(),
   persona: personaHandle.optional(),
+  session: sessionHandleSchema.optional(),
+  csrfBind: csrfBindSchema.optional(),
   /** Optional JSON body object (POST); paramName may use dot-paths such as "filter.name". */
   jsonBody: z.unknown().optional(),
+  xmlTemplate: z.string().max(16_384).optional(),
+  graphqlQuery: z.string().max(8_192).optional(),
   paramName: z.string().trim().regex(/^[A-Za-z0-9_.\-\[\]]{1,128}$/),
-  paramLocation: z.enum(['query', 'json']).default('query'),
+  paramLocation: universalParamLocationSchema.default('query'),
   baselineValue: z.string().max(256).default('1'),
   quoteStyle: z.enum(['single', 'double', 'numeric']).default('single'),
   /** Optional custom value template; may use {{baseline}} and {{sql_expr}} (verifier-minted k=k / k=k+1). */
@@ -252,6 +408,8 @@ export const sqlBooleanDiffReplaySpecSchema = replayBase.extend({
   const serialized = JSON.stringify({
     pathAndQuery: spec.pathAndQuery,
     jsonBody: spec.jsonBody,
+    xmlTemplate: spec.xmlTemplate,
+    graphqlQuery: spec.graphqlQuery,
     baselineValue: spec.baselineValue,
     valueTemplate: spec.valueTemplate,
   })
@@ -260,8 +418,11 @@ export const sqlBooleanDiffReplaySpecSchema = replayBase.extend({
   spec => !spec.valueTemplate || spec.valueTemplate.includes('{{sql_expr}}'),
   'sql_boolean_diff valueTemplate must contain {{sql_expr}}.',
 ).refine(
-  spec => spec.paramLocation !== 'json' || spec.method === 'POST',
+  spec => spec.paramLocation !== 'json' || spec.method !== 'GET',
   'sql_boolean_diff paramLocation "json" requires method POST.',
+).refine(
+  spec => !['form', 'xml', 'graphql_var'].includes(spec.paramLocation) || spec.method !== 'GET',
+  'sql_boolean_diff body paramLocation requires POST/PUT/PATCH.',
 )
 
 export const wsChainStepSchema = z.object({
@@ -353,6 +514,126 @@ export const staticAstProofReplaySpecSchema = replayBase.extend({
   'static_ast_proof endLine must be >= startLine.',
 )
 
+export const authProtocolProofReplaySpecSchema = replayBase.extend({
+  kind: z.literal('auth_protocol_proof'),
+  protocol: z.enum(['jwt', 'oauth', 'oidc', 'session', 'password_reset']).default('jwt'),
+  spaCatchallControl: z.boolean().default(false),
+  steps: z.array(replayStepSchema).min(2).max(12).superRefine((steps, ctx) => {
+    if (!steps.some(s => s.role === 'control') || !steps.some(s => s.role === 'probe')) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'auth_protocol_proof requires at least one control step and one probe step.',
+      })
+    }
+  }),
+}).refine(
+  spec => spec.protocol !== 'jwt' || spec.steps.some(s => Boolean(s.request.authMutation)),
+  'auth_protocol_proof with protocol "jwt" requires at least one step with authMutation and persona.',
+)
+
+const cachePathSchema = z.string().min(1).max(4096).refine(
+  value => value.startsWith('/') && !value.startsWith('//'),
+  'Path must start with a single /.',
+)
+
+function isValidGcbTokenOrPlaceholder(gcb: string | null, allowedPlaceholder: string): boolean {
+  if (!gcb) return false
+  if (gcb === allowedPlaceholder || gcb === '{{cache_buster}}') return true
+  return cacheBusterValueRegex.test(gcb)
+}
+
+export const cacheDifferentialReplaySpecSchema = replayBase.extend({
+  kind: z.literal('cache_differential'),
+  targetOrigin: scopedAssetOrigin,
+  mode: z.enum(['poison', 'deception']).default('poison'),
+  method: z.enum(['GET', 'HEAD']).default('GET'),
+  controlPath: cachePathSchema,
+  probePath: cachePathSchema,
+  verifyPath: cachePathSchema.optional(),
+  poisonHeaders: safeHeaders.optional(),
+  poisonPersona: personaHandle.optional(),
+  spaCatchallControl: z.boolean().default(false),
+}).superRefine((spec, ctx) => {
+  if (containsDestructivePayload(JSON.stringify({
+    controlPath: spec.controlPath,
+    probePath: spec.probePath,
+    verifyPath: spec.verifyPath,
+    poisonHeaders: spec.poisonHeaders,
+  }))) {
+    ctx.addIssue({ code: 'custom', message: 'cache_differential spec rejected by destructive-payload denylist.' })
+  }
+  const ctrlGcb = extractCacheBusterParam(spec.controlPath)
+  const probeGcb = extractCacheBusterParam(spec.probePath)
+  if (!isValidGcbTokenOrPlaceholder(ctrlGcb, '{{control_gcb}}')) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['controlPath'],
+      message: 'cache_differential controlPath requires ?_gcb=<16-36 hex/uuid> (or {{control_gcb}}).',
+    })
+  }
+  if (!isValidGcbTokenOrPlaceholder(probeGcb, '{{probe_gcb}}')) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['probePath'],
+      message: 'cache_differential probePath requires ?_gcb=<16-36 hex/uuid> (or {{probe_gcb}}).',
+    })
+  }
+  if (ctrlGcb && probeGcb && !ctrlGcb.startsWith('{{') && ctrlGcb.toLowerCase() === probeGcb.toLowerCase()) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['probePath'],
+      message: 'cache_differential requires distinct _gcb cache-buster tokens for controlPath and probePath.',
+    })
+  }
+  if (spec.verifyPath) {
+    const verifyGcb = extractCacheBusterParam(spec.verifyPath)
+    if (!isValidGcbTokenOrPlaceholder(verifyGcb, '{{probe_gcb}}')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['verifyPath'],
+        message: 'cache_differential verifyPath requires ?_gcb=<16-36 hex/uuid>.',
+      })
+    }
+  }
+})
+
+export const sqlTimeDiffReplaySpecSchema = replayBase.extend({
+  kind: z.literal('sql_time_diff'),
+  targetOrigin: scopedAssetOrigin,
+  method: z.enum(['GET', 'POST', 'PUT', 'PATCH']).default('GET'),
+  pathAndQuery: z.string().min(1).max(4096).refine(
+    value => value.startsWith('/') && !value.startsWith('//'),
+    'pathAndQuery must start with a single /.',
+  ),
+  headers: safeHeaders.optional(),
+  persona: personaHandle.optional(),
+  session: sessionHandleSchema.optional(),
+  csrfBind: csrfBindSchema.optional(),
+  jsonBody: z.unknown().optional(),
+  xmlTemplate: z.string().max(16_384).optional(),
+  graphqlQuery: z.string().max(8_192).optional(),
+  paramName: z.string().trim().regex(/^[A-Za-z0-9_.\-\[\]]{1,128}$/),
+  paramLocation: universalParamLocationSchema.default('query'),
+  baselineValue: z.string().max(256).default('1'),
+  quoteStyle: z.enum(['single', 'double', 'numeric']).default('single'),
+  dialect: z.enum(['postgres', 'mysql', 'sqlite', 'mssql']).default('postgres'),
+  delayMs: z.number().int().min(1500).max(3000).optional(),
+  valueTemplate: z.string().max(256).optional(),
+  requiresTier3Approval: z.boolean().default(true),
+  controlStep: replayStepSchema.optional(),
+}).refine(spec => !containsDestructivePayload(JSON.stringify({
+  pathAndQuery: spec.pathAndQuery,
+  jsonBody: spec.jsonBody,
+  xmlTemplate: spec.xmlTemplate,
+  graphqlQuery: spec.graphqlQuery,
+  baselineValue: spec.baselineValue,
+  valueTemplate: spec.valueTemplate,
+})), 'sql_time_diff spec rejected by destructive-payload denylist.')
+  .refine(spec => !spec.valueTemplate || spec.valueTemplate.includes('{{delay_sec}}') || spec.valueTemplate.includes('{{delay_ms}}'),
+    'sql_time_diff valueTemplate must contain {{delay_sec}} or {{delay_ms}}.')
+  .refine(spec => !['json', 'form', 'xml', 'graphql_var'].includes(spec.paramLocation) || spec.method !== 'GET',
+    'sql_time_diff body paramLocation requires POST/PUT/PATCH.')
+
 export const declarativeReplaySpecSchema = z.discriminatedUnion('kind', [
   httpChainReplaySpecSchema,
   dnsTakeoverReplaySpecSchema,
@@ -365,6 +646,9 @@ export const declarativeReplaySpecSchema = z.discriminatedUnion('kind', [
   wsChainReplaySpecSchema,
   uploadProbeReplaySpecSchema,
   staticAstProofReplaySpecSchema,
+  authProtocolProofReplaySpecSchema,
+  cacheDifferentialReplaySpecSchema,
+  sqlTimeDiffReplaySpecSchema,
 ])
 
 export const replaySpecSchema = declarativeReplaySpecSchema
@@ -379,6 +663,9 @@ export type WsChainStep = z.output<typeof wsChainStepSchema>
 export type WsChainReplaySpec = z.output<typeof wsChainReplaySpecSchema>
 export type UploadProbeReplaySpec = z.output<typeof uploadProbeReplaySpecSchema>
 export type StaticAstProofReplaySpec = z.output<typeof staticAstProofReplaySpecSchema>
+export type AuthProtocolProofReplaySpec = z.output<typeof authProtocolProofReplaySpecSchema>
+export type CacheDifferentialReplaySpec = z.output<typeof cacheDifferentialReplaySpecSchema>
+export type SqlTimeDiffReplaySpec = z.output<typeof sqlTimeDiffReplaySpecSchema>
 export type DeclarativeReplaySpec = z.output<typeof declarativeReplaySpecSchema>
 
 export const replayAssertionOutcomeSchema = z.object({
@@ -420,6 +707,11 @@ export function replaySpecOrigins(spec: DeclarativeReplaySpec): string[] {
     origins.add(spec.fetchStep.request.origin)
     if (spec.controlStep) origins.add(spec.controlStep.request.origin)
     if (spec.cleanupStep) origins.add(spec.cleanupStep.request.origin)
+  } else if (spec.kind === 'auth_protocol_proof') {
+    for (const step of spec.steps) origins.add(step.request.origin)
+  } else if (spec.kind === 'sql_time_diff') {
+    origins.add(spec.targetOrigin)
+    if (spec.controlStep) origins.add(spec.controlStep.request.origin)
   } else {
     origins.add(spec.targetOrigin)
   }

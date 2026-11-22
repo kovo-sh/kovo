@@ -1,0 +1,33 @@
+id: "mysql-config-exposure"
+name: "MySQL Conifg - Exposure"
+severity: "high"
+description: "Detects exposure of MySQL credentials, configuration, and command history via HTTP. Exposure of files such as .my.cnf and .mysql_history may lead to leakage of database passwords or SQL history, enabling attackers to compromise databases."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "config"
+  - "mysql"
+  - "database"
+  - "vuln"
+reference: "https://dev.mysql.com/doc/refman/8.0/en/option-files.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.my.cnf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "password\\s*=\\s*[\"']?[^\"'\\s]+[\"']?"
+  - type: "word"
+    part: "body"
+    words:
+      - "[client]"
+  - type: "status"
+    status:
+      - 200

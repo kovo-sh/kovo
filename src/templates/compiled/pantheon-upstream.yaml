@@ -1,0 +1,32 @@
+id: "pantheon-upstream"
+name: "Pantheon upstream.yml Disclosure"
+severity: "low"
+description: "Public Pantheon YAML Configuration Files might include sensitive info"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "devops"
+  - "patheon"
+  - "config"
+  - "files"
+  - "vuln"
+reference: "https://pantheon.io/docs/pantheon-yml"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pantheon.upstream.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "database:"
+      - "protected_web_paths:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

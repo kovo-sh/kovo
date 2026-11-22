@@ -1,0 +1,29 @@
+id: "concrete5-installer"
+name: "Concrete5 - Installer Page Exposure"
+severity: "high"
+description: "Detects exposed Concrete5 Installation page."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "concrete5"
+  - "vuln"
+reference: "https://documentation.concretecms.org/developers/introduction/installing-concrete-cms"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php/install"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Install concrete5</title>"
+  - type: "status"
+    status:
+      - 200

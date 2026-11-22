@@ -1,0 +1,30 @@
+id: "cargo-toml-file"
+name: "Cargo TOML File Disclosure"
+severity: "info"
+description: "Safe check derived from cargo-toml-file: Cargo TOML File Disclosure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "cargo"
+  - "vuln"
+reference: "https://doc.rust-lang.org/cargo/reference/manifest.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Cargo.toml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[package]"
+      - "[dependencies]"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

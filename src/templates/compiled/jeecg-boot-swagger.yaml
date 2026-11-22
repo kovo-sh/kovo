@@ -1,0 +1,25 @@
+id: "jeecg-boot-swagger"
+name: "Jeecg Boot Swagger Bootstrap UI - Detect"
+severity: "info"
+description: "Jeecg Swagger Bootstrap UI exposed."
+tech:
+  - "swagger"
+tags:
+  - "jeecg"
+  - "swagger"
+  - "detect"
+  - "exposure"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/jeecg-boot/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Swagger-Bootstrap-UI</title>"

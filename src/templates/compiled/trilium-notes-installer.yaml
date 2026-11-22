@@ -1,0 +1,28 @@
+id: "trilium-notes-installer"
+name: "Trilium Notes Installer - Exposure"
+severity: "high"
+description: "Detects if the Trilium Notes setup page is accessible."
+tech:
+  - "generic"
+tags:
+  - "trilium"
+  - "setup"
+  - "misconfig"
+  - "installer"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Trilium Notes setup"
+  - type: "status"
+    status:
+      - 200

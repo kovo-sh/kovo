@@ -1,0 +1,35 @@
+id: "npmrc-authtoken"
+name: "Hardcoded .npmrc AuthToken"
+severity: "info"
+description: "Safe check derived from npmrc-authtoken: Hardcoded .npmrc AuthToken"
+tech:
+  - "generic"
+tags:
+  - "npm"
+  - "exposure"
+  - "vuln"
+reference: "https://docs.npmjs.com/cli/v8/configuring-npm/npmrc"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.npmrc"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "_authToken="
+      - "_auth="
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+      - "application/javascript"
+      - "application/json"
+    negative: true
+  - type: "status"
+    status:
+      - 200

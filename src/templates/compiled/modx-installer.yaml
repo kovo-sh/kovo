@@ -1,0 +1,30 @@
+id: "modx-installer"
+name: "ModX CMS - Unfinished Installation"
+severity: "high"
+description: "Detected accessible ModX CMS installation or setup pages that indicated an incomplete installation.An exposed installation interface allowed attackers to complete the setup process and gain administrative access."
+tech:
+  - "generic"
+tags:
+  - "modx"
+  - "install"
+  - "exposure"
+  - "misconfig"
+reference: "https://modx.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "ModX Revolution"
+      - "installer-steps"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

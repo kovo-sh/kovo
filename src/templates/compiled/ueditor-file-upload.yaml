@@ -1,0 +1,30 @@
+id: "ueditor-file-upload"
+name: "UEditor - Arbitrary File Upload"
+severity: "high"
+description: "UEditor contains an arbitrary file upload vulnerability. An attacker can upload arbitrary files to the server, which in turn can be used to make the application execute file content as code, As a result, an attacker can possibly obtain sensitive information, modify data, and/or execute unauthorized operations."
+tech:
+  - "dotnet"
+  - "iis"
+tags:
+  - "ueditor"
+  - "fileupload"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-434"
+reference: "https://zhuanlan.zhihu.com/p/85265552"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ueditor/net/controller.ashx?action=catchimage&encode=utf-8"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "没有指定抓取源"

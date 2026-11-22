@@ -1,0 +1,559 @@
+rules:
+- id: detect-angular-element-methods
+  message: Use of angular.element can lead to XSS if user-input is treated as part
+    of the HTML element within `$SINK`. It is recommended to contextually output encode
+    user-input, before inserting into `$SINK`. If the HTML needs to be preserved it
+    is recommended to sanitize the input using $sce.getTrustedHTML or $sanitize.
+  metadata:
+    confidence: LOW
+    references:
+    - https://docs.angularjs.org/api/ng/function/angular.element
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    technology:
+    - angularjs
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+  languages:
+  - javascript
+  - typescript
+  severity: INFO
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern-inside: 'function(..., $SCOPE, ...) { ... }
+
+            '
+        - focus-metavariable: $SCOPE
+        - metavariable-regex:
+            metavariable: $SCOPE
+            regex: ^\$scope$
+      - pattern: $rootScope
+      - pattern: $injector.get('$rootScope')
+      - pattern: $injector.get('$scope')
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'angular.element(...). ... .$SINK($QUERY)
+
+          '
+      - pattern-inside: '$ANGULAR = angular.element(...)
+
+          ...
+
+          $ANGULAR. ... .$SINK($QUERY)
+
+          '
+    - metavariable-regex:
+        metavariable: $SINK
+        regex: ^(after|append|html|prepend|replaceWith|wrap)$
+    - focus-metavariable: $QUERY
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - pattern: $sce.getTrustedHtml(...)
+      - pattern: $sanitize(...)
+      - pattern: DOMPurify.sanitize(...)
+- id: detect-angular-element-taint
+  message: Use of angular.element can lead to XSS if user-input is treated as part
+    of the HTML element within `$SINK`. It is recommended to contextually output encode
+    user-input, before inserting into `$SINK`. If the HTML needs to be preserved it
+    is recommended to sanitize the input using $sce.getTrustedHTML or $sanitize.
+  metadata:
+    confidence: MEDIUM
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://docs.angularjs.org/api/ng/function/angular.element
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angularjs
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: window.location.search
+      - pattern: window.document.location.search
+      - pattern: document.location.search
+      - pattern: location.search
+      - pattern: $location.search(...)
+  - patterns:
+    - pattern-either:
+      - pattern: $DECODE(<... location.hash ...>)
+      - pattern: $DECODE(<... window.location.hash ...>)
+      - pattern: $DECODE(<... document.location.hash ...>)
+      - pattern: $DECODE(<... location.href ...>)
+      - pattern: $DECODE(<... window.location.href ...>)
+      - pattern: $DECODE(<... document.location.href ...>)
+      - pattern: $DECODE(<... document.URL ...>)
+      - pattern: $DECODE(<... window.document.URL ...>)
+      - pattern: $DECODE(<... document.location.href ...>)
+      - pattern: $DECODE(<... document.location.href ...>)
+      - pattern: $DECODE(<... $location.absUrl() ...>)
+      - pattern: $DECODE(<... $location.url() ...>)
+      - pattern: $DECODE(<... $location.hash() ...>)
+    - metavariable-regex:
+        metavariable: $DECODE
+        regex: ^(unescape|decodeURI|decodeURIComponent)$
+  - patterns:
+    - pattern-inside: $http.$METHOD(...).$CONTINUE(function $FUNC($RES) {...})
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: ^(get|delete|head|jsonp|post|put|patch)
+    - pattern: $RES.data
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'angular.element(...). ... .$SINK($QUERY)
+
+          '
+      - pattern-inside: '$ANGULAR = angular.element(...)
+
+          ...
+
+          $ANGULAR. ... .$SINK($QUERY)
+
+          '
+    - metavariable-regex:
+        metavariable: $SINK
+        regex: ^(after|append|html|prepend|replaceWith|wrap)$
+    - focus-metavariable: $QUERY
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - pattern: $sce.getTrustedHtml(...)
+      - pattern: $sanitize(...)
+      - pattern: DOMPurify.sanitize(...)
+- id: detect-angular-open-redirect
+  message: Use of $window.location.href can lead to open-redirect if user input is
+    used for redirection.
+  metadata:
+    asvs:
+      section: V5 Validation, Sanitization and Encoding
+      control_id: 5.5.1 Insecue Redirect
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v51-input-validation
+      version: '4'
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsJs
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    technology:
+    - angular
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: ERROR
+  patterns:
+  - pattern: '$window.location.href = ...
+
+      '
+  - pattern-not: '$window.location.href = "..."
+
+      '
+- id: detect-angular-resource-loading
+  message: $sceDelegateProvider allowlisting can introduce security issues if wildcards
+    are used.
+  metadata:
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsJs
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    technology:
+    - angular
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  pattern-either:
+  - pattern: '$sceDelegateProvider.resourceUrlWhitelist([...,''**'',...]);
+
+      '
+  - patterns:
+    - pattern: '$sceDelegateProvider.resourceUrlWhitelist([...,$DOM,...]);
+
+        '
+    - metavariable-regex:
+        metavariable: $DOM
+        regex: ^'.*\*\*.+'$
+- id: detect-angular-sce-disabled
+  message: $sceProvider is set to false. Disabling Strict Contextual escaping (SCE)
+    in an AngularJS application could provide additional attack surface for XSS vulnerabilities.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angular
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  languages:
+  - javascript
+  - typescript
+  severity: ERROR
+  pattern: '$sceProvider.enabled(false);
+
+    '
+- id: detect-angular-trust-as-css-method
+  message: The use of $sce.trustAsCss can be dangerous if unsanitized user input flows
+    through this API.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsCss
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angular
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '$SOURCE = $scope.$INPUT;
+
+        $sce.trustAsCss($SOURCE);
+
+        '
+    - pattern: '$sce.trustAsCss($scope.$INPUT);
+
+        '
+  - pattern-inside: 'app.controller(..., function($scope,$sce){
+
+      ...
+
+      });
+
+      '
+- id: detect-angular-trust-as-html-method
+  message: The use of $sce.trustAsHtml can be dangerous if unsanitized user input
+    flows through this API.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsHtml
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angular
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '$SOURCE = $scope.$INPUT;
+
+        $sce.trustAsHtml($SOURCE);
+
+        '
+    - pattern: '$sce.trustAsHtml($scope.$INPUT);
+
+        '
+  - pattern-inside: 'app.controller(..., function($scope,$sce){
+
+      ...
+
+      });
+
+      '
+- id: detect-angular-trust-as-js-method
+  message: The use of $sce.trustAsJs can be dangerous if unsanitized user input flows
+    through this API.
+  metadata:
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsJs
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    category: security
+    technology:
+    - angular
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '$SOURCE = $scope.$INPUT;
+
+        $sce.trustAsJs($SOURCE);
+
+        '
+    - pattern: '$sce.trustAsJs($scope.$INPUT);
+
+        '
+  - pattern-inside: 'app.controller(..., function($scope,$sce){
+
+      ...
+
+      });
+
+      '
+- id: detect-angular-trust-as-method
+  message: The use of $sce.trustAs can be dangerous if unsanitized user input flows
+    through this API.
+  metadata:
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    technology:
+    - angular
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-inside: 'app.controller(..., function($scope,$sce) {
+
+        ...
+
+        });
+
+        '
+    - pattern: $scope.$X
+  pattern-sinks:
+  - pattern: $sce.trustAs(...)
+  - pattern: $sce.trustAsHtml(...)
+- id: detect-angular-trust-as-resourceurl-method
+  message: The use of $sce.trustAsResourceUrl can be dangerous if unsanitized user
+    input flows through this API.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsResourceUrl
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angular
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '$SOURCE = $scope.$INPUT;
+
+        $sce.trustAsResourceUrl($SOURCE);
+
+        '
+    - pattern: '$sce.trustAsResourceUrl($scope.$INPUT);
+
+        '
+  - pattern-inside: 'app.controller(..., function($scope,$sce){
+
+      ...
+
+      });
+
+      '
+- id: detect-angular-trust-as-url-method
+  message: The use of $sce.trustAsUrl can be dangerous if unsanitized user input flows
+    through this API.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsUrl
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angular
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  - typescript
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '$SOURCE = $scope.$INPUT;
+
+        $sce.trustAsUrl($SOURCE);
+
+        '
+    - pattern: '$sce.trustAsUrl($scope.$INPUT);
+
+        '
+  - pattern-inside: 'app.controller(..., function($scope,$sce){
+
+      ...
+
+      });
+
+      '
+- id: detect-angular-translateprovider-translations-method
+  message: The use of $translateProvider.translations method can be dangerous if user
+    input is provided to this API.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://docs.angularjs.org/api/ng/service/$sce#trustAsUrl
+    - https://owasp.org/www-chapter-london/assets/slides/OWASPLondon20170727_AngularJS.pdf
+    category: security
+    technology:
+    - angular
+    - typescript
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - javascript
+  severity: WARNING
+  patterns:
+  - pattern: '$translateProvider.translations(...,$SOURCE);
+
+      '
+  - pattern-inside: 'app.controller(..., function($scope,$sce){
+
+      ...
+
+      });
+
+      '

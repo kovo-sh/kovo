@@ -1,0 +1,30 @@
+id: "php-fpm-status"
+name: "PHP-FPM Status"
+severity: "info"
+description: "Safe check derived from php-fpm-status: PHP-FPM Status"
+tech:
+  - "php"
+tags:
+  - "config"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/status?full"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "pool:"
+      - "process manager:"
+      - "start time:"
+      - "pid:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,35 @@
+id: "portainer-init-deploy"
+name: "Portainer - Init Deploy Discovery"
+severity: "medium"
+description: "Portainer initialization deployment files were discovered."
+tech:
+  - "docker"
+tags:
+  - "portainer"
+  - "exposure"
+  - "docker"
+  - "devops"
+  - "disclosure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://documentation.portainer.io/v2.0/deploy/initial/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/users/admin/check"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "No administrator account found inside the database"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 404

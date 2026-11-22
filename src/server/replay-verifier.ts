@@ -3,20 +3,26 @@ import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import { diffResponse, dnsTakeoverAnalyze } from '../../worker/analyzers.ts'
-import type { VerificationTier } from '../domain.ts'
+import { maxInlineVerifyRetries } from '../domain.ts'
+import type { InlineVerifyFeedback, VerificationTier } from '../domain.ts'
 import {
+  cacheBusterValueRegex,
   containsDestructivePayload,
   declarativeReplaySpecSchema,
+  extractCacheBusterParam,
   replayAssertionOutcomeSchema,
   replaySpecOrigins,
 } from '../replay-spec.ts'
-import type { DeclarativeReplaySpec, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
+import type { AuthMutation, DeclarativeReplaySpec, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker, websocketResultToExchange } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
+import { personaSecrets } from './persona-vault.ts'
+import { redact, redactJsonValue } from './redact.ts'
+import type { NamedSecret } from './redact.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
-import type { BrowserDomSinkTrace, BrowserInteractiveAction } from './scoped-browser.ts'
-import { responseSimilarity } from './surface-engine.ts'
+import type { BrowserDomSinkTrace, BrowserInteractiveAction, BrowserSessionStep } from './scoped-browser.ts'
+import { injectUniversalParam, responseSimilarity } from './surface-engine.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
@@ -292,6 +298,12 @@ async function openCanarySession(
 function requestShapeToBrokerRequest(
   req: ReplayStep['request'] | RaceBurstRequest,
   vars: Record<string, string>,
+  opts?: {
+    sessionId?: string
+    sessionGroupRole?: 'setup' | 'control' | 'probe' | 'cleanup'
+    runId?: string
+    assignmentId?: string
+  },
 ): BrokerHttpRequest {
   const pathAndQuery = interpolateString(req.pathAndQuery, vars)
   const headers: Record<string, string> = {}
@@ -307,6 +319,17 @@ function requestShapeToBrokerRequest(
       headers['Content-Type'] = 'application/json'
     }
   }
+  const maybeReq = req as ReplayStep['request']
+  let authMutation: AuthMutation | undefined = maybeReq.authMutation
+  if (authMutation && authMutation.kind === 'jku_x5u_canary') {
+    const rawUrl = authMutation.url ?? authMutation.value
+    const interpUrl = rawUrl !== undefined ? interpolateString(rawUrl, vars) : undefined
+    authMutation = {
+      ...authMutation,
+      ...(authMutation.url !== undefined && interpUrl !== undefined ? { url: interpUrl } : {}),
+      ...(authMutation.value !== undefined && interpUrl !== undefined ? { value: interpUrl } : {}),
+    }
+  }
   return {
     origin: req.origin,
     method: req.method,
@@ -314,12 +337,39 @@ function requestShapeToBrokerRequest(
     headers,
     body,
     persona: req.persona,
+    ...(opts?.sessionId ?? req.session ? { session: opts?.sessionId ?? req.session } : {}),
+    ...(opts?.sessionGroupRole ? { sessionGroupRole: opts.sessionGroupRole } : {}),
+    ...(req.csrfBind !== undefined ? { csrfBind: req.csrfBind } : {}),
+    ...(authMutation ? { authMutation } : {}),
+    ...(maybeReq.traceId ? { traceId: maybeReq.traceId } : {}),
+    ...(opts?.runId ? { runId: opts.runId } : {}),
+    ...(opts?.assignmentId ? { assignmentId: opts.assignmentId } : {}),
     followRedirects: req.followRedirects,
   }
 }
 
-function stepToBrokerRequest(step: ReplayStep, vars: Record<string, string>): BrokerHttpRequest {
-  return requestShapeToBrokerRequest(step.request, vars)
+function stepToBrokerRequest(
+  step: ReplayStep,
+  vars: Record<string, string>,
+  opts?: { replayJarPrefix?: string; runId?: string; assignmentId?: string },
+): BrokerHttpRequest {
+  let sessionId: string | undefined
+  if (step.request.session) {
+    if (opts?.replayJarPrefix) {
+      const candidate = `rv-${opts.replayJarPrefix}-${step.request.session}`
+      sessionId = candidate.length <= 32
+        ? candidate
+        : `rv-${opts.replayJarPrefix}-${createHash('sha256').update(step.request.session).digest('hex').slice(0, 12)}`.slice(0, 32)
+    } else {
+      sessionId = step.request.session
+    }
+  }
+  return requestShapeToBrokerRequest(step.request, vars, {
+    sessionId,
+    sessionGroupRole: step.role,
+    runId: opts?.runId,
+    assignmentId: opts?.assignmentId,
+  })
 }
 
 async function sleepAbortable(ms: number, signal: AbortSignal) {
@@ -346,7 +396,7 @@ const postureCategoryPattern = /access|auth|bypass|cors|header|posture|misconfig
 
 /** requireControlNonError defaults to true for posture / auth-bypass style specs. */
 function defaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
-  if (spec.kind === 'static_ast_proof' || spec.kind === 'sql_boolean_diff') return false
+  if (spec.kind === 'static_ast_proof' || spec.kind === 'sql_boolean_diff' || spec.kind === 'sql_time_diff') return false
   return postureCwes.has(spec.cwe) || postureCategoryPattern.test(spec.category)
 }
 
@@ -454,100 +504,168 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       const vars: Record<string, string> = {}
       const stepsOut: Record<string, unknown> = {}
       const probeStepExchanges: Array<{ id: string; exchange: BrokerExchangeResult }> = []
+      const replayJarPrefix = randomUUID().slice(0, 8)
       let firstControlStep: Record<string, unknown> | undefined
       let firstProbeStep: Record<string, unknown> | undefined
 
-      for (const step of spec.steps) {
-        signal.throwIfAborted()
-        const brokerReq = stepToBrokerRequest(step, vars)
-        if (step.request.batchCount) {
-          const batchReqs = Array.from({ length: step.request.batchCount }, () => ({ ...brokerReq }))
-          const batchResults = await broker.executeBatch(batchReqs, grant, signal)
-          for (const ex of batchResults) recordExchange(ex)
-          const first = batchResults[0]
-          if (first) extractVariables(step, first, vars)
-          const stepEntry: Record<string, unknown> = {
-            id: step.id,
-            role: step.role,
-            batchCount: batchResults.length,
-            statuses: batchResults.map(r => r.status),
-            responses: batchResults.map(summarizeExchange),
-            ...(first ? summarizeExchange(first) : {}),
-          }
-          stepsOut[step.id] = stepEntry
-          if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
-          if (step.role === 'probe') {
-            if (!firstProbeStep) firstProbeStep = stepEntry
-            if (first) probeStepExchanges.push({ id: step.id, exchange: first })
-          }
-        } else {
-          const ex = await broker.executeHttp(brokerReq, grant, signal)
-          recordExchange(ex)
-          extractVariables(step, ex, vars)
-          const stepEntry: Record<string, unknown> = {
-            id: step.id,
-            role: step.role,
-            ...summarizeExchange(ex),
-          }
-          stepsOut[step.id] = stepEntry
-          if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
-          if (step.role === 'probe') {
-            if (!firstProbeStep) firstProbeStep = stepEntry
-            probeStepExchanges.push({ id: step.id, exchange: ex })
-          }
-        }
+      const serializedSteps = JSON.stringify(spec.steps)
+      const needsCanary = /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps) ||
+        spec.steps.some(s => s.request.authMutation?.kind === 'jku_x5u_canary')
+      let canarySession: EphemeralCanarySession | undefined
+      let ctrlCanary: { url: string; token: string; dnsHost: string } | undefined
+      let prbCanary: { url: string; token: string; dnsHost: string } | undefined
+      if (needsCanary) {
+        canarySession = await openCanarySession(params.canaryBroker, params.storage, params.runId, assignmentId, spec.origin)
+        ctrlCanary = canarySession.mint(`http_chain:control:${spec.title}`)
+        prbCanary = canarySession.mint(`http_chain:probe:${spec.title}`)
       }
 
-      if (guardControlErrors) {
+      try {
         for (const step of spec.steps) {
-          if (step.role !== 'control' && step.role !== 'probe') continue
-          const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
-          if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
-            forcedInconclusiveReason = `Unexpected HTTP ${status} on ${step.role} step "${step.id}" (requireControlNonError); declare expectedStatus ${status} to test error behavior.`
-            break
+          signal.throwIfAborted()
+          const stepVars: Record<string, string> = { ...vars }
+          if (ctrlCanary && prbCanary) {
+            const activeCanary = step.role === 'control' ? ctrlCanary : prbCanary
+            stepVars.canary_url = activeCanary.url
+            stepVars.canary_token = activeCanary.token
+            stepVars.canary_dns_host = activeCanary.dnsHost
+          }
+          const brokerReq = stepToBrokerRequest(step, stepVars, {
+            replayJarPrefix,
+            runId: params.runId,
+            assignmentId,
+          })
+          if (brokerReq.authMutation?.kind === 'jku_x5u_canary' && !brokerReq.authMutation.url && !brokerReq.authMutation.value && ctrlCanary && prbCanary) {
+            brokerReq.authMutation = {
+              ...brokerReq.authMutation,
+              url: step.role === 'control' ? ctrlCanary.url : prbCanary.url,
+            }
+          }
+          if (step.request.batchCount) {
+            const batchReqs = Array.from({ length: step.request.batchCount }, () => ({ ...brokerReq }))
+            const batchResults = await broker.executeBatch(batchReqs, grant, signal)
+            for (const ex of batchResults) recordExchange(ex)
+            const first = batchResults[0]
+            if (first) extractVariables(step, first, vars)
+            const stepEntry: Record<string, unknown> = {
+              id: step.id,
+              role: step.role,
+              batchCount: batchResults.length,
+              statuses: batchResults.map(r => r.status),
+              responses: batchResults.map(summarizeExchange),
+              ...(first ? summarizeExchange(first) : {}),
+            }
+            stepsOut[step.id] = stepEntry
+            if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
+            if (step.role === 'probe') {
+              if (!firstProbeStep) firstProbeStep = stepEntry
+              if (first) probeStepExchanges.push({ id: step.id, exchange: first })
+            }
+          } else {
+            const ex = await broker.executeHttp(brokerReq, grant, signal)
+            recordExchange(ex)
+            extractVariables(step, ex, vars)
+            const stepEntry: Record<string, unknown> = {
+              id: step.id,
+              role: step.role,
+              ...summarizeExchange(ex),
+            }
+            stepsOut[step.id] = stepEntry
+            if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
+            if (step.role === 'probe') {
+              if (!firstProbeStep) firstProbeStep = stepEntry
+              probeStepExchanges.push({ id: step.id, exchange: ex })
+            }
           }
         }
-      }
 
-      let spaCatchall: Record<string, unknown> | undefined
-      if (spec.spaCatchallControl) {
-        const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
-        const catchallEx = await broker.executeHttp({
-          origin: spec.origin,
-          method: 'GET',
-          pathAndQuery: catchallPath,
-          followRedirects: true,
-        }, grant, signal)
-        recordExchange(catchallEx)
+        if (guardControlErrors) {
+          for (const step of spec.steps) {
+            if (step.role !== 'control' && step.role !== 'probe') continue
+            const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
+            if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
+              // On probe steps, allow error status if assertionsJq explicitly asserts that error status
+              // (e.g. error-based SQLi testing `.steps.p1.status == 500` while control step is 200).
+              if (step.role === 'probe') {
+                const statusAssertedInJq =
+                  new RegExp(`status\\s*==\\s*${status}\\b|\\b${status}\\s*==\\s*[^;]*status`).test(spec.assertionsJq) ||
+                  (status >= 500 && /status\s*>=\s*500\b/.test(spec.assertionsJq))
+                if (statusAssertedInJq) continue
+              }
+              forcedInconclusiveReason = `Unexpected HTTP ${status} on ${step.role} step "${step.id}" (requireControlNonError); declare expectedStatus ${status} to test error behavior.`
+              break
+            }
+          }
+        }
 
-        const comparisons: Record<string, Record<string, unknown>> = {}
-        let allProbesMatchedCatchall = probeStepExchanges.length > 0
-        for (const probe of probeStepExchanges) {
-          const diff = diffResponse(
-            { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
-            { status: probe.exchange.status, body: probe.exchange.body, mediaType: probe.exchange.mediaType },
-          )
-          comparisons[probe.id] = diff
-          if (!diff.likelySpaCatchall) allProbesMatchedCatchall = false
+        let canaryEvidence: Record<string, unknown> | undefined
+        if (canarySession && prbCanary && ctrlCanary) {
+          let probeCheck = canarySession.check(prbCanary.token)
+          for (let attempt = 0; attempt < 10 && !probeCheck.triggered; attempt += 1) {
+            await sleepAbortable(150, signal)
+            probeCheck = canarySession.check(prbCanary.token)
+          }
+          const controlCheck = canarySession.check(ctrlCanary.token)
+          canaryEvidence = {
+            proof: {
+              canaryProbeTriggered: probeCheck.triggered,
+              canaryControlTriggered: controlCheck.triggered,
+              canaryProbeDetail: probeCheck.detail,
+              canaryControlDetail: controlCheck.detail,
+            },
+            canary: {
+              triggered: probeCheck.triggered && !controlCheck.triggered,
+              probeTriggered: probeCheck.triggered,
+              controlTriggered: controlCheck.triggered,
+              probeDetail: probeCheck.detail,
+              controlDetail: controlCheck.detail,
+            },
+          }
         }
-        spaCatchall = {
-          path: catchallPath,
-          ...summarizeExchange(catchallEx),
-          comparisons,
-          allProbesMatchedCatchall,
-        }
-        if (allProbesMatchedCatchall) {
-          forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
-        }
-      }
 
-      evidencePayload = {
-        ...evidencePayload,
-        steps: stepsOut,
-        ...(firstControlStep ? { control: firstControlStep } : {}),
-        ...(firstProbeStep ? { probe: firstProbeStep } : {}),
-        extractedVars: vars,
-        ...(spaCatchall ? { spaCatchall } : {}),
+        let spaCatchall: Record<string, unknown> | undefined
+        if (spec.spaCatchallControl) {
+          const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+          const catchallEx = await broker.executeHttp({
+            origin: spec.origin,
+            method: 'GET',
+            pathAndQuery: catchallPath,
+            followRedirects: true,
+          }, grant, signal)
+          recordExchange(catchallEx)
+
+          const comparisons: Record<string, Record<string, unknown>> = {}
+          let allProbesMatchedCatchall = probeStepExchanges.length > 0
+          for (const probe of probeStepExchanges) {
+            const diff = diffResponse(
+              { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+              { status: probe.exchange.status, body: probe.exchange.body, mediaType: probe.exchange.mediaType },
+            )
+            comparisons[probe.id] = diff
+            if (!diff.likelySpaCatchall) allProbesMatchedCatchall = false
+          }
+          spaCatchall = {
+            path: catchallPath,
+            ...summarizeExchange(catchallEx),
+            comparisons,
+            allProbesMatchedCatchall,
+          }
+          if (allProbesMatchedCatchall) {
+            forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
+          }
+        }
+
+        evidencePayload = {
+          ...evidencePayload,
+          steps: stepsOut,
+          ...(firstControlStep ? { control: firstControlStep } : {}),
+          ...(firstProbeStep ? { probe: firstProbeStep } : {}),
+          extractedVars: vars,
+          ...(canaryEvidence ?? {}),
+          ...(spaCatchall ? { spaCatchall } : {}),
+        }
+      } finally {
+        await canarySession?.close()
       }
     } else if (spec.kind === 'dns_takeover') {
       const dns = await broker.inspectDns(spec.targetOrigin, grant, signal)
@@ -652,17 +770,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       let firstControlStep: Record<string, unknown> | undefined
       let firstProbeStep: Record<string, unknown> | undefined
 
-      for (const step of spec.steps) {
-        signal.throwIfAborted()
-        const pathAndQuery = interpolateString(step.pathAndQuery, vars)
-        const postMessagePayload = step.postMessagePayload !== undefined
-          ? interpolateValue(step.postMessagePayload, vars)
-          : undefined
-        const resolvedCheckKind = step.checkKind
-          ?? (step.action === 'postmessage_probe' ? 'postmessage'
-            : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
-              : undefined)
-        const enableSinkHook = Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook')
+      const buildStepActions = (step: typeof spec.steps[number]): BrowserInteractiveAction[] => {
         const stepActions: BrowserInteractiveAction[] = []
         if (step.action === 'fill' && step.selector) {
           stepActions.push({ type: 'fill', selector: step.selector, value: interpolateString(step.value ?? '', vars) })
@@ -683,30 +791,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         } else if (step.action === 'dom_xss_sink_hook') {
           stepActions.push({ type: 'dom_xss_sink_hook' })
         }
+        return stepActions
+      }
 
-        const visit = await scopedBrowser.visitPage({
-          origin: step.origin,
-          pathAndQuery,
-          persona: step.persona,
-          checkKind: resolvedCheckKind,
-          canaryToken,
-          selector: step.selector,
-          postMessageOrigin: step.action === 'postmessage_probe'
-            ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
-            : step.postMessageOrigin,
-          postMessagePayload,
-          sameSiteFetch: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
-          actions: stepActions.length > 0 ? stepActions : undefined,
-          enableSinkHook,
-          waitAfterLoadMs: step.waitAfterLoadMs,
-          onExchange: ex => {
-            exchanges.push(ex)
-            const id = params.onExchange?.(ex)
-            if (typeof id === 'string' && id) exchangeIds.push(id)
-            return id
-          },
-        }, grant, signal)
-
+      const recordVisitStep = (step: typeof spec.steps[number], visit: Awaited<ReturnType<ScopedBrowser['visitPage']>>) => {
         const { exchanges: visitExchanges, ...visitSummary } = visit
         const stepEntry: Record<string, unknown> = {
           id: step.id,
@@ -766,7 +854,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           fetchResult: visit.fetchResult ?? null,
           redirectSummary: visit.redirectSummary ?? null,
         })
-
         if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
         if (step.role === 'probe') {
           if (!firstProbeStep) firstProbeStep = stepEntry
@@ -785,6 +872,124 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             status: visit.status,
             hadDynamicSignal,
           })
+        }
+      }
+
+      if (typeof (scopedBrowser as { runBrowserSession?: unknown }).runBrowserSession === 'function') {
+        const sessionSteps: BrowserSessionStep[] = spec.steps.map(step => {
+          const postMessagePayload = step.postMessagePayload !== undefined
+            ? interpolateValue(step.postMessagePayload, vars)
+            : undefined
+          const resolvedCheckKind = step.checkKind
+            ?? (step.action === 'postmessage_probe' ? 'postmessage'
+              : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
+                : undefined)
+          const stepActions = buildStepActions(step)
+          return {
+            id: step.id,
+            role: step.role,
+            description: step.description,
+            origin: step.origin,
+            pathAndQuery: step.pathAndQuery !== undefined ? interpolateString(step.pathAndQuery, vars) : undefined,
+            reusePage: step.reusePage,
+            resetContext: step.resetContext,
+            persona: step.persona,
+            session: step.session,
+            csrfBind: step.csrfBind,
+            traceId: step.traceId,
+            runId: params.runId,
+            assignmentId,
+            action: step.action,
+            checkKind: resolvedCheckKind,
+            canaryToken,
+            selector: step.selector,
+            value: step.value !== undefined ? interpolateString(step.value, vars) : undefined,
+            builtinCheck: step.builtinCheck,
+            urlPattern: step.urlPattern ? interpolateString(step.urlPattern, vars) : undefined,
+            enableSinkHook: Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook'),
+            actions: stepActions.length > 0 ? stepActions : undefined,
+            fetchTarget: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
+            postMessageOrigin: step.action === 'postmessage_probe'
+              ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
+              : step.postMessageOrigin,
+            postMessagePayload,
+            waitAfterLoadMs: step.waitAfterLoadMs,
+            onExchange: ex => {
+              exchanges.push(ex)
+              const id = params.onExchange?.(ex)
+              if (typeof id === 'string' && id) exchangeIds.push(id)
+              return id
+            },
+          }
+        })
+        const visits = await scopedBrowser.runBrowserSession(sessionSteps, grant, signal)
+        for (let i = 0; i < spec.steps.length; i += 1) {
+          const visit = visits[i]
+          if (visit) recordVisitStep(spec.steps[i], visit)
+        }
+      } else {
+        // Fallback for unit-test mocks (e.g. M1.10 fakeBrowser) implementing only visitPage()
+        let lastPathAndQuery: string | undefined
+        let activeRole: 'control' | 'probe' | null = null
+        let lastPersona: string | undefined
+        let lastOrigin: string | undefined
+
+        for (const step of spec.steps) {
+          signal.throwIfAborted()
+          if (step.resetContext === true) {
+            activeRole = null
+          }
+          const resetGroupBoundary =
+            (step.role === 'control' && activeRole === 'probe') ||
+            (step.role === 'probe' && activeRole === 'control') ||
+            lastPersona !== (step.persona ?? undefined) ||
+            lastOrigin !== step.origin ||
+            step.resetContext === true ||
+            step.reusePage === false
+          if (resetGroupBoundary) {
+            lastPathAndQuery = undefined
+          }
+          const rawPath = step.pathAndQuery ?? lastPathAndQuery ?? '/'
+          const pathAndQuery = interpolateString(rawPath, vars)
+          lastPathAndQuery = pathAndQuery
+          if (step.role === 'control' || step.role === 'probe') {
+            activeRole = step.role
+          }
+          lastPersona = step.persona ?? undefined
+          lastOrigin = step.origin
+          const postMessagePayload = step.postMessagePayload !== undefined
+            ? interpolateValue(step.postMessagePayload, vars)
+            : undefined
+          const resolvedCheckKind = step.checkKind
+            ?? (step.action === 'postmessage_probe' ? 'postmessage'
+              : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
+                : undefined)
+          const enableSinkHook = Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook')
+          const stepActions = buildStepActions(step)
+
+          const visit = await scopedBrowser.visitPage({
+            origin: step.origin,
+            pathAndQuery,
+            persona: step.persona,
+            checkKind: resolvedCheckKind,
+            canaryToken,
+            selector: step.selector,
+            postMessageOrigin: step.action === 'postmessage_probe'
+              ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
+              : step.postMessageOrigin,
+            postMessagePayload,
+            sameSiteFetch: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
+            actions: stepActions.length > 0 ? stepActions : undefined,
+            enableSinkHook,
+            waitAfterLoadMs: step.waitAfterLoadMs,
+            onExchange: ex => {
+              exchanges.push(ex)
+              const id = params.onExchange?.(ex)
+              if (typeof id === 'string' && id) exchangeIds.push(id)
+              return id
+            },
+          }, grant, signal)
+          recordVisitStep(step, visit)
         }
       }
 
@@ -1017,23 +1222,28 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         return `${baseValue}' AND ${expr}-- -`
       }
       const buildRequest = (value: string): BrokerHttpRequest => {
-        const headers: Record<string, string> = { ...(spec.headers ?? {}) }
-        if (spec.paramLocation === 'json') {
-          const body: Record<string, unknown> = structuredClone((spec.jsonBody ?? {}) as Record<string, unknown>)
-          setJsonPath(body, spec.paramName, value)
-          headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
-          return {
-            origin: spec.targetOrigin, method: 'POST', pathAndQuery: spec.pathAndQuery, headers,
-            body: JSON.stringify(body), persona: spec.persona, followRedirects: false,
-          }
-        }
-        const url = new URL(spec.pathAndQuery, 'http://guardian.invalid')
-        url.searchParams.set(spec.paramName, value)
-        const hasJson = spec.method === 'POST' && spec.jsonBody !== undefined
-        if (hasJson) headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
+        const injected = injectUniversalParam({
+          pathAndQuery: spec.pathAndQuery,
+          param: spec.paramName,
+          paramLocation: spec.paramLocation,
+          value,
+          method: spec.method,
+          headers: spec.headers,
+          jsonBody: (spec.jsonBody && typeof spec.jsonBody === 'object' && !Array.isArray(spec.jsonBody))
+            ? spec.jsonBody as Record<string, unknown>
+            : undefined,
+          xmlTemplate: spec.xmlTemplate,
+          graphqlQuery: spec.graphqlQuery,
+          session: spec.session,
+          csrfBind: spec.csrfBind,
+          runId: params.runId,
+          assignmentId,
+        })
         return {
-          origin: spec.targetOrigin, method: spec.method, pathAndQuery: url.pathname + url.search, headers,
-          body: hasJson ? JSON.stringify(spec.jsonBody) : undefined, persona: spec.persona, followRedirects: false,
+          origin: spec.targetOrigin,
+          persona: spec.persona,
+          followRedirects: false,
+          ...injected,
         }
       }
 
@@ -1048,6 +1258,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
 
       const rounds: Array<Record<string, unknown>> = []
       let firstBaseline: BrokerExchangeResult | undefined
+      let firstTrue: BrokerExchangeResult | undefined
+      let firstFalse: BrokerExchangeResult | undefined
       let allPass = true
       let unstable = false
       let baselineDrift = false
@@ -1064,22 +1276,30 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const falseEx = await broker.executeHttp(buildRequest(makeValue(k, 'false')), grant, signal)
         recordExchange(falseEx)
         firstBaseline ??= baseEx
+        firstTrue ??= trueEx
+        firstFalse ??= falseEx
         const simBaselineTrue = responseSimilarity(baseEx.body, trueEx.body)
+        const simBaselineFalse = responseSimilarity(baseEx.body, falseEx.body)
         const simTrueFalse = responseSimilarity(trueEx.body, falseEx.body)
-        const statusDivergence = baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500
+        const isOrBranch = /\bOR\b/i.test(spec.valueTemplate ?? '')
+        const statusDivergence = isOrBranch
+          ? (falseEx.status === baseEx.status && trueEx.status !== falseEx.status && trueEx.status < 500) ||
+            (baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500)
+          : (baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500)
         const anyServerError = [baseEx, trueEx, falseEx].some(e => e.status >= 500)
         if (anyServerError) unstable = true
         if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(trueEx.status, spec.expectedStatus)) {
           controlHealthy = false
         }
         if (responseSimilarity(firstBaseline.body, baseEx.body) < 0.9) baselineDrift = true
-        const pass = !anyServerError && simBaselineTrue >= 0.9 && (simTrueFalse <= 0.75 || statusDivergence)
+        const baselineMatch = isOrBranch ? Math.max(simBaselineTrue, simBaselineFalse) >= 0.9 : simBaselineTrue >= 0.9
+        const pass = !anyServerError && baselineMatch && (simTrueFalse <= 0.75 || statusDivergence)
         if (!pass) allPass = false
         rounds.push({
           round: r + 1, k,
           trueExpression: `${k}=${k}`, falseExpression: `${k}=${k + 1}`,
           baseline: lightSummary(baseEx), true: lightSummary(trueEx), false: lightSummary(falseEx),
-          similarityBaselineTrue: simBaselineTrue, similarityTrueFalse: simTrueFalse, statusDivergence, pass,
+          similarityBaselineTrue: simBaselineTrue, similarityBaselineFalse: simBaselineFalse, similarityTrueFalse: simTrueFalse, statusDivergence, isOrBranch, pass,
         })
       }
       const controlPassed = controlHealthy && !unstable && !baselineDrift
@@ -1094,6 +1314,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         targetOrigin: spec.targetOrigin,
         paramName: spec.paramName,
         quoteStyle: spec.quoteStyle,
+        baseline: firstBaseline ? summarizeExchange(firstBaseline) : (rounds[0]?.baseline ?? null),
+        trueProbe: firstTrue ? summarizeExchange(firstTrue) : (rounds[0]?.true ?? null),
+        falseProbe: firstFalse ? summarizeExchange(firstFalse) : (rounds[0]?.false ?? null),
         sqlDiff: {
           passed: deterministicProofPassed,
           controlPassed,
@@ -1278,14 +1501,465 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           controlPassed: astResult.verified,
         },
       }
+    } else if (spec.kind === 'auth_protocol_proof') {
+      const vars: Record<string, string> = {}
+      const stepsOut: Record<string, unknown> = {}
+      const probeStepExchanges: Array<{ id: string; exchange: BrokerExchangeResult }> = []
+      const replayJarPrefix = randomUUID().slice(0, 8)
+      let firstControlStep: Record<string, unknown> | undefined
+      let firstProbeStep: Record<string, unknown> | undefined
+
+      const serializedSteps = JSON.stringify(spec.steps)
+      const needsCanary = spec.steps.some(s => s.request.authMutation?.kind === 'jku_x5u_canary') ||
+        /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps)
+      let canarySession: EphemeralCanarySession | undefined
+      let ctrlCanary: { url: string; token: string; dnsHost: string } | undefined
+      let prbCanary: { url: string; token: string; dnsHost: string } | undefined
+      let controlCanaryToken: string | undefined
+      let probeCanaryToken: string | undefined
+
+      if (needsCanary) {
+        canarySession = await openCanarySession(params.canaryBroker, params.storage, params.runId, assignmentId, spec.origin)
+        ctrlCanary = canarySession.mint(`auth_protocol_proof:control:${spec.title}`)
+        prbCanary = canarySession.mint(`auth_protocol_proof:probe:${spec.title}`)
+        controlCanaryToken = ctrlCanary.token
+        probeCanaryToken = prbCanary.token
+      }
+
+      try {
+        for (const step of spec.steps) {
+          signal.throwIfAborted()
+          const stepVars: Record<string, string> = { ...vars }
+          if (ctrlCanary && prbCanary) {
+            const activeCanary = step.role === 'control' ? ctrlCanary : prbCanary
+            stepVars.canary_url = activeCanary.url
+            stepVars.canary_token = activeCanary.token
+            stepVars.canary_dns_host = activeCanary.dnsHost
+          }
+          const brokerReq = stepToBrokerRequest(step, stepVars, {
+            replayJarPrefix,
+            runId: params.runId,
+            assignmentId,
+          })
+          if (brokerReq.authMutation?.kind === 'jku_x5u_canary' && !brokerReq.authMutation.url && !brokerReq.authMutation.value && ctrlCanary && prbCanary) {
+            const targetCanaryUrl = step.role === 'control' ? ctrlCanary.url : prbCanary.url
+            brokerReq.authMutation = { ...brokerReq.authMutation, url: targetCanaryUrl }
+          }
+          const ex = await broker.executeHttp(brokerReq, grant, signal)
+          recordExchange(ex)
+          extractVariables(step, ex, vars)
+          const stepEntry: Record<string, unknown> = {
+            id: step.id,
+            role: step.role,
+            ...summarizeExchange(ex),
+          }
+          stepsOut[step.id] = stepEntry
+          if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
+          if (step.role === 'probe') {
+            if (!firstProbeStep) firstProbeStep = stepEntry
+            probeStepExchanges.push({ id: step.id, exchange: ex })
+          }
+        }
+
+        if (guardControlErrors) {
+          for (const step of spec.steps) {
+            if (step.role !== 'control' && step.role !== 'probe') continue
+            const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
+            if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
+              // On probe steps, allow error status if assertionsJq explicitly asserts that error status
+              // (e.g. error-based SQLi testing `.steps.p1.status == 500` while control step is 200).
+              if (step.role === 'probe') {
+                const statusAssertedInJq =
+                  new RegExp(`status\\s*==\\s*${status}\\b|\\b${status}\\s*==\\s*[^;]*status`).test(spec.assertionsJq) ||
+                  (status >= 500 && /status\s*>=\s*500\b/.test(spec.assertionsJq))
+                if (statusAssertedInJq) continue
+              }
+              forcedInconclusiveReason = `Unexpected HTTP ${status} on ${step.role} step "${step.id}" (requireControlNonError); declare expectedStatus ${status} to test error behavior.`
+              break
+            }
+          }
+        }
+
+        let canaryProof: Record<string, unknown> | undefined
+        if (canarySession && probeCanaryToken && controlCanaryToken) {
+          let probeCheck = canarySession.check(probeCanaryToken)
+          for (let attempt = 0; attempt < 10 && !probeCheck.triggered; attempt += 1) {
+            await sleepAbortable(150, signal)
+            probeCheck = canarySession.check(probeCanaryToken)
+          }
+          const controlCheck = canarySession.check(controlCanaryToken)
+          deterministicProofPassed = probeCheck.triggered && !controlCheck.triggered
+          if (!deterministicProofPassed) {
+            proofFailureReason = 'auth_protocol_proof OOB canary callback did not trigger exclusively on probe step.'
+          }
+          canaryProof = {
+            probeTriggered: probeCheck.triggered,
+            controlTriggered: controlCheck.triggered,
+            probeDetail: probeCheck.detail,
+            controlDetail: controlCheck.detail,
+          }
+        }
+
+        let spaCatchall: Record<string, unknown> | undefined
+        if (spec.spaCatchallControl) {
+          const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+          const catchallEx = await broker.executeHttp({
+            origin: spec.origin,
+            method: 'GET',
+            pathAndQuery: catchallPath,
+            followRedirects: true,
+          }, grant, signal)
+          recordExchange(catchallEx)
+          const comparisons: Record<string, Record<string, unknown>> = {}
+          let allProbesMatchedCatchall = probeStepExchanges.length > 0
+          for (const probe of probeStepExchanges) {
+            const diff = diffResponse(
+              { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+              { status: probe.exchange.status, body: probe.exchange.body, mediaType: probe.exchange.mediaType },
+            )
+            comparisons[probe.id] = diff
+            if (!diff.likelySpaCatchall) allProbesMatchedCatchall = false
+          }
+          spaCatchall = { path: catchallPath, ...summarizeExchange(catchallEx), comparisons, allProbesMatchedCatchall }
+          if (allProbesMatchedCatchall) {
+            forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
+          }
+        }
+
+        evidencePayload = {
+          ...evidencePayload,
+          protocol: spec.protocol,
+          steps: stepsOut,
+          ...(firstControlStep ? { control: firstControlStep } : {}),
+          ...(firstProbeStep ? { probe: firstProbeStep } : {}),
+          extractedVars: vars,
+          ...(canaryProof ? { canaryProof } : {}),
+          ...(spaCatchall ? { spaCatchall } : {}),
+        }
+      } finally {
+        await canarySession?.close()
+      }
+    } else if (spec.kind === 'cache_differential') {
+      const controlGcb = randomUUID()
+      const probeGcb = randomUUID()
+      const resolveCachePath = (raw: string, token: string): string =>
+        raw.replaceAll('{{control_gcb}}', controlGcb)
+          .replaceAll('{{probe_gcb}}', probeGcb)
+          .replaceAll('{{cache_buster}}', token)
+
+      const controlPath = resolveCachePath(spec.controlPath, controlGcb)
+      const probePath = resolveCachePath(spec.probePath, probeGcb)
+      const verifyPath = spec.verifyPath ? resolveCachePath(spec.verifyPath, probeGcb) : probePath
+
+      const actualCtrlGcb = extractCacheBusterParam(controlPath)
+      const actualProbeGcb = extractCacheBusterParam(probePath)
+      if (!actualCtrlGcb || !cacheBusterValueRegex.test(actualCtrlGcb) ||
+          !actualProbeGcb || !cacheBusterValueRegex.test(actualProbeGcb)) {
+        return inconclusiveResult('cache_differential requires valid ?_gcb=<16-36 hex/uuid> tokens.', exchanges, exchangeIds, { kind: spec.kind })
+      }
+      if (actualCtrlGcb.toLowerCase() === actualProbeGcb.toLowerCase()) {
+        return inconclusiveResult('cache_differential cannot reuse _gcb between control and probe.', exchanges, exchangeIds, { kind: spec.kind })
+      }
+
+      const controlEx = await broker.executeHttp({
+        origin: spec.targetOrigin,
+        method: spec.method,
+        pathAndQuery: controlPath,
+        probeClass: 'cache_differential',
+        followRedirects: false,
+        runId: params.runId,
+        assignmentId,
+      }, grant, signal)
+      recordExchange(controlEx)
+
+      const probeEx = await broker.executeHttp({
+        origin: spec.targetOrigin,
+        method: spec.method,
+        pathAndQuery: probePath,
+        headers: spec.poisonHeaders,
+        persona: spec.poisonPersona,
+        probeClass: 'cache_poison_deception',
+        followRedirects: false,
+        runId: params.runId,
+        assignmentId,
+      }, grant, signal)
+      recordExchange(probeEx)
+
+      const verifyEx = await broker.executeHttp({
+        origin: spec.targetOrigin,
+        method: spec.method,
+        pathAndQuery: verifyPath,
+        probeClass: 'cache_differential',
+        cacheVerify: true,
+        followRedirects: false,
+        runId: params.runId,
+        assignmentId,
+      }, grant, signal)
+      recordExchange(verifyEx)
+
+      if (guardControlErrors) {
+        if (isUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) {
+          forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on cache_differential control step (requireControlNonError).`
+        } else if (isUnexpectedErrorStatus(verifyEx.status, spec.expectedStatus)) {
+          forcedInconclusiveReason = `Unexpected HTTP ${verifyEx.status} on cache_differential verify step (requireControlNonError).`
+        }
+      }
+
+      const ageRaw = verifyEx.respHeaders.age
+      const age = ageRaw !== undefined ? Number(ageRaw) : NaN
+      const cacheHeaderSignal = [
+        verifyEx.respHeaders['x-cache'],
+        verifyEx.respHeaders['cf-cache-status'],
+        verifyEx.respHeaders['x-cache-status'],
+        verifyEx.respHeaders['x-proxy-cache'],
+        verifyEx.respHeaders['cache-status'],
+      ].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
+      const cacheHitObserved = (Number.isFinite(age) && age > 0) || cacheHeaderSignal
+      const simControlVsVerify = responseSimilarity(controlEx.body, verifyEx.body)
+      const simProbeVsVerify = responseSimilarity(probeEx.body, verifyEx.body)
+      const poisonPersistedToVictim =
+        (simControlVsVerify < 0.95 || verifyEx.status !== controlEx.status) &&
+        (simProbeVsVerify >= 0.85 || verifyEx.status === probeEx.status)
+
+      deterministicProofPassed = cacheHitObserved && poisonPersistedToVictim
+      if (!deterministicProofPassed) {
+        proofFailureReason = !cacheHitObserved
+          ? 'Verify request did not observe a cache hit (missing HIT header or Age > 0).'
+          : 'Clean unauthenticated verify response matched clean control rather than poisoned probe.'
+      }
+
+      let spaCatchall: Record<string, unknown> | undefined
+      if (spec.spaCatchallControl) {
+        const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+        const catchallEx = await broker.executeHttp({
+          origin: spec.targetOrigin,
+          method: 'GET',
+          pathAndQuery: catchallPath,
+          followRedirects: true,
+        }, grant, signal)
+        recordExchange(catchallEx)
+        const diff = diffResponse(
+          { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+          { status: verifyEx.status, body: verifyEx.body, mediaType: verifyEx.mediaType },
+        )
+        spaCatchall = {
+          path: catchallPath,
+          ...summarizeExchange(catchallEx),
+          comparisons: { verify: diff },
+          allProbesMatchedCatchall: diff.likelySpaCatchall,
+        }
+        if (diff.likelySpaCatchall) {
+          forcedInconclusiveReason = 'cache_differential verify response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
+        }
+      }
+
+      const controlSummary = { id: 'control', role: 'control', ...summarizeExchange(controlEx) }
+      const probeSummary = { id: 'probe', role: 'probe', ...summarizeExchange(probeEx) }
+      const verifySummary = { id: 'verify', role: 'probe', ...summarizeExchange(verifyEx) }
+
+      evidencePayload = {
+        ...evidencePayload,
+        targetOrigin: spec.targetOrigin,
+        mode: spec.mode,
+        control: controlSummary,
+        probe: probeSummary,
+        verify: verifySummary,
+        steps: { control: controlSummary, probe: probeSummary, verify: verifySummary },
+        ...(spaCatchall ? { spaCatchall } : {}),
+        cacheProof: {
+          mode: spec.mode,
+          controlGcb: actualCtrlGcb,
+          probeGcb: actualProbeGcb,
+          cacheHitObserved,
+          poisonPersistedToVictim,
+          simControlVsVerify,
+          simProbeVsVerify,
+          age: Number.isFinite(age) ? age : null,
+        },
+      }
+    } else if (spec.kind === 'sql_time_diff') {
+      const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+      if (!localLab) {
+        if (tier < 3) {
+          grant.audit('denied', spec.targetOrigin)
+          return inconclusiveResult('sql_time_diff is blocked on public projects below Tier 3 (requires local-lab or Tier 3 HITL approval).', exchanges, exchangeIds, { kind: spec.kind })
+        }
+        const approved = grant.isStateChangeApproved
+          ? grant.isStateChangeApproved(spec.targetOrigin, spec.method, spec.pathAndQuery)
+          : false
+        if (!approved) {
+          grant.audit('denied', spec.targetOrigin)
+          return inconclusiveResult('sql_time_diff requires explicit Tier 3 HITL operator approval on public targets.', exchanges, exchangeIds, { kind: spec.kind })
+        }
+      }
+
+      const delayMs = Math.max(1500, Math.min(3000, spec.delayMs ?? randomInt(1500, 2601)))
+      const delaySec = Number((delayMs / 1000).toFixed(3))
+      const delaySecInt = Math.max(1, Math.round(delayMs / 1000))
+      const baseValue = spec.baselineValue
+
+      const makeDelayPayload = (): string => {
+        if (spec.valueTemplate) {
+          return spec.valueTemplate
+            .replaceAll('{{baseline}}', baseValue)
+            .replaceAll('{{delay_ms}}', String(delayMs))
+            .replaceAll('{{delay_sec}}', String(delaySec))
+        }
+        let fnExpr: string
+        if (spec.dialect === 'mysql') fnExpr = `SLEEP(${delaySec})`
+        else if (spec.dialect === 'mssql') fnExpr = `WAITFOR DELAY '0:0:${delaySecInt}'`
+        else if (spec.dialect === 'sqlite') fnExpr = `1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(${Math.min(90_000_000, delayMs * 25_000)}))))`
+        else fnExpr = `(SELECT 1 FROM pg_sleep(${delaySec})) IS NULL`
+
+        if (spec.dialect === 'mssql') {
+          return spec.quoteStyle === 'numeric'
+            ? `${baseValue}; ${fnExpr}`
+            : spec.quoteStyle === 'double'
+              ? `${baseValue}"; ${fnExpr}-- -`
+              : `${baseValue}'; ${fnExpr}-- -`
+        }
+        if (spec.quoteStyle === 'numeric') return `${baseValue} AND ${fnExpr}`
+        if (spec.quoteStyle === 'double') return `${baseValue}" AND ${fnExpr}-- -`
+        return `${baseValue}' AND ${fnExpr}-- -`
+      }
+
+      const buildRequest = (value: string): BrokerHttpRequest => {
+        const injected = injectUniversalParam({
+          pathAndQuery: spec.pathAndQuery,
+          param: spec.paramName,
+          paramLocation: spec.paramLocation,
+          value,
+          method: spec.method,
+          headers: spec.headers,
+          jsonBody: (spec.jsonBody && typeof spec.jsonBody === 'object' && !Array.isArray(spec.jsonBody))
+            ? spec.jsonBody as Record<string, unknown>
+            : undefined,
+          xmlTemplate: spec.xmlTemplate,
+          graphqlQuery: spec.graphqlQuery,
+          session: spec.session,
+          csrfBind: spec.csrfBind,
+          runId: params.runId,
+          assignmentId,
+        })
+        return {
+          origin: spec.targetOrigin,
+          persona: spec.persona,
+          followRedirects: false,
+          timeoutMs: Math.max(10_000, delayMs + 5_000),
+          ...injected,
+        }
+      }
+
+      let controlSummary: Record<string, unknown> | null = null
+      let controlHealthy = true
+      if (spec.controlStep) {
+        const ctrlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}, {
+          runId: params.runId,
+          assignmentId,
+        }), grant, signal)
+        recordExchange(ctrlEx)
+        controlSummary = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(ctrlEx) }
+        if (isUnexpectedErrorStatus(ctrlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) controlHealthy = false
+      }
+
+      const roundCount = 3
+      const rounds: Array<Record<string, unknown>> = []
+      const baseDurations: number[] = []
+      const probeDurations: number[] = []
+      let anyServerError = false
+      const delayPayload = makeDelayPayload()
+
+      for (let r = 0; r < roundCount; r += 1) {
+        signal.throwIfAborted()
+        const t0 = performance.now()
+        const baseEx = await broker.executeHttp(buildRequest(baseValue), grant, signal)
+        const baseMeasured = Math.max(baseEx.durationMs, Math.round(performance.now() - t0))
+        recordExchange(baseEx)
+
+        const t1 = performance.now()
+        const probeEx = await broker.executeHttp(buildRequest(delayPayload), grant, signal)
+        const probeMeasured = Math.max(probeEx.durationMs, Math.round(performance.now() - t1))
+        recordExchange(probeEx)
+
+        if (baseEx.status >= 500 || probeEx.status >= 500) anyServerError = true
+        if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(probeEx.status, spec.expectedStatus)) {
+          controlHealthy = false
+        }
+        baseDurations.push(baseMeasured)
+        probeDurations.push(probeMeasured)
+        rounds.push({
+          round: r + 1,
+          baselineMs: baseMeasured,
+          probeMs: probeMeasured,
+          baseline: lightSummary(baseEx),
+          delayProbe: lightSummary(probeEx),
+        })
+      }
+
+      const median = (arr: number[]) => {
+        const sorted = [...arr].sort((a, b) => a - b)
+        const m = Math.floor(sorted.length / 2)
+        return sorted.length % 2 === 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2
+      }
+      const baselineMedianMs = median(baseDurations)
+      const probeMedianMs = median(probeDurations)
+      const deltaMedianMs = probeMedianMs - baselineMedianMs
+      const minProbeMs = Math.min(...probeDurations)
+      const maxBaselineMs = Math.max(...baseDurations)
+      const nonOverlapping = minProbeMs > maxBaselineMs
+      const controlPassed = controlHealthy && !anyServerError
+      deterministicProofPassed = controlPassed && nonOverlapping && deltaMedianMs >= 0.85 * delayMs
+      if (!deterministicProofPassed) {
+        proofFailureReason = !controlPassed
+          ? 'sql_time_diff control unstable (5xx or unexpected error status).'
+          : !nonOverlapping
+            ? `Timing overlap detected across 3 rounds (minProbe=${minProbeMs}ms <= maxBaseline=${maxBaselineMs}ms).`
+            : `Median timing delta (${deltaMedianMs}ms) fell below 0.85 * ${delayMs}ms.`
+      }
+
+      evidencePayload = {
+        ...evidencePayload,
+        targetOrigin: spec.targetOrigin,
+        paramName: spec.paramName,
+        paramLocation: spec.paramLocation,
+        delayMs,
+        sqlTimeDiff: {
+          passed: deterministicProofPassed,
+          controlPassed,
+          delayMs,
+          baselineMedianMs,
+          probeMedianMs,
+          deltaMedianMs,
+          minProbeMs,
+          maxBaselineMs,
+          nonOverlapping,
+          rounds,
+        },
+        control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
+        probe: rounds[0] ? { role: 'probe', ...(rounds[0].delayProbe as Record<string, unknown>) } : null,
+      }
     }
   } catch (err) {
+    const catchSecrets: NamedSecret[] = [
+      ...(params.grant.secrets ?? []),
+      ...(params.grant.personas ? personaSecrets(params.grant.personas) : []),
+      ...(broker.getRegisteredSecrets?.() ?? []),
+    ]
+    const safePayload = redactJsonValue(evidencePayload, catchSecrets)
     if (err instanceof BrokerDenied || err instanceof BrokerCircuitOpen || err instanceof BrokerApprovalRequired) {
-      return inconclusiveResult(err.message, exchanges, exchangeIds, evidencePayload)
+      return inconclusiveResult(redact(err.message, catchSecrets), exchanges, exchangeIds, safePayload)
     }
-    const message = err instanceof Error ? err.message : String(err)
-    return inconclusiveResult(`Replay execution failed: ${message}`, exchanges, exchangeIds, evidencePayload)
+    const message = redact(err instanceof Error ? err.message : String(err), catchSecrets)
+    return inconclusiveResult(`Replay execution failed: ${message}`, exchanges, exchangeIds, safePayload)
   }
+
+  // Scrub any dynamic broker-registered secrets (jar cookies, CSRF tokens, mutated JWTs) + grant/persona secrets
+  const dynamicSecrets: NamedSecret[] = [
+    ...(params.grant.secrets ?? []),
+    ...(params.grant.personas ? personaSecrets(params.grant.personas) : []),
+    ...(broker.getRegisteredSecrets?.() ?? []),
+  ]
+  evidencePayload = redactJsonValue(evidencePayload, dynamicSecrets)
 
   // 4. Air-Gapped Assertion Evaluation via one-shot --network none just-bash worker
   const serializedPayload = JSON.stringify(evidencePayload, null, 2)
@@ -1303,7 +1977,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     }, signal)
   } catch (err) {
     return inconclusiveResult(
-      `Verification container failed: ${err instanceof Error ? err.message : String(err)}`,
+      `Verification container failed: ${redact(err instanceof Error ? err.message : String(err), dynamicSecrets)}`,
       exchanges,
       exchangeIds,
       evidencePayload,
@@ -1427,4 +2101,245 @@ export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<
       ? 'fixed'
       : 'inconclusive'
   return { verdict, replay }
+}
+
+export interface VerifyReplaySpecInlineParams extends VerifyReplaySpecParams {
+  findingId?: string
+  attemptCount?: number
+  maxRetries?: number
+  secrets?: readonly NamedSecret[]
+}
+
+export interface InlineReplayVerificationResult {
+  feedback: InlineVerifyFeedback
+  replay: ReplayVerificationResult
+}
+
+function toStepStatusItem(
+  id: string,
+  role: string,
+  entry: Record<string, unknown>,
+): InlineVerifyFeedback['stepStatuses'][number] {
+  const status = typeof entry.status === 'number' && Number.isFinite(entry.status) ? entry.status : null
+  const mediaType = typeof entry.mediaType === 'string' && entry.mediaType ? entry.mediaType : undefined
+  const bodyLen = typeof entry.bodyBytes === 'number' && Number.isFinite(entry.bodyBytes)
+    ? Math.max(0, Math.round(entry.bodyBytes))
+    : typeof entry.body === 'string'
+      ? Buffer.byteLength(entry.body, 'utf8')
+      : typeof entry.domSnippet === 'string'
+        ? Buffer.byteLength(entry.domSnippet, 'utf8')
+        : 0
+  return {
+    id,
+    role,
+    status,
+    ...(mediaType ? { mediaType } : {}),
+    bodyLen,
+  }
+}
+
+export function buildInlineVerifyFeedback(
+  spec: DeclarativeReplaySpec | unknown,
+  replay: ReplayVerificationResult,
+  attemptCount: number,
+  maxRetries = maxInlineVerifyRetries,
+  secrets: readonly NamedSecret[] = [],
+): InlineVerifyFeedback {
+  const maxAttempts = 1 + Math.max(0, maxRetries)
+  const retriesRemaining = Math.max(0, maxAttempts - attemptCount)
+  const payload = replay.evidencePayload ?? {}
+  const kind = spec && typeof spec === 'object' && 'kind' in spec && typeof (spec as { kind?: unknown }).kind === 'string'
+    ? (spec as { kind: string }).kind
+    : (typeof payload.kind === 'string' ? payload.kind : '')
+
+  const stepStatuses: InlineVerifyFeedback['stepStatuses'] = []
+  if (payload.steps && typeof payload.steps === 'object' && !Array.isArray(payload.steps)) {
+    for (const [key, val] of Object.entries(payload.steps as Record<string, unknown>)) {
+      if (!val || typeof val !== 'object') continue
+      const entry = val as Record<string, unknown>
+      const id = typeof entry.id === 'string' ? entry.id : key
+      const role = typeof entry.role === 'string' ? entry.role : 'probe'
+      stepStatuses.push(toStepStatusItem(id, role, entry))
+    }
+  } else if (kind === 'race_burst') {
+    if (payload.control && typeof payload.control === 'object') {
+      const c = payload.control as Record<string, unknown>
+      stepStatuses.push(toStepStatusItem(typeof c.id === 'string' ? c.id : 'control', 'control', c))
+    }
+    const burstResults = (payload.burst as { results?: unknown[] } | undefined)?.results
+    if (Array.isArray(burstResults)) {
+      burstResults.forEach((item, idx) => {
+        if (item && typeof item === 'object') {
+          stepStatuses.push(toStepStatusItem(`burst-${idx + 1}`, 'probe', item as Record<string, unknown>))
+        }
+      })
+    }
+    if (payload.postCheck && typeof payload.postCheck === 'object') {
+      const p = payload.postCheck as Record<string, unknown>
+      stepStatuses.push(toStepStatusItem(typeof p.id === 'string' ? p.id : 'postCheck', 'probe', p))
+    }
+  } else if (kind === 'rce_proof' || kind === 'browser_dom') {
+    if (payload.control && typeof payload.control === 'object') {
+      stepStatuses.push(toStepStatusItem('control', 'control', payload.control as Record<string, unknown>))
+    }
+    if (payload.probe && typeof payload.probe === 'object') {
+      stepStatuses.push(toStepStatusItem('probe', 'probe', payload.probe as Record<string, unknown>))
+    }
+  } else if (kind === 'sql_boolean_diff') {
+    const rounds = (payload.sqlDiff as { rounds?: Array<Record<string, unknown>> } | undefined)?.rounds
+    const r0 = Array.isArray(rounds) ? rounds[0] : undefined
+    if (r0) {
+      if (r0.baseline && typeof r0.baseline === 'object') {
+        stepStatuses.push(toStepStatusItem('baseline', 'control', r0.baseline as Record<string, unknown>))
+      }
+      if (r0.true && typeof r0.true === 'object') {
+        stepStatuses.push(toStepStatusItem('true', 'probe', r0.true as Record<string, unknown>))
+      }
+      if (r0.false && typeof r0.false === 'object') {
+        stepStatuses.push(toStepStatusItem('false', 'probe', r0.false as Record<string, unknown>))
+      }
+    }
+  } else if (kind === 'dns_takeover') {
+    if (payload.http && typeof payload.http === 'object') {
+      stepStatuses.push(toStepStatusItem('http', 'probe', payload.http as Record<string, unknown>))
+    }
+  } else if (kind === 'cache_differential') {
+    if (payload.control && typeof payload.control === 'object') {
+      stepStatuses.push(toStepStatusItem('control', 'control', payload.control as Record<string, unknown>))
+    }
+    if (payload.probe && typeof payload.probe === 'object') {
+      stepStatuses.push(toStepStatusItem('probe', 'probe', payload.probe as Record<string, unknown>))
+    }
+    if (payload.verify && typeof payload.verify === 'object') {
+      stepStatuses.push(toStepStatusItem('verify', 'probe', payload.verify as Record<string, unknown>))
+    }
+  } else if (kind === 'sql_time_diff') {
+    const rounds = (payload.sqlTimeDiff as { rounds?: Array<Record<string, unknown>> } | undefined)?.rounds
+    const r0 = Array.isArray(rounds) ? rounds[0] : undefined
+    if (r0) {
+      if (r0.baseline && typeof r0.baseline === 'object') {
+        stepStatuses.push(toStepStatusItem('baseline', 'control', r0.baseline as Record<string, unknown>))
+      }
+      if (r0.delayProbe && typeof r0.delayProbe === 'object') {
+        stepStatuses.push(toStepStatusItem('delayProbe', 'probe', r0.delayProbe as Record<string, unknown>))
+      }
+    }
+  }
+
+  const reason = replay.outcome.reason ?? ''
+  const requireControlNonErrorTriggered = /requireControlNonError/i.test(reason) ? true : undefined
+
+  let failedStepId: string | undefined
+  if (replay.verdict === 'dismissed' || replay.verdict === 'inconclusive') {
+    const stepMatch = /step\s+"([^"]+)"/i.exec(reason)
+    if (stepMatch) {
+      failedStepId = stepMatch[1]
+    } else if (/upload_probe\s+control\s+step/i.test(reason)) {
+      failedStepId = 'control'
+    } else if (/upload_probe\s+fetch\s+step/i.test(reason)) {
+      failedStepId = 'fetch'
+    } else {
+      const errStep = stepStatuses.find(s => s.status === null || s.status === 0 || s.status === 404 || s.status >= 500)
+      if (errStep) {
+        failedStepId = errStep.id
+      } else if (!replay.outcome.controlPassed) {
+        failedStepId = stepStatuses.find(s => s.role === 'control')?.id ?? stepStatuses[0]?.id
+      } else {
+        failedStepId = stepStatuses.find(s => s.role === 'probe')?.id ?? stepStatuses[0]?.id
+      }
+    }
+  }
+
+  let spaCatchallMatched: boolean | undefined
+  let spaSimilarityScore: number | undefined
+  if (payload.spaCatchall && typeof payload.spaCatchall === 'object') {
+    const spa = payload.spaCatchall as { allProbesMatchedCatchall?: unknown; comparisons?: Record<string, { tokenSimilarity?: unknown }> }
+    spaCatchallMatched = Boolean(spa.allProbesMatchedCatchall)
+    if (spa.comparisons && typeof spa.comparisons === 'object') {
+      const scores = Object.values(spa.comparisons)
+        .map(c => (c && typeof c.tokenSimilarity === 'number' && Number.isFinite(c.tokenSimilarity) ? c.tokenSimilarity : null))
+        .filter((v): v is number => v !== null)
+      if (scores.length) spaSimilarityScore = Math.max(...scores)
+    }
+  }
+
+  let canaryTriggered: boolean | undefined
+  const proofObj = payload.proof as { canaryProbeTriggered?: unknown } | undefined
+  const probeObj = payload.probe as { canaryCheck?: { triggered?: unknown } } | undefined
+  if (typeof proofObj?.canaryProbeTriggered === 'boolean') {
+    canaryTriggered = proofObj.canaryProbeTriggered
+  } else if (typeof probeObj?.canaryCheck?.triggered === 'boolean') {
+    canaryTriggered = probeObj.canaryCheck.triggered
+  } else if (Array.isArray(payload.pages)) {
+    const probePages = (payload.pages as Array<{ role?: string; canaryCheck?: { triggered?: unknown } }>)
+      .filter(p => p.role === 'probe' && typeof p.canaryCheck?.triggered === 'boolean')
+    if (probePages.length) {
+      canaryTriggered = probePages.some(p => p.canaryCheck?.triggered === true)
+    }
+  }
+
+  const jqError = /^(?:Replay jq assertion|Replay assertion output violated schema|Verification container failed)/i.test(reason)
+    ? redact(reason, secrets).slice(0, 400)
+    : undefined
+
+  const assertionSummary: InlineVerifyFeedback['assertionSummary'] = {
+    observed: redact(replay.outcome.observed, secrets).slice(0, 400),
+    expected: redact(replay.outcome.expected, secrets).slice(0, 400),
+    ...(reason ? { reason: redact(reason, secrets).slice(0, 400) } : {}),
+  }
+
+  const rawFeedback: InlineVerifyFeedback = {
+    verdict: replay.verdict,
+    ...(replay.verificationTier ? { verificationTier: replay.verificationTier } : {}),
+    ...(failedStepId ? { failedStepId: redact(failedStepId, secrets) } : {}),
+    controlPassed: replay.outcome.controlPassed,
+    ...(requireControlNonErrorTriggered ? { requireControlNonErrorTriggered } : {}),
+    ...(spaCatchallMatched !== undefined ? { spaCatchallMatched } : {}),
+    ...(spaSimilarityScore !== undefined ? { spaSimilarityScore } : {}),
+    ...(canaryTriggered !== undefined ? { canaryTriggered } : {}),
+    ...(jqError ? { jqError } : {}),
+    assertionSummary,
+    stepStatuses,
+    retriesRemaining,
+  }
+
+  return redactJsonValue(rawFeedback, secrets)
+}
+
+export async function verifyReplaySpecInline(
+  params: VerifyReplaySpecInlineParams,
+): Promise<InlineReplayVerificationResult> {
+  const maxRetries = Math.max(0, params.maxRetries ?? maxInlineVerifyRetries)
+  const maxAttempts = 1 + maxRetries
+  const attemptCount = Math.max(1, params.attemptCount ?? 1)
+  const allSecrets: NamedSecret[] = [
+    ...(params.secrets ?? []),
+    ...(params.grant.secrets ?? []),
+    ...(params.grant.personas ? personaSecrets(params.grant.personas) : []),
+  ]
+
+  if (attemptCount > maxAttempts) {
+    const reason = `Inline verification retry limit reached (maxInlineVerifyRetries=${maxRetries}).`
+    const emptyReplay = inconclusiveResult(reason, [], [], { retryLimitExceeded: true })
+    const feedback = redactJsonValue({
+      verdict: 'inconclusive',
+      controlPassed: false,
+      assertionSummary: {
+        observed: 'retry_limit_exceeded',
+        expected: `<= ${maxAttempts} verification attempts`,
+        reason,
+      },
+      stepStatuses: [],
+      retriesRemaining: 0,
+    } satisfies InlineVerifyFeedback, allSecrets)
+    return { feedback, replay: emptyReplay }
+  }
+
+  const replay = await verifyReplaySpec(params)
+  const finalSecrets: NamedSecret[] = [
+    ...allSecrets,
+    ...(params.broker.getRegisteredSecrets?.() ?? []),
+  ]
+  const feedback = buildInlineVerifyFeedback(params.spec, replay, attemptCount, maxRetries, finalSecrets)
+  return { feedback, replay }
 }

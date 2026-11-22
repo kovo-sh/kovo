@@ -1,0 +1,30 @@
+id: "sap-logon-error-message"
+name: "SAP Logon Error Message"
+severity: "info"
+description: "Identifies \"Logon Error Message\" in the SAP Internet Communication Framework which returns a 404 status code."
+tech:
+  - "generic"
+tags:
+  - "sap"
+  - "logon"
+  - "error"
+  - "log"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Logon Error Message"
+      - "SAP Internet Communication Framework Team"
+    condition: "and"
+  - type: "status"
+    status:
+      - 404

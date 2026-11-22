@@ -1,0 +1,30 @@
+id: "secnet-info-leak"
+name: "Secnet Intelligent Routing System actpt_5g.data - Information Leak"
+severity: "high"
+description: "Secnet Intelligent Routing System is exposed."
+tech:
+  - "generic"
+tags:
+  - "info-leak"
+  - "secnet"
+  - "misconfig"
+  - "vuln"
+reference: "https://mp.weixin.qq.com/s/lNlI5ZtUJG50ipS0WfytUw"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/actpt_5g.data"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"http_username\":"
+      - "\"http_passwd\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

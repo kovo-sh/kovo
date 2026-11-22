@@ -1,0 +1,28 @@
+id: "eyesofnetwork-detect"
+name: "EyesOfNetwork Detect"
+severity: "info"
+description: "EyesOfNetwork detection"
+tech:
+  - "php"
+tags:
+  - "tech"
+  - "cisa"
+  - "eyesofnetwork"
+  - "discovery"
+reference: "https://www.eyesofnetwork.com/en"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>EyesOfNetwork</title>"
+  - type: "status"
+    status:
+      - 200

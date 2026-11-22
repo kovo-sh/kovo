@@ -1,0 +1,32 @@
+id: "exposed-svn"
+name: "SVN Configuration - Detect"
+severity: "medium"
+description: "SVN configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "svn"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.svn/entries"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "(^\\d\\s*dir|\\.svn-base|has-props|svn:\\/\\/|([\\da-f]{32}[\\S+\\r\\n\\s]+[\\d]{4}-[\\d]{2}-[\\d]{2}T[\\d]{2}:[\\d]{2}:[\\d]{2}.[\\d]{6}Z))"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"

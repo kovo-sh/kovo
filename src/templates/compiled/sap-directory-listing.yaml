@@ -1,0 +1,33 @@
+id: "sap-directory-listing"
+name: "SAP Directory Listing"
+severity: "medium"
+description: "SAP Directory Listing is enabled."
+tech:
+  - "generic"
+tags:
+  - "sap"
+  - "listing"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/irj/go/km/navigation/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "title=\"~system\""
+      - "NetWeaver"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"

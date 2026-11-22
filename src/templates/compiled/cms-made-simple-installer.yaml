@@ -1,0 +1,29 @@
+id: "cms-made-simple-installer"
+name: "CMS Made Simple Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed CMS Made Simple Installation page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "cms-made-simple"
+  - "vuln"
+reference: "https://www.cmsmadesimple.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "CMS Made Simple Install/Upgrade"
+  - type: "status"
+    status:
+      - 200

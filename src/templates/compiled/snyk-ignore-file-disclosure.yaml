@@ -1,0 +1,27 @@
+id: "snyk-ignore-file-disclosure"
+name: "Snyk Ignore File Disclosure"
+severity: "info"
+description: "Safe check derived from snyk-ignore-file-disclosure: Snyk Ignore File Disclosure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "vuln"
+reference: "https://github.com/detectify/ugly-duckling/blob/master/modules/crowdsourced/snyk-ignore-file-disclosure.json"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.snyk"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "# Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities."
+  - type: "status"
+    status:
+      - 200

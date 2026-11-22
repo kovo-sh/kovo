@@ -1,0 +1,38 @@
+id: "serverless-framework-config-exposure"
+name: "Serverless Framework - Configuration Exposure"
+severity: "medium"
+description: "A Serverless Framework configuration file (serverless.yml) was found exposed on the web server. The file describes the service, cloud provider, functions and often provider level environment variables, IAM statements and plugin settings, which can disclose the application architecture and occasionally hardcoded secrets to an unauthenticated visitor."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "config"
+  - "serverless"
+  - "iac"
+  - "aws"
+cwe: "CWE-200"
+reference: "https://www.serverless.com/framework/docs/providers/aws/guide/serverless.yml"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/serverless.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "service:"
+      - "provider:"
+      - "functions:"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200

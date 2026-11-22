@@ -1,0 +1,30 @@
+id: "seq-dashboard-unauth"
+name: "Seq Dashboard - Unauthenticated"
+severity: "high"
+description: "Seq is exposed without authentication"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "seq"
+  - "dashboard"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/#/dashboards"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Log out"
+      - "dashboards</a>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

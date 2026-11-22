@@ -1,0 +1,30 @@
+id: "mcloud-installer"
+name: "mCloud Panel - Installer"
+severity: "critical"
+description: "mCloud installer was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "mcloud"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-284"
+reference: "https://mcloudcorp.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/clusterList"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>mcloud-installer-web"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,28 @@
+id: "rack-mini-profiler"
+name: "rack-mini-profiler - Environment Information Disclosure"
+severity: "high"
+description: "rack-mini-profiler is prone to environmental information disclosure which could help an attacker formulate additional attacks."
+tech:
+  - "rails"
+tags:
+  - "config"
+  - "debug"
+  - "rails"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?pp=env"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Rack Environment"
+  - type: "status"
+    status:
+      - 200

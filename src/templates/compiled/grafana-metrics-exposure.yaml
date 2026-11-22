@@ -1,0 +1,36 @@
+id: "grafana-metrics-exposure"
+name: "Grafana Metrics Endpoint - Information Disclosure"
+severity: "low"
+description: "Detected Grafana metrics endpoint exposed without authentication revealed sensitive infrastructure information, including version, edition, user counts, dashboard statistics, datasources, and database connection details."
+tech:
+  - "grafana"
+tags:
+  - "grafana"
+  - "exposure"
+  - "metrics"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://grafana.com/docs/grafana/latest/setup-grafana/set-up-grafana-monitoring/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "grafana_build_info"
+      - "# TYPE grafana_"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"

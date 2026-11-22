@@ -1,0 +1,24 @@
+id: "exposed-vscode"
+name: "Visual Studio Code Directories - Detect"
+severity: "medium"
+description: "Visual Studio Code directories were detected."
+tech:
+  - "generic"
+tags:
+  - "vscode"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.vscode/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of /.vscode"

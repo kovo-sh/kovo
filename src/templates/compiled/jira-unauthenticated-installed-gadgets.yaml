@@ -1,0 +1,26 @@
+id: "jira-unauthenticated-installed-gadgets"
+name: "Jira Unauthenticated Installed gadgets"
+severity: "info"
+description: "Some Jira instances allow to read the installed gadgets (sometimes it's also possible to read config xml file for some gadgets)"
+tech:
+  - "generic"
+tags:
+  - "atlassian"
+  - "jira"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rest/config/1.0/directory"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "jaxbDirectoryContents"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "komodo-detect"
+name: "Komodo - Detect"
+severity: "info"
+description: "Komodo, a web application for building and deploying software across servers, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "komodo"
+  - "devops"
+  - "detect"
+reference: "https://github.com/moghtech/komodo"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Komodo</title>"
+      - "name=\"apple-mobile-web-app-title\" content=\"Komodo\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

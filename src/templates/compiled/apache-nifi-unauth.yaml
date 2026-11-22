@@ -1,0 +1,34 @@
+id: "apache-nifi-unauth"
+name: "Apache NiFi - Unauthenticated Access"
+severity: "high"
+description: "Apache NiFi server was able to be accessed because no authentication was required."
+tech:
+  - "apache"
+tags:
+  - "misconfig"
+  - "apache"
+  - "nifi"
+  - "unauth"
+  - "vuln"
+cwe: "CWE-285"
+reference: "https://github.com/jm0x0/apache_nifi_processor_rce"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/nifi-api/access/config"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"supportsLogin\":false}"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

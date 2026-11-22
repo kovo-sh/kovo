@@ -1,0 +1,29 @@
+id: "harbor-detect"
+name: "Harbor Detect"
+severity: "info"
+description: "Harbor is an open source trusted cloud native registry project that stores, signs, and scans content."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "harbor"
+  - "discovery"
+reference: "https://github.com/goharbor/harbor"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v2.0/systeminfo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"auth_mode\""
+      - "\"harbor_version\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

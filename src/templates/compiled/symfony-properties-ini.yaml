@@ -1,0 +1,30 @@
+id: "symfony-properties-ini"
+name: "Symfony properties.ini File Disclosure"
+severity: "info"
+description: "Safe check derived from symfony-properties-ini: Symfony properties.ini File Disclosure"
+tech:
+  - "symfony"
+tags:
+  - "symfony"
+  - "exposure"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/properties.ini"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "name="
+      - "author="
+      - "orm="
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

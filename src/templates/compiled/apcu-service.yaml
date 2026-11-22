@@ -1,0 +1,27 @@
+id: "apcu-service"
+name: "APCu service information leakage"
+severity: "low"
+description: "APCu service is vulnerable to information leakage."
+tech:
+  - "php"
+tags:
+  - "config"
+  - "service"
+  - "apcu"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/apc/apc.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "APCu Version Information"
+      - "General Cache Information"
+      - "Detailed Memory Usage and Fragmentation"

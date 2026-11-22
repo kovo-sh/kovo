@@ -1,0 +1,1994 @@
+rules:
+- id: avoid-session-manipulation
+  metadata:
+    shortDescription: Allowing an attacker to manipulate the session may lead to unintended
+      behavior.
+    tags:
+    - security
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-276: Incorrect Default Permissions'
+    references:
+    - https://brakemanscanner.org/docs/warning_types/session_manipulation/
+    category: security
+    technology:
+    - rails
+    help: '## Remediation
+
+      Session manipulation can occur when an application allows user-input in session
+      keys. Since sessions are typically considered a source of truth (e.g. to check
+      the logged-in user or to match CSRF tokens), allowing an attacker to manipulate
+      the session may lead to unintended behavior.
+
+
+      ## References
+
+      [Session Manipulation](https://brakemanscanner.org/docs/warning_types/session_manipulation/)
+
+      '
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: This gets data from session using user inputs. A malicious user may be
+    able to retrieve information from your session that you didn't intend them to.
+    Do not use user input as a session key.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  pattern-sinks:
+  - pattern: session[...]
+- id: avoid-tainted-file-access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/file_access/index.markdown
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: Using user input when accessing files is potentially dangerous. A malicious
+    actor could use this to modify or access files they have no right to.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: Dir.$X(...)
+      - pattern: File.$X(...)
+      - pattern: IO.$X(...)
+      - pattern: Kernel.$X(...)
+      - pattern: PStore.$X(...)
+      - pattern: Pathname.$X(...)
+    - metavariable-pattern:
+        metavariable: $X
+        patterns:
+        - pattern-either:
+          - pattern: chdir
+          - pattern: chroot
+          - pattern: delete
+          - pattern: entries
+          - pattern: foreach
+          - pattern: glob
+          - pattern: install
+          - pattern: lchmod
+          - pattern: lchown
+          - pattern: link
+          - pattern: load
+          - pattern: load_file
+          - pattern: makedirs
+          - pattern: move
+          - pattern: new
+          - pattern: open
+          - pattern: read
+          - pattern: readlines
+          - pattern: rename
+          - pattern: rmdir
+          - pattern: safe_unlink
+          - pattern: symlink
+          - pattern: syscopy
+          - pattern: sysopen
+          - pattern: truncate
+          - pattern: unlink
+- id: avoid-tainted-ftp-call
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/file_access/index.markdown
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: Using user input when accessing files is potentially dangerous. A malicious
+    actor could use this to modify or access files they have no right to.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  pattern-sinks:
+  - pattern-either:
+    - pattern: Net::FTP.$X(...)
+    - patterns:
+      - pattern-inside: '$FTP = Net::FTP.$OPEN(...)
+
+          ...
+
+          $FTP.$METHOD(...)
+
+          '
+      - pattern: $FTP.$METHOD(...)
+- id: avoid-tainted-http-request
+  metadata:
+    owasp:
+    - A10:2021 - Server-Side Request Forgery (SSRF)
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/file_access/index.markdown
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    impact: MEDIUM
+    likelihood: MEDIUM
+    confidence: MEDIUM
+  message: Using user input when accessing files is potentially dangerous. A malicious
+    actor could use this to modify or access files they have no right to.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  pattern-sinks:
+  - pattern-either:
+    - patterns:
+      - pattern: Net::HTTP::$METHOD.new(...)
+      - metavariable-pattern:
+          metavariable: $METHOD
+          patterns:
+          - pattern-either:
+            - pattern: Copy
+            - pattern: Delete
+            - pattern: Get
+            - pattern: Head
+            - pattern: Lock
+            - pattern: Mkcol
+            - pattern: Move
+            - pattern: Options
+            - pattern: Patch
+            - pattern: Post
+            - pattern: Propfind
+            - pattern: Proppatch
+            - pattern: Put
+            - pattern: Trace
+            - pattern: Unlock
+    - patterns:
+      - pattern: Net::HTTP.$X(...)
+      - metavariable-pattern:
+          metavariable: $X
+          patterns:
+          - pattern-either:
+            - pattern: get
+            - pattern: get2
+            - pattern: head
+            - pattern: head2
+            - pattern: options
+            - pattern: patch
+            - pattern: post
+            - pattern: post2
+            - pattern: post_form
+            - pattern: put
+            - pattern: request
+            - pattern: request_get
+            - pattern: request_head
+            - pattern: request_post
+            - pattern: send_request
+            - pattern: trace
+            - pattern: get_print
+            - pattern: get_response
+            - pattern: start
+- id: avoid-tainted-shell-call
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/file_access/index.markdown
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: Using user input when accessing files is potentially dangerous. A malicious
+    actor could use this to modify or access files they have no right to.
+  languages:
+  - ruby
+  severity: ERROR
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: params[...]
+    - pattern: cookies
+    - pattern: request.env
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern: Kernel.$X(...)
+      - patterns:
+        - pattern-either:
+          - pattern: Shell.$X(...)
+          - patterns:
+            - pattern-inside: '$SHELL = Shell.$ANY(...)
+
+                ...
+
+                $SHELL.$X(...)
+
+                '
+            - pattern: $SHELL.$X(...)
+    - metavariable-pattern:
+        metavariable: $X
+        patterns:
+        - pattern-either:
+          - pattern: cat
+          - pattern: chdir
+          - pattern: chroot
+          - pattern: delete
+          - pattern: entries
+          - pattern: exec
+          - pattern: foreach
+          - pattern: glob
+          - pattern: install
+          - pattern: lchmod
+          - pattern: lchown
+          - pattern: link
+          - pattern: load
+          - pattern: load_file
+          - pattern: makedirs
+          - pattern: move
+          - pattern: new
+          - pattern: open
+          - pattern: read
+          - pattern: readlines
+          - pattern: rename
+          - pattern: rmdir
+          - pattern: safe_unlink
+          - pattern: symlink
+          - pattern: syscopy
+          - pattern: sysopen
+          - pattern: system
+          - pattern: truncate
+          - pattern: unlink
+- id: detailed-exceptions
+  metadata:
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-200: Exposure of Sensitive Information to an Unauthorized Actor'
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_detailed_exceptions.rb
+    category: security
+    technology:
+    - rails
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Found that the setting for providing detailed exception reports in Rails
+    is set to true. This can lead to information exposure, where sensitive system
+    or internal information is displayed to the end user. Instead, turn this setting
+    off.
+  languages:
+  - ruby
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: 'config.consider_all_requests_local = true
+
+          '
+    - patterns:
+      - pattern-inside: "class $CONTROLLER < ApplicationController\n  ...\nend\n"
+      - pattern: "def show_detailed_exceptions? (...)\n  ...\nreturn $RETURN\nend\n"
+      - metavariable-pattern:
+          metavariable: $RETURN
+          patterns:
+          - pattern-not: 'false
+
+              '
+- id: rails-skip-forgery-protection
+  pattern: skip_forgery_protection
+  message: This call turns off CSRF protection allowing CSRF attacks against the application
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    category: security
+    technology:
+    - rails
+    references:
+    - https://api.rubyonrails.org/classes/ActionController/RequestForgeryProtection/ClassMethods.html#method-i-skip_forgery_protection
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: ruby-pg-sqli
+  mode: taint
+  pattern-propagators:
+  - pattern: $X << $Y
+    from: $Y
+    to: $X
+  pattern-sources:
+  - pattern-either:
+    - pattern: 'params
+
+        '
+    - pattern: 'cookies
+
+        '
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$CON = PG.connect(...)
+
+          ...
+
+          '
+      - pattern-inside: '$CON = PG::Connection.open(...)
+
+          ...
+
+          '
+      - pattern-inside: '$CON = PG::Connection.new(...)
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern: '$CON.$METHOD($X,...)
+
+          '
+      - pattern: '$CON.$METHOD $X, ...
+
+          '
+    - focus-metavariable: $X
+    - metavariable-regex:
+        metavariable: $METHOD
+        regex: ^(exec|exec_params)$
+  languages:
+  - ruby
+  message: 'Detected string concatenation with a non-literal variable in a pg Ruby
+    SQL statement. This could lead to SQL injection if the variable is user-controlled
+    and not properly sanitized. In order to prevent SQL injection, use parameterized
+    queries or prepared statements instead. You can use parameterized queries like
+    so: `conn.exec_params(''SELECT $1 AS a, $2 AS b, $3 AS c'', [1, 2, nil])` And
+    you can use prepared statements with `exec_prepared`.'
+  metadata:
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://www.rubydoc.info/gems/pg/PG/Connection
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  severity: WARNING
+- id: avoid-content-tag
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_content_tag.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/template_injection/index.markdown
+    - https://www.netsparker.com/blog/web-security/preventing-xss-ruby-on-rails-web-applications/
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: '''content_tag()'' bypasses HTML escaping for some portion of the content.
+    If external data can reach here, this exposes your application to cross-site scripting
+    (XSS) attacks. Ensure no external data reaches here. If you must do this, create
+    your HTML manually and use ''html_safe''. Ensure no external data enters the HTML-safe
+    string!'
+  languages:
+  - ruby
+  severity: WARNING
+  pattern: content_tag(...)
+- id: avoid-default-routes
+  metadata:
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-276: Incorrect Default Permissions'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/default_routes/index.markdown
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Default routes are enabled in this routes file. This means any public method
+    on a controller can be called as an action. It is very easy to accidentally expose
+    a method you didn't mean to. Instead, remove this line and explicitly include
+    all routes you intend external users to follow.
+  languages:
+  - ruby
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: map.connect ":controller/:action/:id"
+    - pattern: match ':controller(/:action(/:id(.:format)))'
+  paths:
+    include:
+    - '*routes.rb'
+- id: avoid-html-safe
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_cross_site_scripting.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/cross_site_scripting/index.markdown
+    - https://www.netsparker.com/blog/web-security/preventing-xss-ruby-on-rails-web-applications/
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: '''html_safe()'' does not make the supplied string safe. ''html_safe()''
+    bypasses HTML escaping. If external data can reach here, this exposes your application
+    to cross-site scripting (XSS) attacks. Ensure no external data reaches here.'
+  languages:
+  - ruby
+  severity: WARNING
+  pattern-either:
+  - pattern: $STR.html_safe
+  - pattern: $STR.html_safe.$MORE
+- id: avoid-link-to
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_link_to.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://brakemanscanner.org/docs/warning_types/link_to/
+    - https://brakemanscanner.org/docs/warning_types/link_to_href/
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: This code includes user input in `link_to`. In Rails 2.x, the body of `link_to`
+    is not escaped. This means that user input which reaches the body will be executed
+    when the HTML is rendered. Even in other versions, values starting with `javascript:`
+    or `data:` are not escaped. It is better to create and use a safer function which
+    checks the body argument.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  - pattern-either:
+    - pattern: $MODEL.url(...)
+    - pattern: $MODEL.uri(...)
+    - pattern: $MODEL.link(...)
+    - pattern: $MODEL.page(...)
+    - pattern: $MODEL.site(...)
+  pattern-sinks:
+  - pattern: link_to(...)
+  pattern-sanitizers:
+  - patterns:
+    - pattern: '"...#{...}..."
+
+        '
+    - pattern-not: '"#{...}..."
+
+        '
+- id: avoid-raw
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_cross_site_scripting.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://api.rubyonrails.org/classes/ActionView/Helpers/OutputSafetyHelper.html#method-i-raw
+    - https://www.netsparker.com/blog/web-security/preventing-xss-ruby-on-rails-web-applications/
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: '''raw()'' bypasses HTML escaping. If external data can reach here, this
+    exposes your application to cross-site scripting (XSS) attacks. If you must do
+    this, construct individual strings and mark them as safe for HTML rendering with
+    `html_safe()`.'
+  languages:
+  - ruby
+  severity: WARNING
+  pattern: raw(...)
+- id: avoid-redirect
+  metadata:
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-601: URL Redirection to Untrusted Site (''Open Redirect'')'
+    references:
+    - https://brakemanscanner.org/docs/warning_types/redirect/
+    category: security
+    technology:
+    - rails
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: When a redirect uses user input, a malicious user can spoof a website under
+    a trusted URL or access restricted parts of a site. When using user-supplied values,
+    sanitize the value before using it for the redirect.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  - patterns:
+    - pattern: $MODEL.$X(...)
+    - pattern-not: $MODEL.$X("...")
+    - metavariable-pattern:
+        metavariable: $X
+        pattern-either:
+        - pattern: all
+        - pattern: create
+        - pattern: create!
+        - pattern: find
+        - pattern: find_by_sql
+        - pattern: first
+        - pattern: last
+        - pattern: new
+        - pattern: from
+        - pattern: group
+        - pattern: having
+        - pattern: joins
+        - pattern: lock
+        - pattern: order
+        - pattern: reorder
+        - pattern: select
+        - pattern: where
+        - pattern: find_by
+        - pattern: find_by!
+        - pattern: take
+  pattern-sinks:
+  - pattern: redirect_to(...)
+  pattern-sanitizers:
+  - pattern: params.merge(:only_path => true)
+  - pattern: params.merge(:host => ...)
+- id: avoid-render-dynamic-path
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    references:
+    - https://brakemanscanner.org/docs/warning_types/dynamic_render_paths/
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  message: Avoid rendering user input. It may be possible for a malicious user to
+    input a path that lets them access a template they shouldn't. To prevent this,
+    check dynamic template paths against a predefined allowlist to make sure it's
+    an allowed template.
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern: params
+  - pattern: cookies
+  - pattern: request.env
+  pattern-sinks:
+  - patterns:
+    - pattern-inside: render($X => $INPUT, ...)
+    - pattern: $INPUT
+    - metavariable-pattern:
+        metavariable: $X
+        pattern-either:
+        - pattern: action
+        - pattern: template
+        - pattern: partial
+        - pattern: file
+- id: avoid-render-inline
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_render_inline.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://brakemanpro.com/2017/09/08/cross-site-scripting-in-rails#inline-renders---even-worse-than-xss
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: '''render inline: ...'' renders an entire ERB template inline and is dangerous.
+    If external data can reach here, this exposes your application to server-side
+    template injection (SSTI) or cross-site scripting (XSS) attacks. Instead, consider
+    using a partial or another safe rendering method.'
+  languages:
+  - ruby
+  severity: WARNING
+  pattern: 'render inline: ...'
+- id: avoid-render-text
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_render_inline.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://brakemanpro.com/2017/09/08/cross-site-scripting-in-rails#inline-renders---even-worse-than-xss
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: '''render text: ...'' actually sets the content-type to ''text/html''.
+    If external data can reach here, this exposes your application to cross-site scripting
+    (XSS) attacks. Instead, use ''render plain: ...'' to render non-HTML text.'
+  languages:
+  - ruby
+  severity: WARNING
+  pattern: 'render text: ...'
+  fix-regex:
+    regex: 'text:'
+    replacement: 'plain:'
+- id: manual-template-creation
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_template_injection.rb
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/template_injection/index.markdown
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Detected manual creation of an ERB template. Manual creation of templates
+    may expose your application to server-side template injection (SSTI) or cross-site
+    scripting (XSS) attacks if user input is used to create the template. Instead,
+    create a '.erb' template file and use 'render'.
+  languages:
+  - ruby
+  severity: WARNING
+  pattern: ERB.new(...)
+- id: alias-for-html-safe
+  message: The syntax `<%== ... %>` is an alias for `html_safe`. This means the content
+    inside these tags will be rendered as raw HTML. This may expose your application
+    to cross-site scripting. If you need raw HTML, prefer using the more explicit
+    `html_safe` and be sure to correctly sanitize variables using a library such as
+    DOMPurify.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://medium.com/sumone-technical-blog/a-pretty-way-to-unescape-html-in-a-ruby-on-rails-application-efc22b850027
+    - https://stackoverflow.com/questions/4251284/raw-vs-html-safe-vs-h-to-unescape-html#:~:text===
+    category: security
+    technology:
+    - rails
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - generic
+  paths:
+    include:
+    - '*.erb'
+  severity: WARNING
+  patterns:
+  - pattern: <%== ... %>
+  - pattern-not: <%== $...A.to_json %>
+- id: dangerous-link-to
+  message: 'Detected a template variable used in ''link_to''. This will generate dynamic
+    data in the ''href'' attribute. This allows a malicious actor to input the ''javascript:''
+    URI and is subject to cross- site scripting (XSS) attacks. If using a relative
+    URL, start with a literal forward slash and concatenate the URL, like this: ''link_to
+    "Here", "/"+@link''. You may also consider setting the Content Security Policy
+    (CSP) header.'
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_link_to.rb
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Ruby_on_Rails_Cheat_Sheet.html#cross-site-scripting-xss
+    - https://brakemanscanner.org/docs/warning_types/link_to_href/
+    category: security
+    technology:
+    - rails
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - generic
+  paths:
+    include:
+    - '*.erb'
+  severity: WARNING
+  patterns:
+  - pattern-inside: <%= ... %>
+  - pattern-not-inside: link_to ... "/" + ... @$VAR
+  - pattern-not-inside: link_to ... '/' + ... @$VAR
+  - pattern: link_to ... @$VAR
+- id: unquoted-attribute
+  message: 'Detected a unquoted template variable as an attribute. If unquoted, a
+    malicious actor could inject custom JavaScript handlers. To fix this, add quotes
+    around the template expression, like this: "<%= expr %>".'
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://brakemanpro.com/2017/09/08/cross-site-scripting-in-rails#unquoted-attributes
+    - https://flask.palletsprojects.com/en/1.1.x/security/#cross-site-scripting-xss
+    category: security
+    technology:
+    - rails
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - generic
+  paths:
+    include:
+    - '*.erb'
+  severity: WARNING
+  patterns:
+  - pattern-inside: <$TAG ...>
+  - pattern-not-inside: ="..."
+  - pattern-not-inside: ="<%= ... %>"
+  - pattern-not-inside: ='...'
+  - pattern-not-inside: ='<%= ... %>'
+  - pattern: <%= ... %>
+  fix-regex:
+    regex: <%=(.*?)%>
+    replacement: '"<%=\1%>"'
+- id: libxml-backend
+  languages:
+  - ruby
+  pattern: ActiveSupport::XmlMini.backend = "LibXML"
+  severity: WARNING
+  message: This application is using LibXML as the XML backend. LibXML can be vulnerable
+    to XML External Entities (XXE) vulnerabilities. Use the built-in Rails XML parser,
+    REXML, instead.
+  metadata:
+    references:
+    - https://www.stackhawk.com/blog/rails-xml-external-entities-xxe-guide-examples-and-prevention/
+    - https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+    technology:
+    - rails
+    - libxml
+    category: security
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    owasp:
+    - A04:2017 - XML External Entities (XXE)
+    - A05:2021 - Security Misconfiguration
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+- id: xml-external-entities-enabled
+  languages:
+  - ruby
+  patterns:
+  - pattern-either:
+    - pattern-inside: "LibXML::XML.class_eval do\n  ...\nend\n"
+    - pattern-inside: "XML.class_eval do\n  ...\nend\n"
+  - pattern: XML.default_substitute_entities = true
+  severity: ERROR
+  message: This application is explicitly enabling external entities enabling an attacker
+    to inject malicious XML to exploit an XML External Entities (XXE) vulnerability.
+    This could let the attacker cause a denial-of-service by forcing the parser to
+    parse large files, or at worst, let the attacker download sensitive files or user
+    data. Use the built-in Rails XML parser, REXML, instead.
+  metadata:
+    references:
+    - https://www.stackhawk.com/blog/rails-xml-external-entities-xxe-guide-examples-and-prevention/
+    - https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+    technology:
+    - rails
+    - libxml
+    category: security
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    owasp:
+    - A04:2017 - XML External Entities (XXE)
+    - A05:2021 - Security Misconfiguration
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+- id: check-before-filter
+  mode: search
+  patterns:
+  - pattern-either:
+    - pattern: 'skip_filter ..., :except => $ARGS
+
+        '
+    - pattern: 'skip_before_filter ..., :except => $ARGS
+
+        '
+    - pattern: 'skip_before_action ..., :except => $ARGS
+
+        '
+  message: 'Disabled-by-default Rails controller checks make it much easier to introduce
+    access control mistakes. Prefer an allowlist approach with `:only => [...]` rather
+    than `except: => [...]`'
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_skip_before_filter.rb
+    category: security
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    impact: MEDIUM
+    likelihood: MEDIUM
+    confidence: MEDIUM
+- id: check-cookie-store-session-security-attributes
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: ':$KEY => false
+
+          '
+      - pattern-inside: 'ActionController::Base.session = {...}
+
+          '
+    - pattern: '$MODULE::Application.config.session_store :cookie_store, ..., :$KEY
+        => false, ...
+
+        '
+    - pattern: '$CLASS.application.config.session_store :cookie_store, ..., $KEY:
+        false, ...
+
+        '
+  - metavariable-regex:
+      metavariable: $KEY
+      regex: ^(session_)?(http_?only|secure)$
+  message: Found a Rails `cookie_store` session configuration setting the `$KEY` attribute
+    to `false`. If using a cookie-based session store, the HttpOnly and Secure flags
+    should be set.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_session_settings.rb
+    category: security
+    cwe:
+    - 'CWE-1004: Sensitive Cookie Without ''HttpOnly'' Flag'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/02-Testing_for_Cookies_Attributes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: check-dynamic-render-local-file-include
+  mode: search
+  paths:
+    include:
+    - '*.erb'
+  patterns:
+  - pattern: 'params[...]
+
+      '
+  - pattern-inside: 'render :file => ...
+
+      '
+  message: Found request parameters in a call to `render` in a dynamic context. This
+    can allow end users to request arbitrary local files which may result in leaking
+    sensitive information persisted on disk.
+  languages:
+  - generic
+  severity: WARNING
+  metadata:
+    technology:
+    - ruby
+    - rails
+    category: security
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_render.rb
+    references:
+    - https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/07-Input_Validation_Testing/11.1-Testing_for_Local_File_Inclusion
+    - https://github.com/presidentbeef/brakeman/blob/f74cb53ead47f0af821d98b5b41e16d63100c240/test/apps/rails2/app/views/home/test_render.html.erb
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-http-verb-confusion
+  mode: search
+  patterns:
+  - pattern: "if request.get?\n  ...\nelse\n  ...\nend\n"
+  - pattern-not-inside: "if ...\nelsif ...\n  ...\nend\n"
+  message: Found an improperly constructed control flow block with `request.get?`.
+    Rails will route HEAD requests as GET requests but they will fail the `request.get?`
+    check, potentially causing unexpected behavior unless an `elif` condition is used.
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_verb_confusion.rb
+    category: security
+    cwe:
+    - 'CWE-650: Trusting HTTP Permission Methods on the Server Side'
+    owasp:
+    - A04:2021 - Insecure Design
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails6/app/controllers/accounts_controller.rb
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-permit-attributes-high
+  patterns:
+  - pattern: $P.permit($ATTRIBUTE)
+  - metavariable-regex:
+      metavariable: $ATTRIBUTE
+      regex: .*(admin|account_id).*
+  message: Calling `permit` on security-critical properties like `$ATTRIBUTE` may
+    leave your application vulnerable to mass assignment.
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_permit_attributes.rb
+    category: security
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+- id: check-permit-attributes-medium
+  patterns:
+  - pattern: $P.permit($ATTRIBUTE)
+  - metavariable-regex:
+      metavariable: $ATTRIBUTE
+      regex: .*(role|banned).*
+  message: Calling `permit` on security-critical properties like `$ATTRIBUTE` may
+    leave your application vulnerable to mass assignment.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_permit_attributes.rb
+    category: security
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+- id: check-rails-secret-yaml
+  paths:
+    include:
+    - '*secrets.*.yml'
+    - '*secrets.*.yaml'
+  patterns:
+  - pattern: 'secret_key_base: $VALUE
+
+      '
+  - metavariable-pattern:
+      metavariable: $VALUE
+      language: generic
+      patterns:
+      - pattern-not: '<%= ... %>
+
+          '
+  - pattern-inside: "production:\n  ...\n"
+  message: $VALUE Found a string literal assignment to a production Rails session
+    secret in `secrets.yaml`. Do not commit secret values to source control! Any user
+    in possession of this value may falsify arbitrary session data in your application.
+    Read this value from an environment variable, KMS, or file on disk outside of
+    source control.
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_session_settings.rb
+    category: security
+    cwe:
+    - 'CWE-540: Inclusion of Sensitive Information in Source Code'
+    owasp:
+    - A01:2021 - Broken Access Control
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails4/config/secrets.yml
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+- id: check-rails-session-secret-handling
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: ':$KEY => "$LITERAL"
+
+          '
+      - pattern-inside: 'ActionController::Base.session = {...}
+
+          '
+    - pattern: '$RAILS::Application.config.$KEY = "$LITERAL"
+
+        '
+    - pattern: 'Rails.application.config.$KEY = "$LITERAL"
+
+        '
+  - metavariable-regex:
+      metavariable: $KEY
+      regex: ^secret(_(token|key_base))?$
+  message: Found a string literal assignment to a Rails session secret `$KEY`. Do
+    not commit secret values to source control! Any user in possession of this value
+    may falsify arbitrary session data in your application. Read this value from an
+    environment variable, KMS, or file on disk outside of source control.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_session_settings.rb
+    category: security
+    cwe:
+    - 'CWE-540: Inclusion of Sensitive Information in Source Code'
+    owasp:
+    - A01:2021 - Broken Access Control
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/02-Testing_for_Cookies_Attributes
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails4_with_engines/config/initializers/secret_token.rb
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails3/config/initializers/secret_token.rb
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-redirect-to
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: params
+      - pattern: cookies
+      - pattern: request.env
+      - pattern: url_for(params[...],...,:only_path => false,...)
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern: '$F(...)
+
+            '
+        - metavariable-pattern:
+            metavariable: $F
+            patterns:
+            - pattern-not-regex: (params|url_for|cookies|request.env|permit|redirect_to)
+      - pattern: 'params.merge! :only_path => true
+
+          ...
+
+          '
+      - pattern: 'params.slice(...)
+
+          ...
+
+          '
+      - pattern: 'redirect_to [...]
+
+          '
+      - patterns:
+        - pattern: '$MODEL. ... .$M(...)
+
+            ...
+
+            '
+        - metavariable-regex:
+            metavariable: $MODEL
+            regex: '[A-Z]\w+'
+        - metavariable-regex:
+            metavariable: $M
+            regex: (all|create|find|find_by|find_by_sql|first|last|new|from|group|having|joins|lock|order|reorder|select|where|take)
+      - patterns:
+        - pattern: 'params.$UNSAFE_HASH.merge(...,:only_path => true,...)
+
+            ...
+
+            '
+        - metavariable-regex:
+            metavariable: $UNSAFE_HASH
+            regex: to_unsafe_h(ash)?
+      - patterns:
+        - pattern: params.permit(...,$X,...)
+        - metavariable-pattern:
+            metavariable: $X
+            patterns:
+            - pattern-not-regex: (host|port|(sub)?domain)
+  pattern-sinks:
+  - patterns:
+    - pattern: $X
+    - pattern-inside: 'redirect_to $X, ...
+
+        '
+    - pattern-not-regex: params\.\w+(?<!permit)\(.*?\)
+  message: Found potentially unsafe handling of redirect behavior $X. Do not pass
+    `params` to `redirect_to` without the `:only_path => true` hash value.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_redirect.rb
+    category: security
+    cwe:
+    - 'CWE-601: URL Redirection to Untrusted Site (''Open Redirect'')'
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html
+    owasp:
+    - A01:2021 - Broken Access Control
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-regex-dos
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: 'cookies[...]
+
+          '
+      - patterns:
+        - pattern: 'cookies. ... .$PROPERTY[...]
+
+            '
+        - metavariable-regex:
+            metavariable: $PROPERTY
+            regex: (?!signed|encrypted)
+      - pattern: 'params[...]
+
+          '
+      - pattern: 'request.env[...]
+
+          '
+      - patterns:
+        - pattern: $Y
+        - pattern-either:
+          - pattern-inside: '$RECORD.read_attribute($Y)
+
+              '
+          - pattern-inside: '$RECORD[$Y]
+
+              '
+        - metavariable-regex:
+            metavariable: $RECORD
+            regex: '[A-Z][a-z]+'
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern: $Y
+        - pattern-inside: '/...#{...}.../
+
+            '
+      - patterns:
+        - pattern: $Y
+        - pattern-inside: 'Regexp.new(...)
+
+            '
+  message: Found a potentially user-controllable argument in the construction of a
+    regular expressions. This may result in excessive resource consumption when applied
+    to certain inputs, or when the user is allowed to control the match target. Avoid
+    allowing users to specify regular expressions processed by the server. If you
+    must support user-controllable input in a regular expression, use an allow-list
+    to restrict the expressions users may supply to limit catastrophic backtracking.
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_regex_dos.rb
+    category: security
+    cwe:
+    - 'CWE-1333: Inefficient Regular Expression Complexity'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-render-local-file-include
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: params[...]
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: 'render ..., file: $X
+
+          '
+      - pattern: 'render ..., inline: $X
+
+          '
+      - pattern: 'render ..., template: $X
+
+          '
+      - pattern: 'render ..., action: $X
+
+          '
+      - pattern: 'render $X, ...
+
+          '
+    - focus-metavariable: $X
+  pattern-sanitizers:
+  - patterns:
+    - pattern: $MAP[...]
+    - metavariable-pattern:
+        metavariable: $MAP
+        patterns:
+        - pattern-not-regex: params
+  - pattern: File.basename(...)
+  message: Found request parameters in a call to `render`. This can allow end users
+    to request arbitrary local files which may result in leaking sensitive information
+    persisted on disk. Where possible, avoid letting users specify template paths
+    for `render`. If you must allow user input, use an allow-list of known templates
+    or normalize the user-supplied value with `File.basename(...)`.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    technology:
+    - ruby
+    - rails
+    category: security
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_render.rb
+    references:
+    - https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/07-Input_Validation_Testing/11.1-Testing_for_Local_File_Inclusion
+    - https://github.com/presidentbeef/brakeman/blob/f74cb53/test/apps/rails2/app/controllers/home_controller.rb#L48-L60
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    vulnerability_class:
+    - Path Traversal
+- id: check-reverse-tabnabbing
+  mode: search
+  paths:
+    include:
+    - '*.erb'
+  patterns:
+  - pattern: '_blank
+
+      '
+  - pattern-inside: 'target: ...
+
+      '
+  - pattern-not-inside: '<%= ... rel: ''noopener noreferrer'' ...%>
+
+      '
+  - pattern-either:
+    - patterns:
+      - pattern-inside: '<%= $...INLINERUBYDO do -%>
+
+          ...
+
+          <% end %>
+
+          '
+      - metavariable-pattern:
+          metavariable: $...INLINERUBYDO
+          language: ruby
+          patterns:
+          - pattern: 'link_to ...
+
+              '
+          - pattern-not: 'link_to "...", "...", ...
+
+              '
+    - patterns:
+      - pattern-not-inside: '<%= ... do - %>
+
+          '
+      - pattern-inside: '<%= $...INLINERUBY %>
+
+          '
+      - metavariable-pattern:
+          metavariable: $...INLINERUBY
+          language: ruby
+          patterns:
+          - pattern: 'link_to ...
+
+              '
+          - pattern-not: 'link_to ''...'', ''...'', ...
+
+              '
+          - pattern-not: 'link_to ''...'', target: ...
+
+              '
+  message: Setting an anchor target of `_blank` without the `noopener` or `noreferrer`
+    attribute allows reverse tabnabbing on Internet Explorer, Opera, and Android Webview.
+  languages:
+  - generic
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_reverse_tabnabbing.rb
+    category: security
+    cwe:
+    - 'CWE-1022: Use of Web Link to Untrusted Target with window.opener Access'
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://developer.mozilla.org/en-US/docs/Web/HTML/Element/a#browser_compatibility
+    - https://github.com/presidentbeef/brakeman/blob/3f5d5d5/test/apps/rails5/app/views/users/show.html.erb
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-secrets
+  patterns:
+  - pattern: $VAR = "$VALUE"
+  - metavariable-regex:
+      metavariable: $VAR
+      regex: (?i)password|secret|(rest_auth_site|api)_key$
+  - metavariable-regex:
+      metavariable: $VALUE
+      regex: .+
+  message: Found a Brakeman-style secret - a variable with the name password/secret/api_key/rest_auth_site_key
+    and a non-empty string literal value.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    technology:
+    - ruby
+    - rails
+    category: security
+    cwe:
+    - 'CWE-200: Exposure of Sensitive Information to an Unauthorized Actor'
+    owasp:
+    - A01:2021 - Broken Access Control
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_secrets.rb
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+    - https://github.com/presidentbeef/brakeman/blob/3f5d5d5f00864cdf7769c50f5bd26f1769a4ba75/test/apps/rails3.1/app/controllers/users_controller.rb
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-send-file
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: 'cookies[...]
+
+        '
+    - patterns:
+      - pattern: 'cookies. ... .$PROPERTY[...]
+
+          '
+      - metavariable-regex:
+          metavariable: $PROPERTY
+          regex: (?!signed|encrypted)
+    - pattern: 'params[...]
+
+        '
+    - pattern: 'request.env[...]
+
+        '
+  pattern-sinks:
+  - patterns:
+    - pattern: 'send_file ...
+
+        '
+  message: Allowing user input to `send_file` allows a malicious user to potentially
+    read arbitrary files from the server. Avoid accepting user input in `send_file`
+    or normalize with `File.basename(...)`
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_send_file.rb
+    category: security
+    cwe:
+    - 'CWE-73: External Control of File Name or Path'
+    owasp:
+    - A04:2021 - Insecure Design
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://owasp.org/www-community/attacks/Path_Traversal
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-sql
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: 'cookies[...]
+
+        '
+    - patterns:
+      - pattern: 'cookies. ... .$PROPERTY[...]
+
+          '
+      - metavariable-regex:
+          metavariable: $PROPERTY
+          regex: (?!signed|encrypted)
+    - pattern: 'params[...]
+
+        '
+    - pattern: 'request.env[...]
+
+        '
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern: $X
+        - pattern-either:
+          - pattern-inside: ':$KEY => $X
+
+              '
+          - pattern-inside: '["...",$X,...]
+
+              '
+      - pattern: 'params[...].to_i
+
+          '
+      - pattern: 'params[...].to_f
+
+          '
+      - patterns:
+        - pattern: 'params[...] ? $A : $B
+
+            '
+        - metavariable-pattern:
+            metavariable: $A
+            patterns:
+            - pattern-not: 'params[...]
+
+                '
+        - metavariable-pattern:
+            metavariable: $B
+            patterns:
+            - pattern-not: 'params[...]
+
+                '
+  pattern-sinks:
+  - patterns:
+    - pattern: $X
+    - pattern-not-inside: '$P.where("...",...)
+
+        '
+    - pattern-not-inside: '$P.where(:$KEY => $VAL,...)
+
+        '
+    - pattern-either:
+      - pattern-inside: '$P.$M(...)
+
+          '
+      - pattern-inside: '$P.$M("...",...)
+
+          '
+    - pattern-inside: "class $P < ActiveRecord::Base\n  ...\nend\n"
+    - metavariable-regex:
+        metavariable: $M
+        regex: (where|find|first|last|select|minimum|maximum|calculate|sum|average)
+  message: Found potential SQL injection due to unsafe SQL query construction via
+    $X. Where possible, prefer parameterized queries.
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_sql.rb
+    category: security
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://owasp.org/www-community/attacks/SQL_Injection
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails3.1/app/models/product.rb
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-unsafe-reflection-methods
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: 'cookies[...]
+
+        '
+    - patterns:
+      - pattern: 'cookies. ... .$PROPERTY[...]
+
+          '
+      - metavariable-regex:
+          metavariable: $PROPERTY
+          regex: (?!signed|encrypted)
+    - pattern: 'params[...]
+
+        '
+    - pattern: 'request.env[...]
+
+        '
+  pattern-sinks:
+  - patterns:
+    - pattern: $X
+    - pattern-either:
+      - pattern-inside: '$X. ... .to_proc
+
+          '
+      - patterns:
+        - pattern-inside: '$Y.method($Z)
+
+            '
+        - focus-metavariable: $Z
+      - patterns:
+        - pattern-inside: '$Y.tap($Z)
+
+            '
+        - focus-metavariable: $Z
+      - patterns:
+        - pattern-inside: '$Y.tap{ |$ANY| $Z }
+
+            '
+        - focus-metavariable: $Z
+  message: Found user-controllable input to a reflection method. This may allow a
+    user to alter program behavior and potentially execute arbitrary instructions
+    in the context of the process. Do not provide arbitrary user input to `tap`, `method`,
+    or `to_proc`
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_unsafe_reflection_methods.rb
+    category: security
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails6/app/controllers/groups_controller.rb
+    cwe2022-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-unsafe-reflection
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: 'cookies[...]
+
+        '
+    - patterns:
+      - pattern: 'cookies. ... .$PROPERTY[...]
+
+          '
+      - metavariable-regex:
+          metavariable: $PROPERTY
+          regex: (?!signed|encrypted)
+    - pattern: 'params[...]
+
+        '
+    - pattern: 'request.env[...]
+
+        '
+  pattern-sinks:
+  - patterns:
+    - pattern: $X
+    - pattern-either:
+      - pattern-inside: '$X.constantize
+
+          '
+      - pattern-inside: '$X. ... .safe_constantize
+
+          '
+      - pattern-inside: 'const_get(...)
+
+          '
+      - pattern-inside: 'qualified_const_get(...)
+
+          '
+  message: Found user-controllable input to Ruby reflection functionality. This allows
+    a remote user to influence runtime behavior, up to and including arbitrary remote
+    code execution. Do not provide user-controllable input to reflection functionality.
+    Do not call symbol conversion on user-controllable input.
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_unsafe_reflection.rb
+    category: security
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails2/app/controllers/application_controller.rb
+    cwe2022-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: check-unscoped-find
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: 'cookies[...]
+
+        '
+    - patterns:
+      - pattern: 'cookies. ... .$PROPERTY[...]
+
+          '
+      - metavariable-regex:
+          metavariable: $PROPERTY
+          regex: (?!signed|encrypted)
+    - pattern: 'params[...]
+
+        '
+    - pattern: 'request.env[...]
+
+        '
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: $MODEL.find(...)
+      - pattern: $MODEL.find_by_id(...)
+      - pattern: $MODEL.find_by_id!(...)
+    - metavariable-regex:
+        metavariable: $MODEL
+        regex: '[A-Z]\S+'
+  message: Found an unscoped `find(...)` with user-controllable input. If the ActiveRecord
+    model being searched against is sensitive, this may lead to Insecure Direct Object
+    Reference (IDOR) behavior and allow users to read arbitrary records. Scope the
+    find to the current user, e.g. `current_user.accounts.find(params[:id])`.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_unscoped_find.rb
+    category: security
+    cwe:
+    - 'CWE-639: Authorization Bypass Through User-Controlled Key'
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://brakemanscanner.org/docs/warning_types/unscoped_find/
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails3.1/app/controllers/users_controller.rb
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+- id: check-validation-regex
+  mode: search
+  patterns:
+  - pattern-either:
+    - pattern: 'validates ..., :format => <... $V ...>,...
+
+        '
+    - pattern: 'validates_format_of ..., :with => <... $V ...>,...
+
+        '
+  - metavariable-regex:
+      metavariable: $V
+      regex: /(.{2}(?<!\\A)[^\/]+|[^\/]+(?<!\\[Zz]))\/
+  message: $V Found an incorrectly-bounded regex passed to `validates_format_of` or
+    `validate ... format => ...`. Ruby regex behavior is multiline by default and
+    lines should be terminated by `\A` for beginning of line and `\Z` for end of line,
+    respectively.
+  languages:
+  - ruby
+  severity: ERROR
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_validation_regex.rb
+    category: security
+    cwe:
+    - 'CWE-185: Incorrect Regular Expression'
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://brakemanscanner.org/docs/warning_types/format_validation/
+    - https://github.com/presidentbeef/brakeman/blob/aef6253a8b7bcb97116f2af1ed2a561a6ae35bd5/test/apps/rails3/app/models/account.rb
+    - https://github.com/presidentbeef/brakeman/blob/main/test/apps/rails3.1/app/models/account.rb
+    subcategory:
+    - vuln
+    impact: MEDIUM
+    likelihood: MEDIUM
+    confidence: MEDIUM

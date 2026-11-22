@@ -1,0 +1,27 @@
+id: "aem-bg-servlet"
+name: "AEM BG-Servlets"
+severity: "info"
+description: "Safe check derived from aem-bg-servlet: AEM BG-Servlets"
+tech:
+  - "generic"
+tags:
+  - "aem"
+  - "misconfig"
+  - "vuln"
+reference: "https://www.slideshare.net/0ang3el/hunting-for-security-bugs-in-aem-webapps-129262212"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/system/bgservlets/test.css"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<br/>Flushing output<br/>"

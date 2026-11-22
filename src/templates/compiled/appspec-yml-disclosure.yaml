@@ -1,0 +1,36 @@
+id: "appspec-yml-disclosure"
+name: "Appspec YML/YAML - Detect"
+severity: "medium"
+description: "Appspec YML and YAML files are susceptible to information disclosure."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/detectify/ugly-duckling/blob/master/modules/crowdsourced/appsec-yml-disclosure.json"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/appspec.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "version:"
+      - "os:"
+      - "files:"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200

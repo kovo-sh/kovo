@@ -1,0 +1,31 @@
+id: "strapi-cms-detect"
+name: "Strapi CMS detect"
+severity: "info"
+description: "Open source Node.js Headless CMS to easily build customisable APIs"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "strapi"
+  - "cms"
+  - "discovery"
+reference: "https://github.com/strapi/strapi"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/init"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"data\""
+      - "\"uuid\""
+      - "\"hasAdmin\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

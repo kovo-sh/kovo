@@ -1,0 +1,32 @@
+id: "gcloud-config-default"
+name: "Google Cloud Default Config - Detect"
+severity: "info"
+description: "Google Cloud default configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "google"
+  - "cloud"
+  - "devops"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://cloud.google.com"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/configurations/config_default"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[core]"
+      - "account"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

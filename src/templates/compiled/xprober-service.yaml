@@ -1,0 +1,27 @@
+id: "xprober-service"
+name: "X Prober Server - Information Disclosure"
+severity: "medium"
+description: "X Prober Server information disclosure was detected."
+tech:
+  - "php"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/kmvan/x-prober"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/xprober.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"appName\":\"X Prober\""
+      - "<title>X Prober"
+    condition: "and"

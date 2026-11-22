@@ -1,0 +1,47 @@
+id: "prometheus-metrics"
+name: "Prometheus Metrics - Detect"
+severity: "medium"
+description: "Prometheus metrics page was detected."
+tech:
+  - "prometheus"
+tags:
+  - "exposure"
+  - "prometheus"
+  - "hackerone"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/prometheus/prometheus"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "cpu_seconds_total"
+      - "http_request_duration_seconds"
+      - "process_virtual_memory_bytes"
+      - "process_start_time_seconds"
+  - type: "word"
+    part: "body"
+    words:
+      - "lvm_"
+      - "kube"
+      - "namedprocess"
+      - "mysqld"
+      - "collectd_"
+      - "libvirt_"
+      - "mongodb"
+      - "blackbox_"
+      - "haproxy_"
+      - "rabbitmq_"
+    negative: true
+  - type: "status"
+    status:
+      - 200

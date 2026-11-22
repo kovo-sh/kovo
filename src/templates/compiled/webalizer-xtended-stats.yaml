@@ -1,0 +1,30 @@
+id: "webalizer-xtended-stats"
+name: "Webalizer Xtended Statistics Exposed"
+severity: "low"
+description: "Webalizer Xtended Statistics is exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "stats"
+  - "webalizer"
+  - "vuln"
+reference: "https://www.patrickfrei.ch/webalizer/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/usage/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<TITLE>Webalizer</TITLE>"
+      - "SRC=menu.html"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

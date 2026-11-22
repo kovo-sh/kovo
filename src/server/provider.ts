@@ -5,7 +5,7 @@ import { stream as messages, streamSimple as simpleMessages } from '@earendil-wo
 import type { Api, Model, ProviderStreams } from '@earendil-works/pi-ai'
 import { obj, str } from '@earendil-works/pi-schema'
 import { DEFAULT_PROVIDER } from '../domain.ts'
-import type { ProviderSettings, ThinkingLevel } from '../domain.ts'
+import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { defaultStreamResponseLimit, redactProviderText, sanitizeProviderStream, sanitizeProviderValue } from './provider-stream.ts'
 import { redact } from './redact.ts'
@@ -81,6 +81,7 @@ export type ProviderOptions = {
   idleTimeoutMs?: number
   totalTimeoutMs?: number
   thinkingLevel?: ThinkingLevel
+  roleAffinity?: RoleAffinity
   beforeCall?: () => void
   onUsage?: UsageCallback
   onProfileSuccess?: (profileId: string) => void
@@ -327,7 +328,7 @@ function buildSingleStreamImpl(
     api,
     baseUrl: settings.protocol === 'messages' ? settings.endpoint.replace(/\/v1$/, '') : settings.endpoint,
     input: ['text'],
-    reasoning: api === 'anthropic-messages' ? thinkingEnabled : false,
+    reasoning: thinkingEnabled,
     contextWindow,
     maxTokens,
     cost: {
@@ -352,12 +353,22 @@ function buildSingleStreamImpl(
     stream: (selected, transcript, sOpts) => responses(selected as Model<'openai-responses'>, transcript, {
       ...sOpts,
       ...streamOpts,
+      ...(effectiveThinking !== 'off' ? { reasoningEffort: effectiveThinking } : { reasoningEffort: undefined }),
       ...(connection ? { toolChoice: 'required' as const } : {}),
     }),
     streamSimple: (selected, transcript, sOpts) =>
       chooseEvidenceTool(transcript)
-        ? responses(selected as Model<'openai-responses'>, transcript, { ...sOpts, ...streamOpts, toolChoice: 'required' })
-        : simpleResponses(selected as Model<'openai-responses'>, transcript, { ...sOpts, ...streamOpts }),
+        ? responses({ ...(selected as Model<'openai-responses'>), reasoning: false }, transcript, {
+            ...sOpts,
+            ...streamOpts,
+            reasoningEffort: undefined,
+            toolChoice: 'required',
+          })
+        : simpleResponses(selected as Model<'openai-responses'>, transcript, {
+            ...sOpts,
+            ...streamOpts,
+            ...(effectiveThinking !== 'off' ? { reasoning: effectiveThinking } : { reasoning: undefined }),
+          }),
   } : {
     stream: (selected, transcript, sOpts) => messages(selected as Model<'anthropic-messages'>, transcript, {
       ...sOpts,
@@ -417,9 +428,25 @@ export function classifyFailoverError(message: string): { failover: boolean; har
   return { failover: false, hard: false }
 }
 
-export function orderProfiles(profiles: readonly ResolvedModelProfile[], estimatedTokens: number): ResolvedModelProfile[] {
+function roleRank(profile: ResolvedModelProfile, preferredRole?: RoleAffinity): number {
+  if (!preferredRole || preferredRole === 'any') return 0
+  const aff = profile.roleAffinity ?? 'any'
+  if (aff === preferredRole) return 0
+  if (aff === 'any') return 1
+  return 2
+}
+
+function compareProfiles(a: ResolvedModelProfile, b: ResolvedModelProfile, preferredRole?: RoleAffinity): number {
+  return roleRank(a, preferredRole) - roleRank(b, preferredRole) || b.priority - a.priority
+}
+
+export function orderProfiles(
+  profiles: readonly ResolvedModelProfile[],
+  estimatedTokens: number,
+  preferredRole?: RoleAffinity,
+): ResolvedModelProfile[] {
   const now = Date.now()
-  const sorted = [...profiles].sort((a, b) => b.priority - a.priority)
+  const sorted = [...profiles].sort((a, b) => compareProfiles(a, b, preferredRole))
   const fitting = sorted.filter(p => p.contextWindow <= 0 || estimatedTokens <= p.contextWindow * 0.95)
   const pool = fitting.length ? fitting : sorted
   const healthy = pool.filter(p => !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > now))
@@ -427,12 +454,16 @@ export function orderProfiles(profiles: readonly ResolvedModelProfile[], estimat
     ? healthy
     : [...pool].sort((a, b) => (a.cooldownUntil ?? 0) - (b.cooldownUntil ?? 0)).slice(0, 1)
 
-  // Round-robin within equal-priority groups.
+  // Round-robin within equal (roleRank, priority) groups.
   const tick = rrCounter++
   const out: ResolvedModelProfile[] = []
   for (let i = 0; i < base.length;) {
     let j = i + 1
-    while (j < base.length && base[j].priority === base[i].priority) j++
+    while (
+      j < base.length &&
+      roleRank(base[j], preferredRole) === roleRank(base[i], preferredRole) &&
+      base[j].priority === base[i].priority
+    ) j++
     const group = base.slice(i, j)
     if (group.length > 1) {
       const offset = tick % group.length
@@ -451,15 +482,16 @@ export function providerPool(
   options: ProviderOptions = {},
 ) {
   if (!profiles.length) throw new Error('No enabled workspace model profiles are configured.')
-  const sorted = [...profiles].sort((a, b) => b.priority - a.priority)
-  const primary = sorted[0]
+  const sorted = [...profiles].sort((a, b) => compareProfiles(a, b, options.roleAffinity))
+  const now = Date.now()
+  const primary = sorted.find(p => !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > now)) ?? sorted[0]
   const callCounter = { count: 0, maxCalls: options.maxCalls ?? defaultMaxCalls }
   const primaryBuilt = buildSingleStreamImpl(primary, scenario, options, callCounter, primary.id)
 
   const wrapMethod = (method: 'stream' | 'streamSimple'): ProviderStreams['stream'] => {
     return (_selected, transcript, sOpts) => {
       const estimatedTokens = Math.ceil(JSON.stringify(transcript).length / 3.5)
-      const ordered = orderProfiles(sorted, estimatedTokens)
+      const ordered = orderProfiles(sorted, estimatedTokens, options.roleAffinity)
 
       // Execute failover strictly inside the safe window (before yielding the first non-error event).
       const iter = (async function* () {

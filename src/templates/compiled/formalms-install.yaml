@@ -1,0 +1,28 @@
+id: "formalms-install"
+name: "Formalms Exposed Installation"
+severity: "high"
+description: "Formalms Installation is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "formalms"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>forma.lms installer</title>"
+      - "<h1>forma.lms - Installation</h1>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

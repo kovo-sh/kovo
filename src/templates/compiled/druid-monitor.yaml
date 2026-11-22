@@ -1,0 +1,28 @@
+id: "druid-monitor"
+name: "Alibaba Druid Monitor Unauthorized Access"
+severity: "high"
+description: "Alibaba Druid Monitor is exposed."
+tech:
+  - "generic"
+tags:
+  - "druid"
+  - "alibaba"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/druid/index.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Druid Stat Index</title>"
+  - type: "status"
+    status:
+      - 200

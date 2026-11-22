@@ -1,0 +1,32 @@
+id: "headplane-detect"
+name: "Headplane - Detect"
+severity: "info"
+description: "Headplane is an open-source web management interface for Headscale deployments."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "headplane"
+  - "headscale"
+  - "remote-access"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/tale/headplane"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Headplane</title>"
+      - "/admin/assets/entry.client-"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

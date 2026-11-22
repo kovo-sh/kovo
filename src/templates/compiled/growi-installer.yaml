@@ -1,0 +1,28 @@
+id: "growi-installer"
+name: "GROWI Installer - Exposure"
+severity: "high"
+description: "Checks for the presence of a GROWI Installer."
+tech:
+  - "generic"
+tags:
+  - "install"
+  - "growi"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/installer"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Installer - GROWI</title>"
+  - type: "status"
+    status:
+      - 200

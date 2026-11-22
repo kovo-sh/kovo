@@ -1,0 +1,31 @@
+id: "nvidia-triton-detect"
+name: "Triton Inference Server - Detect"
+severity: "info"
+description: "Detected the NVIDIA Triton Inference Server, an open-source platform for serving AI/ML models. It supported multiple frameworks and exposed HTTP/gRPC endpoints for high-performance inferencing."
+tech:
+  - "generic"
+tags:
+  - "oss"
+  - "nvidia"
+  - "triton"
+  - "tech"
+  - "discovery"
+reference: "https://github.com/triton-inference-server/server"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/v2"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "{\"name\":\"triton\","
+      - "\"extensions\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

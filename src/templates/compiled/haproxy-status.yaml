@@ -1,0 +1,30 @@
+id: "haproxy-status"
+name: "HAProxy Statistics Page - Detect"
+severity: "medium"
+description: "HAProxy statistics page was detected."
+tech:
+  - "generic"
+tags:
+  - "logs"
+  - "haproxy"
+  - "edb"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/4191"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/haproxy-status"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Statistics Report for HAProxy"
+  - type: "status"
+    status:
+      - 200

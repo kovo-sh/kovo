@@ -1,0 +1,25 @@
+id: "s3-detect"
+name: "Detect Amazon-S3 Bucket"
+severity: "info"
+description: "Safe check derived from s3-detect: Detect Amazon-S3 Bucket"
+tech:
+  - "s3"
+tags:
+  - "aws"
+  - "s3"
+  - "bucket"
+  - "tech"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/%c0"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "(?:InvalidURI|InvalidArgument|NoSuchBucket)"

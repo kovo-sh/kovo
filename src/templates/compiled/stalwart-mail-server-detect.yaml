@@ -1,0 +1,32 @@
+id: "stalwart-mail-server-detect"
+name: "Stalwart Mail Server - Detect"
+severity: "info"
+description: "Stalwart Mail Server, an open-source mail and collaboration server, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "stalwart"
+  - "mail-server"
+  - "mail"
+  - "detect"
+reference: "https://stalw.art/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Stalwart Management</title>"
+      - "TrunkApplicationStarted"
+      - "_bg.wasm"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

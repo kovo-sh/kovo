@@ -1,0 +1,29 @@
+id: "emby-installer"
+name: "Emby Installation Page - Exposure"
+severity: "high"
+description: "Checks for the presence of a Emby Installer Page."
+tech:
+  - "generic"
+tags:
+  - "install"
+  - "emby"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/web/index.html?start=wizard#!/wizard/wizardstart.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Auto-Install"
+      - "emby-elements"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

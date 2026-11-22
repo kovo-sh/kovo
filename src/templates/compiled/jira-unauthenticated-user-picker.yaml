@@ -1,0 +1,24 @@
+id: "jira-unauthenticated-user-picker"
+name: "Jira Unauthenticated User Picker"
+severity: "info"
+description: "Safe check derived from jira-unauthenticated-user-picker: Jira Unauthenticated User Picker"
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "atlassian"
+  - "jira"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/secure/popups/UserPickerBrowser.jspa"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "user-picker"

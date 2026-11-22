@@ -1,0 +1,30 @@
+id: "emlog-installer"
+name: "Emlog Pro - Installation"
+severity: "high"
+description: "Emlog Pro Installation page has been exposed."
+tech:
+  - "php"
+tags:
+  - "emlog"
+  - "install"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - ">MySQL"
+      - "install.php?action=install"
+      - "emlog"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

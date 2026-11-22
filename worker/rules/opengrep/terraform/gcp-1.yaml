@@ -1,0 +1,2795 @@
+rules:
+- id: gcp-artifact-registry-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_artifact_registry_repository\" $ANYTHING {\n  ...\n\
+      }\n"
+  - pattern-not-inside: "resource \"google_artifact_registry_repository\" $ANYTHING\
+      \ {\n  ...\n  kms_key_name = ...\n  ...\n}\n"
+  message: Ensure Artifact Registry Repositories are encrypted with Customer Supplied
+    Encryption Keys (CSEK)
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-artifact-registry-private-repo-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_artifact_registry_repository_iam_binding"
+        "..." {
+
+        ...
+
+        members = [ ..., "allAuthenticatedUsers", ...]
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_artifact_registry_repository_iam_binding"
+        "..." {
+
+        ...
+
+        members = [ ..., "allUsers", ...]
+
+        ...
+
+        }
+
+        '
+  message: "Ensure that Artifact Registry repositories are not anonymously or publicly\
+    \ accessible\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-artifact-registry-private-repo-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_artifact_registry_repository_iam_member" "..."
+        {
+
+        ...
+
+        member = "allUsers"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_artifact_registry_repository_iam_member" "..."
+        {
+
+        ...
+
+        member = "allAuthenticatedUsers"
+
+        ...
+
+        }
+
+        '
+  message: "Ensure that Artifact Registry repositories are not anonymously or publicly\
+    \ accessible\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-bigquery-dataset-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_bigquery_dataset\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_bigquery_dataset\" $ANYTHING {\n  ...\n\
+      \  default_encryption_configuration {\n    ...\n    kms_key_name = ...\n   \
+      \ ...\n  }\n  ...\n}\n"
+  message: "Ensure that BigQuery datasets are not anonymously or publicly accessible\t"
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-bigquery-private-table-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_bigquery_table_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allAuthenticatedUsers", ...]
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_bigquery_table_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allUsers", ...]
+
+        ...
+
+        }
+
+        '
+  message: "Ensure that BigQuery Tables are not anonymously or publicly accessible\t\
+    \t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-bigquery-private-table-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_bigquery_table_iam_member" "..." {
+
+        ...
+
+        member = "allAuthenticatedUsers"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_bigquery_table_iam_member" "..." {
+
+        ...
+
+        member = "allUsers"
+
+        ...
+
+        }
+
+        '
+  message: "Ensure that BigQuery Tables are not anonymously or publicly accessible\t\
+    \t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-bigquery-table-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_bigquery_table\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_bigquery_table\" $ANYTHING {\n  ...\n \
+      \ encryption_configuration {\n    ...\n    kms_key_name = ...\n    ...\n  }\n\
+      \  ...\n}\n"
+  message: "Ensure Big Query Tables are encrypted with Customer Supplied Encryption\
+    \ Keys (CSEK)\t"
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-bigtable-instance-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_bigtable_instance\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_bigtable_instance\" $ANYTHING {\n  ...\n\
+      \  cluster {\n    ...\n    kms_key_name = ...\n    ...\n  }\n  ...\n}\n"
+  message: "Ensure Big Table Instances are encrypted with Customer Supplied Encryption\
+    \ Keys (CSEK)\t"
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-build-workers-private
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_cloudbuild_worker_pool" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_cloudbuild_worker_pool\" \"...\" {\n...\n\
+      worker_config {\n  ...\n  no_external_ip = true\n  ...\n}\n...\n}\n"
+  message: "Ensure Cloud build workers are private\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-cloud-storage-logging
+  patterns:
+  - pattern: "resource \"google_storage_bucket\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_storage_bucket\" $ANYTHING {\n  ...\n \
+      \ logging {\n      log_bucket = ...\n  }          \n  ...\n}\n"
+  message: Ensure bucket logs access.
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A10:2017 - Insufficient Logging & Monitoring
+    - A09:2021 - Security Logging and Monitoring Failures
+    cwe:
+    - 'CWE-778: Insufficient Logging'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: MEDIUM
+- id: gcp-compute-boot-disk-encryption
+  patterns:
+  - pattern: "resource \"google_compute_instance\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_compute_instance\" $ANYTHING {\n  ...\n\
+      \  boot_disk {\n    disk_encryption_key_raw = ...\n  }\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_compute_instance\" $ANYTHING {\n  ...\n\
+      \  boot_disk {\n    kms_key_self_link = ...\n  }\n  ...\n}\n"
+  message: Ensure VM disks for critical VMs are encrypted with Customer Supplied Encryption
+    Keys (CSEK)
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A04:2021 - Insecure Design
+    cwe:
+    - 'CWE-311: Missing Encryption of Sensitive Data'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-compute-disk-encryption
+  patterns:
+  - pattern: "resource \"google_compute_disk\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_compute_disk\" $ANYTHING {\n  ...\n  disk_encryption_key\
+      \ {\n    raw_key = ...\n  }\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_compute_disk\" $ANYTHING {\n  ...\n  disk_encryption_key\
+      \ {\n    kms_key_self_link = ...\n  }\n  ...\n}\n"
+  message: Ensure VM disks for critical VMs are encrypted with Customer Supplied Encryption
+    Keys (CSEK)
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A04:2021 - Insecure Design
+    cwe:
+    - 'CWE-311: Missing Encryption of Sensitive Data'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-compute-firewall-unrestricted-ingress-20
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [20]\n}\nsource_ranges = [\"0.0.0.0/0\"\
+        ]\n...\n}\n"
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [..., \"20\", ...]\n}\nsource_ranges\
+        \ = [\"0.0.0.0/0\"]\n...\n}\n"
+  message: Ensure Google compute firewall ingress does not allow unrestricted FTP
+    access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-firewall-unrestricted-ingress-21
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [21]\n}\nsource_ranges = [\"0.0.0.0/0\"\
+        ]\n...\n}\n"
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [..., \"21\", ...]\n}\nsource_ranges\
+        \ = [\"0.0.0.0/0\"]\n...\n}\n"
+  message: Ensure Google compute firewall ingress does not allow unrestricted FTP
+    access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-firewall-unrestricted-ingress-22
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [22]\n}\nsource_ranges = [\"0.0.0.0/0\"\
+        ]\n...\n}\n"
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [..., \"22\", ...]\n}\nsource_ranges\
+        \ = [\"0.0.0.0/0\"]\n...\n}\n"
+  message: Ensure Google compute firewall ingress does not allow unrestricted SSH
+    access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-firewall-unrestricted-ingress-3306
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [3306]\n}\nsource_ranges = [\"0.0.0.0/0\"\
+        ]\n...\n}\n"
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [..., \"3306\", ...]\n}\nsource_ranges\
+        \ = [\"0.0.0.0/0\"]\n...\n}\n"
+  message: Ensure Google compute firewall ingress does not allow unrestricted MySQL
+    access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-firewall-unrestricted-ingress-3389
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [3389]\n}\nsource_ranges = [\"0.0.0.0/0\"\
+        ]\n...\n}\n"
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [..., \"3389\", ...]\n}\nsource_ranges\
+        \ = [\"0.0.0.0/0\"]\n...\n}\n"
+  message: Ensure Google compute firewall ingress does not allow unrestricted RDP
+    access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-firewall-unrestricted-ingress-80
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [80]\n}\nsource_ranges = [\"0.0.0.0/0\"\
+        ]\n...\n}\n"
+    - pattern-inside: "resource \"google_compute_firewall\" \"...\" {\n...\nallow\
+        \ {\n  protocol = \"tcp\"\n  ports    = [..., \"80\", ...]\n}\nsource_ranges\
+        \ = [\"0.0.0.0/0\"]\n...\n}\n"
+  message: Ensure Google compute firewall ingress does not allow unrestricted HTTP
+    access
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-ip-forward
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_compute_instance" "..." {
+
+      ...
+
+      can_ip_forward = true
+
+      ...
+
+      }
+
+      '
+  message: "Ensure that IP forwarding is not enabled on Instances. This lets the instance\
+    \ act as a traffic router and receive traffic not intended for it, which may route\
+    \ traffic through unintended passages.\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: INFO
+- id: gcp-compute-os-login
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_compute_instance\" \"...\" {\n...\nmetadata\
+      \ = {\n    enable-oslogin = false\n}\n...\n}\n"
+  message: "Ensure that no instance in the project overrides the project setting for\
+    \ enabling OSLogin (OSLogin needs to be enabled in project metadata for all instances)\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-project-os-login
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_compute_project_metadata" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_compute_project_metadata\" \"...\" {\n\
+      ...\nmetadata = {\n    enable-oslogin = \"True\"\n}\n...\n}\n"
+  - pattern-not-inside: "resource \"google_compute_project_metadata\" \"...\" {\n\
+      ...\nmetadata = {\n    enable-oslogin = True\n}\n...\n}\n"
+  message: "Ensure oslogin is enabled for a Project\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-public-ip
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_compute_instance\" \"...\" {\n...\nnetwork_interface\
+      \ {\n  ...\n  network = \"default\"\n  ...\n}\n...\n}\n"
+  message: "Ensure that Compute instances do not have public IP addresses\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-serial-ports
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_compute_instance\" \"...\" {\n...\nmetadata\
+      \ = {\n    serial-port-enable = true\n}\n...\n}\n"
+  message: "Ensure 'Enable connecting to serial ports' is not enabled for VM Instance\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-ssl-policy
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_compute_ssl_policy" "..." {
+
+        ...
+
+        profile = "MODERN"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_compute_ssl_policy" "..." {
+
+        ...
+
+        profile = "CUSTOM"
+
+        custom_features = [..., "TLS_RSA_WITH_AES_256_GCM_SHA384", ...]
+
+        ...
+
+        }
+
+        '
+  - pattern-not-inside: 'resource "google_compute_ssl_policy" "..." {
+
+      ...
+
+      profile = "MODERN"
+
+      min_tls_version = "TLS_1_2"
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_compute_ssl_policy" "..." {
+
+      ...
+
+      profile = "CUSTOM"
+
+      custom_features = ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
+
+      ...
+
+      }
+
+      '
+  message: Ensure no HTTPS or SSL proxy load balancers permit SSL policies with weak
+    cipher suites
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-compute-template-ip-forward
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_compute_instance_template" "..." {
+
+      ...
+
+      can_ip_forward = true
+
+      ...
+
+      }
+
+      '
+  message: Ensure that IP forwarding is not enabled on Instances. This lets the instance
+    act as a traffic router and receive traffic not intended for it, which may route
+    traffic through unintended passages.
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    references:
+    - https://www.trendmicro.com/cloudoneconformity/knowledge-base/gcp/ComputeEngine/disable-ip-forwarding.html
+    technology:
+    - terraform
+    - gcp
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: INFO
+- id: gcp-compute-template-public-ip
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_compute_instance_template\" \"...\" {\n...\n\
+      network_interface {\n  ...\n  network = \"default\"\n  ...\n}\n...\n}\n"
+  message: "Ensure that Compute instances do not have public IP addresses\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-dataflow-job-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_dataflow_job\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_dataflow_job\" $ANYTHING {\n  ...\n  kms_key_name\
+      \ = ...\n  ...\n}\n"
+  message: Ensure data flow jobs are encrypted with Customer Supplied Encryption Keys
+    (CSEK)
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-dataflow-private-job
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_dataflow_job" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_dataflow_job" "..." {
+
+      ...
+
+      ip_configuration = "WORKER_IP_PRIVATE"
+
+      ...
+
+      }
+
+      '
+  message: Ensure Dataflow jobs are private
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-datafusion-private-instance
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_data_fusion_instance" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_data_fusion_instance" "..." {
+
+      ...
+
+      private_instance = true
+
+      ...
+
+      }
+
+      '
+  message: Ensure Data fusion instances are private
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-datafusion-stack-driver-logging
+  patterns:
+  - pattern-inside: "resource \"google_data_fusion_instance\" $ANYTHING {\n  ...\n\
+      }\n"
+  - pattern-not-inside: "resource \"google_data_fusion_instance\" $ANYTHING {\n  ...\n\
+      \  enable_stackdriver_logging = true      \n  ...\n}\n"
+  message: Ensure Datafusion has stack driver logging enabled.
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-datafusion-stack-driver-monitoring
+  patterns:
+  - pattern-inside: "resource \"google_data_fusion_instance\" $ANYTHING {\n  ...\n\
+      }\n"
+  - pattern-not-inside: "resource \"google_data_fusion_instance\" $ANYTHING {\n  ...\n\
+      \  enable_stackdriver_monitoring = true        \n  ...\n}\n"
+  message: Ensure Datafusion has stack driver monitoring enabled.
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-dataproc-cluster-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_dataproc_cluster\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_dataproc_cluster\" $ANYTHING {\n  ...\n\
+      \  cluster_config {\n    encryption_config {\n      ...\n      kms_key_name\
+      \ = ...\n      ...\n    }\n  }\n  ...\n}\n"
+  message: "Ensure Dataproc cluster is encrypted with Customer Supplied Encryption\
+    \ Keys (CSEK)\t"
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-dataproc-cluster-public-ip
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_dataproc_cluster\" \"...\" {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_dataproc_cluster\" \"...\" {\n  ...\n \
+      \ cluster_config {\n    gce_cluster_config {\n      ...\n      internal_ip_only\
+      \ = true\n      ...\n    }\n  ...\n  }\n}\n"
+  message: Ensure Dataproc Clusters do not have public IPs
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-dataproc-private-cluster-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_dataproc_cluster_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allAuthenticatedUsers", ...]
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_dataproc_cluster_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allUsers", ...]
+
+        ...
+
+        }
+
+        '
+  message: Ensure that Dataproc clusters are not anonymously or publicly accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-dataproc-private-cluster-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_dataproc_cluster_iam_member" "..." {
+
+        ...
+
+        member = "allUsers"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_dataproc_cluster_iam_member" "..." {
+
+        ...
+
+        member = "allAuthenticatedUsers"
+
+        ...
+
+        }
+
+        '
+  message: Ensure that Dataproc clusters are not anonymously or publicly accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-dns-key-specs-rsasha1
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_dns_managed_zone\" \"...\" {\n...\ndnssec_config\
+      \ {\n    ...\n    default_key_specs {\n        ...\n        algorithm  = \"\
+      rsasha1\"\n        key_type   = \"zoneSigning\"\n        ...\n    }\n    ...\n\
+      }\n...\n}\n"
+  - pattern-inside: "resource \"google_dns_managed_zone\" \"...\" {\n...\ndnssec_config\
+      \ {\n    ...\n    default_key_specs {\n        ...\n        algorithm  = \"\
+      rsasha1\"\n        key_type   = \"keySigning\"\n        ...\n    }\n    ...\n\
+      }\n...\n}\n"
+  message: "Ensure that RSASHA1 is not used for the zone-signing and key-signing keys\
+    \ in Cloud DNS DNSSEC\t"
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-folder-impersonation-roles-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_folder_iam_binding" "..." {
+
+      ...
+
+      role = "roles/editor"
+
+      members = [ ... ]
+
+      ...
+
+      }
+
+      '
+  message: "Ensure no roles that enable to impersonate and manage all service accounts\
+    \ are used at a folder level\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-folder-impersonation-roles-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_folder_iam_member" "..." {
+
+      ...
+
+      role = "roles/editor"
+
+      member = ...
+
+      ...
+
+      }
+
+      '
+  message: "Ensure no roles that enable to impersonate and manage all service accounts\
+    \ are used at a folder level\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-folder-member-default-service-account-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_folder_iam_binding" "..." {
+
+      ...
+
+      members = [..., $MEMBER, ...]
+
+      ...
+
+      }
+
+      '
+  - metavariable-regex:
+      metavariable: $MEMBER
+      regex: ((.*)-compute@appspot.gserviceaccount.com)
+  message: Ensure Default Service account is not used at a folder level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-folder-member-default-service-account-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_folder_iam_member" "..." {
+
+      ...
+
+      member = $MEMBER
+
+      ...
+
+      }
+
+      '
+  - metavariable-regex:
+      metavariable: $MEMBER
+      regex: ((.*)-compute@developer.gserviceaccount.com)
+  message: Ensure Default Service account is not used at a folder level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-basic-auth
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nmaster_auth\
+      \ {\n  client_certificate_config {\n    ...\n  }\n}\n...\n}\n"
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nmaster_auth\
+      \ {\n  ...\n  username = \"\"\n  password = \"\"\n  ...\n}\n...\n}\n"
+  message: "Ensure GKE basic auth is disabled\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-client-certificate-disabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nmaster_auth\
+      \ {\n  ...\n  client_certificate_config {\n    ...\n    issue_client_certificate\
+      \ = false\n    ...\n  }\n  ...\n}\n...\n}\n"
+  message: Ensure client certificate authentication to Kubernetes Engine Clusters
+    is disabled
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-cluster-logging
+  patterns:
+  - pattern: "resource \"google_container_cluster\" $ANYTHING {\n  ...\n  logging_service\
+      \ = \"none\"\n  ...\n}\n"
+  message: Ensure logging is set to Enabled on Kubernetes Engine Clusters
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-gke-enabled-vpc-flow-logs
+  patterns:
+  - pattern-inside: "resource \"google_container_cluster\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_container_cluster\" $ANYTHING {\n  ...\n\
+      \  enable_intranode_visibility = true\n  ...\n}\n"
+  message: Enable VPC Flow Logs and Intranode Visibility
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-gke-ensure-integrity-monitoring
+  patterns:
+  - pattern-inside: "resource \"google_container_cluster\" $ANYTHING {\n  ...\n  node_config\
+      \ {\n    ...\n    shielded_instance_config {\n      enable_integrity_monitoring\
+      \ = false\n    }\n    ...\n  }     \n  ...\n}\n"
+  message: Ensure Integrity Monitoring for Shielded GKE Nodes is Enabled
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-gke-kubernetes-rbac-google-groups
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nauthenticator_groups_config\
+      \ {\n  ...\n  security_group = \"...\"\n  ...\n}\n...\n}\n"
+  message: Manage Kubernetes RBAC users with Google Groups for GKE
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-legacy-auth-enabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      enable_legacy_abac = true
+
+      ...
+
+      }
+
+      '
+  message: Ensure Legacy Authorization is set to Disabled on Kubernetes Engine Clusters
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-legacy-instance-metadata-disabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      min_master_version = 1.12
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      min_master_version = 1.13
+
+      ...
+
+      }
+
+      '
+  message: Ensure legacy Compute Engine instance metadata APIs are Disabled
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-master-authz-networks-enabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nmaster_authorized_networks_config\
+      \ {\n  ...\n}\n...\n}\n"
+  message: Ensure master authorized networks is set to enabled in GKE clusters
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-monitoring-enabled
+  patterns:
+  - pattern-inside: "resource \"google_container_cluster\" $ANYTHING {\n  ...\n  monitoring_service\
+      \ = \"none\"  \n  ...\n}\n"
+  message: Ensure monitoring is set to Enabled on Kubernetes Engine Clusters
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-gke-network-policy-enabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_container_cluster\" \"...\" {\n...\nnetwork_policy\
+      \ {\n  ...\n  enabled = false\n  ...\n}\n...\n}\n"
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\ndatapath_provider\
+      \ = \"ADVANCED_DATAPATH\"\nnetwork_policy {\n  ...\n  enabled = false\n  ...\n\
+      }\n...\n}\n"
+  message: Ensure Network Policy is enabled on Kubernetes Engine Clusters
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-nodepool-integrity-monitoring
+  patterns:
+  - pattern-inside: "resource \"google_container_node_pool\" $ANYTHING {\n  ...\n\
+      \  node_config {\n    ...\n    shielded_instance_config {\n      enable_integrity_monitoring\
+      \ = false\n    }\n    ...\n  }     \n  ...\n}\n"
+  message: Ensure Integrity Monitoring for Shielded GKE Nodes is Enabled
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-gke-pod-security-policy-enabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\npod_security_policy_config\
+      \ {\n  ...\n  enabled = true\n  ...\n}\n...\n}\n"
+  message: Ensure PodSecurityPolicy controller is enabled on the Kubernetes Engine
+    Clusters
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-private-cluster-config
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nprivate_cluster_config\
+      \ {\n  ...\n}\n...\n}\n"
+  message: Ensure Kubernetes Cluster is created with Private cluster enabled
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-public-control-plane
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nmaster_authorized_networks_config\
+      \ {\n  ...\n  cidr_blocks {\n        ...\n  }\n  ...\n}\n...\n}\n"
+  message: Ensure GKE Control Plane is not public
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-gke-secure-boot-for-shielded-nodes
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_container_cluster" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: "resource \"google_container_cluster\" \"...\" {\n...\nshielded_instance_config\
+      \ {\n  ...\n  enable_secure_boot = true\n  ...\n}\n...\n}\n"
+  message: "Ensure Secure Boot for Shielded GKE Nodes is Enabled\t"
+  metadata:
+    category: best-practice
+    technology:
+    - terraform
+    - gcp
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-insecure-load-balancer-tls-version
+  patterns:
+  - pattern: "resource \"google_compute_ssl_policy\" $ANYTHING {\n  ...\n  min_tls_version\
+      \ = \"...\"\n  ...\n}\n"
+  - pattern-not: "resource \"google_compute_ssl_policy\" $ANYTHING {\n  ...\n  min_tls_version\
+      \ = \"TLS_1_2\"\n  ...\n}\n"
+  message: Detected GCP Load Balancer to be using an insecure version of TLS. To fix
+    this set your "min_tls_version" to "TLS_1_2"
+  languages:
+  - terraform
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    technology:
+    - gcp
+    - terraform
+    category: security
+    references:
+    - https://docs.bridgecrew.io/docs/google-cloud-policy-index
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-kms-prevent-destroy
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_kms_crypto_key\" \"...\" {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_kms_crypto_key\" \"...\" {\n  ...\n  lifecycle\
+      \ {\n    prevent_destroy = true\n  }\n  ...\n}\n"
+  message: Ensure KMS keys are protected from deletion
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-memory-store-for-redis-auth-enabled
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_redis_instance" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_redis_instance" "..." {
+
+      ...
+
+      auth_enabled = true
+
+      ...
+
+      }
+
+      '
+  message: Ensure Memorystore for Redis has AUTH enabled
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-memory-store-for-redis-intransit-encryption
+  patterns:
+  - pattern: "resource \"google_redis_instance\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_redis_instance\" $ANYTHING {\n  ...\n \
+      \ transit_encryption_mode = \"SERVER_AUTHENTICATION\"\n  ...\n}\n"
+  message: Ensure Memorystore for Redis uses intransit encryption
+  languages:
+  - hcl
+  severity: WARNING
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    technology:
+    - terraform
+    - gcp
+    category: security
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+- id: gcp-org-impersonation-roles-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_organization_iam_binding" "..." {
+
+      ...
+
+      role = "roles/editor"
+
+      members = [ ... ]
+
+      ...
+
+      }
+
+      '
+  message: "Ensure no roles that enable to impersonate and manage all service accounts\
+    \ are used at an organization level\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-org-impersonation-roles-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_organization_iam_member" "..." {
+
+      ...
+
+      role = "roles/editor"
+
+      member = ...
+
+      ...
+
+      }
+
+      '
+  message: "Ensure no roles that enable to impersonate and manage all service accounts\
+    \ are used at an organization level\t"
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-org-member-default-service-account-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_organization_iam_binding" "..." {
+
+      ...
+
+      members = [..., $MEMBER, ...]
+
+      ...
+
+      }
+
+      '
+  - metavariable-regex:
+      metavariable: $MEMBER
+      regex: ((.*)-compute@developer.gserviceaccount.com)
+  message: Ensure default service account is not used at an organization level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-org-member-default-service-account-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_organization_iam_member" "..." {
+
+      ...
+
+      member = $MEMBER
+
+      ...
+
+      }
+
+      '
+  - metavariable-regex:
+      metavariable: $MEMBER
+      regex: ((.*)-compute@developer.gserviceaccount.com)
+  message: Ensure default service account is not used at an organization level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-project-default-network
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_project" "..." {
+
+      ...
+
+      }
+
+      '
+  - pattern-not-inside: 'resource "google_project" "..." {
+
+      ...
+
+      auto_create_network   = false
+
+      ...
+
+      }
+
+      '
+  message: Ensure that the default network does not exist in a project. Set auto_create_network
+    to `false`.
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-project-member-default-service-account-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_project_iam_binding" "..." {
+
+      ...
+
+      members = [..., $MEMBER, ...]
+
+      ...
+
+      }
+
+      '
+  - metavariable-regex:
+      metavariable: $MEMBER
+      regex: ((.*)-compute@developer.gserviceaccount.com)
+  message: Ensure Default Service account is not used at a project level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-project-member-default-service-account-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_project_iam_member" "..." {
+
+      ...
+
+      member = $MEMBER
+
+      ...
+
+      }
+
+      '
+  - metavariable-regex:
+      metavariable: $MEMBER
+      regex: ((.*)-compute@developer.gserviceaccount.com)
+  message: Ensure Default Service account is not used at a project level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-project-service-account-user-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_project_iam_binding" "..." {
+
+        ...
+
+        role = "roles/iam.serviceAccountTokenCreator"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_project_iam_binding" "..." {
+
+        ...
+
+        role = "roles/iam.serviceAccountUser"
+
+        ...
+
+        }
+
+        '
+  message: Ensure that IAM users are not assigned the Service Account User or Service
+    Account Token Creator roles at project level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-project-service-account-user-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_project_iam_member" "..." {
+
+        ...
+
+        role = "roles/iam.serviceAccountTokenCreator"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_project_iam_member" "..." {
+
+        ...
+
+        role = "roles/iam.serviceAccountUser"
+
+        ...
+
+        }
+
+        '
+  message: Ensure that IAM users are not assigned the Service Account User or Service
+    Account Token Creator roles at project level
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-pubsub-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_pubsub_topic\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_pubsub_topic\" $ANYTHING {\n  ...\n  kms_key_name\
+      \ = ...\n  ...\n}\n"
+  message: Ensure PubSub Topics are encrypted with Customer Supplied Encryption Keys
+    (CSEK)
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-pubsub-private-topic-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_pubsub_topic_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allAuthenticatedUsers", ...]
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_pubsub_topic_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allUsers", ...]
+
+        ...
+
+        }
+
+        '
+  message: Ensure that Pub/Sub Topics are not anonymously or publicly accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-pubsub-private-topic-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_pubsub_topic_iam_member" "..." {
+
+        ...
+
+        member = "allUsers"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_pubsub_topic_iam_member" "..." {
+
+        ...
+
+        member = "allAuthenticatedUsers"
+
+        ...
+
+        }
+
+        '
+  message: Ensure that Pub/Sub Topics are not anonymously or publicly accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-run-private-service-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_cloud_run_service_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allAuthenticatedUsers", ...]
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_cloud_run_service_iam_binding" "..." {
+
+        ...
+
+        members = [ ..., "allUsers", ...]
+
+        ...
+
+        }
+
+        '
+  message: Ensure that GCP Cloud Run services are not anonymously or publicly accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-run-private-service-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: 'resource "google_cloud_run_service_iam_member" "..." {
+
+        ...
+
+        member = "allAuthenticatedUsers"
+
+        ...
+
+        }
+
+        '
+    - pattern-inside: 'resource "google_cloud_run_service_iam_member" "..." {
+
+        ...
+
+        member = "allUsers"
+
+        ...
+
+        }
+
+        '
+  message: Ensure that GCP Cloud Run services are not anonymously or publicly accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-spanner-database-encrypted-with-cmk
+  patterns:
+  - pattern: "resource \"google_spanner_database\" $ANYTHING {\n  ...\n}\n"
+  - pattern-not-inside: "resource \"google_spanner_database\" $ANYTHING {\n  ...\n\
+      \  encryption_config {\n    ...\n    kms_key_name = ...\n    ...\n  }\n  ...\n\
+      }\n"
+  message: Ensure Spanner Database is encrypted with Customer Supplied Encryption
+    Keys (CSEK)
+  metadata:
+    category: security
+    technology:
+    - terraform
+    - gcp
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    cwe:
+    - 'CWE-320: CWE CATEGORY: Key Management Errors'
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-sql-database-require-ssl
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_sql_database_instance\" \"...\" {\n    ...\n\
+      }\n"
+  - pattern-not-inside: "resource \"google_sql_database_instance\" \"...\" {\n   \
+      \ ...\n    ip_configuration {\n        ...\n        require_ssl = true\n   \
+      \     ...\n    }\n    ...\n}\n"
+  - pattern-not-inside: "resource \"google_sql_database_instance\" \"...\" {\n   \
+      \ ...\n    ip_configuration {\n        ...\n        ssl_mode = ...\n       \
+      \ ...\n    }\n    ...\n}\n"
+  message: Ensure all Cloud SQL database instance requires all incoming connections
+    to use SSL
+  metadata:
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-326: Inadequate Encryption Strength'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-sql-public-database
+  patterns:
+  - pattern: resource
+  - pattern-either:
+    - pattern-inside: "resource \"google_sql_database_instance\" \"...\" {\n...\n\
+        ip_configuration {\n  ...\n  authorized_networks {\n    ...\n    value = \"\
+        0.0.0.0/0\"\n    ...\n  }\n  ...\n}\n...\n}\n"
+    - pattern-inside: "resource \"google_sql_database_instance\" \"...\" {\n...\n\
+        ip_configuration {\n  ...\n  dynamic \"authorized_networks\" {\n    ...\n\
+        \    content {\n      ...\n      value = \"0.0.0.0/0\"\n      ...\n    }\n\
+        \    ...\n  }\n  ...\n}\n...\n}\n"
+  message: Ensure that Cloud SQL database Instances are not open to the world
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-sqlserver-no-public-ip
+  patterns:
+  - pattern: resource
+  - pattern-inside: "resource \"google_sql_database_instance\" \"...\" {\n...\nip_configuration\
+      \ {\n  ...\n  ipv4_enabled = true\n  ...\n}\n...\n}\n"
+  message: Ensure Cloud SQL database does not have public IP
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-storage-bucket-not-public-iam-binding
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_storage_bucket_iam_binding" "..." {
+
+      ...
+
+      members = [ ..., "allAuthenticatedUsers", ...]
+
+      ...
+
+      }
+
+      '
+  message: Ensure that Container Registry repositories are not anonymously or publicly
+    accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING
+- id: gcp-storage-bucket-not-public-iam-member
+  patterns:
+  - pattern: resource
+  - pattern-inside: 'resource "google_storage_bucket_iam_member" "..." {
+
+      ...
+
+      member = "allUsers"
+
+      ...
+
+      }
+
+      '
+  message: Ensure that Container Registry repositories are not anonymously or publicly
+    accessible
+  metadata:
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    category: security
+    technology:
+    - terraform
+    - gcp
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - hcl
+  severity: WARNING

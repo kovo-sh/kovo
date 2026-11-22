@@ -1,0 +1,29 @@
+id: "ibm-decision-runner"
+name: "IBM Decision Runner - Detect"
+severity: "info"
+description: "IBM Decision Runner Service was detected."
+tech:
+  - "generic"
+tags:
+  - "ibm"
+  - "detect"
+  - "tech"
+  - "ibm-decision-runner"
+  - "discovery"
+reference: "https://www.ibm.com/docs/en/odm/8.8.1?topic=simulation-tuning-decision-runner-web-application"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/DecisionRunner/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Decision Runner</title>"
+  - type: "status"
+    status:
+      - 200

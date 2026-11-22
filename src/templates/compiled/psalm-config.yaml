@@ -1,0 +1,38 @@
+id: "psalm-config"
+name: "Psalm Configuration Exposure - Detect"
+severity: "low"
+description: "Psalm configuration page was detected."
+tech:
+  - "php"
+tags:
+  - "devops"
+  - "exposure"
+  - "php"
+  - "psalm"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://psalm.dev/docs/running_psalm/configuration/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/psalm.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<psalm"
+      - "<projectFiles"
+      - "xmlns:xsi"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/xml"
+  - type: "status"
+    status:
+      - 200

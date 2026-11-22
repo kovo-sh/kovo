@@ -1,0 +1,98 @@
+rules:
+- id: nestjs-header-cors-any
+  message: Access-Control-Allow-Origin response header is set to "*". This will disable
+    CORS Same Origin Policy restrictions.
+  metadata:
+    cwe:
+    - 'CWE-183: Permissive List of Allowed Inputs'
+    asvs:
+      section: 'V14: Configuration Verification Requirements'
+      control_id: 14.4.8 Permissive CORS
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x22-V14-Config.md#v144-http-security-headers-requirements
+      version: '4'
+    category: security
+    technology:
+    - nestjs
+    owasp:
+    - A04:2021 - Insecure Design
+    references:
+    - https://owasp.org/Top10/A04_2021-Insecure_Design
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - typescript
+  severity: WARNING
+  pattern-either:
+  - pattern: "class $CN {\n    @Header(\"=~/[Aa][Cc][Cc][Ee][Ss][Ss]-[Cc][Oo][Nn][Tt][Rr][Oo][Ll]-[Aa][Ll][Ll][Oo][Ww]-[Oo][Rr][Ii][Gg][Ii][Nn]/\"\
+      , '*')\n    $FN(...) {\n        ...\n    }\n}\n"
+  - pattern: 'NestFactory.create($MODULE, {cors: true})
+
+      '
+  - pattern: 'NestFactory.create($MODULE, {cors: {origin: ''*''}})
+
+      '
+  - pattern: '$APP.enableCors()
+
+      '
+  - pattern: '$APP.enableCors({origin: ''*''})
+
+      '
+- id: nestjs-header-xss-disabled
+  message: X-XSS-Protection header is set to 0. This will disable the browser's XSS
+    Filter.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    category: security
+    technology:
+    - nestjs
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - typescript
+  severity: WARNING
+  pattern: "class $CN {\n    ...\n    @Header(\"=~/[Xx]-[Xx][Ss][Ss]-[Pp][Rr][Oo][Tt][Ee][Cc][Tt][Ii][Oo][Nn]/\"\
+    , '0')\n    $FN(...) {\n        ...\n    }\n    ...\n}\n"
+- id: nestjs-open-redirect
+  message: 'Untrusted user input in {url: ...} can result in Open Redirect vulnerability.'
+  metadata:
+    cwe:
+    - 'CWE-601: URL Redirection to Untrusted Site (''Open Redirect'')'
+    category: security
+    technology:
+    - nestjs
+    owasp:
+    - A01:2021 - Broken Access Control
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - typescript
+  severity: WARNING
+  patterns:
+  - pattern: 'return {url: $URL}
+
+      '
+  - pattern-inside: "class $CN {\n    @Redirect(...)\n    $FN(...) {\n        ...\n\
+      \    }\n}\n"
+  - pattern-not: 'return {url: "..."}
+
+      '

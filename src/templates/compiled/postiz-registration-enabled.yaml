@@ -1,0 +1,29 @@
+id: "postiz-registration-enabled"
+name: "Postiz - User Registration Enabled"
+severity: "info"
+description: "Postiz registration page is exposed and allows public account creation. Unrestricted registration may allow unauthorized users to create accounts."
+tech:
+  - "generic"
+tags:
+  - "postiz"
+  - "misconfig"
+  - "exposure"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/auth"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Postiz Register</title>"
+      - "Create Account</div></button>"
+      - "Sign Up</h1>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

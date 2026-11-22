@@ -1,0 +1,34 @@
+id: "phpsec-config"
+name: "phpspec Config - Detect"
+severity: "info"
+description: "phpspec configuration information was detected."
+tech:
+  - "php"
+tags:
+  - "exposure"
+  - "phpsec"
+  - "php"
+  - "devops"
+  - "cicd"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://phpspec.net/en/stable/cookbook/configuration.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.phpspec.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "suites:"
+      - "main:"
+      - "namespace:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

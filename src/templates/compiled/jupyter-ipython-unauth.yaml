@@ -1,0 +1,29 @@
+id: "jupyter-ipython-unauth"
+name: "Jupyter ipython - Authorization Bypass"
+severity: "critical"
+description: "Jupyter was able to be accessed without authentication."
+tech:
+  - "generic"
+tags:
+  - "unauth"
+  - "jupyter"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-288"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ipython/tree"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "ipython/static/components"
+      - "ipython/kernelspecs"

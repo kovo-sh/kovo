@@ -1,0 +1,30 @@
+id: "unifi-wizard-install"
+name: "UniFi Wizard Installer"
+severity: "high"
+description: "UniFi Wizard is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "unifi"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/manage/wizard/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "UniFi Wizard"
+      - "app-unifi-wizard"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

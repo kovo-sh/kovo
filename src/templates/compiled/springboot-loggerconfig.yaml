@@ -1,0 +1,38 @@
+id: "springboot-loggerconfig"
+name: "Spring Boot LoggerConfig Actuator Panel - Detect"
+severity: "info"
+description: "Spring Boot LoggerConfig Actuator panel was detected."
+tech:
+  - "springboot"
+  - "actuator"
+tags:
+  - "misconfig"
+  - "springboot"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://raw.githubusercontent.com/maurosoria/dirsearch/master/db/dicc.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/loggingConfig"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[\"loggingConfig\"]"
+      - "\"propertySources\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+      - "application/vnd.spring-boot.actuator"
+      - "application/vnd.spring-boot.actuator.v1+json"
+  - type: "status"
+    status:
+      - 200

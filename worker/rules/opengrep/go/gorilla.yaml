@@ -1,0 +1,188 @@
+rules:
+- id: handler-assignment-from-multiple-sources
+  metadata:
+    cwe:
+    - 'CWE-289: Authentication Bypass by Alternate Name'
+    category: security
+    technology:
+    - gorilla
+    confidence: MEDIUM
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    references:
+    - https://cwe.mitre.org/data/definitions/289.html
+    subcategory:
+    - audit
+    impact: MEDIUM
+    likelihood: LOW
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-inside: "func $HANDLER(..., $R *http.Request, ...) {\n  ...\n}\n"
+    - focus-metavariable: $R
+    - pattern-either:
+      - pattern: $R.query
+  pattern-sinks:
+  - patterns:
+    - pattern: '$Y, err := store.Get(...)
+
+        ...
+
+        $VAR := $Y.Values[...]
+
+        ...
+
+        $VAR = $R
+
+        '
+    - focus-metavariable: $R
+  - patterns:
+    - pattern: '$Y, err := store.Get(...)
+
+        ...
+
+        var $VAR $INT = $Y.Values["..."].($INT)
+
+        ...
+
+        $VAR = $R
+
+        '
+    - focus-metavariable: $R
+  message: 'Variable $VAR is assigned from two different sources: ''$Y'' and ''$R''.
+    Make sure this is intended, as this could cause logic bugs if they are treated
+    as they are the same object.'
+  languages:
+  - go
+  severity: WARNING
+- id: session-cookie-missing-httponly
+  patterns:
+  - pattern-not-inside: "&sessions.Options{\n  ...,\n  HttpOnly: true,\n  ...,\n}\n"
+  - pattern: "&sessions.Options{\n  ...,\n}\n"
+  message: A session cookie was detected without setting the 'HttpOnly' flag. The
+    'HttpOnly' flag for cookies instructs the browser to forbid client-side scripts
+    from reading the cookie which mitigates XSS attacks. Set the 'HttpOnly' flag by
+    setting 'HttpOnly' to 'true' in the Options struct.
+  metadata:
+    cwe:
+    - 'CWE-1004: Sensitive Cookie Without ''HttpOnly'' Flag'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://github.com/0c34/govwa/blob/139693e56406b5684d2a6ae22c0af90717e149b8/user/session/session.go#L69
+    category: security
+    technology:
+    - gorilla
+    confidence: MEDIUM
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+  fix-regex:
+    regex: (HttpOnly\s*:\s+)false
+    replacement: \1true
+  severity: WARNING
+  languages:
+  - go
+- id: session-cookie-missing-secure
+  patterns:
+  - pattern-not-inside: "&sessions.Options{\n  ...,\n  Secure: true,\n  ...,\n}\n"
+  - pattern: "&sessions.Options{\n  ...,\n}\n"
+  message: A session cookie was detected without setting the 'Secure' flag. The 'secure'
+    flag for cookies prevents the client from transmitting the cookie over insecure
+    channels such as HTTP. Set the 'Secure' flag by setting 'Secure' to 'true' in
+    the Options struct.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://github.com/0c34/govwa/blob/139693e56406b5684d2a6ae22c0af90717e149b8/user/session/session.go#L69
+    category: security
+    technology:
+    - gorilla
+    confidence: MEDIUM
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+  fix-regex:
+    regex: (Secure\s*:\s+)false
+    replacement: \1true
+  severity: WARNING
+  languages:
+  - go
+- id: session-cookie-samesitenone
+  patterns:
+  - pattern-inside: "&sessions.Options{\n  ...,\n  SameSite: http.SameSiteNoneMode,\n\
+      \  ...,\n}\n"
+  - pattern: "&sessions.Options{\n  ...,\n}\n"
+  message: Found SameSiteNoneMode setting in Gorilla session options. Consider setting
+    SameSite to Lax, Strict or Default for enhanced security.
+  metadata:
+    cwe:
+    - 'CWE-1275: Sensitive Cookie with Improper SameSite Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://pkg.go.dev/github.com/gorilla/sessions#Options
+    category: security
+    technology:
+    - gorilla
+    confidence: MEDIUM
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+  fix-regex:
+    regex: (SameSite\s*:\s+)http.SameSiteNoneMode
+    replacement: \1http.SameSiteDefaultMode
+  severity: WARNING
+  languages:
+  - go
+- id: websocket-missing-origin-check
+  patterns:
+  - pattern-inside: 'import ("github.com/gorilla/websocket")
+
+      ...
+
+      '
+  - patterns:
+    - pattern-not-inside: '$UPGRADER = websocket.Upgrader{..., CheckOrigin: $FN ,...}
+
+        ...
+
+        '
+    - pattern-not-inside: '$UPGRADER.CheckOrigin = $FN2
+
+        ...
+
+        '
+    - pattern: '$UPGRADER.Upgrade(...)
+
+        '
+  message: 'The Origin header in the HTTP WebSocket handshake is used to guarantee
+    that the connection accepted by the WebSocket is from a trusted origin domain.
+    Failure to enforce can lead to Cross Site Request Forgery (CSRF). As per "gorilla/websocket"
+    documentation: "A CheckOrigin function should carefully validate the request origin
+    to prevent cross-site request forgery."'
+  languages:
+  - go
+  severity: WARNING
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    references:
+    - https://pkg.go.dev/github.com/gorilla/websocket#Upgrader
+    technology:
+    - gorilla
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW

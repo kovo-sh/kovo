@@ -1,0 +1,29 @@
+id: "perl-status"
+name: "Apache Mod_perl Status Page - Detect"
+severity: "medium"
+description: "Apache mod_perl status page was detected."
+tech:
+  - "apache"
+tags:
+  - "config"
+  - "exposure"
+  - "apache"
+  - "status"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://perl.apache.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/perl-status"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Apache2::Status"
+      - "Perl version"
+    condition: "and"

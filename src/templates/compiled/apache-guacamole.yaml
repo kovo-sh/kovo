@@ -1,0 +1,28 @@
+id: "apache-guacamole"
+name: "Apache Guacamole Login Page and version detection"
+severity: "info"
+description: "Safe check derived from apache-guacamole: Apache Guacamole Login Page and version detection"
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "guacamole"
+  - "tech"
+  - "login"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/translations/en.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Apache Guacamole"
+  - type: "status"
+    status:
+      - 200

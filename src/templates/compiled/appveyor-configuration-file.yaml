@@ -1,0 +1,30 @@
+id: "appveyor-configuration-file"
+name: "AppVeyor Configuration Page - Detect"
+severity: "medium"
+description: "AppVeyor configuration page was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "devops"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.appveyor.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "install:"
+      - "test_script:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

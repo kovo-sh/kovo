@@ -1,0 +1,33 @@
+id: "victoriametrics-vmagent-api-exposure"
+name: "VictoriaMetrics vmagent - Unauthenticated Targets Exposure"
+severity: "low"
+description: "VictoriaMetrics vmagent targets endpoint is exposed without authentication, leaking internal service inventory and scrape configuration."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "victoriametrics"
+  - "vmagent"
+  - "unauth"
+  - "misconfig"
+reference: "https://docs.victoriametrics.com/victoriametrics/vmagent/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/targets"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"activeTargets\""
+  - type: "word"
+    part: "header"
+    words:
+      - "X-Server-Hostname"
+  - type: "status"
+    status:
+      - 200

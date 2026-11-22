@@ -1,0 +1,28 @@
+id: "snipeit-panel"
+name: "Snipe-IT Panel - Detect"
+severity: "info"
+description: "Snipe-IT panel was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "snipeit"
+  - "tech"
+  - "discovery"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "window.snipeit"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,29 @@
+id: "librenms-installer"
+name: "LibreNMS Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed LibreNMS installation page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "librenms"
+  - "vuln"
+reference: "https://docs.librenms.org/Installation/Install-LibreNMS/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/checks"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "LibreNMS Install"
+  - type: "status"
+    status:
+      - 200

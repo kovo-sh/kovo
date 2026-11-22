@@ -1,0 +1,36 @@
+id: "phpwind-installer"
+name: "phpwind Installer Exposure"
+severity: "high"
+description: "phpwind is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "phpwind"
+  - "exposure"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php?a=check"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Powered by phpwind</title>"
+      - "安装"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "You have installed. To reinstall, you need to clear the data/install.lock file"
+      - "您已经安装过，需要重新安装请先删除data/install.lock文件"
+    negative: true
+  - type: "status"
+    status:
+      - 200

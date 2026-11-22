@@ -48,7 +48,10 @@ function tokenize(src: string): Line[] {
     const stripped = stripComment(rawLines[n]).replace(/\s+$/, '')
     if (!stripped.trim()) continue
     if (/^\t/.test(stripped)) throw new MiniYamlError('tabs are not allowed for indentation', n + 1)
-    if (/^---\s*$/.test(stripped) && out.length === 0) continue
+    if (/^(?:---|\.\.\.)\s*$/.test(stripped)) {
+      if (/^---\s*$/.test(stripped) && out.length === 0) continue
+      throw new MiniYamlError('multi-document streams are not supported', n + 1)
+    }
     const indent = stripped.length - stripped.trimStart().length
     out.push({ indent, text: stripped.trimStart(), no: n + 1 })
   }
@@ -58,7 +61,15 @@ function tokenize(src: string): Line[] {
 function unquote(s: string, no: number): string {
   if (s.startsWith('"')) {
     if (!s.endsWith('"') || s.length < 2) throw new MiniYamlError('unterminated double-quoted string', no)
-    return s.slice(1, -1).replace(/\\(["\\nrt/])/g, (_m, c: string) => (c === 'n' ? '\n' : c === 'r' ? '\r' : c === 't' ? '\t' : c))
+    return s.slice(1, -1).replace(/\\(["\\nrtbf/]|u[0-9a-fA-F]{4})/g, (_m, c: string) => {
+      if (c === 'n') return '\n'
+      if (c === 'r') return '\r'
+      if (c === 't') return '\t'
+      if (c === 'b') return '\b'
+      if (c === 'f') return '\f'
+      if (c.startsWith('u')) return String.fromCharCode(parseInt(c.slice(1), 16))
+      return c
+    })
   }
   if (!s.endsWith("'") || s.length < 2) throw new MiniYamlError('unterminated single-quoted string', no)
   return s.slice(1, -1).replaceAll("''", "'")
@@ -96,7 +107,10 @@ function findKeySplit(text: string): number {
     const ch = text[i]
     if (quote) {
       if (ch === '\\' && quote === '"') { i += 1; continue }
-      if (ch === quote) quote = null
+      if (ch === quote) {
+        if (quote === "'" && text[i + 1] === "'") { i += 1; continue }
+        quote = null
+      }
       continue
     }
     if (ch === '"' || ch === "'") { if (i === 0) quote = ch; continue }
@@ -118,10 +132,19 @@ function parseInline(raw: string, no: number): unknown {
     const inner = s.slice(1, -1)
     const obj: Record<string, unknown> = {}
     for (const part of splitTopLevel(inner, ',').map(p => p.trim()).filter(p => p !== '')) {
-      const at = findKeySplit(part.endsWith(':') ? part : part)
+      const at = findKeySplit(part)
       if (at < 0) throw new MiniYamlError(`invalid flow map entry "${part}"`, no)
       const k = part.slice(0, at).trim()
-      const key = k.startsWith('"') || k.startsWith("'") ? unquote(k, no) : k
+      const quoted = k.startsWith('"') || k.startsWith("'")
+      if (!quoted && /^[&*!|>]/.test(k)) {
+        throw new MiniYamlError(`unsupported YAML construct "${k[0]}"`, no)
+      }
+      const key = quoted ? unquote(k, no) : k
+      if (key === '<<') throw new MiniYamlError('merge keys are not supported', no)
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        throw new MiniYamlError(`forbidden key "${key}"`, no)
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, key)) throw new MiniYamlError(`duplicate key "${key}"`, no)
       obj[key] = parseInline(part.slice(at + 1), no)
     }
     return obj
@@ -151,7 +174,14 @@ function parseMap(ctx: Ctx, indent: number): Record<string, unknown> {
     const at = findKeySplit(line.text)
     if (at < 0) throw new MiniYamlError(`expected "key: value" but found "${line.text}"`, line.no)
     const rawKey = line.text.slice(0, at).trim()
-    const key = rawKey.startsWith('"') || rawKey.startsWith("'") ? unquote(rawKey, line.no) : rawKey
+    const isQuoted = rawKey.startsWith('"') || rawKey.startsWith("'")
+    if (!isQuoted && /^[&*!|>]/.test(rawKey)) {
+      throw new MiniYamlError(`unsupported YAML construct "${rawKey[0]}"`, line.no)
+    }
+    const key = isQuoted ? unquote(rawKey, line.no) : rawKey
+    if (key === '<<') {
+      throw new MiniYamlError('merge keys are not supported', line.no)
+    }
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
       throw new MiniYamlError(`forbidden key "${key}"`, line.no)
     }

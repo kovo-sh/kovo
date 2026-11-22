@@ -1,0 +1,31 @@
+id: "httpd-config"
+name: "Apache httpd Config File - Detect"
+severity: "info"
+description: "Apache httpd configuration information was detected."
+tech:
+  - "apache"
+tags:
+  - "config"
+  - "exposure"
+  - "httpd"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://httpd.apache.org/docs/current/configuring.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/httpd.conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "LoadModule"
+      - "# LoadModule"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

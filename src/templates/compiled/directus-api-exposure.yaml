@@ -1,0 +1,31 @@
+id: "directus-api-exposure"
+name: "Directus Server Info - Unauthenticated Fingerprint"
+severity: "info"
+description: "Directus /server/info endpoint is exposed without authentication, leaking project metadata and license configuration."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "directus"
+  - "fingerprint"
+  - "unauth"
+reference: "https://directus.io/docs/api/server"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/server/info"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"display_powered_by\""
+      - "\"DIRECTUS\""
+      - "\"entitlements\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

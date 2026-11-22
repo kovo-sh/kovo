@@ -1,0 +1,36 @@
+id: "vagrantfile-exposure"
+name: "Vagrantfile Exposure"
+severity: "low"
+description: "Vagrantfile is exposed to external users."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vagrant"
+  - "oss"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Vagrantfile"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "./vagrant/config/vagrant-local.yml"
+      - "./vagrant/config/vagrant-local.example.yml"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200

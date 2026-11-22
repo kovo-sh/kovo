@@ -36,8 +36,41 @@ export interface ApprovedEndpointPattern {
   createdAt?: number
 }
 
+export const approvedEndpointPatternSchema = z.object({
+  origin: z.string().trim().min(1).max(253),
+  method: z.string().trim().min(1).max(16),
+  pathPattern: z.string().trim().min(1).max(512),
+  scopeRevision: z.number().int().nonnegative().optional(),
+  createdAt: z.number().int().nonnegative().optional(),
+})
+
 export const thinkingLevels = ['off', 'low', 'medium', 'high'] as const
 export type ThinkingLevel = typeof thinkingLevels[number]
+
+export const roleAffinities = ['reasoning', 'tactical', 'fast', 'any'] as const
+export type RoleAffinity = typeof roleAffinities[number]
+
+export const specialistProfiles = [
+  'bola-bfla-specialist',
+  'injection-parser-specialist',
+  'auth-session-oauth-specialist',
+  'client-browser-dom-specialist',
+  'graphql-api-specialist',
+  'business-logic-race-specialist',
+  'protocol-cache-edge-specialist',
+] as const
+export type SpecialistProfile = typeof specialistProfiles[number]
+
+export const endpointSources = ['spa_crawl', 'js_ast', 'openapi', 'graphql', 'repo_ast', 'surface_probe'] as const
+export type EndpointSource = typeof endpointSources[number]
+
+export const paramLocations = ['query', 'json', 'form', 'path', 'header', 'xml', 'graphql_var', 'cookie'] as const
+export type ParamLocation = typeof paramLocations[number]
+
+export const secondOrderCanaryStatuses = ['planted', 'surfaced', 'verified'] as const
+export type SecondOrderCanaryStatus = typeof secondOrderCanaryStatuses[number]
+
+export const maxInlineVerifyRetries = 2
 
 export const httpMethods = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
 export type HttpMethod = typeof httpMethods[number]
@@ -60,6 +93,56 @@ export type CallerCompatibility = typeof callerCompatibilities[number]
 export const dynamicRetestVerdicts = ['fixed', 'reproduced', 'skipped'] as const
 export type DynamicRetestVerdict = typeof dynamicRetestVerdicts[number]
 
+export const inlineVerifyFeedbackSchema = z.object({
+  verdict: z.enum(['confirmed', 'static_verified', 'dismissed', 'inconclusive']),
+  verificationTier: z.enum(verificationTiers).optional(),
+  failedStepId: z.string().optional(),
+  controlPassed: z.boolean(),
+  requireControlNonErrorTriggered: z.boolean().optional(),
+  spaCatchallMatched: z.boolean().optional(),
+  spaSimilarityScore: z.number().optional(),
+  canaryTriggered: z.boolean().optional(),
+  jqError: z.string().optional(),
+  assertionSummary: z.object({
+    observed: z.string(),
+    expected: z.string(),
+    reason: z.string().optional(),
+  }).optional(),
+  stepStatuses: z.array(z.object({
+    id: z.string(),
+    role: z.string(),
+    status: z.number().int().nullable(),
+    mediaType: z.string().optional(),
+    bodyLen: z.number().int().nonnegative(),
+  })),
+  retriesRemaining: z.number().int().nonnegative(),
+})
+export type InlineVerifyFeedback = z.output<typeof inlineVerifyFeedbackSchema>
+
+export const failureTaxonomyBuckets = [
+  'surface_miss',
+  'hypothesis_miss',
+  'form_encoding_missing',
+  'csrf_blocked',
+  'context_reset',
+  'tier_blocked',
+  'trigger_miss',
+  'jq_assertion_bug',
+  'spa_catchall_fp',
+  'replay_spec_miss',
+  'budget_exhausted',
+] as const
+export type FailureTaxonomyBucket = typeof failureTaxonomyBuckets[number]
+
+export interface BenchmarkFunnel {
+  targetVulns: number
+  surfaceDiscovered: number
+  hypothesisFormed: number
+  signalObserved: number
+  specSubmitted: number
+  zeroLlmConfirmed: number
+}
+
 export const codeLocationSchema = z.object({
   repo: z.string().trim().min(1).max(200),
   file: z.string().trim().min(1).max(500),
@@ -70,6 +153,24 @@ export const codeLocationSchema = z.object({
 })
 export type CodeLocation = z.output<typeof codeLocationSchema>
 
+export const iastRuntimes = ['node', 'python', 'jvm', 'generic'] as const
+export type IastRuntime = typeof iastRuntimes[number]
+
+export const labServiceSchema = z.object({
+  name: z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+  image: z.string().trim().min(1).max(300).optional(),
+  dockerfile: z.string().trim().min(1).max(300).optional(),
+  startCommand: z.string().trim().min(1).max(500).optional(),
+  internalPort: z.number().int().min(1).max(65_535).optional(),
+  healthPath: z.string().trim().startsWith('/').max(256).optional(),
+  env: z.record(z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/), z.string().max(1024)).optional(),
+  memoryLimit: z.string().trim().max(32).optional(),
+  cpus: z.string().trim().max(16).optional(),
+  pidsLimit: z.number().int().min(16).max(1024).optional(),
+  dependsOn: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
+})
+export type LabServiceConfig = z.output<typeof labServiceSchema>
+
 export const labConfigSchema = z.object({
   enabled: z.boolean().default(false),
   repo: z.string().trim().min(1).max(200).optional(),
@@ -78,6 +179,17 @@ export const labConfigSchema = z.object({
   dockerComposeFile: z.string().trim().min(1).max(300).optional(),
   healthPath: z.string().trim().startsWith('/').max(256).default('/'),
   internalPort: z.number().int().min(1).max(65_535).optional(),
+  image: z.string().trim().min(1).max(300).optional(),
+  env: z.record(z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/), z.string().max(1024)).optional(),
+  buildTimeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+  healthTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+  memoryLimit: z.string().trim().max(32).optional(),
+  cpus: z.string().trim().max(16).optional(),
+  pidsLimit: z.number().int().min(16).max(1024).optional(),
+  services: z.array(labServiceSchema).max(6).optional(),
+  seedCommand: z.string().trim().min(1).max(500).optional(),
+  iastEnabled: z.boolean().optional(),
+  iastRuntime: z.enum(iastRuntimes).optional(),
 })
 export type LabConfig = z.output<typeof labConfigSchema>
 
@@ -195,6 +307,7 @@ export const newProject = z.object({
   seeds: z.array(z.string().trim().min(1).max(253)).min(1).max(maxProjectSeeds),
   environment: z.enum(['public', 'local-lab']).default('public'),
   labConfig: labConfigSchema.optional(),
+  sandboxWriteAllowlist: z.array(approvedEndpointPatternSchema).max(100).optional(),
 }).transform((data, ctx) => {
   const originSchema = assetOriginForEnvironment(data.environment)
   const normalizedSeeds: string[] = []
@@ -229,6 +342,7 @@ export const newRun = z.object({
   maxRpsPerOrigin: z.number().int().min(1).max(maxRpsPerOriginCeiling).default(defaultMaxRpsPerOrigin),
   workerConcurrency: z.number().int().min(1).max(maxWorkerConcurrency).default(defaultWorkerConcurrency),
   workerMaxTurns: z.number().int().min(1).max(maxWorkerMaxTurns).default(defaultWorkerMaxTurns),
+  multiTrialEnabled: z.boolean().default(true),
 })
 
 export const referrerPolicies = [
@@ -613,6 +727,7 @@ export const DEFAULT_PROVIDER = {
   contextWindow: 1_048_576,
   maxTokens: 16_384,
   thinkingLevel: 'medium' as ThinkingLevel,
+  roleAffinity: 'any' as RoleAffinity,
   inputCostPerMtok: 0.15,
   cachedInputCostPerMtok: 0.003,
   outputCostPerMtok: 0.60,
@@ -642,6 +757,7 @@ export const providerSettings = z.object({
   contextWindow: z.number().int().min(32_000).max(2_000_000).default(DEFAULT_PROVIDER.contextWindow),
   maxTokens: z.number().int().min(512).max(393_216).default(DEFAULT_PROVIDER.maxTokens),
   thinkingLevel: z.enum(thinkingLevels).default(DEFAULT_PROVIDER.thinkingLevel),
+  roleAffinity: z.enum(roleAffinities).default(DEFAULT_PROVIDER.roleAffinity),
   inputCostPerMtok: z.number().min(0).max(500).default(DEFAULT_PROVIDER.inputCostPerMtok),
   cachedInputCostPerMtok: z.number().min(0).max(500).default(DEFAULT_PROVIDER.cachedInputCostPerMtok),
   outputCostPerMtok: z.number().min(0).max(500).default(DEFAULT_PROVIDER.outputCostPerMtok),
@@ -670,6 +786,7 @@ export interface PublicModelProfile {
   contextWindow: number
   maxTokens: number
   thinkingLevel: ThinkingLevel
+  roleAffinity: RoleAffinity
   inputCostPerMtok: number
   cachedInputCostPerMtok: number
   outputCostPerMtok: number

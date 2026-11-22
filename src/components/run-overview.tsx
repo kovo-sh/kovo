@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { exportSarifAction } from '../actions.ts'
+import { checkRunLabHealthAction, exportSarifAction, startRunLabAction, stopRunLabAction } from '../actions.ts'
 import {
   approvalPolicies,
   assessmentCheckTitles,
@@ -84,18 +84,22 @@ function isHeaderHygiene(f: Finding) {
 
 const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, informational: 4 }
 
-export function RunOverview({ detail, history, execute, openEvidence, pending }: {
+export function RunOverview({ detail, history, execute, openEvidence, pending, refreshRun }: {
   detail: RunDetail
   history: ReadonlyMap<string, string>
   execute: (command: Command, onSuccess?: () => void) => void
   openEvidence: (id: string) => void
   pending: boolean
+  refreshRun?: () => Promise<void>
 }) {
   const { run, project, assignments, evidence, approvals, personas, threatModel } = detail
   const plan = run.reviewPlan
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState<ScopeDraft>()
   const [exportingSarif, setExportingSarif] = useState(false)
+  const [labPending, setLabPending] = useState(false)
+  const [labStatusMsg, setLabStatusMsg] = useState('')
+  const [labErrorMsg, setLabErrorMsg] = useState('')
   const [hygieneOpen, setHygieneOpen] = useState(false)
   const [auditLogOpen, setAuditLogOpen] = useState(false)
   const [threatOpen, setThreatOpen] = useState(false)
@@ -145,6 +149,50 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
       downloadSarifBlob(res.content, res.filename)
     } finally {
       setExportingSarif(false)
+    }
+  }
+
+  async function handleLabStart() {
+    setLabPending(true)
+    setLabErrorMsg('')
+    setLabStatusMsg('')
+    try {
+      const res = await startRunLabAction({ data: { runId: run.id } })
+      setLabStatusMsg(res.target ? `Lab running at ${res.target.origin}` : 'Lab started.')
+      await refreshRun?.()
+    } catch (err) {
+      setLabErrorMsg(err instanceof Error ? err.message : 'Failed to start lab stack.')
+    } finally {
+      setLabPending(false)
+    }
+  }
+
+  async function handleLabStop() {
+    setLabPending(true)
+    setLabErrorMsg('')
+    setLabStatusMsg('')
+    try {
+      await stopRunLabAction({ data: { runId: run.id } })
+      setLabStatusMsg('Lab stack stopped (0 orphan containers).')
+      await refreshRun?.()
+    } catch (err) {
+      setLabErrorMsg(err instanceof Error ? err.message : 'Failed to stop lab stack.')
+    } finally {
+      setLabPending(false)
+    }
+  }
+
+  async function handleLabHealth() {
+    setLabPending(true)
+    setLabErrorMsg('')
+    try {
+      const res = await checkRunLabHealthAction({ data: { runId: run.id } })
+      setLabStatusMsg(res.message)
+      await refreshRun?.()
+    } catch (err) {
+      setLabErrorMsg(err instanceof Error ? err.message : 'Health check failed.')
+    } finally {
+      setLabPending(false)
     }
   }
 
@@ -226,6 +274,63 @@ export function RunOverview({ detail, history, execute, openEvidence, pending }:
         </span>
       </div>
     </section>
+
+    {project.environment === 'local-lab' && <section className="overview-card lab-runner-panel" aria-label="Local lab runner">
+      <div className="section-heading">
+        <div>
+          <div className="inline-badges">
+            <h2>Local lab runner</h2>
+            <span className={`badge ${detail.labTarget ? 'badge-complete' : project.labConfig?.enabled ? 'badge-trace' : ''}`}>
+              {detail.labTarget ? 'Running' : project.labConfig?.enabled ? 'Ready' : 'Disabled'}
+            </span>
+            <span className={`badge ${project.labConfig?.iastEnabled ? 'badge-complete' : ''}`}>
+              {project.labConfig?.iastEnabled ? 'IAST enabled' : 'IAST off'}
+            </span>
+          </div>
+          <p className="muted xs" style={{ marginTop: 4 }}>
+            Isolated Docker <code>--internal</code> stack · Port {project.labConfig?.internalPort ?? 8080} · Health <code>{project.labConfig?.healthPath ?? '/health'}</code>
+            {project.labConfig?.dockerComposeFile && <> · Compose <code>{project.labConfig.dockerComposeFile}</code></>}
+          </p>
+        </div>
+        <div className="toolbar">
+          {detail.labTarget ? <Button type="button" className="btn-danger" disabled={labPending} onClick={() => void handleLabStop()}>
+            Stop lab
+          </Button> : <Button type="button" variant="default" disabled={labPending || !detail.localLabEnvEnabled || !project.labConfig?.enabled} onClick={() => void handleLabStart()}>
+            Start lab
+          </Button>}
+          <Button type="button" variant="ghost" disabled={labPending} onClick={() => void handleLabHealth()}>
+            Health check
+          </Button>
+          <Button type="button" variant="ghost" disabled={labPending} onClick={() => { void refreshRun?.() }}>
+            Refresh
+          </Button>
+        </div>
+      </div>
+      <div className="lab-meta-grid">
+        {project.labConfig?.services && project.labConfig.services.length > 0 && <div className="lab-meta-item">
+          <span className="muted xs">Services </span>
+          <div className="inline-badges">
+            {project.labConfig.services.map(svc => <span key={svc.name} className="badge badge-trace mono">
+              {' '}{svc.name}{svc.internalPort ? `:${svc.internalPort}` : ''}{' '}
+            </span>)}
+          </div>
+        </div>}
+        {project.labConfig?.seedCommand && <div className="lab-meta-item">
+          <span className="muted xs">Seed command </span>
+          <code className="mono xs">{' '}{project.labConfig.seedCommand}{' '}</code>
+        </div>}
+        {detail.labTarget && <div className="lab-meta-item">
+          <span className="muted xs">Loopback origin </span>
+          <code className="mono xs">{' '}{detail.labTarget.origin}{' '}</code>
+        </div>}
+        {(detail.labTelemetry?.length ?? 0) > 0 && <div className="lab-meta-item">
+          <span className="muted xs">IAST telemetry </span>
+          <span className="badge badge-complete mono">{' '}{detail.labTelemetry.length} traces recorded{' '}</span>
+        </div>}
+      </div>
+      {labStatusMsg && <p role="status" className="muted xs" style={{ marginTop: 6 }}>{labStatusMsg}</p>}
+      {labErrorMsg && <p role="alert" className="form-error" style={{ marginTop: 6 }}>{labErrorMsg}</p>}
+    </section>}
 
     {hygieneOpen && hygieneFindings.length > 0 && <section className="overview-card hygiene-drawer">
       <div className="section-heading">

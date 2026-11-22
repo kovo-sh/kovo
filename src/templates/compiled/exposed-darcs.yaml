@@ -1,0 +1,28 @@
+id: "exposed-darcs"
+name: "Darcs Configuration - Detect"
+severity: "info"
+description: "Darcs configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "http://darcs.net/Using/Configuration#sources"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/_darcs/prefs/binaries"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Binary file regexps"
+  - type: "status"
+    status:
+      - 200

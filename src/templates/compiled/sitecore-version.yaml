@@ -1,0 +1,27 @@
+id: "sitecore-version"
+name: "Sitecore version detection"
+severity: "info"
+description: "Safe check derived from sitecore-version: Sitecore version detection"
+tech:
+  - "generic"
+tags:
+  - "sitecore"
+  - "tech"
+  - "discovery"
+reference: "https://www.cvedetails.com/vulnerability-list/vendor_id-9609/Sitecore.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/sitecore/shell/sitecore.version.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "Sitecore Corporation"

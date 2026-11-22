@@ -1,0 +1,236 @@
+rules:
+- id: conf-csrf-headers-bypass
+  patterns:
+  - pattern-either:
+    - pattern: X-Requested-With = "*"
+    - pattern: Csrf-Token = "..."
+  - pattern-inside: 'bypassHeaders {...
+
+      ...
+
+      ...}
+
+      '
+  - pattern-not-inside: "{...\n  ...\n  ...blackList = [...\"application/x-www-form-urlencoded\"\
+      ...\"multipart/form-data\"...\"text/plain\"...]\n  ...\n...}\n"
+  - pattern-not-inside: "{...\n  ...\n  ...blackList = [...\"application/x-www-form-urlencoded\"\
+      ...\"text/plain\"...\"multipart/form-data\"...]\n  ...\n...}\n"
+  - pattern-not-inside: "{...\n  ...\n  ...blackList = [...\"multipart/form-data\"\
+      ...\"application/x-www-form-urlencoded\"...\"text/plain\"...]\n  ...\n...}\n"
+  - pattern-not-inside: "{...\n  ...\n  ...blackList = [...\"multipart/form-data\"\
+      ...\"text/plain\"...\"application/x-www-form-urlencoded\"...]\n  ...\n...}\n"
+  - pattern-not-inside: "{...\n  ...\n  ...blackList = [...\"text/plain\"...\"application/x-www-form-urlencoded\"\
+      ...\"multipart/form-data\"...]\n  ...\n...}\n"
+  - pattern-not-inside: "{...\n  ...\n  ...blackList = [...\"text/plain\"...\"multipart/form-data\"\
+      ...\"application/x-www-form-urlencoded\"...]\n  ...\n...}\n"
+  message: Possibly bypassable CSRF configuration found. CSRF is an attack that forces
+    an end user to execute unwanted actions on a web application in which they’re
+    currently authenticated. Make sure that Content-Type black list is configured
+    and CORS filter is turned on.
+  languages:
+  - generic
+  severity: ERROR
+  paths:
+    include:
+    - '*.conf'
+  metadata:
+    references:
+    - https://www.playframework.com/documentation/2.8.x/Migration25#CSRF-changes
+    - https://owasp.org/www-community/attacks/csrf
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - scala
+    - play
+    confidence: MEDIUM
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+- id: conf-insecure-cookie-settings
+  patterns:
+  - pattern: secure = false
+  - pattern-inside: "session = {\n  ...\n}\n"
+  message: Session cookie `Secure` flag is explicitly disabled. The `secure` flag
+    for cookies prevents the client from transmitting the cookie over insecure channels
+    such as HTTP. Set the `Secure` flag by setting `secure` to `true` in configuration
+    file.
+  languages:
+  - generic
+  severity: WARNING
+  paths:
+    include:
+    - '*.conf'
+  metadata:
+    category: security
+    references:
+    - https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies#security
+    - https://www.playframework.com/documentation/2.8.x/SettingsSession#Session-Configuration
+    technology:
+    - play
+    - scala
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+- id: tainted-slick-sqli
+  mode: taint
+  metadata:
+    references:
+    - https://scala-slick.org/doc/3.3.3/sql.html#splicing-literal-values
+    - https://scala-slick.org/doc/3.2.0/sql-to-slick.html#non-optimal-sql-code
+    category: security
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    technology:
+    - scala
+    - slick
+    - play
+    confidence: HIGH
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+  message: Detected a tainted SQL statement. This could lead to SQL injection if variables
+    in the SQL statement are not properly sanitized. Avoid using using user input
+    for generating SQL strings.
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - patterns:
+        - pattern: $REQ
+        - pattern-either:
+          - pattern-inside: "Action {\n  $REQ: Request[$T] => \n    ...\n}\n"
+          - pattern-inside: "Action(...) {\n  $REQ: Request[$T] => \n    ...\n}\n"
+          - pattern-inside: "Action.async {\n  $REQ: Request[$T] => \n    ...\n}\n"
+          - pattern-inside: "Action.async(...) {\n  $REQ: Request[$T] => \n    ...\n\
+              }\n"
+      - patterns:
+        - pattern: $PARAM
+        - pattern-either:
+          - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = Action {\n  ...\n\
+              }\n"
+          - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = Action(...) {\n\
+              \  ...\n}\n"
+          - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = Action.async {\n\
+              \  ...\n}\n"
+          - pattern-inside: "def $CTRL(..., $PARAM: $TYPE, ...) = Action.async(...)\
+              \ {\n  ...\n}\n"
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: $MODEL.overrideSql(...)
+      - pattern: sql"..."
+    - pattern-inside: 'import slick.$DEPS
+
+        ...
+
+        '
+  severity: ERROR
+  languages:
+  - scala
+- id: twirl-html-var
+  patterns:
+  - pattern-either:
+    - pattern: '@Html($VAL)
+
+        '
+    - pattern: '@Html(...$VAL + ...)
+
+        '
+    - pattern: '@Html(... + $VAL...)
+
+        '
+  - metavariable-regex:
+      metavariable: $VAL
+      regex: \w*
+  message: Raw html content controlled by a variable detected. You may be accidentally
+    bypassing secure methods of rendering HTML by manually constructing HTML and this
+    could create a cross-site scripting vulnerability, which could let attackers steal
+    sensitive user data. Try to avoid using `Html()` or consider properly sanitizing
+    input data.
+  languages:
+  - generic
+  severity: WARNING
+  paths:
+    include:
+    - '*.html'
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://www.playframework.com/documentation/2.8.x/ScalaTemplates#Escaping
+    technology:
+    - scala
+    - play
+    - twirl
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+- id: webservice-ssrf
+  patterns:
+  - pattern: $WS.url($URL)
+  - pattern-either:
+    - pattern-inside: "class $CLASS (..., $WS: WSClient, ...) {\n  ...\n}\n"
+    - pattern-inside: "def $FUNC(..., $WS: WSClient, ...) = {\n  ...\n}\n"
+    - pattern-inside: '$WS = AhcWSClient(...)
+
+        ...
+
+        '
+  - pattern-either:
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = $A {\n  ...\n}\n"
+    - pattern-inside: "def $FUNC(..., $URL: $T, ...) = {\n  ...\n}\n"
+  message: A parameter being passed directly into `WSClient` most likely lead to SSRF.
+    This could allow an attacker to send data to their own server, potentially exposing
+    sensitive data sent with this request. They could also probe internal servers
+    or other resources that the server running this code can access. Do not allow
+    arbitrary hosts. Instead, create an allowlist for approved hosts hardcode the
+    correct host.
+  metadata:
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    owasp:
+    - A10:2021 - Server-Side Request Forgery (SSRF)
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    - https://www.playframework.com/documentation/2.8.x/ScalaWS
+    category: security
+    technology:
+    - scala
+    - play
+    confidence: LOW
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - scala
+  severity: WARNING

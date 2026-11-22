@@ -1,0 +1,31 @@
+id: "apache-jspwiki-ip-userenum"
+name: "Apache JSPWiki - User IP Enumeration"
+severity: "low"
+description: "Enumerates the IP Address and users that is currently accessing an Apache JSPWiki web application, leading open source WikiWiki engine, feature-rich and built around standard JEE components (Java, servlets, JSP)."
+tech:
+  - "apache"
+  - "tomcat"
+  - "java"
+tags:
+  - "jspwiki"
+  - "apache"
+  - "enumeration"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Wiki.jsp?page=SystemInfo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<b>Active Wiki Users</b>"
+      - "Number of active sessions"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

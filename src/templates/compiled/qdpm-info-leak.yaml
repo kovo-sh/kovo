@@ -1,0 +1,31 @@
+id: "qdpm-info-leak"
+name: "qdPM 9.2 - DB Credentials Exposure"
+severity: "high"
+description: "qdPM 9.2 database credentials were discovered."
+tech:
+  - "generic"
+tags:
+  - "qdpm"
+  - "exposure"
+  - "edb"
+  - "vuln"
+reference: "https://www.exploit-db.com/exploits/50176"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/core/config/databases.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "dsn:"
+      - "username:"
+      - "password:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "cabot-detect"
+name: "Cabot - Detect"
+severity: "info"
+description: "Cabot, an open-source monitoring and alerting service, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "cabot"
+  - "monitoring"
+  - "detect"
+reference: "https://github.com/arachnys/cabot"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Cabot by Arachnys</title>"
+      - "/static/arachnys/img/icon_48x48."
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

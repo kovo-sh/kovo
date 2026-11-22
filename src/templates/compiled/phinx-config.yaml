@@ -1,0 +1,31 @@
+id: "phinx-config"
+name: "Phinx Configuration Exposure"
+severity: "medium"
+description: "Phinx configuration file was exposed."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "files"
+  - "vuln"
+reference: "https://book.cakephp.org/phinx/0/en/configuration.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/phinx.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "paths:"
+      - "environments:"
+      - "development:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

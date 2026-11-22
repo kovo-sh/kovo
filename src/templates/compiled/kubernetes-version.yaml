@@ -1,0 +1,29 @@
+id: "kubernetes-version"
+name: "Kubernetes Version Exposure"
+severity: "info"
+description: "Searches for exposed Kubernetes API servers which return version information unauthenticated. For Google Kubernetes Engine (GKE) and Amazon Elastic Kubernetes Service (EKS) this template will extract default patch version for you."
+tech:
+  - "kubernetes"
+tags:
+  - "tech"
+  - "k8s"
+  - "kubernetes"
+  - "devops"
+  - "discovery"
+reference: "https://cloud.google.com/kubernetes-engine/docs/release-notes"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "gitVersion"
+      - "goVersion"
+      - "platform"
+    condition: "and"

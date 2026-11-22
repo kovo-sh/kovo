@@ -1,0 +1,33 @@
+id: "seafile-api"
+name: "Seafile API - Detect"
+severity: "info"
+description: "Seafile API was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "api"
+  - "detect"
+  - "discovery"
+reference: "https://download.seafile.com/published/web-api/home.md"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api2/server-info/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "seafile-basic"
+      - "seafile-pro"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

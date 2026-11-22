@@ -1,0 +1,34 @@
+id: "gitlab-public-snippets"
+name: "GitLab public snippets"
+severity: "info"
+description: "Safe check derived from gitlab-public-snippets: GitLab public snippets"
+tech:
+  - "gitlab"
+tags:
+  - "gitlab"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+reference: "https://gist.github.com/vysecurity/20311c29d879e0aba9dcffbe72a88b10"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/explore/snippets"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Snippets · Explore · GitLab</title>"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "No snippets found"
+      - "Nothing here."
+    negative: true

@@ -1,0 +1,37 @@
+id: "rakefile-disclosure"
+name: "Rakefile - File Disclosure"
+severity: "info"
+description: "Rakefile configuration file was detected."
+tech:
+  - "rails"
+tags:
+  - "devops"
+  - "exposure"
+  - "rakefile"
+  - "config"
+  - "ruby"
+  - "rails"
+  - "vuln"
+reference: "https://ruby.github.io/rake/doc/rakefile_rdoc.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Rakefile"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "application.load_tasks"
+      - "config/application"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "require"
+      - "desc"
+      - "task :"
+    condition: "and"

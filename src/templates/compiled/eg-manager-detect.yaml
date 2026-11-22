@@ -1,0 +1,27 @@
+id: "eg-manager-detect"
+name: "eG Manager Detect"
+severity: "info"
+description: "Safe check derived from eg-manager-detect: eG Manager Detect"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "eg"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/final/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title> eG Innovations, Inc.</title>"
+      - "eG Innovations, Inc. All Rights Reserved"
+  - type: "status"
+    status:
+      - 200

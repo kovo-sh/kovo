@@ -1,0 +1,30 @@
+id: "gokapi-detect"
+name: "Gokapi - Detect"
+severity: "info"
+description: "Gokapi is a self-hosted file-sharing server for expiring downloads."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "gokapi"
+  - "file-sharing"
+  - "detect"
+reference: "https://github.com/Forceu/Gokapi"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Gokapi</title>"
+      - "gokapi.min."
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

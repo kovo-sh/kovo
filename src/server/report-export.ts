@@ -325,7 +325,7 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
           }
         } else if (specRow.spec.kind === 'browser_chain') {
           for (const step of specRow.spec.steps) {
-            lines.push(`${stepNum++}. **[Replay · ${inline(step.role, secrets)} · ${inline(step.action, secrets)}]** ${inline(step.origin + step.pathAndQuery, secrets)} — ${inline(step.description, secrets)}`)
+            lines.push(`${stepNum++}. **[Replay · ${inline(step.role, secrets)} · ${inline(step.action, secrets)}]** ${inline(step.origin + (step.pathAndQuery ?? ' (reusePage)'), secrets)} — ${inline(step.description, secrets)}`)
           }
         } else if (specRow.spec.kind === 'race_burst') {
           if (specRow.spec.controlStep) {

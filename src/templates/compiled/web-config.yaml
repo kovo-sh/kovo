@@ -1,0 +1,30 @@
+id: "web-config"
+name: "Web Configuration File - Detect"
+severity: "low"
+description: "Web configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/imhunterand/ApachSAL/blob/main/assets/exploits.json"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/web.config"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<configuration>"
+      - "<system.webServer>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

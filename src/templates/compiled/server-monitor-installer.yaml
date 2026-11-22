@@ -1,0 +1,35 @@
+id: "server-monitor-installer"
+name: "Server Monitor Installer"
+severity: "high"
+description: "Server Monitor is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "monitor"
+  - "exposure"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>SERVER MONITOR - Install</title>"
+      - "PHP Server Monitor - Install"
+      - "install.php?action=config"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

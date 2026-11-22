@@ -1,0 +1,32 @@
+id: "hexstrike-ai-config"
+name: "HexStrike AI MCP Agents - Config"
+severity: "info"
+description: "HexStrike AI MCP Agents server config page exposure."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "hexstrike-ai"
+reference: "https://github.com/0x4m4/hexstrike-ai"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/health"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "HexStrike"
+      - "telemetry"
+      - "tools_status"
+      - "uptime"
+      - "version"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

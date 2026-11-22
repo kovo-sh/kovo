@@ -1,0 +1,158 @@
+rules:
+- id: use-SRI-for-CDNs
+  languages:
+  - generic
+  severity: WARNING
+  message: 'Consuming CDNs without including a SubResource Integrity (SRI) can expose
+    your application and its users to compromised code. SRIs allow you to consume
+    specific versions of content where if even a single byte is compromised, the resource
+    will not be loaded. Add an integrity attribute to your <script> and <link> tags
+    pointing to CDN content to ensure the resources have not been compromised. A crossorigin
+    attribute should also be added. For a more thorough explanation along with explicit
+    instructions on remediating, follow the directions from Mozilla here: https://developer.mozilla.org/en-US/blog/securing-cdn-using-sri-why-how/'
+  metadata:
+    cwe:
+    - 'CWE-346: Origin Validation Error'
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    cwe2020-top25': true
+    cwe2021-top25': true
+    cwe2022-top25': true
+    impact: MEDIUM
+    likelihood: MEDIUM
+    confidence: MEDIUM
+    category: security
+    subcategory:
+    - vuln
+    technology:
+    - salesforce
+    - visualforce
+    references:
+    - https://cwe.mitre.org/data/definitions/352.html
+    - https://developer.mozilla.org/en-US/blog/securing-cdn-using-sri-why-how/
+  patterns:
+  - pattern-either:
+    - pattern: <link...href="$URL..."...>
+    - pattern: <script...src="$URL..."...>
+  - metavariable-regex:
+      metavariable: $URL
+      regex: http[A-Za-z0-9\/\.\-\:]
+  - pattern-not: <script...integrity="..."...src="..."...>
+  - pattern-not: <script...src="..."...integrity="..."...>
+  - pattern-not: <link...integrity="..."...href="..."...>
+  - pattern-not: <link...href="..."...integrity="..."...>
+  paths:
+    include:
+    - '*.component'
+    - '*.page'
+- id: xss-from-unescaped-url-param
+  languages:
+  - generic
+  severity: ERROR
+  message: To remediate this issue, ensure that all URL parameters are properly escaped
+    before including them in scripts. Please update your code to use either the JSENCODE
+    method to escape URL parameters or the escape="true" attribute on <apex:outputText>
+    tags. Passing URL parameters directly into scripts and DOM sinks creates an opportunity
+    for Cross-Site Scripting attacks. Cross-Site Scripting (XSS) attacks are a type
+    of injection, in which malicious scripts are injected into otherwise benign and
+    trusted websites. To remediate this issue, ensure that all URL parameters are
+    properly escaped before including them in scripts.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/pages_security_tips_xss.htm
+    category: security
+    subcategory:
+    - vuln
+    technology:
+    - salesforce
+    - visualforce
+    cwe2022-top25: true
+    cwe2021-top25: true
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  patterns:
+  - pattern-either:
+    - pattern: <apex:outputText...escape="false"...value="{!...CurrentPage.parameters.$URL_PARAM}".../>
+    - pattern: <apex:outputText...value="{!...CurrentPage.parameters.$URL_PARAM}"...escape="false".../>
+    - pattern: <script>...'{!...CurrentPage.parameters.$URL_PARAM}'...</script>
+  - pattern-not: <script>...'{!...JSENCODE(...CurrentPage.parameters.$URL_PARAM})'...</script>
+  paths:
+    include:
+    - '*.component'
+    - '*.page'
+- id: csp-header-attribute
+  languages:
+  - generic
+  severity: INFO
+  message: Visualforce Pages must have the cspHeader attribute set to true. This attribute
+    is available in API version 55 or higher.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://help.salesforce.com/s/articleView?id=sf.csp_trusted_sites.htm&type=5
+    category: security
+    subcategory:
+    - vuln
+    technology:
+    - salesforce
+    - visualforce
+    cwe2022-top25: true
+    cwe2021-top25: true
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  patterns:
+  - pattern: <apex:page...>...</apex:page>
+  - pattern-not: <apex:page...cspHeader="true"...>...</apex:page>
+  - pattern-not: <apex:page...>...<!--deprecated-->...</apex:page>
+  - pattern-not: <apex:page...>...<!-- deprecated -->...</apex:page>
+  paths:
+    include:
+    - '*.page'
+- id: visualforce-page-api-version
+  languages:
+  - generic
+  severity: WARNING
+  message: Visualforce Pages must use API version 55 or higher for required use of
+    the cspHeader attribute set to true.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_pages.htm
+    category: security
+    subcategory:
+    - vuln
+    technology:
+    - salesforce
+    - visualforce
+    cwe2022-top25: true
+    cwe2021-top25: true
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  patterns:
+  - pattern-inside: <apiVersion.../apiVersion>
+  - pattern-either:
+    - pattern-regex: '[>][0-9].[0-9][<]'
+    - pattern-regex: '[>][1-4][0-9].[0-9][<]'
+    - pattern-regex: '[>][5][0-4].[0-9][<]'
+  paths:
+    include:
+    - '*.page-meta.xml'

@@ -1,0 +1,36 @@
+id: "laravel-log-file"
+name: "Laravel log file publicly accessible"
+severity: "high"
+description: "The log file of this Laravel web app might reveal details on the inner workings of the app, possibly even tokens, credentials or personal information."
+tech:
+  - "laravel"
+tags:
+  - "laravel"
+  - "logs"
+  - "exposure"
+  - "vuln"
+reference: "https://laravel.com/docs/master/logging"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/storage/logs/laravel.log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "InvalidArgumentException"
+      - "local.ERROR"
+      - "ErrorException"
+      - "syntax error"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+      - "text/x-log"
+  - type: "status"
+    status:
+      - 200

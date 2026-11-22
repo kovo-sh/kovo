@@ -9,6 +9,7 @@ import { RunExchanges } from './run-exchanges.tsx'
 import { RunOverview } from './run-overview.tsx'
 import type { Command } from './run-overview.tsx'
 import { RunReport } from './run-report.tsx'
+import { RunSurface } from './run-surface.tsx'
 import { approvalPolicyMeta, capabilityTierMeta, formatUsd, phaseNames } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
 import { ThreadTranscript } from './thread-transcript.tsx'
@@ -20,7 +21,7 @@ import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } fro
 import { WorkerInspector } from './worker-inspector.tsx'
 import { WorkflowTrace } from './workflow-trace.tsx'
 
-type View = 'overview' | 'trace' | 'exchanges' | 'report'
+type View = 'overview' | 'surface' | 'trace' | 'exchanges' | 'report'
 
 const DEFAULT_PANEL_WIDTH = 440
 const MIN_PANEL_WIDTH = 320
@@ -295,6 +296,10 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
             className="run-tab" data-active={view === 'overview'}>
             Overview
           </Link>
+          <Link to="/runs/$runId" params={{ runId: run.id }} search={{ view: 'surface' }}
+            className="run-tab" data-active={view === 'surface'}>
+            Surface {(detail.endpoints?.length ?? 0) > 0 && <span className="run-tab-count" aria-hidden="true">{detail.endpoints.length}</span>}
+          </Link>
           <Link to="/runs/$runId" params={{ runId: run.id }} search={{ view: 'trace' }}
             className="run-tab" data-active={view === 'trace'}>
             Trace <span className="run-tab-count" aria-hidden="true">{assignments.length}</span>
@@ -530,15 +535,19 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
 
     {/* Full-Viewport Split Workbench with Draggable Vertical Splitter */}
     <div className="workbench-split">
-      <section className="work-surface" aria-label={view === 'report' ? 'Run report' : view === 'exchanges' ? 'Run exchanges' : 'Workflow'}>
+      <section className="work-surface" aria-label={view === 'report' ? 'Run report' : view === 'exchanges' ? 'Run exchanges' : view === 'surface' ? 'Surface view' : 'Workflow'}>
         {view !== 'report' && needsModel && <div className="workflow-callout run-model-callout">
           <div><h2>Connect a model to continue</h2><p>Model settings will return you to this run.</p></div>
           <Link className="action-link primary" to="/settings" search={{ runId }}>Set up model</Link>
         </div>}
 
         <div className="work-scroll" hidden={view !== 'overview'}>
-          <RunOverview detail={detail} history={history} execute={execute} openEvidence={setArtifact} pending={action.pending} />
+          <RunOverview detail={detail} history={history} execute={execute} openEvidence={setArtifact} pending={action.pending} refreshRun={refreshRun} />
         </div>
+
+        {view === 'surface' && <div className="work-scroll exchanges-page-wrap">
+          <RunSurface detail={detail} />
+        </div>}
 
         <div className="trace-holder" hidden={view !== 'trace'}>
           <WorkflowTrace

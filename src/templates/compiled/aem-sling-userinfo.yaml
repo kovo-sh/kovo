@@ -1,0 +1,33 @@
+id: "aem-sling-userinfo"
+name: "Adobe AEM Sling User Info Servlet Exposure"
+severity: "info"
+description: "Safe check derived from aem-sling-userinfo: Adobe AEM Sling User Info Servlet Exposure"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "aem"
+  - "adobe"
+  - "exposure"
+  - "vuln"
+reference: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/aem2.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/system/sling/info.sessionInfo.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "userID:"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

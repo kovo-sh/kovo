@@ -8,8 +8,14 @@ import { parseMiniYaml } from './yaml.ts'
 export const templateTechTags = [
   'generic', 'nextjs', 'vite', 'express', 'django', 'fastapi', 'springboot', 'nestjs', 'graphql',
   'clerk', 'supabase', 'wordpress', 'nginx', 'apache', 'php', 'swagger', 'cloudflare', 'react', 'node',
+  'rails', 'flask', 'laravel', 'symfony', 'drupal', 'jenkins', 'gitlab', 'grafana', 'prometheus',
+  'kibana', 'elasticsearch', 'tomcat', 'iis', 'traefik', 'keycloak', 'auth0', 'oidc',
+  'java', 'go', 'python', 'dotnet', 'actuator', 'nuxt', 'vue', 'angular', 'vercel', 's3', 'kubernetes', 'docker',
 ] as const
 export type TemplateTechTag = typeof templateTechTags[number]
+
+export const defaultCompiledTemplateLimit = 150
+export const compiledTemplateLimitCeiling = 400
 
 const readOnlyMethods = ['GET', 'HEAD', 'OPTIONS'] as const
 const tier3Methods = ['POST', 'PUT', 'PATCH'] as const
@@ -80,8 +86,8 @@ export class TemplateValidationError extends Error {
   }
 }
 
-const thirdPartyOastPattern = /(?:interact\.sh|interactsh|oast\.(?:pro|live|site|online|fun|me)|burpcollaborator|requestbin|pipedream|webhook\.site|ngrok|canarytokens|dnslog|ceye\.io|oastify|beeceptor|requestcatcher)/i
-const privateHostPattern = /(?:\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\b169\.254\.\d{1,3}\.\d{1,3}\b|\b0\.0\.0\.0\b|\blocalhost\b|\[::1?\]|metadata\.google\.internal|\bfd[0-9a-f]{2}:)/i
+const thirdPartyOastPattern = /(?:interact\.sh|interactsh|oast\.(?:pro|live|site|online|fun|me)|oast\.[a-z]{2,10}\b|burpcollaborator|requestbin|pipedream|webhook\.site|ngrok|canarytokens|dnslog|ceye\.io|oastify|beeceptor|requestcatcher|dnsbin\.|bxss\.me|xss\.ht)/i
+const privateHostPattern = /(?:\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\b169\.254\.\d{1,3}\.\d{1,3}\b|\b0\.0\.0\.0\b|\blocalhost\b|\[::1?\]|::ffff:|metadata\.google\.internal|metadata\.azure\.internal|100\.100\.100\.200|\b2852039166\b|\b0xa9fea9fe\b|\bfd[0-9a-f]{2}:)/i
 const allowedPlaceholders = /\{\{(?:rand|guardian_canary_http|guardian_canary_dns)\}\}/g
 const originLikeHeaders = /^(?:origin|referer)$/i
 
@@ -112,11 +118,24 @@ function assertRequestFieldSafe(label: string, value: string, headerName?: strin
 }
 
 export function assertTemplateSafety(t: SafeTemplate): void {
-  const serialized = JSON.stringify({ request: t.request, control: t.control, matchers: t.matchers, name: t.name })
-  if (containsDestructivePayload(serialized) || containsDestructivePayload(decodeLoose(serialized))) {
+  const serialized = JSON.stringify({ request: t.request, control: t.control, matchers: t.matchers, name: t.name, description: t.description })
+  const decodedOnce = decodeLoose(serialized)
+  const decodedTwice = decodeLoose(decodedOnce)
+  const plusDecoded = decodeLoose(decodedTwice.replace(/\+/g, ' '))
+  if (
+    containsDestructivePayload(serialized) ||
+    containsDestructivePayload(decodedOnce) ||
+    containsDestructivePayload(decodedTwice) ||
+    containsDestructivePayload(plusDecoded)
+  ) {
     throw new TemplateValidationError('Template matches the destructive-payload denylist.')
   }
-  if (containsWebshellSignature(serialized)) {
+  if (
+    containsWebshellSignature(serialized) ||
+    containsWebshellSignature(decodedOnce) ||
+    containsWebshellSignature(decodedTwice) ||
+    containsWebshellSignature(plusDecoded)
+  ) {
     throw new TemplateValidationError('Template contains a webshell/code-execution signature.')
   }
   const requests = [t.request, ...(t.control ? [t.control] : [])]
@@ -250,13 +269,39 @@ export interface TemplateSelection {
   skipped: Array<{ id: string; reason: string }>
 }
 
+const techAliases: Record<string, TemplateTechTag> = {
+  next: 'nextjs', nextjs: 'nextjs',
+  spring: 'springboot', springboot: 'springboot',
+  nest: 'nestjs', nestjs: 'nestjs',
+  wp: 'wordpress', wordpress: 'wordpress',
+  openapi: 'swagger', swagger: 'swagger',
+  httpd: 'apache', apache2: 'apache',
+  k8s: 'kubernetes', kubernetes: 'kubernetes',
+  nodejs: 'node', node: 'node',
+  reactjs: 'react', react: 'react',
+  vuejs: 'vue', vue: 'vue',
+  nuxtjs: 'nuxt', nuxt: 'nuxt',
+  angularjs: 'angular', angular: 'angular',
+  py: 'python', python3: 'python',
+  golang: 'go', go: 'go',
+  rubyonrails: 'rails', rails: 'rails',
+  springactuator: 'actuator', actuator: 'actuator',
+  aspnet: 'dotnet', csharp: 'dotnet',
+}
+
+export function normalizeTechTagSet(techTags?: readonly string[]): Set<string> {
+  const tags = new Set((techTags ?? []).map(t => t.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(Boolean))
+  for (const t of [...tags]) {
+    if (techAliases[t]) tags.add(techAliases[t])
+  }
+  return tags
+}
+
 export function selectSafeTemplates(
   templates: readonly SafeTemplate[],
   options: { techTags?: readonly string[]; templateIds?: readonly string[]; tier: number; maxTemplates: number },
 ): TemplateSelection {
-  const tags = new Set((options.techTags ?? []).map(t => t.toLowerCase().replace(/[^a-z0-9]/g, '')))
-  const aliases: Record<string, string> = { next: 'nextjs', 'nextjs': 'nextjs', spring: 'springboot', springboot: 'springboot', nest: 'nestjs', nestjs: 'nestjs', wp: 'wordpress' }
-  for (const t of [...tags]) if (aliases[t]) tags.add(aliases[t])
+  const tags = normalizeTechTagSet(options.techTags)
   const wantIds = options.templateIds?.length ? new Set(options.templateIds) : null
   const selected: SafeTemplate[] = []
   const skipped: Array<{ id: string; reason: string }> = []
@@ -268,9 +313,28 @@ export function selectSafeTemplates(
     selected.push(t)
   }
   const severityRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
-  selected.sort((a, b) => severityRank[a.severity] - severityRank[b.severity] || a.id.localeCompare(b.id))
+  const explicitMatchRank = (t: SafeTemplate): number => {
+    if (tags.size === 0) return 0
+    return t.tech.some(x => x !== 'generic' && tags.has(x)) ? 0 : 1
+  }
+  selected.sort((a, b) =>
+    explicitMatchRank(a) - explicitMatchRank(b) ||
+    severityRank[a.severity] - severityRank[b.severity] ||
+    (a.cve ? 0 : 1) - (b.cve ? 0 : 1) ||
+    a.id.localeCompare(b.id))
   if (selected.length > options.maxTemplates) {
     for (const t of selected.splice(options.maxTemplates)) skipped.push({ id: t.id, reason: 'template cap' })
   }
   return { selected, skipped }
+}
+
+export function selectTemplatesForTech(
+  templates: readonly SafeTemplate[],
+  options: { techTags?: readonly string[]; templateIds?: readonly string[]; tier: number; maxTemplates?: number },
+): TemplateSelection {
+  const rawMax = options.maxTemplates ?? defaultCompiledTemplateLimit
+  const clampedMax = Number.isFinite(rawMax)
+    ? Math.max(1, Math.min(Math.round(rawMax), compiledTemplateLimitCeiling))
+    : defaultCompiledTemplateLimit
+  return selectSafeTemplates(templates, { ...options, maxTemplates: clampedMax })
 }

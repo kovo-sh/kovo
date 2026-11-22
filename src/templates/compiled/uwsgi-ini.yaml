@@ -1,0 +1,27 @@
+id: "uwsgi-ini"
+name: "uwsgi.ini File Exposure"
+severity: "info"
+description: "Safe check derived from uwsgi-ini: uwsgi.ini File Exposure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "uwsgi"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/uwsgi.ini"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[uwsgi]"
+  - type: "status"
+    status:
+      - 200

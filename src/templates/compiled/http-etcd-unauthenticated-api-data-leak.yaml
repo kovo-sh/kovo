@@ -1,0 +1,38 @@
+id: "http-etcd-unauthenticated-api-data-leak"
+name: "etcd Unauthenticated HTTP API Leak"
+severity: "high"
+description: "etcd HTTP API is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "hackerone"
+  - "unauth"
+  - "etcd"
+  - "vuln"
+reference: "https://hackerone.com/reports/1088429"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/v2/auth/roles"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"roles\""
+      - "\"permissions\""
+      - "\"role\""
+      - "\"kv\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

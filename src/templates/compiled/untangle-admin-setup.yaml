@@ -1,0 +1,30 @@
+id: "untangle-admin-setup"
+name: "Untangle Exposed Admin Signup"
+severity: "medium"
+description: "Untangle Exposed Admin Signup is exposed publicly."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "untangle"
+  - "admin"
+  - "setup"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/setup.do"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Setup Wizard</title>"
+      - "java.untangle.com"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

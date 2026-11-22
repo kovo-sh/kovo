@@ -1,0 +1,31 @@
+id: "wordpress-plugins-lifterlms"
+name: "WordPress Plugin lifterlms Listing"
+severity: "info"
+description: "Searches for sensitive directories present in the lifterlms plugin."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "listing"
+  - "plugin"
+  - "edb"
+  - "vuln"
+reference: "https://www.exploit-db.com/ghdb/6420"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/lifterlms/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of"
+      - "/wp-content/plugins/lifterlms/"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

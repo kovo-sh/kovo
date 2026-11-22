@@ -1,0 +1,28 @@
+id: "nagiosxi-installer"
+name: "Nagios XI Installer"
+severity: "high"
+description: "Nagios XI is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "install"
+  - "nagiosxi"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/nagiosxi/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Nagios XI Installation"
+  - type: "status"
+    status:
+      - 200

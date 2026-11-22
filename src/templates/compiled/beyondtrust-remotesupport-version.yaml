@@ -1,0 +1,28 @@
+id: "beyondtrust-remotesupport-version"
+name: "BeyondTrust Remote Support Version - Detect"
+severity: "info"
+description: "Detects and extracts version information from BeyondTrust Remote Support installations by querying the /get_rdf endpoint."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "beyondtrust"
+  - "version"
+  - "detect"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/get_rdf?comp=sdcust&locale_code=en-us"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "all"
+    words:
+      - "BeyondTrust"

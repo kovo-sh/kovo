@@ -1,0 +1,36 @@
+id: "cacti-guest-access-enabled"
+name: "Cacti - Guest User Access Enabled"
+severity: "medium"
+description: "Cacti instance has guest user access enabled, allowing unauthenticated users to access graph_view.php and potentially other resources."
+tech:
+  - "php"
+tags:
+  - "cacti"
+  - "misconfig"
+  - "unauth"
+  - "guest-access"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/graph_view.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Tree Mode"
+      - "List Mode"
+      - "Preview Mode"
+  - type: "word"
+    part: "body"
+    words:
+      - "Login to Cacti"
+      - "Please enter your Cacti"
+    negative: true
+  - type: "status"
+    status:
+      - 200

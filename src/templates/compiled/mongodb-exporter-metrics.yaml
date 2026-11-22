@@ -1,0 +1,35 @@
+id: "mongodb-exporter-metrics"
+name: "MongoDB Exporter - Detect"
+severity: "medium"
+description: "MongoDB exporter was detected."
+tech:
+  - "generic"
+tags:
+  - "mongodb"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/percona/mongodb_exporter"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "# HELP"
+  - type: "word"
+    part: "body"
+    words:
+      - "mongodb"
+      - "mongodb_exporter_build_info"
+  - type: "status"
+    status:
+      - 200

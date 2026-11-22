@@ -1,0 +1,29 @@
+id: "justfans-installer"
+name: "JustFans Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed JustFans Setup page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "justfans"
+  - "vuln"
+reference: "https://codecanyon.net/item/justfans-premium-content-creators-saas-platform/35154898"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Install the script - JustFans"
+  - type: "status"
+    status:
+      - 200

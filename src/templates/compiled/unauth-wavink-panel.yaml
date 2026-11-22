@@ -1,0 +1,38 @@
+id: "unauth-wavink-panel"
+name: "Wavlink Panel - Unauthenticated Access"
+severity: "high"
+description: "Wavlink Panel was able to be accessed with no authentication requirements in place."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "wavlink"
+  - "unauth"
+  - "misconfig"
+  - "router"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wifi_base.shtml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>APP</title>"
+  - type: "regex"
+    part: "body"
+    regex:
+      - "var passphraseKey12=\"(.*)\";"
+  - type: "word"
+    part: "body"
+    words:
+      - "var passphraseKey12=\"\";"
+    negative: true
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,28 @@
+id: "cgi-test-page"
+name: "CGI Test page"
+severity: "info"
+description: "Safe check derived from cgi-test-page: CGI Test page"
+tech:
+  - "generic"
+tags:
+  - "cgi"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/test/test.cgi"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "HTTP_ACCEPT"
+      - "HTTP_ACCEPT_ENCODING"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

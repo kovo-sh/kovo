@@ -1,0 +1,28 @@
+id: "businesso-installer"
+name: "Businesso Installer Exposure"
+severity: "high"
+description: "Businesso is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "businesso"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Businesso Installer</title>"
+  - type: "status"
+    status:
+      - 200

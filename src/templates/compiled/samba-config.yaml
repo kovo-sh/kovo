@@ -1,0 +1,32 @@
+id: "samba-config"
+name: "Samba Config - Detect"
+severity: "info"
+description: "Samba configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "smb"
+  - "samba"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.samba.org/samba/docs/using_samba/ch06.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/smb.conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "configuration file"
+      - "samba"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

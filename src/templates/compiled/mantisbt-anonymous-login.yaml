@@ -1,0 +1,31 @@
+id: "mantisbt-anonymous-login"
+name: "mantisbt - Anonymous Login"
+severity: "medium"
+description: "mantisbt Anonymous login were discovered."
+tech:
+  - "php"
+tags:
+  - "default-logins"
+  - "anonymous"
+  - "mantisbt"
+  - "default-login"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/my_view_page.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"user-info\">anonymous</span>"
+      - "My View"
+      - "Roadmap"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

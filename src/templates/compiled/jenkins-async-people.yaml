@@ -1,0 +1,23 @@
+id: "jenkins-async-people"
+name: "Jenkins panel async-people"
+severity: "info"
+description: "Safe check derived from jenkins-async-people: Jenkins panel async-people"
+tech:
+  - "jenkins"
+tags:
+  - "jenkins"
+  - "vuln"
+reference: "https://bugs.eclipse.org/bugs/show_bug.cgi?id=564944"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/asynchPeople/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>People -  [Jenkins]</title>"

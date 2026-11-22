@@ -1,0 +1,28 @@
+id: "espeasy-installer"
+name: "ESPEasy Installation Exposure"
+severity: "medium"
+description: "ESPEasy is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "espeasy"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ESPEasy"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Install ESPEasy"
+  - type: "status"
+    status:
+      - 200

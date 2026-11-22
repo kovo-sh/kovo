@@ -1,0 +1,30 @@
+id: "jsapi-ticket-json"
+name: "JsAPI Ticket Json"
+severity: "low"
+description: "JsAPI Ticket internal file is exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "jsapi"
+  - "files"
+  - "vuln"
+reference: "https://www.exploit-db.com/ghdb/6070"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/jsapi_ticket.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"expire_time\":"
+      - "\"jsapi_ticket\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

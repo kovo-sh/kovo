@@ -1,0 +1,29 @@
+id: "apache-activemq-artemis-detect"
+name: "Apache ActiveMQ Artemis - Detection"
+severity: "info"
+description: "Detects a Apache ActiveMQ Artemis Console, the next generation message broker by ActiveMQ."
+tech:
+  - "apache"
+tags:
+  - "tech"
+  - "activemq"
+  - "artemis"
+  - "apache"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/apache/activemq-artemis/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/console/hawtconfig.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "img/activemq.png"
+      - "ActiveMQ Artemis"
+      - "Apache Artemis"

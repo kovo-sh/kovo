@@ -1,0 +1,29 @@
+id: "blackbox-exporter-metrics"
+name: "Blackbox Exporter Metrics Exposed"
+severity: "info"
+description: "Safe check derived from blackbox-exporter-metrics: Blackbox Exporter Metrics Exposed"
+tech:
+  - "generic"
+tags:
+  - "blackbox"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Blackbox exporter"
+      - "blackbox_exporter_build_info"
+  - type: "status"
+    status:
+      - 200

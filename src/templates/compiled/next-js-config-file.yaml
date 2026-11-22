@@ -1,0 +1,30 @@
+id: "next-js-config-file"
+name: "Next JS Config - File Disclosure"
+severity: "low"
+description: "Next JS Config file is exposed."
+tech:
+  - "nextjs"
+tags:
+  - "exposure"
+  - "files"
+  - "nextjs"
+  - "vuln"
+reference: "https://nextjs.org/docs/app/api-reference/config/next-config-js"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/next.config.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "nextConfig"
+      - "module.exports ="
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

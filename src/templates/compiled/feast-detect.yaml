@@ -1,0 +1,30 @@
+id: "feast-detect"
+name: "Feast Feature Store - Detect"
+severity: "info"
+description: "Detected Feast, an open-source feature store for managing and serving ML features."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "feast"
+  - "feature-store"
+  - "ml"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/feast-dev/feast"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/p/automl_pipeline"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Feast Feature Store"
+  - type: "status"
+    status:
+      - 200

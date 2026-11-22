@@ -1,0 +1,29 @@
+id: "wp-mstore-plugin-listing"
+name: "Wordpress Plugin MStore API"
+severity: "low"
+description: "Searches for sensitive directories present in the mstore-api plugin."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "listing"
+  - "wp-plugin"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/mstore-api/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of"
+      - "/wp-content/plugins/mstore-api"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

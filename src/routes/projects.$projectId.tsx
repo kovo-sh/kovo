@@ -10,6 +10,8 @@ import {
   removeProjectSpec,
   syncGithubRepositories,
   testPersonaAuthAction,
+  updateProjectLabConfigAction,
+  updateProjectSandboxAllowlistAction,
 } from '../actions.ts'
 import { AccessPolicyImport } from '../components/access-policy-import.tsx'
 import { FormError, Status, timeText, useAction } from '../components/common.tsx'
@@ -27,13 +29,14 @@ import {
   defaultMaxRpsPerOrigin,
   defaultWorkerConcurrency,
   defaultWorkerMaxTurns,
+  iastRuntimes,
   maxBudgetRequests,
   maxRpsPerOriginCeiling,
   maxSpecBytes,
   maxWorkerConcurrency,
   maxWorkerMaxTurns,
 } from '../domain.ts'
-import type { ApprovalPolicy, CapabilityTier, PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../domain.ts'
+import type { ApprovalPolicy, CapabilityTier, IastRuntime, LabServiceConfig, PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../domain.ts'
 
 export const Route = createFileRoute('/projects/$projectId')({
   loader: ({ params }) => projectData({ data: { projectId: params.projectId } }),
@@ -148,8 +151,9 @@ function formatPersonaAuthBadge(persona: PublicPersona): string {
 }
 
 function ProjectPage() {
-  const { project, assets, personas, specs, runs, hasGithubPat } = Route.useLoaderData()
+  const { project, assets, personas, specs, runs, hasGithubPat, localLabEnvEnabled } = Route.useLoaderData()
   const navigate = useNavigate()
+  const labAllowed = project.environment === 'local-lab' && localLabEnvEnabled
   const [panel, setPanel] = useState<'candidate' | 'dns' | 'access'>()
   const [specPanel, setSpecPanel] = useState<'upload' | 'github'>()
   const [addingPersona, setAddingPersona] = useState(false)
@@ -190,10 +194,33 @@ function ProjectPage() {
   const [specName, setSpecName] = useState('')
   const [specContent, setSpecContent] = useState('')
 
+  // LabRunner v4 configuration state
+  const [labEnabled, setLabEnabled] = useState(() => Boolean(project.labConfig?.enabled))
+  const [labComposeFile, setLabComposeFile] = useState(() => project.labConfig?.dockerComposeFile ?? '')
+  const [labServicesJson, setLabServicesJson] = useState(() =>
+    project.labConfig?.services?.length ? JSON.stringify(project.labConfig.services) : '',
+  )
+  const [labSeedCommand, setLabSeedCommand] = useState(() => project.labConfig?.seedCommand ?? '')
+  const [labIastEnabled, setLabIastEnabled] = useState(() => Boolean(project.labConfig?.iastEnabled))
+  const [labIastRuntime, setLabIastRuntime] = useState<IastRuntime>(() => project.labConfig?.iastRuntime ?? 'node')
+  const [labHealthPath, setLabHealthPath] = useState(() => project.labConfig?.healthPath ?? '/health')
+  const [labInternalPort, setLabInternalPort] = useState(() =>
+    project.labConfig?.internalPort ? String(project.labConfig.internalPort) : '8080',
+  )
+  const [labNotice, setLabNotice] = useState('')
+
+  // Tier-2 Sandbox Write Allowlist state
+  const [allowOrigin, setAllowOrigin] = useState(() => project.seeds[0] ?? '')
+  const [allowMethod, setAllowMethod] = useState('POST')
+  const [allowPath, setAllowPath] = useState('')
+  const [allowNotice, setAllowNotice] = useState('')
+
   const action = useAction()
   const inventoryAction = useAction()
   const personaAction = useAction()
   const specAction = useAction()
+  const labAction = useAction()
+  const allowlistAction = useAction()
 
   function applyPreset(preset: MissionPreset) {
     setSelectedPreset(preset.id)
@@ -980,6 +1007,236 @@ function ProjectPage() {
           }}>Delete</Button>
         </div>
       </li>)}</ul> : <p className="muted" style={{ marginTop: 8 }}>No specs or repository snapshots imported yet.</p>}
+    </section>
+
+    <section className="stacked-section" aria-label="Local lab runner">
+      <div className="section-heading">
+        <div>
+          <h2>Local lab runner</h2>
+          <p className="muted">
+            Isolated multi-container Docker <code>--internal</code> target stack with optional persona seeding and opt-in IAST telemetry.
+            {!labAllowed && ' Requires a Local Lab project and server-side GUARDIAN_ALLOW_LOCAL_LAB=1.'}
+          </p>
+        </div>
+        <span className={`badge ${labAllowed ? (labEnabled ? 'badge-complete' : 'badge-trace') : ''}`}>
+          {labAllowed ? (labEnabled ? 'Lab enabled' : 'Lab ready') : 'Disabled (fail-closed)'}
+        </span>
+      </div>
+      {labNotice && <p role="status" className="muted">{labNotice}</p>}
+      <form className="form-card" onSubmit={event => {
+        event.preventDefault()
+        setLabNotice('')
+        let parsedServices: LabServiceConfig[] | undefined
+        const servicesTrimmed = labServicesJson.trim()
+        if (servicesTrimmed) {
+          try {
+            const raw = JSON.parse(servicesTrimmed) as unknown
+            if (!Array.isArray(raw)) throw new Error('Services must be a JSON array.')
+            parsedServices = raw as LabServiceConfig[]
+          } catch (err) {
+            void labAction.submit(async () => {
+              throw new Error(err instanceof Error ? err.message : 'Services must be valid JSON.')
+            })
+            return
+          }
+        }
+        const parsedPort = labInternalPort.trim() ? Number(labInternalPort.trim()) : undefined
+        void labAction.submit(() => updateProjectLabConfigAction({
+          data: {
+            requestId: crypto.randomUUID(),
+            projectId: project.id,
+            labConfig: {
+              enabled: labEnabled,
+              ...(labComposeFile.trim() ? { dockerComposeFile: labComposeFile.trim() } : {}),
+              ...(parsedServices ? { services: parsedServices } : {}),
+              ...(labSeedCommand.trim() ? { seedCommand: labSeedCommand.trim() } : {}),
+              iastEnabled: labIastEnabled,
+              iastRuntime: labIastRuntime,
+              healthPath: labHealthPath.trim() || '/health',
+              ...(parsedPort !== undefined && Number.isFinite(parsedPort) ? { internalPort: parsedPort } : {}),
+            },
+          },
+        }), () => {
+          setLabNotice('Lab runner settings saved.')
+        })
+      }}>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            className="native-checkbox"
+            checked={labEnabled}
+            disabled={!labAllowed || labAction.pending}
+            onChange={e => setLabEnabled(e.target.checked)}
+          />
+          Enable local lab
+        </label>
+        <div className="field-grid-2">
+          <label>Docker Compose file
+            <Input
+              name="dockerComposeFile"
+              value={labComposeFile}
+              disabled={!labAllowed || labAction.pending}
+              onChange={e => setLabComposeFile(e.target.value)}
+              placeholder="docker-compose.lab.yml"
+            />
+          </label>
+          <label>Seed command
+            <Input
+              name="seedCommand"
+              value={labSeedCommand}
+              disabled={!labAllowed || labAction.pending}
+              onChange={e => setLabSeedCommand(e.target.value)}
+              placeholder="node scripts/seed-personas.mjs"
+            />
+          </label>
+        </div>
+        <label>Services (JSON)
+          <Textarea
+            name="services"
+            rows={3}
+            value={labServicesJson}
+            disabled={!labAllowed || labAction.pending}
+            onChange={e => setLabServicesJson(e.target.value)}
+            placeholder='[{"name":"app","internalPort":8080},{"name":"postgres"}]'
+          />
+        </label>
+        <div className="field-grid-3">
+          <label>Health path
+            <Input
+              name="healthPath"
+              value={labHealthPath}
+              disabled={!labAllowed || labAction.pending}
+              onChange={e => setLabHealthPath(e.target.value)}
+              placeholder="/health"
+            />
+          </label>
+          <label>Internal port
+            <Input
+              name="internalPort"
+              type="number"
+              min={1}
+              max={65535}
+              value={labInternalPort}
+              disabled={!labAllowed || labAction.pending}
+              onChange={e => setLabInternalPort(e.target.value)}
+            />
+          </label>
+          <label>Target runtime
+            <NativeSelect
+              name="iastRuntime"
+              value={labIastRuntime}
+              disabled={!labAllowed || labAction.pending}
+              onChange={e => setLabIastRuntime(e.target.value as IastRuntime)}
+            >
+              {iastRuntimes.map(rt => <option key={rt} value={rt}>{rt}</option>)}
+            </NativeSelect>
+          </label>
+        </div>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            className="native-checkbox"
+            checked={labIastEnabled}
+            disabled={!labAllowed || labAction.pending}
+            onChange={e => setLabIastEnabled(e.target.checked)}
+          />
+          Enable IAST telemetry (redacted local-lab sink &amp; coverage side-channel)
+        </label>
+        <FormError error={labAction.error} />
+        <div className="form-actions">
+          <Button type="submit" variant="default" disabled={!labAllowed || labAction.pending}>
+            Save lab settings
+          </Button>
+        </div>
+      </form>
+    </section>
+
+    <section className="stacked-section" aria-label="Sandbox write allowlist">
+      <div className="section-heading">
+        <div>
+          <h2>Tier-2 sandbox write allowlist</h2>
+          <p className="muted">Explicitly allow non-destructive Tier-2 POST probes on approved staging or test-account endpoints. Defaults to empty on public projects.</p>
+        </div>
+        <span className="badge">{(project.sandboxWriteAllowlist ?? []).length} rules</span>
+      </div>
+      {allowNotice && <p role="status" className="muted">{allowNotice}</p>}
+      <form className="form-card" onSubmit={event => {
+        event.preventDefault()
+        setAllowNotice('')
+        const nextEntry = {
+          origin: allowOrigin.trim(),
+          method: allowMethod.trim().toUpperCase(),
+          pathPattern: allowPath.trim(),
+        }
+        const existing = project.sandboxWriteAllowlist ?? []
+        const updated = [...existing, nextEntry]
+        void allowlistAction.submit(() => updateProjectSandboxAllowlistAction({
+          data: {
+            requestId: crypto.randomUUID(),
+            projectId: project.id,
+            sandboxWriteAllowlist: updated,
+          },
+        }), () => {
+          setAllowPath('')
+          setAllowNotice('Sandbox write allowlist updated.')
+        })
+      }}>
+        <div className="field-grid-3">
+          <label>Allowlist origin
+            <Input
+              name="allowOrigin"
+              required
+              value={allowOrigin}
+              onChange={e => setAllowOrigin(e.target.value)}
+              placeholder={project.seeds[0] ?? 'https://example.com'}
+            />
+          </label>
+          <label>Allowlist method
+            <NativeSelect name="allowMethod" value={allowMethod} onChange={e => setAllowMethod(e.target.value)}>
+              <option value="POST">POST</option>
+              <option value="PUT">PUT</option>
+              <option value="PATCH">PATCH</option>
+              <option value="GET">GET</option>
+            </NativeSelect>
+          </label>
+          <label>Path pattern
+            <Input
+              name="allowPathPattern"
+              required
+              value={allowPath}
+              onChange={e => setAllowPath(e.target.value)}
+              placeholder="/api/search"
+            />
+          </label>
+        </div>
+        <FormError error={allowlistAction.error} />
+        <div className="form-actions">
+          <Button type="submit" variant="default" disabled={allowlistAction.pending || !allowOrigin.trim() || !allowPath.trim()}>
+            Add allowlist rule
+          </Button>
+        </div>
+      </form>
+      {(project.sandboxWriteAllowlist ?? []).length > 0 ? <ul className="project-list">
+        {(project.sandboxWriteAllowlist ?? []).map((rule, idx) => <li key={`${rule.origin}:${rule.method}:${rule.pathPattern}:${idx}`}>
+          <div className="list-row">
+            <span className="inline-badges">
+              <span className="badge badge-trace">{rule.method}</span>
+              <strong className="mono">{rule.origin}</strong>
+              <code className="mono">{rule.pathPattern}</code>
+            </span>
+            <Button variant="ghost" className="btn-danger" disabled={allowlistAction.pending} onClick={() => {
+              const updated = (project.sandboxWriteAllowlist ?? []).filter((_, i) => i !== idx)
+              void allowlistAction.submit(() => updateProjectSandboxAllowlistAction({
+                data: {
+                  requestId: crypto.randomUUID(),
+                  projectId: project.id,
+                  sandboxWriteAllowlist: updated,
+                },
+              }), () => setAllowNotice('Removed allowlist rule.'))
+            }}>Remove</Button>
+          </div>
+        </li>)}
+      </ul> : <p className="muted" style={{ marginTop: 8 }}>No sandbox write allowlist rules configured (default fail-closed empty list).</p>}
     </section>
   </main>
 }

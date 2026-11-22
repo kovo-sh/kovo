@@ -1,0 +1,31 @@
+id: "deos-open500ems-panel"
+name: "DEOS OPEN 500EMS Controller - Admin Exposure"
+severity: "high"
+description: "The DEOS OPEN 500EMS controller exposes administrative functions without authentication."
+tech:
+  - "generic"
+tags:
+  - "openv500"
+  - "disclosure"
+  - "panel"
+  - "vuln"
+cwe: "CWE-284"
+reference: "https://www.deos-ag.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/cosmobdf.cgi?function=0"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<b>OPENview</b>"
+      - "/cgi-bin/cosmobdf.cgi?function=12"
+      - "/cgi-bin/cosmobdf.cgi?function=2"

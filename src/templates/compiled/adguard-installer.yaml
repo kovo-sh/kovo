@@ -1,0 +1,27 @@
+id: "adguard-installer"
+name: "AdGuard - Installation"
+severity: "high"
+description: "AdGuard Installation panel has been exposed."
+tech:
+  - "generic"
+tags:
+  - "adguard"
+  - "misconfig"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Setup AdGuard Home"
+  - type: "status"
+    status:
+      - 200

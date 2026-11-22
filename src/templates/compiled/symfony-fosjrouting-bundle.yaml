@@ -1,0 +1,33 @@
+id: "symfony-fosjrouting-bundle"
+name: "Symfony FOSJsRoutingBundle"
+severity: "info"
+description: "Safe check derived from symfony-fosjrouting-bundle: Symfony FOSJsRoutingBundle"
+tech:
+  - "symfony"
+tags:
+  - "misconfig"
+  - "symfony"
+  - "vuln"
+reference: "https://packagist.org/packages/friendsofsymfony/jsrouting-bundle"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/js/routing?callback=fos.Router.setDatafoobarfoo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/**/fos.Router.setDatafoobarfoo({"
+      - "routes"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/javascript"
+  - type: "status"
+    status:
+      - 200

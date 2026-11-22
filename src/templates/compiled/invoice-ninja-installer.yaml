@@ -1,0 +1,29 @@
+id: "invoice-ninja-installer"
+name: "Invoice Ninja Setup Page - Exposure"
+severity: "high"
+description: "Detects exposed Invoice Ninja Setup page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "invoice"
+  - "vuln"
+reference: "https://invoiceninja.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Invoice Ninja Setup"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,28 @@
+id: "dkron-detect"
+name: "Dkron - Detect"
+severity: "info"
+description: "detected a Dkron server, a distributed and fault-tolerant job scheduling system for cloud-native environments."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "dkron"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/distribworks/dkron/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ui/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Dkron</title>"
+  - type: "status"
+    status:
+      - 200

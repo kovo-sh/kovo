@@ -1,0 +1,33 @@
+id: "tiny-rss-installer"
+name: "Tiny Tiny RSS Installer Exposure"
+severity: "high"
+description: "Tiny Tiny RSS is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "tiny"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Tiny Tiny RSS - Installer"
+      - "Test configuration"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

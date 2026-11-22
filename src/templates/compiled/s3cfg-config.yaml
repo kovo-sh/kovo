@@ -1,0 +1,37 @@
+id: "s3cfg-config"
+name: "S3CFG Configuration - Detect"
+severity: "high"
+description: "S3CFG configuration file was detected."
+tech:
+  - "s3"
+tags:
+  - "amazon"
+  - "s3"
+  - "exposure"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://s3tools.org/kb/item14.htm"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.s3cfg"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "access_key"
+      - "bucket_location"
+      - "secret_key"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,29 @@
+id: "saia-web-server"
+name: "Saia PCD Web-Server Configuration Page - Detect"
+severity: "info"
+description: "Saia PCD Web-Server configuration page was detected."
+tech:
+  - "generic"
+tags:
+  - "edb"
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/6865"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/loadtextfile.htm#programinfo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Saia PCD Web Server</title>"
+  - type: "status"
+    status:
+      - 200

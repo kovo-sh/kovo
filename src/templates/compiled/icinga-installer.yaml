@@ -1,0 +1,31 @@
+id: "icinga-installer"
+name: "Icinga Web 2 Installer Exposure"
+severity: "high"
+description: "Icinga Web 2 installer/setup wizard is publicly accessible. The setup page at /icingaweb2/setup exposes the configuration wizard which guides through full application configuration including database credentials, authentication backends, and admin account creation. While a setup token is required to proceed, the exposure of the installer itself is a serious misconfiguration that signals an incomplete or improperly secured installation."
+tech:
+  - "generic"
+tags:
+  - "icinga"
+  - "exposure"
+  - "misconfig"
+  - "installer"
+cwe: "CWE-200"
+reference: "https://icinga.com/docs/icinga-web/latest/doc/02-Installation/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/icingaweb2/setup"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Welcome to the configuration of Icinga Web 2"
+      - "Setup Token"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,33 @@
+id: "xampp-environment-variables"
+name: "XAMPP Environment Variables Exposure"
+severity: "low"
+description: "printenv.pl file is exposed in XAMPP leaking environment variables."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "xampp"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/printenv.pl"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<TITLE>Environment Variables</TITLE>"
+      - "Environment Variables:"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

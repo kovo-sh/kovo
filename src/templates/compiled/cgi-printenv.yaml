@@ -1,0 +1,32 @@
+id: "cgi-printenv"
+name: "Test CGI Script - Detect"
+severity: "medium"
+description: "Test CGI script was detected. Response page returned by this CGI script exposes a list of server environment variables."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "cgi"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.acunetix.com/vulnerabilities/web/test-cgi-script-leaking-environment-variables/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/printenv.pl"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "MYSQL_HOME"
+      - "OPENSSL_CONF"
+      - "REMOTE_ADDR"
+      - "SERVER_ADMIN"
+      - "Environment Variables:"
+  - type: "status"
+    status:
+      - 200

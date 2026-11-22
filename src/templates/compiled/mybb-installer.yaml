@@ -1,0 +1,36 @@
+id: "mybb-installer"
+name: "MyBB Installation Panel - Detect"
+severity: "high"
+description: "Detects exposed MyBB Installation page."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "mybb"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "MyBB"
+      - "Installation Wizard"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "currently locked"
+    negative: true
+  - type: "status"
+    status:
+      - 200

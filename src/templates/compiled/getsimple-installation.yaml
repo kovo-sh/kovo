@@ -1,0 +1,32 @@
+id: "getsimple-installation"
+name: "GetSimple CMS - Installer"
+severity: "critical"
+description: "GetSimple CMS installer was found."
+tech:
+  - "php"
+tags:
+  - "getsimple"
+  - "exposure"
+  - "installer"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-284"
+reference: "http://get-simple.info/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>GetSimple &raquo; Installation</title>"
+      - "PHP Version"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

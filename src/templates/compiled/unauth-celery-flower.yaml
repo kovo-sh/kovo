@@ -1,0 +1,31 @@
+id: "unauth-celery-flower"
+name: "Celery Flower - Unauthenticated Access"
+severity: "high"
+description: "Celery Flower was able to be accessed with no authentication requirements in place."
+tech:
+  - "generic"
+tags:
+  - "celery"
+  - "flower"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/dashboard"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/dashboard"
+      - "/tasks"
+      - "github.com/mher/flower"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,27 @@
+id: "aem-querybuilder-feed-servlet"
+name: "AEM QueryBuilder Feed Servlet"
+severity: "info"
+description: "Safe check derived from aem-querybuilder-feed-servlet: AEM QueryBuilder Feed Servlet"
+tech:
+  - "generic"
+tags:
+  - "aem"
+  - "misconfig"
+  - "vuln"
+reference: "https://helpx.adobe.com/experience-manager/6-3/sites/developing/using/querybuilder-predicate-reference.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/bin/querybuilder.feed"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "CQ Feed"

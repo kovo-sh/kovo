@@ -1,0 +1,34 @@
+id: "smarterstats-setup"
+name: "SmarterStats Setup Exposure"
+severity: "high"
+description: "SmarterStats Setup is exposed."
+tech:
+  - "dotnet"
+  - "iis"
+tags:
+  - "misconfig"
+  - "smarterstats"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Admin/frmWelcome.aspx"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "SmarterStats - SmarterStats"
+      - "Create System Administrator"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

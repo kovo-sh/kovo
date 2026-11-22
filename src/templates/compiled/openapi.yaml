@@ -1,0 +1,35 @@
+id: "openapi"
+name: "OpenAPI - Detect"
+severity: "info"
+description: "OpenAPI was detected."
+tech:
+  - "swagger"
+tags:
+  - "exposure"
+  - "api"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://www.openapis.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/openapi.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "openapi"
+      - "paths"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/openapi+json"
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

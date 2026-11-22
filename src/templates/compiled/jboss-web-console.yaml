@@ -1,0 +1,33 @@
+id: "jboss-web-console"
+name: "JBoss Management Console Server Information Page - Detect"
+severity: "info"
+description: "JBoss Management Console server information page was detected."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "jboss"
+  - "unauth"
+  - "edb"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/5215"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/web-console/ServerInfo.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Application Server"
+      - "Management Console"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

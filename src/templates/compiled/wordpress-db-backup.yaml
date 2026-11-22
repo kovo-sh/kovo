@@ -1,0 +1,28 @@
+id: "wordpress-db-backup"
+name: "WordPress DB Backup"
+severity: "medium"
+description: "This template checks for exposed database in wordpress."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "backups"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/backup-db/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of /"
+      - ".sql\">"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

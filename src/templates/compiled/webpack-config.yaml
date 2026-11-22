@@ -1,0 +1,40 @@
+id: "webpack-config"
+name: "Webpack Configuration File - Detect"
+severity: "info"
+description: "Webpack configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://webpack.js.org/configuration/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/webpack.config.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "module.exports"
+      - "const"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/javascript"
+      - "text/javascript"
+  - type: "word"
+    part: "body"
+    words:
+      - "<html"
+      - "<!doctype"
+    negative: true
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,32 @@
+id: "wp-install"
+name: "WordPress Exposed Installation"
+severity: "critical"
+description: "Wordpress installation files have been detected"
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "misconfig"
+  - "panel"
+  - "wordpress"
+  - "vuln"
+cwe: "CWE-284"
+reference: "https://smaranchand.com.np/2020/04/misconfigured-wordpress-takeover-to-remote-code-execution/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-admin/install.php?step=1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>WordPress &rsaquo; Installation</title>"
+      - "Site Title"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

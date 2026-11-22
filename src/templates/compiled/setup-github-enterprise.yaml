@@ -1,0 +1,30 @@
+id: "setup-github-enterprise"
+name: "Setup GitHub Enterprise - Detect"
+severity: "info"
+description: "Safe check derived from setup-github-enterprise: Setup GitHub Enterprise - Detect"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "installer"
+  - "github"
+  - "setup"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/start"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Setup GitHub Enterprise"
+      - "Install GitHub Enterprise"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

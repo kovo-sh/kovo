@@ -1,0 +1,28 @@
+id: "phpunit-result-cache-exposure"
+name: "PHPUnit Result Cache File Exposure"
+severity: "low"
+description: "PHPUnit cache file is exposed."
+tech:
+  - "php"
+tags:
+  - "config"
+  - "exposure"
+  - "devops"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.phpunit.result.cache"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"defects\""
+  - type: "status"
+    status:
+      - 200

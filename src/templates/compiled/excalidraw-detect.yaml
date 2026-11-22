@@ -1,0 +1,30 @@
+id: "excalidraw-detect"
+name: "Excalidraw - Detect"
+severity: "info"
+description: "Excalidraw, an open-source virtual whiteboard for collaborative diagrams, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "excalidraw"
+  - "detect"
+  - "discovery"
+reference: "https://excalidraw.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "property=\"og:site_name\" content=\"Excalidraw\""
+      - "window.EXCALIDRAW_ASSET_PATH ="
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

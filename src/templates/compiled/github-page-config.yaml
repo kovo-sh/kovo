@@ -1,0 +1,31 @@
+id: "github-page-config"
+name: "Github pages config file"
+severity: "info"
+description: "Find github pages config file."
+tech:
+  - "generic"
+tags:
+  - "github"
+  - "exposure"
+  - "config"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/_config.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "jekyll"
+      - "title"
+      - "baseurl"
+    condition: "and"

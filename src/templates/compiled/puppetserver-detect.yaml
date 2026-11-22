@@ -1,0 +1,33 @@
+id: "puppetserver-detect"
+name: "Puppetserver Detection"
+severity: "info"
+description: "Safe check derived from puppetserver-detect: Puppetserver Detection"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "puppet"
+  - "exposure"
+  - "intrusive"
+  - "discovery"
+reference: "https://insinuator.net/2020/09/puppet-assessment-techniques/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/puppet-ca/v1/certificate_request/{{rand}}"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 404
+  - type: "word"
+    part: "header"
+    words:
+      - "x-puppet-version"
+  - type: "word"
+    part: "body"
+    words:
+      - "{{randstr}}"

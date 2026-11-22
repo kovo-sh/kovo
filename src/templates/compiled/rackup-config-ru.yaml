@@ -1,0 +1,35 @@
+id: "rackup-config-ru"
+name: "Rackup Configuration - Detect"
+severity: "info"
+description: "Rackup configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "config"
+  - "rackup"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://raw.githubusercontent.com/maurosoria/dirsearch/master/db/dicc.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config.ru"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "run Rails.application"
+      - "/config/environment"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "Bundler.require"
+      - "require 'rubygems'"
+    condition: "and"

@@ -1,0 +1,30 @@
+id: "deos-openview-panel"
+name: "DEOS OPENview Admin Panel Unauthenticated Access"
+severity: "high"
+description: "The DEOS OPENview administrative panel is accessible without authentication."
+tech:
+  - "generic"
+tags:
+  - "openview"
+  - "disclosure"
+  - "panel"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-284"
+reference: "https://www.deos-ag.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/client/index.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>OPENview</title>"

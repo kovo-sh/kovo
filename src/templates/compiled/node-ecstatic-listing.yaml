@@ -1,0 +1,31 @@
+id: "node-ecstatic-listing"
+name: "Node ecstatic Directory Listing"
+severity: "low"
+description: "Directiory listing enabled in Node ecstatic."
+tech:
+  - "node"
+tags:
+  - "node"
+  - "js"
+  - "listing"
+  - "ecstatic"
+  - "vuln"
+reference: "https://tripla.dk/2020/03/26/multiple-vulnerabilities-in-nodejs-ecstatic-http-server-http-party/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/img/"
+  headers:
+    "Range": "10000"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Index of /img/</title>"
+  - type: "status"
+    status:
+      - 200

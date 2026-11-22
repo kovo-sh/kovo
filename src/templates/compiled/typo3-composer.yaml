@@ -1,0 +1,31 @@
+id: "typo3-composer"
+name: "Typo3 composer.json Exposure"
+severity: "low"
+description: "The web application is based on Typo3 CMS. A sensitive file has been found. Access to such files must be restricted, as it may lead to disclosure of sensitive information about the web application."
+tech:
+  - "generic"
+tags:
+  - "typo3"
+  - "cms"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+reference: "https://docs.typo3.org/c/typo3/cms-core/main/en-us/Changelog/9.0/Breaking-83302-ComposerRestrictsInstallationOfTypo3cms.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/typo3/sysext/install/composer.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "The Install Tool mounted as the module Tools>Install in TYPO3."
+      - "typo3-cms-framework"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

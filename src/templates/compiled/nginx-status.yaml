@@ -1,0 +1,27 @@
+id: "nginx-status"
+name: "Nginx Status Page"
+severity: "info"
+description: "Safe check derived from nginx-status: Nginx Status Page"
+tech:
+  - "nginx"
+tags:
+  - "misconfig"
+  - "nginx"
+  - "status"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/nginx_status"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Active connections:"
+  - type: "status"
+    status:
+      - 200

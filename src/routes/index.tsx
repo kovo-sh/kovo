@@ -13,19 +13,20 @@ export const Route = createFileRoute('/')({
 function Workspace() {
   const { workspace, projects, hasModel } = Route.useLoaderData()
   const navigate = useNavigate()
-  const [creating, setCreating] = useState(projects.length === 0)
+  const [creating, setCreating] = useState<boolean | null>(null)
+  const isCreating = creating ?? projects.length === 0
   const action = useAction()
 
   return <main className="workspace-page">
     <div className="page-title">
       <div><p className="eyebrow">{workspace.name}</p><h1>Projects</h1></div>
-      {!creating && <Button variant="default" onClick={() => setCreating(true)}>New project</Button>}
+      {!isCreating && <Button variant="default" onClick={() => setCreating(true)}>New project</Button>}
     </div>
     {!hasModel && <div className="model-callout">
       <div><h2>Connect a model</h2><p className="muted">Configure one or more OpenRouter or compatible LLM profiles for coordinator and worker reviews.</p></div>
       <Link className="action-link primary" to="/settings">Set up model</Link>
     </div>}
-    {creating && <form className="form-card" onSubmit={event => {
+    {isCreating && <form className="form-card" onSubmit={event => {
       event.preventDefault()
       const form = new FormData(event.currentTarget)
       const environment = form.get('environment') === 'local-lab' ? 'local-lab' as const : 'public' as const
@@ -34,7 +35,10 @@ function Workspace() {
         name: String(form.get('name')),
         seeds: String(form.get('seeds')).split(/[\s,]+/).filter(Boolean),
         environment,
-      } }), async project => { await navigate({ to: '/projects/$projectId', params: { projectId: project.id } }) })
+      } }), async project => {
+        setCreating(false)
+        await navigate({ to: '/projects/$projectId', params: { projectId: project.id } })
+      })
     }}>
       <h2>Create a project</h2>
       <label>Project name<Input name="name" placeholder="Product website" required maxLength={160} /></label>

@@ -1,0 +1,27 @@
+id: "rails-debug-mode"
+name: "Rails Debug Mode"
+severity: "medium"
+description: "Rails debug mode is enabled."
+tech:
+  - "rails"
+tags:
+  - "debug"
+  - "rails"
+  - "exposure"
+  - "intrusive"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/{{rand}}"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Rails.root:"
+      - "Action Controller: Exception caught"
+    condition: "and"

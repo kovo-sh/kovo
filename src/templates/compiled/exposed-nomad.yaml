@@ -1,0 +1,37 @@
+id: "exposed-nomad"
+name: "Nomad - Exposed Jobs"
+severity: "medium"
+description: "Nomad jobs were discovered."
+tech:
+  - "generic"
+tags:
+  - "nomad"
+  - "devops"
+  - "hashicorp"
+  - "panel"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.nomadproject.io/docs/internals/security"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ui/jobs"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Nomad"
+      - "nomad-ui"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

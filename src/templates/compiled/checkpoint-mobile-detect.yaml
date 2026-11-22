@@ -1,0 +1,30 @@
+id: "checkpoint-mobile-detect"
+name: "Check Point Mobile SSL VPN - Detect"
+severity: "info"
+description: "Check Point Mobile SSL VPN was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "checkpoint"
+  - "detect"
+  - "discovery"
+reference: "https://www.checkpoint.com/quantum/remote-access-vpn/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/sslvpn/Login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Check Point Mobile"
+      - "Check Point Software Technologies"
+    condition: "and"
+  - type: "status"
+    status:
+      - 403

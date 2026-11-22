@@ -1,0 +1,32 @@
+id: "lighter-config"
+name: "Lighter - Config Exposed"
+severity: "medium"
+description: "Detects if the config page of the Lighter server is exposed, it is an opensource REST application for interacting with Apache Spark on Kubernetes or Apache Hadoop YARN."
+tech:
+  - "generic"
+tags:
+  - "lighter"
+  - "exacaster"
+  - "spark"
+  - "config"
+  - "exposure"
+reference: "https://github.com/exacaster/lighter"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/lighter/api/configuration"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "sparkHistoryServerUrl"
+      - "externalLogsUrlTemplate"
+      - "sessionConfiguration"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

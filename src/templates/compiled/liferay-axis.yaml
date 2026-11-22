@@ -1,0 +1,33 @@
+id: "liferay-axis"
+name: "Liferay /api/axis - API Exposed"
+severity: "info"
+description: "Safe check derived from liferay-axis: Liferay /api/axis - API Exposed"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "liferay"
+  - "api"
+  - "vuln"
+reference: "https://github.com/ilmila/J2EEScan/blob/master/src/main/java/burp/j2ee/issues/impl/LiferayAPI.java"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/axis"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - ".*<h2>And now\\.\\.\\. Some Services<\\/h2>.*"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

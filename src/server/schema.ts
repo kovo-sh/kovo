@@ -1,10 +1,10 @@
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import type {
-  ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
-  CodeLocation, DnsSource, DynamicRetestVerdict, EvidenceSummary, Finding, LabConfig,
-  OwaspCategory, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, Phase,
-  PreparedObservation, ReportBody, ReviewPlan, RunStatus, ThinkingLevel, ThreatModelSummary,
+  ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, BenchmarkFunnel, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
+  CodeLocation, DnsSource, DynamicRetestVerdict, EndpointSource, EvidenceSummary, FailureTaxonomyBucket, Finding, InlineVerifyFeedback, LabConfig,
+  OwaspCategory, ParamLocation, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, Phase,
+  PreparedObservation, ReportBody, ReviewPlan, RoleAffinity, RunStatus, SecondOrderCanaryStatus, SpecialistProfile, ThinkingLevel, ThreatModelSummary,
   VerificationTier, WorkerPhase, WorkerStatus,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
@@ -29,6 +29,7 @@ export const modelProfiles = sqliteTable('model_profiles', {
   contextWindow: integer('context_window').default(1_048_576).notNull(),
   maxTokens: integer('max_tokens').default(16_384).notNull(),
   thinkingLevel: text('thinking_level').$type<ThinkingLevel>().default('medium').notNull(),
+  roleAffinity: text('role_affinity').$type<RoleAffinity>().default('any').notNull(),
   inputCostPerMtok: real('input_cost_per_mtok').default(0.15).notNull(),
   cachedInputCostPerMtok: real('cached_input_cost_per_mtok').default(0.003).notNull(),
   outputCostPerMtok: real('output_cost_per_mtok').default(0.6).notNull(),
@@ -46,6 +47,7 @@ export const projects = sqliteTable('projects', {
   seeds: text('seeds', { mode: 'json' }).$type<string[]>().notNull(),
   defaultScope: text('default_scope', { mode: 'json' }).$type<string[]>().notNull(),
   labConfig: text('lab_config', { mode: 'json' }).$type<LabConfig | null>(),
+  sandboxWriteAllowlist: text('sandbox_write_allowlist', { mode: 'json' }).$type<ApprovedEndpointPattern[]>().default([]).notNull(),
   createdAt: integer('created_at').notNull(),
 })
 
@@ -111,6 +113,9 @@ export const runs = sqliteTable('runs', {
   maxRpsPerOrigin: integer('max_rps_per_origin').default(5).notNull(),
   workerConcurrency: integer('worker_concurrency').default(6).notNull(),
   workerMaxTurns: integer('worker_max_turns').default(150).notNull(),
+  dynamicStepBudget: integer('dynamic_step_budget'),
+  multiTrialEnabled: integer('multi_trial_enabled', { mode: 'boolean' }).default(true).notNull(),
+  phase0CompletedAt: integer('phase0_completed_at'),
   reviewPlan: text('review_plan', { mode: 'json' }).$type<ReviewPlan>(),
   candidates: text('candidates', { mode: 'json' }).$type<Candidate[]>().notNull(),
   approved: text('approved', { mode: 'json' }).$type<string[]>().notNull(),
@@ -143,6 +148,9 @@ export const chainSteps = sqliteTable('chain_steps', {
   dependsOnStepIds: text('depends_on_step_ids', { mode: 'json' }).$type<string[]>().notNull(),
   status: text('status').$type<'pending' | 'ready' | 'running' | 'complete' | 'blocked' | 'tainted' | 'canceled'>().notNull(),
   assignedWorkerId: text('assigned_worker_id'),
+  specialistProfile: text('specialist_profile').$type<SpecialistProfile | null>(),
+  trialGroupId: text('trial_group_id'),
+  trialIndex: integer('trial_index').default(0).notNull(),
   sourceOrigins: text('source_origins', { mode: 'json' }).$type<string[]>().notNull(),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
@@ -269,6 +277,9 @@ export const replaySpecs = sqliteTable('replay_specs', {
   spec: text('spec', { mode: 'json' }).$type<DeclarativeReplaySpec>().notNull(),
   specSha256: text('spec_sha256').notNull(),
   sourceOrigins: text('source_origins', { mode: 'json' }).$type<string[]>().notNull(),
+  attemptCount: integer('attempt_count').default(1).notNull(),
+  verifiedInline: integer('verified_inline', { mode: 'boolean' }).default(false).notNull(),
+  lastVerificationDiff: text('last_verification_diff', { mode: 'json' }).$type<InlineVerifyFeedback | null>(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('replay_specs_run').on(table.runId)])
 
@@ -429,3 +440,111 @@ export const operations = sqliteTable('operations', {
   fingerprint: text('fingerprint').notNull(),
   result: text('result').notNull(),
 })
+
+export const endpoints = sqliteTable('endpoints', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  scopeRevision: integer('scope_revision').notNull(),
+  origin: text('origin').notNull(),
+  method: text('method').notNull(),
+  pathTemplate: text('path_template').notNull(),
+  source: text('source').$type<EndpointSource>().notNull(),
+  framework: text('framework'),
+  authRequirement: text('auth_requirement'),
+  ownershipGuard: text('ownership_guard'),
+  sinkKinds: text('sink_kinds', { mode: 'json' }).$type<string[]>().default([]).notNull(),
+  testedClasses: text('tested_classes', { mode: 'json' }).$type<string[]>().default([]).notNull(),
+  coveragePct: real('coverage_pct'),
+  riskScore: integer('risk_score').default(50).notNull(),
+  codeLocation: text('code_location', { mode: 'json' }).$type<CodeLocation | null>(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, table => [
+  uniqueIndex('endpoints_run_route').on(table.runId, table.origin, table.method, table.pathTemplate),
+  index('endpoints_run_risk').on(table.runId, table.riskScore),
+])
+
+export const endpointParams = sqliteTable('endpoint_params', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  endpointId: text('endpoint_id').notNull().references(() => endpoints.id),
+  name: text('name').notNull(),
+  location: text('location').$type<ParamLocation>().notNull(),
+  inferredType: text('inferred_type'),
+  isCsrf: integer('is_csrf', { mode: 'boolean' }).default(false).notNull(),
+  isObjectId: integer('is_object_id', { mode: 'boolean' }).default(false).notNull(),
+  source: text('source').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [
+  uniqueIndex('endpoint_params_unique').on(table.endpointId, table.name, table.location),
+  index('endpoint_params_run').on(table.runId, table.endpointId),
+])
+
+export const apiDependencies = sqliteTable('api_dependencies', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  producerEndpointId: text('producer_endpoint_id').notNull().references(() => endpoints.id),
+  consumerEndpointId: text('consumer_endpoint_id').notNull().references(() => endpoints.id),
+  resourceKey: text('resource_key').notNull(),
+  sampleResourceIdHash: text('sample_resource_id_hash'),
+  personaHandle: text('persona_handle'),
+  observedTransitions: text('observed_transitions', { mode: 'json' }).$type<string[]>().default([]).notNull(),
+  testedBola: integer('tested_bola', { mode: 'boolean' }).default(false).notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [
+  uniqueIndex('api_dependencies_edge').on(table.runId, table.producerEndpointId, table.consumerEndpointId, table.resourceKey),
+  index('api_dependencies_run').on(table.runId, table.testedBola),
+])
+
+export const secondOrderCanaries = sqliteTable('second_order_canaries', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  assignmentId: text('assignment_id').notNull(),
+  marker: text('marker').notNull().unique(),
+  injectedOrigin: text('injected_origin').notNull(),
+  injectedEndpoint: text('injected_endpoint').notNull(),
+  injectedParam: text('injected_param').notNull(),
+  injectedPersona: text('injected_persona'),
+  surfacedOrigin: text('surfaced_origin'),
+  surfacedEndpoint: text('surfaced_endpoint'),
+  surfacedPersona: text('surfaced_persona'),
+  surfacedExchangeId: text('surfaced_exchange_id'),
+  status: text('status').$type<SecondOrderCanaryStatus>().default('planted').notNull(),
+  createdAt: integer('created_at').notNull(),
+  surfacedAt: integer('surfaced_at'),
+}, table => [
+  index('second_order_canaries_run').on(table.runId, table.status),
+])
+
+export const labTelemetry = sqliteTable('lab_telemetry', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  exchangeId: text('exchange_id').notNull(),
+  traceId: text('trace_id').notNull(),
+  routesHit: text('routes_hit', { mode: 'json' }).$type<string[]>().default([]).notNull(),
+  newLinesCovered: integer('new_lines_covered').default(0).notNull(),
+  sinkEventsCount: integer('sink_events_count').default(0).notNull(),
+  hasUnhandledException: integer('has_unhandled_exception', { mode: 'boolean' }).default(false).notNull(),
+  artifactId: text('artifact_id').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [
+  index('lab_telemetry_run').on(table.runId, table.createdAt),
+  uniqueIndex('lab_telemetry_trace').on(table.runId, table.traceId),
+])
+
+export const benchmarkRuns = sqliteTable('benchmark_runs', {
+  id: text('id').primaryKey().notNull(),
+  suite: text('suite').notNull(),
+  gitSha: text('git_sha').notNull(),
+  modelRoutingConfig: text('model_routing_config', { mode: 'json' }).$type<Record<string, unknown>>().default({}).notNull(),
+  targetsTotal: integer('targets_total').notNull(),
+  confirmedCount: integer('confirmed_count').notNull(),
+  falsePositiveCount: integer('false_positive_count').notNull(),
+  funnelCounts: text('funnel_counts', { mode: 'json' }).$type<BenchmarkFunnel>().notNull(),
+  failureTaxonomy: text('failure_taxonomy', { mode: 'json' }).$type<Record<FailureTaxonomyBucket, number>>().notNull(),
+  totalCostUsd: real('total_cost_usd').default(0).notNull(),
+  durationMs: integer('duration_ms').default(0).notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [
+  index('benchmark_runs_suite').on(table.suite, table.createdAt),
+])

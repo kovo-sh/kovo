@@ -1,0 +1,34 @@
+id: "editor-exposure"
+name: "Editor Configuration File - Detect"
+severity: "low"
+description: "Editor configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.editorconfig"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "= true"
+      - "indent_style"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200

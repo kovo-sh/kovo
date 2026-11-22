@@ -1,0 +1,29 @@
+id: "bravia-signage"
+name: "BRAVIA Signage - Exposure"
+severity: "medium"
+description: "Bravia Signage is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "bravia"
+  - "sony"
+  - "vuln"
+reference: "https://twitter.com/WhiteOakSec/status/1667197552461004800"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/#/settings"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "BRAVIA Signage"
+  - type: "status"
+    status:
+      - 200

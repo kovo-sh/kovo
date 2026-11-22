@@ -1,0 +1,28 @@
+id: "aem-merge-metadata-servlet"
+name: "AEM MergeMetadataServlet"
+severity: "info"
+description: "Safe check derived from aem-merge-metadata-servlet: AEM MergeMetadataServlet"
+tech:
+  - "generic"
+tags:
+  - "aem"
+  - "misconfig"
+  - "vuln"
+reference: "https://speakerdeck.com/0ang3el/aem-hacker-approaching-adobe-experience-manager-webapps-in-bug-bounty-programs?slide=91"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/libs/dam/merge/metadata.html?path=/etc&.ico"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "assetPaths"
+    condition: "and"

@@ -1,0 +1,28 @@
+id: "airflow-configuration-exposure"
+name: "Apache Airflow Configuration Page - Detect"
+severity: "medium"
+description: "Apache Airflow configuration page was detected."
+tech:
+  - "apache"
+tags:
+  - "exposure"
+  - "config"
+  - "airflow"
+  - "apache"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/airflow.cfg"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[core]"
+      - "[api]"
+    condition: "and"

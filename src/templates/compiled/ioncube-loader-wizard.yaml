@@ -1,0 +1,29 @@
+id: "ioncube-loader-wizard"
+name: "ioncube Loader Wizard Disclosure"
+severity: "medium"
+description: "An ioncube Loader Wizard was discovered."
+tech:
+  - "php"
+tags:
+  - "ioncube"
+  - "disclosure"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://firefart.at/post/multiple-vulnerabilities-in-ioncube-loader-wizard/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ioncube/loader-wizard.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "ionCube Loader Wizard"
+  - type: "status"
+    status:
+      - 200

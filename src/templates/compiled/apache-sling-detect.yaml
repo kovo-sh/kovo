@@ -1,0 +1,29 @@
+id: "apache-sling-detect"
+name: "Apache Sling - Detect"
+severity: "info"
+description: "Detects a Apache Sling, a Java-based web framework designed for content-centric applications, using a RESTful approach to map URL requests directly to resources in a Java Content Repository (JCR)."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "sling"
+  - "detect"
+reference: "https://github.com/apache/sling"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/starter.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Apache Sling"
+      - "sling.apache"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

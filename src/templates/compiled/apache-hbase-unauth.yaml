@@ -1,0 +1,28 @@
+id: "apache-hbase-unauth"
+name: "Apache Hbase Unauth"
+severity: "medium"
+description: "Apache Hbase is exposed."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<name>hbase.defaults.for.version</name>"
+      - "<source>hbase-default.xml</source>"
+  - type: "status"
+    status:
+      - 200

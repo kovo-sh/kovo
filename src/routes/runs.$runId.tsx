@@ -3,8 +3,8 @@ import { runData } from '../actions.ts'
 import { RunWorkspace } from '../components/run-workspace.tsx'
 
 export const Route = createFileRoute('/runs/$runId')({
-  validateSearch: (search): { view?: 'overview' | 'trace' | 'exchanges' | 'report' } => ({
-    view: search.view === 'trace' || search.view === 'report' || search.view === 'overview' || search.view === 'exchanges'
+  validateSearch: (search): { view?: 'overview' | 'surface' | 'trace' | 'exchanges' | 'report' } => ({
+    view: search.view === 'surface' || search.view === 'trace' || search.view === 'report' || search.view === 'overview' || search.view === 'exchanges'
       ? search.view
       : undefined,
   }),

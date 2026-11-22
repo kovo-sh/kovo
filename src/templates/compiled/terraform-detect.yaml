@@ -1,0 +1,28 @@
+id: "terraform-detect"
+name: "Detect Terraform Provider"
+severity: "info"
+description: "Write Infrastructure as Code - https://www.terraform.io/"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "terraform"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/provider.tf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "access_key"
+      - "terraform"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

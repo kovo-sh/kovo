@@ -1,0 +1,36 @@
+id: "bitbucket-pipelines"
+name: "BitBucket Pipelines Configuration Exposure"
+severity: "info"
+description: "Safe check derived from bitbucket-pipelines: BitBucket Pipelines Configuration Exposure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "bitbucket"
+  - "devops"
+  - "cicd"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/bitbucket-pipelines.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "pipelines:"
+      - "step:"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200

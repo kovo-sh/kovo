@@ -1,0 +1,28 @@
+id: "backup-directory-listing"
+name: "Backup Directory Listing - Detect"
+severity: "low"
+description: "Backup Directory Listing folder was detected."
+tech:
+  - "generic"
+tags:
+  - "hackerone"
+  - "backups"
+  - "exposure"
+  - "vuln"
+reference: "https://www.invicti.com/learn/directory-listing/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/backup/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "Index of .*/backup"
+  - type: "status"
+    status:
+      - 200

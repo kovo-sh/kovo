@@ -1,0 +1,746 @@
+rules:
+- id: allow-privilege-escalation-no-securitycontext
+  patterns:
+  - pattern-inside: "containers:\n  ...\n"
+  - pattern-inside: "- $NAME: $CONTAINER\n  ...\n"
+  - pattern: 'image: ...
+
+      ...
+
+      '
+  - pattern-not: "image: ...\n...\nsecurityContext:\n  ...\n"
+  - metavariable-regex:
+      metavariable: $NAME
+      regex: name
+  - focus-metavariable: $NAME
+  fix: "securityContext:\n  allowPrivilegeEscalation: false\n$NAME\n"
+  message: In Kubernetes, each pod runs in its own isolated environment with its own
+    set of security policies. However, certain container images may contain `setuid`
+    or `setgid` binaries that could allow an attacker to perform privilege escalation
+    and gain access to sensitive resources. To mitigate this risk, it's recommended
+    to add a `securityContext` to the container in the pod, with the parameter `allowPrivilegeEscalation`
+    set to `false`. This will prevent the container from running any privileged processes
+    and limit the impact of any potential attacks. By adding a `securityContext` to
+    your Kubernetes pod, you can help to ensure that your containerized applications
+    are more secure and less vulnerable to privilege escalation attacks.
+  metadata:
+    cwe:
+    - 'CWE-732: Incorrect Permission Assignment for Critical Resource'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#privilege-escalation
+    - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+    - https://www.kernel.org/doc/Documentation/prctl/no_new_privs.txt
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-4-add-no-new-privileges-flag
+    category: security
+    technology:
+    - kubernetes
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: allow-privilege-escalation-true
+  patterns:
+  - pattern-inside: "containers:\n  ...\n"
+  - pattern-inside: "- name: $CONTAINER\n  ...\n"
+  - pattern-inside: 'image: ...
+
+      ...
+
+      '
+  - pattern-inside: "securityContext:\n  ...\n"
+  - pattern: 'allowPrivilegeEscalation: $TRUE
+
+      '
+  - metavariable-pattern:
+      metavariable: $TRUE
+      pattern: 'true
+
+        '
+  - focus-metavariable: $TRUE
+  fix: 'false
+
+    '
+  message: In Kubernetes, each pod runs in its own isolated environment with its own  set
+    of security policies. However, certain container images may contain  `setuid`
+    or `setgid` binaries that could allow an attacker to perform  privilege escalation
+    and gain access to sensitive resources. To mitigate  this risk, it's recommended
+    to add a `securityContext` to the container in  the pod, with the parameter `allowPrivilegeEscalation`
+    set to `false`.  This will prevent the container from running any privileged processes
+    and  limit the impact of any potential attacks.  In the container `$CONTAINER`
+    this parameter is set to `true` which makes this container much more vulnerable
+    to privelege escalation attacks.
+  metadata:
+    cwe:
+    - 'CWE-732: Incorrect Permission Assignment for Critical Resource'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#privilege-escalation
+    - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+    - https://www.kernel.org/doc/Documentation/prctl/no_new_privs.txt
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-4-add-no-new-privileges-flag
+    category: security
+    technology:
+    - kubernetes
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: allow-privilege-escalation
+  patterns:
+  - pattern-inside: "containers:\n  ...\n"
+  - pattern-inside: "- name: $CONTAINER\n  ...\n"
+  - pattern: 'image: ...
+
+      ...
+
+      '
+  - pattern-inside: "image: ...\n...\n$SC:\n  ...\n"
+  - metavariable-regex:
+      metavariable: $SC
+      regex: ^(securityContext)$
+  - pattern-not-inside: "image: ...\n...\nsecurityContext:\n  ...\n  allowPrivilegeEscalation:\
+      \ $VAL\n"
+  - focus-metavariable: $SC
+  fix: "securityContext:\n  allowPrivilegeEscalation: false #\n"
+  message: In Kubernetes, each pod runs in its own isolated environment with its own
+    set of security policies. However, certain container images may contain `setuid`
+    or `setgid` binaries that could allow an attacker to perform privilege escalation
+    and gain access to sensitive resources. To mitigate this risk, it's recommended
+    to add a `securityContext` to the container in the pod, with the parameter `allowPrivilegeEscalation`
+    set to `false`. This will prevent the container from running any privileged processes
+    and limit the impact of any potential attacks. By adding the `allowPrivilegeEscalation`
+    parameter to your the `securityContext`, you can help to ensure that your containerized
+    applications are more secure and less vulnerable to privilege escalation attacks.
+  metadata:
+    cwe:
+    - 'CWE-732: Incorrect Permission Assignment for Critical Resource'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#privilege-escalation
+    - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+    - https://www.kernel.org/doc/Documentation/prctl/no_new_privs.txt
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-4-add-no-new-privileges-flag
+    category: security
+    technology:
+    - kubernetes
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: flask-debugging-enabled
+  languages:
+  - yaml
+  severity: WARNING
+  message: Do not set FLASK_ENV to "development" since that sets `debug=True` in Flask.
+    Use "dev" or a similar term instead.
+  metadata:
+    owasp: A06:2017 - Security Misconfiguration
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    references:
+    - https://flask.palletsprojects.com/en/2.0.x/debugging/
+    - https://flask.palletsprojects.com/en/2.0.x/config/#ENV
+    category: security
+    technology:
+    - kubernetes
+    - flask
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  patterns:
+  - pattern-inside: 'env: [...]
+
+      '
+  - pattern: '{name: FLASK_ENV, value: "development"}
+
+      '
+  fix-regex:
+    regex: development
+    replacement: dev
+- id: exposing-docker-socket-hostpath
+  patterns:
+  - pattern-inside: "volumes:\n  ...\n"
+  - pattern: "hostPath:\n  ...\n  path: /var/run/docker.sock\n"
+  message: Exposing host's Docker socket to containers via a volume. The owner of
+    this socket is root. Giving someone access to it is equivalent to giving unrestricted
+    root access to your host. Remove 'docker.sock' from hostpath to prevent this.
+  metadata:
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    references:
+    - https://kubernetes.io/docs/concepts/storage/volumes/#hostpath
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#volumes-and-file-systems
+    - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-1-do-not-expose-the-docker-daemon-socket-even-to-the-containers
+    category: security
+    technology:
+    - kubernetes
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: hostipc-pod
+  patterns:
+  - pattern-inside: "spec:\n  ...\n"
+  - pattern: 'hostIPC: true
+
+      '
+  message: Pod is sharing the host IPC namespace. This allows container processes
+    to communicate with processes on the host which reduces isolation and bypasses
+    container protection models. Remove the 'hostIPC' key to disable this functionality.
+  metadata:
+    cwe:
+    - 'CWE-693: Protection Mechanism Failure'
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#host-namespaces
+    category: security
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: hostnetwork-pod
+  patterns:
+  - pattern-inside: "spec:\n  ...\n"
+  - pattern: 'hostNetwork: true
+
+      '
+  message: Pod may use the node network namespace. This gives the pod access to the
+    loopback device, services listening on localhost, and could be used to snoop on
+    network activity of other pods on the same node. Remove the 'hostNetwork' key
+    to disable this functionality.
+  metadata:
+    cwe:
+    - 'CWE-406: Insufficient Control of Network Message Volume (Network Amplification)'
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#host-namespaces
+    category: security
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: hostpid-pod
+  patterns:
+  - pattern-inside: "spec:\n  ...\n"
+  - pattern: 'hostPID: true
+
+      '
+  message: Pod is sharing the host process ID namespace. When paired with ptrace this
+    can be used to escalate privileges outside of the container. Remove the 'hostPID'
+    key to disable this functionality.
+  metadata:
+    cwe:
+    - 'CWE-269: Improper Privilege Management'
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#host-namespaces
+    category: security
+    technology:
+    - kubernetes
+    owasp:
+    - A04:2021 - Insecure Design
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: legacy-api-clusterrole-excessive-permissions
+  patterns:
+  - pattern: '"*"
+
+      '
+  - pattern-inside: 'resources: $A
+
+      ...
+
+      '
+  - pattern-inside: 'verbs: $A
+
+      ...
+
+      '
+  - pattern-inside: "- apiGroups: [\"\"]\n  ...\n"
+  - pattern-inside: 'apiVersion: rbac.authorization.k8s.io/v1
+
+      ...
+
+      '
+  - pattern-inside: 'kind: ClusterRole
+
+      ...
+
+      '
+  message: 'Semgrep detected a Kubernetes core API ClusterRole with excessive permissions.
+    Attaching excessive permissions to a ClusterRole associated with the core namespace
+    allows the V1 API to perform arbitrary actions on arbitrary resources attached
+    to the cluster. Prefer explicit allowlists of verbs/resources when configuring
+    the core API namespace. '
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-269: Improper Privilege Management'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://kubernetes.io/docs/reference/access-authn-authz/rbac/#role-and-clusterrole
+    - https://kubernetes.io/docs/concepts/security/rbac-good-practices/#general-good-practice
+    - https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#api-groups
+    category: security
+    technology:
+    - kubernetes
+    cwe2021-top25: false
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: HIGH
+- id: privileged-container
+  pattern-either:
+  - patterns:
+    - pattern-inside: "containers:\n  ...\n"
+    - pattern: "image: ...\n...\nsecurityContext:\n  ...\n  privileged: true\n"
+  - patterns:
+    - pattern-inside: "spec:\n  ...\n"
+    - pattern-not-inside: 'image: ...
+
+        ...
+
+        '
+    - pattern: 'privileged: true
+
+        '
+  message: Container or pod is running in privileged mode. This grants the container
+    the equivalent of root capabilities on the host machine. This can lead to container
+    escapes, privilege escalation, and other security concerns. Remove the 'privileged'
+    key to disable this capability.
+  metadata:
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#privileged
+    - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html
+    category: security
+    technology:
+    - kubernetes
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: run-as-non-root-container-level-missing-security-context
+  patterns:
+  - pattern-inside: "spec:\n  ...\n  containers:\n    ...\n  ...\n"
+  - pattern-not-inside: "spec:\n  ...\n  securityContext:\n    ...\n    runAsNonRoot:\
+      \ $VAL\n  ...\n"
+  - pattern-inside: "spec:\n  ...\n  containers:\n    ...\n"
+  - pattern-inside: "spec:\n  ...\n  containers:\n    ...\n    - name: $NAME\n   \
+      \   image: ...\n      ...\n      securityContext:\n        ...\n        runAsNonRoot:\
+      \ $VALUE\n"
+  - pattern: "- name: $CONTAINER\n  $IMAGE: $IMAGEVAL\n  ...\n"
+  - pattern-not: "- name: $CONTAINER\n  image: $IMAGEVAL\n  ...\n  securityContext:\n\
+      \    ...\n"
+  - metavariable-regex:
+      metavariable: $IMAGE
+      regex: image
+  - focus-metavariable: $IMAGE
+  fix: "securityContext:\n  runAsNonRoot: true\n$IMAGE\n"
+  message: When running containers in Kubernetes, it's important to ensure that they
+    are properly secured to prevent privilege escalation attacks. One potential vulnerability
+    is when a container is allowed to run applications as the root user, which could
+    allow an attacker to gain access to sensitive resources. To mitigate this risk,
+    it's recommended to add a `securityContext` to the container, with the parameter
+    `runAsNonRoot` set to `true`. This will ensure that the container runs as a non-root
+    user, limiting the damage that could be caused by any potential attacks. By adding
+    a `securityContext` to the container in your Kubernetes pod, you can help to ensure
+    that your containerized applications are more secure and less vulnerable to privilege
+    escalation attacks.
+  metadata:
+    references:
+    - https://kubernetes.io/blog/2016/08/security-best-practices-kubernetes-deployment/
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-2-set-a-user
+    category: security
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - yaml
+  severity: INFO
+- id: run-as-non-root-container-level
+  patterns:
+  - pattern-inside: "spec:\n  ...\n  containers:\n    ...\n  ...\n"
+  - pattern-not-inside: "spec:\n  ...\n  securityContext:\n    ...\n    runAsNonRoot:\
+      \ $VAL\n  ...\n"
+  - pattern-inside: "spec:\n  ...\n  containers:\n    ...\n"
+  - pattern-inside: "spec:\n  ...\n  containers:\n    ...\n    - name: $NAME\n   \
+      \   image: ...\n      ...\n      securityContext:\n        ...\n        runAsNonRoot:\
+      \ $VALUE\n"
+  - pattern: "- name: $CONTAINER\n  image: ...\n  ...\n  $SC:\n    ...\n"
+  - metavariable-regex:
+      metavariable: $SC
+      regex: ^(securityContext)$
+  - pattern-not: "- name: $CONTAINER\n  image: ...\n  ...\n  securityContext:\n  \
+      \  ...\n    runAsNonRoot: $VALUE\n"
+  - focus-metavariable: $SC
+  fix: "$SC:\n  runAsNonRoot: true #\n"
+  message: When running containers in Kubernetes, it's important to ensure that they
+    are properly secured to prevent privilege escalation attacks. One potential vulnerability
+    is when a container is allowed to run applications as the root user, which could
+    allow an attacker to gain access to sensitive resources. To mitigate this risk,
+    it's recommended to add a `securityContext` to the container, with the parameter
+    `runAsNonRoot` set to `true`. This will ensure that the container runs as a non-root
+    user, limiting the damage that could be caused by any potential attacks. By adding
+    a `securityContext` to the container in your Kubernetes pod, you can help to ensure
+    that your containerized applications are more secure and less vulnerable to privilege
+    escalation attacks.
+  metadata:
+    references:
+    - https://kubernetes.io/blog/2016/08/security-best-practices-kubernetes-deployment/
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-2-set-a-user
+    category: security
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - yaml
+  severity: INFO
+- id: run-as-non-root-security-context-pod-level
+  patterns:
+  - pattern-inside: "spec:\n  ...\n  $SC:\n    ...\n  ...\n"
+  - metavariable-regex:
+      metavariable: $SC
+      regex: ^(securityContext)$
+  - pattern-not-inside: "spec:\n  ...\n  securityContext:\n    runAsNonRoot: $VAL\n\
+      \  ...\n"
+  - pattern-inside: "$SPEC:\n  ...\n  containers:\n    ...\n"
+  - pattern-not-inside: "$SPEC:\n  ...\n  containers:\n    ...\n    - name: $NAME\n\
+      \      image: ...\n      ...\n      securityContext:\n        ...\n        runAsNonRoot:\
+      \ $VALUE\n"
+  - focus-metavariable: $SC
+  fix: "$SC:\n  runAsNonRoot: true #\n"
+  message: When running containers in Kubernetes, it's important to ensure that they
+    are properly secured to prevent privilege escalation attacks. One potential vulnerability
+    is when a container is allowed to run applications as the root user, which could
+    allow an attacker to gain access to sensitive resources. To mitigate this risk,
+    it's recommended to add a `securityContext` to the container, with the parameter
+    `runAsNonRoot` set to `true`. This will ensure that the container runs as a non-root
+    user, limiting the damage that could be caused by any potential attacks. By adding
+    a `securityContext` to the container in your Kubernetes pod, you can help to ensure
+    that your containerized applications are more secure and less vulnerable to privilege
+    escalation attacks.
+  metadata:
+    references:
+    - https://kubernetes.io/blog/2016/08/security-best-practices-kubernetes-deployment/
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-2-set-a-user
+    category: security
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - yaml
+  severity: INFO
+- id: run-as-non-root-unsafe-value
+  patterns:
+  - pattern-either:
+    - pattern: "spec:\n  ...\n  securityContext:\n    ...\n    runAsNonRoot: $VALUE\n"
+    - patterns:
+      - pattern-inside: "containers:\n  ...\n"
+      - pattern: "image: ...\n...\nsecurityContext:\n  ...\n  runAsNonRoot: $VALUE\n"
+  - metavariable-pattern:
+      metavariable: $VALUE
+      pattern: 'false
+
+        '
+  - focus-metavariable: $VALUE
+  fix: 'true
+
+    '
+  message: When running containers in Kubernetes, it's important to ensure that they  are
+    properly secured to prevent privilege escalation attacks.  One potential vulnerability
+    is when a container is allowed to run  applications as the root user, which could
+    allow an attacker to gain  access to sensitive resources. To mitigate this risk,
+    it's recommended to  add a `securityContext` to the container, with the parameter
+    `runAsNonRoot`  set to `true`. This will ensure that the container runs as a non-root
+    user,  limiting the damage that could be caused by any potential attacks. By  adding
+    a `securityContext` to the container in your Kubernetes pod, you can  help to
+    ensure that your containerized applications are more secure and  less vulnerable
+    to privilege escalation attacks.
+  metadata:
+    references:
+    - https://kubernetes.io/blog/2016/08/security-best-practices-kubernetes-deployment/
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-2-set-a-user
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    category: security
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: INFO
+- id: run-as-non-root
+  patterns:
+  - pattern-inside: "$SPEC:\n  ...\n  containers:\n    ...\n  ...\n"
+  - metavariable-regex:
+      metavariable: $SPEC
+      regex: ^(spec)$
+  - pattern-not-inside: "spec:\n  ...\n  securityContext:\n    ...\n  ...\n"
+  - pattern-inside: "$SPEC:\n  ...\n  containers:\n    ...\n"
+  - pattern-not-inside: "$SPEC:\n  ...\n  containers:\n    ...\n    - name: $NAME\n\
+      \      image: ...\n      ...\n      securityContext:\n        ...\n        runAsNonRoot:\
+      \ $VALUE\n"
+  - focus-metavariable: $SPEC
+  fix: "$SPEC:\n  securityContext:\n    runAsNonRoot: true #\n"
+  message: When running containers in Kubernetes, it's important to ensure that they  are
+    properly secured to prevent privilege escalation attacks.  One potential vulnerability
+    is when a container is allowed to run  applications as the root user, which could
+    allow an attacker to gain  access to sensitive resources. To mitigate this risk,
+    it's recommended to  add a `securityContext` to the container, with the parameter
+    `runAsNonRoot`  set to `true`. This will ensure that the container runs as a non-root
+    user,  limiting the damage that could be caused by any potential attacks. By  adding
+    a `securityContext` to the container in your Kubernetes pod, you can  help to
+    ensure that your containerized applications are more secure and  less vulnerable
+    to privilege escalation attacks.
+  metadata:
+    references:
+    - https://kubernetes.io/blog/2016/08/security-best-practices-kubernetes-deployment/
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-2-set-a-user
+    category: security
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    technology:
+    - kubernetes
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - yaml
+  severity: INFO
+- id: secrets-in-config-file
+  patterns:
+  - pattern: '$KEY: $VALUE
+
+      '
+  - pattern-inside: 'data: ...
+
+      '
+  - pattern-inside: 'kind: Secret
+
+      ...
+
+      '
+  - metavariable-regex:
+      metavariable: $VALUE
+      regex: (?i)^[aA-zZ0-9+/]+={0,2}$
+  - metavariable-analysis:
+      analyzer: entropy
+      metavariable: $VALUE
+  message: 'Secrets ($VALUE) should not be stored in infrastructure as code files.
+    Use an alternative such as Bitnami Sealed Secrets or KSOPS to encrypt Kubernetes
+    Secrets. '
+  metadata:
+    cwe:
+    - 'CWE-798: Use of Hard-coded Credentials'
+    category: security
+    technology:
+    - kubernetes
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    references:
+    - https://kubernetes.io/docs/concepts/configuration/secret/
+    - https://media.defense.gov/2021/Aug/03/2002820425/-1/-1/0/CTR_Kubernetes_Hardening_Guidance_1.1_20220315.PDF
+    - https://docs.gitlab.com/ee/user/clusters/agent/gitops/secrets_management.html
+    - https://www.cncf.io/blog/2021/04/22/revealing-the-secrets-of-kubernetes-secrets/
+    - https://github.com/bitnami-labs/sealed-secrets
+    - https://www.cncf.io/blog/2022/01/25/secrets-management-essential-when-using-kubernetes/
+    - https://blog.oddbit.com/post/2021-03-09-getting-started-with-ksops/
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: skip-tls-verify-cluster
+  pattern: "cluster:\n  ...\n  insecure-skip-tls-verify: true\n"
+  message: 'Cluster is disabling TLS certificate verification when communicating with
+    the server. This makes your HTTPS connections insecure. Remove the ''insecure-skip-tls-verify:
+    true'' key to secure communication.'
+  metadata:
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://kubernetes.io/docs/reference/config-api/client-authentication.v1beta1/#client-authentication-k8s-io-v1beta1-Cluster
+    category: security
+    technology:
+    - kubernetes
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: skip-tls-verify-service
+  pattern: "spec:\n  ...\n  insecureSkipTLSVerify: true\n"
+  message: 'Service is disabling TLS certificate verification when communicating with
+    the server. This makes your HTTPS connections insecure. Remove the ''insecureSkipTLSVerify:
+    true'' key to secure communication.'
+  metadata:
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.20/#apiservice-v1-apiregistration-k8s-io
+    category: security
+    technology:
+    - kubernetes
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - yaml
+  severity: WARNING
+- id: writable-filesystem-container
+  patterns:
+  - pattern-inside: "containers:\n  ...\n"
+  - pattern-inside: "- name: $CONTAINER\n  ...\n"
+  - pattern: 'image: ...
+
+      ...
+
+      '
+  - pattern-not: "image: ...\n...\nsecurityContext:\n  ...\n  readOnlyRootFilesystem:\
+      \ true\n"
+  - focus-metavariable: $CONTAINER
+  message: 'Container $CONTAINER is running with a writable root filesystem. This
+    may allow malicious applications to download and run additional payloads, or modify
+    container files. If an application inside a container has to save something temporarily
+    consider using a tmpfs. Add ''readOnlyRootFilesystem: true'' to this container
+    to prevent this.'
+  metadata:
+    cwe:
+    - 'CWE-732: Incorrect Permission Assignment for Critical Resource'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://kubernetes.io/docs/concepts/policy/pod-security-policy/#volumes-and-file-systems
+    - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+    - https://blog.atomist.com/security-of-docker-kubernetes/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-8-set-filesystem-and-volumes-to-read-only
+    category: security
+    technology:
+    - kubernetes
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING

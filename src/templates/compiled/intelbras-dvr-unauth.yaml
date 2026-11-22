@@ -1,0 +1,31 @@
+id: "intelbras-dvr-unauth"
+name: "Intelbras DVR - Unrestricted Access"
+severity: "low"
+description: "The HTTP GET request to /cap.js on the server Intelbras DVR reveals several potentially sensitive pieces of information that are not properly protected or encrypted."
+tech:
+  - "generic"
+tags:
+  - "unauth"
+  - "intelbras"
+  - "dvr"
+  - "misconfig"
+  - "vuln"
+reference: "https://github.com/netsecfish/intelbras_cap_js"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cap.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "var talkTypes="
+      - "var userInfo="
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

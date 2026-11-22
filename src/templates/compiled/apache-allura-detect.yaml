@@ -1,0 +1,31 @@
+id: "apache-allura-detect"
+name: "Apache Allura - Detection"
+severity: "info"
+description: "Detects a Apache Allura server, a open source implementation of a software \"forge\"."
+tech:
+  - "apache"
+tags:
+  - "tech"
+  - "allura"
+  - "apache"
+  - "detect"
+  - "discovery"
+reference: "https://allura.apache.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/neighborhood"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>All Neighborhoods</title>"
+      - ">Apache Allura</a>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

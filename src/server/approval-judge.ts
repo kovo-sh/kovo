@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { ApprovalPolicy, ApprovedEndpointPattern } from '../domain.ts'
+import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { providerPool } from './provider.ts'
 import type { UsageCallback } from './provider.ts'
@@ -278,12 +279,14 @@ export function createSafetyJudgeLlmCall(
   } = {},
 ): SafetyJudgeLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
-    const { models, model } = providerPool(profiles, 'approval-safety-judge', {
+    const routed = resolveProfilePoolForRole('fast', profiles)
+    const { models, model } = providerPool(routed, 'approval-safety-judge', {
       signal: options.signal,
       secrets: options.secrets,
       onUsage: options.onUsage,
       maxCalls: 1,
       thinkingLevel: 'off',
+      roleAffinity: 'fast',
       firstEventTimeoutMs: 25_000,
       idleTimeoutMs: 25_000,
       totalTimeoutMs: 35_000,

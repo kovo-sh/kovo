@@ -1,0 +1,29 @@
+id: "invicti-enterprise-installer"
+name: "Invicti Enterprise Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed Invicti Enterprise Installation page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "invicti"
+  - "vuln"
+reference: "https://www.invicti.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wizard/database/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Invicti Enterprise - Installation Wizard"
+  - type: "status"
+    status:
+      - 200

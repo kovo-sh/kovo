@@ -1,0 +1,31 @@
+id: "blazor-webassembly-detect"
+name: "Blazor WebAssembly - Detect"
+severity: "info"
+description: "Blazor WebAssembly application was detected."
+tech:
+  - "generic"
+tags:
+  - "blazor"
+  - "webassembly"
+  - "detect"
+  - "discovery"
+reference: "https://dotnet.microsoft.com/en-us/apps/aspnet/web-apps/blazor"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/_framework/blazor.boot.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "dotnet.wasm"
+      - "\"entryAssembly\""
+      - "\"Microsoft.JSInterop.WebAssembly.dll\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

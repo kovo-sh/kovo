@@ -1,0 +1,26 @@
+id: "ansible-config-disclosure"
+name: "Ansible Configuration Page - Detect"
+severity: "medium"
+description: "Ansible configuration page was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ansible.cfg"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[defaults]"
+      - "[inventory]"
+    condition: "and"

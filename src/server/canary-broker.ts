@@ -7,8 +7,64 @@ import type { IncomingHttpHeaders, Server } from 'node:http'
 import { isIP } from 'node:net'
 import { and, eq } from 'drizzle-orm'
 import { redact, redactHeaders } from './redact.ts'
+import type { NamedSecret } from './redact.ts'
 import { canaries } from './schema.ts'
 import type { Store } from './store.ts'
+
+export interface SecondOrderCanaryRecord {
+  id: string
+  runId: string
+  assignmentId: string
+  marker: string
+  injectedOrigin: string
+  injectedEndpoint: string
+  injectedParam: string
+  injectedPersona: string | null
+  surfacedOrigin: string | null
+  surfacedEndpoint: string | null
+  surfacedPersona: string | null
+  surfacedExchangeId: string | null
+  status: string
+  createdAt: number
+  surfacedAt: number | null
+}
+
+export interface SecondOrderStore {
+  insertSecondOrderCanary(input: {
+    runId: string
+    assignmentId: string
+    marker: string
+    injectedOrigin: string
+    injectedEndpoint: string
+    injectedParam: string
+    injectedPersona?: string | null
+  }): SecondOrderCanaryRecord
+  markSecondOrderCanarySurfaced(
+    id: string,
+    details: {
+      surfacedOrigin: string
+      surfacedEndpoint: string
+      surfacedPersona?: string | null
+      surfacedExchangeId?: string | null
+      status?: 'surfaced' | 'verified'
+    },
+  ): SecondOrderCanaryRecord
+  listSecondOrderCanaries(runId: string, status?: 'planted' | 'surfaced' | 'verified'): SecondOrderCanaryRecord[]
+  runDetail?(runId: string): {
+    run: { id: string; scopeRevision: number }
+    assignments: Array<{ id: string; goalRevision: number; sourceOrigins: string[] }>
+  }
+  addFact?(run: never, assignment: never, input: {
+    kind: 'note'
+    origin: string
+    summary: string
+    data?: Record<string, unknown>
+    evidenceIds?: string[]
+    exchangeIds?: string[]
+    sourceOrigins?: string[]
+    secrets?: readonly NamedSecret[]
+  }): unknown
+}
 
 export interface CanaryListenerOptions {
   host?: string
@@ -83,11 +139,37 @@ interface MintedMeta {
   runId: string
   label: string
   origin: string | null
-  storage?: Store
+  storage?: Store | SecondOrderStore
   createdAt: number
 }
 
+export interface MintedSecondOrderCanary {
+  id?: string
+  marker: string
+  runId: string
+  assignmentId: string
+  injectedOrigin: string
+  injectedEndpoint: string
+  injectedParam: string
+  injectedPersona: string | null
+  httpUrl: string
+  dnsHost: string
+}
+
+interface MintedSecondOrderMeta {
+  id?: string
+  runId: string
+  assignmentId: string
+  injectedOrigin: string
+  injectedEndpoint: string
+  injectedParam: string
+  injectedPersona: string | null
+  storage?: Store | SecondOrderStore
+}
+
 const tokenPattern = /guardian-canary-[a-f0-9]{24}/i
+const secondOrderPattern = /gn2o_[a-f0-9]{8,16}/i
+const secondOrderGlobalPattern = /gn2o_[a-f0-9]{8,16}/gi
 const maxHitsPerToken = 50
 const maxTrackedTokens = 5_000
 const defaultDnsDomain = 'canary.guardian.invalid'
@@ -103,6 +185,10 @@ const dnsTypeNames: Record<number, string> = {
   28: 'AAAA',
   33: 'SRV',
   255: 'ANY',
+}
+
+function isFullStore(s: Store | SecondOrderStore | undefined): s is Store {
+  return Boolean(s && 'db' in s && (s as Store).db)
 }
 
 function normalizePublicBaseUrl(raw: string | undefined): string | null {
@@ -264,15 +350,134 @@ function normalizeIncomingHeaders(headers: IncomingHttpHeaders): Record<string, 
 }
 
 function extractTokenFromRequest(url: URL, hostHeader: string | undefined): string | null {
-  const pathMatch = tokenPattern.exec(url.pathname)
+  const pathMatch = tokenPattern.exec(url.pathname) ?? secondOrderPattern.exec(url.pathname)
   if (pathMatch) return pathMatch[0].toLowerCase()
-  const queryMatch = tokenPattern.exec(url.search)
+  const queryMatch = tokenPattern.exec(url.search) ?? secondOrderPattern.exec(url.search)
   if (queryMatch) return queryMatch[0].toLowerCase()
   if (hostHeader) {
-    const hostMatch = tokenPattern.exec(hostHeader)
+    const hostMatch = tokenPattern.exec(hostHeader) ?? secondOrderPattern.exec(hostHeader)
     if (hostMatch) return hostMatch[0].toLowerCase()
   }
   return null
+}
+
+function recordSecondOrderSurfaceFact(
+  storage: SecondOrderStore,
+  runId: string,
+  assignmentId: string | undefined,
+  canary: SecondOrderCanaryRecord,
+  surfacedOrigin: string,
+  surfacedEndpoint: string,
+  surfacedPersona: string | null,
+  exchangeId: string | null,
+) {
+  if (!storage.runDetail || !storage.addFact) return
+  try {
+    const detail = storage.runDetail(runId)
+    const assignment = (assignmentId
+      ? detail.assignments.find(a => a.id === assignmentId)
+      : undefined) ?? detail.assignments[0]
+    if (!detail?.run || !assignment) return
+    const addFactFn = storage.addFact as unknown as (
+      run: unknown,
+      assignment: unknown,
+      input: {
+        kind: string
+        origin: string
+        summary: string
+        data?: Record<string, unknown>
+        evidenceIds?: string[]
+        exchangeIds?: string[]
+        sourceOrigins?: string[]
+      },
+    ) => unknown
+    addFactFn.call(storage, detail.run, assignment, {
+      kind: 'second_order_surface',
+      origin: surfacedOrigin,
+      summary: `High-priority second-order canary ${canary.marker} surfaced on ${surfacedOrigin}${surfacedEndpoint} (injected via ${canary.injectedOrigin}${canary.injectedEndpoint} param=${canary.injectedParam}).`,
+      data: {
+        subkind: 'second_order_surface',
+        priority: 'high',
+        canaryId: canary.id,
+        marker: canary.marker,
+        injectedOrigin: canary.injectedOrigin,
+        injectedEndpoint: canary.injectedEndpoint,
+        injectedParam: canary.injectedParam,
+        injectedPersona: canary.injectedPersona,
+        surfacedOrigin,
+        surfacedEndpoint,
+        surfacedPersona,
+        surfacedExchangeId: exchangeId,
+      },
+      ...(exchangeId ? { exchangeIds: [exchangeId] } : {}),
+      sourceOrigins: [canary.injectedOrigin, surfacedOrigin],
+    })
+  } catch {
+    // Best-effort fact recording if DB closed or assignment missing.
+  }
+}
+
+export interface ScanSecondOrderInput {
+  text: string
+  runId?: string
+  assignmentId?: string
+  origin: string
+  endpoint: string
+  persona?: string | null
+  exchangeId?: string | null
+  storage?: SecondOrderStore
+}
+
+export function scanSecondOrderMarkers(input: ScanSecondOrderInput): SecondOrderCanaryRecord[] {
+  if (!input.runId || !input.storage || !input.text || !input.text.includes('gn2o_')) {
+    return []
+  }
+  const matches = input.text.match(secondOrderGlobalPattern)
+  if (!matches || matches.length === 0) return []
+  const found = new Set(matches.map(m => m.toLowerCase()))
+
+  let planted: SecondOrderCanaryRecord[] = []
+  try {
+    planted = input.storage.listSecondOrderCanaries(input.runId, 'planted')
+  } catch {
+    return []
+  }
+  if (planted.length === 0) return []
+
+  const surfacedRecords: SecondOrderCanaryRecord[] = []
+  const bareEndpoint = input.endpoint.split('?')[0]
+  for (const canary of planted) {
+    if (!found.has(canary.marker.toLowerCase())) continue
+    const sameOrigin = canary.injectedOrigin === input.origin
+    const sameEndpoint = canary.injectedEndpoint === input.endpoint || canary.injectedEndpoint === bareEndpoint
+    const samePersona = (canary.injectedPersona ?? null) === (input.persona ?? null)
+    if (sameOrigin && sameEndpoint && samePersona) {
+      continue
+    }
+    try {
+      const updated = input.storage.markSecondOrderCanarySurfaced(canary.id, {
+        surfacedOrigin: input.origin,
+        surfacedEndpoint: input.endpoint,
+        surfacedPersona: input.persona ?? null,
+        surfacedExchangeId: input.exchangeId ?? null,
+        status: 'surfaced',
+      })
+      recordSecondOrderSurfaceFact(
+        input.storage,
+        input.runId,
+        input.assignmentId ?? canary.assignmentId,
+        updated,
+        input.origin,
+        input.endpoint,
+        input.persona ?? null,
+        input.exchangeId ?? null,
+      )
+      surfacedRecords.push(updated)
+    } catch {
+      // Best-effort update if DB closed concurrently.
+    }
+  }
+  return surfacedRecords
 }
 
 function formatHostForUrl(host: string): string {
@@ -310,7 +515,7 @@ function detailToCanaryHit(token: string, detail: Record<string, unknown>): Cana
 
 export class CanaryBroker {
   private readonly secret = randomBytes(32)
-  private readonly defaultStorage?: Store
+  private readonly defaultStorage?: Store | SecondOrderStore
   private server?: Server
   private dnsSocket?: DgramSocket
   private boundHost: string | null = null
@@ -321,9 +526,10 @@ export class CanaryBroker {
   private publicBaseUrl: string | null = null
   private dnsDomain: string
   private readonly minted = new Map<string, MintedMeta>()
+  private readonly mintedSecondOrder = new Map<string, MintedSecondOrderMeta>()
   private readonly hitsByToken = new Map<string, CanaryHit[]>()
 
-  constructor(options: { storage?: Store; dnsDomain?: string } = {}) {
+  constructor(options: { storage?: Store | SecondOrderStore; dnsDomain?: string } = {}) {
     this.defaultStorage = options.storage
     this.publicBaseUrl = normalizePublicBaseUrl(
       process.env.GUARDIAN_CANARY_PUBLIC_URL ?? process.env.GUARDIAN_CANARY_BASE_URL,
@@ -367,7 +573,7 @@ export class CanaryBroker {
       try {
         const parsed = parseDnsQuery(msg)
         if (!parsed) return
-        const match = tokenPattern.exec(parsed.qname)
+        const match = tokenPattern.exec(parsed.qname) ?? secondOrderPattern.exec(parsed.qname)
         const token = match ? match[0].toLowerCase() : null
         const queryType = dnsTypeNames[parsed.qtype] ?? `TYPE${parsed.qtype}`
         const isValid = Boolean(token)
@@ -543,7 +749,7 @@ export class CanaryBroker {
 
     const meta = this.minted.get(hit.token)
     const storage = meta?.storage ?? this.defaultStorage
-    if (storage && meta) {
+    if (isFullStore(storage) && meta) {
       try {
         storage.db.update(canaries).set({
           triggered: true,
@@ -558,6 +764,24 @@ export class CanaryBroker {
         // Best-effort persistence if DB is closed or token is in-memory only.
       }
     }
+
+    const secondOrderMeta = this.mintedSecondOrder.get(hit.token)
+    const secondOrderStorage = secondOrderMeta?.storage ?? this.defaultStorage
+    if (secondOrderMeta && secondOrderStorage) {
+      const surfacedOrigin = this.effectiveBaseUrl() ?? `https://${this.dnsDomain}`
+      const surfacedEndpoint = hit.protocol === 'dns'
+        ? `canary-dns:${hit.dnsHost ?? hit.path}`
+        : `canary-http:${hit.path}`
+      scanSecondOrderMarkers({
+        text: hit.token,
+        runId: secondOrderMeta.runId,
+        assignmentId: secondOrderMeta.assignmentId,
+        origin: surfacedOrigin,
+        endpoint: surfacedEndpoint,
+        persona: 'oob-callback',
+        storage: secondOrderStorage,
+      })
+    }
   }
 
   recordCallback(token: string, detail: Record<string, unknown>) {
@@ -570,7 +794,7 @@ export class CanaryBroker {
     runId: string,
     label: string,
     origin?: string,
-    options?: { storage?: Store; assignmentId?: string },
+    options?: { storage?: Store | SecondOrderStore; assignmentId?: string },
   ): MintedCanary {
     const id = randomUUID()
     const digest = createHmac('sha256', this.secret)
@@ -596,7 +820,7 @@ export class CanaryBroker {
       createdAt,
     })
 
-    if (storage) {
+    if (isFullStore(storage)) {
       const purpose = (origin ? `${label} (${origin})` : label).slice(0, 200)
       storage.db.insert(canaries).values({
         id,
@@ -628,7 +852,89 @@ export class CanaryBroker {
     }
   }
 
-  checkCanary(token: string, options?: { storage?: Store; runId?: string }): CanaryCheckResult {
+  mintSecondOrderCanary(input: {
+    runId: string
+    assignmentId?: string
+    injectedOrigin?: string
+    injectedEndpoint?: string
+    sourceEndpoint?: string
+    injectedParam?: string
+    injectedPersona?: string | null
+    sourcePersona?: string | null
+    storage?: Store | SecondOrderStore
+  }): MintedSecondOrderCanary {
+    let marker = ''
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const digest = createHmac('sha256', this.secret)
+        .update(input.runId)
+        .update(randomBytes(8))
+        .digest('hex')
+        .slice(0, 8)
+      const candidate = `gn2o_${digest}`
+      if (!this.mintedSecondOrder.has(candidate)) {
+        marker = candidate
+        break
+      }
+    }
+    if (!marker) {
+      marker = `gn2o_${randomBytes(4).toString('hex')}`
+    }
+
+    const assignmentId = input.assignmentId ?? 'canary-broker'
+    const injectedOrigin = input.injectedOrigin ?? 'https://second-order.invalid'
+    const injectedEndpoint = input.injectedEndpoint ?? input.sourceEndpoint ?? '/'
+    const injectedParam = input.injectedParam ?? 'input'
+    const injectedPersona = input.injectedPersona ?? input.sourcePersona ?? null
+    const storage = input.storage ?? this.defaultStorage
+
+    let id: string | undefined
+    if (storage) {
+      const row = storage.insertSecondOrderCanary({
+        runId: input.runId,
+        assignmentId,
+        marker,
+        injectedOrigin,
+        injectedEndpoint,
+        injectedParam,
+        injectedPersona,
+      })
+      id = row.id
+    }
+
+    if (this.mintedSecondOrder.size >= maxTrackedTokens) {
+      const oldestKey = this.mintedSecondOrder.keys().next().value
+      if (oldestKey) this.mintedSecondOrder.delete(oldestKey)
+    }
+    this.mintedSecondOrder.set(marker, {
+      id,
+      runId: input.runId,
+      assignmentId,
+      injectedOrigin,
+      injectedEndpoint,
+      injectedParam,
+      injectedPersona,
+      storage,
+    })
+
+    const effective = this.effectiveBaseUrl()
+    const dnsHost = `${marker}.${this.dnsDomain}`
+    const httpUrl = effective ? `${effective}/c/${marker}` : `https://${this.dnsDomain}/c/${marker}`
+
+    return {
+      ...(id ? { id } : {}),
+      marker,
+      runId: input.runId,
+      assignmentId,
+      injectedOrigin,
+      injectedEndpoint,
+      injectedParam,
+      injectedPersona,
+      httpUrl,
+      dnsHost,
+    }
+  }
+
+  checkCanary(token: string, options?: { storage?: Store | SecondOrderStore; runId?: string }): CanaryCheckResult {
     const normalized = token.trim().toLowerCase()
     const meta = this.minted.get(normalized)
     const storage = options?.storage ?? meta?.storage ?? this.defaultStorage
@@ -636,7 +942,7 @@ export class CanaryBroker {
 
     const memHits = [...(this.hitsByToken.get(normalized) ?? [])]
     let row: typeof canaries.$inferSelect | undefined
-    if (storage) {
+    if (isFullStore(storage)) {
       try {
         row = runId
           ? storage.db.select().from(canaries).where(and(eq(canaries.runId, runId), eq(canaries.token, normalized))).get()
@@ -646,7 +952,7 @@ export class CanaryBroker {
       }
     }
 
-    if (row && memHits.length > 0 && !row.triggered) {
+    if (row && memHits.length > 0 && !row.triggered && isFullStore(storage)) {
       const latest = memHits[memHits.length - 1]
       try {
         storage!.db.update(canaries).set({

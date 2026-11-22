@@ -1,0 +1,26 @@
+id: "jira-unauthenticated-dashboards"
+name: "Jira Unauthenticated Dashboards"
+severity: "info"
+description: "Safe check derived from jira-unauthenticated-dashboards: Jira Unauthenticated Dashboards"
+tech:
+  - "generic"
+tags:
+  - "atlassian"
+  - "jira"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rest/api/2/dashboard?maxResults=100"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "dashboards"
+      - "startAt"
+      - "maxResults"
+    condition: "and"

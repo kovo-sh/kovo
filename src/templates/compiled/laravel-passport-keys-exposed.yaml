@@ -1,0 +1,36 @@
+id: "laravel-passport-keys-exposed"
+name: "Laravel Passport - OAuth2 Keys Exposed"
+severity: "high"
+description: "Laravel Passport OAuth2 RSA private or public keys are publicly accessible at default storage paths. Exposed private keys allow attackers to forge OAuth2 access tokens and impersonate any user."
+tech:
+  - "laravel"
+tags:
+  - "laravel"
+  - "passport"
+  - "oauth"
+  - "exposure"
+  - "keys"
+reference: "https://laravel.com/docs/10.x/passport#installation"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/storage/oauth-private.key"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "-----BEGIN RSA PRIVATE KEY-----"
+      - "-----BEGIN PUBLIC KEY-----"
+  - type: "word"
+    part: "body"
+    words:
+      - "<html"
+      - "<!DOCTYPE"
+    negative: true
+  - type: "status"
+    status:
+      - 200

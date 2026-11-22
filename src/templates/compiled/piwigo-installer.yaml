@@ -1,0 +1,28 @@
+id: "piwigo-installer"
+name: "Piwigo Installation Page - Exposure"
+severity: "high"
+description: "Piwigo is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "install"
+  - "piwigo"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "Piwigo ([0-9.]+) \\- Installation"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,28 @@
+id: "insecure-crossdomain"
+name: "Insecure cross-domain.xml file"
+severity: "info"
+description: "Safe check derived from insecure-crossdomain: Insecure cross-domain.xml file"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "generic"
+  - "files"
+  - "vuln"
+reference: "https://www.acunetix.com/vulnerabilities/web/insecure-crossdomain-xml-file"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/crossdomain.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<allow-access-from domain=\"*\"/>"

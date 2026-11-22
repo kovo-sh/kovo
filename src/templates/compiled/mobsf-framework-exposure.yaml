@@ -1,0 +1,29 @@
+id: "mobsf-framework-exposure"
+name: "MobSF Framework - Exposure"
+severity: "high"
+description: "MobSF Framework is exposed."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "mobsf"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/recent_scans/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Recent Scans"
+      - "Mobile Security Framework - MobSF"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

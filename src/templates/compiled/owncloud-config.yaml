@@ -1,0 +1,30 @@
+id: "owncloud-config"
+name: "owncloud Config - Detect"
+severity: "info"
+description: "owncloud configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://owncloud.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/owncloud/config/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of"
+      - "owncloud/config"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

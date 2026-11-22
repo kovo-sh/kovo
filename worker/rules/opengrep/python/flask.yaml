@@ -1,0 +1,1355 @@
+rules:
+- id: flask-cache-query-string
+  patterns:
+  - pattern-either:
+    - pattern: "@app.route(\"...\")\n@cache.cached(...)\ndef $HANDLER(...):\n  ...\n\
+        \  request.args.get(...)\n"
+    - pattern: "@app.route(\"...\", methods=[..., \"POST\", ...])\n@cache.cached(...)\n\
+        def $HANDLER(...):\n  ...\n"
+    - pattern: "@app.route(\"...\", methods=[..., \"PUT\", ...])\n@cache.cached(...)\n\
+        def $HANDLER(...):\n  ...\n"
+    - pattern: "@app.route(\"...\", methods=[..., \"DELETE\", ...])\n@cache.cached(...)\n\
+        def $HANDLER(...):\n  ...\n"
+    - pattern: "@app.route(\"...\", methods=[..., \"PATCH\", ...])\n@cache.cached(...)\n\
+        def $HANDLER(...):\n  ...\n"
+  - pattern-not: "@app.route(\"...\")\n@cache.cached(..., query_string=True)\ndef\
+      \ $HANDLER(...):\n  ...\n  request.args.get(...)\n"
+  message: Flask-caching doesn't cache query strings by default. You have to use `query_string=True`.
+    Also you shouldn't cache verbs that can mutate state.
+  severity: WARNING
+  languages:
+  - python
+  metadata:
+    category: caching
+    technology:
+    - flask
+- id: avoid_app_run_with_bad_host
+  message: Running flask app with host 0.0.0.0 could expose the server publicly.
+  metadata:
+    cwe:
+    - 'CWE-668: Exposure of Resource to Wrong Sphere'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - flask
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  languages:
+  - python
+  severity: WARNING
+  pattern-either:
+  - pattern: app.run(..., host="0.0.0.0", ...)
+  - pattern: app.run(..., "0.0.0.0", ...)
+- id: avoid_using_app_run_directly
+  patterns:
+  - pattern-not-inside: "if __name__ == '__main__':\n  ...\n"
+  - pattern-not-inside: "def $X(...):\n  ...\n"
+  - pattern: app.run(...)
+  message: top-level app.run(...) is ignored by flask. Consider putting app.run(...)
+    behind a guard, like inside a function
+  metadata:
+    cwe:
+    - 'CWE-668: Exposure of Resource to Wrong Sphere'
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - flask
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: debug-enabled
+  patterns:
+  - pattern-inside: 'import flask
+
+      ...
+
+      '
+  - pattern: $APP.run(..., debug=True, ...)
+  message: Detected Flask app with debug=True. Do not deploy to production with this
+    flag enabled as it will leak sensitive information. Instead, consider using Flask
+    configuration variables or setting 'debug' using system environment variables.
+  metadata:
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    owasp: A06:2017 - Security Misconfiguration
+    references:
+    - https://labs.detectify.com/2015/10/02/how-patreon-got-hacked-publicly-exposed-werkzeug-debugger/
+    category: security
+    technology:
+    - flask
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  severity: WARNING
+  languages:
+  - python
+- id: directly-returned-format-string
+  message: Detected Flask route directly returning a formatted string. This is subject
+    to cross-site scripting if user input can reach the string. Consider using the
+    template engine instead and rendering pages with 'render_template()'.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - flask
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - patterns:
+      - pattern-inside: "@$APP.route(...)\ndef $FUNC(..., $PARAM, ...):\n  ...\n"
+      - pattern: $PARAM
+    - pattern: 'request.$FUNC.get(...)
+
+        '
+    - pattern: 'request.$FUNC(...)
+
+        '
+    - pattern: request.$FUNC[...]
+  pattern-sinks:
+  - patterns:
+    - pattern-not-inside: return "..."
+    - pattern-either:
+      - pattern: return "...".format(...)
+      - pattern: return "..." % ...
+      - pattern: return "..." + ...
+      - pattern: return ... + "..."
+      - pattern: return f"...{...}..."
+      - patterns:
+        - pattern: return $X
+        - pattern-either:
+          - pattern-inside: '$X = "...".format(...)
+
+              ...
+
+              '
+          - pattern-inside: '$X = "..." % ...
+
+              ...
+
+              '
+          - pattern-inside: '$X = "..." + ...
+
+              ...
+
+              '
+          - pattern-inside: '$X = ... + "..."
+
+              ...
+
+              '
+          - pattern-inside: '$X = f"...{...}..."
+
+              ...
+
+              '
+        - pattern-not-inside: '$X = "..."
+
+            ...
+
+            '
+- id: flask-cors-misconfiguration
+  message: Setting 'support_credentials=True' together with 'origin="*"' is a CORS
+    misconfiguration that can allow third party origins to read sensitive data. Using
+    this configuration, flask_cors will dynamically reflects the Origin of each request
+    in the Access-Control-Allow-Origin header, allowing all origins and allowing cookies
+    and credentials to be sent along with request. It is recommended to specify allowed
+    origins instead of using "*" when setting 'support_credentials=True'.
+  languages:
+  - python
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '@cross_origin(..., origins="*", supports_credentials=True, ...)
+
+        '
+    - pattern: 'CORS(..., supports_credentials=True, origins="*", ...)
+
+        '
+    - pattern: 'CORS(..., resources={"...": {...,"origins": "*",
+
+        "supports_credentials": True,...}})
+
+        '
+  metadata:
+    category: security
+    subcategory:
+    - audit
+    cwe:
+    - 'CWE-942: Permissive Cross-domain Policy with Untrusted Domains'
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    confidence: LOW
+    likelihood: LOW
+    impact: HIGH
+    technology:
+    - flask
+    references:
+    - https://pypi.org/project/Flask-Cors/
+    - https://flask-cors.readthedocs.io/en/latest/index.html
+- id: avoid_hardcoded_config_TESTING
+  message: Hardcoded variable `TESTING` detected. Use environment variables or config
+    files instead
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://bento.dev/checks/flask/avoid-hardcoded-config/
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#builtin-configuration-values
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#environment-and-debug-features
+    subcategory:
+    - audit
+    technology:
+    - flask
+  languages:
+  - python
+  pattern-either:
+  - pattern: $M.config['TESTING'] = True
+  - pattern: $M.config['TESTING'] = False
+  - pattern: $M.update(TESTING=True, ...)
+  - pattern: $M.update(TESTING=False, ...)
+- id: avoid_hardcoded_config_SECRET_KEY
+  message: Hardcoded variable `SECRET_KEY` detected. Use environment variables or
+    config files instead
+  severity: ERROR
+  metadata:
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://bento.dev/checks/flask/avoid-hardcoded-config/
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#builtin-configuration-values
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#environment-and-debug-features
+    subcategory:
+    - audit
+    technology:
+    - flask
+  languages:
+  - python
+  pattern-either:
+  - pattern: $M.update(SECRET_KEY="=~/.*/")
+  - pattern: $M.config['SECRET_KEY'] = "=~/.*/"
+- id: avoid_hardcoded_config_ENV
+  message: Hardcoded variable `ENV` detected. Set this by using FLASK_ENV environment
+    variable
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://bento.dev/checks/flask/avoid-hardcoded-config/
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#builtin-configuration-values
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#environment-and-debug-features
+    subcategory:
+    - audit
+    technology:
+    - flask
+  languages:
+  - python
+  pattern-either:
+  - pattern: $M.update(ENV="=~/^development|production$/")
+  - pattern: $M.config['ENV'] = "=~/^development|production$/"
+- id: avoid_hardcoded_config_DEBUG
+  message: Hardcoded variable `DEBUG` detected. Set this by using FLASK_DEBUG environment
+    variable
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    category: security
+    cwe:
+    - 'CWE-489: Active Debug Code'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://bento.dev/checks/flask/avoid-hardcoded-config/
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#builtin-configuration-values
+    - https://flask.palletsprojects.com/en/1.1.x/config/?highlight=configuration#environment-and-debug-features
+    subcategory:
+    - audit
+    technology:
+    - flask
+  languages:
+  - python
+  pattern-either:
+  - pattern: $M.update(DEBUG=True)
+  - pattern: $M.update(DEBUG=False)
+  - pattern: $M.config['DEBUG'] = True
+  - pattern: $M.config['DEBUG'] = False
+- id: host-header-injection-python
+  message: The `flask.request.host` is used to construct an HTTP request.  This can
+    lead to host header injection issues. Vulnerabilities  that generally occur due
+    to this issue are authentication bypasses,  password reset issues, Server-Side-Request-Forgery
+    (SSRF), and many more.  It is recommended to validate the URL before passing it
+    to a  request library, or using application logic such as authentication  or password
+    resets.
+  patterns:
+  - pattern-either:
+    - pattern: '$X = <... "=~/.*http[s]*:///" + flask.request.host ...>;
+
+        '
+    - pattern: '$X = <... "=~/.*http[s]*:///" + flask.request["host"] ...>;
+
+        '
+    - pattern: '$Z = flask.request.host;
+
+        ...
+
+        $X = <... "=~/.*http[s]*:///" + $Z ...>;
+
+        '
+    - pattern: '$Z = flask.request["host"];
+
+        ...
+
+        $X = <... "=~/.*http[s]*:///" + $Z ...>;
+
+        '
+  - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC():\n  ...\n"
+  languages:
+  - python
+  severity: INFO
+  metadata:
+    cwe:
+    - 'CWE-20: Improper Input Validation'
+    category: security
+    references:
+    - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/17-Testing_for_Host_Header_Injection
+    - https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html
+    technology:
+    - flask
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+- id: render-template-string
+  pattern: flask.render_template_string(...)
+  metadata:
+    cwe:
+    - 'CWE-96: Improper Neutralization of Directives in Statically Saved Code (''Static
+      Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://nvisium.com/blog/2016/03/09/exploring-ssti-in-flask-jinja2.html
+    category: security
+    technology:
+    - flask
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Found a template created with string formatting. This is susceptible to
+    server-side template injection and cross-site scripting attacks.
+  languages:
+  - python
+  severity: WARNING
+- id: secure-set-cookie
+  patterns:
+  - pattern-either:
+    - pattern-inside: '$RESP = flask.make_response(...)
+
+        ...
+
+        '
+    - pattern-inside: '$RESP = flask.Response(...)
+
+        ...
+
+        '
+  - pattern-not: $RESP.set_cookie(..., secure=$A, httponly=$B, samesite=$C, ...)
+  - pattern-not: $RESP.set_cookie(..., **$A)
+  - pattern: $RESP.set_cookie(...)
+  message: Found a Flask cookie with insecurely configured properties.  By default
+    the secure, httponly and samesite ar configured insecurely. cookies should be
+    handled securely by setting `secure=True`, `httponly=True`, and `samesite='Lax'`
+    in response.set_cookie(...). If these parameters are not properly set, your cookies
+    are not properly protected and are at risk of being stolen by an attacker. Include
+    the `secure=True`, `httponly=True`, `samesite='Lax'` arguments or set these to
+    be true in the Flask configuration.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without ''Secure'' Attribute'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://flask.palletsprojects.com/en/3.0.x/api/#flask.Response.set_cookie
+    - https://flask.palletsprojects.com/en/3.0.x/security/#set-cookie-options
+    category: security
+    technology:
+    - python
+    - flask
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+    functional-categories:
+    - web::search::cookie-config::flask
+  languages:
+  - python
+  severity: WARNING
+- id: flask-wtf-csrf-disabled
+  message: Setting 'WTF_CSRF_ENABLED' to 'False' explicitly disables CSRF protection.
+  options:
+    symbolic_propagation: true
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    references:
+    - https://flask-wtf.readthedocs.io/en/1.2.x/csrf/
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    functional-categories:
+    - web::search::csrf-config::flask
+    - web::search::csrf-config::flask-wtf
+  severity: WARNING
+  languages:
+  - python
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-either:
+        - pattern: $APP.config["WTF_CSRF_ENABLED"] = $FALSE
+        - pattern: $APP.config.WTF_CSRF_ENABLED = $FALSE
+        - patterns:
+          - pattern: "$APP.config.$UPDATE(\n  ...,\n  WTF_CSRF_ENABLED = $FALSE,\n\
+              \  ...\n)\n"
+          - pattern-not-inside: "$APP.config.$UPDATE(\n    ...,\n    TESTING=True,\n\
+              \    ...\n)\n"
+          - pattern-not-inside: "$APP.config.$UPDATE(\n    ...,\n    DEBUG=True,\n\
+              \    ...\n)\n"
+          - metavariable-regex:
+              metavariable: $UPDATE
+              regex: ^(update|from_mapping)$
+        - pattern: '$OBJ = $CLASS()
+
+            ...
+
+            $OBJ.WTF_CSRF_ENABLED = $FALSE
+
+            ...
+
+            $APP.config.from_object($OBJ, ...)
+
+            '
+        - pattern: 'WTF_CSRF_ENABLED = $FALSE
+
+            ...
+
+            $APP.config.from_object(__name__)
+
+            '
+      - metavariable-regex:
+          metavariable: $FALSE
+          regex: ^(False)$
+      - focus-metavariable: $FALSE
+  fix: 'True'
+- id: make-response-with-unknown-content
+  patterns:
+  - pattern: flask.make_response(...)
+  - pattern-not-inside: flask.make_response()
+  - pattern-not-inside: flask.make_response("...", ...)
+  - pattern-not-inside: 'flask.make_response({"...": "..."}, ...)'
+  - pattern-not-inside: flask.make_response(flask.redirect(...), ...)
+  - pattern-not-inside: flask.make_response(flask.render_template(...), ...)
+  - pattern-not-inside: flask.make_response(flask.jsonify(...), ...)
+  - pattern-not-inside: flask.make_response(json.dumps(...), ...)
+  - pattern-not-inside: '$X = flask.render_template(...)
+
+      ...
+
+      flask.make_response($X, ...)
+
+      '
+  - pattern-not-inside: '$X = flask.jsonify(...)
+
+      ...
+
+      flask.make_response($X, ...)
+
+      '
+  - pattern-not-inside: '$X = json.dumps(...)
+
+      ...
+
+      flask.make_response($X, ...)
+
+      '
+  message: Be careful with `flask.make_response()`. If this response is rendered onto
+    a webpage, this could create a cross-site scripting (XSS) vulnerability. `flask.make_response()`
+    will not autoescape HTML. If you are rendering HTML, write your HTML in a template
+    file and use `flask.render_template()` which will take care of escaping. If you
+    are returning data from an API, consider using `flask.jsonify()`.
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    references:
+    - https://github.com/python-security/pyt//blob/093a077bcf12d1f58ddeb2d73ddc096623985fb0/examples/vulnerable_code/XSS_assign_to_other_var.py#L11
+    - https://flask.palletsprojects.com/en/1.1.x/api/#flask.Flask.make_response
+    - https://flask.palletsprojects.com/en/1.1.x/api/#response-objects
+    category: security
+    technology:
+    - flask
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+- id: dangerous-template-string
+  message: Found a template created with string formatting. This is susceptible to
+    server-side template injection and cross-site scripting attacks.
+  metadata:
+    cwe:
+    - 'CWE-96: Improper Neutralization of Directives in Statically Saved Code (''Static
+      Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://nvisium.com/blog/2016/03/09/exploring-ssti-in-flask-jinja2.html
+    - https://pequalsnp-team.github.io/cheatsheet/flask-jinja2-ssti
+    category: security
+    technology:
+    - flask
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: ERROR
+  pattern-either:
+  - pattern: '$V = "...".format(...)
+
+      ...
+
+      flask.render_template_string($V, ...)
+
+      '
+  - pattern: '$V = "...".format(...)
+
+      ...
+
+      return flask.render_template_string($V, ...), $MORE
+
+      '
+  - pattern: '$V = "..." % $S
+
+      ...
+
+      flask.render_template_string($V, ...)
+
+      '
+  - pattern: '$V = "..." % $S
+
+      ...
+
+      return flask.render_template_string($V, ...), $MORE
+
+      '
+  - pattern: '$V = "..."
+
+      ...
+
+      $V += $O
+
+      ...
+
+      flask.render_template_string($V, ...)
+
+      '
+  - pattern: '$V = "..."
+
+      ...
+
+      $V += $O
+
+      ...
+
+      return flask.render_template_string($V, ...), $MORE
+
+      '
+  - pattern: '$V = f"...{$X}..."
+
+      ...
+
+      flask.render_template_string($V, ...)
+
+      '
+  - pattern: '$V = f"...{$X}..."
+
+      ...
+
+      return flask.render_template_string($V, ...), $CODE
+
+      '
+- id: flask-api-method-string-format
+  patterns:
+  - pattern-either:
+    - pattern: "def $METHOD(...,$ARG,...):\n  ...\n  $STRING = \"...\".format(...,$ARG,...)\n\
+        \  ...\n  ... = requests.$REQMETHOD($STRING,...)\n"
+    - pattern: "def $METHOD(...,$ARG,...):\n  ...\n  ... = requests.$REQMETHOD(\"\
+        ...\".format(...,$ARG,...),...)\n"
+  - pattern-inside: "class $CLASS(...):\n  method_decorators = ...\n  ...\n"
+  message: Method $METHOD in API controller $CLASS provides user arg $ARG to requests
+    method $REQMETHOD
+  severity: ERROR
+  languages:
+  - python
+  metadata:
+    cwe:
+    - 'CWE-134: Use of Externally-Controlled Format String'
+    category: security
+    technology:
+    - flask
+    references:
+    - https://cwe.mitre.org/data/definitions/134.html
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+- id: hashids-with-flask-secret
+  languages:
+  - python
+  message: The Flask secret key is used as salt in HashIDs. The HashID mechanism is
+    not secure. By observing sufficient HashIDs, the salt used to construct them can
+    be recovered. This means the Flask secret key can be obtained by attackers, through
+    the HashIDs.
+  metadata:
+    category: security
+    subcategory:
+    - vuln
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    owasp:
+    - A02:2021 – Cryptographic Failures
+    references:
+    - https://flask.palletsprojects.com/en/2.2.x/config/#SECRET_KEY
+    - http://carnage.github.io/2015/08/cryptanalysis-of-hashids
+    technology:
+    - flask
+    likelihood: LOW
+    impact: HIGH
+    confidence: HIGH
+  pattern-either:
+  - pattern: hashids.Hashids(..., salt=flask.current_app.config['SECRET_KEY'], ...)
+  - pattern: hashids.Hashids(flask.current_app.config['SECRET_KEY'], ...)
+  - patterns:
+    - pattern-inside: '$APP = flask.Flask(...)
+
+        ...
+
+        '
+    - pattern-either:
+      - pattern: hashids.Hashids(..., salt=$APP.config['SECRET_KEY'], ...)
+      - pattern: hashids.Hashids($APP.config['SECRET_KEY'], ...)
+  severity: ERROR
+- id: os-system-injection
+  languages:
+  - python
+  severity: ERROR
+  message: User data detected in os.system. This could be vulnerable to a command
+    injection and should be avoided. If this must be done, use the 'subprocess' module
+    instead and pass the arguments as a list.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://owasp.org/www-community/attacks/Command_Injection
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  pattern-either:
+  - patterns:
+    - pattern: os.system(...)
+    - pattern-either:
+      - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+          \  ...\n  os.system(..., <... $ROUTEVAR ...>, ...)\n"
+      - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+          \  ...\n  $INTERM = <... $ROUTEVAR ...>\n  ...\n  os.system(..., <... $INTERM\
+          \ ...>, ...)\n"
+  - pattern: os.system(..., <... flask.request.$W.get(...) ...>, ...)
+  - pattern: os.system(..., <... flask.request.$W[...] ...>, ...)
+  - pattern: os.system(..., <... flask.request.$W(...) ...>, ...)
+  - pattern: os.system(..., <... flask.request.$W ...>, ...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W.get(...) ...>
+
+        ...
+
+        os.system(<... $INTERM ...>)
+
+        '
+    - pattern: os.system(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W[...] ...>
+
+        ...
+
+        os.system(<... $INTERM ...>)
+
+        '
+    - pattern: os.system(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W(...) ...>
+
+        ...
+
+        os.system(<... $INTERM ...>)
+
+        '
+    - pattern: os.system(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W ...>
+
+        ...
+
+        os.system(<... $INTERM ...>)
+
+        '
+    - pattern: os.system(...)
+- id: ssrf-requests
+  languages:
+  - python
+  severity: ERROR
+  message: Data from request object is passed to a new server-side request. This could
+    lead to a server-side request forgery (SSRF). To mitigate, ensure that schemes
+    and hosts are validated against an allowlist, do not forward the response to the
+    user, and ensure proper authentication and transport-layer security in the proxied
+    request.
+  metadata:
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    owasp:
+    - A10:2021 - Server-Side Request Forgery (SSRF)
+    references:
+    - https://owasp.org/www-community/attacks/Server_Side_Request_Forgery
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  pattern-either:
+  - patterns:
+    - pattern: requests.$FUNC(...)
+    - pattern-either:
+      - pattern-inside: "@$APP.$ROUTE_METHOD($ROUTE, ...)\ndef $ROUTE_FUNC(..., $ROUTEVAR,\
+          \ ...):\n  ...\n  requests.$FUNC(..., <... $ROUTEVAR ...>, ...)\n"
+      - pattern-inside: "@$APP.$ROUTE_METHOD($ROUTE, ...)\ndef $ROUTE_FUNC(..., $ROUTEVAR,\
+          \ ...):\n  ...\n  $INTERM = <... $ROUTEVAR ...>\n  ...\n  requests.$FUNC(...,\
+          \ <... $INTERM ...>, ...)\n"
+    - metavariable-regex:
+        metavariable: $ROUTE_METHOD
+        regex: ^(route|get|post|put|delete|patch)$
+  - pattern: requests.$FUNC(..., <... flask.request.$W.get(...) ...>, ...)
+  - pattern: requests.$FUNC(..., <... flask.request.$W[...] ...>, ...)
+  - pattern: requests.$FUNC(..., <... flask.request.$W(...) ...>, ...)
+  - pattern: requests.$FUNC(..., <... flask.request.$W ...>, ...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W.get(...) ...>
+
+        ...
+
+        requests.$FUNC(<... $INTERM ...>, ...)
+
+        '
+    - pattern: requests.$FUNC(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W[...] ...>
+
+        ...
+
+        requests.$FUNC(<... $INTERM ...>, ...)
+
+        '
+    - pattern: requests.$FUNC(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W(...) ...>
+
+        ...
+
+        requests.$FUNC(<... $INTERM ...>, ...)
+
+        '
+    - pattern: requests.$FUNC(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W ...>
+
+        ...
+
+        requests.$FUNC(<... $INTERM ...>, ...)
+
+        '
+    - pattern: requests.$FUNC(...)
+- id: eval-injection
+  languages:
+  - python
+  severity: ERROR
+  message: Detected user data flowing into eval. This is code injection and should
+    be avoided.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://nedbatchelder.com/blog/201206/eval_really_is_dangerous.html
+    category: security
+    technology:
+    - flask
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  pattern-either:
+  - patterns:
+    - pattern: eval(...)
+    - pattern-either:
+      - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+          \  ...\n  eval(..., <... $ROUTEVAR ...>, ...)\n"
+      - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+          \  ...\n  $INTERM = <... $ROUTEVAR ...>\n  ...\n  eval(..., <... $INTERM\
+          \ ...>, ...)\n"
+  - pattern: eval(..., <... flask.request.$W.get(...) ...>, ...)
+  - pattern: eval(..., <... flask.request.$W[...] ...>, ...)
+  - pattern: eval(..., <... flask.request.$W(...) ...>, ...)
+  - pattern: eval(..., <... flask.request.$W ...>, ...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W.get(...) ...>
+
+        ...
+
+        eval(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: eval(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W[...] ...>
+
+        ...
+
+        eval(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: eval(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W(...) ...>
+
+        ...
+
+        eval(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: eval(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W ...>
+
+        ...
+
+        eval(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: eval(...)
+- id: exec-injection
+  languages:
+  - python
+  severity: ERROR
+  message: Detected user data flowing into exec. This is code injection and should
+    be avoided.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://nedbatchelder.com/blog/201206/exec_really_is_dangerous.html
+    category: security
+    technology:
+    - flask
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  pattern-either:
+  - patterns:
+    - pattern: exec(...)
+    - pattern-either:
+      - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+          \  ...\n  exec(..., <... $ROUTEVAR ...>, ...)\n"
+      - pattern-inside: "@$APP.route($ROUTE, ...)\ndef $FUNC(..., $ROUTEVAR, ...):\n\
+          \  ...\n  $INTERM = <... $ROUTEVAR ...>\n  ...\n  exec(..., <... $INTERM\
+          \ ...>, ...)\n"
+  - pattern: exec(..., <... flask.request.$W.get(...) ...>, ...)
+  - pattern: exec(..., <... flask.request.$W[...] ...>, ...)
+  - pattern: exec(..., <... flask.request.$W(...) ...>, ...)
+  - pattern: exec(..., <... flask.request.$W ...>, ...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W.get(...) ...>
+
+        ...
+
+        exec(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: exec(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W[...] ...>
+
+        ...
+
+        exec(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: exec(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W(...) ...>
+
+        ...
+
+        exec(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: exec(...)
+  - patterns:
+    - pattern-inside: '$INTERM = <... flask.request.$W ...>
+
+        ...
+
+        exec(..., <... $INTERM ...>, ...)
+
+        '
+    - pattern: exec(...)
+- id: insecure-deserialization
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://docs.python.org/3/library/pickle.html
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Detected the use of an insecure deserialization library in a Flask route.
+    These libraries are prone to code execution vulnerabilities. Ensure user data
+    does not enter this function. To fix this, try to avoid serializing whole objects.
+    Consider instead using a serializer such as JSON.
+  languages:
+  - python
+  severity: ERROR
+  patterns:
+  - pattern-inside: "@app.route(...)\ndef $X(...):\n  ...\n"
+  - pattern-not: $MODULE.$FUNC("...")
+  - pattern-not: $MODULE.$FUNC(open("...", ...))
+  - pattern-either:
+    - pattern: pickle.$FUNC(...)
+    - pattern: _pickle.$FUNC(...)
+    - pattern: cPickle.$FUNC(...)
+    - pattern: dill.$FUNC(...)
+    - pattern: shelve.$FUNC(...)
+    - pattern: yaml.load(...)
+- id: avoid_send_file_without_path_sanitization
+  patterns:
+  - pattern-inside: "@app.route(...)\ndef $X(filename):\n  ...\n"
+  - pattern: flask.send_file(filename, ...)
+  message: Detected a user-controlled `filename` that could flow to `flask.send_file()`
+    function. This could lead to an attacker reading arbitrary file from the system,
+    leaking private information. Make sure to properly sanitize filename or use `flask.send_from_directory`
+  metadata:
+    cwe:
+    - 'CWE-73: External Control of File Name or Path'
+    owasp:
+    - A04:2021 - Insecure Design
+    category: security
+    technology:
+    - flask
+    references:
+    - https://owasp.org/Top10/A04_2021-Insecure_Design
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+- id: unescaped-template-extension
+  message: Flask does not automatically escape Jinja templates unless they have .html,
+    .htm, .xml, or .xhtml extensions. This could lead to XSS attacks. Use .html, .htm,
+    .xml, or .xhtml for your template extensions. See https://flask.palletsprojects.com/en/1.1.x/templating/#jinja-setup
+    for more information.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    source-rule-url: https://pypi.org/project/flake8-flask/
+    references:
+    - https://flask.palletsprojects.com/en/1.1.x/templating/#jinja-setup
+    - https://semgrep.dev/blog/2020/bento-check-unescaped-template-extensions-in-flask/
+    - https://bento.dev/checks/flask/unescaped-file-extension/
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  patterns:
+  - pattern-not: flask.render_template("=~/.+\.html$/", ...)
+  - pattern-not: flask.render_template("=~/.+\.xml$/", ...)
+  - pattern-not: flask.render_template("=~/.+\.htm$/", ...)
+  - pattern-not: flask.render_template("=~/.+\.xhtml$/", ...)
+  - pattern-not: flask.render_template($X + "=~/\.html$/", ...)
+  - pattern-not: flask.render_template($X + "=~/\.xml$/", ...)
+  - pattern-not: flask.render_template($X + "=~/\.htm$/", ...)
+  - pattern-not: flask.render_template($X + "=~/\.xhtml$/", ...)
+  - pattern-not: flask.render_template("=~/.+\.html$/" % $X, ...)
+  - pattern-not: flask.render_template("=~/.+\.xml$/" % $X, ...)
+  - pattern-not: flask.render_template("=~/.+\.htm$/" % $X, ...)
+  - pattern-not: flask.render_template("=~/.+\.xhtml$/" % $X, ...)
+  - pattern-not: flask.render_template("=~/.+\.html$/".format(...), ...)
+  - pattern-not: flask.render_template("=~/.+\.xml$/".format(...), ...)
+  - pattern-not: flask.render_template("=~/.+\.htm$/".format(...), ...)
+  - pattern-not: flask.render_template("=~/.+\.xhtml$/".format(...), ...)
+  - pattern-not: flask.render_template($TEMPLATE)
+  - pattern-either:
+    - pattern: flask.render_template("...", ...)
+    - pattern: flask.render_template($X + "...", ...)
+    - pattern: flask.render_template("..." % $Y, ...)
+    - pattern: flask.render_template("...".format(...), ...)
+  languages:
+  - python
+  severity: WARNING
+- id: response-contains-unsanitized-input
+  message: Flask response reflects unsanitized user input. This could lead to a cross-site
+    scripting vulnerability (https://owasp.org/www-community/attacks/xss/) in which
+    an attacker causes arbitrary code to be executed in the user's browser. To prevent,
+    please sanitize the user input, e.g. by rendering the response in a Jinja2 template
+    (see considerations in https://flask.palletsprojects.com/en/1.0.x/security/).
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://flask.palletsprojects.com/en/1.0.x/security/
+    - https://owasp.org/www-community/attacks/xss/
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+  pattern-either:
+  - pattern: '$X = flask.request.args.get(...)
+
+      ...
+
+      flask.make_response("...".format($X))
+
+      '
+  - pattern: '$X = flask.request.args.get(...)
+
+      ...
+
+      flask.make_response(f"...{$X}...")
+
+      '
+  - pattern: '$X = flask.request.args.get(...)
+
+      ...
+
+      flask.make_response(f"...{$X}")
+
+      '
+  - pattern: '$X = flask.request.args.get(...)
+
+      ...
+
+      flask.make_response(f"{$X}...")
+
+      '
+- id: direct-use-of-jinja2
+  message: Detected direct use of jinja2. If not done properly, this may bypass HTML
+    escaping which opens up the application to cross-site scripting (XSS) vulnerabilities.
+    Prefer using the Flask method 'render_template()' and templates with a '.html'
+    extension in order to prevent XSS.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://jinja.palletsprojects.com/en/2.11.x/api/#basics
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+  pattern-either:
+  - pattern: jinja2.Environment(...)
+  - pattern: jinja2.Template.render(...)
+  - patterns:
+    - pattern-inside: '$TEMPLATE = $ENV.get_template(...)
+
+        ...
+
+        '
+    - pattern: $TEMPLATE.render(...)
+  - patterns:
+    - pattern-inside: '$TEMPLATE = jinja2.Template(...)
+
+        ...
+
+        '
+    - pattern: $TEMPLATE.render(...)
+- id: explicit-unescape-with-markup
+  message: Detected explicitly unescaped content using 'Markup()'. This permits the
+    unescaped data to include unescaped HTML which could result in cross-site scripting.
+    Ensure this data is not externally controlled, or consider rewriting to not use
+    'Markup()'.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://tedboy.github.io/flask/generated/generated/flask.Markup.html
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - python
+  severity: WARNING
+  pattern-either:
+  - pattern: flask.Markup.unescape(...)
+  - pattern: $MARKUPOBJ.unescape()
+  - patterns:
+    - pattern-either:
+      - pattern: flask.Markup($Q)
+      - pattern: markupsafe.Markup($Q)
+    - metavariable-pattern:
+        metavariable: $Q
+        patterns:
+        - pattern-not: '"..."'
+- id: template-unescaped-with-safe
+  message: Detected a segment of a Flask template where autoescaping is explicitly
+    disabled with '| safe' filter. This allows rendering of raw HTML in this segment.
+    Ensure no user data is rendered here, otherwise this is a cross-site scripting
+    (XSS) vulnerability.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://flask.palletsprojects.com/en/1.1.x/security/#cross-site-scripting-xss
+    category: security
+    technology:
+    - flask
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - regex
+  paths:
+    include:
+    - '*.html'
+  severity: WARNING
+  pattern-regex: '{{.*?\|\s*safe(\s*}})?'
+- id: template-unquoted-attribute-var
+  message: 'Detected a unquoted template variable as an attribute. If unquoted, a
+    malicious actor could inject custom JavaScript handlers. To fix this, add quotes
+    around the template expression, like this: "{{ $...VAR }}".'
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://flask.palletsprojects.com/en/1.1.x/security/#cross-site-scripting-xss
+    category: security
+    technology:
+    - flask
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - generic
+  paths:
+    include:
+    - '*.html'
+    - '*.py'
+  severity: WARNING
+  patterns:
+  - pattern: ={{$...VAR}}
+  - pattern-inside: '<$TAG ... >
+
+      '
+  - metavariable-pattern:
+      metavariable: $...VAR
+      pattern-either:
+      - pattern: 'request.$VALUE.get(...)
+
+          '
+      - pattern: 'request.$VALUE[''...'']
+
+          '
+      - patterns:
+        - pattern: $REQ
+        - pattern-either:
+          - pattern-inside: "$REQ = request.$VALUE.get(...)\n... \n"
+          - pattern-inside: "$REQ = request.$VALUE['...']\n... \n"
+  fix: '="{{$...VAR}}"
+
+    '

@@ -1,0 +1,35 @@
+id: "bun-lock"
+name: "Bun Lock File Disclosure"
+severity: "info"
+description: "The bun.lockb file is similar to the package-lock.json file used by npm or the yarn.lock file used by Yarn. It serves as a lock file that ensures consistent and reproducible installations of dependencies across different environments."
+tech:
+  - "node"
+tags:
+  - "exposure"
+  - "files"
+  - "node"
+  - "npm"
+  - "bun"
+  - "vuln"
+reference: "https://bun.sh/docs/install/lockfile"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/bun.lockb"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "bun-lockfile-format-v0"
+      - "#!/usr/bin/env bun"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+  - type: "status"
+    status:
+      - 200

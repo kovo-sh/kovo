@@ -1,0 +1,25 @@
+id: "telerik-fileupload-detect"
+name: "Detect Telerik Web UI Fileupload Handler"
+severity: "info"
+description: "This template detects the Telerik Web UI fileupload handler."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "telerik"
+  - "fileupload"
+  - "intrusive"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Telerik.Web.UI.WebResource.axd?type=rau"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "RadAsyncUpload handler is registered succesfully"

@@ -1,0 +1,27 @@
+id: "apache-skywalking-horizon-ui-detect"
+name: "Apache SkyWalking Horizon UI - Detect"
+severity: "info"
+description: "Detects an SkyWalking Horizon UI server, using the next-generation UI (Horizon)."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "skywalking-horizon-ui"
+  - "detect"
+reference: "https://github.com/apache/skywalking-horizon-ui"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "SkyWalking Horizon UI"
+  - type: "status"
+    status:
+      - 200

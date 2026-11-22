@@ -1,0 +1,31 @@
+id: "hp-ilo-serial-key-disclosure"
+name: "HP iLO Serial Key - Detect"
+severity: "medium"
+description: "HP iLO serial key was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/detectify/ugly-duckling/blob/master/modules/crowdsourced/hp-ilo-serial-key-disclosure.json"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/xmldata?item=CpqKey"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "LTYPE"
+      - "LNAME"
+      - "KEY"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

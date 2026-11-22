@@ -1,0 +1,29 @@
+id: "ubersmith-installer"
+name: "Ubersmith Setup Page - Exposure"
+severity: "high"
+description: "Detects exposed Ubersmith Setup page."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "ubersmith"
+  - "vuln"
+reference: "https://ubersmith.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Ubersmith Setup"
+  - type: "status"
+    status:
+      - 200

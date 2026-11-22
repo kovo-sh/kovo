@@ -1,0 +1,28 @@
+id: "bagisto-installer"
+name: "Bagisto Installer Exposure"
+severity: "high"
+description: "Bagisto is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "bagisto"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/installer"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Bagisto Installer"
+  - type: "status"
+    status:
+      - 200

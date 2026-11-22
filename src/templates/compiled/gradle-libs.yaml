@@ -1,0 +1,30 @@
+id: "gradle-libs"
+name: "Gradle Library Version Disclosure"
+severity: "info"
+description: "Safe check derived from gradle-libs: Gradle Library Version Disclosure"
+tech:
+  - "generic"
+tags:
+  - "file"
+  - "gradle"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/gradle/libs.versions.toml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[versions]"
+      - "[libraries]"
+      - "[bundles]"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

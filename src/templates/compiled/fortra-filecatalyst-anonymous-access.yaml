@@ -1,0 +1,34 @@
+id: "fortra-filecatalyst-anonymous-access"
+name: "Fortra FileCatalyst - Anonymous Access"
+severity: "low"
+description: "Detects Fortra FileCatalyst web interfaces that allow anonymous or guest access. FileCatalyst is a managed file transfer solution, and anonymous access to its portal can expose sensitive files and configuration if not properly secured. This template checks for publicly accessible instances with guest or unauthenticated user functionality."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "filecatalyst"
+  - "fortra"
+  - "anonymous"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+reference: "https://www.fortra.com/products/filecatalyst"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/workflow/jsp/downloadFiles.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "</i>Guest"
+      - "Logout</a>"
+      - "FileCatalyst"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

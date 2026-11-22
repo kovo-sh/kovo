@@ -1,0 +1,35 @@
+id: "http-etcd-unauthenticated-raft"
+name: "etcd RAFT Unauthenticated API"
+severity: "high"
+description: "etcd's v2 API is reachable without authentication, exposing the /v2/members endpoint. This endpoint discloses the full cluster membership list, including each member's name, internal peer URLs, and client URLs, without requiring any credentials."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "unauth"
+  - "etcd"
+  - "exposure"
+cwe: "CWE-306"
+reference: "https://etcd.io/docs/v3.5/op-guide/authentication/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/members"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "peerURLs"
+      - "clientURLs"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

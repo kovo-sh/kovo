@@ -1,0 +1,30 @@
+id: "pghero-dashboard-exposure"
+name: "PgHero Dashboard Exposure Panel - Detect"
+severity: "medium"
+description: "PgHero Dashboard Exposure panel was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "panel"
+  - "pghero"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/ankane/pghero"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/connections"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>PgHero / Connections</title>"
+  - type: "status"
+    status:
+      - 200

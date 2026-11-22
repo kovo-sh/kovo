@@ -1,0 +1,30 @@
+id: "label-studio-signup"
+name: "Label Studio - Sign-up Detect"
+severity: "info"
+description: "Detects the presence of the Label Studio sign-up."
+tech:
+  - "generic"
+tags:
+  - "label-studio"
+  - "sign-up"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/user/signup"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Label Studio"
+      - "Sign up"
+      - "Create Account"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

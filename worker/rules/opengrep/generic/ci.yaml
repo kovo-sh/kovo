@@ -1,0 +1,61 @@
+rules:
+- id: changed-semgrepignore
+  paths:
+    include:
+    - .semgrepignore
+  patterns:
+  - pattern-regex: '^(.*)$
+
+      '
+  - pattern-not-regex: '^\n.*$
+
+      '
+  - pattern-not-regex: '^#.*$
+
+      '
+  message: '`$1` has been added to the .semgrepignore list of ignored paths. Someone
+    from app-sec may want to audit these changes.'
+  languages:
+  - generic
+  severity: WARNING
+  metadata:
+    technology:
+    - semgrep
+    references:
+    - https://semgrep.dev/docs/ignoring-files-folders-code/
+    category: best-practice
+- id: bash_reverse_shell
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    category: security
+    technology:
+    - ci
+    confidence: HIGH
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: HIGH
+  message: Semgrep found a bash reverse shell
+  severity: ERROR
+  languages:
+  - generic
+  pattern-either:
+  - pattern: 'sh -i >& /dev/udp/.../... 0>&1
+
+      '
+  - pattern: '<...>/dev/tcp/.../...; sh <&... >&... 2>&
+
+      '
+  - pattern: '<...>/dev/tcp/.../...; cat <&... | while read line; do $line 2>&...
+      >&...;done
+
+      '
+  - pattern: 'sh -i ...<...> /dev/tcp/.../... ...<&... 1>&... 2>&
+
+      '

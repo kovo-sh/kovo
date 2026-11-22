@@ -1,0 +1,35 @@
+id: "gcloud-access-token"
+name: "Google Cloud Access Token"
+severity: "medium"
+description: "Internal Google Cloud access tokens are exposed."
+tech:
+  - "generic"
+tags:
+  - "google"
+  - "cloud"
+  - "devops"
+  - "exposure"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/access_tokens.db"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "SQLite"
+      - "access_token"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+  - type: "status"
+    status:
+      - 200

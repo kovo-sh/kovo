@@ -1,0 +1,180 @@
+rules:
+- id: jwt-python-exposed-data
+  message: The object is passed strictly to jwt.encode(...) Make sure that sensitive
+    information is not exposed through JWT token payload.
+  severity: WARNING
+  metadata:
+    owasp:
+    - A02:2017 - Broken Authentication
+    - A04:2021 - Insecure Design
+    cwe:
+    - 'CWE-522: Insufficiently Protected Credentials'
+    source-rule-url: https://semgrep.dev/blog/2020/hardcoded-secrets-unverified-tokens-and-other-common-jwt-mistakes/
+    category: security
+    technology:
+    - jwt
+    references:
+    - https://owasp.org/Top10/A04_2021-Insecure_Design
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - python
+  patterns:
+  - pattern-inside: "def $FUNC(...,$INPUT,...):\n  ...\n"
+  - pattern: jwt.encode($INPUT,...)
+- id: jwt-python-exposed-credentials
+  languages:
+  - python
+  metadata:
+    cwe:
+    - 'CWE-522: Insufficiently Protected Credentials'
+    owasp:
+    - A02:2017 - Broken Authentication
+    - A04:2021 - Insecure Design
+    source-rule-url: https://semgrep.dev/blog/2020/hardcoded-secrets-unverified-tokens-and-other-common-jwt-mistakes/
+    references:
+    - https://cwe.mitre.org/data/definitions/522.html
+    category: security
+    technology:
+    - jwt
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  message: Password is exposed through JWT token payload. This is not encrypted and
+    the password could be compromised. Do not store passwords in JWT tokens.
+  pattern-either:
+  - pattern: 'jwt.encode({...,"password":$P,...},...)
+
+      '
+  - pattern: '$PAYLOAD = {...,"password":$P,...}
+
+      ...
+
+      jwt.encode($PAYLOAD,...)
+
+      '
+  severity: ERROR
+- id: jwt-python-hardcoded-secret
+  message: 'Hardcoded JWT secret or private key is used. This is a Insufficiently
+    Protected Credentials weakness: https://cwe.mitre.org/data/definitions/522.html
+    Consider using an appropriate security mechanism to protect the credentials (e.g.
+    keeping secrets in environment variables)'
+  metadata:
+    cwe:
+    - 'CWE-522: Insufficiently Protected Credentials'
+    owasp:
+    - A02:2017 - Broken Authentication
+    - A04:2021 - Insecure Design
+    references:
+    - https://semgrep.dev/blog/2020/hardcoded-secrets-unverified-tokens-and-other-common-jwt-mistakes/
+    category: security
+    technology:
+    - jwt
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+  patterns:
+  - pattern: 'jwt.encode($X, $SECRET, ...)
+
+      '
+  - focus-metavariable: $SECRET
+  - pattern: '"..."
+
+      '
+  languages:
+  - python
+  severity: ERROR
+- id: jwt-python-none-alg
+  message: Detected use of the 'none' algorithm in a JWT token. The 'none' algorithm
+    assumes the integrity of the token has already been verified. This would allow
+    a malicious actor to forge a JWT token that will automatically be verified. Do
+    not explicitly use the 'none' algorithm. Instead, use an algorithm such as 'HS256'.
+  metadata:
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    source-rule-url: https://semgrep.dev/blog/2020/hardcoded-secrets-unverified-tokens-and-other-common-jwt-mistakes/
+    category: security
+    technology:
+    - jwt
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+  pattern-either:
+  - pattern: 'jwt.encode(...,algorithm="none",...)
+
+      '
+  - pattern: jwt.decode(...,algorithms=[...,"none",...],...)
+- id: unverified-jwt-decode
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern: 'jwt.decode(..., options={..., "verify_signature": $BOOL, ...}, ...)
+
+          '
+      - metavariable-pattern:
+          metavariable: $BOOL
+          pattern: 'False
+
+            '
+      - focus-metavariable: $BOOL
+    - patterns:
+      - pattern: '$OPTS = {..., "verify_signature": $BOOL, ...}
+
+          ...
+
+          jwt.decode(..., options=$OPTS, ...)
+
+          '
+      - metavariable-pattern:
+          metavariable: $BOOL
+          pattern: 'False
+
+            '
+      - focus-metavariable: $BOOL
+  message: Detected JWT token decoded with 'verify=False'. This bypasses any integrity
+    checks for the token which means the token could be tampered with by malicious
+    actors. Ensure that the JWT token is verified.
+  metadata:
+    owasp:
+    - A02:2017 - Broken Authentication
+    - A07:2021 - Identification and Authentication Failures
+    cwe:
+    - 'CWE-287: Improper Authentication'
+    references:
+    - https://github.com/we45/Vulnerable-Flask-App/blob/752ee16087c0bfb79073f68802d907569a1f0df7/app/app.py#L96
+    category: security
+    technology:
+    - jwt
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  fix: 'True
+
+    '
+  severity: ERROR
+  languages:
+  - python

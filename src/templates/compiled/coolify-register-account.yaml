@@ -1,0 +1,29 @@
+id: "coolify-register-account"
+name: "Coolify Register User Account - Enabled"
+severity: "medium"
+description: "Exposed Coolify user register page."
+tech:
+  - "generic"
+tags:
+  - "coolify"
+  - "register"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/register"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Password again"
+      - "Coolify"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

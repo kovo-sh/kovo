@@ -1,0 +1,39 @@
+id: "netgear-router-exposure"
+name: "NETGEAR Routers - Serial Number Disclosure"
+severity: "medium"
+description: "Multiple NETGEAR router models disclose their serial number which can be used to obtain the admin password if password recovery is enabled."
+tech:
+  - "generic"
+tags:
+  - "edb"
+  - "netgear"
+  - "exposure"
+  - "iot"
+  - "router"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/exploits/47117"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rootDesc.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+      - 501
+  - type: "word"
+    part: "body"
+    words:
+      - "<serialNumber>"
+      - "<deviceType>"
+      - "<modelNumber>"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/xml"

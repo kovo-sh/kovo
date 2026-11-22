@@ -1,0 +1,1130 @@
+rules:
+- id: bad-deserialization-env
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: request.env
+  pattern-sinks:
+  - pattern-either:
+    - pattern: 'CSV.load(...)
+
+        '
+    - pattern: 'Marshal.load(...)
+
+        '
+    - pattern: 'Marshal.restore(...)
+
+        '
+    - pattern: 'Oj.object_load(...)
+
+        '
+    - pattern: 'Oj.load($X)
+
+        '
+  message: Checks for unsafe deserialization. Objects in Ruby can be serialized into
+    strings, then later loaded from strings. However, uses of load and object_load
+    can cause remote code execution. Loading user input with MARSHAL or CSV can potentially
+    be dangerous. Use JSON in a secure fashion instead.
+  metadata:
+    references:
+    - https://groups.google.com/g/rubyonrails-security/c/61bkgvnSGTQ/m/nehwjA8tQ8EJ
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_deserialize.rb
+    category: security
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    technology:
+    - ruby
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+- id: bad-deserialization-yaml
+  patterns:
+  - pattern: 'YAML.load($...ARGS)
+
+      '
+  - pattern-not: 'YAML.load(..., safe: true, ...)
+
+      '
+  - pattern-not: 'YAML.load("...", ...)
+
+      '
+  - pattern-not-inside: 'YAML.load(..., File.read(...), ...)
+
+      '
+  - pattern-not-inside: '$FILE = File.read(...)
+
+      ...
+
+      YAML.load(..., $FILE, ...)
+
+      '
+  - pattern-not-inside: '$FILENAME = ...
+
+      ...
+
+      $FILE = File.read($FILENAME, ...)
+
+      ...
+
+      YAML.load(..., $FILE, ...)
+
+      '
+  - pattern-not-inside: 'YAML.load(..., $X.$Y(File.read(...)), ...)
+
+      '
+  - pattern-not-inside: 'YAML.load(..., $X.$Y(File.read(...)).$Z, ...)
+
+      '
+  - pattern-not-inside: '$T = $MOD.$MET(File.read(...))
+
+      ...
+
+      YAML.load(..., $T, ...)
+
+      '
+  - pattern-not-inside: '$T = $MOD.$MET(File.read(...))
+
+      ...
+
+      YAML.load(..., $T.$R, ...)
+
+      '
+  fix: Psych.safe_load($...ARGS)
+  message: Unsafe deserialization from YAML. Objects in Ruby can be serialized into
+    strings, then later loaded from strings. However, uses of load and object_load
+    can cause remote code execution. Loading user input with YAML can potentially
+    be dangerous. Use JSON in a secure fashion instead. However, loading YAML from
+    a static file is not dangerous and should not be flagged.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://groups.google.com/g/rubyonrails-security/c/61bkgvnSGTQ/m/nehwjA8tQ8EJ
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_deserialize.rb
+    category: security
+    technology:
+    - ruby
+    - yaml
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+- id: bad-deserialization
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: params
+    - pattern: cookies
+  pattern-sinks:
+  - pattern-either:
+    - pattern: 'CSV.load(...)
+
+        '
+    - pattern: 'Marshal.load(...)
+
+        '
+    - pattern: 'Marshal.restore(...)
+
+        '
+    - pattern: 'Oj.object_load(...)
+
+        '
+    - pattern: 'Oj.load($X)
+
+        '
+  message: Checks for unsafe deserialization. Objects in Ruby can be serialized into
+    strings, then later loaded from strings. However, uses of load and object_load
+    can cause remote code execution. Loading user input with MARSHAL or CSV can potentially
+    be dangerous. Use JSON in a secure fashion instead.
+  metadata:
+    references:
+    - https://groups.google.com/g/rubyonrails-security/c/61bkgvnSGTQ/m/nehwjA8tQ8EJ
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_deserialize.rb
+    category: security
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    technology:
+    - ruby
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - ruby
+  severity: ERROR
+- id: cookie-serialization
+  message: Checks if code allows cookies to be deserialized using Marshal. If the
+    attacker can craft a valid cookie, this could lead to remote code execution. The
+    hybrid check is just to warn users to migrate to :json for best practice.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_cookie_serialization.rb
+    - https://robertheaton.com/2013/07/22/how-to-hack-a-rails-app-using-its-secret-token/
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+  pattern-either:
+  - pattern: 'Rails.application.config.action_dispatch.cookies_serializer = :marshal
+
+      '
+  - pattern: 'Rails.application.config.action_dispatch.cookies_serializer = :hybrid
+
+      '
+- id: create-with
+  patterns:
+  - pattern-not: '$FUNC.create_with($PARAMSB.permit(...))
+
+      '
+  - pattern: '$FUNC.create_with($PARAMSA)
+
+      '
+  message: Checks for strong parameter bypass through usage of create_with. Create_with
+    bypasses strong parameter protection, which could allow attackers to set arbitrary
+    attributes on models. To fix this vulnerability, either remove all create_with
+    calls or use the permit function to specify tags that are allowed to be set.
+  metadata:
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_create_with.rb
+    - https://groups.google.com/g/rubyonrails-security/c/M4chq5Sb540/m/CC1Fh0Y_NWwJ
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+- id: dangerous-exec
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: "def $F(...,$ARG,...)\n    ...\nend\n"
+    - focus-metavariable: $ARG
+  - pattern: params
+  - pattern: cookies
+  pattern-sinks:
+  - patterns:
+    - pattern: '$EXEC(...)
+
+        '
+    - pattern-not: '$EXEC("...","...","...",...)
+
+        '
+    - pattern-not: '$EXEC(["...","...","...",...],...)
+
+        '
+    - pattern-not: '$EXEC({...},"...","...","...",...)
+
+        '
+    - pattern-not: '$EXEC({...},["...","...","...",...],...)
+
+        '
+    - metavariable-regex:
+        metavariable: $EXEC
+        regex: ^(system|exec|spawn|Process.exec|Process.spawn|Open3.capture2|Open3.capture2e|Open3.capture3|Open3.popen2|Open3.popen2e|Open3.popen3|IO.popen|Gem::Util.popen|PTY.spawn)$
+  message: Detected non-static command inside $EXEC. Audit the input to '$EXEC'. If
+    unverified user data can reach this call site, this is a code injection vulnerability.
+    A malicious actor can inject a malicious script to execute arbitrary code.
+  metadata:
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_execute.rb
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - ruby
+    - rails
+    references:
+    - https://guides.rubyonrails.org/security.html#command-line-injection
+    cwe2022-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: HIGH
+    confidence: MEDIUM
+  severity: WARNING
+  languages:
+  - ruby
+- id: dangerous-open
+  patterns:
+  - pattern: 'open($CMD,...)
+
+      '
+  - pattern-not: 'open("...",...)
+
+      '
+  - metavariable-regex:
+      metavariable: $CMD
+      regex: '|'
+  message: Detected non-static command inside 'open'. Audit the input to 'open'. If
+    unverified user data can reach this call site, this is a code injection vulnerability.
+    A malicious actor can inject a malicious script to execute arbitrary code.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - ruby
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - ruby
+- id: dangerous-open3-pipeline
+  patterns:
+  - pattern: 'Open3.$PIPE(...)
+
+      '
+  - pattern-not: 'Open3.$PIPE(...,"...",...)
+
+      '
+  - metavariable-regex:
+      metavariable: $PIPE
+      regex: ^(pipeline|pipeline_r|pipeline_rw|pipeline_start|pipeline_w)$
+  message: Detected non-static command inside $PIPE. Audit the input to '$PIPE'. If
+    unverified user data can reach this call site, this is a code injection vulnerability.
+    A malicious actor can inject a malicious script to execute arbitrary code.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - ruby
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - ruby
+- id: dangerous-subshell
+  patterns:
+  - pattern: '`...#{$VAL}...`
+
+      '
+  - pattern-not: '`...#{"..."}...`
+
+      '
+  - pattern-not-inside: '$VAL = "..."
+
+      ...
+
+      '
+  message: Detected non-static command inside `...`. If unverified user data can reach
+    this call site, this is a code injection vulnerability. A malicious actor can
+    inject a malicious script to execute arbitrary code.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - ruby
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - ruby
+- id: dangerous-syscall
+  pattern: 'syscall
+
+    '
+  message: '''syscall'' is essentially unsafe and unportable. The DL (https://apidock.com/ruby/Fiddle)
+    library is preferred for safer and a bit more portable programming.'
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    category: security
+    technology:
+    - ruby
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - ruby
+- id: divide-by-zero
+  message: Detected a possible ZeroDivisionError.
+  metadata:
+    cwe:
+    - 'CWE-369: Divide By Zero'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_divide_by_zero.rb
+    category: security
+    technology:
+    - ruby
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+  languages:
+  - ruby
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: $VAR
+    - metavariable-regex:
+        metavariable: $VAR
+        regex: ^\d*(?!\.)$
+  pattern-sinks:
+  - patterns:
+    - pattern-inside: $NUMER / 0
+    - pattern: $NUMER
+- id: file-disclosure
+  message: Special requests can determine whether a file exists on a filesystem that's
+    outside the Rails app's root directory. To fix this, set config.serve_static_assets
+    = false.
+  metadata:
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (''Path
+      Traversal'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_file_disclosure.rb
+    - https://groups.google.com/g/rubyonrails-security/c/23fiuwb1NBA/m/MQVM1-5GkPMJ
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+  pattern: config.serve_static_assets = true
+  fix-regex:
+    regex: =(\s)*true
+    replacement: = false
+- id: filter-skipping
+  patterns:
+  - pattern-not: '$CALL "=~/.*(/:action.*).*/", $ACTION
+
+      '
+  - pattern: '$CALL "=~/.*(/:action.*).*/"
+
+      '
+  message: Checks for use of action in Ruby routes. This can cause Rails to render
+    an arbitrary view if an attacker creates an URL accurately. Affects 3.0 applications.
+    Can avoid the vulnerability by providing additional constraints.
+  metadata:
+    cwe:
+    - 'CWE-1021: Improper Restriction of Rendered UI Layers or Frames'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_filter_skipping.rb
+    - https://groups.google.com/g/rubyonrails-security/c/NCCsca7TEtY
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A04:2021 - Insecure Design
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+- id: force-ssl-false
+  message: Checks for configuration setting of force_ssl to false. Force_ssl forces
+    usage of HTTPS, which could lead to network interception of unencrypted application
+    traffic. To fix, set config.force_ssl = true.
+  metadata:
+    cwe:
+    - 'CWE-311: Missing Encryption of Sensitive Data'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_force_ssl.rb
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A04:2021 - Insecure Design
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: HIGH
+  languages:
+  - ruby
+  severity: WARNING
+  pattern: config.force_ssl = false
+  fix-regex:
+    regex: =\s*false
+    replacement: = true
+- id: hardcoded-http-auth-in-controller
+  patterns:
+  - pattern-inside: "class $CONTROLLER < ApplicationController\n  ...\n  http_basic_authenticate_with\
+      \ ..., :password => \"$SECRET\", ...\nend\n"
+  - focus-metavariable: $SECRET
+  message: Detected hardcoded password used in basic authentication in a controller
+    class. Including this password in version control could expose this credential.
+    Consider refactoring to use environment variables or configuration files.
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-798: Use of Hard-coded Credentials'
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/basic_auth/index.markdown
+    category: security
+    technology:
+    - ruby
+    - secrets
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: HIGH
+  languages:
+  - ruby
+- id: hardcoded-secret-rsa-passphrase
+  message: Found the use of an hardcoded passphrase for RSA. The passphrase can be
+    easily discovered, and therefore should not be stored in source-code. It is recommended
+    to remove the passphrase from source-code, and use system environment variables
+    or a restricted configuration file.
+  languages:
+  - ruby
+  severity: WARNING
+  metadata:
+    technology:
+    - ruby
+    - secrets
+    category: security
+    references:
+    - https://cwe.mitre.org/data/definitions/522.html
+    cwe:
+    - 'CWE-798: Use of Hard-coded Credentials'
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: HIGH
+  patterns:
+  - pattern-either:
+    - pattern: OpenSSL::PKey::RSA.new(..., '...')
+    - pattern: OpenSSL::PKey::RSA.new(...).to_pem(..., '...')
+    - pattern: OpenSSL::PKey::RSA.new(...).export(..., '...')
+    - patterns:
+      - pattern-inside: '$OPENSSL = OpenSSL::PKey::RSA.new(...)
+
+          ...
+
+          '
+      - pattern-either:
+        - pattern: '$OPENSSL.export(...,''...'')
+
+            '
+        - pattern: '$OPENSSL.to_pem(...,''...'')
+
+            '
+    - patterns:
+      - pattern-either:
+        - patterns:
+          - pattern-inside: '$ASSIGN = ''...''
+
+              ...
+
+              '
+          - pattern: OpenSSL::PKey::RSA.new(..., $ASSIGN)
+        - patterns:
+          - pattern-inside: 'def $METHOD1(...)
+
+              ...
+
+              $ASSIGN = ''...''
+
+              ...
+
+              end
+
+              ...
+
+              def $METHOD2(...)
+
+              ...
+
+              end
+
+              '
+          - pattern: OpenSSL::PKey::RSA.new(..., $ASSIGN)
+        - patterns:
+          - pattern-inside: "$ASSIGN = '...'\n...\ndef $METHOD(...)\n  $OPENSSL =\
+              \ OpenSSL::PKey::RSA.new(...)\n...\nend\n...\n"
+          - pattern-either:
+            - pattern: $OPENSSL.export(...,$ASSIGN)
+            - pattern: $OPENSSL.to_pem(...,$ASSIGN)
+        - patterns:
+          - pattern-inside: 'def $METHOD1(...)
+
+              ...
+
+              $OPENSSL = OpenSSL::PKey::RSA.new(...)
+
+              ...
+
+              $ASSIGN = ''...''
+
+              ...
+
+              end
+
+              ...
+
+              '
+          - pattern-either:
+            - pattern: $OPENSSL.export(...,$ASSIGN)
+            - pattern: $OPENSSL.to_pem(...,$ASSIGN)
+        - patterns:
+          - pattern-inside: 'def $METHOD1(...)
+
+              ...
+
+              $ASSIGN = ''...''
+
+              ...
+
+              end
+
+              ...
+
+              def $METHOD2(...)
+
+              ...
+
+              $OPENSSL = OpenSSL::PKey::RSA.new(...)
+
+              ...
+
+              end
+
+              ...
+
+              '
+          - pattern-either:
+            - pattern: $OPENSSL.export(...,$ASSIGN)
+            - pattern: $OPENSSL.to_pem(...,$ASSIGN)
+- id: json-entity-escape
+  pattern-either:
+  - pattern: 'ActiveSupport.escape_html_entities_in_json = false
+
+      '
+  - pattern: 'config.active_support.escape_html_entities_in_json = false
+
+      '
+  message: Checks if HTML escaping is globally disabled for JSON output. This could
+    lead to XSS.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_json_entity_escape.rb
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: WARNING
+- id: mass-assignment-protection-disabled
+  pattern: $MODEL.new(params[...], ..., :without_protection => true, ...)
+  message: Mass assignment protection disabled for '$MODEL'. This could permit assignment
+    to sensitive model fields without intention. Instead, use 'attr_accessible' for
+    the model or disable mass assigment using 'config.active_record.whitelist_attributes
+    = true'. ':without_protection => true' must be removed for this to take effect.
+  metadata:
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/mass_assignment/index.markdown
+    category: security
+    technology:
+    - ruby
+    references:
+    - https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  severity: WARNING
+  languages:
+  - ruby
+- id: missing-csrf-protection
+  patterns:
+  - pattern: "class $CONTROLLER < ActionController::Base\n  ...\nend\n"
+  - pattern-not: "class $CONTROLLER < ActionController::Base\n  ...\n  protect_from_forgery\
+      \ :with => :exception\nend\n"
+  - pattern-not: "class $CONTROLLER < ActionController::Base\n  ...\n  protect_from_forgery\
+      \ prepend: true, with: :exception\nend\n"
+  message: Detected controller which does not enable cross-site request forgery protections
+    using 'protect_from_forgery'. Add 'protect_from_forgery :with => :exception' to
+    your controller class.
+  severity: ERROR
+  metadata:
+    cwe:
+    - 'CWE-352: Cross-Site Request Forgery (CSRF)'
+    owasp:
+    - A01:2021 - Broken Access Control
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/docs/warning_types/cross-site_request_forgery/index.markdown
+    category: security
+    technology:
+    - ruby
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+- id: model-attr-accessible
+  message: 'Checks for dangerous permitted attributes that can lead to mass assignment
+    vulnerabilities. Query parameters allowed using permit and attr_accessible are
+    checked for allowance of dangerous attributes admin, banned, role, and account_id.
+    Also checks for usages of params.permit!, which allows everything. Fix: don''t
+    allow admin, banned, role, and account_id using permit or attr_accessible.'
+  metadata:
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_model_attr_accessible.rb
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+  pattern-either:
+  - pattern: '....permit(..., :admin, ...)
+
+      '
+  - pattern: '....permit(..., :role, ...)
+
+      '
+  - pattern: '....permit(..., :banned, ...)
+
+      '
+  - pattern: '....permit(..., :account_id, ...)
+
+      '
+  - pattern: 'attr_accessible ..., :admin, ...
+
+      '
+  - pattern: 'attr_accessible ..., :role, ...
+
+      '
+  - pattern: 'attr_accessible ..., :banned, ...
+
+      '
+  - pattern: 'attr_accessible ..., :account_id, ...
+
+      '
+  - pattern: 'params.permit!
+
+      '
+- id: model-attributes-attr-accessible
+  patterns:
+  - pattern-not: 'class $CLASS < $TYPE
+
+      ...
+
+      attr_accessible :$XXX
+
+      ...
+
+      end
+
+      ...
+
+      $CLASS.$FUNC(...)
+
+      '
+  - pattern: 'class $CLASS < $TYPE
+
+      ...
+
+      end
+
+      ...
+
+      $CLASS.$FUNC(...)
+
+      '
+  - metavariable-pattern:
+      metavariable: $TYPE
+      patterns:
+      - pattern-not-regex: (?i)(Error|Exception)
+  - focus-metavariable: $CLASS
+  message: Checks for models that do not use attr_accessible. This means there is
+    no limiting of which variables can be manipulated through mass assignment. For
+    newer Rails applications, parameters should be allowlisted using strong parameters.
+    For older Rails versions, they should be allowlisted using strong_attributes.
+  metadata:
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_model_attributes.rb
+    category: security
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    technology:
+    - rails
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+- id: ruby-eval
+  message: Use of eval with user-controllable input detected. This can lead  to attackers
+    running arbitrary code. Ensure external data does not  reach here, otherwise this
+    is a security vulnerability. Consider  other ways to do this without eval.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe2022-top25: true
+    cwe2021-top25: true
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    source-rule-url: https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_evaluation.rb
+    subcategory:
+    - vuln
+    technology:
+    - ruby
+    - rails
+  languages:
+  - ruby
+  mode: taint
+  pattern-sources:
+  - pattern-either:
+    - pattern: params
+    - pattern: cookies
+    - patterns:
+      - pattern: 'RubyVM::InstructionSequence.compile(...)
+
+          '
+      - pattern-not: 'RubyVM::InstructionSequence.compile("...")
+
+          '
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: $X.eval
+      - pattern: $X.class_eval
+      - pattern: $X.instance_eval
+      - pattern: $X.module_eval
+      - pattern: $X.eval(...)
+      - pattern: $X.class_eval(...)
+      - pattern: $X.instance_eval(...)
+      - pattern: $X.module_eval(...)
+      - pattern: eval(...)
+      - pattern: class_eval(...)
+      - pattern: module_eval(...)
+      - pattern: instance_eval(...)
+    - pattern-not: $M("...",...)
+- id: bad-send
+  message: Checks for unsafe use of Object#send, try, __send__, and public_send. These
+    only account for unsafe use of a method, not target. This can lead to arbitrary
+    calling of exit, along with arbitrary code execution. Please be sure to sanitize
+    input in order to avoid this.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_send.rb
+    - https://the.igreque.info/posts/2016/01-object-send-considered-harmful-en.html
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A03:2021 - Injection
+    cwe2022-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: ERROR
+  pattern-either:
+  - pattern: '$PARAM = params[...]
+
+      ...
+
+      $RES = $MOD.send($PARAM.$FUNC)
+
+      '
+  - pattern: '$PARAM = params[...]
+
+      ...
+
+      $RES = $MOD.try($PARAM.$FUNC)
+
+      '
+  - pattern: '$PARAM = params[...]
+
+      ...
+
+      $RES = $MOD.__send__($PARAM.$FUNC)
+
+      '
+  - pattern: '$PARAM = params[...]
+
+      ...
+
+      $RES = $MOD.public_send($PARAM.$FUNC)'
+- id: ssl-mode-no-verify
+  pattern: OpenSSL::SSL::VERIFY_NONE
+  message: Detected SSL that will accept an unverified connection. This makes the
+    connections susceptible to man-in-the-middle attacks. Use 'OpenSSL::SSL::VERIFY_PEER'
+    instead.
+  fix-regex:
+    regex: VERIFY_NONE
+    replacement: VERIFY_PEER
+  severity: WARNING
+  languages:
+  - ruby
+  metadata:
+    cwe:
+    - 'CWE-295: Improper Certificate Validation'
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A07:2021 - Identification and Authentication Failures
+    references:
+    - https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+- id: mass-assignment-vuln
+  patterns:
+  - pattern-either:
+    - pattern: '$MOD.new(params[$CODE])
+
+        '
+    - pattern: '$MOD.new(..., params[$CODE], :without_protection => true, ...)
+
+        '
+  - pattern-not-inside: 'attr_accessible $VAR
+
+      ...
+
+      $MOD.new(params[$CODE])
+
+      '
+  message: 'Checks for calls to without_protection during mass assignment (which allows
+    record creation from hash values). This can lead to users bypassing permissions
+    protections. For Rails 4 and higher, mass protection is on by default. Fix: Don''t
+    use :without_protection => true. Instead, configure attr_accessible to control
+    attribute access.'
+  metadata:
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-915: Improperly Controlled Modification of Dynamically-Determined Object
+      Attributes'
+    references:
+    - https://github.com/presidentbeef/brakeman/blob/main/lib/brakeman/checks/check_without_protection.rb
+    - https://www.acunetix.com/vulnerabilities/web/rails-mass-assignment/
+    category: security
+    technology:
+    - ruby
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  languages:
+  - ruby
+  severity: WARNING
+- id: weak-hashes-md5
+  message: Should not use md5 to generate hashes. md5 is proven to be vulnerable through
+    the use of brute-force attacks. Could also result in collisions, leading to potential
+    collision attacks. Use SHA256 or other hashing functions instead.
+  metadata:
+    cwe:
+    - 'CWE-328: Use of Weak Hash'
+    references:
+    - https://www.ibm.com/support/pages/security-bulletin-vulnerability-md5-signature-and-hash-algorithm-affects-sterling-integrator-and-sterling-file-gateway-cve-2015-7575
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - ruby
+  severity: WARNING
+  pattern-either:
+  - pattern: Digest::MD5.base64digest $X
+  - pattern: Digest::MD5.hexdigest $X
+  - pattern: Digest::MD5.digest $X
+  - pattern: Digest::MD5.new
+  - pattern: OpenSSL::Digest::MD5.base64digest $X
+  - pattern: OpenSSL::Digest::MD5.hexdigest $X
+  - pattern: OpenSSL::Digest::MD5.digest $X
+  - pattern: OpenSSL::Digest::MD5.new
+- id: weak-hashes-sha1
+  message: Should not use SHA1 to generate hashes. There is a proven SHA1 hash collision
+    by Google, which could lead to vulnerabilities. Use SHA256, SHA3 or other hashing
+    functions instead.
+  metadata:
+    cwe:
+    - 'CWE-328: Use of Weak Hash'
+    references:
+    - https://security.googleblog.com/2017/02/announcing-first-sha1-collision.html
+    - https://shattered.io/
+    category: security
+    technology:
+    - ruby
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - ruby
+  severity: WARNING
+  pattern-either:
+  - pattern: Digest::SHA1.$FUNC
+  - pattern: OpenSSL::Digest::SHA1.$FUNC
+  - pattern: OpenSSL::HMAC.$FUNC("sha1",...)

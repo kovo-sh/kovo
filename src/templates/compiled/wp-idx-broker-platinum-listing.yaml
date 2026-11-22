@@ -1,0 +1,31 @@
+id: "wp-idx-broker-platinum-listing"
+name: "WordPress Plugin Idx Broker Platinum Listing"
+severity: "info"
+description: "Searches for sensitive directories present in the idx-broker-platinum plugin."
+tech:
+  - "wordpress"
+tags:
+  - "plugin"
+  - "edb"
+  - "wordpress"
+  - "listing"
+  - "vuln"
+reference: "https://www.exploit-db.com/ghdb/6416"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/idx-broker-platinum/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of"
+      - "wp-content/plugins/idx-broker-platinum/"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

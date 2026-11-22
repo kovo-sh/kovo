@@ -1,0 +1,36 @@
+id: "solarassistant-detect"
+name: "SolarAssistant - Detect"
+severity: "info"
+description: "SolarAssistant provides local monitoring and control for solar inverters and battery systems."
+tech:
+  - "generic"
+tags:
+  - "solarassistant"
+  - "tech"
+  - "iot"
+  - "solar"
+  - "energy"
+  - "detect"
+reference: "https://solar-assistant.io/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/sign_in"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>SolarAssistant</title>"
+      - "phx-track-static"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "_solar_assistant_key="
+  - type: "status"
+    status:
+      - 200

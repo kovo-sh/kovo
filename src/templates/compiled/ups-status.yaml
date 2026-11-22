@@ -1,0 +1,30 @@
+id: "ups-status"
+name: "APC UPC Multimon Status Page - Detect"
+severity: "info"
+description: "Multimon UPS status page was detected."
+tech:
+  - "generic"
+tags:
+  - "logs"
+  - "status"
+  - "edb"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "http://www.apcupsd.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/apcupsd/multimon.cgi"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Multimon: UPS Status Page"
+  - type: "status"
+    status:
+      - 200

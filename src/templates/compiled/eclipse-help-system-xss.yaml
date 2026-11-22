@@ -1,0 +1,35 @@
+id: "eclipse-help-system-xss"
+name: "IBM Eclipse Help System - Cross-Site Scripting"
+severity: "high"
+description: "IBM Eclipse Help System 6.1.0 through 6.1.0.6, 6.1.5 through 6.1.5.3, 7.0 through 7.0.0.2, and 8.0 prior to 8.0.0.1 contains a cross-site scripting vulnerability. An attacker can execute arbitrary script in the browser of an unsuspecting user in the context of the affected site."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "ibm"
+  - "xss"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://packetstormsecurity.com/files/131924/IBM-Eclipse-Help-System-IEHS-Cross-Site-Scripting.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/help/index.jsp?view=%3Cscript%3Ealert(document.cookie)%3C/script%3E"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<script>alert(document.cookie)</script>"
+      - "file not found"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"

@@ -1,0 +1,33 @@
+id: "wgetrc-config"
+name: "Wgetrc Configuration File - Detect"
+severity: "info"
+description: "Wgetrc configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.gnu.org/software/wget/manual/html_node/Wgetrc-Commands.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wgetrc"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/etc/wgetrc"
+      - "wget.info"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+  - type: "status"
+    status:
+      - 200

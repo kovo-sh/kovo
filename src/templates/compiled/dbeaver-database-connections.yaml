@@ -1,0 +1,32 @@
+id: "dbeaver-database-connections"
+name: "DBeaver Database Connections - Detect"
+severity: "info"
+description: "DBeaver database connections were detected."
+tech:
+  - "generic"
+tags:
+  - "dbeaver"
+  - "files"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://dbeaver.com/docs/wiki/Admin-Manage-Connections/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.dbeaver/data-sources.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"folders\": {"
+      - "\"connection-types\": {"
+      - "\"connections\": {"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

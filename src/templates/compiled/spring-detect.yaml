@@ -1,0 +1,29 @@
+id: "spring-detect"
+name: "Java Spring Detection"
+severity: "info"
+description: "Safe check derived from spring-detect: Java Spring Detection"
+tech:
+  - "java"
+  - "springboot"
+tags:
+  - "tech"
+  - "java"
+  - "spring"
+  - "discovery"
+reference: "https://mkyong.com/spring-boot/spring-rest-error-handling-example/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/error"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"status\":999"
+  - type: "status"
+    status:
+      - 500

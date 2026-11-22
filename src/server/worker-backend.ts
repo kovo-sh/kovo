@@ -113,6 +113,86 @@ export const astVerifyResultSchema = z.object({
   reason: z.string().optional(),
 })
 
+export const callGraphSinkKindSchema = z.enum([
+  'api_route',
+  'server_action',
+  'webhook',
+  'db_query',
+  'outbound_fetch',
+  'redirect',
+  'postmessage_iframe',
+  'upload_storage',
+  'auth_config',
+  'other',
+])
+
+export const callGraphRequestSchema = z.object({
+  repo: repoIdentifierSchema,
+  paths: z.array(repoRelativePathSchema).max(32).optional(),
+  maxDepth: z.number().int().min(2).max(12).optional(),
+  customGuardPatterns: z.array(z.string().min(1).max(200)).max(40).optional(),
+  customSanitizerPatterns: z.array(z.string().min(1).max(200)).max(40).optional(),
+  customSinkPatterns: z.array(z.object({
+    pattern: z.string().min(1).max(200),
+    sinkKind: callGraphSinkKindSchema,
+  })).max(40).optional(),
+  timeoutMs: z.number().int().min(5_000).max(120_000).optional(),
+})
+
+export const callGraphResultSchema = z.object({
+  repo: z.string(),
+  filesScanned: z.number().int().min(0),
+  nodes: z.array(z.object({
+    id: z.string(),
+    file: z.string(),
+    line: z.number().int().min(0),
+    endLine: z.number().int().min(0).optional(),
+    symbol: z.string(),
+    kind: z.enum(['entrypoint', 'function', 'middleware', 'sink', 'guard', 'sanitizer']),
+    httpMethod: z.string().optional(),
+    routePath: z.string().optional(),
+    sinkKind: callGraphSinkKindSchema.optional(),
+    guards: z.array(z.string()),
+    sanitizers: z.array(z.string()),
+    calls: z.array(z.string()),
+  })),
+  edges: z.array(z.object({
+    fromId: z.string(),
+    toId: z.string(),
+    file: z.string(),
+    line: z.number().int().min(0),
+  })),
+  taintPaths: z.array(z.object({
+    entrypointId: z.string(),
+    entrypointSymbol: z.string(),
+    entrypointFile: z.string(),
+    entrypointLine: z.number().int().min(0),
+    routeOrAction: z.string(),
+    httpMethod: z.string().optional(),
+    sinkId: z.string(),
+    sinkSymbol: z.string(),
+    sinkFile: z.string(),
+    sinkLine: z.number().int().min(0),
+    sinkKind: callGraphSinkKindSchema,
+    callChain: z.array(z.object({
+      file: z.string(),
+      line: z.number().int().min(0),
+      symbol: z.string(),
+      role: z.enum(['entrypoint', 'intermediate', 'guard', 'sanitizer', 'sink']),
+    })),
+    dominatingGuards: z.array(z.string()),
+    partialGuards: z.array(z.string()),
+    dominatingSanitizers: z.array(z.string()),
+    isUnguardedPath: z.boolean(),
+    authCheck: z.string(),
+    ownershipCheck: z.string(),
+    severity: z.enum(['critical', 'high', 'medium', 'low']),
+    maskedSnippet: z.string(),
+  })),
+  evidencePath: z.string().optional(),
+  durationMs: z.number().int().min(0),
+})
+
 export type WorkerJob = z.input<typeof jobSchema>
 export type WorkerResult = z.output<typeof resultSchema>
 export type SastEngine = z.infer<typeof sastEngineSchema>
@@ -124,6 +204,8 @@ export type OfflineScriptRequest = z.input<typeof offlineScriptRequestSchema>
 export type OfflineScriptResult = z.output<typeof offlineScriptResultSchema>
 export type AstVerifyRequest = z.input<typeof astVerifyRequestSchema>
 export type AstVerifyResult = z.output<typeof astVerifyResultSchema>
+export type CallGraphRequest = z.input<typeof callGraphRequestSchema>
+export type CallGraphResult = z.output<typeof callGraphResultSchema>
 
 export interface WorkerSession {
   stage(name: string, content: string, signal: AbortSignal): Promise<string>
@@ -132,6 +214,7 @@ export interface WorkerSession {
   sast(req: SastScanRequest, signal: AbortSignal): Promise<SastScanResult>
   runScript(req: OfflineScriptRequest, signal: AbortSignal): Promise<OfflineScriptResult>
   verifyStaticAst(req: AstVerifyRequest, signal: AbortSignal): Promise<AstVerifyResult>
+  callGraph?(req: CallGraphRequest, signal: AbortSignal): Promise<CallGraphResult>
   close(): Promise<void>
 }
 
@@ -204,7 +287,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly activeContainers = new Set<string>()
   private reclaiming?: Promise<void>
 
-  constructor({ image = 'guardian-worker:local', workspace }: {
+  constructor({ image = 'guardian-worker:v4', workspace }: {
     image?: string
     workspace?: { id: string; directory: string }
   } = {}) {
@@ -260,10 +343,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
   }
 
   private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions) {
-    const memoryMb = Math.round(clamp(options?.memoryMb, 1024, 512, 2048))
+    // Default 1536m RAM, 2.0 CPU, 256 PIDs (ceiling: 4096m / 4.0 / 384)
+    const memoryMb = Math.round(clamp(options?.memoryMb, 1536, 512, 4096))
     const cpus = Number(clamp(options?.cpus, 2.0, 0.5, 4.0).toFixed(2))
-    const pidsLimit = Math.round(clamp(options?.pidsLimit, 192, 64, 256))
-    const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 256))
+    const pidsLimit = Math.round(clamp(options?.pidsLimit, 256, 64, 384))
+    const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 512))
     return [
       'container', 'create', '--name', name, '--interactive', '--rm', '--pull', 'never',
       '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
@@ -471,6 +555,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
         const timeoutMs = (parsed.timeoutMs ?? 30_000) + 10_000
         const res = await request({ op: 'ast_verify', ...parsed }, opSignal, timeoutMs)
         return astVerifyResultSchema.parse(res.result)
+      },
+      async callGraph(rawReq, opSignal) {
+        const parsed = callGraphRequestSchema.parse(rawReq)
+        const timeoutMs = (parsed.timeoutMs ?? 45_000) + 15_000
+        const res = await request({ op: 'call_graph', ...parsed }, opSignal, timeoutMs)
+        return callGraphResultSchema.parse(res.result)
       },
       async close() {
         signal.removeEventListener('abort', onAbort)

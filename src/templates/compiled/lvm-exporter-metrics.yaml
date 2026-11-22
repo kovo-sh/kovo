@@ -1,0 +1,32 @@
+id: "lvm-exporter-metrics"
+name: "LVM Exporter Metrics"
+severity: "low"
+description: "LVM Exporter Metrics is exposed."
+tech:
+  - "generic"
+tags:
+  - "lvm"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "# HELP"
+  - type: "word"
+    part: "body"
+    words:
+      - "lvm_"
+  - type: "status"
+    status:
+      - 200

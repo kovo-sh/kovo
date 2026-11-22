@@ -1,0 +1,33 @@
+id: "httpbin-xss"
+name: "HTTPBin - Cross-Site Scripting"
+severity: "high"
+description: "HTTPBin contains a cross-site scripting vulnerability which can allow an attacker to execute arbitrary script. This can allow the attacker to steal cookie-based authentication credentials and launch other attacks."
+tech:
+  - "generic"
+tags:
+  - "xss"
+  - "httpbin"
+  - "oss"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://github.com/postmanlabs/httpbin"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/base64/PHNjcmlwdD5hbGVydChkb2N1bWVudC5kb21haW4pPC9zY3JpcHQ+"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "^<script>alert\\(document.domain\\)</script>$"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

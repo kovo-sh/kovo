@@ -1,0 +1,31 @@
+id: "oxid-eshop-installer"
+name: "Oxid EShop Installer Exposure"
+severity: "high"
+description: "Oxid EShop is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "oxid"
+  - "eshop"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Setup/index.php/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "OXID eShop installation"
+      - "System Requirements"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

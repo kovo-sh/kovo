@@ -1,0 +1,36 @@
+id: "tasmoadmin-detect"
+name: "TasmoAdmin - Detect"
+severity: "info"
+description: "TasmoAdmin is a web interface for centrally managing devices running Tasmota firmware."
+tech:
+  - "generic"
+tags:
+  - "tasmoadmin"
+  - "tasmota"
+  - "tech"
+  - "iot"
+  - "home-automation"
+  - "detect"
+reference: "https://github.com/TasmoAdmin/TasmoAdmin"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Login - TasmoAdmin</title>"
+      - "/resources/js/compiled/Sonoff.min.js"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "TASMO_SESSION="
+  - type: "status"
+    status:
+      - 200

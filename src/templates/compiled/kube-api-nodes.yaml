@@ -1,0 +1,34 @@
+id: "kube-api-nodes"
+name: "Kube API Nodes"
+severity: "info"
+description: "Scans for kube nodes"
+tech:
+  - "kubernetes"
+tags:
+  - "tech"
+  - "k8s"
+  - "kubernetes"
+  - "devops"
+  - "kube"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/nodes"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"NodeList\":"
+      - "\"items\":"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "\"containerRuntimeVersion\""
+      - "\"kubeletVersion\": \"v"
+    condition: "and"

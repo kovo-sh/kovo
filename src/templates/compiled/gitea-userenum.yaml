@@ -1,0 +1,28 @@
+id: "gitea-userenum"
+name: "Gitea - User Enumeration"
+severity: "low"
+description: "Enumerates the users registered in the Gitea web application, a self-hosted all-in-one software development service, including Git hosting, code review, team collaboration, package registry and CI/CD."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "gitea"
+  - "enumeration"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/explore/users/sitemap-1.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/schemas/sitemap/"
+      - "lastmod"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

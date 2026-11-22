@@ -1,0 +1,35 @@
+id: "oracle-ebs-sqllog-disclosure"
+name: "Oracle EBS - SQL Log Disclosure"
+severity: "medium"
+description: "An Oracle EBS SQL log was discovered."
+tech:
+  - "generic"
+tags:
+  - "oracle"
+  - "ebs"
+  - "logs"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://the-infosec.com/2017/03/29/do-you-know-what-your-erp-is-telling-us/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/OA_HTML/bin/sqlnet.log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "DESCRIPTION="
+      - "USER="
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

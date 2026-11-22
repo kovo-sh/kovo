@@ -1,0 +1,30 @@
+id: "oracle-test-cgi"
+name: "Oracle Application Server test-cgi Page"
+severity: "info"
+description: "Safe check derived from oracle-test-cgi: Oracle Application Server test-cgi Page"
+tech:
+  - "generic"
+tags:
+  - "oracle"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/test-cgi"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "SERVER_SOFTWARE ="
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

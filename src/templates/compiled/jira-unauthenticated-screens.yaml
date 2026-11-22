@@ -1,0 +1,34 @@
+id: "jira-unauthenticated-screens"
+name: "Jira Unauthenticated Access to screens"
+severity: "info"
+description: "Safe check derived from jira-unauthenticated-screens: Jira Unauthenticated Access to screens"
+tech:
+  - "generic"
+tags:
+  - "atlassian"
+  - "jira"
+  - "vuln"
+reference: "https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-screens/#api-rest-api-2-screens-get"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rest/api/2/screens"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"id\":"
+      - "\"name\":"
+      - "\"description\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "atlassian.xsrf.token"

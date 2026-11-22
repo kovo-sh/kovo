@@ -1,0 +1,30 @@
+id: "azuracast-installer"
+name: "AzuraCast - Unfinished Installation"
+severity: "high"
+description: "Detected exposed AzuraCast setup wizard that allows unauthorized superuser account creation.An unfinished AzuraCast installation exposes setup endpoints that enable attackers to create administrator accounts and gain full control of the application."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "azuracast"
+  - "exposure"
+  - "unauth"
+reference: "https://github.com/AzuraCast/AzuraCast"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/register"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Set Up AzuraCast"
+      - "SetupRegister"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

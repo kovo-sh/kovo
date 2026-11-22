@@ -1,0 +1,30 @@
+id: "jira-serverinfo"
+name: "Jira Rest API Server Information"
+severity: "info"
+description: "Detected Jira REST API serverInfo endpoint is accessible without authentication, exposing sensitive server information including version, build number, server title, base URL, and server time."
+tech:
+  - "generic"
+tags:
+  - "jira"
+  - "tech"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-server-info/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rest/api/latest/serverInfo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"baseUrl\""
+      - "\"deploymentType\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

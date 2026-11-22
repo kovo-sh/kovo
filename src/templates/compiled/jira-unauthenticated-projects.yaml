@@ -1,0 +1,26 @@
+id: "jira-unauthenticated-projects"
+name: "Jira Unauthenticated Projects"
+severity: "info"
+description: "Safe check derived from jira-unauthenticated-projects: Jira Unauthenticated Projects"
+tech:
+  - "generic"
+tags:
+  - "atlassian"
+  - "jira"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rest/api/2/project?maxResults=100"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "projects"
+      - "startAt"
+      - "maxResults"
+    condition: "and"

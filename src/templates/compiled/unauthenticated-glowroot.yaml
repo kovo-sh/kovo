@@ -1,0 +1,34 @@
+id: "unauthenticated-glowroot"
+name: "Glowroot Anonymous User"
+severity: "high"
+description: "Anonymous user access allows to understand the host internals"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "unauth"
+  - "glowroot"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/backend/admin/users?username=anonymous"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"username\":\"anonymous\""
+      - "\"Administrator\""
+      - "\"newPassword\":\"\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,34 @@
+id: "aws-config"
+name: "AWS Configuration - Detect"
+severity: "medium"
+description: "AWS config found via /.aws/config."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "aws"
+  - "credential"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.aws/config"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "aws_access_key_id\\s*=\\s*"
+      - "region\\s*=\\s*"
+  - type: "word"
+    part: "body"
+    words:
+      - "[default]"
+  - type: "status"
+    status:
+      - 200

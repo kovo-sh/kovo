@@ -1,0 +1,31 @@
+id: "corebos-htaccess"
+name: "CoreBos - .htaccess File Exposure"
+severity: "info"
+description: "CoreBos was discovered to have .htaccess file exposed to public which includes sensitive information."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "corebos"
+  - "huntr"
+  - "misconfig"
+  - "vuln"
+reference: "https://huntr.dev/bounties/5b0fe6e3-4ca1-44ae-8875-d7e6c065432e/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/htaccess.txt"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Options -Indexes"
+      - "<FilesMatch"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

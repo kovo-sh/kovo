@@ -1,0 +1,33 @@
+id: "readme-md"
+name: "README.md file disclosure"
+severity: "info"
+description: "Internal documentation file often used in projects which can contain sensitive information."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "markdown"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/README.md"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "#"
+      - "##"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/markdown"
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

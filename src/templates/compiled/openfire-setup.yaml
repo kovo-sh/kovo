@@ -1,0 +1,29 @@
+id: "openfire-setup"
+name: "Openfire Setup - Exposure"
+severity: "high"
+description: "Checks for the presence of a Openfire Setup Page."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "install"
+  - "openfire"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/index.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Welcome to Openfire Setup"
+  - type: "status"
+    status:
+      - 200

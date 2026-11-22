@@ -1,0 +1,30 @@
+id: "airflow-debug"
+name: "Airflow Debug Trace"
+severity: "low"
+description: "Airflow Debug Trace enabled."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "airflow"
+  - "fpd"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/airflow/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<h1> Ooops. </h1>"
+      - "Traceback (most recent call last)"
+    condition: "and"
+  - type: "status"
+    status:
+      - 500

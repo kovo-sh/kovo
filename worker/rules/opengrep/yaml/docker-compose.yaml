@@ -1,0 +1,197 @@
+rules:
+- id: exposing-docker-socket-volume
+  patterns:
+  - pattern-inside: 'version: ...
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern: "volumes:\n  - ...\n  - /var/run/docker.sock:/var/run/docker.sock\n\
+        \  - ...\n"
+    - pattern: "volumes:\n  - ...\n  - /run/docker.sock:/run/docker.sock\n  - ...\n"
+    - pattern: "volumes:\n  - ...\n  - /var/run/docker.sock:/run/docker.sock\n  -\
+        \ ...\n"
+    - pattern: "volumes:\n  - ...\n  - /run/docker.sock:/var/run/docker.sock\n  -\
+        \ ...\n"
+    - pattern: "volumes:\n  - ...\n  - /var/run/docker.sock\n  - ...\n"
+    - pattern: "volumes:\n  - ...\n  - /run/docker.sock\n  - ...\n"
+    - pattern: "volumes:\n  - ...\n  - ...\n    source: /var/run/docker.sock\n   \
+        \ ...\n  - ...\n"
+    - pattern: "volumes:\n  - ...\n  - ...\n    source: /run/docker.sock\n    ...\n\
+        \  - ...\n"
+  message: Exposing host's Docker socket to containers via a volume. The owner of
+    this socket is root. Giving someone access to it is equivalent to giving unrestricted
+    root access to your host. Remove 'docker.sock' from volumes to prevent this.
+  metadata:
+    references:
+    - https://docs.docker.com/compose/compose-file/compose-file-v3/#volume-configuration-reference
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-1-do-not-expose-the-docker-daemon-socket-even-to-the-containers
+    category: security
+    technology:
+    - docker-compose
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A06:2017 - Security Misconfiguration
+    - A05:2021 - Security Misconfiguration
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: no-new-privileges
+  patterns:
+  - pattern-inside: "version: ...\n...\nservices:\n  ...\n"
+  - pattern: "$SERVICE:\n  ...\n  image: ...\n"
+  - pattern-not: "$SERVICE:\n  ...\n  image: ...\n  ...\n  security_opt:\n    - ...\n\
+      \    - no-new-privileges:true\n    - ...\n"
+  - focus-metavariable: $SERVICE
+  message: Service '$SERVICE' allows for privilege escalation via setuid or setgid
+    binaries. Add 'no-new-privileges:true' in 'security_opt' to prevent this.
+  metadata:
+    cwe:
+    - 'CWE-732: Incorrect Permission Assignment for Critical Resource'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://raesene.github.io/blog/2019/06/01/docker-capabilities-and-no-new-privs/
+    - https://www.kernel.org/doc/Documentation/prctl/no_new_privs.txt
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-4-add-no-new-privileges-flag
+    category: security
+    technology:
+    - docker-compose
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: privileged-service
+  patterns:
+  - pattern-inside: "version: ...\n...\nservices:\n  ...\n  $SERVICE:\n    ...\n \
+      \   privileged: $TRUE\n"
+  - focus-metavariable: $TRUE
+  - metavariable-regex:
+      metavariable: $TRUE
+      regex: (true)
+  fix: 'false
+
+    '
+  message: Service '$SERVICE' is running in privileged mode. This grants the container
+    the equivalent of root capabilities on the host machine. This can lead to container
+    escapes, privilege escalation, and other security concerns. Remove the 'privileged'
+    key to disable this capability.
+  metadata:
+    cwe:
+    - 'CWE-250: Execution with Unnecessary Privileges'
+    owasp:
+    - A06:2017 - Security Misconfiguration
+    - A05:2021 - Security Misconfiguration
+    references:
+    - https://www.trendmicro.com/en_us/research/19/l/why-running-a-privileged-container-in-docker-is-a-bad-idea.html
+    - https://containerjournal.com/topics/container-security/why-running-a-privileged-container-is-not-a-good-idea/
+    category: security
+    technology:
+    - docker-compose
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: HIGH
+    confidence: HIGH
+  languages:
+  - yaml
+  severity: WARNING
+- id: seccomp-confinement-disabled
+  patterns:
+  - pattern-inside: "version: ...\n...\nservices:\n  ...\n"
+  - pattern: "$SERVICE:\n  ...\n  image: ...\n  ...\n  security_opt:\n    - ...\n\
+      \    - seccomp:unconfined\n"
+  message: Service '$SERVICE' is explicitly disabling seccomp confinement. This runs
+    the service in an unrestricted state. Remove 'seccomp:unconfined' to prevent this.
+  metadata:
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    references:
+    - https://docs.docker.com/engine/security/seccomp/
+    category: security
+    technology:
+    - docker-compose
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: selinux-separation-disabled
+  patterns:
+  - pattern-inside: "version: ...\n...\nservices:\n  ...\n"
+  - pattern: "$SERVICE:\n  ...\n  image: ...\n  ...\n  security_opt:\n    - ...\n\
+      \    - label:disable\n"
+  message: Service '$SERVICE' is explicitly disabling SELinux separation. This runs
+    the service as an unconfined type. Remove 'label:disable' to prevent this.
+  metadata:
+    cwe:
+    - 'CWE-284: Improper Access Control'
+    references:
+    - https://www.projectatomic.io/blog/2016/03/dwalsh_selinux_containers/
+    - https://docs.docker.com/engine/reference/run/#security-configuration
+    category: security
+    technology:
+    - docker-compose
+    owasp:
+    - A05:2017 - Broken Access Control
+    - A01:2021 - Broken Access Control
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING
+- id: writable-filesystem-service
+  patterns:
+  - pattern-inside: "version: ...\n...\nservices:\n  ...\n"
+  - pattern: "$SERVICE:\n  ...\n  image: ...\n  ...\n"
+  - pattern-not: "$SERVICE:\n  ...\n  image: ...\n  ...\n  read_only: true\n"
+  - focus-metavariable: $SERVICE
+  message: 'Service ''$SERVICE'' is running with a writable root filesystem. This
+    may allow malicious applications to download and run additional payloads, or modify
+    container files. If an application inside a container has to save something temporarily
+    consider using a tmpfs. Add ''read_only: true'' to this service to prevent this.'
+  metadata:
+    cwe:
+    - 'CWE-732: Incorrect Permission Assignment for Critical Resource'
+    owasp:
+    - A05:2021 - Security Misconfiguration
+    - A06:2017 - Security Misconfiguration
+    references:
+    - https://docs.docker.com/compose/compose-file/compose-file-v3/#domainname-hostname-ipc-mac_address-privileged-read_only-shm_size-stdin_open-tty-user-working_dir
+    - https://blog.atomist.com/security-of-docker-kubernetes/
+    - https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html#rule-8-set-filesystem-and-volumes-to-read-only
+    category: security
+    technology:
+    - docker-compose
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  languages:
+  - yaml
+  severity: WARNING

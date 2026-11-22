@@ -1,0 +1,33 @@
+id: "exposed-bzr"
+name: "Bazaar Configuration - Detect"
+severity: "info"
+description: "Bazaar configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "http://doc.bazaar.canonical.com/beta/en/user-reference/configuration-help.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.bzr/branch/branch.conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "parent_location"
+      - "push_location"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"

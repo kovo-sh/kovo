@@ -1,0 +1,34 @@
+id: "avideo-install"
+name: "AVideo Installer - Detect"
+severity: "high"
+description: "AVideo installer panel was detected."
+tech:
+  - "php"
+tags:
+  - "panel"
+  - "install"
+  - "avideo"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-459"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Install AVideo</title>"
+  - type: "word"
+    part: "body"
+    words:
+      - "Your system is installed, remove the"
+    negative: true
+  - type: "status"
+    status:
+      - 200

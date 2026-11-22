@@ -1,0 +1,33 @@
+id: "liferay-jsonws"
+name: "Liferay /api/jsonws - API Exposed"
+severity: "low"
+description: "Liferay /api/jsonws - API is Exposed."
+tech:
+  - "generic"
+tags:
+  - "liferay"
+  - "exposure"
+  - "api"
+  - "misconfig"
+  - "vuln"
+reference: "https://github.com/ilmila/J2EEScan/blob/master/src/main/java/burp/j2ee/issues/impl/LiferayAPI.java"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/jsonws"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - ".*<title>json-web-services-api<\\/title>.*"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

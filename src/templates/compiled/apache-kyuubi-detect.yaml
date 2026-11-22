@@ -1,0 +1,29 @@
+id: "apache-kyuubi-detect"
+name: "Apache Kyuubi - Detect"
+severity: "info"
+description: "Detects a Apache Kyuubi server, a distributed and multi-tenant gateway to provide serverless SQL on data warehouses and lakehouses."
+tech:
+  - "apache"
+tags:
+  - "tech"
+  - "kyuubi"
+  - "apache"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/apache/kyuubi/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ui/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Apache Kyuubi Dashboard"
+  - type: "status"
+    status:
+      - 200

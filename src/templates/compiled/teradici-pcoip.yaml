@@ -1,0 +1,25 @@
+id: "teradici-pcoip"
+name: "Teradici PCoIP Detection"
+severity: "info"
+description: "Teradici PColP was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "pcoip"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://www.teradici.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/info/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "PCoIP Connection Manager"

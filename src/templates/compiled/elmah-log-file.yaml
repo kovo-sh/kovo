@@ -1,0 +1,28 @@
+id: "elmah-log-file"
+name: "ELMAH Exposure"
+severity: "high"
+description: "ELMAH (Error Logging Modules and Handlers) is an application-wide error logging facility that is completely pluggable. It can be dynamically added to a running ASP.NET web application, or even all ASP.NET web applications on a machine, without any need for re-compilation or re-deployment. In some cases, the logs expose ASPXAUTH cookies allowing to hijack a logged in administrator session."
+tech:
+  - "generic"
+tags:
+  - "logs"
+  - "elmah"
+  - "exposure"
+  - "vuln"
+reference: "https://code.google.com/archive/p/elmah/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/elmah"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Error Log for"
+  - type: "status"
+    status:
+      - 200

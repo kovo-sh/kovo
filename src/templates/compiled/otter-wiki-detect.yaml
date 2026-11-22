@@ -1,0 +1,31 @@
+id: "otter-wiki-detect"
+name: "Otter Wiki - Detect"
+severity: "info"
+description: "Otter Wiki is an open-source wiki powered by Python, Markdown, and Git."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "otterwiki"
+  - "wiki"
+  - "markdown"
+  - "detect"
+reference: "https://github.com/redimp/otterwiki"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/static/css/otterwiki.css"
+      - "An Otter Wiki Logo"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

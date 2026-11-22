@@ -1,0 +1,27 @@
+id: "ranger-detection"
+name: "Apache Ranger Detection"
+severity: "info"
+description: "Safe check derived from ranger-detection: Apache Ranger Detection"
+tech:
+  - "apache"
+  - "tomcat"
+  - "java"
+tags:
+  - "tech"
+  - "apache"
+  - "ranger"
+  - "discovery"
+reference: "https://github.com/apache/ranger"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title> Ranger - Sign In</title>"

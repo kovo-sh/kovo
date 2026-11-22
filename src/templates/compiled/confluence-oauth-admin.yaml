@@ -1,0 +1,29 @@
+id: "confluence-oauth-admin"
+name: "Confluence OAuth Administration Endpoint"
+severity: "info"
+description: "Safe check derived from confluence-oauth-admin: Confluence OAuth Administration Endpoint"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "jira"
+  - "confluence"
+  - "atlassian"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/plugins/servlet/oauth/view-consumer-info"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>OAuth Consumer Information"
+      - "OAuth Administration"
+  - type: "status"
+    status:
+      - 200

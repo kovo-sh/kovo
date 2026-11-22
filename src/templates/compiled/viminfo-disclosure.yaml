@@ -1,0 +1,35 @@
+id: "viminfo-disclosure"
+name: "Viminfo - File Disclosure"
+severity: "low"
+description: "Viminfo file was detected."
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "viminfo"
+  - "config"
+  - "vuln"
+reference: "https://renenyffenegger.ch/notes/development/vim/editing/viminfo/index"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.viminfo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Viminfo version"
+      - "Command Line History"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+  - type: "status"
+    status:
+      - 200

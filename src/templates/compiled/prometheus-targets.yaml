@@ -1,0 +1,34 @@
+id: "prometheus-targets"
+name: "Prometheus targets API endpoint"
+severity: "info"
+description: "The targets endpoint exposes services belonging to the infrastructure, including their roles and labels. In addition to showing the target machine addresses, the endpoint also exposes metadata labels that are added by the target provider. These labels are intended to contain non-sensitive values, like the name of the server or its description, but various cloud platforms may automatically expose sensitive data in these labels, oftentimes without the developer's knowledge."
+tech:
+  - "prometheus"
+tags:
+  - "prometheus"
+  - "misconfig"
+  - "vuln"
+reference: "https://jfrog.com/blog/dont-let-prometheus-steal-your-fire/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/targets"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "\"status\": \"success\""
+      - "\"data\":"
+      - "\"labels\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"

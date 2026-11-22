@@ -1,0 +1,31 @@
+id: "aspnetcore-dev-env"
+name: "ASP.NET Core Development Environment - Exposure"
+severity: "info"
+description: "The ASP.NET Core application is running in Development mode, which could exposes detailed error messages and stack traces on the '/Error' page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "aspnetcore"
+  - "exposure"
+  - "vuln"
+reference: "https://docs.microsoft.com/en-us/aspnet/core/fundamentals/environments"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Error"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<strong>ASPNETCORE_ENVIRONMENT</strong> environment variable to <strong>Development</strong>"
+  - type: "word"
+    part: "body"
+    words:
+      - "ASPNETCORE_ENVIRONMENT"
+      - "<environment include=\"Development\">"
+    condition: "and"

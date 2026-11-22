@@ -1,0 +1,28 @@
+id: "zoneminder-system-log"
+name: "ZoneMinder System Log - Detect"
+severity: "low"
+description: "ZoneMinder system log file exposed."
+tech:
+  - "generic"
+tags:
+  - "logs"
+  - "zoneminder"
+  - "exposure"
+  - "discovery"
+reference: "https://www.exploit-db.com/ghdb/6926"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?view=log"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>ZM - System Log</title>"
+  - type: "status"
+    status:
+      - 200

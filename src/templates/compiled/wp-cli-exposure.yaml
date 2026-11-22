@@ -1,0 +1,30 @@
+id: "wp-cli-exposure"
+name: "WP-CLI Yaml File Exposure"
+severity: "info"
+description: "Safe check derived from wp-cli-exposure: WP-CLI Yaml File Exposure"
+tech:
+  - "wordpress"
+tags:
+  - "config"
+  - "exposure"
+  - "wp-cli"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-cli.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "apache_modules:"
+      - "mod_rewrite"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

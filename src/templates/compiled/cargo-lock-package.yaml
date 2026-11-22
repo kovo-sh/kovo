@@ -1,0 +1,30 @@
+id: "cargo-lock-package"
+name: "Cargo Lock Packages Disclosure"
+severity: "info"
+description: "Safe check derived from cargo-lock-package: Cargo Lock Packages Disclosure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "files"
+  - "cargo"
+  - "vuln"
+reference: "https://raw.githubusercontent.com/maurosoria/dirsearch/master/db/dicc.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Cargo.lock"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[[package]]"
+      - "dependencies = ["
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

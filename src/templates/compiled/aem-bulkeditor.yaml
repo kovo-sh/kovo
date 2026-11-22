@@ -1,0 +1,29 @@
+id: "aem-bulkeditor"
+name: "AEM BulkEditor"
+severity: "info"
+description: "Safe check derived from aem-bulkeditor: AEM BulkEditor"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "aem"
+  - "adobe"
+  - "editor"
+  - "vuln"
+reference: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/aem2.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/etc/importers/bulkeditor.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>AEM BulkEditor</title>"
+  - type: "status"
+    status:
+      - 200

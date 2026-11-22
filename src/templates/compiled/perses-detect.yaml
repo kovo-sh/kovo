@@ -1,0 +1,33 @@
+id: "perses-detect"
+name: "Perses - Detect"
+severity: "info"
+description: "Perses, an open-source observability visualisation and dashboard platform, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "perses"
+  - "observability"
+  - "monitoring"
+  - "dashboard"
+  - "detect"
+reference: "https://perses.dev/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<meta name=\"description\" content=\"Perses\">"
+      - "<title>Perses</title>"
+      - "perses-dark-theme-enabled"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

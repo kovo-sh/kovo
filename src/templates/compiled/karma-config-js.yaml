@@ -1,0 +1,30 @@
+id: "karma-config-js"
+name: "Karma Configuration File - Detect"
+severity: "medium"
+description: "Karma configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "devops"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.config/karma.conf.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "// Karma configuration"
+      - "module.exports"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

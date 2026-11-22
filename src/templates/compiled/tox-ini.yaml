@@ -1,0 +1,35 @@
+id: "tox-ini"
+name: "Tox Configuration File - Detect"
+severity: "info"
+description: "Tox configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "config"
+  - "tox"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://tox.wiki/en/latest/config.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/tox.ini"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[tox]"
+      - "[testenv]"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+  - type: "status"
+    status:
+      - 200

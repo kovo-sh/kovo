@@ -1,0 +1,31 @@
+id: "php-fpm-config"
+name: "PHP-FPM Configuration Page - Detect"
+severity: "info"
+description: "PHP-FPM configuration page was detected."
+tech:
+  - "php"
+tags:
+  - "config"
+  - "exposure"
+  - "php"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.php.net/manual/en/install.fpm.php"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/php-fpm.conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "FPM Configuration"
+      - "Pool Definitions"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

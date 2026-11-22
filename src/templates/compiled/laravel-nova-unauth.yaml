@@ -1,0 +1,36 @@
+id: "laravel-nova-unauth"
+name: "Laravel Nova - Unauthenticated Admin Panel Access"
+severity: "high"
+description: "Laravel Nova admin panel is accessible without authentication. Nova provides full CRUD access to application models and database records, making unauthenticated access a critical security risk."
+tech:
+  - "laravel"
+tags:
+  - "laravel"
+  - "nova"
+  - "admin"
+  - "unauth"
+  - "exposure"
+reference: "https://nova.laravel.com/docs/4.0/installation.html#authorizing-nova"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/nova/dashboards/main"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Nova.booting"
+      - "nova-resources"
+  - type: "word"
+    part: "body"
+    words:
+      - "nova-login"
+      - "/nova/login"
+    negative: true
+  - type: "status"
+    status:
+      - 200

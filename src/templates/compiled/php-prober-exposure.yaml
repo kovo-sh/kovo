@@ -1,0 +1,30 @@
+id: "php-prober-exposure"
+name: "PHP Prober - Exposure"
+severity: "medium"
+description: "PHP Prober Server exposure was detected."
+tech:
+  - "php"
+tags:
+  - "exposure"
+  - "php"
+  - "prober"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/prober.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Server Parameters"
+      - "PHP Prober"
+      - "Real-time Data"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

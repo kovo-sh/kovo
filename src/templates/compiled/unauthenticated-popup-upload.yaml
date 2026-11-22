@@ -1,0 +1,31 @@
+id: "unauthenticated-popup-upload"
+name: "Unauthenticated Popup File Upload - Detect"
+severity: "info"
+description: "Endpoints where files can be uploaded without authentication were detected."
+tech:
+  - "dotnet"
+  - "iis"
+tags:
+  - "edb"
+  - "fileupload"
+  - "misconfig"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/6671"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/RichWidgets/Popup_Upload.aspx"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Popup Upload"
+  - type: "status"
+    status:
+      - 200

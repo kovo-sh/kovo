@@ -1,0 +1,30 @@
+id: "uvdesk-helpdesk-installer"
+name: "UVDesk Helpdesk Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed UVDesk Helpdesk Installation page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "uvdesk"
+  - "helpdesk"
+  - "vuln"
+reference: "https://www.uvdesk.com/en/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/#welcome"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "UVDesk Helpdesk Community Edition - Installation Wizard"
+  - type: "status"
+    status:
+      - 200

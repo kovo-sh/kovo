@@ -1,0 +1,29 @@
+id: "sendgrid-env"
+name: "SendGrid Env File Exposure"
+severity: "medium"
+description: "SendGrid file is exposed containing environment variables."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "sendgrid"
+  - "key"
+  - "api"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/sendgrid.env"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "SG\\.[a-zA-Z0-9-_]{22}\\.[a-zA-Z0-9_-]{43}"
+  - type: "status"
+    status:
+      - 429

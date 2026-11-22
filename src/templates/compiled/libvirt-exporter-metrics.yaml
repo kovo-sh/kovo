@@ -1,0 +1,30 @@
+id: "libvirt-exporter-metrics"
+name: "Libvirt Exporter Metrics"
+severity: "low"
+description: "Libvirt Exporter is leaking metrics."
+tech:
+  - "generic"
+tags:
+  - "libvirt"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "# HELP"
+      - "libvirt_"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

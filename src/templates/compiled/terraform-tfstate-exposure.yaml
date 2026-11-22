@@ -1,0 +1,38 @@
+id: "terraform-tfstate-exposure"
+name: "Terraform State - File Exposure"
+severity: "high"
+description: "A Terraform state file was found exposed on the web server. State files map real world infrastructure to configuration and frequently store resource attributes such as passwords, private keys, database connection strings and access tokens in clear text, so public exposure can leak sensitive credentials for the managed infrastructure."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "config"
+  - "terraform"
+  - "iac"
+  - "files"
+cwe: "CWE-538"
+reference: "https://developer.hashicorp.com/terraform/language/state"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/terraform.tfstate"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"outputs\""
+      - "\"version\""
+      - "\"resources\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200

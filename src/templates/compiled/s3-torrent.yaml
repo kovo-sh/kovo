@@ -1,0 +1,27 @@
+id: "s3-torrent"
+name: "Amazon S3 Torrent Download - Detect"
+severity: "info"
+description: "Amazon S3 Torrent download was detected, which can allow a malicious user to download files."
+tech:
+  - "s3"
+tags:
+  - "misconfig"
+  - "aws"
+  - "s3"
+  - "bucket"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?torrent"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "RequestTorrentOfBucketError"
+      - "s3-tracker"

@@ -1,0 +1,38 @@
+id: "springboot-beans"
+name: "Detect Springboot Beans Actuator"
+severity: "low"
+description: "Displays a complete list of all the Spring beans in the application"
+tech:
+  - "springboot"
+  - "actuator"
+tags:
+  - "springboot"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/beans"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"type\""
+      - "\"beans\""
+      - "\"dependencies\""
+      - "\"scope\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+      - "application/vnd.spring-boot.actuator"
+      - "application/vnd.spring-boot.actuator.v1+json"

@@ -1,0 +1,35 @@
+id: "aws-s3-explorer"
+name: "Amazon Web Services S3 Explorer - Detect"
+severity: "medium"
+description: "Amazon Web Services S3 Explorer page was detected. Page contains links to sensitive information."
+tech:
+  - "s3"
+tags:
+  - "s3"
+  - "edb"
+  - "misconfig"
+  - "aws"
+  - "amazon"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.exploit-db.com/ghdb/7967"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>AWS S3 Explorer</title>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

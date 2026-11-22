@@ -1,0 +1,30 @@
+id: "npm-cli-metrics-json"
+name: "NPM Anonymous CLI Metrics Json"
+severity: "low"
+description: "anonymous-cli-metrics.json internal file in NPM is exposed."
+tech:
+  - "generic"
+tags:
+  - "npm"
+  - "devops"
+  - "exposure"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/anonymous-cli-metrics.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"metricId\""
+      - "\"metrics\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

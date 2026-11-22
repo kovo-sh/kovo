@@ -1,0 +1,903 @@
+rules:
+- id: react-dangerouslysetinnerhtml
+  message: Detection of dangerouslySetInnerHTML from non-constant definition. This
+    can inadvertently expose users to cross-site scripting (XSS) attacks if this comes
+    from user-provided input. If you have to use dangerouslySetInnerHTML, consider
+    using a sanitization library such as DOMPurify to sanitize your HTML.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://react.dev/reference/react-dom/components/common#dangerously-setting-the-inner-html
+    category: security
+    confidence: MEDIUM
+    technology:
+    - react
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'function ...({..., $X, ...}) { ... }
+
+          '
+      - pattern-inside: 'function ...(..., $X, ...) { ... }
+
+          '
+    - focus-metavariable: $X
+    - pattern-not-inside: '$F. ... .$SANITIZEUNC(...)
+
+        '
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $X
+    - pattern-either:
+      - pattern: '{...,dangerouslySetInnerHTML: {__html: $X},...}
+
+          '
+      - pattern: '<$Y ... dangerouslySetInnerHTML={{__html: $X}} />
+
+          '
+    - pattern-not: '<$Y ... dangerouslySetInnerHTML={{__html: "..."}} />
+
+        '
+    - pattern-not: '{...,dangerouslySetInnerHTML:{__html: "..."},...}
+
+        '
+    - metavariable-pattern:
+        patterns:
+        - pattern-not: '{...}
+
+            '
+        metavariable: $X
+    - pattern-not: '<... {__html: "..."} ...>
+
+        '
+    - pattern-not: '<... {__html: `...`} ...>
+
+        '
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: 'import $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("underscore.string")
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern: $S.escapeHTML(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import { ..., $S,... } from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("dompurify")
+
+          ...
+
+          '
+      - pattern-inside: 'import $S from "isomorphic-dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "isomorphic-dompurify"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("isomorphic-dompurify")
+
+          ...
+
+          '
+    - pattern-either:
+      - patterns:
+        - pattern-inside: '$VALUE = $S(...)
+
+            ...
+
+            '
+        - pattern: $VALUE.sanitize(...)
+      - patterns:
+        - pattern-inside: '$VALUE = $S.sanitize
+
+            ...
+
+            '
+        - pattern: $S(...)
+      - pattern: $S.sanitize(...)
+      - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from ''xss'';
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from ''xss'';
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("xss")
+
+          ...
+
+          '
+    - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from ''sanitize-html'';
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "sanitize-html";
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("sanitize-html")
+
+          ...
+
+          '
+    - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$S = new Remarkable()
+
+          ...
+
+          '
+    - pattern: $S.render(...)
+- id: react-href-var
+  message: Detected a variable used in an anchor tag with the 'href' attribute. A
+    malicious actor may be able to input the 'javascript:' URI, which could cause
+    cross-site scripting (XSS). It is recommended to disallow 'javascript:' URIs within
+    your application.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://reactjs.org/blog/2019/08/08/react-v16.9.0.html#deprecating-javascript-urls
+    - https://pragmaticwebsecurity.com/articles/spasecurity/react-xss-part1.html
+    category: security
+    confidence: LOW
+    technology:
+    - react
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - label: TAINTED
+    patterns:
+    - pattern-either:
+      - pattern-inside: 'function ...({..., $X, ...}) { ... }
+
+          '
+      - pattern-inside: 'function ...(..., $X, ...) { ... }
+
+          '
+    - focus-metavariable: $X
+    - pattern-either:
+      - pattern: $X.$Y
+      - pattern: $X[...]
+    - pattern-not-inside: '$F. ... .$SANITIZEUNC(...)
+
+        '
+  - label: CONCAT
+    requires: TAINTED
+    patterns:
+    - pattern-either:
+      - pattern: '`...${$X}...`
+
+          '
+      - pattern: '$SANITIZE + <... $X ...>
+
+          '
+    - pattern-not: '`${$X}...`
+
+        '
+    - pattern-not: '$X + ...
+
+        '
+    - focus-metavariable: $X
+  - label: CLEAN
+    by-side-effect: true
+    patterns:
+    - pattern-either:
+      - pattern: $A($SOURCE)
+      - pattern: $SANITIZE. ... .$A($SOURCE)
+      - pattern: $A. ... .$SANITIZE($SOURCE)
+    - focus-metavariable: $SOURCE
+    - metavariable-regex:
+        metavariable: $A
+        regex: (?i)(.*valid|.*sanitiz)
+  pattern-sinks:
+  - requires: TAINTED and not CONCAT and not CLEAN
+    patterns:
+    - focus-metavariable: $X
+    - pattern-either:
+      - pattern: '<$EL href={$X} />
+
+          '
+      - pattern: 'React.createElement($EL, {href: $X})
+
+          '
+      - pattern-inside: '$PARAMS = {href: $X};
+
+          ...
+
+          React.createElement($EL, $PARAMS);
+
+          '
+    - metavariable-pattern:
+        patterns:
+        - pattern-not-regex: (?i)(button)
+        metavariable: $EL
+- id: react-jwt-decoded-property
+  message: Property decoded from JWT token without verifying and cannot be trustworthy.
+  metadata:
+    cwe:
+    - 'CWE-922: Insecure Storage of Sensitive Information'
+    references:
+    - https://pragmaticwebsecurity.com/articles/oauthoidc/localstorage-xss.html
+    category: security
+    owasp:
+    - A01:2021 - Broken Access Control
+    technology:
+    - react
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - typescript
+  - javascript
+  severity: INFO
+  patterns:
+  - pattern-inside: 'import jwt_decode from "jwt-decode";
+
+      ...
+
+      '
+  - pattern-inside: '$DECODED = jwt_decode($TOKEN,...);
+
+      ...
+
+      '
+  - pattern: $DECODED.$PROPERTY
+- id: react-jwt-in-localstorage
+  message: Storing JWT tokens in localStorage known to be a bad practice, consider
+    moving your tokens from localStorage to a HTTP cookie.
+  metadata:
+    cwe:
+    - 'CWE-922: Insecure Storage of Sensitive Information'
+    references:
+    - https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies
+    category: security
+    owasp:
+    - A01:2021 - Broken Access Control
+    technology:
+    - react
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - typescript
+  - javascript
+  severity: INFO
+  patterns:
+  - pattern-inside: 'import jwt_decode from "jwt-decode";
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern: '$DECODED = jwt_decode($TOKEN,...);
+
+        ...
+
+        localStorage.setItem($NAME, <... $TOKEN ...>);
+
+        '
+    - pattern: '$DECODED = jwt_decode(...);
+
+        ...
+
+        localStorage.setItem($NAME, <... $DECODED ...>);
+
+        '
+- id: react-unsanitized-method
+  message: Detection of $HTML from non-constant definition. This can inadvertently
+    expose users to cross-site scripting (XSS) attacks if this comes from user-provided
+    input. If you have to use $HTML, consider using a sanitization library such as
+    DOMPurify to sanitize your HTML.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://developer.mozilla.org/en-US/docs/Web/API/Document/writeln
+    - https://developer.mozilla.org/en-US/docs/Web/API/Document/write
+    - https://developer.mozilla.org/en-US/docs/Web/API/Element/insertAdjacentHTML
+    category: security
+    confidence: MEDIUM
+    technology:
+    - react
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'function ...({..., $X, ...}) { ... }
+
+          '
+      - pattern-inside: 'function ...(..., $X, ...) { ... }
+
+          '
+    - focus-metavariable: $X
+    - pattern-either:
+      - pattern: $X.$Y
+      - pattern: $X[...]
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: "this.window.document. ... .$HTML('...',$SINK) \n"
+      - pattern: "window.document. ... .$HTML('...',$SINK) \n"
+      - pattern: "document.$HTML($SINK)  \n"
+    - metavariable-regex:
+        metavariable: $HTML
+        regex: (writeln|write)
+    - focus-metavariable: $SINK
+  - patterns:
+    - pattern-either:
+      - pattern: "$PROP. ... .$HTML('...',$SINK) \n"
+    - metavariable-regex:
+        metavariable: $HTML
+        regex: (insertAdjacentHTML)
+    - focus-metavariable: $SINK
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: 'import $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("underscore.string")
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern: $S.escapeHTML(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import { ..., $S,... } from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("dompurify")
+
+          ...
+
+          '
+      - pattern-inside: 'import $S from "isomorphic-dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "isomorphic-dompurify"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("isomorphic-dompurify")
+
+          ...
+
+          '
+    - pattern-either:
+      - patterns:
+        - pattern-inside: '$VALUE = $S(...)
+
+            ...
+
+            '
+        - pattern: $VALUE.sanitize(...)
+      - patterns:
+        - pattern-inside: '$VALUE = $S.sanitize
+
+            ...
+
+            '
+        - pattern: $S(...)
+      - pattern: $S.sanitize(...)
+      - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from ''xss'';
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from ''xss'';
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("xss")
+
+          ...
+
+          '
+    - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from ''sanitize-html'';
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "sanitize-html";
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("sanitize-html")
+
+          ...
+
+          '
+    - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$S = new Remarkable()
+
+          ...
+
+          '
+    - pattern: $S.render(...)
+- id: react-unsanitized-property
+  message: Detection of $HTML from non-constant definition. This can inadvertently
+    expose users to cross-site scripting (XSS) attacks if this comes from user-provided
+    input. If you have to use $HTML, consider using a sanitization library such as
+    DOMPurify to sanitize your HTML.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://react.dev/reference/react-dom/components/common#dangerously-setting-the-inner-html
+    category: security
+    confidence: MEDIUM
+    technology:
+    - react
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'function ...({..., $X, ...}) { ... }
+
+          '
+      - pattern-inside: 'function ...(..., $X, ...) { ... }
+
+          '
+    - focus-metavariable: $X
+    - pattern-either:
+      - pattern: $X.$Y
+      - pattern: $X[...]
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$BODY = $REACT.useRef(...)
+
+          ...
+
+          '
+      - pattern-inside: '$BODY = useRef(...)
+
+          ...
+
+          '
+      - pattern-inside: '$BODY = findDOMNode(...)
+
+          ...
+
+          '
+      - pattern-inside: '$BODY = createRef(...)
+
+          ...
+
+          '
+      - pattern-inside: '$BODY = $REACT.findDOMNode(...)
+
+          ...
+
+          '
+      - pattern-inside: '$BODY = $REACT.createRef(...)
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern: "$BODY. ... .$HTML = $SINK \n"
+      - pattern: "$BODY.$HTML = $SINK  \n"
+    - metavariable-regex:
+        metavariable: $HTML
+        regex: (innerHTML|outerHTML)
+    - focus-metavariable: $SINK
+  - patterns:
+    - pattern-either:
+      - pattern: ReactDOM.findDOMNode(...).$HTML = $SINK
+    - metavariable-regex:
+        metavariable: $HTML
+        regex: (innerHTML|outerHTML)
+    - focus-metavariable: $SINK
+  pattern-sanitizers:
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: 'import $S from "underscore.string"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("underscore.string")
+
+          ...
+
+          '
+    - pattern-either:
+      - pattern: $S.escapeHTML(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import { ..., $S,... } from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "dompurify"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("dompurify")
+
+          ...
+
+          '
+      - pattern-inside: 'import $S from "isomorphic-dompurify"
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "isomorphic-dompurify"
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("isomorphic-dompurify")
+
+          ...
+
+          '
+    - pattern-either:
+      - patterns:
+        - pattern-inside: '$VALUE = $S(...)
+
+            ...
+
+            '
+        - pattern: $VALUE.sanitize(...)
+      - patterns:
+        - pattern-inside: '$VALUE = $S.sanitize
+
+            ...
+
+            '
+        - pattern: $S(...)
+      - pattern: $S.sanitize(...)
+      - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from ''xss'';
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from ''xss'';
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("xss")
+
+          ...
+
+          '
+    - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: 'import $S from ''sanitize-html'';
+
+          ...
+
+          '
+      - pattern-inside: 'import * as $S from "sanitize-html";
+
+          ...
+
+          '
+      - pattern-inside: '$S = require("sanitize-html")
+
+          ...
+
+          '
+    - pattern: $S(...)
+  - patterns:
+    - pattern-either:
+      - pattern-inside: '$S = new Remarkable()
+
+          ...
+
+          '
+    - pattern: $S.render(...)
+- id: react-insecure-request
+  message: Unencrypted request over HTTP detected.
+  metadata:
+    vulnerability: Insecure Transport
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    references:
+    - https://www.npmjs.com/package/axios
+    category: security
+    technology:
+    - react
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-either:
+        - pattern-inside: 'import $AXIOS from ''axios'';
+
+            ...
+
+            $AXIOS.$METHOD(...)
+
+            '
+        - pattern-inside: '$AXIOS = require(''axios'');
+
+            ...
+
+            $AXIOS.$METHOD(...)
+
+            '
+      - pattern: $AXIOS.$VERB("$URL",...)
+      - metavariable-regex:
+          metavariable: $VERB
+          regex: ^(get|post|delete|head|patch|put|options)
+    - patterns:
+      - pattern-either:
+        - pattern-inside: 'import $AXIOS from ''axios'';
+
+            ...
+
+            $AXIOS(...)
+
+            '
+        - pattern-inside: '$AXIOS = require(''axios'');
+
+            ...
+
+            $AXIOS(...)
+
+            '
+      - pattern-either:
+        - pattern: '$AXIOS({url: "$URL"}, ...)'
+        - pattern: '$OPTS = {url: "$URL"}
+
+            ...
+
+            $AXIOS($OPTS, ...)
+
+            '
+    - pattern: fetch("$URL", ...)
+  - metavariable-regex:
+      metavariable: $URL
+      regex: ^([Hh][Tt][Tt][Pp]:\/\/(?!localhost).*)
+- id: react-markdown-insecure-html
+  message: Overwriting `transformLinkUri` or `transformImageUri` to something insecure,
+    or turning `allowDangerousHtml` on, or turning `escapeHtml` off, will open the
+    code up to XSS vectors.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (''Cross-site
+      Scripting'')'
+    owasp:
+    - A07:2017 - Cross-Site Scripting (XSS)
+    - A03:2021 - Injection
+    references:
+    - https://www.npmjs.com/package/react-markdown#security
+    category: security
+    technology:
+    - react
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: LOW
+    confidence: LOW
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern-inside: '$X = require(''react-markdown/with-html'');
+
+        ...
+
+        '
+    - pattern-inside: '$X = require(''react-markdown'');
+
+        ...
+
+        '
+    - pattern-inside: 'import ''react-markdown/with-html'';
+
+        ...
+
+        '
+    - pattern-inside: 'import ''react-markdown'';
+
+        ...
+
+        '
+  - pattern-either:
+    - pattern: '<$EL allowDangerousHtml />
+
+        '
+    - pattern: '<$EL escapeHtml={false} />
+
+        '
+    - pattern: '<$EL transformLinkUri=... />
+
+        '
+    - pattern: '<$EL transformImageUri=... />
+
+        '

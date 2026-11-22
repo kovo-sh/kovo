@@ -1,0 +1,27 @@
+id: "freshrss-installer"
+name: "FreshRSS - Installation"
+severity: "high"
+description: "FreshRSS Installation panel has been exposed."
+tech:
+  - "generic"
+tags:
+  - "freshrss"
+  - "misconfig"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/i/?rid"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Installation · FreshRSS"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,32 @@
+id: "websheets-config"
+name: "Websheets Configuration File - Detect"
+severity: "high"
+description: "Websheets configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "websheets"
+  - "config"
+  - "exposure"
+  - "files"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/daveagp/websheets"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ws-config.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"db-password\":"
+      - "\"db-database\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

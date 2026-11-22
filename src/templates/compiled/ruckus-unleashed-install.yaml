@@ -1,0 +1,31 @@
+id: "ruckus-unleashed-install"
+name: "Ruckus Unleashed Exposed Installation"
+severity: "high"
+description: "Ruckus Unleashed is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "misconfig"
+  - "ruckus"
+  - "unleashed"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/wizard.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Setup Wizard"
+      - "/ruckus"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

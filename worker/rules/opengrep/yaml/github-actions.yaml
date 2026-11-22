@@ -1,0 +1,418 @@
+rules:
+- id: allowed-unsecure-commands
+  languages:
+  - yaml
+  severity: WARNING
+  message: The environment variable `ACTIONS_ALLOW_UNSECURE_COMMANDS` grants this
+    workflow permissions to use the `set-env` and `add-path` commands. There is a
+    vulnerability in these commands that could result in environment variables being
+    modified by an attacker. Depending on the use of the environment variable, this
+    could enable an attacker to, at worst, modify the system path to run a different
+    command than intended, resulting in arbitrary code execution. This could result
+    in stolen code or secrets. Don't use `ACTIONS_ALLOW_UNSECURE_COMMANDS`. Instead,
+    use Environment Files. See https://github.com/actions/toolkit/blob/main/docs/commands.md#environment-files
+    for more information.
+  metadata:
+    cwe:
+    - 'CWE-749: Exposed Dangerous Method or Function'
+    owasp: A06:2017 - Security Misconfiguration
+    references:
+    - https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/
+    - https://github.com/actions/toolkit/security/advisories/GHSA-mfwh-5m23-j46w
+    - https://github.com/actions/toolkit/blob/main/docs/commands.md#environment-files
+    category: security
+    technology:
+    - github-actions
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-inside: '{env: ...}'
+      - pattern: 'ACTIONS_ALLOW_UNSECURE_COMMANDS: true'
+- id: unsafe-add-mask-workflow-command
+  patterns:
+  - pattern-regex: '::add-mask::'
+  languages:
+  - yaml
+  severity: WARNING
+  message: GitHub Actions provides the **'add-mask'** workflow command to mask sensitive
+    data in the workflow logs. If **'add-mask'** is not used or if workflow commands
+    have been stopped, sensitive data can leaked into the workflow logs. An attacker
+    could simply copy the workflow to another branch and add the following payload
+    `echo "::stop-commands::$stopMarker"` to stop workflow command processing ([described
+    here](https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#stopping-and-starting-workflow-commands)),
+    which will cause the secret token to be exposed despite the **'add-mask'** usage.
+    For more information, please refer to the [GitHub documentation](https://github.com/actions/toolkit/blob/main/docs/commands.md#register-a-secret).
+  metadata:
+    cwe:
+    - 'CWE-200: Exposure of Sensitive Information to an Unauthorized Actor'
+    owasp: A06:2017 - Security Misconfiguration
+    category: security
+    technology:
+    - github-actions
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    vulnerability_class:
+    - Dangerous Method or Function
+    references:
+    - https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/
+    - https://github.com/actions/runner/issues/159
+    - https://github.com/actions/runner/issues/475
+    - https://github.com/actions/runner/issues/807
+    - https://0xn3va.gitbook.io/cheat-sheets/ci-cd/github/actions#misuse-of-sensitive-data-in-workflows
+    - https://github.com/github/docs/blob/main/content/actions/using-workflows/workflow-commands-for-github-actions.md#masking-a-value-in-a-log
+- id: curl-eval
+  languages:
+  - yaml
+  message: Data is being eval'd from a `curl` command. An attacker with control of
+    the server in the `curl` command could inject malicious code into the `eval`,
+    resulting in a system comrpomise. Avoid eval'ing untrusted data if you can. If
+    you must do this, consider checking the SHA sum of the content returned by the
+    server to verify its integrity.
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://docs.github.com/en/actions/learn-github-actions/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+    technology:
+    - github-actions
+    - bash
+    - curl
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: HIGH
+    confidence: LOW
+  patterns:
+  - pattern-inside: 'steps: [...]'
+  - pattern-inside: "- run: ...\n  ...\n"
+  - pattern: 'run: $SHELL'
+  - metavariable-pattern:
+      language: bash
+      metavariable: $SHELL
+      patterns:
+      - pattern: '$DATA=<... curl ...>
+
+          ...
+
+          eval <... $DATA ...>
+
+          '
+  severity: ERROR
+- id: github-script-injection
+  languages:
+  - yaml
+  message: 'Using variable interpolation `${{...}}` with `github` context data in
+    a `actions/github-script`''s `script:` step could allow an attacker to inject
+    their own code into the runner. This would allow them to steal secrets and code.
+    `github` context data can have arbitrary user input and should be treated as untrusted.
+    Instead, use an intermediate environment variable with `env:` to store the data
+    and use the environment variable in the `run:` script. Be sure to use double-quotes
+    the environment variable, like this: "$ENVVAR".'
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (''Code Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    references:
+    - https://docs.github.com/en/actions/learn-github-actions/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+    - https://securitylab.github.com/research/github-actions-untrusted-input/
+    - https://github.com/actions/github-script
+    technology:
+    - github-actions
+    cwe2022-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: HIGH
+    confidence: HIGH
+  patterns:
+  - pattern-inside: 'steps: [...]'
+  - pattern-inside: 'uses: $ACTION
+
+      ...
+
+      '
+  - pattern-inside: "with:\n  ...\n  script: ...\n  ...\n"
+  - pattern: 'script: $SHELL'
+  - metavariable-regex:
+      metavariable: $ACTION
+      regex: actions/github-script@.*
+  - metavariable-pattern:
+      language: generic
+      metavariable: $SHELL
+      patterns:
+      - pattern-either:
+        - pattern: ${{ github.event.issue.title }}
+        - pattern: ${{ github.event.issue.body }}
+        - pattern: ${{ github.event.pull_request.title }}
+        - pattern: ${{ github.event.pull_request.body }}
+        - pattern: ${{ github.event.comment.body }}
+        - pattern: ${{ github.event.review.body }}
+        - pattern: ${{ github.event.review_comment.body }}
+        - pattern: ${{ github.event.pages. ... .page_name}}
+        - pattern: ${{ github.event.head_commit.message }}
+        - pattern: ${{ github.event.head_commit.author.email }}
+        - pattern: ${{ github.event.head_commit.author.name }}
+        - pattern: ${{ github.event.commits ... .author.email }}
+        - pattern: ${{ github.event.commits ... .author.name }}
+        - pattern: ${{ github.event.pull_request.head.ref }}
+        - pattern: ${{ github.event.pull_request.head.label }}
+        - pattern: ${{ github.event.pull_request.head.repo.default_branch }}
+        - pattern: ${{ github.head_ref }}
+        - pattern: ${{ github.event.inputs ... }}
+        - pattern: ${{ github.event.discussion.title }}
+        - pattern: ${{ github.event.discussion.body }}
+  severity: ERROR
+- id: pull-request-target-code-checkout
+  languages:
+  - yaml
+  message: This GitHub Actions workflow file uses `pull_request_target` and checks
+    out code from the incoming pull request. When using `pull_request_target`, the
+    Action runs in the context of the target repository, which includes access to
+    all repository secrets. Normally, this is safe because the Action only runs code
+    from the target repository, not the incoming PR. However, by checking out the
+    incoming PR code, you're now using the incoming code for the rest of the action.
+    You may be inadvertently executing arbitrary code from the incoming PR with access
+    to repository secrets, which would let an attacker steal repository secrets. This
+    normally happens by running build scripts (e.g., `npm build` and `make`) or dependency
+    installation scripts (e.g., `python setup.py install`). Audit your workflow file
+    to make sure no code from the incoming PR is executed. Please see https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+    for additional mitigations.
+  metadata:
+    category: security
+    owasp:
+    - A01:2021 - Broken Access Control
+    cwe:
+    - 'CWE-913: Improper Control of Dynamically-Managed Code Resources'
+    references:
+    - https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+    - https://github.com/justinsteven/advisories/blob/master/2021_github_actions_checkspelling_token_leak_via_advice_symlink.md
+    technology:
+    - github-actions
+    subcategory:
+    - audit
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+  patterns:
+  - pattern-either:
+    - pattern-inside: "on:\n  ...\n  pull_request_target: ...\n  ...\n...\n"
+    - pattern-inside: 'on: [..., pull_request_target, ...]
+
+        ...
+
+        '
+    - pattern-inside: 'on: pull_request_target
+
+        ...
+
+        '
+  - pattern-inside: "jobs:\n  ...\n  $JOBNAME:\n    ...\n    steps:\n      ...\n"
+  - pattern: "...\nuses: \"$ACTION\"\nwith:\n  ...\n  ref: $EXPR\n"
+  - metavariable-regex:
+      metavariable: $ACTION
+      regex: actions/checkout@.*
+  - metavariable-pattern:
+      language: generic
+      metavariable: $EXPR
+      patterns:
+      - pattern: ${{ github.event.pull_request ... }}
+  severity: WARNING
+- id: run-shell-injection
+  languages:
+  - yaml
+  message: 'Using variable interpolation `${{...}}` with `github` context data in
+    a `run:` step could allow an attacker to inject their own code into the runner.
+    This would allow them to steal secrets and code. `github` context data can have
+    arbitrary user input and should be treated as untrusted. Instead, use an intermediate
+    environment variable with `env:` to store the data and use the environment variable
+    in the `run:` script. Be sure to use double-quotes the environment variable, like
+    this: "$ENVVAR".'
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    references:
+    - https://docs.github.com/en/actions/learn-github-actions/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+    - https://securitylab.github.com/research/github-actions-untrusted-input/
+    technology:
+    - github-actions
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: HIGH
+    confidence: HIGH
+  patterns:
+  - pattern-inside: 'steps: [...]'
+  - pattern-inside: "- run: ...\n  ...\n"
+  - pattern: 'run: $SHELL'
+  - metavariable-pattern:
+      language: generic
+      metavariable: $SHELL
+      patterns:
+      - pattern-either:
+        - pattern: ${{ github.event.issue.title }}
+        - pattern: ${{ github.event.issue.body }}
+        - pattern: ${{ github.event.pull_request.title }}
+        - pattern: ${{ github.event.pull_request.body }}
+        - pattern: ${{ github.event.comment.body }}
+        - pattern: ${{ github.event.review.body }}
+        - pattern: ${{ github.event.review_comment.body }}
+        - pattern: ${{ github.event.pages. ... .page_name}}
+        - pattern: ${{ github.event.head_commit.message }}
+        - pattern: ${{ github.event.head_commit.author.email }}
+        - pattern: ${{ github.event.head_commit.author.name }}
+        - pattern: ${{ github.event.commits ... .author.email }}
+        - pattern: ${{ github.event.commits ... .author.name }}
+        - pattern: ${{ github.event.pull_request.head.ref }}
+        - pattern: ${{ github.event.pull_request.head.label }}
+        - pattern: ${{ github.event.pull_request.head.repo.default_branch }}
+        - pattern: ${{ github.head_ref }}
+        - pattern: ${{ github.event.inputs ... }}
+        - pattern: ${{ github.event.discussion.title }}
+        - pattern: ${{ github.event.discussion.body }}
+  severity: ERROR
+- id: third-party-action-not-pinned-to-commit-sha
+  patterns:
+  - pattern-inside: '{steps: ...}'
+  - pattern: 'uses: "$USES"
+
+      '
+  - metavariable-pattern:
+      metavariable: $USES
+      language: generic
+      patterns:
+      - pattern-not-regex: ^[.]/
+      - pattern-not-regex: ^actions/
+      - pattern-not-regex: ^github/
+      - pattern-not-regex: '@[0-9a-f]{40}$'
+      - pattern-not-regex: ^docker://.*@sha256:[0-9a-f]{64}$
+  message: An action sourced from a third-party repository on GitHub is not pinned
+    to a full length commit SHA. Pinning an action to a full length commit SHA is
+    currently the only way to use an action as an immutable release. Pinning to a
+    particular SHA helps mitigate the risk of a bad actor adding a backdoor to the
+    action's repository, as they would need to generate a SHA-1 collision for a valid
+    Git object payload.
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    cwe:
+    - 'CWE-1357: Reliance on Insufficiently Trustworthy Component'
+    - 'CWE-353: Missing Support for Integrity Check'
+    owasp: A06:2021 - Vulnerable and Outdated Components
+    references:
+    - https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components
+    - https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions
+    category: security
+    technology:
+    - github-actions
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: LOW
+    confidence: HIGH
+- id: workflow-run-target-code-checkout
+  languages:
+  - yaml
+  message: This GitHub Actions workflow file uses `workflow_run` and checks out code
+    from the incoming pull request. When using `workflow_run`, the Action runs in
+    the context of the target repository, which includes access to all repository
+    secrets. Normally, this is safe because the Action only runs code from the target
+    repository, not the incoming PR. However, by checking out the incoming PR code,
+    you're now using the incoming code for the rest of the action. You may be inadvertently
+    executing arbitrary code from the incoming PR with access to repository secrets,
+    which would let an attacker steal repository secrets. This normally happens by
+    running build scripts (e.g., `npm build` and `make`) or dependency installation
+    scripts (e.g., `python setup.py install`). Audit your workflow file to make sure
+    no code from the incoming PR is executed. Please see https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+    for additional mitigations.
+  metadata:
+    category: security
+    owasp: A01:2017 - Injection
+    cwe: 'CWE-913: Improper Control of Dynamically-Managed Code Resources'
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    subcategory:
+    - vuln
+    references:
+    - https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+    - https://github.com/justinsteven/advisories/blob/master/2021_github_actions_checkspelling_token_leak_via_advice_symlink.md
+    - https://www.legitsecurity.com/blog/github-privilege-escalation-vulnerability
+    technology:
+    - github-actions
+  patterns:
+  - pattern-inside: "on:\n  ...\n  workflow_run: ...\n  ...\n...\n"
+  - pattern-inside: "jobs:\n  ...\n  $JOBNAME:\n    ...\n    steps:\n      ...\n"
+  - pattern: "...\nuses: \"$ACTION\"\nwith:\n  ...\n  ref: $EXPR\n"
+  - metavariable-regex:
+      metavariable: $ACTION
+      regex: actions/checkout@.*
+  - metavariable-pattern:
+      language: generic
+      metavariable: $EXPR
+      patterns:
+      - pattern: ${{ github.event.workflow_run ... }}
+  severity: WARNING
+- id: semgrep-github-action-push-without-branches
+  message: The 'branches' field (in the push event configuration) contains no branches.
+    This causes all branches to be scanned and may result in unneccessary duplicate
+    findings across the entire codebase.
+  severity: WARNING
+  languages:
+  - yaml
+  paths:
+    include:
+    - .github/workflows/semgrep.yml
+    - '*.test.yml'
+  patterns:
+  - pattern-either:
+    - pattern: 'on: [..., push, ...]
+
+        ...
+
+        '
+    - pattern: 'on: push
+
+        ...
+
+        '
+    - pattern: "on:\n  ...\n  push: \"\"\n  ...\n...\n"
+    - pattern: "on:\n  ...\n  push: {}\n  ...\n...\n"
+    - patterns:
+      - pattern-inside: "on:\n  ...\n  push: ...\n  ...\n...\n"
+      - pattern-either:
+        - pattern: 'branches: ""
+
+            '
+        - pattern: 'branches: []
+
+            '
+  metadata:
+    category: correctness
+    technology:
+    - github-action

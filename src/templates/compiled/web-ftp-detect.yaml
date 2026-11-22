@@ -1,0 +1,29 @@
+id: "web-ftp-detect"
+name: "Web FTP Detection"
+severity: "info"
+description: "Safe check derived from web-ftp-detect: Web FTP Detection"
+tech:
+  - "generic"
+tags:
+  - "webftp"
+  - "tech"
+  - "ftp"
+  - "discovery"
+reference: "https://www.exploit-db.com/ghdb/7013"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/upload/web-ftp.cgi"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Web-FTP"
+      - "square login"
+  - type: "status"
+    status:
+      - 200

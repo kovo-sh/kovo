@@ -1,0 +1,37 @@
+id: "codemeter-detect"
+name: "Wibu-Systems CodeMeter WebAdmin - Version Detection"
+severity: "info"
+description: "Detects Wibu-Systems CodeMeter WebAdmin and extracts the CodeMeter version displayed by its web interface."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "detect"
+  - "wibu"
+  - "codemeter"
+  - "webadmin"
+  - "version"
+  - "discovery"
+reference: "https://www.wibu.com/products/codemeter/runtime.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/dashboard.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "CodeMeter"
+      - "WebAdmin"
+    condition: "and"
+  - type: "regex"
+    part: "body"
+    regex:
+      - "Version [0-9]+\\.[0-9]+[a-z]?\\b"
+  - type: "status"
+    status:
+      - 200

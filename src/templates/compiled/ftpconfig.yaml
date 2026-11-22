@@ -1,0 +1,33 @@
+id: "ftpconfig"
+name: "Atom remote-ssh ftpconfig Exposure"
+severity: "high"
+description: "Created by remote-ssh for Atom, contains SFTP/SSH server details and credentials"
+tech:
+  - "generic"
+tags:
+  - "atom"
+  - "ftp"
+  - "config"
+  - "exposure"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.ftpconfig"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"protocol\":"
+      - "\"host\":"
+      - "\"user\":"
+      - "\"passphrase\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

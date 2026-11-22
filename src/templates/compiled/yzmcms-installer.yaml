@@ -1,0 +1,34 @@
+id: "yzmcms-installer"
+name: "YzmCMS - Installer"
+severity: "high"
+description: "YzmCMS is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "yzmcms"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/application/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "安装程序 - YzmCMS"
+      - "YzmCMS"
+  - type: "word"
+    part: "body"
+    words:
+      - "/index.php?step=2"
+      - "/install.css"
+  - type: "status"
+    status:
+      - 200

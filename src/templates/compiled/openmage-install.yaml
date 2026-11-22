@@ -1,0 +1,28 @@
+id: "openmage-install"
+name: "OpenMage Installation Wizard"
+severity: "high"
+description: "OpenMage is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "openmage"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "OpenMage Installation Wizard"
+  - type: "status"
+    status:
+      - 200

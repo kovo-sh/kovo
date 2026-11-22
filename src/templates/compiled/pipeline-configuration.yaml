@@ -1,0 +1,30 @@
+id: "pipeline-configuration"
+name: "Pipeline Configuration Exposure"
+severity: "info"
+description: "Safe check derived from pipeline-configuration: Pipeline Configuration Exposure"
+tech:
+  - "generic"
+tags:
+  - "devops"
+  - "exposure"
+  - "cicd"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pipeline.yaml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "system:"
+      - "project_name:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

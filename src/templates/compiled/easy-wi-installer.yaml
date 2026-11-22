@@ -1,0 +1,28 @@
+id: "easy-wi-installer"
+name: "Easy-WI Installation Page - Exposure"
+severity: "high"
+description: "Easy-WI is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "install"
+  - "easy-wi"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Welcome to the Easy-WI installer!"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,117 @@
+rules:
+- id: java-jwt-decode-without-verify
+  message: Detected the decoding of a JWT token without a verify step. JWT tokens
+    must be verified before use, otherwise the token's integrity is unknown. This
+    means a malicious actor could forge a JWT token with any claims. Call '.verify()'
+    before using the token.
+  metadata:
+    cwe:
+    - 'CWE-345: Insufficient Verification of Data Authenticity'
+    owasp:
+    - A08:2021 - Software and Data Integrity Failures
+    source-rule-url: https://semgrep.dev/blog/2020/hardcoded-secrets-unverified-tokens-and-other-common-jwt-mistakes/
+    category: security
+    technology:
+    - jwt
+    confidence: MEDIUM
+    references:
+    - https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+  languages:
+  - java
+  severity: WARNING
+  patterns:
+  - pattern: 'com.auth0.jwt.JWT.decode(...);
+
+      '
+  - pattern-not-inside: "class $CLASS {\n  ...\n  $RETURNTYPE $FUNC (...) {\n    ...\n\
+      \    $VERIFIER.verify(...);\n    ...\n  }\n}"
+- id: java-jwt-hardcoded-secret
+  message: A hard-coded credential was detected. It is not recommended to store credentials
+    in source-code, as this risks secrets being leaked and used by either an internal
+    or external malicious adversary. It is recommended to use environment variables
+    to securely provide credentials or retrieve credentials from a secure vault or
+    HSM (Hardware Security Module).
+  metadata:
+    cwe:
+    - 'CWE-798: Use of Hard-coded Credentials'
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    technology:
+    - java
+    - secrets
+    - jwt
+    category: security
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: HIGH
+  languages:
+  - java
+  severity: WARNING
+  patterns:
+  - pattern-either:
+    - pattern: '(Algorithm $ALG) = $ALGO.$HMAC("$Y");
+
+        '
+    - pattern: '$SECRET = "$Y";
+
+        ...
+
+        (Algorithm $ALG) = $ALGO.$HMAC($SECRET);
+
+        '
+    - pattern: "class $CLASS {\n  ...\n  $TYPE $SECRET = \"$Y\";\n  ...\n  $RETURNTYPE\
+        \ $FUNC (...) {\n    ...\n    (Algorithm $ALG) = $ALGO.$HMAC($SECRET);\n \
+        \   ...\n  }\n  ...\n}\n"
+  - focus-metavariable: $Y
+  - metavariable-regex:
+      metavariable: $HMAC
+      regex: (HMAC384|HMAC256|HMAC512)
+- id: java-jwt-none-alg
+  message: Detected use of the 'none' algorithm in a JWT token. The 'none' algorithm
+    assumes the integrity of the token has already been verified. This would allow
+    a malicious actor to forge a JWT token that will automatically be verified. Do
+    not explicitly use the 'none' algorithm. Instead, use an algorithm such as 'HS256'.
+  metadata:
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    source-rule-url: https://semgrep.dev/blog/2020/hardcoded-secrets-unverified-tokens-and-other-common-jwt-mistakes/
+    category: security
+    technology:
+    - jwt
+    confidence: HIGH
+    references:
+    - https://owasp.org/Top10/A02_2021-Cryptographic_Failures
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+  languages:
+  - java
+  severity: ERROR
+  pattern-either:
+  - pattern: '$JWT.sign(com.auth0.jwt.algorithms.Algorithm.none());
+
+      '
+  - pattern: '$NONE = com.auth0.jwt.algorithms.Algorithm.none();
+
+      ...
+
+      $JWT.sign($NONE);
+
+      '
+  - pattern: "class $CLASS {\n  ...\n  $TYPE $NONE = com.auth0.jwt.algorithms.Algorithm.none();\n\
+      \  ...\n  $RETURNTYPE $FUNC (...) {\n    ...\n    $JWT.sign($NONE);\n    ...\n\
+      \  }\n  ...\n}"

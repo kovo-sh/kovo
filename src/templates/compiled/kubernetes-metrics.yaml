@@ -1,0 +1,33 @@
+id: "kubernetes-metrics"
+name: "Detect Kubernetes Exposed Metrics"
+severity: "low"
+description: "Information Disclosure of Garbage Collection"
+tech:
+  - "kubernetes"
+tags:
+  - "kubernetes"
+  - "exposure"
+  - "devops"
+  - "misconfig"
+  - "vuln"
+reference: "https://kubernetes.io/docs/concepts/cluster-administration/system-metrics/#metrics-in-kubernetes"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "namespace"
+      - "HELP"
+      - "TYPE"
+      - "kube"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

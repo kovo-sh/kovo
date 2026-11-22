@@ -1,0 +1,30 @@
+id: "cube-105-install"
+name: "Cube-105 - Exposed Installation"
+severity: "high"
+description: "Cube-105 is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "cube"
+  - "cube105"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wizard/wizard.cs"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Cube-105 Setup Wizard"
+      - "initial setup"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

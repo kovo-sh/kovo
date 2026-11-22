@@ -1,0 +1,30 @@
+id: "gruntfile-exposure"
+name: "Gruntfile Config - Detect"
+severity: "info"
+description: "Gruntfile configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://gruntjs.com/sample-gruntfile"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Gruntfile.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "module.exports"
+      - "grunt"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

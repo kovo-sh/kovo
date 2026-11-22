@@ -1,0 +1,31 @@
+id: "mlflow-unauth"
+name: "Mlflow - Unauthenticated Access"
+severity: "high"
+description: "Unauthenticated Access to MLflow dashboard."
+tech:
+  - "generic"
+tags:
+  - "unauth"
+  - "mlflow"
+  - "oss"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ajax-api/2.0/preview/mlflow/experiments/get?experiment_id=0"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "experiment_id"
+      - "name"
+      - "artifact_location"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

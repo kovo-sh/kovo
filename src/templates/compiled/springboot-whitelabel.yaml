@@ -1,0 +1,31 @@
+id: "springboot-whitelabel"
+name: "SpringBoot WhiteLabel Error Page - Detect"
+severity: "info"
+description: "Safe check derived from springboot-whitelabel: SpringBoot WhiteLabel Error Page - Detect"
+tech:
+  - "springboot"
+tags:
+  - "tech"
+  - "spring"
+  - "springboot"
+  - "errorpage"
+  - "discovery"
+reference: "https://codingnconcepts.com/spring-boot/disable-whitelabel-error-page-spring-boot/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+  headers:
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+control:
+  headers: {}
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<h1>Whitelabel Error Page</h1>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"

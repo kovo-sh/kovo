@@ -1,0 +1,29 @@
+id: "oracle-webcenter-sites"
+name: "Oracle WebCenter Sites"
+severity: "info"
+description: "Safe check derived from oracle-webcenter-sites: Oracle WebCenter Sites"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "oracle"
+  - "webcenter"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/welcome_webcenter.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "FOR ORACLE"
+      - "WebCenter Framework"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

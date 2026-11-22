@@ -1,0 +1,33 @@
+id: "osquery-fleet-detect"
+name: "OSQuery Fleet Detection Panel - Detect"
+severity: "info"
+description: "OSQuery Fleet Detection panel was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "fleet"
+  - "osquery"
+  - "tech"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://fleetdm.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Fleet"
+      - "osquery"
+      - "/assets/bundle"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

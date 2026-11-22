@@ -1,0 +1,30 @@
+id: "jackett-unauth"
+name: "Jackett UI - Unauthenticated"
+severity: "high"
+description: "The Jackett UI can be accessed without authentication, potentially exposing sensitive information and configuration settings to unauthorized users."
+tech:
+  - "generic"
+tags:
+  - "unauth"
+  - "misconfig"
+  - "exposure"
+  - "jackett-ui"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/UI/Dashboard"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Jackett"
+      - "API Key:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

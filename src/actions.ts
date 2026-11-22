@@ -2,11 +2,13 @@ import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { importAccessPolicy } from './access-policy.ts'
 import {
+  approvedEndpointPatternSchema,
   createPersona,
   deletePersona,
   id,
   importDnsInventory,
   importProjectSpec,
+  isLocalLabEnvEnabled,
   labConfigSchema,
   newProject,
   newRun,
@@ -16,6 +18,8 @@ import {
 } from './domain.ts'
 import { execution } from './server/execution.ts'
 import { hasGithubPat, projectReposDir, syncGithubRepos } from './server/github-connector.ts'
+import { assertLocalLabAllowed, LabRunner } from './server/lab-runner.ts'
+import type { LabTargetHandle } from './server/lab-runner.ts'
 import {
   checkModelConnection,
   deleteModelProfile,
@@ -71,11 +75,36 @@ export const removeModelProfile = createServerFn({ method: 'POST' })
 
 // --- Projects, Assets, Specs, GitHub Sync & Personas ---
 
+let sharedLabRunner: LabRunner | undefined
+function getLabRunner(): LabRunner {
+  sharedLabRunner ??= new LabRunner()
+  return sharedLabRunner
+}
+
+function serializeLabTarget(handle: LabTargetHandle | undefined) {
+  if (!handle) return null
+  return {
+    targetId: handle.targetId,
+    runId: handle.runId,
+    networkName: handle.networkName,
+    containerName: handle.containerName,
+    containerNames: handle.containerNames,
+    origin: handle.origin,
+    baseUrls: handle.baseUrls,
+    hostPort: handle.hostPort,
+    internalPort: handle.internalPort,
+    healthPath: handle.healthPath,
+    seededPersonas: handle.seededPersonas,
+    startedAt: handle.startedAt,
+  }
+}
+
 export const projectData = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id }))
   .handler(({ data }) => ({
     ...store().projectDetail(data.projectId),
     hasGithubPat: hasGithubPat(),
+    localLabEnvEnabled: isLocalLabEnvEnabled(),
   }))
 
 export const createProject = createServerFn({ method: 'POST' }).validator(newProject)
@@ -168,7 +197,20 @@ export const readWorkerSessionAction = createServerFn({ method: 'GET' })
 
 export const runData = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id }))
-  .handler(({ data }) => ({ ...store().runDetail(data.runId), hasModel: modelReady() }))
+  .handler(({ data }) => {
+    const db = store()
+    const detail = db.runDetail(data.runId)
+    return {
+      ...detail,
+      endpoints: db.listEndpoints(data.runId),
+      endpointParams: db.listEndpointParams(data.runId),
+      apiDependencies: db.listApiDependencies(data.runId),
+      labTelemetry: db.listLabTelemetry(data.runId),
+      labTarget: serializeLabTarget(getLabRunner().getTarget(data.runId)),
+      localLabEnvEnabled: isLocalLabEnvEnabled(),
+      hasModel: modelReady(),
+    }
+  })
 
 export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
   .handler(({ data }) => store().createRun(data))
@@ -236,3 +278,73 @@ export const updateProjectLabConfigAction = createServerFn({ method: 'POST' })
     labConfig: labConfigSchema.nullable(),
   }))
   .handler(({ data }) => store().updateProjectLabConfig(data))
+
+export const updateProjectSandboxAllowlistAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    sandboxWriteAllowlist: z.array(approvedEndpointPatternSchema).max(100),
+  }))
+  .handler(({ data }) => store().updateProjectSandboxWriteAllowlist(data))
+
+export const startRunLabAction = createServerFn({ method: 'POST' })
+  .validator(z.object({ runId: id }))
+  .handler(async ({ data }) => {
+    const db = store()
+    const run = db.run(data.runId)
+    const project = db.project(run.projectId)
+    assertLocalLabAllowed(project.environment)
+    if (!project.labConfig?.enabled) {
+      throw new Error('Enable local lab in Project settings before starting LabRunner.')
+    }
+    const repoDir = projectReposDir(db.directory, project.id)
+    const handle = await getLabRunner().startLabTarget({
+      runId: run.id,
+      environment: project.environment,
+      repoDir,
+      labConfig: project.labConfig,
+      storage: db,
+      projectId: project.id,
+      signal: AbortSignal.timeout(120_000),
+    })
+    return { target: serializeLabTarget(handle) }
+  })
+
+export const stopRunLabAction = createServerFn({ method: 'POST' })
+  .validator(z.object({ runId: id }))
+  .handler(async ({ data }) => {
+    await getLabRunner().stopLabTarget(data.runId)
+    return { stopped: true }
+  })
+
+export const checkRunLabHealthAction = createServerFn({ method: 'GET' })
+  .validator(z.object({ runId: id }))
+  .handler(async ({ data }) => {
+    const handle = getLabRunner().getTarget(data.runId)
+    if (!handle) {
+      return { running: false, healthy: false, message: 'Lab stack is not running.' }
+    }
+    try {
+      const path = handle.healthPath.startsWith('/') ? handle.healthPath : '/' + handle.healthPath
+      const res = await fetch(`${handle.origin}${path}`, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(3_000),
+      })
+      await res.body?.cancel().catch(() => undefined)
+      return {
+        running: true,
+        healthy: res.status < 500,
+        statusCode: res.status,
+        origin: handle.origin,
+        message: `HTTP ${res.status} at ${handle.origin}${path}`,
+      }
+    } catch (err) {
+      return {
+        running: true,
+        healthy: false,
+        origin: handle.origin,
+        message: err instanceof Error ? err.message : 'Health check failed.',
+      }
+    }
+  })

@@ -1,0 +1,29 @@
+id: "divi-form-builder-detect"
+name: "Divi Form Builder - Detect"
+severity: "info"
+description: "Divi Form Builder is a premium WordPress form plugin by Divi Engine."
+tech:
+  - "wordpress"
+tags:
+  - "tech"
+  - "wordpress"
+  - "wp-plugin"
+  - "divi-form-builder"
+  - "divi"
+reference: "https://diviengine.com/product/divi-form-builder/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "wp-content/plugins/divi-form-builder"
+  - type: "status"
+    status:
+      - 200

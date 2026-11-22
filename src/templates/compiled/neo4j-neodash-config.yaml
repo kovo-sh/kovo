@@ -1,0 +1,35 @@
+id: "neo4j-neodash-config"
+name: "Neo4j Neodash Config - Exposure"
+severity: "medium"
+description: "Detects the file config.json from Neo4j Neodash web application, it contains information about DB connection with Neo4J."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "neodash"
+  - "neo4j"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "standaloneHost"
+      - "standalonePort"
+      - "standaloneDatabase"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

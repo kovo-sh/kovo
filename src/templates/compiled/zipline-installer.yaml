@@ -1,0 +1,32 @@
+id: "zipline-installer"
+name: "Zipline - Installer"
+severity: "critical"
+description: "Zipline installer setup was detected."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "setup"
+  - "zipline"
+  - "installer"
+  - "vuln"
+reference: "https://zipline.diced.sh/docs/get-started/docker"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Setup Zipline"
+      - "Configuration"
+      - "Create a super-admin account"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,29 @@
+id: "exposed-hg"
+name: "HG Configuration - Detect"
+severity: "medium"
+description: "HG configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.hg/hgrc"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[paths]"
+      - "default"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,41 @@
+id: "powerdns-monitor-exposure"
+name: "PowerDNS Authoritative Server Monitor - Unauthenticated Exposure"
+severity: "medium"
+description: "Exposed PowerDNS Authoritative Server monitor allows unauthenticated access to operational stats, aiding reconnaissance but not zone takeover."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "misconfig"
+  - "powerdns"
+  - "dns"
+  - "monitor"
+  - "unauth"
+  - "panel"
+cwe: "CWE-200"
+reference: "https://docs.powerdns.com/authoritative/http-api/index.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "PowerDNS Authoritative Server Monitor"
+      - "PowerDNS"
+  - type: "word"
+    part: "body"
+    words:
+      - "Queries/second"
+      - "Remote server IP addresses"
+      - "Log Messages"
+      - "Variables"
+      - "Cache hitrate"
+  - type: "status"
+    status:
+      - 200

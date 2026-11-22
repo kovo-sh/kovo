@@ -1,0 +1,31 @@
+id: "wp-sfwd-lms-listing"
+name: "WordPress Plugin Sfwd-lms Listing"
+severity: "info"
+description: "Searches for sensitive directories present in the sfwd-lms plugin."
+tech:
+  - "wordpress"
+tags:
+  - "wordpress"
+  - "listing"
+  - "plugin"
+  - "edb"
+  - "vuln"
+reference: "https://www.exploit-db.com/ghdb/6426"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/sfwd-lms/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of"
+      - "wp-content/plugins/sfwd-lms"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

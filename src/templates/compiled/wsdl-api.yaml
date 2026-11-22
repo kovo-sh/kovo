@@ -1,0 +1,28 @@
+id: "wsdl-api"
+name: "WSDL API - Detect"
+severity: "info"
+description: "WSDL API was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "api"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://www.w3.org/TR/wsdl/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?wsdl"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "wsdl:definitions"
+  - type: "status"
+    status:
+      - 200

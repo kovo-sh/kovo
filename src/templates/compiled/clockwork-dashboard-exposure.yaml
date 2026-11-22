@@ -1,0 +1,34 @@
+id: "clockwork-dashboard-exposure"
+name: "Clockwork Dashboard Exposure"
+severity: "high"
+description: "Clockwork Dashboard is exposed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+reference: "https://github.com/detectify/ugly-duckling/blob/master/modules/crowdsourced/clockwork-dashboard-exposure.json"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/__clockwork/latest"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"id\":"
+      - "\"version\":"
+      - "\"method\":"
+      - "\"url\":"
+      - "\"time\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"

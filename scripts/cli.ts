@@ -30,6 +30,11 @@ export interface CliOptions {
   sarifPath?: string
   failOn: FailOnSeverity
   localLab: boolean
+  composeFile?: string
+  labPort?: number
+  labHealthPath?: string
+  labSeedCommand?: string
+  iast: boolean
   outputDir: string
   goal?: string
   timeoutSec: number
@@ -73,6 +78,11 @@ export function formatCliHelp(): string {
     '  --sarif <path>             Write OASIS SARIF 2.1.0 report JSON to path',
     '  --fail-on <severity>       Exit code 2 threshold: critical|high|medium|low (default: high)',
     '  --local-lab                Enable local-lab HTTP/port target mode (requires GUARDIAN_ALLOW_LOCAL_LAB=1)',
+    '  --compose <file>           Docker Compose file relative to --repo for --local-lab stack',
+    '  --lab-port <n>             Internal port for --local-lab container (default: 8080)',
+    '  --lab-health <path>        Health check path for --local-lab container (default: /health)',
+    '  --lab-seed <cmd>           Deterministic persona seed command for --local-lab stack',
+    '  --iast                     Enable opt-in local-lab IAST & coverage telemetry side-channel',
     '  --output-dir <dir>         Output directory for SQLite state, Markdown & JSON reports',
     '  --goal <text>              Custom assessment goal prompt',
     '  --timeout-sec <n>          Maximum run duration in seconds (default: 900)',
@@ -107,6 +117,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       budgetUsd: 15,
       failOn: 'high',
       localLab: false,
+      iast: false,
       outputDir: resolve('.guardian', 'cli-run'),
       timeoutSec: 900,
       help: true,
@@ -124,6 +135,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     budgetUsd: 15,
     failOn: 'high',
     localLab: false,
+    iast: false,
     outputDir: resolve('.guardian', `cli-run-${Date.now()}`),
     timeoutSec: 900,
     help: false,
@@ -212,6 +224,30 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       }
       case '--local-lab':
         opts.localLab = true
+        break
+      case '--compose':
+        opts.composeFile = nextValue(arg, i).trim()
+        i++
+        break
+      case '--lab-port': {
+        const n = Number(nextValue(arg, i))
+        if (!Number.isInteger(n) || n < 1 || n > 65_535) {
+          throw new Error(`Invalid --lab-port value "${args[i + 1]}": expected integer 1..65535.`)
+        }
+        opts.labPort = n
+        i++
+        break
+      }
+      case '--lab-health':
+        opts.labHealthPath = nextValue(arg, i).trim()
+        i++
+        break
+      case '--lab-seed':
+        opts.labSeedCommand = nextValue(arg, i).trim()
+        i++
+        break
+      case '--iast':
+        opts.iast = true
         break
       case '--output-dir':
         opts.outputDir = resolve(nextValue(arg, i))
@@ -440,19 +476,57 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
 
   try {
     const environment: 'public' | 'local-lab' = opts.localLab ? 'local-lab' : 'public'
-    const tier: CapabilityTier = opts.tier ?? (validatedOrigins.length > 0 ? 1 : 0)
     const budgetRequests = opts.budgetRequests ?? (opts.localLab ? 10_000 : 4_000)
 
-    // For repo-only Tier 0 offline scans without an explicit origin, use a synthetic static-only placeholder seed.
+    // Boot multi-service --internal LabRunner stack when --local-lab + --repo is used without an external --origin
+    // (or when --compose / --lab-seed / --iast explicitly requests managed container launch).
+    const shouldBootLab = opts.localLab && opts.repos.length > 0 && (
+      validatedOrigins.length === 0 || Boolean(opts.composeFile) || Boolean(opts.labSeedCommand) || opts.iast
+    )
+    const labBootId = randomUUID()
+    let labHandle: Awaited<ReturnType<LabRunner['startLabTarget']>> | undefined
+    if (shouldBootLab) {
+      const telemetryDir = opts.iast ? join(opts.outputDir, 'evidence', 'lab-telemetry') : undefined
+      labHandle = await labRunner.startLabTarget({
+        runId: labBootId,
+        environment: 'local-lab',
+        repoDir: opts.repos[0],
+        telemetryDir,
+        labConfig: {
+          enabled: true,
+          dockerComposeFile: opts.composeFile,
+          internalPort: opts.labPort ?? 8080,
+          healthPath: opts.labHealthPath ?? '/health',
+          seedCommand: opts.labSeedCommand,
+          iastEnabled: opts.iast,
+          iastRuntime: 'node',
+        },
+        signal: AbortSignal.timeout(Math.min(opts.timeoutSec * 1000, 120_000)),
+      })
+    }
+
     const effectiveOrigins = validatedOrigins.length > 0
-      ? validatedOrigins
-      : (opts.localLab ? ['http://127.0.0.1:8080'] : ['https://static-audit.invalid'])
+      ? (labHandle ? [...new Set([labHandle.origin, ...validatedOrigins])] : validatedOrigins)
+      : (labHandle ? [labHandle.origin] : (opts.localLab ? ['http://127.0.0.1:8080'] : ['https://static-audit.invalid']))
+
+    const tier: CapabilityTier = opts.tier ?? (validatedOrigins.length > 0 || labHandle ? 1 : 0)
 
     const { id: projectId } = storage.createProject({
       requestId: randomUUID(),
       name: `CLI Scan (${basename(opts.outputDir)})`,
       seeds: effectiveOrigins,
       environment,
+      ...(labHandle ? {
+        labConfig: {
+          enabled: true,
+          dockerComposeFile: opts.composeFile,
+          internalPort: opts.labPort ?? 8080,
+          healthPath: opts.labHealthPath ?? '/health',
+          seedCommand: opts.labSeedCommand,
+          iastEnabled: opts.iast,
+          iastRuntime: 'node' as const,
+        },
+      } : {}),
     })
 
     const mountedRepos = opts.repos.length > 0

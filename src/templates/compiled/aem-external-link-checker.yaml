@@ -1,0 +1,33 @@
+id: "aem-external-link-checker"
+name: "Adobe AEM External Link Checker Exposure"
+severity: "info"
+description: "Safe check derived from aem-external-link-checker: Adobe AEM External Link Checker Exposure"
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "aem"
+  - "adobe"
+  - "exposure"
+  - "vuln"
+reference: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/aem2.txt"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/etc/linkchecker.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>External Link Checker</title>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

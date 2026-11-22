@@ -1,0 +1,32 @@
+id: "cadvisor-exposure"
+name: "cAdvisor - Detect"
+severity: "medium"
+description: "cAdvisor page was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "misconfig"
+  - "dashboard"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/containers/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>cAdvisor - /</title>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

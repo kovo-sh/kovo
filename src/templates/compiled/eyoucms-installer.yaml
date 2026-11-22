@@ -1,0 +1,30 @@
+id: "eyoucms-installer"
+name: "EyouCMS - Installation"
+severity: "high"
+description: "EyouCMS installation is exposed."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "eyoucms"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "EyouCms"
+      - "/install/index.php?step=2"
+      - "使用协议</p>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

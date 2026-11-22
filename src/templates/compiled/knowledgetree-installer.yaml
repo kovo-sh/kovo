@@ -1,0 +1,28 @@
+id: "knowledgetree-installer"
+name: "KnowledgeTree Installer Exposure"
+severity: "high"
+description: "KnowledgeTree is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "knowledgetree"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/wizard/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>KnowledgeTree Installer"
+  - type: "status"
+    status:
+      - 200

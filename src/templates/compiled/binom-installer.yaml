@@ -1,0 +1,30 @@
+id: "binom-installer"
+name: "Binom Installer Exposure"
+severity: "high"
+description: "Binom is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "binom"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Install Binom</title>"
+      - "System check"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

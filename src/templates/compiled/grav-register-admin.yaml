@@ -1,0 +1,30 @@
+id: "grav-register-admin"
+name: "Grav Register Admin User - Detect"
+severity: "high"
+description: "Exposed Grav admin user register page."
+tech:
+  - "generic"
+tags:
+  - "grav"
+  - "register"
+  - "admin"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Grav Register Admin User | Grav"
+      - "admin accounts"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

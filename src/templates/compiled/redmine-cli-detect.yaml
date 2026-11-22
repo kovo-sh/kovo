@@ -1,0 +1,29 @@
+id: "redmine-cli-detect"
+name: "Detect Redmine CLI Configuration File"
+severity: "info"
+description: "A small command-line utility to interact with Redmine - https://pypi.org/project/Redmine-CLI/"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "redmine"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.redmine-cli"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "default"
+      - "my_id"
+      - "root_url"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

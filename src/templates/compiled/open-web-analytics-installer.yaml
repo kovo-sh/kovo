@@ -1,0 +1,28 @@
+id: "open-web-analytics-installer"
+name: "Open Web Analytics Installer - Exposure"
+severity: "high"
+description: "Open Web Analytics is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "open-web-analytics"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Installation - Open Web Analytics"
+  - type: "status"
+    status:
+      - 200

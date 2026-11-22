@@ -1,0 +1,39 @@
+id: "netrc"
+name: "Netrc - Config File Discovery"
+severity: "high"
+description: "Netrc configuration file was discovered."
+tech:
+  - "generic"
+tags:
+  - "netrc"
+  - "config"
+  - "exposure"
+  - "vuln"
+reference: "https://www.gnu.org/software/inetutils/manual/html_node/The-_002enetrc-file.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.netrc"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "regex"
+    part: "body"
+    regex:
+      - "machine [0-9A-Za-z](?:(?:[0-9A-Za-z]|-){0,61}[0-9A-Za-z])?(?:\\.[0-9A-Za-z](?:(?:[0-9A-Za-z]|-){0,61}[0-9A-Za-z])?)*\\.?"
+  - type: "word"
+    part: "body"
+    words:
+      - "login "
+      - "password "
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+    negative: true

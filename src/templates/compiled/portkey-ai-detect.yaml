@@ -1,0 +1,29 @@
+id: "portkey-ai-detect"
+name: "Portkey AI Detection"
+severity: "info"
+description: "Detected Portkey AI interface. Portkey was an AI gateway that provided observability, governance, and reliability for LLM applications."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "portkey"
+  - "ai"
+  - "llm"
+  - "gateway"
+reference: "https://portkey.ai/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Portkey AI"
+  - type: "status"
+    status:
+      - 200

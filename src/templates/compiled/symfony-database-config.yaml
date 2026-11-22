@@ -1,0 +1,36 @@
+id: "symfony-database-config"
+name: "Symfony Database Configuration File - Detect"
+severity: "high"
+description: "Symfony database configuration file was detected and may contain database credentials."
+tech:
+  - "symfony"
+tags:
+  - "config"
+  - "exposure"
+  - "symfony"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://symfony.com/legacy/doc/reference/1_3/en/07-Databases"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config/databases.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+    negative: true
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "class:"
+      - "param:"
+    condition: "and"

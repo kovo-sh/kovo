@@ -1,0 +1,29 @@
+id: "crxde-lite"
+name: "CRXDE Lite - Exposure"
+severity: "low"
+description: "CRXDE Lite exposure was detected."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "aem"
+  - "crxde"
+  - "exposure"
+  - "adobe"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/Az0x7/vulnerability-Checklist/blob/main/Aem%20misconfiguration/aem.md"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/crx/de/index.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>CRXDE Lite</title>"

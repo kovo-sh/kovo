@@ -1,0 +1,38 @@
+id: "aspnet-launchsettings-exposure"
+name: "ASP.NET Launch Settings - Exposure"
+severity: "medium"
+description: "Detected exposed launchSettings.json files in ASP.NET Core applications. This file contains environment variables and launch configurations that may leak sensitive information."
+tech:
+  - "dotnet"
+tags:
+  - "aspnet"
+  - "config"
+  - "exposure"
+  - "json"
+  - "dotnet"
+  - "vuln"
+reference: "https://learn.microsoft.com/en-us/aspnet/core/fundamentals/environments"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Properties/launchSettings.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "profiles"
+      - "iisSettings"
+      - "commandName"
+      - "launchBrowser"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

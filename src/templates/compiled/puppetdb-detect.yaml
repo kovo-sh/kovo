@@ -1,0 +1,32 @@
+id: "puppetdb-detect"
+name: "PuppetDB Detection"
+severity: "info"
+description: "Safe check derived from puppetdb-detect: PuppetDB Detection"
+tech:
+  - "generic"
+tags:
+  - "puppet"
+  - "tech"
+  - "exposure"
+  - "discovery"
+reference: "https://puppet.com/docs/puppetdb/7/api/meta/v1/version.html#pdbmetav1version"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pdb/meta/v1/version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "regex"
+    part: "body"
+    regex:
+      - "\"version\"\\s:\\s\"([0-9.]+)\""

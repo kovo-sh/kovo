@@ -1,0 +1,34 @@
+id: "ht-deployment"
+name: ".htdeployment - Files Tree Cache File"
+severity: "medium"
+description: "FTP Deployment cache file that contains whole files structure with paths to potentially sensitive files."
+tech:
+  - "php"
+tags:
+  - "files"
+  - "exposure"
+  - "php"
+  - "deployment"
+  - "cache"
+  - "dg"
+  - "vuln"
+reference: "https://github.com/dg/ftp-deployment/tree/master"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.htdeployment"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[config]"
+      - "1F 8B"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/octet-stream"
+      - "text/plain"

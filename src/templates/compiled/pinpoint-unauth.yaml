@@ -1,0 +1,34 @@
+id: "pinpoint-unauth"
+name: "PinPoint Unauth"
+severity: "high"
+description: "PinPoint is exposed."
+tech:
+  - "generic"
+tags:
+  - "pippoint"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+reference: "https://github.com/pinpoint-apm/pinpoint"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/applications.pinpoint"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "applicationName"
+      - "serviceType"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

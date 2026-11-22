@@ -1,0 +1,27 @@
+id: "hpe-system-management-anonymous-access"
+name: "HPE System Management Anonymous Access"
+severity: "low"
+description: "HPE system management anonymous access is enabled."
+tech:
+  - "php"
+tags:
+  - "hp"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/chpstrt.php?chppath=Home"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "username = \"hpsmh_anonymous\";"
+      - "var host_addr = '"
+      - "var ip_addr   = '"
+    condition: "and"

@@ -1,0 +1,28 @@
+id: "testrail-install"
+name: "TestRail Installation Wizard"
+severity: "high"
+description: "TestRail is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "testrail"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/index.php?/installer"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "TestRail Installation Wizard"
+  - type: "status"
+    status:
+      - 200

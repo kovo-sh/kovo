@@ -1,0 +1,33 @@
+id: "sass-lint"
+name: "Sass Lint File Exposure"
+severity: "info"
+description: "Safe check derived from sass-lint: Sass Lint File Exposure"
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "sass"
+  - "devops"
+  - "cicd"
+  - "files"
+  - "vuln"
+reference: "https://github.com/sasstools/sass-lint/blob/develop/docs/sass-lint.yml"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.sass-lint.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "options:"
+      - "formatter:"
+      - "files:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

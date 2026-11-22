@@ -1,0 +1,30 @@
+id: "krayin-installer"
+name: "Krayin CMS - Installer"
+severity: "high"
+description: "Krayin CRM installer page was detected."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "exposure"
+  - "krayin"
+  - "crm"
+  - "install"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Krayin Installer"
+      - "Welcome to Installation"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

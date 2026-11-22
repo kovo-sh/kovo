@@ -1,0 +1,30 @@
+id: "webpack-mix-js"
+name: "Webpack Mix File Disclosure"
+severity: "info"
+description: "Safe check derived from webpack-mix-js: Webpack Mix File Disclosure"
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "devops"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/webpack.mix.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Mix Asset Management"
+      - "const mix"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

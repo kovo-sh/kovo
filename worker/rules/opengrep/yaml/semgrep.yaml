@@ -1,0 +1,997 @@
+rules:
+- fix: bash
+  id: lang-consistency-bash
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'bash' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(sh)$
+  severity: WARNING
+- fix: cpp
+  id: lang-consistency-cpp
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'cpp' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(c\+\+)$
+  severity: WARNING
+- fix: csharp
+  id: lang-consistency-csharp
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'csharp' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(c\#)$
+  severity: WARNING
+- fix: dockerfile
+  id: lang-consistency-dockerfile
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'dockerfile' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(docker)$
+  severity: WARNING
+- fix: elixir
+  id: lang-consistency-elixir
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'elixir' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(ex)$
+  severity: WARNING
+- fix: go
+  id: lang-consistency-go
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'go' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(golang)$
+  severity: WARNING
+- fix: hcl
+  id: lang-consistency-hcl
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'hcl' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(tf|terraform)$
+  severity: WARNING
+- fix: js
+  id: lang-consistency-js
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'js' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(javascript)$
+  severity: WARNING
+- fix: kotlin
+  id: lang-consistency-kotlin
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'kotlin' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(kt)$
+  severity: WARNING
+- fix: python
+  id: lang-consistency-python
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'python' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(py)$
+  severity: WARNING
+- fix: regex
+  id: lang-consistency-regex
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'regex' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(none)$
+  severity: WARNING
+- fix: solidity
+  id: lang-consistency-solidity
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'solidity' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(sol)$
+  severity: WARNING
+- fix: ts
+  id: lang-consistency-ts
+  languages:
+  - yaml
+  message: Found '$X' in language config which diverges from semgrep.dev normalization.
+    Please use 'ts' instead.
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern: $X
+  - pattern-inside: 'languages: ...'
+  - metavariable-regex:
+      metavariable: $X
+      regex: ^(typescript)$
+  severity: WARNING
+- id: duplicate-id
+  message: The 'id' field $X was used multiple times. The 'id' field needs to be unique.
+  severity: ERROR
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern-inside: "...\n- id: $X\n  ...\n...\n- id: $X\n  ...\n...\n"
+  - pattern: 'id: $X
+
+      '
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+- id: duplicate-pattern
+  message: Two identical pattern clauses were detected. This will cause Semgrep to
+    run the same pattern twice. Remove one of the duplicate pattern clauses.
+  severity: ERROR
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern-inside: '- pattern: $X
+
+      ...
+
+      - pattern: $X
+
+      ...
+
+      '
+  - pattern: 'pattern: $X
+
+      '
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+- id: empty-message
+  message: This rule has an empty message field. Consider adding a message field that
+    communicates why this rule is an issue and how to fix it. This will increase the
+    chance that the finding gets addressed.
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern: 'message: ""
+
+      '
+  severity: WARNING
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+- id: interfile-true-under-metadata-and-no-options
+  message: '`interfile: true` should be under the `options` field, not the `metadata`
+    field.'
+  languages:
+  - yaml
+  severity: WARNING
+  patterns:
+  - pattern: "rules:\n  - id: $ID\n    ...\n    $METADATA:\n      ...\n      $INTERFILE:\
+      \ true\n      ...\n    ...\n"
+  - pattern-not-inside: "rules:\n  - id: $ID\n    ...\n    options:\n      ...\n \
+      \   ...\n"
+  - metavariable-regex:
+      metavariable: $INTERFILE
+      regex: interfile
+  - metavariable-regex:
+      metavariable: $METADATA
+      regex: metadata
+  - focus-metavariable: $METADATA
+  fix: "options:\n  interfile: true\nmetadata\n"
+- id: interfile-true-under-metadata-and-options-already-present
+  message: '`interfile: true` should be under the `options` field, not the `metadata`
+    field.'
+  languages:
+  - yaml
+  severity: WARNING
+  patterns:
+  - pattern: "rules:\n  - id: $ID\n    ...\n    $METADATA:\n      ...\n      $INTERFILE:\
+      \ true\n      ...\n    ...\n"
+  - pattern-inside: "rules:\n  - id: $ID\n    ...\n    $OPTIONS:\n      $FIRST_OPT:\
+      \ $VAL\n      ...\n    ...\n"
+  - pattern-not-inside: "rules:\n  - id: $ID\n    ...\n    $OPTIONS:\n      ...\n\
+      \      interfile: true\n      ...\n    ...\n"
+  - metavariable-regex:
+      metavariable: $INTERFILE
+      regex: interfile
+  - metavariable-regex:
+      metavariable: $METADATA
+      regex: metadata
+  - metavariable-regex:
+      metavariable: $OPTIONS
+      regex: options
+  - focus-metavariable: $FIRST_OPT
+  fix: 'interfile: true
+
+    $FIRST_OPT
+
+    '
+- id: yaml-key-indentation-check
+  message: 'It looks like you have an YAML indentation issue -- instead of writing
+    `$KEY`,  put a space between the hyphen and what comes after! Otherwise, it reads  as
+    a single string. '
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository
+    category: correctness
+    technology:
+    - semgrep
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'rules: ...
+
+        '
+    - pattern: "$KEY: >-\n  $VALUE\n"
+    - focus-metavariable: $KEY
+    - metavariable-regex:
+        metavariable: $KEY
+        regex: ^-(\w*)$
+- id: message-whitespace-check
+  message: It looks like you have an additional space in your rule message, this can
+    look awkward in the finding output, please remove the additional whitespace!
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern-inside: 'rules: ...
+
+      '
+  - pattern: "message: >-\n  $VALUE\n"
+  - focus-metavariable:
+    - $VALUE
+  - pattern-regex: \w.*
+  - pattern-regex: \s{2,}
+  fix-regex:
+    regex: (?<=\S)\s(\s{1,})
+    replacement: ' '
+- id: metadata-category
+  message: This Semgrep rule is missing a valid 'category' field in the 'metadata'.
+    'category' must be one of 'security', 'correctness', 'best-practice', 'performance',
+    'maintainability', or 'portability'.
+  severity: INFO
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern: 'id: $RULEID'
+  - pattern-not-inside: "- ...\n  metadata:\n    ...\n    category: $CATEGORY\n"
+  languages:
+  - yaml
+  metadata:
+    category: best-practice
+    technology:
+    - semgrep
+- id: metadata-confidence-incorrect-value
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern: 'confidence: $VALUE
+
+      '
+  - pattern-not: 'confidence: LOW
+
+      '
+  - pattern-not: 'confidence: MEDIUM
+
+      '
+  - pattern-not: 'confidence: HIGH
+
+      '
+  message: 'Semgrep rule confidence: $VALUE detected, but the value must be LOW, MEDIUM,
+    or HIGH. For more information visit:  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/'
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-confidence
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern-not-inside: "metadata: \n  ...\n  confidence: $VALUE\n"
+  message: This Semgrep rule is missing a valid 'confidence' field in the 'metadata'.
+    which should be either LOW, MEDIUM, or HIGH. For more information visit  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-cwe
+  message: '$...CWE The cwe tag in rule metadata should always be in the format "CWE-000:
+    Title".'
+  severity: ERROR
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: ...'
+  - pattern-inside: 'metadata: ...'
+  - pattern: 'cwe: ...'
+  - pattern-not-regex: CWE-[\d]+:\s+\w
+  metadata:
+    category: best-practice
+    technology:
+    - semgrep
+- id: metadata-deepsemgrep
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  $DEEPSEMGREP: true\n  ...\n"
+  - focus-metavariable: $DEEPSEMGREP
+  - metavariable-regex:
+      metavariable: $DEEPSEMGREP
+      regex: ^(deepsemgrep)$
+  message: 'We no longer support `deepsemgrep: true`, please use `interfile:true`'
+  fix-regex:
+    regex: deepsemgrep
+    replacement: interfile
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+    references:
+    - https://semgrep.dev/
+- id: metadata-impact-incorrect-value
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern: 'impact: $VALUE
+
+      '
+  - pattern-not: 'impact: LOW
+
+      '
+  - pattern-not: 'impact: MEDIUM
+
+      '
+  - pattern-not: 'impact: HIGH
+
+      '
+  message: 'Semgrep rule impact: $VALUE detected, but the value must be LOW, MEDIUM,
+    or HIGH. For more information visit:  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/'
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-impact
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern-not-inside: "metadata: \n  ...\n  impact: $VALUE\n"
+  message: This Semgrep rule is missing a valid 'impact' field in the 'metadata'.
+    which should be either LOW, MEDIUM, or HIGH. For more information visit  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/writing-rules/rule-syntax/#TODO
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-incorrect-option
+  message: It looks like $KEY is not in the default list of expected options, if this
+    is a new key update this rule
+  languages:
+  - yaml
+  severity: INFO
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern-inside: 'rules: ...
+
+      '
+  - pattern-inside: "options:\n  $A\n"
+  - focus-metavariable: $A
+  - pattern: '$KEY: $VALUE
+
+      '
+  - metavariable-regex:
+      metavariable: $KEY
+      regex: (?!options|constant_propagation|symbolic_propagation|taint_unify_mvars|taint_assume_safe_functions|taint_assume_safe_indexes|taint_assume_safe_comparisons|taint_assume_safe_booleans|taint_assume_safe_numbers|ac_matching|commutative_boolop|flddef_assign|arrow_is_function|let_is_var|go_deeper_expr|go_deeper_stmt|implicit_deep_exprstmt|implicit_ellipsis|xml_singleton_loose_matching|xml_attrs_implicit_ellipsis|xml_children_ordered|generic_engine|generic_multiline|generic_braces|generic_extra_braces|generic_extra_word_characters|generic_caseless|generic_ellipsis_max_span|generic_comment_style|interfile|generic_engine|commutative_compop|taint_focus_on)
+- id: metadata-likelihood-incorrect-value
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern: 'likelihood: $VALUE
+
+      '
+  - pattern-not: 'likelihood: LOW
+
+      '
+  - pattern-not: 'likelihood: MEDIUM
+
+      '
+  - pattern-not: 'likelihood: HIGH
+
+      '
+  message: 'Semgrep rule likelihood: $VALUE detected, but the value must be LOW, MEDIUM,
+    or HIGH. For more information visit:  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/'
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-likelihood
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern-not-inside: "metadata: \n  ...\n  likelihood: $VALUE\n"
+  message: This Semgrep rule is missing a valid 'likelihood' field in the 'metadata'.
+    which should be either LOW, MEDIUM, or HIGH. For more information visit  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-owasp
+  message: The `owasp` tag in Semgrep rule metadata should start with the format "A00:YYYY",
+    where A00 is the OWASP Top 10 number and YYYY is the OWASP Top 10 year.
+  severity: ERROR
+  languages:
+  - json
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: ...'
+  - pattern-inside: 'metadata: ...'
+  - pattern-either:
+    - patterns:
+      - pattern: 'owasp: "..."'
+      - pattern-not: 'owasp: "=~/^(A|K|LLM)(0?[1-9]|10):\s+.+$/"'
+      - pattern-not: 'owasp: "=~/^(A|K|LLM)(0[1-9]|10):([0-9]{4})?\s+.+$/"'
+    - patterns:
+      - pattern-inside: 'owasp: [...]'
+      - pattern: '"$ANYTHING"'
+      - pattern-not-regex: .*(A|K|LLM)(0[1-9]|10):[0-9]{4}\s+.*
+      - pattern-not-regex: 'owasp:'
+  metadata:
+    category: best-practice
+    technology:
+    - semgrep
+- id: metadata-references
+  message: The references in rule metadata should always be a list, even if there's
+    only one.
+  severity: ERROR
+  languages:
+  - json
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: ...
+
+      '
+  - pattern-inside: 'metadata: ...
+
+      '
+  - pattern: 'references: ...
+
+      '
+  - pattern-not: 'references: [...]
+
+      '
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-subcategory-incorrect-value
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern: "subcategory: \n  - $VALUE\n"
+  - pattern-not: "subcategory: \n  - vuln\n"
+  - pattern-not: "subcategory: \n  - audit\n"
+  - pattern-not: "subcategory: \n  - secure default\n"
+  message: 'Semgrep rule likelihood: $VALUE detected, but the value must be vuln,
+    audit, or secure default. For more information visit: https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/'
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-subcategory
+  patterns:
+  - pattern-inside: "rules: \n  ...\n"
+  - pattern-inside: "metadata: \n  ...\n  category: security\n  ...\n"
+  - pattern-not-inside: "metadata: \n  ...\n  subcategory: $VALUE\n"
+  message: This Semgrep rule is missing a valid 'subcategory' field in the 'metadata'.
+    which should be either audit, vuln, or secure default. For more information visit  https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/
+    category: correctness
+    technology:
+    - semgrep
+- id: metadata-technology
+  message: This Semgrep rule is missing a 'technology' field in the 'metadata'. Consider
+    adding a list of technologies based on the rule's associated library or framework,
+    or another piece of relevant information.
+  severity: INFO
+  pattern-either:
+  - patterns:
+    - pattern-not-inside: "- ...\n  mode: join\n"
+    - pattern-inside: 'rules: [..., $RULE, ...]'
+    - pattern: $RULE
+    - pattern: 'id: ...
+
+        ...
+
+        '
+    - pattern-not: "id: ...\n...\nmetadata:\n  ...\n  technology:\n    - ...\n"
+  - patterns:
+    - pattern-inside: "id: $OUTER_RULEID\nmode: join\njoin:\n  rules: [ ..., $INNER_RULE,\
+        \ ...]\n  ...\n...\n"
+    - pattern-not: "id: $OUTER_RULEID\n...\nmetadata:\n  ...\n  technology:\n    -\
+        \ ...\n"
+  languages:
+  - yaml
+  metadata:
+    category: best-practice
+    technology:
+    - semgrep
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository/#technology
+- id: missing-language-field
+  message: Please include a 'languages' field for your rule $RULEID!
+  languages:
+  - yaml
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'rules: [..., $RULE, ...]'
+    - pattern: 'id: $RULEID'
+    - pattern-not-inside: "- ...\n  languages: ...\n"
+    - pattern-not-inside: "- ...\n  mode: join\n"
+  - patterns:
+    - pattern-inside: 'rules: [ ..., $OUTER_RULE, ...]
+
+        '
+    - pattern-inside: $OUTER_RULE
+    - pattern-inside: "id: $OUTER_RULEID\nmode: join\njoin:\n  rules: [ ..., $INNER_RULE,\
+        \ ...]\n  ...\n...\n"
+    - pattern-inside: $INNER_RULE
+    - pattern-not-inside: "- languages: ...\n  ...\n"
+    - pattern: 'id: $RULEID
+
+        '
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/writing-rules/rule-syntax/#required
+    category: correctness
+    technology:
+    - semgrep
+- id: missing-message-field
+  message: This rule does not have a message. Semgrep requires that rules have a message.
+    Include a message to explain what the rule does. Consider writing a message that
+    explains why this is an issue and how to fix it.
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern: 'id: $RULEID'
+  - pattern-not-inside: "- ...\n  message: ...\n"
+  - pattern-not-inside: "- ...\n  mode: extract\n"
+  severity: WARNING
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+    references:
+    - https://semgrep.dev/docs/writing-rules/rule-syntax/
+- id: multi-line-message
+  message: 'This rule has a multi-line message field, which may display poorly in
+    a terminal. Consider ensuring it is on one line. For example, use `message: >-`,
+    not `message: |`.'
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern: 'message: "=~/[\\n\\r]/"
+
+      '
+  severity: WARNING
+  metadata:
+    category: correctness
+    technology:
+    - semgrep
+    references:
+    - https://github.com/returntocorp/semgrep-rules/issues/1431
+- id: missing-deconstructed-value
+  message: Looks like this value is deconstructing a const/var/let you need to use
+    all three `const {...} =` `var {...} =` and `let {...} =` to provide accurate
+    coverage consider adding the missing patterns in a `pattern-inside` for better
+    coverage.
+  languages:
+  - yaml
+  severity: WARNING
+  metadata:
+    references:
+    - https://semgrep.dev/docs/contributing/contributing-to-semgrep-rules-repository
+    category: correctness
+    technology:
+    - semgrep
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-inside: 'rules: ...
+
+          '
+      - pattern-not-inside: "- pattern-either:\n    ...\n"
+      - pattern: "- pattern-inside:\n    $VALUE\n"
+      - pattern-either:
+        - pattern-regex: const {.*}.*=
+        - pattern-regex: let {.*}.*=
+        - pattern-regex: var {.*}.*=
+    - patterns:
+      - patterns:
+        - pattern-inside: 'rules: ...
+
+            '
+        - pattern-inside: "- pattern-either:\n    $VALUE\n"
+        - focus-metavariable:
+          - $VALUE
+        - pattern-inside: "- pattern-inside: \n    $A\n"
+        - metavariable-regex:
+            metavariable: $A
+            regex: .*\s.*(var|const|let)\s{.*}\s=
+      - pattern-not:
+          patterns:
+          - pattern-inside: "...\n- pattern-inside: \n    $Z\n...\n- pattern-inside:\
+              \ \n    $B\n...            \n- pattern-inside: \n    $C\n...\n"
+          - metavariable-regex:
+              metavariable: $Z
+              regex: .*\s.*(var|const|let).*{.*}
+          - metavariable-regex:
+              metavariable: $B
+              regex: .*\s.*(var|const|let).*{.*}
+          - metavariable-regex:
+              metavariable: $C
+              regex: .*\s.*(var|const|let).*{.*}
+- id: slow-pattern-general-func
+  languages:
+  - yaml
+  message: Using patterns like `function (...) {...}` is too general it will probably
+    slow down the rule performance.
+  patterns:
+  - pattern-either:
+    - pattern-inside: 'pattern-inside: $X
+
+        '
+    - pattern-inside: 'pattern-not-inside: $X
+
+        '
+    - pattern-inside: 'pattern: $X
+
+        '
+    - pattern-inside: 'pattern-not: $X
+
+        '
+  - pattern-regex: function[^{]*{[\s\n]*\.\.\.[\s\n]*}
+  - pattern-either:
+    - pattern-inside: 'languages: [...,"javascript",...]
+
+        ...
+
+        '
+    - pattern-inside: 'languages: [...,"typescript",...]
+
+        ...
+
+        '
+  severity: WARNING
+  metadata:
+    category: performance
+    technology:
+    - semgrep
+- id: slow-pattern-general-property
+  languages:
+  - yaml
+  message: Using patterns like `$X.$Y` may be too general and may slow down the rule
+    performance.
+  patterns:
+  - pattern-either:
+    - pattern-inside: 'pattern-inside: $X
+
+        '
+    - pattern-inside: 'pattern-not-inside: $X
+
+        '
+    - pattern-inside: 'pattern: $X
+
+        '
+    - pattern-inside: 'pattern-not: $X
+
+        '
+  - pattern-regex: \$[A-Z]*\.\$[A-Z]*
+  severity: WARNING
+  metadata:
+    category: performance
+    technology:
+    - semgrep
+- id: slow-pattern-single-metavariable
+  languages:
+  - yaml
+  message: Using a single metavariable as a pattern drastically slows down the rule
+    performance because it will match every expression in a file. Instead, try to
+    match something specific such as a function name, or anchor on a statement that
+    may occur above or below the pattern. The more specific you can be, the faster
+    the pattern will run.
+  patterns:
+  - pattern-either:
+    - pattern-inside: 'pattern-inside: $PATTERN
+
+        '
+    - pattern-inside: 'pattern-not-inside: $PATTERN
+
+        '
+    - pattern-inside: 'pattern: $PATTERN
+
+        '
+    - pattern-inside: 'pattern-not: $PATTERN
+
+        '
+  - metavariable-regex:
+      metavariable: $PATTERN
+      regex: \$[A-Z_]*
+  severity: WARNING
+  metadata:
+    category: performance
+    technology:
+    - semgrep
+- id: slow-pattern-top-ellipsis
+  languages:
+  - yaml
+  message: Using the ellipsis operator `...` at the top of the pattern drastically
+    slows down the rule performance.
+  patterns:
+  - pattern-either:
+    - pattern-inside: 'pattern-inside: $X
+
+        '
+    - pattern-inside: 'pattern-not-inside: $X
+
+        '
+    - pattern-inside: 'pattern: $X
+
+        '
+    - pattern-inside: 'pattern-not: $X
+
+        '
+  - pattern-regex: \|\s*\n\s*\.\.\.\s*\n[^\n]*\n\s*\.\.\.
+  severity: WARNING
+  metadata:
+    category: performance
+    technology:
+    - semgrep
+- id: unnecessary-parent-operator
+  message: Unnecessary parent operator. Remove one to fix.
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'rules: [..., $RULE, ...]'
+  - pattern-either:
+    - patterns:
+      - pattern: 'pattern-either:
+
+          - $THING1
+
+          - ...
+
+          '
+      - pattern-not: 'pattern-either:
+
+          - $THING1
+
+          - $THING2
+
+          - ...
+
+          '
+    - patterns:
+      - pattern: 'patterns:
+
+          - $THING1
+
+          - ...
+
+          '
+      - pattern-not: 'patterns:
+
+          - $THING1
+
+          - $THING2
+
+          - ...
+
+          '
+    - pattern: "pattern-either:\n- ...\n- pattern-either:\n  - ...\n"
+  severity: WARNING
+  metadata:
+    category: best-practice
+    technology:
+    - semgrep
+- id: unsatisfiable-rule
+  message: You can not use 'pattern' $A and 'pattern-not' $A together; this will always
+    be empty.
+  severity: ERROR
+  languages:
+  - yaml
+  patterns:
+  - pattern-inside: 'patterns: [...]'
+  - pattern-either:
+    - patterns:
+      - pattern-inside: '- pattern: $A
+
+          ...
+
+          '
+      - pattern: '- pattern-not: $A
+
+          '
+    - patterns:
+      - pattern-inside: '- pattern-not: $A
+
+          ...
+
+          '
+      - pattern: '- pattern: $A
+
+          '
+  metadata:
+    category: correctness
+    technology:
+    - semgrep

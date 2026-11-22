@@ -1,0 +1,29 @@
+id: "laragon-phpinfo"
+name: "Laragon - phpinfo Disclosure"
+severity: "low"
+description: "Laragon phpinfo file was exposed."
+tech:
+  - "generic"
+tags:
+  - "laragon"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?q=info"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "PHP Extension"
+      - "PHP Version"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

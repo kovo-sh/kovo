@@ -1,0 +1,30 @@
+id: "unauth-selenium-grid-console"
+name: "Selenium Grid Console - Detect"
+severity: "info"
+description: "Selenium Grid Console panel was detected."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "unauth"
+  - "selenium"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/grid/console"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Grid Console"
+      - "view config"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

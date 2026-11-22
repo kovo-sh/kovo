@@ -1,0 +1,34 @@
+id: "kubernetes-pods-api"
+name: "Kubernetes Pods - API Discovery & Remote Code Execution"
+severity: "critical"
+description: "A Kubernetes Pods API was discovered. When the service port is available, unauthenticated users can execute commands inside the container."
+tech:
+  - "kubernetes"
+tags:
+  - "k8"
+  - "unauth"
+  - "kubernetes"
+  - "devops"
+  - "misconfig"
+  - "vuln"
+reference: "https://github.com/officialhocc/Kubernetes-Kubelet-RCE"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pods"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "apiVersion"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

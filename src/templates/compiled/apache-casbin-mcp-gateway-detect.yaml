@@ -1,0 +1,29 @@
+id: "apache-casbin-mcp-gateway-detect"
+name: "Apache Casbin MCP Gateway - Detection"
+severity: "info"
+description: "Detects an Apache Casbin MCP Gateway server, a lightweight gateway service that instantly transforms existing MCP Servers and APIs into MCP servers with zero code changes."
+tech:
+  - "apache"
+tags:
+  - "tech"
+  - "casbin-mcp-gateway"
+  - "apache"
+  - "detect"
+reference: "https://github.com/apache/casbin-mcp-gateway"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/health"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"service\": \"mcp-gateway\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

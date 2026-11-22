@@ -1,0 +1,28 @@
+id: "gitea-detect"
+name: "Gitea Detect"
+severity: "info"
+description: "Gitea was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "gitea"
+  - "discovery"
+reference: "https://about.gitea.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/user/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Powered by Gitea"
+      - "content=\"Gitea"
+  - type: "status"
+    status:
+      - 200

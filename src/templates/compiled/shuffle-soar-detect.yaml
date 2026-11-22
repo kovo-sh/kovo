@@ -1,0 +1,35 @@
+id: "shuffle-soar-detect"
+name: "Shuffle SOAR - Detect"
+severity: "info"
+description: "Shuffle is an open-source security automation platform focused on collaboration and resource sharing."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "detect"
+  - "shuffle"
+  - "soar"
+  - "security"
+reference: "https://shuffler.io/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/manifest.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"short_name\": \"Shuffle\""
+      - "\"name\": \"Shuffle webapp\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

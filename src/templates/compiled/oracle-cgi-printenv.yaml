@@ -1,0 +1,33 @@
+id: "oracle-cgi-printenv"
+name: "Oracle CGI printenv - Information Disclosure"
+severity: "medium"
+description: "Oracle CGI printenv component is susceptible to an information disclosure vulnerability."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "oracle"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/ilmila/J2EEScan/blob/master/src/main/java/burp/j2ee/issues/impl/OracleCGIPrintEnv.java"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/printenv"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "DOCUMENT_ROOT=\""
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

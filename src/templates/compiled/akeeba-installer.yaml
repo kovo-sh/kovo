@@ -1,0 +1,28 @@
+id: "akeeba-installer"
+name: "Akeeba Backup Installer - Exposure"
+severity: "high"
+description: "Akeeba Backup is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "akeeba"
+  - "install"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/installation/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Akeeba Backup Installer"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,27 @@
+id: "wamp-xdebug-detect"
+name: "WAMP Xdebug - Detect"
+severity: "info"
+description: "WAMP Xdebug was detected."
+tech:
+  - "generic"
+tags:
+  - "debug"
+  - "config"
+  - "wamp"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/random-robbie/My-Shodan-Scripts/blob/1b01bceecc9be0b74b202f445874920eee48bba5/wamp-xdebug/wamp-xdebug.py"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/?phpinfo=-1"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "xdebug.remote_connect_back</td><td class=\"v\">On</td><td class=\"v\">On</td>"

@@ -1,0 +1,34 @@
+id: "tianqing-info-leak"
+name: "Tianqing Info Leak"
+severity: "medium"
+description: "Information exposed in Tianqing."
+tech:
+  - "generic"
+tags:
+  - "tianqing"
+  - "exposure"
+  - "vuln"
+reference: "https://mp.weixin.qq.com/s/wH5luLISE_G381W2ssv93g"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/dbstat/gettablessize"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "schema_name"
+      - "table_name"
+      - "table_size"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

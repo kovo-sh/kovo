@@ -1,0 +1,33 @@
+id: "faveo-helpdesk-detect"
+name: "Faveo Helpdesk - Detect"
+severity: "info"
+description: "Faveo Helpdesk, a web-based ticketing and customer support platform, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "faveo"
+  - "helpdesk"
+  - "ticketing"
+  - "support"
+  - "detect"
+reference: "https://www.faveohelpdesk.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Faveo HELPDESK</title>"
+      - "http-equiv=\"refresh\""
+      - "URL=public"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

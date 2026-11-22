@@ -1,0 +1,33 @@
+id: "behat-config"
+name: "Behat Configuration File - Detect"
+severity: "medium"
+description: "Behat configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "behat"
+  - "devops"
+  - "cicd"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://docs.behat.org/en/v2.5/guides/7.config.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/behat.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "default:"
+      - "paths:"
+      - "suites:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

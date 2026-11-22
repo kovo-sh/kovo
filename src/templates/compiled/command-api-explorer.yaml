@@ -1,0 +1,31 @@
+id: "command-api-explorer"
+name: "Command API Explorer Panel - Detect"
+severity: "info"
+description: "Command API Explorer panel was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/explorer.html"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Command API Explorer</title>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "postgres-exporter-metrics"
+name: "Postgres Exporter Metrics"
+severity: "low"
+description: "Postgres Exporter Metrics is exposed."
+tech:
+  - "generic"
+tags:
+  - "postgres"
+  - "exposure"
+  - "debug"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "postgres"
+      - "# HELP"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

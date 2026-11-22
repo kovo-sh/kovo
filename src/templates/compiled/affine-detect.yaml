@@ -1,0 +1,32 @@
+id: "affine-detect"
+name: "AFFiNE - Detect"
+severity: "info"
+description: "AFFiNE is an open-source, self-hostable knowledge base and collaborative workspace."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "affine"
+  - "knowledge-base"
+  - "collaboration"
+  - "detect"
+reference: "https://affine.pro/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>AFFiNE</title>"
+      - "name=\"env:isSelfHosted\" content=\"true\""
+      - "npm-blocksuite"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

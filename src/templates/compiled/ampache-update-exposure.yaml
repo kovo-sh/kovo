@@ -1,0 +1,33 @@
+id: "ampache-update-exposure"
+name: "Ampache Update Page Exposure"
+severity: "low"
+description: "Ampache update page is exposed."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "ampache"
+  - "exposure"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/update.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Ampache Update"
+  - type: "word"
+    part: "body"
+    words:
+      - "No Update Needed"
+      - "No updates needed"
+    negative: true
+  - type: "status"
+    status:
+      - 200

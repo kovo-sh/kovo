@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os'
 import { dirname, extname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
 import { Bash, InMemoryFs, MountableFs, OverlayFs } from 'just-bash'
-import { runAnalyzer } from './analyzers.ts'
-import type { AnalyzerName } from './analyzers.ts'
+import { buildCallGraphFromFiles, runAnalyzer } from './analyzers.ts'
+import type { AnalyzerName, CallGraphBuildResult, CallGraphSinkKind } from './analyzers.ts'
 
 export type SastEngine = 'opengrep' | 'ast-grep' | 'gitleaks' | 'trufflehog' | 'trivy-fs' | 'bandit'
 export type SastSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info'
@@ -92,6 +92,21 @@ type OneShotInput =
     }
   | ({ op: 'ast_verify' } & AstVerifyRequest)
 
+export interface CallGraphRequest {
+  repo: string
+  paths?: string[]
+  maxDepth?: number
+  customGuardPatterns?: string[]
+  customSanitizerPatterns?: string[]
+  customSinkPatterns?: Array<{ pattern: string; sinkKind: CallGraphSinkKind }>
+}
+
+export interface CallGraphResult extends CallGraphBuildResult {
+  repo: string
+  evidencePath?: string
+  durationMs: number
+}
+
 type SessionMessage =
   | { id: string; op: 'stage'; name: string; content: string }
   | { id: string; op: 'exec'; command: string; outputs: string[]; timeoutMs?: number }
@@ -99,6 +114,7 @@ type SessionMessage =
   | ({ id: string; op: 'sast' } & SastScanRequest)
   | ({ id: string; op: 'script' } & OfflineScriptRequest)
   | ({ id: string; op: 'ast_verify' } & AstVerifyRequest)
+  | ({ id: string; op: 'call_graph' } & CallGraphRequest)
   | { id: string; op: 'shutdown' }
 
 const maxInputBytes = 16 * 1024 * 1024
@@ -275,7 +291,7 @@ function toolEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOME: '/tmp',
     XDG_CACHE_HOME: '/tmp/.cache',
     XDG_CONFIG_HOME: '/tmp/.config',
-    TRIVY_CACHE_DIR: '/tmp/.trivy-cache',
+    TRIVY_CACHE_DIR: process.env.TRIVY_CACHE_DIR || '/opt/trivy-cache',
     TRIVY_DISABLE_TELEMETRY: 'true',
     SEMGREP_SEND_METRICS: 'off',
     OPENGREP_SEND_METRICS: 'off',
@@ -650,9 +666,17 @@ function runBuiltinSecretScan(repoRoot: string, targets: string[], engine: 'gitl
 async function runOpengrepEngine(repoRoot: string, targets: string[], timeoutMs: number): Promise<{ findings: SastFinding[]; ok: boolean; note?: string }> {
   const configDir = join(RULES_ROOT, 'opengrep')
   if (!existsSync(configDir)) return { findings: [], ok: false, note: 'Missing /opt/guardian-rules/opengrep' }
-  const res = await execTool('opengrep', [
-    'scan', '--config', configDir, '--json', '--no-git-ignore', '--quiet', ...targets,
-  ], { cwd: repoRoot, timeoutMs })
+  const interfileArgs = [
+    'scan', '--config', configDir, '--enable-interfile', '--interfile-depth=3', '--interfile-timeout=15',
+    '--max-memory=1024', '--json', '--no-git-ignore', '--quiet', ...targets,
+  ]
+  let res = await execTool('opengrep', interfileArgs, { cwd: repoRoot, timeoutMs })
+  if (!res.stdout.trim() && res.exitCode !== 0) {
+    // Fallback retry without --enable-interfile for huge/edge repositories
+    res = await execTool('opengrep', [
+      'scan', '--config', configDir, '--max-memory=1024', '--json', '--no-git-ignore', '--quiet', ...targets,
+    ], { cwd: repoRoot, timeoutMs })
+  }
   if (!res.stdout.trim()) {
     return { findings: [], ok: res.exitCode === 0, note: res.exitCode === 0 ? undefined : (res.stderr.trim().slice(0, 200) || `exit ${res.exitCode}`) }
   }
@@ -830,10 +854,12 @@ async function runTrivyFsEngine(repoRoot: string, targets: string[], timeoutMs: 
   const findings: SastFinding[] = []
   let trivyOk = true
   let note: string | undefined
+  const cacheDir = process.env.TRIVY_CACHE_DIR || '/opt/trivy-cache'
   for (const target of targets) {
     const res = await execTool('trivy', [
-      'fs', '--scanners', 'misconfig', '--offline-scan',
-      '--skip-check-update', '--skip-db-update', '--format', 'json', '--quiet', target,
+      'fs', '--scanners', 'vuln,misconfig', '--offline-scan',
+      '--skip-check-update', '--skip-db-update', '--skip-java-db-update',
+      '--cache-dir', cacheDir, '--format', 'json', '--quiet', target,
     ], { cwd: repoRoot, timeoutMs })
     if (res.exitCode !== 0 && !res.stdout.trim()) {
       trivyOk = false
@@ -851,19 +877,47 @@ async function runTrivyFsEngine(repoRoot: string, targets: string[], timeoutMs: 
             Severity?: string
             CauseMetadata?: { StartLine?: number; EndLine?: number }
           }>
+          Vulnerabilities?: Array<{
+            VulnerabilityID?: string
+            PkgName?: string
+            InstalledVersion?: string
+            FixedVersion?: string
+            Title?: string
+            Description?: string
+            Severity?: string
+            CweIDs?: string[]
+          }>
         }>
       }
       for (const result of parsed.Results ?? []) {
+        const relTarget = toRepoRelative(repoRoot, result.Target ?? '')
         for (const mis of result.Misconfigurations ?? []) {
           findings.push({
             engine: 'trivy-fs',
             ruleId: String(mis.ID ?? 'trivy.misconfig'),
             severity: normalizeSeverity(mis.Severity),
-            file: toRepoRelative(repoRoot, result.Target ?? ''),
+            file: relTarget,
             line: Number(mis.CauseMetadata?.StartLine ?? 1),
             endLine: mis.CauseMetadata?.EndLine ? Number(mis.CauseMetadata.EndLine) : undefined,
             message: secretMask(String(mis.Title || mis.Description || 'IaC misconfiguration')).slice(0, 400),
             maskedPreview: secretMask(String(mis.Title ?? mis.ID ?? '')).slice(0, 200),
+          })
+        }
+        for (const vuln of result.Vulnerabilities ?? []) {
+          const vulnId = String(vuln.VulnerabilityID ?? 'trivy.vuln')
+          const pkg = String(vuln.PkgName ?? 'package')
+          const inst = String(vuln.InstalledVersion ?? '')
+          const fix = vuln.FixedVersion ? ` -> fix ${vuln.FixedVersion}` : ''
+          const cwe = Array.isArray(vuln.CweIDs) && vuln.CweIDs[0] ? extractCwe(vuln.CweIDs[0]) : undefined
+          findings.push({
+            engine: 'trivy-fs',
+            ruleId: vulnId,
+            severity: normalizeSeverity(vuln.Severity),
+            file: relTarget,
+            line: 1,
+            message: secretMask(`${vulnId}: ${pkg}@${inst}${fix} — ${vuln.Title || vuln.Description || 'Vulnerable dependency'}`).slice(0, 400),
+            maskedPreview: secretMask(`${pkg}@${inst} (${vulnId})`).slice(0, 200),
+            ...(cwe ? { cwe } : {}),
           })
         }
       }
@@ -872,9 +926,16 @@ async function runTrivyFsEngine(repoRoot: string, targets: string[], timeoutMs: 
       note = 'Failed to parse trivy JSON output.'
     }
   }
-  // Complement with deterministic offline SCA lockfile scanner
+  // Complement with deterministic offline SCA lockfile scanner (deduplicated against Trivy CVEs)
   const scaFindings = runOfflineSca(repoRoot, targets)
-  findings.push(...scaFindings)
+  const seenKeys = new Set(findings.map(f => `${f.ruleId}|${f.file}|${f.maskedPreview}`))
+  for (const sf of scaFindings) {
+    const key = `${sf.ruleId}|${sf.file}|${sf.maskedPreview}`
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key)
+      findings.push(sf)
+    }
+  }
   return { findings, ok: trivyOk || scaFindings.length > 0, note }
 }
 
@@ -1229,6 +1290,65 @@ async function runAstVerify(req: AstVerifyRequest): Promise<AstVerifyResult> {
   }
 }
 
+const CALL_GRAPH_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.php', '.rb'])
+
+async function runCallGraphIndex(
+  req: CallGraphRequest,
+  id: string,
+  inputDirectory: string,
+  stagedContents: Map<string, string>,
+): Promise<CallGraphResult> {
+  const startedAt = Date.now()
+  const repoRoot = resolveRepoRoot(req.repo)
+  const targets = resolveRepoSubpaths(repoRoot, req.paths)
+  const allFiles = walkFiles(targets, 1200)
+  const fileInputs: Array<{ file: string; content: string }> = []
+  let totalBytes = 0
+  for (const abs of allFiles) {
+    if (!CALL_GRAPH_EXTS.has(extname(abs).toLowerCase())) continue
+    try {
+      const st = lstatSync(abs)
+      if (!st.isFile() || st.isSymbolicLink() || st.size > 512 * 1024) continue
+      if (totalBytes + st.size > 8 * 1024 * 1024) break
+      const content = readFileSync(abs, 'utf8')
+      totalBytes += st.size
+      fileInputs.push({ file: toRepoRelative(repoRoot, abs), content })
+    } catch {
+      // skip unreadable files
+    }
+  }
+
+  const built = buildCallGraphFromFiles(fileInputs, {
+    maxDepth: req.maxDepth,
+    customGuardPatterns: req.customGuardPatterns,
+    customSanitizerPatterns: req.customSanitizerPatterns,
+    customSinkPatterns: req.customSinkPatterns,
+  })
+  const maskedPaths = built.taintPaths.map(tp => ({
+    ...tp,
+    maskedSnippet: secretMask(tp.maskedSnippet),
+  }))
+
+  const result: CallGraphResult = {
+    repo: req.repo,
+    filesScanned: built.filesScanned,
+    nodes: built.nodes.slice(0, 600),
+    edges: built.edges.slice(0, 1200),
+    taintPaths: maskedPaths.slice(0, 200),
+    durationMs: Date.now() - startedAt,
+  }
+
+  const safeId = id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || randomUUID().slice(0, 12)
+  const relEvidence = `call-graph/${safeId}.json`
+  const fullJson = JSON.stringify({ ...result, nodes: built.nodes, edges: built.edges, taintPaths: maskedPaths }, null, 2)
+  if (Buffer.byteLength(fullJson) <= maxFileBytes) {
+    await stageFile(inputDirectory, relEvidence, fullJson)
+    stagedContents.set(relEvidence, fullJson)
+    result.evidencePath = '/evidence/' + relEvidence
+  }
+  return result
+}
+
 // ============================================================================
 // Core Sandbox & Backwards-Compatible Staging / Exec / Session Modes
 // ============================================================================
@@ -1375,12 +1495,20 @@ async function runSession() {
         const result = await execCommand(shell, scratch, msg.command, msg.outputs, msg.timeoutMs ?? 60_000)
         respond({ id: msg.id, ok: true, result })
       } else if (msg.op === 'analyze') {
-        const result = runAnalyzer(msg.tool, msg.args, (name: string) => {
-          const clean = name.replace(/^\/evidence\//, '')
-          const cached = stagedContents.get(clean)
-          if (cached !== undefined) return cached
-          throw new Error('Staged evidence file not found: ' + clean)
-        })
+        if (msg.tool === 'call-graph' && typeof msg.args?.repo === 'string' && !Array.isArray(msg.args?.files)) {
+          const cgResult = await runCallGraphIndex(msg.args as unknown as CallGraphRequest, msg.id, inputDirectory, stagedContents)
+          respond({ id: msg.id, ok: true, result: cgResult })
+        } else {
+          const result = runAnalyzer(msg.tool, msg.args, (name: string) => {
+            const clean = name.replace(/^\/evidence\//, '')
+            const cached = stagedContents.get(clean)
+            if (cached !== undefined) return cached
+            throw new Error('Staged evidence file not found: ' + clean)
+          })
+          respond({ id: msg.id, ok: true, result })
+        }
+      } else if (msg.op === 'call_graph') {
+        const result = await runCallGraphIndex(msg, msg.id, inputDirectory, stagedContents)
         respond({ id: msg.id, ok: true, result })
       } else if (msg.op === 'sast') {
         const result = await runSastScan(msg, msg.id, inputDirectory, stagedContents)

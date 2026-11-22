@@ -1,0 +1,28 @@
+id: "bugtraceai-detect"
+name: "BugTraceAI - Detect"
+severity: "info"
+description: "Detects BugTraceAI, an agentic AI pentesting platform, via its FastAPI engine root (serving \"BugTraceAI API\" identification JSON), its nginx SPA frontend, or its BugStore playground instance."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "bugtraceai"
+  - "detect"
+  - "ai"
+reference: "https://blog.gitguardian.com/ai-pentesting-tools-beyond-artex/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/bugtraceai"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>BugTraceAI</title>"
+  - type: "status"
+    status:
+      - 200

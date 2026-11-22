@@ -1,0 +1,29 @@
+id: "icecast-mediaserver-detect"
+name: "Icecast Streaming Media Server Information Panel - Detect"
+severity: "info"
+description: "Icecast Streaming Media Server information panel was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "icecast"
+  - "media-server"
+  - "detect"
+  - "discovery"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/server_version.xsl"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Icecast Streaming Media Server"
+  - type: "status"
+    status:
+      - 200

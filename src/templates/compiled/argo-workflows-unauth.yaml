@@ -1,0 +1,36 @@
+id: "argo-workflows-unauth"
+name: "Argo Workflows - Unauthenticated Dashboard"
+severity: "high"
+description: "Argo Workflows dashboard is accessible without authentication. Argo Workflows is a Kubernetes-native workflow engine that can execute arbitrary containers and commands. Unauthenticated access allows viewing, creating, and modifying workflows."
+tech:
+  - "kubernetes"
+tags:
+  - "misconfig"
+  - "argo"
+  - "kubernetes"
+  - "unauth"
+  - "workflow"
+cwe: "CWE-306"
+reference: "https://argo-workflows.readthedocs.io/en/latest/argo-server-auth-mode/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v1/workflows/argo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"metadata\""
+      - "\"items\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

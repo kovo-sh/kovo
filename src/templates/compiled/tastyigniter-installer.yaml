@@ -1,0 +1,29 @@
+id: "tastyigniter-installer"
+name: "TastyIgniter Setup Page - Exposure"
+severity: "high"
+description: "Detects exposed TastyIgniter Setup page."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "tastyigniter"
+  - "vuln"
+reference: "https://tastyigniter.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/setup/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "TastyIgniter - Setup"
+  - type: "status"
+    status:
+      - 200

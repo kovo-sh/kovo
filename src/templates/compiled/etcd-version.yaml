@@ -1,0 +1,36 @@
+id: "etcd-version"
+name: "Etcd Version - Detect"
+severity: "info"
+description: "Template detects Etcd version."
+tech:
+  - "kubernetes"
+tags:
+  - "tech"
+  - "k8s"
+  - "kubernetes"
+  - "devops"
+  - "etcd"
+  - "discovery"
+reference: "https://etcd.io/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/version"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"etcdserver\""
+      - "\"etcdcluster\""
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

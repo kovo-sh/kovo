@@ -1,0 +1,34 @@
+id: "dzzoffice-installer"
+name: "DzzOffice - Installer Page Exposure"
+severity: "high"
+description: "Detects exposed DzzOffice Installation page."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "dzzoffice"
+  - "vuln"
+cwe: "CWE-200"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "DzzOffice"
+  - type: "word"
+    part: "body"
+    words:
+      - "简体中文 UTF8 版"
+      - "Simplified Chinese UTF8 version"
+  - type: "status"
+    status:
+      - 200

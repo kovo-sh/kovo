@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { and, desc, eq } from 'drizzle-orm'
 import type { z } from 'zod'
 import { providerSettings } from '../domain.ts'
-import type { ProviderSettings, PublicModelProfile } from '../domain.ts'
+import type { ProviderSettings, PublicModelProfile, RoleAffinity } from '../domain.ts'
 import { testProvider } from './provider.ts'
 import { redact } from './redact.ts'
 import { modelProfiles } from './schema.ts'
@@ -56,6 +56,7 @@ function toPublicProfile(row: typeof modelProfiles.$inferSelect): PublicModelPro
     contextWindow: row.contextWindow,
     maxTokens: row.maxTokens,
     thinkingLevel: row.thinkingLevel,
+    roleAffinity: row.roleAffinity ?? 'any',
     inputCostPerMtok: row.inputCostPerMtok,
     cachedInputCostPerMtok: row.cachedInputCostPerMtok,
     outputCostPerMtok: row.outputCostPerMtok,
@@ -110,6 +111,7 @@ export function privateModelProfiles(storage: Store = store()): ResolvedModelPro
         contextWindow: row.contextWindow,
         maxTokens: row.maxTokens,
         thinkingLevel: row.thinkingLevel,
+        roleAffinity: row.roleAffinity ?? 'any',
         inputCostPerMtok: row.inputCostPerMtok,
         cachedInputCostPerMtok: row.cachedInputCostPerMtok,
         outputCostPerMtok: row.outputCostPerMtok,
@@ -130,6 +132,43 @@ export function privateModelSettings(storage: Store = store()): ResolvedModelPro
 
 export function modelReady(storage: Store = store()): boolean {
   return privateModelProfiles(storage).length > 0
+}
+
+export function isProfileHealthy(p: ResolvedModelProfile, now = Date.now()): boolean {
+  return !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > now)
+}
+
+export function resolveProfilePoolForRole(
+  role: RoleAffinity,
+  source: readonly ResolvedModelProfile[] | Store = store(),
+): ResolvedModelProfile[] {
+  const all = 'db' in source
+    ? privateModelProfiles(source)
+    : source.filter(p => p.enabled)
+  if (!all.length) return []
+
+  const sortedAll = [...all].sort((a, b) => b.priority - a.priority)
+  if (role === 'any') return sortedAll
+
+  const exact = sortedAll.filter(p => p.roleAffinity === role)
+  const generic = sortedAll.filter(p => (p.roleAffinity ?? 'any') === 'any')
+  const primaryPool = [...exact, ...generic]
+
+  if (!primaryPool.length) {
+    return sortedAll
+  }
+
+  const now = Date.now()
+  const isHealthy = (p: ResolvedModelProfile) => isProfileHealthy(p, now)
+
+  if (!primaryPool.some(isHealthy)) {
+    const restHealthy = sortedAll.filter(
+      p => p.roleAffinity !== role && (p.roleAffinity ?? 'any') !== 'any' && isHealthy(p),
+    )
+    if (restHealthy.length) return [...restHealthy, ...primaryPool]
+  }
+
+  return primaryPool
 }
 
 export function recordProfileSuccess(profileId: string, storage: Store = store()): void {
@@ -265,6 +304,7 @@ export async function saveModelProfile(
       contextWindow: settings.contextWindow,
       maxTokens: settings.maxTokens,
       thinkingLevel: settings.thinkingLevel,
+      roleAffinity: settings.roleAffinity,
       inputCostPerMtok: settings.inputCostPerMtok,
       cachedInputCostPerMtok: settings.cachedInputCostPerMtok,
       outputCostPerMtok: settings.outputCostPerMtok,

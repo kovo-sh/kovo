@@ -1,0 +1,24 @@
+id: "sap-netweaver-info-leak"
+name: "SAP NetWeaver ICM Info page leak"
+severity: "medium"
+description: "Detection of SAP NetWeaver ABAP Webserver /public/info page"
+tech:
+  - "generic"
+tags:
+  - "sap"
+  - "misconfig"
+  - "vuln"
+reference: "https://www.acunetix.com/vulnerabilities/web/sap-icf-sap-public-info-sensitive-information-disclosure/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/sap/public/info"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "RFC_SYSTEM_INFO.Response"

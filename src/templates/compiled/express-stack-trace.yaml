@@ -1,0 +1,33 @@
+id: "express-stack-trace"
+name: "Express Stack Trace"
+severity: "low"
+description: "Express Stack trace is exposed."
+tech:
+  - "express"
+tags:
+  - "misconfig"
+  - "express"
+  - "intrusive"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/{{rand}}"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "NotFoundError: Not Found"
+      - "at Function.handle"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 404

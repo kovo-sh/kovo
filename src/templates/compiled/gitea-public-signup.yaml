@@ -1,0 +1,34 @@
+id: "gitea-public-signup"
+name: "Gitea Public Registration Enabled"
+severity: "high"
+description: "A misconfiguration in Gitea allows arbitrary users to sign up and read code hosted on the service."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "gitea"
+  - "vuln"
+reference: "https://www.youtube.com/watch?v=oHhofSj9lEM&t=157s"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/user/sign_up"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Powered by Gitea"
+      - "Register -"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "Registration is disabled. Please contact your site administrator."
+    negative: true
+  - type: "status"
+    status:
+      - 200

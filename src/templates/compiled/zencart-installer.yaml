@@ -1,0 +1,29 @@
+id: "zencart-installer"
+name: "Zen Cart Installer"
+severity: "high"
+description: "Zen Cart is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "zencart"
+  - "install"
+  - "exposure"
+  - "vuln"
+reference: "https://www.zen-cart.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/zc_install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>Zen Cart&reg; Installer</title>"
+  - type: "status"
+    status:
+      - 200

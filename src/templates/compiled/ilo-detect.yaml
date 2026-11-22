@@ -1,0 +1,32 @@
+id: "ilo-detect"
+name: "HP iLO"
+severity: "info"
+description: "Version of HP iLO"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "ilo"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/xmldata?item=all"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "text/xml"
+  - type: "word"
+    part: "body"
+    words:
+      - "<RIMP>"
+      - "<HSI>"
+    condition: "and"

@@ -1,0 +1,29 @@
+id: "svnserve-config"
+name: "Svnserve Configuration File - Detect"
+severity: "info"
+description: "Svnserve configuration file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "svnserve"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://linux.die.net/man/8/svnserve"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/svnserve.conf"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "This file controls the configuration of the svnserve daemon"
+  - type: "status"
+    status:
+      - 200

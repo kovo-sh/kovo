@@ -1,0 +1,1180 @@
+rules:
+- id: bypass-tls-verification
+  message: Checks for disabling of TLS/SSL certificate verification. This should only
+    be used for debugging purposes because it leads to vulnerability to MTM attacks.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://stackoverflow.com/questions/12122159/how-to-do-a-https-request-with-bad-certificate
+    subcategory:
+    - vuln
+    technology:
+    - go
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  pattern-either:
+  - pattern: 'tls.Config{..., InsecureSkipVerify: true, ...}
+
+      '
+  - pattern: '$CONFIG = &tls.Config{...}
+
+      ...
+
+      $CONFIG.InsecureSkipVerify = true
+
+      '
+- id: disallow-old-tls-versions
+  message: Detects creations of tls configuration objects with an insecure MinVersion
+    of TLS. These protocols are deprecated due to POODLE, man in the middle attacks,
+    and other vulnerabilities.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: HIGH
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://stackoverflow.com/questions/26429751/java-http-clients-and-poodle
+    subcategory:
+    - vuln
+    technology:
+    - go
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  patterns:
+  - pattern-either:
+    - pattern: 'tls.Config{..., MinVersion: $TLS.$VERSION, ...}
+
+        '
+    - pattern: '$CONFIG = &tls.Config{...}
+
+        ...
+
+        $CONFIG.MinVersion = $TLS.$VERSION
+
+        '
+  - metavariable-regex:
+      metavariable: $VERSION
+      regex: (VersionTLS10|VersionTLS11|VersionSSL30)
+- id: ftp-request
+  message: Checks for outgoing connections to ftp servers with the ftp package. FTP
+    does not encrypt traffic, possibly leading to PII being sent plaintext over the
+    network. Instead, connect via the SFTP protocol.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://godoc.org/github.com/jlaffaye/ftp#Dial
+    - https://github.com/jlaffaye/ftp
+    subcategory:
+    - vuln
+    technology:
+    - ftp
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  fix-regex:
+    regex: '[fF][tT][pP]://'
+    replacement: sftp://
+    count: 1
+  pattern-either:
+  - pattern: 'ftp.Dial("=~/^[fF][tT][pP]://.*/", ...)
+
+      '
+  - pattern: 'ftp.DialTimeout("=~/^[fF][tT][pP]://.*/", ...)
+
+      '
+  - pattern: 'ftp.Connect("=~/^[fF][tT][pP]://.*/")
+
+      '
+  - pattern: '$URL = "=~/^[fF][tT][pP]://.*/"
+
+      ...
+
+      ftp.Dial($URL, ...)
+
+      '
+  - pattern: '$URL = "=~/^[fF][tT][pP]://.*/"
+
+      ...
+
+      ftp.DialTimeout($URL, ...)
+
+      '
+  - pattern: '$URL = "=~/^[fF][tT][pP]://.*/"
+
+      ...
+
+      ftp.Connect($URL)
+
+      '
+- id: gorequest-http-request
+  message: Checks for requests to http (unencrypted) sites using gorequest, a popular
+    HTTP client library. This is dangerous because it could result in plaintext PII
+    being passed around the network.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://github.com/parnurzeal/gorequest
+    subcategory:
+    - vuln
+    technology:
+    - gorequest
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  pattern-either:
+  - patterns:
+    - pattern-inside: '$REQ = gorequest.New()
+
+        ...
+
+        $RES = ...
+
+        '
+    - pattern: '$REQ.$FUNC("=~/[hH][tT][tT][pP]://.*/")
+
+        '
+    - metavariable-regex:
+        metavariable: $FUNC
+        regex: (Get|Post|Delete|Head|Put|Patch)
+  - patterns:
+    - pattern: gorequest.New().$FUNC("=~/[hH][tT][tT][pP]://.*/")
+    - metavariable-regex:
+        metavariable: $FUNC
+        regex: (Get|Post|Delete|Head|Put|Patch)
+- id: grequests-http-request
+  message: Checks for requests to http (unencrypted) sites using grequests, a popular
+    HTTP client library. This is dangerous because it could result in plaintext PII
+    being passed around the network.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://godoc.org/github.com/levigross/grequests#DoRegularRequest
+    - https://github.com/levigross/grequests
+    subcategory:
+    - vuln
+    technology:
+    - grequests
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  patterns:
+  - pattern-either:
+    - pattern: 'grequests.$FUNC(...,"=~/[hH][tT][tT][pP]://.*/", ...)
+
+        '
+    - pattern: '$FUNC(...,"=~/[hH][tT][tT][pP]://.*/", ...)
+
+        '
+  - metavariable-regex:
+      metavariable: $FUNC
+      regex: (Get|Head|Post|Put|Delete|Patch|Options|Req|DoRegularRequest)
+- id: http-customized-request
+  message: Checks for requests sent via http.NewRequest to http:// URLS. This is dangerous
+    because the server is attempting to connect to a website that does not encrypt
+    traffic with TLS. Instead, send requests only to https:// URLS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://golang.org/pkg/net/http/#NewRequest
+    subcategory:
+    - vuln
+    technology:
+    - go
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern: 'http.NewRequest(..., "=~/[hH][tT][tT][pP]://.*/", ...)
+
+    '
+- id: http-request
+  message: Checks for requests sent via http.$FUNC to http:// URLS. This is dangerous
+    because the server is attempting to connect to a website that does not encrypt
+    traffic with TLS. Instead, send requests only to https:// URLS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://golang.org/pkg/net/http/#Get
+    subcategory:
+    - vuln
+    technology:
+    - go
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  patterns:
+  - pattern-either:
+    - pattern: 'http.$FUNC("=~/[hH][tT][tT][pP]://.*/", ...)
+
+        '
+    - patterns:
+      - pattern-inside: '$CLIENT := &http.Client{...}
+
+          ...
+
+          '
+      - pattern: 'client.$FUNC("=~/[hH][tT][tT][pP]://.*/", ...)
+
+          '
+  - pattern-not: http.$FUNC("=~/[hH][tT][tT][pP]://127.0.0.1.*/", ...)
+  - pattern-not: client.$FUNC("=~/[hH][tT][tT][pP]://127.0.0.1.*/", ...)
+  - pattern-not: http.$FUNC("=~/[hH][tT][tT][pP]://localhost.*/", ...)
+  - pattern-not: client.$FUNC("=~/[hH][tT][tT][pP]://localhost.*/", ...)
+  - metavariable-regex:
+      metavariable: $FUNC
+      regex: (Get|Post|Head|PostForm)
+- id: sling-http-request
+  message: Checks for requests to http (unencrypted) sites using gorequest, a popular
+    HTTP client library. This is dangerous because it could result in plaintext PII
+    being passed around the network.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://godoc.org/github.com/dghubble/sling#Sling.Add
+    - https://github.com/dghubble/sling
+    subcategory:
+    - vuln
+    technology:
+    - sling
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  pattern-either:
+  - patterns:
+    - pattern-inside: '$REQ = sling.New()
+
+        ...
+
+        $RES = ...
+
+        '
+    - pattern: '$REQ.$FUNC("=~/[hH][tT][tT][pP]://.*/")
+
+        '
+    - metavariable-regex:
+        metavariable: $FUNC
+        regex: (Get|Post|Delete|Head|Put|Options|Patch|Base|Connect)
+  - patterns:
+    - pattern: sling.New().$FUNC("=~/[hH][tT][tT][pP]://.*/")
+    - metavariable-regex:
+        metavariable: $FUNC
+        regex: (Get|Post|Delete|Head|Put|Options|Patch|Base|Connect)
+  - patterns:
+    - pattern-inside: '$REQ = sling.New()
+
+        ...
+
+        $URL = "=~/[hH][tT][tT][pP]://.*/"
+
+        ...
+
+        $RES = ...
+
+        '
+    - pattern: '$REQ.$FUNC($URL)
+
+        '
+    - metavariable-regex:
+        metavariable: $FUNC
+        regex: (Get|Post|Delete|Head|Put|Options|Patch|Base|Connect)
+  - patterns:
+    - pattern-inside: '$URL = "=~/[hH][tT][tT][pP]://.*/"
+
+        ...
+
+        $RES = ...
+
+        '
+    - pattern: 'sling.New().$FUNC($URL)
+
+        '
+    - metavariable-regex:
+        metavariable: $FUNC
+        regex: (Get|Post|Delete|Head|Put|Options|Patch|Base|Connect)
+- id: telnet-request
+  message: Checks for attempts to connect to an insecure telnet server using the package
+    telnet. This is bad because it can lead to man in the middle attacks.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://godoc.org/github.com/reiver/go-telnet
+    subcategory:
+    - vuln
+    technology:
+    - go-telnet
+    vulnerability: Insecure Transport
+  languages:
+  - go
+  pattern: 'telnet.DialToAndCall(...)
+
+    '
+- id: spring-ftp-request
+  message: Checks for outgoing connections to ftp servers via Spring plugin ftpSessionFactory.
+    FTP does not encrypt traffic, possibly leading to PII being sent plaintext over
+    the network.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.spring.io/spring-integration/api/org/springframework/integration/ftp/session/AbstractFtpSessionFactory.html#setClientMode-int-
+    subcategory:
+    - vuln
+    technology:
+    - spring
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[fF][tT][pP]://'
+    replacement: sftp://
+    count: 1
+  pattern-either:
+  - pattern: '$SF = new DefaultFtpSessionFactory(...);
+
+      ...
+
+      $SF.setHost("=~/^[fF][tT][pP]://.*/");
+
+      ...
+
+      $SF.$FUNC(...);
+
+      '
+  - pattern: '$SF = new DefaultFtpSessionFactory(...);
+
+      ...
+
+      String $URL = "=~/^[fF][tT][pP]://.*/";
+
+      ...
+
+      $SF.setHost($URL);
+
+      ...
+
+      $SF.$FUNC(...);
+
+      '
+- id: spring-http-request
+  message: Checks for requests sent via Java Spring RestTemplate API to http:// URLS.
+    This is dangerous because the server is attempting to connect to a website that
+    does not encrypt traffic with TLS. Instead, send requests only to https:// URLS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.spring.io/spring/docs/current/javadoc-api/org/springframework/web/client/RestTemplate.html#delete-java.lang.String-java.util.Map-
+    - https://www.baeldung.com/rest-template
+    subcategory:
+    - vuln
+    technology:
+    - spring
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  patterns:
+  - pattern-either:
+    - pattern: '$RESTTEMP = new RestTemplate(...);
+
+        ...
+
+        $RESTTEMP.$FUNC("=~/[hH][tT][tT][pP]://.*/", ...);
+
+        '
+    - pattern: '$RESTTEMP = new RestTemplate(...);
+
+        ...
+
+        String $URL = "=~/[hH][tT][tT][pP]://.*/";
+
+        ...
+
+        $RESTTEMP.$FUNC($URL, ...);
+
+        '
+    - pattern: '$RESTTEMP = new RestTemplate(...);
+
+        ...
+
+        $URL = new URI(..., "=~/[hH][tT][tT][pP]://.*/", ...);
+
+        ...
+
+        $RESTTEMP.$FUNC($URL, ...);
+
+        '
+  - metavariable-regex:
+      metavariable: $FUNC
+      regex: (delete|doExecute|exchange|getForEntity|getForObject|headForHeaders|optionsForAllow|patchForObject|postForEntity|postForLocation|postForObject|put)
+- id: disallow-old-tls-versions1
+  message: Detects direct creations of SSLConnectionSocketFactories that don't disallow
+    SSL v2, SSL v3, and TLS v1. SSLSocketFactory can be used to validate the identity
+    of the HTTPS server against a list of trusted certificates. These protocols are
+    deprecated due to POODLE, man in the middle attacks, and other vulnerabilities.
+  severity: WARNING
+  metadata:
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://stackoverflow.com/questions/26429751/java-http-clients-and-poodle
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  patterns:
+  - pattern: 'new SSLConnectionSocketFactory(...);
+
+      '
+  - pattern-not: 'new SSLConnectionSocketFactory(..., new String[] {"TLSv1.2", "TLSv1.3"},
+      ...);
+
+      '
+  - pattern-not: 'new SSLConnectionSocketFactory(..., new String[] {"TLSv1.3", "TLSv1.2"},
+      ...);
+
+      '
+  - pattern-not: 'new SSLConnectionSocketFactory(..., new String[] {"TLSv1.3"}, ...);
+
+      '
+  - pattern-not: 'new SSLConnectionSocketFactory(..., new String[] {"TLSv1.2"}, ...);
+
+      '
+  - pattern-not-inside: '(SSLConnectionSocketFactory $SF) = new SSLConnectionSocketFactory(...);
+      ... (TlsConfig $TLSCONFIG) = TlsConfig.custom(). ... .setSupportedProtocols(TLS.V_1_2).
+      ... .build(); ... HttpClientConnectionManager cm = $CM.create(). ... .setSSLSocketFactory($SF).
+      ... .setDefaultTlsConfig($TLSCONFIG). ... .build();
+
+      '
+  - pattern-not-inside: '(SSLConnectionSocketFactory $SF) = new SSLConnectionSocketFactory(...);
+      ... (TlsConfig $TLSCONFIG) = TlsConfig.custom(). ... .setSupportedProtocols(TLS.V_1_3).
+      ... .build(); ... HttpClientConnectionManager cm = $CM.create(). ... .setSSLSocketFactory($SF).
+      ... .setDefaultTlsConfig($TLSCONFIG). ... .build();
+
+      '
+- id: disallow-old-tls-versions2
+  message: Detects setting client protocols to insecure versions of TLS and SSL. These
+    protocols are deprecated due to POODLE, man in the middle attacks, and other vulnerabilities.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://stackoverflow.com/questions/26504653/is-it-possible-to-disable-sslv3-for-all-java-applications
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  patterns:
+  - pattern: $VALUE. ... .setProperty("jdk.tls.client.protocols", "$PATTERNS");
+  - metavariable-pattern:
+      metavariable: $PATTERNS
+      language: generic
+      patterns:
+      - pattern-either:
+        - pattern: TLS1
+        - pattern-regex: ^(.*TLSv1|.*SSLv.*)$
+        - pattern-regex: ^(.*TLSv1,.*)
+- id: http-components-request
+  message: Checks for requests sent via Apache HTTP Components to http:// URLS. This
+    is dangerous because the server is attempting to connect to a website that does
+    not encrypt traffic with TLS. Instead, send requests only to https:// URLS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://hc.apache.org/httpcomponents-client-ga/quickstart.html
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - pattern: '$HTTPCLIENT = HttpClients.$CREATE(...);
+
+      ...
+
+      $HTTPREQ = new $HTTPFUNC("=~/[hH][tT][tT][pP]://.*/");
+
+      ...
+
+      $RESPONSE = $HTTPCLIENT.execute($HTTPREQ);
+
+      '
+  - pattern: '$HTTPCLIENT = HttpClients.$CREATE(...);
+
+      ...
+
+      $RESPONSE = $HTTPCLIENT.execute(new $HTTPFUNC("=~/[hH][tT][tT][pP]://.*/"));
+
+      '
+- id: httpclient-http-request
+  message: Checks for requests sent via HttpClient to http:// URLS. This is dangerous
+    because the server is attempting to connect to a website that does not encrypt
+    traffic with TLS. Instead, send requests only to https:// URLS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://openjdk.java.net/groups/net/httpclient/intro.html
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - patterns:
+    - pattern: 'URI.create("=~/[hH][tT][tT][pP]://.*/", ...)
+
+        '
+    - pattern-inside: 'HttpClient $CLIENT = ...;
+
+        ...
+
+        HttpRequest $REQ = ...;
+
+        ...
+
+        $CLIENT.sendAsync(...);
+
+        '
+  - patterns:
+    - pattern: 'URI.create("=~/[hH][tT][tT][pP]://.*/", ...)
+
+        '
+    - pattern-inside: 'HttpClient $CLIENT = ...;
+
+        ...
+
+        HttpRequest $REQ = ...;
+
+        ...
+
+        $CLIENT.send(...);
+
+        '
+  - patterns:
+    - pattern: 'URI.create($URI)
+
+        '
+    - pattern-inside: 'String $URI = "=~/[hH][tT][tT][pP]://.*/";
+
+        ...
+
+        HttpClient $CLIENT = ...;
+
+        ...
+
+        HttpRequest $REQ = ...;
+
+        ...
+
+        $CLIENT.send(...);
+
+        '
+  - patterns:
+    - pattern: 'URI.create($URI)
+
+        '
+    - pattern-inside: 'String $URI = "=~/[hH][tT][tT][pP]://.*/";
+
+        ...
+
+        HttpClient $CLIENT = ...;
+
+        ...
+
+        HttpRequest $REQ = ...;
+
+        ...
+
+        $CLIENT.sendAsync(...);
+
+        '
+- id: httpget-http-request
+  message: Detected an HTTP request sent via HttpGet. This could lead to sensitive
+    information being sent  over an insecure channel. Instead, it is recommended to
+    send requests over HTTPS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/net/URLConnection.html
+    - https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/net/URL.html#openConnection()
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  patterns:
+  - pattern: '"=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      '
+  - pattern-inside: '$R = new HttpGet("=~/[Hh][Tt][Tt][Pp]://.*/");
+
+      ...
+
+      $CLIENT. ... .execute($R, ...);
+
+      '
+- id: httpurlconnection-http-request
+  message: Detected an HTTP request sent via HttpURLConnection. This could lead to
+    sensitive information being sent over an insecure channel. Instead, it is recommended
+    to send requests over HTTPS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/net/URLConnection.html
+    - https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/net/URL.html#openConnection()
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  patterns:
+  - pattern: '"=~/[Hh][Tt][Tt][Pp]://.*/"
+
+      '
+  - pattern-either:
+    - pattern-inside: 'URL $URL = new URL ("=~/[Hh][Tt][Tt][Pp]://.*/", ...);
+
+        ...
+
+        $CON = (HttpURLConnection) $URL.openConnection(...);
+
+        ...
+
+        $CON.$FUNC(...);
+
+        '
+    - pattern-inside: 'URL $URL = new URL ("=~/[Hh][Tt][Tt][Pp]://.*/", ...);
+
+        ...
+
+        $CON = $URL.openConnection(...);
+
+        ...
+
+        $CON.$FUNC(...);
+
+        '
+- id: socket-request
+  message: Insecure transport rules to catch socket connections to http, telnet, and
+    ftp servers. This is dangerous because these are protocols that do not encrypt
+    traffic.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: LOW
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.oracle.com/javase/8/docs/api/java/net/Socket.html
+    subcategory:
+    - audit
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  pattern-either:
+  - pattern: '$SOCKET = new Socket("=~/[tT][eE][lL][nN][eE][tT]://.*/", ...);
+
+      ...
+
+      $OUT = new PrintWriter($SOCKET.getOutputStream(...), ...);
+
+      ...
+
+      $OUT.$FUNC(...);
+
+      '
+  - pattern: '$SOCKET = new Socket("=~/^[fF][tT][pP]://.*/", ...);
+
+      ...
+
+      $OUT = new PrintWriter($SOCKET.getOutputStream(...), ...);
+
+      ...
+
+      $OUT.$FUNC(...);
+
+      '
+  - pattern: '$SOCKET = new Socket("=~/[hH][tT][tT][pP]://.*/", ...);
+
+      ...
+
+      $OUT = new PrintWriter($SOCKET.getOutputStream(...), ...);
+
+      ...
+
+      $OUT.$FUNC(...);
+
+      '
+- id: tls-renegotiation
+  message: Checks for cases where java applications are allowing unsafe renegotiation.
+    This leaves the application vulnerable to a man-in-the-middle attack where chosen
+    plain text is injected as prefix to a TLS connection.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://www.oracle.com/java/technologies/javase/tlsreadme.html
+    subcategory:
+    - vuln
+    technology:
+    - java
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  pattern: 'java.lang.System.setProperty("sun.security.ssl.allowUnsafeRenegotiation",
+    true);
+
+    '
+- id: unirest-http-request
+  message: Checks for requests sent via Unirest to http:// URLS. This is dangerous
+    because the server is attempting to connect to a website that does not encrypt
+    traffic with TLS. Instead, send requests only to https:// URLS.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://kong.github.io/unirest-java/#requests
+    subcategory:
+    - vuln
+    technology:
+    - unirest
+    vulnerability: Insecure Transport
+  languages:
+  - java
+  fix-regex:
+    regex: '[Hh][Tt][Tt][Pp]://'
+    replacement: https://
+    count: 1
+  pattern-either:
+  - pattern: 'Unirest.get("=~/[hH][tT][tT][pP]://.*/")
+
+      '
+  - pattern: 'Unirest.post("=~/[hH][tT][tT][pP]://.*/")
+
+      '
+- id: rest-http-client-support
+  message: Checks for requests to http (unencrypted) sites using some of node js's
+    most popular REST/HTTP libraries, including node-rest-client, axios, and got.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://www.npmjs.com/package/axios
+    - https://www.npmjs.com/package/got
+    - https://www.npmjs.com/package/node-rest-client
+    subcategory:
+    - vuln
+    technology:
+    - node.js
+    vulnerability: Insecure Transport
+  languages:
+  - javascript
+  patterns:
+  - pattern-either:
+    - pattern-inside: '$CLIENT = require(''node-rest-client'').Client;
+
+        ...
+
+        $C = new $CLIENT();
+
+        ...
+
+        '
+    - pattern-inside: '$C = require(''axios'');
+
+        ...
+
+        '
+    - pattern-inside: '$C = require(''got'');
+
+        ...
+
+        '
+  - pattern-either:
+    - pattern: '$C.$REQ("=~/http://.*/", ...)
+
+        '
+    - pattern: '$C("=~/http://.*/", ...)
+
+        '
+    - pattern: '$C({...,url: "=~/http://.*/"})
+
+        '
+    - pattern: '$C.$REQ({...,url: "=~/http://.*/"})
+
+        '
+- id: using-http-server
+  message: Checks for any usage of http servers instead of https servers. Encourages
+    the usage of https protocol instead of http, which does not have TLS and is therefore
+    unencrypted. Using http can lead to man-in-the-middle attacks in which the attacker
+    is able to read sensitive information.
+  severity: WARNING
+  metadata:
+    likelihood: LOW
+    impact: MEDIUM
+    confidence: LOW
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp:
+    - A02:2021 - Cryptographic Failures
+    - A03:2017 - Sensitive Data Exposure
+    references:
+    - https://nodejs.org/api/http.html#http_class_http_agent
+    - https://groups.google.com/g/rubyonrails-security/c/NCCsca7TEtY
+    subcategory:
+    - audit
+    technology:
+    - node.js
+    vulnerability: Insecure Transport
+  languages:
+  - javascript
+  patterns:
+  - pattern-inside: '$HTTP = require(''http'');
+
+      ...
+
+      '
+  - pattern-either:
+    - pattern: '$HTTP.$FUNC(...);
+
+        '
+    - pattern: 'new $HTTP.$FUNC2(...);
+
+        '
+  - pattern: $HTTP
+- id: http-client-requests
+  message: Checks for requests to http (unencrypted) sites using some of ruby's most
+    popular REST/HTTP libraries, including httparty and restclient.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://github.com/rest-client/rest-client
+    - https://github.com/jnunemaker/httparty/tree/master/docs
+    subcategory:
+    - vuln
+    technology:
+    - httparty
+    - rest-client
+    vulnerability: Insecure Transport
+  languages:
+  - ruby
+  pattern-either:
+  - pattern: 'HTTParty.$PARTYVERB("=~/[hH][tT][tT][pP]://.*/", ...)
+
+      '
+  - pattern: '$STRING = "=~/[hH][tT][tT][pP]://.*/"
+
+      ...
+
+      HTTParty.$PARTYVERB($STRING, ...)
+
+      '
+  - pattern: 'RestClient.$RESTVERB "=~/[hH][tT][tT][pP]://.*/", ...
+
+      '
+  - pattern: 'RestClient::Request.execute(..., url: "=~/[hH][tT][tT][pP]://.*/", ...)
+
+      '
+- id: net-ftp-request
+  message: Checks for outgoing connections to ftp servers with the 'net/ftp' package.
+    FTP does not encrypt traffic, possibly leading to PII being sent plaintext over
+    the network. Instead, connect via the SFTP protocol.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.ruby-lang.org/en/2.0.0/Net/FTP.html
+    subcategory:
+    - vuln
+    technology:
+    - ruby
+    vulnerability: Insecure Transport
+  languages:
+  - ruby
+  pattern-either:
+  - pattern: '$FTP = Net::FTP.new(''...'')
+
+      ...
+
+      $FTP.login
+
+      '
+  - pattern: "Net::FTP.open('...') do |ftp|\n  ...\n  ftp.login\nend\n"
+- id: net-http-request
+  message: Checks for requests sent to http:// URLs. This is dangerous as the server
+    is attempting to connect to a website that does not encrypt traffic with TLS.
+    Instead, only send requests to https:// URLs.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://ruby-doc.org/stdlib-2.6.5/libdoc/net/http/rdoc/Net/
+    subcategory:
+    - vuln
+    technology:
+    - ruby
+    vulnerability: Insecure Transport
+  languages:
+  - ruby
+  patterns:
+  - pattern-either:
+    - pattern: '$URI = URI(''=~/[hH][tT][tT][pP]://.*/'')
+
+        ...
+
+        Net::HTTP::$FUNC.new $URI
+
+        '
+    - pattern: '$URI = URI(''=~/[hH][tT][tT][pP]://.*/'')
+
+        ...
+
+        Net::HTTP.$FUNC($URI, ...)
+
+        '
+    - pattern: 'Net::HTTP.$FUNC(URI(''=~/[hH][tT][tT][pP]://.*/''), ...)
+
+        '
+  - metavariable-regex:
+      metavariable: $FUNC
+      regex: ([gG]et|post_form|[pP]ost|get_response|get_print|Head|Patch|Put|Proppatch|Lock|Unlock|Options|Propfind|Delete|Move|Copy|Trace|Mkcol)
+- id: net-telnet-request
+  message: Checks for creation of telnet servers or attempts to connect through telnet.
+    This is insecure as the telnet protocol supports no encryption, and data passes
+    through unencrypted.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://docs.ruby-lang.org/en/2.2.0/Net/Telnet.html
+    - https://www.rubydoc.info/gems/net-ssh-telnet2/0.1.0/Net/SSH/Telnet
+    subcategory:
+    - vuln
+    technology:
+    - ruby
+    vulnerability: Insecure Transport
+  languages:
+  - ruby
+  pattern-either:
+  - pattern: 'Net::Telnet::new(...)
+
+      '
+  - pattern: 'Net::SSH::Telnet.new(...)
+
+      '
+- id: openuri-request
+  message: Checks for requests to http and ftp (unencrypted) sites using OpenURI.
+  severity: WARNING
+  metadata:
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+    category: security
+    cwe: 'CWE-319: Cleartext Transmission of Sensitive Information'
+    owasp: A03:2017 - Sensitive Data Exposure
+    references:
+    - https://ruby-doc.org/stdlib-2.6.3/libdoc/open-uri/rdoc/OpenURI.html
+    subcategory:
+    - vuln
+    technology:
+    - open-uri
+    vulnerability: Insecure Transport
+  languages:
+  - ruby
+  pattern-either:
+  - pattern: 'URI.open(''=~/[hH][tT][tT][pP]://.*/'', ...)
+
+      '
+  - pattern: '$URI = URI.parse(''=~/[hH][tT][tT][pP]://.*/'', ...)
+
+      ...
+
+      $URI.open
+
+      '
+  - pattern: 'URI.open(''=~/^[fF][tT][pP]://.*/'', ...)
+
+      '
+  - pattern: '$URI = URI.parse(''=~/^[fF][tT][pP]://.*/'', ...)
+
+      ...
+
+      $URI.open
+
+      '

@@ -1,0 +1,28 @@
+id: "meteobridge-detect"
+name: "MeteoBridge - Detect"
+severity: "info"
+description: "Exposed MeteoBridge devices by identifying their unique HTTP response patterns."
+tech:
+  - "generic"
+tags:
+  - "meteobridge"
+  - "tech"
+  - "detect"
+  - "discovery"
+reference: "https://www.meteobridge.com"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cgi-bin/meteobridge.cgi"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "header"
+    words:
+      - "Basic realm=\"MeteoBridge\""
+  - type: "status"
+    status:
+      - 401

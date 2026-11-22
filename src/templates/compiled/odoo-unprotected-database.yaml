@@ -1,0 +1,33 @@
+id: "odoo-unprotected-database"
+name: "Odoo - Unprotected Database"
+severity: "critical"
+description: "The system has an Odoo application whose database manager is unprotected, indicating potential unauthorized access."
+tech:
+  - "generic"
+tags:
+  - "odoo"
+  - "database"
+  - "unauth"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/web/database/manager"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Warning, your Odoo database manager is not protected."
+  - type: "word"
+    part: "body"
+    words:
+      - "The database manager has been disabled by the administrator"
+    negative: true
+  - type: "status"
+    status:
+      - 200

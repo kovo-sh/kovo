@@ -1,0 +1,38 @@
+id: "apollo-adminservice-unauth"
+name: "Apollo Admin Service - Unauthenticated Access"
+severity: "medium"
+description: "ApolloAdminservice was able to be accessed without authentication."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "unauth"
+  - "apollo"
+  - "apolloadminservice"
+  - "vuln"
+cwe: "CWE-522"
+reference: "https://landgrey.me/blog/20/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/apps"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "appId"
+      - "orgName"
+      - "ownerName"
+      - "dataChangeCreatedBy"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

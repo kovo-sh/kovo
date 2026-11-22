@@ -1,0 +1,34 @@
+id: "sftp-deployment-config"
+name: "Atom SFTP Configuration File - Detect"
+severity: "high"
+description: "Atom SFTP deployment configuration file was detected. File contains server details and credentials."
+tech:
+  - "generic"
+tags:
+  - "sftp"
+  - "atom"
+  - "config"
+  - "exposure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://atom.io/packages/sftp-deployment"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/deployment-config.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"host\":"
+      - "\"username\":"
+      - "\"password\":"
+      - "\"remotePath\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

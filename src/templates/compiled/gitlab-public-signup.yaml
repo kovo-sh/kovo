@@ -1,0 +1,36 @@
+id: "gitlab-public-signup"
+name: "GitLab public signup"
+severity: "info"
+description: "Safe check derived from gitlab-public-signup: GitLab public signup"
+tech:
+  - "gitlab"
+tags:
+  - "gitlab"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/users/sign_in"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<a data-qa-selector=\"register_link\" href=\"/users/sign_up\">Register now</a>"
+      - "data-qa-selector=\"new_user_register_button\""
+  - type: "word"
+    part: "body"
+    words:
+      - "https://about.gitlab.com"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<meta content=\"GitLab.com\" property=\"og:description\">"
+    negative: true

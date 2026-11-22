@@ -1,0 +1,33 @@
+id: "cisco-ucm-detect"
+name: "Cisco Unified Communications Manager - Detect"
+severity: "info"
+description: "Detected the presence of the Cisco Unified Communications User Management portal."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "detect"
+  - "cisco"
+  - "ucm"
+  - "discovery"
+reference: "https://developer.cisco.com/site/user-data-services/develop-and-test/api-reference/#version"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cucm-uds/version"
+  headers:
+    "Accept": "application/xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<versionInformation"
+      - "<version>"
+    condition: "and"

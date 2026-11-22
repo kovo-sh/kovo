@@ -1,0 +1,29 @@
+id: "stackposts-installer"
+name: "StackPosts Installation Page - Exposure"
+severity: "high"
+description: "Detects exposed StackPosts installation page."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "install"
+  - "exposure"
+  - "stackposts"
+  - "vuln"
+reference: "https://codecanyon.net/item/stackposts-social-marketing-tool/21747459"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Install - StackPosts - Social Marketing Tools"
+  - type: "status"
+    status:
+      - 200

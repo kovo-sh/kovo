@@ -1,0 +1,32 @@
+id: "rollup-js-config"
+name: "Rollup.js Configuration - Detect"
+severity: "info"
+description: "Rollup configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "devops"
+  - "cicd"
+  - "rollupjs"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://rollup.docschina.org/guide/en/#configuration-files"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rollup.config.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "export default ["
+      - "input:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

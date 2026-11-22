@@ -1,0 +1,29 @@
+id: "jackett-installer"
+name: "Jackett - Installer"
+severity: "high"
+description: "Jackett installer exposed."
+tech:
+  - "generic"
+tags:
+  - "install"
+  - "jackett"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/configure"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Jackett"
+      - "Install</a>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

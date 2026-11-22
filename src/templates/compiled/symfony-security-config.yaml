@@ -1,0 +1,32 @@
+id: "symfony-security-config"
+name: "Symfony Security Configuration File - Detect"
+severity: "info"
+description: "Symfony security configuration file was detected."
+tech:
+  - "symfony"
+tags:
+  - "config"
+  - "exposure"
+  - "symfony"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://symfony2-document.readthedocs.io/en/latest/book/security.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config/packages/security.yaml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "security:"
+      - "firewalls:"
+      - "access_control:"
+    condition: "and"

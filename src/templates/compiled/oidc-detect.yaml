@@ -1,0 +1,28 @@
+id: "oidc-detect"
+name: "Detect OpenID Connect provider"
+severity: "info"
+description: "Detects OpenID Connect providers. See https://en.wikipedia.org/wiki/OpenID_Connect"
+tech:
+  - "oidc"
+tags:
+  - "tech"
+  - "oidc"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.well-known/openid-configuration"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "issuer"
+      - "authorization_endpoint"
+    condition: "and"

@@ -1,0 +1,28 @@
+id: "token-info-json"
+name: "Token Info Json File"
+severity: "info"
+description: "Safe check derived from token-info-json: Token Info Json File"
+tech:
+  - "wordpress"
+tags:
+  - "exposure"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/wp-content/plugins/constant-contact-forms/vendor/constantcontact/constantcontact/test/Json/Auth/token_info.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"client_id\":"
+      - "\"user_name\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

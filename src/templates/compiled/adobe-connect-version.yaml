@@ -1,0 +1,30 @@
+id: "adobe-connect-version"
+name: "Adobe Connect Central Version"
+severity: "info"
+description: "Safe check derived from adobe-connect-version: Adobe Connect Central Version"
+tech:
+  - "generic"
+tags:
+  - "adobe"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/version.txt"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "package="
+  - type: "word"
+    part: "header"
+    words:
+      - "text/plain"
+  - type: "status"
+    status:
+      - 200

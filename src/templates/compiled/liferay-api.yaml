@@ -1,0 +1,33 @@
+id: "liferay-api"
+name: "Liferay /api/liferay - API Exposed"
+severity: "info"
+description: "Safe check derived from liferay-api: Liferay /api/liferay - API Exposed"
+tech:
+  - "generic"
+tags:
+  - "liferay"
+  - "exposure"
+  - "api"
+  - "misconfig"
+  - "vuln"
+reference: "https://github.com/ilmila/J2EEScan/blob/master/src/main/java/burp/j2ee/issues/impl/LiferayAPI.java"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/liferay"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - ".*Internal Server Error.*An error occurred while accessing the requested resource\\..*"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 404

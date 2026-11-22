@@ -20,26 +20,34 @@ import {
   defaultWorkerConcurrency,
   defaultWorkerMaxTurns,
   isLocalLabEnvEnabled,
+  specialistProfiles,
   workerHistory,
 } from '../domain.ts'
 import type {
   ApprovalPolicy,
   ApprovedEndpointPattern,
+  BenchmarkFunnel,
   CallerCompatibility,
   Candidate,
   CapabilityTier,
   CheckCoverage,
   CodeLocation,
   DynamicRetestVerdict,
+  EndpointSource,
   EvidenceSummary,
+  FailureTaxonomyBucket,
   Finding,
+  InlineVerifyFeedback,
   LabConfig,
   OwaspCategory,
+  ParamLocation,
   PatchProposalStatus,
   PatchProposalSummary,
   ReportBody,
   RunCommand,
+  SecondOrderCanaryStatus,
   SelectedChecks,
+  SpecialistProfile,
   ThreatModelSummary,
   VerificationTier,
   WorkerPhase,
@@ -63,7 +71,7 @@ import { accessPolicyReviews } from './access-policy-checks.ts'
 import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-judge.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { listProjectPersonas } from './persona-vault.ts'
-import { redact, redactHeaders } from './redact.ts'
+import { redact, redactHeaders, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { responseCapture, restrictAccessVerification } from './report-evidence.ts'
 import { responseReview } from './response-checks.ts'
@@ -91,6 +99,12 @@ export type SurfaceProbe = typeof tables.surfaceProbes.$inferSelect
 export type PatchProposal = typeof tables.patchProposals.$inferSelect
 export type ReportRow = typeof tables.reports.$inferSelect
 export type MessageRow = typeof tables.messages.$inferSelect
+export type EndpointRow = typeof tables.endpoints.$inferSelect
+export type EndpointParamRow = typeof tables.endpointParams.$inferSelect
+export type ApiDependencyRow = typeof tables.apiDependencies.$inferSelect
+export type SecondOrderCanaryRow = typeof tables.secondOrderCanaries.$inferSelect
+export type LabTelemetryRow = typeof tables.labTelemetry.$inferSelect
+export type BenchmarkRunRow = typeof tables.benchmarkRuns.$inferSelect
 
 export type FactKind =
   | Fact['kind']
@@ -250,6 +264,7 @@ export class Store {
     const result = migrate(this.db, { migrationsFolder: resolve('drizzle') })
     if (result && 'exitCode' in result) throw new Error('Guardian database migration failed.')
     this.initV3Schema()
+    this.initV4Schema()
     this.initFts()
     const current = this.db.select().from(tables.workspaces).limit(1).get()
     this.workspace = current ?? this.db.insert(tables.workspaces).values({
@@ -354,6 +369,144 @@ export class Store {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS patch_proposals_run ON patch_proposals (run_id, finding_id);
+    `)
+  }
+
+  private initV4Schema() {
+    const existingColumns = (table: string): Set<string> => {
+      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    }
+    const ensureColumn = (table: string, column: string, definition: string) => {
+      if (!existingColumns(table).has(column)) {
+        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+      }
+    }
+
+    // model_profiles v4 columns
+    ensureColumn('model_profiles', 'role_affinity', "TEXT NOT NULL DEFAULT 'any'")
+
+    // projects v4 columns
+    ensureColumn('projects', 'sandbox_write_allowlist', "TEXT NOT NULL DEFAULT '[]'")
+
+    // runs v4 columns
+    ensureColumn('runs', 'dynamic_step_budget', 'INTEGER')
+    ensureColumn('runs', 'multi_trial_enabled', 'INTEGER NOT NULL DEFAULT 1')
+    ensureColumn('runs', 'phase0_completed_at', 'INTEGER')
+
+    // chain_steps v4 columns
+    ensureColumn('chain_steps', 'specialist_profile', 'TEXT')
+    ensureColumn('chain_steps', 'trial_group_id', 'TEXT')
+    ensureColumn('chain_steps', 'trial_index', 'INTEGER NOT NULL DEFAULT 0')
+
+    // replay_specs v4 columns
+    ensureColumn('replay_specs', 'attempt_count', 'INTEGER NOT NULL DEFAULT 1')
+    ensureColumn('replay_specs', 'verified_inline', 'INTEGER NOT NULL DEFAULT 0')
+    ensureColumn('replay_specs', 'last_verification_diff', 'TEXT')
+
+    // v4 tables & indexes
+    this.client.exec(`
+      CREATE TABLE IF NOT EXISTS endpoints (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        scope_revision INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path_template TEXT NOT NULL,
+        source TEXT NOT NULL,
+        framework TEXT,
+        auth_requirement TEXT,
+        ownership_guard TEXT,
+        sink_kinds TEXT NOT NULL DEFAULT '[]',
+        tested_classes TEXT NOT NULL DEFAULT '[]',
+        coverage_pct REAL,
+        risk_score INTEGER NOT NULL DEFAULT 50,
+        code_location TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS endpoints_run_route ON endpoints (run_id, origin, method, path_template);
+      CREATE INDEX IF NOT EXISTS endpoints_run_risk ON endpoints (run_id, risk_score);
+
+      CREATE TABLE IF NOT EXISTS endpoint_params (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+        name TEXT NOT NULL,
+        location TEXT NOT NULL,
+        inferred_type TEXT,
+        is_csrf INTEGER NOT NULL DEFAULT 0,
+        is_object_id INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS endpoint_params_unique ON endpoint_params (endpoint_id, name, location);
+      CREATE INDEX IF NOT EXISTS endpoint_params_run ON endpoint_params (run_id, endpoint_id);
+
+      CREATE TABLE IF NOT EXISTS api_dependencies (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        producer_endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+        consumer_endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+        resource_key TEXT NOT NULL,
+        sample_resource_id_hash TEXT,
+        persona_handle TEXT,
+        observed_transitions TEXT NOT NULL DEFAULT '[]',
+        tested_bola INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS api_dependencies_edge ON api_dependencies (run_id, producer_endpoint_id, consumer_endpoint_id, resource_key);
+      CREATE INDEX IF NOT EXISTS api_dependencies_run ON api_dependencies (run_id, tested_bola);
+
+      CREATE TABLE IF NOT EXISTS second_order_canaries (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        assignment_id TEXT NOT NULL,
+        marker TEXT NOT NULL UNIQUE,
+        injected_origin TEXT NOT NULL,
+        injected_endpoint TEXT NOT NULL,
+        injected_param TEXT NOT NULL,
+        injected_persona TEXT,
+        surfaced_origin TEXT,
+        surfaced_endpoint TEXT,
+        surfaced_persona TEXT,
+        surfaced_exchange_id TEXT,
+        status TEXT NOT NULL DEFAULT 'planted',
+        created_at INTEGER NOT NULL,
+        surfaced_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS second_order_canaries_run ON second_order_canaries (run_id, status);
+
+      CREATE TABLE IF NOT EXISTS lab_telemetry (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        exchange_id TEXT NOT NULL,
+        trace_id TEXT NOT NULL,
+        routes_hit TEXT NOT NULL DEFAULT '[]',
+        new_lines_covered INTEGER NOT NULL DEFAULT 0,
+        sink_events_count INTEGER NOT NULL DEFAULT 0,
+        has_unhandled_exception INTEGER NOT NULL DEFAULT 0,
+        artifact_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS lab_telemetry_run ON lab_telemetry (run_id, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS lab_telemetry_trace ON lab_telemetry (run_id, trace_id);
+
+      CREATE TABLE IF NOT EXISTS benchmark_runs (
+        id TEXT PRIMARY KEY NOT NULL,
+        suite TEXT NOT NULL,
+        git_sha TEXT NOT NULL,
+        model_routing_config TEXT NOT NULL DEFAULT '{}',
+        targets_total INTEGER NOT NULL,
+        confirmed_count INTEGER NOT NULL,
+        false_positive_count INTEGER NOT NULL,
+        funnel_counts TEXT NOT NULL,
+        failure_taxonomy TEXT NOT NULL,
+        total_cost_usd REAL NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS benchmark_runs_suite ON benchmark_runs (suite, created_at);
     `)
   }
 
@@ -1022,7 +1175,17 @@ export class Store {
     dependsOnFactIds?: string[]
     dependsOnStepIds?: string[]
     sourceOrigins?: string[]
+    specialistProfile?: SpecialistProfile | null
+    trialGroupId?: string | null
+    trialIndex?: number
   }): ChainStep {
+    if (
+      input.specialistProfile !== undefined &&
+      input.specialistProfile !== null &&
+      !(specialistProfiles as readonly string[]).includes(input.specialistProfile)
+    ) {
+      throw new Error(`Invalid specialistProfile "${String(input.specialistProfile)}": expected one of ${specialistProfiles.join(', ')}.`)
+    }
     const existingSteps = this.listChainSteps(run.id)
     const nextSeq = (existingSteps.at(-1)?.seq ?? 0) + 1
     const depFactIds = [...new Set(input.dependsOnFactIds ?? [])]
@@ -1060,6 +1223,9 @@ export class Store {
         dependsOnStepIds: depStepIds,
         status: allDepStepsComplete ? 'ready' : 'pending',
         assignedWorkerId: null,
+        specialistProfile: input.specialistProfile ?? null,
+        trialGroupId: input.trialGroupId ?? null,
+        trialIndex: Math.max(0, Math.round(input.trialIndex ?? 0)),
         sourceOrigins: [...origins],
         createdAt: now,
         updatedAt: now,
@@ -1554,6 +1720,11 @@ export class Store {
     findingId: string,
     spec: DeclarativeReplaySpec,
     sourceOrigins: string[],
+    options?: {
+      initialAttemptCount?: number
+      verifiedInline?: boolean
+      lastVerificationDiff?: InlineVerifyFeedback | null
+    },
   ): ReplaySpecRow {
     const specSha256 = createHash('sha256').update(JSON.stringify(spec)).digest('hex')
     return this.db.insert(tables.replaySpecs).values({
@@ -1566,6 +1737,9 @@ export class Store {
       spec,
       specSha256,
       sourceOrigins: [...new Set(sourceOrigins)],
+      attemptCount: options?.initialAttemptCount ?? 1,
+      verifiedInline: options?.verifiedInline ?? false,
+      lastVerificationDiff: options?.lastVerificationDiff ?? null,
       createdAt: Date.now(),
     }).returning().get()
   }
@@ -1581,6 +1755,45 @@ export class Store {
   listReplaySpecs(runId: string): ReplaySpecRow[] {
     return this.db.select().from(tables.replaySpecs).where(eq(tables.replaySpecs.runId, runId))
       .orderBy(desc(tables.replaySpecs.createdAt)).all()
+  }
+
+  listReplaySpecsForFinding(runId: string, findingId: string): ReplaySpecRow[] {
+    return this.db.select().from(tables.replaySpecs).where(and(
+      eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.findingId, findingId),
+    )).orderBy(desc(tables.replaySpecs.createdAt)).all()
+  }
+
+  incrementReplaySpecAttempt(
+    id: string,
+    feedback: InlineVerifyFeedback,
+    updated?: {
+      spec?: DeclarativeReplaySpec
+      sourceOrigins?: string[]
+      secrets?: readonly NamedSecret[]
+    },
+  ): ReplaySpecRow {
+    const secrets = updated?.secrets ?? []
+    const cleanFeedback = redactJsonValue(feedback, secrets)
+    return this.transaction(() => {
+      const existing = this.db.select().from(tables.replaySpecs).where(eq(tables.replaySpecs.id, id)).get()
+      if (!existing) throw new Error('Replay spec not found.')
+      const verified = existing.verifiedInline ||
+        cleanFeedback.verdict === 'confirmed' ||
+        cleanFeedback.verdict === 'static_verified'
+      const specPatch = updated?.spec && !existing.verifiedInline
+        ? {
+            spec: updated.spec,
+            specSha256: createHash('sha256').update(JSON.stringify(updated.spec)).digest('hex'),
+            ...(updated.sourceOrigins ? { sourceOrigins: [...new Set(updated.sourceOrigins)] } : {}),
+          }
+        : {}
+      return this.db.update(tables.replaySpecs).set({
+        attemptCount: sql`${tables.replaySpecs.attemptCount} + 1`,
+        verifiedInline: verified,
+        lastVerificationDiff: cleanFeedback,
+        ...specPatch,
+      }).where(eq(tables.replaySpecs.id, id)).returning().get()!
+    }, { behavior: 'immediate' })
   }
 
   recordRetestRun(
@@ -2014,6 +2227,16 @@ export class Store {
           finding: storedFinding,
         }).run()
       }
+      if (targetRow) {
+        if (finding.id !== targetRow.id) {
+          this.db.update(tables.replaySpecs).set({ findingId: targetRow.id })
+            .where(and(eq(tables.replaySpecs.runId, run.id), eq(tables.replaySpecs.findingId, finding.id))).run()
+        }
+        if (redundantRow && redundantRow.id !== targetRow.id) {
+          this.db.update(tables.replaySpecs).set({ findingId: targetRow.id })
+            .where(and(eq(tables.replaySpecs.runId, run.id), eq(tables.replaySpecs.findingId, redundantRow.id))).run()
+        }
+      }
       if (redundantRow && redundantRow.id !== targetRow?.id) {
         this.db.delete(tables.findings).where(eq(tables.findings.id, redundantRow.id)).run()
       }
@@ -2096,10 +2319,12 @@ export class Store {
       const originValidator = assetOriginForEnvironment(environment)
       const validatedSeeds = [...new Set(input.seeds.map(seed => originValidator.parse(seed)))]
       const labConfig = environment === 'local-lab' && input.labConfig
-        ? (input.labConfig.enabled && !isLocalLabEnvEnabled()
+        ? ((input.labConfig.enabled || input.labConfig.iastEnabled) && !isLocalLabEnvEnabled()
             ? (() => { throw new Error('Enabling local-lab execution requires GUARDIAN_ALLOW_LOCAL_LAB=1.') })()
             : input.labConfig)
-        : null
+        : (input.labConfig?.enabled || input.labConfig?.iastEnabled
+            ? (() => { throw new Error('Local-lab execution and IAST telemetry are forbidden on public projects.') })()
+            : null)
       const project = this.db.insert(tables.projects).values({
         id: randomUUID(),
         workspaceId: this.workspace.id,
@@ -2108,6 +2333,7 @@ export class Store {
         seeds: validatedSeeds,
         defaultScope: [],
         labConfig,
+        sandboxWriteAllowlist: input.sandboxWriteAllowlist ?? [],
         createdAt: Date.now(),
       }).returning().get()
       this.db.insert(tables.projectAssets).values(project.seeds.map(origin => ({
@@ -2121,12 +2347,12 @@ export class Store {
   updateProjectLabConfig(input: { requestId: string; projectId: string; labConfig: LabConfig | null }) {
     return this.operate(input, () => {
       const project = this.project(input.projectId)
-      if (input.labConfig?.enabled) {
+      if (input.labConfig?.enabled || input.labConfig?.iastEnabled) {
         if (project.environment !== 'local-lab') {
-          throw new Error('Local-lab app execution is forbidden on public projects.')
+          throw new Error('Local-lab app execution and IAST telemetry are forbidden on public projects.')
         }
         if (!isLocalLabEnvEnabled()) {
-          throw new Error('Local-lab app execution requires GUARDIAN_ALLOW_LOCAL_LAB=1 on the server.')
+          throw new Error('Local-lab app execution and IAST telemetry require GUARDIAN_ALLOW_LOCAL_LAB=1 on the server.')
         }
       }
       const nextConfig = project.environment === 'local-lab' ? input.labConfig : null
@@ -2139,7 +2365,46 @@ export class Store {
     })
   }
 
-  createRun(input: Omit<z.output<typeof newRun>, 'approvalPolicy'> & { approvalPolicy?: ApprovalPolicy }) {
+  updateProjectSandboxWriteAllowlist(input: {
+    requestId: string
+    projectId: string
+    sandboxWriteAllowlist: ApprovedEndpointPattern[]
+  }) {
+    return this.operate(input, () => {
+      const project = this.project(input.projectId)
+      const originValidator = assetOriginForEnvironment(project.environment)
+      const validated: ApprovedEndpointPattern[] = []
+      for (const entry of input.sandboxWriteAllowlist) {
+        const origin = originValidator.parse(entry.origin)
+        const method = entry.method.trim().toUpperCase()
+        const pathPattern = entry.pathPattern.trim()
+        if (!pathPattern.startsWith('/')) {
+          throw new Error('Allowlist path pattern must start with "/".')
+        }
+        validated.push({
+          origin,
+          method,
+          pathPattern,
+          ...(entry.scopeRevision !== undefined ? { scopeRevision: entry.scopeRevision } : {}),
+          createdAt: entry.createdAt ?? Date.now(),
+        })
+      }
+      this.db.update(tables.projects)
+        .set({ sandboxWriteAllowlist: validated })
+        .where(eq(tables.projects.id, project.id))
+        .run()
+      this.event(null, 'project.sandbox_allowlist_updated', 'Project sandbox write allowlist updated.', {
+        projectId: project.id,
+        count: validated.length,
+      })
+      return { id: project.id, sandboxWriteAllowlist: validated }
+    })
+  }
+
+  createRun(input: Omit<z.output<typeof newRun>, 'approvalPolicy' | 'multiTrialEnabled'> & {
+    approvalPolicy?: ApprovalPolicy
+    multiTrialEnabled?: boolean
+  }) {
     return this.operate(input, () => {
       const project = this.project(input.projectId)
       const goal = redact(input.goal)
@@ -2175,6 +2440,9 @@ export class Store {
         maxRpsPerOrigin: input.maxRpsPerOrigin ?? defaultMaxRpsPerOrigin,
         workerConcurrency: input.workerConcurrency ?? defaultWorkerConcurrency,
         workerMaxTurns: input.workerMaxTurns ?? defaultWorkerMaxTurns,
+        dynamicStepBudget: null,
+        multiTrialEnabled: input.multiTrialEnabled ?? true,
+        phase0CompletedAt: null,
         candidates: [],
         approved: [],
         createdAt: Date.now(),
@@ -3073,6 +3341,434 @@ export class Store {
       }
       return { id: run.id }
     })
+  }
+
+  // --- v4 Application State Graph, Second-Order Canaries, Lab Telemetry & Benchmarks ---
+
+  upsertEndpoint(input: {
+    runId: string
+    scopeRevision: number
+    origin: string
+    method: string
+    pathTemplate: string
+    source: EndpointSource
+    framework?: string | null
+    authRequirement?: string | null
+    ownershipGuard?: string | null
+    sinkKinds?: readonly string[]
+    testedClasses?: readonly string[]
+    coveragePct?: number | null
+    riskScore?: number
+    codeLocation?: CodeLocation | null
+  }): EndpointRow {
+    const method = input.method.trim().toUpperCase()
+    const pathTemplate = input.pathTemplate.trim()
+    const now = Date.now()
+    const clampRisk = (v: number) =>
+      Number.isFinite(v)
+        ? Math.max(0, Math.min(100, Math.round(v)))
+        : v === Infinity ? 100 : v === -Infinity ? 0 : 50
+    const clampCoverage = (v: number | null | undefined) =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : null
+
+    return this.transaction(() => {
+      const existing = this.db.select().from(tables.endpoints).where(and(
+        eq(tables.endpoints.runId, input.runId),
+        eq(tables.endpoints.origin, input.origin),
+        eq(tables.endpoints.method, method),
+        eq(tables.endpoints.pathTemplate, pathTemplate),
+      )).get()
+      if (existing) {
+        const nextSinks = [...new Set([...existing.sinkKinds, ...(input.sinkKinds ?? [])])]
+        const nextTested = [...new Set([...existing.testedClasses, ...(input.testedClasses ?? [])])]
+        const nextRisk = clampRisk(Math.max(existing.riskScore, input.riskScore ?? existing.riskScore))
+        const nextCov = input.coveragePct !== undefined ? clampCoverage(input.coveragePct) : existing.coveragePct
+        return this.db.update(tables.endpoints).set({
+          scopeRevision: Math.max(existing.scopeRevision, input.scopeRevision),
+          framework: input.framework ?? existing.framework,
+          authRequirement: input.authRequirement ?? existing.authRequirement,
+          ownershipGuard: input.ownershipGuard ?? existing.ownershipGuard,
+          sinkKinds: nextSinks,
+          testedClasses: nextTested,
+          coveragePct: nextCov,
+          riskScore: nextRisk,
+          codeLocation: input.codeLocation ?? existing.codeLocation,
+          updatedAt: now,
+        }).where(eq(tables.endpoints.id, existing.id)).returning().get()!
+      }
+      return this.db.insert(tables.endpoints).values({
+        id: randomUUID(),
+        runId: input.runId,
+        scopeRevision: input.scopeRevision,
+        origin: input.origin,
+        method,
+        pathTemplate,
+        source: input.source,
+        framework: input.framework ?? null,
+        authRequirement: input.authRequirement ?? null,
+        ownershipGuard: input.ownershipGuard ?? null,
+        sinkKinds: [...new Set(input.sinkKinds ?? [])],
+        testedClasses: [...new Set(input.testedClasses ?? [])],
+        coveragePct: clampCoverage(input.coveragePct),
+        riskScore: clampRisk(input.riskScore ?? 50),
+        codeLocation: input.codeLocation ?? null,
+        createdAt: now,
+        updatedAt: now,
+      }).returning().get()
+    }, { behavior: 'immediate' })
+  }
+
+  listEndpoints(runId: string, filter?: {
+    origin?: string
+    method?: string
+    source?: EndpointSource
+    untestedClass?: string
+    minRiskScore?: number
+    maxCoveragePct?: number
+    orderBy?: 'risk' | 'coverage' | 'updated'
+    limit?: number
+  }): EndpointRow[] {
+    const conditions = [eq(tables.endpoints.runId, runId)]
+    if (filter?.origin) conditions.push(eq(tables.endpoints.origin, filter.origin))
+    if (filter?.method) conditions.push(eq(tables.endpoints.method, filter.method.trim().toUpperCase()))
+    if (filter?.source) conditions.push(eq(tables.endpoints.source, filter.source))
+
+    const rows = this.db.select().from(tables.endpoints).where(and(...conditions)).all()
+    const filtered = rows.filter(row => {
+      if (filter?.untestedClass && row.testedClasses.includes(filter.untestedClass)) return false
+      if (filter?.minRiskScore !== undefined && row.riskScore < filter.minRiskScore) return false
+      if (filter?.maxCoveragePct !== undefined && (row.coveragePct ?? 0) > filter.maxCoveragePct) return false
+      return true
+    })
+
+    const orderBy = filter?.orderBy ?? 'risk'
+    filtered.sort((a, b) => {
+      if (orderBy === 'coverage') {
+        const ca = a.coveragePct ?? -1
+        const cb = b.coveragePct ?? -1
+        return ca - cb || b.riskScore - a.riskScore
+      }
+      if (orderBy === 'updated') {
+        return b.updatedAt - a.updatedAt
+      }
+      return b.riskScore - a.riskScore || (a.coveragePct ?? 0) - (b.coveragePct ?? 0)
+    })
+
+    const limit = typeof filter?.limit === 'number' && Number.isFinite(filter.limit)
+      ? Math.min(Math.max(1, Math.round(filter.limit)), 2000)
+      : 500
+    return filtered.slice(0, limit)
+  }
+
+  updateEndpointCoverage(
+    endpointId: string,
+    coveragePct: number | null,
+    testedClasses?: readonly string[],
+  ): EndpointRow {
+    const existing = this.db.select().from(tables.endpoints).where(eq(tables.endpoints.id, endpointId)).get()
+    if (!existing) throw new Error('Endpoint not found.')
+    const nextCov = typeof coveragePct === 'number' && Number.isFinite(coveragePct)
+      ? Math.max(0, Math.min(100, coveragePct))
+      : coveragePct === null ? null : existing.coveragePct
+    const nextTested = testedClasses
+      ? [...new Set([...existing.testedClasses, ...testedClasses])]
+      : existing.testedClasses
+    return this.db.update(tables.endpoints).set({
+      coveragePct: nextCov,
+      testedClasses: nextTested,
+      updatedAt: Date.now(),
+    }).where(eq(tables.endpoints.id, endpointId)).returning().get()!
+  }
+
+  upsertEndpointParam(input: {
+    runId: string
+    endpointId: string
+    name: string
+    location: ParamLocation
+    inferredType?: string | null
+    isCsrf?: boolean
+    isObjectId?: boolean
+    source: string
+  }): EndpointParamRow {
+    const now = Date.now()
+    return this.transaction(() => {
+      const existing = this.db.select().from(tables.endpointParams).where(and(
+        eq(tables.endpointParams.endpointId, input.endpointId),
+        eq(tables.endpointParams.name, input.name),
+        eq(tables.endpointParams.location, input.location),
+      )).get()
+      if (existing) {
+        return this.db.update(tables.endpointParams).set({
+          inferredType: input.inferredType ?? existing.inferredType,
+          isCsrf: existing.isCsrf || Boolean(input.isCsrf),
+          isObjectId: existing.isObjectId || Boolean(input.isObjectId),
+          source: input.source,
+        }).where(eq(tables.endpointParams.id, existing.id)).returning().get()!
+      }
+      return this.db.insert(tables.endpointParams).values({
+        id: randomUUID(),
+        runId: input.runId,
+        endpointId: input.endpointId,
+        name: input.name,
+        location: input.location,
+        inferredType: input.inferredType ?? null,
+        isCsrf: Boolean(input.isCsrf),
+        isObjectId: Boolean(input.isObjectId),
+        source: input.source,
+        createdAt: now,
+      }).returning().get()
+    }, { behavior: 'immediate' })
+  }
+
+  listEndpointParams(runId: string, endpointId?: string): EndpointParamRow[] {
+    const where = endpointId
+      ? and(eq(tables.endpointParams.runId, runId), eq(tables.endpointParams.endpointId, endpointId))
+      : eq(tables.endpointParams.runId, runId)
+    return this.db.select().from(tables.endpointParams).where(where)
+      .orderBy(asc(tables.endpointParams.createdAt)).all()
+  }
+
+  recordApiDependency(input: {
+    runId: string
+    producerEndpointId: string
+    consumerEndpointId: string
+    resourceKey: string
+    sampleResourceIdHash?: string | null
+    personaHandle?: string | null
+    observedTransitions?: readonly string[]
+    testedBola?: boolean
+  }): ApiDependencyRow {
+    const safeHash = input.sampleResourceIdHash ? redact(input.sampleResourceIdHash).slice(0, 64) : null
+    const now = Date.now()
+    return this.transaction(() => {
+      const existing = this.db.select().from(tables.apiDependencies).where(and(
+        eq(tables.apiDependencies.runId, input.runId),
+        eq(tables.apiDependencies.producerEndpointId, input.producerEndpointId),
+        eq(tables.apiDependencies.consumerEndpointId, input.consumerEndpointId),
+        eq(tables.apiDependencies.resourceKey, input.resourceKey),
+      )).get()
+      if (existing) {
+        const mergedTransitions = [...new Set([...existing.observedTransitions, ...(input.observedTransitions ?? [])])]
+        return this.db.update(tables.apiDependencies).set({
+          sampleResourceIdHash: safeHash ?? existing.sampleResourceIdHash,
+          personaHandle: input.personaHandle ?? existing.personaHandle,
+          observedTransitions: mergedTransitions,
+          testedBola: existing.testedBola || Boolean(input.testedBola),
+        }).where(eq(tables.apiDependencies.id, existing.id)).returning().get()!
+      }
+      return this.db.insert(tables.apiDependencies).values({
+        id: randomUUID(),
+        runId: input.runId,
+        producerEndpointId: input.producerEndpointId,
+        consumerEndpointId: input.consumerEndpointId,
+        resourceKey: input.resourceKey,
+        sampleResourceIdHash: safeHash,
+        personaHandle: input.personaHandle ?? null,
+        observedTransitions: [...new Set(input.observedTransitions ?? [])],
+        testedBola: Boolean(input.testedBola),
+        createdAt: now,
+      }).returning().get()
+    }, { behavior: 'immediate' })
+  }
+
+  listApiDependencies(runId: string): ApiDependencyRow[] {
+    return this.db.select().from(tables.apiDependencies).where(eq(tables.apiDependencies.runId, runId))
+      .orderBy(asc(tables.apiDependencies.createdAt)).all()
+  }
+
+  markApiDependencyTestedBola(id: string): ApiDependencyRow {
+    const updated = this.db.update(tables.apiDependencies).set({ testedBola: true })
+      .where(eq(tables.apiDependencies.id, id)).returning().get()
+    if (!updated) throw new Error('API dependency not found.')
+    return updated
+  }
+
+  insertSecondOrderCanary(input: {
+    runId: string
+    assignmentId: string
+    marker: string
+    injectedOrigin: string
+    injectedEndpoint: string
+    injectedParam: string
+    injectedPersona?: string | null
+  }): SecondOrderCanaryRow {
+    const existing = this.db.select().from(tables.secondOrderCanaries).where(
+      eq(tables.secondOrderCanaries.marker, input.marker),
+    ).get()
+    if (existing) {
+      if (existing.runId === input.runId) return existing
+      throw new Error('Second-order canary marker collision across runs.')
+    }
+    return this.db.insert(tables.secondOrderCanaries).values({
+      id: randomUUID(),
+      runId: input.runId,
+      assignmentId: input.assignmentId,
+      marker: input.marker,
+      injectedOrigin: input.injectedOrigin,
+      injectedEndpoint: redact(input.injectedEndpoint),
+      injectedParam: redact(input.injectedParam),
+      injectedPersona: input.injectedPersona ?? null,
+      surfacedOrigin: null,
+      surfacedEndpoint: null,
+      surfacedPersona: null,
+      surfacedExchangeId: null,
+      status: 'planted',
+      createdAt: Date.now(),
+      surfacedAt: null,
+    }).returning().get()
+  }
+
+  markSecondOrderCanarySurfaced(
+    id: string,
+    details: {
+      surfacedOrigin: string
+      surfacedEndpoint: string
+      surfacedPersona?: string | null
+      surfacedExchangeId?: string | null
+      status?: 'surfaced' | 'verified'
+    },
+  ): SecondOrderCanaryRow {
+    const updated = this.db.update(tables.secondOrderCanaries).set({
+      surfacedOrigin: details.surfacedOrigin,
+      surfacedEndpoint: redact(details.surfacedEndpoint),
+      surfacedPersona: details.surfacedPersona ?? null,
+      surfacedExchangeId: details.surfacedExchangeId ?? null,
+      status: details.status ?? 'surfaced',
+      surfacedAt: Date.now(),
+    }).where(eq(tables.secondOrderCanaries.id, id)).returning().get()
+    if (!updated) throw new Error('Second-order canary not found.')
+    this.event(updated.runId, 'second_order_canary.surfaced',
+      `Second-order canary surfaced on ${updated.surfacedOrigin}${updated.surfacedEndpoint ?? ''}.`, {
+        canaryId: updated.id,
+        marker: updated.marker,
+        injectedOrigin: updated.injectedOrigin,
+        injectedEndpoint: updated.injectedEndpoint,
+        surfacedOrigin: updated.surfacedOrigin,
+        surfacedEndpoint: updated.surfacedEndpoint,
+        surfacedPersona: updated.surfacedPersona,
+        status: updated.status,
+      })
+    return updated
+  }
+
+  listSecondOrderCanaries(runId: string, status?: SecondOrderCanaryStatus): SecondOrderCanaryRow[] {
+    const where = status
+      ? and(eq(tables.secondOrderCanaries.runId, runId), eq(tables.secondOrderCanaries.status, status))
+      : eq(tables.secondOrderCanaries.runId, runId)
+    return this.db.select().from(tables.secondOrderCanaries).where(where)
+      .orderBy(desc(tables.secondOrderCanaries.createdAt)).all()
+  }
+
+  insertLabTelemetry(input: {
+    runId: string
+    exchangeId: string
+    traceId: string
+    routesHit: readonly string[]
+    newLinesCovered: number
+    sinkEventsCount: number
+    hasUnhandledException: boolean
+    artifactId: string
+  }): LabTelemetryRow {
+    const cleanRoutes = [...new Set(input.routesHit.map(r => redact(r)))]
+    const newLinesCovered = Number.isFinite(input.newLinesCovered) ? Math.max(0, Math.round(input.newLinesCovered)) : 0
+    const sinkEventsCount = Number.isFinite(input.sinkEventsCount) ? Math.max(0, Math.round(input.sinkEventsCount)) : 0
+    return this.db.insert(tables.labTelemetry).values({
+      id: randomUUID(),
+      runId: input.runId,
+      exchangeId: input.exchangeId,
+      traceId: input.traceId,
+      routesHit: cleanRoutes,
+      newLinesCovered,
+      sinkEventsCount,
+      hasUnhandledException: Boolean(input.hasUnhandledException),
+      artifactId: input.artifactId,
+      createdAt: Date.now(),
+    }).onConflictDoUpdate({
+      target: [tables.labTelemetry.runId, tables.labTelemetry.traceId],
+      set: {
+        exchangeId: input.exchangeId,
+        routesHit: cleanRoutes,
+        newLinesCovered,
+        sinkEventsCount,
+        hasUnhandledException: Boolean(input.hasUnhandledException),
+        artifactId: input.artifactId,
+      },
+    }).returning().get()
+  }
+
+  listLabTelemetry(runId: string): LabTelemetryRow[] {
+    return this.db.select().from(tables.labTelemetry).where(eq(tables.labTelemetry.runId, runId))
+      .orderBy(desc(tables.labTelemetry.createdAt)).all()
+  }
+
+  insertBenchmarkRun(input: {
+    id?: string
+    suite: string
+    gitSha: string
+    modelRoutingConfig?: Record<string, unknown>
+    targetsTotal: number
+    confirmedCount: number
+    falsePositiveCount: number
+    funnelCounts: BenchmarkFunnel
+    failureTaxonomy: Record<FailureTaxonomyBucket, number>
+    totalCostUsd?: number
+    durationMs?: number
+  }): BenchmarkRunRow {
+    const cleanRouting = input.modelRoutingConfig
+      ? redactJsonValue(input.modelRoutingConfig)
+      : {}
+    const nonNegInt = (v: number | undefined) =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0
+    const nonNegNum = (v: number | undefined) =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.max(0, v) : 0
+    return this.db.insert(tables.benchmarkRuns).values({
+      id: input.id ?? randomUUID(),
+      suite: input.suite,
+      gitSha: input.gitSha,
+      modelRoutingConfig: cleanRouting,
+      targetsTotal: nonNegInt(input.targetsTotal),
+      confirmedCount: nonNegInt(input.confirmedCount),
+      falsePositiveCount: nonNegInt(input.falsePositiveCount),
+      funnelCounts: input.funnelCounts,
+      failureTaxonomy: input.failureTaxonomy,
+      totalCostUsd: nonNegNum(input.totalCostUsd),
+      durationMs: nonNegInt(input.durationMs),
+      createdAt: Date.now(),
+    }).returning().get()
+  }
+
+  listBenchmarkRuns(suite?: string, limit = 50): BenchmarkRunRow[] {
+    const capped = typeof limit === 'number' && Number.isFinite(limit)
+      ? Math.min(Math.max(1, Math.round(limit)), 500)
+      : 50
+    const query = suite
+      ? this.db.select().from(tables.benchmarkRuns).where(eq(tables.benchmarkRuns.suite, suite))
+      : this.db.select().from(tables.benchmarkRuns)
+    return query.orderBy(desc(tables.benchmarkRuns.createdAt)).limit(capped).all()
+  }
+
+  getLatestBenchmarkRun(suite: string): BenchmarkRunRow | null {
+    return this.db.select().from(tables.benchmarkRuns).where(eq(tables.benchmarkRuns.suite, suite))
+      .orderBy(desc(tables.benchmarkRuns.createdAt)).limit(1).get() ?? null
+  }
+
+  updateRunPhase0Completed(runId: string, ts = Date.now()): Run {
+    const updated = this.updateRun(runId, { phase0CompletedAt: ts })
+    this.event(runId, 'phase0.completed', 'Phase-0 deterministic surface mapping completed.', {
+      phase0CompletedAt: ts,
+    })
+    return updated
+  }
+
+  updateRunDynamicStepBudget(runId: string, budget: number | null): Run {
+    if (budget === null) return this.updateRun(runId, { dynamicStepBudget: null })
+    if (!Number.isFinite(budget)) {
+      if (budget === Infinity) return this.updateRun(runId, { dynamicStepBudget: 300 })
+      if (budget === -Infinity) return this.updateRun(runId, { dynamicStepBudget: 1 })
+      return this.run(runId)
+    }
+    const clamped = Math.max(1, Math.min(300, Math.round(budget)))
+    return this.updateRun(runId, { dynamicStepBudget: clamped })
   }
 }
 

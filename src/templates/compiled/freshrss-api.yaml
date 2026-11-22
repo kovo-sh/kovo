@@ -1,0 +1,30 @@
+id: "freshrss-api"
+name: "FreshRSS Google Reader API Exposure"
+severity: "low"
+description: "Detected an exposed FreshRSS instance with the Google Reader API enabled, which could have allowed unauthorized access to RSS feeds and user-related data via accessible API endpoints."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "freshrss"
+  - "google"
+  - "api"
+  - "vuln"
+reference: "https://freshrss.github.io/FreshRSS/en/developers/06_GoogleReader_API.html"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "FreshRSS API endpoints"
+      - "Google Reader compatible API"
+  - type: "status"
+    status:
+      - 200

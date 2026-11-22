@@ -1,0 +1,30 @@
+id: "ws-ftp-ini"
+name: "WS FTP File Disclosure"
+severity: "low"
+description: "WS FTP file is disclosed."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "ftp"
+  - "files"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ws_ftp.ini"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "HOST="
+      - "UID="
+      - "DIR="
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,35 @@
+id: "springboot-gateway"
+name: "Detect Spring Gateway Actuator"
+severity: "medium"
+description: "Sensitive environment variables may not be masked"
+tech:
+  - "springboot"
+  - "actuator"
+tags:
+  - "springboot"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+reference: "https://wya.pl/2021/12/20/bring-your-own-ssrf-the-gateway-actuator/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/gateway/routes"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "predicate"
+      - "route_id"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

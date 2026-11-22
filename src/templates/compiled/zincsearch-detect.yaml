@@ -1,0 +1,32 @@
+id: "zincsearch-detect"
+name: "ZincSearch - Detect"
+severity: "info"
+description: "ZincSearch, a lightweight search engine written in Go, was detected."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "zincsearch"
+  - "search"
+  - "detect"
+reference: "https://github.com/zincsearch/zincsearch"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>ZincSearch</title>"
+  - type: "regex"
+    part: "body"
+    regex:
+      - "\\./assets/index[.-][A-Za-z0-9_-]+\\.js"
+  - type: "status"
+    status:
+      - 200

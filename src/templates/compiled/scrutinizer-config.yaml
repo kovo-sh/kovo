@@ -1,0 +1,32 @@
+id: "scrutinizer-config"
+name: "Scrutinizer Config - Detect"
+severity: "info"
+description: "Scrutinizer configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "scrutinizer"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://scrutinizer-ci.com/docs/configuration"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.scrutinizer.yml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "build:"
+      - "filter:"
+      - "tools:"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,28 @@
+id: "accellion-detect"
+name: "Accellion - Detect"
+severity: "info"
+description: "Dectection of Accellion File Transfer Appliance."
+tech:
+  - "generic"
+tags:
+  - "accellion"
+  - "tech"
+  - "detect"
+  - "discovery"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/cfadmin/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "/cfadmin/img/accellion-logo.png"
+      - "secured by accellion"
+  - type: "status"
+    status:
+      - 200

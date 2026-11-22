@@ -1,0 +1,34 @@
+id: "fastcgi-echo"
+name: "FastCGI Echo Endpoint Script - Detect"
+severity: "info"
+description: "FastCGI echo endpoint script was detected, which lists several kinds of sensitive information such as port numbers, server software versions, port numbers, and IP addresses."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "logs"
+  - "oracle"
+  - "fastcgi"
+  - "edb"
+  - "vuln"
+reference: "https://www.exploit-db.com/ghdb/183"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/fcgi-bin/echo"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>FastCGI echo</title>"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

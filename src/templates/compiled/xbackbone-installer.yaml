@@ -1,0 +1,28 @@
+id: "xbackbone-installer"
+name: "XBackBone Installer - Exposure"
+severity: "high"
+description: "Checks for the presence of a XBackBone Installer."
+tech:
+  - "generic"
+tags:
+  - "install"
+  - "xbackbone"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>XBackBone Installer</title>"
+  - type: "status"
+    status:
+      - 200

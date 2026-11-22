@@ -1,0 +1,37 @@
+id: "redmine-issues-exposure"
+name: "Redmine Issues - Exposure"
+severity: "medium"
+description: "Redmine instance exposed issues via the REST API without authentication. This could have leaked sensitive project information, issue details, and user data."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "redmine"
+  - "exposure"
+  - "disclosure"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.redmine.org/projects/redmine/wiki/rest_api"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/issues.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"issues\":"
+      - "\"total_count\":"
+      - "\"project\":"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

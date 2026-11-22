@@ -1,0 +1,36 @@
+id: "springboot-caches"
+name: "Springboot Actuator Caches"
+severity: "low"
+description: "The caches endpoint provides access to the application's caches."
+tech:
+  - "springboot"
+  - "actuator"
+tags:
+  - "misconfig"
+  - "springboot"
+  - "exposure"
+  - "vuln"
+reference: "https://docs.spring.io/spring-boot/docs/current/actuator-api/htmlsingle/#caches"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/caches"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "cacheManagers"
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+      - "application/vnd.spring-boot.actuator"
+      - "application/vnd.spring-boot.actuator.v1+json"
+      - "application/vnd.spring-boot.actuator.v2+json"
+  - type: "status"
+    status:
+      - 200

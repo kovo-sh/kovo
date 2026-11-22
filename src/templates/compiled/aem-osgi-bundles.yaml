@@ -1,0 +1,30 @@
+id: "aem-osgi-bundles"
+name: "Adobe AEM Installed OSGI Bundles"
+severity: "low"
+description: "Adobe AEM Installed OSGI Bundles leaked."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "aem"
+  - "adobe"
+  - "vuln"
+reference: "https://www.slideshare.net/0ang3el/hacking-aem-sites"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/bin.tidy.infinity.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"jcr:primaryType\":"
+      - "\"jcr:uuid\":"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

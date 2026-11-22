@@ -1,0 +1,253 @@
+rules:
+- id: awscdk-bucket-encryption
+  message: 'Add "encryption: $Y.BucketEncryption.KMS_MANAGED" or "encryption: $Y.BucketEncryption.S3_MANAGED"
+    to the bucket props for Bucket construct $X'
+  metadata:
+    cwe:
+    - 'CWE-311: Missing Encryption of Sensitive Data'
+    category: security
+    technology:
+    - AWS-CDK
+    references:
+    - https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A04:2021 - Insecure Design
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - typescript
+  severity: ERROR
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'import {Bucket} from ''@aws-cdk/aws-s3''
+
+        ...
+
+        '
+    - pattern: const $X = new Bucket(...)
+    - pattern-not: 'const $X = new Bucket(..., {..., encryption: BucketEncryption.KMS_MANAGED,
+        ...})
+
+        '
+    - pattern-not: 'const $X = new Bucket(..., {..., encryption: BucketEncryption.KMS,
+        ...})
+
+        '
+    - pattern-not: 'const $X = new Bucket(..., {..., encryption: BucketEncryption.S3_MANAGED,
+        ...})
+
+        '
+  - patterns:
+    - pattern-inside: 'import * as $Y from ''@aws-cdk/aws-s3''
+
+        ...
+
+        '
+    - pattern: const $X = new $Y.Bucket(...)
+    - pattern-not: 'const $X = new $Y.Bucket(..., {..., encryption: $Y.BucketEncryption.KMS_MANAGED,
+        ...})
+
+        '
+    - pattern-not: 'const $X = new $Y.Bucket(..., {..., encryption: $Y.BucketEncryption.KMS,
+        ...})
+
+        '
+    - pattern-not: 'const $X = new $Y.Bucket(..., {..., encryption: $Y.BucketEncryption.S3_MANAGED,
+        ...})
+
+        '
+- id: aws-cdk-bucket-enforcessl
+  message: Bucket $X is not set to enforce encryption-in-transit, if not explictly
+    setting this on the bucket policy - the property "enforceSSL" should be set to
+    true
+  metadata:
+    cwe:
+    - 'CWE-319: Cleartext Transmission of Sensitive Information'
+    category: security
+    technology:
+    - AWS-CDK
+    references:
+    - https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A02:2021 - Cryptographic Failures
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - ts
+  severity: ERROR
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'import {Bucket} from ''@aws-cdk/aws-s3'';
+
+        ...
+
+        '
+    - pattern: const $X = new Bucket(...)
+    - pattern-not: 'const $X = new Bucket(..., {enforceSSL: true}, ...)
+
+        '
+  - patterns:
+    - pattern-inside: 'import * as $Y from ''@aws-cdk/aws-s3'';
+
+        ...
+
+        '
+    - pattern: const $X = new $Y.Bucket(...)
+    - pattern-not: 'const $X = new $Y.Bucket(..., {..., enforceSSL: true, ...})
+
+        '
+- id: awscdk-sqs-unencryptedqueue
+  message: 'Queue $X is missing encryption at rest. Add "encryption: $Y.QueueEncryption.KMS"
+    or "encryption: $Y.QueueEncryption.KMS_MANAGED" to the queue props to enable encryption
+    at rest for the queue.'
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-311: Missing Encryption of Sensitive Data'
+    technology:
+    - AWS-CDK
+    references:
+    - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-data-protection.html
+    owasp:
+    - A03:2017 - Sensitive Data Exposure
+    - A04:2021 - Insecure Design
+    subcategory:
+    - vuln
+    likelihood: LOW
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - ts
+  severity: WARNING
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'import {Queue} from ''@aws-cdk/aws-sqs''
+
+        ...
+
+        '
+    - pattern: const $X = new Queue(...)
+    - pattern-not: 'const $X = new Queue(..., {..., encryption: QueueEncryption.KMS_MANAGED,
+        ...})
+
+        '
+    - pattern-not: 'const $X = new Queue(..., {..., encryption: QueueEncryption.KMS,
+        ...})
+
+        '
+  - patterns:
+    - pattern-inside: 'import * as $Y from ''@aws-cdk/aws-sqs''
+
+        ...
+
+        '
+    - pattern: const $X = new $Y.Queue(...)
+    - pattern-not: 'const $X = new $Y.Queue(..., {..., encryption: $Y.QueueEncryption.KMS_MANAGED,
+        ...})
+
+        '
+    - pattern-not: 'const $X = new $Y.Queue(..., {..., encryption: $Y.QueueEncryption.KMS,
+        ...})
+
+        '
+- id: awscdk-bucket-grantpublicaccessmethod
+  message: Using the GrantPublicAccess method on bucket contruct $X will make the
+    objects in the bucket world accessible. Verify if this is intentional.
+  metadata:
+    cwe:
+    - 'CWE-306: Missing Authentication for Critical Function'
+    category: security
+    technology:
+    - AWS-CDK
+    references:
+    - https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-overview.html
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: HIGH
+    confidence: MEDIUM
+  languages:
+  - ts
+  severity: WARNING
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'import {Bucket} from ''@aws-cdk/aws-s3''
+
+        ...
+
+        '
+    - pattern: 'const $X = new Bucket(...)
+
+        ...
+
+        $X.grantPublicAccess(...)
+
+        '
+  - patterns:
+    - pattern-inside: 'import * as $Y from ''@aws-cdk/aws-s3''
+
+        ...
+
+        '
+    - pattern: 'const $X = new $Y.Bucket(...)
+
+        ...
+
+        $X.grantPublicAccess(...)
+
+        '
+- id: awscdk-codebuild-project-public
+  message: CodeBuild Project $X is set to have a public URL. This will make the build
+    results, logs, artifacts publically accessible, including builds prior to the
+    project being public. Ensure this is acceptable for the project.
+  metadata:
+    category: security
+    cwe:
+    - 'CWE-306: Missing Authentication for Critical Function'
+    technology:
+    - AWS-CDK
+    references:
+    - https://docs.aws.amazon.com/codebuild/latest/userguide/public-builds.html
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - ts
+  severity: WARNING
+  pattern-either:
+  - patterns:
+    - pattern-inside: 'import {Project} from ''@aws-cdk/aws-codebuild''
+
+        ...
+
+        '
+    - pattern: 'const $X = new Project(..., {..., badge: true, ...})
+
+        '
+  - patterns:
+    - pattern-inside: 'import * as $Y from ''@aws-cdk/aws-codebuild''
+
+        ...
+
+        '
+    - pattern: 'const $X = new $Y.Project(..., {..., badge: true, ...})
+
+        '

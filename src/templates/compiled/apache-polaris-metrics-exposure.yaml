@@ -1,0 +1,31 @@
+id: "apache-polaris-metrics-exposure"
+name: "Apache Polaris - Information Disclosure"
+severity: "medium"
+description: "Detects a Apache Polaris server, the interoperable, open source catalog for Apache Iceberg."
+tech:
+  - "apache"
+tags:
+  - "apache"
+  - "polaris"
+  - "exposure"
+  - "metrics"
+  - "misconfig"
+reference: "https://github.com/apache/polaris"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/q/metrics"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "application=\"Polaris\""
+      - "org.apache.polaris"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

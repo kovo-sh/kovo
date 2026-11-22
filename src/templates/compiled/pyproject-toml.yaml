@@ -1,0 +1,36 @@
+id: "pyproject-toml"
+name: "pyproject.toml Configuration - Detect"
+severity: "info"
+description: "pyproject.toml configuration was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "pyproject"
+  - "pip"
+  - "devops"
+  - "cicd"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://pip.pypa.io/en/stable/reference/build-system/pyproject-toml/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pyproject.toml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "[tool.black]"
+      - "exclude ="
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "[tool.poetry]"
+      - "name ="
+    condition: "and"

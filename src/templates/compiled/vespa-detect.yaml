@@ -1,0 +1,30 @@
+id: "vespa-detect"
+name: "Vespa - Detect"
+severity: "info"
+description: "Vespa, an open-source big-data serving engine used for low-latency search, recommendation, and vector/embedding retrieval, increasingly deployed as the retrieval backend in AI and RAG (retrieval-augmented generation) pipelines, was detected. Exposed config-server or container endpoints could have leaked application deployment metadata, cluster status, and version information, and may have allowed unauthenticated access to indexed/vectorized data if the query API was left open."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "vespa"
+  - "ai"
+  - "vector-db"
+  - "search"
+  - "detect"
+  - "discovery"
+reference: "https://vespa.ai/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/ApplicationStatus"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"vespa\""
+      - "\"version\""
+    condition: "and"

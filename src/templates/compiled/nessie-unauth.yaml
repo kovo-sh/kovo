@@ -1,0 +1,40 @@
+id: "nessie-unauth"
+name: "Project Nessie - Unauthenticated API Access"
+severity: "high"
+description: "Project Nessie ships with nessie.server.authentication.enabled=false by default, so every request to the Nessie REST API is served as anonymous. An unauthenticated GET /api/v2/trees returns all branches and tags with their commit hashes, and the same access allows creating commits, merging, reassigning and deleting references of the data lakehouse catalog."
+tech:
+  - "generic"
+tags:
+  - "nessie"
+  - "iceberg"
+  - "exposure"
+  - "misconfig"
+  - "unauth"
+cwe: "CWE-306"
+reference: "https://projectnessie.org/nessie-latest/authentication/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api/v2/trees"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"references\""
+      - "\"hasMore\""
+    condition: "and"
+  - type: "regex"
+    part: "body"
+    regex:
+      - "\"type\"\\s*:\\s*\"(BRANCH|TAG)\""
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

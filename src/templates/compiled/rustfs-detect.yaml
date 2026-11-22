@@ -1,0 +1,29 @@
+id: "rustfs-detect"
+name: "Rustfs - Detect"
+severity: "info"
+description: "Detects a Rustfs server, a high-performance, distributed object storage system built in Rust."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "rustfs"
+  - "detect"
+reference: "https://github.com/rustfs/rustfs"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rustfs/console/auth/login"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>RustFS</title>"
+      - "title\":\"RustFS"
+      - "/rustfs/console/_nuxt"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,30 @@
+id: "aqua-enterprise-detect"
+name: "Aqua Enterprise Detect"
+severity: "info"
+description: "Safe check derived from aqua-enterprise-detect: Aqua Enterprise Detect"
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "aqua"
+  - "discovery"
+reference: "https://www.aquasec.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/api"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "\"version\""
+      - "\"enable_sso\""
+      - "\"num_protected_kube_nodes\""
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

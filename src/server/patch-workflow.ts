@@ -10,6 +10,7 @@ import type { Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { applyUnifiedDiffToDirectory } from './lab-runner.ts'
 import type { LabRunner } from './lab-runner.ts'
+import { isProfileHealthy, resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { providerPool } from './provider.ts'
 import type { UsageCallback } from './provider.ts'
@@ -175,12 +176,17 @@ function makeFreshProviderCall(
   options: { signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback },
 ): PatchLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
-    const { models, model } = providerPool(profiles, scenario, {
+    const routed = resolveProfilePoolForRole('reasoning', profiles)
+    const now = Date.now()
+    const primary = routed.find(p => isProfileHealthy(p, now)) ?? routed[0]
+    const effectiveThinking = primary?.thinkingLevel === 'off' ? 'off' : 'high'
+    const { models, model } = providerPool(routed, scenario, {
       signal: options.signal,
       secrets: options.secrets,
       onUsage: options.onUsage,
       maxCalls: 2,
-      thinkingLevel: 'medium',
+      thinkingLevel: effectiveThinking,
+      roleAffinity: 'reasoning',
       firstEventTimeoutMs: 60_000,
       idleTimeoutMs: 60_000,
       totalTimeoutMs: 120_000,

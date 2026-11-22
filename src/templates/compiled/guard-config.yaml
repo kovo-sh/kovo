@@ -1,0 +1,32 @@
+id: "guard-config"
+name: "Guardfile Config - Detect"
+severity: "info"
+description: "Guardfile configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "exposure"
+  - "file"
+  - "guard"
+  - "config"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://github.com/guard/guard"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/Guardfile"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "guard :"
+      - "end"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

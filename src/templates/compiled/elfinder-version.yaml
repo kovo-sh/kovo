@@ -1,0 +1,31 @@
+id: "elfinder-version"
+name: "elFinder Version - Detect"
+severity: "info"
+description: "Detects elFinder installations and extracts the version string from the bundled elfinder.min.js or elFinder.version.js files. This template only identifies the version and does not check for any vulnerability."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "elfinder"
+  - "oss"
+  - "version"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/Studio-42/elFinder/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/js/elfinder.min.js"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "elFinder - file manager for web"
+      - "elFinder.prototype.version ="
+  - type: "status"
+    status:
+      - 200

@@ -1,0 +1,29 @@
+id: "mongod-exposure"
+name: "MongoD Server - Exposure"
+severity: "low"
+description: "Safe check derived from mongod-exposure: MongoD Server - Exposure"
+tech:
+  - "generic"
+tags:
+  - "mongod"
+  - "exposure"
+  - "info-leak"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>mongod"
+      - "List all commands"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

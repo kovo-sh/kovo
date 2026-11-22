@@ -1,0 +1,35 @@
+id: "prestashop-installer"
+name: "Prestashop Installer Exposure"
+severity: "high"
+description: "Prestashop is susceptible to the Installation page exposure due to misconfiguration."
+tech:
+  - "php"
+tags:
+  - "misconfig"
+  - "prestashop"
+  - "exposure"
+  - "install"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/install/index.php"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<title>PrestaShop Installation Assistant</title>"
+      - "<li>System configuration</li>"
+      - "<li>Store installation</li>"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

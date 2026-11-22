@@ -1,0 +1,32 @@
+id: "ibm-websphere-xml"
+name: "IBM WebSphere Application - Source File Exposure"
+severity: "medium"
+description: "Disclose application specific files contained within the war file, including files under the web-inf and meta-inf directories."
+tech:
+  - "generic"
+tags:
+  - "ibm"
+  - "websphere"
+  - "exposure"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-219"
+reference: "https://www.acunetix.com/vulnerabilities/web/ibm-websphere-weblogic-application-source-file-exposure/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/iojs/%2e/WEB-INF/web.xml"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "</web-app>"
+      - "<servlet>"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

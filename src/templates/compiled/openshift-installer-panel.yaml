@@ -1,0 +1,33 @@
+id: "openshift-installer-panel"
+name: "OpenShift Assisted Installer Panel - Detect"
+severity: "medium"
+description: "OpenShift Assisted Installer panel was detected."
+tech:
+  - "generic"
+tags:
+  - "panel"
+  - "openshift"
+  - "cluster"
+  - "misconfig"
+  - "vuln"
+cwe: "CWE-284"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/clusters"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "OpenShift Assisted Installer"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

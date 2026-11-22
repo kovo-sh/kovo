@@ -1,0 +1,642 @@
+rules:
+- id: dangerous-asyncio-create-exec
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $CMD
+    - pattern-either:
+      - pattern: asyncio.create_subprocess_exec($PROG, $CMD, ...)
+      - pattern: asyncio.create_subprocess_exec($PROG, [$CMD, ...], ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec($PROG, $CMD, ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec($PROG, [$CMD, ...], ...)
+      - pattern: asyncio.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", $CMD, ...)
+      - pattern: asyncio.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", $CMD, ...], ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec($PROG, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", $CMD, ...)
+      - pattern: asyncio.subprocess.create_subprocess_exec($PROG, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", $CMD, ...], ...)
+  message: Detected 'create_subprocess_exec' function with argument tainted by `event`
+    object. If this data can be controlled by a malicious actor, it may be an instance
+    of command injection. Audit the use of this call to ensure it is not controllable
+    by an external resource. You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec
+    - https://docs.python.org/3/library/shlex.html
+    category: security
+    technology:
+    - python
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-exec
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $CMD
+    - pattern-either:
+      - pattern: $LOOP.subprocess_exec($PROTOCOL, $CMD, ...)
+      - pattern: $LOOP.subprocess_exec($PROTOCOL, [$CMD, ...], ...)
+      - pattern: $LOOP.subprocess_exec($PROTOCOL, "=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", $CMD, ...)
+      - pattern: $LOOP.subprocess_exec($PROTOCOL, ["=~/(sh|bash|ksh|csh|tcsh|zsh)/",
+          "-c", $CMD, ...], ...)
+  message: Detected subprocess function '$LOOP.subprocess_exec' with argument tainted
+    by `event` object. If this data can be controlled by a malicious actor, it may
+    be an instance of command injection. Audit the use of this call to ensure it is
+    not controllable by an external resource. You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.subprocess_exec
+    - https://docs.python.org/3/library/shlex.html
+    category: security
+    technology:
+    - python
+    - aws-lambda
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-asyncio-shell
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $CMD
+    - pattern-either:
+      - pattern: $LOOP.subprocess_shell($PROTOCOL, $CMD)
+      - pattern: asyncio.subprocess.create_subprocess_shell($CMD, ...)
+      - pattern: asyncio.create_subprocess_shell($CMD, ...)
+  message: Detected asyncio subprocess function with argument tainted by `event` object.
+    If this data can be controlled by a malicious actor, it may be an instance of
+    command injection. Audit the use of this call to ensure it is not controllable
+    by an external resource. You may consider using 'shlex.escape()'.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/asyncio-subprocess.html
+    - https://docs.python.org/3/library/shlex.html
+    category: security
+    technology:
+    - python
+    - aws-lambda
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+- id: dangerous-spawn-process
+  mode: taint
+  message: Detected `os` function with argument tainted by `event` object. This is
+    dangerous if external data can reach this function call because it allows a malicious
+    actor to execute commands. Ensure no external data reaches here.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b605_start_process_with_a_shell.html
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    - aws-lambda
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $CMD
+    - pattern-either:
+      - patterns:
+        - pattern: os.$METHOD($MODE, $CMD, ...)
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (spawnl|spawnle|spawnlp|spawnlpe|spawnv|spawnve|spawnvp|spawnvp|spawnvpe|posix_spawn|posix_spawnp|startfile)
+      - patterns:
+        - pattern-inside: os.$METHOD($MODE, $BASH, ["-c", $CMD,...],...)
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (spawnv|spawnve|spawnvp|spawnvp|spawnvpe|posix_spawn|posix_spawnp)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+      - patterns:
+        - pattern-inside: os.$METHOD($MODE, $BASH, "-c", $CMD,...)
+        - metavariable-regex:
+            metavariable: $METHOD
+            regex: (spawnl|spawnle|spawnlp|spawnlpe)
+        - metavariable-regex:
+            metavariable: $BASH
+            regex: (.*)(sh|bash|ksh|csh|tcsh|zsh)
+- id: dangerous-subprocess-use
+  mode: taint
+  message: Detected subprocess function with argument tainted by an `event` object.  If
+    this data can be controlled by a malicious actor, it may be an instance of command
+    injection. The default option for `shell` is False, and this is secure by default.
+    Consider removing the `shell=True` or setting it to False explicitely. Using `shell=False`
+    means you have to split the command string into an array of strings for the command
+    and its arguments. You may consider using 'shlex.split()' for this purpose.
+  metadata:
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.3.8 OS Command Injection
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v53-output-encoding-and-injection-prevention-requirements
+      version: '4'
+    references:
+    - https://docs.python.org/3/library/subprocess.html
+    - https://docs.python.org/3/library/shlex.html
+    category: security
+    technology:
+    - python
+    - aws-lambda
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - pattern: subprocess.$FUNC(..., shell=True, ...)
+  pattern-sanitizers:
+  - pattern: shlex.split(...)
+  - pattern: pipes.quote(...)
+  - pattern: shlex.quote(...)
+- id: dangerous-system-call
+  mode: taint
+  message: Detected `os` function with argument tainted by `event` object. This is
+    dangerous if external data can reach this function call because it allows a malicious
+    actor to execute commands. Use the 'subprocess' module instead, which is easier
+    to use without accidentally exposing a command injection vulnerability.
+  metadata:
+    source-rule-url: https://bandit.readthedocs.io/en/latest/plugins/b605_start_process_with_a_shell.html
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (''OS
+      Command Injection'')'
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.2.4 Dyanmic Code Execution Features
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v52-sanitization-and-sandboxing-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: ERROR
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $CMD
+    - pattern-either:
+      - pattern: os.system($CMD,...)
+      - pattern: os.popen($CMD,...)
+      - pattern: os.popen2($CMD,...)
+      - pattern: os.popen3($CMD,...)
+      - pattern: os.popen4($CMD,...)
+- id: dynamodb-filter-injection
+  mode: taint
+  metadata:
+    cwe:
+    - 'CWE-943: Improper Neutralization of Special Elements in Data Query Logic'
+    owasp:
+    - A01:2017 - Injection
+    category: security
+    technology:
+    - python
+    - boto3
+    - aws-lambda
+    - dynamodb
+    references:
+    - https://medium.com/appsecengineer/dynamodb-injection-1db99c2454ac
+    subcategory:
+    - vuln
+    impact: MEDIUM
+    likelihood: MEDIUM
+    confidence: MEDIUM
+  message: Detected DynamoDB query filter that is tainted by `$EVENT` object. This
+    could lead to NoSQL injection if the variable is user-controlled and not properly
+    sanitized. Explicitly assign query params instead of passing data from `$EVENT`
+    directly to DynamoDB client.
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sanitizers:
+  - patterns:
+    - pattern: '{...}
+
+        '
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $SINK
+    - pattern-either:
+      - pattern: $TABLE.scan(..., ScanFilter = $SINK, ...)
+      - pattern: $TABLE.query(..., QueryFilter = $SINK, ...)
+    - pattern-either:
+      - patterns:
+        - pattern-inside: '$TABLE = $DB.Table(...)
+
+            ...
+
+            '
+        - pattern-inside: '$DB = boto3.resource(''dynamodb'', ...)
+
+            ...
+
+            '
+      - pattern-inside: '$TABLE = boto3.client(''dynamodb'', ...)
+
+          ...
+
+          '
+  severity: ERROR
+  languages:
+  - python
+- id: psycopg-sqli
+  languages:
+  - python
+  message: 'Detected SQL statement that is tainted by `event` object. This could lead
+    to SQL injection if the variable is user-controlled and not properly sanitized.
+    In order to prevent SQL injection, use parameterized queries or prepared statements
+    instead. You can use parameterized statements like so: `cursor.execute(''SELECT
+    * FROM projects WHERE status = %s'', ''active'')`'
+  mode: taint
+  metadata:
+    references:
+    - https://www.psycopg.org/docs/cursor.html#cursor.execute
+    - https://www.psycopg.org/docs/cursor.html#cursor.executemany
+    - https://www.psycopg.org/docs/cursor.html#cursor.mogrify
+    category: security
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    technology:
+    - aws-lambda
+    - psycopg
+    - psycopg2
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $QUERY
+    - pattern-either:
+      - pattern: $CURSOR.execute($QUERY,...)
+      - pattern: $CURSOR.executemany($QUERY,...)
+      - pattern: $CURSOR.mogrify($QUERY,...)
+    - pattern-inside: 'import psycopg2
+
+        ...
+
+        '
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  severity: WARNING
+- id: pymssql-sqli
+  languages:
+  - python
+  message: 'Detected SQL statement that is tainted by `event` object. This could lead
+    to SQL injection if the variable is user-controlled and not properly sanitized.
+    In order to prevent SQL injection, use parameterized queries or prepared statements
+    instead. You can use parameterized statements like so: `cursor.execute(''SELECT
+    * FROM projects WHERE status = %s'', ''active'')`'
+  mode: taint
+  metadata:
+    references:
+    - https://pypi.org/project/pymssql/
+    category: security
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    technology:
+    - aws-lambda
+    - pymssql
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $QUERY
+    - pattern: $CURSOR.execute($QUERY,...)
+    - pattern-inside: 'import pymssql
+
+        ...
+
+        '
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  severity: WARNING
+- id: pymysql-sqli
+  languages:
+  - python
+  message: 'Detected SQL statement that is tainted by `event` object. This could lead
+    to SQL injection if the variable is user-controlled and not properly sanitized.
+    In order to prevent SQL injection, use parameterized queries or prepared statements
+    instead. You can use parameterized statements like so: `cursor.execute(''SELECT
+    * FROM projects WHERE status = %s'', (''active''))`'
+  mode: taint
+  metadata:
+    references:
+    - https://pypi.org/project/PyMySQL/#id4
+    category: security
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    technology:
+    - aws-lambda
+    - pymysql
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $QUERY
+    - pattern: $CURSOR.execute($QUERY,...)
+    - pattern-either:
+      - pattern-inside: 'import pymysql
+
+          ...
+
+          '
+      - pattern-inside: 'import pymysql.cursors
+
+          ...
+
+          '
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  severity: WARNING
+- id: sqlalchemy-sqli
+  languages:
+  - python
+  message: 'Detected SQL statement that is tainted by `event` object. This could lead
+    to SQL injection if the variable is user-controlled and not properly sanitized.
+    In order to prevent SQL injection, use parameterized queries or prepared statements
+    instead. You can use parameterized statements like so: `cursor.execute(''SELECT
+    * FROM projects WHERE status = ?'', ''active'')`'
+  mode: taint
+  metadata:
+    references:
+    - https://docs.sqlalchemy.org/en/14/core/connections.html#sqlalchemy.engine.Connection.execute
+    category: security
+    owasp:
+    - A01:2017 - Injection
+    - A03:2021 - Injection
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command
+      (''SQL Injection'')'
+    technology:
+    - aws-lambda
+    - sqlalchemy
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: HIGH
+    impact: MEDIUM
+    confidence: MEDIUM
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $QUERY
+    - pattern: $CURSOR.execute($QUERY,...)
+    - pattern-inside: 'import sqlalchemy
+
+        ...
+
+        '
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  severity: WARNING
+- id: tainted-code-exec
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: eval($CODE, ...)
+      - pattern: exec($CODE, ...)
+  message: Detected the use of `exec/eval`.This can be dangerous if used to evaluate
+    dynamic content. If this content can be input from outside the program, this may
+    be a code injection vulnerability. Ensure evaluated content is not definable by
+    external sources.
+  metadata:
+    cwe:
+    - 'CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code
+      (''Eval Injection'')'
+    owasp:
+    - A03:2021 - Injection
+    asvs:
+      section: 'V5: Validation, Sanitization and Encoding Verification Requirements'
+      control_id: 5.2.4 Dyanmic Code Execution Features
+      control_url: https://github.com/OWASP/ASVS/blob/master/4.0/en/0x13-V5-Validation-Sanitization-Encoding.md#v52-sanitization-and-sandboxing-requirements
+      version: '4'
+    category: security
+    technology:
+    - python
+    license: Commons Clause License Condition v1.0[LGPL-2.1-only]
+    references:
+    - https://owasp.org/Top10/A03_2021-Injection
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING
+- id: tainted-pickle-deserialization
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: event
+    - pattern-inside: "def $HANDLER(event, context):\n  ...\n"
+  pattern-sinks:
+  - patterns:
+    - focus-metavariable: $SINK
+    - pattern-either:
+      - pattern: pickle.load($SINK,...)
+      - pattern: pickle.loads($SINK,...)
+      - pattern: _pickle.load($SINK,...)
+      - pattern: _pickle.loads($SINK,...)
+      - pattern: cPickle.load($SINK,...)
+      - pattern: cPickle.loads($SINK,...)
+      - pattern: dill.load($SINK,...)
+      - pattern: dill.loads($SINK,...)
+      - pattern: shelve.open($SINK,...)
+  message: Avoid using `pickle`, which is known to lead to code execution vulnerabilities.
+    When unpickling, the serialized data could be manipulated to run arbitrary code.
+    Instead, consider serializing the relevant data as JSON or a similar text-based
+    serialization format.
+  metadata:
+    owasp:
+    - A08:2017 - Insecure Deserialization
+    - A08:2021 - Software and Data Integrity Failures
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    references:
+    - https://docs.python.org/3/library/pickle.html
+    - https://davidhamann.de/2020/04/05/exploiting-python-pickle/
+    category: security
+    technology:
+    - python
+    - aws-lambda
+    cwe2022-top25: true
+    cwe2021-top25: true
+    subcategory:
+    - vuln
+    likelihood: MEDIUM
+    impact: MEDIUM
+    confidence: MEDIUM
+  languages:
+  - python
+  severity: WARNING

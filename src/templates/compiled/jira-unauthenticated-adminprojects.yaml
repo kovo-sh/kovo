@@ -1,0 +1,34 @@
+id: "jira-unauthenticated-adminprojects"
+name: "Jira Unauthenticated Admin Projects"
+severity: "info"
+description: "Safe check derived from jira-unauthenticated-adminprojects: Jira Unauthenticated Admin Projects"
+tech:
+  - "generic"
+tags:
+  - "atlassian"
+  - "jira"
+  - "vuln"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/rest/menu/latest/admin"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "key"
+      - "link"
+      - "label"
+      - "self"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200
+  - type: "word"
+    part: "header"
+    words:
+      - "atlassian.xsrf.token"

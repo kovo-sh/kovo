@@ -1,0 +1,30 @@
+{
+  "source": "https://github.com/opengrep/opengrep-rules",
+  "commitSha": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+  "existingAndGuardianRules": 39,
+  "curatedCommunityRules": 1474,
+  "totalRules": 1513,
+  "yamlFiles": 137,
+  "byLanguage": {
+    "bash": 2,
+    "c": 12,
+    "csharp": 42,
+    "dockerfile": 7,
+    "generic": 247,
+    "go": 63,
+    "html": 2,
+    "java": 106,
+    "javascript": 160,
+    "php": 57,
+    "problem-based-packs": 27,
+    "python": 237,
+    "ruby": 78,
+    "rust": 10,
+    "scala": 23,
+    "solidity": 35,
+    "swift": 3,
+    "terraform": 262,
+    "typescript": 18,
+    "yaml": 83
+  }
+}

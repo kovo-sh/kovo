@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
+import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { providerPool } from './provider.ts'
 import type { UsageCallback } from './provider.ts'
@@ -667,12 +668,14 @@ export function createProviderLlmCall(
   } = {},
 ): SemanticDedupeLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
-    const { models, model } = providerPool(profiles, options.scenario ?? 'dedupe-judge', {
+    const routed = resolveProfilePoolForRole('fast', profiles)
+    const { models, model } = providerPool(routed, options.scenario ?? 'dedupe-judge', {
       signal: options.signal,
       secrets: options.secrets,
       onUsage: options.onUsage,
       maxCalls: 2,
       thinkingLevel: 'off',
+      roleAffinity: 'fast',
       firstEventTimeoutMs: 30_000,
       idleTimeoutMs: 30_000,
       totalTimeoutMs: 45_000,

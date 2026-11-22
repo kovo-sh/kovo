@@ -1,0 +1,32 @@
+id: "aem-dump-contentnode"
+name: "AEM Dump Content Node Properties"
+severity: "medium"
+description: "Node Properties are exposed in AEM Dump."
+tech:
+  - "node"
+tags:
+  - "misconfig"
+  - "aem"
+  - "adobe"
+  - "vuln"
+reference: "https://www.slideshare.net/0ang3el/hacking-aem-sites"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/content.infinity.json"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "\"rep:privileges\":["
+  - type: "word"
+    part: "header"
+    words:
+      - "application/json"
+  - type: "status"
+    status:
+      - 200

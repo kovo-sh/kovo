@@ -1,0 +1,256 @@
+rules:
+  - id: guardian.taint.js.express-sqli
+    languages: [javascript, typescript]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: HTTP request input flows into database query without parameterization."
+    metadata:
+      cwe: "CWE-89"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+      - pattern: $REQ.headers
+      - pattern: req.query.$X
+      - pattern: req.body.$X
+      - pattern: req.params.$X
+    pattern-sanitizers:
+      - pattern: parseInt(...)
+      - pattern: Number(...)
+      - pattern: Boolean(...)
+    pattern-sinks:
+      - pattern: $DB.query($SINK, ...)
+      - pattern: $DB.execute($SINK, ...)
+      - pattern: $DB.raw($SINK, ...)
+      - pattern: $PRISMA.$queryRawUnsafe($SINK, ...)
+      - pattern: $PRISMA.$executeRawUnsafe($SINK, ...)
+
+  - id: guardian.taint.js.cmd-exec
+    languages: [javascript, typescript]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: HTTP request input flows into OS command execution."
+    metadata:
+      cwe: "CWE-78"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sinks:
+      - pattern: exec($SINK, ...)
+      - pattern: execSync($SINK, ...)
+      - pattern: $CP.exec($SINK, ...)
+      - pattern: $CP.execSync($SINK, ...)
+
+  - id: guardian.taint.js.ssrf-fetch
+    languages: [javascript, typescript]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: HTTP request input flows into outbound fetch/axios URL."
+    metadata:
+      cwe: "CWE-918"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sanitizers:
+      - pattern: new URL(...)
+    pattern-sinks:
+      - pattern: fetch($SINK, ...)
+      - pattern: axios.get($SINK, ...)
+      - pattern: axios.post($SINK, ...)
+      - pattern: got($SINK, ...)
+
+  - id: guardian.taint.js.path-traversal
+    languages: [javascript, typescript]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: HTTP request input flows into filesystem path operation."
+    metadata:
+      cwe: "CWE-22"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sanitizers:
+      - pattern: path.basename(...)
+    pattern-sinks:
+      - pattern: fs.readFile($SINK, ...)
+      - pattern: fs.readFileSync($SINK, ...)
+      - pattern: fs.writeFile($SINK, ...)
+      - pattern: $RES.sendFile($SINK, ...)
+
+  - id: guardian.taint.js.open-redirect
+    languages: [javascript, typescript]
+    mode: taint
+    severity: WARNING
+    message: "Interprocedural taint: HTTP request input flows into HTTP redirect."
+    metadata:
+      cwe: "CWE-601"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sinks:
+      - pattern: $RES.redirect($SINK)
+      - pattern: NextResponse.redirect($SINK, ...)
+
+  - id: guardian.taint.js.dom-xss
+    languages: [javascript, typescript]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: untrusted message/URL input flows into DOM HTML sink."
+    metadata:
+      cwe: "CWE-79"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $EV.data
+      - pattern: window.location.search
+      - pattern: window.location.hash
+      - pattern: new URLSearchParams(...)
+    pattern-sanitizers:
+      - pattern: DOMPurify.sanitize(...)
+    pattern-sinks:
+      - pattern: $EL.innerHTML = $SINK
+      - pattern: $EL.outerHTML = $SINK
+      - pattern: document.write($SINK)
+
+  - id: guardian.taint.py.flask-sqli
+    languages: [python]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: Flask/Django/FastAPI request input flows into SQL execution."
+    metadata:
+      cwe: "CWE-89"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: request.args
+      - pattern: request.form
+      - pattern: request.json
+      - pattern: request.GET
+      - pattern: request.POST
+    pattern-sanitizers:
+      - pattern: int(...)
+    pattern-sinks:
+      - pattern: $CUR.execute($SINK, ...)
+      - pattern: $DB.session.execute($SINK, ...)
+
+  - id: guardian.taint.py.cmd-exec
+    languages: [python]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: web request input flows into OS command execution."
+    metadata:
+      cwe: "CWE-78"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: request.args
+      - pattern: request.form
+      - pattern: request.json
+      - pattern: request.GET
+      - pattern: request.POST
+    pattern-sinks:
+      - pattern: os.system($SINK)
+      - pattern: subprocess.run($SINK, ..., shell=True, ...)
+      - pattern: subprocess.Popen($SINK, ..., shell=True, ...)
+
+  - id: guardian.taint.py.ssrf
+    languages: [python]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: web request input flows into outbound HTTP client."
+    metadata:
+      cwe: "CWE-918"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: request.args
+      - pattern: request.form
+      - pattern: request.json
+      - pattern: request.GET
+    pattern-sinks:
+      - pattern: requests.get($SINK, ...)
+      - pattern: requests.post($SINK, ...)
+      - pattern: httpx.get($SINK, ...)
+      - pattern: urllib.request.urlopen($SINK, ...)
+
+  - id: guardian.taint.py.ssti
+    languages: [python]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: web request input flows into dynamic template rendering."
+    metadata:
+      cwe: "CWE-1336"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: request.args
+      - pattern: request.form
+      - pattern: request.json
+    pattern-sinks:
+      - pattern: render_template_string($SINK, ...)
+      - pattern: jinja2.Template($SINK)
+
+  - id: guardian.taint.go.sqli
+    languages: [go]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: HTTP request parameter flows into SQL query."
+    metadata:
+      cwe: "CWE-89"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $R.URL.Query(...)
+      - pattern: $R.FormValue(...)
+      - pattern: $C.Query(...)
+      - pattern: $C.Param(...)
+    pattern-sinks:
+      - pattern: $DB.Query($SINK, ...)
+      - pattern: $DB.QueryRow($SINK, ...)
+      - pattern: $DB.Exec($SINK, ...)
+
+  - id: guardian.taint.go.ssrf
+    languages: [go]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: HTTP request parameter flows into outbound http.Get/NewRequest."
+    metadata:
+      cwe: "CWE-918"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $R.URL.Query(...)
+      - pattern: $C.Query(...)
+    pattern-sinks:
+      - pattern: http.Get($SINK)
+      - pattern: http.NewRequest($M, $SINK, ...)
+
+  - id: guardian.taint.java.sqli
+    languages: [java]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: servlet/Spring parameter flows into Statement SQL execution."
+    metadata:
+      cwe: "CWE-89"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $REQ.getParameter(...)
+    pattern-sinks:
+      - pattern: $STMT.executeQuery($SINK)
+      - pattern: $STMT.executeUpdate($SINK)
+      - pattern: $STMT.execute($SINK)

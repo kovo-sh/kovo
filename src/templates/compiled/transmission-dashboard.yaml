@@ -1,0 +1,29 @@
+id: "transmission-dashboard"
+name: "Transmission Dashboard - Detect"
+severity: "medium"
+description: "Transmission dashboard was detected."
+tech:
+  - "generic"
+tags:
+  - "misconfig"
+  - "transmission"
+  - "exposure"
+  - "dashboard"
+  - "discovery"
+cwe: "CWE-200"
+reference: "https://transmissionbt.com/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/transmission/web/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "The Transmission Project"
+      - "Transmission Web Interface"
+    condition: "and"

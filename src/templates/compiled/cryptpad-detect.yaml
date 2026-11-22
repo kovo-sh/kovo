@@ -1,0 +1,32 @@
+id: "cryptpad-detect"
+name: "CryptPad - Detect"
+severity: "info"
+description: "CryptPad is an open-source, end-to-end encrypted collaboration suite."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "cryptpad"
+  - "collaboration"
+  - "encrypted"
+  - "detect"
+reference: "https://cryptpad.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "data-localization=\"main_title\">CryptPad:"
+      - "data-bootload=\"/customize/template.js\""
+      - "data-main=\"/common/boot.js"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

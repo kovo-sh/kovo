@@ -1,0 +1,36 @@
+id: "tomcat-snoop-servlet-exposed"
+name: "Apache Tomcat - Snoop Servlet Information Disclosure"
+severity: "info"
+description: "The Snoop servlet is exposed in the Apache Tomcat examples directory."
+tech:
+  - "apache"
+  - "tomcat"
+  - "java"
+tags:
+  - "apache"
+  - "jakarta"
+  - "tomcat"
+  - "exposure"
+  - "info-leak"
+  - "vuln"
+reference: "https://vulners.com/nessus/TOMCAT_SNOOP.NASL"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/examples/jsp/snp/snoop.jsp"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "Request Information"
+      - "Path info"
+      - "Server name"
+      - "Remote address"
+    condition: "and"
+  - type: "status"
+    status:
+      - 200

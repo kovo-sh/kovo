@@ -1,0 +1,34 @@
+id: "awstats-config"
+name: "AWStats Config - Detect"
+severity: "info"
+description: "AWStats configuration information was detected."
+tech:
+  - "generic"
+tags:
+  - "config"
+  - "exposure"
+  - "awstats"
+  - "vuln"
+cwe: "CWE-200"
+reference: "https://www.awstats.org/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/awstats/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "or"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "AWSTATS CONFIGURE"
+      - "MAIN SETUP SECTION"
+    condition: "and"
+  - type: "word"
+    part: "body"
+    words:
+      - "Index of /awstats"
+      - "Parent Directory"
+    condition: "and"

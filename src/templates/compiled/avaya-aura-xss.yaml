@@ -1,0 +1,37 @@
+id: "avaya-aura-xss"
+name: "Avaya Aura Utility Services Administration - Cross-Site Scripting"
+severity: "medium"
+description: "Avaya Aura Utility Services Administration contains a cross-site scripting vulnerability. An attacker can inject arbitrary script in the browser of an unsuspecting user in the context of the affected site. This can allow the attacker to steal cookie-based authentication credentials and launch other attacks."
+tech:
+  - "tomcat"
+  - "java"
+tags:
+  - "xss"
+  - "avaya"
+  - "aura"
+  - "iot"
+  - "vuln"
+cwe: "CWE-80"
+reference: "https://blog.assetnote.io/2023/02/01/rce-in-avaya-aura/"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/admin/public/login.jsp?error=%3Cscript%3Ealert(document.domain)%3C/script%3e"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "word"
+    part: "body"
+    words:
+      - "<script>alert(document.domain)</script>"
+      - "Avaya Aura Device Services"
+    condition: "and"
+  - type: "word"
+    part: "header"
+    words:
+      - "text/html"
+  - type: "status"
+    status:
+      - 200

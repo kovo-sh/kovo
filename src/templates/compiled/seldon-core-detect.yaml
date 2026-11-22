@@ -1,0 +1,32 @@
+id: "seldon-core-detect"
+name: "Seldon Core - Detect"
+severity: "info"
+description: "Seldon Core, an open-source MLOps/LLMOps framework for deploying, monitoring, and scaling machine learning models on Kubernetes, was detected. Its Pipeline Gateway component, which routes inference requests between chained model pipelines, exposed an unauthenticated status endpoint returning a fixed JSON banner and a matching Server response header. Exposed instances may have revealed internal ML pipeline configuration and provided a foothold for further probing of the inference API."
+tech:
+  - "generic"
+tags:
+  - "tech"
+  - "seldon-core"
+  - "ml"
+  - "ai"
+  - "mlops"
+  - "detect"
+  - "discovery"
+reference: "https://github.com/SeldonIO/seldon-core"
+spaExclusion: true
+request:
+  method: "GET"
+  path: "/"
+control:
+  method: "GET"
+  path: "/.guardian-none-{{rand}}"
+matchers-condition: "and"
+matchers:
+  - type: "regex"
+    part: "body"
+    regex:
+      - "\"name\":\\s*\"seldon-pipelinegateway\""
+  - type: "word"
+    part: "header"
+    words:
+      - "seldon-pipelinegateway"
