@@ -1,0 +1,386 @@
+// Exchanges: every brokered request, allowed or denied, newest first.
+// Rows come from the detail's newest-500 window, then the `broker.exchange`
+// event log for anything older (so the list covers the whole run), plus
+// `broker.denied` events. Text search also runs server-side
+// (`searchRunExchanges`: path, body and headers) and merges the hits.
+// The inspector loads headers and body with `readExchange` on demand.
+import { useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
+import { searchRunExchanges } from '../../../actions.ts'
+import { formatExchangeAsCurl } from '../../curl-parser.ts'
+import { Dropdown, FilterBox, matchQ, Tabs, useDebounced, VList } from '../controls.tsx'
+import { useFullExchange, useRun, useRunModel } from '../data.tsx'
+import { EmptyState, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
+import { fmtN, fmtRel, fmtTimeS, host, plural, prettyBody, short } from '../format.ts'
+import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { Icon } from '../icons.tsx'
+import { useShortcuts } from '../keyboard.tsx'
+import { CHECK_HEADERS, normFStatus, PHASE_LABEL, stLabel } from '../meta.ts'
+import type { RunEvent } from '../model.ts'
+import { useLinks, useListNav, useNav, useViewState } from '../nav.tsx'
+import { PaneBody, PaneHeader } from '../pane.tsx'
+import type { InspectorMap, InspectorProps } from '../pane.tsx'
+import { useToast } from '../toast.tsx'
+
+type SearchHit = Awaited<ReturnType<typeof searchRunExchanges>>[number]
+
+export interface XRow {
+  id: string
+  denied: boolean
+  method: string
+  status: number
+  origin: string
+  path: string
+  persona: string | null
+  dur: number | null
+  t: number
+  worker: string | null
+  /** Reconstructed from the event log: headers/body load on open. */
+  partial: boolean
+  eventId?: number
+  note?: string
+}
+
+type Tab = 'all' | '2xx' | '3xx' | '4xx' | '5xx' | 'denied'
+type Group = 'none' | 'origin' | 'persona'
+const bucket = (r: XRow): Tab => r.denied ? 'denied' : r.status >= 500 ? '5xx' : r.status >= 400 ? '4xx' : r.status >= 300 ? '3xx' : '2xx'
+const str = (v: unknown) => (typeof v === 'string' ? v : null)
+
+/** Every exchange row we can show without fetching: summary window + event log + denials. */
+function useExchangeRows(hits: SearchHit[]) {
+  const { detail, events } = useRun()
+  return useMemo(() => {
+    const out: XRow[] = []
+    const seen = new Set<string>()
+    for (const e of detail.exchangesSummary) {
+      seen.add(e.id)
+      out.push({ id: e.id, denied: false, method: e.method, status: e.status, origin: e.origin, path: e.pathAndQuery, persona: e.personaHandle, dur: e.durationMs, t: e.createdAt, worker: e.assignmentId, partial: false })
+    }
+    for (const h of hits) {
+      if (seen.has(h.id)) continue
+      seen.add(h.id)
+      out.push({ id: h.id, denied: false, method: h.method, status: h.status, origin: h.origin, path: h.pathAndQuery, persona: h.personaHandle, dur: h.durationMs, t: h.createdAt, worker: h.assignmentId, partial: false })
+    }
+    for (const ev of events) {
+      if (ev.kind === 'broker.exchange') {
+        const id = str(ev.detail.exchangeId)
+        if (!id || seen.has(id)) continue
+        seen.add(id)
+        const origin = str(ev.detail.origin) ?? ''
+        const m = ev.message.match(/^(\S+) (.*) → (\d+)$/)
+        const target = m?.[2] ?? ''
+        const path = target.startsWith(origin) ? target.slice(origin.length) : target
+        out.push({ id, denied: false, method: m?.[1] ?? '—', status: Number(ev.detail.status ?? m?.[3] ?? 0), origin, path: path || '/', persona: str(ev.detail.personaHandle), dur: null, t: ev.createdAt, worker: str(ev.detail.assignmentId), partial: true, eventId: ev.id })
+      } else if (ev.kind === 'broker.denied' || ev.kind === 'broker.circuit_open') {
+        out.push({ id: 'ev:' + ev.id, denied: true, method: '—', status: Number(ev.detail.status ?? 0), origin: str(ev.detail.origin) ?? '', path: '', persona: null, dur: null, t: ev.createdAt, worker: str(ev.detail.assignmentId), partial: false, eventId: ev.id, note: ev.message })
+      }
+    }
+    out.sort((a, b) => b.t - a.t || (b.eventId ?? 0) - (a.eventId ?? 0))
+    return out
+  }, [detail.exchangesSummary, events, hits])
+}
+
+type Item = { type: 'head'; key: string; label: string; count: number; icon: 'globe' | 'lock' } | { type: 'row'; key: string; r: XRow }
+
+export function ExchangesView() {
+  const { detail, counts, eventsReady } = useRun()
+  const model = useRunModel()
+  const nav = useNav()
+  const [tab, setTab] = useViewState<Tab>('exchanges.tab', 'all')
+  const [group, setGroup] = useViewState<Group>('exchanges.group', 'none')
+  const [q, setQ] = useViewState('exchanges.q', '')
+  const [method, setMethod] = useViewState('exchanges.method', '')
+  const [origin, setOrigin] = useViewState('exchanges.origin', '')
+  const [persona, setPersona] = useViewState('exchanges.persona', '')
+  const [collapsed, setCollapsed] = useViewState<Record<string, boolean>>('exchanges.collapsed', {})
+
+  // Server-side search (bodies and headers too), merged into the rows.
+  const dq = useDebounced(q.trim(), 260)
+  const [search, setSearch] = useState<{ q: string; origin: string; hits: SearchHit[]; busy: boolean; error?: boolean }>({ q: '', origin: '', hits: [], busy: false })
+  useEffect(() => {
+    if (dq.length < 3) { setSearch({ q: '', origin: '', hits: [], busy: false }); return }
+    let live = true
+    setSearch(s => ({ ...s, busy: true }))
+    searchRunExchanges({ data: { runId: detail.run.id, query: dq, origin: origin || undefined, limit: 100 } })
+      .then(hits => { if (live) setSearch({ q: dq, origin, hits, busy: false }) },
+        () => { if (live) setSearch({ q: dq, origin, hits: [], busy: false, error: true }) })
+    return () => { live = false }
+  }, [dq, origin, detail.run.id])
+  const hitIds = useMemo(() => new Set(search.hits.map(h => h.id)), [search.hits])
+  const rows = useExchangeRows(search.hits)
+
+  // facets
+  const facets = useMemo(() => {
+    const methods = new Map<string, number>(), origins = new Map<string, number>(), personas = new Map<string, number>()
+    for (const r of rows) {
+      if (!r.denied) methods.set(r.method, (methods.get(r.method) ?? 0) + 1)
+      if (r.origin) origins.set(r.origin, (origins.get(r.origin) ?? 0) + 1)
+      if (!r.denied) { const p = r.persona ?? ''; personas.set(p, (personas.get(p) ?? 0) + 1) }
+    }
+    const sorted = (m: Map<string, number>) => [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    return { methods: sorted(methods), origins: sorted(origins), personas: sorted(personas) }
+  }, [rows])
+
+  const base = useMemo(() => rows.filter(r =>
+    (!method || r.method === method) && (!origin || r.origin === origin) && (!persona || (persona === '-' ? !r.persona && !r.denied : r.persona === persona))
+    && (!q.trim() || hitIds.has(r.id) || matchQ(q, [r.method, host(r.origin), r.path, r.status, r.persona ?? 'anonymous', r.denied ? 'denied' : 'allowed', r.note ?? ''].join(' ')))), [rows, method, origin, persona, q, hitIds])
+  const tabs = useMemo(() => {
+    const t: Record<string, number> = { all: base.length }
+    base.forEach(r => { const b = bucket(r); t[b] = (t[b] ?? 0) + 1 })
+    return ([['all', 'All'], ['2xx', '2xx'], ['3xx', '3xx'], ['4xx', '4xx'], ['5xx', '5xx'], ['denied', 'Denied']] as [Tab, string][])
+      .filter(([k]) => t[k] || k === tab).map(([k, l]) => [k, l, t[k] ?? 0] as [Tab, string, number])
+  }, [base, tab])
+  const shown = useMemo(() => tab === 'all' ? base : base.filter(r => bucket(r) === tab), [base, tab])
+
+  const items = useMemo<Item[]>(() => {
+    if (group === 'none') return shown.map(r => ({ type: 'row', key: r.id, r }))
+    const m = new Map<string, XRow[]>()
+    shown.forEach(r => { const k = group === 'origin' ? r.origin : (r.denied ? '(denied)' : r.persona ?? ''); m.set(k, [...(m.get(k) ?? []), r]) })
+    const out: Item[] = []
+    ;[...m.entries()].sort((a, b) => group === 'origin' ? host(a[0]).localeCompare(host(b[0])) : a[0].localeCompare(b[0])).forEach(([k, list]) => {
+      const ck = group + ':' + k
+      out.push({ type: 'head', key: 'h:' + ck, label: group === 'origin' ? host(k) || '—' : k === '' ? 'Anonymous' : k === '(denied)' ? 'Denied (no persona)' : k, count: list.length, icon: group === 'origin' ? 'globe' : 'lock' })
+      if (!collapsed[ck]) list.forEach(r => out.push({ type: 'row', key: r.id, r }))
+    })
+    return out
+  }, [shown, group, collapsed])
+  const ids = useMemo(() => items.flatMap(it => it.type === 'row' ? [it.r.id] : []), [items])
+  const { index } = useListNav({ ids, kind: 'exchange' })
+  const scrollIdx = useMemo(() => index < 0 ? -1 : items.findIndex(it => it.key === ids[index]), [index, items, ids])
+  useShortcuts([{ key: 'G', run: () => setGroup(group === 'none' ? 'origin' : group === 'origin' ? 'persona' : 'none') }])
+  const selId = nav.sel?.kind === 'exchange' ? nav.sel.id : null
+  const active: [string, string, () => void][] = [
+    ...(method ? [['Method', method, () => setMethod('')] as [string, string, () => void]] : []),
+    ...(origin ? [['Origin', host(origin), () => setOrigin('')] as [string, string, () => void]] : []),
+    ...(persona ? [['Persona', persona === '-' ? 'Anonymous' : persona, () => setPersona('')] as [string, string, () => void]] : []),
+  ]
+  const allowedCount = rows.filter(r => !r.denied).length
+  const height = (it: Item) => (it.type === 'head' ? 32 : 36)
+
+  if (!rows.length && eventsReady && !counts.exchanges) {
+    return <EmptyState icon="exchanges" title="No exchanges yet"
+      action={detail.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
+      Every request a worker makes passes through the policy broker and is logged here, allowed or denied.
+    </EmptyState>
+  }
+
+  const missing = Math.max(0, counts.exchanges - allowedCount)
+  const footer = <div className="listnote">
+    <Icon name="exchanges" />
+    {missing > 0
+      ? <span>{fmtN(allowedCount)} of {fmtN(counts.exchanges)} exchanges loaded{!eventsReady ? '; the event log is still replaying' : ''}.</span>
+      : <span>All {fmtN(counts.exchanges)} brokered exchanges{rows.length > allowedCount ? ` and ${plural(rows.length - allowedCount, 'denial')}` : ''}. Rows older than the newest {fmtN(detail.exchangesSummary.length)} load their headers when opened.</span>}
+  </div>
+
+  return <>
+    <div className="toolbar">
+      <Tabs tabs={tabs} value={tab} onChange={setTab} />
+      <span className="tb-sp" />
+      <FilterBox value={q} onChange={setQ} placeholder="Filter" onEnter={() => ids[0] && nav.select({ kind: 'exchange', id: ids[0] })} />
+      <Dropdown icon="sliders" title="Grouping (⇧G cycles) and filters" menuClassName="sf-ddw"
+        label={<><span className="dim">Group</span><span>{group === 'none' ? 'Time' : group === 'origin' ? 'Origin' : 'Persona'}</span>{active.length > 0 && <span className="sf-ddn num">{active.length}</span>}</>}>
+        <div className="dd-sec">Grouping<span className="kbd-group" style={{ marginLeft: 'auto' }}><span className="kbd">⇧</span><span className="kbd">G</span></span></div>
+        <Seg<Group> value={group} onChange={setGroup} options={[{ value: 'none', label: 'Time' }, { value: 'origin', label: 'Origin' }, { value: 'persona', label: 'Persona' }]} />
+        <div className="dd-sec">Method</div>
+        <div className="sf-chips">{[['', rows.filter(r => !r.denied).length] as [string, number], ...facets.methods].map(([m, n]) =>
+          <button key={m || 'all'} type="button" className={'sf-chip' + (method === m ? ' on' : '')} onClick={() => setMethod(m)}>{m || 'All'}<span className="num">{fmtN(n)}</span></button>)}</div>
+        <div className="dd-sec">Persona</div>
+        <div className="sf-chips">{[['', 0] as [string, number], ...facets.personas].map(([p, n]) => {
+          const v = p === '' && n ? '-' : p
+          return <button key={v || 'all'} type="button" className={'sf-chip' + (persona === v ? ' on' : '')} onClick={() => setPersona(v)}>
+            {v === '' ? 'All' : v === '-' ? 'Anonymous' : v}{n > 0 && <span className="num">{fmtN(n)}</span>}</button>
+        })}</div>
+        <div className="dd-sec">Origin<span className="sf-dd-r num">{facets.origins.length}</span></div>
+        <div className="sf-olist">
+          <button type="button" className={'dd-item' + (!origin ? ' on' : '')} onClick={() => setOrigin('')}>All origins</button>
+          {facets.origins.map(([o, n]) => <button key={o} type="button" className={'dd-item' + (origin === o ? ' on' : '')} onClick={() => setOrigin(o)}>
+            <span className="mono sf-ell">{host(o)}</span><span className="ct num">{fmtN(n)}</span>
+          </button>)}
+        </div>
+      </Dropdown>
+    </div>
+    {(active.length > 0 || search.busy || search.q) && <div className="strip sf-fstrip">
+      {active.map(([k, v, clear]) => <span key={k} className="sf-af"><span className="muted">{k}</span><span className="mono">{v}</span>
+        <button type="button" aria-label={'Clear ' + k} onClick={clear}><Icon name="close" size={11} /></button></span>)}
+      {search.busy ? <span className="muted">Searching paths, bodies and headers…</span>
+        : search.q ? <span className="muted">{search.error ? 'Server search failed; showing local matches.' : search.hits.length >= 100 ? 'Server search stops at 100 matches in paths, bodies and headers; more may exist. Refine the query or add a filter to narrow it.' : `Server search: ${plural(search.hits.length, 'match', 'matches')} in paths, bodies and headers.`}</span> : null}
+      <span className="tb-sp" />
+      {active.length > 0 && <button type="button" className="linkbtn" style={{ margin: 0 }} onClick={() => { setMethod(''); setOrigin(''); setPersona('') }}>Clear filters</button>}
+    </div>}
+    {!rows.length && !eventsReady ? <Skeleton /> :
+      <VList items={items} itemKey={it => it.key} height={height} scrollToIndex={scrollIdx} footer={shown.length ? footer : undefined}
+        empty={<EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>}
+        render={(it, _i, style) => {
+          if (it.type === 'head') {
+            const ck = it.key.slice(2)
+            const col = !!collapsed[ck]
+            return <div key={it.key} style={style} className={'ghead sf-ghead' + (col ? ' collapsed' : '')} role="button" tabIndex={-1} onClick={() => setCollapsed(c => ({ ...c, [ck]: !col }))}>
+              <Icon name="chev" /><span className="g muted"><Icon name={it.icon} /></span><span className={it.icon === 'globe' ? 'mono' : ''}>{it.label}</span><span className="ct num">{fmtN(it.count)}</span>
+            </div>
+          }
+          const r = it.r
+          return <div key={it.key} style={style} className={'row' + (selId === r.id ? ' cur' : '') + (r.denied ? ' sf-denied' : '')} data-id={r.id}
+            onClick={() => nav.select({ kind: 'exchange', id: r.id })}>
+            <span className="c-time mono num">{fmtRel(r.t, model.base)}</span>
+            <span className="c-meth mono">{r.method}</span>
+            <span className={'c-code mono num ' + (r.denied ? 'sf-deny' : 'code-' + String(r.status)[0])}>{r.denied ? <Icon name="slash" size={13} /> : r.status}</span>
+            {group !== 'origin' && <span className="mono muted sf-xhost">{host(r.origin)}</span>}
+            <span className="c-path mono" title={r.path}>{r.denied ? <span className="sf-deny-t">{r.note ?? 'Denied by the broker'}</span> : r.path}</span>
+            {r.persona && group !== 'persona' && <span className="c-persona"><Tag icon="lock">{r.persona}</Tag></span>}
+            {hitIds.has(r.id) && <span className="sf-hit" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
+            <span className="c-dur mono num">{r.dur != null ? fmtN(r.dur) + 'ms' : ''}</span>
+          </div>
+        }} />}
+  </>
+}
+
+// ---------------------------------------------------------------- inspector
+
+/** Response headers that matter for security review (highlighted in the table). */
+const SECURITY_HEADERS = new Set([
+  'strict-transport-security', 'content-security-policy', 'content-security-policy-report-only', 'x-content-type-options',
+  'x-frame-options', 'referrer-policy', 'permissions-policy', 'cross-origin-opener-policy', 'cross-origin-embedder-policy',
+  'cross-origin-resource-policy', 'access-control-allow-origin', 'access-control-allow-credentials', 'access-control-allow-methods',
+  'access-control-allow-headers', 'set-cookie', 'server', 'x-powered-by', 'via', 'www-authenticate',
+])
+const BASELINE: [string, string][] = [
+  ['strict-transport-security', 'HSTS'], ['content-security-policy', 'CSP'], ['x-content-type-options', 'nosniff'],
+  ['x-frame-options', 'Frame options'], ['referrer-policy', 'Referrer policy'],
+]
+
+function HeaderTable({ headers, flagged }: { headers: Record<string, string> | undefined; flagged: Set<string> }) {
+  const ks = Object.keys(headers ?? {})
+  if (!ks.length) return <p className="muted">None recorded</p>
+  return <table className="hdrs mono"><tbody>{ks.map(k => {
+    const lk = k.toLowerCase()
+    return <tr key={k} className={flagged.has(lk) ? 'sf-flag' : SECURITY_HEADERS.has(lk) ? 'sf-sec' : undefined}>
+      <td>{k}</td><td>{String(headers![k])}</td>
+    </tr>
+  })}</tbody></table>
+}
+
+function ExchangeInspector({ sel }: InspectorProps) {
+  const { detail, events } = useRun()
+  const model = useRunModel()
+  const links = useLinks()
+  const toast = useToast()
+  const id = sel.id
+  const denied = id.startsWith('ev:')
+  const ev: RunEvent | undefined = useMemo(() => denied ? events.find(e => e.id === Number(id.slice(3))) : undefined, [denied, events, id])
+  const sum = model.exchangeById.get(id)
+  const loaded = useFullExchange(id, !denied)
+  const full = loaded ?? undefined
+  const err = loaded === null
+  const [bodyAll, setBodyAll] = useState(false)
+
+  if (denied) {
+    const origin = str(ev?.detail.origin) ?? ''
+    const w = ev ? model.workerById.get(str(ev.detail.assignmentId) ?? '') : undefined
+    return <>
+      <PaneHeader title="Denied request" sub={ev ? '#' + ev.id : undefined} />
+      <PaneBody><div className="d">
+        {!ev ? <Skeleton rows={4} /> : <>
+          <div className="d-meta"><Tag icon="slash">{ev.kind === 'broker.circuit_open' ? 'Circuit open' : 'Denied by broker'}</Tag></div>
+          <h2 style={{ fontSize: 14, lineHeight: '21px', fontWeight: 500 }}>{ev.message}</h2>
+          <Props rows={[
+            ['Time', <span className="num">{fmtTimeS(ev.createdAt)} <span className="mono muted">{fmtRel(ev.createdAt, model.base)}</span></span>],
+            ...(origin ? [['Origin', <span className="mono">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
+            ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="sf-ell">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
+          ]} />
+          <p className="sf-note">The policy broker refused this request before it left Guardian: the origin is outside the approved scope or its circuit breaker is open. Nothing was sent.</p>
+          <Section title="Related"><LinkRow icon="activity" onClick={() => links.event(ev.id)}>Open in Activity</LinkRow></Section>
+        </>}
+      </div></PaneBody>
+    </>
+  }
+
+  const evRow = !sum && !full ? events.find(e => e.kind === 'broker.exchange' && e.detail.exchangeId === id) : undefined
+  const method = full?.method ?? sum?.method ?? evRow?.message.split(' ')[0] ?? ''
+  const status = full?.status ?? sum?.status ?? Number(evRow?.detail.status ?? 0)
+  const origin = full?.origin ?? sum?.origin ?? str(evRow?.detail.origin) ?? ''
+  const path = full?.pathAndQuery ?? sum?.pathAndQuery ?? ''
+  const persona = full ? full.personaHandle : sum ? sum.personaHandle : str(evRow?.detail.personaHandle)
+  const dur = full?.durationMs ?? sum?.durationMs
+  const t = full?.createdAt ?? sum?.createdAt ?? evRow?.createdAt
+  const wid = full?.assignmentId ?? sum?.assignmentId ?? str(evRow?.detail.assignmentId)
+  const w = wid ? model.workerById.get(wid) : undefined
+  const finalOrigin = full?.finalOrigin ?? sum?.finalOrigin
+  const redirects = full?.redirectOrigins ?? sum?.redirectOrigins ?? []
+  const mediaType = full?.mediaType ?? sum?.mediaType ?? ''
+  const fs = model.exchangeFindings.get(id) ?? []
+  const evIds = [...new Set(fs.flatMap(f => f.evidenceIds))].filter(e => model.evidenceById.has(e))
+  const bodyArt = full?.bodyArtifactId ?? sum?.bodyArtifactId
+  const iast = (detail.labTelemetry ?? []).filter(x => x.exchangeId === id)
+  // headers a citing finding's check inspects
+  const flagged = new Set(fs.flatMap(f => CHECK_HEADERS[f.check?.id ?? ''] ?? []))
+  const resp = full?.respHeaders ?? {}
+  const respKeys = new Set(Object.keys(resp).map(k => k.toLowerCase()))
+  const body = full ? prettyBody(full.body, mediaType) : sum ? prettyBody(sum.bodyPreview, mediaType) : ''
+  const CAP = 12000
+  const copyCurl = () => {
+    const cmd = formatExchangeAsCurl({ method, origin, pathAndQuery: path, reqHeaders: full?.reqHeaders, personaHandle: persona })
+    void navigator.clipboard?.writeText(cmd).then(() => toast.show('Copied as cURL', { icon: 'check', sub: full ? 'Sanitized request headers included' : 'Headers still loading; URL only' }),
+      () => toast.show('Could not copy to the clipboard', { tone: 'error' }))
+  }
+  return <>
+    <PaneHeader title="Exchange" sub={short(id)} extra={<button type="button" className="icon-btn" title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="download" />cURL</button>} />
+    <PaneBody><div className="d">
+      <div className="d-meta">
+        <Tag mono>{method || '—'}</Tag>
+        <Tag mono className={'code-' + String(status)[0]}>{status || '—'}</Tag>
+        {persona ? <Tag icon="lock">{persona}</Tag> : <Tag>Anonymous</Tag>}
+        {dur != null && <Tag className="num">{fmtN(dur)} ms</Tag>}
+      </div>
+      <h2 className="mono sf-url"><span className="muted">{origin}</span>{path || (full ? '' : '…')}</h2>
+      <Props rows={[
+        ...(t ? [['Time', <span className="num">{fmtTimeS(t)} <span className="mono muted">{fmtRel(t, model.base)}</span></span>] as [ReactNode, ReactNode]] : []),
+        ['Origin', <span className="mono">{host(origin)}</span>, () => links.host(origin)],
+        ...(finalOrigin && finalOrigin !== origin ? [['Final origin', <span className="mono">{host(finalOrigin)}</span>] as [ReactNode, ReactNode]] : []),
+        ...(redirects.some(x => x !== origin && x !== finalOrigin) ? [['Redirects', <span className="mono sf-wrap">{redirects.map(host).join(' → ')}</span>] as [ReactNode, ReactNode]] : []),
+        ['Media type', <span className="mono">{mediaType || (full ? '—' : '…')}</span>],
+        ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="sf-ell">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
+      ]} />
+      {fs.length > 0 && <Section title="Cited by" right={plural(fs.length, 'finding')}>
+        {fs.map(f => <LinkRow key={f.id} glyph={<SevGlyph sev={f.severity} />} right={stLabel(normFStatus(f.status))} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
+      </Section>}
+      {(evIds.length > 0 || (bodyArt && model.evidenceById.has(bodyArt))) && <Section title="Evidence" right={evIds.length || 1}>
+        {(bodyArt && model.evidenceById.has(bodyArt) && !evIds.includes(bodyArt) ? [bodyArt, ...evIds] : evIds).slice(0, 8).map(e => {
+          const evd = model.evidenceById.get(e)!
+          return <LinkRow key={e} icon="fact" right={evd.kind} trailing="chevR" onClick={() => links.evidence(e)}>{evd.title}</LinkRow>
+        })}
+      </Section>}
+      {err ? <p className="sf-note">Couldn’t load the full request and response for this exchange.</p> : !full ? <Section title="Headers"><Skeleton rows={5} /></Section> : <>
+        <Section title="Security headers" right={BASELINE.filter(([h]) => respKeys.has(h)).length + ' of ' + BASELINE.length}>
+          <div className="sf-sh">{BASELINE.map(([h, l]) => {
+            const has = respKeys.has(h)
+            return <span key={h} className={'sf-shi' + (has ? '' : ' absent') + (flagged.has(h) ? ' flag' : '')} title={has ? h + ': ' + resp[Object.keys(resp).find(k => k.toLowerCase() === h)!] : h + ' is absent'}>
+              <Icon name={has ? 'check' : 'x'} size={12} />{l}
+            </span>
+          })}</div>
+        </Section>
+        <Section title="Request headers" right={Object.keys(full.reqHeaders ?? {}).length || undefined}><HeaderTable headers={full.reqHeaders} flagged={new Set()} /></Section>
+        <Section title="Response headers" right={Object.keys(resp).length || undefined}><HeaderTable headers={resp} flagged={flagged} /></Section>
+      </>}
+      {iast.length > 0 && <Section title="IAST traces" right={iast.length}>
+        {iast.map(x => <LinkRow key={x.id} icon="node" trailing={model.evidenceById.has(x.artifactId) ? 'chevR' : null}
+          sub={x.routesHit.join(', ') || undefined} right={`${x.newLinesCovered} lines · ${x.sinkEventsCount} sinks`}
+          onClick={() => model.evidenceById.has(x.artifactId) && links.evidence(x.artifactId)}>
+          {x.hasUnhandledException ? 'Unhandled exception' : 'Trace'} <span className="mono muted">{short(x.traceId)}</span>
+        </LinkRow>)}
+      </Section>}
+      {body && <Section title={full && full.body.length > (sum?.bodyPreview.length ?? 0) ? 'Response body' : 'Body preview'} right={full ? fmtN(full.body.length) + ' chars' : undefined}>
+        <pre className="block mono sf-body">{bodyAll ? body : body.slice(0, CAP)}</pre>
+        {body.length > CAP && !bodyAll && <button type="button" className="linkbtn" onClick={() => setBodyAll(true)}>Show all {fmtN(body.length)} characters</button>}
+      </Section>}
+      {w && <Section title="Related">
+        <LinkRow glyph={<StatusGlyph status={w.status} />} right={PHASE_LABEL[w.phase] ?? w.phase} trailing="workflow" onClick={() => links.worker(w.id)}>{w.title}</LinkRow>
+        <LinkRow icon="surface" onClick={() => links.host(origin)}>{host(origin)} on the surface map</LinkRow>
+      </Section>}
+    </div></PaneBody>
+  </>
+}
+
+/** Inspectors this view owns, keyed by selection kind ('exchange'). */
+export const exchangesInspectors: InspectorMap = {
+  exchange: ExchangeInspector,
+}

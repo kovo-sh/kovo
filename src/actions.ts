@@ -212,6 +212,26 @@ export const runData = createServerFn({ method: 'GET' })
     }
   })
 
+// Run workspace shell: the run switcher (every run in the workspace, newest first, with
+// project names) and true totals for lists the run detail caps (exchanges, events).
+export const runShellData = createServerFn({ method: 'GET' })
+  .validator(z.object({ runId: id }))
+  .handler(({ data }) => {
+    const db = store()
+    const run = db.run(data.runId)
+    const runs = db.client.prepare(`select r.id as id, r.goal as goal, r.status as status, r.phase as phase,
+        r.created_at as createdAt, r.project_id as projectId, p.name as projectName,
+        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+      from runs r join projects p on p.id = r.project_id
+      where r.workspace_id = ? order by r.created_at desc limit 200`).all(run.workspaceId) as {
+      id: string; goal: string; status: string; phase: string; createdAt: number; projectId: string; projectName: string; findings: number
+    }[]
+    const counts = db.client.prepare(`select
+        (select count(*) from broker_exchanges where run_id = ?) as exchanges,
+        (select count(*) from events where run_id = ?) as events`).get(run.id, run.id) as { exchanges: number; events: number }
+    return { runs: runs.map(r => ({ ...r, findings: Number(r.findings) })), counts: { exchanges: Number(counts.exchanges), events: Number(counts.events) } }
+  })
+
 export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
   .handler(({ data }) => store().createRun(data))
 

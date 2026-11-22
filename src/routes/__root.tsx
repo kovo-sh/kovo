@@ -1,4 +1,4 @@
-import { createRootRoute, HeadContent, Link, Outlet, Scripts } from '@tanstack/react-router'
+import { createRootRoute, HeadContent, Link, Outlet, Scripts, useRouterState } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { Brand } from '../components/common.tsx'
@@ -102,6 +102,9 @@ function ViewPreferences() {
 }
 
 function Shell() {
+  // The run workspace is full-screen with its own rail and header.
+  const runPage = useRouterState({ select: state => state.matches.some(match => match.routeId.startsWith('/runs/$runId')) })
+  if (runPage) return <Outlet />
   return <>
     <header className="app-nav">
       <Brand />

@@ -1,0 +1,130 @@
+// Status and severity glyphs. Shape always doubles colour (colour-blind safe).
+import type { ReactNode } from 'react'
+import { SEV_COL } from './meta.ts'
+import type { CoverageStatus, RiskTier } from './meta.ts'
+import { RISKL } from './meta.ts'
+
+/** Severity: critical = filled red tile with "!", others = 3 signal bars, info = 3 dots. */
+export function SevGlyph({ sev }: { sev: string | null | undefined }) {
+  const s = sev || 'informational'
+  if (s === 'critical') {
+    return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+      <rect x="1" y="1" width="12" height="12" rx="3" fill="var(--crit)" />
+      <path d="M7 4v3.5M7 9.75v.01" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  }
+  const n = ({ high: 3, medium: 2, low: 1 } as Record<string, number>)[s] ?? 0
+  const col = ({ high: 'var(--high)', medium: 'var(--med)', low: 'var(--fg-2)' } as Record<string, string>)[s] ?? 'var(--fg-3)'
+  const bars: [number, number, number][] = [[1.5, 8, 4], [5.75, 5.5, 6.5], [10, 3, 9]]
+  return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+    {bars.map((b, i) => n === 0
+      ? <rect key={i} x={b[0]} y="6" width="2.5" height="2" rx="1" fill="var(--fg-3)" />
+      : <rect key={i} x={b[0]} y={b[1]} width="2.5" height={b[2]} rx="1" fill={i < n ? col : 'var(--fg-4)'} />)}
+  </svg>
+}
+
+function Ring({ stroke, dash, children }: { stroke: string; dash?: boolean; children?: ReactNode }) {
+  return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+    <circle cx="7" cy="7" r="5.75" fill="none" stroke={stroke} strokeWidth="1.4" strokeDasharray={dash ? '2.1 1.9' : undefined} />
+    {children}
+  </svg>
+}
+
+/**
+ * Status glyph for findings, workers, runs, steps, coverage and approvals.
+ * "confirmed" is a quiet outlined check: accent colour means selection/focus only.
+ */
+export function StatusGlyph({ status }: { status: string | null | undefined }) {
+  switch (status) {
+    case 'confirmed': case 'verified': case 'static_verified': case 'approved':
+      return <Ring stroke="var(--fg-3)"><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--fg-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+    case 'reported':
+      return <Ring stroke="var(--fg-3)"><path d="M7 4.25 9.75 7 7 9.75 4.25 7Z" fill="var(--fg-2)" /></Ring>
+    case 'complete': case 'no_issue_found':
+      return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+        <circle cx="7" cy="7" r="6.5" fill="var(--fg-4)" />
+        <path d="M4.4 7.2 6.2 9 9.7 5.3" fill="none" stroke="var(--panel)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    case 'pending': case 'proposed': case 'ready': case 'queued': case 'needs_follow_up': {
+      const c = status === 'needs_follow_up' ? 'var(--warn)' : 'var(--fg-2)'
+      return <Ring stroke={c}><path d="M7 3.5A3.5 3.5 0 0 1 7 10.5Z" fill={c} /></Ring>
+    }
+    case 'running': case 'active':
+      return <Ring stroke="var(--accent)"><path d="M7 3.5A3.5 3.5 0 0 1 10.5 7H7Z" fill="var(--accent)" /></Ring>
+    case 'inconclusive':
+      return <Ring stroke="var(--fg-3)" dash><path d="M7 7h.01" stroke="var(--fg-3)" strokeWidth="2" strokeLinecap="round" /></Ring>
+    case 'dismissed': case 'canceled': case 'ruled_out': case 'stopped': case 'expired':
+      return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+        <circle cx="7" cy="7" r="5.75" fill="none" stroke="var(--fg-4)" strokeWidth="1.4" />
+        <path d="M4.9 9.1l4.2-4.2" stroke="var(--fg-3)" strokeWidth="1.4" strokeLinecap="round" />
+      </svg>
+    case 'not_applicable':
+      return <Ring stroke="var(--fg-4)" dash><path d="M4.75 7h4.5" stroke="var(--fg-4)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
+    case 'failed': case 'tainted': case 'denied': case 'blocked':
+      return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+        <circle cx="7" cy="7" r="6.5" fill="var(--bad)" />
+        <path d="M5 5l4 4M9 5 5 9" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" />
+      </svg>
+    case 'paused': case 'budget_paused': case 'waiting_approval':
+      return <Ring stroke="var(--warn)"><path d="M5.75 5v4M8.25 5v4" stroke="var(--warn)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
+    case 'waiting': case 'consent':
+      return <Ring stroke="var(--fg-2)"><path d="M7 4.5V7l1.75 1" fill="none" stroke="var(--fg-2)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
+    default:
+      return <Ring stroke="var(--fg-3)" />
+  }
+}
+
+/** Activity event dot, coloured by event family. */
+export function EventGlyph({ kind }: { kind: string }) {
+  const fam = kind.split('.')[0]
+  let col = 'var(--fg-4)'
+  if (kind === 'broker.denied' || kind === 'worker.failed') col = 'var(--bad)'
+  else if (fam === 'finding') col = kind === 'finding.verified' ? 'var(--fg)' : 'var(--fg-2)'
+  else if (['planner', 'report', 'run', 'approval'].includes(fam) || kind === 'interrupted') col = 'var(--fg-2)'
+  else if (fam === 'worker') col = 'var(--fg-3)'
+  return <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true"><circle cx="7" cy="7" r="3" fill={col} /></svg>
+}
+
+/** Coverage swatch: tinted tile + status shape (surface map, legends). */
+export function CovSwatch({ status, size }: { status: CoverageStatus | string; size?: [number, number] }) {
+  return <span className={'sw st-' + status} style={size ? { width: size[0], height: size[1] } : undefined}>
+    <span className={'gl gl-' + status} />
+  </span>
+}
+
+/** Surface map severity pin: shape = severity, solid = confirmed, outline = unverified, slash = dismissed. */
+export function PinGlyph({ sev, status, size = 10 }: { sev: string; status: string; size?: number }) {
+  const col = SEV_COL[sev] || 'var(--fg-4)'
+  const solid = status === 'confirmed' || status === 'verified' || status === 'static_verified'
+  const dis = status === 'dismissed'
+  const s = size, h = s / 2
+  let shape: ReactNode
+  if (sev === 'critical') shape = <path d={`M${h} .7 ${s - .7} ${h} ${h} ${s - .7} .7 ${h}Z`} />
+  else if (sev === 'high') shape = <path d={`M${h} .8 ${s - .6} ${s - .9} .6 ${s - .9}Z`} />
+  else if (sev === 'medium') shape = <rect x="1" y="1" width={s - 2} height={s - 2} rx="1" />
+  else if (sev === 'low') shape = <circle cx={h} cy={h} r={h - 1} />
+  else shape = <circle cx={h} cy={h} r={h - 2.2} />
+  const c2 = sev === 'informational' ? 'var(--fg-3)' : sev === 'low' ? 'var(--fg-2)' : col
+  return <svg viewBox={`0 0 ${s} ${s}`} width={s} height={s} style={{ overflow: 'visible' }} aria-hidden="true">
+    <g fill={dis ? 'none' : solid ? c2 : 'none'} stroke={dis ? 'var(--fg-4)' : c2} strokeWidth={solid && !dis ? 0 : 1.3}>{shape}</g>
+    {dis && <path d={`M0 ${s} ${s} 0`} stroke="var(--fg-4)" strokeWidth="1.2" />}
+  </svg>
+}
+
+/** Threat-model risk as 4 rising bars. */
+export function TierBars({ tier }: { tier: RiskTier }) {
+  const n = { critical: 4, high: 3, medium: 2, low: 1, unranked: 0 }[tier]
+  return <span className="tier" title={RISKL[tier]}>
+    {[0, 1, 2, 3].map(i => <i key={i} className={i < n ? 'f' : ''} style={{ height: 4 + i * 1.5 }} />)}
+  </span>
+}
+
+/** Run phase track: 4 segments, done / current (accent) / future. */
+export function PhaseTrack({ phase }: { phase: string }) {
+  const order = ['consent', 'threat_model', 'investigation', 'verification']
+  const map: Record<string, number> = { consent: 0, review: 0, discovery: 0, threat_model: 1, investigation: 2, verification: 3 }
+  const pi = map[phase] ?? 0
+  return <span className="phase-track" aria-hidden="true">
+    {order.map((p, i) => <i key={p} className={phase === 'complete' || i < pi ? 'done' : i === pi ? 'cur' : ''} />)}
+  </span>
+}
