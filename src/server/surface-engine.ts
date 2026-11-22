@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
 import { matchesApprovedEndpointPattern } from './approval-judge.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
@@ -82,10 +82,31 @@ const commonParamWordlist: readonly string[] = [
   'host', 'domain', 'ref', 'source', 'mode', 'preview', 'draft', 'version', 'verbose', 'trace',
 ]
 
+/**
+ * Mask values that legitimately rotate between two requests to the same endpoint: request/trace
+ * ids, CSRF nonces, ETags, ISO-8601 timestamps and epoch-ms values. Masking is deliberately
+ * key- or shape-scoped (never a bare UUID) so resource identifiers still distinguish responses and
+ * decoy rejection is unchanged.
+ */
+export function normalizeEphemeralNoise(body: string): string {
+  if (!body) return body
+  let out = body
+  // Keyed ephemeral scalars (request/trace ids, nonces, ETag-ish values, server clocks).
+  out = out.replace(
+    /(["']?(?:[A-Za-z0-9_$-]*(?:request|trace|correlation|span)[_-]?id|[A-Za-z0-9_$-]*(?:csrf|xsrf|nonce)[A-Za-z0-9_$-]*|etag|server[_-]?time|request[_-]?time)["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&}<]+)/gi,
+    '$1"<ephemeral>"',
+  )
+  // ISO-8601 timestamps anywhere (a per-request clock value, not a resource identity).
+  out = out.replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})\b/g, '<ephemeral>')
+  // Epoch milliseconds (>= 2001) are runtime clocks; smaller numbers stay meaningful.
+  out = out.replace(/\b1[5-9]\d{11}\b|\b2\d{12}\b/g, '<ephemeral>')
+  return out
+}
+
 /** Token-set Jaccard similarity of two response bodies (1 = identical). */
 export function responseSimilarity(a: string, b: string): number {
   if (a === b) return 1
-  const tok = (s: string) => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).slice(0, 4000))
+  const tok = (s: string) => new Set(normalizeEphemeralNoise(s).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).slice(0, 4000))
   const ta = tok(a)
   const tb = tok(b)
   if (ta.size === 0 && tb.size === 0) {
@@ -885,7 +906,7 @@ export type DifferentialProbeClass =
   | 'sqli_boolean' | 'sqli_time_diff' | 'ssti_math' | 'ssrf_canary' | 'nosqli_type'
   | 'path_traversal_benign' | 'graphql_audit' | 'authz_matrix' | 'workflow_invariant'
   | 'xss_context' | 'auth_protocol_audit' | 'xxe_canary' | 'cache_poison_deception' | 'mass_assignment'
-  | 'command_injection'
+  | 'command_injection' | 'csrf_state_change' | 'webhook_signature_bypass' | 'open_redirect_differential'
 
 export interface ProbeDifferentialRequest {
   probeClass: DifferentialProbeClass
@@ -935,6 +956,35 @@ export interface ProbeDifferentialRequest {
   expectedTransitions?: string[]
   /** graphql_audit schema-driven SDL resolver fuzzer */
   sdl?: string
+  /**
+   * csrf_state_change: GET route that exposes the mutated value, the JSON field that carries it,
+   * and the mutation body field. `controlValue` restores/keeps the baseline state and
+   * `expectedValue` is the value only the tokenless probe write should produce.
+   */
+  readPath?: string
+  stateField?: string
+  bodyField?: string
+  controlValue?: string | number | boolean
+  expectedValue?: string | number | boolean
+  /** GET routes to visit before a CSRF control write so the session jar holds the token. */
+  csrfPrimePaths?: string[]
+  /** Ordered read routes for CSRF state proof (detail page, parent, collection list). */
+  readPathCandidates?: string[]
+  /** Identifier used to locate the mutated record inside a collection read. */
+  stateRecordId?: string
+  /** Foreign Origin header for the tokenless CSRF probe (never sent on the control). */
+  foreignOrigin?: string
+  /** bodyShape hints for CSRF writes that use an action envelope (e.g. {field,value}). */
+  writeBody?: Record<string, unknown>
+  /** webhook_signature_bypass: signature header/body hints and read-back state. */
+  webhookHeader?: string
+  webhookBody?: Record<string, unknown>
+  readStateField?: string
+  readStateValue?: string | number | boolean
+  /** open_redirect_differential: benign target and observed trusted prefixes for prefix-bypass variants. */
+  redirectBaseTargets?: string[]
+  /** authz_matrix write-path BOLA: verify cross-tenant mutation with an owner read-back. */
+  writePathRead?: boolean
   /** Persona user ids used to interpret ownership fields in cross-persona GraphQL reads. */
   ownerUserId?: string
   otherUserId?: string
@@ -1277,7 +1327,7 @@ async function diffOperatorTypes(ctx: DiffContext): Promise<DiffOutcome> {
       baseRecords: countRecords(base.body), probeRecords: countRecords(ex.body), diverges,
     })
     if (diverges && neutralMatchesBase && ex.status < 500) {
-      anomalies.push({ type: 'operator_type_divergence', operator: variant.name, status: ex.status })
+      anomalies.push({ type: 'operator_type_divergence', operator: variant.name, status: ex.status, neutralMatchesBase: true })
     }
   }
   const hit = results.some(r => r.diverges) && neutralMatchesBase
@@ -1917,6 +1967,539 @@ function extractCreatedIdFromJson(body: string): string | null {
   }
 }
 
+function jsonRecord(body: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(body) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch { return null }
+}
+
+function scalarMatches(actual: unknown, expected: unknown): boolean {
+  if (actual === undefined || actual === null) return false
+  if (typeof actual === 'object') return false
+  return String(actual) === String(expected)
+}
+
+const csrfStateFields = [
+  'name', 'status', 'state', 'title', 'label', 'displayName', 'display_name', 'description',
+  'note', 'notes', 'tier', 'plan', 'enabled', 'active', 'value',
+]
+/** Fields safe to mutate for a write-path authorization proof (lifecycle state is excluded). */
+const bolaWriteFields = [
+  'name', 'title', 'label', 'note', 'notes', 'description', 'return_url', 'returnUrl', 'returnTo',
+  'amount', 'amountCents', 'amount_cents', 'total', 'tier', 'plan', 'enabled', 'active', 'value',
+  'status', 'state',
+]
+
+function firstStateField(record: Record<string, unknown> | null, preferred?: string): string | null {
+  if (!record) return null
+  if (preferred && preferred in record && typeof record[preferred] !== 'object') return preferred
+  return csrfStateFields.find(f => f in record && typeof record[f] !== 'object') ?? null
+}
+
+/**
+ * Locate the mutated scalar on a read response: a top-level field, or the matching record inside a
+ * collection (`items`, `jobs`, …) when only list routes are exposed.
+ */
+function stateViewOf(
+  record: Record<string, unknown> | null,
+  preferred?: string,
+  recordId?: string,
+): { field: string; value: unknown } | null {
+  if (!record) return null
+  const direct = firstStateField(record, preferred)
+  if (direct) return { field: direct, value: record[direct] }
+  for (const value of Object.values(record)) {
+    if (!Array.isArray(value)) continue
+    const rows = value.filter((r): r is Record<string, unknown> => Boolean(r) && typeof r === 'object' && !Array.isArray(r))
+    const match = recordId
+      ? rows.find(r => Object.values(r).some(v => (typeof v === 'string' || typeof v === 'number') && String(v) === recordId))
+      : rows[0]
+    if (!match) continue
+    const field = preferred && preferred in match && typeof match[preferred] !== 'object'
+      ? preferred
+      : csrfStateFields.find(f => f in match && typeof match[f] !== 'object')
+    if (field) return { field, value: match[field] }
+  }
+  return null
+}
+
+function stateValueCandidate(current: unknown, field: string): string | number | boolean {
+  if (typeof current === 'number' && Number.isFinite(current)) return Math.round(current) + 73_337
+  if (typeof current === 'boolean') return !current
+  if (/url|uri|link|callback|redirect|return/i.test(field)) return `https://guardian-state-${randToken(8)}.invalid/cb`
+  if (/status|state/i.test(field)) return `guardian_state_${randToken(6)}`
+  return `guardian_state_${randToken(10)}`
+}
+
+/**
+ * CSRF state-change differential (CWE-352).
+ *
+ * A cookie-authenticated mutation is replayed with only the victim session (no anti-CSRF token and
+ * a foreign Origin), then the documented read route must show the new value. A same-origin control
+ * write with the session's token restores the baseline (and proves the endpoint is functional), so a
+ * 200 that never mutates or a token-enforcing endpoint both stay silent.
+ */
+async function diffCsrfStateChange(ctx: DiffContext): Promise<DiffOutcome> {
+  const { req, send, anomalies } = ctx
+  const method: 'POST' | 'PUT' | 'PATCH' =
+    req.method === 'PUT' || req.method === 'PATCH' ? req.method : 'POST'
+  const readPath = req.readPath
+  if (!readPath) return { verdict: 'inconclusive', summary: 'csrf_state_change needs a read path.', details: {} }
+  if (!req.session) return { verdict: 'inconclusive', summary: 'csrf_state_change needs a bound session.', details: {} }
+
+  // Visit token-issuing routes first so the broker jar can bind the session's anti-CSRF token.
+  const readCandidates = [...new Set([readPath, ...(req.readPathCandidates ?? [])])].slice(0, 4)
+  const primes = [...new Set([...(req.csrfPrimePaths ?? []), ...readCandidates, '/'])].slice(0, 5)
+  for (const path of primes) {
+    if (ctx.runner.stopReason) break
+    await send({ method: 'GET', pathAndQuery: path })
+  }
+
+  let effectiveReadPath = readPath
+  let baseline: BrokerExchangeResult | null = null
+  let baselineView: { field: string; value: unknown } | null = null
+  for (const path of readCandidates) {
+    const ex = await send({ method: 'GET', pathAndQuery: path })
+    if (!ex || ex.status < 200 || ex.status >= 300) continue
+    const view = stateViewOf(jsonRecord(ex.body), req.stateField, req.stateRecordId)
+    if (!view) continue
+    effectiveReadPath = path
+    baseline = ex
+    baselineView = view
+    break
+  }
+  if (!baseline || !baselineView) {
+    return { verdict: 'inconclusive', summary: 'No readable state field was found on the candidate read routes.', details: {} }
+  }
+  const stateField = baselineView.field
+  const baselineValue = baselineView.value
+  const readPathResolved = effectiveReadPath
+  const controlValue = req.controlValue ?? baselineValue
+  let expectedValue = req.expectedValue ?? stateValueCandidate(baselineValue, stateField)
+  if (scalarMatches(controlValue, expectedValue)) {
+    return { verdict: 'no_signal', summary: 'Control and expected state values are identical; nothing to differentiate.', details: {} }
+  }
+  const bodyField = req.bodyField ?? stateField
+  const writeBody = (value: unknown): Record<string, unknown> => {
+    if (req.writeBody) {
+      if ('field' in req.writeBody) return { ...req.writeBody, field: bodyField, value }
+      return { ...req.writeBody, [bodyField]: value }
+    }
+    return { [bodyField]: value }
+  }
+  const foreignOrigin = req.foreignOrigin ?? 'https://untrusted.invalid'
+  const encodeBody = (value: unknown, encoding: 'json' | 'form'): { headers: Record<string, string>; body: string } => {
+    const payload = writeBody(value)
+    if (encoding === 'form') {
+      return {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: Object.entries(payload).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+      }
+    }
+    return { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
+  }
+
+  let probeWrite: BrokerExchangeResult | null = null
+  let probeRead: BrokerExchangeResult | null = null
+  let mutationEncoding: 'json' | 'form' | null = null
+  for (const encoding of ['json', 'form'] as const) {
+    const encoded = encodeBody(expectedValue, encoding)
+    probeWrite = await send({
+      method,
+      pathAndQuery: req.pathAndQuery,
+      headers: { ...encoded.headers, Origin: foreignOrigin, Referer: `${foreignOrigin}/` },
+      body: encoded.body,
+    })
+    if (!probeWrite || probeWrite.status < 200 || probeWrite.status >= 300) continue
+    probeRead = await send({ method: 'GET', pathAndQuery: readPathResolved })
+    const probeView = stateViewOf(probeRead ? jsonRecord(probeRead.body) : null, stateField, req.stateRecordId)
+    if (probeView && scalarMatches(probeView.value, expectedValue)) { mutationEncoding = encoding; break }
+  }
+  const probeView = stateViewOf(probeRead ? jsonRecord(probeRead.body) : null, stateField, req.stateRecordId)
+  const mutated = Boolean(probeView && probeRead && probeRead.status >= 200 && probeRead.status < 300 &&
+    !scalarMatches(probeView.value, baselineValue))
+  if (mutated && probeView) expectedValue = probeView.value as string | number | boolean
+
+  // Restore the baseline with a same-origin token-bound control. If the control cannot mutate the
+  // same field, the "probe succeeded" evidence is not trustworthy (the route may ignore writes).
+  const controlEncoded = encodeBody(controlValue, mutationEncoding ?? 'json')
+  const controlWrite = await send({
+    method,
+    pathAndQuery: req.pathAndQuery,
+    headers: { ...controlEncoded.headers, Origin: req.origin, Referer: `${req.origin}/` },
+    body: controlEncoded.body,
+    csrfBind: true,
+  })
+  const controlRead = controlWrite && controlWrite.status >= 200 && controlWrite.status < 300
+    ? await send({ method: 'GET', pathAndQuery: readPathResolved })
+    : null
+  const controlView = stateViewOf(controlRead ? jsonRecord(controlRead.body) : null, stateField, req.stateRecordId)
+  const controlRestored = Boolean(controlView && (
+    scalarMatches(controlView.value, controlValue) ||
+    (mutated && scalarMatches(controlView.value, expectedValue))
+  ))
+
+  const details = {
+    stateField, baselineValue, controlValue, expectedValue, bodyField,
+    baselineStatus: baseline.status, probeStatus: probeWrite?.status ?? null,
+    probeReadStatus: probeRead?.status ?? null,
+    controlStatus: controlWrite?.status ?? null,
+    controlRestored,
+    mutated,
+    encoding: mutationEncoding,
+  }
+  if (!mutated || !controlRestored) {
+    return {
+      verdict: 'no_signal',
+      summary: mutated
+        ? 'The tokenless write mutated state but the token-bound control could not restore it; treating the differential as unstable.'
+        : 'The tokenless cross-origin write did not change the documented state (or was rejected).',
+      details,
+    }
+  }
+  anomalies.push({
+    type: 'csrf_state_change',
+    path: req.pathAndQuery,
+    method,
+    bodyField,
+    readPath: readPathResolved,
+    stateField,
+    controlValue,
+    expectedValue,
+    ...(mutationEncoding ? { bodyEncoding: mutationEncoding } : {}),
+  })
+  return {
+    verdict: 'signal',
+    summary: 'A cookie-authenticated state change succeeded without the anti-CSRF token and the documented read route proved the mutation.',
+    details,
+  }
+}
+
+const webhookHeaderNames = [
+  'x-hub-signature-256', 'x-hub-signature', 'stripe-signature', 'x-webhook-signature',
+  'x-signature-256', 'x-signature', 'x-slack-signature', 'x-shopify-hmac-sha256',
+]
+const webhookSignatureKeyFields = ['signature', 'sig', 'hmac', 'token', 'code']
+const webhookKeyFields = ['key', 'secret', 'signingKey', 'signing_key', 'webhookKey', 'webhook_key']
+
+/** Canonical payload strings a receiver might sign; only used to build an attacker-chosen key pair. */
+function webhookCanonicals(body: Record<string, unknown>, ts: string): string[] {
+  const event = body.event ?? body.payload ?? body.data ?? body
+  const eventText = typeof event === 'string' ? event : JSON.stringify(event)
+  const withoutSig = { ...body }
+  for (const f of [...webhookSignatureKeyFields, ...webhookHeaderNames]) delete withoutSig[f]
+  return [
+    `${ts}.${eventText}`,
+    `${ts}.${JSON.stringify(withoutSig)}`,
+    JSON.stringify(event),
+    JSON.stringify(withoutSig),
+  ]
+}
+
+/**
+ * Webhook signature differential (CWE-345).
+ *
+ * Control: a tampered/random signature must be rejected. Probe: an unsigned (or attacker-key
+ * self-signed) delivery is accepted. The endpoint is only reported when a follow-up read shows the
+ * event was actually processed, so receivers that answer 200 without persisting stay silent.
+ */
+async function diffWebhookSignature(ctx: DiffContext): Promise<DiffOutcome> {
+  const { req, send, anomalies } = ctx
+  const body = req.webhookBody ? { ...req.webhookBody } : null
+  const readPath = req.readPath
+  const stateField = req.readStateField
+  const expected = req.readStateValue
+  if (!body) {
+    return { verdict: 'inconclusive', summary: 'webhook_signature_bypass needs a delivery body.', details: {} }
+  }
+  const ts = String(Math.floor(Date.now() / 1000))
+  const delivery = { ...body, ts }
+  const controlHeader = req.webhookHeader ?? webhookHeaderNames[0]
+  const control = await send({
+    method: 'POST', pathAndQuery: req.pathAndQuery,
+    headers: { 'Content-Type': 'application/json', [controlHeader]: `guardian_invalid_${randToken(12)}` },
+    body: JSON.stringify(delivery),
+  })
+  if (!control) return { verdict: 'inconclusive', summary: 'Webhook control request failed.', details: {} }
+  const controlRejected = control.status >= 400 && control.status < 500
+
+  const accepted: Array<{ variant: string; header?: string; body: Record<string, unknown>; status: number; responseBody: string }> = []
+  // (a) no signature at all
+  const unsigned = await send({
+    method: 'POST', pathAndQuery: req.pathAndQuery,
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(delivery),
+  })
+  if (unsigned && unsigned.status >= 200 && unsigned.status < 300) {
+    accepted.push({ variant: 'unsigned', body: delivery, status: unsigned.status, responseBody: unsigned.body })
+  }
+  // (b) attacker-chosen key echoed inline (a receiver that trusts an inline signing key)
+  if (accepted.length === 0) {
+    const attackerKey = `guardian_whk_${randToken(10)}`
+    const canonicals = webhookCanonicals(delivery, ts)
+    for (const keyField of webhookKeyFields.slice(0, 3)) {
+      for (const sigField of webhookSignatureKeyFields.slice(0, 3)) {
+        if (ctx.runner.stopReason || accepted.length > 0) break
+        const withKey = { ...delivery, [keyField]: attackerKey }
+        for (const canonical of canonicals.slice(0, 2)) {
+          const sig = createHmac('sha256', attackerKey).update(canonical).digest('hex')
+          const attempt = { ...withKey, [sigField]: sig }
+          const ex = await send({
+            method: 'POST', pathAndQuery: req.pathAndQuery,
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(attempt),
+          })
+          if (ex && ex.status >= 200 && ex.status < 300) {
+            accepted.push({ variant: `inline_key:${keyField}/${sigField}`, body: attempt, status: ex.status, responseBody: ex.body })
+            break
+          }
+        }
+      }
+    }
+  }
+  if (accepted.length === 0) {
+    return {
+      verdict: 'no_signal',
+      summary: controlRejected
+        ? 'The receiver rejected tampered and unsigned deliveries.'
+        : 'No unsigned or self-signed delivery was accepted.',
+      details: { controlStatus: control.status, controlRejected },
+    }
+  }
+  const read = readPath ? await send({ method: 'GET', pathAndQuery: readPath }) : null
+  const readJson = read ? jsonRecord(read.body) : null
+  const readbackProven = Boolean(read && read.status >= 200 && read.status < 300 && stateField && expected !== undefined && (
+    scalarMatches(readJson?.[stateField], expected) ||
+    (Array.isArray(readJson?.[stateField]) && (readJson![stateField] as unknown[]).length >= Number(expected))
+  ))
+  // Fallback when the receiver exposes no delivery read route: a rejected control plus an accepted
+  // forged delivery that returns an explicit processing acknowledgement is still a signature bypass.
+  const acceptedResponse = accepted[0]!.status >= 200 && accepted[0]!.status < 300
+  const acceptedBodyText = accepted[0]!.responseBody.toLowerCase()
+  const responseAck = acceptedResponse && /"(?:ok|received|processed|accepted|success)"\s*:\s*true/.test(acceptedBodyText)
+  const acceptanceProven = controlRejected && responseAck
+  if (!readbackProven && !acceptanceProven) {
+    return {
+      verdict: 'no_signal',
+      summary: 'The forged delivery was accepted but the follow-up read did not show it was processed.',
+      details: { controlStatus: control.status, accepted: accepted[0]?.variant, readStatus: read?.status ?? null },
+    }
+  }
+  const anomalyReadPath = readPath ?? req.pathAndQuery
+  const anomalyStateField = stateField ?? 'ok'
+  const anomalyExpected = expected ?? true
+  anomalies.push({
+    type: 'webhook_signature_bypass',
+    path: req.pathAndQuery,
+    headerName: controlHeader,
+    body: accepted[0]!.body,
+    readPath: anomalyReadPath,
+    stateField: anomalyStateField,
+    expectedValue: anomalyExpected,
+    variant: accepted[0]!.variant,
+    proof: readbackProven ? 'readback' : 'acceptance',
+  })
+  return {
+    verdict: 'signal',
+    summary: readbackProven
+      ? 'A forged webhook delivery was accepted and the follow-up read confirmed the event was processed.'
+      : 'A forged webhook delivery was accepted while a tampered control was rejected.',
+    details: { controlStatus: control.status, accepted: accepted[0]?.variant, readStatus: read?.status ?? null, readbackProven },
+  }
+}
+
+/** Extract an off-origin redirect target from a 3xx Location or a client-side meta/script redirect. */
+export function redirectTargetOf(ex: BrokerExchangeResult, origin: string): string | null {
+  const location = ex.respHeaders.location ?? ex.respHeaders.Location
+  const raw = Array.isArray(location) ? location[0] : location
+  if (raw && (ex.status >= 300 && ex.status < 400)) return raw
+  const meta = /<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'>\s]+)/i.exec(ex.body)
+  if (meta) return meta[1]
+  const js = /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i.exec(ex.body)
+  if (js) return js[1]
+  return null
+}
+
+/** Host a browser would actually navigate to for `target`, normalising protocol-relative and `\` forms. */
+export function redirectHostOf(target: string, origin: string): string | null {
+  const cleaned = target.trim().replace(/\\/g, '/')
+  const withScheme = cleaned.startsWith('//') ? `https:${cleaned}` : cleaned
+  try {
+    return new URL(withScheme, origin).hostname.toLowerCase()
+  } catch { return null }
+}
+
+/** Absolute form of an observed redirect target (protocol-relative forms get an explicit scheme). */
+function absoluteRedirectTarget(target: string, origin: string): string | null {
+  const cleaned = target.trim().replace(/\\/g, '/')
+  const withScheme = cleaned.startsWith('//') ? `https:${cleaned}` : cleaned
+  try { return new URL(withScheme, origin).toString() } catch { return null }
+}
+
+/**
+ * General open-redirect differential (CWE-601). A benign same-origin control target must stay on
+ * origin; an off-origin canary (absolute, protocol-relative, backslash, userinfo or trusted-prefix
+ * spoof) must actually change the observed redirect host before it is reported.
+ */
+async function diffOpenRedirectDifferential(ctx: DiffContext): Promise<DiffOutcome> {
+  const { req, send, anomalies } = ctx
+  const param = req.param
+  const location = req.paramLocation ?? 'query'
+  if (!param) return { verdict: 'inconclusive', summary: 'open_redirect_differential needs a candidate parameter.', details: {} }
+  const originHost = new URL(req.origin).hostname.toLowerCase()
+  const canaryHost = `gxr${randToken(10)}.invalid`
+  const controlTarget = `/guardian-return-${randToken(6)}`
+  const trusted = (req.redirectBaseTargets ?? []).slice(0, 3)
+  const payloads: string[] = [
+    `https://${canaryHost}/cb`,
+    `//${canaryHost}/cb`,
+    `/\\${canaryHost}/cb`,
+    `https://${originHost}.${canaryHost}/cb`,
+  ]
+  for (const base of trusted) {
+    let host: string | null = null
+    try { host = new URL(base).hostname } catch { host = null }
+    if (!host || !/^[a-z0-9.-]+$/i.test(host)) continue
+    payloads.push(
+      `https://${host}.${canaryHost}/cb`,
+      `https://${host}@${canaryHost}/cb`,
+      `https://${host}\\@${canaryHost}/cb`,
+    )
+  }
+  const requestFor = (value: string): InjectedRequest => {
+    if (location === 'json') {
+      return { method: req.method === 'GET' ? 'POST' : (req.method ?? 'POST'), pathAndQuery: req.pathAndQuery, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...(req.jsonBody ?? {}), [param]: value }) }
+    }
+    if (location === 'form') {
+      return { method: req.method === 'GET' ? 'POST' : (req.method ?? 'POST'), pathAndQuery: req.pathAndQuery, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: `${encodeURIComponent(param)}=${encodeURIComponent(value)}` }
+    }
+    const sep = req.pathAndQuery.includes('?') ? '&' : '?'
+    return { method: 'GET', pathAndQuery: `${req.pathAndQuery}${sep}${encodeURIComponent(param)}=${encodeURIComponent(value)}` }
+  }
+  const control = await send(requestFor(controlTarget))
+  if (!control) return { verdict: 'inconclusive', summary: 'Open-redirect control request failed.', details: {} }
+  const controlTargetLoc = redirectTargetOf(control, req.origin)
+  const controlHost = controlTargetLoc ? redirectHostOf(controlTargetLoc, req.origin) : null
+  const controlStaysOnOrigin = controlHost === null || controlHost === originHost || control.status >= 400
+  if (!controlStaysOnOrigin) {
+    return { verdict: 'inconclusive', summary: 'The benign control already redirects off-origin; no stable baseline.', details: { controlStatus: control.status, controlHost } }
+  }
+  const tried: Array<Record<string, unknown>> = []
+  for (const payload of payloads.slice(0, 8)) {
+    if (ctx.runner.stopReason) break
+    const ex = await send(requestFor(payload))
+    if (!ex) continue
+    const target = redirectTargetOf(ex, req.origin)
+    const host = target ? redirectHostOf(target, req.origin) : null
+    const offOriginCanary = Boolean(host && host !== originHost && (host === canaryHost || host.endsWith(`.${canaryHost}`)))
+    const absolute = target ? absoluteRedirectTarget(target, req.origin) : null
+    tried.push({ payload, status: ex.status, location: absolute?.slice(0, 200) ?? target?.slice(0, 200) ?? null, host })
+    if (!offOriginCanary || !absolute) continue
+    anomalies.push({
+      type: 'open_redirect_differential',
+      payload,
+      location: absolute,
+      param,
+      paramLocation: location,
+      method: ex.status >= 300 && ex.status < 400 ? 'GET' : (req.method ?? 'GET'),
+      controlHost,
+    })
+    return {
+      verdict: 'signal',
+      summary: 'An unvalidated redirect target changed the observed redirect host to an off-origin canary.',
+      details: { controlStatus: control.status, controlHost, tried },
+    }
+  }
+  return { verdict: 'no_signal', summary: 'Redirect targets stayed on the registered origin.', details: { controlStatus: control.status, controlHost, tried } }
+}
+
+/**
+ * Write-path BOLA proof: a non-owner patches a benign field, the owner reads the object back, and
+ * the original value is restored. Only a confirmed owner-visible mutation is reported.
+ */
+async function proveWritePathBola(
+  ctx: DiffContext,
+  opts: { method: 'PUT' | 'PATCH'; id: string; ownerPersona?: string; otherPersona?: string },
+): Promise<Record<string, unknown> | null> {
+  const { req, runner } = ctx
+  if (!opts.ownerPersona || !opts.otherPersona) return null
+  const target = req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(opts.id))
+  const readBefore = await runner.send({
+    origin: ctx.origin, method: 'GET', pathAndQuery: target, persona: opts.ownerPersona,
+    ...(req.session ? { session: req.session } : {}),
+  })
+  if (!readBefore.ok) return null
+  runner.stage(readBefore.ex)
+  const beforeJson = jsonRecord(readBefore.ex.body)
+  if (!beforeJson) return null
+  const candidates = bolaWriteFields
+    .filter(f => f in beforeJson && /^(?:string|number|boolean)$/.test(typeof beforeJson[f]))
+    .slice(0, 3)
+  if (candidates.length === 0) return null
+  const bodyShapes = (field: string, value: unknown): Array<Record<string, unknown>> => {
+    const direct = { [field]: value }
+    const wrapped = { field, value }
+    return [wrapped, direct]
+  }
+  for (const field of candidates) {
+    const original = beforeJson[field]
+    const expected = stateValueCandidate(original, field)
+    for (const writeBody of bodyShapes(field, expected)) {
+      const write = await runner.send({
+        origin: ctx.origin, method: opts.method, pathAndQuery: target, persona: opts.otherPersona,
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(writeBody),
+        ...(req.session ? { session: req.session } : {}),
+      })
+      if (!write.ok) return null
+      runner.stage(write.ex)
+      if (write.ex.status < 200 || write.ex.status >= 300) continue
+      const readAfter = await runner.send({
+        origin: ctx.origin, method: 'GET', pathAndQuery: target, persona: opts.ownerPersona,
+        ...(req.session ? { session: req.session } : {}),
+      })
+      if (!readAfter.ok) return null
+      runner.stage(readAfter.ex)
+      const afterJson = jsonRecord(readAfter.ex.body)
+      if (!afterJson) continue
+      if (!scalarMatches(afterJson[field], expected)) {
+        // A rejected shape may still have written a different value; restore the field before moving on.
+        if (!scalarMatches(afterJson[field], original)) {
+          for (const restoreBody of bodyShapes(field, original)) {
+            const restore = await runner.send({
+              origin: ctx.origin, method: opts.method, pathAndQuery: target, persona: opts.ownerPersona,
+              headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restoreBody),
+              ...(req.session ? { session: req.session } : {}),
+            })
+            if (restore.ok) runner.stage(restore.ex)
+          }
+        }
+        continue
+      }
+      // Best-effort restore by the legitimate owner with the shape that worked.
+      const restoreBody = 'field' in writeBody ? { field: writeBody.field, value: original } : { [field]: original }
+      const cleanup = await runner.send({
+        origin: ctx.origin, method: opts.method, pathAndQuery: target, persona: opts.ownerPersona,
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restoreBody),
+        ...(req.session ? { session: req.session } : {}),
+      })
+      if (cleanup.ok) runner.stage(cleanup.ex)
+      return {
+        type: 'write_path_bola',
+        resourceId: opts.id,
+        path: req.pathAndQuery,
+        method: opts.method,
+        writeBody,
+        readPath: req.pathAndQuery,
+        stateField: field,
+        expectedValue: expected,
+        controlValue: original,
+        cleanupBody: restoreBody,
+        cleanupStatus: cleanup.ok ? cleanup.ex.status : null,
+      }
+    }
+  }
+  return null
+}
+
 async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
   const { req, runner, notes, anomalies } = ctx
   const method: HttpMethod = (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE')
@@ -1974,6 +2557,7 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
 
   const matrix: Array<Record<string, unknown>> = []
   const orderedIds = ids.slice(0, 6)
+  let writeProof: Record<string, unknown> | null = null
   for (const id of orderedIds) {
     const path = functionLevel ? req.pathAndQuery : req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(id))
     let ownerEx: BrokerExchangeResult | null = null
@@ -2007,6 +2591,12 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
       if (ownerEx && ownerEx.status >= 400) {
         matrix.push({ resourceId: id, actor: 'owner', status: ownerEx.status, inaccessible: true })
         continue
+      }
+      // Safe cross-tenant write proof: PATCH/PUT a benign field, verify with an owner read-back,
+      // then restore. Runs once per endpoint on the first owner-readable identifier.
+      if (req.writePathRead && !writeProof && !functionLevel && (method === 'PATCH' || method === 'PUT') && req.otherPersona && req.ownerPersona) {
+        writeProof = await proveWritePathBola(ctx, { method, id, ownerPersona: req.ownerPersona, otherPersona: req.otherPersona })
+        if (writeProof) anomalies.push(writeProof)
       }
     }
     for (const a of actors) {
@@ -3014,6 +3604,9 @@ export async function probeDifferential(
       case 'xxe_canary': outcome = await diffXxeCanary(ctx, canaryBroker, grant, signal); break
       case 'cache_poison_deception': outcome = await diffCachePoisonDeception(ctx); break
       case 'mass_assignment': outcome = await diffMassAssignment(ctx); break
+      case 'csrf_state_change': outcome = await diffCsrfStateChange(ctx); break
+      case 'webhook_signature_bypass': outcome = await diffWebhookSignature(ctx); break
+      case 'open_redirect_differential': outcome = await diffOpenRedirectDifferential(ctx); break
     }
   } catch (err) {
     if (err instanceof StopProbe) {
