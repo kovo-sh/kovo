@@ -79,6 +79,7 @@ import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } fr
 import type { EvidenceReview } from './evidence-checks.ts'
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
 import { LabRunner } from './lab-runner.ts'
+import type { LabTargetHandle } from './lab-runner.ts'
 import {
   privateModelProfiles,
   recordProfileFailure,
@@ -754,6 +755,7 @@ export class Execution {
   private readonly runAuthStarted = new Map<string, string>()
   private readonly runAuthInFlight = new Map<string, AbortController>()
   private readonly startedLabRuns = new Set<string>()
+  private readonly startedLabHandles = new Map<string, LabTargetHandle>()
   private readonly variantSweptFindings = new Set<string>()
   private readonly variantSweepInFlight = new Set<string>()
   private safetyTimer?: NodeJS.Timeout
@@ -836,7 +838,12 @@ export class Execution {
     this.personaAuth.stopAll()
     await this.labRunner.stopAll().catch(() => undefined)
     this.startedLabRuns.clear()
+    this.startedLabHandles.clear()
     await this.canaryBroker.stopListener().catch(() => undefined)
+  }
+
+  getLabTargetHandle(runId: string): LabTargetHandle | undefined {
+    return this.startedLabHandles.get(runId)
   }
 
   private scheduleWake() {
@@ -1209,10 +1216,12 @@ export class Execution {
         const current = this.storage.run(runId)
         if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped') {
           this.startedLabRuns.delete(runId)
+          this.startedLabHandles.delete(runId)
           void this.labRunner.stopLabTarget(runId).catch(() => undefined)
         }
       } catch {
         this.startedLabRuns.delete(runId)
+        this.startedLabHandles.delete(runId)
         void this.labRunner.stopLabTarget(runId).catch(() => undefined)
       }
     }
@@ -1404,7 +1413,7 @@ export class Execution {
     this.active.set(claimed.id, job)
 
     try {
-      const { grant, secrets } = this.buildGrant(job, freshRun, approvedOrigins)
+      let { grant, secrets } = this.buildGrant(job, freshRun, approvedOrigins)
       const specs = this.storage.listProjectSpecsFull(freshRun.projectId)
       const { reposDir, mountedRepos } = this.projectReposMount(freshRun.projectId)
 
@@ -1416,19 +1425,72 @@ export class Execution {
           project.labConfig?.enabled &&
           isLocalLabEnvEnabled() &&
           !this.startedLabRuns.has(freshRun.id) &&
-          reposDir &&
-          (project.labConfig.dockerComposeFile || project.labConfig.dockerfile || project.labConfig.image)
+          reposDir
         ) {
-          const primaryRepoDir = mountedRepos[0] ? join(reposDir, mountedRepos[0]) : reposDir
-          if (existsSync(primaryRepoDir)) {
-            await this.labRunner.startLabTarget({
+          const primaryRepoRel = mountedRepos[0] ? mountedRepos[0].replace(/^\/repos\//, '') : ''
+          const primaryRepoDir = primaryRepoRel ? join(reposDir, primaryRepoRel) : reposDir
+          const hasLabLaunchSpec = Boolean(
+            project.labConfig.dockerComposeFile ||
+            project.labConfig.dockerfile ||
+            project.labConfig.image ||
+            project.labConfig.startCommand ||
+            (Array.isArray(project.labConfig.services) && project.labConfig.services.length > 0) ||
+            (existsSync(primaryRepoDir) && existsSync(join(primaryRepoDir, 'Dockerfile'))),
+          )
+          if (existsSync(primaryRepoDir) && hasLabLaunchSpec) {
+            const handle = await this.labRunner.startLabTarget({
               runId: freshRun.id,
               environment: project.environment,
               repoDir: primaryRepoDir,
               labConfig: project.labConfig,
+              storage: this.storage,
+              projectId: project.id,
+              ...(project.labConfig.iastEnabled ? { telemetryDir: join(this.storage.directory, 'evidence', 'lab-telemetry') } : {}),
               signal: task.controller.signal,
             })
             this.startedLabRuns.add(freshRun.id)
+            this.startedLabHandles.set(freshRun.id, handle)
+            this.storage.event(
+              freshRun.id,
+              'lab.started',
+              `Local lab target booted at ${handle.origin}.`,
+              {
+                origin: handle.origin,
+                baseUrls: handle.baseUrls,
+                containerName: handle.containerName,
+                seededPersonas: handle.seededPersonas.map(p => p.handle),
+              },
+            )
+            // Expose the booted local-lab origin & any seeded personas into the run scope
+            let scopeChanged = false
+            if (!approvedOrigins.has(handle.origin)) {
+              const latestForOrigin = this.storage.run(freshRun.id)
+              this.storage.suggestCandidateHost(latestForOrigin, handle.origin, 'lab_runner', false)
+              const withCand = this.storage.run(freshRun.id)
+              const cand = withCand.candidates.find(c => c.origin === handle.origin)
+              if (cand && !withCand.approved.includes(cand.id)) {
+                this.storage.updateRun(freshRun.id, { approved: [...withCand.approved, cand.id] })
+              }
+              approvedOrigins.add(handle.origin)
+              job.origins.add(handle.origin)
+              scopeChanged = true
+            }
+            const seededPersonaIds = handle.seededPersonas
+              .map(p => p.personaId)
+              .filter((id): id is string => typeof id === 'string' && id.length > 0)
+            if (seededPersonaIds.length > 0) {
+              const latestForPersonas = this.storage.run(freshRun.id)
+              const mergedPersonas = [...new Set([...latestForPersonas.approvedPersonaIds, ...seededPersonaIds])]
+              if (mergedPersonas.length !== latestForPersonas.approvedPersonaIds.length) {
+                this.storage.updateRun(freshRun.id, { approvedPersonaIds: mergedPersonas })
+                scopeChanged = true
+              }
+            }
+            if (scopeChanged) {
+              const refreshed = this.buildGrant(job, this.storage.run(freshRun.id), approvedOrigins)
+              grant = refreshed.grant
+              secrets = refreshed.secrets
+            }
           }
         }
       } catch {
@@ -1439,6 +1501,7 @@ export class Execution {
       this.storage.updateRunDynamicStepBudget(freshRun.id, computeDynamicStepBudget(this.storage, freshRun.id))
 
       // 0c. Zero-LLM Phase-0 deterministic surface mapper (runs before LLM Turn 1)
+      const phase0RootExchanges = new Map<string, BrokerExchangeResult>()
       if (!freshRun.phase0CompletedAt && approvedOrigins.size > 0 && this.authorize(job)) {
         try {
           await runPhase0Recon({
@@ -1457,6 +1520,9 @@ export class Execution {
             signal: task.controller.signal,
             assignmentId: claimed.id,
             onExchange: ex => {
+              if (ex.method === 'GET' && ex.pathAndQuery === '/' && !phase0RootExchanges.has(ex.origin)) {
+                phase0RootExchanges.set(ex.origin, ex)
+              }
               const saved = this.storage.recordExchange({
                 runId: freshRun.id,
                 assignmentId: claimed.id,
@@ -1549,41 +1615,119 @@ export class Execution {
             : { observation: null, note: 'No prepared observation was supplied.' }
         } else {
           try {
-            const ex = await this.broker.executeHttp({
-              origin: asset.origin,
-              method: 'GET',
-              pathAndQuery: '/',
-              followRedirects: true,
-              timeoutMs: 12_000,
-            }, grant, task.controller.signal)
-            const savedEx = this.storage.recordExchange({
-              runId: freshRun.id,
-              assignmentId: hostWorker.id,
-              scopeRevision: freshRun.scopeRevision,
-              origin: ex.origin,
-              finalOrigin: ex.finalOrigin,
-              redirectOrigins: ex.redirectOrigins,
-              method: ex.method,
-              pathAndQuery: ex.pathAndQuery,
-              personaHandle: ex.personaHandle,
-              status: ex.status,
-              mediaType: ex.mediaType,
-              reqHeaders: ex.reqHeaders,
-              respHeaders: ex.respHeaders,
-              body: ex.body,
-              durationMs: ex.durationMs,
-              secrets,
-            })
-            capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
-            observations.push({
-              origin: asset.origin,
-              finalOrigin: ex.finalOrigin,
-              status: ex.status,
-              mediaType: ex.mediaType,
-              server: ex.respHeaders['server'],
-              poweredBy: ex.respHeaders['x-powered-by'],
-              exchangeId: savedEx.id,
-            })
+            const cachedPhase0Root = phase0RootExchanges.get(asset.origin)
+            const priorRootRow = !cachedPhase0Root
+              ? this.storage.client.prepare(
+                  `SELECT id, origin, final_origin AS finalOrigin, status, media_type AS mediaType, resp_headers AS respHeadersJson
+                   FROM broker_exchanges
+                   WHERE run_id = ? AND scope_revision = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
+                   ORDER BY created_at ASC LIMIT 1`,
+                ).get(freshRun.id, freshRun.scopeRevision, asset.origin) as {
+                  id: string
+                  origin: string
+                  finalOrigin: string
+                  status: number
+                  mediaType: string
+                  respHeadersJson: string
+                } | undefined
+              : undefined
+
+            if (cachedPhase0Root) {
+              capture = { observation: cachedPhase0Root.observation, note: 'Recorded approved HTTPS root response.' }
+              observations.push({
+                origin: asset.origin,
+                finalOrigin: cachedPhase0Root.finalOrigin,
+                status: cachedPhase0Root.status,
+                mediaType: cachedPhase0Root.mediaType,
+                server: cachedPhase0Root.respHeaders['server'],
+                poweredBy: cachedPhase0Root.respHeaders['x-powered-by'],
+              })
+            } else if (priorRootRow) {
+              let headersObj: Record<string, string> = {}
+              try { headersObj = JSON.parse(priorRootRow.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
+              const h = (name: string): string | undefined => headersObj[name.toLowerCase()]
+              const transport = h('strict-transport-security') ?? ''
+              const ages = transport.split(';').filter(d => /^\s*max-age\s*(?:=|$)/i.test(d))
+              const parsedAge = ages.length === 1 ? ages[0].match(/^\s*max-age\s*=\s*(?:"(\d+)"|(\d+))\s*$/i) : null
+              const maxAge = parsedAge ? Number(parsedAge[1] ?? parsedAge[2]) : NaN
+              const xcto = h('x-content-type-options')
+              const nosniff = xcto?.split(',', 1)[0].trim().toLowerCase() === 'nosniff'
+              const cspVal = h('content-security-policy')
+              const cspRo = h('content-security-policy-report-only')
+              const xfo = h('x-frame-options')
+              const frameAncestors = Boolean(cspVal && /(?:^|;)\s*frame-ancestors\s+[^;]+/i.test(cspVal))
+              const validXfo = Boolean(xfo && /^(?:deny|sameorigin)\s*$/i.test(xfo.split(',', 1)[0]))
+              const refRaw = h('referrer-policy')
+              const validRefs = ['no-referrer', 'no-referrer-when-downgrade', 'origin', 'origin-when-cross-origin', 'same-origin', 'strict-origin', 'strict-origin-when-cross-origin', 'unsafe-url'] as const
+              const refPolicy: PublicObservation['referrerPolicy'] = refRaw === undefined
+                ? 'absent'
+                : refRaw.includes('"')
+                  ? 'unrecognized'
+                  : (refRaw.split(',').map(t => t.trim()).findLast((t): t is typeof validRefs[number] => (validRefs as readonly string[]).includes(t)) ?? 'unrecognized')
+              const srv = h('server')?.trim()
+              capture = {
+                observation: {
+                  origin: priorRootRow.origin,
+                  finalOrigin: priorRootRow.finalOrigin,
+                  status: priorRootRow.status,
+                  mediaType: priorRootRow.mediaType || 'unknown',
+                  transportMaxAge: Number.isSafeInteger(maxAge) && maxAge >= 0 ? maxAge : null,
+                  includeSubDomains: /(?:^|;)\s*includeSubDomains\s*(?:;|$)/i.test(transport),
+                  source: 'public response',
+                  contentTypeOptions: xcto === undefined ? 'absent' : nosniff ? 'nosniff' : 'unrecognized',
+                  referrerPolicy: refPolicy,
+                  contentSecurityPolicy: cspVal !== undefined ? (cspVal.trim() ? 'enforced' : 'unrecognized') : cspRo !== undefined ? (cspRo.trim() ? 'report-only' : 'unrecognized') : 'absent',
+                  frameProtection: frameAncestors && validXfo ? 'both' : frameAncestors ? 'csp-frame-ancestors' : validXfo ? 'x-frame-options' : xfo !== undefined ? 'unrecognized' : 'absent',
+                  serverDisclosure: h('x-powered-by') ? 'technology' : !srv ? 'absent' : /(?:\d|\/|next|express|php|asp\.net|nginx|apache)/i.test(srv) ? 'technology' : 'generic',
+                },
+                note: 'Reused recorded approved HTTPS root response.',
+              }
+              observations.push({
+                origin: asset.origin,
+                finalOrigin: priorRootRow.finalOrigin,
+                status: priorRootRow.status,
+                mediaType: priorRootRow.mediaType,
+                server: headersObj['server'],
+                poweredBy: headersObj['x-powered-by'],
+                exchangeId: priorRootRow.id,
+              })
+            } else {
+              const ex = await this.broker.executeHttp({
+                origin: asset.origin,
+                method: 'GET',
+                pathAndQuery: '/',
+                followRedirects: true,
+                timeoutMs: 12_000,
+              }, grant, task.controller.signal)
+              const savedEx = this.storage.recordExchange({
+                runId: freshRun.id,
+                assignmentId: hostWorker.id,
+                scopeRevision: freshRun.scopeRevision,
+                origin: ex.origin,
+                finalOrigin: ex.finalOrigin,
+                redirectOrigins: ex.redirectOrigins,
+                method: ex.method,
+                pathAndQuery: ex.pathAndQuery,
+                personaHandle: ex.personaHandle,
+                status: ex.status,
+                mediaType: ex.mediaType,
+                reqHeaders: ex.reqHeaders,
+                respHeaders: ex.respHeaders,
+                body: ex.body,
+                durationMs: ex.durationMs,
+                secrets,
+              })
+              capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
+              observations.push({
+                origin: asset.origin,
+                finalOrigin: ex.finalOrigin,
+                status: ex.status,
+                mediaType: ex.mediaType,
+                server: ex.respHeaders['server'],
+                poweredBy: ex.respHeaders['x-powered-by'],
+                exchangeId: savedEx.id,
+              })
+            }
           } catch (error) {
             capture = {
               observation: null,

@@ -834,6 +834,55 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2a. Standard seed probes
     for (const seedPath of PHASE0_SEED_PATHS) {
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
+      if (seedPath === '/') {
+        // On crash recovery, reuse any already-recorded GET / for this (runId, scopeRevision, origin)
+        // so baseline GET / is never duplicated across SIGKILL + resume.
+        try {
+          const prior = storage.client.prepare(
+            `SELECT status, media_type AS mediaType, resp_headers AS respHeadersJson, body_preview AS bodyPreview
+             FROM broker_exchanges
+             WHERE run_id = ? AND scope_revision = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
+             ORDER BY created_at ASC LIMIT 1`,
+          ).get(runId, scopeRevision, origin) as {
+            status: number
+            mediaType: string
+            respHeadersJson: string
+            bodyPreview: string
+          } | undefined
+          if (prior) {
+            probedPaths.add('GET /')
+            let headersObj: Record<string, string> = {}
+            try { headersObj = JSON.parse(prior.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
+            for (const t of detectTechTags(headersObj, prior.bodyPreview ?? '')) techFingerprint.add(t)
+            if (prior.status < 400) recordEndpoint('GET', '/', 'surface_probe')
+            const html = extractHtmlLinksAndScripts(prior.bodyPreview ?? '', origin)
+            for (const s of html.scripts) {
+              if (!jsQueue.includes(s)) jsQueue.push(s)
+            }
+            for (const l of html.links.slice(0, 60)) {
+              dynamicPaths.add(normalizeRouteTemplate(l))
+              if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
+            }
+            for (const form of html.forms) {
+              const ep = recordEndpoint(form.method, form.action, 'surface_probe')
+              for (const inp of form.inputs) {
+                storage.upsertEndpointParam({
+                  runId,
+                  endpointId: ep.id,
+                  name: inp,
+                  location: form.method === 'GET' ? 'query' : 'form',
+                  isCsrf: CSRF_PARAM_RE.test(inp),
+                  isObjectId: OBJECT_ID_PARAM_RE.test(inp),
+                  source: 'phase0_html',
+                })
+                dynamicParams.add(inp)
+                paramsDiscovered += 1
+              }
+            }
+            continue
+          }
+        } catch { /* fall through to live GET / */ }
+      }
       const ex = await safeGet(seedPath)
       if (!ex) continue
 

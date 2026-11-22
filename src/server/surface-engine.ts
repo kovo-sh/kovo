@@ -990,14 +990,20 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   const baselineDialect = dbErrorDialect(baseA.body)
   let detectedErrorDialect: string | null = null
   let consecutive5xx = 0
+  let total5xx = 0
 
   const checkDbError = (ex: BrokerExchangeResult | null) => {
     if (!ex) return
-    if (ex.status >= 500) consecutive5xx += 1
-    else consecutive5xx = 0
+    if (ex.status >= 500) {
+      consecutive5xx += 1
+      total5xx += 1
+    } else {
+      consecutive5xx = 0
+    }
     const d = dbErrorDialect(ex.body)
     if (d && d !== baselineDialect && !detectedErrorDialect) {
       detectedErrorDialect = d
+      anomalies.push({ type: 'db_error_fingerprint', dialect: d })
     }
   }
 
@@ -1014,13 +1020,15 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   ]
   const signals: Array<Record<string, unknown>> = []
   for (const style of styles) {
-    if (consecutive5xx >= 3) break
+    if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
     const rounds: Array<Record<string, unknown>> = []
     let pass = true
     for (let r = 0; r < 2; r += 1) {
+      if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
       const k = randomInt(1000, 9999)
       const t = await send(injectParam(req, style.make(k, true)))
       checkDbError(t)
+      if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
       const f = await send(injectParam(req, style.make(k, false)))
       checkDbError(f)
       if (!t || !f) { pass = false; break }
@@ -1040,10 +1048,10 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   }
 
   let unionSignal: Record<string, unknown> | null = null
-  if (!signals.some(s => s.passed) && consecutive5xx < 3) {
+  if (!signals.some(s => s.passed) && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2)) {
     const unionResults: Array<{ cols: number; status: number; simToBase: number }> = []
     for (const cols of [1, 2, 3]) {
-      if (consecutive5xx >= 3) break
+      if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) break
       const nulls = Array.from({ length: cols }, () => 'NULL').join(',')
       const ex = await send(injectParam(req, `${baseValue}' UNION SELECT ${nulls}-- -`))
       checkDbError(ex)
@@ -1060,9 +1068,13 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
     }
   }
 
-  const quoteOne = consecutive5xx < 3 ? await send(injectParam(req, `${baseValue}'`)) : null
+  const quoteOne = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+    ? await send(injectParam(req, `${baseValue}'`))
+    : null
   checkDbError(quoteOne)
-  const quoteTwo = consecutive5xx < 3 ? await send(injectParam(req, `${baseValue}''`)) : null
+  const quoteTwo = (consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2))
+    ? await send(injectParam(req, `${baseValue}''`))
+    : null
   checkDbError(quoteTwo)
 
   const errorDialect = detectedErrorDialect ?? (quoteOne ? dbErrorDialect(quoteOne.body) : null)
@@ -1085,7 +1097,9 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   if (details.dbErrorDialect) {
     verdict = 'signal'
     summary = `${passed ? summary + ' ' : ''}${String(details.dbErrorDialect)} database error fingerprint on SQL syntax probe.`
-    anomalies.push({ type: 'db_error_fingerprint', dialect: details.dbErrorDialect })
+    if (!anomalies.some(a => a.type === 'db_error_fingerprint')) {
+      anomalies.push({ type: 'db_error_fingerprint', dialect: details.dbErrorDialect })
+    }
   }
   return { verdict, summary, details }
 }
@@ -1502,7 +1516,7 @@ async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffO
   const safeMaxAliases = Math.max(3, Math.min(req.maxAliases ?? 3, 8))
 
   const typename = await send(gql('{__typename}'))
-  const fullIntroQuery = '{__schema{queryType{name} mutationType{name} types{name kind fields{name args{name type{kind name ofType{kind name ofType{kind name ofType{kind name}}}}} type{kind name ofType{kind name ofType{kind name ofType{kind name}}}}}}}}'
+  const fullIntroQuery = '{__schema{queryType{name} mutationType{name} types{name kind fields{name args{name type{kind name ofType{kind name}}} type{kind name ofType{kind name ofType{kind name}}}}}}}'
   const introspection = await send(gql(fullIntroQuery))
   const introParsed = introspection ? parse(introspection.body) : null
   const introSchemaObj = introParsed?.data?.__schema as Record<string, unknown> | undefined

@@ -813,6 +813,10 @@ export class Store {
       .orderBy(desc(tables.brokerExchanges.createdAt)).limit(500).all()
       .map(ex => ({ ...ex, bodyPreview: ex.bodyPreview.slice(0, 320) }))
     const coverageEntries = this.listCoverageEntries(runId)
+    const endpoints = this.listEndpoints(runId)
+    const endpointParams = this.listEndpointParams(runId)
+    const apiDependencies = this.listApiDependencies(runId)
+    const labTelemetry = this.listLabTelemetry(runId)
     const openProofGaps = this.listOpenProofGaps(runId, run.goalRevision)
     const sastRuns = this.listSastRuns(runId)
     const surfaceProbes = this.listSurfaceProbes(runId)
@@ -847,6 +851,10 @@ export class Store {
       approvals,
       exchangesSummary,
       coverageEntries,
+      endpoints,
+      endpointParams,
+      apiDependencies,
+      labTelemetry,
       openProofGaps,
       sastRuns,
       surfaceProbes,
