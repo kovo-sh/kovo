@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Re-run the Guardian v4 / M7 release gate.
 #
-#   bash docs/reverify-v4.sh                 # 511 node tests + 8 Playwright (Docker required for Playwright)
-#   bash docs/reverify-v4.sh --fast          # typecheck + build + M7 suites only
-#   bash docs/reverify-v4.sh --with-bench    # gate + realistic-bench 114 tests + benchmark typecheck
+#   bash docs/reverify-v4.sh                 # 524 node tests + 8 Playwright (Docker required for Playwright)
+#   bash docs/reverify-v4.sh --fast          # typecheck + build + M7 suites only (59 tests)
+#   bash docs/reverify-v4.sh --with-bench    # gate + realistic-bench 142 tests + benchmark typecheck
 #
 # The script only reads the repository and writes logs under /tmp. It never mutates source,
 # never contacts a non-loopback target, and never prints credential material.
@@ -89,8 +89,9 @@ if [[ "$FAST" -eq 0 ]]; then
     tests/v4-m5-lab-iast-ui.test.ts tests/v4-m6-benchmarks.test.ts
 fi
 
-run_node "v4 M7 discovery/held-out/synthesis" \
-  tests/v4-m7-discovery.test.ts tests/v4-m7-heldout.test.ts tests/v4-m7-specs.test.ts
+run_node "v4 M7 discovery/held-out/heldout2/probes2/synthesis" \
+  tests/v4-m7-discovery.test.ts tests/v4-m7-heldout.test.ts tests/v4-m7-heldout2.test.ts \
+  tests/v4-m7-probes2.test.ts tests/v4-m7-specs.test.ts
 
 if [[ "$FAST" -eq 0 ]]; then
   run_node "v4 tiered E2E matrix (single concurrency)" \
@@ -111,13 +112,13 @@ if [[ "$FAST" -eq 0 ]]; then
     PW="$(grep -oE '[0-9]+ passed' "$TMP/playwright.log" | tail -1 | awk '{print $1}')"
     grep -E '[0-9]+ (passed|failed|flaky)' "$TMP/playwright.log" | tail -2 | sed 's/^/   /'
     TOTAL=$((TOTAL + PW))
-    echo "gate total: $TOTAL (expected 519)"
+    echo "gate total: $TOTAL (expected 532)"
   else
     echo "!! Docker socket not reachable: skipping 8 Playwright tests."
-    echo "   gate total: $TOTAL node tests (519 requires Docker)."
+    echo "   gate total: $TOTAL node tests (532 requires Docker)."
   fi
 else
-  echo "fast mode: $TOTAL node tests (full gate is 519)."
+  echo "fast mode: $TOTAL node tests (full gate is 532)."
 fi
 
 if [[ "$WITH_BENCH" -eq 1 ]]; then
@@ -126,7 +127,7 @@ if [[ "$WITH_BENCH" -eq 1 ]]; then
   node_modules/.bin/tsc -p benchmarks/realistic-bench/tsconfig.json --noEmit
   local_before=$TOTAL
   run_node "realistic-bench harness" --test-concurrency=1 benchmarks/realistic-bench/tests/
-  echo "realistic-bench tests: $((TOTAL - local_before)) (separate from the 519 gate total)"
+  echo "realistic-bench tests: $((TOTAL - local_before)) (separate from the 532 gate total)"
 fi
 
 echo
