@@ -108,8 +108,19 @@ import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardCheck
 import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
-import { assessmentAssignments, store } from './store.ts'
-import type { Assignment, ChainStep, Fact, PatchProposal, ReplaySpecRow, Run, Store } from './store.ts'
+import { assessmentAssignments, extractResourceRefsFromExchange, isOpaqueResourceId, store } from './store.ts'
+import type {
+  Assignment,
+  ChainStep,
+  ExtractedResourceRef,
+  Fact,
+  PatchProposal,
+  ReplaySpecRow,
+  ResourceHarvestExchange,
+  ResourceSampleRow,
+  Run,
+  Store,
+} from './store.ts'
 import { probeDifferential, probeSurface, runSafeTemplates } from './surface-engine.ts'
 import { LinuxWorkerBackend } from './worker-backend.ts'
 import type { WorkerBackend } from './worker-backend.ts'
@@ -528,81 +539,106 @@ export function convertCodeAuditSuspectsToChainSteps(
   return created
 }
 
-const STATIC_ASSET_PATH_RE = /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|pdf)(?:\?|$)/i
-const RESOURCE_ID_KEY_RE = /^(?:id|uuid|[a-z][a-z0-9]*Id|[a-z][a-z0-9_]*_id)$/
-const IGNORED_ID_VALUES = new Set(['true', 'false', 'null', 'undefined', 'default', 'self', 'me', 'current', 'none', 'all', 'new', 'list', 'index', 'health', 'status', 'public'])
-const PATH_RESOURCE_RE = /\/(?:api\/(?:v\d+\/)?)?([a-z][a-z0-9_-]{1,32})\/([0-9]{2,16}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?:usr|org|proj|acct|app|ord|inv|doc|file|chat|team|sub|cus|ws|res)_[a-zA-Z0-9_-]{4,64})(?:\/|$|\?)/i
+export interface BolaConsumerVariant {
+  method: 'GET' | 'PUT' | 'PATCH' | 'DELETE'
+  endpoint: string
+  /** Reversible write variants are benign; DELETE is only replayable at Tier 3 / local-lab. */
+  destructive: boolean
+  requiresTier: 1 | 2 | 3
+}
 
-export function extractPersonaResourcesFromExchange(ex: {
-  origin: string
-  method: string
-  pathAndQuery: string
-  personaHandle?: string | null
-  status: number
-  mediaType: string
-  body: string
-}): Array<{ resourceId: string; endpoint: string; method: string; field: string }> {
-  if (!ex.personaHandle) return []
-  if (ex.status < 200 || ex.status >= 300) return []
-  if (STATIC_ASSET_PATH_RE.test(ex.pathAndQuery) || ex.pathAndQuery.startsWith('/_next/static/')) return []
+export interface BolaTestQueueItem extends PersonaResourceQueueItem {
+  resourceKey: string
+  variants: BolaConsumerVariant[]
+  source: 'fact' | 'sample'
+}
 
-  const found: Array<{ resourceId: string; endpoint: string; method: string; field: string }> = []
-  const seen = new Set<string>()
-  const push = (resourceId: string, endpoint: string, field: string) => {
-    const clean = resourceId.trim()
-    if (!clean || clean.length < 2 || clean.length > 128) return
-    if (IGNORED_ID_VALUES.has(clean.toLowerCase())) return
-    const key = `${endpoint}|${clean}`
-    if (seen.has(key) || found.length >= 12) return
-    seen.add(key)
-    found.push({ resourceId: clean, endpoint, method: ex.method.toUpperCase(), field })
-  }
+/** Backwards-compatible re-export: harvesting lives in `store.ts` so Phase-0/crawl can share it. */
+export function extractPersonaResourcesFromExchange(ex: ResourceHarvestExchange): ExtractedResourceRef[] {
+  return extractResourceRefsFromExchange(ex)
+}
 
-  const pathMatch = PATH_RESOURCE_RE.exec(ex.pathAndQuery)
-  if (pathMatch) {
-    push(pathMatch[2], ex.pathAndQuery.split('?')[0], `path:${pathMatch[1]}`)
-  }
-
-  if (ex.mediaType.toLowerCase().includes('json') && ex.body && ex.body.length <= 256 * 1024) {
-    try {
-      const parsed = JSON.parse(ex.body) as unknown
-      const basePath = ex.pathAndQuery.split('?')[0]
-      const walk = (node: unknown, depth: number) => {
-        if (depth > 8 || found.length >= 12 || !node || typeof node !== 'object') return
-        if (Array.isArray(node)) {
-          for (const item of node.slice(0, 5)) walk(item, depth + 1)
-          return
-        }
-        for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
-          if (found.length >= 12) break
-          if (RESOURCE_ID_KEY_RE.test(key)) {
-            if (typeof val === 'string' && val.trim().length >= 3) {
-              push(val, basePath, key)
-            } else if (typeof val === 'number' && Number.isInteger(val) && val > 0) {
-              push(String(val), basePath, key)
-            }
-          } else if (val && typeof val === 'object') {
-            walk(val, depth + 1)
-          }
-        }
-      }
-      walk(parsed, 1)
-    } catch {
-      // Ignore non-JSON or truncated bodies
+/**
+ * Instantiate consumer item endpoints (`GET/PUT/PATCH/DELETE /…/:resourceId`) from a producer path.
+ * Observed concrete item URLs are preserved; collection URLs get the harvested id appended.
+ */
+export function instantiateConsumerEndpoints(
+  endpoint: string,
+  resourceId: string,
+  method = 'GET',
+): BolaConsumerVariant[] {
+  const bare = (endpoint.split('?')[0] || '/').replace(/\/+$/, '') || '/'
+  let itemEndpoint = bare
+  const last = bare.split('/').filter(Boolean).at(-1) ?? ''
+  if (!/:[A-Za-z_][A-Za-z0-9_-]*|\{[A-Za-z0-9_-]+\}|\[[A-Za-z0-9_-]+\]/.test(bare)) {
+    if (!isOpaqueResourceId(last)) {
+      itemEndpoint = `${bare === '/' ? '' : bare}/${encodeURIComponent(resourceId)}`
     }
+  } else {
+    itemEndpoint = bare.replace(
+      /:[A-Za-z_][A-Za-z0-9_-]*|\{[A-Za-z0-9_-]+\}|\[[A-Za-z0-9_-]+\]/,
+      encodeURIComponent(resourceId),
+    )
   }
+  const itemTemplate = normalizeEndpointTemplate(itemEndpoint)
+  const hasPlaceholder = /:[A-Za-z_][A-Za-z0-9_-]*/.test(itemTemplate)
+  const concrete = hasPlaceholder
+    ? itemTemplate.replace(/:[A-Za-z_][A-Za-z0-9_-]*/, encodeURIComponent(resourceId))
+    : itemEndpoint
+  const methods: Array<BolaConsumerVariant['method']> = ['GET', 'PUT', 'PATCH', 'DELETE']
+  const variants = methods.map(variant => ({
+    method: variant,
+    endpoint: concrete,
+    destructive: variant === 'DELETE',
+    requiresTier: (variant === 'DELETE' ? 3 : variant === 'GET' ? 2 : 2) as 1 | 2 | 3,
+  }))
+  // Keep the original method first so existing single-method consumers remain deterministic.
+  const requested = method.toUpperCase()
+  return variants.sort((a, b) => Number(b.method === requested) - Number(a.method === requested))
+}
 
-  return found
+function testPersonasForOwner(
+  ownerPersona: string,
+  origin: string,
+  personas: readonly { handle: string; originAllowlist: readonly string[] }[],
+): string[] {
+  const eligible = personas
+    .filter(p => p.originAllowlist.includes(origin))
+    .map(p => p.handle)
+  if (ownerPersona === 'anonymous') return [...new Set(eligible)]
+  return [...new Set([...eligible.filter(handle => handle !== ownerPersona), 'anonymous'])]
 }
 
 export function buildBolaTestQueue(
   facts: readonly Fact[],
   personas: readonly { handle: string; originAllowlist: readonly string[] }[],
   approvedOrigins: ReadonlySet<string>,
-): PersonaResourceQueueItem[] {
+  samples: readonly ResourceSampleRow[] = [],
+): BolaTestQueueItem[] {
   if (personas.length < 2) return []
-  const queue: PersonaResourceQueueItem[] = []
+  const queue: BolaTestQueueItem[] = []
   const seen = new Set<string>()
+  const perTypeCount = new Map<string, number>()
+  const perTypeBudget = 8
+  const overallBudget = 80
+  const enqueue = (item: Omit<BolaTestQueueItem, 'variants' | 'testAsPersonas'>) => {
+    if (queue.length >= overallBudget) return
+    const key = `${item.origin}|${item.ownerPersona}|${item.endpoint}|${item.resourceId}|${item.method ?? 'GET'}`
+    if (seen.has(key)) return
+    const typeKey = `${item.origin}|${item.resourceKey}`
+    const used = perTypeCount.get(typeKey) ?? 0
+    if (used >= perTypeBudget) return
+    if (!item.resourceId || item.resourceId === '[redacted]') return
+    const testAsPersonas = testPersonasForOwner(item.ownerPersona, item.origin, personas)
+    if (!testAsPersonas.length) return
+    seen.add(key)
+    perTypeCount.set(typeKey, used + 1)
+    queue.push({
+      ...item,
+      testAsPersonas,
+      variants: instantiateConsumerEndpoints(item.endpoint, item.resourceId, item.method ?? 'GET'),
+    })
+  }
 
   for (const fact of facts) {
     if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
@@ -620,32 +656,41 @@ export function buildBolaTestQueue(
       : typeof data.path === 'string' ? data.path
         : typeof data.pathAndQuery === 'string' ? data.pathAndQuery : ''
     if (!ownerPersona || !resourceId || !endpoint) continue
-
     const method = typeof data.method === 'string' ? data.method.toUpperCase() : 'GET'
-    const otherPersonas = personas
-      .filter(p => p.handle !== ownerPersona && p.originAllowlist.includes(fact.origin))
-      .map(p => p.handle)
-    const testAsPersonas = [...new Set([...otherPersonas, 'anonymous'])]
-    if (!testAsPersonas.length) continue
-
-    const key = `${fact.origin}|${ownerPersona}|${endpoint}|${resourceId}`
-    if (seen.has(key)) continue
-    seen.add(key)
-
-    queue.push({
+    const resourceKey = typeof data.field === 'string' ? data.field.replace(/^path:/, '') : 'id'
+    enqueue({
       factId: fact.id,
       origin: fact.origin,
       ownerPersona,
+      resourceKey,
       resourceId,
       endpoint,
       method,
-      testAsPersonas,
       summary: fact.summary,
+      source: 'fact',
     })
-    if (queue.length >= 25) break
   }
 
-  return queue
+  for (const sample of samples) {
+    if (!approvedOrigins.has(sample.origin)) continue
+    enqueue({
+      origin: sample.origin,
+      ownerPersona: sample.ownerPersona,
+      resourceKey: sample.resourceKey,
+      resourceId: sample.resourceId,
+      endpoint: sample.endpoint,
+      method: sample.method,
+      summary: `${sample.authenticated ? 'Authenticated' : 'Unauthenticated'} sample ${sample.resourceKey}=${sample.resourceId} observed at ${sample.method} ${sample.endpoint}.`,
+      source: 'sample',
+    })
+  }
+
+  // Prioritize authenticated owners and higher-risk item routes deterministically.
+  return queue.sort((a, b) =>
+    Number(b.ownerPersona !== 'anonymous') - Number(a.ownerPersona !== 'anonymous') ||
+    Number(/:(?:id|uuid)|[0-9]{1,}/i.test(b.endpoint)) - Number(/:(?:id|uuid)|[0-9]{1,}/i.test(a.endpoint)) ||
+    a.resourceKey.localeCompare(b.resourceKey),
+  ).slice(0, overallBudget)
 }
 
 const CROSS_HOST_LEVERAGE_PATTERNS: ReadonlyArray<{ label: string; kindMatch?: string[]; pattern: RegExp }> = [
@@ -1149,6 +1194,96 @@ export class Execution {
    * Scan a brokered HTTP exchange (response body + headers) for second-order canary markers.
    * Runs in Execution (not only inside RequestBroker) so injected/custom brokers are covered too.
    */
+  /** SQLite endpoint-parameter and API-dependency catalog, resolved to route/method display keys. */
+  private endpointGraphCatalog(runId: string): {
+    endpointParams: Array<{
+      endpoint: string
+      origin: string
+      method: string
+      name: string
+      location: string
+      inferredType: string | null
+      isCsrf: boolean
+      isObjectId: boolean
+      source: string
+    }>
+    apiDependencies: Array<{
+      producer: string
+      consumer: string
+      resourceKey: string
+      personaHandle: string | null
+      testedBola: boolean
+    }>
+  } {
+    const endpoints = this.storage.listEndpoints(runId, { limit: 2000 })
+    const byId = new Map(endpoints.map(ep => [ep.id, ep]))
+    const endpointParams = this.storage.listEndpointParams(runId).slice(0, 400).map(param => {
+      const ep = byId.get(param.endpointId)
+      return {
+        endpoint: ep ? `${ep.method} ${ep.pathTemplate}` : param.endpointId,
+        origin: ep?.origin ?? '',
+        method: ep?.method ?? '',
+        name: param.name,
+        location: param.location,
+        inferredType: param.inferredType,
+        isCsrf: param.isCsrf,
+        isObjectId: param.isObjectId,
+        source: param.source,
+      }
+    })
+    const apiDependencies = this.storage.listApiDependencies(runId).slice(0, 200).map(dep => {
+      const producer = byId.get(dep.producerEndpointId)
+      const consumer = byId.get(dep.consumerEndpointId)
+      return {
+        producer: producer ? `${producer.method} ${producer.pathTemplate}` : dep.producerEndpointId,
+        consumer: consumer ? `${consumer.method} ${consumer.pathTemplate}` : dep.consumerEndpointId,
+        resourceKey: dep.resourceKey,
+        personaHandle: dep.personaHandle,
+        testedBola: dep.testedBola,
+      }
+    })
+    return { endpointParams, apiDependencies }
+  }
+
+  /** Persist real per-endpoint coverage for one exercised request. */
+  private markEndpointCoverage(
+    run: Run,
+    origin: string,
+    method: string,
+    pathAndQuery: string,
+    testedClass: string,
+  ): void {
+    this.storage.noteEndpointProbe({
+      runId: run.id,
+      scopeRevision: run.scopeRevision,
+      origin,
+      method,
+      pathAndQuery,
+      testedClass,
+      source: 'surface_probe',
+    })
+  }
+
+  /** Mark every concrete request embedded in a declarative replay spec as tested. */
+  private markReplaySpecCoverage(run: Run, spec: unknown, testedClass: string): void {
+    const visited = new Set<unknown>()
+    const walk = (node: unknown, depth: number) => {
+      if (depth > 8 || !node || typeof node !== 'object') return
+      if (visited.has(node)) return
+      visited.add(node)
+      const record = node as Record<string, unknown>
+      if (
+        typeof record.origin === 'string' &&
+        typeof record.pathAndQuery === 'string' &&
+        typeof record.method === 'string'
+      ) {
+        this.markEndpointCoverage(run, record.origin, record.method, record.pathAndQuery, testedClass)
+      }
+      for (const value of Object.values(record)) walk(value, depth + 1)
+    }
+    walk(spec, 0)
+  }
+
   private scanSecondOrderExchange(
     run: Run,
     assignmentId: string,
@@ -2052,6 +2187,7 @@ export class Execution {
           const personasPub = [...grant.personas?.values() ?? []].map(p => ({
             handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
           }))
+          const graphCatalog = this.endpointGraphCatalog(freshRun.id)
           const answer = await agentTurn({
             directory: this.storage.directory,
             sessionId: `tm-${freshRun.id}-${freshRun.goalRevision}-${freshRun.scopeRevision}`,
@@ -2069,7 +2205,17 @@ export class Execution {
                 name: s.name, kind: s.kind, origin: s.origin, preview: s.content.slice(0, 1200),
               })),
               mountedRepos,
-              observations: observations.slice(0, 40),
+              observations: [
+                ...observations.slice(0, 38),
+                ...(graphCatalog.endpointParams.length || graphCatalog.apiDependencies.length
+                  ? [{
+                      kind: 'endpoint_graph_catalog',
+                      endpointParams: graphCatalog.endpointParams.slice(0, 80),
+                      apiDependencies: graphCatalog.apiDependencies.slice(0, 40),
+                      note: 'Persisted endpoint_params (injectable locations/CSRF/object-id flags) and producer→consumer api_dependencies harvested from Phase-0, crawl and worker exchanges. Prioritize ID-bearing consumer routes and CSRF-bound write paths.',
+                    }]
+                  : []),
+              ],
             }),
             signal: task.controller.signal,
             secrets,
@@ -3173,6 +3319,7 @@ export class Execution {
           this.storage.listFacts(current.id, { includeTainted: false, limit: 200 }),
           personas.map(p => ({ handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist })),
           approvedOrigins,
+          this.storage.listResourceSamples(current.id),
         )
       : []
 
@@ -3215,6 +3362,13 @@ export class Execution {
         durationMs: ex.durationMs,
         secrets: currentSecrets(),
       })
+      this.storage.trackExchangeResources({
+        runId: current.id,
+        scopeRevision: latest.scopeRevision,
+        exchange: ex,
+        source: 'surface_probe',
+      })
+      this.markEndpointCoverage(latest, ex.origin, ex.method, ex.pathAndQuery, 'http_exchange')
       this.scanSecondOrderExchange(latest, claimed.id, ex, saved.id)
       return saved.id
     }
@@ -3358,6 +3512,7 @@ export class Execution {
             }
             if (outcome) {
               requestsUsed += outcome.requestsSent
+              this.markEndpointCoverage(latest, item.ep.origin, 'GET', item.idPath, 'diff:authz_matrix')
               const unauthorized = outcome.anomalies.find(a => a.type === 'unauthorized_access')
               if (outcome.verdict === 'signal' && unauthorized) {
                 const resourceId = typeof unauthorized.resourceId === 'string' ? unauthorized.resourceId : resource.resourceId
@@ -3423,6 +3578,7 @@ export class Execution {
               onExchange: recordExchange,
             }, this.broker, grant, signal)
             requestsUsed += discovery.requestsSent
+            this.markEndpointCoverage(latest, item.ep.origin, 'GET', item.ep.pathTemplate, 'surface:params')
             const discovered = [...new Set(
               discovery.anomalies
                 .filter(a => a.kind === 'param' && typeof a.param === 'string')
@@ -3472,6 +3628,7 @@ export class Execution {
           }
           if (!outcome) continue
           requestsUsed += outcome.requestsSent
+          this.markEndpointCoverage(latest, item.ep.origin, method, pathAndQuery, 'diff:sqli_boolean')
           const booleanSignal = outcome.anomalies.find(a => a.type === 'boolean_differential')
           const dbError = outcome.anomalies.find(a => a.type === 'db_error_fingerprint')
           if (outcome.verdict !== 'signal' || (!booleanSignal && !dbError)) continue
@@ -3890,22 +4047,49 @@ export class Execution {
     // Priority #3: Auto-enqueue cross-persona BOLA/IDOR step if >= 2 personas discovered owned resources not yet tested
     let bolaAutoSteps = 0
     if (afterRound.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
-      const bolaQueue = buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins)
-      const originsWithResources = [...new Set(bolaQueue.map(item => item.origin))]
-      for (const origin of originsWithResources) {
+      const bolaQueue = buildBolaTestQueue(
+        allUntaintedFacts,
+        personas,
+        approvedOrigins,
+        this.storage.listResourceSamples(run.id),
+      )
+      // A bounded per-resource-type budget (not one step per origin): on realistic multi-tenant
+      // apps several ID-bearing resource types share an origin and each deserves its own matrix.
+      const typeGroups = new Map<string, BolaTestQueueItem[]>()
+      for (const item of bolaQueue) {
+        const key = `${item.origin}\u0000${item.resourceKey}`
+        const list = typeGroups.get(key) ?? []
+        list.push(item)
+        typeGroups.set(key, list)
+      }
+      const candidateGroups = [...typeGroups.values()]
+        .sort((a, b) =>
+          Number(b[0].ownerPersona !== 'anonymous') - Number(a[0].ownerPersona !== 'anonymous') ||
+          b.length - a.length,
+        )
+      const perOriginSteps = new Map<string, number>()
+      for (const itemsForType of candidateGroups) {
         if (allSteps.length + bolaAutoSteps >= dynamicStepBudget) break
+        const origin = itemsForType[0].origin
+        if ((perOriginSteps.get(origin) ?? 0) >= 3) continue
+        const resourceKey = itemsForType[0].resourceKey
         const alreadyPlanned = allSteps.some(s =>
           s.sourceOrigins.includes(origin) &&
-          (s.skills.includes('bola-idor-race') || /\b(?:bola|idor|cross-persona)\b/i.test(s.title)),
+          (s.title.includes(`resource:${resourceKey}`) || (
+            s.skills.includes('bola-idor-race') && /\b(?:bola|idor|cross-persona)\b/i.test(s.title)
+          )),
         )
         if (alreadyPlanned) continue
         const asset = afterRound.candidates.find(c => c.origin === origin && afterRound.approved.includes(c.id))
         if (!asset) continue
-        const itemsForOrigin = bolaQueue.filter(i => i.origin === origin).slice(0, 5)
+        const itemsForOrigin = itemsForType.slice(0, 6)
         const factIds = itemsForOrigin.map(i => i.factId).filter((fid): fid is string => Boolean(fid))
+        const variants = [...new Set(itemsForOrigin.flatMap(i => i.variants.map(v =>
+          `${v.method} ${v.endpoint}${v.destructive ? ' (Tier 3 only)' : ''}`,
+        )))].slice(0, 8)
         this.storage.addChainStep(afterRound, {
-          title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname}`,
-          hypothesis: `Replay ${itemsForOrigin.length} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(i => `${i.endpoint} [${i.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} to verify tenant isolation and submit a DeclarativeReplaySpec if unauthorized access succeeds.`,
+          title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname} · resource:${resourceKey}`,
+          hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(i => `${i.endpoint} [${i.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. Verify tenant isolation with GET first; use benign PUT/PATCH field deltas only where reversible; DELETE stays Tier 3/local-lab. Submit a DeclarativeReplaySpec if unauthorized access succeeds.`,
           category: 'broken-access-control',
           priority: 92,
           targetAssetIds: [asset.id],
@@ -3915,6 +4099,7 @@ export class Execution {
           specialistProfile: 'bola-bfla-specialist',
         })
         bolaAutoSteps += 1
+        perOriginSteps.set(origin, (perOriginSteps.get(origin) ?? 0) + 1)
       }
     }
 
@@ -3981,7 +4166,8 @@ export class Execution {
         testedClasses: ep.testedClasses,
       }))
 
-    const prompt = chainPlannerPrompt({
+    const graphCatalog = this.endpointGraphCatalog(run.id)
+    const chainPlannerInput = {
       goal: afterRound.goal,
       roundNo: roundRes.roundNo,
       capabilityTier: afterRound.capabilityTier,
@@ -4025,13 +4211,16 @@ export class Execution {
       secondOrderCanaries,
       uncoveredEndpoints,
       dynamicStepBudget,
+      endpointParams: graphCatalog.endpointParams,
+      apiDependencies: graphCatalog.apiDependencies,
       budgetRemaining: {
         usd: Math.max(0, Number((afterRound.budgetUsd - afterRound.spentUsd).toFixed(4))),
         requests: afterRound.budgetRequests === 0
-          ? 'unlimited'
+          ? ('unlimited' as const)
           : Math.max(0, afterRound.budgetRequests - afterRound.spentRequests),
       },
-    })
+    }
+    const prompt = chainPlannerPrompt(chainPlannerInput)
 
     const answer = await agentTurn({
       directory: this.storage.directory,
@@ -4238,54 +4427,24 @@ export class Execution {
       }
 
       const trackPersonaResources = (curRun: Run, res: BrokerExchangeResult, exchangeId: string) => {
-        if (!res.personaHandle) return
-        const observedResources = extractPersonaResourcesFromExchange({
-          origin: res.origin,
-          method: res.method,
-          pathAndQuery: res.pathAndQuery,
-          personaHandle: res.personaHandle,
-          status: res.status,
-          mediaType: res.mediaType,
-          body: res.body,
-        })
-        if (!observedResources.length) return
-
-        // Always infer producer -> consumer edges in SQLite api_dependencies (hashed sample ID, never raw secret)
-        try {
-          const producerPath = normalizeEndpointTemplate(res.pathAndQuery.split('?')[0] || '/')
-          const producerEp = this.storage.upsertEndpoint({
-            runId: curRun.id,
-            scopeRevision: curRun.scopeRevision,
+        // Persist samples + producer->consumer edges for authenticated AND unauthenticated responses.
+        // (Unauthenticated leaks can seed later cross-persona BOLA/IDOR replay targets.)
+        const observedResources = this.storage.trackExchangeResources({
+          runId: curRun.id,
+          scopeRevision: curRun.scopeRevision,
+          exchange: {
             origin: res.origin,
-            method: res.method.toUpperCase(),
-            pathTemplate: producerPath,
-            source: 'surface_probe',
-          })
-          const originEndpoints = this.storage.listEndpoints(curRun.id, { origin: res.origin })
-          const basePrefix = producerPath.replace(/\/+$/, '')
-          for (const item of observedResources) {
-            const sampleHash = `sha256:${createHash('sha256').update(item.resourceId).digest('hex').slice(0, 16)}`
-            for (const cand of originEndpoints) {
-              if (cand.id === producerEp.id) continue
-              const tmpl = cand.pathTemplate
-              const extendsBase = basePrefix && basePrefix !== '/' &&
-                tmpl.startsWith(`${basePrefix}/`) &&
-                /(?::[a-zA-Z0-9_-]+|\{[a-zA-Z0-9_-]+\})/.test(tmpl.slice(basePrefix.length))
-              const matchesKey = item.field && !item.field.startsWith('path:') &&
-                (tmpl.includes(`:${item.field}`) || tmpl.includes(`{${item.field}}`))
-              if (!extendsBase && !matchesKey) continue
-              this.storage.recordApiDependency({
-                runId: curRun.id,
-                producerEndpointId: producerEp.id,
-                consumerEndpointId: cand.id,
-                resourceKey: item.field.replace(/^path:/, ''),
-                sampleResourceIdHash: sampleHash,
-                personaHandle: res.personaHandle,
-              })
-            }
-          }
-        } catch { /* best-effort dependency edge inference */ }
-
+            method: res.method,
+            pathAndQuery: res.pathAndQuery,
+            personaHandle: res.personaHandle,
+            status: res.status,
+            mediaType: res.mediaType,
+            body: res.body,
+            respHeaders: res.respHeaders,
+          },
+          source: 'surface_probe',
+        })
+        if (!observedResources.length || !res.personaHandle) return
         if (curRun.capabilityTier < 2 || (grant.personas?.size ?? 0) < 2) return
         let seenSet = this.recordedPersonaResources.get(curRun.id)
         if (!seenSet) {
@@ -4293,6 +4452,7 @@ export class Execution {
           this.recordedPersonaResources.set(curRun.id, seenSet)
         }
         for (const item of observedResources) {
+          if (item.resourceId === '[redacted]') continue
           const dedupKey = `${res.origin}|${res.personaHandle}|${item.endpoint}|${item.resourceId}`
           if (seenSet.has(dedupKey)) continue
           seenSet.add(dedupKey)
@@ -4407,6 +4567,7 @@ export class Execution {
 
         // Priority #3: Auto-track persona_resource facts when Tier >= 2 and >= 2 personas are approved
         trackPersonaResources(curRun, res, saved.id)
+        this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
         this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
 
         let stagedPath: string | null = null
@@ -4521,7 +4682,8 @@ export class Execution {
             secrets: currentSecrets(),
           })
           trackPersonaResources(curRun, res, saved.id)
-        this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
+          this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
+          this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
           return {
             exchangeId: saved.id,
             origin: res.origin,
@@ -4602,7 +4764,8 @@ export class Execution {
               secrets: currentSecrets(),
             })
             trackPersonaResources(curRun, res, saved.id)
-        this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
+            this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
+            this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
             return {
               exchangeId: saved.id, status: res.status, durationMs: res.durationMs,
               bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
@@ -4900,6 +5063,13 @@ export class Execution {
             },
           }, this.broker, grant, signal)
 
+          this.markEndpointCoverage(
+            curRun,
+            res.origin,
+            args.methods?.[0] ?? 'GET',
+            args.basePath ?? '/',
+            `surface:${res.mode}`,
+          )
           this.storage.recordSurfaceProbe({
             runId: curRun.id,
             assignmentId: job.assignment.id,
@@ -4932,6 +5102,42 @@ export class Execution {
             ? Math.min(args.maxRequests, remainingReqs)
             : Math.min(60, remainingReqs)
 
+          // Default parameter / resource-ID selection from persisted endpoint_params & api_dependencies.
+          const requestedTemplate = normalizeEndpointTemplate(args.pathAndQuery.split('?')[0] || '/')
+          const targetEndpoint = this.storage.listEndpoints(curRun.id, { origin: cleanOrigin })
+            .find(ep => ep.pathTemplate === requestedTemplate &&
+              (!args.method || ep.method === args.method.toUpperCase()))
+            ?? this.storage.listEndpoints(curRun.id, { origin: cleanOrigin })
+              .find(ep => ep.pathTemplate === requestedTemplate)
+          const targetParams = targetEndpoint ? this.storage.listEndpointParams(curRun.id, targetEndpoint.id) : []
+          const injectableParams = targetParams.filter(p => ['query', 'json', 'form', 'path', 'graphql_var'].includes(p.location) && !p.isCsrf)
+          const preferredParam = [...injectableParams].sort((a, b) =>
+            Number(DETERMINISTIC_PARAM_HINT_RE.test(b.name)) - Number(DETERMINISTIC_PARAM_HINT_RE.test(a.name)) ||
+            Number(a.isObjectId) - Number(b.isObjectId),
+          )[0]
+          const resolvedParamName = args.paramName ?? preferredParam?.name
+          const preferredParamLocation = preferredParam && preferredParam.location !== 'cookie'
+            ? preferredParam.location
+            : undefined
+          const resolvedParamLocation = args.paramLocation ?? preferredParamLocation
+          const resourceSamples = this.storage.listResourceSamples(curRun.id)
+            .filter(sample => sample.origin === cleanOrigin && sample.resourceId !== '[redacted]')
+          const matchingResourceIds = [...new Set([
+            ...resourceSamples
+              .filter(sample => normalizeEndpointTemplate(sample.endpoint) === requestedTemplate ||
+                requestedTemplate.includes(`:${sample.resourceKey}`) ||
+                requestedTemplate.split('/').includes(sample.resourceId))
+              .map(sample => sample.resourceId),
+            ...resourceSamples.map(sample => sample.resourceId),
+          ])].slice(0, 10)
+          const resolvedResourceIds = args.resourceIds?.length ? args.resourceIds : matchingResourceIds
+          const resolvedSsrfParams = args.ssrfParams?.length
+            ? args.ssrfParams
+            : injectableParams
+                .map(param => param.name)
+                .filter(name => /(?:url|uri|link|redirect|callback|dest|host|path|file|fetch|webhook|next|return)/i.test(name))
+                .slice(0, 16)
+
           if (args.probeClass === 'ssrf_canary') {
             const project = this.storage.project(curRun.projectId)
             if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && isLocalLabEnvEnabled())) {
@@ -4944,14 +5150,14 @@ export class Execution {
             origin: cleanOrigin,
             pathAndQuery: args.pathAndQuery,
             method: args.method,
-            param: args.paramName,
-            paramLocation: args.paramLocation,
+            param: resolvedParamName,
+            paramLocation: resolvedParamLocation,
             jsonBody: args.body,
             baselineValue: args.baselineValue,
             persona: args.persona,
             headers: args.headers,
-            ssrfParams: args.ssrfParams,
-            resourceIds: args.resourceIds,
+            ssrfParams: resolvedSsrfParams,
+            resourceIds: resolvedResourceIds,
             ownerPersona: args.persona,
             otherPersona: args.otherPersona,
             runId: curRun.id,
@@ -4983,6 +5189,13 @@ export class Execution {
             },
           }, this.broker, grant, this.canaryBroker, signal)
 
+          this.markEndpointCoverage(
+            curRun,
+            res.origin,
+            args.method ?? 'GET',
+            args.pathAndQuery,
+            `diff:${res.probeClass}`,
+          )
           this.storage.recordSurfaceProbe({
             runId: curRun.id,
             assignmentId: job.assignment.id,
@@ -5826,6 +6039,7 @@ export class Execution {
             this.storage.listFacts(run.id, { includeTainted: false, limit: 200 }),
             personasPub,
             permittedAtAdmission,
+            this.storage.listResourceSamples(run.id),
           )
         : []
 
@@ -6234,10 +6448,18 @@ export class Execution {
           durationMs: ex.durationMs,
           secrets: currentSecrets(),
         })
+        this.storage.trackExchangeResources({
+          runId: run.id,
+          scopeRevision: run.scopeRevision,
+          exchange: ex,
+          source: 'surface_probe',
+        })
+        this.markEndpointCoverage(run, ex.origin, ex.method, ex.pathAndQuery, `replay:${specRow.spec.kind}`)
         return saved.id
       },
     }
     const result = await verifyReplaySpec(verifyParams)
+    this.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
 
     const current = this.check(job)
     this.storage.transaction(() => {
@@ -6568,10 +6790,19 @@ export class Execution {
           durationMs: ex.durationMs,
           secrets: params.currentSecrets(),
         })
+        this.storage.trackExchangeResources({
+          runId: latest.id,
+          scopeRevision: latest.scopeRevision,
+          exchange: ex,
+          source: 'surface_probe',
+        })
+        this.markEndpointCoverage(latest, ex.origin, ex.method, ex.pathAndQuery, `replay:${parsed.kind}`)
         params.onExchangeObserved?.(latest, ex, saved.id)
         return saved.id
       },
     })
+    const latestForCoverage = this.check(params.job)
+    this.markReplaySpecCoverage(latestForCoverage, parsed, `replay:${parsed.kind}`)
 
     if (nextAttempt > maxAttempts) {
       return {
