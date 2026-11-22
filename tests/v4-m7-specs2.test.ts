@@ -285,28 +285,84 @@ describe('M7.2 NoSQL operator injection synthesis', () => {
 describe('v5 M3 contracts (awaiting probe shapes)', () => {
   test('CSRF state change: token-bound control, tokenless probe, read-back', () => {
     const built = expectSpec(outcome({
-      hyp: hypothesis({ endpoint: endpoint({ method: 'PATCH', path: '/api/v1/profile', params: [] }), probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'PATCH' }),
+      hyp: hypothesis({ endpoint: endpoint({ method: 'PATCH', path: '/api/v1/profile', params: [] }), probeClass: 'csrf_state_change', param: undefined, location: undefined, method: 'PATCH' }),
       anomalies: [{
         type: 'csrf_state_change', path: '/api/v1/profile', method: 'PATCH', bodyField: 'displayName',
         controlValue: 'guardian-control', expectedValue: 'guardian-probe', readPath: '/api/v1/profile', stateField: 'displayName',
       }],
     }), 'http_chain')
-    const steps = built.spec.steps as Array<{ id: string; request: { method: string; csrfBind?: boolean; jsonBody?: Record<string, unknown> } }>
-    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1', 'p2'])
-    assert.equal(steps[0].request.csrfBind, true)
-    assert.equal(steps[1].request.csrfBind, undefined)
+    const steps = built.spec.steps as Array<{ id: string; request: { method: string; csrfBind?: boolean; jsonBody?: Record<string, unknown>; headers?: Record<string, string> } }>
+    assert.deepEqual(steps.map(s => s.id), ['s1', 's2', 'c1', 'r1', 'p1', 'p2'])
+    const control = steps.find(s => s.id === 'c1')!
+    const probe = steps.find(s => s.id === 'p1')!
+    assert.equal(control.request.csrfBind, true)
+    assert.equal(probe.request.csrfBind, undefined)
+    assert.equal(probe.request.headers?.Origin, 'https://untrusted.invalid')
     const hit = jq(String(built.spec.assertionsJq), {
       steps: {
         c1: { status: 200 },
+        r1: { status: 200, json: { displayName: 'guardian-control' } },
         p1: { status: 200 },
         p2: { status: 200, json: { displayName: 'guardian-probe' } },
       },
     })
     assert.equal(hit.confirmed, true)
     const untouched = jq(String(built.spec.assertionsJq), {
-      steps: { c1: { status: 200 }, p1: { status: 403 }, p2: { status: 200, json: { displayName: 'guardian-control' } } },
+      steps: {
+        c1: { status: 200 }, r1: { status: 200, json: { displayName: 'guardian-control' } },
+        p1: { status: 403 }, p2: { status: 200, json: { displayName: 'guardian-control' } },
+      },
     })
     assert.equal(untouched.confirmed, false)
+  })
+
+  test('CSRF form-encoded writes honour bodyEncoding and keep a form content type', () => {
+    const ep = endpoint({ method: 'POST', path: '/rest/settings', params: [] })
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'csrf_state_change', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'csrf_state_change', path: '/rest/settings', method: 'POST', bodyField: 'name', bodyEncoding: 'form',
+        controlValue: 'guardian-control', expectedValue: 'guardian-probe', readPath: '/rest/settings', stateField: 'name',
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { textBody?: string; jsonBody?: unknown; headers?: Record<string, string> } }>
+    const probe = steps.find(s => s.id === 'p1')!
+    assert.equal(probe.request.headers?.['Content-Type'], 'application/x-www-form-urlencoded')
+    assert.equal(probe.request.textBody, 'name=guardian-probe')
+    assert.equal(probe.request.jsonBody, undefined)
+  })
+
+  test('CSRF collection state is found by record id inside items[]', () => {
+    const ep = endpoint({
+      method: 'POST',
+      path: '/api/v1/jobs/{id}/trigger',
+      params: [{ name: 'id', location: 'path', isObjectId: true, isCsrf: false }],
+    })
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'csrf_state_change', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'csrf_state_change', path: '/api/v1/jobs/job_ab12/trigger', method: 'POST', bodyField: 'state',
+        controlValue: 'queued', expectedValue: 'running', readPath: '/api/v1/jobs', stateField: 'state',
+      }],
+    }), 'http_chain')
+    const hit = jq(String(built.spec.assertionsJq), {
+      steps: {
+        c1: { status: 200 },
+        r1: { status: 200, json: { items: [{ id: 'job_ab12', state: 'queued' }, { id: 'job_zz99', state: 'queued' }] } },
+        p1: { status: 200 },
+        p2: { status: 200, json: { items: [{ id: 'job_zz99', state: 'queued' }, { id: 'job_ab12', state: 'running' }] } },
+      },
+    })
+    assert.equal(hit.confirmed, true)
+    const wrongRecord = jq(String(built.spec.assertionsJq), {
+      steps: {
+        c1: { status: 200 },
+        r1: { status: 200, json: { items: [{ id: 'job_ab12', state: 'queued' }] } },
+        p1: { status: 200 },
+        p2: { status: 200, json: { items: [{ id: 'job_ab12', state: 'queued' }, { id: 'job_zz99', state: 'running' }] } },
+      },
+    })
+    assert.equal(wrongRecord.confirmed, false)
   })
 
   test('webhook signature bypass: tampered control rejected, unsigned delivery accepted', () => {
@@ -324,6 +380,70 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       steps: { c1: { status: 401 }, p1: { status: 200 }, p2: { status: 200, json: { status: 'paid' } } },
     })
     assert.equal(hit.confirmed, true)
+  })
+
+  test('webhook acceptance mode confirms without a delivery read route', () => {
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: endpoint({ method: 'POST', path: '/webhooks/events', params: [] }), probeClass: 'webhook_signature_bypass', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'webhook_signature_bypass', proof: 'acceptance', path: '/webhooks/events', headerName: 'X-Signature',
+        body: { event: 'invoice.paid', ts: '1700000000' },
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { headers?: Record<string, string> } }>
+    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1'])
+    assert.equal(steps[0].request.headers?.['X-Signature'], 'guardian-invalid-signature')
+    const hit = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 401 }, p1: { status: 200, body: '{"ok":true}' } } })
+    assert.equal(hit.confirmed, true)
+    const noAck = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 401 }, p1: { status: 200, body: '{"ok":false}' } } })
+    assert.equal(noAck.confirmed, false)
+    const notRejected = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 200 }, p1: { status: 200, body: '{"received":true}' } } })
+    assert.equal(notRejected.controlPassed, false)
+  })
+
+  test('webhook read-back accepts an array delivery counter threshold', () => {
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: endpoint({ method: 'POST', path: '/api/webhooks', params: [] }), probeClass: 'webhook_signature_bypass', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'webhook_signature_bypass', proof: 'readback', variant: 'unsigned',
+        path: '/api/webhooks', headerName: 'x-webhook-signature',
+        body: { event: 'guardian.probe' }, readPath: '/api/webhooks/deliveries', stateField: 'deliveries', expectedValue: 3,
+      }],
+    }), 'http_chain')
+    const hit = jq(String(built.spec.assertionsJq), {
+      steps: { c1: { status: 401 }, p1: { status: 200 }, p2: { status: 200, json: { deliveries: [{}, {}, {}] } } },
+    })
+    assert.equal(hit.confirmed, true)
+    const tooFew = jq(String(built.spec.assertionsJq), {
+      steps: { c1: { status: 401 }, p1: { status: 200 }, p2: { status: 200, json: { deliveries: [{}, {}] } } },
+    })
+    assert.equal(tooFew.confirmed, false)
+  })
+
+  test('webhook read-back on the same POST path (CRUD create) is not a receiver proof', () => {
+    const o = outcome({
+      hyp: hypothesis({ endpoint: endpoint({ method: 'POST', path: '/api/webhooks', params: [] }), probeClass: 'webhook_signature_bypass', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'webhook_signature_bypass', proof: 'readback', path: '/api/webhooks', headerName: 'x-signature',
+        body: { event: 'probe' }, readPath: '/api/webhooks', stateField: 'items', expectedValue: 3,
+      }],
+    })
+    assert.equal(synthesizeSpec(o, env()), null)
+  })
+
+  test('webhook self-signed deliveries tamper the inline signature in the control', () => {
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: endpoint({ method: 'POST', path: '/webhooks/events', params: [] }), probeClass: 'webhook_signature_bypass', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'webhook_signature_bypass', proof: 'acceptance', variant: 'inline_key:key/sig',
+        path: '/webhooks/events', headerName: 'X-Signature',
+        body: { event: 'invoice.paid', key: 'guardian_whk_abc', sig: 'valid-digest' },
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { headers?: Record<string, string>; jsonBody?: Record<string, unknown> } }>
+    assert.equal(steps[0].request.headers?.['X-Signature'], undefined)
+    assert.equal(steps[0].request.jsonBody?.sig, 'guardian-invalid-signature')
+    assert.equal(steps[1].request.jsonBody?.sig, 'valid-digest')
   })
 
   test('open redirect: observed external target is replayed against a benign control', () => {
@@ -375,6 +495,43 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       steps: { c1: { status: 200, json: { title: 'original' } }, p1: { status: 200 }, p2: { status: 200, json: { title: 'original' } } },
     })
     assert.equal(notPersisted.confirmed, false)
+  })
+
+  test('write-path BOLA falls back to an owner list read when only a collection is exposed', () => {
+    const ep = endpoint({
+      method: 'PATCH',
+      path: '/api/v1/jobs/{id}',
+      params: [{ name: 'id', location: 'path', isObjectId: true, isCsrf: false }],
+    })
+    const specs = synthesizeSpecs(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'PATCH' }),
+      anomalies: [{
+        type: 'write_path_bola', resourceId: 'job_ab12', path: '/api/v1/jobs/{id}', method: 'PATCH',
+        writeBody: { title: 'pwned' }, readPath: '/api/v1/jobs/{id}', stateField: 'title',
+        expectedValue: 'pwned', cleanupBody: { title: 'original' },
+      }],
+    }), env())
+    assert.equal(specs.length, 2)
+    const detail = specs[0].spec.steps as Array<{ request: { pathAndQuery: string } }>
+    const list = specs[1].spec.steps as Array<{ id: string; request: { pathAndQuery: string } }>
+    assert.equal(detail[0].request.pathAndQuery, '/api/v1/jobs/job_ab12')
+    assert.equal(list[0].request.pathAndQuery, '/api/v1/jobs')
+    const hit = jq(String(specs[1].spec.assertionsJq), {
+      steps: {
+        c1: { status: 200, json: { items: [{ id: 'job_zz99', title: 'other' }] } },
+        p1: { status: 200 },
+        p2: { status: 200, json: { items: [{ id: 'job_zz99', title: 'other' }, { id: 'job_ab12', title: 'pwned' }] } },
+      },
+    })
+    assert.equal(hit.confirmed, true)
+    const wrongRecord = jq(String(specs[1].spec.assertionsJq), {
+      steps: {
+        c1: { status: 200, json: { items: [{ id: 'job_zz99', title: 'other' }] } },
+        p1: { status: 200 },
+        p2: { status: 200, json: { items: [{ id: 'job_zz99', title: 'pwned' }] } },
+      },
+    })
+    assert.equal(wrongRecord.confirmed, false)
   })
 
   test('M3 contracts refuse partial evidence', () => {

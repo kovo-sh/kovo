@@ -33,6 +33,118 @@ function fillId(path: string, id: string): string {
     : hasPathPlaceholder(path) ? fillPlaceholders(path, encodeURIComponent(id)) : path
 }
 
+const SAFE_SELECTOR = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/
+
+/** `.<path>` jq lookup for an explicit `stateSelector` anomaly field. */
+function selectorPath(stepId: string, selector: string): string | null {
+  if (!SAFE_SELECTOR.test(selector)) return null
+  return `.steps.${stepId}.json${selector.split('.').map(part => `[${jqStr(part)}]`).join('')}`
+}
+
+/**
+ * jq predicate for "the expected scalar exists on this step". Supports a top-level field, an
+ * explicit selector, or a record inside a collection (`items[]`, `jobs[]`, ...). `recordId` narrows
+ * the collection to the mutated object, so an unrelated row cannot satisfy the assertion.
+ */
+function stateExists(stepId: string, field: string, expectedLiteral: string, recordId: string | null, selector?: string, countMode = false): string {
+  if (selector) {
+    const path = selectorPath(stepId, selector)
+    return path ? `(${path} == ${expectedLiteral})` : 'false'
+  }
+  const top = `(.steps.${stepId}.json[${jqStr(field)}] == ${expectedLiteral})`
+  // Webhook counters expose an array and a minimum expected length rather than a scalar value.
+  const topCount = countMode
+    ? `(((.steps.${stepId}.json[${jqStr(field)}] | type) == "array") and (((.steps.${stepId}.json[${jqStr(field)}] | length) >= ${expectedLiteral})))`
+    : 'false'
+  const recordFilter = recordId
+    ? ` | select([.[] | select((type == "string") or (type == "number")) | tostring] | index(${jqStr(recordId)}))`
+    : ''
+  const inCollection = `([.steps.${stepId}.json[]? | select(type == "array") | .[]? | select(type == "object")${recordFilter} | .[${jqStr(field)}]] | map(. == ${expectedLiteral}) | any)`
+  return `((${top}) or (${topCount}) or (${inCollection}))`
+}
+
+/** Strict negation of `stateExists` (no top-level or collection record may already carry the value). */
+function stateAbsent(stepId: string, field: string, expectedLiteral: string, recordId: string | null, selector?: string): string {
+  if (selector) {
+    const path = selectorPath(stepId, selector)
+    return path ? `(${path} != ${expectedLiteral})` : 'false'
+  }
+  const top = `(.steps.${stepId}.json[${jqStr(field)}] != ${expectedLiteral})`
+  const recordFilter = recordId
+    ? ` | select([.[] | select((type == "string") or (type == "number")) | tostring] | index(${jqStr(recordId)}))`
+    : ''
+  const inCollection = `([.steps.${stepId}.json[]? | select(type == "array") | .[]? | select(type == "object")${recordFilter} | .[${jqStr(field)}]] | map(. == ${expectedLiteral}) | any)`
+  return `((${top}) and ((${inCollection}) | not))`
+}
+
+/**
+ * Record id for collection lookups. Prefer the probe's `stateRecordId`; otherwise use the most
+ * id-shaped segment of the observed mutation path (e.g. `/jobs/job_ab12/trigger`).
+ */
+function deriveRecordId(hit: Record<string, unknown>): string | null {
+  const explicit = hit.stateRecordId
+  if (typeof explicit === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(explicit)) return explicit
+  const segments = String(hit.path ?? '').split('?')[0].split('/').filter(Boolean)
+  for (let i = segments.length - 1; i > 0; i -= 1) {
+    const segment = segments[i]
+    if (/^v\d+$/i.test(segment)) continue
+    if (/^[A-Za-z0-9_.:-]{1,128}$/.test(segment) && /[\d_-]/.test(segment)) return segment
+  }
+  return null
+}
+
+/** `/api/v1/documents/{id}` -> `/api/v1/documents` (list route that may expose the record). */
+function collectionPathFrom(template: string): string | null {
+  const segments = template.split('?')[0].split('/').filter(Boolean)
+  const index = segments.findIndex(segment => /^(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\]|\{\{id\}\})$/.test(segment))
+  if (index <= 0) return null
+  return `/${segments.slice(0, index).join('/')}`
+}
+
+interface CsrfBody {
+  headers: Record<string, string>
+  jsonBody?: unknown
+  textBody?: string
+}
+
+/**
+ * CSRF mutation body in the encoding the probe observed (`bodyEncoding`), including action
+ * envelopes `{field, value}` and raw `formBody`/`textBody` templates.
+ */
+function csrfBody(o: HypothesisOutcome, hit: Record<string, unknown>, bodyField: string, value: unknown): CsrfBody | null {
+  if (typeof hit.textBody === 'string' && hit.textBody.length > 0) {
+    const template = hit.textBody
+    const replaced = template
+      .replaceAll('{{value}}', encodeURIComponent(String(value)))
+      .replaceAll('{{expectedValue}}', encodeURIComponent(String(value)))
+    if (replaced === template) return null
+    return { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, textBody: replaced }
+  }
+  const base: Record<string, unknown> = {}
+  const rawForm = hit.formBody && typeof hit.formBody === 'object' && !Array.isArray(hit.formBody) ? hit.formBody as Record<string, unknown> : null
+  if (rawForm) Object.assign(base, rawForm)
+  const explicitWrite = hit.writeBody && typeof hit.writeBody === 'object' && !Array.isArray(hit.writeBody) ? hit.writeBody as Record<string, unknown> : null
+  if (explicitWrite) Object.assign(base, explicitWrite)
+  const hasEnvelope = 'field' in base && 'value' in base
+  if (hasEnvelope) Object.assign(base, { field: bodyField, value })
+  else if ('value' in base && !(bodyField in base)) Object.assign(base, { value })
+  else Object.assign(base, { [bodyField]: value })
+  // The probe's action-envelope hint is not always carried in the anomaly; infer it from the
+  // endpoint parameters when the route exposes a `field`/`value` pair.
+  const bodyParams = o.hyp.endpoint.params.filter(p => (p.location === 'json' || p.location === 'form') && !p.isCsrf)
+  if (!rawForm && !explicitWrite && bodyParams.some(p => /^field$/i.test(p.name)) && bodyParams.some(p => /^value$/i.test(p.name))) {
+    return { headers: { 'Content-Type': 'application/json' }, jsonBody: { field: bodyField, value } }
+  }
+  const encoding = hit.bodyEncoding === 'form' || rawForm ? 'form' : 'json'
+  if (encoding === 'form') {
+    return {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      textBody: Object.entries(base).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+    }
+  }
+  return { headers: { 'Content-Type': 'application/json' }, jsonBody: base }
+}
+
 // ---------------------------------------------------------------------------
 // CSRF: state-changing request accepted without the anti-CSRF token
 // ---------------------------------------------------------------------------
@@ -47,24 +159,47 @@ export function synthCsrfStateChange(o: HypothesisOutcome, env: ProbeEnv): Synth
   const stateField = String(hit.stateField ?? '')
   const expectedLiteral = literal(hit.expectedValue)
   const controlLiteral = literal(hit.controlValue)
+  const stateSelector = typeof hit.stateSelector === 'string' ? hit.stateSelector : undefined
+  const recordId = deriveRecordId(hit)
+  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+    process.stderr.write(`[spec-csrf] path=${path} method=${methodRaw} bodyField=${bodyField} enc=${String(hit.bodyEncoding ?? '-')} readPath=${readPath} stateField=${stateField} control=${String(hit.controlValue ?? '-')} expected=${String(hit.expectedValue ?? '-')} recordId=${recordId ?? '-'} keys=${Object.keys(hit).join(',')}\n`)
+  }
   if (!path.startsWith('/') || !readPath.startsWith('/')) return []
   if (!['POST', 'PUT', 'PATCH'].includes(methodRaw) || !SAFE_FIELD.test(bodyField) || !SAFE_FIELD.test(stateField)) return []
   if (!expectedLiteral || !controlLiteral || expectedLiteral === controlLiteral) return []
+  if (stateSelector && !SAFE_SELECTOR.test(stateSelector)) return []
   const method = methodRaw as 'POST' | 'PUT' | 'PATCH'
-  const write = (value: unknown): RequestParts => ({ method, pathAndQuery: path, jsonBody: { [bodyField]: value } })
-  const jq = `{ controlPassed: (${is2xx('c1')}), ` +
-    `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (.steps.p2.json[${jqStr(stateField)}] == ${expectedLiteral})), ` +
-    `observed: ("state=" + ((.steps.p2.json[${jqStr(stateField)}]) | tostring)), expected: "state change must require the anti-CSRF token" }`
+  const controlBody = csrfBody(o, hit, bodyField, hit.controlValue)
+  const probeBody = csrfBody(o, hit, bodyField, hit.expectedValue)
+  if (!controlBody || !probeBody) return []
+  const read: RequestParts = { method: 'GET', pathAndQuery: readPath }
+  const foreign = { Origin: 'https://untrusted.invalid', Referer: 'https://untrusted.invalid/' }
+  const jq = `{ controlPassed: ((${is2xx('c1')}) and (${is2xx('r1')}) and (${stateAbsent('r1', stateField, expectedLiteral, recordId, stateSelector)})), ` +
+    `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (${stateExists('p2', stateField, expectedLiteral, recordId, stateSelector)})), ` +
+    `observed: ("state=" + ((.steps.p2.json[${jqStr(stateField)}] // "collection") | tostring)), expected: "state change must require the anti-CSRF token" }`
+  const steps: Array<Record<string, unknown>> = []
+  if (env.caps.sessionAndCsrf) {
+    steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies from the site root', { method: 'GET', pathAndQuery: '/' }, env.owner))
+    steps.push(stepOf(env, 's2', 'setup', 'Load the state page so the jar binds its anti-CSRF token', read, env.owner))
+  }
+  steps.push(stepOf(env, 'c1', 'control', 'State change with the anti-CSRF token bound', {
+    method, pathAndQuery: path, headers: controlBody.headers,
+    ...(controlBody.jsonBody !== undefined ? { jsonBody: controlBody.jsonBody } : {}),
+    ...(controlBody.textBody !== undefined ? { textBody: controlBody.textBody } : {}),
+  }, env.owner, env.caps.sessionAndCsrf ? { csrfBind: true } : {}))
+  steps.push(stepOf(env, 'r1', 'control', 'Read the restored baseline state', read, env.owner))
+  steps.push(stepOf(env, 'p1', 'probe', 'Same state change without the anti-CSRF token (foreign Origin)', {
+    method, pathAndQuery: path, headers: { ...probeBody.headers, ...foreign },
+    ...(probeBody.jsonBody !== undefined ? { jsonBody: probeBody.jsonBody } : {}),
+    ...(probeBody.textBody !== undefined ? { textBody: probeBody.textBody } : {}),
+  }, env.owner))
+  steps.push(stepOf(env, 'p2', 'probe', 'Read the mutated state', read, env.owner))
   return [{
     kind: 'http_chain',
     spec: {
       ...baseFields(env, 'CSRF protection missing on a state-changing request', 'CWE-352', 'csrf', 'high', jq),
       kind: 'http_chain',
-      steps: [
-        stepOf(env, 'c1', 'control', 'State change with the anti-CSRF token bound', write(hit.controlValue), env.owner, env.caps.sessionAndCsrf ? { csrfBind: true } : {}),
-        stepOf(env, 'p1', 'probe', 'Same state change without the anti-CSRF token', write(hit.expectedValue), env.owner),
-        stepOf(env, 'p2', 'probe', 'Read the mutated state', { method: 'GET', pathAndQuery: readPath }, env.owner),
-      ],
+      steps,
     },
   }]
 }
@@ -82,10 +217,50 @@ export function synthWebhookSignature(o: HypothesisOutcome, env: ProbeEnv): Synt
   const body = hit.body && typeof hit.body === 'object' && !Array.isArray(hit.body) ? hit.body as Record<string, unknown> : null
   const stateField = String(hit.stateField ?? '')
   const expectedLiteral = literal(hit.expectedValue)
-  if (!path.startsWith('/') || !readPath.startsWith('/') || !body) return []
-  if (!SAFE_HEADER.test(header) || /^(?:authorization|cookie|host)$/i.test(header) || !SAFE_FIELD.test(stateField) || !expectedLiteral) return []
+  const acceptance = hit.proof === 'acceptance'
+  // A POST to the same path as the delivery/list read is a CRUD create, not a signed inbound
+  // receiver; only an explicit processing acknowledgement may confirm that ambiguous shape.
+  if (!acceptance && readPath && readPath === path) return []
+  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+    process.stderr.write(`[spec-webhook] path=${path} variant=${String(hit.variant ?? '-')} proof=${String(hit.proof ?? '-')} header=${header || '-'} bodyKeys=${body ? Object.keys(body).join(',') : 'none'} readPath=${readPath || '-'} stateField=${String(hit.stateField ?? '-')} expected=${String(hit.expectedValue ?? '-')}\n`)
+  }
+  if (!path.startsWith('/') || !body) return []
+  if (!SAFE_HEADER.test(header) || /^(?:authorization|cookie|host)$/i.test(header)) return []
+  if (!acceptance && (!readPath.startsWith('/') || !SAFE_FIELD.test(stateField) || !expectedLiteral)) return []
+  const control = () => {
+    // Self-signed deliveries carry the signing key and signature *inside* the body; a header-only
+    // tamper would leave the inline signature valid and turn the control into another acceptance.
+    const inline = /^inline_key:([A-Za-z0-9_]+)\/([A-Za-z0-9_]+)$/.exec(String(hit.variant ?? ''))
+    if (inline) {
+      return stepOf(env, 'c1', 'control', 'Tampered inline signature is rejected', {
+        method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: { ...body, [inline[2]]: 'guardian-invalid-signature' },
+      }, null, {}, [400, 401, 403, 422])
+    }
+    return stepOf(env, 'c1', 'control', 'Tampered signature is rejected', {
+      method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json', [header]: 'guardian-invalid-signature' }, jsonBody: body,
+    }, null, {}, [400, 401, 403, 422])
+  }
+  if (acceptance) {
+    // No delivery read route: the receiver's explicit processing acknowledgement plus a rejected
+    // tampered control is the evidence (matches the probe's acceptance proof).
+    const ack = '(((.steps.p1.body // "") | tostring) | test("\\"(?:ok|received|processed|accepted|success)\\"\\\\s*:\\\\s*true"; "i"))'
+    const jq = `{ controlPassed: (.steps.c1.status >= 400 and .steps.c1.status < 500), ` +
+      `confirmed: ((.steps.c1.status >= 400 and .steps.c1.status < 500) and (${is2xx('p1')}) and (${ack})), ` +
+      `observed: ("unsigned status=" + (.steps.p1.status | tostring)), expected: "unsigned webhook deliveries must be rejected" }`
+    return [{
+      kind: 'http_chain',
+      spec: {
+        ...baseFields(env, 'Webhook signature verification bypass (unsigned delivery accepted)', 'CWE-345', 'broken-authentication', 'high', jq),
+        kind: 'http_chain',
+        steps: [
+          control(),
+          stepOf(env, 'p1', 'probe', 'Same delivery unsigned is accepted and processed', { method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: body }, null),
+        ],
+      },
+    }]
+  }
   const jq = `{ controlPassed: (.steps.c1.status >= 400 and .steps.c1.status < 500), ` +
-    `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (.steps.p2.json[${jqStr(stateField)}] == ${expectedLiteral})), ` +
+    `confirmed: ((.steps.c1.status >= 400 and .steps.c1.status < 500) and (${is2xx('p1')}) and (${is2xx('p2')}) and (${stateExists('p2', stateField, expectedLiteral!, deriveRecordId({ ...hit, path: readPath }), typeof hit.stateSelector === 'string' ? hit.stateSelector : undefined, typeof hit.expectedValue === 'number')})), ` +
     `observed: ("unsigned status=" + (.steps.p1.status | tostring) + " state=" + ((.steps.p2.json[${jqStr(stateField)}]) | tostring)), expected: "unsigned webhook deliveries must be rejected" }`
   return [{
     kind: 'http_chain',
@@ -93,8 +268,8 @@ export function synthWebhookSignature(o: HypothesisOutcome, env: ProbeEnv): Synt
       ...baseFields(env, 'Webhook signature verification bypass (unsigned delivery accepted)', 'CWE-345', 'broken-authentication', 'high', jq),
       kind: 'http_chain',
       steps: [
-        stepOf(env, 'c1', 'control', 'Tampered signature is rejected', { method: 'POST', pathAndQuery: path, headers: { [header]: 'guardian-invalid-signature' }, jsonBody: body }, null, {}, [400, 401, 403, 422]),
-        stepOf(env, 'p1', 'probe', 'Same delivery unsigned is accepted', { method: 'POST', pathAndQuery: path, jsonBody: body }, null),
+        control(),
+        stepOf(env, 'p1', 'probe', 'Same delivery unsigned is accepted', { method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: body }, null),
         stepOf(env, 'p2', 'probe', 'Read the delivery side effect', { method: 'GET', pathAndQuery: readPath }, env.owner),
       ],
     },
@@ -143,33 +318,55 @@ export function synthWritePathBola(o: HypothesisOutcome, env: ProbeEnv): Synthes
   const hit = o.anomalies.find(a => a.type === 'write_path_bola' || a.type === 'unauthorized_write')
   if (!hit || !env.owner || !env.other) return []
   const id = String(hit.resourceId ?? '')
-  const readPath = String(hit.readPath ?? '')
+  const detailRead = String(hit.readPath ?? '')
   const stateField = String(hit.stateField ?? '')
   const expectedLiteral = literal(hit.expectedValue)
   const body = hit.writeBody && typeof hit.writeBody === 'object' && !Array.isArray(hit.writeBody) ? hit.writeBody as Record<string, unknown> : null
   const methodRaw = String(hit.method ?? 'PATCH').toUpperCase()
-  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(id) || !readPath.startsWith('/') || !SAFE_FIELD.test(stateField)) return []
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(id) || !SAFE_FIELD.test(stateField)) return []
   if (!expectedLiteral || !body || !['POST', 'PUT', 'PATCH'].includes(methodRaw)) return []
   const method = methodRaw as 'POST' | 'PUT' | 'PATCH'
-  const target = fillId(String(hit.path ?? o.hyp.endpoint.path), id)
-  const read = fillId(readPath, id)
+  const targetTemplate = String(hit.path ?? o.hyp.endpoint.path)
+  const target = fillId(targetTemplate, id)
   const cleanup = hit.cleanupBody && typeof hit.cleanupBody === 'object' && !Array.isArray(hit.cleanupBody) ? hit.cleanupBody as Record<string, unknown> : null
-  const jq = `{ controlPassed: ((${is2xx('c1')}) and (.steps.c1.json[${jqStr(stateField)}] != ${expectedLiteral})), ` +
-    `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (.steps.p2.json[${jqStr(stateField)}] == ${expectedLiteral})), ` +
-    `observed: ("owner read-back=" + ((.steps.p2.json[${jqStr(stateField)}]) | tostring)), expected: "non-owner writes must not mutate the object" }`
-  return [{
-    kind: 'http_chain',
-    spec: {
-      ...baseFields(env, 'Cross-tenant write (object-level authorization failure)', 'CWE-639', 'broken-access-control', 'high', jq),
+  const selector = typeof hit.stateSelector === 'string' ? hit.stateSelector : undefined
+  if (selector && !SAFE_SELECTOR.test(selector)) return []
+  // The anomaly's resourceId is the exact object the probe mutated; only fall back to path parsing
+  // when the probe did not carry one.
+  const recordId = typeof hit.stateRecordId === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(hit.stateRecordId)
+    ? hit.stateRecordId
+    : id
+
+  const listTemplateRaw = typeof hit.listReadPath === 'string' ? hit.listReadPath
+    : typeof hit.readListPath === 'string' ? hit.readListPath
+      : typeof hit.collectionPath === 'string' ? hit.collectionPath
+        : collectionPathFrom(detailRead || targetTemplate)
+  const reads: Array<{ label: string; path: string; id: string }> = []
+  if (detailRead.startsWith('/')) reads.push({ label: 'detail', path: fillId(detailRead, id), id: recordId })
+  if (listTemplateRaw && listTemplateRaw.startsWith('/')) {
+    const listPath = fillId(listTemplateRaw, id)
+    if (!reads.some(r => r.path === listPath)) reads.push({ label: 'list', path: listPath, id: recordId })
+  }
+  if (reads.length === 0) return []
+
+  return reads.map(({ label, path: read, id: lookupId }) => {
+    const jq = `{ controlPassed: ((${is2xx('c1')}) and (${stateAbsent('c1', stateField, expectedLiteral, lookupId, selector)})), ` +
+      `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (${stateExists('p2', stateField, expectedLiteral, lookupId, selector)})), ` +
+      `observed: ("owner ${label} read-back=" + ((.steps.p2.json[${jqStr(stateField)}] // "collection") | tostring)), expected: "non-owner writes must not mutate the object" }`
+    return {
       kind: 'http_chain',
-      steps: [
-        stepOf(env, 'c1', 'control', 'Owner reads the object before the write', { method: 'GET', pathAndQuery: read }, env.owner),
-        stepOf(env, 'p1', 'probe', 'Non-owner writes to the object', { method, pathAndQuery: target, jsonBody: body }, env.other),
-        stepOf(env, 'p2', 'probe', 'Owner reads the object back', { method: 'GET', pathAndQuery: read }, env.owner),
-        ...(cleanup ? [stepOf(env, 'z1', 'cleanup', 'Restore the original object value', { method, pathAndQuery: target, jsonBody: cleanup }, env.owner)] : []),
-      ],
-    },
-  }]
+      spec: {
+        ...baseFields(env, 'Cross-tenant write (object-level authorization failure)', 'CWE-639', 'broken-access-control', 'high', jq),
+        kind: 'http_chain',
+        steps: [
+          stepOf(env, 'c1', 'control', `Owner reads the ${label} view before the write`, { method: 'GET', pathAndQuery: read }, env.owner),
+          stepOf(env, 'p1', 'probe', 'Non-owner writes to the object', { method, pathAndQuery: target, jsonBody: body }, env.other),
+          stepOf(env, 'p2', 'probe', `Owner reads the ${label} view back`, { method: 'GET', pathAndQuery: read }, env.owner),
+          ...(cleanup ? [stepOf(env, 'z1', 'cleanup', 'Restore the original object value', { method, pathAndQuery: target, jsonBody: cleanup }, env.owner)] : []),
+        ],
+      },
+    }
+  })
 }
 
 /** Dispatch only the v5 M3 anomaly contracts. */
