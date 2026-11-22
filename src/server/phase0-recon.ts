@@ -2069,10 +2069,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         persona?: string
         anonymous?: boolean
         followRedirects?: boolean
+        /** Navigation seeds may use a small bounded overflow lane so earlier discovery probes
+         *  cannot starve link-only HTML routes. */
+        exceedCap?: boolean
       },
     ): Promise<BrokerExchangeResult | null> => {
       if (originHalted || signal.aborted) return null
-      if (originUsed >= perOriginCap) return null
+      const effectiveCap = opts?.exceedCap ? perOriginCap + 16 : perOriginCap
+      if (originUsed >= effectiveCap) return null
       if (!grant.canRead(origin)) {
         originHalted = true
         stoppedReason = 'scope_revoked'
@@ -2108,7 +2112,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           return null
         }
         if (err instanceof BrokerDenied) {
-          if (!grant.canRead(origin) || /scope|revoked/i.test(err.message)) {
+          if (!grant.canRead(origin)) {
             originHalted = true
             stoppedReason = 'scope_revoked'
             return null
@@ -2755,7 +2759,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const navGetTemplates = [...new Set(storage.listEndpoints(runId, { origin })
       .filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2)
       .map(ep => ep.pathTemplate))]
-    const navCap = Math.min(28, Math.max(0, perOriginCap - originUsed - 8))
+    const navCap = Math.min(28, Math.max(0, perOriginCap + 16 - originUsed))
+    const navOriginCap = perOriginCap + 16
     const attachObservedFields = (baseTemplate: string, body: string) => {
       if (observedFieldAttachments >= 12) return
       const fields = extractJsonFieldNames(body)
@@ -2779,7 +2784,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
     for (let navIndex = 0; navIndex < navQueue.length && navigationRequests < navCap; navIndex += 1) {
-      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
+      if (originHalted || originUsed >= navOriginCap || signal.aborted) break
       const item = navQueue[navIndex]
       if (!item) continue
       const clean = sanitizePathCandidate(item.path, origin)
@@ -2787,7 +2792,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (/[:{}]/.test(clean) || navVisited.has(clean)) continue
       if (writeOnlyPaths.has(normalizeDiscoveryTemplate(clean))) continue
       navVisited.add(clean)
-      const ex = await safeGet(clean)
+      const ex = await safeGet(clean, { exceedCap: true })
       if (!ex) continue
       navigationRequests += 1
       if (softNotFoundResponse(ex)) { soft404Rejected += 1; continue }
