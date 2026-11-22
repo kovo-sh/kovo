@@ -1,0 +1,658 @@
+[
+  {
+    "id": "order-bola-read",
+    "dir": "sites/order-bola-read",
+    "rootCauseFile": "billing/order-access.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "getOrder"
+    ],
+    "triggerRouteKeys": [
+      "getOrder"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "oracleRouteKeys": [
+      "getOrder"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Order detail read across stores — scopes the query by a store header that looks authoritative but is caller-supplied",
+    "implemented": true
+  },
+  {
+    "id": "shipment-bola-write",
+    "dir": "sites/shipment-bola-write",
+    "rootCauseFile": "fulfillment/shipment-update.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "high",
+    "routeKeys": [
+      "updateShipment"
+    ],
+    "triggerRouteKeys": [
+      "updateShipment"
+    ],
+    "oracleKinds": [
+      "cross_tenant_write"
+    ],
+    "oracleRouteKeys": [
+      "updateShipment"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Shipment status update across stores — checks that the shipment exists before writing but never rechecks ownership",
+    "implemented": true
+  },
+  {
+    "id": "product-search-sqli",
+    "dir": "sites/product-search-sqli",
+    "rootCauseFile": "catalog/product-search.ts",
+    "vulnClass": "sqli",
+    "cwe": "CWE-89",
+    "severity": "high",
+    "routeKeys": [
+      "searchProducts"
+    ],
+    "triggerRouteKeys": [
+      "searchProducts"
+    ],
+    "oracleKinds": [
+      "sql_structure_change"
+    ],
+    "oracleRouteKeys": [
+      "searchProducts"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Product search raw SQL — escapes single quotes by doubling but still concatenates the LIKE clause",
+    "implemented": true
+  },
+  {
+    "id": "invoice-path-traversal",
+    "dir": "sites/invoice-path-traversal",
+    "rootCauseFile": "billing/invoice-export.ts",
+    "vulnClass": "path_traversal",
+    "cwe": "CWE-22",
+    "severity": "high",
+    "routeKeys": [
+      "getInvoice"
+    ],
+    "triggerRouteKeys": [
+      "getInvoice"
+    ],
+    "oracleKinds": [
+      "path_escape"
+    ],
+    "oracleRouteKeys": [
+      "getInvoice"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Invoice export path traversal — strips a leading slash from the filename, which does not stop ../ sequences",
+    "implemented": true
+  },
+  {
+    "id": "product-image-ssrf",
+    "dir": "sites/product-image-ssrf",
+    "rootCauseFile": "catalog/image-fetch.ts",
+    "vulnClass": "ssrf",
+    "cwe": "CWE-918",
+    "severity": "high",
+    "routeKeys": [
+      "importProductImage"
+    ],
+    "triggerRouteKeys": [
+      "importProductImage"
+    ],
+    "oracleKinds": [
+      "ssrf_internal_fetch"
+    ],
+    "oracleRouteKeys": [
+      "importProductImage"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Product image import SSRF — blocks obvious metadata hostnames but follows the fetched redirect",
+    "implemented": true
+  },
+  {
+    "id": "checkout-open-redirect",
+    "dir": "sites/checkout-open-redirect",
+    "rootCauseFile": "checkout/return-handler.ts",
+    "vulnClass": "open_redirect",
+    "cwe": "CWE-601",
+    "severity": "medium",
+    "routeKeys": [
+      "checkoutReturn"
+    ],
+    "triggerRouteKeys": [
+      "checkoutReturn"
+    ],
+    "oracleKinds": [
+      "open_redirect"
+    ],
+    "oracleRouteKeys": [
+      "checkoutReturn"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Checkout return open redirect — allowlists a prefix match that a foreign host can spoof as a subdomain",
+    "implemented": true
+  },
+  {
+    "id": "review-stored-xss",
+    "dir": "sites/review-stored-xss",
+    "rootCauseFile": "reviews/review-render.ts",
+    "vulnClass": "xss_stored",
+    "cwe": "CWE-79",
+    "severity": "high",
+    "routeKeys": [
+      "submitReview"
+    ],
+    "triggerRouteKeys": [
+      "moderationQueue"
+    ],
+    "oracleKinds": [
+      "stored_xss_rendered"
+    ],
+    "oracleRouteKeys": [
+      "moderationQueue"
+    ],
+    "secondOrder": true,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Stored review markup on dashboard — sanitizes on submit yet renders stored rich HTML verbatim in moderation",
+    "implemented": true
+  },
+  {
+    "id": "order-mass-assignment",
+    "dir": "sites/order-mass-assignment",
+    "rootCauseFile": "billing/order-update.ts",
+    "vulnClass": "mass_assignment",
+    "cwe": "CWE-915",
+    "severity": "high",
+    "routeKeys": [
+      "updateOrder"
+    ],
+    "triggerRouteKeys": [
+      "updateOrder"
+    ],
+    "oracleKinds": [
+      "mass_assignment"
+    ],
+    "oracleRouteKeys": [
+      "updateOrder"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Order update mass assignment — whitelists note and tags but spreads the rest of the body into the row",
+    "implemented": true
+  },
+  {
+    "id": "api-jwt-alg-none",
+    "dir": "sites/api-jwt-alg-none",
+    "rootCauseFile": "identity/api-auth.ts",
+    "vulnClass": "jwt",
+    "cwe": "CWE-347",
+    "severity": "high",
+    "routeKeys": [
+      "salesReport"
+    ],
+    "triggerRouteKeys": [
+      "salesReport"
+    ],
+    "oracleKinds": [
+      "token_forgery"
+    ],
+    "oracleRouteKeys": [
+      "salesReport"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Sales report JWT alg confusion — verifies the signature but leaves the alg list open to unsigned tokens",
+    "implemented": true
+  },
+  {
+    "id": "refund-csrf",
+    "dir": "sites/refund-csrf",
+    "rootCauseFile": "billing/refund-create.ts",
+    "vulnClass": "csrf",
+    "cwe": "CWE-352",
+    "severity": "medium",
+    "routeKeys": [
+      "createRefund"
+    ],
+    "triggerRouteKeys": [
+      "createRefund"
+    ],
+    "oracleKinds": [
+      "csrf_state_change"
+    ],
+    "oracleRouteKeys": [
+      "createRefund"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Refund creation CSRF — accepts a token field but never compares it to the session token",
+    "implemented": true
+  },
+  {
+    "id": "negative-qty-logic",
+    "dir": "sites/negative-qty-logic",
+    "rootCauseFile": "checkout/cart-items.ts",
+    "vulnClass": "business_logic",
+    "cwe": "CWE-840",
+    "severity": "medium",
+    "routeKeys": [
+      "addCartItem"
+    ],
+    "triggerRouteKeys": [
+      "addCartItem"
+    ],
+    "oracleKinds": [
+      "invariant_violation"
+    ],
+    "oracleRouteKeys": [
+      "addCartItem"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Negative cart quantity — rejects zero quantity but lets negatives through to offset the total",
+    "implemented": true
+  },
+  {
+    "id": "storefront-cache-poison",
+    "dir": "sites/storefront-cache-poison",
+    "rootCauseFile": "catalog/store-page.ts",
+    "vulnClass": "cache_poisoning",
+    "cwe": "CWE-525",
+    "severity": "medium",
+    "routeKeys": [
+      "storeProductPage"
+    ],
+    "triggerRouteKeys": [
+      "storeProductPage"
+    ],
+    "oracleKinds": [
+      "cache_poisoned"
+    ],
+    "oracleRouteKeys": [
+      "storeProductPage"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Storefront product page cache poisoning — caches by path only while echoing a per-viewer store header into the body",
+    "implemented": true
+  },
+  {
+    "id": "giftcard-race",
+    "dir": "sites/giftcard-race",
+    "rootCauseFile": "billing/giftcards.ts",
+    "vulnClass": "race_condition",
+    "cwe": "CWE-362",
+    "severity": "high",
+    "routeKeys": [
+      "redeemGiftCard"
+    ],
+    "triggerRouteKeys": [
+      "redeemGiftCard"
+    ],
+    "oracleKinds": [
+      "race_double_spend"
+    ],
+    "oracleRouteKeys": [
+      "redeemGiftCard"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Gift-card redemption double spend — reads the balance and writes it back with a check-then-act gap under load",
+    "implemented": true
+  },
+  {
+    "id": "payment-webhook-forgery",
+    "dir": "sites/payment-webhook-forgery",
+    "rootCauseFile": "billing/webhooks.ts",
+    "vulnClass": "webhook_forgery",
+    "cwe": "CWE-345",
+    "severity": "critical",
+    "routeKeys": [
+      "paymentWebhook"
+    ],
+    "triggerRouteKeys": [
+      "paymentWebhook"
+    ],
+    "oracleKinds": [
+      "webhook_forgery"
+    ],
+    "oracleRouteKeys": [
+      "paymentWebhook"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": false,
+    "summary": "Payment webhook signature forgery — verifies an HMAC but against a shared test-mode secret anyone can compute",
+    "implemented": true
+  },
+  {
+    "id": "product-feed-xxe",
+    "dir": "sites/product-feed-xxe",
+    "rootCauseFile": "catalog/feed-import.ts",
+    "vulnClass": "xxe",
+    "cwe": "CWE-611",
+    "severity": "high",
+    "routeKeys": [
+      "importProductFeed"
+    ],
+    "triggerRouteKeys": [
+      "importProductFeed"
+    ],
+    "oracleKinds": [
+      "xxe_entity_resolved"
+    ],
+    "oracleRouteKeys": [
+      "importProductFeed"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Product feed XML external entity — parses the feed with entity expansion left enabled for legacy suppliers",
+    "implemented": true
+  },
+  {
+    "id": "checkout-workflow-skip",
+    "dir": "sites/checkout-workflow-skip",
+    "rootCauseFile": "checkout/confirm.ts",
+    "vulnClass": "workflow_bypass",
+    "cwe": "CWE-840",
+    "severity": "critical",
+    "routeKeys": [
+      "confirmOrder"
+    ],
+    "triggerRouteKeys": [
+      "confirmOrder"
+    ],
+    "oracleKinds": [
+      "workflow_skip"
+    ],
+    "oracleRouteKeys": [
+      "confirmOrder"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": false,
+    "summary": "Confirm order before payment capture — confirms the order and only then kicks off an async capture that may never run",
+    "implemented": true
+  },
+  {
+    "id": "coupon-reuse",
+    "dir": "sites/coupon-reuse",
+    "rootCauseFile": "checkout/coupon-apply.ts",
+    "vulnClass": "business_logic",
+    "cwe": "CWE-840",
+    "severity": "medium",
+    "routeKeys": [
+      "applyCoupon"
+    ],
+    "triggerRouteKeys": [
+      "applyCoupon"
+    ],
+    "oracleKinds": [
+      "invariant_violation"
+    ],
+    "oracleRouteKeys": [
+      "applyCoupon"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Single-use coupon reuse — marks the coupon used after applying, so a retry slips in a second use",
+    "implemented": true
+  },
+  {
+    "id": "inventory-oversell",
+    "dir": "sites/inventory-oversell",
+    "rootCauseFile": "checkout/inventory.ts",
+    "vulnClass": "race_condition",
+    "cwe": "CWE-362",
+    "severity": "high",
+    "routeKeys": [
+      "checkout"
+    ],
+    "triggerRouteKeys": [
+      "checkout"
+    ],
+    "oracleKinds": [
+      "race_double_spend"
+    ],
+    "oracleRouteKeys": [
+      "checkout"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Inventory oversell race — reserves stock with a read then write that interleaves under concurrency",
+    "implemented": true
+  },
+  {
+    "id": "refund-exceeds-payment",
+    "dir": "sites/refund-exceeds-payment",
+    "rootCauseFile": "billing/refund-approve.ts",
+    "vulnClass": "business_logic",
+    "cwe": "CWE-840",
+    "severity": "high",
+    "routeKeys": [
+      "approveRefund"
+    ],
+    "triggerRouteKeys": [
+      "approveRefund"
+    ],
+    "oracleKinds": [
+      "invariant_violation"
+    ],
+    "oracleRouteKeys": [
+      "approveRefund"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Refund exceeds captured payment — caps each refund at the order total but ignores prior partial refunds",
+    "implemented": true
+  },
+  {
+    "id": "token-secret-disclosure",
+    "dir": "sites/token-secret-disclosure",
+    "rootCauseFile": "identity/token-list.ts",
+    "vulnClass": "info_disclosure",
+    "cwe": "CWE-200",
+    "severity": "high",
+    "routeKeys": [
+      "listTokens"
+    ],
+    "triggerRouteKeys": [
+      "listTokens"
+    ],
+    "oracleKinds": [
+      "secret_disclosed"
+    ],
+    "oracleRouteKeys": [
+      "listTokens"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "API token list secret disclosure — returns a masked preview that still includes the full secret in a sibling field",
+    "implemented": true
+  },
+  {
+    "id": "customer-bola-read",
+    "dir": "sites/customer-bola-read",
+    "rootCauseFile": "crm/customer-access.ts",
+    "vulnClass": "bola",
+    "cwe": "CWE-639",
+    "severity": "medium",
+    "routeKeys": [
+      "getCustomer"
+    ],
+    "triggerRouteKeys": [
+      "getCustomer"
+    ],
+    "oracleKinds": [
+      "cross_tenant_read"
+    ],
+    "oracleRouteKeys": [
+      "getCustomer"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Customer record read across stores — filters the list endpoint by store but not the single-record endpoint",
+    "implemented": true
+  },
+  {
+    "id": "admin-impersonate-privesc",
+    "dir": "sites/admin-impersonate-privesc",
+    "rootCauseFile": "identity/impersonation.ts",
+    "vulnClass": "bfla",
+    "cwe": "CWE-269",
+    "severity": "critical",
+    "routeKeys": [
+      "adminImpersonate"
+    ],
+    "triggerRouteKeys": [
+      "adminImpersonate"
+    ],
+    "oracleKinds": [
+      "privilege_escalation"
+    ],
+    "oracleRouteKeys": [
+      "adminImpersonate"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": false,
+    "summary": "Staff impersonation privilege escalation — guards the route by login but not by the staff role it assumes",
+    "implemented": true
+  },
+  {
+    "id": "settings-secret-disclosure",
+    "dir": "sites/settings-secret-disclosure",
+    "rootCauseFile": "identity/settings-read.ts",
+    "vulnClass": "info_disclosure",
+    "cwe": "CWE-200",
+    "severity": "medium",
+    "routeKeys": [
+      "getSettings"
+    ],
+    "triggerRouteKeys": [
+      "getSettings"
+    ],
+    "oracleKinds": [
+      "secret_disclosed"
+    ],
+    "oracleRouteKeys": [
+      "getSettings"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Store settings secret disclosure — returns provider keys to any signed-in role rather than owners only",
+    "implemented": true
+  },
+  {
+    "id": "shipping-label-ssrf",
+    "dir": "sites/shipping-label-ssrf",
+    "rootCauseFile": "fulfillment/label-import.ts",
+    "vulnClass": "ssrf",
+    "cwe": "CWE-918",
+    "severity": "medium",
+    "routeKeys": [
+      "importShippingLabel"
+    ],
+    "triggerRouteKeys": [
+      "importShippingLabel"
+    ],
+    "oracleKinds": [
+      "ssrf_internal_fetch"
+    ],
+    "oracleRouteKeys": [
+      "importShippingLabel"
+    ],
+    "secondOrder": false,
+    "chain": null,
+    "canBeDecoy": true,
+    "summary": "Shipping label import SSRF — fetches a label template URL from the manifest without host checks",
+    "implemented": true
+  },
+  {
+    "id": "coupon-after-lock",
+    "dir": "sites/coupon-after-lock",
+    "rootCauseFile": "checkout/coupon-lock.ts",
+    "vulnClass": "workflow_bypass",
+    "cwe": "CWE-840",
+    "severity": "high",
+    "routeKeys": [
+      "applyCoupon"
+    ],
+    "triggerRouteKeys": [
+      "applyCoupon"
+    ],
+    "oracleKinds": [
+      "workflow_skip"
+    ],
+    "oracleRouteKeys": [
+      "applyCoupon"
+    ],
+    "secondOrder": false,
+    "chain": {
+      "id": "promo-chain",
+      "step": 1
+    },
+    "canBeDecoy": true,
+    "summary": "Apply coupon after totals locked — lets a coupon apply even once the cart has moved past the pricing lock",
+    "implemented": true
+  },
+  {
+    "id": "over-refund-chain",
+    "dir": "sites/over-refund-chain",
+    "rootCauseFile": "billing/refund-overage.ts",
+    "vulnClass": "business_logic",
+    "cwe": "CWE-840",
+    "severity": "high",
+    "routeKeys": [
+      "createRefund"
+    ],
+    "triggerRouteKeys": [
+      "createRefund"
+    ],
+    "oracleKinds": [
+      "invariant_violation"
+    ],
+    "oracleRouteKeys": [
+      "createRefund"
+    ],
+    "secondOrder": false,
+    "chain": {
+      "id": "promo-chain",
+      "step": 2
+    },
+    "canBeDecoy": true,
+    "summary": "Refund the inflated discount back as cash — refunds against the discounted total, turning the stacked promo into cash",
+    "implemented": true
+  }
+]
