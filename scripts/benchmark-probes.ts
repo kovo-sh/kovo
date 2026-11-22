@@ -113,7 +113,10 @@ const maxCacheEndpoints = 5
 
 /** True for concrete path segments that look like resource identifiers (not route words). */
 export function looksLikeIdSegment(seg: string): boolean {
-  return /^(?:[A-Za-z][-_][A-Za-z0-9_.-]+|\d{2,}|[0-9a-f]{8}-[0-9a-f-]{8,}|\d+[A-Za-z][A-Za-z0-9]*)$/.test(seg)
+  // Prefixed ids are a short prefix + separator + a value that contains a digit (`p_acme_1`,
+  // `ord_1234`, `inv-1001`). This deliberately rejects dashed route words such as
+  // `openid-configuration` that parse as identifier-shaped without the digit requirement.
+  return /^(?:[A-Za-z]{1,6}[-_][A-Za-z0-9_.:-]*\d[A-Za-z0-9_.:-]*|\d{2,}|[0-9a-f]{8}-[0-9a-f-]{8,}|\d+[A-Za-z][A-Za-z0-9]*)$/.test(seg)
 }
 
 export function hasPathPlaceholder(path: string): boolean {
@@ -201,13 +204,17 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       : []
     const storedReads = [...new Set([...readPaths, ...templatedReads])].slice(0, 3)
 
-    // Object-level authorization: id-bearing paths or id-named parameters.
-    if (pathHasPlaceholder || (idParam && idParam.location === 'query')) {
+    // Object-level authorization: id-bearing paths or id-named parameters. Framework RPC ids are
+    // not resource identifiers, so placeholder action routes are handled by the server-action probe.
+    if ((pathHasPlaceholder && !serverActionPath.test(ep.path)) || (idParam && idParam.location === 'query')) {
       add({ endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep) })
     }
     // Function-level authorization: a privileged mutating verb invoked by a lower-privilege actor.
-    if (caps.newProbeClasses && !isGet && (privilegedPath.test(ep.path) || serverActionPath.test(ep.path))) {
-      add({ endpoint: ep, probeClass: 'authz_matrix', method: writeMethod(ep), ...(serverActionPath.test(ep.path) ? { serverAction: true } : {}) })
+    // Placeholder server-action ids (framework RPC ids that are not on the surface) cannot be invoked
+    // meaningfully; only concrete action routes are probed.
+    const concreteServerAction = serverActionPath.test(ep.path) && !pathHasPlaceholder
+    if (caps.newProbeClasses && !isGet && (privilegedPath.test(ep.path) || concreteServerAction)) {
+      add({ endpoint: ep, probeClass: 'authz_matrix', method: writeMethod(ep), ...(concreteServerAction ? { serverAction: true } : {}) })
     }
 
     for (const p of injectParams) {
@@ -273,7 +280,9 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     }
     if (workflowPath.test(ep.path)) add({ endpoint: ep, probeClass: 'workflow_invariant', method: isGet ? 'GET' : writeMethod(ep) })
     // Race: a single-use value parameter consumed by this write. Prefer a sibling producer route.
-    if (!isGet) {
+    // Restrict to consumption semantics so credential/account writes are never raced.
+    const raceablePath = /(redeem|claim|consume|spend|credit|voucher|coupon|apply|activate|transfer|withdraw|checkout|order|purchase|grant)/i
+    if (!isGet && raceablePath.test(ep.path)) {
       const consume = params.find(p => singleUseParam.test(p.name) && (p.location === 'json' || p.location === 'form' || p.location === 'query'))
       if (consume) {
         const segs = ep.path.split('/').filter(Boolean)
