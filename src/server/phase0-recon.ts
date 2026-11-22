@@ -3,6 +3,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { extname, join, relative, sep } from 'node:path'
 import { jsHarvest } from '../../worker/analyzers.ts'
 import type { CapabilityTier, CodeLocation, EndpointSource, ParamLocation } from '../domain.ts'
+import { mergeTechTags, techTagsFromManifests, techTagsFromResponse } from '../templates/tech-tags.ts'
+import type { ManifestFile } from '../templates/tech-tags.ts'
 import { BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
@@ -572,21 +574,53 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
   return { routes, frameworks: [...frameworks] }
 }
 
-function detectTechTags(respHeaders: Record<string, string>, body: string): string[] {
-  const tags = new Set<string>()
-  const poweredBy = (respHeaders['x-powered-by'] ?? '').toLowerCase()
-  const server = (respHeaders['server'] ?? '').toLowerCase()
-  const combined = `${poweredBy} ${server} ${body.slice(0, 16_000).toLowerCase()}`
-  if (combined.includes('next.js') || combined.includes('__next') || combined.includes('/_next/')) tags.add('nextjs')
-  if (combined.includes('express')) tags.add('express')
-  if (combined.includes('django') || combined.includes('csrfmiddlewaretoken')) tags.add('django')
-  if (combined.includes('spring') || combined.includes('whitelabel error page')) tags.add('spring')
-  if (combined.includes('wordpress') || combined.includes('wp-content')) tags.add('wordpress')
-  if (combined.includes('graphql')) tags.add('graphql')
-  if (combined.includes('nginx')) tags.add('nginx')
-  if (combined.includes('apache')) tags.add('apache')
-  if (combined.includes('php')) tags.add('php')
-  return [...tags]
+const MANIFEST_BASENAMES = new Set([
+  'package.json', 'requirements.txt', 'pyproject.toml', 'pipfile',
+  'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gemfile',
+])
+
+function isManifestBasename(name: string): boolean {
+  const base = name.toLowerCase()
+  return MANIFEST_BASENAMES.has(base) || /^requirements[-.].*\.txt$/.test(base)
+}
+
+/** Read dependency manifests from the mounted repo tree (bounded; never executes a package manager). */
+function readRepoManifests(reposDir: string, maxFiles = 60): ManifestFile[] {
+  if (!reposDir || !existsSync(reposDir)) return []
+  const out: ManifestFile[] = []
+  const stack: string[] = [reposDir]
+  while (stack.length > 0 && out.length < maxFiles) {
+    const dir = stack.pop()!
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of entries) {
+      if (out.length >= maxFiles) break
+      if (SKIP_DIRS.has(name) || name.startsWith('.git')) continue
+      const full = join(dir, name)
+      let st
+      try {
+        st = statSync(full)
+      } catch {
+        continue
+      }
+      if (st.isDirectory()) {
+        stack.push(full)
+        continue
+      }
+      if (!st.isFile() || st.size > 256 * 1024 || !isManifestBasename(name)) continue
+      try {
+        out.push({
+          name: relative(reposDir, full).split(sep).join('/'),
+          content: readFileSync(full, 'utf8'),
+        })
+      } catch { /* unreadable manifest */ }
+    }
+  }
+  return out
 }
 
 export function extractHtmlLinksAndScripts(html: string, origin: string): {
@@ -1958,6 +1992,12 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     } catch { /* skip malformed */ }
   }
 
+  // Repo dependency manifests contribute tech tags even when live responses are uninformative
+  // (or when Tier 0 sends no requests at all).
+  for (const tag of mergeTechTags(techTagsFromManifests(readRepoManifests(params.reposDir ?? '')))) {
+    techFingerprint.add(tag)
+  }
+
   // 1. White-box static framework route extraction (runs at ALL tiers including Tier 0)
   if (params.reposDir && normalizedOrigins.length > 0) {
     const primaryOrigin = normalizedOrigins[0]
@@ -2047,6 +2087,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const jsonDocCandidates: string[] = []
     const navSeeds: Array<{ path: string; depth: number }> = []
     const writeOnlyPaths = new Set<string>()
+    const protectedPaths = new Set<string>()
     const configBindings = new Map<string, RouteMapParamBinding[]>()
     let observedFieldAttachments = 0
     let originHalted = false
@@ -2062,6 +2103,18 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // All discovery fetches carry the approved owner session when one is available, so the SPA
     // shell, API listings, config documents and OpenAPI specs behind login are visible.
     let discoveryPersona = personaForOrigin(params.personas?.find((handle): handle is string => Boolean(handle)))
+
+    // Calibrated protected/API path hints for safe-template path variables (`{{discovered_*_path}}`).
+    const noteDiscoveryResponse = (ex: BrokerExchangeResult): void => {
+      const method = ex.method.toUpperCase()
+      if (method !== 'GET' && method !== 'HEAD') return
+      const bare = ex.pathAndQuery.split('?')[0] || '/'
+      if (!bare.startsWith('/') || bare.startsWith('//') || bare === '/') return
+      if (/[:{}[\]]/.test(bare) || /[\r\n\0]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
+      if ([301, 302, 303, 307, 308, 401, 403].includes(ex.status) && protectedPaths.size < 12) {
+        protectedPaths.add(bare)
+      }
+    }
 
     const safeGet = async (
       pathAndQuery: string,
@@ -2106,6 +2159,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           timeoutMs: 8_000,
         }, grant, signal)
         if (persona) authRequests += 1
+        noteDiscoveryResponse(ex)
         params.onExchange?.(ex)
         return ex
       } catch (err) {
@@ -2263,7 +2317,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             probedPaths.add('GET /')
             let headersObj: Record<string, string> = {}
             try { headersObj = JSON.parse(prior.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
-            for (const t of detectTechTags(headersObj, prior.bodyPreview ?? '')) techFingerprint.add(t)
+            for (const t of mergeTechTags(techTagsFromResponse(headersObj, prior.bodyPreview ?? ''))) techFingerprint.add(t)
             if (prior.status < 400) recordEndpoint('GET', '/', 'surface_probe')
             const html = extractHtmlLinksAndScripts(prior.bodyPreview ?? '', origin)
             for (const s of html.scripts) {
@@ -2309,7 +2363,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (!ex) continue
 
       if (seedPath === '/') {
-        for (const t of detectTechTags(ex.respHeaders, ex.body)) techFingerprint.add(t)
+        for (const t of mergeTechTags(techTagsFromResponse(ex.respHeaders, ex.body))) techFingerprint.add(t)
         if (ex.status < 400) recordEndpoint('GET', '/', 'surface_probe')
         const html = extractHtmlLinksAndScripts(ex.body, origin)
         for (const s of html.scripts) {
@@ -2610,15 +2664,30 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
-    // 2c. Tech-matched safe templates (strictly bounded by remaining per-origin budget)
+    // 2c. Tech-matched safe templates (strictly bounded by remaining per-origin budget). Generic
+    // exposure templates run even when no fingerprint matched, so they must not be gated on a
+    // non-empty tag set.
     const remainingForTemplates = perOriginCap - originUsed
-    if (!originHalted && !signal.aborted && remainingForTemplates >= 4 && techFingerprint.size > 0 && grant.canRead(origin)) {
+    if (!originHalted && !signal.aborted && remainingForTemplates >= 4 && grant.canRead(origin)) {
       const templateBudget = Math.min(20, remainingForTemplates)
+      const templateApiPaths = new Set<string>()
+      const considerApiPath = (rawPath: string): void => {
+        const bare = rawPath.split('?')[0] || '/'
+        if (!bare.startsWith('/') || /[:{}[\]]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
+        if (!/^\/(?:api|rest|graphql|trpc|v\d+)(?:\/|$)/i.test(bare)) return
+        if (templateApiPaths.size < 6) templateApiPaths.add(bare)
+      }
+      for (const ep of storage.listEndpoints(runId, { origin })) considerApiPath(ep.pathTemplate)
+      for (const p of discoveredCandidatePaths) considerApiPath(p)
       let stagedTemplateExchanges = 0
       try {
         const tplRes = await runSafeTemplates({
           origin,
           techFingerprint: [...techFingerprint],
+          discoveredPaths: {
+            protectedPaths: [...protectedPaths].slice(0, 6),
+            apiPaths: [...templateApiPaths].slice(0, 6),
+          },
           maxTemplates: Math.max(1, Math.floor(templateBudget / 2)),
           maxRequests: templateBudget,
           ...(discoveryPersona ? { persona: discoveryPersona } : {}),
@@ -2629,6 +2698,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             stagedTemplateExchanges += 1
             originUsed += 1
             requestsUsed += 1
+            noteDiscoveryResponse(ex)
             return params.onExchange?.(ex)
           },
         }, broker, grant, params.canaryBroker, signal)
@@ -2980,6 +3050,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           browserExchanges += 1
           originUsed += 1
           requestsUsed += 1
+          noteDiscoveryResponse(ex)
           return params.onExchange?.(ex)
         },
       })

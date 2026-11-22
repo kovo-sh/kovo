@@ -22,6 +22,8 @@ import {
   runPhase0Recon,
 } from '../src/server/phase0-recon.ts'
 import type { ScopedBrowser } from '../src/server/scoped-browser.ts'
+import { loadSafeTemplates, selectSafeTemplates } from '../src/templates/loader.ts'
+import { techTagsFromManifests, techTagsFromResponse } from '../src/templates/tech-tags.ts'
 import {
   makeLabGrant, makeStore, makeTempDir, setupApprovedRun, startHttpFixture, withEnv,
 } from './v4-tier-helpers.ts'
@@ -284,5 +286,75 @@ describe('v5 M2 recon probing: phase-0 route-map probing and soft-404 calibratio
     const jsonRoute = JSON.stringify({ items: [{ ext_id: 'AX-1' }] })
     assert.ok(!isSoftNotFound(calibration, { status: 200, mediaType: 'application/json', body: jsonRoute }))
     assert.equal(normalizeDiscoveryTemplate('/api/issues/:issueId'), '/api/issues/:issueId')
+  })
+})
+
+describe('v5 M4 wiring: tech tags and generic exposure templates', () => {
+  test('uses the shared tech-tag mapping for live responses and mounted manifests', async (t: TestContext) => {
+    const live = techTagsFromResponse({ 'x-powered-by': 'Express', server: 'nginx/1.25' }, '<div id="__next">shell</div>')
+    assert.ok(live.includes('express') && live.includes('node'), `live tags: ${live.join(', ')}`)
+    assert.ok(live.includes('nextjs') && live.includes('react'))
+    assert.ok(live.includes('nginx'))
+    const repo = techTagsFromManifests([
+      { name: 'web/package.json', content: JSON.stringify({ dependencies: { next: '14.2.0' } }) },
+      { name: 'api/requirements.txt', content: 'fastapi==0.115.0\nuvicorn\n' },
+    ])
+    assert.ok(repo.includes('nextjs') && repo.includes('fastapi'), `repo tags: ${repo.join(', ')}`)
+
+    const repoDir = makeTempDir(t, 'guardian-v5m4-manifests-')
+    mkdirSync(join(repoDir, 'web'), { recursive: true })
+    writeFileSync(join(repoDir, 'web/package.json'), JSON.stringify({ dependencies: { express: '4.19.0' } }), 'utf8')
+    const { storage } = makeStore(t, 'guardian-v5m4-tags-')
+    const { runId, run } = await setupApprovedRun(storage, { seeds: ['http://127.0.0.1:9'], tier: 0, budgetRequests: 100 })
+    const result = await runPhase0Recon({
+      storage,
+      runId,
+      scopeRevision: run.scopeRevision,
+      tier: 0,
+      origins: ['http://127.0.0.1:9'],
+      budgetRequests: 100,
+      reposDir: repoDir,
+      broker: new RequestBroker({ rejectUnauthorized: false }),
+      grant: makeLabGrant('http://127.0.0.1:9', { tier: 0 }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    assert.ok(result.techFingerprint.includes('express'), `phase-0 tags: ${result.techFingerprint.join(', ')}`)
+    assert.ok(result.techFingerprint.includes('node'))
+  })
+
+  test('runs generic exposure templates when the live fingerprint is empty', async (t: TestContext) => {
+    const fx = await startHttpFixture(t, (_req, _body, res) => {
+      res.statusCode = 404
+      res.setHeader('Content-Type', 'text/plain')
+      res.end('not found')
+    })
+    const { storage } = makeStore(t, 'guardian-v5m4-generic-')
+    const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
+    const result = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
+      storage,
+      runId: setup.runId,
+      scopeRevision: setup.run.scopeRevision,
+      tier: 2,
+      origins: [fx.origin],
+      budgetRequests: 900,
+      broker: new RequestBroker({ rejectUnauthorized: false }),
+      grant: makeLabGrant(fx.origin, { tier: 2 }),
+      signal: AbortSignal.timeout(30_000),
+    }))
+    assert.equal(result.techFingerprint.length, 0, 'fixture fingerprints to no known technology')
+
+    const loaded = loadSafeTemplates()
+    const selection = selectSafeTemplates(loaded.templates, { techTags: [], tier: 2, maxTemplates: 10 })
+    const expectedPrefixes = selection.selected
+      .filter(template => !/\{\{discovered_/.test(template.request.path))
+      .slice(0, 30)
+      .map(template => template.request.path.split('{{')[0] ?? '')
+      .filter(prefix => prefix.startsWith('/') && prefix.length > 1)
+    assert.ok(expectedPrefixes.length > 0, 'generic templates are selectable without a fingerprint')
+    const requestedPaths = fx.requests.map(request => (request.url ?? '/').split('?')[0] ?? '/')
+    assert.ok(
+      requestedPaths.some(path => expectedPrefixes.some(prefix => path.startsWith(prefix))),
+      'at least one generic exposure template was executed with an empty fingerprint',
+    )
   })
 })
