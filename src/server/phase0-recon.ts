@@ -2306,21 +2306,26 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       seedFetches += 1
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       if (seedPath === '/') {
-        // On crash recovery, reuse any already-recorded GET / for this (runId, scopeRevision, origin)
-        // so baseline GET / is never duplicated across SIGKILL + resume.
+        // On crash recovery, reuse any already-recorded GET / for this (runId, origin) so the
+        // baseline is never duplicated across SIGKILL + resume. Scope revisions can advance while
+        // paused, so the revision is intentionally not part of the reuse key; the live grant still
+        // gates whether the origin may be read.
         try {
           const prior = storage.client.prepare(
             `SELECT status, media_type AS mediaType, resp_headers AS respHeadersJson, body_preview AS bodyPreview
              FROM broker_exchanges
-             WHERE run_id = ? AND scope_revision = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
+             WHERE run_id = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
              ORDER BY created_at ASC LIMIT 1`,
-          ).get(runId, scopeRevision, origin) as {
+          ).get(runId, origin) as {
             status: number
             mediaType: string
             respHeadersJson: string
             bodyPreview: string
           } | undefined
           if (prior) {
+            // Match safeGet's dedupe key (`METHOD persona path`) so the navigation pass does not
+            // re-fetch the recovered baseline route on resume. Keep the legacy key too.
+            probedPaths.add(`GET ${discoveryPersona ?? ''} /`)
             probedPaths.add('GET /')
             let headersObj: Record<string, string> = {}
             try { headersObj = JSON.parse(prior.respHeadersJson) as Record<string, string> } catch { /* ignore */ }

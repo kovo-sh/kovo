@@ -685,26 +685,30 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
   // Live Execution multi-trial test with local jq backend (zero Docker dependency)
   const fx = await startHttpFixture(t, async (req, _b, res) => {
     if (req.url === '/slow-sibling') {
-      await new Promise(r => setTimeout(r, 2_000))
+      await new Promise(r => setTimeout(r, 30_000))
     }
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify({ leaked: req.url === '/probe' }))
   })
 
   let llmCalls = 0
+  let trialCalls = 0
   const llm = await startMockLlmServer(t, (call) => {
     llmCalls += 1
     const bodyText = JSON.stringify(call.body.input ?? '')
-    // Only Trial 0 immediately proposes & confirms; Trial 1 runs a slow probe so early-stop cancels it mid-flight
-    if (bodyText.includes('[trial 2]') || bodyText.includes('Trial 1')) {
-      if (bodyText.includes('c_sib_req')) {
-        return {
-          type: 'tool_call',
-          callId: `c_sib_done_${llmCalls}`,
-          name: 'complete_intent',
-          argumentsJson: JSON.stringify({ status: 'ruled_out', summary: 'slow sibling' }),
-        }
+    // The mock must not depend on prompt wording (v5 adds board/trial text): the first trial model
+    // call becomes the slow sibling, the second proposes immediately so early-stop can cancel it.
+    const trialPrompt = bodyText.includes('Crown Jewel Auth Bypass Check')
+    if (trialPrompt) trialCalls += 1
+    if (bodyText.includes('c_sib_req')) {
+      return {
+        type: 'tool_call',
+        callId: `c_sib_done_${llmCalls}`,
+        name: 'complete_intent',
+        argumentsJson: JSON.stringify({ status: 'ruled_out', summary: 'slow sibling' }),
       }
+    }
+    if (trialPrompt && trialCalls === 1) {
       return {
         type: 'tool_call',
         callId: 'c_sib_req',
@@ -769,7 +773,7 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
   await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
-    const deadline = Date.now() + 8_000
+    const deadline = Date.now() + 25_000
     while (Date.now() < deadline) {
       const steps = storage.listChainSteps(runId)
       if (steps.length >= 2 && steps.some(s => s.status === 'canceled')) break

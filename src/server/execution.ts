@@ -954,6 +954,8 @@ export class Execution {
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
   private wakeScheduled = false
+  /** Set by stop(); prevents queued microtasks/timers from touching a closed store. */
+  private stopped = false
 
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
@@ -997,6 +999,7 @@ export class Execution {
 
   start() {
     if (this.safetyTimer) return
+    this.stopped = false
     if (this.isCanaryListenerConfigured()) {
       void this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() }).catch(() => undefined)
     }
@@ -1015,6 +1018,8 @@ export class Execution {
   }
 
   async stop() {
+    this.stopped = true
+    this.wakeScheduled = false
     this.unsubWake?.()
     this.unsubWake = undefined
     if (this.safetyTimer) { clearInterval(this.safetyTimer); this.safetyTimer = undefined }
@@ -1040,10 +1045,11 @@ export class Execution {
   }
 
   private scheduleWake() {
-    if (this.wakeScheduled) return
+    if (this.stopped || this.wakeScheduled) return
     this.wakeScheduled = true
     queueMicrotask(() => {
       this.wakeScheduled = false
+      if (this.stopped) return
       this.wake()
     })
   }
@@ -2033,6 +2039,7 @@ export class Execution {
   // --- Event-Driven Scheduler ---
 
   wake() {
+    if (this.stopped) return
     // 0. Mirror roster state and retire warm members on stop/scope revocation.
     for (const runId of [...this.trackedBoardRuns]) {
       try { this.syncBoardRoster(this.storage.run(runId)) } catch { this.trackedBoardRuns.delete(runId) }
@@ -2505,9 +2512,9 @@ export class Execution {
               ? this.storage.client.prepare(
                   `SELECT id, origin, final_origin AS finalOrigin, status, media_type AS mediaType, resp_headers AS respHeadersJson
                    FROM broker_exchanges
-                   WHERE run_id = ? AND scope_revision = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
+                   WHERE run_id = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
                    ORDER BY created_at ASC LIMIT 1`,
-                ).get(freshRun.id, freshRun.scopeRevision, asset.origin) as {
+                ).get(freshRun.id, asset.origin) as {
                   id: string
                   origin: string
                   finalOrigin: string

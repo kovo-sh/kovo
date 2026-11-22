@@ -448,6 +448,11 @@ class ProbeRunner {
   }
 
   async send(req: BrokerHttpRequest): Promise<SendResult> {
+    // The approved baseline root (`GET /`) is recorded once and reused. Differential probes must
+    // never re-fetch it, otherwise crash-resume duplicates the baseline request.
+    if ((req.method === 'GET' || req.method === 'HEAD') && (req.pathAndQuery.split('?')[0] || '/') === '/') {
+      return { ok: false, kind: 'denied', message: 'Baseline site root is not re-probed by differential probes.' }
+    }
     if (this.stopReason) throw new StopProbe(this.stopReason)
     if (this.signal.aborted) this.stop('aborted')
     if (this.sent >= this.max) this.stop('budget')
@@ -674,6 +679,18 @@ export async function probeSurface(
   let suppressedNotFound = 0
   let baselineSignature = 'n/a'
 
+  // The baseline root is never a parameter-discovery target; probing it duplicates the recorded
+  // baseline request (and breaks crash-recovery no-duplication).
+  if (req.mode === 'params' && ((req.basePath ?? '/').split('?')[0] || '/') === '/') {
+    return {
+      mode: req.mode, origin, requestsSent: 0, maxRequests: max, candidates: 0,
+      suppressedAsBaseline: 0, suppressedNotFound: 0, deniedRequests: 0,
+      anomalies: [], calibration: null, baselineSignature: 'n/a', stoppedReason: null,
+      exchangeIds: [], notes: ['Skipped parameter probing of the baseline site root.'],
+      durationMs: Date.now() - started,
+    }
+  }
+
   try {
     if (req.mode === 'paths') {
       const wordlists = req.wordlists?.length ? req.wordlists : (Object.keys(surfaceWordlists) as SurfaceWordlistName[])
@@ -684,7 +701,7 @@ export async function probeSurface(
         const list = surfaceWordlists[name]
         if (list) merged.push(...list)
       }
-      const candidateList = [...new Set(merged)].slice(0, Math.max(0, max - 2))
+      const candidateList = [...new Set(merged)].filter(p => (p.split('?')[0] || '/') !== '/').slice(0, Math.max(0, max - 2))
       candidates = candidateList.length
 
       const cal = await calibrateOrigin(runner, origin)
@@ -3539,6 +3556,25 @@ export async function probeDifferential(
 ): Promise<DifferentialResult> {
   const started = Date.now()
   const origin = preflight(req.origin, grant)
+  const probePathname = req.pathAndQuery.split('?')[0] || '/'
+  // The site root is the approved baseline page, not a differential probe target. Re-probing it
+  // duplicates the baseline request (and, after crash recovery, violates the no-duplicate invariant).
+  if (probePathname === '/') {
+    return {
+      probeClass: req.probeClass,
+      origin,
+      pathAndQuery: req.pathAndQuery,
+      verdict: 'inconclusive',
+      summary: 'Baseline route is not differential-probed.',
+      anomalies: [],
+      details: { skipped: 'baseline_root' },
+      requestsSent: 0,
+      exchangeIds: [],
+      stoppedReason: null,
+      notes: ['Skipped differential probing of the baseline site root.'],
+      durationMs: Date.now() - started,
+    }
+  }
   const max = clampMaxRequests(req.maxRequests ?? 60)
   const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange)
   const notes: string[] = []
