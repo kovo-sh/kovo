@@ -262,6 +262,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
     encodingSkipPaths: plan.encodingSkips.map(s => s.path),
     budgetSkippedPaths: [...budgetSkipped],
   })
+  notes.push(`Requests used: ${env.requestsUsed()} / ${maxRequests}; hypotheses=${plan.hypotheses.length}; budgetSkipped=${budgetSkipped.size}`)
   return { traces, findings: collectConfirmedFindings(args.manifest, executed, traces), backendKind: verifier.kind }
 }
 
