@@ -116,7 +116,10 @@ export function createEgress(opts: {
   const allowed = new Map<number, InternalServiceRef>()
   for (const s of opts.internalServices) allowed.set(s.port, { name: s.name, port: s.port, internal: s.internal })
   for (const p of opts.oobCallbackPorts ?? []) {
-    if (!allowed.has(p)) allowed.set(p, { name: `oob:${p}`, port: p, internal: false })
+    // A caller-registered OOB callback listener is loopback infrastructure: an input-derived fetch
+    // that reaches it is exactly the out-of-band SSRF impact the oracle must record. Access is still
+    // limited to the exact registered port; every unregistered port stays blocked.
+    if (!allowed.has(p)) allowed.set(p, { name: `oob:${p}`, port: p, internal: true })
   }
 
   return {

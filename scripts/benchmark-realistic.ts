@@ -45,6 +45,7 @@ import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
 import type { Finding } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
+import { resolveOobCallbackPorts } from './benchmark-env.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
@@ -1137,12 +1138,15 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const listener = await canary.startListener({ host: '127.0.0.1', port: 0 })
     const oobPort = listener.port
     if (!oobPort) fail('canary listener did not bind a loopback port')
+    // Same invariant as the procedural harness: the app may call back only to this exact port,
+    // and Execution must use this same broker for SSRF/XXE verification.
+    const oobCallbackPorts = resolveOobCallbackPorts(canary, [oobPort])
 
     started = await startRealisticApp({
       app,
       seed,
       ...(args.heldOut ? { heldOutSalt: process.env.GUARDIAN_RB_HELDOUT_SALT } : {}),
-      oobCallbackPorts: [oobPort],
+      oobCallbackPorts,
     })
     const briefing = briefingFor(started, args.mode)
     for (const p of briefing.personas) secrets.push({ value: p.password, placeholder: '[[persona-password]]' })

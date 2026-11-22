@@ -11,7 +11,7 @@ All code here is benchmark scope: nothing under `src/` or `scripts/` was modifie
 
 | File | Purpose |
 | --- | --- |
-| `guardian-adapter.ts` | `runGuardianAgainstMaterialized()` — discovery → hypotheses → probes → replay-spec synthesis → Zero-LLM verification, emitted as `SubmittedFinding[]` + `RunTelemetry`. Also `readMaterializedSurface()`, `loadGuardianEngine()`, and a manifest-mode `runGuardianLivePipelineAgainstMaterialized()`. |
+| `guardian-adapter.ts` | `runGuardianAgainstMaterialized()` — discovery → hypotheses → probes → replay-spec synthesis → Zero-LLM verification, emitted as `SubmittedFinding[]` + `RunTelemetry`. Also `startOobCanaryBroker()`, `readMaterializedSurface()`, `loadGuardianEngine()`, and a manifest-mode `runGuardianLivePipelineAgainstMaterialized()`. |
 | `guardian-login.ts` | Derives the login route from `variant.json` routes and exchanges briefing email/password for cookie/bearer credentials per persona. |
 | `benchmark-realistic.ts` | Thin CLI: materialize → run Guardian → `gradeRun()` → recall/precision by class + decoy FP count. |
 
@@ -36,6 +36,7 @@ const run = await runGuardianAgainstMaterialized({
   verifierBackend: 'auto',           // 'auto' | 'docker' | 'local-jq'
   benchMode: 'grey-box',             // black-box | grey-box | white-box (default grey-box)
   started,                           // optional: reuse an app the caller already started
+  oobCanary,                         // optional: broker started before `started` (see below)
   // emitUnconfirmedFindings: false  // default: only confirmed/static-verified findings
 })
 
@@ -61,6 +62,13 @@ Behavior:
 - Findings are deduped by `path|param|cwe`; a submitted TP requires verifier verdict
   `confirmed`, matching the grader's "confirmed" rule. `static_verified` is counted as a proof
   gap: it has no `codeLocation` here, so the grader would otherwise score it as an unmatched FP.
+- Out-of-band SSRF/XXE wiring: the app's contained egress permits loopback HTTP only to the
+  internal mock services plus the exact `oobCallbackPorts` it was started with. The CLI therefore
+  calls `startOobCanaryBroker()` **before** `startRealisticApp()`, passes that loopback port to the
+  app, and forwards the same broker as `oobCanary`; `createEngineEnv` reuses it (instead of minting
+  a second listener) so probes, replay verification and the app all agree on one callback port.
+  When the adapter starts the app itself it performs the same ordering. Only the registered port
+  is reachable; every other loopback port remains `port_blocked`.
 - Login: prefers a non-legacy `POST` route whose key/path contains `login|signin|session`, tries
   JSON → form → JSON+tenant, and accepts either a `Set-Cookie` session or a bearer token field.
   All non-deletion cookies are kept (labs use prefixed names like `acme_sid`, not just `sid`).

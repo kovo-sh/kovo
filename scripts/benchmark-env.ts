@@ -25,6 +25,8 @@ export interface EngineEnv {
   grant: Grant
   runId: string
   scopeRevision: number
+  /** Loopback port(s) the target app was told to allow for out-of-band callbacks. */
+  oobCallbackPorts: number[]
   probeEnv: ProbeEnv
   controller: AbortController
   requestsUsed: () => number
@@ -52,6 +54,43 @@ function personaSpec(rec: PersonaRecord): { authKind: 'bearer' | 'header' | 'coo
 export interface EngineEnvOptions {
   /** Initial blind-SQLi allowance; the live pipeline recomputes it once hypotheses are known. */
   slowProbes?: number
+  /**
+   * Reuse an already-running CanaryBroker (started before the target app so its loopback port could
+   * be passed to the app's egress allowlist). The caller keeps ownership: createEngineEnv will not
+   * stop it during cleanup.
+   */
+  canaryBroker?: CanaryBroker
+  /**
+   * Exact loopback ports the started app permits for out-of-band callbacks. When a broker is
+   * supplied (or created) its HTTP listener port must be one of these so probes and the app agree
+   * on a single reachable callback endpoint.
+   */
+  oobCallbackPorts?: number[]
+}
+
+/**
+ * Validate the OOB port wiring shared by the graded harness and the app:
+ * a running listener must expose exactly a port the app's egress allowlist was given.
+ */
+export function resolveOobCallbackPorts(
+  canaryBroker: CanaryBroker,
+  oobCallbackPorts: number[] | undefined,
+): number[] {
+  const listener = canaryBroker.listenerInfo()
+  const listenerPort = listener.running ? listener.port : null
+  const allowed = [...new Set(oobCallbackPorts ?? (listenerPort != null ? [listenerPort] : []))]
+  for (const port of allowed) {
+    if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+      throw new Error(`oobCallbackPorts must be exact loopback ports (got ${port})`)
+    }
+  }
+  if (listenerPort != null && !allowed.includes(listenerPort)) {
+    throw new Error(
+      `canary listener port ${listenerPort} is not in oobCallbackPorts [${allowed.join(', ')}]; `
+      + 'the target app would block the callback',
+    )
+  }
+  return allowed
 }
 
 export async function createEngineEnv(handle: BenchmarkServerHandle, caps: ProfileCaps, assignmentLabel: string, opts: EngineEnvOptions = {}): Promise<EngineEnv> {
@@ -100,8 +139,15 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
   } as unknown as Parameters<Store['command']>[0])
   const scopeRevision = storage.runDetail(run.id).run.scopeRevision
 
-  const canaryBroker = new CanaryBroker({ storage })
-  await canaryBroker.startLocalListener()
+  const canaryBroker = opts.canaryBroker ?? new CanaryBroker({ storage })
+  const ownsCanaryBroker = !opts.canaryBroker
+  if (!canaryBroker.listenerInfo().running) {
+    // If the caller already told the app to allow one exact port, bind the listener there so both
+    // sides agree. Otherwise let the OS pick a free loopback port.
+    const explicitPort = opts.oobCallbackPorts?.length === 1 ? opts.oobCallbackPorts[0] : undefined
+    await canaryBroker.startListener({ host: '127.0.0.1', ...(explicitPort ? { port: explicitPort } : {}) })
+  }
+  const oobCallbackPorts = resolveOobCallbackPorts(canaryBroker, opts.oobCallbackPorts)
   // The lab servers intentionally answer SQL-error probes with 5xx; keep the production circuit breaker
   // from tripping on that expected noise (loopback lab only, never applied to public targets).
   const broker = new RequestBroker({ source: 'fixture response', storage, canaryBroker, circuit5xxThreshold: 500, circuit429Threshold: 500 })
@@ -130,10 +176,12 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
     ...(other && userIdByHandle.get(other) ? { otherUserId: userIdByHandle.get(other)! } : {}),
   }
   return {
-    storage, broker, canaryBroker, grant, runId: run.id, scopeRevision, probeEnv, controller, requestsUsed: () => used,
+    storage, broker, canaryBroker, grant, runId: run.id, scopeRevision, oobCallbackPorts, probeEnv, controller, requestsUsed: () => used,
     cleanup: async () => {
       controller.abort()
-      try { await canaryBroker.stop() } catch { /* best effort */ }
+      if (ownsCanaryBroker) {
+        try { await canaryBroker.stop() } catch { /* best effort */ }
+      }
       try { storage.close() } catch { /* already closed */ }
       rmSync(dir, { recursive: true, force: true })
     },

@@ -15,7 +15,7 @@ import type { AppName, BenchMode, GradeInput } from './lib/types.ts'
 import { assertLocalLabAllowed } from './lib/safety.ts'
 import { gradeRun, renderScorecard, startRealisticApp } from './run.ts'
 import { validateGradeInput } from './grader/schema.ts'
-import { runGuardianAgainstMaterialized } from './guardian-adapter.ts'
+import { runGuardianAgainstMaterialized, startOobCanaryBroker } from './guardian-adapter.ts'
 import type { ProfileMode, VerifierChoice } from './guardian-adapter.ts'
 
 interface CliArgs {
@@ -111,11 +111,23 @@ async function main(): Promise<void> {
   const args = readArgs(process.argv.slice(2))
   assertLocalLabAllowed()
 
-  const started = await startRealisticApp({
-    app: args.app, seed: args.seed, ...(args.heldOutSalt ? { heldOutSalt: args.heldOutSalt } : {}),
-  })
+  // Canary first: the app's contained egress only permits loopback ports it was started with, so
+  // the OOB listener must exist before the app boots. The same broker then backs the grant and the
+  // SSRF/XXE replay verification, keeping the callback port identical everywhere.
+  const oob = await startOobCanaryBroker()
+  let started: Awaited<ReturnType<typeof startRealisticApp>>
   try {
-    process.stdout.write(`[realistic-bench] ${args.app} seed=${args.seed} (${started.plan.seedSet}) ${args.profileMode} ${args.mode} ${started.origin}\n`)
+    started = await startRealisticApp({
+      app: args.app, seed: args.seed,
+      ...(args.heldOutSalt ? { heldOutSalt: args.heldOutSalt } : {}),
+      oobCallbackPorts: [oob.port],
+    })
+  } catch (err) {
+    await oob.stop().catch(() => undefined)
+    throw err
+  }
+  try {
+    process.stdout.write(`[realistic-bench] ${args.app} seed=${args.seed} (${started.plan.seedSet}) ${args.profileMode} ${args.mode} ${started.origin} oob=127.0.0.1:${oob.port}\n`)
     const run = await runGuardianAgainstMaterialized({
       treeDir: started.sourceDir,
       seed: args.seed,
@@ -124,6 +136,7 @@ async function main(): Promise<void> {
       verifierBackend: args.verifier,
       benchMode: args.mode,
       started,
+      oobCanary: oob,
     })
 
     const input: GradeInput = {
@@ -168,6 +181,7 @@ async function main(): Promise<void> {
     if (args.outFindings) process.stdout.write(`wrote ${args.outFindings}\n`)
   } finally {
     await started.stop()
+    await oob.stop().catch(() => undefined)
   }
 }
 
