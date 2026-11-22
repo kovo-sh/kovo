@@ -45,7 +45,9 @@ const CSRF_STATE_ROUTES = ['updateSettings']
 const XXE_IMPORT_ROUTES = ['importProjects']
 // Signatures of server-local files that only appear in a response when a declared entity was resolved.
 const RESOLVED_FILE_MARKER = /root:x:0:0:|SESSION_SECRET=|DB_PASSWORD=|API_KEY=rbs_/
-const ACTIVE_MARKUP = /<script\b|javascript:|\son\w+\s*=/i
+// Active markup only: a real tag carrying an event handler, or an executable scheme inside an
+// attribute. Escaped entities (`&lt;img … onerror=…`) are inert text and must not trip this.
+const ACTIVE_MARKUP = /<script\b|<[a-z][^>]*\son\w+\s*=|(?:href|src)\s*=\s*["']?\s*javascript:/i
 
 export function createMonitors(deps: MonitorDeps): MonitorSet {
   const { canaries, plan } = deps

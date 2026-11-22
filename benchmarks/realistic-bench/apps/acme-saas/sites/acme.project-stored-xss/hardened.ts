@@ -5,12 +5,9 @@ import { tenantOf, unauthorized, notFound } from '../../src/common.ts'
 import { htmlEscape } from '../../../../lib/template.ts'
 
 function sanitize(input: string): string {
-  return input
-    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
-    .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
-    .replace(/\son\w+\s*=\s*'[^']*'/gi, '')
-    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
-    .replace(/javascript:/gi, '')
+  // Strict variant: no rich HTML at all. Escaping is stronger than the naive event-handler
+  // regex, which is bypassable (e.g. `<svg/onload=…>` has no leading whitespace).
+  return htmlEscape(input)
 }
 
 export default function register(app: AppContext): void {

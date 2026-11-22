@@ -14,7 +14,7 @@ export interface MonitorDeps {
   canaries: CanaryRegistry
 }
 
-const ACTIVE_MARKUP = /<script\b|javascript:|\son\w+\s*=/i
+const ACTIVE_MARKUP = /<script\b|<[a-z][^>]*\son\w+\s*=|(?:href|src)\s*=\s*["']?\s*javascript:/i
 const AUDIT_SPECS = [
   { table: 'accounts', columns: ['id', 'team_id', 'name', 'tier', 'notes'] },
   { table: 'users', columns: ['id', 'team_id', 'role', 'persona'] },

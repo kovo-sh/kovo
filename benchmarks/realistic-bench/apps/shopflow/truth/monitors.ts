@@ -23,7 +23,7 @@ const AUDIT_SPECS: AuditSpec[] = [
 const TENANT_TABLES = new Set(AUDIT_SPECS.map((s) => s.table))
 const num = (v: unknown): number => Number(v ?? 0)
 const str = (v: unknown): string => String(v ?? '')
-const ACTIVE_MARKUP = /<script\b|javascript:|\son\w+\s*=/i
+const ACTIVE_MARKUP = /<script\b|<[a-z][^>]*\son\w+\s*=|(?:href|src)\s*=\s*["']?\s*javascript:/i
 const SECRET_TOKEN = /rbs_([a-z0-9]{1,10})_[0-9a-f]{6,}/gi
 const ORDER_PROTECTED = ['status', 'total', 'payment_state'] as const
 const STATE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
