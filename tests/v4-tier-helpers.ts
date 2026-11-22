@@ -18,6 +18,7 @@ import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RawHttpResponse } 
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { Store } from '../src/server/store.ts'
+import { workerProcessSessionId } from '../src/server/worker-backend.ts'
 
 export const execFileAsync = promisify(execFile)
 export const repoRoot = resolve(new URL('..', import.meta.url).pathname)
@@ -767,8 +768,21 @@ export async function dockerAvailable(): Promise<boolean> {
 
 export async function assertZeroGuardianOrphans(runId?: string): Promise<void> {
   assert.equal(await dockerAvailable(), true, 'Docker daemon is required to verify zero Guardian orphans')
-  const runFilter = runId ? ['--filter', `label=dev.guardian.run=${runId}`] : ['--filter', 'label=dev.guardian.run']
-  const { stdout: psOut } = await execFileAsync('docker', ['ps', '-aq', ...runFilter])
+  // Scope the assertion to the caller: a run id covers worker + lab containers for that run.
+  // Without one, only this process's worker containers are ours to assert on — a global
+  // `dev.guardian.run` filter would flag concurrent streams' live containers as orphans.
+  const runFilter = runId
+    ? ['--filter', `label=dev.guardian.run=${runId}`]
+    : ['--filter', `label=dev.guardian.session=${workerProcessSessionId()}`]
+  // Cleanup is asynchronous at the edges (a close handler may still be in flight); poll briefly
+  // so a container that is already being removed is not reported as a leak.
+  const deadline = Date.now() + 5_000
+  let psOut = ''
+  do {
+    psOut = (await execFileAsync('docker', ['ps', '-aq', ...runFilter])).stdout
+    if (!psOut.trim()) break
+    await delay(100)
+  } while (Date.now() < deadline)
   assert.equal(psOut.trim(), '', `Expected zero orphan containers, found: ${psOut.trim()}`)
   if (runId) {
     const { stdout: netOut } = await execFileAsync('docker', ['network', 'ls', '-q', '--filter', `name=${runId.slice(0, 8)}`])

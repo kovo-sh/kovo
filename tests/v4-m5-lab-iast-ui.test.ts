@@ -332,6 +332,7 @@ test('M5-6 Surface Graph SSR route renders endpoints, endpoint_params, and api_d
   const dir = mkdtempSync(join(tmpdir(), 'guardian-m5-surface-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   let runId = ''
+  let consumerId = ''
   {
     const storage = new Store(dir)
     const { id: projectId } = storage.createProject({
@@ -394,6 +395,7 @@ test('M5-6 Surface Graph SSR route renders endpoints, endpoint_params, and api_d
       personaHandle: 'user_a',
       observedTransitions: ['draft', 'submitted'],
     })
+    consumerId = consumer.id
     storage.close()
   }
 
@@ -401,7 +403,7 @@ test('M5-6 Surface Graph SSR route renders endpoints, endpoint_params, and api_d
   t.after(() => app.dispose())
   await app.start()
   const token = readFileSync(join(dir, 'local-session'), 'utf8').trim()
-  const resp = await fetch(`${app.url}/runs/${runId}?view=surface`, {
+  const resp = await fetch(`${app.url}/runs/${runId}?view=surface&sel=endpoint:${consumerId}`, {
     headers: { Cookie: `guardian_local=${token}` },
   })
   assert.equal(resp.status, 200)

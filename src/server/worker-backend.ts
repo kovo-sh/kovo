@@ -17,7 +17,19 @@ const repoRelativePathSchema = z.string().min(1).max(512).refine(
   'Invalid repository-relative path.',
 )
 const workerNamespace = 'dev.guardian.workspace'
+// Attribution labels: a leaked container must identify its run/assignment/session.
+const runNamespace = 'dev.guardian.run'
+const assignmentNamespace = 'dev.guardian.assignment'
+const sessionNamespace = 'dev.guardian.session'
+const createdAtNamespace = 'dev.guardian.created-at'
+/** A container may legitimately sit in `created` only for the create→start instant. */
+const DEFAULT_STALE_CREATED_MS = 120_000
+const processSessionId = randomUUID()
 const liveContainers = new Set<string>()
+/** Process-scoped label value carried by every worker container (test/diagnostic seam). */
+export function workerProcessSessionId() {
+  return processSessionId
+}
 let liveExitHookInstalled = false
 function removeLiveContainers() {
   for (const container of liveContainers) {
@@ -327,53 +339,148 @@ function docker(args: string[], signal: AbortSignal, input?: string) {
     cli.once('error', error => reject(signal.aborted ? signal.reason : error))
     cli.once('close', code => {
       if (code === 0) resolve(Buffer.concat(chunks).toString('utf8'))
-      else reject(new Error(formatWorkerFailure(Buffer.concat(stderrChunks).toString('utf8'), code)))
+      else {
+        const stderr = Buffer.concat(stderrChunks).toString('utf8')
+        if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+          console.error('[worker-docker]', args.slice(0, 3).join(' '), 'exit', code, stderr.trim().split('\n').slice(0, 2).join(' | '))
+        }
+        reject(new Error(formatWorkerFailure(stderr, code)))
+      }
     })
   })
 }
 
+type DockerRunner = (args: string[], signal: AbortSignal, input?: string) => Promise<string>
+/** The real CLI executor, exported so Docker-gated tests can wrap it (e.g. force a start failure). */
+export const dockerCliRunner: DockerRunner = docker
+
 export class LinuxWorkerBackend implements WorkerBackend {
   private readonly image: string
   private readonly owner?: string
+  private readonly runId?: string
+  private readonly docker: DockerRunner
+  private readonly staleCreatedMs: number
   private readonly activeContainers = new Set<string>()
+  private readonly removals = new Map<string, Promise<void>>()
   private reclaiming?: Promise<void>
 
-  constructor({ image = 'guardian-worker:v4', workspace }: {
+  constructor({ image = 'guardian-worker:v4', workspace, runId, dockerRunner, staleCreatedMs }: {
     image?: string
     workspace?: { id: string; directory: string }
+    runId?: string
+    /** Test seam: replace the docker CLI executor (defaults to the real CLI). */
+    dockerRunner?: DockerRunner
+    /** Grace before an abandoned `created` container is reclaimed (default 2 min). */
+    staleCreatedMs?: number
   } = {}) {
     this.image = image
+    this.runId = runId
+    this.docker = dockerRunner ?? docker
+    this.staleCreatedMs = Math.max(0, staleCreatedMs ?? DEFAULT_STALE_CREATED_MS)
     if (workspace) {
       this.owner = createHash('sha256').update(workspace.id).update('\0').update(realpathSync(workspace.directory)).digest('hex')
     }
   }
 
+  /**
+   * Reclaim leftovers from earlier workers. This runs on every operation and also from
+   * Execution's 30 s sweep. Ownerless backends (preflight probes, benchmark clients) must
+   * sweep too: they were the ones accumulating unattributed `created` containers.
+   *
+   * Housekeeping is strictly best-effort: a 404/409 from a concurrent removal must never
+   * fail the worker operation that happened to trigger the sweep (that surfaced as a false
+   * "Verification container failed" during inline replay verification).
+   */
   reclaimInactive() {
-    if (!this.owner) return Promise.resolve()
-    return this.reclaiming ??= this.removeInactive(this.owner).finally(() => {
-      this.reclaiming = undefined
-    })
+    return this.reclaiming ??= (async () => {
+      try {
+        if (this.owner) await this.removeInactive(this.owner)
+        await this.removeStaleCreated()
+      } catch (error) {
+        if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+          console.error('[worker-docker] reclaim skipped:', error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160))
+        }
+      } finally {
+        this.reclaiming = undefined
+      }
+    })()
+  }
+
+  private removeContainer(name: string) {
+    // Coalesce concurrent removals: `finally` + the session close/error handlers can race,
+    // and a second `docker rm` reports "removal ... already in progress" instead of a clean exit.
+    const existing = this.removals.get(name)
+    if (existing) return existing
+    const removal = this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000))
+      .then(() => undefined, () => undefined)
+      .finally(() => { this.removals.delete(name) })
+    this.removals.set(name, removal)
+    return removal
+  }
+
+  /**
+   * Remove guardian containers abandoned before use (`created`) or after they stopped
+   * (`exited`/`dead`) — e.g. a SIGKILLed test process or a crashed CLI. Running (`Up`)
+   * containers are left alone: they may belong to a concurrent stream. Only containers
+   * older than the grace window are touched so an in-flight create is never killed.
+   */
+  private async removeStaleCreated() {
+    const signal = AbortSignal.timeout(5_000)
+    let rows: string
+    try {
+      rows = await this.docker([
+        'container', 'ls', '--all', '--no-trunc',
+        '--filter', 'status=created', '--filter', 'status=exited', '--filter', 'status=dead',
+        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.guardian.created-at"}}\t{{.CreatedAt}}',
+      ], signal)
+    } catch {
+      return
+    }
+    const now = Date.now()
+    const stale: string[] = []
+    for (const row of rows.trim().split('\n')) {
+      if (!row) continue
+      const [id, name, createdLabel, createdAt] = row.split('\t')
+      if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) continue
+      if (this.activeContainers.has(name)) continue
+      const stamped = Number(createdLabel)
+      const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
+      if (!Number.isFinite(age) || age < this.staleCreatedMs) continue
+      stale.push(id)
+    }
+    if (stale.length) {
+      if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+        console.error('[worker-docker] removeStaleCreated ids', stale.map(i => i.slice(0, 12)).join(','), 'rows', rows.trim().split('\n').length)
+      }
+      await this.docker(['container', 'rm', '--force', ...stale], signal).catch(() => undefined)
+    }
   }
 
   private async removeInactive(owner: string) {
     const signal = AbortSignal.timeout(5_000)
-    const list = async () => {
-      const rows = await docker([
-        'container', 'ls', '--all', '--no-trunc', '--filter', `label=${workerNamespace}=${owner}`,
-        '--format', '{{.ID}}\t{{.Names}}',
-      ], signal)
-      return rows.trim().split('\n').flatMap(row => {
-        const [id, name] = row.split('\t')
-        return /^[a-f0-9]{64}$/.test(id) && workerName.test(name) && !this.activeContainers.has(name) ? [id] : []
-      })
-    }
-    const inactive = await list()
-    if (!inactive.length) return
+    let inactive: string[] = []
     try {
-      await docker(['container', 'rm', '--force', ...inactive], signal)
-    } catch (error) {
-      if ((await list()).length) throw error
+      const rows = await this.docker([
+        'container', 'ls', '--all', '--no-trunc', '--filter', `label=${workerNamespace}=${owner}`,
+        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.guardian.created-at"}}\t{{.CreatedAt}}\t{{.Label "dev.guardian.session"}}',
+      ], signal)
+      inactive = rows.trim().split('\n').flatMap(row => {
+        if (!row) return []
+        const [id, name, _createdLabel, _createdAt, session] = row.split('\t')
+        if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) return []
+        // Never touch this process's own containers: a concurrent run/session may be between
+        // create and start. Cross-process leftovers are reclaimed regardless of age.
+        if (this.activeContainers.has(name) || session === processSessionId) return []
+        return [id]
+      })
+    } catch {
+      return
     }
+    if (!inactive.length) return
+    if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+      console.error('[worker-docker] removeInactive owner', owner.slice(0, 8), 'active', this.activeContainers.size, 'ids', inactive.map(i => i.slice(0, 12)).join(','))
+    }
+    await this.docker(['container', 'rm', '--force', ...inactive], signal).catch(() => undefined)
   }
 
   private resolveReposMountArgs(reposDir?: string): string[] {
@@ -394,13 +501,19 @@ export class LinuxWorkerBackend implements WorkerBackend {
   }
 
   private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions) {
+    // Every container is attributable even when the caller did not supply a run id:
+    // `run` falls back to the workspace hash or this process's ad-hoc session.
+    const runLabelValue = this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`)
     // Default 1536m RAM, 2.0 CPU, 256 PIDs (ceiling: 4096m / 4.0 / 384)
     const memoryMb = Math.round(clamp(options?.memoryMb, 1536, 512, 4096))
     const cpus = Number(clamp(options?.cpus, 2.0, 0.5, 4.0).toFixed(2))
     const pidsLimit = Math.round(clamp(options?.pidsLimit, 256, 64, 384))
     const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 512))
     return [
-      'container', 'create', '--name', name, '--interactive', '--rm', '--pull', 'never',
+      // No `--rm`: Docker's automatic removal races the explicit `rm --force` below and the
+      // daemon answers "removal of container ... is already in progress", which previously
+      // surfaced as a failed worker session. Explicit removal is the single mechanism.
+      'container', 'create', '--name', name, '--interactive', '--pull', 'never',
       '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges',
       '--pids-limit', String(pidsLimit),
@@ -408,8 +521,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
       '--memory', `${memoryMb}m`, '--memory-swap', `${memoryMb}m`,
       '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
       ...this.resolveReposMountArgs(options?.reposDir),
-      '--label', 'dev.guardian.assignment=' + assignmentId,
+      '--label', `${assignmentNamespace}=` + assignmentId,
+      '--label', `${runNamespace}=${runLabelValue}`,
       ...(this.owner ? ['--label', `${workerNamespace}=${this.owner}`] : []),
+      '--label', `${sessionNamespace}=${processSessionId}`,
+      '--label', `${createdAtNamespace}=` + Date.now(),
       this.image,
       ...extraArgs,
     ]
@@ -428,11 +544,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await docker(this.containerCreateArgs(name, job.assignmentId, [], options), deadline)
-      const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
+      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], options), deadline)
+      const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       return resultSchema.parse(JSON.parse(result))
     } finally {
-      await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainer(name)
       this.activeContainers.delete(name)
       liveContainers.delete(name)
     }
@@ -455,11 +571,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await docker(this.containerCreateArgs(name, assignmentId, [], options), deadline)
-      const result = await docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
+      await this.docker(this.containerCreateArgs(name, assignmentId, [], options), deadline)
+      const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       return astVerifyResultSchema.parse(JSON.parse(result))
     } finally {
-      await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainer(name)
       this.activeContainers.delete(name)
       liveContainers.delete(name)
     }
@@ -473,18 +589,28 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+      await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
     } catch (error) {
-      await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainer(name)
       this.activeContainers.delete(name)
       liveContainers.delete(name)
       throw error
     }
 
-    const cli: ChildProcess = spawn('docker', ['container', 'start', '--attach', '--interactive', name], {
-      env: dockerEnv(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
+    let cli: ChildProcess
+    try {
+      // A container that exists but never gets `start` must not outlive this call: spawn can
+      // throw synchronously (bad DOCKER_HOST, CLI removed) or be aborted by a dead session.
+      cli = spawn('docker', ['container', 'start', '--attach', '--interactive', name], {
+        env: dockerEnv(),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      await this.removeContainer(name)
+      this.activeContainers.delete(name)
+      liveContainers.delete(name)
+      throw error
+    }
     const sessionStderr: Buffer[] = []
     let sessionStderrBytes = 0
     cli.stderr?.on('data', (chunk: Buffer) => {
@@ -494,7 +620,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       sessionStderr.push(slice)
       sessionStderrBytes += slice.length
     })
-    const removeContainer = () => docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+    const removeContainer = () => this.removeContainer(name)
     cli.stdin?.on('error', () => { /* Ignore EPIPE or write-after-end during shutdown. */ })
     const pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (err: Error) => void }>()
     let closed = false
@@ -549,7 +675,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         try { cli.kill() } catch { /* ignore */ }
         failAll(new Error('Isolated worker session closed.'))
         rl.close()
-        await docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+        await this.removeContainer(name)
         this.activeContainers.delete(name)
       liveContainers.delete(name)
       })()
