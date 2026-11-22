@@ -90,11 +90,11 @@ const oauthPath = /(oauth|authorize|\/auth\b|openid|oidc|sso|login\/callback)/i
 const xmlPath = /(xml|import|soap|upload|feed|sitemap|saml|parse|svg|rss|wsdl)/i
 const graphqlPath = /graphql/i
 const workflowPath = /(order|checkout|cart|payment|workflow|step|confirm|refund|invoice)/i
-const authishPath = /(oauth|authorize|openid|token|jwt|auth|session|login|sso|well-known|partner|ledger|credential|apikey|api-key)/i
+const authishPath = /(oauth|authorize|openid|token|jwt|auth|session|login|sso|well-known|partner|ledger|credential|apikey|api-key|whoami|userinfo|identity|reports?\/(?:sales|summary|analytics)|internal|export)/i
 /** Routes whose mutating verb usually requires an elevated role/function (BFLA candidates). */
 const privilegedPath = /(admin|internal|manage|staff|superuser|privileged|permission|feature[-_]?flag|backoffice)/i
 /** Parameters that name a file or path handled by a download/export/serve route. */
-const fileParam = /^(?:file|filename|filepath|file_name|name|path|download|export|doc|document|attachment|resource|target)$/i
+const fileParam = /^(?:file|filename|filepath|file_name|logfile|log_file|log|name|path|download|export|doc|document|attachment|resource|target)$/i
 /** Parameters that plausibly reach a shell/OS command interpreter. */
 const shellParam = /(host|hostname|ip|addr|domain|target|cmd|command|exec|shell|run|ping|diag|lookup|resolve|nslookup|whois)/i
 const shellPath = /(ping|diagnostic|exec|command|shell|health|resolve|lookup|whois|dns|system)/i
@@ -135,7 +135,7 @@ export interface InferredParam extends DiscoveredParam { purpose?: InferredPurpo
 
 const searchRouteHint = /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|saved-?views?)(?:$|[/_.-])/i
 const searchSeg = /^(?:search|query|find|lookup|filter|run)$/i
-const fileServeSeg = /^(?:download|downloads|view|serve|file|files|asset|assets|receipt|receipts|invoice|invoices|label|labels|document|documents|attachment|attachments|media|raw|content|archive|archives|backup|backups|log|logs|journal|journals)$/i
+const fileServeSeg = /^(?:download|downloads|view|serve|file|files|asset|assets|receipt|receipts|invoice|invoices|billing[-_]?docs?|label|labels|document|documents|attachment|attachments|media|raw|content|archive|archives|backup|backups|log|logs|journal|journals)$/i
 const downloadPathHint = /(?:^|[/_.-])(?:download|downloads|export|exports)(?:$|[/_.-])/i
 const importRouteHint = /(?:^|[/_.-])(?:import|imports|feeds?|upload|uploads|parse|xml|saml|soap|svg|rss|wsdl|manifests?|descriptor|labels?|backups?|archives?)(?:$|[/_.-])/i
 const urlRouteHint = /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhooks?|hooks?|callbacks?|integrations?|connectors?|proxy|proxies|fetch|remote|links?)(?:$|[/_.-])/i
@@ -264,9 +264,9 @@ function csrfReadPathFor(path: string, getPaths: readonly string[]): string | nu
 function redirectCandidateParams(path: string): string[] {
   const p = path.toLowerCase()
   if (/(sso|oauth|authorize|openid|login)/.test(p)) return ['next', 'returnTo', 'returnUrl']
-  if (/(checkout|return)/.test(p)) return ['returnUrl', 'returnTo', 'redirect']
-  if (/(download|export)/.test(p)) return ['url', 'returnTo', 'redirect']
-  return ['url', 'next', 'redirect']
+  if (/(checkout|return)/.test(p)) return ['returnUrl', 'returnTo', 'next', 'redirect']
+  if (/(download|export)/.test(p)) return ['url', 'next', 'returnTo', 'redirect']
+  return ['url', 'next', 'redirect', 'returnTo']
 }
 
 /**
@@ -543,7 +543,8 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       }
       // JWT/OAuth protocol auditing only runs on auth-shaped routes; running it on every parameterless
       // GET burns a large fraction of the request budget with no new evidence.
-      if (!pathHasPlaceholder && caps.authMutation && (isGet || method === 'POST') && (authishPath.test(ep.path) || oauthPath.test(ep.path))) {
+      if (!pathHasPlaceholder && caps.authMutation && (isGet || method === 'POST') && (authishPath.test(ep.path) || oauthPath.test(ep.path)) &&
+          !/(?:logout|signout|revoke|delete|reset|forgot)/i.test(ep.path)) {
         add({ endpoint: ep, probeClass: 'auth_protocol_audit', method: isGet ? 'GET' : 'POST' })
       }
       if ((xmlPath.test(ep.path) || isXmlImportRoute(ep)) && !isGet && !params.some(p => p.location === 'xml')) {
@@ -587,7 +588,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         const candidates = discovered.length > 0
           ? discovered
           : redirectCandidateParams(ep.path).map(name => ({ name, location: 'query', isObjectId: false, isCsrf: false }))
-        for (const cand of candidates.slice(0, 3)) {
+        for (const cand of candidates.slice(0, 4)) {
           if (redirectHypotheses >= maxRedirectHypotheses) break
           add({
             endpoint: ep, probeClass: 'open_redirect_differential',
@@ -1105,7 +1106,8 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
       ctx.paramActive = false
       for (const validName of mineBaselines(corpus, h.param.name, h.endpoint.path).filter(v => /^[A-Za-z0-9_. -]{1,60}$/.test(v) && !/[\\/]/.test(v)).slice(0, 2)) {
         const ex = await sendFor(h.param.name, validName)
-        if (ex && ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0) { ctx.paramActive = true; break }
+        if (ex && ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0 &&
+            (!fake || ex.status !== fake.status || responseSimilarity(ex.body, fake.body) < 0.9)) { ctx.paramActive = true; break }
       }
       const payloads = ['../../../../etc/passwd', '../../../../var/log/system/audit.log']
       for (const payload of ctx.paramActive ? [] : payloads) {
@@ -1964,8 +1966,8 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   }
   if (h.probeClass === 'auth_protocol_audit') {
     req.persona = env.jwtPersona ?? env.owner
-    // Authorize-style flows are GET redirects; token/introspection endpoints keep their discovered method.
-    req.method = oauthPath.test(h.endpoint.path) ? 'GET' : h.method
+    // Only authorize-style flows are GET redirects; token/introspection endpoints keep their method.
+    req.method = /(?:authorize|oauth|openid|\/sso\/)/i.test(h.endpoint.path) ? 'GET' : h.method
     if (ctx.seedQuery) req.pathAndQuery = `${h.endpoint.path.split('?')[0]}?${ctx.seedQuery}`
   }
   if (h.probeClass === 'graphql_audit') req.method = 'POST'
