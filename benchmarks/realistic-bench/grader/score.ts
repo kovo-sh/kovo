@@ -4,7 +4,7 @@ import type {
   Scorecard, Severity, SubmittedFinding, VulnOutcome, VulnResult,
 } from '../lib/types.ts'
 import { failureTaxonomyBuckets } from '../lib/types.ts'
-import { endpointMatches, matchFindingToEntries } from './match.ts'
+import { classCompatible, endpointMatches, findingHitsEntry, matchFindingToEntries } from './match.ts'
 import type { GradeEntry } from './match.ts'
 import { attributeEvent, classifyFailure, computeFunnel } from './attribution.ts'
 import type { FailureContext, FunnelStage } from './attribution.ts'
@@ -54,21 +54,31 @@ export function gradeRun(input: GradeInput): Scorecard {
 
   const vulnEntries: GradeEntry[] = gt.vulns.map((e) => ({ entry: e, isDecoy: false }))
   const decoyEntries: GradeEntry[] = gt.decoys.map((e) => ({ entry: e, isDecoy: true }))
-  const allEntries = [...vulnEntries, ...decoyEntries]
 
-  // Match every active finding to its best entry.
-  const matchOf = new Map<string, { entry: GroundTruthEntry; isDecoy: boolean } | null>()
+  // Match every active finding. A finding may claim several endpoints: it binds to at most one
+  // vulnerable site (best class/param match) and to every decoy site it names. Counting each
+  // distinct decoy site once prevents a single multi-endpoint finding from hiding decoy false
+  // positives behind a vuln match, while duplicate claims on one site still collapse.
   const vulnMatched = new Map<string, SubmittedFinding[]>()
   const decoyMatched = new Map<string, SubmittedFinding[]>()
   const unmatched: SubmittedFinding[] = []
   for (const f of active) {
-    const m = matchFindingToEntries(f, allEntries)
-    matchOf.set(f.id, m ? { entry: m.entry, isDecoy: m.isDecoy } : null)
-    if (!m) { unmatched.push(f); continue }
-    const bucket = m.isDecoy ? decoyMatched : vulnMatched
-    const list = bucket.get(m.entry.siteId) ?? []
-    list.push(f)
-    bucket.set(m.entry.siteId, list)
+    const vulnMatch = matchFindingToEntries(f, vulnEntries)
+    if (vulnMatch) {
+      const list = vulnMatched.get(vulnMatch.entry.siteId) ?? []
+      list.push(f)
+      vulnMatched.set(vulnMatch.entry.siteId, list)
+    }
+    const decoySites = new Set<string>()
+    for (const ge of decoyEntries) {
+      if (decoySites.has(ge.entry.siteId)) continue
+      if (!classCompatible(f, ge.entry) || !findingHitsEntry(f, ge.entry)) continue
+      decoySites.add(ge.entry.siteId)
+      const list = decoyMatched.get(ge.entry.siteId) ?? []
+      list.push(f)
+      decoyMatched.set(ge.entry.siteId, list)
+    }
+    if (!vulnMatch && decoySites.size === 0) unmatched.push(f)
   }
 
   // Evaluate each vuln.
@@ -87,9 +97,9 @@ export function gradeRun(input: GradeInput): Scorecard {
       }
     }
     if (outcome !== 'confirmed') {
-      const anyStatic = matched.some((f) => f.status === 'static_verified' && rootCauseMatch(f, entry))
-      if (anyStatic && matched.every((f) => f.status === 'static_verified')) outcome = 'static_only'
-      else if (anyStatic && !matched.some((f) => f.status !== 'static_verified')) outcome = 'static_only'
+      const allStatic = matched.length > 0 && matched.every((f) => f.status === 'static_verified')
+      const anyRootCause = matched.some((f) => f.status === 'static_verified' && rootCauseMatch(f, entry))
+      if (allStatic && anyRootCause) outcome = 'static_only'
     }
     return { entry, matched, attributedEvents, outcome, confirmingFinding }
   })
@@ -201,7 +211,11 @@ export function gradeRun(input: GradeInput): Scorecard {
   }
 
   const confirmingFindings = evals.map((e) => e.confirmingFinding).filter((f): f is SubmittedFinding => !!f)
-  const chainsCompleted = gt.chains.filter((ch) =>
+  // Defensive: count only chains whose every member is a vulnerable target. buildGroundTruth
+  // already omits fully-hardened chains, but hand-authored GroundTruth inputs may not.
+  const vulnSiteIds = new Set(gt.vulns.map((v) => v.siteId))
+  const completableChains = gt.chains.filter((ch) => ch.siteIds.every((sid) => vulnSiteIds.has(sid)))
+  const chainsCompleted = completableChains.filter((ch) =>
     ch.siteIds.every((sid) => evals.find((e) => e.entry.siteId === sid)?.outcome === 'confirmed')).length
   const egressBlocked = (input.egressLog ?? []).filter((e) => !e.allowed).length
 
@@ -221,7 +235,7 @@ export function gradeRun(input: GradeInput): Scorecard {
     decoyFalsePositives,
     unmatchedFalsePositives,
     duplicateFindings,
-    chainsTotal: gt.chains.length,
+    chainsTotal: completableChains.length,
     chainsCompleted,
     funnel: computeFunnel(funnelStages),
     failureBuckets,

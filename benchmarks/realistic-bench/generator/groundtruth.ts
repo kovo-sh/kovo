@@ -51,9 +51,12 @@ export function buildGroundTruth(bp: AppBlueprint, plan: VariantPlan): GroundTru
     else decoys.push(entry)
   }
 
+  // Chains are scoring targets only when every member is vulnerable. Decoy units share a mode, so
+  // a chain selected as a decoy is fully hardened and must not inflate chainsTotal with an
+  // unachievable goal.
   const chainMap = new Map<string, { id: string; siteIds: string[]; severity: Severity }>()
   for (const site of bp.sites) {
-    if (!site.chain) continue
+    if (!site.chain || plan.sites[site.id] !== 'vulnerable') continue
     const c = chainMap.get(site.chain.id) ?? { id: site.chain.id, siteIds: [], severity: 'low' }
     c.siteIds.push(site.id)
     if (SEVERITY_RANK[site.severity] > SEVERITY_RANK[c.severity]) c.severity = site.severity

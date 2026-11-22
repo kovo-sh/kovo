@@ -8,7 +8,9 @@ const TRUSTED_HOSTS = new Set(['pay.shopflow.test'])
 export default function register(app: AppContext): void {
   app.route('checkoutReturn', (ctx: ReqCtx) => {
     const target = String(ctx.query[app.paramName('returnUrl')] ?? '/')
-    if (target.startsWith('/') && !target.startsWith('//')) return ctx.redirect(target)
+    // Local paths must stay origin-relative after browser normalisation: `/\host` and
+    // `\\host` both resolve off-origin, so reject any backslash or whitespace.
+    if (target.startsWith('/') && !target.startsWith('//') && !/[\\\s]/.test(target)) return ctx.redirect(target)
     let host = ''
     try { host = new URL(target).host } catch { host = '' }
     if (!TRUSTED_HOSTS.has(host)) return ctx.redirect('/')

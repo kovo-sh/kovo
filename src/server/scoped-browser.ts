@@ -106,6 +106,13 @@ export interface BrowserXhrRecord {
   origin: string
   resourceType: string
   status: number | null
+  /**
+   * Response media type for same-origin XHR/fetch calls whose body was captured for discovery.
+   * Headers are never copied into the record.
+   */
+  mediaType?: string
+  /** Bounded, redacted JSON-ish response preview for same-origin XHR/fetch (no headers, no secrets). */
+  bodyPreview?: string
 }
 
 export interface BrowserPostMessageSummary {
@@ -211,6 +218,16 @@ interface PlaywrightPage {
 
 interface PlaywrightContext {
   addInitScript(script: string | (() => void)): Promise<void>
+  addCookies?(cookies: Array<{
+    name: string
+    value: string
+    domain: string
+    path: string
+    secure?: boolean
+    httpOnly?: boolean
+    sameSite?: 'Strict' | 'Lax' | 'None'
+    expires?: number
+  }>): Promise<void>
   route(url: string, handler: (route: PlaywrightRoute) => Promise<void> | void): Promise<void>
   newPage(): Promise<PlaywrightPage>
   close(): Promise<void>
@@ -228,11 +245,40 @@ export interface ScopedBrowserOptions {
 
 const maxBrowserTimeoutMs = 30_000
 const maxDomSnippetChars = 16_384
+/** Per-visit ceiling for captured XHR/fetch JSON bodies used by route-map/navigation discovery. */
+const maxXhrBodyCharsPerVisit = 262_144
+/** Per-response ceiling; route maps and config tables are small, listings can be large. */
+const maxXhrBodyCharsPerRecord = 65_536
 const maxInteractiveActions = 20
 const forbiddenBrowserForwardHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|connection|accept-encoding|sec-fetch-.*|sec-ch-.*)$/i
 const allowedMethods = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'])
 const safeReadOnlyFetchMethods = new Set(['GET', 'HEAD', 'OPTIONS'])
 const unsafeSelectorPattern = /[<>{};`\\]|javascript:/i
+
+/**
+ * Capture a bounded, redacted JSON-ish response preview for a same-origin XHR/fetch so discovery can
+ * expand route-map/config documents and navigation payloads that are only reachable from the SPA.
+ * Only bodies are exposed; request/response headers never enter the browser record.
+ */
+function captureXhrJsonBody(input: {
+  exchange: BrokerExchangeResult
+  sameOrigin: boolean
+  secrets: readonly NamedSecret[]
+  budget: { chars: number }
+}): { mediaType?: string; bodyPreview?: string } {
+  const { exchange, sameOrigin, secrets, budget } = input
+  if (!sameOrigin) return {}
+  if (exchange.status < 200 || exchange.status >= 400) return {}
+  if (!exchange.body) return {}
+  const looksStructured = /json/i.test(exchange.mediaType) || /^\s*[{[]/.test(exchange.body.slice(0, 64))
+  if (!looksStructured) return {}
+  if (budget.chars >= maxXhrBodyCharsPerVisit) return {}
+  const limit = Math.max(0, Math.min(maxXhrBodyCharsPerRecord, maxXhrBodyCharsPerVisit - budget.chars))
+  if (limit === 0) return {}
+  const bodyPreview = redact(exchange.body, secrets).slice(0, limit)
+  budget.chars += bodyPreview.length
+  return { mediaType: exchange.mediaType, bodyPreview }
+}
 
 async function launchChromium(): Promise<PlaywrightBrowserLike> {
   try {
@@ -449,6 +495,36 @@ function safeFulfillHeaders(respHeaders: Record<string, string>): Record<string,
   return out
 }
 
+/**
+ * Mirror non-HttpOnly session-jar cookies into the Playwright context so SPA JS
+ * (`document.cookie`, Axios XSRF double-submit) observes the same values that the
+ * broker sends on the wire. Values never leave the browser process or enter results.
+ */
+async function mirrorJarCookies(
+  context: PlaywrightContext | undefined,
+  broker: RequestBroker,
+  scope: { session?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
+  origin: string,
+): Promise<void> {
+  if (!context?.addCookies) return
+  try {
+    const cookies = broker.sessionCookiesForBrowser(scope, origin)
+    if (cookies.length === 0) return
+    await context.addCookies(cookies.map(cookie => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+      secure: cookie.secure,
+      httpOnly: false,
+      sameSite: cookie.sameSite,
+      ...(cookie.expires !== undefined ? { expires: cookie.expires } : {}),
+    })))
+  } catch {
+    // Best-effort mirroring: a cookie that Playwright rejects must never fail a visit.
+  }
+}
+
 function hasDestructiveInput(text: string): boolean {
   if (containsDestructivePayload(text)) return true
   try {
@@ -556,6 +632,7 @@ export class ScopedBrowser {
     const exchangeIds: string[] = []
     const xhrRequests: BrowserXhrRecord[] = []
     const allRequests: BrowserXhrRecord[] = []
+    const xhrBodyBudget = { chars: 0 }
     const blockedOrigins = new Set<string>()
     const consoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
     const xhrWaiters: Array<(rec: BrowserXhrRecord) => void> = []
@@ -677,6 +754,12 @@ export class ScopedBrowser {
           exchanges.push(exchange)
           const recordedId = req.onExchange?.(exchange)
           if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
+          await mirrorJarCookies(context, this.broker, {
+            session: req.session,
+            runId: req.runId,
+            assignmentId: req.assignmentId,
+            sessionGroupRole: req.sessionGroupRole,
+          }, parsedUrl.origin)
 
           const reqRecord: BrowserXhrRecord = {
             method,
@@ -684,6 +767,9 @@ export class ScopedBrowser {
             origin: parsedUrl.origin,
             resourceType,
             status: exchange.status,
+            ...((resourceType === 'xhr' || resourceType === 'fetch')
+              ? captureXhrJsonBody({ exchange, sameOrigin: parsedUrl.origin === initialOrigin, secrets, budget: xhrBodyBudget })
+              : {}),
           }
           if (allRequests.length < 150) allRequests.push(reqRecord)
           if (resourceType === 'xhr' || resourceType === 'fetch') {
@@ -1325,6 +1411,7 @@ export class ScopedBrowser {
       let stepExchangeIds: string[] = []
       let stepXhrRequests: BrowserXhrRecord[] = []
       let stepAllRequests: BrowserXhrRecord[] = []
+      let stepXhrBodyBudget = { chars: 0 }
       let stepBlockedOrigins = new Set<string>()
       let stepConsoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
       const xhrWaiters: Array<(rec: BrowserXhrRecord) => void> = []
@@ -1362,6 +1449,7 @@ export class ScopedBrowser {
         stepExchangeIds = []
         stepXhrRequests = []
         stepAllRequests = []
+        stepXhrBodyBudget = { chars: 0 }
         stepBlockedOrigins = new Set<string>()
         stepConsoleMessages = []
 
@@ -1504,6 +1592,12 @@ export class ScopedBrowser {
               stepExchanges.push(exchange)
               const recordedId = cur.step.onExchange?.(exchange)
               if (typeof recordedId === 'string' && recordedId) stepExchangeIds.push(recordedId)
+              await mirrorJarCookies(context, this.broker, {
+                session: cur.step.session ?? sessionId,
+                runId: cur.step.runId,
+                assignmentId: cur.step.assignmentId,
+                sessionGroupRole: cur.step.role,
+              }, parsedUrl.origin)
 
               const reqRecord: BrowserXhrRecord = {
                 method,
@@ -1511,6 +1605,9 @@ export class ScopedBrowser {
                 origin: parsedUrl.origin,
                 resourceType,
                 status: exchange.status,
+                ...((resourceType === 'xhr' || resourceType === 'fetch')
+                  ? captureXhrJsonBody({ exchange, sameOrigin: parsedUrl.origin === cur.origin, secrets: routeSecrets, budget: stepXhrBodyBudget })
+                  : {}),
               }
               if (stepAllRequests.length < 150) stepAllRequests.push(reqRecord)
               if (resourceType === 'xhr' || resourceType === 'fetch') {

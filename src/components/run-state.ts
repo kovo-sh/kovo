@@ -1,5 +1,5 @@
 import type { runData } from '../actions.ts'
-import type { ApprovalPolicy, CapabilityTier, OwaspCategory, Phase } from '../domain.ts'
+import type { ApprovalPolicy, BoardMemberState, BoardMessageKind, CapabilityTier, OwaspCategory, Phase } from '../domain.ts'
 
 export type RunDetail = Awaited<ReturnType<typeof runData>>
 export type Worker = RunDetail['assignments'][number]
@@ -80,4 +80,31 @@ export const owaspCategoryLabels: Record<OwaspCategory, string> = {
 export function formatUsd(amount: number) {
   if (!Number.isFinite(amount)) return '$0.00'
   return amount < 0.01 && amount > 0 ? '<$0.01' : `$${amount.toFixed(2)}`
+}
+
+export const boardKindLabels: Record<BoardMessageKind, string> = {
+  brief: 'BRIEF',
+  claim: 'CLAIM',
+  handoff: 'HANDOFF',
+  lead: 'LEAD',
+  blocker: 'BLOCKER',
+  approval: 'APPROVAL',
+  verdict: 'VERDICT',
+  status: 'STATUS',
+  note: 'NOTE',
+}
+
+export const boardStateMeta: Record<BoardMemberState, { label: string; symbol: string; className: string }> = {
+  working: { label: 'working', symbol: '●', className: 'state-working' },
+  waiting: { label: 'waiting', symbol: '○', className: 'state-waiting' },
+  paused: { label: 'paused', symbol: '⏸', className: 'state-paused' },
+  retired: { label: 'retired', symbol: '✓', className: 'state-retired' },
+}
+
+export const boardRoleLabels: Record<string, string> = {
+  operator: 'Operator',
+  coordinator: 'Coordinator',
+  specialist: 'Specialist',
+  verifier: 'Verifier',
+  system: 'System',
 }

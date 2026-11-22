@@ -1,7 +1,8 @@
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import type {
-  ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, BenchmarkFunnel, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
+  ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, BenchmarkFunnel, BoardAuthorRole, BoardMemberRole, BoardMemberState,
+  BoardMessageKind, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
   CodeLocation, DnsSource, DynamicRetestVerdict, EndpointSource, EvidenceSummary, FailureTaxonomyBucket, Finding, InlineVerifyFeedback, LabConfig,
   OwaspCategory, ParamLocation, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, Phase,
   PreparedObservation, ReportBody, ReviewPlan, RoleAffinity, RunStatus, SecondOrderCanaryStatus, SpecialistProfile, ThinkingLevel, ThreatModelSummary,
@@ -530,6 +531,55 @@ export const labTelemetry = sqliteTable('lab_telemetry', {
 }, table => [
   index('lab_telemetry_run').on(table.runId, table.createdAt),
   uniqueIndex('lab_telemetry_trace').on(table.runId, table.traceId),
+])
+
+export const boardMembers = sqliteTable('board_members', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  handle: text('handle').notNull(), // e.g. 'coordinator', 'bola', 'auth', 'bola-2'
+  role: text('role').$type<BoardMemberRole>().notNull(),
+  specialistProfile: text('specialist_profile').$type<SpecialistProfile | null>(),
+  sessionId: text('session_id').notNull(),
+  activeAssignmentId: text('active_assignment_id'),
+  state: text('state').$type<BoardMemberState>().notNull(),
+  roleAffinity: text('role_affinity').$type<RoleAffinity | null>(),
+  lastReadSeq: integer('last_read_seq').default(0).notNull(),
+  turnsUsed: integer('turns_used').default(0).notNull(),
+  postsCount: integer('posts_count').default(0).notNull(),
+  peerHopsUsed: integer('peer_hops_used').default(0).notNull(),
+  scopeRevision: integer('scope_revision').notNull(),
+  goalRevision: integer('goal_revision').notNull(),
+  sourceOrigins: text('source_origins', { mode: 'json' }).$type<string[]>().notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, table => [
+  uniqueIndex('board_members_run_handle').on(table.runId, table.handle),
+  index('board_members_run_state').on(table.runId, table.state),
+])
+
+export const boardMessages = sqliteTable('board_messages', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  seq: integer('seq').notNull(), // strictly monotonic per run (1, 2, 3, ...)
+  authorHandle: text('author_handle').notNull(),
+  authorRole: text('author_role').$type<BoardAuthorRole>().notNull(),
+  kind: text('kind').$type<BoardMessageKind>().notNull(),
+  mentions: text('mentions', { mode: 'json' }).$type<string[]>().notNull(),
+  body: text('body').notNull(), // redacted, capped <= 1200 chars
+  refFactIds: text('ref_fact_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  refExchangeIds: text('ref_exchange_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  refFindingIds: text('ref_finding_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  refStepId: text('ref_step_id'),
+  refApprovalId: text('ref_approval_id'),
+  replyToSeq: integer('reply_to_seq'),
+  scopeRevision: integer('scope_revision').notNull(),
+  goalRevision: integer('goal_revision').notNull(),
+  sourceOrigins: text('source_origins', { mode: 'json' }).$type<string[]>().notNull(),
+  tainted: integer('tainted', { mode: 'boolean' }).default(false).notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [
+  uniqueIndex('board_messages_run_seq').on(table.runId, table.seq),
+  index('board_messages_run_tainted').on(table.runId, table.tainted, table.seq),
 ])
 
 export const benchmarkRuns = sqliteTable('benchmark_runs', {

@@ -11,7 +11,10 @@ import type { importAccessPolicy } from '../access-policy.ts'
 import {
   assessmentCheckTitles,
   assetOriginForEnvironment,
+  boardHandlePattern,
+  boardSystemHandles,
   canReviewScope,
+  canonicalBoardHandles,
   defaultBudgetRequests,
   defaultBudgetUsd,
   defaultLabBudgetRequests,
@@ -20,6 +23,9 @@ import {
   defaultWorkerConcurrency,
   defaultWorkerMaxTurns,
   isLocalLabEnvEnabled,
+  maxBoardBodyLength,
+  normalizeBoardHandle,
+  parseBoardMentions,
   specialistProfiles,
   workerHistory,
 } from '../domain.ts'
@@ -27,6 +33,10 @@ import type {
   ApprovalPolicy,
   ApprovedEndpointPattern,
   BenchmarkFunnel,
+  BoardAuthorRole,
+  BoardMemberRole,
+  BoardMemberState,
+  BoardMessageKind,
   CallerCompatibility,
   Candidate,
   CapabilityTier,
@@ -99,6 +109,8 @@ export type SurfaceProbe = typeof tables.surfaceProbes.$inferSelect
 export type PatchProposal = typeof tables.patchProposals.$inferSelect
 export type ReportRow = typeof tables.reports.$inferSelect
 export type MessageRow = typeof tables.messages.$inferSelect
+export type BoardMemberRow = typeof tables.boardMembers.$inferSelect
+export type BoardMessageRow = typeof tables.boardMessages.$inferSelect
 export type EndpointRow = typeof tables.endpoints.$inferSelect
 export type EndpointParamRow = typeof tables.endpointParams.$inferSelect
 export type ApiDependencyRow = typeof tables.apiDependencies.$inferSelect
@@ -265,6 +277,7 @@ export class Store {
     if (result && 'exitCode' in result) throw new Error('Guardian database migration failed.')
     this.initV3Schema()
     this.initV4Schema()
+    this.initV5Schema()
     this.initFts()
     const current = this.db.select().from(tables.workspaces).limit(1).get()
     this.workspace = current ?? this.db.insert(tables.workspaces).values({
@@ -510,6 +523,111 @@ export class Store {
     `)
   }
 
+  /**
+   * v5 Swarm Message Board tables. `CREATE TABLE IF NOT EXISTS` + defensive column backfill keeps
+   * every v2–v4 SQLite database losslessly upgradable in place (no destructive rebuilds).
+   */
+  private initV5Schema() {
+    this.client.exec(`
+      CREATE TABLE IF NOT EXISTS board_members (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        handle TEXT NOT NULL,
+        role TEXT NOT NULL,
+        specialist_profile TEXT,
+        session_id TEXT NOT NULL,
+        active_assignment_id TEXT,
+        state TEXT NOT NULL,
+        role_affinity TEXT,
+        last_read_seq INTEGER NOT NULL DEFAULT 0,
+        turns_used INTEGER NOT NULL DEFAULT 0,
+        posts_count INTEGER NOT NULL DEFAULT 0,
+        peer_hops_used INTEGER NOT NULL DEFAULT 0,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        source_origins TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS board_members_run_handle ON board_members (run_id, handle);
+      CREATE INDEX IF NOT EXISTS board_members_run_state ON board_members (run_id, state);
+
+      CREATE TABLE IF NOT EXISTS board_messages (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        seq INTEGER NOT NULL,
+        author_handle TEXT NOT NULL,
+        author_role TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        mentions TEXT NOT NULL,
+        body TEXT NOT NULL,
+        ref_fact_ids TEXT NOT NULL,
+        ref_exchange_ids TEXT NOT NULL,
+        ref_finding_ids TEXT NOT NULL,
+        ref_step_id TEXT,
+        ref_approval_id TEXT,
+        reply_to_seq INTEGER,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        source_origins TEXT NOT NULL,
+        tainted INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS board_messages_run_seq ON board_messages (run_id, seq);
+      CREATE INDEX IF NOT EXISTS board_messages_run_tainted ON board_messages (run_id, tainted, seq);
+    `)
+
+    const existingColumns = (table: string): Set<string> => {
+      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    }
+    const ensureColumn = (table: string, column: string, definition: string) => {
+      if (!existingColumns(table).has(column)) {
+        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+      }
+    }
+
+    for (const [column, definition] of [
+      ['role_affinity', 'TEXT'],
+      ['last_read_seq', 'INTEGER NOT NULL DEFAULT 0'],
+      ['turns_used', 'INTEGER NOT NULL DEFAULT 0'],
+      ['posts_count', 'INTEGER NOT NULL DEFAULT 0'],
+      ['peer_hops_used', 'INTEGER NOT NULL DEFAULT 0'],
+      ['active_assignment_id', 'TEXT'],
+      ['updated_at', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) {
+      ensureColumn('board_members', column, definition)
+    }
+    for (const [column, definition] of [
+      ['ref_fact_ids', "TEXT NOT NULL DEFAULT '[]'"],
+      ['ref_exchange_ids', "TEXT NOT NULL DEFAULT '[]'"],
+      ['ref_finding_ids', "TEXT NOT NULL DEFAULT '[]'"],
+      ['ref_step_id', 'TEXT'],
+      ['ref_approval_id', 'TEXT'],
+      ['reply_to_seq', 'INTEGER'],
+      ['tainted', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) {
+      ensureColumn('board_messages', column, definition)
+    }
+
+    // Backfill the deterministic system roster for runs created before v5 so an upgraded
+    // database renders a complete Board tab without mutating any existing evidence rows.
+    this.client.exec(`
+      INSERT OR IGNORE INTO board_members
+        (id, run_id, handle, role, session_id, state, scope_revision, goal_revision, source_origins, created_at, updated_at)
+      SELECT lower(hex(randomblob(16))), id, 'coordinator', 'coordinator', coordinator_id, 'waiting', scope_revision, goal_revision, '[]', created_at, created_at FROM runs;
+      INSERT OR IGNORE INTO board_members
+        (id, run_id, handle, role, session_id, state, scope_revision, goal_revision, source_origins, created_at, updated_at)
+      SELECT lower(hex(randomblob(16))), id, 'verifier', 'verifier', 'system:verifier', 'waiting', scope_revision, goal_revision, '[]', created_at, created_at FROM runs;
+      INSERT OR IGNORE INTO board_members
+        (id, run_id, handle, role, session_id, state, scope_revision, goal_revision, source_origins, created_at, updated_at)
+      SELECT lower(hex(randomblob(16))), id, 'broker', 'system', 'system:broker', 'waiting', scope_revision, goal_revision, '[]', created_at, created_at FROM runs;
+      INSERT OR IGNORE INTO board_members
+        (id, run_id, handle, role, session_id, state, scope_revision, goal_revision, source_origins, created_at, updated_at)
+      SELECT lower(hex(randomblob(16))), id, 'canary', 'system', 'system:canary', 'waiting', scope_revision, goal_revision, '[]', created_at, created_at FROM runs;
+    `)
+  }
+
   private initFts() {
     try {
       this.client.exec(`
@@ -644,8 +762,304 @@ export class Store {
     return id
   }
 
-  eventsAfter(runId: string, after: number, limit = 1000) {
-    return this.db.select({
+  // --- v5 Swarm Message Board ---
+
+  private approvedOriginsFor(run: Run): Set<string> {
+    const approved = new Set(run.approved)
+    return new Set(run.candidates.filter(candidate => approved.has(candidate.id)).map(candidate => candidate.origin))
+  }
+
+  boardMember(runId: string, handle: string): BoardMemberRow | undefined {
+    const normalized = normalizeBoardHandle(handle)
+    if (!normalized) return undefined
+    return this.db.select().from(tables.boardMembers).where(and(
+      eq(tables.boardMembers.runId, runId), eq(tables.boardMembers.handle, normalized),
+    )).get()
+  }
+
+  listBoardMembers(runId: string): BoardMemberRow[] {
+    return this.db.select().from(tables.boardMembers).where(eq(tables.boardMembers.runId, runId))
+      .orderBy(asc(tables.boardMembers.createdAt), asc(tables.boardMembers.handle)).all()
+  }
+
+  upsertBoardMember(runOrId: Run | string, input: {
+    handle: string
+    role: BoardMemberRole
+    specialistProfile?: SpecialistProfile | null
+    sessionId?: string
+    activeAssignmentId?: string | null
+    state?: BoardMemberState
+    roleAffinity?: BoardMemberRow['roleAffinity']
+    lastReadSeq?: number
+    turnsUsed?: number
+    postsCount?: number
+    peerHopsUsed?: number
+    scopeRevision?: number
+    goalRevision?: number
+    sourceOrigins?: readonly string[]
+  }): BoardMemberRow {
+    const run = typeof runOrId === 'string' ? this.run(runOrId) : runOrId
+    const handle = normalizeBoardHandle(input.handle)
+    if (!handle || !boardHandlePattern.test(handle)) {
+      throw new Error('Board handle must match ^[a-z][a-z0-9_-]{1,23}$.')
+    }
+    if (input.specialistProfile && !specialistProfiles.includes(input.specialistProfile)) {
+      throw new Error('Unknown specialist profile.')
+    }
+    const now = Date.now()
+    const existing = this.boardMember(run.id, handle)
+    const values = {
+      handle,
+      role: input.role,
+      specialistProfile: input.specialistProfile ?? existing?.specialistProfile ?? null,
+      sessionId: input.sessionId ?? existing?.sessionId ?? randomUUID(),
+      activeAssignmentId: input.activeAssignmentId !== undefined ? input.activeAssignmentId : existing?.activeAssignmentId ?? null,
+      state: input.state ?? existing?.state ?? 'waiting',
+      roleAffinity: input.roleAffinity !== undefined ? input.roleAffinity : existing?.roleAffinity ?? null,
+      lastReadSeq: Math.max(0, Math.round(input.lastReadSeq ?? existing?.lastReadSeq ?? 0)),
+      turnsUsed: Math.max(0, Math.round(input.turnsUsed ?? existing?.turnsUsed ?? 0)),
+      postsCount: Math.max(0, Math.round(input.postsCount ?? existing?.postsCount ?? 0)),
+      peerHopsUsed: Math.max(0, Math.round(input.peerHopsUsed ?? existing?.peerHopsUsed ?? 0)),
+      scopeRevision: Math.max(0, Math.round(input.scopeRevision ?? existing?.scopeRevision ?? run.scopeRevision)),
+      goalRevision: Math.max(0, Math.round(input.goalRevision ?? existing?.goalRevision ?? run.goalRevision)),
+      sourceOrigins: [...new Set(input.sourceOrigins ?? existing?.sourceOrigins ?? [])],
+    }
+    if (existing) {
+      return this.db.update(tables.boardMembers).set({ ...values, updatedAt: now })
+        .where(eq(tables.boardMembers.id, existing.id)).returning().get()!
+    }
+    return this.db.insert(tables.boardMembers).values({
+      id: randomUUID(), runId: run.id, ...values, createdAt: now, updatedAt: now,
+    }).returning().get()
+  }
+
+  updateBoardMemberState(runId: string, handle: string, patch: {
+    state?: BoardMemberState
+    activeAssignmentId?: string | null
+    lastReadSeq?: number
+    turnsUsed?: number
+    postsCount?: number
+    peerHopsUsed?: number
+    scopeRevision?: number
+    goalRevision?: number
+    roleAffinity?: BoardMemberRow['roleAffinity']
+    sourceOrigins?: readonly string[]
+    sessionId?: string
+  }): BoardMemberRow {
+    const existing = this.boardMember(runId, handle)
+    if (!existing) throw new Error('Board member not found.')
+    return this.upsertBoardMember(runId, {
+      handle: existing.handle,
+      role: existing.role,
+      specialistProfile: existing.specialistProfile,
+      sessionId: patch.sessionId ?? existing.sessionId,
+      activeAssignmentId: patch.activeAssignmentId !== undefined ? patch.activeAssignmentId : existing.activeAssignmentId,
+      state: patch.state ?? existing.state,
+      roleAffinity: patch.roleAffinity !== undefined ? patch.roleAffinity : existing.roleAffinity,
+      lastReadSeq: patch.lastReadSeq ?? existing.lastReadSeq,
+      turnsUsed: patch.turnsUsed ?? existing.turnsUsed,
+      postsCount: patch.postsCount ?? existing.postsCount,
+      peerHopsUsed: patch.peerHopsUsed ?? existing.peerHopsUsed,
+      scopeRevision: patch.scopeRevision ?? existing.scopeRevision,
+      goalRevision: patch.goalRevision ?? existing.goalRevision,
+      sourceOrigins: patch.sourceOrigins ?? existing.sourceOrigins,
+    })
+  }
+
+  retireBoardMember(run: Run | string, handle: string, reason: string): BoardMemberRow {
+    const resolved = typeof run === 'string' ? this.run(run) : run
+    const member = this.updateBoardMemberState(resolved.id, handle, { state: 'retired' })
+    this.event(resolved.id, 'board.member.retired', `@${member.handle} retired.`, {
+      handle: member.handle, reason, assignmentId: member.activeAssignmentId, scopeRevision: resolved.scopeRevision,
+    })
+    return member
+  }
+
+  private boardHandleAllowList(runId: string): Set<string> {
+    const handles = new Set<string>([...canonicalBoardHandles, ...boardSystemHandles])
+    for (const member of this.listBoardMembers(runId)) {
+      if (member.state === 'retired') handles.delete(member.handle)
+      else handles.add(member.handle)
+    }
+    return handles
+  }
+
+  /** Redact + cap + reject prompt-injection carriers before a board body reaches SQLite or SSE. */
+  private cleanBoardBody(body: string, secrets: readonly NamedSecret[]): string {
+    const trimmed = body.trim()
+    if (!trimmed) throw new Error('Board message body is required.')
+    if (/<\s*\/?\s*(?:script|iframe|object|embed|style|img|svg|a|div|span|table|form|input|link|meta|html|body|br|p|h[1-6])\b[^>]*>/i.test(trimmed)) {
+      throw new Error('Board messages cannot contain raw HTML or markup.')
+    }
+    const headerLines = trimmed.split('\n').filter(line =>
+      /^(?:host|user-agent|authorization|cookie|set-cookie|content-type|content-length|accept|referer|origin|x-[a-z0-9-]+):\s*\S/i.test(line.trim()))
+    if (headerLines.length >= 2) {
+      throw new Error('Board messages cannot contain multi-line HTTP header dumps. Reference an exchange instead.')
+    }
+    const cleaned = redact(trimmed, secrets).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    if (cleaned.length <= maxBoardBodyLength) return cleaned
+    return cleaned.slice(0, maxBoardBodyLength - 1) + '…'
+  }
+
+  postBoardMessage(runOrId: Run | string, input: {
+    authorHandle: string
+    authorRole: BoardAuthorRole
+    kind: BoardMessageKind
+    body: string
+    mentions?: readonly string[]
+    refFactIds?: readonly string[]
+    refExchangeIds?: readonly string[]
+    refFindingIds?: readonly string[]
+    refStepId?: string | null
+    refApprovalId?: string | null
+    replyToSeq?: number | null
+    sourceOrigins?: readonly string[]
+  }, secrets: readonly NamedSecret[] = []): BoardMessageRow {
+    const run = typeof runOrId === 'string' ? this.run(runOrId) : runOrId
+    const authorHandle = normalizeBoardHandle(input.authorHandle)
+    if (!authorHandle) throw new Error('Invalid board author handle.')
+    const roleHandles: Record<Exclude<BoardAuthorRole, 'specialist'>, readonly string[]> = {
+      operator: ['operator'],
+      coordinator: ['coordinator'],
+      verifier: ['verifier'],
+      system: ['broker', 'canary', 'system'],
+    }
+    if (input.authorRole === 'specialist') {
+      if (['operator', 'coordinator', 'verifier', 'broker', 'canary', 'system', 'all'].includes(authorHandle)) {
+        throw new Error('A specialist cannot post under a system actor handle.')
+      }
+    } else if (!roleHandles[input.authorRole].includes(authorHandle)) {
+      throw new Error(`@${authorHandle} cannot post with the ${input.authorRole} author role.`)
+    }
+    const allowed = this.boardHandleAllowList(run.id)
+    if (input.authorRole === 'specialist' && !allowed.has(authorHandle)) {
+      throw new Error(`Specialist @${authorHandle} is not on the active board roster.`)
+    }
+    const mentions = [...new Set((input.mentions ?? parseBoardMentions(input.body))
+      .map(mention => normalizeBoardHandle(mention))
+      .filter((h): h is string => Boolean(h)))]
+    for (const mention of mentions) {
+      if (mention === 'all') {
+        if (!['operator', 'coordinator', 'system'].includes(input.authorRole)) {
+          throw new Error('Only the operator, coordinator, or system actors may use @all.')
+        }
+        continue
+      }
+      if (!allowed.has(mention)) throw new Error(`Cannot mention unknown or retired board handle @${mention}.`)
+    }
+    const approvedOrigins = this.approvedOriginsFor(run)
+    const sourceOrigins = [...new Set(input.sourceOrigins ?? approvedOrigins)]
+    if (sourceOrigins.some(origin => !approvedOrigins.has(origin))) {
+      throw new Error('Board message references an origin outside approved scope.')
+    }
+    const body = this.cleanBoardBody(input.body, secrets)
+    if (input.replyToSeq !== undefined && input.replyToSeq !== null) {
+      const exists = this.db.select({ id: tables.boardMessages.id }).from(tables.boardMessages).where(and(
+        eq(tables.boardMessages.runId, run.id), eq(tables.boardMessages.seq, input.replyToSeq),
+      )).get()
+      if (!exists) throw new Error('Cannot reply to a board sequence that does not exist.')
+    }
+    const message = this.transaction(() => {
+      const maxSeq = this.db.select({ value: sql<number>`COALESCE(MAX(${tables.boardMessages.seq}), 0)` })
+        .from(tables.boardMessages).where(eq(tables.boardMessages.runId, run.id)).get()
+      const seq = Number(maxSeq?.value ?? 0) + 1
+      return this.db.insert(tables.boardMessages).values({
+        id: randomUUID(),
+        runId: run.id,
+        seq,
+        authorHandle,
+        authorRole: input.authorRole,
+        kind: input.kind,
+        mentions,
+        body,
+        refFactIds: [...new Set(input.refFactIds ?? [])].slice(0, 50),
+        refExchangeIds: [...new Set(input.refExchangeIds ?? [])].slice(0, 50),
+        refFindingIds: [...new Set(input.refFindingIds ?? [])].slice(0, 50),
+        refStepId: input.refStepId ?? null,
+        refApprovalId: input.refApprovalId ?? null,
+        replyToSeq: input.replyToSeq ?? null,
+        scopeRevision: run.scopeRevision,
+        goalRevision: run.goalRevision,
+        sourceOrigins,
+        tainted: false,
+        createdAt: Date.now(),
+      }).returning().get()
+    }, { behavior: 'immediate' })
+    const member = this.boardMember(run.id, authorHandle)
+    if (member) {
+      this.db.update(tables.boardMembers).set({ postsCount: member.postsCount + 1, updatedAt: Date.now() })
+        .where(eq(tables.boardMembers.id, member.id)).run()
+    }
+    this.event(run.id, 'board.message', `@${authorHandle} posted a ${input.kind}.`, {
+      boardMessageId: message.id, seq: message.seq, authorHandle, authorRole: input.authorRole,
+      kind: input.kind, mentions, refApprovalId: message.refApprovalId, tainted: false,
+    })
+    return message
+  }
+
+  listBoardMessages(runId: string, opts: {
+    sinceSeq?: number
+    limit?: number
+    includeTainted?: boolean
+    authorHandle?: string
+    kind?: BoardMessageKind
+    mentionHandle?: string
+    approvalId?: string
+  } = {}): BoardMessageRow[] {
+    const sinceSeq = Math.max(0, Math.round(opts.sinceSeq ?? 0))
+    const limit = Math.min(Math.max(1, opts.limit ?? 200), 500)
+    const authorHandle = opts.authorHandle ? normalizeBoardHandle(opts.authorHandle) : null
+    const mentionHandle = opts.mentionHandle ? normalizeBoardHandle(opts.mentionHandle) : null
+    return this.db.select().from(tables.boardMessages).where(and(
+      eq(tables.boardMessages.runId, runId),
+      gt(tables.boardMessages.seq, sinceSeq),
+      ...(opts.includeTainted ? [] : [eq(tables.boardMessages.tainted, false)]),
+      ...(opts.kind ? [eq(tables.boardMessages.kind, opts.kind)] : []),
+      ...(authorHandle ? [eq(tables.boardMessages.authorHandle, authorHandle)] : []),
+      ...(opts.approvalId ? [eq(tables.boardMessages.refApprovalId, opts.approvalId)] : []),
+    )).orderBy(asc(tables.boardMessages.seq)).all()
+      .filter(message => !mentionHandle || message.mentions.includes(mentionHandle))
+      .slice(0, limit)
+  }
+
+  /**
+   * Scope revocation: immediately taint board posts touching unapproved origins and retire the
+   * affected roster members so revoked-origin text can never reach a later specialist wake.
+   */
+  taintBoardMessagesForRevokedOrigins(runId: string, approvedOrigins: ReadonlySet<string>): {
+    taintedMessageIds: string[]
+    retiredHandles: string[]
+  } {
+    const taintedMessageIds: string[] = []
+    for (const message of this.db.select().from(tables.boardMessages).where(and(
+      eq(tables.boardMessages.runId, runId), eq(tables.boardMessages.tainted, false),
+    )).all()) {
+      if (message.sourceOrigins.some(origin => !approvedOrigins.has(origin))) {
+        taintedMessageIds.push(message.id)
+      }
+    }
+    if (taintedMessageIds.length) {
+      this.db.update(tables.boardMessages).set({ tainted: true }).where(and(
+        eq(tables.boardMessages.runId, runId), inArray(tables.boardMessages.id, taintedMessageIds),
+      )).run()
+    }
+    const retiredHandles: string[] = []
+    for (const member of this.listBoardMembers(runId)) {
+      if (member.state === 'retired') continue
+      if (member.sourceOrigins.some(origin => !approvedOrigins.has(origin))) {
+        this.updateBoardMemberState(runId, member.handle, { state: 'retired', activeAssignmentId: null })
+        retiredHandles.push(member.handle)
+      }
+    }
+    if (taintedMessageIds.length || retiredHandles.length) {
+      this.event(runId, 'board.tainted', 'Scope revocation tainted board messages and retired affected members.', {
+        taintedMessageIds, retiredHandles,
+      })
+    }
+    return { taintedMessageIds, retiredHandles }
+  }
+
+  eventsAfter(runId: string, after: number, limit = 1000) {    return this.db.select({
       id: tables.events.id, kind: tables.events.kind, message: tables.events.message,
       detail: tables.events.detail, createdAt: tables.events.createdAt,
     }).from(tables.events).where(and(
@@ -864,6 +1278,8 @@ export class Store {
       findings,
       messages: this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
         .orderBy(asc(tables.messages.createdAt), sql`${tables.messages}.rowid`).all(),
+      boardMembers: this.listBoardMembers(runId),
+      boardMessages: this.listBoardMessages(runId, { includeTainted: true, limit: 500 }),
       evidence: evidence.map(item => ({ ...item, title: evidenceTitle(run, item.kind, item.title) })),
       reports: this.db.select().from(tables.reports).where(eq(tables.reports.runId, runId))
         .orderBy(desc(tables.reports.version)).all(),
@@ -2455,6 +2871,20 @@ export class Store {
         approved: [],
         createdAt: Date.now(),
       }).returning().get()
+      for (const [handle, role] of [
+        ['coordinator', 'coordinator'],
+        ['verifier', 'verifier'],
+        ['broker', 'system'],
+        ['canary', 'system'],
+      ] as const) {
+        this.upsertBoardMember(run, {
+          handle,
+          role,
+          sessionId: handle === 'coordinator' ? run.coordinatorId : `system:${handle}`,
+          state: 'waiting',
+          sourceOrigins: [],
+        })
+      }
       this.event(run.id, 'run.created', 'Run created.', {
         capabilityTier,
         approvalPolicy: run.approvalPolicy,
@@ -2804,10 +3234,12 @@ export class Store {
       }
     }
 
+    const boardTaint = this.taintBoardMessagesForRevokedOrigins(run.id, approvedOrigins)
+
     if (taintedFactIds.length || taintedStepIds.length || canceledAssignmentIds.length) {
       this.event(run.id, 'scope.revoked',
-        `Scope revision ${scopeRevision} tainted ${taintedFactIds.length} facts, ${taintedStepIds.length} steps, and canceled ${canceledAssignmentIds.length} assignments.`,
-        { scopeRevision, taintedFactIds, taintedStepIds, canceledAssignmentIds })
+        `Scope revision ${scopeRevision} tainted ${taintedFactIds.length} facts, ${taintedStepIds.length} steps, ${boardTaint.taintedMessageIds.length} board posts, and canceled ${canceledAssignmentIds.length} assignments.`,
+        { scopeRevision, taintedFactIds, taintedStepIds, canceledAssignmentIds, ...boardTaint })
     }
   }
 
@@ -3208,6 +3640,22 @@ export class Store {
           this.revise(run, input.goal)
           break
         case 'message': {
+          // Mirror operator text onto the board (defaulting plain text to @coordinator) while
+          // keeping the legacy coordinator thread fully functional for v2–v4 compatibility.
+          try {
+            const allowed = this.boardHandleAllowList(run.id)
+            const parsed = parseBoardMentions(input.message).filter(handle => allowed.has(handle) || handle === 'all')
+            const targets = parsed.length ? parsed : ['coordinator']
+            this.postBoardMessage(run, {
+              authorHandle: 'operator',
+              authorRole: 'operator',
+              kind: targets.length === 1 && targets[0] === 'coordinator' ? 'note' : 'handoff',
+              body: input.message,
+              mentions: targets,
+            })
+          } catch {
+            // Board mirroring is advisory; legacy operator messaging must never regress.
+          }
           const questionId = this.message(run.id, run.coordinatorId, 'operator', input.message)
           this.event(run.id, 'coordinator.message', 'Coordinator message received.')
           if (run.status !== 'running') {
@@ -3221,6 +3669,31 @@ export class Store {
             this.message(run.id, run.coordinatorId, 'guardian',
               'This run needs a configured model profile. Open Settings to add a model profile.', questionId)
           }
+          break
+        }
+        case 'board_post': {
+          const allowed = this.boardHandleAllowList(run.id)
+          const parsed = [...new Set((input.mentions ?? parseBoardMentions(input.body))
+            .map(handle => normalizeBoardHandle(handle))
+            .filter((handle): handle is string => Boolean(handle)))]
+          const mentions = parsed.filter(handle => allowed.has(handle) || handle === 'all')
+          const rejected = parsed.filter(handle => !allowed.has(handle) && handle !== 'all')
+          if (rejected.length) throw new Error(`Cannot mention unknown board handle @${rejected[0]}.`)
+          this.postBoardMessage(run, {
+            authorHandle: 'operator',
+            authorRole: 'operator',
+            kind: input.kind ?? (mentions.some(handle => handle !== 'coordinator') ? 'handoff' : 'note'),
+            body: input.body,
+            mentions,
+            replyToSeq: input.replyToSeq ?? null,
+          })
+          break
+        }
+        case 'retire_member': {
+          const member = this.boardMember(run.id, input.handle)
+          if (!member) throw new Error('Board member not found.')
+          if (member.role === 'coordinator') throw new Error('The coordinator cannot be retired.')
+          this.retireBoardMember(run, member.handle, 'Retired by operator.')
           break
         }
         case 'inject_hint': {

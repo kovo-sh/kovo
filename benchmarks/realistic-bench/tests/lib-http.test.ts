@@ -4,6 +4,7 @@ import type { AddressInfo } from 'node:net'
 import type { Actor, PersonaId, PersonaCredential, VariantPlan } from '../lib/types.ts'
 import { createOracle, isFromInput, type Oracle } from '../lib/oracle.ts'
 import { createHttpApp, type HttpApp, type ResolveActor } from '../lib/http.ts'
+import { offOrigin } from '../lib/http-util.ts'
 import type { SessionRecord } from '../lib/http-session.ts'
 
 function personas(): Record<PersonaId, PersonaCredential> {
@@ -89,6 +90,19 @@ test('open_redirect only for input-derived off-origin location', async () => {
   const evs = oracle.events().filter((e) => e.kind === 'open_redirect')
   assert.equal(evs.length, before + 1)
   assert.equal(evs.at(-1)!.detail.location, 'https://evil.example/pwn')
+})
+
+test('offOrigin resolves targets the way a browser does (backslash, protocol-relative, schemes)', () => {
+  const host = '127.0.0.1:4321'
+  assert.equal(offOrigin('/api/me', host), false)
+  assert.equal(offOrigin('/api/me?next=https://x.test', host), false)
+  assert.equal(offOrigin('relative/path', host), false)
+  assert.equal(offOrigin('', host), false)
+  assert.equal(offOrigin('https://evil.example/x', host), true)
+  assert.equal(offOrigin('//evil.example/x', host), true)
+  assert.equal(offOrigin('https:evil.example/x', host), true)
+  assert.equal(offOrigin('/\\evil.example/x', host), true) // browsers fold `\` to `/`
+  assert.equal(offOrigin('\\\\evil.example/x', host), true)
 })
 
 test('session set/get round-trips; bogus cookie marks sessionLost', async () => {
