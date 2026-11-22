@@ -54,6 +54,8 @@ async function render(view) {
   if (view === 'reports') return renderReports()
   if (view === 'logs') return renderLogs()
   if (view === 'diagnostics') return renderDiagnostics()
+  if (view === 'webhooks') return renderWebhooks()
+  if (view === 'integrations') return renderIntegrations()
 }
 
 async function renderDashboard() {
@@ -122,6 +124,44 @@ async function renderDiagnostics() {
 function esc(v) {
   return String(v).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+}
+
+async function renderWebhooks() {
+  app.innerHTML = `
+    <section class="card">
+      <h1>Outbound webhooks</h1>
+      <label>Endpoint URL <input id="webhook-url" value="https://example.test/hook"></label>
+      <button id="webhook-save">Save target</button>
+      <p id="webhook-out" class="muted"></p>
+    </section>`
+  document.getElementById('webhook-save').addEventListener('click', async () => {
+    const field = (config.params && config.params.webhookUrl) || 'url'
+    const body = {}
+    body[field] = document.getElementById('webhook-url').value
+    const r = await api('webhookCreate', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+    document.getElementById('webhook-out').textContent = r.id ? `Saved ${r.id}` : (r.error || 'Save failed')
+  })
+}
+
+async function renderIntegrations() {
+  app.innerHTML = `
+    <section class="card">
+      <h1>Connector check</h1>
+      <label>Connector URL <input id="integration-url" value="https://example.test/status"></label>
+      <button id="integration-run">Test connection</button>
+      <p id="integration-out" class="muted"></p>
+    </section>`
+  document.getElementById('integration-run').addEventListener('click', async () => {
+    const field = (config.params && config.params.webhookUrl) || 'url'
+    const body = {}
+    body[field] = document.getElementById('integration-url').value
+    const r = await api('integrationFetch', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+    document.getElementById('integration-out').textContent = r.reachable ? 'Connector reachable' : 'Connector unavailable'
+  })
 }
 
 nav.addEventListener('click', (e) => {

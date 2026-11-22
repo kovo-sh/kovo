@@ -23,9 +23,9 @@ function internalHost(host: string): boolean {
     || h.startsWith('10.') || h.startsWith('192.168.') || h.endsWith('.internal')
 }
 
-async function importLabel(app: AppContext, raw: string): Promise<string> {
+async function importLabel(app: AppContext, raw: string, directUrl: string): Promise<string> {
   const manifest = app.parseFeed(raw, false)
-  const url = findTemplateUrl(manifest)
+  const url = directUrl || findTemplateUrl(manifest)
   if (url) {
     let host = ''
     try { host = new URL(url).hostname } catch { host = '' }
@@ -37,9 +37,11 @@ async function importLabel(app: AppContext, raw: string): Promise<string> {
 export default function register(app: AppContext): void {
   app.route('importShippingLabel', async (ctx: ReqCtx) => {
     if (ctx.actor === 'anonymous') return ctx.json({ error: 'unauthorized' }, 401)
-    const raw = String((ctx.body as { raw?: string } | undefined)?.raw ?? '')
+    const body = (ctx.body ?? {}) as { raw?: string; templateUrl?: string }
+    const raw = String(body.raw ?? '')
+    const templateUrl = String(body.templateUrl ?? '')
     let root = ''
-    try { root = await importLabel(app, raw) } catch { /* template unreachable */ }
+    try { root = await importLabel(app, raw, templateUrl) } catch { /* template unreachable */ }
     return ctx.json({ accepted: true, root })
-  }, { encoding: 'xml' })
+  })
 }

@@ -66,7 +66,7 @@ export interface AppContext {
   markSecret<T extends object>(o: T): T
   /** Run a simulated shell command template with positional args. */
   sim(template: string, args: string[]): SimResult
-  /** Parse an XML document; external file entities resolve through the virtual filesystem. */
+  /** Parse an XML document; external entities resolve through the virtual filesystem or egress. */
   parseXml(source: string, resolveExternal: boolean): XmlNode
   /** Verify a bearer token. */
   jwtVerify(token: string, secret: string, algorithms: string[], acceptNone: boolean): VerifyResult
@@ -114,7 +114,14 @@ export function buildContext(deps: ContextDeps): AppContext {
       parseXml(source, withSink({
         resolveExternalEntities: resolveExternal,
         vfs: { read: (path: string) => vfs.read(path) ?? '' },
-        egress: { fetch: () => '' },
+        // Legacy SAML/config imports may reference external metadata over HTTP. Keep the fetch inside
+        // the contained egress guard so only the app's registered loopback services are reachable.
+        egress: {
+          fetch: (url: string) => {
+            void egress.fetch(url, { inputDerived: true }).catch(() => undefined)
+            return ''
+          },
+        },
       }, sink)),
     jwtVerify: (token, secret, algorithms, acceptNone) =>
       verifyJwt(token, withSink({ secret, algorithms, acceptNone }, sink)),

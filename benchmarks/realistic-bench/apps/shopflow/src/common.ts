@@ -11,7 +11,7 @@ const UI_ROUTES = [
   'login', 'logout', 'session', 'csrfToken', 'listProducts', 'getProduct', 'searchProducts',
   'productReviews', 'submitReview', 'createCart', 'getCart', 'addCartItem', 'applyCoupon', 'checkout',
   'listGiftCards', 'listOrders', 'getOrder', 'getInvoice', 'moderationQueue', 'listPayments',
-  'createRefund', 'getSettings',
+  'createRefund', 'getSettings', 'importProductImage', 'importShippingLabel',
 ]
 
 export default function register(app: AppContext): void {
@@ -41,9 +41,16 @@ export default function register(app: AppContext): void {
   app.route('healthCheck', (ctx) => ctx.json({ status: 'ok', app: 'shopflow' }))
 
   app.route('appConfig', (ctx) => {
-    const routes: Record<string, string> = {}
-    for (const key of UI_ROUTES) if (plan.routes[key]) routes[key] = plan.routes[key]!.path
-    return ctx.json({ apiPrefix: plan.apiPrefix, routes })
+    const routes: Record<string, { method: string; path: string }> = {}
+    for (const key of UI_ROUTES) {
+      const route = plan.routes[key]
+      if (route) routes[key] = { method: route.method, path: route.path }
+    }
+    const params: Record<string, string> = {
+      imageUrl: 'imageUrl',
+      templateUrl: 'templateUrl',
+    }
+    return ctx.json({ apiPrefix: plan.apiPrefix, routes, params })
   })
 
   app.route('getSettings', (ctx) => {

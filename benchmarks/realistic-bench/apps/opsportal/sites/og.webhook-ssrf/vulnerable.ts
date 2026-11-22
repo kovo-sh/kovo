@@ -1,12 +1,19 @@
 // Webhook targets: operators register a delivery URL and can fire a one-off test delivery to confirm
-// the endpoint answers. Registration rejects the obvious loopback literal; the test delivery loads the
-// stored target and performs the server-side call.
+// the endpoint answers. Registration only rejects link-local/metadata hosts (the classic obvious
+// case) and the test delivery loads the stored target and performs the server-side call.
 import type { AppContext, ReqCtx } from '../../src/context.ts'
 
 interface TargetRow { url: string }
 
+function urlField(body: Record<string, unknown>, name: string): string {
+  return String(body[name] ?? body.url ?? body.endpoint ?? body.callbackUrl ?? '')
+}
+
 function blockedAtRegistration(url: string): boolean {
-  try { return new URL(url).hostname === '127.0.0.1' } catch { return true }
+  try {
+    const h = new URL(url).hostname.toLowerCase()
+    return h === 'metadata.google.internal' || h === 'metadata' || h.startsWith('169.254.')
+  } catch { return true }
 }
 
 export default function register(app: AppContext): void {
@@ -15,7 +22,7 @@ export default function register(app: AppContext): void {
 
   app.route('webhookCreate', (ctx: ReqCtx) => {
     if (ctx.actor === 'anonymous') return ctx.json({ error: 'auth_required' }, 401)
-    const url = String((ctx.body as Record<string, unknown>)[urlP] ?? '')
+    const url = urlField(ctx.body as Record<string, unknown>, urlP)
     if (!/^https?:\/\/\S+$/.test(url) || blockedAtRegistration(url)) return ctx.json({ error: 'invalid_url' }, 400)
     const res = app.run('INSERT INTO webhook_targets(team_id, name, url) VALUES (?,?,?)',
       [ctx.tenant, 'Test target', url])

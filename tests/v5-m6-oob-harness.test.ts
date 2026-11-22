@@ -16,7 +16,11 @@ import {
 import type { EngineModuleLike } from '../benchmarks/realistic-bench/guardian-adapter.ts'
 import { briefingFor, startRealisticApp } from '../benchmarks/realistic-bench/run.ts'
 import { loginPersonas } from '../benchmarks/realistic-bench/guardian-login.ts'
-import type { Briefing, StartedApp } from '../benchmarks/realistic-bench/lib/types.ts'
+import type { Briefing, SiteMode, StartedApp } from '../benchmarks/realistic-bench/lib/types.ts'
+import shopflow from '../benchmarks/realistic-bench/apps/shopflow/index.ts'
+import { blueprint as shopflowBlueprint } from '../benchmarks/realistic-bench/apps/shopflow/truth/blueprint.ts'
+import { generateVariant } from '../benchmarks/realistic-bench/generator/variant.ts'
+import { buildGroundTruth } from '../benchmarks/realistic-bench/generator/groundtruth.ts'
 
 function withLocalLab<T>(fn: () => Promise<T>): Promise<T> {
   const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
@@ -221,6 +225,139 @@ test('OOB wiring: adapter forwards the same broker and never serializes persona 
       assert.doesNotMatch(blob, new RegExp(sentinel), 'persona passwords must never reach result artefacts')
     } finally {
       rmSync(treeDir, { recursive: true, force: true })
+    }
+  })
+})
+
+async function startShopflowWithModes(seed: number, modes: Record<string, SiteMode>, oobPort: number): Promise<StartedApp> {
+  const plan = generateVariant(shopflowBlueprint, seed)
+  for (const [id, mode] of Object.entries(modes)) plan.sites[id] = mode
+  return shopflow.start({
+    plan,
+    groundTruth: buildGroundTruth(shopflowBlueprint, plan),
+    oobCallbackPorts: [oobPort],
+  })
+}
+
+function canaryApi(broker: unknown) {
+  return broker as {
+    mintCanary: (runId: string, label: string, origin?: string) => { token: string; httpUrl: string }
+    checkCanary: (token: string) => { hit: boolean }
+  }
+}
+
+test('app OOB realism: vulnerable SSRF/XXE twins reach the registered loopback port and fire the oracle', async () => {
+  await withLocalLab(async () => {
+    const oob = await startOobCanaryBroker()
+    let started: StartedApp | undefined
+    try {
+      started = await startShopflowWithModes(2, {
+        'product-image-ssrf': 'vulnerable',
+        'shipping-label-ssrf': 'vulnerable',
+        'product-feed-xxe': 'vulnerable',
+      }, oob.port)
+      const briefing = briefingFor(started, 'grey-box')
+      const persona = await loginPersona(started, briefing)
+      const headers = authHeaders(persona)
+      const broker = canaryApi(oob.broker)
+      const post = (path: string, body: string, extra: Record<string, string> = {}) =>
+        fetch(`${started!.origin}${path}`, { method: 'POST', headers: { ...headers, ...extra }, body })
+
+      const image = broker.mintCanary('app-oob', 'product-image')
+      const imagePath = started.plan.routes.importProductImage!.path.replace(/:[A-Za-z0-9_]+/, '1')
+      assert.equal((await post(imagePath, JSON.stringify({ imageUrl: image.httpUrl }))).status, 202)
+
+      const label = broker.mintCanary('app-oob', 'shipping-label')
+      const labelPath = started.plan.routes.importShippingLabel!.path
+      assert.equal((await post(labelPath, JSON.stringify({ templateUrl: label.httpUrl, raw: '' }))).status, 200)
+
+      const xxe = broker.mintCanary('app-oob', 'product-feed-xxe')
+      const xxePath = started.plan.routes.importProductFeed!.path
+      const xml = `<?xml version="1.0"?><!DOCTYPE root [<!ENTITY gxxe SYSTEM "${xxe.httpUrl}">]><root><note>&gxxe;</note></root>`
+      assert.equal((await post(xxePath, xml, { 'content-type': 'application/xml' })).status, 200)
+
+      await new Promise(resolve => setTimeout(resolve, 500))
+      assert.equal(broker.checkCanary(image.token).hit, true, 'product-image SSRF must reach the registered OOB port')
+      assert.equal(broker.checkCanary(label.token).hit, true, 'shipping-label SSRF must reach the registered OOB port')
+      assert.equal(broker.checkCanary(xxe.token).hit, true, 'product-feed XXE must reach the registered OOB port')
+      const events = started.oracle.events()
+      assert.ok(events.some(e => e.kind === 'ssrf_internal_fetch' && e.routeKey === 'importProductImage'))
+      assert.ok(events.some(e => e.kind === 'ssrf_internal_fetch' && e.routeKey === 'importShippingLabel'))
+      assert.ok(events.some(e => e.kind === 'xxe_entity_resolved' && e.routeKey === 'importProductFeed'))
+    } finally {
+      if (started) await started.stop()
+      await oob.stop().catch(() => undefined)
+    }
+  })
+})
+
+test('app OOB realism: opsportal saved webhook fetch fires from the ping trigger', async () => {
+  await withLocalLab(async () => {
+    const oob = await startOobCanaryBroker()
+    let started: StartedApp | undefined
+    try {
+      started = await startRealisticApp({ app: 'opsportal', seed: 2, oobCallbackPorts: [oob.port] })
+      const briefing = briefingFor(started, 'grey-box')
+      const persona = await loginPersona(started, briefing)
+      const headers = authHeaders(persona)
+      const broker = canaryApi(oob.broker)
+      const minted = broker.mintCanary('app-oob', 'webhook-ssrf')
+      const urlField = started.plan.params['webhookUrl'] ?? 'url'
+      const createPath = started.plan.routes['webhookCreate']!.path
+      const created = await fetch(`${started.origin}${createPath}`, {
+        method: 'POST', headers, body: JSON.stringify({ [urlField]: minted.httpUrl }),
+      })
+      assert.equal(created.status, 200)
+      const createdBody = await created.json() as { id?: string }
+      assert.ok(createdBody.id)
+      const triggerPath = started.plan.routes['webhookTest']!.path.replace(/:[A-Za-z0-9_]+/, encodeURIComponent(createdBody.id!))
+      assert.equal((await fetch(`${started.origin}${triggerPath}`, { method: 'POST', headers, body: '{}' })).status, 200)
+      await new Promise(resolve => setTimeout(resolve, 400))
+      assert.equal(broker.checkCanary(minted.token).hit, true)
+      assert.ok(started.oracle.events().some(e => e.kind === 'ssrf_internal_fetch' && e.routeKey === 'webhookTest'))
+    } finally {
+      if (started) await started.stop()
+      await oob.stop().catch(() => undefined)
+    }
+  })
+})
+
+test('app OOB realism: hardened SSRF/XXE twins stay silent on the same loopback callback', async () => {
+  await withLocalLab(async () => {
+    const oob = await startOobCanaryBroker()
+    let started: StartedApp | undefined
+    try {
+      started = await startShopflowWithModes(2, {
+        'product-image-ssrf': 'hardened',
+        'shipping-label-ssrf': 'hardened',
+        'product-feed-xxe': 'hardened',
+      }, oob.port)
+      const briefing = briefingFor(started, 'grey-box')
+      const persona = await loginPersona(started, briefing)
+      const headers = authHeaders(persona)
+      const broker = canaryApi(oob.broker)
+      const post = (path: string, body: string, extra: Record<string, string> = {}) =>
+        fetch(`${started!.origin}${path}`, { method: 'POST', headers: { ...headers, ...extra }, body })
+
+      const image = broker.mintCanary('app-oob', 'hardened-product-image')
+      const imagePath = started.plan.routes.importProductImage!.path.replace(/:[A-Za-z0-9_]+/, '1')
+      await post(imagePath, JSON.stringify({ imageUrl: image.httpUrl }))
+      const label = broker.mintCanary('app-oob', 'hardened-shipping-label')
+      await post(started.plan.routes.importShippingLabel!.path, JSON.stringify({ templateUrl: label.httpUrl, raw: '' }))
+      const xxe = broker.mintCanary('app-oob', 'hardened-xxe')
+      const xml = `<?xml version="1.0"?><!DOCTYPE root [<!ENTITY gxxe SYSTEM "${xxe.httpUrl}">]><root><note>&gxxe;</note></root>`
+      await post(started.plan.routes.importProductFeed!.path, xml, { 'content-type': 'application/xml' })
+
+      await new Promise(resolve => setTimeout(resolve, 400))
+      assert.equal(broker.checkCanary(image.token).hit, false)
+      assert.equal(broker.checkCanary(label.token).hit, false)
+      assert.equal(broker.checkCanary(xxe.token).hit, false)
+      const events = started.oracle.events()
+      assert.equal(events.filter(e => e.kind === 'ssrf_internal_fetch' || e.kind === 'xxe_entity_resolved').length, 0)
+      assert.equal(started.oracle.egress().filter(e => e.allowed).length, 0, 'hardened twins must not reach any egress target')
+    } finally {
+      if (started) await started.stop()
+      await oob.stop().catch(() => undefined)
     }
   })
 })

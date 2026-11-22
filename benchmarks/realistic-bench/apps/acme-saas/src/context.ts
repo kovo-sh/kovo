@@ -16,6 +16,7 @@ import type { Egress, InternalServiceRef } from '../../../lib/egress.ts'
 import type { IdCodec } from '../../../lib/ids.ts'
 import type { CanaryRegistry } from '../../../lib/canary.ts'
 import type { Handler, RouteOpts, HttpApp } from '../../../lib/http.ts'
+import type { XmlNode } from '../../../lib/xml.ts'
 
 export interface AppConfig {
   metadataOrigin: string // base origin of the internal metadata/service-discovery mock
@@ -33,6 +34,7 @@ export interface Wiring {
   verifyToken(token: string, acceptNone: boolean): { valid: boolean; payload?: unknown }
   verifyWebhook(secret: string, body: string, ts: string, sig: string): boolean
   simulate(template: string, args: string[]): { output: string; commands: string[] }
+  parseXml(source: string, external: boolean, vfs: Vfs, egress: Egress): XmlNode
 }
 
 export interface UserRow {
@@ -66,6 +68,8 @@ export interface AppContext {
   userForActor(actor: Actor | PersonaId | string): UserRow | undefined
   /** Fetch a tenant-scoped row by its external id from a table (undefined if absent). */
   byExternalId<T = Record<string, unknown>>(table: string, externalId: string): T | undefined
+  /** Parse an XML document; external entities resolve through the virtual filesystem/egress. */
+  parseXml(source: string, external: boolean): XmlNode
 }
 
 export interface BuildContextDeps {
@@ -97,6 +101,9 @@ export function buildContext(deps: BuildContextDeps): AppContext {
     },
     byExternalId(table, externalId) {
       return db.get(`SELECT * FROM ${table} WHERE external_id = ?`, [externalId]) as never
+    },
+    parseXml(source, external) {
+      return wiring.parseXml(source, external, vfs, egress)
     },
   }
 }

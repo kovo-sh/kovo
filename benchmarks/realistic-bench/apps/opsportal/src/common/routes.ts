@@ -6,7 +6,8 @@ import type { AppContext, ReqCtx } from '../context.ts'
 const UI_ROUTES = [
   'login', 'logout', 'me', 'csrf', 'dashboardSummary', 'graphql', 'ticketList', 'ticketView',
   'ticketNoteCreate', 'accountList', 'accountGet', 'reportList', 'reportRender', 'searchList',
-  'logList', 'logView', 'jobList', 'webhookList', 'integrationList', 'flagList', 'diagRun',
+  'logList', 'logView', 'jobList', 'webhookList', 'webhookCreate', 'webhookTest',
+  'integrationList', 'integrationFetch', 'flagList', 'diagRun',
 ]
 
 export function registerCommon(app: AppContext): void {
@@ -22,7 +23,9 @@ export function registerCommon(app: AppContext): void {
       if (r) routes[key] = { method: r.method, path: r.path }
     }
     const params: Record<string, string> = {}
-    for (const key of ['templateSrc', 'host', 'noteBody', 'searchQuery', 'logName']) params[key] = app.p(key)
+    for (const key of ['templateSrc', 'host', 'noteBody', 'searchQuery', 'logName', 'webhookUrl', 'webhookId']) {
+      if (app.plan.params[key]) params[key] = app.p(key)
+    }
     return ctx.json({ apiPrefix: app.plan.apiPrefix, idFormat: app.plan.idFormat, routes, params })
   })
 
