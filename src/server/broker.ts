@@ -241,6 +241,8 @@ export type Grant = {
   secrets?: readonly NamedSecret[]
   sandboxWriteAllowlist?: ApprovedEndpointPattern[]
   scopeRevision?: number
+  /** Explicit operator-approved non-default target ports (e.g. 8080/8443) for authorized staging origins. */
+  allowedPorts?: number[]
   storage?: SecondOrderStore
   canaryBroker?: CanaryBroker
   mintCanary?: (purpose: string, origin?: string) => { httpUrl?: string; url?: string } | null
@@ -284,11 +286,20 @@ export type BrokerOptions = {
   circuit5xxThreshold?: number
   circuit429Threshold?: number
   circuitWindowMs?: number
+  /** Half-open route cooldown in ms (clamped to 15–30s). Defaults to 15s. */
+  circuitCooldownMs?: number
   rejectUnauthorized?: boolean
   storage?: SecondOrderStore
   canaryBroker?: CanaryBroker
   maxJarsPerAssignment?: number
   maxCookiesPerJar?: number
+  /** Injectable clock (test-only) used by circuit-breaker accounting. */
+  now?: () => number
+  /**
+   * Rate-limited persona re-authentication invoked by the broker on a persona-bound 401.
+   * Returning true retries the request once with freshly resolved persona headers.
+   */
+  reauth?: (personaHandle: string, origin: string) => Promise<boolean | void>
 }
 
 const maxPathLength = 8192
@@ -313,7 +324,11 @@ const canaryUrlRegex = /^\/c\/guardian-canary-[a-f0-9]{24}$/i
 
 interface JarCookieEntry {
   key: string
+  /** Origin that issued the cookie. Host-only cookies are scoped strictly to it. */
   origin: string
+  /** RFC-6265 Domain scope (hostname). Equals the issuing hostname when host-only. */
+  domain: string
+  hostOnly: boolean
   name: string
   value: string
   path: string
@@ -321,13 +336,34 @@ interface JarCookieEntry {
   httpOnly: boolean
   sameSite: string | null
   expiresAt?: number
+  /** Epoch ms of the most recent Set-Cookie write for this jar entry. */
+  setAt: number
+  /**
+   * Number of Set-Cookie writes observed for this entry inside the current jar.
+   * `>= 2` marks an in-jar rotation, which is allowed to supersede a stale
+   * Persona Vault cookie (a single colliding write never may — that invariant
+   * prevents a target from hijacking the operator-approved credential).
+   */
+  writeCount: number
 }
 
 interface StoredCsrfToken {
   value: string
-  sourceKind: 'cookie' | 'meta' | 'hidden_input' | 'json'
+  sourceKind: 'cookie' | 'meta' | 'hidden_input' | 'json' | 'header' | 'vault_cookie'
   detectedName?: string
   updatedAt: number
+}
+
+/** Browser-safe projection of a jar cookie, used to mirror non-HttpOnly cookies into Playwright. */
+export interface BrowserMirrorCookie {
+  name: string
+  value: string
+  domain: string
+  path: string
+  secure: boolean
+  httpOnly: boolean
+  sameSite: 'Strict' | 'Lax' | 'None'
+  expires?: number
 }
 
 interface SessionJar {
@@ -357,6 +393,36 @@ function cookiePathMatches(requestPath: string, cookiePath: string): boolean {
   if (requestPath === cookiePath) return true
   const prefix = cookiePath.endsWith('/') ? cookiePath : `${cookiePath}/`
   return requestPath.startsWith(prefix)
+}
+
+/** RFC-6265 domain-match: host-only cookies require an exact issuing origin; Domain cookies match subdomains. */
+function cookieDomainMatches(entry: JarCookieEntry, url: URL): boolean {
+  if (entry.hostOnly) return entry.origin === url.origin
+  const host = url.hostname.toLowerCase()
+  return host === entry.domain || host.endsWith(`.${entry.domain}`)
+}
+
+/** URL-decode double-submit CSRF cookie values (e.g. `XSRF-TOKEN=abc%3D`) defensively. */
+function decodeCsrfValue(raw: string): string {
+  if (!raw.includes('%')) return raw
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
+}
+
+/** Path prefixes used to key CSRF tokens by `(origin, pathPrefix)` with origin fallback. */
+function csrfPathPrefixes(pathname: string): string[] {
+  const out: string[] = []
+  let cursor = pathname || '/'
+  for (;;) {
+    out.push(cursor)
+    if (cursor === '/' || cursor === '') break
+    const idx = cursor.lastIndexOf('/')
+    cursor = idx <= 0 ? '/' : cursor.slice(0, idx)
+  }
+  return out
 }
 
 function parseSetCookieHeaderEntries(
@@ -417,15 +483,25 @@ function parseSetCookieHeaderEntries(
         // Reject cross-origin Domain attribute
         continue
       }
+      // RFC-6265 §5.3 step 5: reject public-suffix / single-label Domain scopes
+      // (e.g. Domain=com). `localhost` stays valid for authorized local labs.
+      if (!domainAttr.includes('.') && domainAttr !== 'localhost') continue
     }
 
+    const hostOnly = !domainAttr
+    const domain = hostOnly ? requestUrl.hostname.toLowerCase() : domainAttr!
     const path = normalizeCookiePath(pathAttr, requestUrl.pathname)
-    const key = `${requestUrl.origin}\0${path}\0${name}`
+    // Host-only keys stay scoped to the issuing origin (port included); Domain keys are
+    // shared across in-scope subdomains (`app.` <-> `api.`) inside the same session jar.
+    const scopeKey = hostOnly ? `host:${requestUrl.origin}` : `domain:${domain}`
+    const key = `${scopeKey}\0${path}\0${name}`
     out.push({
       action: deleteCookie ? 'delete' : 'set',
       entry: {
         key,
         origin: requestUrl.origin,
+        domain,
+        hostOnly,
         name,
         value,
         path,
@@ -433,6 +509,8 @@ function parseSetCookieHeaderEntries(
         httpOnly,
         sameSite,
         expiresAt,
+        setAt: now,
+        writeCount: 0,
       },
     })
   }
@@ -758,13 +836,76 @@ function sessionCookiePolicy(headers: IncomingHttpHeaders): PublicObservation['s
   return 'insecure'
 }
 
-function safeUrl(url: URL, allowQuery: boolean, localLab: boolean): boolean {
+/**
+ * Non-default ports are refused on public targets unless the operator explicitly
+ * allowlists them (grant.allowedPorts) or exports GUARDIAN_ALLOWED_PORTS=8080,8443.
+ * This keeps the port invariant while permitting authorized staging origins.
+ */
+function operatorApprovedPorts(): number[] {
+  const raw = process.env.GUARDIAN_ALLOWED_PORTS
+  if (!raw) return []
+  const out: number[] = []
+  for (const part of raw.split(',')) {
+    const n = Number(part.trim())
+    if (Number.isInteger(n) && n > 0 && n <= 65535) out.push(n)
+  }
+  return out
+}
+
+function portAllowed(port: string, protocol: string, allowedPorts?: readonly number[]): boolean {
+  if (!port) return true
+  const defaultPort = protocol === 'https:' ? '443' : '80'
+  if (port === defaultPort) return true
+  const numeric = Number(port)
+  if (!Number.isInteger(numeric)) return false
+  return Boolean(allowedPorts?.includes(numeric)) || operatorApprovedPorts().includes(numeric)
+}
+
+function safeUrl(url: URL, allowQuery: boolean, localLab: boolean, allowedPorts?: readonly number[]): boolean {
   const validProtocol = url.protocol === 'https:' || (localLab && url.protocol === 'http:')
   if (!validProtocol || url.username || url.password || url.hash) return false
-  if (!localLab && url.port) return false
+  if (!localLab && !portAllowed(url.port, url.protocol, allowedPorts)) return false
   if (!allowQuery && !localLab && url.search) return false
   const full = url.pathname + url.search
   return full.length <= maxPathLength && !url.pathname.startsWith('//') && !/[\r\n\0]/.test(full)
+}
+
+const routeUuidSegment = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const routeNumericSegment = /^\d+$/
+const routeLongHexSegment = /^[0-9a-f]{16,}$/i
+const routePrefixedIdSegment = /^[a-z]{2,10}_[a-zA-Z0-9]{8,}$/
+const routeOpaqueSegment = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
+
+/** Stable `(origin, routeTemplate)` circuit key: dynamic path segments collapse to `*`. */
+export function routeTemplateForPath(pathname: string): string {
+  const segments = (pathname || '/').split('/')
+  const templated = segments.map((seg, idx) => {
+    if (idx === 0 || seg === '') return seg
+    if (
+      routeUuidSegment.test(seg) ||
+      routeNumericSegment.test(seg) ||
+      routeLongHexSegment.test(seg) ||
+      routePrefixedIdSegment.test(seg) ||
+      routeOpaqueSegment.test(seg)
+    ) {
+      return '*'
+    }
+    return seg.toLowerCase()
+  })
+  return templated.join('/') || '/'
+}
+
+function parseRetryAfterSeconds(headers: IncomingHttpHeaders | undefined): number | undefined {
+  const raw = headers?.['retry-after']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (!value) return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const asNumber = Number(trimmed)
+  if (Number.isFinite(asNumber) && asNumber >= 0) return Math.min(asNumber, 300)
+  const asDate = Date.parse(trimmed)
+  if (Number.isFinite(asDate)) return Math.min(Math.max(0, Math.ceil((asDate - Date.now()) / 1000)), 300)
+  return undefined
 }
 
 function encodeMultipartParts(parts: readonly BrokerMultipartPart[]): { contentType: string; body: string } {
@@ -1434,15 +1575,28 @@ type OriginHealth = {
   errors5xx: number[]
   errors429: number[]
   openReason?: string
+  openUntil?: number
   tokens: number
   lastRefill: number
   inFlight: number
   batchActive: boolean
+  /** Adaptive rate cap after 429 pressure; recovers toward the configured cap on healthy responses. */
+  adaptiveRps?: number
+  retryAfterUntil?: number
+}
+
+type RouteHealth = {
+  failures: number[]
+  openUntil?: number
+  cooldownMs: number
+  halfOpen: boolean
+  consecutiveOpens: number
 }
 
 export class RequestBroker {
   private readonly options: BrokerOptions
   private readonly origins = new Map<string, OriginHealth>()
+  private readonly routeCircuits = new Map<string, RouteHealth>()
   private readonly sessionJars = new Map<string, SessionJar>()
   private readonly redactedSecrets = new Map<string, NamedSecret>()
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
@@ -1505,10 +1659,20 @@ export class RequestBroker {
         this.sessionJars.delete(key)
         continue
       }
-      for (const [ck, c] of jar.cookies.entries()) {
-        if (c.origin === origin) jar.cookies.delete(ck)
+      let originHost = ''
+      try {
+        originHost = new URL(origin).hostname.toLowerCase()
+      } catch {
+        originHost = ''
       }
-      jar.csrfTokens.delete(origin)
+      for (const [ck, c] of jar.cookies.entries()) {
+        const domainScopedToOrigin = !c.hostOnly && originHost !== '' &&
+          (c.domain === originHost || originHost.endsWith(`.${c.domain}`))
+        if (c.origin === origin || domainScopedToOrigin) jar.cookies.delete(ck)
+      }
+      for (const tokenKey of [...jar.csrfTokens.keys()]) {
+        if (tokenKey.startsWith(`${origin}\0`) || tokenKey === origin) jar.csrfTokens.delete(tokenKey)
+      }
     }
   }
 
@@ -1533,7 +1697,7 @@ export class RequestBroker {
       return existing
     }
 
-    const maxJars = Math.max(1, Math.min(this.options.maxJarsPerAssignment ?? 4, 8))
+    const maxJars = Math.max(1, Math.min(this.options.maxJarsPerAssignment ?? 12, 12))
     const assignmentJars = [...this.sessionJars.values()].filter(j => j.assignmentKey === assignmentKey)
     if (assignmentJars.length >= maxJars) {
       assignmentJars.sort((a, b) => a.lastUsedAt - b.lastUsedAt)
@@ -1582,12 +1746,15 @@ export class RequestBroker {
   ) {
     const maxCookies = Math.max(1, Math.min(this.options.maxCookiesPerJar ?? 32, 64))
     const parsedEntries = parseSetCookieHeaderEntries(response.headers, url)
+    const csrfPathPrefix = normalizeCookiePath(undefined, url.pathname)
     for (const item of parsedEntries) {
       if (item.action === 'delete') {
         jar.cookies.delete(item.entry.key)
         continue
       }
-      if (jar.cookies.has(item.entry.key)) {
+      const existing = jar.cookies.get(item.entry.key)
+      item.entry.writeCount = (existing?.writeCount ?? 0) + 1
+      if (existing) {
         jar.cookies.delete(item.entry.key)
       } else if (jar.cookies.size >= maxCookies) {
         while (jar.cookies.size >= maxCookies) {
@@ -1600,8 +1767,8 @@ export class RequestBroker {
       this.registerSecret(`jar:${jar.session}:${item.entry.name}`, item.entry.value)
 
       if (csrfCookieNameRegex.test(item.entry.name) && item.entry.value) {
-        jar.csrfTokens.set(url.origin, {
-          value: item.entry.value,
+        jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
+          value: decodeCsrfValue(item.entry.value),
           sourceKind: 'cookie',
           detectedName: item.entry.name,
           updatedAt: Date.now(),
@@ -1609,14 +1776,87 @@ export class RequestBroker {
       }
     }
 
+    // Response-header CSRF sources (double-submit / Next.js / XSRF variants).
+    for (const headerName of ['x-csrf-token', 'x-xsrf-token', 'csrf-token', 'x-csrftoken']) {
+      const raw = response.headers[headerName]
+      const value = Array.isArray(raw) ? raw[0] : raw
+      if (!value || !value.trim()) continue
+      const token = decodeCsrfValue(value.trim())
+      this.registerSecret(`csrf:${jar.session}:${headerName}`, token)
+      jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
+        value: token,
+        sourceKind: 'header',
+        detectedName: headerName,
+        updatedAt: Date.now(),
+      })
+      break
+    }
+
     const bodyCsrf = extractCsrfFromBody(mediaType, response.body ?? '')
     if (bodyCsrf) {
       this.registerSecret(`csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`, bodyCsrf.value)
-      jar.csrfTokens.set(url.origin, {
+      jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
         ...bodyCsrf,
+        value: decodeCsrfValue(bodyCsrf.value),
         updatedAt: Date.now(),
       })
     }
+  }
+
+  /** Look up a CSRF token for a hop: `(origin, pathPrefix)` first, then most-recent origin fallback. */
+  private lookupCsrfToken(jar: SessionJar, url: URL): StoredCsrfToken | undefined {
+    for (const prefix of csrfPathPrefixes(url.pathname)) {
+      const hit = jar.csrfTokens.get(`${url.origin}\0${prefix}`)
+      if (hit) return hit
+    }
+    let latest: StoredCsrfToken | undefined
+    for (const [key, token] of jar.csrfTokens.entries()) {
+      if (!key.startsWith(`${url.origin}\0`)) continue
+      if (!latest || token.updatedAt > latest.updatedAt) latest = token
+    }
+    return latest
+  }
+
+  /** Internal helper for ScopedBrowser: non-HttpOnly jar cookies applicable to `origin` (never logged/serialized). */
+  sessionCookiesForBrowser(
+    scope: { session?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
+    origin: string,
+  ): BrowserMirrorCookie[] {
+    if (!scope.session) return []
+    const assignmentKey = `${scope.runId ?? 'default'}\0${scope.assignmentId ?? 'default'}`
+    const jarKey = `${assignmentKey}\0${scope.sessionGroupRole ?? 'default'}\0${scope.session}`
+    const jar = this.sessionJars.get(jarKey)
+    if (!jar) return []
+    let parsed: URL
+    try {
+      parsed = new URL('/', origin)
+    } catch {
+      return []
+    }
+    const now = Date.now()
+    const out: BrowserMirrorCookie[] = []
+    for (const entry of jar.cookies.values()) {
+      if (entry.httpOnly) continue
+      if (!cookieDomainMatches(entry, parsed)) continue
+      if (entry.expiresAt !== undefined && entry.expiresAt <= now) continue
+      if (entry.secure && parsed.protocol !== 'https:') continue
+      const sameSite = entry.sameSite?.toLowerCase()
+      out.push({
+        name: entry.name,
+        value: entry.value,
+        domain: entry.hostOnly ? parsed.hostname : entry.domain,
+        path: entry.path,
+        secure: entry.secure,
+        httpOnly: false,
+        sameSite: sameSite === 'strict' ? 'Strict' : sameSite === 'none' ? 'None' : 'Lax',
+        ...(entry.expiresAt !== undefined ? { expires: Math.floor(entry.expiresAt / 1000) } : {}),
+      })
+    }
+    return out
+  }
+
+  private now(): number {
+    return this.options.now ? this.options.now() : Date.now()
   }
 
   private health(origin: string, capacity = 5): OriginHealth {
@@ -1626,7 +1866,7 @@ export class RequestBroker {
         errors5xx: [],
         errors429: [],
         tokens: capacity,
-        lastRefill: Date.now(),
+        lastRefill: this.now(),
         inFlight: 0,
         batchActive: false,
       }
@@ -1635,8 +1875,31 @@ export class RequestBroker {
     return state
   }
 
+  /** Origin-wide circuit (connection resets/timeouts/global 502–504/429 exhaustion). */
   isCircuitOpen(origin: string): boolean {
-    return Boolean(this.origins.get(origin)?.openReason)
+    const state = this.origins.get(origin)
+    if (!state?.openReason) return false
+    if (state.openUntil !== undefined && this.now() >= state.openUntil) {
+      // Half-open: allow a single recovery probe by clearing the hard block.
+      state.openReason = undefined
+      state.openUntil = undefined
+      state.errors5xx = []
+      return false
+    }
+    return true
+  }
+
+  /** Route-scoped circuit for ordinary 5xx responses. */
+  isRouteCircuitOpen(origin: string, routeTemplate: string): boolean {
+    const key = `${origin}\0${routeTemplate}`
+    const route = this.routeCircuits.get(key)
+    if (!route?.openUntil) return false
+    if (this.now() >= route.openUntil) {
+      route.halfOpen = true
+      route.openUntil = undefined
+      return false
+    }
+    return true
   }
 
   resetCircuit(origin?: string) {
@@ -1646,9 +1909,77 @@ export class RequestBroker {
         h.errors5xx = []
         h.errors429 = []
         h.openReason = undefined
+        h.openUntil = undefined
+        h.retryAfterUntil = undefined
+        h.adaptiveRps = undefined
+      }
+      for (const key of [...this.routeCircuits.keys()]) {
+        if (key.startsWith(`${origin}\0`)) this.routeCircuits.delete(key)
       }
     } else {
       this.origins.clear()
+      this.routeCircuits.clear()
+    }
+  }
+
+  private cooldownMs(consecutiveOpens: number): number {
+    const base = Math.max(15_000, Math.min(this.options.circuitCooldownMs ?? 15_000, 30_000))
+    return Math.min(30_000, base * Math.max(1, Math.min(consecutiveOpens, 2)))
+  }
+
+  private assertRouteCircuit(origin: string, routeTemplate: string): void {
+    if (!this.isRouteCircuitOpen(origin, routeTemplate)) return
+    throw new BrokerCircuitOpen(
+      origin,
+      `Route ${routeTemplate} tripped its 5xx circuit; half-open retry pending.`,
+    )
+  }
+
+  private recordRouteStatus(origin: string, routeTemplate: string, status: number, audit: Grant['audit']) {
+    const key = `${origin}\0${routeTemplate}`
+    const now = this.now()
+    const windowMs = this.options.circuitWindowMs ?? 30_000
+    const threshold = this.options.circuit5xxThreshold ?? 5
+    let route = this.routeCircuits.get(key)
+    if (!route) {
+      route = { failures: [], cooldownMs: this.cooldownMs(1), halfOpen: false, consecutiveOpens: 0 }
+      this.routeCircuits.set(key, route)
+    }
+    if (status >= 500 && status <= 599) {
+      route.failures = route.failures.filter(ts => now - ts < windowMs)
+      route.failures.push(now)
+      if (route.halfOpen || route.failures.length >= threshold) {
+        route.consecutiveOpens += 1
+        route.cooldownMs = this.cooldownMs(route.consecutiveOpens)
+        route.openUntil = now + route.cooldownMs
+        route.halfOpen = false
+        route.failures = []
+        audit('circuit_open', origin, status)
+        throw new BrokerCircuitOpen(
+          origin,
+          `Route ${routeTemplate} observed ${threshold}+ HTTP 5xx responses; cooling down ${Math.round(route.cooldownMs / 1000)}s (half-open).`,
+        )
+      }
+    } else if (status < 500) {
+      // Healthy response: close a half-open route and decay the failure window.
+      route.failures = []
+      route.halfOpen = false
+      route.consecutiveOpens = 0
+    }
+  }
+
+  private recordTransportFailure(origin: string, audit: Grant['audit']) {
+    const state = this.health(origin)
+    const now = this.now()
+    const windowMs = this.options.circuitWindowMs ?? 30_000
+    const threshold = this.options.circuit5xxThreshold ?? 5
+    state.errors5xx = state.errors5xx.filter(ts => now - ts < windowMs)
+    state.errors5xx.push(now)
+    if (state.errors5xx.length >= threshold) {
+      state.openReason = `Observed ${state.errors5xx.length} connection resets/timeouts within ${Math.round(windowMs / 1000)}s.`
+      state.openUntil = now + this.cooldownMs(2)
+      audit('circuit_open', origin)
+      throw new BrokerCircuitOpen(origin, state.openReason)
     }
   }
 
@@ -1657,21 +1988,31 @@ export class RequestBroker {
     maxRps: number,
     signal: AbortSignal,
     bypassConcurrency = false,
+    routeTemplate?: string,
   ): Promise<() => void> {
-    const rps = Math.max(1, Math.min(20, maxRps))
-    const state = this.health(origin, rps)
-    if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
+    const configuredRps = Math.max(1, Math.min(20, maxRps))
+    const state = this.health(origin, configuredRps)
+    if (state.openReason && (!state.openUntil || this.now() < state.openUntil)) {
+      throw new BrokerCircuitOpen(origin, state.openReason)
+    }
+    if (!state.openReason) state.openUntil = undefined
+    if (routeTemplate) this.assertRouteCircuit(origin, routeTemplate)
 
     for (;;) {
       signal.throwIfAborted()
-      if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
+      if (state.openReason && (!state.openUntil || this.now() < state.openUntil)) {
+        throw new BrokerCircuitOpen(origin, state.openReason)
+      }
+      if (routeTemplate) this.assertRouteCircuit(origin, routeTemplate)
       const now = Date.now()
+      const rps = Math.max(1, Math.min(configuredRps, state.adaptiveRps ?? configuredRps))
       const elapsedSec = Math.max(0, (now - state.lastRefill) / 1000)
       state.tokens = Math.min(rps, state.tokens + elapsedSec * rps)
       state.lastRefill = now
 
+      const retryAfterWait = state.retryAfterUntil !== undefined ? state.retryAfterUntil - now : 0
       const concurrencyOk = bypassConcurrency || state.inFlight < 2
-      if (concurrencyOk && state.tokens >= 1) {
+      if (retryAfterWait <= 0 && concurrencyOk && state.tokens >= 1) {
         state.tokens -= 1
         state.inFlight += 1
         return () => {
@@ -1679,9 +2020,11 @@ export class RequestBroker {
         }
       }
 
-      const waitMs = state.tokens < 1
-        ? Math.min(250, Math.max(20, Math.ceil(((1 - state.tokens) / rps) * 1000)))
-        : 40
+      const waitMs = retryAfterWait > 0
+        ? Math.min(1_000, Math.max(50, retryAfterWait))
+        : state.tokens < 1
+          ? Math.min(250, Math.max(20, Math.ceil(((1 - state.tokens) / rps) * 1000)))
+          : 40
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
           signal.removeEventListener('abort', onAbort)
@@ -1696,27 +2039,73 @@ export class RequestBroker {
     }
   }
 
-  private recordStatus(origin: string, status: number, audit: Grant['audit']) {
-    const state = this.health(origin)
-    const now = Date.now()
+  private recordStatus(
+    origin: string,
+    status: number,
+    audit: Grant['audit'],
+    meta?: { routeTemplate?: string; headers?: IncomingHttpHeaders; configuredRps?: number },
+  ) {
+    const state = this.health(origin, meta?.configuredRps ?? 5)
+    const now = this.now()
     const windowMs = this.options.circuitWindowMs ?? 30_000
     const threshold5xx = this.options.circuit5xxThreshold ?? 5
     const threshold429 = this.options.circuit429Threshold ?? 8
     state.errors5xx = state.errors5xx.filter(ts => now - ts < windowMs)
     state.errors429 = state.errors429.filter(ts => now - ts < windowMs)
-    if (status >= 500 && status <= 599) {
-      state.errors5xx.push(now)
-      if (state.errors5xx.length >= threshold5xx) {
-        state.openReason = `Observed ${state.errors5xx.length} HTTP 5xx responses within ${Math.round(windowMs / 1000)}s.`
-        audit('circuit_open', origin, status)
-        throw new BrokerCircuitOpen(origin, state.openReason)
+
+    if (status === 429) {
+      const retryAfter = parseRetryAfterSeconds(meta?.headers)
+      if (retryAfter !== undefined && retryAfter > 0) {
+        state.retryAfterUntil = now + retryAfter * 1000
       }
-    } else if (status === 429) {
+      const configured = Math.max(1, meta?.configuredRps ?? 5)
+      state.adaptiveRps = Math.max(1, Math.floor((state.adaptiveRps ?? configured) / 2))
       state.errors429.push(now)
       if (state.errors429.length >= threshold429) {
         state.openReason = `Observed ${state.errors429.length} HTTP 429 rate-limit responses within ${Math.round(windowMs / 1000)}s.`
+        state.openUntil = now + this.cooldownMs(2)
         audit('circuit_open', origin, status)
         throw new BrokerCircuitOpen(origin, state.openReason)
+      }
+      return
+    }
+
+    // Global gateway/availability failures keep origin-wide protection.
+    if (status === 502 || status === 503 || status === 504) {
+      state.errors5xx.push(now)
+      if (state.errors5xx.length >= threshold5xx) {
+        state.openReason = `Observed ${state.errors5xx.length} HTTP ${status} responses within ${Math.round(windowMs / 1000)}s.`
+        state.openUntil = now + this.cooldownMs(2)
+        audit('circuit_open', origin, status)
+        throw new BrokerCircuitOpen(origin, state.openReason)
+      }
+      return
+    }
+
+    if (status >= 500 && status <= 599) {
+      const routeTemplate = meta?.routeTemplate ?? routeTemplateForPath('/')
+      this.recordRouteStatus(origin, routeTemplate, status, audit)
+      return
+    }
+
+    // Healthy response: recover an adaptive RPS cap toward the configured ceiling.
+    if (status < 400) {
+      const configured = Math.max(1, meta?.configuredRps ?? 5)
+      if (state.adaptiveRps !== undefined) {
+        state.adaptiveRps = Math.min(configured, state.adaptiveRps + 1)
+        if (state.adaptiveRps >= configured) state.adaptiveRps = undefined
+      }
+      if (state.retryAfterUntil !== undefined && now >= state.retryAfterUntil) state.retryAfterUntil = undefined
+    }
+
+    // Any non-5xx response from a route proves half-open recovery for that route only.
+    if (status < 500 && meta?.routeTemplate) {
+      const route = this.routeCircuits.get(`${origin}\0${meta.routeTemplate}`)
+      if (route) {
+        route.failures = []
+        route.halfOpen = false
+        route.consecutiveOpens = 0
+        route.openUntil = undefined
       }
     }
   }
@@ -1748,7 +2137,7 @@ export class RequestBroker {
     }
     const check = () => {
       deadline.throwIfAborted()
-      if (!safeUrl(url, false, localLab) || !grant.canRead(url.origin)) {
+      if (!safeUrl(url, false, localLab, grant.allowedPorts) || !grant.canRead(url.origin)) {
         deny('Destination is outside the current assignment scope.')
       }
     }
@@ -1756,7 +2145,7 @@ export class RequestBroker {
       check()
       const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin)
       check()
-      const release = await this.acquireSlot(url.origin, grant.maxRpsPerOrigin ?? 5, deadline)
+      const release = await this.acquireSlot(url.origin, grant.maxRpsPerOrigin ?? 5, deadline, false, routeTemplateForPath(url.pathname))
       let response: RawHttpResponse
       try {
         grant.audit('allowed', url.origin)
@@ -1769,7 +2158,11 @@ export class RequestBroker {
       }
       check()
       grant.audit('observed', url.origin, response.status)
-      this.recordStatus(url.origin, response.status, grant.audit)
+      this.recordStatus(url.origin, response.status, grant.audit, {
+        routeTemplate: routeTemplateForPath(url.pathname),
+        headers: response.headers,
+        configuredRps: grant.maxRpsPerOrigin ?? 5,
+      })
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         return observed(grant.origin, url, response, this.options.source ?? 'public response')
       }
@@ -1832,7 +2225,7 @@ export class RequestBroker {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Request path escaped the requested origin.')
     }
-    if (!safeUrl(url, true, localLab) || !grant.canRead(initialOrigin)) {
+    if (!safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(initialOrigin)) {
       this.purgeSessionJars(undefined, initialOrigin)
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Destination is outside the current assignment scope.')
@@ -2261,20 +2654,25 @@ export class RequestBroker {
     req: BrokerHttpRequest,
     grant: Grant,
     signal: AbortSignal,
-    options: { bypassConcurrency: boolean; preResolvedAddresses?: PublicAddress[] },
+    options: {
+      bypassConcurrency: boolean
+      preResolvedAddresses?: PublicAddress[]
+      reauthAttempted?: boolean
+      refreshedPersonaHeaders?: Record<string, string>
+    },
   ): Promise<BrokerExchangeResult> {
     await this.applyAuthMutationIfNeeded(prepared, req, grant, signal)
     const {
       initialOrigin,
       localLab,
       personaHandle,
-      resolvedPersonaHeaders,
       cleanHeaders,
       secrets,
       followRedirects,
       maxRps,
       timeoutMs,
     } = prepared
+    let personaHeaders = options.refreshedPersonaHeaders ?? prepared.resolvedPersonaHeaders
     let url = new URL(prepared.url.href)
     const jar = this.getOrCreateSessionJar(req, grant)
 
@@ -2285,7 +2683,7 @@ export class RequestBroker {
     const redirectOrigins = new Set<string>([url.origin])
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
-    let includePersona = Boolean(resolvedPersonaHeaders && Object.keys(resolvedPersonaHeaders).length > 0)
+    let includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
 
     const deny = (message: string): never => {
       grant.audit('denied', url.origin)
@@ -2293,7 +2691,7 @@ export class RequestBroker {
     }
     const check = () => {
       deadline.throwIfAborted()
-      if (!safeUrl(url, true, localLab) || !grant.canRead(url.origin)) {
+      if (!safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(url.origin)) {
         this.purgeSessionJars(undefined, url.origin)
         deny('Destination is outside the current assignment scope.')
       }
@@ -2315,8 +2713,8 @@ export class RequestBroker {
         ...cleanHeaders,
       }
       let personaCookieRaw: string | undefined
-      if (includePersona && resolvedPersonaHeaders) {
-        for (const [k, v] of Object.entries(resolvedPersonaHeaders)) {
+      if (includePersona && personaHeaders) {
+        for (const [k, v] of Object.entries(personaHeaders)) {
           if (k.toLowerCase() === 'cookie') {
             personaCookieRaw = v
           } else {
@@ -2329,25 +2727,33 @@ export class RequestBroker {
         outboundHeaders['X-Guardian-Trace-Id'] = req.traceId.slice(0, 128)
       }
 
-      // Merge session jar cookies with Persona Vault cookies (Persona Vault always takes strict precedence).
+      // Merge session jar cookies with Persona Vault cookies.
+      // Invariant: the Vault credential wins over a colliding jar cookie UNLESS the jar
+      // observed a genuine rotation (2+ Set-Cookie writes for that name), in which case
+      // the fresh rotated value supersedes the stale vault cookie.
       const mergedCookies = new Map<string, string>()
+      const jarCookieByName = new Map<string, JarCookieEntry>()
       if (jar) {
         const now = Date.now()
         for (const entry of jar.cookies.values()) {
-          if (entry.origin !== url.origin) continue
+          if (!cookieDomainMatches(entry, url)) continue
           if (entry.expiresAt !== undefined && entry.expiresAt <= now) continue
           if (entry.secure && url.protocol !== 'https:') continue
           if (!cookiePathMatches(url.pathname, entry.path)) continue
           const sameSiteLower = entry.sameSite?.toLowerCase()
           if (isCrossOriginHop && sameSiteLower === 'strict') continue
           if (isCrossOriginHop && sameSiteLower === 'lax' && activeMethod !== 'GET' && activeMethod !== 'HEAD') continue
-          mergedCookies.set(entry.name, entry.value)
+          jarCookieByName.set(entry.name, entry)
         }
       }
-      if (personaCookieRaw) {
-        for (const [k, v] of parseCookieHeaderPairs(personaCookieRaw).entries()) {
-          mergedCookies.set(k, v)
-        }
+      const vaultCookies = personaCookieRaw ? parseCookieHeaderPairs(personaCookieRaw) : new Map<string, string>()
+      for (const [name, entry] of jarCookieByName) {
+        if (!vaultCookies.has(name) || entry.writeCount > 1) mergedCookies.set(name, entry.value)
+      }
+      for (const [k, v] of vaultCookies) {
+        const jarEntry = jarCookieByName.get(k)
+        if (jarEntry && jarEntry.writeCount > 1) continue
+        mergedCookies.set(k, v)
       }
       if (mergedCookies.size > 0) {
         outboundHeaders.Cookie = [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
@@ -2355,6 +2761,7 @@ export class RequestBroker {
 
       // Automatic CSRF token binding (same-origin only)
       let hopBody = activeBody
+      let hopContentType: string | undefined
       let injectedCsrfHeaderName: string | undefined
       if (jar && req.csrfBind && !isCrossOriginHop) {
         const cfg = req.csrfBind === true ? {} : req.csrfBind
@@ -2363,14 +2770,14 @@ export class RequestBroker {
           const nowTs = Date.now()
           for (const entry of jar.cookies.values()) {
             if (
-              entry.origin === url.origin &&
+              cookieDomainMatches(entry, url) &&
               entry.name === cfg.cookieName &&
               cookiePathMatches(url.pathname, entry.path) &&
               !(entry.secure && url.protocol !== 'https:') &&
               !(entry.expiresAt !== undefined && entry.expiresAt <= nowTs)
             ) {
               csrfToken = {
-                value: entry.value,
+                value: decodeCsrfValue(entry.value),
                 sourceKind: 'cookie',
                 detectedName: entry.name,
                 updatedAt: nowTs,
@@ -2379,11 +2786,25 @@ export class RequestBroker {
             }
           }
         }
-        csrfToken ??= jar.csrfTokens.get(url.origin)
+        csrfToken ??= this.lookupCsrfToken(jar, url)
+        if (!csrfToken) {
+          // Fall back to a double-submit cookie supplied by the Persona Vault.
+          for (const [name, value] of vaultCookies) {
+            if (!csrfCookieNameRegex.test(name) || !value) continue
+            csrfToken = {
+              value: decodeCsrfValue(value),
+              sourceKind: 'vault_cookie',
+              detectedName: name,
+              updatedAt: Date.now(),
+            }
+            break
+          }
+        }
         if (csrfToken) {
           this.registerSecret(`csrf:${jar.session}:${csrfToken.detectedName ?? 'token'}`, csrfToken.value)
           const headerName = cfg.headerName ?? (
-            csrfToken.sourceKind === 'cookie' && csrfToken.detectedName?.toLowerCase() === 'xsrf-token'
+            (csrfToken.sourceKind === 'cookie' || csrfToken.sourceKind === 'vault_cookie') &&
+            csrfToken.detectedName?.toLowerCase() === 'xsrf-token'
               ? 'X-XSRF-TOKEN'
               : 'X-CSRF-Token'
           )
@@ -2416,12 +2837,30 @@ export class RequestBroker {
               } catch {
                 // Leave malformed JSON body untouched
               }
+            } else if (ct.includes('multipart/form-data') && req.multipartParts?.length) {
+              // Multipart CSRF injection: re-encode with an extra field part (deterministic boundary).
+              const fieldName = cfg.fieldName ?? csrfToken.detectedName ?? '_csrf'
+              if (!req.multipartParts.some(part => part.name === fieldName)) {
+                const encoded = encodeMultipartParts([
+                  ...req.multipartParts,
+                  { name: fieldName, contentType: 'text/plain', content: csrfToken.value },
+                ])
+                hopBody = encoded.body
+                hopContentType = encoded.contentType
+              }
             }
           }
         }
       }
+      if (hopContentType) {
+        for (const existingKey of Object.keys(outboundHeaders)) {
+          if (existingKey.toLowerCase() === 'content-type') delete outboundHeaders[existingKey]
+        }
+        outboundHeaders['Content-Type'] = hopContentType
+      }
 
-      const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency)
+      const hopRouteTemplate = routeTemplateForPath(url.pathname)
+      const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency, hopRouteTemplate)
       let response: RawHttpResponse
       try {
         grant.audit('allowed', url.origin)
@@ -2433,17 +2872,46 @@ export class RequestBroker {
           readBody: true,
           rejectUnauthorized: this.options.rejectUnauthorized ?? true,
         })
+      } catch (err) {
+        if (!deadline.aborted) this.recordTransportFailure(url.origin, grant.audit)
+        throw err
       } finally {
         release()
       }
       check()
       grant.audit('observed', url.origin, response.status)
-      this.recordStatus(url.origin, response.status, grant.audit)
+      this.recordStatus(url.origin, response.status, grant.audit, {
+        routeTemplate: hopRouteTemplate,
+        headers: response.headers,
+        configuredRps: maxRps,
+      })
 
       const requestOriginHeader = cleanHeaders['Origin'] ?? cleanHeaders['origin']
       const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
       if (jar) {
         this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType)
+      }
+
+      // 401 auto-refresh: invoke the rate-limited persona re-auth callback once, then retry.
+      if (
+        response.status === 401 &&
+        includePersona &&
+        personaHandle &&
+        !req.authMutation &&
+        !options.reauthAttempted &&
+        this.options.reauth &&
+        !deadline.aborted
+      ) {
+        const refreshed = await this.options.reauth(personaHandle, url.origin).catch(() => false)
+        if (refreshed !== false) {
+          const refreshedPersona = grant.personas?.get(personaHandle)
+          const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
+          return this.executePreparedHttp(prepared, req, grant, signal, {
+            ...options,
+            reauthAttempted: true,
+            ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
+          })
+        }
       }
 
       if (followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
@@ -2545,7 +3013,9 @@ export class RequestBroker {
         throw new BrokerDenied(`Origin ${origin} is outside the current assignment scope.`)
       }
       const state = this.health(origin, grant.maxRpsPerOrigin ?? 5)
-      if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
+      if (this.isCircuitOpen(origin)) {
+        throw new BrokerCircuitOpen(origin, state.openReason ?? 'Origin circuit is open.')
+      }
       if (state.batchActive) throw new BrokerDenied(`Another synchronized batch is already running for ${origin}.`)
       uniqueOrigins.add(origin)
     }
@@ -2766,7 +3236,7 @@ export class RequestBroker {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('WebSocket path is invalid or exceeds Guardian 8 KiB limit.')
     }
-    if (url.origin !== initialOrigin || !safeUrl(url, true, localLab) || !grant.canRead(initialOrigin)) {
+    if (url.origin !== initialOrigin || !safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(initialOrigin)) {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('WebSocket destination is outside the current assignment scope.')
     }
