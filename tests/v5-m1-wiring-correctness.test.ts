@@ -37,10 +37,11 @@ import {
   extractSpecDedupeFields,
 } from '../src/server/dedupe.ts'
 import { Execution } from '../src/server/execution.ts'
-import { buildInlineVerifyFeedback } from '../src/server/replay-verifier.ts'
+import { assessBflaImpact, buildInlineVerifyFeedback } from '../src/server/replay-verifier.ts'
 import type { BrokerExchangeResult } from '../src/server/broker.ts'
 import { loadSkill, listSkills, selectPreInjectionSkills } from '../src/server/skills.ts'
 import { Store } from '../src/server/store.ts'
+import { LinuxWorkerBackend, formatWorkerFailure } from '../src/server/worker-backend.ts'
 import type { Assignment, Run } from '../src/server/store.ts'
 import { setupApprovedRun, startHttpFixture, withEnv } from './v4-tier-helpers.ts'
 
@@ -920,4 +921,147 @@ test('M1 fallback: the agentic path is untouched when a model profile exists', a
   assert.equal(privateExec.deterministicInFlight.size, 0, 'profile-backed runs must not enter deterministic mode')
   assert.equal(privateExec.deterministicCompleted.size, 0)
   assert.equal(storage.workerList(runId).filter(w => w.title.includes('Deterministic differential probes')).length, 0)
+})
+
+// ============================================================================
+// Precision: vertical BFLA requires impact (not a read-only 2xx)
+// ============================================================================
+
+function bflaSpec(overrides: { cwe?: string; probeMethod?: string; titles?: string } = {}) {
+  return {
+    version: 1 as const,
+    kind: 'http_chain' as const,
+    origin: fakeOrigin,
+    title: overrides.titles ?? 'Viewer role can access admin endpoint',
+    category: 'broken-access-control',
+    cwe: overrides.cwe ?? 'CWE-285',
+    severity: 'high' as const,
+    severityRationale: 'A viewer reached a function reserved for administrators.',
+    impact: 'Vertical privilege escalation.',
+    remediation: 'Enforce a role/function authorization check before the handler runs.',
+    recheckInstructions: 'Replay the actor matrix after the fix.',
+    spaCatchallControl: false,
+    assertionsJq: '{ controlPassed: (.steps.ctrl.status == 200), confirmed: (.steps.prb.status == 200), observed: "ok", expected: "denied" }',
+    steps: [
+      { id: 'ctrl', role: 'control' as const, description: 'Admin call', request: { origin: fakeOrigin, method: 'GET' as const, pathAndQuery: '/api/admin/auditlogs', persona: 'admin', followRedirects: false } },
+      { id: 'prb', role: 'probe' as const, description: 'Viewer call', request: { origin: fakeOrigin, method: (overrides.probeMethod ?? 'GET') as 'GET', pathAndQuery: '/api/admin/auditlogs', persona: 'viewer', followRedirects: false } },
+    ],
+  }
+}
+
+test('M1 precision: read-only BFLA with only a 2xx cannot confirm (impact gate)', () => {
+  const spec = bflaSpec()
+  // Both admin and viewer are allowed to read this route (the reported false positive).
+  const flat = assessBflaImpact(spec, {
+    ctrl: { id: 'ctrl', role: 'control', status: 200, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"rows":[1,2,3,4,5,6,7,8]}' },
+    prb: { id: 'prb', role: 'probe', status: 200, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"rows":[1,2,3,4,5,6,7,8]}' },
+  })
+  assert.equal(flat.required, true)
+  assert.equal(flat.satisfied, false)
+  assert.match(flat.reason, /lacks impact evidence/i)
+})
+
+test('M1 precision: BFLA confirms with a denied sibling actor or a successful privileged mutation', () => {
+  const spec = bflaSpec()
+  const differential = assessBflaImpact(spec, {
+    ctrl: { id: 'ctrl', role: 'control', status: 403, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"error":"forbidden"}' },
+    prb: { id: 'prb', role: 'probe', status: 200, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"rows":[{"actor":"admin","action":"delete-user","target":"user-42"},{"actor":"admin","action":"rotate-key"}]}' },
+  })
+  assert.equal(differential.required, true)
+  assert.equal(differential.satisfied, true)
+  assert.match(differential.reason, /Role differential/i)
+
+  const mutatingSpec = {
+    ...bflaSpec({ probeMethod: 'DELETE', cwe: 'CWE-269' }),
+    assertionsJq: '{ controlPassed: (.steps.ctrl.status == 200), confirmed: (.steps.prb.status == 204), observed: "deleted", expected: "denied" }',
+  }
+  const mutation = assessBflaImpact(mutatingSpec as never, {
+    ctrl: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users' },
+    prb: { status: 204, method: 'DELETE', pathAndQuery: '/api/admin/users/42', body: '' },
+  })
+  assert.equal(mutation.required, true)
+  assert.equal(mutation.satisfied, true)
+  assert.match(mutation.reason, /mutating step/i)
+
+  const failedMutation = assessBflaImpact(mutatingSpec as never, {
+    ctrl: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users' },
+    prb: { status: 403, method: 'DELETE', pathAndQuery: '/api/admin/users/42', body: '{"error":"forbidden"}' },
+  })
+  assert.equal(failedMutation.satisfied, false)
+})
+
+test('M1 precision: object-level BOLA (CWE-639) is not gated by the BFLA impact rule', () => {
+  const bola = {
+    ...bflaSpec(),
+    cwe: 'CWE-639',
+    title: 'Cross-tenant invoice read',
+    impact: 'Horizontal data exposure.',
+  }
+  const assessment = assessBflaImpact(bola as never, {
+    ctrl: { status: 200, method: 'GET', pathAndQuery: '/api/invoices/1', body: '{"id":1}' },
+    prb: { status: 200, method: 'GET', pathAndQuery: '/api/invoices/1', body: '{"id":1}' },
+  })
+  assert.equal(assessment.required, false)
+  assert.equal(assessment.satisfied, true)
+})
+
+test('M1 precision: BFLA gate feeds the verdict and survives feedback enrichment', () => {
+  assert.ok(/const bflaImpact = assessBflaImpact\(spec, stepsOut\)/.test(
+    readFileSync(join(repoRoot, 'src/server/replay-verifier.ts'), 'utf8')))
+  assert.ok(/forcedInconclusiveReason = bflaImpact\.reason/.test(
+    readFileSync(join(repoRoot, 'src/server/replay-verifier.ts'), 'utf8')))
+  const feedback = buildInlineVerifyFeedback(
+    { kind: 'http_chain' },
+    {
+      verdict: 'inconclusive',
+      outcome: { confirmed: false, controlPassed: false, observed: 'viewer 200', expected: 'viewer denied', reason: 'Read-only BFLA proof lacks impact evidence.' },
+      exchangeIds: [],
+      exchanges: [],
+      evidencePayload: { kind: 'http_chain', bflaImpact: { required: true, satisfied: false, reason: 'lacks impact' } },
+      evidenceSha256: 'e',
+    },
+    1,
+    2,
+  )
+  assert.equal(feedback.bflaImpactRequired, true)
+  assert.equal(feedback.impactEvidenceMissing, true)
+})
+
+// ============================================================================
+// Worker reliability: real Docker cause surfaced + failed containers removed
+// ============================================================================
+
+test('M1 worker reliability: docker failures report the real cause and never the bare image hint', async (t) => {
+  const withDetail = formatWorkerFailure('docker: Error response from daemon: No such image: guardian-missing:v5\nsecond line', 125)
+  assert.match(withDetail, /No such image/)
+  assert.match(withDetail, /exit 125/)
+  assert.match(withDetail, /Build the local worker image/)
+  assert.ok(withDetail.length <= 520)
+  const bare = formatWorkerFailure('', 1)
+  assert.match(bare, /exit 1/)
+  assert.match(bare, /Build the local worker image/)
+
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-worker-'))
+  const storage = new Store(dir)
+  t.after(() => {
+    storage.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const backend = new LinuxWorkerBackend({
+    image: 'guardian-m1-missing-image:v5',
+    workspace: { id: storage.workspace.id, directory: storage.directory },
+  })
+  let message = ''
+  try {
+    await backend.run(
+      { assignmentId: randomUUID(), files: [], command: 'true', outputs: [] },
+      AbortSignal.timeout(30_000),
+    )
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error)
+  }
+  assert.ok(message.length > 0, 'a missing worker image must fail loudly')
+  assert.notEqual(message, 'The isolated worker failed. Build the local worker image and check Docker availability.')
+  assert.match(message, /isolated worker failed|Docker Unix socket|ENOENT|docker/i)
+  await backend.reclaimInactive().catch(() => undefined)
 })

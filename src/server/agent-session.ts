@@ -508,7 +508,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'request_http', 'request_http_batch', 'probe_differential', 'derive_evidence', 'run_sast_scan',
     ],
     skills: ['bola-idor-race', 'source-first-audit', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding with a multi-persona http_chain DeclarativeReplaySpec.',
+    focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding with a multi-persona http_chain DeclarativeReplaySpec. BFLA needs IMPACT: a 2xx from a lower-privileged actor on a read-only route is not escalation by itself - include a privileged mutation that succeeds (2xx) or a same-route role differential (one actor gets data, another is denied), otherwise the Zero-LLM verifier will dismiss it.',
   },
   'injection-parser-specialist': {
     id: 'injection-parser-specialist',

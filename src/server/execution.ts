@@ -694,8 +694,8 @@ function isSafeIdempotentPost(pathAndQuery: string, body?: string): boolean {
 /** Parameter names worth a differential SQL probe (generic, engine-level — not app-specific). */
 const DETERMINISTIC_PARAM_HINT_RE = /^(?:id|uuid|q|query|search|s|filter|sort|order|orderby|where|name|email|slug|path|file|url|uri|host|cmd|exec|template|view|lang|category|type|limit|offset|page|next|redirect|return)$/i
 const DETERMINISTIC_NUMERIC_PARAM_RE = /^(?:id|page|limit|offset|qty|quantity|amount|price|count|num|index)$/i
-const DETERMINISTIC_ID_SEGMENT_RE = /(?:\/:[a-z_][a-z0-9_]*|\{\{id\}\}|\/\[[^\]]+\]|\/\d{2,16}(?=\/|$)|\/[0-9a-f]{8}-[0-9a-f]{4}-)/i
-const DETERMINISTIC_PATH_PARAM_RE = /\/:[a-z_][a-z0-9_]*|\/\{\{id\}\}|\/\[[^\]]+\]/gi
+const DETERMINISTIC_ID_SEGMENT_RE = /(?:\/:[a-z_][a-z0-9_]*|\{\{id\}\}|\/[a-z_][a-z0-9_]*\}|\/\[[^\]]+\]|\/\d{2,16}(?=\/|$)|\/[0-9a-f]{8}-[0-9a-f]{4}-)/i
+const DETERMINISTIC_PATH_PARAM_RE = /\/:[a-z_][a-z0-9_]*|\/\{\{id\}\}|\/\{[a-z_][a-z0-9_]*\}|\/\[[^\]]+\]/gi
 
 function deterministicQueryParamNames(pathTemplate: string): string[] {
   const qIdx = pathTemplate.indexOf('?')
@@ -718,8 +718,63 @@ function deterministicIdPath(pathTemplate: string): string | null {
   return replaced.includes('{{id}}') ? replaced : null
 }
 
-/** Shared replay-spec boilerplate for deterministically synthesized specs. */
-function baseReplaySpecFields(
+/** Tolerant OpenAPI extraction for specs whose stored text is redacted or truncated. */
+function parseTolerantOpenApiTargets(
+  content: string,
+  defaultOrigin: string,
+  approvedOrigins: ReadonlySet<string>,
+): Array<{
+  origin: string
+  method: string
+  pathTemplate: string
+  riskScore: number
+  params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+}> {
+  const pathKeyRe = /"(\/[A-Za-z0-9_\-{}\/.:$\[\]]{0,200})"\s*:\s*\{/g
+  const matches = [...content.matchAll(pathKeyRe)]
+  if (!matches.length) return []
+  const out: Array<{
+    origin: string
+    method: string
+    pathTemplate: string
+    riskScore: number
+    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+  }> = []
+  for (let idx = 0; idx < matches.length; idx += 1) {
+    const match = matches[idx]
+    const pathTemplate = match[1]
+    if (!pathTemplate.startsWith('/')) continue
+    const start = (match.index ?? 0) + match[0].length
+    const end = idx + 1 < matches.length ? (matches[idx + 1].index ?? content.length) : content.length
+    const block = content.slice(start, end)
+    const methods = [...block.matchAll(/"(get|post|put|patch|delete)"\s*:\s*\{/g)].map(m => m[1].toUpperCase())
+    if (!methods.length) continue
+    const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
+    const paramRe = /"name"\s*:\s*"([A-Za-z0-9_.\-\[\]]{1,64})"[\s\S]{0,200}?"in"\s*:\s*"(query|path|header|formData|body)"/g
+    for (const param of block.matchAll(paramRe)) {
+      const location = param[2] === 'formData' ? 'form' : param[2] === 'body' ? 'json' : param[2] as 'query' | 'path' | 'header'
+      if (!params.some(p => p.name === param[1])) params.push({ name: param[1], location })
+    }
+    for (const matchPath of pathTemplate.matchAll(/\{([A-Za-z0-9_]+)\}/g)) {
+      if (!params.some(p => p.name === matchPath[1])) params.push({ name: matchPath[1], location: 'path' })
+    }
+    for (const method of methods) {
+      if (method === 'DELETE') continue
+      const hasInjectable = params.some(p => p.location === 'query' || p.location === 'json' || p.location === 'form')
+      if (!hasInjectable && !deterministicIdPath(pathTemplate)) continue
+      out.push({
+        origin: approvedOrigins.has(defaultOrigin) ? defaultOrigin : [...approvedOrigins][0],
+        method,
+        pathTemplate,
+        riskScore: hasInjectable ? 65 : 55,
+        params,
+      })
+    }
+  }
+  return out.slice(0, 60)
+}
+
+/** Shared replay-spec boilerplate for deterministically synthesized specs. */function baseReplaySpecFields(
   _run: Run,
   origin: string,
   overrides: {
@@ -1153,6 +1208,9 @@ export class Execution {
     if (specRow.spec.kind === 'static_ast_proof') return false
     if (findingRow.finding.codeLocations?.length) return true
     if (feedback?.canaryTriggered === true) return true
+    // A vertical-BFLA proof that only missed impact is repairable by adding a role-differential or
+    // mutation step, so it is worth one bounded Phase-3 reasoning pass.
+    if ((feedback as { impactEvidenceMissing?: boolean } | undefined)?.impactEvidenceMissing === true) return true
     const controlPassed = feedback?.controlPassed === true
     const differentialKinds = new Set([
       'sql_boolean_diff', 'sql_time_diff', 'cache_differential', 'auth_protocol_proof', 'rce_proof', 'race_burst',
@@ -2813,6 +2871,118 @@ export class Execution {
   }
 
   /**
+   * Parse imported OpenAPI/route-map project specs into bounded deterministic probe targets.
+   * Generic engine behavior: no app, route, or parameter hardcoding.
+   */
+  private deriveDeterministicRouteTargets(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    existing: ReadonlyArray<{ origin: string; method: string; pathTemplate: string }>,
+  ): Array<{
+    origin: string
+    method: string
+    pathTemplate: string
+    riskScore: number
+    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+  }> {
+    let specs: Array<{ name: string; kind: string; content: string }> = []
+    try {
+      specs = this.storage.listProjectSpecsFull(run.projectId)
+    } catch {
+      return []
+    }
+    const seen = new Set(existing.map(ep => `${ep.origin}|${ep.method.toUpperCase()}|${ep.pathTemplate}`))
+    const out: Array<{
+      origin: string
+      method: string
+      pathTemplate: string
+      riskScore: number
+      params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+    }> = []
+    const defaultOrigin = [...approvedOrigins][0]
+    const mapLocation = (value: unknown): 'query' | 'json' | 'form' | 'path' | 'header' | null => {
+      const raw = typeof value === 'string' ? value.toLowerCase() : ''
+      if (raw === 'query' || raw === 'path' || raw === 'header') return raw
+      if (raw === 'formdata' || raw === 'form') return 'form'
+      if (raw === 'body') return 'json'
+      return null
+    }
+
+    for (const spec of specs.slice(0, 6)) {
+      const head = spec.content.slice(0, 400)
+      if (!/openapi|swagger/i.test(spec.kind) && !/"(?:openapi|swagger)"\s*:/.test(head) && !/^\s*openapi\s*:/m.test(head)) continue
+      let doc: Record<string, unknown> | undefined
+      try {
+        doc = JSON.parse(spec.content) as Record<string, unknown>
+      } catch {
+        doc = undefined
+      }
+      const paths = (doc as { paths?: Record<string, unknown> } | undefined)?.paths
+      if (!paths || typeof paths !== 'object') {
+        // Tolerant fallback: imported specs can be redacted/truncated before storage, so the JSON
+        // may not parse. Extract path keys + methods + parameters textually instead of giving up.
+        for (const target of parseTolerantOpenApiTargets(spec.content, defaultOrigin, approvedOrigins)) {
+          const key = `${target.origin}|${target.method}|${target.pathTemplate}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          out.push(target)
+        }
+        continue
+      }
+
+      let origin = defaultOrigin
+      const servers = (doc as { servers?: Array<{ url?: unknown }> } | undefined)?.servers
+      if (Array.isArray(servers) && typeof servers[0]?.url === 'string') {
+        try {
+          const serverOrigin = new URL(servers[0].url, defaultOrigin).origin
+          if (approvedOrigins.has(serverOrigin)) origin = serverOrigin
+        } catch { /* keep default */ }
+      }
+
+      for (const [rawPath, rawItem] of Object.entries(paths).slice(0, 80)) {
+        if (typeof rawPath !== 'string' || !rawPath.startsWith('/') || rawPath.length > 300) continue
+        const item = rawItem as Record<string, unknown> | null
+        if (!item || typeof item !== 'object') continue
+        const sharedParams = Array.isArray(item.parameters) ? item.parameters as Array<Record<string, unknown>> : []
+        for (const method of ['get', 'post', 'put', 'patch'] as const) {
+          const op = item[method] as Record<string, unknown> | undefined
+          if (!op || typeof op !== 'object') continue
+          const key = `${origin}|${method.toUpperCase()}|${rawPath}`
+          if (seen.has(key)) continue
+          const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
+          const pushParam = (name: unknown, location: unknown) => {
+            const mapped = mapLocation(location)
+            if (typeof name !== 'string' || !name || !/^[A-Za-z0-9_.\-[\]]{1,64}$/.test(name)) return
+            if (!mapped) return
+            if (params.some(p => p.name === name)) return
+            params.push({ name, location: mapped })
+          }
+          for (const param of [...sharedParams, ...(Array.isArray(op.parameters) ? op.parameters as Array<Record<string, unknown>> : [])]) {
+            pushParam(param?.name, param?.in)
+          }
+          const jsonSchema = (op.requestBody as { content?: Record<string, { schema?: { properties?: Record<string, unknown> } }> } | undefined)
+            ?.content?.['application/json']?.schema
+          if (jsonSchema?.properties && typeof jsonSchema.properties === 'object') {
+            for (const name of Object.keys(jsonSchema.properties).slice(0, 12)) pushParam(name, 'body')
+          }
+          for (const match of rawPath.matchAll(/\{([A-Za-z0-9_]+)\}/g)) pushParam(match[1], 'path')
+          seen.add(key)
+          const hasInjectable = params.some(p => p.location === 'query' || p.location === 'json' || p.location === 'form')
+          if (!hasInjectable && !deterministicIdPath(rawPath)) continue
+          out.push({
+            origin,
+            method: method.toUpperCase(),
+            pathTemplate: rawPath,
+            riskScore: hasInjectable ? 65 : 55,
+            params,
+          })
+        }
+      }
+    }
+    return out.slice(0, 60)
+  }
+
+  /**
    * Bounded, tier/scope/budget-aware deterministic hypotheses for discovered endpoints. Used only
    * when the run has no model profile: it probes the highest-value discovered routes, records
    * facts, synthesizes DeclarativeReplaySpecs from differential anomalies, and lets the normal
@@ -2826,7 +2996,6 @@ export class Execution {
 
     const endpoints = this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 150 })
       .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE')
-    if (!endpoints.length) return
 
     const allParams = this.storage.listEndpointParams(current.id)
     const paramsByEndpoint = new Map<string, typeof allParams>()
@@ -2835,6 +3004,47 @@ export class Execution {
       list.push(param)
       paramsByEndpoint.set(param.endpointId, list)
     }
+
+    // Route-map/OpenAPI-derived entry routes: grey-box/white-box runs import API references, and
+    // phase-0 may not have materialized every path yet on this branch. Parsing them here keeps the
+    // deterministic baseline meaningful without depending on an LLM planner.
+    const derivedTargets = this.deriveDeterministicRouteTargets(current, approvedOrigins, endpoints)
+    const syntheticEndpoints = derivedTargets.map(target => ({
+      id: `derived:${target.method}:${target.pathTemplate}`,
+      runId: current.id,
+      scopeRevision: current.scopeRevision,
+      origin: target.origin,
+      method: target.method,
+      pathTemplate: target.pathTemplate,
+      source: 'openapi' as const,
+      framework: null,
+      authRequirement: null,
+      ownershipGuard: null,
+      sinkKinds: [] as string[],
+      testedClasses: [] as string[],
+      coveragePct: 0,
+      riskScore: target.riskScore,
+      codeLocation: null,
+      createdAt: current.createdAt,
+      updatedAt: current.createdAt,
+    }))
+    for (const [idx, target] of derivedTargets.entries()) {
+      const endpointId = syntheticEndpoints[idx].id
+      paramsByEndpoint.set(endpointId, target.params.map((param, paramIdx) => ({
+        id: `${endpointId}:p${paramIdx}`,
+        runId: current.id,
+        endpointId,
+        name: param.name,
+        location: param.location,
+        inferredType: null,
+        isCsrf: false,
+        isObjectId: /^(?:id|uuid|[a-z][a-z0-9]*Id)$/i.test(param.name),
+        source: 'openapi',
+        createdAt: current.createdAt,
+      })) as unknown as typeof allParams)
+    }
+    const probeEndpoints = [...endpoints, ...syntheticEndpoints]
+    if (!probeEndpoints.length) return
 
     const personas = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
     const personaHandles = personas.map(p => p.handle)
@@ -2848,35 +3058,37 @@ export class Execution {
         )
       : []
 
-    const ranked = endpoints
+    const injectableLocations = new Set(['query', 'json', 'form'])
+    const ranked = probeEndpoints
       .map(ep => {
         const epParams = paramsByEndpoint.get(ep.id) ?? []
-        const hinted = epParams.find(p => DETERMINISTIC_PARAM_HINT_RE.test(p.name)) ?? epParams[0]
+        const injectable = epParams
+          .filter(p => injectableLocations.has(p.location))
+          .sort((a, b) => Number(DETERMINISTIC_PARAM_HINT_RE.test(b.name)) - Number(DETERMINISTIC_PARAM_HINT_RE.test(a.name)))
+          .slice(0, 2)
         const queryNames = deterministicQueryParamNames(ep.pathTemplate)
-        const hintedQuery = queryNames.find(name => DETERMINISTIC_PARAM_HINT_RE.test(name)) ?? queryNames[0]
-        const paramName = hinted?.name ?? hintedQuery
-        const paramLocation = hinted?.location ?? (hintedQuery ? 'query' : undefined)
+        const paramCandidates = injectable.length
+          ? injectable.map(p => ({ name: p.name, location: p.location as 'query' | 'json' | 'form' }))
+          : queryNames.slice(0, 2).map(name => ({ name, location: 'query' as const }))
         const idPath = deterministicIdPath(ep.pathTemplate)
         const originResources = resourceQueue.filter(item => item.origin === ep.origin)
         let score = ep.riskScore
-        if (paramName) score += 25
-        if (idPath) score += 20
+        if (paramCandidates.length) score += 25
+        if (idPath) score += 12
         if ((ep.sinkKinds ?? []).length > 0) score += 10
         if (originResources.length > 0) score += 15
-        return { ep, paramName, paramLocation, idPath, originResources, score }
+        // Prefer routes with injectable parameters before path-only id routes.
+        if (!paramCandidates.length && !idPath) score -= 20
+        return { ep, paramCandidates, idPath, originResources, score }
       })
-      .filter(item =>
-        Boolean(item.paramName) ||
-        (item.idPath !== null && tier >= 2 && item.originResources.length > 0),
-      )
       .sort((a, b) => b.score - a.score)
 
     if (!ranked.length) return
 
-    const maxEndpoints = Math.min(14, Math.max(4, Math.floor((current.dynamicStepBudget ?? 24) / 2)))
+    const maxEndpoints = Math.min(18, Math.max(4, Math.floor((current.dynamicStepBudget ?? 24) * 0.75)))
     const requestCap = current.budgetRequests > 0
-      ? Math.max(0, Math.min(80, current.budgetRequests - current.spentRequests))
-      : 80
+      ? Math.max(0, Math.min(160, current.budgetRequests - current.spentRequests))
+      : 160
     if (requestCap < 6) return
 
     const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
@@ -2896,7 +3108,7 @@ export class Execution {
       leaseExpiresAt: Date.now() + 10 * 60_000,
     }) ?? worker
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
-    const { grant, secrets, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
+    const { grant, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
 
     const recordExchange = (ex: BrokerExchangeResult) => {
       const latest = this.storage.run(current.id)
@@ -3019,19 +3231,46 @@ export class Execution {
           }
         }
 
-        // 2) SQL injection differential on a parameterized route (non-destructive boolean/error only).
-        if (item.paramName) {
-          const location = item.paramLocation ?? 'query'
-          if (location === 'cookie') continue
+        // 2) SQL injection differential on parameterized routes (non-destructive boolean/error only).
+        // When recon did not persist parameters, discover them first with the deterministic
+        // param-differential surface mode (bounded), then inject into the discovered names.
+        let candidateParams: Array<{ name: string; location: 'query' | 'json' | 'form' }> = item.paramCandidates
+        if (!candidateParams.length && item.ep.method !== 'DELETE' && requestsUsed < requestCap - 6) {
+          try {
+            const discovery = await probeSurface({
+              origin: item.ep.origin,
+              mode: 'params',
+              basePath: item.ep.pathTemplate.split('?')[0],
+              paramLocation: 'query',
+              methods: ['GET'],
+              persona: personaHandles[0],
+              maxRequests: Math.max(4, Math.min(12, requestCap - requestsUsed - 4)),
+              onExchange: recordExchange,
+            }, this.broker, grant, signal)
+            requestsUsed += discovery.requestsSent
+            const discovered = [...new Set(
+              discovery.anomalies
+                .filter(a => a.kind === 'param' && typeof a.param === 'string')
+                .map(a => String(a.param)),
+            )].slice(0, 2)
+            candidateParams = discovered.map(name => ({ name, location: 'query' as const }))
+          } catch (error) {
+            if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
+          }
+        }
+
+        for (const candidate of candidateParams.slice(0, 2)) {
+          if (requestsUsed >= requestCap || signal.aborted) break
+          const location = candidate.location
           const method = item.ep.method === 'POST' ? 'POST' : 'GET'
           if (method === 'POST' && !['query', 'json', 'form'].includes(location)) continue
-          const baselineValue = DETERMINISTIC_NUMERIC_PARAM_RE.test(item.paramName) ? '1' : 'guardian'
-          const quoteStyle: 'single' | 'double' | 'numeric' = DETERMINISTIC_NUMERIC_PARAM_RE.test(item.paramName) ? 'numeric' : 'single'
+          const baselineValue = DETERMINISTIC_NUMERIC_PARAM_RE.test(candidate.name) ? '1' : 'guardian'
+          const quoteStyle: 'single' | 'double' | 'numeric' = DETERMINISTIC_NUMERIC_PARAM_RE.test(candidate.name) ? 'numeric' : 'single'
           const pathAndQuery = location === 'query'
-            ? withQueryParam(item.ep.pathTemplate, item.paramName, baselineValue)
+            ? withQueryParam(item.ep.pathTemplate, candidate.name, baselineValue)
             : item.ep.pathTemplate.split('?')[0]
           const jsonBody = method === 'POST' && location === 'json'
-            ? { [item.paramName]: baselineValue }
+            ? { [candidate.name]: baselineValue }
             : undefined
           let outcome
           try {
@@ -3040,7 +3279,7 @@ export class Execution {
               probeClass: 'sqli_boolean',
               method,
               pathAndQuery,
-              param: item.paramName,
+              param: candidate.name,
               paramLocation: location,
               baselineValue,
               ...(jsonBody ? { jsonBody } : {}),
@@ -3062,11 +3301,11 @@ export class Execution {
             asset,
             spec: {
               ...baseReplaySpecFields(latest, item.ep.origin, {
-                title: `SQL parameterization differential · ${method} ${item.ep.pathTemplate.slice(0, 80)} (${item.paramName})`,
+                title: `SQL parameterization differential · ${method} ${item.ep.pathTemplate.slice(0, 80)} (${candidate.name})`,
                 category: 'injection-input',
                 cwe: 'CWE-89',
                 severity: 'high',
-                severityRationale: `Deterministic ${booleanSignal ? 'boolean differential' : 'SQL error fingerprint'} observed on parameter "${item.paramName}"${dialect ? ` (${dialect})` : ''}.`,
+                severityRationale: `Deterministic ${booleanSignal ? 'boolean differential' : 'SQL error fingerprint'} observed on parameter "${candidate.name}"${dialect ? ` (${dialect})` : ''}.`,
                 impact: 'Unparameterized SQL handling allows boolean/oracle-based data inference.',
                 remediation: 'Bind the parameter with the ORM/query parameterizer and remove string interpolation.',
                 recheckInstructions: 'Replay the boolean differential after switching to a bound parameter.',
@@ -3075,7 +3314,7 @@ export class Execution {
               targetOrigin: item.ep.origin,
               method,
               pathAndQuery,
-              paramName: item.paramName,
+              paramName: candidate.name,
               paramLocation: location,
               baselineValue,
               quoteStyle,
@@ -3086,13 +3325,13 @@ export class Execution {
               subkind: 'differential_anomaly',
               probeClass: 'sqli_boolean',
               endpoint: item.ep.pathTemplate,
-              param: item.paramName,
+              param: candidate.name,
               paramLocation: location,
               method,
               dialect,
               anomalies: outcome.anomalies.slice(0, 5),
             },
-            factSummary: `Deterministic sqli_boolean signal on ${method} ${item.ep.pathTemplate} parameter "${item.paramName}"${dialect ? ` (${dialect} error fingerprint)` : ''}.`,
+            factSummary: `Deterministic sqli_boolean signal on ${method} ${item.ep.pathTemplate} parameter "${candidate.name}"${dialect ? ` (${dialect} error fingerprint)` : ''}.`,
             exchangeIds: outcome.exchangeIds,
             secrets: currentSecrets(),
           })

@@ -153,8 +153,106 @@ function extractVariables(step: ReplayStep, exchange: BrokerExchangeResult, vars
   }
 }
 
-function summarizeExchange(ex: BrokerExchangeResult) {
-  let json: unknown = null
+const BFLA_CWE_RE = /^CWE-(?:285|269|862|863)$/i
+const BFLA_TEXT_RE = /\b(?:bfla|broken function[- ]level|function[- ]level|privilege escalation|vertical access)\b/i
+const READ_ONLY_REPLAY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const MUTATING_REPLAY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+export interface BflaImpactAssessment {
+  required: boolean
+  satisfied: boolean
+  reason: string
+}
+
+function readStepField(entry: Record<string, unknown> | undefined, key: string): unknown {
+  return entry && typeof entry === 'object' ? entry[key] : undefined
+}
+
+function normalizedReplayPath(value: string | undefined): string {
+  if (!value) return ''
+  return value.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/'
+}
+
+/**
+ * Vertical (function-level) BFLA needs *impact*, not just a 2xx from a lower-privileged actor.
+ * A read-only route that every authenticated role may legitimately read must never confirm as
+ * privilege escalation: the deterministic replay has to show either a successful privileged
+ * mutation or a same-route role differential (one actor 2xx with real data, another actor denied).
+ * Object-level BOLA (CWE-639) is intentionally unaffected.
+ */
+export function assessBflaImpact(
+  spec: DeclarativeReplaySpec,
+  stepsOut: Record<string, unknown>,
+): BflaImpactAssessment {
+  if (spec.kind !== 'http_chain') {
+    return { required: false, satisfied: true, reason: 'Not an HTTP chain replay spec.' }
+  }
+  const descriptor = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact} ${spec.severityRationale}`
+  const vertical = BFLA_CWE_RE.test(spec.cwe) || BFLA_TEXT_RE.test(descriptor)
+  if (!vertical || spec.steps.length < 2) {
+    return { required: false, satisfied: true, reason: 'Not a function-level BFLA proof.' }
+  }
+
+  const steps = spec.steps.map(step => {
+    const entry = stepsOut[step.id] as Record<string, unknown> | undefined
+    const status = readStepField(entry, 'status')
+    const body = readStepField(entry, 'body')
+    return {
+      id: step.id,
+      role: step.role,
+      method: step.request.method.toUpperCase(),
+      persona: step.request.persona ?? null,
+      path: normalizedReplayPath(step.request.pathAndQuery),
+      status: typeof status === 'number' ? status : null,
+      bodyBytes: typeof body === 'string' ? body.length : 0,
+    }
+  })
+
+  const mutating = steps.filter(step => MUTATING_REPLAY_METHODS.has(step.method))
+  if (mutating.length > 0) {
+    const succeeded = mutating.find(step => step.status !== null && step.status >= 200 && step.status < 300)
+    if (succeeded) {
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Privileged mutating step "${succeeded.id}" returned HTTP ${succeeded.status}.`,
+      }
+    }
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'BFLA mutating step did not succeed, so no privileged side effect was demonstrated.',
+    }
+  }
+
+  if (!steps.every(step => READ_ONLY_REPLAY_METHODS.has(step.method))) {
+    return { required: true, satisfied: false, reason: 'BFLA proof used a non-read method without a 2xx mutation.' }
+  }
+
+  // Same-route role differential: a different actor is denied while the probe actor receives data.
+  for (const probe of steps) {
+    if (probe.status === null || probe.status < 200 || probe.status >= 300 || probe.bodyBytes < 64) continue
+    for (const other of steps) {
+      if (other.id === probe.id) continue
+      if (other.path !== probe.path) continue
+      if (other.status === null || other.status < 400) continue
+      if (other.persona === probe.persona && other.role === probe.role) continue
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Role differential: "${probe.id}" (${probe.persona ?? 'anonymous'}) received HTTP ${probe.status} while "${other.id}" (${other.persona ?? 'anonymous'}) was denied with HTTP ${other.status}.`,
+      }
+    }
+  }
+
+  return {
+    required: true,
+    satisfied: false,
+    reason: 'Read-only BFLA proof lacks impact evidence: a 2xx from one actor on a read-only route is not privilege escalation unless another actor is denied on the same route or the response exposes data the actor cannot otherwise access. Add a same-route role-differential or a privileged mutation step.',
+  }
+}
+
+function summarizeExchange(ex: BrokerExchangeResult) {  let json: unknown = null
   if (ex.mediaType.includes('json')) {
     try { json = JSON.parse(ex.body) } catch { json = null }
   }
@@ -655,6 +753,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           }
         }
 
+        const bflaImpact = assessBflaImpact(spec, stepsOut)
         evidencePayload = {
           ...evidencePayload,
           steps: stepsOut,
@@ -663,6 +762,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           extractedVars: vars,
           ...(canaryEvidence ?? {}),
           ...(spaCatchall ? { spaCatchall } : {}),
+          bflaImpact,
+        }
+        if (bflaImpact.required && !bflaImpact.satisfied && !forcedInconclusiveReason) {
+          forcedInconclusiveReason = bflaImpact.reason
         }
       } finally {
         await canarySession?.close()
@@ -2190,6 +2293,9 @@ export interface EnrichedInlineVerifyFeedback extends InlineVerifyFeedback {
   extractedVars?: Array<{ key: string; preview: string }>
   sqlRoundSummaries?: InlineSqlRoundSummary[]
   verificationKind?: string
+  /** True when a vertical BFLA (function-level) proof lacked impact evidence. */
+  bflaImpactRequired?: boolean
+  impactEvidenceMissing?: boolean
 }
 
 const inlinePreviewBytes = 512
@@ -2457,6 +2563,9 @@ export function buildInlineVerifyFeedback(
   }
 
   const sqlRounds = kind === 'sql_boolean_diff' || kind === 'sql_time_diff' ? summarizeSqlRounds(payload) : []
+  const bflaImpact = payload.bflaImpact as { required?: unknown; satisfied?: unknown; reason?: unknown } | undefined
+  const bflaImpactRequired = bflaImpact?.required === true ? true : undefined
+  const impactEvidenceMissing = bflaImpact?.required === true && bflaImpact?.satisfied === false ? true : undefined
 
   const rawFeedback: EnrichedInlineVerifyFeedback = {
     verdict: replay.verdict,
@@ -2477,6 +2586,8 @@ export function buildInlineVerifyFeedback(
     ...(extractedVarSummaries.length ? { extractedVars: extractedVarSummaries } : {}),
     ...(sqlRounds.length ? { sqlRoundSummaries: sqlRounds } : {}),
     ...(kind ? { verificationKind: kind } : {}),
+    ...(bflaImpactRequired ? { bflaImpactRequired } : {}),
+    ...(impactEvidenceMissing ? { impactEvidenceMissing } : {}),
   }
 
   // Enrichment is built from already-redacted exchanges; this final pass catches anything that
