@@ -395,8 +395,10 @@ export function benchmarkCliHelp(): string {
     'GUARDIAN_BENCH_PROBE_CONCURRENCY, GUARDIAN_BENCH_VERIFY_CONCURRENCY, GUARDIAN_BENCH_SLOW_PROBES,',
     'GUARDIAN_BENCH_CLASS_CAP / GUARDIAN_BENCH_CLASS_ENDPOINT_CAP (class=limit,...).',
     'Patch-verification bounds: GUARDIAN_BENCH_PATCH_TIMEOUT_MS (per patch, default 90000),',
-    'GUARDIAN_BENCH_ALLPATCH_TIMEOUT_MS (all-patches pass, default 600000),',
+    'GUARDIAN_BENCH_ALLPATCH_TIMEOUT_MS (all-patches baseline-spec replay, default 600000),',
     'GUARDIAN_BENCH_PATCH_ISOLATION (unrelated findings replayed per patch, default 4).',
+    'GUARDIAN_BENCH_ALLPATCH_FRESH=1 adds an optional fresh all-patches discovery pass;',
+    'its findings are reported as newly-confirming, never as patch evidence.',
   ].join('\n')
 }
 

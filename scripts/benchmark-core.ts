@@ -188,8 +188,8 @@ export const DEFAULT_PER_ENDPOINT_CLASS_CAPS: Readonly<Record<string, number>> =
   path_traversal_benign: 1,
   auth_protocol_audit: 1,
   cache_poison_deception: 1,
-  sqli_time_diff: 2,
-  sqli_boolean: 2,
+  sqli_time_diff: 3,
+  sqli_boolean: 8,
   ssti_math: 3,
   xss_context: 2,
   authz_matrix: 2,
@@ -209,8 +209,8 @@ export const DEFAULT_PER_CLASS_CAPS: Readonly<Record<string, number>> = {
   path_traversal_benign: 8,
   auth_protocol_audit: 16,
   cache_poison_deception: 5,
-  authz_matrix: 4,
-  mass_assignment: 3,
+  authz_matrix: 8,
+  mass_assignment: 8,
   workflow_invariant: 3,
   graphql_audit: 1,
 }
@@ -313,7 +313,8 @@ export function computeSlowProbeAllowance(candidateCount: number, explicit?: num
 }
 
 const sqlNameHint = /(^|[_-])(q|query|search|term|filter|sort|order|id|uid|name|category|ref|sku|text|body|comment|invoice|email|user|account|host|type|status|page|limit)$/i
-const sqlPathHint = /(\/api\/|\/search|lookup|query|products|items|orders|accounts?|profile|comments|xm|graphql|login|report|filter|list)/i
+const blindSinkHint = /(filter|query|search|where|lookup|analytics|report|metric|stat|term)/i
+const sqlPathHint = /(\/api\/|\/search|lookup|query|products|items|orders|accounts?|profile|comments|xm|graphql|login|report|filter|list|\/_actions|server.?action)/i
 const lowSignalLocation = new Set(['header', 'cookie', 'path'])
 
 export interface SlowProbeCandidate {
@@ -331,7 +332,11 @@ export interface SlowProbeCandidate {
 export function scoreSlowProbePlausibility(c: SlowProbeCandidate): number {
   let score = 0
   if (sqlPathHint.test(c.path)) score += 3
+  if (blindSinkHint.test(c.path)) score += 2
   if (c.param && sqlNameHint.test(c.param)) score += 2
+  if (c.param && blindSinkHint.test(c.param)) score += 2
+  // Dotted paths (`filter.name`) are blind-SQLi sinks in modern JSON APIs.
+  if (c.param?.includes('.')) score += 2
   if (c.path.split('/').filter(Boolean).length >= 2) score += 1
   const loc = c.location ?? ''
   if (loc === 'query' || loc === 'json' || loc === 'form' || loc === 'xml' || loc === 'graphql_var') score += 1
@@ -436,7 +441,18 @@ export const PARALLEL_SAFE_PROBE_CLASSES: ReadonlySet<string> = new Set([
   'xss_context',
   'path_traversal_benign',
   'authz_matrix',
-  'auth_protocol_audit',
+])
+
+/**
+ * Hypotheses whose replay specs are pure reads and may be verified in parallel. Auth/JWT/cache/XSS
+ * specs can bind sessions, mutate a lab user's role, or touch shared state, so their replays stay
+ * serial even when the probe itself was a read-only GET.
+ */
+export const BATCH_VERIFY_PROBE_CLASSES: ReadonlySet<string> = new Set([
+  'sqli_boolean',
+  'sqli_time_diff',
+  'ssti_math',
+  'path_traversal_benign',
 ])
 
 export interface ConcurrencySafety {
@@ -460,11 +476,12 @@ export function classifyHypothesisConcurrency(h: {
   method: string
   secondOrder?: boolean
   browserEligible?: boolean
+  urlDomSink?: boolean
   location?: string
   csrfBound?: boolean
 }): ConcurrencySafety {
   if (h.secondOrder) return { parallelSafe: false, reason: 'second_order_write' }
-  if (h.browserEligible) return { parallelSafe: false, reason: 'shared_browser' }
+  if (h.browserEligible || h.urlDomSink) return { parallelSafe: false, reason: 'shared_browser' }
   if (h.csrfBound) return { parallelSafe: false, reason: 'csrf_session_jar' }
   if (h.method.toUpperCase() !== 'GET') return { parallelSafe: false, reason: 'stateful_write' }
   if (h.probeClass === 'cache_poison_deception') return { parallelSafe: false, reason: 'shared_cache_state' }
@@ -749,6 +766,10 @@ export interface AllPatchesVerification {
   newlyConfirming: string[]
   /** Baseline vulns whose only evidence was a spec shared with another target (not patch evidence). */
   ambiguous?: string[]
+  /** Baseline-attributed specs replayed against the all-patched server. */
+  replayed?: number
+  /** Replayed baseline specs that no longer confirmed (dismissed/inconclusive, no transport error). */
+  dismissed?: number
   decoyFalsePositivesBefore: number
   decoyFalsePositivesAfter: number
   verdict: 'fixed' | 'regressed' | 'inconclusive'
@@ -892,6 +913,7 @@ export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
       const a = pv.allPatches
       lines.push('')
       lines.push(`- All patches applied: **${a.verdict}**${a.attempted ? '' : ' (not run)'}`)
+      if (a.replayed !== undefined) lines.push(`  - Baseline specs replayed: ${a.replayed}; dismissed: ${a.dismissed ?? 0}`)
       if (a.stillConfirming.length) lines.push(`  - Still confirming: ${a.stillConfirming.join(', ')}`)
       if (a.newlyConfirming.length) lines.push(`  - Newly confirming: ${a.newlyConfirming.join(', ')}`)
       lines.push(`  - Decoy false positives before/after: ${a.decoyFalsePositivesBefore}/${a.decoyFalsePositivesAfter}`)

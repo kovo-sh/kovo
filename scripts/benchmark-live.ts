@@ -20,6 +20,7 @@ import { compatibleClasses, endpointMatches, scoreManifest } from './benchmark-s
 import type { ScoredOutcome } from './benchmark-score.ts'
 import { synthesizeSpecs } from './benchmark-specs.ts'
 import {
+  BATCH_VERIFY_PROBE_CLASSES,
   applyBenchmarkClassCaps,
   classifyHypothesisConcurrency,
   computeSlowProbeAllowance,
@@ -125,7 +126,7 @@ export interface PatchVerificationArgs {
   orchestration?: BenchmarkOrchestrationOverrides
   /** Wall-clock bound for one isolated patch retest (default 90s). */
   patchTimeoutMs?: number
-  /** Wall-clock bound for the all-patches-applied pipeline pass (default 10 min). */
+  /** Wall-clock bound for the all-patches baseline-spec replay (default 10 min). */
   allPatchesTimeoutMs?: number
   hooks?: PatchVerificationHooks
 }
@@ -285,7 +286,6 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
 
   const signalledParams = new Set<string>()
   const budgetSkipped = new Set<string>()
-  const verifyTimeoutSignal = AbortSignal.timeout(90_000)
 
   const runOne = async (hyp: Hypothesis): Promise<TaskResult | null> => {
     const stat = statFor(hyp.probeClass)
@@ -327,16 +327,19 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       probeClass: hyp.probeClass, method: hyp.method,
       ...(hyp.secondOrder ? { secondOrder: true } : {}),
       ...(hyp.browserEligible ? { browserEligible: true } : {}),
+      ...(hyp.urlDomSink ? { urlDomSink: true } : {}),
       ...(needsCsrf(hyp) ? { csrfBound: true } : {}),
     })
-    const verifyConcurrency = safety.parallelSafe ? Math.max(1, config.verifyConcurrency) : 1
+    const verifyConcurrency = safety.parallelSafe && BATCH_VERIFY_PROBE_CLASSES.has(hyp.probeClass)
+      ? Math.max(1, config.verifyConcurrency)
+      : 1
     outer:
     for (const batch of verificationBatches(candidates, verifyConcurrency)) {
       const settled = await Promise.all(batch.map(async synth => {
         scored.specSubmitted = true
         scored.spec = synth.spec
         try {
-          const res = await verifyWithProfile(env, synth.spec, verifier.backend, caps.inlineRetries, watch, verifyTimeoutSignal)
+          const res = await verifyWithProfile(env, synth.spec, verifier.backend, caps.inlineRetries, watch)
           return { synth, res }
         } catch (err) {
           notes.push(`verify error on ${hyp.endpoint.path} (${hyp.probeClass}): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`)
@@ -378,6 +381,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       probeClass: hyp.probeClass, method: hyp.method,
       ...(hyp.secondOrder ? { secondOrder: true } : {}),
       ...(hyp.browserEligible ? { browserEligible: true } : {}),
+      ...(hyp.urlDomSink ? { urlDomSink: true } : {}),
       ...(needsCsrf(hyp) ? { csrfBound: true } : {}),
     })
     const siblingKey = hyp.probeClass === 'sqli_time_diff' ? hyp.key.replace(/^sqli_time_diff\|/, 'sqli_boolean|') : null
@@ -396,6 +400,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
   // Per-class budget telemetry: request counts are per task (exchange-level) so they stay stable
   // under concurrency; broker audit units (used/cap) double-count allowed+observed.
   notes.push(`Orchestration: probeConcurrency=${config.probeConcurrency} verifyConcurrency=${config.verifyConcurrency} maxRequests=${config.maxRequests} deadlineMs=${config.deadlineMs} slowProbes=${slowAllowance}/${slowCandidates.length} discoveryMs=${discoveryMs}`)
+  notes.push('Serial lanes: non-GET writes, second-order plants, browser/url-DOM XSS, cache deception, SSRF/XXE canaries, auth-protocol probes. Broker rate limit: 20 rps per origin.')
   if (capped.dropped.length) {
     const byClass = new Map<string, number>()
     for (const d of capped.dropped) byClass.set(d.probeClass, (byClass.get(d.probeClass) ?? 0) + 1)
@@ -696,7 +701,6 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
   const findingById = new Map<string, ConfirmedFinding>()
   for (const f of baselineFindings) if (!findingById.has(f.id)) findingById.set(f.id, f)
   const ambiguousIds = new Set(baselineFindings.filter(f => !f.isDecoy && f.ambiguousAttribution).map(f => f.id))
-  const baselineVulnIds = new Set(baselineFindings.filter(f => !f.isDecoy && !f.ambiguousAttribution).map(f => f.id))
   const decoyFalsePositivesBefore = new Set(baselineFindings.filter(f => f.isDecoy).map(f => f.id)).size
 
   const perPatch: PatchVerificationEntry[] = []
@@ -799,44 +803,118 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
     perPatch.push(entry)
   }
 
-  // 2. All patches applied: a fresh full pipeline pass must re-confirm nothing and keep decoys clean.
+  // 2. All patches applied: replay the baseline-attributed specs as the evidence of record.
+  //
+  // A fresh pipeline pass is NOT used to decide whether a patched vuln regressed: it re-synthesises
+  // specs from the patched surface and can credit an always-on surface (e.g. GraphQL introspection)
+  // to a challenge whose planted flaw is actually gone. Replaying the exact baseline specs keeps the
+  // all-patches verdict comparable to the per-patch retests.
   const allPatchIds = groups.map(g => g.patchId).sort()
   const allPatches: AllPatchesVerification = {
     patchIds: allPatchIds,
     attempted: false,
     stillConfirming: [],
     newlyConfirming: [],
+    ambiguous: [...ambiguousIds].sort(),
     decoyFalsePositivesBefore,
-    decoyFalsePositivesAfter: decoyFalsePositivesBefore,
+    decoyFalsePositivesAfter: 0,
     verdict: 'inconclusive',
     notes: [],
   }
-  try {
-    const all = await withTimeout(runtime.runFull(allPatchIds), allPatchesTimeoutMs, 'all-patches pipeline')
+  if (baselineFindings.length === 0) {
     allPatches.attempted = true
-    const allVulnIds = new Set(all.findings.filter(f => !f.isDecoy).map(f => f.id))
-    const allDecoyIds = new Set(all.findings.filter(f => f.isDecoy).map(f => f.id))
-    allPatches.stillConfirming = [...baselineVulnIds].filter(id => allVulnIds.has(id)).sort()
-    allPatches.newlyConfirming = [...allVulnIds].filter(id => !baselineVulnIds.has(id) && !ambiguousIds.has(id)).sort()
-    allPatches.ambiguous = [...ambiguousIds].sort()
-    if (ambiguousIds.size > 0) {
-      allPatches.notes.push(`Attribution ambiguous (shared evidence, excluded from patch verdict): ${[...ambiguousIds].sort().join(', ')}.`)
+    allPatches.verdict = 'fixed'
+    allPatches.notes.push('No confirmed baseline findings to replay; nothing for the all-patches pass to re-confirm.')
+  } else {
+    const allController = new AbortController()
+    const allTimer = setTimeout(() => allController.abort(), allPatchesTimeoutMs)
+    allTimer.unref?.()
+    try {
+      const results = await withTimeout(
+        runtime.replayAll({
+          findings: baselineFindings,
+          patchedIds: allPatchIds,
+          timeoutMs: allPatchesTimeoutMs,
+          signal: allController.signal,
+        }),
+        allPatchesTimeoutMs + 1_000,
+        'all-patches baseline spec replay',
+      )
+      allPatches.attempted = true
+      const still: string[] = []
+      const decoyStill: string[] = []
+      let dismissed = 0
+      let failed = 0
+      let replayed = 0
+      for (const finding of baselineFindings) {
+        const res = results.get(finding.id)
+        const verdict = res?.verdict ?? 'missing'
+        const confirmed = isConfirmedish(res?.verdict)
+        if (finding.isDecoy) {
+          if (confirmed) decoyStill.push(finding.id)
+          continue
+        }
+        if (finding.ambiguousAttribution) continue
+        replayed += 1
+        if (confirmed) {
+          still.push(finding.id)
+          if (res?.note) allPatches.notes.push(`${finding.id}: ${res.note}`)
+        } else if (['error', 'missing', 'timeout'].includes(verdict)) {
+          failed += 1
+          allPatches.notes.push(`${finding.id}: all-patches replay ${verdict}${res?.note ? ` (${res.note})` : ''}`)
+        } else {
+          dismissed += 1
+        }
+      }
+      allPatches.replayed = replayed
+      allPatches.dismissed = dismissed
+      allPatches.stillConfirming = still.sort()
+      allPatches.decoyFalsePositivesAfter = decoyStill.length
+      // Regressed only on genuine baseline-spec re-confirmation. Transport failures are inconclusive,
+      // not proof that the patch failed.
+      allPatches.verdict = still.length > 0 ? 'regressed' : failed > 0 ? 'inconclusive' : 'fixed'
+      if (still.length) {
+        allPatches.notes.push(`Baseline specs still confirming with all patches applied: ${still.sort().join(', ')}.`)
+      }
+      if (decoyStill.length) {
+        allPatches.notes.push(`Baseline decoy false-positive specs still confirmed after patches: ${decoyStill.sort().join(', ')} (decoys have no patch by design).`)
+      }
+      if (ambiguousIds.size > 0) {
+        allPatches.notes.push(`Attribution ambiguous (shared evidence, excluded from patch verdict): ${[...ambiguousIds].sort().join(', ')}.`)
+      }
+      allPatches.notes.push('All-patches verdict is based on replaying baseline-attributed specs; a fresh pipeline pass is not used as patch evidence.')
+    } catch (err) {
+      allPatches.verdict = 'inconclusive'
+      allPatches.notes.push(`All-patches baseline spec replay did not complete: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`)
+    } finally {
+      clearTimeout(allTimer)
     }
-    allPatches.decoyFalsePositivesAfter = allDecoyIds.size
-    allPatches.verdict = allPatches.stillConfirming.length === 0 && allDecoyIds.size === 0 ? 'fixed' : 'regressed'
-    if (all.notes.length) allPatches.notes.push(...all.notes.slice(0, 5))
-    if (allPatches.stillConfirming.length) {
-      allPatches.notes.push(`Still confirming with all patches applied: ${allPatches.stillConfirming.join(', ')}.`)
+  }
+
+  // Optional regression discovery: a fresh all-patched pipeline may surface new probe classes. Its
+  // findings are NEVER used to mark a baseline vuln as still-confirming; only ids with no baseline
+  // attribution are reported as newly confirming, and same-id findings are informational.
+  if (allPatches.attempted && process.env.GUARDIAN_BENCH_ALLPATCH_FRESH === '1') {
+    try {
+      const fresh = await withTimeout(runtime.runFull(allPatchIds), allPatchesTimeoutMs, 'all-patches discovery pass')
+      const baselineIds = new Set(baselineFindings.map(f => f.id))
+      const freshVulns = fresh.findings.filter(f => !f.isDecoy)
+      const newIds = [...new Set(freshVulns.map(f => f.id).filter(id => !baselineIds.has(id) && !ambiguousIds.has(id)))].sort()
+      allPatches.newlyConfirming = newIds
+      const reused = [...new Set(freshVulns.map(f => f.id).filter(id => baselineIds.has(id)))].sort()
+      if (reused.length) {
+        allPatches.notes.push(`Fresh pass also re-synthesised specs for baseline targets (${reused.join(', ')}); ignored for the verdict because baseline specs are the evidence of record.`)
+      }
+      if (newIds.length) {
+        allPatches.notes.push(`Fresh pass surfaced findings with no baseline attribution: ${newIds.join(', ')} (reported, never counted as still-confirming).`)
+      }
+      const freshDecoys = fresh.findings.filter(f => f.isDecoy).map(f => f.id).sort()
+      if (freshDecoys.length) {
+        allPatches.notes.push(`Fresh pass decoy false positives: ${freshDecoys.join(', ')} (reported separately).`)
+      }
+    } catch (err) {
+      allPatches.notes.push(`Optional fresh discovery pass did not complete: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`)
     }
-    if (allDecoyIds.size) {
-      allPatches.notes.push(`Decoy false positives after all patches: ${[...allDecoyIds].sort().join(', ')} (decoys have no patch by design).`)
-    }
-    if (allPatches.newlyConfirming.length) {
-      allPatches.notes.push(`Newly confirming (not seen at baseline): ${allPatches.newlyConfirming.join(', ')}.`)
-    }
-  } catch (err) {
-    allPatches.verdict = 'inconclusive'
-    allPatches.notes.push(`All-patches pass did not complete: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`)
   }
 
   const summary: PatchVerificationSummary = {

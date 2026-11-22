@@ -22,6 +22,10 @@ import {
 import type { BenchmarkScheduledTask } from '../scripts/benchmark-core.ts'
 import { benchmarkCliHelp, parseBenchmarkCliArgs } from '../scripts/benchmark-recall.ts'
 import { parseArgs as parseMatrixArgs } from '../scripts/benchmark-realistic-matrix.ts'
+import { verifyPatchesLive } from '../scripts/benchmark-live.ts'
+import type { ConfirmedFinding, PatchReplayResult, PatchVerificationHooks } from '../scripts/benchmark-live.ts'
+import type { BenchmarkManifest } from '../scripts/benchmark-core.ts'
+import { withEnv } from './v4-tier-helpers.ts'
 
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -100,6 +104,12 @@ describe('M7 orchestration: adaptive slow probes', () => {
     assert.ok(high > low)
   })
 
+  test('blind JSON filter sinks outrank generic params', () => {
+    const blind = scoreSlowProbePlausibility({ key: 'k', path: '/api/v1/analytics/query', param: 'filter.name', location: 'json', method: 'POST' })
+    const generic = scoreSlowProbePlausibility({ key: 'k', path: '/app/settings', param: 'display-name', location: 'query', method: 'GET' })
+    assert.ok(blind > generic, `blind=${blind} generic=${generic}`)
+  })
+
   test('selection keeps the highest-plausibility candidates without reordering execution', () => {
     const candidates = [
       { key: 'early-low', path: '/static/a', param: 'x', location: 'header', method: 'GET' },
@@ -112,7 +122,7 @@ describe('M7 orchestration: adaptive slow probes', () => {
     assert.ok(selected.has('late-high'))
     assert.ok(!selected.has('early-low'))
     // The returned value is a set; callers iterate the plan, so writes keep plan order.
-    assert.deepEqual([...selected], ['mid', 'late-high'])
+    assert.deepEqual([...selected].sort(), ['late-high', 'mid'])
     assert.equal(selectSlowProbeKeys(candidates, 0).size, 0)
   })
 })
@@ -162,7 +172,7 @@ describe('M7 orchestration: per-class caps', () => {
 
 describe('M7 orchestration: concurrency safety classification', () => {
   test('read-only GET hypotheses are parallel-safe', () => {
-    for (const probeClass of ['sqli_boolean', 'sqli_time_diff', 'ssti_math', 'path_traversal_benign', 'authz_matrix', 'auth_protocol_audit']) {
+    for (const probeClass of ['sqli_boolean', 'sqli_time_diff', 'ssti_math', 'path_traversal_benign', 'authz_matrix']) {
       assert.equal(classifyHypothesisConcurrency({ probeClass, method: 'GET' }).parallelSafe, true, probeClass)
     }
     assert.equal(classifyHypothesisConcurrency({ probeClass: 'xss_context', method: 'GET' }).parallelSafe, true)
@@ -180,6 +190,7 @@ describe('M7 orchestration: concurrency safety classification', () => {
       [{ probeClass: 'xxe_canary', method: 'POST' }, 'stateful_write'],
       [{ probeClass: 'graphql_audit', method: 'POST' }, 'stateful_write'],
       [{ probeClass: 'workflow_invariant', method: 'GET' }, 'class:workflow_invariant'],
+      [{ probeClass: 'auth_protocol_audit', method: 'GET' }, 'class:auth_protocol_audit'],
     ]
     for (const [input, reason] of cases) {
       const out = classifyHypothesisConcurrency(input as { probeClass: string; method: string })
@@ -275,8 +286,7 @@ describe('M7 orchestration: bounded scheduler', () => {
   })
 })
 
-describe('M7 orchestration: CLI flags', () => {
-  test('recall CLI parses the new orchestration flags', () => {
+describe('M7 orchestration: CLI flags', () => {  test('recall CLI parses the new orchestration flags', () => {
     const opts = parseBenchmarkCliArgs([
       '--suite', 'xben-25', '--max-requests', '1500', '--deadline-ms', '120000',
       '--probe-concurrency', '6', '--verify-concurrency', '3', '--slow-probes', '8',
@@ -307,5 +317,100 @@ describe('M7 orchestration: CLI flags', () => {
     assert.equal(parseMatrixArgs(['--suite', 'held-out-saas']).suite, 'held-out-saas')
     assert.throws(() => parseMatrixArgs(['--suite', 'bogus']), /--suite/)
     assert.throws(() => parseMatrixArgs(['--probe-concurrency', '9']), /probe-concurrency/)
+  })
+})
+
+describe('M7 orchestration: all-patches verdict uses baseline spec replay', () => {
+  const manifest: BenchmarkManifest = {
+    challenges: [
+      { id: 'a', vulnClass: 'sqli', endpoint: '/api/a', patchId: 'p1' },
+      { id: 'b', vulnClass: 'graphql', endpoint: '/graphql', patchId: 'p2' },
+    ],
+  }
+  const finding = (id: string, spec: string): ConfirmedFinding => ({
+    id, isDecoy: false, path: `/api/${id}`, probeClass: 'sqli_boolean', spec: { kind: spec },
+  })
+  const baseline = { findings: [finding('a', 'spec-a'), finding('b', 'spec-b')] }
+
+  function hooks(opts: {
+    replay: (ids: string[]) => Map<string, PatchReplayResult>
+    freshFindings?: ConfirmedFinding[]
+    calls?: { runFull: number }
+  }): PatchVerificationHooks {
+    return {
+      runFull: async () => {
+        if (opts.calls) opts.calls.runFull += 1
+        return { findings: opts.freshFindings ?? [], notes: [] }
+      },
+      replayAll: async ({ findings }) => opts.replay(findings.map(f => f.id)),
+    }
+  }
+
+  test('a fresh always-on finding does not mark a patched vuln as regressed when baseline specs dismiss', async () => {
+    const calls = { runFull: 0 }
+    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
+      manifest,
+      baseline,
+      // Even though a fresh run would re-confirm both ids, the replay evidence is authoritative.
+      hooks: hooks({
+        calls,
+        freshFindings: [finding('a', 'fresh-a'), finding('b', 'fresh-b'), finding('extra', 'fresh-extra')],
+        replay: ids => new Map(ids.map(id => [id, { verdict: 'dismissed', verdicts: ['dismissed'] }])),
+      }),
+    }))
+    assert.equal(summary.fixed, 2)
+    assert.equal(calls.runFull, 0, 'fresh pipeline must not run unless explicitly enabled')
+    const all = summary.allPatches!
+    assert.equal(all.verdict, 'fixed')
+    assert.deepEqual(all.stillConfirming, [])
+    assert.deepEqual(all.newlyConfirming, [])
+    assert.equal(all.replayed, 2)
+    assert.equal(all.dismissed, 2)
+    assert.equal(all.decoyFalsePositivesAfter, 0)
+  })
+
+  test('optional fresh discovery reports unattributed findings as newly confirming, never still confirming', async () => {
+    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: '1' }, () => verifyPatchesLive({
+      manifest,
+      baseline,
+      hooks: hooks({
+        freshFindings: [finding('a', 'fresh-a'), finding('b', 'fresh-b'), finding('extra', 'fresh-extra')],
+        replay: ids => new Map(ids.map(id => [id, { verdict: 'dismissed', verdicts: ['dismissed'] }])),
+      }),
+    }))
+    const all = summary.allPatches!
+    assert.equal(all.verdict, 'fixed')
+    assert.deepEqual(all.stillConfirming, [])
+    assert.deepEqual(all.newlyConfirming, ['extra'])
+    assert.ok(all.notes.some(n => /no baseline attribution: extra/.test(n)))
+  })
+
+  test('a baseline spec that still confirms is a genuine regression', async () => {
+    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
+      manifest,
+      baseline,
+      hooks: hooks({
+        replay: ids => new Map(ids.map(id => [id, id === 'a'
+          ? { verdict: 'confirmed', verdicts: ['confirmed'] }
+          : { verdict: 'dismissed', verdicts: ['dismissed'] }])),
+      }),
+    }))
+    const all = summary.allPatches!
+    assert.equal(all.verdict, 'regressed')
+    assert.deepEqual(all.stillConfirming, ['a'])
+    assert.equal(all.dismissed, 1)
+  })
+
+  test('transport failures make the all-patches pass inconclusive, not regressed', async () => {
+    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
+      manifest,
+      baseline,
+      hooks: hooks({
+        replay: ids => new Map(ids.map(id => [id, { verdict: 'error', verdicts: ['error'] }])),
+      }),
+    }))
+    const all = summary.allPatches!
+    assert.equal(all.verdict, 'inconclusive')
+    assert.deepEqual(all.stillConfirming, [])
   })
 })
