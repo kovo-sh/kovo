@@ -460,8 +460,9 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
 
     // Traversal needs a genuine file/path parameter; path-shape probing alone cannot prove a jail escape.
     // Inferred names are all tried, each gated by a cheap single-payload jail-escape pre-check.
+    const fileRouteHint = /(?:download|downloads|export|exports|file|files|asset|assets|document|documents|attachment|attachments|receipt|receipts|invoice|invoices|label|labels|statement|statements|media|raw|content|logs?|journals?|view|read|serve|backup|backups|archive|archives)/i
     const fileParams = effectiveParams
-      .filter(p => (inferredPurpose(p) === 'file' || fileParam.test(p.name)) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
+      .filter(p => (inferredPurpose(p) === 'file' || (fileParam.test(p.name) && fileRouteHint.test(ep.path))) && (p.location === 'query' || p.location === 'json' || p.location === 'form'))
       .slice(0, inferred.length > 0 ? 3 : 1)
     for (const fileP of isGet ? fileParams : []) {
       add({ endpoint: ep, probeClass: 'path_traversal_benign', param: fileP, location: fileP.location as SurfaceParamLocation, method: 'GET' })
@@ -1084,12 +1085,16 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
     }
     const fake = await sendFor(`gxprobe${shortToken(5)}`, 'gxprobe')
     if (inferredPurpose === 'file') {
-      // A file parameter is active only when it actually reads outside the served root. One
-      // passwd-shaped payload (and a suffix-preserving log path) is enough to decide.
+      // A file parameter is active when it reads a valid in-jail name, or when it reads outside the
+      // served root. One passwd-shaped payload (and a suffix-preserving log path) decides the latter.
       const passwd = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
-      const payloads = ['../../../../etc/passwd', '../../../../var/log/system/audit.log']
       ctx.paramActive = false
-      for (const payload of payloads) {
+      for (const validName of mineBaselines(corpus, h.param.name, h.endpoint.path).filter(v => /^[A-Za-z0-9_. -]{1,60}$/.test(v) && !/[\\/]/.test(v)).slice(0, 2)) {
+        const ex = await sendFor(h.param.name, validName)
+        if (ex && ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0) { ctx.paramActive = true; break }
+      }
+      const payloads = ['../../../../etc/passwd', '../../../../var/log/system/audit.log']
+      for (const payload of ctx.paramActive ? [] : payloads) {
         const real = await sendFor(h.param.name, payload)
         if (!real) continue
         if (passwd.test(real.body)) { ctx.paramActive = true; break }
@@ -1105,6 +1110,20 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
       }
     }
     if (ctx.paramActive === false) return ctx
+  }
+  if (h.param && h.probeClass === 'path_traversal_benign') {
+    const mined = mineBaselines(corpus, h.param.name, h.endpoint.path)
+      .filter(v => /^[A-Za-z0-9_. -]{1,60}$/.test(v) && !/[\\/]/.test(v))
+    // Pick a value the endpoint actually serves; a valid in-jail name is what proves a handler
+    // strips `../` before resolving (and therefore needs an encoded variant to test).
+    for (const value of mined.slice(0, 4)) {
+      try {
+        const ex = await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...injectUniversalParam({
+          pathAndQuery: probePathFor(h), param: h.param.name, paramLocation: h.location!, value, method: h.method,
+        }) }, env.grant, env.signal)
+        if (ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0) { ctx.baseline = value; break }
+      } catch { /* keep trying */ }
+    }
   }
   if (h.param && sqliClasses.has(h.probeClass)) {
     const mined = mineBaselines(corpus, h.param.name, h.endpoint.path)
@@ -1269,24 +1288,24 @@ async function runSecondOrderCheck(
     ...h.endpoint.params.filter(p => idName.test(p.name) && body && typeof body[p.name] === 'string').map(p => String(body![p.name])),
     ...(await idPool(env)),
   ]
-  const readTargets: Array<{ path: string; templated: boolean }> = []
+  const readTargets: Array<{ path: string; fromCreated: boolean }> = []
   for (const rp of h.readPaths.slice(0, 3)) {
     if (hasPathPlaceholder(rp)) {
-      for (const idv of [...new Set(fillIds)].slice(0, 3)) readTargets.push({ path: fillPlaceholders(rp, encodeURIComponent(idv)), templated: true })
+      for (const idv of [...new Set(fillIds)].slice(0, 3)) readTargets.push({ path: fillPlaceholders(rp, encodeURIComponent(idv)), fromCreated: createdIds.includes(idv) })
       continue
     }
     const segs = rp.split('?')[0].split('/')
     const idIdx = segs.findIndex(s => s && looksLikeIdSegment(s))
-    if (idIdx < 0) { readTargets.push({ path: rp, templated: false }); continue }
+    if (idIdx < 0) { readTargets.push({ path: rp, fromCreated: false }); continue }
     // Prefer the value the write actually used, then other observed ids.
     const orderedIds = [...new Set([...fillIds.filter(v => v === segs[idIdx]), ...fillIds])].slice(0, 3)
     for (const idv of orderedIds) {
       const next = [...segs]
       next[idIdx] = encodeURIComponent(idv)
-      readTargets.push({ path: next.join('/') + (rp.includes('?') ? `?${rp.split('?')[1]}` : ''), templated: true })
+      readTargets.push({ path: next.join('/') + (rp.includes('?') ? `?${rp.split('?')[1]}` : ''), fromCreated: createdIds.includes(idv) })
     }
   }
-  for (const { path: readPath, templated: idSpecificRead } of readTargets.slice(0, 5)) {
+  for (const { path: readPath, fromCreated } of readTargets.slice(0, 5)) {
     if (env.signal.aborted) break
     const readEx = await sendRaw(env, {
       method: 'GET', pathAndQuery: readPath,
@@ -1304,10 +1323,10 @@ async function runSecondOrderCheck(
     })
     if (analysis.exploitable) {
       // A create-only write returns an id the replay spec cannot reference (the stored-XSS
-      // synthesizer replays the observed read path verbatim), so only stable listing reads or
-      // updates to an existing object are submitted.
+      // synthesizer replays the observed read path verbatim). Reads of the *created* object are
+      // therefore unconfirmable; a parent/container page (e.g. the project's activity feed) is fine.
       const createOnly = h.method === 'POST' && !hasPathPlaceholder(h.endpoint.path)
-      if (createOnly && idSpecificRead) {
+      if (createOnly && fromCreated) {
         result.details.storedOnNewObject = { readPath, context: analysis.context }
         continue
       }
@@ -1918,6 +1937,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   }
   if (h.param) {
     if (ctx.baseline && sqliClasses.has(h.probeClass)) req.baselineValue = ctx.baseline
+    if (ctx.baseline && h.probeClass === 'path_traversal_benign') req.baselineValue = ctx.baseline
     if (ctx.xmlTemplate && h.location === 'xml') req.xmlTemplate = ctx.xmlTemplate
     if (ctx.graphqlQuery && h.location === 'graphql_var') req.graphqlQuery = ctx.graphqlQuery
   }

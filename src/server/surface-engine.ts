@@ -1472,7 +1472,7 @@ async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> {
   const passwdSignature = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
   // Generic read oracles: classic passwd, a synthetic app secret, and a well-known log file. The
   // `.log` variants keep a suffix check satisfied (`name.endsWith('.log')`) while still escaping.
-  const candidates = [
+  const candidates: Array<{ value: string; kind: 'passwd' | 'content' }> = [
     { value: '../../../../etc/passwd', kind: 'passwd' },
     { value: '../../../../../../etc/passwd', kind: 'passwd' },
     { value: '../../../../app/config/secrets.env', kind: 'content' },
@@ -1486,6 +1486,23 @@ async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> {
     { value: '../config.json', kind: 'content' },
   ]
   const results: Array<Record<string, unknown>> = []
+  // Filter evidence: when a valid in-jail name still resolves after a literal `../` prefix, the
+  // handler strips traversal syntax before resolving. Only then is an encoded (double-decoded)
+  // variant a legitimate bypass to test; sending it blindly flags hardened single-segment handlers.
+  let filterStripsTraversal = false
+  if (req.baselineValue) {
+    const valid = await send(injectParam({ ...req, param }, req.baselineValue))
+    const stripped = await send(injectParam({ ...req, param }, `../${req.baselineValue}`))
+    filterStripsTraversal = Boolean(valid && stripped && valid.status >= 200 && valid.status < 300 &&
+      stripped.status >= 200 && stripped.status < 300 && responseSimilarity(valid.body, stripped.body) >= 0.95)
+  }
+  if (filterStripsTraversal) {
+    candidates.push(
+      { value: '..%2f..%2f..%2f..%2fetc%2fpasswd', kind: 'passwd' },
+      { value: '..%2fprivate%2fsecret.txt', kind: 'content' },
+      { value: '..%2f..%2fsrv%2fprivate%2fsecret.txt', kind: 'content' },
+    )
+  }
   for (const cand of candidates) {
     const ex = await send(injectParam({ ...req, param }, cand.value))
     if (!ex) continue
