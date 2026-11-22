@@ -12,6 +12,9 @@ import type { CanaryBroker } from '../src/server/canary-broker.ts'
 import { probeDifferential } from '../src/server/surface-engine.ts'
 import type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialRequest, SurfaceParamLocation } from '../src/server/surface-engine.ts'
 import type { Store } from '../src/server/store.ts'
+import { injectUniversalParam, responseSimilarity } from '../src/server/surface-engine.ts'
+import { mineBaselines, mineGraphqlQuery, mineSeedQuery, mineXmlTemplate } from './benchmark-corpus.ts'
+import type { Corpus } from './benchmark-corpus.ts'
 import type { BenchmarkProfileMode } from './benchmark-core.ts'
 
 export interface ProfileCaps {
@@ -63,7 +66,8 @@ export interface HypothesisPlan {
 const idName = /(^|[_-])(id|uid|uuid|sku|slug|key|ref)$/i
 const urlName = /(url|uri|link|callback|webhook|redirect|next|dest|target|feed|image|src|endpoint)/i
 const accountPath = /(profile|account|\/me\b|settings|user|org|tenant|team|member)/i
-const cacheablePath = /(static|asset|public|catalog|account|profile|\/me\b|settings|dashboard|billing|home|page|news|docs|css|js|export)/i
+const cacheablePath = /(static|asset|public|catalog|account|profile|\/me\b|settings|dashboard|billing|home|page|news|docs|css|js|export|cache|banner|summary|landing|index|content)/i
+const oauthPath = /(oauth|authorize|\/auth\b|openid|oidc|sso|login\/callback)/i
 const xmlPath = /(xml|import|soap|upload|feed|sitemap|saml|parse|svg|rss)/i
 const graphqlPath = /graphql/i
 const workflowPath = /(order|checkout|cart|payment|workflow|step|confirm|refund|invoice)/i
@@ -138,7 +142,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       if (isGet && !pathHasPlaceholder && params.length === 0 && cacheablePath.test(ep.path)) {
         add({ endpoint: ep, probeClass: 'cache_poison_deception', method: 'GET' })
       }
-      if (isGet && !pathHasPlaceholder && params.length === 0 && caps.authMutation) {
+      if (isGet && !pathHasPlaceholder && (params.length === 0 || oauthPath.test(ep.path)) && caps.authMutation) {
         add({ endpoint: ep, probeClass: 'auth_protocol_audit', method: 'GET' })
       }
       if (xmlPath.test(ep.path) && !isGet && !params.some(p => p.location === 'xml')) {
@@ -172,7 +176,12 @@ export interface ProbeEnv {
   personaUserIds: string[]
   session: string
   slowProbesLeft: number
+  corpus?: Corpus
+  ctxCache?: Map<string, ResolvedContext>
 }
+
+/** Target-observed context (baseline value, XML/GraphQL shape, seed query) resolved for a hypothesis. */
+export interface ResolvedContext { baseline?: string; xmlTemplate?: string; graphqlQuery?: string; seedQuery?: string }
 
 export interface HypothesisOutcome {
   hyp: Hypothesis
@@ -185,6 +194,9 @@ export interface HypothesisOutcome {
   requests: number
   summary?: string
   error?: string
+  ctx?: ResolvedContext
+  /** Personas actually used for an authz_matrix probe (owner = privileged/control, other = probe). */
+  pair?: { owner?: string; other?: string }
 }
 
 const csrfBody = /(csrf|xsrf|anti-?forgery|invalid token|token (missing|required|mismatch))/i
@@ -259,6 +271,53 @@ export function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.owner, ot
   }
 }
 
+
+const sqliClasses = new Set<string>(['sqli_boolean', 'sqli_time_diff'])
+
+async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedContext> {
+  const cache = (env.ctxCache ??= new Map())
+  const key = `${h.endpoint.method}|${h.endpoint.path}|${h.param?.name ?? ''}|${h.location ?? ''}|${sqliClasses.has(h.probeClass) ? 'sql' : 'x'}`
+  const hit = cache.get(key)
+  if (hit) return hit
+  const ctx: ResolvedContext = {}
+  cache.set(key, ctx)
+  const corpus = env.corpus
+  if (!corpus) return ctx
+  if (h.param && h.location === 'xml') ctx.xmlTemplate = mineXmlTemplate(corpus, h.param.name) ?? undefined
+  if (h.param && h.location === 'graphql_var') ctx.graphqlQuery = mineGraphqlQuery(corpus, h.param.name) ?? undefined
+  if (h.probeClass === 'auth_protocol_audit' && oauthPath.test(h.endpoint.path)) {
+    const seed = mineSeedQuery(corpus, h.endpoint.path.split('?')[0])
+    if (seed) ctx.seedQuery = seed
+  }
+  if (h.param && sqliClasses.has(h.probeClass)) {
+    const candidates = mineBaselines(corpus, h.param.name, h.endpoint.path).slice(0, 5)
+    if (candidates.length > 0) {
+      const body = siblingBody(h)
+      const send = async (value: string): Promise<BrokerExchangeResult | null> => {
+        try {
+          const inj = injectUniversalParam({
+            pathAndQuery: probePathFor(h), param: h.param!.name, paramLocation: h.location!, value, method: h.method,
+            ...(h.location === 'json' && body ? { jsonBody: body } : {}),
+            ...(h.location === 'form' && body ? { formBody: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v)])) } : {}),
+            ...(h.location === 'graphql_var' ? { jsonBody: { variables: body ?? {} } } : {}),
+            ...(ctx.xmlTemplate ? { xmlTemplate: ctx.xmlTemplate } : {}),
+            ...(ctx.graphqlQuery ? { graphqlQuery: ctx.graphqlQuery } : {}),
+            ...(env.caps.sessionAndCsrf ? { session: env.session, csrfBind: needsCsrf(h) ? true : undefined } : {}),
+          })
+          return await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...inj }, env.grant, env.signal)
+        } catch { return null }
+      }
+      const bogus = await send('zzguardianzz')
+      for (const value of candidates) {
+        const ex = await send(value)
+        if (!ex || ex.status >= 500) continue
+        if (!bogus || ex.status !== bogus.status || responseSimilarity(ex.body, bogus.body) < 0.9) { ctx.baseline = value; break }
+      }
+    }
+  }
+  return ctx
+}
+
 export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (ex: BrokerExchangeResult) => void): Promise<HypothesisOutcome> {
   const out: HypothesisOutcome = {
     hyp: h, verdict: 'inconclusive', anomalies: [], details: {}, csrfRejected: false, contextReset: false, tierBlocked: false, requests: 0,
@@ -268,9 +327,18 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     if ((ex.status === 403 || ex.status === 400 || ex.status === 419) && csrfBody.test(ex.body)) out.csrfRejected = true
     if ((ex.status === 401 || ex.status === 403 || ex.status === 440) && sessionBody.test(ex.body)) out.contextReset = true
   }
+  const ctx = await resolveContext(h, env)
+  out.ctx = ctx
   let req: ProbeDifferentialRequest
   switch (h.probeClass) {
-    case 'authz_matrix': req = authzRequest(h, env); break
+    case 'authz_matrix': {
+      let owner = env.owner
+      let other = env.other
+      if (/(admin|internal|manage|staff|flag|role|permission)/i.test(h.endpoint.path) && env.admin && (env.viewer ?? env.other)) { owner = env.admin; other = env.viewer ?? env.other }
+      out.pair = { owner, other }
+      req = authzRequest(h, env, owner, other)
+      break
+    }
     case 'ssrf_canary':
       req = buildProbeRequest(h, env, { ssrfParams: h.param ? [h.param.name] : [], waitMs: 2500 }); break
     case 'xxe_canary': req = buildProbeRequest(h, env, { waitMs: 2500 }); break
@@ -279,9 +347,15 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = buildProbeRequest(h, env); delete req.param; delete req.paramLocation; break
     default: req = buildProbeRequest(h, env)
   }
+  if (h.param) {
+    if (ctx.baseline && sqliClasses.has(h.probeClass)) req.baselineValue = ctx.baseline
+    if (ctx.xmlTemplate && h.location === 'xml') req.xmlTemplate = ctx.xmlTemplate
+    if (ctx.graphqlQuery && h.location === 'graphql_var') req.graphqlQuery = ctx.graphqlQuery
+  }
   if (h.probeClass === 'auth_protocol_audit') {
     req.persona = env.jwtPersona ?? env.owner
     req.method = 'GET'
+    if (ctx.seedQuery) req.pathAndQuery = `${h.endpoint.path.split('?')[0]}?${ctx.seedQuery}`
   }
   if (h.probeClass === 'graphql_audit') req.method = 'POST'
   req.onExchange = ex => { watch(ex) }

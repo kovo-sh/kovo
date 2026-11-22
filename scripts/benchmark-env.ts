@@ -13,6 +13,7 @@ import { createProjectPersona } from '../src/server/persona-vault.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { runPhase0Recon } from '../src/server/phase0-recon.ts'
 import { probeSurface } from '../src/server/surface-engine.ts'
+import { buildCorpus } from './benchmark-corpus.ts'
 import { Store } from '../src/server/store.ts'
 import type { BenchmarkServerHandle } from './benchmark-recall.ts'
 import type { DiscoveredEndpoint, ProbeEnv, ProfileCaps } from './benchmark-probes.ts'
@@ -129,6 +130,7 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
 export async function discoverEndpoints(env: EngineEnv, caps: ProfileCaps, onExchange: (ex: BrokerExchangeResult) => void): Promise<DiscoveredEndpoint[]> {
   const { probeEnv } = env
   if (caps.phase0Recon) {
+    probeEnv.corpus = await buildCorpus(env.broker, env.grant, probeEnv.origin, env.controller.signal, [undefined, probeEnv.owner])
     await runPhase0Recon({
       storage: env.storage, runId: env.runId, scopeRevision: env.scopeRevision, tier: caps.tier, origins: [probeEnv.origin],
       budgetRequests: 900, broker: env.broker, canaryBroker: env.canaryBroker, grant: env.grant, signal: env.controller.signal,

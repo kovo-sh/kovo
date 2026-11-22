@@ -107,8 +107,9 @@ function sanitizePathCandidate(raw: string, baseOrigin: string): string | null {
     return null
   }
   try {
+    const expectedOrigin = new URL(baseOrigin).origin
     const parsed = new URL(trimmed, baseOrigin)
-    if (parsed.origin !== baseOrigin) return null
+    if (parsed.origin !== expectedOrigin) return null
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
     if (/[\r\n\0\\]/.test(parsed.pathname + parsed.search)) return null
     return parsed.pathname + parsed.search

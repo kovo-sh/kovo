@@ -17,7 +17,7 @@ import { formHypotheses, profileCaps, runHypothesis } from './benchmark-probes.t
 import type { Hypothesis, HypothesisOutcome } from './benchmark-probes.ts'
 import { scoreManifest } from './benchmark-score.ts'
 import type { ScoredOutcome } from './benchmark-score.ts'
-import { synthesizeSpec } from './benchmark-specs.ts'
+import { synthesizeSpecs } from './benchmark-specs.ts'
 import type {
   BenchmarkManifest,
   BenchmarkProfileMode,
@@ -117,16 +117,18 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
     }
     if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
       notes.push(`[debug] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'}@${hyp.location ?? '-'} -> ${outcome.verdict}: ${(outcome.summary ?? outcome.error ?? '').slice(0, 140)} anomalies=${outcome.anomalies.map(a => String(a.type)).join(',')}`)
+      if (outcome.verdict === 'signal') notes.push(`[debugjson] ${hyp.probeClass} ${hyp.endpoint.path} ${JSON.stringify(outcome.anomalies).slice(0, 900)} details=${JSON.stringify(outcome.details).slice(0, 500)}`)
     }
-    const synth = synthesizeSpec(outcome, env.probeEnv)
-    if (synth) {
+    const candidates = synthesizeSpecs(outcome, env.probeEnv).slice(0, 4)
+    for (const synth of candidates) {
       scored.specSubmitted = true
       try {
         const res = await verifyWithProfile(env, synth.spec, verifier.backend, caps.inlineRetries, onExchange)
-        scored.confirmed = res.verdict === 'confirmed'
         scored.jqError = Boolean(res.feedback?.jqError)
         scored.spaCatchall = Boolean(res.feedback?.spaCatchallMatched)
         if (/blocked below Tier 3|requires explicit Tier 3/i.test(res.replay?.outcome.reason ?? '')) scored.tierBlocked = true
+        if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[debugverify] ${synth.kind} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} -> ${res.verdict}: ${(res.replay?.outcome.reason ?? res.replay?.outcome.observed ?? '').slice(0, 160)}`)
+        if (res.verdict === 'confirmed') { scored.confirmed = true; break }
       } catch (err) {
         notes.push(`verify error on ${hyp.endpoint.path} (${hyp.probeClass}): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`)
       }
