@@ -140,6 +140,19 @@ function safeProbePath(path: string): boolean {
   return path.startsWith('/') && !path.startsWith('//') && path.length <= 512 && !/[\r\n\0\\]/.test(path) && !containsDestructivePayload(path)
 }
 
+/** Reduce a redirect Location to a scheme+host+path base (drops per-request code/state parameters). */
+function redirectBaseFromLocation(location: string): string | null {
+  if (!location || /[\r\n\0]/.test(location)) return null
+  try {
+    const u = new URL(location, 'http://guardian.invalid')
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    if (!u.hostname) return null
+    return `${u.protocol}//${u.host}${u.pathname || '/'}`
+  } catch {
+    return null
+  }
+}
+
 function setQueryParam(pathAndQuery: string, name: string, value: string): string {
   const url = new URL(pathAndQuery, 'http://guardian.invalid')
   url.searchParams.set(name, value)
@@ -1480,6 +1493,49 @@ function buildGraphqlOperation(
   return { query, variables, nestedPath }
 }
 
+/**
+ * Resolve a GraphQL variable probe into a concrete operation: introspect the endpoint, find a root
+ * field that accepts the parameter under test, and synthesize a typed query/mutation for it.
+ * Only used when the caller did not supply an explicit `graphqlQuery`.
+ */
+async function resolveGraphqlArgQuery(
+  req: ProbeDifferentialRequest,
+  send: (r: InjectedRequest & { persona?: string }) => Promise<BrokerExchangeResult | null>,
+): Promise<void> {
+  if (!req.param) return
+  const introQuery = '{__schema{queryType{name} mutationType{name} types{name kind fields{name args{name type{kind name ofType{kind name}}}}}}}'
+  const intro = await send({
+    method: 'POST',
+    pathAndQuery: req.pathAndQuery,
+    body: JSON.stringify({ query: introQuery }),
+    headers: { 'Content-Type': 'application/json', ...(req.headers ?? {}) },
+    persona: req.persona,
+  })
+  if (!intro) return
+  let schemaObj: Record<string, unknown> | undefined
+  try {
+    const parsed = JSON.parse(intro.body) as { data?: { __schema?: Record<string, unknown> } }
+    schemaObj = parsed.data?.__schema
+  } catch {
+    return
+  }
+  if (!schemaObj || !Array.isArray((schemaObj as { types?: unknown[] }).types)) return
+  const schema = parseGraphqlIntrospection(schemaObj)
+  const roots: Array<{ kind: 'query' | 'mutation'; typeName: string | null }> = [
+    { kind: 'query', typeName: schema.queryType },
+    { kind: 'mutation', typeName: schema.mutationType },
+  ]
+  for (const root of roots) {
+    if (!root.typeName) continue
+    const field = (schema.types[root.typeName] ?? []).find(f => f.args.some(a => a.name === req.param))
+    if (!field) continue
+    const op = buildGraphqlOperation(schema, root.kind, field, 3)
+    req.graphqlQuery = op.query
+    req.jsonBody = { ...(req.jsonBody ?? {}), variables: op.variables }
+    return
+  }
+}
+
 async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffOutcome> {
   const { req, send, notes, anomalies } = ctx
   const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
@@ -2001,20 +2057,31 @@ async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): Promise<
   }
 }
 
-async function diffXssContext(ctx: DiffContext): Promise<DiffOutcome> {
-  const { req, send, anomalies } = ctx
-  const canary = `gxss${randToken(8)}`
-  const probeEx = await send(injectParam(req, `${canary}"'<>`))
-  if (!probeEx) return { verdict: 'inconclusive', summary: 'XSS context probe request failed.', details: {} }
+export type ReflectionContext = 'event_handler_attr' | 'href_url' | 'js_string' | 'html_attr' | 'html_body'
 
-  const body = probeEx.body
+export interface ReflectionAnalysis {
+  reflected: boolean
+  context: ReflectionContext
+  unencodedChars: string[]
+  domSinkHint: string | null
+  mediaType: string
+  renderable: boolean
+  exploitable: boolean
+}
+
+/**
+ * Shared reflection analysis for reflected *and* second-order (stored) XSS checks.
+ * Locates `canary` in `body` and classifies the surrounding rendering context.
+ */
+export function analyzeXssReflection(body: string, mediaType: string, canary: string): ReflectionAnalysis {
   const idx = body.indexOf(canary)
+  const mediaLower = mediaType.toLowerCase()
+  const renderable = mediaLower.includes('html') || mediaLower.includes('svg') || mediaLower.includes('xml') || /^\s*</.test(body)
   if (idx < 0) {
-    return { verdict: 'no_signal', summary: 'Probe marker was not reflected in response.', details: { status: probeEx.status } }
+    return { reflected: false, context: 'html_body', unencodedChars: [], domSinkHint: null, mediaType, renderable, exploitable: false }
   }
 
   const windowStart = Math.max(0, idx - 200)
-  const windowEnd = Math.min(body.length, idx + canary.length + 120)
   const before = body.slice(windowStart, idx)
   const snippet = body.slice(idx, Math.min(body.length, idx + canary.length + 16))
   const unencodedChars: string[] = []
@@ -2022,7 +2089,7 @@ async function diffXssContext(ctx: DiffContext): Promise<DiffOutcome> {
     if (snippet.includes(ch)) unencodedChars.push(ch)
   }
 
-  let context: 'event_handler_attr' | 'href_url' | 'js_string' | 'html_attr' | 'html_body' = 'html_body'
+  let context: ReflectionContext = 'html_body'
   if (/\bon[a-z]+\s*=\s*["']?[^"'>]*$/i.test(before)) {
     context = 'event_handler_attr'
   } else if (/\b(?:href|src|action|formaction)\s*=\s*["']?[^"'>]*$/i.test(before)) {
@@ -2036,10 +2103,8 @@ async function diffXssContext(ctx: DiffContext): Promise<DiffOutcome> {
   const sinkMatch = /\b(innerHTML|outerHTML|document\.write|eval|Function)\b/i.exec(body.slice(Math.max(0, idx - 200), Math.min(body.length, idx + 200)))
   const domSinkHint = sinkMatch ? sinkMatch[1] : null
 
-  const mediaLower = probeEx.mediaType.toLowerCase()
-  const isRenderable = mediaLower.includes('html') || mediaLower.includes('svg') || mediaLower.includes('xml') || /^\s*</.test(body)
   const exploitable =
-    isRenderable && (
+    renderable && (
       (context === 'html_body' && (unencodedChars.includes('<') || unencodedChars.includes('>') || Boolean(domSinkHint))) ||
       (context === 'html_attr' && (unencodedChars.includes('"') || unencodedChars.includes("'"))) ||
       (context === 'js_string' && (unencodedChars.includes('"') || unencodedChars.includes("'") || unencodedChars.includes('<') || Boolean(domSinkHint))) ||
@@ -2047,6 +2112,22 @@ async function diffXssContext(ctx: DiffContext): Promise<DiffOutcome> {
       context === 'event_handler_attr' ||
       Boolean(domSinkHint)
     )
+
+  return { reflected: true, context, unencodedChars, domSinkHint, mediaType, renderable, exploitable }
+}
+
+async function diffXssContext(ctx: DiffContext): Promise<DiffOutcome> {
+  const { req, send, anomalies } = ctx
+  const canary = `gxss${randToken(8)}`
+  const probeEx = await send(injectParam(req, `${canary}"'<>`))
+  if (!probeEx) return { verdict: 'inconclusive', summary: 'XSS context probe request failed.', details: {} }
+
+  const body = probeEx.body
+  const analysis = analyzeXssReflection(body, probeEx.mediaType, canary)
+  if (!analysis.reflected) {
+    return { verdict: 'no_signal', summary: 'Probe marker was not reflected in response.', details: { status: probeEx.status } }
+  }
+  const { context, unencodedChars, domSinkHint, exploitable } = analysis
 
   if (exploitable) {
     anomalies.push({
@@ -2089,7 +2170,16 @@ async function diffAuthProtocolAudit(
   // Branch A: OAuth / OIDC redirect_uri & PKCE downgrade audit
   if (/redirect_uri=/i.test(req.pathAndQuery) || /oauth|authorize/i.test(req.pathAndQuery)) {
     const baseUrl = new URL(req.pathAndQuery, 'http://guardian.invalid')
-    const origRedirect = baseUrl.searchParams.get('redirect_uri') ?? 'https://app.example.invalid/cb'
+    // Learn the app's registered redirect target behaviourally: when the caller did not supply a
+    // redirect_uri, the authorize endpoint still issues its default 3xx Location. Use that host as the
+    // baseline for substring/prefix bypass variants instead of assuming a hardcoded client origin.
+    let origRedirect = baseUrl.searchParams.get('redirect_uri')
+    if (!origRedirect) {
+      const defaultEx = await send({ method: 'GET', pathAndQuery: req.pathAndQuery, headers: req.headers })
+      const learned = redirectBaseFromLocation(defaultEx?.respHeaders.location ?? '')
+      origRedirect = learned ?? 'https://app.example.invalid/cb'
+      checks.push({ check: 'oauth_default_redirect_learned', learned: Boolean(learned), baselineHost: (() => { try { return new URL(origRedirect).hostname } catch { return null } })() })
+    }
     const origParsed = (() => {
       try { return new URL(origRedirect) } catch { return new URL('https://app.example.invalid/cb') }
     })()
@@ -2335,7 +2425,7 @@ async function diffXxeCanary(
 }
 
 async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOutcome> {
-  const { req, runner, send, anomalies } = ctx
+  const { req, runner, send, anomalies, notes } = ctx
   const ctrlGcb = randomUUID()
   const ctrlPath = appendCacheBuster(req.pathAndQuery, ctrlGcb)
   const ctrlEx = await send({
@@ -2428,6 +2518,7 @@ async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOutcome> 
       persona: req.persona,
       probeClass: 'cache_poison_deception',
     })
+    notes.push(`cache deception auth probe ${deceptionUrl.slice(0, 120)} -> ${authEx?.status ?? 'error'}`)
     if (authEx && authEx.status >= 200 && authEx.status < 300) {
       const verifyRes = await runner.send({
         origin: ctx.origin,
@@ -2443,11 +2534,16 @@ async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOutcome> 
         const sim = responseSimilarity(authEx.body, verifyRes.ex.body)
         const age = Number(verifyRes.ex.respHeaders.age ?? NaN)
         const hitHdr = /\bhit\b/i.test(verifyRes.ex.respHeaders['x-cache'] ?? verifyRes.ex.respHeaders['cf-cache-status'] ?? '')
-        if (verifyRes.ex.status === 200 && sim >= 0.85 && (hitHdr || (Number.isFinite(age) && age > 0))) {
+        const cached = hitHdr || (Number.isFinite(age) && age > 0)
+        notes.push(`cache deception verify status=${verifyRes.ex.status} similarity=${sim.toFixed(3)} cacheHit=${hitHdr} age=${Number.isFinite(age) ? age : 'n/a'}`)
+        // Token-set similarity under-weights tiny HTML bodies (a single cache-comment marker can cost
+        // ~0.25), so require an explicit cache HIT/Age header and a moderate body match instead.
+        if (verifyRes.ex.status === 200 && cached && sim >= 0.6) {
           anomalies.push({
             type: 'web_cache_deception',
             deceptionUrl,
             similarity: sim,
+            cacheHit: hitHdr,
             suggestedReplayKind: 'cache_differential',
           })
         }
@@ -2622,6 +2718,16 @@ export async function probeDifferential(
     return res.ex
   }
   const ctx: DiffContext = { req, origin, runner, notes, anomalies, send }
+
+  // GraphQL variable probes need a real operation that binds the argument under test.
+  if (req.paramLocation === 'graphql_var' && !req.graphqlQuery) {
+    try {
+      await resolveGraphqlArgQuery(req, send)
+    } catch (err) {
+      if (err instanceof StopProbe) throw err
+      notes.push(`graphql operation resolution failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`)
+    }
+  }
 
   try {
     switch (req.probeClass) {
