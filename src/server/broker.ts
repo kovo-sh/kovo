@@ -2122,9 +2122,23 @@ export class RequestBroker {
     const addresses = await withAbort(resolve(hostname), deadline)
     deadline.throwIfAborted()
     const localLab = allowLocalLab(grant)
-    if (addresses.length === 0 || (!localLab && addresses.some(address => !isPublicAddress(address)))) {
+    // Link-local ranges (169.254.0.0/16 incl. cloud metadata, fe80::/10) are never legitimate
+    // targets — not even in an authorized local-lab. This guard stays fail-closed regardless of
+    // Tier-3 auto-approval or GUARDIAN_ALLOW_LOCAL_LAB.
+    const linkLocal = addresses.some(address => {
+      try {
+        return ipaddr.process(address.address).range() === 'linkLocal'
+      } catch {
+        return true
+      }
+    })
+    if (addresses.length === 0 || linkLocal || (!localLab && addresses.some(address => !isPublicAddress(address)))) {
       grant.audit('denied', originForAudit)
-      throw new BrokerDenied('The target hostname did not resolve exclusively to public addresses.')
+      throw new BrokerDenied(
+        linkLocal
+          ? 'The target hostname resolved to a link-local/metadata address; cloud metadata and link-local endpoints are never permitted.'
+          : 'The target hostname did not resolve exclusively to public addresses.',
+      )
     }
     return addresses
   }
