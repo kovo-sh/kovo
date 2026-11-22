@@ -53,7 +53,7 @@ import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { responseEvidence } from './response-checks.ts'
 import type { BrowserInteractiveAction, BrowserSessionStep } from './scoped-browser.ts'
-import { listSkills, listSkillTags, loadSkill, searchSkills, skillsByTag } from './skills.ts'
+import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from './skills.ts'
 import type { DifferentialProbeClass, SurfaceWordlistName } from './surface-engine.ts'
 import type { SastEngine } from './worker-backend.ts'
 
@@ -508,7 +508,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'request_http', 'request_http_batch', 'probe_differential', 'derive_evidence', 'run_sast_scan',
     ],
     skills: ['bola-idor-race', 'source-first-audit', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding with a multi-persona http_chain DeclarativeReplaySpec.',
+    focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding with a multi-persona http_chain DeclarativeReplaySpec. BFLA needs IMPACT: a 2xx from a lower-privileged actor on a read-only route is not escalation by itself - include a privileged mutation that succeeds (2xx) or a same-route role differential (one actor gets data, another is denied), otherwise the Zero-LLM verifier will dismiss it.',
   },
   'injection-parser-specialist': {
     id: 'injection-parser-specialist',
@@ -522,7 +522,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'mint_second_order_canary', 'list_second_order_canaries', 'run_sast_scan', 'run_offline_script',
       'derive_evidence', 'analyze_artifact',
     ],
-    skills: ['sqli-parser-injection', 'source-first-audit', 'false-positive-elimination'],
+    skills: ['sqli-boolean-differential', 'ssti-non-destructive', 'xxe-canary-proof', 'injection-benign-proof', 'path-traversal-canonicalization', 'source-first-audit', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on SQLi (boolean/time/error across query/json/form/path/header/xml/graphql_var), NoSQLi, SSTI, XXE, SSRF, path traversal, and command injection. Confirm via sql_boolean_diff, sql_time_diff, rce_proof, or http_chain.',
   },
   'auth-session-oauth-specialist': {
@@ -536,7 +536,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'request_http', 'probe_differential', 'mint_canary', 'check_canary',
       'browser_visit', 'browser_session', 'analyze_artifact', 'run_offline_script', 'derive_evidence',
     ],
-    skills: ['jwt-oauth-saml', 'auth-oauth-oidc', 'false-positive-elimination'],
+    skills: ['jwt-session-security', 'auth-oauth-oidc', 'clerk-auth0-oidc', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on JWT authMutation flaws (alg_none, strip_signature, kid_inject, rs256_to_hs256_jwks, jku_x5u_canary, expired_replay), OAuth redirect_uri parser differentials, PKCE downgrades, CSRF, and session fixation. Confirm via auth_protocol_proof or http_chain.',
   },
   'client-browser-dom-specialist': {
@@ -551,7 +551,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'request_http', 'mint_canary', 'check_canary', 'mint_second_order_canary', 'list_second_order_canaries',
       'analyze_artifact',
     ],
-    skills: ['xss-dom-prototype', 'oob-ssrf-browser-chain', 'cross-host-chaining', 'recon-modern-spa'],
+    skills: ['client-side-xss-postmessage', 'prototype-pollution-dom-server', 'cors-csrf-cross-origin', 'websocket-cswsh', 'oob-ssrf-browser-chain', 'cross-host-chaining', 'recon-modern-spa'],
     focusPrompt: 'Focus strictly on Reflected/DOM/Stored XSS, postMessage origin bypass, CSWSH WebSocket hijacking, and client-side state/storage leaks. Confirm via browser_chain (dom_xss_sink_hook/postmessage_probe) or ws_chain.',
   },
   'graphql-api-specialist': {
@@ -578,7 +578,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace',
       'probe_differential', 'derive_evidence',
     ],
-    skills: ['bola-idor-race', 'false-positive-elimination'],
+    skills: ['business-logic-workflows', 'mass-assignment-overposting', 'bola-idor-race', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on workflow step-skip (e.g. draft -> refund), quantity/price invariant violations (-1, 0, overflow), mass assignment, and TOCTOU double-spend races. Confirm via race_burst or http_chain.',
   },
   'protocol-cache-edge-specialist': {
@@ -592,7 +592,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
       'request_http', 'inspect_dns', 'inspect_tls', 'probe_surface', 'probe_differential',
       'run_safe_templates', 'query_cves', 'analyze_artifact', 'suggest_candidate_host',
     ],
-    skills: ['cache-smuggling-desync', 'cve-runtime-correlation', 'false-positive-elimination'],
+    skills: ['cache-smuggling-desync', 'cve-runtime-correlation', 'cors-csrf-cross-origin', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on shared cache poisoning/deception (mandatory ?_gcb=), CORS/header misconfigurations, DNS takeover, TLS posture, and tech-matched CVE runtime reachability. Confirm via cache_differential, dns_takeover, tls_audit, or http_chain.',
   },
 }
@@ -604,6 +604,107 @@ export function resolveSpecialistProfile(profileId: string): SpecialistProfileCo
   return SPECIALIST_PROFILES[profileId as SpecialistProfile]
 }
 
+interface SpecialistIntentRule {
+  patterns: Array<{ re: RegExp; weight: number }>
+  categories?: Record<string, number>
+  sinks?: Record<string, number>
+  /** Skills unique to this profile (shared playbooks are excluded to avoid tie noise). */
+  anchors?: readonly string[]
+}
+
+/**
+ * Deterministic weighted intent table. Weights are additive:
+ * explicit category/sink > profile-unique skill anchor > keyword hits.
+ * Bare `header`, `checkout`, and `refund` are intentionally NOT keywords: they previously hijacked
+ * authz/injection steps into the cache/edge or business-logic specialists.
+ */
+const SPECIALIST_INTENT_RULES: Record<SpecialistProfile, SpecialistIntentRule> = {
+  'graphql-api-specialist': {
+    patterns: [
+      { re: /\bgraphql\b|\bgql\b|nested resolver|\/graphql\b|graphql_var/i, weight: 16 },
+      { re: /\b(?:schema|introspection|alias batching|resolver)\b/i, weight: 3 },
+      { re: /\bmutation\b|\bfield\b/i, weight: 1 },
+    ],
+    categories: { 'api-rest-graphql': 9 },
+    anchors: ['api-rest-graphql'],
+  },
+  'protocol-cache-edge-specialist': {
+    patterns: [
+      { re: /\b(?:cache|poison|poisoning|deception|smuggl\w*|desync|x-forwarded-host|x-original-url|cdn)\b/i, weight: 5 },
+      { re: /\b(?:dns|takeover|dangling cname|tls|ssl|certificate|hsts)\b/i, weight: 4 },
+      { re: /\b(?:content-security-policy|csp|x-frame-options|strict-transport-security|access-control-allow|security header|header normalization)\b/i, weight: 4 },
+      { re: /\b(?:edge|protocol|http\/2|request smuggling)\b/i, weight: 2 },
+    ],
+    categories: { 'misconfig-exposure': 9, 'transport-crypto': 9 },
+    anchors: ['cache-smuggling-desync', 'cve-runtime-correlation'],
+  },
+  'business-logic-race-specialist': {
+    patterns: [
+      { re: /\b(?:race|toctou|double[- ]?spend|coupon|voucher|workflow|step[- ]?skip|state machine)\b/i, weight: 5 },
+      { re: /\b(?:invariant|idempotenc\w*|quantity|discount|balance|quota|credits?|subscription plan)\b/i, weight: 4 },
+      { re: /\bbusiness[- ]logic\b/i, weight: 5 },
+    ],
+    categories: { 'business-logic-race': 9, 'business-logic': 9 },
+    sinks: { server_action: 2 },
+    anchors: ['business-logic-workflows', 'mass-assignment-overposting'],
+  },
+  'client-browser-dom-specialist': {
+    patterns: [
+      { re: /\b(?:xss|dom|innerhtml|postmessage|dom clobbering|prototype pollution)\b/i, weight: 5 },
+      { re: /\b(?:websocket|cswsh|socket\.io)\b/i, weight: 5 },
+      { re: /\b(?:browser|client[- ]side|spa|localstorage|sessionstorage|document\.cookie)\b/i, weight: 3 },
+      { re: /\b(?:csrf|cors|clickjacking)\b/i, weight: 2 },
+    ],
+    categories: { 'cors-client-side': 9 },
+    sinks: { postmessage_iframe: 9 },
+    anchors: ['client-side-xss-postmessage', 'prototype-pollution-dom-server', 'cors-csrf-cross-origin', 'websocket-cswsh'],
+  },
+  'auth-session-oauth-specialist': {
+    patterns: [
+      { re: /\b(?:jwt|jws|jwk|jwks|alg(?:orithm)?[- ]?none|oauth|oidc|saml|pkce|bearer|id token|access token)\b/i, weight: 5 },
+      { re: /\b(?:auth(?:entication|orization)? bypass|authn|authz header|authorization header|session fixation|session hijack|mfa|login|password reset|refresh token)\b/i, weight: 4 },
+      { re: /\b(?:cookie|security header|token replay|token confusion)\b/i, weight: 2 },
+    ],
+    categories: { 'auth-identity': 9, 'auth-session': 9 },
+    sinks: { auth_config: 8 },
+    anchors: ['jwt-session-security', 'auth-oauth-oidc', 'clerk-auth0-oidc'],
+  },
+  'injection-parser-specialist': {
+    patterns: [
+      { re: /\b(?:sqli|sql injection|sql|nosqli|nosql injection)\b/i, weight: 5 },
+      { re: /\b(?:xxe|xml external entity|ssti|template injection|server-side template)\b/i, weight: 5 },
+      { re: /\b(?:rce|command injection|os command|deserializ\w*|ldap injection|xpath injection)\b/i, weight: 5 },
+      { re: /\b(?:path traversal|directory traversal|ssrf|upload|injection|parser differential|expression injection)\b/i, weight: 4 },
+      { re: /\b(?:orm|query builder|raw query)\b/i, weight: 2 },
+    ],
+    categories: { 'injection-input': 9, 'ssrf-redirects': 8, 'upload-storage': 8 },
+    sinks: { db_query: 8, outbound_fetch: 7, upload_storage: 7 },
+    anchors: ['sqli-boolean-differential', 'ssti-non-destructive', 'xxe-canary-proof', 'injection-benign-proof', 'path-traversal-canonicalization'],
+  },
+  'bola-bfla-specialist': {
+    patterns: [
+      { re: /\b(?:bola|bfla|idor|id or|broken object level|broken function level)\b/i, weight: 6 },
+      { re: /\b(?:cross[- ]tenant|tenant isolation|ownership check|privilege escalation|access[- ]control|permission|admin access)\b/i, weight: 5 },
+      { re: /\b(?:authorization|authz)\b/i, weight: 2 },
+    ],
+    categories: { 'broken-access-control': 9 },
+    sinks: { api_route: 2, server_action: 2 },
+    anchors: ['bola-idor-race'],
+  },
+}
+
+const SHARED_PLAYBOOK_SKILLS = new Set([
+  'false-positive-elimination',
+  'source-first-audit',
+  'oob-ssrf-browser-chain',
+  'cross-host-chaining',
+  'recon-modern-spa',
+])
+
+/**
+ * Weighted intent router for chain steps. Explicit `specialistProfile` always wins; otherwise the
+ * highest-scoring profile is chosen deterministically (ties resolved by the profile order below).
+ */
 export function routeStepToSpecialist(input: {
   title?: string
   hypothesis?: string
@@ -611,35 +712,57 @@ export function routeStepToSpecialist(input: {
   skills?: readonly string[]
   endpoint?: string
   sinkKind?: string
+  specialistProfile?: string | null
 }): SpecialistProfile {
-  const primaryText = `${input.title ?? ''} ${input.hypothesis ?? ''} ${input.endpoint ?? ''}`.toLowerCase()
-  const skillsSet = new Set((input.skills ?? []).map(s => s.toLowerCase()))
-  const cat = (input.category ?? '').toLowerCase()
-  const sink = (input.sinkKind ?? '').toLowerCase()
+  const explicit = input.specialistProfile?.trim()
+  if (explicit && (specialistProfiles as readonly string[]).includes(explicit)) {
+    return explicit as SpecialistProfile
+  }
 
-  if (/\bgraphql\b|\/graphql\b|gql\b|nested resolver/.test(primaryText) || skillsSet.has('api-rest-graphql')) {
-    return 'graphql-api-specialist'
+  const primaryText = `${input.title ?? ''} ${input.hypothesis ?? ''} ${input.endpoint ?? ''}`
+  const skillsSet = new Set((input.skills ?? []).map(s => s.trim().toLowerCase()).filter(Boolean))
+  const cat = (input.category ?? '').trim().toLowerCase()
+  const sink = (input.sinkKind ?? '').trim().toLowerCase()
+
+  // A step that explicitly names a GraphQL surface belongs to the GraphQL specialist even when the
+  // planner's generic access-control category/skills would otherwise pull it to BOLA. Concrete
+  // injection sinks (e.g. SQLi through a graphql_var scalar) still route to the injection parser.
+  if (/\bgraphql\b|\bgql\b|\/graphql\b/i.test(primaryText)) {
+    const namesInjectionSink = /\b(?:sqli|sql injection|sql|ssti|template injection|xxe|command injection|rce|nosql|nosql injection|deserializ\w*|ldap injection)\b/i.test(primaryText)
+    if (!namesInjectionSink) return 'graphql-api-specialist'
   }
-  if (/\b(?:cache|poison|deception|x-forwarded-host|smuggl|desync|dns|takeover|tls|ssl|header|edge|protocol)\b/.test(primaryText) || skillsSet.has('cache-smuggling-desync')) {
-    return 'protocol-cache-edge-specialist'
+
+  const scores = new Map<SpecialistProfile, number>()
+  for (const profile of specialistProfiles) {
+    const rule = SPECIALIST_INTENT_RULES[profile]
+    let score = 0
+    const catWeight = rule.categories?.[cat]
+    if (catWeight) score += catWeight
+    const sinkWeight = rule.sinks?.[sink]
+    if (sinkWeight) score += sinkWeight
+    for (const anchor of rule.anchors ?? []) {
+      if (skillsSet.has(anchor) && !SHARED_PLAYBOOK_SKILLS.has(anchor)) score += 5
+    }
+    for (const { re, weight } of rule.patterns) {
+      if (re.test(primaryText)) score += weight
+    }
+    scores.set(profile, score)
   }
-  if (/\b(?:race|toctou|coupon|double[- ]?spend|workflow|step[- ]?skip|checkout|refund|invariant|business[- ]logic)\b/.test(primaryText) || cat === 'business-logic-race') {
-    return 'business-logic-race-specialist'
+
+  let best: SpecialistProfile = 'bola-bfla-specialist'
+  let bestScore = 0
+  for (const profile of specialistProfiles) {
+    const score = scores.get(profile) ?? 0
+    if (score > bestScore) {
+      best = profile
+      bestScore = score
+    }
   }
-  if (/\b(?:xss|dom|innerhtml|postmessage|websocket|cswsh|browser|client-side|spa|prototype)\b/.test(primaryText) || cat === 'cors-client-side' || sink === 'postmessage_iframe' || skillsSet.has('xss-dom-prototype')) {
-    return 'client-browser-dom-specialist'
-  }
-  if (/\b(?:jwt|oauth|oidc|saml|pkce|session|cookie|login|mfa|alg.?none|jwks|auth_protocol)\b/.test(primaryText) || cat === 'auth-identity' || cat === 'auth-session' || sink === 'auth_config' || sink === 'webhook' || skillsSet.has('jwt-oauth-saml') || skillsSet.has('auth-oauth-oidc')) {
-    return 'auth-session-oauth-specialist'
-  }
-  if (/\b(?:sqli|sql|xxe|ssti|rce|command|nosql|deserial|traversal|ssrf|upload|injection|parser|db_query)\b/.test(primaryText) || cat === 'injection-input' || cat === 'ssrf-redirects' || cat === 'upload-storage' || sink === 'db_query' || sink === 'outbound_fetch' || sink === 'redirect' || sink === 'upload_storage' || skillsSet.has('sqli-parser-injection')) {
-    return 'injection-parser-specialist'
-  }
-  if (/\b(?:bola|bfla|idor|cross-tenant|ownership|tenant|access[- ]control|permission|orders|invoices)\b/.test(primaryText) || cat === 'broken-access-control' || sink === 'api_route' || sink === 'server_action') {
+  if (bestScore === 0) {
+    if (cat === 'misconfig-exposure' || cat === 'transport-crypto') return 'protocol-cache-edge-specialist'
     return 'bola-bfla-specialist'
   }
-  if (cat === 'misconfig-exposure' || cat === 'transport-crypto') return 'protocol-cache-edge-specialist'
-  return 'bola-bfla-specialist'
+  return best
 }
 
 export function filterHandlersForSpecialist(
@@ -795,13 +918,14 @@ const scenarioInstructions: Record<AgentScenario, string> = {
 
   'chain-planner': [
     'You are Guardian v3’s Stateless Coordinator Planner.',
-    'Review the engagement goal, capability tier, approved origins, threat model, hostTiers, codeAuditSuspects, recorded facts, cold-graph digests, coverage ledger, openProofGaps (`needs_follow_up`), existing chain_steps, and operator hints.',
+    'Review the engagement goal, capability tier, approved origins, threat model, hostTiers, codeAuditSuspects, recorded facts, cold-graph digests, coverage ledger, openProofGaps (`needs_follow_up`), existing chain_steps, `secondOrderCanaries` (planted/surfaced second-order markers), and operator hints.',
     'Apply strict **80/20 Crown-Jewel Prioritization**:',
     '- Allocate ~80% of newSteps and worker turn budget to `crown_jewel` hosts (auth/OAuth/Clerk, billing/Stripe/webhooks, APIs/Server Actions, LLM gateways, uploads, sandboxes, staging/admin), `code_audit_suspect` leads from mounted source repos, multi-persona BOLA/IDOR + race-condition tests, and cross-host chains.',
     '- Cap `low_value_static` hosts (blog/docs/marketing/landing) to at most 1 lightweight recon/DNS check total when `crown_jewel` hosts are present; NEVER schedule follow-up steps for routine missing-header hygiene on static hosts.',
     'Review every `openProofGaps` (`needs_follow_up`) coverage entry before setting `"done": true`: either schedule a concrete follow-up step that can resolve the gap under the current capability tier or leave it transparently documented as an Open Proof Gap when blocked by missing tier/persona/lab access.',
     'Plan high-impact, prerequisite-ordered defensive investigation steps that chain discovered primitives into verified High/Critical findings (using `probe_surface`, `probe_differential`, `run_safe_templates`, `probe_websocket`, `run_sast_scan`, `browser_visit`, and `request_http_race`).',
     'Avoid duplicating completed/running steps or re-testing already verified `(origin, cwe)` findings.',
+    'Treat a `secondOrderCanaries` row whose `surfacedPersona` differs from `injectedPersona`, or whose surfaced render is active HTML, as a top-priority lead: schedule an explicit re-read/verification step before declaring "done".',
     'Return ONLY valid JSON matching: { "summary": string, "newSteps": [{ "title": string, "hypothesis": string, "category": string, "priority": number, "origins": string[], "skills": string[], "dependsOnFactIds": string[], "dependsOnStepIds": string[] }], "cancelStepIds": string[], "done": boolean }.',
     'Only set "done": true when crown-jewel attack surfaces, code-audit suspects, resolvable open proof gaps, and promising cross-host/BOLA chains for the current goal have been thoroughly investigated or ruled out with enforcing controls.',
   ].join('\n'),
@@ -1019,6 +1143,17 @@ export function chainPlannerPrompt(input: {
     proofGapReason?: string | null
   }[]
   pendingFindings?: readonly { id: string; origin: string; title: string; status: string; severity: string }[]
+  secondOrderCanaries?: readonly {
+    marker: string
+    status: string
+    injectedOrigin: string
+    injectedEndpoint: string
+    injectedParam: string
+    injectedPersona: string | null
+    surfacedOrigin: string | null
+    surfacedEndpoint: string | null
+    surfacedPersona: string | null
+  }[]
   uncoveredEndpoints?: readonly { id: string; origin: string; method: string; pathTemplate: string; riskScore: number; coveragePct: number; testedClasses: readonly string[] }[]
   dynamicStepBudget?: number
   operatorHints?: readonly string[]
@@ -1173,6 +1308,7 @@ export function workerInvestigationPrompt(input: {
   specsSummary?: readonly { name: string; kind: string; origin?: string | null; stagedPath?: string }[]
   mountedRepos?: readonly string[]
   availableSkills?: readonly string[]
+  preInjectedSkills?: readonly { name: string; title: string; summary: string; tags: readonly string[]; excerpt: string }[]
 }): string {
   const specialistConfig = input.step.specialistProfile
     ? SPECIALIST_PROFILES[input.step.specialistProfile]
@@ -1191,6 +1327,15 @@ export function workerInvestigationPrompt(input: {
     parentFacts: input.parentFacts ?? [],
     specs: input.specsSummary ?? [],
     mountedRepos: input.mountedRepos ?? [],
+    // Deterministically pre-injected top 1-2 playbooks (profile + tech + sink) so the worker does
+    // not have to discover them in a 41-skill catalog.
+    preInjectedSkills: (input.preInjectedSkills ?? []).map(s => ({
+      name: s.name,
+      title: s.title,
+      summary: s.summary,
+      tags: [...s.tags],
+      excerpt: s.excerpt,
+    })),
     availableSkills: input.availableSkills ?? listSkills().map(s => s.name),
   })
 }
@@ -2797,4 +2942,4 @@ export async function agentTurn(job: AgentTurnJob): Promise<string> {
   return session.answer.slice(0, 16_000)
 }
 
-export { listSkills, listSkillTags, loadSkill, searchSkills, skillsByTag }
+export { listSkills, listSkillTags, loadSkill, searchSkills, skillsByTag, selectPreInjectionSkills }

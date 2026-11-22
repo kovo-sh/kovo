@@ -108,6 +108,9 @@ export interface CanaryHit {
   remoteIp: string
   userAgent: string
   headers: Record<string, string>
+  /** Bounded (<=4 KiB), redacted preview of an HTTP POST/webhook callback body. */
+  bodyPreview?: string
+  bodyBytes?: number
   receivedAt: string
   timestamp: number
 }
@@ -370,6 +373,7 @@ function recordSecondOrderSurfaceFact(
   surfacedEndpoint: string,
   surfacedPersona: string | null,
   exchangeId: string | null,
+  extra?: { mediaType?: string | null; surfaces?: SecondOrderSurface[] },
 ) {
   if (!storage.runDetail || !storage.addFact) return
   try {
@@ -408,6 +412,9 @@ function recordSecondOrderSurfaceFact(
         surfacedEndpoint,
         surfacedPersona,
         surfacedExchangeId: exchangeId,
+        surfacedMediaType: extra?.mediaType ?? null,
+        crossPersona: (canary.injectedPersona ?? null) !== (surfacedPersona ?? null),
+        surfaces: (extra?.surfaces ?? []).slice(-20),
       },
       ...(exchangeId ? { exchangeIds: [exchangeId] } : {}),
       sourceOrigins: [canary.injectedOrigin, surfacedOrigin],
@@ -424,8 +431,71 @@ export interface ScanSecondOrderInput {
   origin: string
   endpoint: string
   persona?: string | null
+  mediaType?: string | null
   exchangeId?: string | null
   storage?: SecondOrderStore
+}
+
+export interface SecondOrderSurface {
+  origin: string
+  endpoint: string
+  persona: string | null
+  mediaType: string | null
+  exchangeId: string | null
+  observedAt: number
+}
+
+const maxTrackedSecondOrderSurfaces = 5_000
+const maxSurfacesPerCanary = 20
+/** Distinct surfaces already observed per canary id, keyed `(origin, endpoint, persona, mediaType)`. */
+const observedSecondOrderSurfaces = new Map<string, Map<string, SecondOrderSurface>>()
+
+function normalizeSurfaceEndpoint(endpoint: string): string {
+  const pathOnly = endpoint.split('?')[0].split('#')[0].trim()
+  if (!pathOnly) return '/'
+  const withSlash = pathOnly.startsWith('/') ? pathOnly : `/${pathOnly}`
+  const collapsed = withSlash.replace(/\/{2,}/g, '/')
+  return collapsed.length > 1 ? collapsed.replace(/\/+$/, '').toLowerCase() : collapsed.toLowerCase()
+}
+
+function recordObservedSurface(
+  canaryId: string,
+  input: ScanSecondOrderInput,
+): { isNew: boolean; surfaces: SecondOrderSurface[] } {
+  let byKey = observedSecondOrderSurfaces.get(canaryId)
+  if (!byKey) {
+    if (observedSecondOrderSurfaces.size >= maxTrackedSecondOrderSurfaces) {
+      const oldest = observedSecondOrderSurfaces.keys().next().value
+      if (oldest !== undefined) observedSecondOrderSurfaces.delete(oldest)
+    }
+    byKey = new Map<string, SecondOrderSurface>()
+    observedSecondOrderSurfaces.set(canaryId, byKey)
+  }
+  const endpoint = normalizeSurfaceEndpoint(input.endpoint)
+  const mediaType = input.mediaType?.trim().toLowerCase() || null
+  const persona = input.persona?.trim() || null
+  const key = `${input.origin}|${endpoint}|${persona ?? ''}|${mediaType ?? ''}`
+  const isNew = !byKey.has(key)
+  if (isNew) {
+    if (byKey.size >= maxSurfacesPerCanary) {
+      const oldest = byKey.keys().next().value
+      if (oldest !== undefined) byKey.delete(oldest)
+    }
+    byKey.set(key, {
+      origin: input.origin,
+      endpoint,
+      persona,
+      mediaType,
+      exchangeId: input.exchangeId ?? null,
+      observedAt: Date.now(),
+    })
+  }
+  return { isNew, surfaces: [...byKey.values()] }
+}
+
+/** Test/diagnostic helper: drop in-memory surface tracking. */
+export function resetSecondOrderSurfaceTracking(): void {
+  observedSecondOrderSurfaces.clear()
 }
 
 export function scanSecondOrderMarkers(input: ScanSecondOrderInput): SecondOrderCanaryRecord[] {
@@ -436,46 +506,59 @@ export function scanSecondOrderMarkers(input: ScanSecondOrderInput): SecondOrder
   if (!matches || matches.length === 0) return []
   const found = new Set(matches.map(m => m.toLowerCase()))
 
-  let planted: SecondOrderCanaryRecord[] = []
+  let known: SecondOrderCanaryRecord[] = []
   try {
-    planted = input.storage.listSecondOrderCanaries(input.runId, 'planted')
+    // Track every canary for the run, not only `planted`: a single early benign JSON echo used to
+    // move the row to `surfaced`, permanently blinding cross-persona/admin renders afterwards.
+    known = input.storage.listSecondOrderCanaries(input.runId)
   } catch {
     return []
   }
-  if (planted.length === 0) return []
+  if (known.length === 0) return []
 
   const surfacedRecords: SecondOrderCanaryRecord[] = []
   const bareEndpoint = input.endpoint.split('?')[0]
-  for (const canary of planted) {
+  for (const canary of known) {
     if (!found.has(canary.marker.toLowerCase())) continue
+    if (canary.status === 'retired') continue
     const sameOrigin = canary.injectedOrigin === input.origin
     const sameEndpoint = canary.injectedEndpoint === input.endpoint || canary.injectedEndpoint === bareEndpoint
     const samePersona = (canary.injectedPersona ?? null) === (input.persona ?? null)
     if (sameOrigin && sameEndpoint && samePersona) {
+      // Benign self-echo (injecting persona viewing its own value) is not evidence of a surface.
       continue
     }
-    try {
-      const updated = input.storage.markSecondOrderCanarySurfaced(canary.id, {
-        surfacedOrigin: input.origin,
-        surfacedEndpoint: input.endpoint,
-        surfacedPersona: input.persona ?? null,
-        surfacedExchangeId: input.exchangeId ?? null,
-        status: 'surfaced',
-      })
-      recordSecondOrderSurfaceFact(
-        input.storage,
-        input.runId,
-        input.assignmentId ?? canary.assignmentId,
-        updated,
-        input.origin,
-        input.endpoint,
-        input.persona ?? null,
-        input.exchangeId ?? null,
-      )
-      surfacedRecords.push(updated)
-    } catch {
-      // Best-effort update if DB closed concurrently.
+
+    const { isNew, surfaces } = recordObservedSurface(canary.id, input)
+    if (!isNew) continue
+
+    const isFirstSurface = canary.status === 'planted'
+    let record: SecondOrderCanaryRecord = canary
+    if (isFirstSurface) {
+      try {
+        record = input.storage.markSecondOrderCanarySurfaced(canary.id, {
+          surfacedOrigin: input.origin,
+          surfacedEndpoint: input.endpoint,
+          surfacedPersona: input.persona ?? null,
+          surfacedExchangeId: input.exchangeId ?? null,
+          status: 'surfaced',
+        })
+      } catch {
+        // Best-effort update if DB closed concurrently; still record the surface fact.
+      }
     }
+    recordSecondOrderSurfaceFact(
+      input.storage,
+      input.runId,
+      input.assignmentId ?? canary.assignmentId,
+      record,
+      input.origin,
+      input.endpoint,
+      input.persona ?? null,
+      input.exchangeId ?? null,
+      { mediaType: input.mediaType ?? null, surfaces },
+    )
+    surfacedRecords.push(record)
   }
   return surfacedRecords
 }
@@ -650,35 +733,64 @@ export class CanaryBroker {
       const port = parsePort(options.port, 'GUARDIAN_CANARY_PORT')
 
       const server = createServer((req, res) => {
-        // Drain inbound request body without buffering untrusted payloads.
-        req.resume()
-        try {
-          const url = new URL(req.url ?? '/', `http://${formatHostForUrl(host)}`)
-          const token = extractTokenFromRequest(url, req.headers.host)
-          if (token) {
-            const now = Date.now()
-            const hit: CanaryHit = {
-              protocol: 'http',
-              token,
-              method: (req.method ?? 'GET').toUpperCase().slice(0, 16),
-              path: redact(url.pathname).slice(0, 512),
-              query: redact(url.search).slice(0, 512),
-              remoteIp: (req.socket?.remoteAddress ?? '').slice(0, 128),
-              userAgent: redact(String(req.headers['user-agent'] ?? '')).slice(0, 200),
-              headers: normalizeIncomingHeaders(req.headers),
-              receivedAt: new Date(now).toISOString(),
-              timestamp: now,
-            }
-            this.appendHit(hit)
+        // Bound and redact POST/webhook callback bodies instead of discarding them: second-order
+        // and SSRF/webhook proofs often carry their evidence in the callback payload.
+        const maxCallbackBodyBytes = 4096
+        const chunks: Buffer[] = []
+        let received = 0
+        let totalBytes = 0
+        let truncated = false
+        req.on('data', (chunk: Buffer) => {
+          totalBytes += chunk.length
+          if (received >= maxCallbackBodyBytes) {
+            truncated = true
+            return
           }
-        } catch {
-          // Ignore malformed URLs on callback listener; still return benign 200.
+          const remaining = maxCallbackBodyBytes - received
+          const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk
+          chunks.push(slice)
+          received += slice.length
+          if (slice.length < chunk.length) truncated = true
+        })
+        req.on('error', () => { /* ignore malformed callback streams */ })
+        const finish = () => {
+          try {
+            const url = new URL(req.url ?? '/', `http://${formatHostForUrl(host)}`)
+            const token = extractTokenFromRequest(url, req.headers.host)
+            if (token) {
+              const now = Date.now()
+              const rawBody = Buffer.concat(chunks).toString('utf8')
+              const bodyPreview = rawBody
+                ? redact(rawBody, []).slice(0, maxCallbackBodyBytes) + (truncated ? '…[truncated]' : '')
+                : undefined
+              const hit: CanaryHit = {
+                protocol: 'http',
+                token,
+                method: (req.method ?? 'GET').toUpperCase().slice(0, 16),
+                path: redact(url.pathname).slice(0, 512),
+                query: redact(url.search).slice(0, 512),
+                remoteIp: (req.socket?.remoteAddress ?? '').slice(0, 128),
+                userAgent: redact(String(req.headers['user-agent'] ?? '')).slice(0, 200),
+                headers: normalizeIncomingHeaders(req.headers),
+                ...(bodyPreview ? { bodyPreview, bodyBytes: totalBytes } : {}),
+                receivedAt: new Date(now).toISOString(),
+                timestamp: now,
+              }
+              this.appendHit(hit)
+            }
+          } catch {
+            // Ignore malformed URLs on callback listener; still return benign 200.
+          }
+          res.writeHead(200, {
+            'content-type': 'text/plain; charset=utf-8',
+            'cache-control': 'no-store',
+            connection: 'close',
+          }).end('guardian-canary-ok')
         }
-        res.writeHead(200, {
-          'content-type': 'text/plain; charset=utf-8',
-          'cache-control': 'no-store',
-          connection: 'close',
-        }).end('guardian-canary-ok')
+        req.on('end', finish)
+        req.on('close', () => {
+          if (!req.complete) finish()
+        })
       })
 
       server.listen(port, host)

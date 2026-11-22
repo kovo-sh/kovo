@@ -153,8 +153,106 @@ function extractVariables(step: ReplayStep, exchange: BrokerExchangeResult, vars
   }
 }
 
-function summarizeExchange(ex: BrokerExchangeResult) {
-  let json: unknown = null
+const BFLA_CWE_RE = /^CWE-(?:285|269|862|863)$/i
+const BFLA_TEXT_RE = /\b(?:bfla|broken function[- ]level|function[- ]level|privilege escalation|vertical access)\b/i
+const READ_ONLY_REPLAY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const MUTATING_REPLAY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+export interface BflaImpactAssessment {
+  required: boolean
+  satisfied: boolean
+  reason: string
+}
+
+function readStepField(entry: Record<string, unknown> | undefined, key: string): unknown {
+  return entry && typeof entry === 'object' ? entry[key] : undefined
+}
+
+function normalizedReplayPath(value: string | undefined): string {
+  if (!value) return ''
+  return value.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/'
+}
+
+/**
+ * Vertical (function-level) BFLA needs *impact*, not just a 2xx from a lower-privileged actor.
+ * A read-only route that every authenticated role may legitimately read must never confirm as
+ * privilege escalation: the deterministic replay has to show either a successful privileged
+ * mutation or a same-route role differential (one actor 2xx with real data, another actor denied).
+ * Object-level BOLA (CWE-639) is intentionally unaffected.
+ */
+export function assessBflaImpact(
+  spec: DeclarativeReplaySpec,
+  stepsOut: Record<string, unknown>,
+): BflaImpactAssessment {
+  if (spec.kind !== 'http_chain') {
+    return { required: false, satisfied: true, reason: 'Not an HTTP chain replay spec.' }
+  }
+  const descriptor = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact} ${spec.severityRationale}`
+  const vertical = BFLA_CWE_RE.test(spec.cwe) || BFLA_TEXT_RE.test(descriptor)
+  if (!vertical || spec.steps.length < 2) {
+    return { required: false, satisfied: true, reason: 'Not a function-level BFLA proof.' }
+  }
+
+  const steps = spec.steps.map(step => {
+    const entry = stepsOut[step.id] as Record<string, unknown> | undefined
+    const status = readStepField(entry, 'status')
+    const body = readStepField(entry, 'body')
+    return {
+      id: step.id,
+      role: step.role,
+      method: step.request.method.toUpperCase(),
+      persona: step.request.persona ?? null,
+      path: normalizedReplayPath(step.request.pathAndQuery),
+      status: typeof status === 'number' ? status : null,
+      bodyBytes: typeof body === 'string' ? body.length : 0,
+    }
+  })
+
+  const mutating = steps.filter(step => MUTATING_REPLAY_METHODS.has(step.method))
+  if (mutating.length > 0) {
+    const succeeded = mutating.find(step => step.status !== null && step.status >= 200 && step.status < 300)
+    if (succeeded) {
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Privileged mutating step "${succeeded.id}" returned HTTP ${succeeded.status}.`,
+      }
+    }
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'BFLA mutating step did not succeed, so no privileged side effect was demonstrated.',
+    }
+  }
+
+  if (!steps.every(step => READ_ONLY_REPLAY_METHODS.has(step.method))) {
+    return { required: true, satisfied: false, reason: 'BFLA proof used a non-read method without a 2xx mutation.' }
+  }
+
+  // Same-route role differential: a different actor is denied while the probe actor receives data.
+  for (const probe of steps) {
+    if (probe.status === null || probe.status < 200 || probe.status >= 300 || probe.bodyBytes < 64) continue
+    for (const other of steps) {
+      if (other.id === probe.id) continue
+      if (other.path !== probe.path) continue
+      if (other.status === null || other.status < 400) continue
+      if (other.persona === probe.persona && other.role === probe.role) continue
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Role differential: "${probe.id}" (${probe.persona ?? 'anonymous'}) received HTTP ${probe.status} while "${other.id}" (${other.persona ?? 'anonymous'}) was denied with HTTP ${other.status}.`,
+      }
+    }
+  }
+
+  return {
+    required: true,
+    satisfied: false,
+    reason: 'Read-only BFLA proof lacks impact evidence: a 2xx from one actor on a read-only route is not privilege escalation unless another actor is denied on the same route or the response exposes data the actor cannot otherwise access. Add a same-route role-differential or a privileged mutation step.',
+  }
+}
+
+function summarizeExchange(ex: BrokerExchangeResult) {  let json: unknown = null
   if (ex.mediaType.includes('json')) {
     try { json = JSON.parse(ex.body) } catch { json = null }
   }
@@ -655,6 +753,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           }
         }
 
+        const bflaImpact = assessBflaImpact(spec, stepsOut)
         evidencePayload = {
           ...evidencePayload,
           steps: stepsOut,
@@ -663,6 +762,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           extractedVars: vars,
           ...(canaryEvidence ?? {}),
           ...(spaCatchall ? { spaCatchall } : {}),
+          bflaImpact,
+        }
+        if (bflaImpact.required && !bflaImpact.satisfied && !forcedInconclusiveReason) {
+          forcedInconclusiveReason = bflaImpact.reason
         }
       } finally {
         await canarySession?.close()
@@ -2144,13 +2247,143 @@ function toStepStatusItem(
   }
 }
 
+export interface InlineExchangeHeaderSummary {
+  stepId: string
+  status: number
+  contentType?: string
+  location?: string
+  cacheControl?: string
+  xCache?: string
+  age?: string
+  vary?: string
+  accessControl?: string
+  setCookie?: Array<{ name: string; secure: boolean; httpOnly: boolean; sameSite: string | null }>
+}
+
+export interface InlineStepBodyPreview {
+  stepId: string
+  status: number
+  mediaType?: string
+  preview: string
+  truncated: boolean
+}
+
+export interface InlineSqlRoundSummary {
+  round: number
+  pass?: boolean
+  baselineStatus?: number | null
+  trueStatus?: number | null
+  falseStatus?: number | null
+  delayProbeStatus?: number | null
+  similarityBaselineTrue?: number
+  similarityTrueFalse?: number
+  baselineMs?: number
+  probeMs?: number
+}
+
+/**
+ * Enriched inline verification feedback. Extra fields are additive on top of the persisted
+ * `InlineVerifyFeedback` contract (the domain schema strips nothing on read), so older consumers
+ * and stored rows keep working while the repairing agent gets actionable evidence.
+ */
+export interface EnrichedInlineVerifyFeedback extends InlineVerifyFeedback {
+  replayExchangeIds?: string[]
+  keyResponseHeaders?: InlineExchangeHeaderSummary[]
+  stepBodyPreviews?: InlineStepBodyPreview[]
+  extractedVars?: Array<{ key: string; preview: string }>
+  sqlRoundSummaries?: InlineSqlRoundSummary[]
+  verificationKind?: string
+  /** True when a vertical BFLA (function-level) proof lacked impact evidence. */
+  bflaImpactRequired?: boolean
+  impactEvidenceMissing?: boolean
+}
+
+const inlinePreviewBytes = 512
+const maxInlineExchanges = 8
+const maxInlineExtractedVars = 12
+
+function sanitizeInlinePreview(text: string, secrets: readonly NamedSecret[]): { preview: string; truncated: boolean } {
+  const redacted = redact(text, secrets)
+  const cleaned = redacted
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (Buffer.byteLength(cleaned, 'utf8') <= inlinePreviewBytes) return { preview: cleaned, truncated: false }
+  const sliced = Buffer.from(cleaned, 'utf8').subarray(0, inlinePreviewBytes).toString('utf8').replace(/\uFFFD+$/, '')
+  return { preview: `${sliced}…`, truncated: true }
+}
+
+function headerValue(headers: Record<string, string>, name: string): string | undefined {
+  const key = Object.keys(headers).find(k => k.toLowerCase() === name)
+  return key ? headers[key] : undefined
+}
+
+function summarizeKeyResponseHeaders(
+  exchanges: readonly BrokerExchangeResult[],
+  stepIds: readonly string[],
+  secrets: readonly NamedSecret[],
+): InlineExchangeHeaderSummary[] {
+  const out: InlineExchangeHeaderSummary[] = []
+  for (const [idx, ex] of exchanges.slice(0, maxInlineExchanges).entries()) {
+    const headers = ex.respHeaders ?? {}
+    const accessControl = Object.entries(headers)
+      .filter(([k]) => k.toLowerCase().startsWith('access-control-'))
+      .map(([k, v]) => `${k.toLowerCase()}: ${redact(v, secrets).slice(0, 120)}`)
+      .sort()
+      .join('; ')
+    const setCookie = (ex.setCookies ?? []).slice(0, 8).map(c => ({
+      name: c.name,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      sameSite: c.sameSite,
+    }))
+    out.push({
+      stepId: stepIds[idx] ?? `exchange-${idx + 1}`,
+      status: ex.status,
+      ...(headerValue(headers, 'content-type') ? { contentType: redact(headerValue(headers, 'content-type')!, secrets).slice(0, 120) } : {}),
+      ...(headerValue(headers, 'location') ? { location: redact(headerValue(headers, 'location')!, secrets).slice(0, 240) } : {}),
+      ...(headerValue(headers, 'cache-control') ? { cacheControl: redact(headerValue(headers, 'cache-control')!, secrets).slice(0, 160) } : {}),
+      ...(headerValue(headers, 'x-cache') ? { xCache: redact(headerValue(headers, 'x-cache')!, secrets).slice(0, 80) } : {}),
+      ...(headerValue(headers, 'age') ? { age: redact(headerValue(headers, 'age')!, secrets).slice(0, 40) } : {}),
+      ...(headerValue(headers, 'vary') ? { vary: redact(headerValue(headers, 'vary')!, secrets).slice(0, 160) } : {}),
+      ...(accessControl ? { accessControl } : {}),
+      ...(setCookie.length ? { setCookie } : {}),
+    })
+  }
+  return out
+}
+
+function summarizeSqlRounds(payload: Record<string, unknown>): InlineSqlRoundSummary[] {
+  const sqlDiff = payload.sqlDiff as { rounds?: Array<Record<string, unknown>> } | undefined
+  const sqlTimeDiff = payload.sqlTimeDiff as { rounds?: Array<Record<string, unknown>> } | undefined
+  const rounds = Array.isArray(sqlDiff?.rounds) ? sqlDiff!.rounds : Array.isArray(sqlTimeDiff?.rounds) ? sqlTimeDiff!.rounds : []
+  const num = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined
+  const status = (value: unknown): number | null =>
+    value && typeof value === 'object' && typeof (value as { status?: unknown }).status === 'number'
+      ? (value as { status: number }).status
+      : null
+  return rounds.slice(0, 5).map((r, idx) => ({
+    round: num(r.round) ?? idx + 1,
+    ...(typeof r.pass === 'boolean' ? { pass: r.pass } : {}),
+    baselineStatus: status(r.baseline),
+    trueStatus: status(r.true),
+    falseStatus: status(r.false),
+    ...(r.delayProbe !== undefined ? { delayProbeStatus: status(r.delayProbe) } : {}),
+    ...(num(r.similarityBaselineTrue) !== undefined ? { similarityBaselineTrue: num(r.similarityBaselineTrue)! } : {}),
+    ...(num(r.similarityTrueFalse) !== undefined ? { similarityTrueFalse: num(r.similarityTrueFalse)! } : {}),
+    ...(num(r.baselineMs) !== undefined ? { baselineMs: Math.round(num(r.baselineMs)!) } : {}),
+    ...(num(r.probeMs) !== undefined ? { probeMs: Math.round(num(r.probeMs)!) } : {}),
+  }))
+}
+
 export function buildInlineVerifyFeedback(
   spec: DeclarativeReplaySpec | unknown,
   replay: ReplayVerificationResult,
   attemptCount: number,
   maxRetries = maxInlineVerifyRetries,
   secrets: readonly NamedSecret[] = [],
-): InlineVerifyFeedback {
+): EnrichedInlineVerifyFeedback {
   const maxAttempts = 1 + Math.max(0, maxRetries)
   const retriesRemaining = Math.max(0, maxAttempts - attemptCount)
   const payload = replay.evidencePayload ?? {}
@@ -2294,7 +2527,47 @@ export function buildInlineVerifyFeedback(
     ...(reason ? { reason: redact(reason, secrets).slice(0, 400) } : {}),
   }
 
-  const rawFeedback: InlineVerifyFeedback = {
+  // --- M1.5 enrichment: actionable, bounded, redacted evidence for the repairing agent ---
+  const enrichedHeaders = summarizeKeyResponseHeaders(replay.exchanges ?? [], stepStatuses.map(s => s.id), secrets)
+  const bodyPreviews: InlineStepBodyPreview[] = []
+  if (replay.verdict !== 'confirmed' && replay.verdict !== 'static_verified') {
+    const failedIds = new Set<string>()
+    if (failedStepId) failedIds.add(failedStepId)
+    for (const step of stepStatuses) {
+      if (step.id === failedStepId || step.status === null || step.status === 0 || step.status >= 400) failedIds.add(step.id)
+    }
+    for (const [idx, ex] of (replay.exchanges ?? []).slice(0, maxInlineExchanges).entries()) {
+      const stepId = stepStatuses[idx]?.id ?? `exchange-${idx + 1}`
+      if (failedIds.size && !failedIds.has(stepId)) continue
+      if (!ex.body) continue
+      const { preview, truncated } = sanitizeInlinePreview(ex.body, secrets)
+      if (!preview) continue
+      bodyPreviews.push({
+        stepId,
+        status: ex.status,
+        ...(ex.mediaType ? { mediaType: ex.mediaType } : {}),
+        preview,
+        truncated,
+      })
+      if (bodyPreviews.length >= 4) break
+    }
+  }
+
+  const extractedVarSummaries: Array<{ key: string; preview: string }> = []
+  const rawExtractedVars = payload.extractedVars
+  if (rawExtractedVars && typeof rawExtractedVars === 'object' && !Array.isArray(rawExtractedVars)) {
+    for (const [key, value] of Object.entries(rawExtractedVars as Record<string, unknown>).slice(0, maxInlineExtractedVars)) {
+      const { preview } = sanitizeInlinePreview(String(value ?? ''), secrets)
+      extractedVarSummaries.push({ key, preview })
+    }
+  }
+
+  const sqlRounds = kind === 'sql_boolean_diff' || kind === 'sql_time_diff' ? summarizeSqlRounds(payload) : []
+  const bflaImpact = payload.bflaImpact as { required?: unknown; satisfied?: unknown; reason?: unknown } | undefined
+  const bflaImpactRequired = bflaImpact?.required === true ? true : undefined
+  const impactEvidenceMissing = bflaImpact?.required === true && bflaImpact?.satisfied === false ? true : undefined
+
+  const rawFeedback: EnrichedInlineVerifyFeedback = {
     verdict: replay.verdict,
     ...(replay.verificationTier ? { verificationTier: replay.verificationTier } : {}),
     ...(failedStepId ? { failedStepId: redact(failedStepId, secrets) } : {}),
@@ -2307,8 +2580,18 @@ export function buildInlineVerifyFeedback(
     assertionSummary,
     stepStatuses,
     retriesRemaining,
+    ...(replay.exchangeIds?.length ? { replayExchangeIds: replay.exchangeIds.slice(0, maxInlineExchanges) } : {}),
+    ...(enrichedHeaders.length ? { keyResponseHeaders: enrichedHeaders } : {}),
+    ...(bodyPreviews.length ? { stepBodyPreviews: bodyPreviews } : {}),
+    ...(extractedVarSummaries.length ? { extractedVars: extractedVarSummaries } : {}),
+    ...(sqlRounds.length ? { sqlRoundSummaries: sqlRounds } : {}),
+    ...(kind ? { verificationKind: kind } : {}),
+    ...(bflaImpactRequired ? { bflaImpactRequired } : {}),
+    ...(impactEvidenceMissing ? { impactEvidenceMissing } : {}),
   }
 
+  // Enrichment is built from already-redacted exchanges; this final pass catches anything that
+  // slipped through and guarantees the persisted feedback never carries live credentials.
   return redactJsonValue(rawFeedback, secrets)
 }
 

@@ -271,16 +271,42 @@ function dockerEnv() {
   }
 }
 
+const workerFailureGuidance = 'Build the local worker image and check Docker availability.'
+
+/**
+ * Build an operator-actionable worker failure message. Docker CLI stderr holds the real cause
+ * (missing image, daemon socket, OOM, conflict); the old generic message hid it and made worker
+ * failures indistinguishable from a missing image.
+ */
+export function formatWorkerFailure(stderr: string, exitCode: number | null): string {
+  const detail = stderr
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(' ')
+    .slice(0, 400)
+  const code = typeof exitCode === 'number' ? `exit ${exitCode}` : 'terminated'
+  return detail
+    ? `The isolated worker failed (${code}): ${detail}. ${workerFailureGuidance}`
+    : `The isolated worker failed (${code}). ${workerFailureGuidance}`
+}
+
+const maxDockerStderrBytes = 8 * 1024
+
 function docker(args: string[], signal: AbortSignal, input?: string) {
   signal.throwIfAborted()
   return new Promise<string>((resolve, reject) => {
     const cli = spawn('docker', args, {
       signal,
       env: dockerEnv(),
-      stdio: ['pipe', 'pipe', 'ignore'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
     const chunks: Buffer[] = []
     let size = 0
+    const stderrChunks: Buffer[] = []
+    let stderrBytes = 0
     const limit = 16 * 1024 * 1024
     cli.stdout.on('data', (chunk: Buffer) => {
       size += chunk.length
@@ -289,12 +315,19 @@ function docker(args: string[], signal: AbortSignal, input?: string) {
         reject(new Error('Worker output exceeded its limit.'))
       } else chunks.push(chunk)
     })
+    cli.stderr.on('data', (chunk: Buffer) => {
+      if (stderrBytes >= maxDockerStderrBytes) return
+      const remaining = maxDockerStderrBytes - stderrBytes
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk
+      stderrChunks.push(slice)
+      stderrBytes += slice.length
+    })
     cli.stdin.on('error', () => { /* Early exit closes stdin. */ })
     cli.stdin.end(input)
     cli.once('error', error => reject(signal.aborted ? signal.reason : error))
     cli.once('close', code => {
       if (code === 0) resolve(Buffer.concat(chunks).toString('utf8'))
-      else reject(new Error('The isolated worker failed. Build the local worker image and check Docker availability.'))
+      else reject(new Error(formatWorkerFailure(Buffer.concat(stderrChunks).toString('utf8'), code)))
     })
   })
 }
@@ -450,8 +483,18 @@ export class LinuxWorkerBackend implements WorkerBackend {
 
     const cli: ChildProcess = spawn('docker', ['container', 'start', '--attach', '--interactive', name], {
       env: dockerEnv(),
-      stdio: ['pipe', 'pipe', 'ignore'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
+    const sessionStderr: Buffer[] = []
+    let sessionStderrBytes = 0
+    cli.stderr?.on('data', (chunk: Buffer) => {
+      if (sessionStderrBytes >= maxDockerStderrBytes) return
+      const remaining = maxDockerStderrBytes - sessionStderrBytes
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk
+      sessionStderr.push(slice)
+      sessionStderrBytes += slice.length
+    })
+    const removeContainer = () => docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
     cli.stdin?.on('error', () => { /* Ignore EPIPE or write-after-end during shutdown. */ })
     const pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (err: Error) => void }>()
     let closed = false
@@ -477,13 +520,21 @@ export class LinuxWorkerBackend implements WorkerBackend {
         // Ignore malformed noise
       }
     })
-    cli.once('close', () => {
+    cli.once('close', code => {
       closed = true
-      failAll(new Error('Isolated worker session exited unexpectedly.'))
+      failAll(new Error(formatWorkerFailure(Buffer.concat(sessionStderr).toString('utf8'), code).replace(/^The isolated worker failed/, 'Isolated worker session exited unexpectedly')))
+      // A session that never reached `close()` (crash, image pull, OOM) could leave a container in
+      // `created` state; always remove it here so abandoned workers do not accumulate.
+      this.activeContainers.delete(name)
+      liveContainers.delete(name)
+      void removeContainer()
     })
     cli.once('error', error => {
       closed = true
       failAll(error)
+      this.activeContainers.delete(name)
+      liveContainers.delete(name)
+      void removeContainer()
     })
 
     const close = () => {
