@@ -2871,6 +2871,146 @@ export class Execution {
   }
 
   /**
+   * Extract entry routes from JSON route maps/config docs already fetched during recon
+   * (e.g. `/app-config.json`, `/routes`, OpenAPI JSON). Bounded and generic: any object with a
+   * `path`/`pathTemplate` string or an array of `/api/...` strings qualifies.
+   */
+  private async deriveRuntimeRouteMapTargets(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    grant: Grant,
+    assignment: Assignment,
+    signal: AbortSignal,
+    recordExchange: (exchange: BrokerExchangeResult) => string,
+  ): Promise<Array<{
+    origin: string
+    method: string
+    pathTemplate: string
+    riskScore: number
+    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+  }>> {
+    const out: Array<{
+      origin: string
+      method: string
+      pathTemplate: string
+      riskScore: number
+      params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+    }> = []
+    let summaries: Array<{ id: string; origin: string; method: string; pathAndQuery: string; status: number; mediaType: string }> = []
+    try {
+      summaries = this.storage.runDetail(run.id).exchangesSummary
+    } catch {
+      return []
+    }
+    const configPathRe = /(?:app-config|config|routes|manifest|openapi|swagger|api-docs)(?:\.[a-z]+)?(?:\?|$)/i
+    let configExchanges = summaries
+      .filter(ex => ex.method === 'GET' && ex.status >= 200 && ex.status < 300 && /json/i.test(ex.mediaType))
+      .filter(ex => configPathRe.test(ex.pathAndQuery))
+      .slice(0, 4)
+
+    // Phase-0 may not have fetched the runtime route map yet; fetch at most two generic config
+    // candidates so recon-derived routes are still reachable in deterministic mode.
+    if (configExchanges.length === 0) {
+      const origin = [...approvedOrigins][0]
+      const alreadyFetched = new Set(summaries.map(ex => ex.pathAndQuery))
+      for (const candidate of ['/app-config.json', '/api/routes', '/routes.json']) {
+        if (configExchanges.length >= 2) break
+        if (alreadyFetched.has(candidate) || signal.aborted) continue
+        try {
+          const ex = await this.broker.executeHttp({
+            origin,
+            method: 'GET',
+            pathAndQuery: candidate,
+            followRedirects: false,
+            runId: run.id,
+            assignmentId: assignment.id,
+          }, grant, signal)
+          const id = recordExchange(ex)
+          if (ex.status >= 200 && ex.status < 300 && /json/i.test(ex.mediaType)) {
+            configExchanges.push({
+              id,
+              origin: ex.origin,
+              method: ex.method,
+              pathAndQuery: ex.pathAndQuery,
+              status: ex.status,
+              mediaType: ex.mediaType,
+            })
+          }
+        } catch {
+          // Config probing is best-effort; continue with whatever recon already recorded.
+        }
+      }
+    }
+
+    const normalizeTemplate = (value: string) =>
+      value.replace(/\{([a-z][a-z0-9_]*):([a-z][a-z0-9_-]*)\}/gi, '$2').slice(0, 300)
+
+    const pushTarget = (origin: string, method: string, rawPath: string) => {
+      if (!approvedOrigins.has(origin)) return
+      if (!rawPath.startsWith('/') || rawPath.length > 300) return
+      const pathTemplate = normalizeTemplate(rawPath)
+      if (!/^\/[A-Za-z0-9_\-{}\/.:]*$/.test(pathTemplate)) return
+      if (out.some(t => t.origin === origin && t.method === method && t.pathTemplate === pathTemplate)) return
+      if (out.length >= 60) return
+      const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
+      for (const match of pathTemplate.matchAll(/\{([A-Za-z0-9_]+)\}/g)) params.push({ name: match[1], location: 'path' })
+      out.push({ origin, method, pathTemplate, riskScore: 70, params })
+    }
+
+    const visit = (node: unknown, origin: string, depth: number) => {
+      if (depth > 5 || out.length >= 60) return
+      if (Array.isArray(node)) {
+        for (const item of node.slice(0, 200)) visit(item, origin, depth + 1)
+        return
+      }
+      if (!node || typeof node !== 'object') return
+      const obj = node as Record<string, unknown>
+      const methodRaw = typeof obj.method === 'string' ? obj.method : typeof obj.verb === 'string' ? obj.verb : null
+      const pathRaw = typeof obj.path === 'string' ? obj.path
+        : typeof obj.pathTemplate === 'string' ? obj.pathTemplate
+          : typeof obj.route === 'string' ? obj.route : null
+      if (pathRaw && pathRaw.startsWith('/')) {
+        const method = (methodRaw ?? 'GET').toUpperCase()
+        // Only read methods are probed deterministically without a declared body schema.
+        if (method === 'GET' || method === 'HEAD') pushTarget(origin, method, pathRaw)
+      }
+      for (const [key, value] of Object.entries(obj).slice(0, 200)) {
+        if (typeof value === 'string' && value.startsWith('/api/') && value.length <= 200) {
+          pushTarget(origin, 'GET', value)
+        } else if (key === 'paths' && value && typeof value === 'object') {
+          for (const [pathKey, pathValue] of Object.entries(value as Record<string, unknown>).slice(0, 120)) {
+            if (!pathKey.startsWith('/')) continue
+            const methods = pathValue && typeof pathValue === 'object'
+              ? Object.keys(pathValue as Record<string, unknown>).filter(k => ['get', 'post', 'put', 'patch'].includes(k.toLowerCase()))
+              : []
+            for (const method of methods.length ? methods : ['get']) pushTarget(origin, method.toUpperCase(), pathKey)
+          }
+        } else if (value && typeof value === 'object') {
+          visit(value, origin, depth + 1)
+        }
+      }
+    }
+
+    for (const summary of configExchanges) {
+      let body = ''
+      try {
+        body = this.storage.getExchange(run.id, summary.id).body
+      } catch {
+        continue
+      }
+      if (!body || body.length > 512 * 1024) continue
+      let doc: unknown
+      try {
+        doc = JSON.parse(body)
+      } catch {
+        continue
+      }
+      visit(doc, summary.origin, 0)
+    }
+    return out
+  }
+
+  /**
    * Parse imported OpenAPI/route-map project specs into bounded deterministic probe targets.
    * Generic engine behavior: no app, route, or parameter hardcoding.
    */
@@ -3005,46 +3145,6 @@ export class Execution {
       paramsByEndpoint.set(param.endpointId, list)
     }
 
-    // Route-map/OpenAPI-derived entry routes: grey-box/white-box runs import API references, and
-    // phase-0 may not have materialized every path yet on this branch. Parsing them here keeps the
-    // deterministic baseline meaningful without depending on an LLM planner.
-    const derivedTargets = this.deriveDeterministicRouteTargets(current, approvedOrigins, endpoints)
-    const syntheticEndpoints = derivedTargets.map(target => ({
-      id: `derived:${target.method}:${target.pathTemplate}`,
-      runId: current.id,
-      scopeRevision: current.scopeRevision,
-      origin: target.origin,
-      method: target.method,
-      pathTemplate: target.pathTemplate,
-      source: 'openapi' as const,
-      framework: null,
-      authRequirement: null,
-      ownershipGuard: null,
-      sinkKinds: [] as string[],
-      testedClasses: [] as string[],
-      coveragePct: 0,
-      riskScore: target.riskScore,
-      codeLocation: null,
-      createdAt: current.createdAt,
-      updatedAt: current.createdAt,
-    }))
-    for (const [idx, target] of derivedTargets.entries()) {
-      const endpointId = syntheticEndpoints[idx].id
-      paramsByEndpoint.set(endpointId, target.params.map((param, paramIdx) => ({
-        id: `${endpointId}:p${paramIdx}`,
-        runId: current.id,
-        endpointId,
-        name: param.name,
-        location: param.location,
-        inferredType: null,
-        isCsrf: false,
-        isObjectId: /^(?:id|uuid|[a-z][a-z0-9]*Id)$/i.test(param.name),
-        source: 'openapi',
-        createdAt: current.createdAt,
-      })) as unknown as typeof allParams)
-    }
-    const probeEndpoints = [...endpoints, ...syntheticEndpoints]
-    if (!probeEndpoints.length) return
 
     const personas = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
     const personaHandles = personas.map(p => p.handle)
@@ -3057,39 +3157,6 @@ export class Execution {
           approvedOrigins,
         )
       : []
-
-    const injectableLocations = new Set(['query', 'json', 'form'])
-    const ranked = probeEndpoints
-      .map(ep => {
-        const epParams = paramsByEndpoint.get(ep.id) ?? []
-        const injectable = epParams
-          .filter(p => injectableLocations.has(p.location))
-          .sort((a, b) => Number(DETERMINISTIC_PARAM_HINT_RE.test(b.name)) - Number(DETERMINISTIC_PARAM_HINT_RE.test(a.name)))
-          .slice(0, 2)
-        const queryNames = deterministicQueryParamNames(ep.pathTemplate)
-        const paramCandidates = injectable.length
-          ? injectable.map(p => ({ name: p.name, location: p.location as 'query' | 'json' | 'form' }))
-          : queryNames.slice(0, 2).map(name => ({ name, location: 'query' as const }))
-        const idPath = deterministicIdPath(ep.pathTemplate)
-        const originResources = resourceQueue.filter(item => item.origin === ep.origin)
-        let score = ep.riskScore
-        if (paramCandidates.length) score += 25
-        if (idPath) score += 12
-        if ((ep.sinkKinds ?? []).length > 0) score += 10
-        if (originResources.length > 0) score += 15
-        // Prefer routes with injectable parameters before path-only id routes.
-        if (!paramCandidates.length && !idPath) score -= 20
-        return { ep, paramCandidates, idPath, originResources, score }
-      })
-      .sort((a, b) => b.score - a.score)
-
-    if (!ranked.length) return
-
-    const maxEndpoints = Math.min(18, Math.max(4, Math.floor((current.dynamicStepBudget ?? 24) * 0.75)))
-    const requestCap = current.budgetRequests > 0
-      ? Math.max(0, Math.min(160, current.budgetRequests - current.spentRequests))
-      : 160
-    if (requestCap < 6) return
 
     const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
     if (!asset) return
@@ -3134,9 +3201,99 @@ export class Execution {
       return saved.id
     }
 
+    const signal = job.controller.signal
+
+    // Route-map/OpenAPI-derived entry routes: grey-box/white-box runs import API references, and
+    // phase-0 may not have materialized every path yet on this branch. Parsing them here keeps the
+    // deterministic baseline meaningful without depending on an LLM planner.
+    const derivedTargets = [
+      ...this.deriveDeterministicRouteTargets(current, approvedOrigins, endpoints),
+      ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
+    ].filter((target, idx, all) =>
+      all.findIndex(other => other.origin === target.origin && other.method === target.method && other.pathTemplate === target.pathTemplate) === idx,
+    )
+    const syntheticEndpoints = derivedTargets.map(target => ({
+      id: `derived:${target.method}:${target.pathTemplate}`,
+      runId: current.id,
+      scopeRevision: current.scopeRevision,
+      origin: target.origin,
+      method: target.method,
+      pathTemplate: target.pathTemplate,
+      source: 'openapi' as const,
+      framework: null,
+      authRequirement: null,
+      ownershipGuard: null,
+      sinkKinds: [] as string[],
+      testedClasses: [] as string[],
+      coveragePct: 0,
+      riskScore: target.riskScore,
+      codeLocation: null,
+      createdAt: current.createdAt,
+      updatedAt: current.createdAt,
+    }))
+    for (const [idx, target] of derivedTargets.entries()) {
+      const endpointId = syntheticEndpoints[idx].id
+      paramsByEndpoint.set(endpointId, target.params.map((param, paramIdx) => ({
+        id: `${endpointId}:p${paramIdx}`,
+        runId: current.id,
+        endpointId,
+        name: param.name,
+        location: param.location,
+        inferredType: null,
+        isCsrf: false,
+        isObjectId: /^(?:id|uuid|[a-z][a-z0-9]*Id)$/i.test(param.name),
+        source: 'openapi',
+        createdAt: current.createdAt,
+      })) as unknown as typeof allParams)
+    }
+    const probeEndpoints = [...endpoints, ...syntheticEndpoints]
+    if (!probeEndpoints.length) return
+
+    const injectableLocations = new Set(['query', 'json', 'form'])
+    const ranked = probeEndpoints
+      .map(ep => {
+        const epParams = paramsByEndpoint.get(ep.id) ?? []
+        const injectable = epParams
+          .filter(p => injectableLocations.has(p.location))
+          .sort((a, b) => Number(DETERMINISTIC_PARAM_HINT_RE.test(b.name)) - Number(DETERMINISTIC_PARAM_HINT_RE.test(a.name)))
+          .slice(0, 2)
+        const queryNames = deterministicQueryParamNames(ep.pathTemplate)
+        const paramCandidates = injectable.length
+          ? injectable.map(p => ({ name: p.name, location: p.location as 'query' | 'json' | 'form' }))
+          : queryNames.slice(0, 2).map(name => ({ name, location: 'query' as const }))
+        const idPath = deterministicIdPath(ep.pathTemplate)
+        const originResources = resourceQueue.filter(item => item.origin === ep.origin)
+        let score = ep.riskScore
+        if (paramCandidates.length) score += 25
+        if (idPath) score += 12
+        if ((ep.sinkKinds ?? []).length > 0) score += 10
+        if (originResources.length > 0) score += 15
+        // Generic hints that a route consumes query input even when recon did not persist params.
+        if (/\b(?:search|query|filter|export|report|list|lookup|find|browse)\b/i.test(ep.pathTemplate)) score += 20
+        if (/^\/api\/[a-z][a-z0-9_-]{1,40}$/i.test(ep.pathTemplate.replace(/\?.*$/, ''))) score += 8
+        // Prefer routes with injectable parameters before path-only id routes.
+        if (!paramCandidates.length && !idPath) score -= 20
+        return { ep, paramCandidates, idPath, originResources, score }
+      })
+      .filter(item => {
+        // Nothing testable: path placeholders without harvested ids and no injectable parameter.
+        const placeholderOnly = /:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]+\]/.test(item.ep.pathTemplate)
+        if (item.paramCandidates.length) return true
+        if (item.idPath !== null && item.originResources.length > 0) return true
+        return !placeholderOnly
+      })
+      .sort((a, b) => b.score - a.score)
+
+    if (!ranked.length) return
+
+    const maxEndpoints = Math.min(22, Math.max(4, Math.floor((current.dynamicStepBudget ?? 24) * 0.9)))
+    const requestCap = current.budgetRequests > 0
+      ? Math.max(0, Math.min(200, current.budgetRequests - current.spentRequests))
+      : 200
+    if (requestCap < 6) return
+
     let requestsUsed = 0
     let findingsCreated = 0
-    const signal = job.controller.signal
     try {
       for (const item of ranked.slice(0, maxEndpoints)) {
         if (requestsUsed >= requestCap || signal.aborted) break
@@ -3257,6 +3414,12 @@ export class Execution {
           } catch (error) {
             if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
           }
+        }
+
+        // Search-like routes commonly take a free-text term even when recon/OpenAPI did not record
+        // the parameter name; try the conventional term once (bounded, non-destructive).
+        if (!candidateParams.length && /(?:search|query|filter|find|lookup|browse)/i.test(item.ep.pathTemplate)) {
+          candidateParams = [{ name: 'q', location: 'query' }]
         }
 
         for (const candidate of candidateParams.slice(0, 2)) {
