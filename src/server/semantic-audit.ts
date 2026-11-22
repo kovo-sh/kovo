@@ -180,6 +180,11 @@ export interface SinkBackwardPath {
   dominatingGuards: string[]
   partialGuards: string[]
   dominatingSanitizers: string[]
+  /** Missing authorization/tenant guard on an auth-sensitive route. */
+  isAuthUnguarded: boolean
+  /** Missing input sanitizer on an injection-capable sink. */
+  isInjectionUnsanitized: boolean
+  /** Either independent finding above (aggregate, backwards-compatible). */
   isUnguardedPath: boolean
 }
 
@@ -1159,9 +1164,9 @@ export function analyzeSinkBackwardPaths(
     const sinkKind: AuditSinkKind = sink.sinkKind ?? 'other'
     const authSensitive = ['api_route', 'server_action', 'webhook', 'auth_config', 'db_query'].includes(sinkKind)
     const injectionSink = ['db_query', 'outbound_fetch', 'redirect', 'postmessage_iframe', 'upload_storage', 'other'].includes(sinkKind)
-    const isUnguardedPath =
-      (authSensitive && dominatingGuards.length === 0 && dominatingSanitizers.length === 0) ||
-      (injectionSink && dominatingSanitizers.length === 0 && dominatingGuards.length === 0)
+    const isAuthUnguarded = authSensitive && dominatingGuards.length === 0
+    const isInjectionUnsanitized = injectionSink && dominatingSanitizers.length === 0
+    const isUnguardedPath = isAuthUnguarded || isInjectionUnsanitized
 
     results.push({
       entrypointId: ep.id,
@@ -1179,6 +1184,8 @@ export function analyzeSinkBackwardPaths(
       dominatingGuards,
       partialGuards,
       dominatingSanitizers,
+      isAuthUnguarded,
+      isInjectionUnsanitized,
       isUnguardedPath,
     })
   }
@@ -1345,7 +1352,11 @@ export function scoreAndBuildSuspects(params: {
       ? 'present'
       : 'missing'
     const trace = bp.callChain.join(' -> ')
-    const hypothesis = `Backward taint path ${trace} reaches ${bp.sinkKind} sink without dominating ${bp.dominatingGuards.length === 0 ? 'auth/tenant guard' : 'sanitizer'}.`
+    const missingControls = [
+      bp.isAuthUnguarded ? 'auth/tenant guard' : null,
+      bp.isInjectionUnsanitized ? 'input sanitizer' : null,
+    ].filter((value): value is string => value !== null)
+    const hypothesis = `Backward taint path ${trace} reaches ${bp.sinkKind} sink without dominating ${missingControls.join(' or ') || 'control'}.`
     const fingerprint = makeSuspectFingerprint(origin, params.repo, bp.sinkFile, bp.sinkLine, bp.sinkKind, bp.routeOrAction)
     const data: CodeAuditSuspectData = {
       subkind: 'code_audit_suspect',
@@ -1871,18 +1882,58 @@ function sinkToCategoryAndSkills(sinkKind: AuditSinkKind): { category: OwaspCate
   }
 }
 
+/**
+ * Stable identity for a code-audit suspect: the same (repo, file, line, sinkKind)
+ * location must not be queued twice, even when it is produced by multiple
+ * semantic-audit stages or repeated worker passes.
+ */
+export function codeAuditSuspectLocationKey(input: {
+  id?: string
+  repo?: unknown
+  file?: unknown
+  line?: unknown
+  sinkKind?: unknown
+}): string {
+  const repo = typeof input.repo === 'string' ? input.repo : ''
+  const file = typeof input.file === 'string' ? input.file : ''
+  if (!file) return `id:${input.id ?? ''}`
+  const line = typeof input.line === 'number' && Number.isFinite(input.line) ? input.line : 0
+  const sinkKind = typeof input.sinkKind === 'string' ? input.sinkKind : ''
+  return `${repo}|${file}|${line}|${sinkKind}`
+}
+
+export function dedupeCodeAuditSuspects<T extends { id: string; data: unknown }>(suspects: readonly T[]): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const suspect of suspects) {
+    const data = (suspect.data && typeof suspect.data === 'object' ? suspect.data : {}) as Record<string, unknown>
+    const key = codeAuditSuspectLocationKey({ ...data, id: suspect.id })
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(suspect)
+  }
+  return out
+}
+
 export function toChainStepInputs(
   run: Pick<Run, 'candidates' | 'approved'>,
   suspects: readonly SemanticAuditSuspect[],
   hostTiers?: Record<string, HostTier>,
+  persistedFactIds?: readonly string[],
 ): Array<Parameters<Store['addChainStep']>[1]> {
   const out: Array<Parameters<Store['addChainStep']>[1]> = []
-  for (const s of suspects) {
+  const seenLocations = new Set<string>()
+  for (let index = 0; index < suspects.length; index += 1) {
+    const s = suspects[index]
     const asset = run.candidates.find(c => c.origin === s.origin && run.approved.includes(c.id))
     if (!asset) continue
+    const locationKey = codeAuditSuspectLocationKey(s)
+    if (seenLocations.has(locationKey)) continue
+    seenLocations.add(locationKey)
     const { category, skills } = sinkToCategoryAndSkills(s.sinkKind)
     const isCrown = (hostTiers?.[s.origin] ?? classifyHostTier(s.origin)) === 'crown_jewel'
     const priority = Math.min(100, Math.max(20, s.priorityScore + (isCrown ? 5 : 0)))
+    const factId = persistedFactIds?.[index]
     out.push({
       title: `Semantic audit · ${s.routeOrAction.slice(0, 80)} (${s.file}:${s.line})`,
       hypothesis: s.hypothesis,
@@ -1892,6 +1943,7 @@ export function toChainStepInputs(
       skills,
       sourceOrigins: [s.origin],
       specialistProfile: s.specialistProfile,
+      ...(factId ? { dependsOnFactIds: [factId] } : {}),
     })
   }
   return out
