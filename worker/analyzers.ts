@@ -915,6 +915,11 @@ export interface CallGraphTaintPathOut {
   dominatingGuards: string[]
   partialGuards: string[]
   dominatingSanitizers: string[]
+  /** Missing authorization/tenant guard on an auth-sensitive route. */
+  isAuthUnguarded: boolean
+  /** Missing input sanitizer on an injection-capable sink. */
+  isInjectionUnsanitized: boolean
+  /** Either of the two independent findings above (backwards-compatible aggregate). */
   isUnguardedPath: boolean
   authCheck: string
   ownershipCheck: string
@@ -962,20 +967,139 @@ function resolveRelativeImportPath(fromFile: string, spec: string, allFiles: Set
   return null
 }
 
+/**
+ * Blank out comments and string/template literals while preserving offsets and
+ * newlines, so guard/sanitizer matches only come from executable code.
+ */
+function maskCommentsAndStrings(text: string): string {
+  const out = text.split('')
+  let mode: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' = 'code'
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    const next = text[i + 1]
+    if (mode === 'code') {
+      if (ch === '/' && next === '/') {
+        out[i] = ' '
+        out[i + 1] = ' '
+        mode = 'line'
+        i += 1
+        continue
+      }
+      if (ch === '/' && next === '*') {
+        out[i] = ' '
+        out[i + 1] = ' '
+        mode = 'block'
+        i += 1
+        continue
+      }
+      if (ch === "'") { out[i] = ' '; mode = 'single'; continue }
+      if (ch === '"') { out[i] = ' '; mode = 'double'; continue }
+      if (ch === '`') { out[i] = ' '; mode = 'template'; continue }
+      continue
+    }
+    if (mode === 'line') {
+      if (ch === '\n') { mode = 'code'; continue }
+      out[i] = ' '
+      continue
+    }
+    if (mode === 'block') {
+      if (ch === '*' && next === '/') {
+        out[i] = ' '
+        out[i + 1] = ' '
+        mode = 'code'
+        i += 1
+        continue
+      }
+      if (ch !== '\n') out[i] = ' '
+      continue
+    }
+    // String / template literal body.
+    if (ch === '\\') {
+      out[i] = ' '
+      if (i + 1 < text.length) {
+        if (text[i + 1] !== '\n') out[i + 1] = ' '
+        i += 1
+      }
+      continue
+    }
+    const closer = mode === 'single' ? "'" : mode === 'double' ? '"' : '`'
+    if (ch === closer) {
+      out[i] = ' '
+      mode = 'code'
+      continue
+    }
+    if (ch !== '\n') out[i] = ' '
+  }
+  return out.join('')
+}
+
+interface PatternOccurrence {
+  name: string
+  offset: number
+}
+
+function findOccurrences(
+  text: string,
+  source: string,
+  customPatterns?: readonly string[],
+): PatternOccurrence[] {
+  const masked = maskCommentsAndStrings(text)
+  const found: PatternOccurrence[] = []
+  for (const match of masked.matchAll(new RegExp(source, 'g'))) {
+    if (typeof match.index === 'number' && match[0]) {
+      found.push({ name: match[0], offset: match.index })
+    }
+  }
+  for (const pattern of customPatterns ?? []) {
+    if (!pattern) continue
+    let index = masked.indexOf(pattern)
+    while (index >= 0) {
+      found.push({ name: pattern, offset: index })
+      index = masked.indexOf(pattern, index + pattern.length)
+    }
+  }
+  return found
+}
+
+function findSinkOccurrences(
+  text: string,
+  customSinks?: ReadonlyArray<{ pattern: string; sinkKind: CallGraphSinkKind }>,
+): Array<{ sinkKind: CallGraphSinkKind; label: string; offset: number }> {
+  const masked = maskCommentsAndStrings(text)
+  const hits: Array<{ sinkKind: CallGraphSinkKind; label: string; offset: number }> = []
+  for (const builtin of BUILTIN_SINK_PATTERNS) {
+    const re = new RegExp(builtin.re.source, builtin.re.flags.includes('g') ? builtin.re.flags : `${builtin.re.flags}g`)
+    for (const match of masked.matchAll(re)) {
+      if (typeof match.index === 'number') {
+        hits.push({ sinkKind: builtin.sinkKind, label: builtin.label, offset: match.index })
+      }
+    }
+  }
+  for (const custom of customSinks ?? []) {
+    if (!custom.pattern) continue
+    let index = masked.indexOf(custom.pattern)
+    while (index >= 0) {
+      hits.push({ sinkKind: custom.sinkKind, label: custom.pattern, offset: index })
+      index = masked.indexOf(custom.pattern, index + custom.pattern.length)
+    }
+  }
+  return hits.sort((a, b) => a.offset - b.offset)
+}
+
 function detectSinksInText(
   text: string,
   customSinks?: ReadonlyArray<{ pattern: string; sinkKind: CallGraphSinkKind }>,
 ): Array<{ sinkKind: CallGraphSinkKind; label: string }> {
-  const hits: Array<{ sinkKind: CallGraphSinkKind; label: string }> = []
-  for (const b of BUILTIN_SINK_PATTERNS) {
-    if (b.re.test(text)) hits.push({ sinkKind: b.sinkKind, label: b.label })
+  const hits = findSinkOccurrences(text, customSinks)
+  const seen = new Set<string>()
+  const out: Array<{ sinkKind: CallGraphSinkKind; label: string }> = []
+  for (const hit of hits) {
+    const key = `${hit.sinkKind}:${hit.label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ sinkKind: hit.sinkKind, label: hit.label })
   }
-  for (const cs of customSinks ?? []) {
-    if (cs.pattern && text.includes(cs.pattern)) {
-      hits.push({ sinkKind: cs.sinkKind, label: cs.pattern })
-    }
-  }
-  return hits
+  return out
 }
 
 function detectGuardsAndSanitizers(
@@ -983,19 +1107,9 @@ function detectGuardsAndSanitizers(
   customGuards?: readonly string[],
   customSanitizers?: readonly string[],
 ): { guards: string[]; sanitizers: string[] } {
-  const guards: string[] = []
-  const sanitizers: string[] = []
-  const gm = text.match(new RegExp(DEFAULT_GUARD_RE.source, 'g'))
-  if (gm) guards.push(...gm)
-  for (const cg of customGuards ?? []) {
-    if (cg && text.includes(cg)) guards.push(cg)
-  }
-  const sm = text.match(new RegExp(DEFAULT_SANITIZER_RE.source, 'g'))
-  if (sm) sanitizers.push(...sm)
-  for (const cs of customSanitizers ?? []) {
-    if (cs && text.includes(cs)) sanitizers.push(cs)
-  }
-  return { guards: uniq(guards, 20), sanitizers: uniq(sanitizers, 20) }
+  const guards = uniq(findOccurrences(text, DEFAULT_GUARD_RE.source, customGuards).map(o => o.name), 20)
+  const sanitizers = uniq(findOccurrences(text, DEFAULT_SANITIZER_RE.source, customSanitizers).map(o => o.name), 20)
+  return { guards, sanitizers }
 }
 
 function extractBodyRange(node: AstNode, content: string): { startLine: number; endLine: number; text: string } {
@@ -1277,22 +1391,106 @@ export function buildCallGraphFromFiles(
   }
 
   const taintPaths: CallGraphTaintPathOut[] = []
+
+  const nodeTextCache = new Map<string, string>()
+  const guardOccurrenceCache = new Map<string, PatternOccurrence[]>()
+  const sanitizerOccurrenceCache = new Map<string, PatternOccurrence[]>()
+  const nodeTextFor = (node: CallGraphNodeOut): string => {
+    const cached = nodeTextCache.get(node.id)
+    if (cached !== undefined) return cached
+    const lines = fileLineTexts.get(node.file) ?? []
+    const startIndex = Math.max(0, node.line - 1)
+    const endIndex = typeof node.endLine === 'number'
+      ? Math.min(lines.length, node.endLine)
+      : Math.min(lines.length, startIndex + 25)
+    const text = lines.slice(startIndex, endIndex).join('\n')
+    nodeTextCache.set(node.id, text)
+    return text
+  }
+  const guardOccurrencesFor = (node: CallGraphNodeOut): PatternOccurrence[] => {
+    const cached = guardOccurrenceCache.get(node.id)
+    if (cached) return cached
+    const occurrences = findOccurrences(nodeTextFor(node), DEFAULT_GUARD_RE.source, options.customGuardPatterns)
+    guardOccurrenceCache.set(node.id, occurrences)
+    return occurrences
+  }
+  const sanitizerOccurrencesFor = (node: CallGraphNodeOut): PatternOccurrence[] => {
+    const cached = sanitizerOccurrenceCache.get(node.id)
+    if (cached) return cached
+    const occurrences = findOccurrences(nodeTextFor(node), DEFAULT_SANITIZER_RE.source, options.customSanitizerPatterns)
+    sanitizerOccurrenceCache.set(node.id, occurrences)
+    return occurrences
+  }
+  const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const offsetOfSymbol = (text: string, symbol: string): number | null => {
+    if (!symbol) return null
+    const masked = maskCommentsAndStrings(text)
+    const match = new RegExp(`\\b${escapeRegExp(symbol)}\\b`).exec(masked)
+    return match ? match.index : null
+  }
+  const firstSinkOffset = (node: CallGraphNodeOut, sinkKind: CallGraphSinkKind): number | null => {
+    const hits = findSinkOccurrences(nodeTextFor(node), options.customSinkPatterns)
+    const hit = hits.find(h => h.sinkKind === sinkKind) ?? hits[0]
+    return hit ? hit.offset : null
+  }
+  /**
+   * Statement-order dominance: a guard/sanitizer only counts when it appears
+   * before the call into the next chain node (or before the sink itself).
+   * Comments, string literals and post-sink checks are excluded.
+   */
+  const dominanceLimitOffset = (
+    chain: CallGraphNodeOut[],
+    index: number,
+    sink: CallGraphNodeOut,
+    sinkKind: CallGraphSinkKind,
+  ): number | null => {
+    const node = chain[index]
+    if (index === chain.length - 1) return firstSinkOffset(node, sinkKind)
+    const next = chain[index + 1]
+    const endLine = node.endLine ?? node.line + 25
+    const nested = next.file === node.file && next.line >= node.line && next.line <= endLine
+    if (nested) {
+      if (next.id === sink.id) return firstSinkOffset(node, sinkKind)
+      const nestedSymbol = offsetOfSymbol(nodeTextFor(node), next.symbol)
+      if (nestedSymbol !== null) return nestedSymbol
+      return firstSinkOffset(node, next.sinkKind ?? sinkKind)
+    }
+    return offsetOfSymbol(nodeTextFor(node), next.symbol)
+  }
+
   for (const group of grouped.values()) {
     const { ep, sink, chain } = group[0]
-    const guardSets = group.map(g => new Set(g.chain.flatMap(n => n.guards)))
-    const sanSets = group.map(g => new Set(g.chain.flatMap(n => n.sanitizers)))
+    const sinkKind = sink.sinkKind ?? 'other'
+    const dominatingSetFor = (
+      occurrencesFor: (node: CallGraphNodeOut) => PatternOccurrence[],
+    ): Array<Set<string>> => group.map(g => {
+      const set = new Set<string>()
+      for (let i = 0; i < g.chain.length; i += 1) {
+        const node = g.chain[i]
+        const limit = dominanceLimitOffset(g.chain, i, g.sink, sinkKind)
+        for (const occurrence of occurrencesFor(node)) {
+          if (limit === null || occurrence.offset < limit) set.add(occurrence.name)
+        }
+      }
+      return set
+    })
+    const guardSets = dominatingSetFor(guardOccurrencesFor)
+    const sanSets = dominatingSetFor(sanitizerOccurrencesFor)
     const allGuards = uniq(guardSets.flatMap(s => [...s]), 20)
     const dominatingGuards = allGuards.filter(g => guardSets.every(s => s.has(g)))
     const partialGuards = allGuards.filter(g => !dominatingGuards.includes(g))
     const allSans = uniq(sanSets.flatMap(s => [...s]), 20)
     const dominatingSanitizers = allSans.filter(sn => sanSets.every(s => s.has(sn)))
 
-    const sinkKind = sink.sinkKind ?? 'other'
     const isAuthSensitive = ['api_route', 'server_action', 'webhook', 'auth_config', 'db_query'].includes(sinkKind)
     const isInjectionSink = ['db_query', 'outbound_fetch', 'redirect', 'postmessage_iframe', 'upload_storage', 'other'].includes(sinkKind)
     const hasDomGuard = dominatingGuards.length > 0
     const hasDomSanitizer = dominatingSanitizers.length > 0
-    const isUnguardedPath = (isAuthSensitive && !hasDomGuard && !hasDomSanitizer) || (isInjectionSink && !hasDomSanitizer && !hasDomGuard)
+    // Guards and sanitizers are distinct controls: a sanitizer never satisfies
+    // an authorization check, and an auth guard never sanitizes a sink.
+    const isAuthUnguarded = isAuthSensitive && !hasDomGuard
+    const isInjectionUnsanitized = isInjectionSink && !hasDomSanitizer
+    const isUnguardedPath = isAuthUnguarded || isInjectionUnsanitized
 
     const hasOwnershipGuard = dominatingGuards.some(g => DEFAULT_OWNERSHIP_GUARD_RE.test(g))
     const authCheck = hasDomGuard ? `present (${dominatingGuards.join(', ')})` : partialGuards.length > 0 ? `partial (${partialGuards.join(', ')})` : 'missing'
@@ -1327,6 +1525,8 @@ export function buildCallGraphFromFiles(
       dominatingGuards,
       partialGuards,
       dominatingSanitizers,
+      isAuthUnguarded,
+      isInjectionUnsanitized,
       isUnguardedPath,
       authCheck,
       ownershipCheck,
