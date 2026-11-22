@@ -3,6 +3,10 @@
 // endpoint resolves to an external host rather than internal infrastructure.
 import type { AppContext, ReqCtx } from '../../src/context.ts'
 
+function urlField(body: Record<string, unknown>, name: string): string {
+  return String(body[name] ?? body.url ?? body.endpoint ?? body.callbackUrl ?? '')
+}
+
 function isInternalHost(host: string): boolean {
   const h = host.toLowerCase()
   return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === 'metadata'
@@ -14,7 +18,7 @@ export default function register(app: AppContext): void {
   const urlP = app.p('webhookUrl')
   app.route('integrationFetch', async (ctx: ReqCtx) => {
     if (ctx.actor === 'anonymous') return ctx.json({ error: 'auth_required' }, 401)
-    const url = String((ctx.body as Record<string, unknown>)[urlP] ?? '')
+    const url = urlField((ctx.body ?? {}) as Record<string, unknown>, urlP)
     if (!/^https?:\/\/\S+$/.test(url)) return ctx.json({ error: 'invalid_url' }, 400)
     let host = ''
     try { host = new URL(url).hostname } catch { return ctx.json({ error: 'invalid_url' }, 400) }

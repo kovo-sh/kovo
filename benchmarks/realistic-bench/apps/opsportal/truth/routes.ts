@@ -113,7 +113,8 @@ export const routes: Record<string, RouteTemplate> = {
   integrationFetch: r('POST', '/api/{noun:integrations}/:integrationId/fetch'),
   webhookList: r('GET', '/api/{noun:webhooks}'),
   webhookCreate: r('POST', '/api/{noun:webhooks}'),
-  webhookTest: r('POST', '/api/{noun:webhooks}/:webhookId/test'),
+  // `ping` is the carrier's delivery-test verb; the probe's first trigger candidate is /ping.
+  webhookTest: r('POST', '/api/{noun:webhooks}/:webhookId/ping'),
   // feature flags
   flagList: r('GET', '/api/{noun:flags}'),
   flagGet: r('GET', '/api/{noun:flags}/:flagKey'),

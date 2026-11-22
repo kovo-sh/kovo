@@ -5,9 +5,11 @@ import { renderReview } from '/review.js'
 let config = { apiPrefix: '/api', routes: {} }
 let csrf = null
 
-async function api(routeKey, opts = {}) {
-  const path = config.routes[routeKey]
-  if (!path) throw new Error('unknown route ' + routeKey)
+async function api(routeKey, opts = {}, values = {}) {
+  const spec = config.routes[routeKey]
+  const raw = typeof spec === 'string' ? spec : (spec && spec.path) || ''
+  if (!raw) throw new Error('unknown route ' + routeKey)
+  const path = raw.replace(/:([A-Za-z0-9_]+)/g, (_, key) => encodeURIComponent(values[key] || '1'))
   const headers = Object.assign({ 'content-type': 'application/json' }, opts.headers || {})
   if (csrf) headers['x-csrf-token'] = csrf
   const res = await fetch(path, Object.assign({ headers }, opts))
@@ -21,7 +23,10 @@ function setWho(text) {
 async function signin() {
   const email = document.getElementById('email').value
   const password = document.getElementById('password').value
-  const res = await fetch(config.routes.login, {
+  const spec = config.routes.login
+  const loginPath = typeof spec === 'string' ? spec : (spec && spec.path)
+  if (!loginPath) throw new Error('login route unavailable')
+  const res = await fetch(loginPath, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password }),
   })
   const data = await res.json().catch(() => ({}))
@@ -54,6 +59,34 @@ async function showView(view) {
   } else if (view === 'settings') {
     const data = await api('getSettings')
     el.innerHTML = '<h2>Settings</h2><pre>' + JSON.stringify(data.settings || {}, null, 2) + '</pre>'
+  } else if (view === 'imports') {
+    el.innerHTML = `
+      <h2>Catalog imports</h2>
+      <label>Product ID <input id="import-product" value=""></label>
+      <label>Image URL <input id="import-image" value="https://cdn.example.test/image.png"></label>
+      <button id="import-image-run">Import image</button>
+      <label>Label template URL <input id="import-template" value="https://carrier.example.test/label.xml"></label>
+      <button id="import-label-run">Import shipping label</button>
+      <pre id="import-out"></pre>`
+    document.getElementById('import-image-run').addEventListener('click', async () => {
+      const field = (config.params && config.params.imageUrl) || 'imageUrl'
+      const body = {}
+      body[field] = document.getElementById('import-image').value
+      const productId = document.getElementById('import-product').value
+      const r = await api('importProductImage', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      }, { productId })
+      document.getElementById('import-out').textContent = JSON.stringify(r)
+    })
+    document.getElementById('import-label-run').addEventListener('click', async () => {
+      const field = (config.params && config.params.templateUrl) || 'templateUrl'
+      const body = {}
+      body[field] = document.getElementById('import-template').value
+      const r = await api('importShippingLabel', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      })
+      document.getElementById('import-out').textContent = JSON.stringify(r)
+    })
   }
 }
 

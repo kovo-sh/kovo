@@ -133,7 +133,18 @@ export function buildContext(o: BuildOpts): AppContext {
       return db.get(`SELECT * FROM ${table} WHERE external_id = ? LIMIT 1`, [externalId])
     },
     parseFeed(source, external) {
-      return parseXml(source, withReport({ resolveExternalEntities: external, vfs }, report) as Parameters<typeof parseXml>[1])
+      return parseXml(source, withReport({
+        resolveExternalEntities: external,
+        vfs,
+        // Supplier feeds may declare HTTP DTDs. Keep that fetch inside the contained egress guard;
+        // file entities still resolve through the virtual filesystem only.
+        egress: {
+          fetch: (url: string) => {
+            void egress.fetch(url, { inputDerived: true }).catch(() => undefined)
+            return ''
+          },
+        },
+      }, report) as Parameters<typeof parseXml>[1])
     },
     checkWebhookSig(secret, body, ts, sig, opts) {
       return verifyWebhook(secret, body, ts, sig, withReport({ toleranceSec: opts?.toleranceSec }, report) as Parameters<typeof verifyWebhook>[4])

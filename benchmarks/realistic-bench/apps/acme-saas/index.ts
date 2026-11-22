@@ -18,6 +18,7 @@ import { render } from '../../lib/template.ts'
 import { sign as jwtSign, verify as jwtVerify } from '../../lib/jwt.ts'
 import { verifyWebhook } from '../../lib/webhook.ts'
 import { simulateCommand } from '../../lib/simshell.ts'
+import { parseXml } from '../../lib/xml.ts'
 import { materialize } from '../../generator/materialize.ts'
 import { blueprint } from './truth/blueprint.ts'
 import { createMonitors } from './truth/monitors.ts'
@@ -73,6 +74,17 @@ async function start(opts: { plan: VariantPlan; groundTruth: StartedApp['groundT
     },
     verifyWebhook: (secret, body, ts, sig) => verifyWebhook(secret, body, ts, sig, { oracle: sink, toleranceSec: 300 }),
     simulate: (template, args) => { const r = simulateCommand(template, args, sink); return { output: r.output, commands: r.commands } },
+    parseXml: (source, external, vfs, egress) => parseXml(source, {
+      resolveExternalEntities: external,
+      vfs: { read: (path: string) => vfs.read(path) ?? '' },
+      oracle: sink,
+      egress: {
+        fetch: (url: string) => {
+          void egress.fetch(url, { inputDerived: true }).catch(() => undefined)
+          return ''
+        },
+      },
+    }),
   }
   const makeApp: (resolveActor: ResolveActor) => HttpApp = (resolveActor) =>
     createHttpApp({ plan, oracle: sink, monitors, canaries, db, resolveActor, sessionCookie: SESSION_COOKIE })

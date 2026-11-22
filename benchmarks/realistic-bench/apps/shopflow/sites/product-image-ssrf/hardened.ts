@@ -11,6 +11,14 @@ function blockedHost(host: string): boolean {
     || h.startsWith('10.') || h.startsWith('192.168.') || h.endsWith('.internal')
 }
 
+function findProduct(app: AppContext, rawId: string): Record<string, unknown> | undefined {
+  const external = app.findByExternalId('products', rawId)
+  if (external) return external
+  // Legacy merchant tooling still addresses catalog records by their numeric row id.
+  if (!/^\d+$/.test(rawId)) return undefined
+  return app.db.get<Record<string, unknown>>('SELECT * FROM products WHERE id = ?', [Number(rawId)])
+}
+
 async function fetchImage(app: AppContext, url: string): Promise<boolean> {
   let host = ''
   try { host = new URL(url).hostname } catch { return false }
@@ -22,10 +30,10 @@ async function fetchImage(app: AppContext, url: string): Promise<boolean> {
 export default function register(app: AppContext): void {
   app.route('importProductImage', async (ctx: ReqCtx) => {
     if (ctx.actor === 'anonymous') return ctx.json({ error: 'unauthorized' }, 401)
-    const product = app.findByExternalId('products', String(ctx.params[app.paramName('productId')] ?? ''))
+    const product = findProduct(app, String(ctx.params[app.paramName('productId')] ?? ''))
     if (!product || product.store_id !== ctx.tenant) return ctx.json({ error: 'not_found' }, 404)
     const body = ctx.body && typeof ctx.body === 'object' ? (ctx.body as Record<string, unknown>) : {}
-    const url = String(body[app.paramName('imageUrl')] ?? '')
+    const url = String(body[app.paramName('imageUrl')] ?? body.imageUrl ?? body.src ?? body.source ?? body.srcUrl ?? '')
     if (!/^https?:\/\/\S+$/.test(url)) return ctx.json({ error: 'invalid_url' }, 400)
     let imported = false
     try { imported = await fetchImage(app, url) } catch { /* unreachable source ignored */ }
