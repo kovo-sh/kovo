@@ -2107,6 +2107,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }, grant, signal)
         if (persona) authRequests += 1
         params.onExchange?.(ex)
+        // Cross-persona object-ID harvesting runs for Phase-0 HTTP (authenticated and unauth alike).
+        storage.trackExchangeResources({
+          runId,
+          scopeRevision,
+          exchange: ex,
+          source: 'surface_probe',
+        })
         return ex
       } catch (err) {
         if (err instanceof BrokerCircuitOpen) {
@@ -3217,6 +3224,34 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       personaTouched = true
       personaPages += 1
       pagesVisited += 1
+
+      // Harvest object IDs from every intercepted XHR/fetch/page exchange for this persona
+      // (including anonymous crawl passes) so cross-persona BOLA queues have concrete samples.
+      for (const ex of visit.exchanges) {
+        if (ex.origin !== normalizedOrigin) continue
+        storage.trackExchangeResources({
+          runId,
+          scopeRevision,
+          exchange: ex,
+          source: 'spa_crawl',
+        })
+      }
+      if (visit.domSnippet) {
+        storage.trackExchangeResources({
+          runId,
+          scopeRevision,
+          exchange: {
+            origin: normalizedOrigin,
+            method: 'GET',
+            pathAndQuery: next.pathAndQuery,
+            personaHandle: persona ?? null,
+            status: 200,
+            mediaType: 'text/html',
+            body: visit.domSnippet,
+          },
+          source: 'spa_crawl',
+        })
+      }
 
       // Record visited route
       const routeTemplate = normalizeRouteTemplate(next.pathAndQuery)
