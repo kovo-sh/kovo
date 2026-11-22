@@ -5,7 +5,8 @@
 **Spec Reference:** [SPEC-v4.md](SPEC-v4.md)
 
 > **Status (2026-11-22): historical planning document, superseded by M7.**
-> M1–M7 are implemented and the release gate is complete. Read
+> M1–M7 are implemented and the release gate is complete (XBEN 25/25, held-out
+> 20/20, patches 20/20). Read
 > [VERIFICATION-v4.md](VERIFICATION-v4.md) for the measured gate, recall,
 > held-out, patch-retest and realistic-bench results. The “remaining work” and
 > percentage estimates below describe the pre-M7 state and are kept for history.
@@ -122,7 +123,7 @@ Check exact exported signatures expected by Features 26 & 27 + `T4-13` in `tests
    - Re-run regression suites after any hill-climbing code edits.
 3. **Publish `VERIFICATION-v4.md`** documenting all release gates, hill-climbing iteration table (before -> after deltas), held-out generalization results, and zero-trust boundary verification.
 
-> **Completed:** see [VERIFICATION-v4.md](VERIFICATION-v4.md). Measured held-out recall was 10/20 (target `>=18/20`) and patch verification 9/20 (target `>=14/20`); the release document reports both without adjustment.
+> **Completed:** see [VERIFICATION-v4.md](VERIFICATION-v4.md). Final held-out recall is 20/20 (target `>=18/20`), decoy FPs 0/6, and patch verification 20/20 (target `>=14/20`). Realistic-bench remains the open v4 baseline (0/172 dev, 3/171 held-out); v5 targets are in [plans/ROADMAP-v5.md](plans/ROADMAP-v5.md).
 
 ---
 

@@ -211,6 +211,16 @@ interface PlaywrightPage {
 
 interface PlaywrightContext {
   addInitScript(script: string | (() => void)): Promise<void>
+  addCookies?(cookies: Array<{
+    name: string
+    value: string
+    domain: string
+    path: string
+    secure?: boolean
+    httpOnly?: boolean
+    sameSite?: 'Strict' | 'Lax' | 'None'
+    expires?: number
+  }>): Promise<void>
   route(url: string, handler: (route: PlaywrightRoute) => Promise<void> | void): Promise<void>
   newPage(): Promise<PlaywrightPage>
   close(): Promise<void>
@@ -449,6 +459,36 @@ function safeFulfillHeaders(respHeaders: Record<string, string>): Record<string,
   return out
 }
 
+/**
+ * Mirror non-HttpOnly session-jar cookies into the Playwright context so SPA JS
+ * (`document.cookie`, Axios XSRF double-submit) observes the same values that the
+ * broker sends on the wire. Values never leave the browser process or enter results.
+ */
+async function mirrorJarCookies(
+  context: PlaywrightContext | undefined,
+  broker: RequestBroker,
+  scope: { session?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
+  origin: string,
+): Promise<void> {
+  if (!context?.addCookies) return
+  try {
+    const cookies = broker.sessionCookiesForBrowser(scope, origin)
+    if (cookies.length === 0) return
+    await context.addCookies(cookies.map(cookie => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+      secure: cookie.secure,
+      httpOnly: false,
+      sameSite: cookie.sameSite,
+      ...(cookie.expires !== undefined ? { expires: cookie.expires } : {}),
+    })))
+  } catch {
+    // Best-effort mirroring: a cookie that Playwright rejects must never fail a visit.
+  }
+}
+
 function hasDestructiveInput(text: string): boolean {
   if (containsDestructivePayload(text)) return true
   try {
@@ -677,6 +717,12 @@ export class ScopedBrowser {
           exchanges.push(exchange)
           const recordedId = req.onExchange?.(exchange)
           if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
+          await mirrorJarCookies(context, this.broker, {
+            session: req.session,
+            runId: req.runId,
+            assignmentId: req.assignmentId,
+            sessionGroupRole: req.sessionGroupRole,
+          }, parsedUrl.origin)
 
           const reqRecord: BrowserXhrRecord = {
             method,
@@ -1504,6 +1550,12 @@ export class ScopedBrowser {
               stepExchanges.push(exchange)
               const recordedId = cur.step.onExchange?.(exchange)
               if (typeof recordedId === 'string' && recordedId) stepExchangeIds.push(recordedId)
+              await mirrorJarCookies(context, this.broker, {
+                session: cur.step.session ?? sessionId,
+                runId: cur.step.runId,
+                assignmentId: cur.step.assignmentId,
+                sessionGroupRole: cur.step.role,
+              }, parsedUrl.origin)
 
               const reqRecord: BrowserXhrRecord = {
                 method,

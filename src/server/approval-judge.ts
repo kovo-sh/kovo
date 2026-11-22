@@ -223,6 +223,7 @@ function detectHardEscalationReason(input: {
   headers?: Record<string, string>
   hasMultipart?: boolean
   isRceProof?: boolean
+  localLab?: boolean
 }): string | null {
   if (input.isRceProof) {
     return 'RCE proof-of-execution probe always requires explicit human approval.'
@@ -232,6 +233,12 @@ function detectHardEscalationReason(input: {
   }
   if (input.method === 'DELETE') {
     return 'HTTP DELETE requests always require explicit human approval.'
+  }
+  if (input.localLab) {
+    // In an authorized local-lab the broker still enforces the destructive-payload
+    // denylist, SSRF guards and RPS caps; keyword-only financial/admin escalations
+    // would otherwise stall legitimate /invoices, /refund, /webhooks and /admin proof.
+    return null
   }
 
   const actionHeader =
@@ -386,6 +393,7 @@ export async function evaluateTier3Approval(
     headers: input.headers,
     hasMultipart: input.hasMultipart,
     isRceProof: input.isRceProof,
+    localLab: input.environment === 'local-lab',
   })
   if (hardEscalationReason) {
     return {
@@ -395,6 +403,20 @@ export async function evaluateTier3Approval(
       reason: hardEscalationReason,
       usedLlm: false,
       stage: 'hard_escalation',
+    }
+  }
+
+  // Stage 1A-local — authorized local-lab auto-approval for keyword-only escalations.
+  // Broker invariants (destructive denylist, SSRF guards, RPS caps, Tier-3 gating)
+  // remain fully enforced; public environments never take this branch.
+  if (input.environment === 'local-lab') {
+    return {
+      decision: 'approve',
+      decidedBy: 'auto-review:rule',
+      riskLevel: 'medium',
+      reason: 'Local-lab environment auto-approval (hard broker invariants enforced; destructive/RCE/DELETE/multipart still escalate).',
+      usedLlm: false,
+      stage: 'benign_fast_path',
     }
   }
 

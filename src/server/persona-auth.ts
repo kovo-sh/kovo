@@ -63,7 +63,12 @@ interface PlaywrightFormPage {
 }
 
 interface PlaywrightFormRoute {
-  request(): { url(): string }
+  request(): {
+    url(): string
+    method?(): string
+    resourceType?(): string
+    headers?(): Record<string, string>
+  }
   abort(errorCode?: string): Promise<void>
   continue(): Promise<void>
 }
@@ -84,6 +89,8 @@ export interface PersonaAuthManagerOptions {
   fetchImpl?: typeof fetch
   launchBrowser?: () => Promise<PlaywrightFormBrowserLike>
   timeoutMs?: number
+  /** Minimum interval between broker-invoked 401 re-auths per persona (default 60s). */
+  reauthMinIntervalMs?: number
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -199,6 +206,66 @@ function checkResponseForCaptchaOrMfa(text: string, target: string, email: strin
   }
 }
 
+const JWT_SHAPE = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/
+
+function isJwtLike(value: string): boolean {
+  return value.length > 40 && value.length < 8192 && JWT_SHAPE.test(value) && value.startsWith('eyJ')
+}
+
+/** Harvest Bearer JWTs from `localStorage` / `sessionStorage` in the authenticated page. */
+async function harvestBrowserTokens(page: PlaywrightFormPage): Promise<string[]> {
+  try {
+    const tokens = await page.evaluate(() => {
+      const shape = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/
+      const looksJwt = (v: string) => v.length > 40 && v.length < 8192 && shape.test(v) && v.startsWith('eyJ')
+      const keyHint = /(?:token|jwt|auth|access|id_token|session)/i
+      const out: string[] = []
+      const stores: Storage[] = []
+      try { stores.push(window.localStorage) } catch { /* blocked */ }
+      try { stores.push(window.sessionStorage) } catch { /* blocked */ }
+      const visit = (value: unknown, depth: number) => {
+        if (depth > 3 || value === null || value === undefined) return
+        if (typeof value === 'string') {
+          const trimmed = value.trim()
+          if (looksJwt(trimmed)) out.push(trimmed)
+          else if ((trimmed.startsWith('{') || trimmed.startsWith('"')) && trimmed.length < 4096) {
+            try { visit(JSON.parse(trimmed), depth + 1) } catch { /* not JSON */ }
+          }
+          return
+        }
+        if (Array.isArray(value)) {
+          for (const item of value.slice(0, 32)) visit(item, depth + 1)
+          return
+        }
+        if (typeof value === 'object') {
+          for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+            if (typeof v === 'string' && looksJwt(v) && (keyHint.test(k) || v.startsWith('eyJ'))) out.push(v)
+            else if (typeof v === 'object') visit(v, depth + 1)
+          }
+        }
+      }
+      for (const store of stores) {
+        for (let i = 0; i < store.length && i < 200; i += 1) {
+          const key = store.key(i)
+          if (!key) continue
+          visit(store.getItem(key), 0)
+        }
+      }
+      return [...new Set(out)].slice(0, 8)
+    })
+    return Array.isArray(tokens) ? tokens.filter((t): t is string => typeof t === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function extractBearerToken(headerValue: string | undefined): string | null {
+  if (!headerValue) return null
+  const match = /^Bearer\s+(\S+)$/i.exec(headerValue.trim())
+  if (!match || !match[1]) return null
+  return isJwtLike(match[1]) ? match[1] : null
+}
+
 async function launchDefaultChromium(): Promise<PlaywrightFormBrowserLike> {
   try {
     const coreName = 'playwright-core'
@@ -284,13 +351,51 @@ export class PersonaAuthManager {
   private readonly fetchImpl: typeof fetch
   private readonly launchBrowser: () => Promise<PlaywrightFormBrowserLike>
   private readonly timeoutMs: number
+  private readonly reauthMinIntervalMs: number
   private readonly runTimers = new Map<string, NodeJS.Timeout[]>()
+  private readonly reauthHandlers = new Map<string, { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean> }>()
 
   constructor(options: PersonaAuthManagerOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis)
     this.launchBrowser = options.launchBrowser ?? launchDefaultChromium
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.reauthMinIntervalMs = Math.max(1_000, options.reauthMinIntervalMs ?? 60_000)
   }
+
+  /**
+   * Register a broker-invoked 401 re-authentication callback for a persona handle.
+   * Calls are rate-limited to at most one per minute per persona (configurable for tests).
+   */
+  registerReauth(handle: string, fn: () => Promise<void>): () => void {
+    this.reauthHandlers.set(handle, { fn, lastAt: 0 })
+    return () => {
+      const current = this.reauthHandlers.get(handle)
+      if (current?.fn === fn) this.reauthHandlers.delete(handle)
+    }
+  }
+
+  /** Invoked by RequestBroker on a persona-bound 401. Returns true when a session refresh ran. */
+  async requestReauth(handle: string): Promise<boolean> {
+    const entry = this.reauthHandlers.get(handle)
+    if (!entry) return false
+    if (entry.inFlight) return entry.inFlight
+    const now = Date.now()
+    if (now - entry.lastAt < this.reauthMinIntervalMs) return false
+    entry.lastAt = now
+    const run = (async () => {
+      try {
+        await entry.fn()
+        return true
+      } catch {
+        return false
+      } finally {
+        entry.inFlight = undefined
+      }
+    })()
+    entry.inFlight = run
+    return run
+  }
+
 
   async authenticatePersona(
     storage: Store,
@@ -678,18 +783,60 @@ export class PersonaAuthManager {
     targetOrigin: string,
     signal?: AbortSignal,
   ): Promise<AuthenticateResult> {
+    // Optional v5 session-hardening knobs (accepted structurally so older persisted configs stay valid).
+    const ext = config as PersonaLoginConfig & {
+      csrfPrefetchUrl?: string
+      refreshUrl?: string
+      refreshTokenJsonPath?: string
+    }
     const loginUrl = config.loginUrl || `${targetOrigin}/api/auth/login`
     const emailField = config.emailField || 'email'
     const passwordField = config.passwordField || 'password'
+    const loginHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    }
+
+    // Optional CSRF pre-fetch: cookie + token seeding for JSON logins behind CSRF middleware.
+    if (ext.csrfPrefetchUrl) {
+      try {
+        const csrfRes = await fetchWithTimeout(
+          this.fetchImpl,
+          ext.csrfPrefetchUrl,
+          { method: 'GET', headers: { Accept: 'application/json,text/html;q=0.9,*/*;q=0.8' }, redirect: 'follow' },
+          Math.min(this.timeoutMs, 8_000),
+          signal,
+        )
+        const csrfText = (await csrfRes.text()).slice(0, 100_000)
+        checkResponseForCaptchaOrMfa(csrfText, ext.csrfPrefetchUrl, email)
+        const csrfCookies = extractSetCookies(csrfRes.headers)
+        if (csrfCookies.size > 0) loginHeaders.Cookie = cookiesToHeader(csrfCookies)
+        let token = csrfRes.headers.get('x-csrf-token') || csrfRes.headers.get('x-xsrf-token') || ''
+        if (!token) {
+          try {
+            const parsed = JSON.parse(csrfText) as unknown
+            for (const path of ['csrfToken', 'csrf_token', 'xsrfToken', 'token', 'data.csrfToken']) {
+              const candidate = getJsonPath(parsed, path)
+              if (candidate) { token = candidate; break }
+            }
+          } catch {
+            const meta = /<meta[^>]+(?:name|property)=["'](?:csrf-token|xsrf-token|_csrf)["'][^>]*content=["']([^"']+)["']/i.exec(csrfText)
+            if (meta?.[1]) token = meta[1]
+          }
+        }
+        if (token) loginHeaders['X-CSRF-Token'] = token
+      } catch (err) {
+        if (err instanceof PersonaAuthError) throw err
+        // Pre-fetch is best-effort; the login itself remains authoritative.
+      }
+    }
+
     const res = await fetchWithTimeout(
       this.fetchImpl,
       loginUrl,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
+        headers: loginHeaders,
         body: JSON.stringify({ [emailField]: email, [passwordField]: password }),
       },
       this.timeoutMs,
@@ -715,20 +862,54 @@ export class PersonaAuthManager {
       )
     }
 
-    // If tokenJsonPath is explicitly specified, prefer extracting that token as Bearer.
-    if (config.tokenJsonPath && body) {
-      const token = getJsonPath(body, config.tokenJsonPath)
-      if (!token) {
-        throw new PersonaAuthError('AUTH_FAILED', `JSON login succeeded (${res.status}) but tokenJsonPath "${config.tokenJsonPath}" was not found in response.`)
-      }
+    const refreshTokenPath = ext.refreshTokenJsonPath || 'refresh_token'
+    const refreshToken = (body && typeof body === 'object') ? getJsonPath(body, refreshTokenPath) : null
+    const refreshUrl = ext.refreshUrl ?? null
+    const tokenPath = config.tokenJsonPath || 'access_token'
+    const refreshIntervalSec = config.refreshIntervalSec ??
+      Math.max(60, Math.min(900, Math.floor(((decodeJwtPayload(getJsonPath(body ?? {}, tokenPath) ?? '')?.exp ?? 0) * 1000 - Date.now()) / 2000) || 300))
+
+    const persistBearer = (token: string, scrub: string[]): AuthenticateResult => {
       const claims = decodeJwtPayload(token)
       const expiresAt = claims?.exp ? claims.exp * 1000 : undefined
+      let currentRefreshToken = refreshToken
+      const doRefresh = refreshUrl && refreshToken
+        ? async () => {
+            const rr = await fetchWithTimeout(
+              this.fetchImpl,
+              refreshUrl,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ refresh_token: currentRefreshToken }),
+              },
+              this.timeoutMs,
+            )
+            const rt = await rr.text()
+            if (!rr.ok) {
+              throw new PersonaAuthError('AUTH_FAILED', `JSON refresh failed (${rr.status}): ${sanitizeErrorText(rt.slice(0, 160), [currentRefreshToken ?? '', password])}`)
+            }
+            let rb: unknown = null
+            try { rb = rt ? JSON.parse(rt) : null } catch { rb = null }
+            const nextToken = rb ? getJsonPath(rb, tokenPath) : null
+            if (!nextToken) throw new PersonaAuthError('AUTH_FAILED', 'JSON refresh response missing access token.')
+            const nextRefresh = rb ? getJsonPath(rb, refreshTokenPath) : null
+            currentRefreshToken = nextRefresh ?? currentRefreshToken
+            writePersonaSessionFile(persona.sessionPath!, {
+              headerType: 'bearer',
+              value: nextToken,
+              expiresAt: decodeJwtPayload(nextToken)?.exp ? decodeJwtPayload(nextToken)!.exp! * 1000 : undefined,
+              adapterUsed: 'json',
+              scrubTokens: [nextToken, currentRefreshToken ?? '', ...scrub],
+            })
+          }
+        : undefined
       writePersonaSessionFile(persona.sessionPath!, {
         headerType: 'bearer',
         value: token,
         expiresAt,
         adapterUsed: 'json',
-        scrubTokens: [token],
+        scrubTokens: [token, ...(currentRefreshToken ? [currentRefreshToken] : []), ...scrub],
       })
       return {
         personaId: persona.id,
@@ -736,10 +917,24 @@ export class PersonaAuthManager {
         adapterUsed: 'json',
         headerType: 'bearer',
         expiresAt,
+        ...(doRefresh ? { refresh: doRefresh, refreshIntervalSec } : {}),
       }
     }
 
-    // Capture Set-Cookie headers first
+    // 1. Explicit Authorization response header (IdP / gateway style).
+    const authResponseToken = extractBearerToken(res.headers.get('authorization') ?? undefined)
+    if (authResponseToken) return persistBearer(authResponseToken, [])
+
+    // 2. Explicit tokenJsonPath.
+    if (config.tokenJsonPath && body) {
+      const token = getJsonPath(body, config.tokenJsonPath)
+      if (!token) {
+        throw new PersonaAuthError('AUTH_FAILED', `JSON login succeeded (${res.status}) but tokenJsonPath "${config.tokenJsonPath}" was not found in response.`)
+      }
+      return persistBearer(token, [])
+    }
+
+    // 3. Set-Cookie session.
     const cookies = extractSetCookies(res.headers)
     if (cookies.size > 0) {
       const cookieHeader = cookiesToHeader(cookies)
@@ -758,7 +953,7 @@ export class PersonaAuthManager {
       }
     }
 
-    // Fall back to standard JSON token fields
+    // 4. Standard JSON token fields.
     const candidatePaths = [
       'access_token',
       'token',
@@ -773,24 +968,7 @@ export class PersonaAuthManager {
     if (body) {
       for (const path of candidatePaths) {
         const token = getJsonPath(body, path)
-        if (token) {
-          const claims = decodeJwtPayload(token)
-          const expiresAt = claims?.exp ? claims.exp * 1000 : undefined
-          writePersonaSessionFile(persona.sessionPath!, {
-            headerType: 'bearer',
-            value: token,
-            expiresAt,
-            adapterUsed: 'json',
-            scrubTokens: [token],
-          })
-          return {
-            personaId: persona.id,
-            handle: persona.handle,
-            adapterUsed: 'json',
-            headerType: 'bearer',
-            expiresAt,
-          }
-        }
+        if (token) return persistBearer(token, [])
       }
     }
 
@@ -815,6 +993,7 @@ export class PersonaAuthManager {
     let context: PlaywrightFormContext | undefined
     let page: PlaywrightFormPage | undefined
     let captchaRouteHit = false
+    const interceptedBearer = new Set<string>()
 
     const assertNoCaptchaInPage = async (p: PlaywrightFormPage) => {
       if (captchaRouteHit) {
@@ -864,6 +1043,9 @@ export class PersonaAuthManager {
       context = await browser.newContext({ ignoreHTTPSErrors: false })
       await context.route('**/*', async route => {
         const reqUrl = route.request().url()
+        const requestHeaders = route.request().headers?.()
+        const bearer = extractBearerToken(requestHeaders?.authorization ?? requestHeaders?.Authorization)
+        if (bearer) interceptedBearer.add(bearer)
         if (CAPTCHA_PATTERN.test(reqUrl)) {
           captchaRouteHit = true
           await route.abort('blockedbyclient')
@@ -871,15 +1053,25 @@ export class PersonaAuthManager {
         }
         try {
           const origin = new URL(reqUrl).origin
-          if (!allowedOrigins.has(origin)) {
-            await route.abort('blockedbyclient')
+          const method = (route.request().method?.() ?? 'GET').toUpperCase()
+          const resourceType = route.request().resourceType?.() ?? 'document'
+          const isReadOnly = method === 'GET' || method === 'HEAD'
+          if (allowedOrigins.has(origin)) {
+            await route.continue()
             return
           }
+          // Read-only static assets / configured IdP subresources may render during login,
+          // but never documents and never mutating requests.
+          if (isReadOnly && resourceType !== 'document' && /^https?:$/i.test(new URL(reqUrl).protocol)) {
+            await route.continue()
+            return
+          }
+          await route.abort('blockedbyclient')
+          return
         } catch {
           await route.abort('blockedbyclient')
           return
         }
-        await route.continue()
       })
 
       page = await context.newPage()
@@ -934,8 +1126,34 @@ export class PersonaAuthManager {
       for (const c of cookies) {
         if (c.name && c.value) cookieMap.set(c.name, c.value)
       }
-      if (cookieMap.size === 0) {
-        throw new PersonaAuthError('INVALID_CREDENTIALS', `Form login on ${loginUrl} produced no session cookies for allowlisted origins.`)
+
+      // Harvest Bearer JWTs from storage + intercepted XHR Authorization headers (SPA logins).
+      const storageTokens = await harvestBrowserTokens(page)
+      const harvested = [...storageTokens, ...interceptedBearer]
+      const bearerToken = harvested.find(token => isJwtLike(token))
+
+      if (cookieMap.size === 0 && !bearerToken) {
+        throw new PersonaAuthError('INVALID_CREDENTIALS', `Form login on ${loginUrl} produced no session cookies or Bearer JWT for allowlisted origins.`)
+      }
+
+      if (cookieMap.size === 0 && bearerToken) {
+        // SPA localStorage/sessionStorage auth: persist the harvested Bearer JWT.
+        const claims = decodeJwtPayload(bearerToken)
+        const session: MintedPersonaSession = {
+          headerType: 'bearer',
+          value: bearerToken,
+          adapterUsed: 'form',
+          ...(claims?.exp ? { expiresAt: claims.exp * 1000 } : {}),
+          scrubTokens: [bearerToken, ...harvested],
+        }
+        writePersonaSessionFile(persona.sessionPath!, session)
+        return {
+          personaId: persona.id,
+          handle: persona.handle,
+          adapterUsed: 'form',
+          headerType: 'bearer',
+          ...(claims?.exp ? { expiresAt: claims.exp * 1000 } : {}),
+        }
       }
 
       const cookieHeader = cookiesToHeader(cookieMap)
@@ -943,7 +1161,7 @@ export class PersonaAuthManager {
         headerType: 'cookie',
         value: cookieHeader,
         adapterUsed: 'form',
-        scrubTokens: [cookieHeader, ...cookieMap.values()],
+        scrubTokens: [cookieHeader, ...cookieMap.values(), ...harvested],
       }
       writePersonaSessionFile(persona.sessionPath!, session)
 
@@ -981,6 +1199,13 @@ export class PersonaAuthManager {
       for (const persona of loginPersonas) {
         const result = await this.authenticatePersona(storage, projectId, persona.id, signal)
         results.push(result)
+        // Broker-invoked 401 re-auth uses the existing refresh closure when available,
+        // otherwise re-runs the full adapter (both are rate-limited to <=1/60s/persona).
+        const reauthRefresh = result.refresh
+        this.registerReauth(persona.handle, async () => {
+          if (reauthRefresh) await reauthRefresh()
+          else await this.authenticatePersona(storage, projectId, persona.id, signal)
+        })
         storage.event(
           runId,
           'persona.authenticated',
