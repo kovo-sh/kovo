@@ -25,7 +25,7 @@
 |---|---|---|---|---|---|
 | **M0** | True E2E realistic-bench harness | Drive real `Execution` loop, baseline scorecard, `benchmark:realistic` CLI | **DONE** (deterministic baseline; agentic run needs model profile) | `m5-m0` / `agents/m0` | — |
 | **M1** | P0 wiring & correctness | broker/browser args, second-order/OOB canaries, dedupe + route templates, specialist routing/skills, `InlineVerifyFeedback` + Phase-3, guard/sanitizer, CVE semver | **DONE** (merged) | `m5-m1-core`, `m5-m1-static` | M0 baseline |
-| **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **PARTIAL** — 2.2/2.3/2.4 DONE; **2.1 RUNNING** | `m7-spa`, `m5-m2-auth`, `m5-m2-state` | — |
+| **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **DONE** (2.1–2.4 merged) | `m7-spa`, `m5-m2-auth`, `m5-m2-state` | — |
 | **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **RUNNING** | `m5-m3-probes`; spec contracts merged (specs2) | M1-core for verifier/schema additions |
 | **M4** | Templates, AST, SAST→DAST, Patch Gate 6 | 2021–2026 corpus, multi-framework AST, bridge, real patch retest | **DONE** (merged; execution/recon wiring pending) | `m5-m4` / `agents/m4` | — |
 | **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 + TOOLS DONE** (UI, board_post/read, deltas, warm controller); execution wiring next | `m5-board`, `m5-board2` | M1 for poster wiring |
@@ -49,7 +49,7 @@
 | m2-auth (merged) | `m5-m2-auth` | `src/server/broker.ts`, `scoped-browser.ts`, `persona-auth.ts`, `approval-judge.ts`, `tests/v5-m2-auth.test.ts` | M2.4 done |
 | board-ui (merged) | `m5-board` | `src/domain.ts`, `src/actions.ts`, `src/server/schema.ts`, `src/server/store.ts`, `src/components/run-board.tsx` (new), `run-workspace.tsx`, `run-state.ts`, `src/app.css`, SSE route, board tests | M5 Phase 1 done |
 
-Retired/merged: `agents/heldout2` (v4 climb: 20/20 held-out, 25/25 xben, 20/20 patches), `agents/rb` (realistic-bench hardening), `agents/docs` (VERIFICATION-v4), `agents/m0` (M0 harness + isolation), `agents/m1-static`, `agents/m2-auth`, `agents/spa`, `agents/board-ui` (M5 Phase 1), `agents/specs2` (M3 synthesis + authz precision), `agents/orch` (speed + all-patches fix), `agents/m4` (templates/AST/bridge/Gate 6).
+Retired/merged: `agents/heldout2` (v4 climb: 20/20 held-out, 25/25 xben, 20/20 patches), `agents/rb` (realistic-bench hardening), `agents/docs` (VERIFICATION-v4), `agents/m0` (M0 harness + isolation), `agents/m1-static`, `agents/m1-core`, `agents/m2-auth`, `agents/m2-state`, `agents/spa`, `agents/recon2`, `agents/board-ui` (M5 Phase 1), `agents/board-tools` (board tools), `agents/specs2` (M3 synthesis + contracts), `agents/orch`, `agents/m4`, `agents/docs-v5`.
 
 Open discrepancy: held-out `allPatches=regressed` is a phantom — fresh synthesis re-confirms always-on GraphQL introspection and credits it to both GraphQL challenges. Per-patch retests are 20/20 fixed. The orchestration stream owns replaying baseline attributed specs for the all-patches pass.
 
