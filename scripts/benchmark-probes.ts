@@ -67,6 +67,16 @@ export interface Hypothesis {
   createPath?: string
   quantityField?: string
   producerBody?: Record<string, unknown>
+  /** Workflow quantity/counter: read-back route whose JSON exposes the conserved value. */
+  workflowReadPath?: string
+  /** Workflow transition: collection list used to resolve a seeded target and read its state. */
+  workflowListPath?: string
+  /** Workflow transition: performing the same transition twice must be rejected the second time. */
+  repeatTransition?: boolean
+  /** Workflow: client-supplied price update on a route with a sibling read-back. */
+  priceTrust?: boolean
+  /** Workflow: repeat a money/single-use mutation twice (aggregate cap). */
+  repeatMutation?: boolean
   /** Race: sibling producer route that mints a single-use value for the consume parameter. */
   raceProducerPath?: string
   /** Race: `single_use` mints a value; `balance` overspends a read-then-write balance/stock. */
@@ -125,14 +135,14 @@ const placeholderSeg = /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/
 const maxInjectionParamsPerEndpoint = 8
 const maxCacheEndpoints = 5
 /** Cookie-authenticated state-change candidates (CSRF) and their observable read routes. */
-const csrfActionPath = /(settings|profile|account|tenant|org|team|refund|job|trigger|approve|confirm|transfer|invite|subscribe|billing|payment|grant)/i
+const csrfActionPath = /(settings|profile|account|tenant|org|team|refund|reversal|payout|disburse|charge|credit|withdraw|job|trigger|approve|confirm|transfer|invite|subscribe|billing|payment|grant|reimburse)/i
 const csrfSkipPath = /(^|\/)(login|logout|2fa|csrf|token|session|oauth|authorize|callback|graphql)(\/|$)/i
 /** Inbound webhook receiver routes (not management/list routes). */
-const webhookReceiverPath = /(^|\/)(?:receive|receive-webhook|callback|callbacks|inbound|deliver|delivery|events)(\/|$)/i
+const webhookReceiverPath = /(^|\/)(?:receive|receive-webhook|callback|callbacks|inbound|deliver|delivery|events|event[-_]?hooks?|webhooks?|receivers?)(\/|$)/i
 /** Navigation/callback parameter names used by open-redirect sinks. */
 const redirectParamName = /^(?:next|nextUrl|next_url|returnTo|return_to|returnUrl|return_url|redirect|redirectUri|redirect_uri|url|uri|continue|continueUrl|callback|callbackUrl|dest|destination|target|go)$/i
 const redirectPathHint = /(sso|oauth|authorize|callback|redirect|return|login|logout|checkout|download|export|continue|resume)/i
-const maxCsrfHypotheses = 6
+const maxCsrfHypotheses = 8
 const maxWebhookHypotheses = 4
 const maxRedirectHypotheses = 16
 const maxRaceHypotheses = 8
@@ -350,6 +360,11 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   let massHypotheses = 0
   let filterAuthzHypotheses = 0
   let secretHypotheses = 0
+  let workflowReadHypotheses = 0
+  let workflowTransitionHypotheses = 0
+  let workflowRepeatHypotheses = 0
+  let priceTrustHypotheses = 0
+  const massProbePaths = new Set<string>()
   const pageCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
   const csrfCandidates: Array<{ ep: DiscoveredEndpoint; readPath: string | null; create: boolean; score: number }> = []
   const webhookCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
@@ -444,8 +459,8 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     }
     // Non-entitled secret exposure: auth-ish collection/detail reads are scanned for tenant secret
     // markers by a viewer-role actor while an anonymous control proves the route is guarded.
-    if (caps.newProbeClasses && isGet && secretHypotheses < 10 &&
-        /(?:api[-_]?keys?|apikeys|secret|token|credential|audit|settings|config|billing|integration)/i.test(ep.path) &&
+    if (caps.newProbeClasses && isGet && secretHypotheses < 12 &&
+        /(?:api[-_]?keys?|apikeys|secret|tokens?|credential|audit|settings|config|billing|integration|connectors?|links?|hooks?|webhooks?|providers?|connections?|accounts?)/i.test(ep.path) &&
         !graphqlPath.test(ep.path)) {
       const key = `secret_scan|${ep.path}`
       if (!writeProbeSeen.has(key)) {
@@ -475,7 +490,9 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       const isSearch = purpose === 'search' || /^(?:q|query|term|keyword|filter|expr|clause|since)$/i.test(p.name)
       const isFile = purpose === 'file'
       const isUrl = purpose === 'url' || urlName.test(p.name)
-      const isCommand = purpose === 'command' || shellParam.test(p.name)
+      const camelWords = p.name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+      const isCommand = purpose === 'command' || shellParam.test(p.name) ||
+        /(?:^|_)(?:host|hostname|ip|addr|domain|target|cmd|command|exec|shell|run|ping|diag|lookup|resolve|nslookup|whois)(?:_|$)/.test(camelWords)
       const isText = purpose === 'text'
       const isTemplate = purpose === 'template'
       const isIdLike = idName.test(p.name) || p.isObjectId
@@ -533,26 +550,108 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         graphqlCandidates.push(ep)
       }
     }
-    // Step-skip: a later transition verb on an object id whose creator route is a sibling POST.
-    if (!isGet && pathHasPlaceholder && actionStepPath.test(ep.path)) {
-      const parent = ep.path.split('/').filter(Boolean)
-        .slice(0, ep.path.split('/').filter(Boolean).findIndex(seg => placeholderSeg.test(seg)))
-        .join('/')
-      const creatorPath = `/${parent}`
-      const creator = endpoints.find(e => e.method.toUpperCase() === 'POST' && e.path === creatorPath)
-      if (creator) {
-        const producerBody: Record<string, unknown> = {}
-        for (const p of creator.params.filter(x => x.location === 'json' || x.location === 'form')) {
-          producerBody[p.name] = p.isObjectId || idName.test(p.name) ? '1' : /(qty|quantity|count|amount|price|total)/i.test(p.name) ? 1 : 'guardian'
+    // Structural action shapes. Path nouns are randomized by realistic apps, so state-changing
+    // routes are recognised from their stable shape: a collection creator (POST), a collection
+    // list/detail GET, and a terminal action verb (accept/confirm/complete/approve/...).
+    const pathSegs = ep.path.split('?')[0].split('/').filter(Boolean)
+    const placeholderIdx = pathSegs.findIndex(seg => placeholderSeg.test(seg))
+    const singlePlaceholder = placeholderIdx >= 0 && pathSegs.slice(placeholderIdx + 1).every(seg => !placeholderSeg.test(seg))
+    const collectionPath = placeholderIdx > 0 ? `/${pathSegs.slice(0, placeholderIdx).join('/')}` : null
+    const prefixSegs = placeholderIdx > 0 ? pathSegs.slice(0, placeholderIdx) : []
+    const detailGet = placeholderIdx > 0
+      ? getPaths.find(g => {
+          const gs = g.split('?')[0].split('/').filter(Boolean)
+          return gs.length === placeholderIdx + 1 && placeholderSeg.test(gs[placeholderIdx]) &&
+            gs.slice(0, placeholderIdx).join('/') === prefixSegs.join('/')
+        })
+      : undefined
+    const collectionGet = collectionPath && getPaths.includes(collectionPath) ? collectionPath : undefined
+    const collectionCreator = collectionPath
+      ? endpoints.find(e => e.method.toUpperCase() === 'POST' && !hasPathPlaceholder(e.path) && e.path === collectionPath)
+      : undefined
+    const lastSeg = pathSegs[pathSegs.length - 1] ?? ''
+    const actionVerb = actionStepPath.test(lastSeg) || /^(?:reapply|reset|rotate)$/i.test(lastSeg)
+    const skipTransitionVerb = /^(?:cancel|logout|signout|revoke|delete|remove|reset|forgot)$/i.test(lastSeg)
+    const creatorBody = (creator: DiscoveredEndpoint): Record<string, unknown> => {
+      const body: Record<string, unknown> = {}
+      for (const p of creator.params.filter(x => x.location === 'json' || x.location === 'form')) {
+        body[p.name] = p.isObjectId || idName.test(p.name) ? '1' : /(qty|quantity|count|amount|price|total)/i.test(p.name) ? 1 : 'guardian'
+      }
+      return body
+    }
+    // Step-skip: a later transition accepted for a fresh/seeded object whose prerequisite is unmet.
+    if (!isGet && method === 'POST' && actionVerb && !skipTransitionVerb &&
+        workflowTransitionHypotheses < 8) {
+      if (pathHasPlaceholder) {
+        if (singlePlaceholder && (collectionCreator || collectionGet || detailGet)) {
+          add({
+            endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep),
+            repeatTransition: true,
+            ...(collectionCreator ? { createPath: collectionCreator.path, producerBody: creatorBody(collectionCreator) } : {}),
+            ...(collectionGet ? { workflowListPath: collectionGet } : {}),
+            ...(detailGet ? { workflowReadPath: detailGet } : {}),
+          })
+          workflowTransitionHypotheses += 1
         }
-        add({ endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep), createPath: creatorPath, producerBody })
+      } else if (pathSegs.length >= 2) {
+        const parentPath = `/${pathSegs.slice(0, -1).join('/')}`
+        const creator = endpoints.find(e => e.method.toUpperCase() === 'POST' && !hasPathPlaceholder(e.path) && e.path === parentPath)
+        const list = getPaths.includes(parentPath) ? parentPath : undefined
+        if (creator || list) {
+          add({
+            endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep),
+            repeatTransition: true,
+            ...(creator ? { createPath: creator.path, producerBody: creatorBody(creator) } : {}),
+            ...(list ? { workflowListPath: list } : {}),
+          })
+          workflowTransitionHypotheses += 1
+        }
       }
     }
-    if (workflowPath.test(ep.path)) {
-      const qtyField = effectiveParams.find(p =>
-        /^(?:qty|quantity|itemQty|count|seats?|amount)$/i.test(p.name) && (p.location === 'json' || p.location === 'form'),
-      )
-      add({ endpoint: ep, probeClass: 'workflow_invariant', method: isGet ? 'GET' : writeMethod(ep), ...(qtyField ? { quantityField: qtyField.name } : {}) })
+    // Quantity/counter invariant: a write whose numeric body field feeds a readable resource state.
+    // Create-shaped line/cart writes get their creator and detail read-back so the probe can prove
+    // the conserved value (e.g. subtotal) left its bound.
+    if (!isGet && workflowReadHypotheses < 6 &&
+        (workflowPath.test(ep.path) ||
+          (singlePlaceholder && Boolean(collectionCreator) && Boolean(detailGet)) ||
+          /(?:qty|quantity|seat|license|licence|wallet|credit|stock|inventory|amount|price|subtotal|total)/i.test(ep.path))) {
+      const bodyParams = effectiveParams.filter(p => p.location === 'json' || p.location === 'form')
+      const qtyField = bodyParams.find(p => /^(?:qty|quantity|itemQty|count|seats?|amount)$/i.test(p.name))
+      const numericIntent = Boolean(qtyField) ||
+        /(?:cart|bag|basket|order|line|item|qty|quantity|seat|license|licence|wallet|credit|stock|inventory|amount|price|subtotal|total)/i.test(ep.path)
+      if (numericIntent && (qtyField || (singlePlaceholder && collectionCreator && detailGet))) {
+        add({
+          endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep),
+          quantityField: qtyField?.name ?? 'qty',
+          ...(singlePlaceholder && collectionCreator ? { createPath: collectionCreator.path, producerBody: creatorBody(collectionCreator) } : {}),
+          ...(singlePlaceholder && detailGet ? { workflowReadPath: detailGet } : {}),
+        })
+        workflowReadHypotheses += 1
+      }
+    }
+    // Client-trusted numeric value: a write that shares its path with a readable summary. The probe
+    // compares the summary before/after a price-bearing write, so a server that ignores the field
+    // (the hardened twin) never signals.
+    if (!isGet && (method === 'PATCH' || method === 'PUT') && priceTrustHypotheses < 3 &&
+        getPaths.includes(ep.path) &&
+        /(?:subscription|billing|plan|price|wallet|payment|invoice|license|licence|seat|account|tenant)/i.test(ep.path)) {
+      add({ endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep), priceTrust: true, workflowReadPath: ep.path })
+      priceTrustHypotheses += 1
+    }
+    // Aggregate cap: repeating a settled money mutation creates a second settled record. Only
+    // eligible when the same resource family exposes a terminal action route (approve/confirm/...)
+    // or the route is explicitly money-shaped, which keeps ordinary creates out of the probe.
+    if (!isGet && method === 'POST' && !pathHasPlaceholder && workflowRepeatHypotheses < 4 && pathSegs.length >= 2) {
+      const familyRoot = `/${pathSegs.slice(0, 2).join('/')}`
+      const familyHasAction = endpoints.some(e =>
+        e.method.toUpperCase() === 'POST' && hasPathPlaceholder(e.path) && e.path.startsWith(`${familyRoot}/`) &&
+        actionStepPath.test(lastPathSegment(e.path)))
+      const moneyShaped = /(refund|reversal|credit|payout|withdraw|settle|charge|payment|deposit|reimburse)/i.test(ep.path) ||
+        /(?:lines?|items?)$/i.test(ep.path) && familyHasAction
+      if (familyHasAction || moneyShaped) {
+        add({ endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep), repeatMutation: true })
+        workflowRepeatHypotheses += 1
+      }
     }
     // Race: a single-use value or a read-then-write balance/stock consumed by this write. Prefer a
     // sibling producer (mint) route; balance mode reads the resource/detail route instead.
@@ -592,11 +691,12 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       // Object updates: overpost privileged fields and prove persistence with a read-back. This
       // covers per-object records whose field names the surface never exposed.
       if (!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder &&
-          !params.some(p => p.location === 'json' || p.location === 'form') && massHypotheses < 6) {
+          !params.some(p => p.location === 'json' || p.location === 'form') && massHypotheses < 10) {
         const key = `mass_assignment|${ep.path}|${method}`
         if (!writeProbeSeen.has(key)) {
           writeProbeSeen.add(key)
           add({ endpoint: ep, probeClass: 'mass_assignment', method: writeMethod(ep) })
+          massProbePaths.add(ep.path)
           massHypotheses += 1
         }
       }
@@ -648,8 +748,12 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         const detailRead = createCandidate
           ? getPaths.find(p => hasPathPlaceholder(p) && p.split('/').filter(Boolean).slice(0, -1).join('/') === ep.path.split('?')[0].split('/').filter(Boolean).join('/'))
           : undefined
-        if ((readPath || detailRead) && (hasCsrfParam || actionish) && (hasCsrfParam || stateBody || actionish)) {
-          csrfCandidates.push({ ep, readPath: readPath ?? null, create: Boolean(!readPath && detailRead), score: (hasCsrfParam ? 2 : 0) + (stateBody ? 2 : 0) + (actionish ? 1 : 0) + (detailRead ? 1 : 0) })
+        const moneyShaped = /(refund|reversal|payout|disburse|charge|credit|withdraw|transfer|payment|settle|reimburse)/i.test(ep.path)
+        if ((readPath || detailRead) && (
+          (moneyShaped && Boolean(detailRead)) ||
+          ((hasCsrfParam || actionish) && (hasCsrfParam || stateBody || actionish))
+        )) {
+          csrfCandidates.push({ ep, readPath: readPath ?? null, create: Boolean(!readPath && detailRead), score: (hasCsrfParam ? 2 : 0) + (stateBody ? 2 : 0) + (actionish ? 1 : 0) + (detailRead ? 1 : 0) + (moneyShaped ? 3 : 0) })
         }
       }
 
@@ -723,9 +827,28 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       add({ endpoint: ep, probeClass: 'xss_context', method: 'GET', browserEligible: true })
     }
   }
-  const prioritized = hypotheses
+  // A self-profile PATCH is a mass-assignment surface; the authz matrix on the same route reads the
+  // same generic success body and would bind to the wrong class (unattributed FP). Keep the
+  // mass-assignment probe for those routes and drop the duplicate authz hypothesis.
+  const selfProfilePath = /(?:^|\/)(?:users?|members?|staff|people|persons?|employees?|profile|operators?|agents?)(?:\/|$)/i
+  const filteredHypotheses = hypotheses.filter(h =>
+    !(h.probeClass === 'authz_matrix' && h.method !== 'GET' &&
+      selfProfilePath.test(h.endpoint.path) && massProbePaths.has(h.endpoint.path)))
+  const prioritized = filteredHypotheses
     .map((h, i) => ({ h, i }))
-    .sort((a, b) => (a.h.probeClass === 'sqli_time_diff' ? 1 : 0) - (b.h.probeClass === 'sqli_time_diff' ? 1 : 0) || a.i - b.i)
+    .sort((a, b) => {
+      // Workflow/state-changing probes must run while the owner session still has its original
+      // role; auth-protocol audits (legacy login, token minting) can rotate/overwrite the session
+      // identity, so they run last. Mass-assignment probes deliberately change their own profile.
+      const phase = (h: Hypothesis): number =>
+        h.probeClass === 'workflow_invariant' ? 0
+          : h.probeClass === 'auth_protocol_audit' ? 1
+            : h.probeClass === 'mass_assignment' ? 2
+              : 3
+      return phase(a.h) - phase(b.h) ||
+        (a.h.probeClass === 'sqli_time_diff' ? 1 : 0) - (b.h.probeClass === 'sqli_time_diff' ? 1 : 0) ||
+        a.i - b.i
+    })
     .map(x => x.h)
   return { hypotheses: prioritized, encodingSkips }
 }
@@ -911,8 +1034,59 @@ function harvestJson(body: string): JsonHarvest {
  * ids read back from the sibling collection route (`/api/v1/invoices/{id}` -> GET `/api/v1/invoices`).
  * Collection responses are fetched once per route and cached for the run.
  */
-export async function idPool(env: ProbeEnv, pathTemplate?: string, persona = env.owner): Promise<string[]> {
-  const cache = (env.idCache ??= new Map())
+/**
+ * A money-shaped body for aggregate-cap probes: harvest a numeric total/amount from the target's
+ * own readable collections (orders, payments, invoices) so a second settlement actually exceeds the
+ * captured total. Returns null when no monetary value is exposed — the probe then stays silent
+ * instead of submitting a finding without a real bound.
+ */
+export async function harvestMoneyBody(env: ProbeEnv, routePath: string): Promise<Record<string, unknown> | null> {
+  const segs = routePath.split('?')[0].split('/').filter(Boolean)
+  const root = segs.length > 1 ? `/${segs.slice(0, 2).join('/')}` : `/${segs[0] ?? ''}`
+  const ranked = (env.endpoints ?? [])
+    .filter(e => e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+      !/\.(?:js|css|json|xml|txt|map|svg|ico|png|jpe?g|gif|webp)$/i.test(e.path.split('?')[0]) &&
+      !/(?:openapi|swagger|docs|spec)/i.test(e.path))
+    .filter(e => e.path === root || e.path.startsWith(`${root}/`) ||
+      /(?:orders?|purchases?|payments?|invoices?|billing|charges?|transactions?|refunds?)/i.test(e.path))
+    .sort((a, b) =>
+      Number(/(?:orders?|purchases?|payments?|invoices?|billing|charges?|transactions?)/i.test(b.path)) -
+      Number(/(?:orders?|purchases?|payments?|invoices?|billing|charges?|transactions?)/i.test(a.path)) ||
+      a.path.length - b.path.length)
+    .slice(0, 3)
+  const maxByField = new Map<string, number>()
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 5 || !node || typeof node !== 'object') return
+    if (Array.isArray(node)) { for (const item of node.slice(0, 20)) walk(item, depth + 1); return }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1_000_000_000 &&
+          /^(?:amount|amountCents|amount_cents|total|totalCents|total_cents|price|priceCents|value|cents|sum)$/i.test(key)) {
+        const current = maxByField.get(key) ?? 0
+        if (value > current) maxByField.set(key, value)
+      } else if (value && typeof value === 'object') {
+        walk(value, depth + 1)
+      }
+    }
+  }
+  for (const candidate of ranked) {
+    try {
+      const ex = await env.broker.executeHttp({
+        origin: env.origin, method: 'GET', pathAndQuery: candidate.path, persona: env.owner,
+        followRedirects: false, timeoutMs: 8_000,
+      }, env.grant, env.signal)
+      if (ex.status < 200 || ex.status >= 300) continue
+      let parsed: unknown
+      try { parsed = JSON.parse(ex.body) } catch { continue }
+      walk(parsed, 0)
+    } catch { /* readable collections are best-effort */ }
+    if (maxByField.size > 0) break
+  }
+  if (maxByField.size === 0) return null
+  const [field, value] = [...maxByField.entries()].sort((a, b) => b[1] - a[1])[0]!
+  return { [field]: Math.floor(value) }
+}
+
+export async function idPool(env: ProbeEnv, pathTemplate?: string, persona = env.owner): Promise<string[]> {  const cache = (env.idCache ??= new Map())
   // Interleave raw persona ids with their numeric suffixes: some routes key on the user id
   // (user-1001) and others on the numeric object id (1001), and the id matrix is bounded.
   const derived = env.personaUserIds
@@ -1381,6 +1555,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
           pathAndQuery: probePathFor(h), param: name, paramLocation: h.location!, value, method: h.method,
           ...(h.location === 'json' && body ? { jsonBody: body } : {}),
           ...(h.location === 'form' && body ? { formBody: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v)])) } : {}),
+          ...(h.location === 'json' ? { headers: { 'Content-Type': 'application/json' } } : h.location === 'form' ? { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
           ...(env.caps.sessionAndCsrf ? { session: env.session, csrfBind: needsCsrf(h) ? true : undefined } : {}),
         })
         return await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...inj }, env.grant, env.signal)
@@ -2323,7 +2498,9 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   // that concrete path on the hypothesis so the replay spec addresses the same object.
   if ((h.probeClass === 'path_traversal_benign' || h.probeClass === 'mass_assignment') && hasPathPlaceholder(h.endpoint.path)) {
     const ids = await idPool(env, h.endpoint.path)
-    if (ids.length > 0) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(ids[0]))
+    // Hypotheses share the discovered endpoint object; clone before substituting a concrete id so
+    // other probes on the same route still see its path template.
+    if (ids.length > 0) h.endpoint = { ...h.endpoint, path: fillPlaceholders(h.endpoint.path, encodeURIComponent(ids[0])) }
   }
   if (h.probeClass === 'race_burst') {
     const race = await runRaceCheck(h, env, watch)
@@ -2358,7 +2535,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
   out.ctx = ctx
   // Effect-level probes (OOB callbacks, state diffs, auth protocol) prove themselves through the
   // target's side effects; a constant response body must not suppress them.
-  const effectProbe = ['ssrf_canary', 'xxe_canary', 'csrf_state_change', 'cache_poison_deception', 'webhook_signature_bypass', 'auth_protocol_audit'].includes(h.probeClass)
+  const effectProbe = ['ssrf_canary', 'xxe_canary', 'csrf_state_change', 'cache_poison_deception', 'webhook_signature_bypass', 'auth_protocol_audit', 'command_injection'].includes(h.probeClass)
   if (ctx.paramActive === false && !effectProbe) {
     out.verdict = 'no_signal'
     out.summary = 'Inferred parameter name does not affect the response (not read by the endpoint).'
@@ -2378,7 +2555,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         if (csrf) req.headers = { ...(req.headers ?? {}), ...csrf }
       }
       if (h.method === 'GET' && env.viewer && !hasPathPlaceholder(h.endpoint.path) &&
-          /(?:keys?|secret|token|credential|audit|settings|config|billing|integration)/i.test(h.endpoint.path)) {
+          /(?:keys?|secret|tokens?|credential|audit|settings|config|billing|integration|connectors?|links?|hooks?|webhooks?|providers?|connections?)/i.test(h.endpoint.path)) {
         req.secretScan = true
         req.viewerPersona = env.viewer
       }
@@ -2413,6 +2590,11 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       delete req.param; delete req.paramLocation
       if (h.quantityField) req.quantityField = h.quantityField
       if (hasPathPlaceholder(h.endpoint.path) && !h.createPath) {
+        if (h.repeatTransition && h.workflowListPath) {
+          // The transition probe resolves a seeded object from its own collection below; keeping the
+          // placeholder lets it pick a record that still has the prerequisite state.
+          req.pathAndQuery = fillPlaceholders(h.endpoint.path, '{{id}}')
+        } else {
         const segs = h.endpoint.path.split('?')[0].split('/').filter(Boolean)
         const collection = segs.length > 2 ? `/${segs.slice(0, -2).join('/')}` : null
         const creator = collection
@@ -2430,6 +2612,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         }
         if (!id) id = (await idPool(env, h.endpoint.path))[0]
         if (id) req.pathAndQuery = fillPlaceholders(h.endpoint.path, encodeURIComponent(id))
+        }
         // Cart/order lines need a real catalog reference as well as the quantity under test.
         if (req.quantityField && /(?:cart|bag|order|line|item)/i.test(h.endpoint.path)) {
           const catalog = (env.endpoints ?? []).find(e =>
@@ -2444,9 +2627,45 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         req.producerBody = h.producerBody ?? {}
         if (hasPathPlaceholder(h.endpoint.path)) req.pathAndQuery = fillPlaceholders(h.endpoint.path, '{{id}}')
       }
-      if (!req.quantityField) {
+      if (h.workflowReadPath) req.workflowReadPath = h.workflowReadPath
+      if (h.workflowListPath) req.workflowListPath = h.workflowListPath
+      req.workflowTargetTemplate = h.endpoint.path
+      if (env.caps.sessionAndCsrf) req.csrfBind = true
+      if (h.repeatTransition) req.repeatTransition = true
+      if (h.priceTrust) req.priceTrust = true
+      if (h.repeatMutation) {
+        req.repeatMutation = true
+        const money = await harvestMoneyBody(env, h.endpoint.path)
+        if (money) {
+          // The body field name is randomized per seed; send the value under every common amount
+          // alias so the route parses the same authoritative total.
+          const value = Object.values(money)[0]
+          req.jsonBody = {
+            ...(req.jsonBody ?? {}),
+            amount: value, amountCents: value, value, total: value, price: value, cents: value,
+          }
+        }
+      }
+      if (!req.quantityField && !req.repeatTransition && !req.priceTrust && !req.repeatMutation) {
         const qty = h.endpoint.params.find(p => /^(?:qty|quantity|itemQty|count|seats?|amount)$/i.test(p.name))
         if (qty) req.quantityField = qty.name
+      }
+      // Workflow probes mix owner/other/viewer actors. The broker's per-session cookie jar is shared
+      // across personas, and a rotated jar cookie can shadow the Vault credential; use a
+      // persona-scoped session so each actor keeps its own jar and the owner write stays owner.
+      if (env.caps.sessionAndCsrf && req.persona) {
+        // Per-hypothesis jar: workflow probes mutate state, and a shared jar can carry a rotated or
+        // consumed session into later writes. A fresh jar + token-issuing GET keeps the owner's
+        // credential authoritative for exactly this probe.
+        const scopedSession = `${env.session}-${req.persona}-${shortToken(4)}`
+        const scopedEnv: ProbeEnv = { ...env, session: scopedSession }
+        out.requests += await primeSessionOnce(h, scopedEnv)
+        req.session = scopedSession
+        req.csrfPrimePaths = (env.endpoints ?? [])
+          .filter(e => e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+            /(?:^|[/_-])(?:me|csrf|session|token|nonce|xsrf)(?:$|[/_-])/i.test(e.path))
+          .map(e => e.path)
+          .slice(0, 2)
       }
       break
     }
@@ -2511,6 +2730,12 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       const pathHint = /token|refresh|jwt|session/i.test(h.endpoint.path)
       req.tokenFields = [...new Set([...tokenFields, ...(pathHint ? ['token', 'refreshToken', 'refresh_token', 'access_token'] : ['token'])])].slice(0, 4)
       req.identityClaims = await identityClaims(env)
+      // Login/token routes can overwrite the caller's session identity (legacy login, self-mint).
+      // Run them anonymously in an isolated jar so later owner probes keep their authorization.
+      if (/(?:login|signin|token|refresh|oauth|sso)/i.test(h.endpoint.path)) {
+        req.persona = undefined
+      }
+      if (env.caps.sessionAndCsrf) req.session = `${env.session}-a-${shortToken(4)}`
       break
     }
     case 'path_traversal_benign':
@@ -2637,7 +2862,7 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         res.anomalies.some(a => a.type === 'write_path_bola' || a.type === 'unauthorized_write')) {
       const ids = await idPool(env, h.endpoint.path)
       const writeId = ids[1] ?? ids[0]
-      if (writeId) h.endpoint.path = fillPlaceholders(h.endpoint.path, encodeURIComponent(writeId))
+      if (writeId) h.endpoint = { ...h.endpoint, path: fillPlaceholders(h.endpoint.path, encodeURIComponent(writeId)) }
     }
   } catch (err) {
     if (err instanceof BrokerApprovalRequired) out.tierBlocked = true

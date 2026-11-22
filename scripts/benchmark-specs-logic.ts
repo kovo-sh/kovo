@@ -162,23 +162,28 @@ export function synthInvariantViolation(o: HypothesisOutcome, env: ProbeEnv): Sy
   const cleanupBody = hit.cleanupBody ?? hit.restoreBody
   const recordId = text(hit.recordId ?? hit.stateRecordId)
   const persona = env.owner
+  // A create-backed invariant addresses the object created inside the replay ({{resource_id}}),
+  // not the concrete id observed while probing.
+  const writePath = createPath ? idIn(path, null) : path
 
   const steps: Array<Record<string, unknown>> = []
-  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime the session jar', { method: 'GET', pathAndQuery: '/' }, persona))
+  const writeExtra = env.caps.sessionAndCsrf ? { csrfBind: true } : {}
+  const csrfPrimePath = typeof hit.csrfPrimePath === 'string' && /^\/(?!\/)[^\s\\]{0,4000}$/.test(hit.csrfPrimePath) ? hit.csrfPrimePath : '/'
+  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime the session jar and CSRF token', { method: 'GET', pathAndQuery: csrfPrimePath }, persona))
   if (createPath && SAFE_PATH.test(createPath)) {
     steps.push({
-      ...stepOf(env, 's2', 'setup', 'Create a fresh object for the invariant check', requestFor('POST', idIn(createPath, null), createBody ?? {}, encoding), persona),
+      ...stepOf(env, 's2', 'setup', 'Create a fresh object for the invariant check', requestFor('POST', idIn(createPath, null), createBody ?? {}, encoding), persona, writeExtra),
       extract: [{ varName: 'resource_id', from: 'json' as const, selector: text(hit.createIdSelector) || 'id' }],
     })
   }
-  const controlRequest = requestFor(method, path, controlBody, encoding)
-  steps.push(stepOf(env, 'c1', 'control', 'In-bounds mutation is accepted', controlRequest, persona))
+  const controlRequest = requestFor(method, writePath, controlBody, encoding)
+  steps.push(stepOf(env, 'c1', 'control', 'In-bounds mutation is accepted', controlRequest, persona, writeExtra))
   if (readPath) steps.push(stepOf(env, 'r1', 'control', 'Read back the in-bounds state', { method: 'GET', pathAndQuery: readPath }, persona))
-  const probeRequest = requestFor(method, path, probeBody, encoding)
-  steps.push(stepOf(env, 'p1', 'probe', 'Out-of-bounds mutation is accepted', probeRequest, persona, batch ? { batchCount: batch } : {}))
+  const probeRequest = requestFor(method, writePath, probeBody, encoding)
+  steps.push(stepOf(env, 'p1', 'probe', 'Out-of-bounds mutation is accepted', probeRequest, persona, { ...writeExtra, ...(batch ? { batchCount: batch } : {}) }))
   if (readPath) steps.push(stepOf(env, 'r2', 'probe', 'Read back the violated state', { method: 'GET', pathAndQuery: readPath }, persona))
   if (cleanupBody && typeof cleanupBody === 'object') {
-    steps.push(stepOf(env, 'z1', 'cleanup', 'Restore the original value', requestFor(method, path, cleanupBody, encoding), persona))
+    steps.push(stepOf(env, 'z1', 'cleanup', 'Restore the original value', requestFor(method, writePath, cleanupBody, encoding), persona, writeExtra))
   }
 
   const controlStateId = readPath ? 'r1' : 'c1'
@@ -213,6 +218,11 @@ export function synthInvariantViolation(o: HypothesisOutcome, env: ProbeEnv): Sy
 // ---------------------------------------------------------------------------
 
 function secretMatcher(hit: Record<string, unknown>): { pattern: string; expr: (stepId: string) => string } | null {
+  // A pre-redaction fingerprint match is exact evidence, but the verifier only sees the scrubbed
+  // body; the stable proof is the redaction placeholder the broker emitted for that secret.
+  if (hit.secretEvidence === 'fingerprint') {
+    return { pattern: '\\[redacted\\]', expr: id => `(.proofMatches.${id}[0] == true)` }
+  }
   const marker = text(hit.secretMarker ?? hit.marker ?? hit.secret)
   if (marker.length >= 6 && marker.length <= 128 && !/[\r\n\0]/.test(marker)) {
     // Keep only the non-secret shape: literal punctuation stays, long hex/digit runs become bounded
@@ -256,15 +266,21 @@ export function synthSecretDisclosure(o: HypothesisOutcome, env: ProbeEnv): Synt
   const controlPathRaw = text(hit.controlPath)
   const ownPathRaw = text(hit.ownPath ?? hit.selfPath)
   const controlPath = ownPathRaw && SAFE_PATH.test(ownPathRaw) ? ownPathRaw : controlPathRaw && SAFE_PATH.test(controlPathRaw) ? controlPathRaw : path
-  const controlActor = asPersona(text(hit.controlPersona)) ?? (controlPath === path && !ownPathRaw ? undefined : actor)
+  // Explicit anonymous denial is a real control (the route is guarded); otherwise the control is a
+  // masked/own view for the same actor. Never silently fall back to the owner: an owner view that
+  // also carries the secret proves nothing.
+  const anonymousControl = text(hit.controlActor) === 'anonymous' ||
+    (!ownPathRaw && !asPersona(text(hit.controlPersona)) && controlPath === path)
+  const controlActor: string | null = anonymousControl ? null : (asPersona(text(hit.controlPersona)) ?? actor)
   const requestBody = hit.body && typeof hit.body === 'object' ? hit.body as Record<string, unknown> : undefined
   const encoding = text(hit.encoding ?? hit.bodyEncoding) === 'form' ? 'form' : 'json'
-  const make = (stepId: string, role: 'control' | 'probe', description: string, target: string, persona: string | undefined): RequestParts =>
+  const make = (stepId: string, role: 'control' | 'probe', description: string, target: string, persona: string | null | undefined): RequestParts =>
     method === 'GET' ? { method, pathAndQuery: target } : requestFor(method as Method, target, requestBody ?? {}, encoding)
 
   const steps: Array<Record<string, unknown>> = []
-  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies from the site root', { method: 'GET', pathAndQuery: '/' }, env.owner))
-  steps.push(stepOf(env, 'c1', 'control', 'The non-entitled actor sees a masked / denied view', make('c1', 'control', 'control', controlPath, controlActor), controlActor))
+  const csrfPrimePath = typeof hit.csrfPrimePath === 'string' && /^\/(?!\/)[^\s\\]{0,4000}$/.test(hit.csrfPrimePath) ? hit.csrfPrimePath : '/'
+  if (env.caps.sessionAndCsrf) steps.push(stepOf(env, 's1', 'setup', 'Prime session cookies and a CSRF token', { method: 'GET', pathAndQuery: csrfPrimePath }, env.owner))
+  steps.push(stepOf(env, 'c1', 'control', anonymousControl ? 'An unauthenticated caller is denied the guarded resource' : 'The non-entitled actor sees a masked / own view', make('c1', 'control', 'control', controlPath, controlActor), controlActor))
   steps.push(stepOf(env, 'p1', 'probe', 'The same actor reads the resource and receives the secret', make('p1', 'probe', 'probe', path, actor), actor))
   const repeat = hit.repeat === true || hit.readBack === true
   if (repeat) steps.push(stepOf(env, 'p2', 'probe', 'Re-read the resource to confirm the secret persists', make('p2', 'probe', 'probe', path, actor), actor))
