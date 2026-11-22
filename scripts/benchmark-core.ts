@@ -373,6 +373,8 @@ export interface AllPatchesVerification {
   stillConfirming: string[]
   /** Vulns confirmed in the all-patches pass that were not confirmed at baseline. */
   newlyConfirming: string[]
+  /** Baseline vulns whose only evidence was a spec shared with another target (not patch evidence). */
+  ambiguous?: string[]
   decoyFalsePositivesBefore: number
   decoyFalsePositivesAfter: number
   verdict: 'fixed' | 'regressed' | 'inconclusive'

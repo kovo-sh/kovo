@@ -30,7 +30,8 @@ grader/       finding↔truth matching, oracle attribution, funnel, budget curve
 apps/<app>/   src/ (neutral, materialized app code) · ui/ (SPA) · sites/<id>/ (spec + vulnerable/hardened twins + solver) ·
               truth/ (blueprint, monitors, catalog, selftest) — truth/ and solvers are never materialized
 run.ts        CLI + programmatic API
-tests/        node:test self-tests (lib detectors, grader, generator, per-app matrices, soundness, e2e grading, safety)
+tests/        node:test self-tests (lib detectors, grader + grader-soundness, generator, held-out
+              integrity, decoy audit, per-app matrices, soundness matrix, e2e grading, safety)
 ```
 
 Three apps: **acme-saas** (B2B SaaS — 28 sites), **shopflow** (e-commerce/payments — 26 sites,
@@ -58,7 +59,69 @@ node benchmarks/realistic-bench/run.ts seeds --set dev --n 5
 ```
 
 Typecheck: `node_modules/.bin/tsc -p benchmarks/realistic-bench/tsconfig.json`
-Tests: `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test --test-concurrency=1 benchmarks/realistic-bench/tests/`
+Tests: `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/` (142 tests)
+
+## Scoring commands (dev and held-out)
+
+Run from the repo root. Everything is loopback-only and refuses to start unless
+`GUARDIAN_ALLOW_LOCAL_LAB=1` is set.
+
+```sh
+export GUARDIAN_ALLOW_LOCAL_LAB=1
+
+# Dev seed: reproducible, no salt. --split dev rejects seeds >= 1_000_000.
+node benchmarks/realistic-bench/benchmark-realistic.ts \
+  --app acme-saas --seed 1 --split dev \
+  --profile-mode v4-full --mode grey-box --verifier auto \
+  --out-json benchmarks/realistic-bench/out/dev-acme-1.score.json \
+  --out-md   benchmarks/realistic-bench/out/dev-acme-1.score.md \
+  --out-findings benchmarks/realistic-bench/out/dev-acme-1.findings.json
+
+# Held-out seed: the salt comes from the environment only (>=16 chars, never committed).
+# --split heldout rejects seeds < 1_000_000 and refuses to run without the salt.
+GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_RB_HELDOUT_SALT="$GUARDIAN_RB_HELDOUT_SALT" \
+  node benchmarks/realistic-bench/benchmark-realistic.ts \
+  --app acme-saas --seed 1000001 --split heldout \
+  --profile-mode v4-full --mode grey-box --verifier auto \
+  --out-json benchmarks/realistic-bench/out/heldout-acme-1000001.score.json \
+  --out-md   benchmarks/realistic-bench/out/heldout-acme-1000001.score.md
+
+# Full dev sweep (all apps, seeds 1-3). Stop on the first failure.
+for app in acme-saas shopflow opsportal; do
+  for seed in 1 2 3; do
+    node benchmarks/realistic-bench/benchmark-realistic.ts \
+      --app "$app" --seed "$seed" --split dev \
+      --out-json "benchmarks/realistic-bench/out/dev-$app-$seed.score.json" || exit 1
+  done
+done
+```
+
+The same scorecard can be produced from externally captured artifacts with
+`node benchmarks/realistic-bench/run.ts grade --truth gt.json --findings f.json --events ev.json
+--requests req.json --telemetry tel.json --md scorecard.md`.
+
+**Current engine gap (do not misread as a benchmark bug):** as of repo `c345f46` / engine
+`ca992f6`, the full Guardian pipeline confirmed **0 vulnerabilities on every dev seed tried**
+(acme 0/22, 0/22, 0/20; shopflow 0/18, 0/19, 0/20; opsportal 0/16, 0/18, 0/17 for seeds
+42/1/2). Precision was 100% on shopflow, 0% on acme/opsportal (a few unmatched findings).
+The gap is engine-side (recon stops at the SPA shell; query/body-driven classes are never
+probed; some authz signals bind sibling/self-service routes). See `ADAPTER.md` for the
+per-finding attribution diagnosis. Treat the recall columns as an engine TODO, not as evidence
+that the planted sites are unreachable — `run.ts selftest` proves every site is exploitable
+when vulnerable and silent when hardened.
+
+## Held-out salt rule
+
+- Held-out seeds (`>= 1_000_000`) are derived with `HMAC-SHA256(GUARDIAN_RB_HELDOUT_SALT, ...)`;
+  the same seed with a different salt produces a different plan. The salt lives only in the
+  environment (or an explicit `{ salt }` argument in tests) and must be **>= 16 characters**.
+- Never commit the salt, echo it into logs, pass it on a command line, or write it next to results.
+  The materialized `variant.json` contains only `app`, `apiPrefix`, `routes`, `params` and
+  `idFormat`; it never contains the salt, the seed set, personas or site modes. Briefings omit
+  the salt and all site/truth fields, and ground truth is never mounted into the app tree.
+- Rotate the salt if it is ever exposed. Tests use a clearly fake fixed salt; that value is not
+  a usable held-out key.
+
 
 ## Modes
 
@@ -73,7 +136,8 @@ Tests: `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test --test-concurrency=1 benchmarks/r
 - **dev** seeds (`1..9999`): freely reproducible; use for development and recall hill-climbing.
 - **held-out** seeds (`>= 1_000_000`): the plan is keyed by HMAC over `GUARDIAN_RB_HELDOUT_SALT`
   (never committed). Without the salt they are refused and their numbers aren't derivable from the
-  repo — use them for the anti-overfitting generalization check.
+  repo — use them for the anti-overfitting generalization check. See "Held-out salt rule" above for
+  artifact and rotation requirements.
 
 Each seed randomizes api prefix, route nouns, param names, id format (`int`/`uuid`/`prefixed`/`hashid`),
 persona credentials, canary salt, and which sites are vulnerable vs hardened (decoy count in
@@ -82,11 +146,47 @@ persona credentials, canary salt, and which sites are vulnerable vs hardened (de
 ## Grading (summary)
 
 A finding is **confirmed** only when it matches a planted vuln (by endpoint + class/CWE family) **and**
-the impact oracle recorded an attributed event with `ts <= submittedAtMs`. A finding matching a decoy
-is a false positive regardless of how confident it is; a finding matching nothing is an unmatched FP.
-`precision = TP / (TP + decoyFP + unmatchedFP)`. The scorecard also reports recall by severity/class,
-chain completion, the 6-stage monotonic funnel, the 11-bucket failure taxonomy, budget curves at
-$1/$5/$20, and blocked-egress counts. See `CONTRACTS.md` for the exact rules.
+the impact oracle recorded an attributed event whose kind **and** routeKey both belong to that site,
+with `ts <= submittedAtMs`. A finding matching a decoy is a false positive regardless of how
+confident it is; a finding matching nothing is an unmatched FP. `precision = TP / (TP + decoyFP +
+unmatchedFP)`.
+
+Accounting details worth knowing before comparing runs:
+- `decoyFalsePositives` counts **decoy sites with at least one active claim**, not claims, so a
+  duplicate pile on one decoy costs one FP. A multi-endpoint finding is credited to at most one
+  vulnerable site but is charged for **every** decoy site it names, so bundling cannot hide decoy
+  claims behind a real finding. `duplicateFindings` counts extra claims on a *vulnerable* site.
+- Claims on a vulnerable site that lack oracle impact are `claimed_without_impact`; they are
+  reported per vuln and counted in the funnel/failure taxonomy, but are **not** in the precision
+  denominator. Precision here is "confirmed-site precision", not "finding precision" — do not read
+  100% as "no false claims on vulnerable routes".
+- `chainsTotal` includes only chains whose members are all vulnerable. A chain unit selected as a
+  decoy is fully hardened and is not an unachievable scoring target.
+
+The scorecard also reports recall by severity/class, chain completion, the 6-stage monotonic funnel,
+the 11-bucket failure taxonomy, budget curves at $1/$5/$20, and blocked-egress counts. See
+`CONTRACTS.md` for the exact rules.
+
+## Decoy audit
+
+`tests/decoy-audit.test.ts` treats decoys as an adversarial control, not just a count:
+- every twin pair is non-trivial and size-comparable (no stub/one-line tell), and neither twin
+  contains its site id, lure, solver marker or classification marker;
+- across seeds 1–30, decoy counts stay in range, keystone sites are never hardened, chain units never
+  split modes, and every selectable site is chosen as a decoy at least once;
+- benign per-persona browsing plus each decoy's own exploit solver produce **zero** oracle events on
+  decoy routes (seeds 1–3);
+- open-redirect decoys are probed with absolute, protocol-relative and origin-relative backslash
+  targets; hardened twins must stay same-origin and silent, while vulnerable twins must redirect
+  off-origin **and** be attributed by the oracle;
+- materialized trees are scanned for site ids, lures, mode strings and hidden plan fields, and each
+  planted file is byte-compared with the chosen twin.
+
+The redirect probes caught a real weak-decoy class: `startsWith('//')` guards alone let `/\host`
+targets through (browsers fold `\` to `/`), and `offOrigin()` previously treated them as local.
+`lib/http-util.ts` now resolves targets with browser semantics, and the affected hardened twins
+reject backslashes/whitespace/scheme-like local paths.
+
 
 ## Impact oracle
 

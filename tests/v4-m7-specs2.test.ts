@@ -1,9 +1,10 @@
 /**
- * M7 round 2: synthesis for the remaining anomaly classes plus authz identifier-binding guards.
+ * M7 round 2 (post-merge): authz identifier-binding precision, NoSQL operator injection, and the
+ * v5 M3 synthesis contracts that await their probe anomaly shapes.
  *
- * Every fixture mirrors an anomaly the surface-engine probe can emit. Specs are evaluated with the
- * same jq expressions the Zero-LLM verifier runs, so a "bogus id returns the owner's own object"
- * response is proven non-confirming rather than merely asserted in prose.
+ * The race / command-injection / traversal / step-skip / GraphQL-BOLA builders are owned by the
+ * merged heldout2 implementation and locked by tests/v4-m7-heldout2.test.ts; this file does not
+ * duplicate them.
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
@@ -104,7 +105,7 @@ const invoiceEndpoint = endpoint({
   params: [{ name: 'id', location: 'path', isObjectId: true, isCsrf: false }],
 })
 
-function matrixOutcome(over: Partial<HypothesisOutcome> = {}, rows = [
+function matrixOutcome(over: Partial<HypothesisOutcome> = {}, rows: Array<Record<string, unknown>> = [
   { resourceId: 'inv-1001', actor: 'owner', status: 200, bodyBytes: 80, bodySha256: 'sha-owner', accessible: true },
   { resourceId: 'inv-1001', actor: 'other_persona', status: 200, bodyBytes: 92, bodySha256: 'sha-other', similarityToOwner: 1, accessible: true },
   { resourceId: 'inv-1001', actor: 'anonymous', status: 403, bodyBytes: 12, accessible: false },
@@ -118,14 +119,14 @@ function matrixOutcome(over: Partial<HypothesisOutcome> = {}, rows = [
 }
 
 describe('M7.2 authz synthesis: identifier binding', () => {
-  test('genuine cross-tenant read gets an owner, bogus-id and non-owner step', () => {
+  test('genuine cross-tenant read gets owner, bogus-id and non-owner steps', () => {
     const built = expectSpec(matrixOutcome(), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; role: string; request: { pathAndQuery: string } }>
     assert.equal(steps.length, 3)
-    assert.deepEqual(steps.map(s => s.id), ['c1', 'n1', 'p1'])
-    assert.match(steps[1].request.pathAndQuery, /inv-gx9000001/)
+    assert.deepEqual(steps.map(s => s.id), ['c2', 'c1', 'p1'])
+    assert.match(steps[0].request.pathAndQuery, /inv-gx9000001/)
     assert.notEqual(steps[0].request.pathAndQuery, steps[1].request.pathAndQuery)
-    assert.match(String(built.spec.assertionsJq), /\.steps\.n1\.status/)
+    assert.match(String(built.spec.assertionsJq), /\.steps\.c2\.status/)
   })
 
   test('bogus id returning the owner session object is not confirming', () => {
@@ -134,7 +135,7 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     const equivalent = jq(String(built.spec.assertionsJq), {
       steps: {
         c1: { status: 200, body: ownerBody, json: { id: 'inv-1001', memo: 'owner only' } },
-        n1: { status: 200, body: ownerBody, json: { id: 'inv-1001', memo: 'owner only' } },
+        c2: { status: 200, body: ownerBody, json: { id: 'inv-1001', memo: 'owner only' } },
         p1: { status: 200, body: ownerBody, json: { id: 'inv-1001', memo: 'owner only' } },
       },
     })
@@ -142,13 +143,13 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     assert.equal(equivalent.controlPassed, false)
   })
 
-  test('a missing identifier (404) plus identical non-owner body confirms', () => {
+  test('a rejected nonexistent identifier plus owner-equivalent non-owner body confirms', () => {
     const built = expectSpec(matrixOutcome(), 'http_chain')
     const ownerBody = JSON.stringify({ id: 'inv-1001', memo: 'owner only' })
     const genuine = jq(String(built.spec.assertionsJq), {
       steps: {
         c1: { status: 200, body: ownerBody, json: { id: 'inv-1001', memo: 'owner only' } },
-        n1: { status: 404, body: '{"error":"not found"}', json: { error: 'not found' } },
+        c2: { status: 404, body: '{"error":"not found"}', json: { error: 'not found' } },
         p1: { status: 200, body: ownerBody, json: { id: 'inv-1001', memo: 'owner only' } },
       },
     })
@@ -181,7 +182,7 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     assert.equal(synthesizeSpec(matrixOutcome({}, rows), env()), null)
   })
 
-  test('mutating BFLA needs a non-trivial object and a rejected bogus id', () => {
+  test('mutating BFLA keeps the object negative control and body template', () => {
     const ep = endpoint({
       method: 'POST',
       path: '/api/admin/users/{id}/promote',
@@ -193,221 +194,54 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     ]
     const built = expectSpec(outcome({
       hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'POST' }),
-      anomalies: [{ type: 'unauthorized_access', resourceId: 'u-1001', actor: 'other_persona', method: 'POST', status: 200 }],
+      anomalies: [{ type: 'unauthorized_access', resourceId: 'u-1001', actor: 'other_persona', method: 'POST', status: 200, bodyTemplate: { note: 'promote' } }],
       details: { matrix: rows },
     }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { jsonBody?: Record<string, unknown> } }>
+    assert.equal(steps[0].request.jsonBody?.note, 'promote')
     const body = JSON.stringify({ ok: true, user: 'u-1001', role: 'admin' })
     const confirmed = jq(String(built.spec.assertionsJq), {
       steps: {
         c1: { status: 200, body, json: { ok: true, user: 'u-1001', role: 'admin' } },
-        n1: { status: 404, body: '{"error":"user not found"}', json: { error: 'user not found' } },
+        c2: { status: 404, body: '{"error":"user not found"}', json: { error: 'user not found' } },
         p1: { status: 200, body, json: { ok: true, user: 'u-1001', role: 'admin' } },
       },
     })
     assert.equal(confirmed.confirmed, true)
+  })
+
+  test('function-level BFLA uses the observed function body without an id control', () => {
+    const ep = endpoint({ method: 'POST', path: '/api/v1/admin/orgs', params: [] })
+    const rows = [
+      { resourceId: '', actor: 'owner', status: 200, bodyBytes: 60, accessible: true },
+      { resourceId: '', actor: 'other_persona', status: 200, bodyBytes: 60, similarityToOwner: 1, accessible: true },
+    ]
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{ type: 'unauthorized_access', resourceId: '', actor: 'other_persona', method: 'POST', status: 200, functionLevel: true, bodyTemplate: ['acme', 'guardian'] }],
+      details: { matrix: rows },
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string; jsonBody?: unknown } }>
+    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1'])
+    assert.equal(steps[0].request.pathAndQuery, '/api/v1/admin/orgs')
+    assert.deepEqual(steps[0].request.jsonBody, ['acme', 'guardian'])
 
     const trivial = rows.map(row => ({ ...row, bodyBytes: 10 }))
     assert.equal(synthesizeSpec(outcome({
       hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'POST' }),
-      anomalies: [{ type: 'unauthorized_access', resourceId: 'u-1001', actor: 'other_persona', method: 'POST', status: 200 }],
+      anomalies: [{ type: 'unauthorized_access', resourceId: '', actor: 'other_persona', method: 'POST', status: 200, functionLevel: true }],
       details: { matrix: trivial },
     }), env()), null)
   })
-})
 
-describe('M7.2 race_burst synthesis', () => {
-  const raceHyp = () => hypothesis({
-    endpoint: endpoint({ method: 'POST', path: '/api/coupon/redeem', params: [] }),
-    probeClass: 'workflow_invariant',
-    param: undefined,
-    location: undefined,
-    method: 'POST',
-  })
-
-  function raceOutcome(anomaly: Record<string, unknown> = {}): HypothesisOutcome {
-    return outcome({
-      hyp: raceHyp(),
-      anomalies: [{
-        type: 'race_condition_differential', path: '/api/coupon/redeem', method: 'POST',
-        attempts: 5, successes: 3, allowed: 1, readPath: '/api/wallet', jsonBody: { code: 'SAVE50' }, ...anomaly,
-      }],
-    })
-  }
-
-  test('a real double-spend differential becomes a control/burst/post-check race_burst', () => {
-    const built = expectSpec(raceOutcome(), 'race_burst')
-    assert.equal(built.spec.kind, 'race_burst')
-    const burst = built.spec.burst as Array<{ method: string; pathAndQuery: string; jsonBody?: Record<string, unknown> }>
-    assert.equal(burst.length, 5)
-    assert.equal(burst[0].method, 'POST')
-    assert.equal(burst[0].pathAndQuery, '/api/coupon/redeem')
-    assert.equal(burst[0].jsonBody?.code, 'SAVE50')
-    const control = built.spec.controlStep as { request: { pathAndQuery: string } }
-    const post = built.spec.postCheckStep as { request: { pathAndQuery: string } }
-    assert.equal(control.request.pathAndQuery, '/api/wallet')
-    assert.equal(post.request.pathAndQuery, '/api/wallet')
-    assert.match(String(built.spec.assertionsJq), /\.burst\.summary\.statuses/)
-  })
-
-  test('the burst assertion requires multiple 2xx responses and a changed state', () => {
-    const built = expectSpec(raceOutcome(), 'race_burst')
-    const payload = (statuses: number[], before: string, after: string) => ({
-      burst: { summary: { statuses, total: statuses.length } },
-      steps: {
-        c1: { status: 200, body: before },
-        c2: { status: 200, body: after },
-      },
-    })
-    const hit = jq(String(built.spec.assertionsJq), payload([200, 200, 409, 409, 409], '{"balance":100}', '{"balance":0}'))
-    assert.equal(hit.confirmed, true)
-    const noStateChange = jq(String(built.spec.assertionsJq), payload([200, 200, 409, 409, 409], '{"balance":100}', '{"balance":100}'))
-    assert.equal(noStateChange.confirmed, false)
-    const singleSuccess = jq(String(built.spec.assertionsJq), payload([200, 409, 409, 409, 409], '{"balance":100}', '{"balance":50}'))
-    assert.equal(singleSuccess.confirmed, false)
-  })
-
-  test('weak or incomplete race evidence refuses to synthesize', () => {
-    assert.equal(synthesizeSpec(raceOutcome({ readPath: undefined }), env()), null)
-    assert.equal(synthesizeSpec(raceOutcome({ successes: 1 }), env()), null)
-    assert.equal(synthesizeSpec(raceOutcome({ attempts: 1 }), env()), null)
-    assert.equal(synthesizeSpec(raceOutcome({ allowed: 3, successes: 3 }), env()), null)
-    assert.equal(synthesizeSpec(outcome({ hyp: raceHyp(), anomalies: [{ type: 'db_error_fingerprint', dialect: 'sqlite' }] }), env()), null)
-  })
-})
-
-describe('M7.2 command-injection rce_proof synthesis', () => {
-  const cmdHyp = () => hypothesis({
-    endpoint: endpoint({ path: '/api/diagnostics/ping', params: [{ name: 'host', location: 'query', isObjectId: false, isCsrf: false }] }),
-    probeClass: 'ssti_math',
-    location: 'query',
-  })
-
-  function cmdOutcome(anomaly: Record<string, unknown>): HypothesisOutcome {
-    return outcome({ hyp: cmdHyp(), anomalies: [{ type: 'command_injection_differential', ...anomaly }] })
-  }
-
-  test('split-echo evidence produces nonce halves joined only by shell concatenation', () => {
-    const built = expectSpec(cmdOutcome({ proofMode: 'split_echo', outputReflected: true }), 'rce_proof')
-    assert.equal(built.spec.proofMode, 'split_echo')
-    const serialized = JSON.stringify(built.spec.probeStep)
-    assert.ok(serialized.includes('{{nonce_part1}}'))
-    assert.ok(serialized.includes('{{nonce_part2}}'))
-    assert.ok(!serialized.includes('{{nonce_part1}}{{nonce_part2}}'))
-  })
-
-  test('dynamic-math evidence uses the verifier nonces with a sub-shell wrapper', () => {
-    const built = expectSpec(cmdOutcome({ proofMode: 'dynamic_math', wrapper: 'subshell', outputReflected: true }), 'rce_proof')
-    assert.equal(built.spec.proofMode, 'dynamic_math')
-    const serialized = JSON.stringify(built.spec.probeStep)
-    assert.ok(serialized.includes('{{nonce_a}}'))
-    assert.ok(serialized.includes('{{nonce_b}}'))
-    assert.ok(serialized.includes('$('))
-  })
-
-  test('out-of-band evidence keeps the canary placeholder', () => {
-    const built = expectSpec(cmdOutcome({ canaryTriggered: true }), 'rce_proof')
-    assert.equal(built.spec.proofMode, 'oob_canary')
-    assert.match(JSON.stringify(built.spec.probeStep), /\{\{canary_(?:url|dns_host)\}\}/)
-  })
-
-  test('observed URL encoding is applied to literal shell syntax only', () => {
-    const built = expectSpec(cmdOutcome({ proofMode: 'dynamic_math', wrapper: 'semicolon', encoding: 'url', outputReflected: true }), 'rce_proof')
-    const path = String((built.spec.probeStep as { request: { pathAndQuery: string } }).request.pathAndQuery)
-    assert.match(path, /%3B/)
-    assert.match(path, /\{\{nonce_a\}\}/)
-    assert.ok(!path.includes('%7B%7B'))
-  })
-
-  test('command evidence without an execution oracle refuses to synthesize', () => {
-    assert.equal(synthesizeSpec(cmdOutcome({ wrapper: 'semicolon' }), env()), null)
-    assert.equal(synthesizeSpec(outcome({
-      hyp: cmdHyp(),
-      anomalies: [{ type: 'command_injection_differential', proofMode: 'made_up', wrapper: 'semicolon' }],
-    }), env()), null)
-  })
-})
-
-describe('M7.2 workflow step-skip synthesis', () => {
-  test('step-skip state evidence becomes a transition http_chain with a state assertion', () => {
+  test('an outcome without the actor matrix still carries a sentinel negative control', () => {
     const built = expectSpec(outcome({
-      hyp: hypothesis({
-        endpoint: endpoint({ method: 'POST', path: '/api/orders/{id}/refund', params: [{ name: 'id', location: 'path', isObjectId: true, isCsrf: false }] }),
-        probeClass: 'workflow_invariant', param: undefined, location: undefined, method: 'POST',
-      }),
-      anomalies: [{ type: 'workflow_step_skip', fromState: 'draft', toState: 'refunded', path: '/api/orders/555/refund', status: 200 }],
+      hyp: hypothesis({ endpoint: invoiceEndpoint, probeClass: 'authz_matrix', param: undefined, location: undefined }),
+      anomalies: [{ type: 'unauthorized_access', resourceId: 'inv-1001', actor: 'other_persona', method: 'GET', status: 200 }],
     }), 'http_chain')
-    const steps = built.spec.steps as Array<{ id: string; request: { method: string; pathAndQuery: string; jsonBody?: unknown } }>
-    assert.equal(steps.length, 2)
-    assert.equal(steps[1].request.method, 'POST')
-    assert.equal(steps[1].request.pathAndQuery, '/api/orders/555/refund')
-    assert.match(String(built.spec.assertionsJq), /refunded/)
-    const hit = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 200 }, p1: { status: 200, json: { state: 'REFUNDED' } } } })
-    assert.equal(hit.confirmed, true)
-    const wrong = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 200 }, p1: { status: 200, json: { state: 'draft' } } } })
-    assert.equal(wrong.confirmed, false)
-  })
-
-  test('step-skip evidence without a target state refuses to synthesize', () => {
-    const base = {
-      hyp: hypothesis({ probeClass: 'workflow_invariant', param: undefined, location: undefined, method: 'POST' }),
-      details: {},
-    }
-    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'workflow_step_skip', fromState: 'draft', path: '/x', status: 200 }] }), env()), null)
-    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'workflow_step_skip', fromState: 'draft', toState: 'draft', path: '/x', status: 200 }] }), env()), null)
-    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'workflow_step_skip', fromState: 'draft', toState: 'refunded', path: '/x', status: 500 }] }), env()), null)
-  })
-})
-
-describe('M7.2 GraphQL nested BOLA and alias batching', () => {
-  const gqlHyp = () => hypothesis({
-    endpoint: endpoint({ method: 'POST', path: '/graphql', params: [] }),
-    probeClass: 'graphql_audit', param: undefined, location: undefined, method: 'POST',
-  })
-
-  test('nested resolver evidence asserts the non-owner receives the owner data', () => {
-    const built = expectSpec(outcome({
-      hyp: gqlHyp(),
-      anomalies: [{ type: 'graphql_nested_bola', field: 'user', nestedPath: ['invoices', 'memo'] }],
-    }), 'http_chain')
-    const steps = built.spec.steps as Array<{ request: { jsonBody?: { query?: string } } }>
-    assert.match(String(steps[1].request.jsonBody?.query), /user\{invoices\{memo\}\}/)
-    assert.match(String(built.spec.assertionsJq), /data == \.steps\.c1\.json\.data/)
-    const same = jq(String(built.spec.assertionsJq), {
-      steps: {
-        c1: { status: 200, json: { data: { user: { invoices: [{ memo: 'x' }] } } } },
-        p1: { status: 200, json: { data: { user: { invoices: [{ memo: 'x' }] } } } },
-      },
-    })
-    assert.equal(same.confirmed, true)
-    const different = jq(String(built.spec.assertionsJq), {
-      steps: {
-        c1: { status: 200, json: { data: { user: { invoices: [{ memo: 'x' }] } } } },
-        p1: { status: 200, json: { data: { user: { invoices: [{ memo: 'y' }] } } } },
-      },
-    })
-    assert.equal(different.confirmed, false)
-  })
-
-  test('alias batching combined with cross-persona evidence yields a second alias-chain candidate', () => {
-    const specs = synthesizeSpecs(outcome({
-      hyp: gqlHyp(),
-      anomalies: [
-        { type: 'graphql_nested_bola', field: 'user', nestedPath: ['invoices', 'memo'] },
-        { type: 'alias_batching_allowed', aliases: 3 },
-      ],
-    }), env())
-    assert.equal(specs.length, 2)
-    assert.match(String((specs[1].spec.assertionsJq)), /alias keys/)
-    const steps = specs[1].spec.steps as Array<{ request: { jsonBody?: { query?: string } } }>
-    assert.match(String(steps[1].request.jsonBody?.query), /a0:user/)
-    assert.match(String(steps[1].request.jsonBody?.query), /a2:user/)
-    const hit = jq(String(specs[1].spec.assertionsJq), {
-      steps: {
-        c1: { status: 200, json: { data: { user: { invoices: [{ memo: 'x' }] } } } },
-        p1: { status: 200, json: { data: { a0: { invoices: [{ memo: 'x' }] }, a1: { invoices: [{ memo: 'x' }] }, a2: { invoices: [{ memo: 'x' }] } } } },
-      },
-    })
-    assert.equal(hit.confirmed, true)
+    const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string } }>
+    assert.deepEqual(steps.map(s => s.id), ['c2', 'c1', 'p1'])
+    assert.match(steps[0].request.pathAndQuery, /guardian-none-/)
   })
 })
 
@@ -448,6 +282,110 @@ describe('M7.2 NoSQL operator injection synthesis', () => {
   })
 })
 
+describe('v5 M3 contracts (awaiting probe shapes)', () => {
+  test('CSRF state change: token-bound control, tokenless probe, read-back', () => {
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: endpoint({ method: 'PATCH', path: '/api/v1/profile', params: [] }), probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'PATCH' }),
+      anomalies: [{
+        type: 'csrf_state_change', path: '/api/v1/profile', method: 'PATCH', bodyField: 'displayName',
+        controlValue: 'guardian-control', expectedValue: 'guardian-probe', readPath: '/api/v1/profile', stateField: 'displayName',
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { method: string; csrfBind?: boolean; jsonBody?: Record<string, unknown> } }>
+    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1', 'p2'])
+    assert.equal(steps[0].request.csrfBind, true)
+    assert.equal(steps[1].request.csrfBind, undefined)
+    const hit = jq(String(built.spec.assertionsJq), {
+      steps: {
+        c1: { status: 200 },
+        p1: { status: 200 },
+        p2: { status: 200, json: { displayName: 'guardian-probe' } },
+      },
+    })
+    assert.equal(hit.confirmed, true)
+    const untouched = jq(String(built.spec.assertionsJq), {
+      steps: { c1: { status: 200 }, p1: { status: 403 }, p2: { status: 200, json: { displayName: 'guardian-control' } } },
+    })
+    assert.equal(untouched.confirmed, false)
+  })
+
+  test('webhook signature bypass: tampered control rejected, unsigned delivery accepted', () => {
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: endpoint({ method: 'POST', path: '/webhooks/events', params: [] }), probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'POST' }),
+      anomalies: [{
+        type: 'webhook_signature_bypass', path: '/webhooks/events', headerName: 'X-Signature',
+        body: { event: 'invoice.paid' }, readPath: '/api/v1/orders/1', stateField: 'status', expectedValue: 'paid',
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; request: { headers?: Record<string, string>; jsonBody?: Record<string, unknown> } }>
+    assert.equal(steps[0].request.headers?.['X-Signature'], 'guardian-invalid-signature')
+    assert.equal(steps[1].request.headers?.['X-Signature'], undefined)
+    const hit = jq(String(built.spec.assertionsJq), {
+      steps: { c1: { status: 401 }, p1: { status: 200 }, p2: { status: 200, json: { status: 'paid' } } },
+    })
+    assert.equal(hit.confirmed, true)
+  })
+
+  test('open redirect: observed external target is replayed against a benign control', () => {
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: endpoint({ path: '/sso/start', params: [{ name: 'next', location: 'query', isObjectId: false, isCsrf: false }] }), probeClass: 'authz_matrix', param: { name: 'next', location: 'query', isObjectId: false, isCsrf: false }, location: 'query' }),
+      anomalies: [{ type: 'open_redirect_differential', payload: 'https://evil.invalid/cb', location: 'https://evil.invalid/cb' }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ request: { pathAndQuery: string } }>
+    assert.match(steps[0].request.pathAndQuery, /guardian-control\.invalid/)
+    assert.match(steps[1].request.pathAndQuery, /evil\.invalid/)
+    const hit = jq(String(built.spec.assertionsJq), {
+      steps: {
+        c1: { status: 200, headers: {} },
+        p1: { status: 302, headers: { location: 'https://evil.invalid/cb' } },
+      },
+    })
+    assert.equal(hit.confirmed, true)
+    const noRedirect = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 200, headers: {} }, p1: { status: 200, headers: {} } } })
+    assert.equal(noRedirect.confirmed, false)
+  })
+
+  test('write-path BOLA: cross-tenant write, owner read-back and cleanup', () => {
+    const ep = endpoint({
+      method: 'PATCH',
+      path: '/api/v1/documents/{id}',
+      params: [{ name: 'id', location: 'path', isObjectId: true, isCsrf: false }],
+    })
+    const built = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'PATCH' }),
+      anomalies: [{
+        type: 'write_path_bola', resourceId: 'doc-1001', path: '/api/v1/documents/{id}', method: 'PATCH',
+        writeBody: { title: 'pwned' }, readPath: '/api/v1/documents/{id}', stateField: 'title',
+        expectedValue: 'pwned', cleanupBody: { title: 'original' },
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ id: string; role: string; request: { pathAndQuery: string; jsonBody?: Record<string, unknown> } }>
+    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1', 'p2', 'z1'])
+    assert.equal(steps[1].request.pathAndQuery, '/api/v1/documents/doc-1001')
+    assert.equal(steps[3].role, 'cleanup')
+    const hit = jq(String(built.spec.assertionsJq), {
+      steps: {
+        c1: { status: 200, json: { title: 'original' } },
+        p1: { status: 200 },
+        p2: { status: 200, json: { title: 'pwned' } },
+      },
+    })
+    assert.equal(hit.confirmed, true)
+    const notPersisted = jq(String(built.spec.assertionsJq), {
+      steps: { c1: { status: 200, json: { title: 'original' } }, p1: { status: 200 }, p2: { status: 200, json: { title: 'original' } } },
+    })
+    assert.equal(notPersisted.confirmed, false)
+  })
+
+  test('M3 contracts refuse partial evidence', () => {
+    const base = { hyp: hypothesis({ probeClass: 'authz_matrix', param: undefined, location: undefined }), details: {} }
+    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'csrf_state_change', path: '/x' }] }), env()), null)
+    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'webhook_signature_bypass', path: '/x', headerName: 'X-Sig' }] }), env()), null)
+    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'open_redirect_differential', payload: 'https://evil.invalid' }] }), env()), null)
+    assert.equal(synthesizeSpec(outcome({ ...base, anomalies: [{ type: 'write_path_bola', resourceId: 'x' }] }), env()), null)
+  })
+})
+
 describe('M7.2 robustness', () => {
   test('path traversal normalization evidence stays unsynthesized', () => {
     const o = outcome({
@@ -467,8 +405,8 @@ describe('M7.2 robustness', () => {
   test('non-signal outcomes never synthesize', () => {
     const o = outcome({
       verdict: 'inconclusive',
-      hyp: hypothesis({ probeClass: 'ssti_math' }),
-      anomalies: [{ type: 'command_injection_differential', proofMode: 'split_echo', outputReflected: true }],
+      hyp: hypothesis({ probeClass: 'race_burst' }),
+      anomalies: [{ type: 'race_double_spend', path: '/x', producerPath: '/y', param: 'code', consumeBody: {} }],
     })
     assert.deepEqual(synthesizeSpecs(o, env()), [])
   })

@@ -1,6 +1,6 @@
 /** Shared helpers for replay-spec synthesis (target-agnostic; built only from probe observations). */
 import { randomBytes } from 'node:crypto'
-import { fillPlaceholders, hasPathPlaceholder, needsCsrf, probePathFor } from './benchmark-probes.ts'
+import { fillPlaceholders, hasPathPlaceholder, needsCsrf, probePathFor, siblingValue } from './benchmark-probes.ts'
 import type { Hypothesis, HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
 export interface SynthesizedSpec {
@@ -57,12 +57,12 @@ export const sameAsControl = (probe: string, control: string) =>
   `((.steps.${probe}.body == .steps.${control}.body) or (((.steps.${probe}.json | keys?) // []) == ((.steps.${control}.json | keys?) // []) and ((.steps.${probe}.body | length) > 2)))`
 
 /** Sibling body parameters observed on the same endpoint, for body-located probes. */
-export function siblingBody(h: Hypothesis): Record<string, unknown> | undefined {
+export function siblingBody(h: Hypothesis, env?: ProbeEnv): Record<string, unknown> | undefined {
   if (h.location !== 'json' && h.location !== 'form' && h.location !== 'graphql_var') return undefined
   const body: Record<string, unknown> = {}
   for (const p of h.endpoint.params) {
     if (p.name === h.param?.name || p.location !== h.location || p.isCsrf) continue
-    body[p.name] = 'guardian'
+    body[p.name] = siblingValue(p.name, env)
   }
   return body
 }
@@ -100,7 +100,7 @@ export function requestParts(o: HypothesisOutcome, env: ProbeEnv, value: string)
   if (!param || !h.location) return null
   const siblings: Record<string, unknown> = {}
   for (const p of h.endpoint.params) {
-    if (p.name !== param.name && p.location === h.location && !p.isCsrf) siblings[p.name] = 'guardian'
+    if (p.name !== param.name && p.location === h.location && !p.isCsrf) siblings[p.name] = siblingValue(p.name, env)
   }
   const path = hasPathPlaceholder(h.endpoint.path) ? fillPlaceholders(h.endpoint.path, '1') : h.endpoint.path
   switch (h.location) {
@@ -136,7 +136,7 @@ export function requestPartsForValue(o: HypothesisOutcome, env: ProbeEnv, value:
   if (!param || !h.location) return null
   const siblings: Record<string, unknown> = {}
   for (const p of h.endpoint.params) {
-    if (p.name !== param.name && p.location === h.location && !p.isCsrf) siblings[p.name] = 'guardian'
+    if (p.name !== param.name && p.location === h.location && !p.isCsrf) siblings[p.name] = siblingValue(p.name, env)
   }
   const path = hasPathPlaceholder(h.endpoint.path) ? fillPlaceholders(h.endpoint.path, '1') : h.endpoint.path
   const text = typeof value === 'string' ? value : JSON.stringify(value)
@@ -149,7 +149,7 @@ export function requestPartsForValue(o: HypothesisOutcome, env: ProbeEnv, value:
       return {
         method: h.method === 'GET' ? 'POST' : h.method, pathAndQuery: path,
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        textBody: Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+        textBody: Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${enc(String(v))}`).join('&'),
       }
     }
     case 'graphql_var': {

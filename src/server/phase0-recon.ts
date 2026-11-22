@@ -99,6 +99,11 @@ const PHASE0_SEED_PATHS: readonly string[] = [
   '/openapi.json',
   '/graphql',
   '/swagger.json',
+  // Common servable route-map/config artifacts (SPA route tables, endpoint manifests).
+  '/config.json',
+  '/routes.json',
+  '/manifest.json',
+  '/api/routes',
 ]
 
 function sanitizePathCandidate(raw: string, baseOrigin: string): string | null {
@@ -126,7 +131,9 @@ function normalizeRouteTemplate(rawPath: string): string {
     .replace(/\/\[([a-zA-Z0-9_-]+)\]/g, '/:$1')
     .replace(/\/\{([a-zA-Z0-9_-]+)\}/g, '/:$1')
     .replace(/\/<(?:[a-zA-Z0-9_]+:)?([a-zA-Z0-9_-]+)>/g, '/:$1')
-  const normalized = normalizeEndpointTemplate(cleaned)
+  // Request paths are case-sensitive: preserve literal segment case (only built-in token shapes
+  // are collapsed to `:id`). Fingerprinting/dedupe opts back into lowercasing separately.
+  const normalized = normalizeEndpointTemplate(cleaned, { preserveCase: true })
   return normalized.startsWith('/') ? normalized : `/${normalized}`
 }
 
@@ -673,6 +680,66 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
     if (out.length < 40) out.push({ method: methodUpper, path: cleanPath, params: deduped.slice(0, 20) })
   }
 
+  /**
+   * Dotted paths for keys in a JS object literal (`{ filter: { name } }` -> filter, filter.name).
+   * Bounded to `maxDepth` and only used to name request parameters, never to execute code.
+   */
+  const objectLiteralPaths = (source: string, maxDepth = 2): string[] => {
+    const out: string[] = []
+    const skipValue = (i: number): number => {
+      let depth = 0
+      while (i < source.length) {
+        const ch = source[i]
+        if (ch === '"' || ch === "'" || ch === '`') {
+          const q = ch
+          i += 1
+          while (i < source.length && source[i] !== q) i += source[i] === '\\' ? 2 : 1
+        } else if (ch === '{' || ch === '[' || ch === '(') depth += 1
+        else if (ch === '}' || ch === ']' || ch === ')') {
+          if (depth === 0) return i
+          depth -= 1
+        } else if ((ch === ',' || ch === '\n') && depth === 0) return i
+        i += 1
+      }
+      return i
+    }
+    const parseObject = (start: number, prefix: string, depth: number): number => {
+      let i = start + 1
+      while (i < source.length) {
+        while (i < source.length && /[\s,]/.test(source[i])) i += 1
+        if (i >= source.length || source[i] === '}') return i + 1
+        const keyMatch = /^[A-Za-z_$][\w$]*/.exec(source.slice(i))
+        if (!keyMatch) return skipValue(i) + 1
+        const key = keyMatch[0]
+        i += key.length
+        while (i < source.length && /\s/.test(source[i])) i += 1
+        if (source[i] !== ':') {
+          // Object shorthand (`{ filter: { name } }`): the identifier itself is the value.
+          if (source[i] === ',' || source[i] === '}' || i >= source.length) {
+            const full = prefix ? `${prefix}.${key}` : key
+            if (depth <= maxDepth) out.push(full)
+            continue
+          }
+          return i + 1
+        }
+        i += 1
+        while (i < source.length && /\s/.test(source[i])) i += 1
+        const full = prefix ? `${prefix}.${key}` : key
+        if (source[i] === '{' && depth < maxDepth) {
+          i = parseObject(i, full, depth + 1)
+        } else {
+          if (depth <= maxDepth) out.push(full)
+          i = skipValue(i) + 1
+        }
+      }
+      return i
+    }
+    // The balanced-call slice includes the wrapping parentheses; start at the first object brace.
+    const objStart = source.indexOf('{')
+    if (objStart >= 0) parseObject(objStart, '', 0)
+    return out
+  }
+
   const scanInit = (defaultMethod: string, path: string, initText: string) => {
     const methodMatch = /\bmethod\s*:\s*['"`]([A-Za-z]+)['"`]/i.exec(initText)
     const method = (methodMatch?.[1] ?? defaultMethod).toUpperCase()
@@ -687,18 +754,28 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
       return
     }
     const params: JsRequestParam[] = []
-    const collect = (block: string, location: 'json' | 'form', skipInitOptions: boolean) => {
+    const collect = (block: string, location: 'json' | 'form', skipInitOptions: boolean, target: JsRequestParam[] = params) => {
       for (const m of block.matchAll(/([A-Za-z_$][\w$]*)\s*:/g)) {
         const name = m[1]
         if (skipInitOptions && JS_RESERVED_BODY_KEYS.test(name)) continue
         if (!skipInitOptions && /^(?:query|variables|operationName)$/i.test(name)) continue
-        params.push({ name, location })
+        target.push({ name, location })
       }
     }
     // Keys inside an explicit serialize call are body fields (a field may legitimately be named "body").
-    for (const m of initText.matchAll(/JSON\.stringify\s*\(\s*\{([^{}]{0,500})\}/g)) collect(m[1], 'json', false)
+    // Nested objects become dotted paths (`filter.name`) so probes can reach the real sink.
+    const dotted: string[] = []
+    for (const m of initText.matchAll(/JSON\.stringify\s*\(/g)) {
+      const openIdx = (m.index ?? 0) + m[0].length - 1
+      const arg = sliceBalancedCall(initText, openIdx)
+      dotted.push(...objectLiteralPaths(arg))
+    }
+    for (const name of dotted) params.push({ name, location: 'json' })
     // Other object-literal keys in the call init (direct axios data object, etc.); skip request options.
-    collect(initText, 'json', true)
+    const nestedLeaf = new Set(dotted.filter(p => p.includes('.')).map(p => p.split('.').at(-1)!))
+    const flatParams: JsRequestParam[] = []
+    collect(initText, 'json', true, flatParams)
+    for (const p of flatParams) if (!nestedLeaf.has(p.name)) params.push(p)
     for (const m of initText.matchAll(/URLSearchParams\s*\(\s*\{([^{}]{0,500})\}/g)) collect(m[1], 'form', false)
     for (const m of initText.matchAll(/\b(new\s+FormData|FormData)\s*\(/g)) {
       const tail = initText.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 400)
@@ -763,6 +840,171 @@ function recordQueryParamsForEndpoint(input: {
     count += 1
   }
   return count
+}
+
+const HTTP_VERBS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
+const ROUTE_COLLECTION_KEYS = /^(?:routes?|paths?|endpoints?|apis?|operations?|handlers?|resources?|navigation|nav|menu|screens?)$/i
+
+export interface RouteMapEntry {
+  method: string
+  path: string
+  params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' }>
+}
+
+/**
+ * Expand configuration/route-map documents served by a single-page app into endpoint candidates.
+ * Recognizes path-keyed method tables (`{"/api/x": {"get": {...}}}`), operation arrays
+ * (`[{path, method, params}]`) and plain path arrays under route-ish keys. Bounded and shape-driven;
+ * no application-specific literals.
+ */
+export function harvestRouteMapDocument(raw: unknown, maxEntries = 200): RouteMapEntry[] {
+  const out: RouteMapEntry[] = []
+  const seen = new Set<string>()
+  const push = (method: string, rawPath: string, params: RouteMapEntry['params'] = []): void => {
+    const path = rawPath.trim()
+    if (!path.startsWith('/') || path.startsWith('//') || path.length > 200 || /[\r\n\0\\]/.test(path)) return
+    const m = method.toUpperCase()
+    if (!HTTP_VERBS.has(method.toLowerCase())) return
+    const clean = path.split('?')[0] || '/'
+    const key = `${m} ${clean}`
+    if (seen.has(key) || out.length >= maxEntries) return
+    seen.add(key)
+    out.push({ method: m, path: clean, params: params.slice(0, 20) })
+  }
+  const paramList = (node: unknown): RouteMapEntry['params'] => {
+    const params: RouteMapEntry['params'] = []
+    if (Array.isArray(node)) {
+      for (const p of node) {
+        if (typeof p === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(p)) params.push({ name: p, location: 'query' })
+        else if (p && typeof p === 'object') {
+          const rec = p as Record<string, unknown>
+          const name = typeof rec.name === 'string' ? rec.name : typeof rec.key === 'string' ? rec.key : null
+          if (!name || !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) continue
+          const loc = String(rec.in ?? rec.location ?? rec.where ?? '').toLowerCase()
+          params.push({ name, location: loc === 'path' ? 'path' : loc === 'body' ? 'json' : 'query' })
+        }
+      }
+    } else if (node && typeof node === 'object') {
+      for (const [name, value] of Object.entries(node as Record<string, unknown>)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) continue
+        const type = String((value && typeof value === 'object' ? (value as Record<string, unknown>).type : value) ?? '').toLowerCase()
+        params.push({ name, location: type === 'path' ? 'path' : 'json' })
+      }
+    }
+    return params
+  }
+  const operationParams = (node: unknown): RouteMapEntry['params'] => {
+    if (!node || typeof node !== 'object') return []
+    const rec = node as Record<string, unknown>
+    return [
+      ...paramList(rec.parameters ?? rec.params ?? rec.query ?? rec.args ?? rec.fields),
+      ...paramList(rec.body ?? rec.requestBody ?? rec.data ?? rec.payload),
+    ]
+  }
+  const methodFrom = (value: unknown, fallbackKey?: string): string | null => {
+    if (typeof value === 'string' && HTTP_VERBS.has(value.toLowerCase())) return value
+    if (fallbackKey && HTTP_VERBS.has(fallbackKey.toLowerCase())) return fallbackKey
+    return null
+  }
+  const walk = (node: unknown, depth: number, contextKey?: string): void => {
+    if (depth > 6 || out.length >= maxEntries || !node) return
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 100)) {
+        if (typeof item === 'string' && contextKey && ROUTE_COLLECTION_KEYS.test(contextKey) && item.startsWith('/')) {
+          push('GET', item)
+          continue
+        }
+        if (!item || typeof item !== 'object') continue
+        const rec = item as Record<string, unknown>
+        const rawPath = typeof rec.path === 'string' ? rec.path
+          : typeof rec.route === 'string' ? rec.route
+            : typeof rec.url === 'string' ? rec.url
+              : typeof rec.endpoint === 'string' ? rec.endpoint : null
+        if (rawPath) {
+          const method = methodFrom(rec.method ?? rec.verb ?? rec.type) ?? 'GET'
+          push(method, rawPath, operationParams(rec))
+          continue
+        }
+        walk(item, depth + 1, contextKey)
+      }
+      return
+    }
+    if (typeof node !== 'object') return
+    const rec = node as Record<string, unknown>
+    // Path-keyed method table.
+    for (const [key, value] of Object.entries(rec)) {
+      if (!key.startsWith('/') || key.startsWith('//')) continue
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const methods = Object.entries(value as Record<string, unknown>).filter(([k]) => HTTP_VERBS.has(k.toLowerCase()))
+        if (methods.length > 0) {
+          for (const [verb, op] of methods) push(verb, key, operationParams(op))
+          continue
+        }
+      }
+      push('GET', key)
+    }
+    for (const [key, value] of Object.entries(rec)) {
+      if (key.startsWith('/')) continue
+      // A single operation object: { path|route, method, params }.
+      if ((key === 'path' || key === 'route' || key === 'url' || key === 'endpoint') && typeof value === 'string' && value.startsWith('/')) {
+        const method = methodFrom(rec.method ?? rec.verb ?? rec.type) ?? 'GET'
+        push(method, value, operationParams(rec))
+        continue
+      }
+      walk(value, depth + 1, key)
+    }
+  }
+  walk(raw, 0)
+  return out
+}
+
+/** Persist endpoints/params harvested from a served route-map/config document. */
+export function parseRouteMapDoc(
+  rawBody: string,
+  origin: string,
+  storage: Store,
+  runId: string,
+  scopeRevision: number,
+  dynamicPaths: Set<string>,
+  dynamicParams: Set<string>,
+): { endpoints: number; params: number } {
+  let doc: unknown
+  try { doc = JSON.parse(rawBody) } catch { return { endpoints: 0, params: 0 } }
+  const entries = harvestRouteMapDocument(doc)
+  let endpoints = 0
+  let params = 0
+  for (const entry of entries.slice(0, 120)) {
+    const clean = sanitizePathCandidate(entry.path, origin)
+    if (!clean || STATIC_ASSET_RE.test(clean)) continue
+    const tmpl = normalizeRouteTemplate(clean)
+    const ep = storage.upsertEndpoint({
+      runId, scopeRevision, origin, method: entry.method, pathTemplate: tmpl,
+      source: 'route_map', riskScore: scoreEndpointRisk(entry.method, tmpl),
+    } as unknown as Parameters<Store['upsertEndpoint']>[0])
+    endpoints += 1
+    dynamicPaths.add(tmpl)
+    for (const p of entry.params) {
+      storage.upsertEndpointParam({
+        runId, endpointId: ep.id, name: p.name, location: p.location,
+        isCsrf: CSRF_PARAM_RE.test(p.name), isObjectId: OBJECT_ID_PARAM_RE.test(p.name), source: 'route_map',
+      })
+      dynamicParams.add(p.name)
+      params += 1
+    }
+  }
+  return { endpoints, params }
+}
+
+/** Bounded scan for client router tables / navigation literals in JS bundles. */
+export function harvestJsRouteTable(code: string): string[] {
+  const out = new Set<string>()
+  const push = (p: string): void => {
+    if (p.startsWith('/') && !p.startsWith('//') && p.length <= 160 && !/[\r\n\0\\]/.test(p) && out.size < 80) out.add(p.split('?')[0] || '/')
+  }
+  for (const m of code.matchAll(/["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]\s*:\s*\{/g)) push(m[1])
+  for (const m of code.matchAll(/\b(?:path|route|to|href)\s*:\s*["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]/g)) push(m[1])
+  for (const m of code.matchAll(/\b(?:navigate|router\.(?:push|replace)|redirect)\s*\(\s*["'`](\/[A-Za-z0-9_\-./:{}[\]]{1,140})["'`]/g)) push(m[1])
+  return [...out]
 }
 
 export function parseOpenApiDoc(
@@ -994,7 +1236,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     const safeGet = async (
       pathAndQuery: string,
-      opts?: { method?: 'GET' | 'POST'; body?: string; headers?: Record<string, string> },
+      opts?: { method?: 'GET' | 'POST'; body?: string; headers?: Record<string, string>; persona?: string },
     ): Promise<BrokerExchangeResult | null> => {
       if (originHalted || signal.aborted) return null
       if (originUsed >= perOriginCap) return null
@@ -1004,7 +1246,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         return null
       }
       const method = opts?.method ?? 'GET'
-      const dedupeKey = `${method} ${pathAndQuery}`
+      const dedupeKey = `${method} ${opts?.persona ?? ''} ${pathAndQuery}`
       if (probedPaths.has(dedupeKey)) return null
       probedPaths.add(dedupeKey)
       originUsed += 1
@@ -1016,6 +1258,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           pathAndQuery,
           headers: opts?.headers,
           body: opts?.body,
+          ...(opts?.persona ? { persona: opts.persona } : {}),
           followRedirects: false,
           runId,
           assignmentId: params.assignmentId,
@@ -1062,8 +1305,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return ep
     }
 
-    // 2a. Standard seed probes
+    // 2a. Standard seed probes. Reserve a small slice of the per-origin cap for JS chunk
+    // harvesting, otherwise a long seed list can starve the bundles that carry XHR/route evidence.
+    const jsReserve = perOriginCap > 4 ? Math.min(4, Math.floor(perOriginCap / 3)) : 0
+    const seedBudget = Math.max(1, perOriginCap - jsReserve)
+    let seedFetches = 0
     for (const seedPath of PHASE0_SEED_PATHS) {
+      if (seedFetches >= seedBudget) break
+      seedFetches += 1
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       if (seedPath === '/') {
         // On crash recovery, reuse any already-recorded GET / for this (runId, scopeRevision, origin)
@@ -1114,7 +1363,12 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           }
         } catch { /* fall through to live GET / */ }
       }
-      const ex = await safeGet(seedPath)
+      let ex = await safeGet(seedPath)
+      // Config/route-map artifacts are often behind auth; retry once with the first approved persona
+      // so authenticated tables are not invisible to recon.
+      if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.[0]) {
+        ex = await safeGet(seedPath, { persona: params.personas[0] })
+      }
       if (!ex) continue
 
       if (seedPath === '/') {
@@ -1180,6 +1434,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         techFingerprint.add('graphql')
       } else if (ex.status >= 200 && ex.status < 300) {
         recordEndpoint('GET', seedPath, 'surface_probe')
+        // Any served JSON document may be a route map or config with an endpoint table.
+        if (/json/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)) {
+          try {
+            const parsed = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+            endpointsDiscovered += parsed.endpoints
+            paramsDiscovered += parsed.params
+          } catch { /* not a route map */ }
+        }
       }
     }
 
@@ -1199,16 +1461,19 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         nextActions?: Array<{ id?: string }>
       }
 
-      const seenJsRoutes = new Set<string>()
+      const seenJsRoutes = new Map<string, string>()
       const addJsEndpoint = (method: string, rawPath: string, bodyKeys: string[] = []): string | null => {
         if (seenJsRoutes.size >= 120) return null
         const clean = sanitizePathCandidate(rawPath, origin)
         if (!clean || STATIC_ASSET_RE.test(clean)) return null
         const tmpl = normalizeRouteTemplate(clean)
         const key = `${method.toUpperCase()} ${tmpl}`
-        if (seenJsRoutes.has(key)) return null
-        seenJsRoutes.add(key)
+        const existingId = seenJsRoutes.get(key)
+        // The same route is often referenced by several sources (harvested calls, regex literal scan,
+        // OpenAPI-derived body keys). Merge parameters instead of dropping later evidence.
+        if (existingId) return existingId
         const ep = recordEndpoint(method, tmpl, 'js_ast')
+        seenJsRoutes.set(key, ep.id)
         for (const bk of bodyKeys.slice(0, 20)) {
           if (!bk) continue
           storage.upsertEndpointParam({
@@ -1253,6 +1518,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           dynamicParams.add(p.name)
           paramsDiscovered += 1
         }
+      }
+      // SPA router tables: path literals in router config are navigable endpoints even without hrefs.
+      for (const routePath of harvestJsRouteTable(ex.body).slice(0, 24)) {
+        addJsEndpoint('GET', routePath)
       }
       if ((harvested.graphqlDocs?.length ?? 0) > 0) {
         recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
