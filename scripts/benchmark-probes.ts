@@ -122,7 +122,7 @@ const redirectParamName = /^(?:next|nextUrl|next_url|returnTo|return_to|returnUr
 const redirectPathHint = /(sso|oauth|authorize|callback|redirect|return|login|logout|checkout|download|export|continue|resume)/i
 const maxCsrfHypotheses = 6
 const maxWebhookHypotheses = 4
-const maxRedirectHypotheses = 10
+const maxRedirectHypotheses = 16
 
 /**
  * Query/body parameters for routes whose parameter names the surface did not expose (server-rendered
@@ -187,7 +187,7 @@ export function inferredQueryParams(ep: DiscoveredEndpoint): InferredParam[] {
   else if (fileServeSeg.test(last) || downloadPathHint.test(path)) {
     // Plain collection routes (`/assets`, `/logs`) do not take a file name; only serving-shaped
     // routes and download/export paths do. This keeps the 17-request traversal oracle focused.
-    const collectionOnly = /s$/i.test(last) && !downloadPathHint.test(path) && !/(?:downloads?|exports?|serve|view)/i.test(path)
+    const collectionOnly = !hasPathPlaceholder(path) && /s$/i.test(last) && !downloadPathHint.test(path) && !/(?:downloads?|exports?|serve|view)/i.test(path)
     if (!collectionOnly) push('file', fileNamesFor(path))
   }
   return out.slice(0, 4)
@@ -1087,7 +1087,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
       // A file parameter is active only when it actually reads outside the served root. One
       // passwd-shaped payload (and a suffix-preserving log path) is enough to decide.
       const passwd = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
-      const payloads = ['..%2f..%2f..%2f..%2fetc%2fpasswd', '..%2f..%2f..%2f..%2fvar%2flog%2fsystem%2faudit.log']
+      const payloads = ['../../../../etc/passwd', '../../../../var/log/system/audit.log']
       ctx.paramActive = false
       for (const payload of payloads) {
         const real = await sendFor(h.param.name, payload)
@@ -1806,7 +1806,13 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     case 'ssrf_canary':
       req = buildProbeRequest(h, env, { ssrfParams: h.param ? [h.param.name] : [], waitMs: 2500 }); break
     case 'xxe_canary': req = buildProbeRequest(h, env, { waitMs: 2500 }); break
-    case 'mass_assignment': req = buildProbeRequest(h, env, { paramLocation: 'json', jsonBody: {} }); break
+    case 'mass_assignment': {
+      req = buildProbeRequest(h, env, { paramLocation: 'json', jsonBody: {} })
+      // Role/team escalation is only observable as an impact event when a non-admin performs it;
+      // probe as the low-privilege persona while the replay still runs as the owner.
+      if (env.viewer && /(?:user|member|people|staff|profile|account)/i.test(h.endpoint.path)) req.persona = env.viewer
+      break
+    }
     case 'graphql_audit': {
       req = buildProbeRequest(h, env)
       req.ownerPersona = env.owner
