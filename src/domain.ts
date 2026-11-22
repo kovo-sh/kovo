@@ -518,6 +518,10 @@ export const personaLoginConfigSchema = z.object({
   passwordField: z.string().trim().min(1).max(64).optional(),
   tokenJsonPath: z.string().trim().min(1).max(160).optional(),
   refreshIntervalSec: z.number().int().min(10).max(3600).optional(),
+  // Optional M2 session-hardening knobs (URLs/paths only — never tokens).
+  refreshUrl: personaLoginUrl.optional(),
+  refreshTokenJsonPath: z.string().trim().min(1).max(160).optional(),
+  csrfPrefetchUrl: personaLoginUrl.optional(),
 })
 export type PersonaLoginConfig = z.output<typeof personaLoginConfigSchema>
 
