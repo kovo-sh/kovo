@@ -42,7 +42,7 @@ import type { BrokerExchangeResult } from '../src/server/broker.ts'
 import { loadSkill, listSkills, selectPreInjectionSkills } from '../src/server/skills.ts'
 import { Store } from '../src/server/store.ts'
 import type { Assignment, Run } from '../src/server/store.ts'
-import { setupApprovedRun } from './v4-tier-helpers.ts'
+import { setupApprovedRun, startHttpFixture, withEnv } from './v4-tier-helpers.ts'
 
 const repoRoot = resolve(new URL('..', import.meta.url).pathname)
 const executionSource = readFileSync(join(repoRoot, 'src/server/execution.ts'), 'utf8')
@@ -252,14 +252,14 @@ test('M1.3: the three previously-collapsing spec kinds extract their real target
 
 test('M1.3: all 14 ReplaySpec kinds keep distinct routes (only TLS is intentionally origin-wide)', () => {
   const specs: Array<{ kind: string; spec: Record<string, unknown>; expected: string }> = [
-    { kind: 'http_chain', expected: '/api/orders/1', spec: { kind: 'http_chain', steps: [
+    { kind: 'http_chain', expected: '/api/orders/1?expand=owner', spec: { kind: 'http_chain', steps: [
       { role: 'control', request: { pathAndQuery: '/api/orders/1', persona: 'user_a', method: 'GET' } },
       { role: 'probe', request: { pathAndQuery: '/api/orders/1?expand=owner', persona: 'user_b', method: 'GET' } },
     ] } },
     { kind: 'dns_takeover', expected: '/assets/health', spec: { kind: 'dns_takeover', probePath: '/assets/health' } },
     { kind: 'tls_audit', expected: '/', spec: { kind: 'tls_audit' } },
     { kind: 'browser_dom', expected: '/search', spec: { kind: 'browser_dom', probePath: '/search', persona: 'user_a' } },
-    { kind: 'browser_chain', expected: '/inbox', spec: { kind: 'browser_chain', steps: [
+    { kind: 'browser_chain', expected: '/inbox?msg=1', spec: { kind: 'browser_chain', steps: [
       { role: 'control', pathAndQuery: '/inbox', persona: 'user_a' },
       { role: 'probe', pathAndQuery: '/inbox?msg=1', persona: 'user_b' },
     ] } },
@@ -343,7 +343,7 @@ async function seedRunWithWorker(storage: Store) {
 
 function countSecondOrderSurfaceFacts(storage: Store, runId: string, marker: string): number {
   return storage.listFacts(runId, { includeTainted: true, limit: 500 })
-    .filter(f => f.kind === 'second_order_surface' && String(f.data?.marker ?? '') === marker).length
+    .filter(f => (f.kind as string) === 'second_order_surface' && String(f.data?.marker ?? '') === marker).length
 }
 
 test('M1.2: minted second-order canaries survive self-echo and keep tracking later surfaces', async (t) => {
@@ -412,7 +412,7 @@ test('M1.2: minted second-order canaries survive self-echo and keep tracking lat
   assert.equal(adminHtml.length, 1)
   assert.equal(countSecondOrderSurfaceFacts(storage, runId, minted.marker), 2)
   const surfaceFacts = storage.listFacts(runId, { includeTainted: true, limit: 500 })
-    .filter(f => f.kind === 'second_order_surface')
+    .filter(f => (f.kind as string) === 'second_order_surface')
   const adminFact = surfaceFacts.find(f => f.data?.surfacedEndpoint === '/admin/users')!
   assert.ok(adminFact)
   assert.equal(adminFact.data?.crossPersona, true)
@@ -559,7 +559,7 @@ test('M1.1: all four brokered tool paths forward session/csrf/authMutation/trace
     assert.ok(batchBlock.includes(fragment), `request_http_batch must forward ${fragment}`)
   }
 
-  const visitBlock = /browser_visit: async \(args, signal\) => \{[\s\S]{0,900}?await this\.browser\.visitPage\(\{[\s\S]{0,700}?\}, grant, signal\)/.exec(executionSource)?.[0] ?? ''
+  const visitBlock = /browser_visit: async \(args, signal\) => \{[\s\S]{0,1200}?await this\.browser\.visitPage\(\{[\s\S]{0,4000}?\}, grant, signal\)/.exec(executionSource)?.[0] ?? ''
   assert.ok(visitBlock)
   for (const fragment of ['session: args.session', 'runId: curRun.id', 'assignmentId: job.assignment.id', 'traceId:']) {
     assert.ok(visitBlock.includes(fragment), `browser_visit must forward ${fragment}`)
@@ -623,7 +623,7 @@ test('M1.5: inline feedback carries exchange ids, key headers, bounded previews,
     { kind: 'http_chain' },
     {
       verdict: 'dismissed',
-      outcome: { controlPassed: false, observed: 'HTTP 403', expected: 'HTTP 200', reason: 'Replay control step "ctrl" returned 403.' },
+      outcome: { confirmed: false, controlPassed: false, observed: 'HTTP 403', expected: 'HTTP 200', reason: 'Replay control step "ctrl" returned 403.' },
       exchangeIds: ['ex-1', 'ex-2'],
       exchanges: [exchange],
       evidencePayload: {
@@ -677,7 +677,7 @@ test('M1.5: sql_boolean_diff and sql_time_diff report every round summary', () =
     { kind: 'sql_boolean_diff' },
     {
       verdict: 'inconclusive',
-      outcome: { controlPassed: true, observed: 'no divergence', expected: 'divergence', reason: 'Boolean differential did not hold across all 3 randomized rounds.' },
+      outcome: { confirmed: false, controlPassed: true, observed: 'no divergence', expected: 'divergence', reason: 'Boolean differential did not hold across all 3 randomized rounds.' },
       exchangeIds: [],
       exchanges: [],
       evidencePayload: {
@@ -706,7 +706,7 @@ test('M1.5: sql_boolean_diff and sql_time_diff report every round summary', () =
     { kind: 'sql_time_diff' },
     {
       verdict: 'inconclusive',
-      outcome: { controlPassed: true, observed: 'no delay', expected: 'delay', reason: 'Timing differential below threshold.' },
+      outcome: { confirmed: false, controlPassed: true, observed: 'no delay', expected: 'delay', reason: 'Timing differential below threshold.' },
       exchangeIds: [],
       exchanges: [],
       evidencePayload: {
@@ -794,7 +794,7 @@ function maxPhase3RefinementJobsForTest(): number {
 }
 
 test('M1.5: refinement dispatch is wired from driveVerification and re-checks the run cap', () => {
-  const driveBlock = /private driveVerification\(run: Run\) \{[\s\S]{0,4000}?for \(const row of pendingFindings\)/.exec(executionSource)?.[0] ?? ''
+  const driveBlock = /private driveVerification\(run: Run\) \{[\s\S]{0,12000}?for \(const row of pendingFindings\)/.exec(executionSource)?.[0] ?? ''
   assert.ok(driveBlock, 'driveVerification block not found')
   assert.ok(driveBlock.includes('eligibleRefineSpecIds'))
   assert.ok(driveBlock.includes('this.refinementBudgetRemaining(run.id)'))
@@ -802,16 +802,122 @@ test('M1.5: refinement dispatch is wired from driveVerification and re-checks th
   assert.ok(/refinement\.dispatched/.test(driveBlock))
   // Inline failures mark eligibility; the normal verification path re-checks it before refining.
   assert.ok(executionSource.includes('this.markRefinementEligible(latestRun.id, updatedSpec.id)'))
-  assert.ok(/strongPreSignal &&\s*this\.refinementBudgetRemaining\(current\.id\) > 0/.test(executionSource))
+  assert.ok(/this\.refinementBudgetRemaining\(current\.id\) > 0/.test(executionSource))
+  assert.ok(/if \(strongPreSignal\) this\.markRefinementEligible/.test(executionSource))
 })
 
-test('M1: newProject helper stays usable (guards against accidental import drift)', () => {
-  const project = newProject({
+test('M1: project schema helper stays usable (guards against accidental import drift)', () => {
+  const project = newProject.parse({
     requestId: randomUUID(),
     name: 'm1 core fixture project',
     seeds: [fakeOrigin],
     environment: 'public',
-  } as unknown as Parameters<typeof newProject>[0])
-  assert.ok(project.id)
+  })
+  assert.ok(project)
   assert.equal(project.environment, 'public')
+})
+
+// ============================================================================
+// M1 fallback: bounded deterministic investigation when no model profile exists
+// ============================================================================
+
+test('M1 fallback: zero model profiles probe discovered endpoints and propose deterministic findings', async (t) => {
+  // Fixture behaves like a boolean-differential SQL sink for the numeric comparison style.
+  const fx = await startHttpFixture(t, (req, _body, res) => {
+    const url = new URL(req.url ?? '/', 'http://fixture.invalid')
+    const q = url.searchParams.get('q') ?? ''
+    const match = /AND\s+(\d+)\s*=\s*(\d+)/.exec(q)
+    const rows = match && match[1] !== match[2] ? [] : [{ id: 1 }, { id: 2 }]
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ rows }))
+  })
+  const storage = makeStore(t)
+  const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 200, tier: 2 })
+  const endpoint = storage.upsertEndpoint({
+    runId,
+    origin: fx.origin,
+    method: 'GET',
+    pathTemplate: '/search?q=',
+    source: 'openapi',
+    riskScore: 70,
+  })
+  storage.upsertEndpointParam({
+    runId,
+    endpointId: endpoint.id,
+    name: 'q',
+    location: 'query',
+    source: 'openapi',
+  })
+  storage.updateRun(runId, { phase: 'investigation', status: 'running' })
+
+  const execution = new Execution(storage)
+  t.after(() => execution.stop())
+  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    (execution as unknown as { runDeterministicInvestigation: (run: Run) => Promise<void> })
+      .runDeterministicInvestigation(storage.run(runId)))
+
+  const detail = storage.runDetail(runId)
+  assert.ok(detail.exchangesSummary.length >= 4, `expected real brokered probes to run (got ${detail.exchangesSummary.length} exchanges)`)
+  assert.ok(detail.exchangesSummary.every(ex => ex.origin === fx.origin))
+
+  const specs = detail.replaySpecs.filter(row => row.spec.kind === 'sql_boolean_diff')
+  assert.equal(specs.length, 1, 'one deterministic sql_boolean_diff spec must be proposed')
+  const finding = detail.findings.find(f => f.replaySpecId === specs[0].id)
+  assert.ok(finding, 'the deterministic spec must be attached to a pending finding')
+  assert.equal(finding!.status, 'pending')
+  assert.equal(finding!.cwe, 'CWE-89')
+
+  const verifyWorkers = storage.workerList(runId).filter(w => w.phase === 'verification' && w.stepId === specs[0].id)
+  assert.equal(verifyWorkers.length, 1, 'normal Zero-LLM verification queue must receive the deterministic spec')
+
+  const facts = storage.listFacts(runId, { includeTainted: false, limit: 100 })
+  assert.ok(facts.some(f => f.data?.subkind === 'differential_anomaly'), 'the differential signal must be recorded as a fact')
+  assert.ok(storage.eventsAfter(runId, 0).some(e => e.kind === 'deterministic_probes.summary'))
+})
+
+test('M1 fallback: deterministic mode respects request budget and never runs destructive methods', async (t) => {
+  const fx = await startHttpFixture(t, (_req, _body, res) => {
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ rows: [{ id: 1 }] }))
+  })
+  const storage = makeStore(t)
+  const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 8, tier: 2 })
+  const endpoint = storage.upsertEndpoint({
+    runId,
+    origin: fx.origin,
+    method: 'DELETE',
+    pathTemplate: '/items/{{id}}',
+    source: 'openapi',
+    riskScore: 90,
+  })
+  storage.upsertEndpointParam({ runId, endpointId: endpoint.id, name: 'id', location: 'path', source: 'openapi' })
+
+  const execution = new Execution(storage)
+  t.after(() => execution.stop())
+  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    (execution as unknown as { runDeterministicInvestigation: (run: Run) => Promise<void> })
+      .runDeterministicInvestigation(storage.run(runId)))
+
+  const detail = storage.runDetail(runId)
+  assert.equal(detail.exchangesSummary.filter(ex => ex.method === 'DELETE').length, 0, 'DELETE endpoints must never be probed')
+  assert.ok(detail.exchangesSummary.length <= 16, 'request cap must bound the deterministic pass')
+})
+
+test('M1 fallback: the agentic path is untouched when a model profile exists', async (t) => {
+  const storage = makeStore(t)
+  const { runId, run } = await setupApprovedRun(storage, { seeds: [fakeOrigin] })
+  storage.updateRun(runId, { phase: 'investigation', status: 'running' })
+  const execution = new Execution(storage)
+  t.after(() => execution.stop())
+
+  const privateExec = execution as unknown as {
+    driveInvestigation: (run: Run, profiles: readonly unknown[]) => void
+    deterministicInFlight: Set<string>
+    deterministicCompleted: Set<string>
+  }
+  privateExec.driveInvestigation(storage.run(runId), [{ id: 'mock-profile' }])
+
+  assert.equal(privateExec.deterministicInFlight.size, 0, 'profile-backed runs must not enter deterministic mode')
+  assert.equal(privateExec.deterministicCompleted.size, 0)
+  assert.equal(storage.workerList(runId).filter(w => w.title.includes('Deterministic differential probes')).length, 0)
 })

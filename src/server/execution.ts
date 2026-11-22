@@ -71,6 +71,7 @@ import type { SecondOrderStore } from './canary-broker.ts'
 import { ColdGraphCompactor } from './compactor.ts'
 import { queryCves } from './cve-broker.ts'
 import {
+  checkStructuralDuplicate,
   createProviderLlmCall,
   evaluateSubmissionDedupe,
   extractSpecDedupeFields,
@@ -106,7 +107,7 @@ import { responseReview } from './response-checks.ts'
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
-import { runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
+import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
 import { assessmentAssignments, store } from './store.ts'
 import type { Assignment, ChainStep, Fact, PatchProposal, ReplaySpecRow, Run, Store } from './store.ts'
 import { probeDifferential, probeSurface, runSafeTemplates } from './surface-engine.ts'
@@ -454,7 +455,7 @@ export function convertCodeAuditSuspectsToChainSteps(
   const created: ChainStep[] = []
   let totalSteps = existingSteps.length
 
-  for (const fact of suspects) {
+  for (const fact of dedupeCodeAuditSuspects(suspects)) {
     if (totalSteps >= hardChainStepsCeiling) break
     if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
     if (coveredFactIds.has(fact.id)) continue
@@ -688,6 +689,64 @@ function isSafeIdempotentPost(pathAndQuery: string, body?: string): boolean {
   return !/\bmutation\b/i.test(body)
 }
 
+// --- Deterministic (zero-LLM) investigation fallback helpers ---
+
+/** Parameter names worth a differential SQL probe (generic, engine-level — not app-specific). */
+const DETERMINISTIC_PARAM_HINT_RE = /^(?:id|uuid|q|query|search|s|filter|sort|order|orderby|where|name|email|slug|path|file|url|uri|host|cmd|exec|template|view|lang|category|type|limit|offset|page|next|redirect|return)$/i
+const DETERMINISTIC_NUMERIC_PARAM_RE = /^(?:id|page|limit|offset|qty|quantity|amount|price|count|num|index)$/i
+const DETERMINISTIC_ID_SEGMENT_RE = /(?:\/:[a-z_][a-z0-9_]*|\{\{id\}\}|\/\[[^\]]+\]|\/\d{2,16}(?=\/|$)|\/[0-9a-f]{8}-[0-9a-f]{4}-)/i
+const DETERMINISTIC_PATH_PARAM_RE = /\/:[a-z_][a-z0-9_]*|\/\{\{id\}\}|\/\[[^\]]+\]/gi
+
+function deterministicQueryParamNames(pathTemplate: string): string[] {
+  const qIdx = pathTemplate.indexOf('?')
+  if (qIdx < 0) return []
+  return pathTemplate
+    .slice(qIdx + 1)
+    .split('&')
+    .map(pair => pair.split('=')[0]?.trim())
+    .filter((name): name is string => Boolean(name && /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(name)))
+}
+
+function withQueryParam(pathTemplate: string, name: string, value: string): string {
+  const base = pathTemplate.split('?')[0]
+  return `${base}?${name}=${encodeURIComponent(value)}`
+}
+
+function deterministicIdPath(pathTemplate: string): string | null {
+  if (!DETERMINISTIC_ID_SEGMENT_RE.test(pathTemplate)) return null
+  const replaced = pathTemplate.replace(DETERMINISTIC_PATH_PARAM_RE, '/{{id}}').replace(/\/\d{2,16}(?=\/|$)/, '/{{id}}')
+  return replaced.includes('{{id}}') ? replaced : null
+}
+
+/** Shared replay-spec boilerplate for deterministically synthesized specs. */
+function baseReplaySpecFields(
+  _run: Run,
+  origin: string,
+  overrides: {
+    title: string
+    category: string
+    cwe: string
+    severity: Finding['severity']
+    severityRationale: string
+    impact: string
+    remediation: string
+    recheckInstructions: string
+  },
+) {
+  return {
+    version: 1 as const,
+    origin,
+    title: overrides.title.slice(0, 200),
+    category: overrides.category,
+    cwe: overrides.cwe,
+    severity: overrides.severity,
+    severityRationale: overrides.severityRationale.slice(0, 800),
+    impact: overrides.impact.slice(0, 1200),
+    remediation: overrides.remediation.slice(0, 1500),
+    recheckInstructions: overrides.recheckInstructions.slice(0, 1000),
+  }
+}
+
 function createBroker(options: { storage: SecondOrderStore; canaryBroker: CanaryBroker }) {
   const target = process.env.GUARDIAN_NETWORK_FIXTURE
   if (!target) {
@@ -767,6 +826,8 @@ export class Execution {
   private readonly pendingTier3ApprovalKeys = new Set<string>()
   /** runId → replay spec ids whose inline failure is eligible for bounded Phase-3 refinement. */
   private readonly refinementEligible = new Map<string, Set<string>>()
+  private readonly deterministicInFlight = new Set<string>()
+  private readonly deterministicCompleted = new Set<string>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -2074,15 +2135,20 @@ export class Execution {
 
         const totalQueued = codeAuditStepsCreated + addedInitial
         this.completeWorker(claimed, current, tmSummary, [savedTm.tmArtifact.id], undefined, secrets)
-        const nextPhase = current.capabilityTier === 0 || !profiles.length ? 'verification' : 'investigation'
+        const deterministicMode = !profiles.length && current.capabilityTier > 0
+        const nextPhase = current.capabilityTier === 0 ? 'verification' : 'investigation'
         this.storage.updateRun(current.id, { phase: nextPhase })
         this.storage.event(current.id, `${nextPhase}.started`,
           nextPhase === 'investigation'
-            ? `Threat model complete${codeAuditStepsCreated ? ` (${codeAuditStepsCreated} source-audit steps + ${addedInitial} initial steps)` : ` (${totalQueued} initial steps)`}. Starting closed-loop chain investigation.`
+            ? deterministicMode
+              ? 'Threat model complete (no model profile configured). Starting bounded deterministic differential probing.'
+              : `Threat model complete${codeAuditStepsCreated ? ` (${codeAuditStepsCreated} source-audit steps + ${addedInitial} initial steps)` : ` (${totalQueued} initial steps)`}. Starting closed-loop chain investigation.`
             : 'Baseline captures complete. Starting deterministic Zero-LLM verification.')
         this.storage.message(current.id, current.coordinatorId, 'guardian',
           nextPhase === 'investigation'
-            ? `Threat model ranked ${finalEntries.length} hosts and queued ${totalQueued} initial investigation steps${codeAuditStepsCreated ? ` (including ${codeAuditStepsCreated} from Source-First Code Audit)` : ''}.`
+            ? deterministicMode
+              ? `Threat model ranked ${finalEntries.length} hosts. No model profile is configured, so Guardian will run a bounded deterministic probe pass over discovered endpoints instead of agentic investigation.`
+              : `Threat model ranked ${finalEntries.length} hosts and queued ${totalQueued} initial investigation steps${codeAuditStepsCreated ? ` (including ${codeAuditStepsCreated} from Source-First Code Audit)` : ''}.`
             : 'Baseline capture complete. Deterministic verification is checking the recorded evidence.')
       }, { behavior: 'immediate' })
     } finally {
@@ -2288,7 +2354,7 @@ export class Execution {
           enableStage1Llm: false,
           persistToStore: true,
         })
-        const semanticSteps = toChainStepInputs(run, semanticRes.rankedSuspects, hostTiersForAudit)
+        const semanticSteps = toChainStepInputs(run, semanticRes.rankedSuspects, hostTiersForAudit, semanticRes.persistedFactIds)
         const existingTitles = new Set(this.storage.listChainSteps(run.id, run.goalRevision).map(s => s.title.trim().toLowerCase()))
         for (const stInput of semanticSteps) {
           const key = stInput.title.trim().toLowerCase()
@@ -2645,7 +2711,12 @@ export class Execution {
   }
 
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
-    if (!profiles.length) return
+    if (!profiles.length) {
+      // No model profile configured: run the bounded deterministic baseline so the run can still
+      // produce real findings (see runDeterministicInvestigation). The agentic path is unchanged.
+      this.driveDeterministicInvestigation(run)
+      return
+    }
     // Always compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
     const computedBudget = computeDynamicStepBudget(this.storage, run.id)
     if (run.dynamicStepBudget === null || run.dynamicStepBudget < computedBudget) {
@@ -2711,6 +2782,454 @@ export class Execution {
     } else if (this.plannerDirty.has(run.id) && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
       this.schedulePlanner(run.id, plannerDebounceMs)
     }
+  }
+
+  // --- Phase 1 (deterministic fallback): bounded zero-LLM probe pass when no model profile exists ---
+
+  private driveDeterministicInvestigation(run: Run) {
+    const key = `${run.id}:${run.goalRevision}:${run.scopeRevision}`
+    if (this.deterministicCompleted.has(key) || this.deterministicInFlight.has(key)) return
+    this.deterministicInFlight.add(key)
+    void this.runDeterministicInvestigation(run)
+      .catch(error => {
+        const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+        this.storage.event(run.id, 'deterministic_probes.failed', `Deterministic probe pass failed: ${msg}`)
+      })
+      .finally(() => {
+        this.deterministicInFlight.delete(key)
+        this.deterministicCompleted.add(key)
+        const latest = this.storage.run(run.id)
+        if (latest.status === 'running' && latest.phase === 'investigation') {
+          this.storage.event(
+            latest.id,
+            'deterministic_probes.complete',
+            'Deterministic probe pass complete. Advancing to Zero-LLM verification.',
+            { reuse: key },
+          )
+          this.advanceToVerification(latest)
+        }
+        this.scheduleWake()
+      })
+  }
+
+  /**
+   * Bounded, tier/scope/budget-aware deterministic hypotheses for discovered endpoints. Used only
+   * when the run has no model profile: it probes the highest-value discovered routes, records
+   * facts, synthesizes DeclarativeReplaySpecs from differential anomalies, and lets the normal
+   * Zero-LLM verification queue confirm or dismiss them.
+   */
+  private async runDeterministicInvestigation(run: Run): Promise<void> {
+    const current = this.storage.run(run.id)
+    if (current.status !== 'running' || current.phase !== 'investigation') return
+    const approvedOrigins = this.approvedOriginsSet(current)
+    if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
+
+    const endpoints = this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 150 })
+      .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE')
+    if (!endpoints.length) return
+
+    const allParams = this.storage.listEndpointParams(current.id)
+    const paramsByEndpoint = new Map<string, typeof allParams>()
+    for (const param of allParams) {
+      const list = paramsByEndpoint.get(param.endpointId) ?? []
+      list.push(param)
+      paramsByEndpoint.set(param.endpointId, list)
+    }
+
+    const personas = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
+    const personaHandles = personas.map(p => p.handle)
+    const tier = current.capabilityTier
+
+    const resourceQueue = tier >= 2 && personaHandles.length >= 2
+      ? buildBolaTestQueue(
+          this.storage.listFacts(current.id, { includeTainted: false, limit: 200 }),
+          personas.map(p => ({ handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist })),
+          approvedOrigins,
+        )
+      : []
+
+    const ranked = endpoints
+      .map(ep => {
+        const epParams = paramsByEndpoint.get(ep.id) ?? []
+        const hinted = epParams.find(p => DETERMINISTIC_PARAM_HINT_RE.test(p.name)) ?? epParams[0]
+        const queryNames = deterministicQueryParamNames(ep.pathTemplate)
+        const hintedQuery = queryNames.find(name => DETERMINISTIC_PARAM_HINT_RE.test(name)) ?? queryNames[0]
+        const paramName = hinted?.name ?? hintedQuery
+        const paramLocation = hinted?.location ?? (hintedQuery ? 'query' : undefined)
+        const idPath = deterministicIdPath(ep.pathTemplate)
+        const originResources = resourceQueue.filter(item => item.origin === ep.origin)
+        let score = ep.riskScore
+        if (paramName) score += 25
+        if (idPath) score += 20
+        if ((ep.sinkKinds ?? []).length > 0) score += 10
+        if (originResources.length > 0) score += 15
+        return { ep, paramName, paramLocation, idPath, originResources, score }
+      })
+      .filter(item =>
+        Boolean(item.paramName) ||
+        (item.idPath !== null && tier >= 2 && item.originResources.length > 0),
+      )
+      .sort((a, b) => b.score - a.score)
+
+    if (!ranked.length) return
+
+    const maxEndpoints = Math.min(14, Math.max(4, Math.floor((current.dynamicStepBudget ?? 24) / 2)))
+    const requestCap = current.budgetRequests > 0
+      ? Math.max(0, Math.min(80, current.budgetRequests - current.spentRequests))
+      : 80
+    if (requestCap < 6) return
+
+    const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
+    if (!asset) return
+
+    const worker = this.storage.makeWorker(
+      current,
+      'investigation',
+      asset,
+      'Deterministic differential probes',
+      'No model profile configured: bounded deterministic probe pass over discovered endpoints.',
+      { sourceOrigins: [...approvedOrigins] },
+    )
+    const claimed = this.storage.updateWorker(worker.id, {
+      status: 'running',
+      lease: randomUUID(),
+      leaseExpiresAt: Date.now() + 10 * 60_000,
+    }) ?? worker
+    const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
+    const { grant, secrets, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
+
+    const recordExchange = (ex: BrokerExchangeResult) => {
+      const latest = this.storage.run(current.id)
+      const saved = this.storage.recordExchange({
+        runId: current.id,
+        assignmentId: claimed.id,
+        scopeRevision: latest.scopeRevision,
+        origin: ex.origin,
+        finalOrigin: ex.finalOrigin,
+        redirectOrigins: ex.redirectOrigins,
+        method: ex.method,
+        pathAndQuery: ex.pathAndQuery,
+        personaHandle: ex.personaHandle,
+        status: ex.status,
+        mediaType: ex.mediaType,
+        reqHeaders: ex.reqHeaders,
+        respHeaders: ex.respHeaders,
+        body: ex.body,
+        durationMs: ex.durationMs,
+        secrets: currentSecrets(),
+      })
+      this.scanSecondOrderExchange(latest, claimed.id, ex, saved.id)
+      return saved.id
+    }
+
+    let requestsUsed = 0
+    let findingsCreated = 0
+    const signal = job.controller.signal
+    try {
+      for (const item of ranked.slice(0, maxEndpoints)) {
+        if (requestsUsed >= requestCap || signal.aborted) break
+        const latest = this.storage.run(current.id)
+        if (latest.status !== 'running' || latest.phase !== 'investigation') break
+        if (this.storage.checkBudgetExceeded(current.id)) break
+        if (!approvedOrigins.has(item.ep.origin)) continue
+
+        const perEndpointCap = Math.max(4, Math.min(16, requestCap - requestsUsed))
+        if (perEndpointCap < 4) break
+
+        const base = {
+          origin: item.ep.origin,
+          runId: current.id,
+          assignmentId: claimed.id,
+          storage: this.storage,
+          maxRequests: perEndpointCap,
+          onExchange: recordExchange,
+        }
+
+        // 1) Cross-persona object authz (ID-bearing routes with harvested owner resources).
+        if (item.idPath && tier >= 2 && item.originResources.length > 0) {
+          const resource = item.originResources[0]
+          const owner = resource.ownerPersona
+          const other = personaHandles.find(handle => handle !== owner)
+          if (other) {
+            let outcome
+            try {
+              outcome = await probeDifferential({
+                ...base,
+                probeClass: 'authz_matrix',
+                method: 'GET',
+                pathAndQuery: item.idPath,
+                persona: owner,
+                ownerPersona: owner,
+                otherPersona: other,
+                resourceIds: item.originResources.slice(0, 3).map(r => r.resourceId),
+                includeAnonymous: false,
+                includeHeaderBypass: false,
+              }, this.broker, grant, this.canaryBroker, signal)
+            } catch (error) {
+              if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
+              outcome = undefined
+            }
+            if (outcome) {
+              requestsUsed += outcome.requestsSent
+              const unauthorized = outcome.anomalies.find(a => a.type === 'unauthorized_access')
+              if (outcome.verdict === 'signal' && unauthorized) {
+                const resourceId = typeof unauthorized.resourceId === 'string' ? unauthorized.resourceId : resource.resourceId
+                const probePath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId))
+                const controlPath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId))
+                const findingId = this.recordDeterministicFinding({
+                  run: latest,
+                  assignment: claimed,
+                  asset,
+                  spec: {
+                    ...baseReplaySpecFields(latest, item.ep.origin, {
+                      title: `Cross-persona object access · ${item.ep.method} ${item.ep.pathTemplate.slice(0, 80)}`,
+                      category: 'broken-access-control',
+                      cwe: 'CWE-639',
+                      severity: 'high',
+                      severityRationale: `Persona ${owner} owns ${resourceId}; persona ${other} received HTTP ${String(unauthorized.status)} on the same object.`,
+                      impact: 'Horizontal privilege escalation: one tenant can read another tenant\'s object by ID.',
+                      remediation: 'Enforce an ownership/tenant predicate on the object lookup before returning or mutating it.',
+                      recheckInstructions: 'Replay the owner control and the cross-persona probe after the fix.',
+                    }),
+                    kind: 'http_chain',
+                    spaCatchallControl: false,
+                    assertionsJq: '{ controlPassed: (.steps.ctrl.status == 200), confirmed: (.steps.prb.status == 200), observed: ("probe status " + (.steps.prb.status | tostring)), expected: "cross-persona probe denied" }',
+                    steps: [
+                      { id: 'ctrl', role: 'control', description: `Owner ${owner} reads its own object`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: controlPath, persona: owner, followRedirects: false } },
+                      { id: 'prb', role: 'probe', description: `Persona ${other} replays the owner object id`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: probePath, persona: other, followRedirects: false } },
+                    ],
+                  },
+                  factData: {
+                    subkind: 'differential_anomaly',
+                    probeClass: 'authz_matrix',
+                    endpoint: item.ep.pathTemplate,
+                    resourceId,
+                    ownerPersona: owner,
+                    otherPersona: other,
+                    anomalies: [unauthorized],
+                  },
+                  factSummary: `Deterministic authz_matrix signal: ${other} reached ${owner}'s resource ${resourceId} at ${item.ep.method} ${item.ep.pathTemplate} (HTTP ${String(unauthorized.status)}).`,
+                  exchangeIds: outcome.exchangeIds,
+                  secrets: currentSecrets(),
+                })
+                if (findingId) findingsCreated += 1
+              }
+            }
+            continue
+          }
+        }
+
+        // 2) SQL injection differential on a parameterized route (non-destructive boolean/error only).
+        if (item.paramName) {
+          const location = item.paramLocation ?? 'query'
+          if (location === 'cookie') continue
+          const method = item.ep.method === 'POST' ? 'POST' : 'GET'
+          if (method === 'POST' && !['query', 'json', 'form'].includes(location)) continue
+          const baselineValue = DETERMINISTIC_NUMERIC_PARAM_RE.test(item.paramName) ? '1' : 'guardian'
+          const quoteStyle: 'single' | 'double' | 'numeric' = DETERMINISTIC_NUMERIC_PARAM_RE.test(item.paramName) ? 'numeric' : 'single'
+          const pathAndQuery = location === 'query'
+            ? withQueryParam(item.ep.pathTemplate, item.paramName, baselineValue)
+            : item.ep.pathTemplate.split('?')[0]
+          const jsonBody = method === 'POST' && location === 'json'
+            ? { [item.paramName]: baselineValue }
+            : undefined
+          let outcome
+          try {
+            outcome = await probeDifferential({
+              ...base,
+              probeClass: 'sqli_boolean',
+              method,
+              pathAndQuery,
+              param: item.paramName,
+              paramLocation: location,
+              baselineValue,
+              ...(jsonBody ? { jsonBody } : {}),
+              ...(personaHandles[0] ? { persona: personaHandles[0] } : {}),
+            }, this.broker, grant, this.canaryBroker, signal)
+          } catch (error) {
+            if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
+            outcome = undefined
+          }
+          if (!outcome) continue
+          requestsUsed += outcome.requestsSent
+          const booleanSignal = outcome.anomalies.find(a => a.type === 'boolean_differential')
+          const dbError = outcome.anomalies.find(a => a.type === 'db_error_fingerprint')
+          if (outcome.verdict !== 'signal' || (!booleanSignal && !dbError)) continue
+          const dialect = typeof dbError?.dialect === 'string' ? dbError.dialect : null
+          const findingId = this.recordDeterministicFinding({
+            run: latest,
+            assignment: claimed,
+            asset,
+            spec: {
+              ...baseReplaySpecFields(latest, item.ep.origin, {
+                title: `SQL parameterization differential · ${method} ${item.ep.pathTemplate.slice(0, 80)} (${item.paramName})`,
+                category: 'injection-input',
+                cwe: 'CWE-89',
+                severity: 'high',
+                severityRationale: `Deterministic ${booleanSignal ? 'boolean differential' : 'SQL error fingerprint'} observed on parameter "${item.paramName}"${dialect ? ` (${dialect})` : ''}.`,
+                impact: 'Unparameterized SQL handling allows boolean/oracle-based data inference.',
+                remediation: 'Bind the parameter with the ORM/query parameterizer and remove string interpolation.',
+                recheckInstructions: 'Replay the boolean differential after switching to a bound parameter.',
+              }),
+              kind: 'sql_boolean_diff',
+              targetOrigin: item.ep.origin,
+              method,
+              pathAndQuery,
+              paramName: item.paramName,
+              paramLocation: location,
+              baselineValue,
+              quoteStyle,
+              ...(jsonBody ? { jsonBody } : {}),
+              assertionsJq: '{ controlPassed: true, confirmed: true, observed: "deterministic boolean differential", expected: "parameterized query" }',
+            },
+            factData: {
+              subkind: 'differential_anomaly',
+              probeClass: 'sqli_boolean',
+              endpoint: item.ep.pathTemplate,
+              param: item.paramName,
+              paramLocation: location,
+              method,
+              dialect,
+              anomalies: outcome.anomalies.slice(0, 5),
+            },
+            factSummary: `Deterministic sqli_boolean signal on ${method} ${item.ep.pathTemplate} parameter "${item.paramName}"${dialect ? ` (${dialect} error fingerprint)` : ''}.`,
+            exchangeIds: outcome.exchangeIds,
+            secrets: currentSecrets(),
+          })
+          if (findingId) findingsCreated += 1
+        }
+      }
+
+      this.storage.event(
+        current.id,
+        'deterministic_probes.summary',
+        `Deterministic probe pass used ${requestsUsed} request(s) across ${Math.min(ranked.length, maxEndpoints)} endpoint(s) and proposed ${findingsCreated} replay spec(s).`,
+        { requestsUsed, endpointsConsidered: ranked.length, endpointsProbed: Math.min(ranked.length, maxEndpoints), findingsCreated, requestCap },
+      )
+      this.storage.message(
+        current.id,
+        current.coordinatorId,
+        'guardian',
+        `No model profile is configured, so Guardian ran a bounded deterministic probe pass (${requestsUsed} requests) and proposed ${findingsCreated} deterministic replay spec(s) for Zero-LLM verification.`,
+      )
+    } finally {
+      try {
+        this.storage.updateWorker(claimed.id, {
+          status: 'complete',
+          outcome: `Deterministic probes: ${requestsUsed} request(s), ${findingsCreated} spec(s).`,
+          lease: null,
+          leaseExpiresAt: null,
+        })
+      } catch { /* run may have been deleted */ }
+    }
+  }
+
+  private recordDeterministicFinding(input: {
+    run: Run
+    assignment: Assignment
+    asset: Candidate
+    spec: unknown
+    factData: Record<string, unknown>
+    factSummary: string
+    exchangeIds: readonly string[]
+    secrets: readonly NamedSecret[]
+  }): string | null {
+    const parsed = declarativeReplaySpecSchema.safeParse(input.spec)
+    if (!parsed.success) return null
+    const spec = parsed.data
+
+    const fields = extractSpecDedupeFields(spec)
+    const existingRows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, input.run.id),
+      eq(findings.goalRevision, input.run.goalRevision),
+    )).all()
+    const existingRefs: ExistingFindingRef[] = existingRows.map(row => {
+      const specRow = row.replaySpecId ? this.storage.getReplaySpec(input.run.id, row.replaySpecId) : null
+      const existingFields = specRow ? extractSpecDedupeFields(specRow.spec) : undefined
+      return {
+        id: row.id,
+        origin: row.finding.origin,
+        title: row.finding.title,
+        status: row.finding.status,
+        cwe: row.finding.cwe,
+        category: row.finding.category,
+        severity: row.finding.severity,
+        endpoint: existingFields?.endpoint ?? null,
+        authState: existingFields?.authState ?? null,
+        specKind: existingFields?.specKind ?? null,
+        method: existingFields?.method ?? null,
+        param: existingFields?.param ?? null,
+        fingerprintHash: row.fingerprintHash ?? null,
+      }
+    })
+    const duplicate = checkStructuralDuplicate({
+      origin: spec.origin,
+      title: spec.title,
+      cwe: spec.cwe,
+      category: spec.category,
+      severity: spec.severity,
+      endpoint: fields.endpoint,
+      authState: fields.authState,
+      specKind: fields.specKind,
+      method: fields.method,
+      param: fields.param,
+    }, existingRefs)
+    if (duplicate.isDuplicate) return null
+
+    const fact = this.storage.addFact(input.run, input.assignment, {
+      kind: 'note',
+      origin: spec.origin,
+      summary: input.factSummary,
+      data: input.factData,
+      exchangeIds: [...input.exchangeIds].slice(0, 5),
+      sourceOrigins: [...new Set(replaySpecOrigins(spec))].filter(o => this.permitted(input.run, o)),
+      secrets: input.secrets,
+    })
+
+    const findingId = randomUUID()
+    const specRow = this.storage.createReplaySpec(input.run, input.assignment, findingId, spec, [...new Set(replaySpecOrigins(spec))])
+    const artifact = this.storage.addArtifact(
+      input.run,
+      input.assignment,
+      'replay',
+      `Deterministic proposed spec · ${spec.title}`,
+      JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec }, null, 2),
+      undefined,
+      input.secrets,
+    )
+    const finding: Finding = {
+      id: findingId,
+      origin: spec.origin,
+      title: spec.title,
+      status: 'pending',
+      severity: spec.severity,
+      reason: spec.severityRationale,
+      remediation: spec.remediation,
+      impact: spec.impact,
+      recheck: spec.recheckInstructions,
+      category: spec.category,
+      cwe: spec.cwe,
+      confidence: 'medium',
+      verification: `Pending Zero-LLM ${spec.kind} replay verification proposed deterministically (spec ${specRow.id}).`,
+      findingKind: 'multi_step_chain',
+      replaySpecId: specRow.id,
+      fingerprintHash: duplicate.fingerprint.hash,
+      chainFactIds: [fact.id],
+      exchangeIds: [...new Set(input.exchangeIds)].slice(0, 6),
+      evidenceIds: [artifact.id],
+      scopeRevision: input.run.scopeRevision,
+    }
+    const saved = this.storage.upsertChainFinding(input.run, input.asset.id, finding, specRow.id, [...new Set(replaySpecOrigins(spec))])
+    this.storage.makeWorker(
+      input.run,
+      'verification',
+      input.asset,
+      `Replay verify · ${spec.title.slice(0, 80)}`,
+      `Zero-LLM deterministic replay verification of deterministically proposed spec ${specRow.id}.`,
+      { stepId: specRow.id, sourceOrigins: [...new Set(replaySpecOrigins(spec))] },
+    )
+    this.storage.addGraphEdge(input.run.id, { fromKind: 'fact', fromId: fact.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
+    return saved.id
   }
 
   private schedulePlanner(runId: string, delayMs = plannerDebounceMs) {
@@ -5333,12 +5852,14 @@ export class Execution {
         )
         const strongPreSignal = this.hasStrongPreVerificationSignal(current, findingRow, specRow, rawFeedback)
         if (strongPreSignal) this.markRefinementEligible(current.id, specRow.id)
+        // Legacy Phase-3 refinement stays available for any spec that failed deterministic replay;
+        // the strong-signal eligibility set only widens dispatch to inline-failed findings that are
+        // never `pending` again. Both paths share the hard <=10 jobs/run cap.
         const canRefine =
           current.capabilityTier > 0 &&
           !this.storage.checkBudgetExceeded(current.id) &&
           privateModelProfiles(this.storage).length > 0 &&
           !alreadyQueuedRefine &&
-          strongPreSignal &&
           this.refinementBudgetRemaining(current.id) > 0 &&
           specRow.sourceOrigins.every(o => permittedAtAdmission.has(o))
         if (canRefine) {

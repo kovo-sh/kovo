@@ -738,8 +738,10 @@ export class CanaryBroker {
         const maxCallbackBodyBytes = 4096
         const chunks: Buffer[] = []
         let received = 0
+        let totalBytes = 0
         let truncated = false
         req.on('data', (chunk: Buffer) => {
+          totalBytes += chunk.length
           if (received >= maxCallbackBodyBytes) {
             truncated = true
             return
@@ -770,7 +772,7 @@ export class CanaryBroker {
                 remoteIp: (req.socket?.remoteAddress ?? '').slice(0, 128),
                 userAgent: redact(String(req.headers['user-agent'] ?? '')).slice(0, 200),
                 headers: normalizeIncomingHeaders(req.headers),
-                ...(bodyPreview ? { bodyPreview, bodyBytes: Buffer.byteLength(rawBody, 'utf8') } : {}),
+                ...(bodyPreview ? { bodyPreview, bodyBytes: totalBytes } : {}),
                 receivedAt: new Date(now).toISOString(),
                 timestamp: now,
               }

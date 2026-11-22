@@ -621,7 +621,7 @@ interface SpecialistIntentRule {
 const SPECIALIST_INTENT_RULES: Record<SpecialistProfile, SpecialistIntentRule> = {
   'graphql-api-specialist': {
     patterns: [
-      { re: /\bgraphql\b|\bgql\b|nested resolver|\/graphql\b|graphql_var/i, weight: 6 },
+      { re: /\bgraphql\b|\bgql\b|nested resolver|\/graphql\b|graphql_var/i, weight: 16 },
       { re: /\b(?:schema|introspection|alias batching|resolver)\b/i, weight: 3 },
       { re: /\bmutation\b|\bfield\b/i, weight: 1 },
     ],
@@ -724,6 +724,14 @@ export function routeStepToSpecialist(input: {
   const cat = (input.category ?? '').trim().toLowerCase()
   const sink = (input.sinkKind ?? '').trim().toLowerCase()
 
+  // A step that explicitly names a GraphQL surface belongs to the GraphQL specialist even when the
+  // planner's generic access-control category/skills would otherwise pull it to BOLA. Concrete
+  // injection sinks (e.g. SQLi through a graphql_var scalar) still route to the injection parser.
+  if (/\bgraphql\b|\bgql\b|\/graphql\b/i.test(primaryText)) {
+    const namesInjectionSink = /\b(?:sqli|sql injection|sql|ssti|template injection|xxe|command injection|rce|nosql|nosql injection|deserializ\w*|ldap injection)\b/i.test(primaryText)
+    if (!namesInjectionSink) return 'graphql-api-specialist'
+  }
+
   const scores = new Map<SpecialistProfile, number>()
   for (const profile of specialistProfiles) {
     const rule = SPECIALIST_INTENT_RULES[profile]
@@ -733,7 +741,7 @@ export function routeStepToSpecialist(input: {
     const sinkWeight = rule.sinks?.[sink]
     if (sinkWeight) score += sinkWeight
     for (const anchor of rule.anchors ?? []) {
-      if (skillsSet.has(anchor) && !SHARED_PLAYBOOK_SKILLS.has(anchor)) score += 6
+      if (skillsSet.has(anchor) && !SHARED_PLAYBOOK_SKILLS.has(anchor)) score += 5
     }
     for (const { re, weight } of rule.patterns) {
       if (re.test(primaryText)) score += weight
