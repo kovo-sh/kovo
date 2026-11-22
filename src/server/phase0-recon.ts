@@ -67,6 +67,7 @@ export interface CrawlStateGraphParams {
   grant: Grant
   signal: AbortSignal
   assignmentId?: string
+  onExchange?: (ex: BrokerExchangeResult) => string | void
 }
 
 export interface CrawlStateGraphResult {
@@ -78,6 +79,8 @@ export interface CrawlStateGraphResult {
   hasPostMessageListener: boolean
   personasCrawled: string[]
   stoppedReason?: string
+  /** Endpoints expanded from route-map/config documents captured in XHR/fetch response bodies. */
+  routeMapEndpoints?: number
 }
 
 export interface StaticExtractedRoute {
@@ -95,6 +98,25 @@ export interface StaticExtractedRoute {
 const CSRF_PARAM_RE = /^(?:_csrf|csrf[_-]?token|xsrf[_-]?token|csrfmiddlewaretoken|__requestverificationtoken|authenticity_token|_token)$/i
 const OBJECT_ID_PARAM_RE = /^(?:id|uuid|[a-z0-9_]*_?id)$/i
 const STATIC_ASSET_RE = /\.(?:css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|mp3|zip|tar|gz|pdf)(?:\?|$)/i
+// SQL/query fragments that surface as quoted literals in source (for example DB helpers named like
+// HTTP verbs). They are never route paths, so structural route extraction must reject them.
+const SQL_ROUTE_FRAGMENT_RE = /\b(?:select|insert|update|delete|from|where|join|having|union|values|into|pragma|drop|alter|truncate|limit|offset|order\s+by|group\s+by|create\s+(?:table|index|view))\b/i
+
+/**
+ * True when a quoted source literal can plausibly be an HTTP route path. Rejects SQL/query fragments,
+ * prose, and other non-path literals while keeping framework token shapes (`:id`, `{id}`, `[id]`).
+ */
+export function isPathLikeRouteLiteral(raw: string): boolean {
+  const literal = raw.trim()
+  if (!literal || literal.length > 300) return false
+  if (/\s/.test(literal)) return false
+  if (/[<>\\"'`]/.test(literal)) return false
+  if (/[?#=;,()]/.test(literal)) return false
+  if (literal.startsWith('//')) return false
+  if (!/^\/?[A-Za-z0-9._~:/@{}\[\]-]+$/.test(literal)) return false
+  if (SQL_ROUTE_FRAGMENT_RE.test(literal)) return false
+  return true
+}
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.next', 'dist', 'build', 'out', 'coverage',
   'vendor', '__pycache__', '.venv', 'venv', 'target', '.gradle', '.idea',
@@ -352,6 +374,7 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
     if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
       const isFastify = /\bfastify\b/i.test(code)
       for (const m of code.matchAll(/\b(?:app|router|fastify|server|api)\.(get|post|put|patch|delete|options|head|all)\s*\(\s*['"`]([^'"`\r\n]+)['"`]/gi)) {
+        if (!isPathLikeRouteLiteral(m[2])) continue
         const method = m[1].toUpperCase() === 'ALL' ? 'GET' : m[1].toUpperCase()
         const pathTemplate = normalizeRouteTemplate(m[2])
         const line = lineNumberAt(code, m.index ?? 0)
@@ -2016,6 +2039,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const jsQueue: string[] = []
     const jsPageByScript = new Map<string, string>()
     const discoveredCandidatePaths: string[] = []
+    const discoveredTemplates: string[] = []
+    const idsByCollection = new Map<string, string[]>()
     const jsonDocCandidates: string[] = []
     const navSeeds: Array<{ path: string; depth: number }> = []
     const writeOnlyPaths = new Set<string>()
@@ -2149,6 +2174,31 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const queueJsonDoc = (cleanPath: string) => {
       if (jsonDocCandidates.length >= 8 || jsonDocCandidates.includes(cleanPath)) return
       jsonDocCandidates.push(cleanPath)
+    }
+
+    // Queue a read-only route harvested from a route map, OpenAPI document, JS bundle or navigation
+    // payload for a bounded confirmation probe. Templated routes are kept apart so they are probed
+    // with concrete ids harvested from their collection, never with a placeholder literal.
+    const queueDiscoveredRoute = (method: string, rawPath: string): void => {
+      const verb = method.toUpperCase()
+      if (verb !== 'GET' && verb !== 'HEAD') return
+      const bare = rawPath.trim()
+      const clean = bare.startsWith('/') && !bare.startsWith('//') && !/[\r\n\0\\]/.test(bare)
+        ? (bare.split('?')[0] || '/')
+        : sanitizePathCandidate(rawPath, origin)
+      if (!clean || clean === '/' || STATIC_ASSET_RE.test(clean)) return
+      if (/[:{}[\]]/.test(clean.split('?')[0] ?? '')) {
+        const template = normalizeDiscoveryTemplate(clean)
+        if (discoveredTemplates.length < 24 && !discoveredTemplates.includes(template)) {
+          discoveredTemplates.push(template)
+          // The collection that produces ids for the detail route is worth probing on its own.
+          const base = template.replace(/\/:[A-Za-z_][A-Za-z0-9_-]*.*$/, '')
+          if (base && base !== template && !/[:{}[\]]/.test(base)) queueDiscoveredRoute('GET', base)
+        }
+        return
+      }
+      if (discoveredCandidatePaths.length >= 40 || discoveredCandidatePaths.includes(clean)) return
+      discoveredCandidatePaths.push(clean)
     }
 
     const queueJsChunk = (specifier: string, fromPath = '/') => {
@@ -2316,6 +2366,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
         endpointsDiscovered += parsed.endpoints
         paramsDiscovered += parsed.params
+        if (parsed.endpoints > 0) {
+          const specDoc = parseJsonOrYaml(ex.body)
+          if (specDoc && typeof specDoc === 'object') {
+            for (const entry of harvestRouteMapDocument(specDoc).slice(0, 120)) {
+              queueDiscoveredRoute(entry.method, entry.path)
+            }
+          }
+        }
         if (parsed.endpoints === 0) {
           // Swagger-less API index documents are handled by the structural route-map expander.
           const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
@@ -2348,7 +2406,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
               for (const entry of entries) {
                 const tmpl = normalizeDiscoveryTemplate(entry.path)
                 if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
-                else if (entry.method === 'GET' && !/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+                else if (entry.method === 'GET') {
+                  queueDiscoveredRoute(entry.method, entry.path)
+                  if (!/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+                }
               }
             }
           } catch { /* not a route map */ }
@@ -2410,6 +2471,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           dynamicParams.add(bk)
           paramsDiscovered += 1
         }
+        queueDiscoveredRoute(method, clean)
         return ep.id
       }
 
@@ -2529,7 +2591,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         for (const entry of entries) {
           const tmpl = normalizeDiscoveryTemplate(entry.path)
           if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
-          else if (entry.method === 'GET' && !/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+          else if (entry.method === 'GET') {
+            queueDiscoveredRoute(entry.method, entry.path)
+            if (!/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+          }
         }
       }
       for (const asset of extractAssetReferences(ex.body)) {
@@ -2574,48 +2639,112 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
-    // 2d. Bounded probe of top discovered high-signal links (strictly within perOriginCap)
-    for (const candidate of discoveredCandidatePaths.slice(0, 12)) {
-      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
-      if (candidate === '/' || STATIC_ASSET_RE.test(candidate)) continue
+    // 2c-bis. Parent-route derivation: a documented subresource (`/api/reports/summary`) implies its
+    // parent resource (`/api/reports`). Bounded to a handful of read-only confirmation probes; the
+    // soft-404 calibration below filters SPA catch-all responses.
+    const parentProbes: string[] = []
+    for (const candidatePath of [...discoveredCandidatePaths, ...discoveredTemplates]) {
+      const bare = (candidatePath.split('?')[0] || '/').replace(/\/+$/, '')
+      const segments = bare.split('/').filter(Boolean)
+      if (segments.length < 3) continue
+      const parent = `/${segments.slice(0, -1).join('/')}`
+      if (/[:{}[\]]/.test(parent)) continue
+      if (parentProbes.includes(parent) || discoveredCandidatePaths.includes(parent)) continue
+      parentProbes.push(parent)
+      if (parentProbes.length >= 6) break
+    }
+
+    // 2d-cal. Extend soft-404 calibration under the discovered API prefix: many SPAs answer unknown
+    // `/api/*` paths with the same HTML shell (HTTP 200) as unknown top-level routes, while real API
+    // routes answer JSON. Two extra probes keep this a cheap confirmation.
+    if (softCalibration && !originHalted && !signal.aborted && originUsed + 2 <= perOriginCap - 8) {
+      const prefixCounts = new Map<string, number>()
+      for (const candidatePath of [...discoveredCandidatePaths, ...discoveredTemplates]) {
+        const prefixMatch = /^\/((?:api|rest|graphql|internal|v\d+)(?:\/v\d+)?)\//i.exec(candidatePath)
+        if (!prefixMatch) continue
+        const prefix = `/${prefixMatch[1]}`
+        prefixCounts.set(prefix, (prefixCounts.get(prefix) ?? 0) + 1)
+      }
+      const apiPrefix = [...prefixCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
+      if (apiPrefix) {
+        for (let i = 0; i < 2; i += 1) {
+          const ex = await safeGet(`${apiPrefix}/.guardian-cal-${randomUUID().replace(/-/g, '').slice(0, 12)}`)
+          if (!ex) continue
+          softCalibration.statuses.push(ex.status)
+          softCalibration.mediaTypes.push(ex.mediaType)
+          softCalibration.lengths.push(ex.body.length)
+          softCalibration.signatures.push(bodyStructuralSignature(ex.body))
+        }
+      }
+    }
+
+    // 2d. Bounded probe of discovered route candidates (links, route maps, JS-AST/OpenAPI paths).
+    // Strictly within perOriginCap; template routes are probed later with concrete ids.
+    const probeDiscovered = async (candidate: string): Promise<void> => {
+      if (originHalted || originUsed >= perOriginCap || signal.aborted) return
+      if (candidate === '/' || STATIC_ASSET_RE.test(candidate)) return
       const ex = await safeGet(candidate)
       // 401/403/405 means the route exists but is gated or method-restricted: still part of the surface.
       if (ex && softNotFoundResponse(ex)) {
         soft404Rejected += 1
-        continue
+        return
       }
-      if (ex && (ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405)) {
-        const ep = recordEndpoint('GET', candidate, 'surface_probe')
-        paramsDiscovered += recordQueryParamsForEndpoint({
-          rawPathAndQuery: candidate, origin, endpointId: ep.id, source: 'phase0_html',
-          storage, runId, dynamicParams,
-        })
-        if (ex.status < 400 && /<html\b|<input\b|<form\b/i.test(ex.body)) {
-          const parsed = extractHtmlLinksAndScripts(ex.body, origin)
-          for (const inp of parsed.inputs.slice(0, 8)) {
-            if (inp.type && /^(?:hidden|submit|button|reset|checkbox|radio|file|image)$/i.test(inp.type)) continue
-            storage.upsertEndpointParam({
-              runId,
-              endpointId: ep.id,
-              name: inp.name,
-              location: 'query',
-              isCsrf: CSRF_PARAM_RE.test(inp.name),
-              isObjectId: OBJECT_ID_PARAM_RE.test(inp.name),
-              source: 'phase0_html',
-            })
-            dynamicParams.add(inp.name)
-            paramsDiscovered += 1
-          }
-          for (const s of parsed.scripts) {
-            queueJsChunk(s, candidate)
-            jsPageByScript.set(s, candidate)
-          }
-          for (const asset of extractAssetReferences(ex.body)) {
-            if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
-            else queueJsChunk(asset, candidate)
-          }
+      if (!ex || !(ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405)) return
+      const ep = recordEndpoint('GET', candidate, 'surface_probe')
+      paramsDiscovered += recordQueryParamsForEndpoint({
+        rawPathAndQuery: candidate, origin, endpointId: ep.id, source: 'phase0_html',
+        storage, runId, dynamicParams,
+      })
+      if (ex.status >= 400) return
+      if (/json/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body.slice(0, 64))) {
+        // Collection listings seed concrete ids for templated detail routes.
+        const ids = extractJsonRecordIds(ex.body)
+        if (ids.length > 0) {
+          idsByCollection.set(normalizeDiscoveryTemplate(candidate.split('?')[0] || '/'), ids)
+        }
+        for (const link of extractJsonLinkTargets(ex.body, origin).slice(0, 8)) {
+          queueDiscoveredRoute('GET', link)
         }
       }
+      if (/<html\b|<input\b|<form\b/i.test(ex.body)) {
+        const parsed = extractHtmlLinksAndScripts(ex.body, origin)
+        for (const inp of parsed.inputs.slice(0, 8)) {
+          if (inp.type && /^(?:hidden|submit|button|reset|checkbox|radio|file|image)$/i.test(inp.type)) continue
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: inp.name,
+            location: 'query',
+            isCsrf: CSRF_PARAM_RE.test(inp.name),
+            isObjectId: OBJECT_ID_PARAM_RE.test(inp.name),
+            source: 'phase0_html',
+          })
+          dynamicParams.add(inp.name)
+          paramsDiscovered += 1
+        }
+        for (const s of parsed.scripts) {
+          queueJsChunk(s, candidate)
+          jsPageByScript.set(s, candidate)
+        }
+        for (const asset of extractAssetReferences(ex.body)) {
+          if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+          else queueJsChunk(asset, candidate)
+        }
+      }
+    }
+
+    const navSeedPaths = new Set(navSeeds.slice(0, 32).map(seed => seed.path))
+    for (const candidate of [...new Set(discoveredCandidatePaths)].slice(0, 20)) {
+      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
+      // Route-map/HTML candidates are also navigation seeds; let the navigation pass probe them so
+      // observed listing fields still seed sibling write endpoints.
+      if (navSeedPaths.has(candidate)) continue
+      await probeDiscovered(candidate)
+    }
+    for (const parent of parentProbes) {
+      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
+      if (navSeedPaths.has(parent)) continue
+      await probeDiscovered(parent)
     }
 
     // 2d-bis. Authenticated JSON navigation: follow HATEOAS links found in API responses and infer
@@ -2688,6 +2817,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       }
       const ids = extractJsonRecordIds(ex.body)
+      if (ids.length > 0) idsByCollection.set(normalizeDiscoveryTemplate(bare), ids)
+      if (ids.length > 0 && item.depth === 0 && navQueue.length < 72 &&
+          /"(?:items|data|results|rows|records|list|values)"\s*:\s*\[/.test(ex.body)) {
+        // Collections without a documented detail template still imply `collection/:id` reads; probe
+        // one concrete id (never a placeholder) so undocumented detail routes become visible.
+        navQueue.push({ path: `${bare.replace(/\/+$/, '')}/${encodeURIComponent(ids[0]!)}`, depth: item.depth + 1 })
+      }
       if (ids.length === 0 || item.depth >= 2) continue
       // Subresource templates (…/:id/view, …/:id/notes) imply the parent detail route; walk it too.
       const detailTemplates = new Set(navGetTemplates)
@@ -2708,6 +2844,23 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             depth: item.depth + 1,
           })
         }
+      }
+    }
+
+    // 2d-bis. Templated entry routes: probe with concrete ids harvested from their collection
+    // listings (never with placeholder literals). This is what turns a route-map `…/:id` entry into a
+    // confirmed live route; the remaining budget slice is reserved by the navigation cap above.
+    let templateProbes = 0
+    for (const template of [...new Set(discoveredTemplates)]) {
+      if (templateProbes >= 8 || originHalted || originUsed >= perOriginCap || signal.aborted) break
+      const templateMatch = /^(.*?)\/:[A-Za-z_][A-Za-z0-9_-]*(.*)$/.exec(template)
+      if (!templateMatch) continue
+      const [, base = '', rest = ''] = templateMatch
+      const ids = idsByCollection.get(normalizeDiscoveryTemplate(base)) ?? []
+      for (const id of ids.slice(0, 2)) {
+        if (templateProbes >= 8 || originHalted || originUsed >= perOriginCap || signal.aborted) break
+        templateProbes += 1
+        await probeDiscovered(`${base}/${encodeURIComponent(id)}${rest}`)
       }
     }
 
@@ -2797,23 +2950,35 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2e. Optional browser SPA crawl when caller supplies ScopedBrowser and budget remains
     const remainingForCrawl = perOriginCap - originUsed
     if (params.browser && !originHalted && !signal.aborted && remainingForCrawl >= 2 && grant.canRead(origin)) {
+      let browserExchanges = 0
       const crawlRes = await crawlStateGraph({
         storage,
         runId,
         scopeRevision,
         origin,
         personas: params.personas,
-        maxPages: Math.min(25, remainingForCrawl),
+        maxPages: Math.min(10, Math.max(1, Math.floor(remainingForCrawl / 2))),
         maxDepth: 3,
         budgetRemaining: remainingForCrawl,
         browser: params.browser,
         grant,
         signal,
         assignmentId: params.assignmentId,
+        onExchange: ex => {
+          browserExchanges += 1
+          originUsed += 1
+          requestsUsed += 1
+          return params.onExchange?.(ex)
+        },
       })
       endpointsDiscovered += crawlRes.endpointsDiscovered
       paramsDiscovered += crawlRes.paramsDiscovered
-      requestsUsed += crawlRes.pagesVisited
+      routeMapEndpoints += crawlRes.routeMapEndpoints ?? 0
+      // Browser traffic is accounted per accepted exchange above; page visits that produced no
+      // recorded exchange still consumed a broker call.
+      const unaccountedPages = Math.max(0, crawlRes.pagesVisited - browserExchanges)
+      originUsed += unaccountedPages
+      requestsUsed += unaccountedPages
     }
     // 2f. Infer producer-consumer api_dependencies edges from discovered collection -> item endpoints
     try {
@@ -2926,6 +3091,12 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
   let pagesVisited = 0
   let endpointsDiscovered = 0
   let paramsDiscovered = 0
+  let routeMapEndpoints = 0
+  const crawlDynamicPaths = new Set<string>()
+  const crawlDynamicParams = new Set<string>()
+  const idsByCollection = new Map<string, string[]>()
+  const parsedXhrDocuments = new Set<string>()
+  const crawlTemplates = new Set<string>()
   const storageKeySet = new Set<string>()
   let hasPostMessageListener = false
   const personasCrawled: string[] = []
@@ -3017,6 +3188,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
           runId,
           assignmentId: params.assignmentId,
           waitAfterLoadMs: 120,
+          ...(params.onExchange ? { onExchange: params.onExchange } : {}),
         }, grant, signal)
       } catch (err) {
         if (err instanceof BrokerCircuitOpen) {
@@ -3088,6 +3260,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       // Record intercepted XHR / fetch / WebSocket / GraphQL / Next-Action calls, including query
       // parameters and (when the browser record exposes it) request-body shape.
       const intercepted = [...visit.xhrRequests, ...(visit.allRequests ?? [])]
+      const pageDocs: Array<{ entries: RouteMapEntry[]; ids: string[]; links: string[]; detailPaths: string[] }> = []
       for (const req of intercepted) {
         if (req.origin !== normalizedOrigin) continue
         if (!['xhr', 'fetch', 'websocket'].includes(req.resourceType) && !/\/api\/|\/graphql|\/trpc/i.test(req.url)) {
@@ -3095,6 +3268,44 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         }
         const clean = sanitizePathCandidate(req.url, normalizedOrigin)
         if (!clean || STATIC_ASSET_RE.test(clean)) continue
+        // Same-origin JSON bodies captured by the scoped browser may be route maps/config tables or
+        // navigation listings: expand them structurally instead of only recording the call itself.
+        const bodyPreview = (req as { bodyPreview?: string }).bodyPreview
+        if (bodyPreview) {
+          const docKey = `${clean.split('?')[0]}|${bodyPreview.length}|${bodyPreview.slice(0, 48)}`
+          if (!parsedXhrDocuments.has(docKey) &&
+              (/json|yaml/i.test(req.mediaType ?? '') || /^\s*[{[]/.test(bodyPreview.slice(0, 64)))) {
+            parsedXhrDocuments.add(docKey)
+            const doc = parseJsonOrYaml(bodyPreview)
+            if (doc && typeof doc === 'object') {
+              const expanded = parseRouteMapDoc(
+                bodyPreview, normalizedOrigin, storage, runId, scopeRevision, crawlDynamicPaths, crawlDynamicParams,
+              )
+              endpointsDiscovered += expanded.endpoints
+              paramsDiscovered += expanded.params
+              routeMapEndpoints += expanded.endpoints
+              const ids = extractJsonRecordIds(bodyPreview)
+              const entries = harvestRouteMapDocument(doc).slice(0, 120)
+              const isCollection = /"(?:items|data|results|rows|records|list|values)"\s*:\s*\[/.test(bodyPreview)
+              pageDocs.push({
+                entries,
+                ids,
+                links: extractJsonLinkTargets(bodyPreview, normalizedOrigin),
+                detailPaths: isCollection && ids[0]
+                  ? [`${(clean.split('?')[0] || '/').replace(/\/+$/, '')}/${encodeURIComponent(ids[0])}`]
+                  : [],
+              })
+              for (const entry of entries) {
+                if (entry.method !== 'GET' && entry.method !== 'HEAD') continue
+                const tmpl = normalizeDiscoveryTemplate(entry.path)
+                if (/:[A-Za-z_][A-Za-z0-9_-]*/.test(tmpl)) crawlTemplates.add(tmpl)
+              }
+              if (ids.length > 0) {
+                idsByCollection.set(normalizeDiscoveryTemplate(clean.split('?')[0] || '/'), ids)
+              }
+            }
+          }
+        }
         const record = req as { body?: unknown; postData?: unknown }
         const rawBody = typeof record.body === 'string' ? record.body : typeof record.postData === 'string' ? record.postData : null
         const shape = inferXhrRequestShape({ url: req.url, method: req.method, body: rawBody })
@@ -3180,11 +3391,30 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
 
       // Enqueue same-origin links strictly within maxDepth
       if (next.depth < maxDepth) {
-        for (const href of visit.links) {
-          const clean = sanitizePathCandidate(href, normalizedOrigin)
-          if (!clean || STATIC_ASSET_RE.test(clean)) continue
-          if (!visitedForPersona.has(clean)) {
-            queue.push({ pathAndQuery: clean, depth: next.depth + 1 })
+        const enqueuePath = (rawPath: string) => {
+          const clean = sanitizePathCandidate(rawPath, normalizedOrigin)
+          if (!clean || STATIC_ASSET_RE.test(clean)) return
+          if (!visitedForPersona.has(clean)) queue.push({ pathAndQuery: clean, depth: next.depth + 1 })
+        }
+        for (const href of visit.links) enqueuePath(href)
+        // JSON navigation/detail responses: follow HATEOAS links and walk collection ids into the
+        // templated detail routes the same documents advertise.
+        for (const doc of pageDocs) {
+          for (const link of doc.links.slice(0, 8)) enqueuePath(link)
+          for (const detailPath of doc.detailPaths) enqueuePath(detailPath)
+          for (const entry of doc.entries) {
+            if (entry.method !== 'GET' && entry.method !== 'HEAD') continue
+            const tmpl = normalizeDiscoveryTemplate(entry.path)
+            if (!/:|\{/.test(tmpl)) { enqueuePath(entry.path); continue }
+          }
+        }
+        // Templates learned on an earlier page become probeable once a listing supplied record ids.
+        for (const tmpl of crawlTemplates) {
+          const templateMatch = /^(.*?)\/:[A-Za-z_][A-Za-z0-9_-]*(.*)$/.exec(tmpl)
+          if (!templateMatch) continue
+          const [, base = '', rest = ''] = templateMatch
+          for (const id of (idsByCollection.get(normalizeDiscoveryTemplate(base)) ?? []).slice(0, 2)) {
+            enqueuePath(`${base}/${encodeURIComponent(id)}${rest}`)
           }
         }
       }
@@ -3204,6 +3434,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     storageKeys: [...storageKeySet],
     hasPostMessageListener,
     personasCrawled,
+    routeMapEndpoints,
     ...(stoppedReason ? { stoppedReason } : {}),
   }
 }
