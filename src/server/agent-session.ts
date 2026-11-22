@@ -2615,6 +2615,8 @@ export interface RunAgentSessionOptions {
   beforeCall?: () => void
   onUsage?: UsageCallback
   onTurn?: (turn: number, maxTurns: number, settling: boolean) => void
+  /** Executed before each model request; return extra user messages (e.g. a <board_delta> block). */
+  onTurnStart?: (turn: number, maxTurns: number) => { messages?: readonly string[] } | void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
 }
@@ -2722,16 +2724,23 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const hooks = [
     hook(GenerationTask, {
       beforeRequest(request) {
-        if (!isSettling()) return undefined
-        const settlementBanner = [
-          `[GUARDIAN SETTLEMENT NOTICE — Turn ${turnsUsed}/${maxTurns}]`,
-          'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
-          'Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding, and (4) call complete_intent with your final status and summary.',
-        ].join(' ')
+        const turnStart = options.onTurnStart?.(turnsUsed + 1, maxTurns)
+        const extraMessages = (turnStart?.messages ?? []).map(content => ({
+          role: 'user' as const, content, timestamp: Date.now(),
+        }))
+        if (isSettling()) {
+          const settlementBanner = [
+            `[GUARDIAN SETTLEMENT NOTICE — Turn ${turnsUsed}/${maxTurns}]`,
+            'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
+            'Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding, and (4) call complete_intent with your final status and summary.',
+          ].join(' ')
+          extraMessages.push({ role: 'user' as const, content: settlementBanner, timestamp: Date.now() })
+        }
+        if (!extraMessages.length) return undefined
         return {
           messages: [
             ...request.messages,
-            { role: 'user' as const, content: settlementBanner, timestamp: Date.now() },
+            ...extraMessages,
           ],
         }
       },
