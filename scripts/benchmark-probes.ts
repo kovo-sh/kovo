@@ -54,6 +54,8 @@ export interface Hypothesis {
   location?: SurfaceParamLocation
   /** Method used for the probe/replay (body locations imply a write method). */
   method: 'GET' | 'POST' | 'PUT' | 'PATCH'
+  /** DELETE endpoints keep `method` POST for spec compatibility but probe the real verb. */
+  deleteMethod?: boolean
   /** Plant on a write endpoint, then re-read listing/detail routes for stored reflection. */
   secondOrder?: boolean
   readPaths?: string[]
@@ -67,6 +69,16 @@ export interface Hypothesis {
   producerBody?: Record<string, unknown>
   /** Race: sibling producer route that mints a single-use value for the consume parameter. */
   raceProducerPath?: string
+  /** Race: `single_use` mints a value; `balance` overspends a read-then-write balance/stock. */
+  raceMode?: 'single_use' | 'balance'
+  /** Race: collection/detail route that exposes the balance/stock being spent. */
+  raceResourcePath?: string
+  /** Race: create route used to mint a fresh resource (cart) before the burst. */
+  raceCreatePath?: string
+  /** CSRF: create-style mutation whose read-back is the created object's detail route. */
+  csrfCreate?: boolean
+  /** Full merged surface used to form this hypothesis (detail/config routes may be surface extras). */
+  knownEndpoints?: readonly DiscoveredEndpoint[]
   /** Server action invoked through a framework RPC route with a positional/JSON body. */
   serverAction?: boolean
   /** Test URL-query-driven DOM sinks on a rendered page (no form interaction needed). */
@@ -96,7 +108,7 @@ const privilegedPath = /(admin|internal|manage|staff|superuser|privileged|permis
 /** Parameters that name a file or path handled by a download/export/serve route. */
 const fileParam = /^(?:file|filename|filepath|file_name|logfile|log_file|log|name|path|download|export|doc|document|attachment|resource|target)$/i
 /** Parameters that plausibly reach a shell/OS command interpreter. */
-const shellParam = /(host|hostname|ip|addr|domain|target|cmd|command|exec|shell|run|ping|diag|lookup|resolve|nslookup|whois)/i
+const shellParam = /\b(?:host|hostname|ip|addr|domain|target|cmd|command|exec|shell|run|ping|diag|lookup|resolve|nslookup|whois)\b/i
 const shellPath = /(ping|diagnostic|exec|command|shell|health|resolve|lookup|whois|dns|system)/i
 /** Single-use value parameters (voucher/coupon/token style) for race testing. */
 const singleUseParam = /^(?:code|voucher|coupon|token|key|secret|invite|promo|gift|redeem|nonce|otp|passcode|ticket)$/i
@@ -123,6 +135,8 @@ const redirectPathHint = /(sso|oauth|authorize|callback|redirect|return|login|lo
 const maxCsrfHypotheses = 6
 const maxWebhookHypotheses = 4
 const maxRedirectHypotheses = 16
+const maxRaceHypotheses = 8
+const maxGraphqlHypotheses = 5
 
 /**
  * Query/body parameters for routes whose parameter names the surface did not expose (server-rendered
@@ -130,7 +144,7 @@ const maxRedirectHypotheses = 16
  * the vocabulary applications actually use for that shape; every candidate is still verified by a
  * differential, so a wrong guess costs a bounded request and never produces a signal on its own.
  */
-export type InferredPurpose = 'search' | 'file' | 'url' | 'command' | 'text' | 'template'
+export type InferredPurpose = 'search' | 'file' | 'url' | 'command' | 'text' | 'template' | 'number'
 export interface InferredParam extends DiscoveredParam { purpose?: InferredPurpose }
 
 const searchRouteHint = /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|saved-?views?)(?:$|[/_.-])/i
@@ -206,6 +220,11 @@ export function inferredBodyParams(ep: DiscoveredEndpoint): InferredParam[] {
   else if (commandRouteHint.test(path)) push('command', commandNamesFor(path))
   else if (searchRouteHint.test(path) || /^(?:run|filter|search|query)$/i.test(last)) {
     push('search', ['filter', 'expr', 'clause', 'q', 'query', 'term', 'since'])
+  } else if (/(?:refund|credit|payment|payout|charge|withdraw|spend|redeem|transfer)/i.test(path)) {
+    // Money-moving writes read a numeric amount from the body even when recon never exposed fields.
+    push('number', ['amount', 'amountCents', 'value', 'total', 'price'])
+  } else if (/(?:checkout|order|cart|purchase|reserve|inventory|stock)/i.test(path)) {
+    push('number', ['quantity', 'qty', 'itemQty', 'productId', 'amount'])
   } else if (textSinkRoute.test(path)) push('text', ['body', 'text', 'content', 'message', 'note', 'comment', 'author'])
   else if (templateRouteHint.test(path)) push('template', ['template', 'layout', 'source'])
   else if (/^(?:PATCH|PUT)$/i.test(ep.method)) push('text', textFieldNamesFor(path))
@@ -319,19 +338,23 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     const key = `${h.probeClass}|${h.endpoint.method}|${h.endpoint.path}|${h.param?.name ?? ''}|${h.location ?? ''}`
     if (seen.has(key)) return
     seen.add(key)
-    hypotheses.push({ ...h, key })
+    hypotheses.push({ ...h, key, knownEndpoints: endpoints })
   }
 
   const getPaths = [...new Set(endpoints.filter(e => e.method.toUpperCase() === 'GET' || e.method.toUpperCase() === 'HEAD').map(e => e.path))]
   const writeProbeSeen = new Set<string>()
   const cacheCandidates: DiscoveredEndpoint[] = []
-  let csrfHypotheses = 0
-  let webhookHypotheses = 0
   let redirectHypotheses = 0
   let inferredGroups = 0
+  let textFieldHypotheses = 0
   let massHypotheses = 0
   let filterAuthzHypotheses = 0
+  let secretHypotheses = 0
   const pageCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
+  const csrfCandidates: Array<{ ep: DiscoveredEndpoint; readPath: string | null; create: boolean; score: number }> = []
+  const webhookCandidates: Array<{ ep: DiscoveredEndpoint; score: number }> = []
+  const raceCandidates: Array<{ ep: DiscoveredEndpoint; param: DiscoveredParam; createPath?: string; resourcePath?: string; mode: 'single_use' | 'balance'; score: number }> = []
+  const graphqlCandidates: DiscoveredEndpoint[] = []
   const inferredPurpose = (p: DiscoveredParam): InferredPurpose | undefined => (p as InferredParam).purpose
 
   for (const ep of endpoints) {
@@ -344,8 +367,22 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     const inferred: InferredParam[] = []
     if (isGet && !params.some(p => p.location === 'query')) inferred.push(...inferredQueryParams(ep))
     if (!isGet && !params.some(p => p.location === 'json' || p.location === 'form' || p.location === 'xml' || p.location === 'graphql_var')) inferred.push(...inferredBodyParams(ep))
-    const allowInferred = caps.newProbeClasses && inferredGroups < maxInferredParamGroups
-    const effectiveParams: DiscoveredParam[] = [...params, ...(allowInferred ? inferred : [])]
+    // Rendered-resource updates often expose only some fields; the descriptive field that feeds the
+    // downstream card is frequently omitted. Add one text candidate so stored XSS can be tested.
+    const inferredText: InferredParam[] = []
+    if (!isGet && (method === 'PATCH' || method === 'PUT') && textFieldHypotheses < 12 &&
+        !params.some(p => /(?:description|content|note|text|body|comment|message)/i.test(p.name))) {
+      const candidate = textFieldNamesFor(ep.path).find(name => !params.some(p => p.name === name))
+      if (candidate) {
+        inferredText.push({ name: candidate, location: 'json', isObjectId: false, isCsrf: false, purpose: 'text' })
+        textFieldHypotheses += 1
+      }
+    }
+    // Action-shaped routes (money, checkout, settings) need body-field inference even after the
+    // generic inferred-parameter budget is spent: they are the inputs for CSRF/race probes.
+    const actionShaped = /(refund|credit|payment|payout|charge|withdraw|spend|redeem|transfer|checkout|cart|order|settings|profile|account|webhook|invite|approve|confirm|trigger|avatar|photos?|images?|integrations?|import|fetch)/i.test(ep.path)
+    const allowInferred = caps.newProbeClasses && (inferredGroups < maxInferredParamGroups || actionShaped)
+    const effectiveParams: DiscoveredParam[] = [...params, ...inferredText, ...(allowInferred ? inferred : [])]
     if (allowInferred && inferred.length > 0) inferredGroups += 1
     const injectParams = effectiveParams.filter(p => !protocolParam.test(p.name)).slice(0, maxInjectionParamsPerEndpoint)
     const readPaths = !isGet ? secondOrderReadPaths(ep.path, getPaths) : []
@@ -380,6 +417,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     if ((pathHasPlaceholder && !serverActionPath.test(ep.path)) || (idParam && idParam.location === 'query')) {
       add({
         endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep),
+        ...(!isGet && method === 'DELETE' ? { deleteMethod: true } : {}),
         ...(!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder ? { writePathRead: true } : {}),
       })
     }
@@ -404,12 +442,24 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       }
       filterAuthzHypotheses += 1
     }
+    // Non-entitled secret exposure: auth-ish collection/detail reads are scanned for tenant secret
+    // markers by a viewer-role actor while an anonymous control proves the route is guarded.
+    if (caps.newProbeClasses && isGet && secretHypotheses < 10 &&
+        /(?:api[-_]?keys?|apikeys|secret|token|credential|audit|settings|config|billing|integration)/i.test(ep.path) &&
+        !graphqlPath.test(ep.path)) {
+      const key = `secret_scan|${ep.path}`
+      if (!writeProbeSeen.has(key)) {
+        writeProbeSeen.add(key)
+        add({ endpoint: ep, probeClass: 'authz_matrix', method: 'GET' })
+        secretHypotheses += 1
+      }
+    }
     // Function-level authorization: a privileged mutating verb invoked by a lower-privilege actor.
     // Placeholder server-action ids (framework RPC ids that are not on the surface) cannot be invoked
     // meaningfully; only concrete action routes are probed.
     const concreteServerAction = serverActionPath.test(ep.path) && !pathHasPlaceholder
     if (caps.newProbeClasses && !isGet && (privilegedPath.test(ep.path) || concreteServerAction)) {
-      add({ endpoint: ep, probeClass: 'authz_matrix', method: writeMethod(ep), ...(concreteServerAction ? { serverAction: true } : {}) })
+      add({ endpoint: ep, probeClass: 'authz_matrix', method: writeMethod(ep), ...(method === 'DELETE' ? { deleteMethod: true } : {}), ...(concreteServerAction ? { serverAction: true } : {}) })
     }
 
     for (const p of injectParams) {
@@ -417,6 +467,8 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         encodingSkips.push({ path: ep.path, location: p.location })
         continue
       }
+      // Numeric amount/quantity candidates exist for race budgeting, not as injection sinks.
+      if (inferredPurpose(p) === 'number') continue
       const location = p.location as SurfaceParamLocation
       const purpose = inferredPurpose(p)
       const pMethod: Hypothesis['method'] = location === 'query' || location === 'path' || location === 'header' ? (isGet ? 'GET' : writeMethod(ep)) : writeMethod(ep)
@@ -475,10 +527,10 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       add({ endpoint: ep, probeClass: 'path_traversal_benign', param: fileP, location: fileP.location as SurfaceParamLocation, method: 'GET' })
     }
     if (graphqlPath.test(ep.path) || ep.source === 'graphql') {
-      const key = `graphql_audit|${ep.path}`
-      if (!writeProbeSeen.has(key)) {
+      const key = `graphql|${ep.path}`
+      if (!writeProbeSeen.has(key) && graphqlCandidates.length < maxGraphqlHypotheses) {
         writeProbeSeen.add(key)
-        add({ endpoint: ep, probeClass: 'graphql_audit', method: 'POST' })
+        graphqlCandidates.push(ep)
       }
     }
     // Step-skip: a later transition verb on an object id whose creator route is a sibling POST.
@@ -496,22 +548,43 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         add({ endpoint: ep, probeClass: 'workflow_invariant', method: writeMethod(ep), createPath: creatorPath, producerBody })
       }
     }
-    if (workflowPath.test(ep.path)) add({ endpoint: ep, probeClass: 'workflow_invariant', method: isGet ? 'GET' : writeMethod(ep) })
-    // Race: a single-use value parameter consumed by this write. Prefer a sibling producer route.
-    // Restrict to consumption semantics so credential/account writes are never raced.
-    const raceablePath = /(redeem|claim|consume|spend|credit|voucher|coupon|apply|activate|transfer|withdraw|checkout|order|purchase|grant)/i
-    if (!isGet && raceablePath.test(ep.path)) {
-      const consume = params.find(p => singleUseParam.test(p.name) && (p.location === 'json' || p.location === 'form' || p.location === 'query'))
+    if (workflowPath.test(ep.path)) {
+      const qtyField = effectiveParams.find(p =>
+        /^(?:qty|quantity|itemQty|count|seats?|amount)$/i.test(p.name) && (p.location === 'json' || p.location === 'form'),
+      )
+      add({ endpoint: ep, probeClass: 'workflow_invariant', method: isGet ? 'GET' : writeMethod(ep), ...(qtyField ? { quantityField: qtyField.name } : {}) })
+    }
+    // Race: a single-use value or a read-then-write balance/stock consumed by this write. Prefer a
+    // sibling producer (mint) route; balance mode reads the resource/detail route instead.
+    const raceablePath = /(redeem|claim|consume|spend|credit|voucher|coupon|apply|activate|transfer|withdraw|checkout|purchase|refund|reserve|oversell|overspend)/i
+    if (!isGet && method === 'POST' && raceablePath.test(ep.path)) {
+      const singleUse = effectiveParams.find(p => singleUseParam.test(p.name) && (p.location === 'json' || p.location === 'form' || p.location === 'query'))
+      const numeric = effectiveParams.find(p => /^(?:amount|amount_?cents|qty|quantity|count|value|total|price)$/i.test(p.name) &&
+        (p.location === 'json' || p.location === 'form' || p.location === 'query'))
+      const consume = singleUse ?? numeric
       if (consume) {
-        const segs = ep.path.split('/').filter(Boolean)
-        const parentPath = `/${segs.slice(0, -1).join('/')}`
+        const segs = ep.path.split('?')[0].split('/').filter(Boolean)
+        const parentPath = segs.length > 1 ? `/${segs.slice(0, -1).join('/')}` : null
         const siblings = endpoints.filter(e => e.method.toUpperCase() === 'POST' && e.path !== ep.path &&
-          e.path.split('/').filter(Boolean).slice(0, -1).join('/') === segs.slice(0, -1).join('/'))
-        const producer = siblings.find(e => /(voucher|coupon|mint|create|issue|generate|invite|token|credit|key)s?$/i.test(e.path)) ?? siblings[0]
-        add({
-          endpoint: ep, probeClass: 'race_burst', param: consume, location: consume.location as SurfaceParamLocation,
-          method: writeMethod(ep), ...(producer ? { raceProducerPath: producer.path } : { raceProducerPath: parentPath }),
-        })
+          e.path.split('?')[0].split('/').filter(Boolean).slice(0, -1).join('/') === segs.slice(0, -1).join('/'))
+        const producer = siblings.find(e => /(voucher|coupon|mint|create|issue|generate|invite|token|credit|key|cart)s?$/i.test(e.path))
+        const resource = parentPath ? getPaths.filter(p => p === parentPath || (hasPathPlaceholder(p) && p.split('/').slice(0, -1).join('/') === parentPath)).sort((a, b) => Number(hasPathPlaceholder(b)) - Number(hasPathPlaceholder(a)))[0] : undefined
+        const mode: 'single_use' | 'balance' = singleUse ? 'single_use' : 'balance'
+        const balanceEligible = mode === 'single_use' || !/(?:voucher|coupon|apply|reapply|grant|invite)/i.test(ep.path)
+        const creator = siblings
+          .filter(e => !hasPathPlaceholder(e.path) && /(voucher|coupon|mint|create|issue|generate|invite|token|credit|key|cart|bag|order)s?$/i.test(e.path))
+          .map(e => e.path)[0]
+          ?? (segs.length > 2
+            ? endpoints.find(e => e.method.toUpperCase() === 'POST' && !hasPathPlaceholder(e.path) && e.path === `/${segs.slice(0, -2).join('/')}`)?.path
+            : undefined)
+        if (balanceEligible && (mode === 'single_use' ? Boolean(producer) : Boolean(resource || numeric))) {
+          raceCandidates.push({
+            ep, param: consume, mode,
+            ...(producer && mode === 'single_use' ? { createPath: producer.path } : creator ? { createPath: creator } : {}),
+            ...(resource ? { resourcePath: resource } : {}),
+            score: (singleUse ? 3 : 1) + (producer ? 1 : 0) + (resource ? 1 : 0),
+          })
+        }
       }
     }
 
@@ -535,9 +608,11 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         }
       }
       // Cache probes: parameterless GETs plus cacheable GETs that carry query parameters (an
-      // unkeyed query string is itself a deception/poisoning vector). Still bounded below.
+      // unkeyed query string is itself a deception/poisoning vector). Templated public/share views
+      // are included (their id is resolved before probing) because cross-actor cache reuse lives
+      // there. Still bounded below.
       const paramlessGet = isGet && !pathHasPlaceholder && params.length === 0
-      const cacheableGet = isGet && !pathHasPlaceholder && cacheablePath.test(ep.path)
+      const cacheableGet = isGet && (!pathHasPlaceholder || /(?:public|share|cache|preview|store|product|catalog|report|account|profile|dashboard|billing|settings|\/me\b)/i.test(ep.path)) && cacheablePath.test(ep.path)
       if ((paramlessGet || cacheableGet) && !graphqlPath.test(ep.path) && !/\.well-known\//i.test(ep.path)) {
         cacheCandidates.push(ep)
       }
@@ -556,30 +631,35 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
       }
 
       // CSRF state-change: a session-authenticated mutation whose read route exposes the field.
+      // Create-shaped form posts (refunds, charge creation) have no list route; their read-back is the
+      // created object's detail route (response id), so they are collected and ranked with the rest.
       if (
-        !isGet && method !== 'DELETE' && csrfHypotheses < maxCsrfHypotheses &&
+        !isGet && method !== 'DELETE' &&
         !serverActionPath.test(ep.path) && !csrfSkipPath.test(ep.path) && !graphqlPath.test(ep.path) &&
         csrfActionPath.test(ep.path)
       ) {
         const readPath = csrfReadPathFor(ep.path, getPaths)
         const hasCsrfParam = ep.params.some(p => p.isCsrf)
         const actionish = /(trigger|approve|confirm|transfer|invite|refund|redeem|accept|settings|profile)/i.test(ep.path)
-        const stateBody = params.some(p =>
+        const stateBody = effectiveParams.some(p =>
           (p.location === 'json' || p.location === 'form') &&
           /name|title|label|note|description|status|state|value|amount|tier|plan|enabled|active/i.test(p.name))
-        if (readPath && (hasCsrfParam || actionish) && (hasCsrfParam || stateBody || actionish)) {
-          add({ endpoint: ep, probeClass: 'csrf_state_change', method: writeMethod(ep) })
-          csrfHypotheses += 1
+        const createCandidate = !readPath && !pathHasPlaceholder && (method === 'POST' || method === 'PUT')
+        const detailRead = createCandidate
+          ? getPaths.find(p => hasPathPlaceholder(p) && p.split('/').filter(Boolean).slice(0, -1).join('/') === ep.path.split('?')[0].split('/').filter(Boolean).join('/'))
+          : undefined
+        if ((readPath || detailRead) && (hasCsrfParam || actionish) && (hasCsrfParam || stateBody || actionish)) {
+          csrfCandidates.push({ ep, readPath: readPath ?? null, create: Boolean(!readPath && detailRead), score: (hasCsrfParam ? 2 : 0) + (stateBody ? 2 : 0) + (actionish ? 1 : 0) + (detailRead ? 1 : 0) })
         }
       }
 
       // Inbound webhook signature: receiver-shaped routes only (never management/list verbs).
-      if (
-        !isGet && method !== 'DELETE' && webhookHypotheses < maxWebhookHypotheses &&
-        (webhookReceiverPath.test(lastPathSegment(ep.path)) || /webhook|callback/i.test(ep.path))
-      ) {
-        add({ endpoint: ep, probeClass: 'webhook_signature_bypass', method: writeMethod(ep) })
-        webhookHypotheses += 1
+      const whSegs = ep.path.split('?')[0].split('/').filter(Boolean)
+      const whLast = whSegs[whSegs.length - 1] ?? ''
+      const whPrev = whSegs[whSegs.length - 2] ?? ''
+      const receiverShaped = webhookReceiverPath.test(whLast) || (whPrev !== '' && webhookReceiverPath.test(whPrev))
+      if (!isGet && method !== 'DELETE' && receiverShaped) {
+        webhookCandidates.push({ ep, score: (webhookReceiverPath.test(whLast) ? 2 : 1) + (/(receive|inbound)/i.test(ep.path) ? 1 : 0) })
       }
 
       // Open redirect: navigation-shaped GET routes plus any discovered URL-ish parameter.
@@ -602,11 +682,33 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
   }
 
   if (caps.newProbeClasses) {
+    // Collected writes are ranked and capped per class so early surface order cannot starve the
+    // endpoints with the strongest state-change evidence.
+    for (const c of csrfCandidates.sort((a, b) => b.score - a.score || a.ep.path.length - b.ep.path.length).slice(0, maxCsrfHypotheses)) {
+      add({ endpoint: c.ep, probeClass: 'csrf_state_change', method: writeMethod(c.ep), ...(c.create ? { csrfCreate: true } : {}) })
+    }
+    for (const c of webhookCandidates.sort((a, b) => b.score - a.score || a.ep.path.length - b.ep.path.length).slice(0, maxWebhookHypotheses)) {
+      add({ endpoint: c.ep, probeClass: 'webhook_signature_bypass', method: writeMethod(c.ep) })
+    }
+    for (const c of raceCandidates.sort((a, b) => b.score - a.score || a.ep.path.length - b.ep.path.length).slice(0, maxRaceHypotheses)) {
+      add({
+        endpoint: c.ep, probeClass: 'race_burst', param: c.param, location: c.param.location as SurfaceParamLocation,
+        method: writeMethod(c.ep), raceMode: c.mode,
+        ...(c.createPath && c.mode === 'single_use' ? { raceProducerPath: c.createPath } : c.createPath ? { raceCreatePath: c.createPath } : {}),
+        ...(c.resourcePath ? { raceResourcePath: c.resourcePath } : {}),
+      })
+    }
+    for (const ep of graphqlCandidates) add({ endpoint: ep, probeClass: 'graphql_audit', method: 'POST' })
+
     // Cache probes are expensive (control + header matrix + victim verifies), so rank candidate
     // routes by cache-ish semantics and take a bounded top slice. Response cache headers are not
     // available at hypothesis-formation time, so this stays a heuristic.
     const ranked = [...cacheCandidates].sort((a, b) => {
-      const score = (e: DiscoveredEndpoint) => (cacheablePath.test(e.path) ? 2 : 0) + (e.path.split('/').filter(Boolean).length >= 2 ? 1 : 0)
+      const score = (e: DiscoveredEndpoint) =>
+        (cacheablePath.test(e.path) ? 2 : 0) +
+        (/(?:public|share|cache|report|product|catalog|storefront|preview|account|profile|dashboard|billing)/i.test(e.path) ? 4 : 0) +
+        (hasPathPlaceholder(e.path) ? 1 : 0) +
+        (e.path.split('/').filter(Boolean).length >= 2 ? 1 : 0)
       return score(b) - score(a) || a.path.length - b.path.length || a.path.localeCompare(b.path)
     })
     for (const ep of ranked.slice(0, maxCacheEndpoints)) {
@@ -666,6 +768,10 @@ export interface ProbeEnv {
   endpoints?: readonly DiscoveredEndpoint[]
   /** Cached GET-response field harvests keyed by path. */
   fieldCache?: Map<string, JsonHarvest>
+  /** Cached identity/session claims (email, id, tenant/store) for forged-token audits. */
+  identityCache?: Map<string, string[]>
+  /** Loopback service origins harvested from config/discovery routes (in-band SSRF proof). */
+  internalTargetCache?: Map<string, string[]>
 }
 
 /** Target-observed context (baseline value, XML/GraphQL shape, seed query) resolved for a hypothesis. */
@@ -953,6 +1059,155 @@ async function csrfHeaderFor(env: ProbeEnv): Promise<Record<string, string> | un
   return out.csrfHeader
 }
 
+/**
+ * Identity claims observed on the target's own session/me routes. Used to build a *forged* token
+ * payload (subject/tenant) without ever reading persona credentials; only scalar JSON values are
+ * harvested and the values stay inside the probe.
+ */
+async function identityClaims(env: ProbeEnv, persona = env.owner): Promise<Record<string, string>> {
+  const cache = (env.identityCache ??= new Map<string, string[]>())
+  const cacheKey = `claims:${persona ?? ''}`
+  const cached = cache.get(cacheKey)
+  if (cached) return Object.fromEntries(cached.map(v => v.split('=', 2) as [string, string]))
+  const routes = (env.endpoints ?? []).filter(e =>
+    e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+    /(?:^|[/_-])(?:me|session|whoami|userinfo|profile|identity|account)(?:$|[/_-])/i.test(e.path),
+  ).slice(0, 3)
+  const claims: Record<string, string> = {}
+  const interesting = /^(?:email|mail|id|uid|userId|user_id|sub|actor|tenant|store|org|organization|workspace|team|role|scope)$/i
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 4 || !node || typeof node !== 'object' || Array.isArray(node)) return
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (v && typeof v === 'object') { walk(v, depth + 1); continue }
+      if (!interesting.test(k) || (typeof v !== 'string' && typeof v !== 'number')) continue
+      const s = String(v)
+      if (s.length === 0 || s.length > 96 || /[\\\r\n]/.test(s)) continue
+      if (!claims[k]) claims[k] = s
+    }
+  }
+  for (const route of routes) {
+    try {
+      const ex = await env.broker.executeHttp({
+        origin: env.origin, method: 'GET', pathAndQuery: route.path, persona,
+        followRedirects: false, timeoutMs: 8_000,
+      }, env.grant, env.signal)
+      if (ex.status < 200 || ex.status >= 300) continue
+      walk(JSON.parse(ex.body), 0)
+    } catch { /* route may not be readable */ }
+  }
+  cache.set(cacheKey, Object.entries(claims).map(([k, v]) => `${k}=${v}`))
+  return claims
+}
+
+/**
+ * Loopback service origins published by the target's own configuration/discovery routes. These are
+ * legitimate egress destinations for the app (service discovery), so a sink that fetches them proves
+ * server-side reachability *in-band* when no OOB callback port is registered.
+ */
+async function harvestInternalTargets(env: ProbeEnv): Promise<string[]> {
+  const cache = (env.internalTargetCache ??= new Map())
+  const cached = cache.get('targets')
+  if (cached) return cached
+  const routes = (env.endpoints ?? []).filter(e =>
+    e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+    /(?:^|[/_-])(?:config|settings|integration|metadata|services?|discovery|webhook|hooks|health|status|info|bootstrap|session)(?:$|[/_-])/i.test(e.path),
+  ).slice(0, 6)
+  const found = new Set<string>()
+  const collect = (node: unknown, depth: number): void => {
+    if (depth > 5 || node === null || node === undefined) return
+    if (typeof node === 'string') {
+      if (/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{2,5}(?:\/|$)/i.test(node) && node.length <= 256) found.add(node)
+      return
+    }
+    if (Array.isArray(node)) { for (const v of node.slice(0, 20)) collect(v, depth + 1); return }
+    if (typeof node === 'object') for (const v of Object.values(node as Record<string, unknown>)) collect(v, depth + 1)
+  }
+  for (const route of routes) {
+    for (const persona of [env.owner, env.admin]) {
+      if (!persona) continue
+      try {
+        const ex = await env.broker.executeHttp({
+          origin: env.origin, method: 'GET', pathAndQuery: route.path, persona,
+          followRedirects: false, timeoutMs: 8_000,
+        }, env.grant, env.signal)
+        if (ex.status !== 200) continue
+        try { collect(JSON.parse(ex.body), 0) } catch { collect(ex.body, 0) }
+      } catch { /* ignore */ }
+      if (found.size >= 4) break
+    }
+    if (found.size >= 4) break
+  }
+  const out = [...found].slice(0, 4)
+  cache.set('targets', out)
+  return out
+}
+
+/**
+ * Root field names and other-actor object ids for a GraphQL endpoint without SDL/introspection.
+ * Roots come from the discovered collection nouns; ids are harvested from the same collections as
+ * the *other* persona so a cross-persona read has an object the caller should not own.
+ */
+export async function graphqlDiscoverySeeds(env: ProbeEnv): Promise<{ roots: string[]; ids: string[]; byRoot: Record<string, string[]> }> {
+  const collections = (env.endpoints ?? []).filter(e =>
+    e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) &&
+    !/(?:search|find|filter|query|me|session|health|config|csrf|token)/i.test(e.path),
+  )
+  const roots = new Set<string>()
+  const rootPaths = new Map<string, string>()
+  for (const ep of collections.slice(0, 20)) {
+    const tail = lastPathSegment(ep.path)
+    if (!/^[a-z][a-z0-9-]{2,24}$/i.test(tail) || /^(?:items|list|all|data|stats)$/i.test(tail)) continue
+    const singular = tail.replace(/ies$/i, 'y').replace(/s$/i, '')
+    for (const name of [singular, tail]) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue
+      roots.add(name)
+      if (!rootPaths.has(name)) rootPaths.set(name, ep.path)
+    }
+  }
+  const ids: string[] = []
+  const byRoot: Record<string, string[]> = {}
+  const persona = env.other ?? env.owner
+  for (const [root, path] of rootPaths) {
+    try {
+      const ex = await env.broker.executeHttp({
+        origin: env.origin, method: 'GET', pathAndQuery: path, persona,
+        followRedirects: false, timeoutMs: 8_000,
+      }, env.grant, env.signal)
+      if (ex.status >= 200 && ex.status < 300) {
+        const found = harvestJson(ex.body).ids.slice(0, 2)
+        if (found.length > 0) byRoot[root] = found
+        ids.push(...found)
+      }
+    } catch { /* ignore */ }
+    if (ids.length >= 6) break
+  }
+  return { roots: [...roots].slice(0, 8), ids: idShaped(ids).slice(0, 4), byRoot }
+}
+
+/**
+ * Delivery body for a receiver that exposes no management/list route. Field names come from the
+ * receiver's own parameters and generic event vocabulary; tenant/store values come from the target's
+ * session claims. This is enough to exercise signature handling without guessing the secret.
+ */
+async function fallbackWebhookBody(h: Hypothesis, env: ProbeEnv): Promise<Record<string, unknown> | null> {
+  const claims = await identityClaims(env)
+  const tenant = claims.store ?? claims.tenant ?? claims.org ?? claims.workspace ?? claims.team ?? ''
+  const paramNames = h.endpoint.params.filter(p => p.location === 'json' || p.location === 'form').map(p => p.name)
+  const body: Record<string, unknown> = {}
+  for (const name of paramNames) {
+    if (/token|sig|signature|hmac/i.test(name)) continue
+    if (/ts|timestamp|time/i.test(name)) body[name] = Math.floor(Date.now() / 1000)
+    else if (/backup|job|run|event|order|id|ref|endpoint|hook/i.test(name)) body[name] = `gwh${shortToken(8)}`
+    else if (/amount|total|value|price/i.test(name)) body[name] = 1
+    else if (/store|tenant|org|account|team/i.test(name)) body[name] = tenant || `gwh${shortToken(4)}`
+    else body[name] = 'guardian.probe'
+  }
+  if (tenant && !Object.keys(body).some(k => /store|tenant|org|account|team/i.test(k))) body.store = tenant
+  if (!Object.keys(body).some(k => /event|type/i.test(k))) body.event = { type: 'guardian.probe', id: `gwh${shortToken(8)}` }
+  body.ts = body.ts ?? Math.floor(Date.now() / 1000)
+  return Object.keys(body).length > 0 ? body : null
+}
+
 async function serverActionBodies(h: Hypothesis, env: ProbeEnv): Promise<unknown[]> {
   const tokens = lastPathSegment(h.endpoint.path).replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[^A-Za-z0-9]+/)
     .filter(t => t.length > 1 && !/^(update|create|make|set|get|do|handle|save|change|toggle|the|for|with)$/i.test(t))
@@ -990,7 +1245,8 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     : idParam
       ? `${h.endpoint.path}?${idParam.name}={{id}}`
       : h.endpoint.path
-  const mutating = h.method !== 'GET'
+  const wireMethod: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' = h.deleteMethod ? 'DELETE' : h.method
+  const mutating = wireMethod !== 'GET'
   let functionBody: unknown
   if (functionLevel && mutating) {
     if (h.serverAction) {
@@ -1003,7 +1259,7 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
       })()
     }
   }
-  const requestBody = functionLevel ? undefined : (mutating ? writeBodyFor(h.endpoint, env, 'json') : undefined)
+  const requestBody = functionLevel ? undefined : (mutating && wireMethod !== 'DELETE' ? writeBodyFor(h.endpoint, env, 'json') : undefined)
   // Role-transition actions need a privileged value to prove the missing role check.
   if (mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(h.endpoint.path)) {
     const privileged = { role: 'admin', grant: 'admin', level: 'admin' }
@@ -1021,7 +1277,7 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     probeClass: 'authz_matrix',
     origin: env.origin,
     pathAndQuery,
-    method: mutating ? h.method : 'GET',
+    method: mutating ? wireMethod : 'GET',
     persona: owner,
     ownerPersona: owner,
     otherPersona: other,
@@ -1516,64 +1772,301 @@ async function runBrowserChainCheck(
 async function runRaceCheck(h: Hypothesis, env: ProbeEnv, watch: (ex: BrokerExchangeResult) => void): Promise<MultiStepResult> {
   const result: MultiStepResult = { hit: false, anomalies: [], details: {}, requests: 0 }
   const param = h.param
-  const producerPath = h.raceProducerPath
-  if (!param || !producerPath) return result
-  const consumeBody = (value: string): Record<string, unknown> => {
-    const body: Record<string, unknown> = {}
-    for (const p of h.endpoint.params) {
-      if (p.isCsrf) continue
-      body[p.name] = p.name === param.name ? value : semanticValue(p.name, env)
-    }
-    if (!(param.name in body)) body[param.name] = value
-    return body
-  }
-  const mint = async (): Promise<{ code: string; value: number } | null> => {
+  if (!param) return result
+  const mode = h.raceMode ?? (h.raceProducerPath ? 'single_use' : 'balance')
+  const productScoped = /(?:checkout|cart|bag|order|purchase|product|ware|inventory|stock)/i.test(h.endpoint.path)
+  const send = async (method: 'GET' | 'POST' | 'PUT' | 'PATCH', pathAndQuery: string, body?: Record<string, unknown>) => {
     const ex = await sendRaw(env, {
-      method: 'POST', pathAndQuery: producerPath, body: '{}',
+      method, pathAndQuery, ...(body ? { body: JSON.stringify(body) } : {}),
       headers: { 'Content-Type': 'application/json' }, persona: env.owner,
       session: env.caps.sessionAndCsrf ? env.session : undefined,
+      ...(env.caps.sessionAndCsrf && method !== 'GET' ? { csrfBind: true } : {}),
     })
     result.requests += 1
-    if (!ex) return null
-    watch(ex)
-    const harvest = harvestJson(ex.body)
-    const code = harvest.fields.get(param.name)?.[0] ?? harvest.ids[0]
-    if (!code) return null
-    const value = Number(harvest.fields.get('value')?.[0] ?? harvest.fields.get('amount')?.[0] ?? 0)
-    return { code, value: Number.isFinite(value) ? value : 0 }
+    if (ex) watch(ex)
+    return ex
   }
-  // Validate the happy path once so a burst failure is not misread as "no race".
-  const single = await mint()
-  if (!single) { result.details.skipped = 'producer_unavailable'; return result }
-  const singleEx = await sendRaw(env, {
-    method: h.method, pathAndQuery: probePathFor(h), body: JSON.stringify(consumeBody(single.code)),
-    headers: { 'Content-Type': 'application/json' }, persona: env.owner,
-    session: env.caps.sessionAndCsrf ? env.session : undefined,
-  })
-  result.requests += 1
-  if (singleEx) watch(singleEx)
-  result.details.singleStatus = singleEx?.status ?? null
-  if (!singleEx || singleEx.status < 200 || singleEx.status >= 300) {
-    result.details.skipped = 'consume_baseline_failed'
+  const numeric = (body: string | undefined): Record<string, number> => {
+    const out: Record<string, number> = {}
+    const fields = body ? harvestJson(body).fields : new Map<string, string[]>()
+    for (const key of ['balance', 'credits', 'stock', 'available', 'remaining', 'inventory', 'quantity', 'count', 'total']) {
+      const values = (fields.get(key) ?? []).map(Number).filter(Number.isFinite)
+      if (values.length > 0) out[key] = Math.max(...values)
+    }
+    return out
+  }
+  const stateFieldPriority = ['balance', 'credits', 'stock', 'available', 'remaining', 'inventory', 'quantity']
+  const pickState = (values: Record<string, number>): { field: string; value: number } | null => {
+    for (const field of stateFieldPriority) if (values[field] !== undefined) return { field, value: values[field]! }
+    return null
+  }
+  const numericAliases = (name: string): string[] => {
+    if (/(?:amount|value|total|price|cents)/i.test(name)) return [...new Set([name, 'amount', 'value', 'cents', 'total', 'price'])]
+    if (/(?:qty|quantity|count|number)/i.test(name)) return [...new Set([name, 'qty', 'quantity', 'count', 'itemQty'])]
+    return [name]
+  }
+  const bodySiblings = (value: number | string): Record<string, unknown> => {
+    const body: Record<string, unknown> = {}
+    for (const p of h.endpoint.params) {
+      if (p.isCsrf || p.name === param.name) continue
+      if (p.location !== 'json' && p.location !== 'form') continue
+      body[p.name] = semanticValue(p.name, env)
+    }
+    if (typeof value === 'number') {
+      for (const alias of numericAliases(param.name)) body[alias] = value
+    } else {
+      body[param.name] = value
+    }
+    if (productScoped) {
+      for (const alias of ['productId', 'product_id', 'product', 'item', 'itemId', 'sku']) body[alias] = '1'
+    }
+    return body
+  }
+  let catalogIds: string[] | null = null
+  const ensureCatalogIds = async (): Promise<string[]> => {
+    if (catalogIds) return catalogIds
+    const route = (env.endpoints ?? []).find(e =>
+      e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && /(?:products?|wares?|catalog|items?|stock|inventory)$/i.test(lastPathSegment(e.path)),
+    )
+    catalogIds = route ? await idPool(env, route.path) : []
+    return catalogIds
+  }
+  // Resolve the concrete consume path (and mint a disposable resource where a create route exists).
+  const setupSteps: Array<Record<string, unknown>> = []
+  let consumePath = probePathFor(h)
+  let resolvedId: string | null = null
+  let resolvedIds: string[] = []
+  if (hasPathPlaceholder(h.endpoint.path)) {
+    if (h.raceCreatePath) {
+      const created = await send('POST', h.raceCreatePath, {})
+      const id = created ? harvestJson(created.body).ids[0] ?? null : null
+      if (id) {
+        resolvedId = id
+        consumePath = fillPlaceholders(h.endpoint.path, encodeURIComponent(id))
+        setupSteps.push({ method: 'POST', pathAndQuery: h.raceCreatePath, jsonBody: {} })
+      }
+    }
+    if (!resolvedId) {
+      const ids = await idPool(env, h.endpoint.path)
+      resolvedIds = ids
+      if (!ids[0]) { result.details.skipped = 'resource_unavailable'; return result }
+      resolvedId = ids[0]
+      consumePath = fillPlaceholders(h.endpoint.path, encodeURIComponent(ids[0]))
+    }
+  }
+  // Resolve body references (product ids) and the resource value the burst is meant to overspend.
+  let baseline: number | null = null
+  let baselineField: string | null = null
+  let readPath: string | null = null
+  let productId: string | null = null
+  let catalogRows: Array<{ id: string; value: number }> = []
+  const catalogRoute = (env.endpoints ?? []).find(e =>
+    e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && /(?:products?|wares?|catalog|items?|stock|inventory)$/i.test(lastPathSegment(e.path)),
+  )?.path
+  const readCandidates: string[] = []
+  if (h.raceResourcePath) {
+    readCandidates.push(hasPathPlaceholder(h.raceResourcePath)
+      ? (resolvedId ? fillPlaceholders(h.raceResourcePath, encodeURIComponent(resolvedId)) : '')
+      : h.raceResourcePath)
+  }
+  if (mode === 'balance' && /(?:checkout|cart|order|purchase|inventory|stock)/i.test(h.endpoint.path) && catalogRoute) readCandidates.push(catalogRoute)
+  for (const read of readCandidates.filter(Boolean)) {
+    const ex = await send('GET', read)
+    const values = numeric(ex?.body)
+    const picked = pickState(values)
+    if (!picked) continue
+    baseline = picked.value
+    baselineField = picked.field
+    readPath = read
+    // Pick the catalog row that owns the largest stock so qty*burst actually exceeds it.
+    if (!productScoped) continue
+    try {
+      const parsed = JSON.parse(ex!.body) as unknown
+      const rows: Array<Record<string, unknown>> = []
+      const walk = (node: unknown, depth: number): void => {
+        if (depth > 4 || !node || typeof node !== 'object') return
+        if (Array.isArray(node)) { for (const item of node) walk(item, depth + 1); return }
+        const rec = node as Record<string, unknown>
+        if (picked.field in rec) rows.push(rec)
+        for (const v of Object.values(rec)) if (v && typeof v === 'object') walk(v, depth + 1)
+      }
+      walk(parsed, 0)
+      const rowsWithValue = rows
+        .map(r => {
+          const v = Number(r[picked.field])
+          const id = ['id', 'external_id', 'externalId', 'uuid'].map(k => r[k]).find(x => typeof x === 'string' || typeof x === 'number')
+          return Number.isFinite(v) && id !== undefined ? { id: String(id), value: v } : null
+        })
+        .filter((r): r is { id: string; value: number } => r !== null)
+        .sort((a, b) => b.value - a.value)
+      catalogRows = rowsWithValue
+      const best = rowsWithValue[0]
+      if (best) productId = best.id
+    } catch { /* non-JSON read */ }
+    break
+  }
+  if (mode === 'single_use') {
+    const producerPath = h.raceProducerPath
+    if (!producerPath) { result.details.skipped = 'producer_unavailable'; return result }
+    const producerEp = (env.endpoints ?? []).find(e => e.path === producerPath && e.method.toUpperCase() === 'POST')
+    const producerBody: Record<string, unknown> = {}
+    for (const p of producerEp?.params ?? []) {
+      if (p.location === 'json' || p.location === 'form') producerBody[p.name] = /product(Id)?$/i.test(p.name) ? (await ensureCatalogIds())[0] ?? '1' : semanticValue(p.name, env)
+    }
+    const mint = async (): Promise<string | null> => {
+      const ex = await send('POST', producerPath, producerBody)
+      if (!ex || ex.status < 200 || ex.status >= 300) return null
+      const harvest = harvestJson(ex.body)
+      return harvest.fields.get(param.name)?.[0] ?? harvest.ids[0] ?? null
+    }
+    const first = await mint()
+    if (!first) { result.details.skipped = 'producer_unavailable'; return result }
+    const singleEx = await send(h.method, consumePath, bodySiblings(first))
+    result.details.singleStatus = singleEx?.status ?? null
+    if (!singleEx || singleEx.status < 200 || singleEx.status >= 300) { result.details.skipped = 'consume_baseline_failed'; return result }
+    const target = await mint()
+    if (!target) { result.details.skipped = 'producer_unavailable'; return result }
+    setupSteps.push({
+      id: 's1', method: 'POST', path: producerPath, body: producerBody,
+      extract: [{ varName: 'code', from: 'json', selector: param.name }],
+    })
+    const value = target
+    const replayBody: Record<string, unknown> = bodySiblings(value)
+    for (const alias of numericAliases(param.name)) replayBody[alias] = `{{code}}`
+    const burstReqs = Array.from({ length: 4 }, () => ({
+      origin: env.origin, method: h.method, pathAndQuery: consumePath,
+      headers: { 'Content-Type': 'application/json' }, persona: env.owner,
+      ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
+      body: JSON.stringify(bodySiblings(value)),
+    }))
+    let statuses: number[] = []
+    try {
+      const burst = await env.broker.executeRaceBurst(burstReqs, env.grant, env.signal)
+      statuses = burst.results.map(r => r.status)
+      for (const ex of burst.results) watch(ex)
+      result.requests += burst.results.length
+    } catch (err) {
+      result.details.burstError = err instanceof Error ? err.message.slice(0, 160) : String(err)
+      return result
+    }
+    const successes = statuses.filter(s => s >= 200 && s < 300).length
+    result.details = { ...result.details, mode, burstSize: 4, statuses, successes, value, baseline, baselineField, readPath, consumePath, producerPath, setupSteps }
+    if (successes >= 2) {
+      result.hit = true
+      result.anomalies.push({
+        type: 'race_double_spend', mode, path: consumePath, producerPath, param: param.name,
+        consumeBody: replayBody, successes, statuses, burstSize: 4,
+        ...(readPath ? { parentPath: readPath } : {}), setupSteps,
+        suggestedReplayKind: 'race_burst',
+      })
+    }
     return result
   }
-  const target = await mint()
-  if (!target) { result.details.skipped = 'producer_unavailable'; return result }
-  const parent = `/${h.endpoint.path.split('/').filter(Boolean).slice(0, -1).join('/')}`
-  const balanceBefore = await sendRaw(env, { method: 'GET', pathAndQuery: parent, persona: env.owner, session: env.caps.sessionAndCsrf ? env.session : undefined })
-  result.requests += 1
-  if (balanceBefore) watch(balanceBefore)
-  const burstSize = 4
-  const burstReqs = Array.from({ length: burstSize }, () => ({
-    origin: env.origin, method: h.method, pathAndQuery: probePathFor(h),
+
+  // Balance/stock mode: derive the per-request value from the observed balance, then overspend it
+  // with concurrent read-then-write requests (2+ acceptances for a value > half the balance).
+  if (baseline === null || baselineField === null) {
+    // No read route: one inexpensive consume exposes the post-state balance in its response.
+    const probe = await send(h.method, consumePath, bodySiblings(1))
+    const picked = pickState(numeric(probe?.body))
+    if (picked) { baseline = picked.value + (probe?.status && probe.status >= 200 && probe.status < 300 ? 1 : 0); baselineField = picked.field }
+  }
+  if (baseline === null || baselineField === null || baseline < 2) {
+    result.details.skipped = 'balanceless'
+    return result
+  }
+  const value = Math.max(1, Math.floor(baseline * 0.75))
+  // Product-scoped stock (cart checkout) must target a real catalog item.
+  const body = bodySiblings(value)
+  if ('productId' in body || 'product_id' in body) {
+    const id = productId ?? (await ensureCatalogIds())[0]
+    if (id) for (const alias of ['productId', 'product_id', 'product', 'item', 'itemId', 'sku']) body[alias] = id
+  }
+  // Prefer the specific record's detail route for the post-burst read so an unrelated row with a
+  // larger balance cannot mask the decrement.
+  if (productId && catalogRoute && productScoped) {
+    const detailTemplate = (env.endpoints ?? []).find(e =>
+      e.method.toUpperCase() === 'GET' && hasPathPlaceholder(e.path) &&
+      e.path.split('?')[0].split('/').filter(Boolean).slice(0, -1).join('/') === catalogRoute.split('/').filter(Boolean).join('/'),
+    )?.path
+    if (detailTemplate) readPath = fillPlaceholders(detailTemplate, encodeURIComponent(productId))
+  }
+  // Replay must run against a resource the probe did not exhaust. Pick a second untouched catalog
+  // row / card and build setup steps that address it (fresh cart where a create route exists).
+  let replayPath = consumePath
+  let replayBody: Record<string, unknown> = body
+  let replayRead: string | null = readPath
+  let replayValue = value
+  const replaySetup: Array<Record<string, unknown>> = []
+  const productField = 'productId' in body ? 'productId' : 'product_id' in body ? 'product_id' : null
+  const detailTemplateFor = (collectionPath: string): string | undefined => (env.endpoints ?? []).find(e =>
+    e.method.toUpperCase() === 'GET' && hasPathPlaceholder(e.path) &&
+    e.path.split('?')[0].split('/').filter(Boolean).slice(0, -1).join('/') === collectionPath.split('/').filter(Boolean).join('/'),
+  )?.path
+  if (productField && catalogRows.length > 0) {
+    const replayRow = catalogRows.find(r => r.id !== productId && r.value >= 2) ?? catalogRows[0]
+    if (replayRow) {
+      replayValue = Math.max(1, Math.floor(replayRow.value * 0.75))
+      replayBody = { ...bodySiblings(replayValue), [productField]: replayRow.id }
+      const detailTemplate = catalogRoute ? detailTemplateFor(catalogRoute) : undefined
+      if (detailTemplate) {
+        const readForReplay = fillPlaceholders(detailTemplate, encodeURIComponent(replayRow.id))
+        replayRead = readForReplay
+        replaySetup.push({
+          id: 's2', method: 'GET', path: readForReplay,
+          extract: [{ varName: 'balance0', from: 'json', selector: baselineField }],
+        })
+      }
+    }
+    if (h.raceCreatePath) {
+      replayPath = h.endpoint.path.replace(/(?::[A-Za-z0-9_]+|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]+\])/g, '{{resource_id}}')
+      replaySetup.unshift({
+        id: 's1', method: 'POST', path: h.raceCreatePath, body: {},
+        extract: [{ varName: 'resource_id', from: 'json', selector: 'id' }],
+      })
+    }
+  } else if (hasPathPlaceholder(h.endpoint.path) && resolvedIds.length > 1) {
+    const template = h.endpoint.path
+    const detailTemplate = detailTemplateFor(`/${template.split('?')[0].split('/').filter(Boolean).slice(0, -1).join('/')}`)
+    const candidates = resolvedIds.filter(id => id !== resolvedId).slice(0, 4)
+    for (const replayId of candidates) {
+      const readForReplay = detailTemplate
+        ? fillPlaceholders(detailTemplate, encodeURIComponent(replayId))
+        : fillPlaceholders(template, encodeURIComponent(replayId))
+      const fresh = await send('GET', readForReplay)
+      if (!fresh || fresh.status < 200 || fresh.status >= 300) continue
+      const picked = pickState(numeric(fresh.body))
+      if (!picked || picked.value < 2) continue
+      replayValue = Math.max(1, Math.floor(picked.value * 0.75))
+      replayBody = bodySiblings(replayValue)
+      replayPath = fillPlaceholders(template, encodeURIComponent(replayId))
+      replayRead = readForReplay
+      replaySetup.push({
+        id: 's1', method: 'GET', path: readForReplay,
+        extract: [{ varName: 'balance0', from: 'json', selector: picked.field }],
+      })
+      break
+    }
+  }
+  if (replaySetup.length === 0 && readPath) {
+    replaySetup.push({
+      id: 's1', method: 'GET', path: readPath,
+      extract: [{ varName: 'balance0', from: 'json', selector: baselineField }],
+    })
+  }
+  const before = baseline
+  const burstReqs = Array.from({ length: 4 }, () => ({
+    origin: env.origin, method: h.method, pathAndQuery: consumePath,
     headers: { 'Content-Type': 'application/json' }, persona: env.owner,
     ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
-    body: JSON.stringify(consumeBody(target.code)),
+    body: JSON.stringify(body),
   }))
   let statuses: number[] = []
+  let burstBodies: string[] = []
   try {
     const burst = await env.broker.executeRaceBurst(burstReqs, env.grant, env.signal)
     statuses = burst.results.map(r => r.status)
+    burstBodies = burst.results.map(r => r.body)
     for (const ex of burst.results) watch(ex)
     result.requests += burst.results.length
   } catch (err) {
@@ -1581,30 +2074,28 @@ async function runRaceCheck(h: Hypothesis, env: ProbeEnv, watch: (ex: BrokerExch
     return result
   }
   const successes = statuses.filter(s => s >= 200 && s < 300).length
-  const balanceAfter = await sendRaw(env, { method: 'GET', pathAndQuery: parent, persona: env.owner, session: env.caps.sessionAndCsrf ? env.session : undefined })
-  result.requests += 1
-  if (balanceAfter) watch(balanceAfter)
-  const balanceOf = (ex: BrokerExchangeResult | null): number | null => {
-    if (!ex) return null
-    const fields = harvestJson(ex.body).fields
-    for (const key of ['balance', 'credits', 'total', 'count']) {
-      const v = Number(fields.get(key)?.[0])
-      if (Number.isFinite(v)) return v
+  let after: number | null = null
+  if (readPath) {
+    const ex = await send('GET', readPath)
+    const values = numeric(ex?.body)
+    after = values[baselineField] ?? null
+  } else {
+    for (const body of burstBodies) {
+      const values = numeric(body)
+      if (values[baselineField] !== undefined) after = Math.min(after ?? Infinity, values[baselineField]!)
     }
-    return null
   }
-  const before = balanceOf(balanceBefore)
-  const after = balanceOf(balanceAfter)
-  result.details = {
-    ...result.details, burstSize, statuses, successes, value: target.value,
-    balanceBefore: before, balanceAfter: after, parentPath: parent, producerPath,
-  }
-  if (successes >= 2) {
+  const overspent = after !== null && after < before - value
+  result.details = { ...result.details, mode, burstSize: 4, statuses, successes, value, baseline: before, baselineField, after, readPath, consumePath, setupSteps }
+  if (successes >= 2 && overspent) {
     result.hit = true
     result.anomalies.push({
-      type: 'race_double_spend', path: probePathFor(h), producerPath, param: param.name,
-      consumeBody: consumeBody('{{code}}'), successes, statuses, burstSize,
-      value: target.value, balanceBefore: before, balanceAfter: after,
+      type: 'race_double_spend', mode, path: replayPath, param: param.name,
+      consumeBody: replayBody, successes, statuses, burstSize: 4,
+      value: replayValue, baseline: before, after, balanceField: baselineField,
+      ...(replayRead ? { parentPath: replayRead, balancePath: replayRead, readPath: replayRead } : {}),
+      setupSteps: replaySetup,
+      cleanupSteps: [],
       suggestedReplayKind: 'race_burst',
     })
   }
@@ -1820,6 +2311,10 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
     if ((ex.status === 401 || ex.status === 403 || ex.status === 440) && sessionBody.test(ex.body)) out.contextReset = true
   }
 
+  // The merged surface (variant routes + grey-box API reference) can include detail/config routes
+  // that Phase-0 did not link. Helpers resolve read-backs and service origins against that surface.
+  if (h.knownEndpoints?.length) env.endpoints = h.knownEndpoints
+
   // Prime the session jar before write probes so cookies + CSRF tokens discovered on the entry page
   // are available to the broker's csrfBind injection.
   if (h.method !== 'GET') out.requests += await primeSessionOnce(h, env)
@@ -1861,7 +2356,10 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
 
   const ctx = await resolveContext(h, env)
   out.ctx = ctx
-  if (ctx.paramActive === false) {
+  // Effect-level probes (OOB callbacks, state diffs, auth protocol) prove themselves through the
+  // target's side effects; a constant response body must not suppress them.
+  const effectProbe = ['ssrf_canary', 'xxe_canary', 'csrf_state_change', 'cache_poison_deception', 'webhook_signature_bypass', 'auth_protocol_audit'].includes(h.probeClass)
+  if (ctx.paramActive === false && !effectProbe) {
     out.verdict = 'no_signal'
     out.summary = 'Inferred parameter name does not affect the response (not read by the endpoint).'
     return out
@@ -1879,10 +2377,15 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         const csrf = await csrfHeaderFor(env)
         if (csrf) req.headers = { ...(req.headers ?? {}), ...csrf }
       }
+      if (h.method === 'GET' && env.viewer && !hasPathPlaceholder(h.endpoint.path) &&
+          /(?:keys?|secret|token|credential|audit|settings|config|billing|integration)/i.test(h.endpoint.path)) {
+        req.secretScan = true
+        req.viewerPersona = env.viewer
+      }
       break
     }
     case 'ssrf_canary':
-      req = buildProbeRequest(h, env, { ssrfParams: h.param ? [h.param.name] : [], waitMs: 2500 }); break
+      req = buildProbeRequest(h, env, { ssrfParams: h.param ? [h.param.name] : [], waitMs: 2500, internalTargets: await harvestInternalTargets(env) }); break
     case 'xxe_canary': req = buildProbeRequest(h, env, { waitMs: 2500 }); break
     case 'mass_assignment': {
       req = buildProbeRequest(h, env, { paramLocation: 'json', jsonBody: {} })
@@ -1895,7 +2398,12 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = buildProbeRequest(h, env)
       req.ownerPersona = env.owner
       req.otherPersona = env.other
-      req.resourceIds = [...new Set([...env.personaUserIds, ...(env.corpus ? mineObservedIds(env.corpus, 6) : [])])].slice(0, 6)
+      const seeds = await graphqlDiscoverySeeds(env)
+      // Persona user ids first: a nested resolver BOLA needs a node owned by the *other* actor, and
+      // those ids are the ones a cross-persona replay can reproduce.
+      req.resourceIds = [...new Set([...env.personaUserIds, ...seeds.ids, ...(env.corpus ? mineObservedIds(env.corpus, 6) : [])])].slice(0, 8)
+      if (seeds.roots.length > 0) req.graphqlRoots = seeds.roots
+      if (Object.keys(seeds.byRoot).length > 0) req.graphqlSeedsByRoot = seeds.byRoot
       if (env.ownerUserId) req.ownerUserId = env.ownerUserId
       if (env.otherUserId) req.otherUserId = env.otherUserId
       break
@@ -1904,17 +2412,107 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = buildProbeRequest(h, env)
       delete req.param; delete req.paramLocation
       if (h.quantityField) req.quantityField = h.quantityField
+      if (hasPathPlaceholder(h.endpoint.path) && !h.createPath) {
+        const segs = h.endpoint.path.split('?')[0].split('/').filter(Boolean)
+        const collection = segs.length > 2 ? `/${segs.slice(0, -2).join('/')}` : null
+        const creator = collection
+          ? (env.endpoints ?? []).find(e => e.method.toUpperCase() === 'POST' && !hasPathPlaceholder(e.path) && e.path === collection)
+          : undefined
+        let id: string | undefined
+        if (creator) {
+          try {
+            const created = await env.broker.executeHttp({
+              origin: env.origin, method: 'POST', pathAndQuery: creator.path, persona: env.owner,
+              headers: { 'Content-Type': 'application/json' }, body: '{}', followRedirects: false, timeoutMs: 8_000,
+            }, env.grant, env.signal)
+            if (created.status >= 200 && created.status < 300) id = harvestJson(created.body).ids[0]
+          } catch { /* creator may reject an empty body */ }
+        }
+        if (!id) id = (await idPool(env, h.endpoint.path))[0]
+        if (id) req.pathAndQuery = fillPlaceholders(h.endpoint.path, encodeURIComponent(id))
+        // Cart/order lines need a real catalog reference as well as the quantity under test.
+        if (req.quantityField && /(?:cart|bag|order|line|item)/i.test(h.endpoint.path)) {
+          const catalog = (env.endpoints ?? []).find(e =>
+            e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && /(?:products?|wares?|catalog|items?)$/i.test(lastPathSegment(e.path)),
+          )
+          const productId = catalog ? (await idPool(env, catalog.path))[0] : undefined
+          if (productId) req.jsonBody = { ...(req.jsonBody ?? {}), productId }
+        }
+      }
       if (h.createPath) {
         req.createPath = h.createPath
         req.producerBody = h.producerBody ?? {}
         if (hasPathPlaceholder(h.endpoint.path)) req.pathAndQuery = fillPlaceholders(h.endpoint.path, '{{id}}')
-        const qty = h.endpoint.params.find(p => /(qty|quantity|count|amount)/i.test(p.name))
+      }
+      if (!req.quantityField) {
+        const qty = h.endpoint.params.find(p => /^(?:qty|quantity|itemQty|count|seats?|amount)$/i.test(p.name))
         if (qty) req.quantityField = qty.name
       }
       break
     }
-    case 'cache_poison_deception': case 'auth_protocol_audit':
-      req = buildProbeRequest(h, env); delete req.param; delete req.paramLocation; break
+    case 'cache_poison_deception': {
+      req = buildProbeRequest(h, env)
+      delete req.param; delete req.paramLocation
+      const cacheShaped = /(?:public|share|preview|storefront|stores?\/|shops?\/|sellers?\/|vendors?\/|catalog)/i.test(h.endpoint.path)
+      const placeholderCount = h.endpoint.path.split('?')[0].split('/').filter(seg => /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.test(seg)).length
+      if (placeholderCount === 1) {
+        const ownerIds = await idPool(env, h.endpoint.path, env.owner)
+        const otherIds = env.other ? await idPool(env, h.endpoint.path, env.other) : []
+        const ownerId = ownerIds[0]
+        const otherId = otherIds.find(id => id !== ownerId) ?? otherIds[0]
+        if (ownerId) req.pathAndQuery = fillPlaceholders(h.endpoint.path, encodeURIComponent(ownerId))
+        if (otherId && otherId !== ownerId) req.crossControlPath = fillPlaceholders(h.endpoint.path, encodeURIComponent(otherId))
+        req.crossActorSeeds = { ...(ownerId ? { owner: ownerId } : {}), ...(otherId ? { other: otherId } : {}) }
+      } else if (placeholderCount >= 2 && cacheShaped && env.other) {
+        const ownerClaims = await identityClaims(env, env.owner)
+        const otherClaims = await identityClaims(env, env.other)
+        const markerOf = (claims: Record<string, string>) => claims.store ?? claims.tenant ?? claims.org ?? claims.workspace ?? claims.team
+        const ownerStore = markerOf(ownerClaims)
+        const otherStore = markerOf(otherClaims)
+        const catalog = (env.endpoints ?? []).find(e =>
+          e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && /(?:wares?|products?|items?|catalog)/i.test(lastPathSegment(e.path)),
+        )
+        const productIds = catalog ? await idPool(env, catalog.path) : []
+        if (ownerStore && otherStore && productIds[0]) {
+          const fillTwo = (store: string): string => {
+            const segs = h.endpoint.path.split('?')[0].split('/').map(seg => {
+              if (!/^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.test(seg)) return seg
+              return null
+            })
+            const lastIdx = segs.reduce((last, seg, i) => (seg === null ? i : last), -1)
+            return segs.map((seg, i) => seg === null ? encodeURIComponent(i === lastIdx ? productIds[0]! : store) : seg).join('/')
+          }
+          req.pathAndQuery = fillTwo(ownerStore)
+          req.crossControlPath = fillTwo(otherStore)
+        }
+      } else if (hasPathPlaceholder(h.endpoint.path)) {
+        const ids = await idPool(env, h.endpoint.path)
+        const id = ids[0]
+        if (id) req.pathAndQuery = fillPlaceholders(h.endpoint.path, encodeURIComponent(id))
+      }
+      if (cacheShaped) {
+        req.ownerPersona = env.owner
+        req.otherPersona = env.other
+        const ownerClaims = await identityClaims(env, env.owner)
+        const otherClaims = env.other ? await identityClaims(env, env.other) : {}
+        const markerOf = (claims: Record<string, string>) => claims.store ?? claims.tenant ?? claims.org ?? claims.workspace ?? claims.team
+        const ownerMarker = markerOf(ownerClaims)
+        const otherMarker = markerOf(otherClaims)
+        if (ownerMarker || otherMarker) req.actorMarkers = { ...(ownerMarker ? { owner: ownerMarker } : {}), ...(otherMarker ? { other: otherMarker } : {}) }
+      }
+      break
+    }
+    case 'auth_protocol_audit': {
+      req = buildProbeRequest(h, env)
+      delete req.param; delete req.paramLocation
+      const tokenFields = h.endpoint.params
+        .filter(p => (p.location === 'json' || p.location === 'form') && /token|jwt|assertion|access/i.test(p.name))
+        .map(p => p.name)
+      const pathHint = /token|refresh|jwt|session/i.test(h.endpoint.path)
+      req.tokenFields = [...new Set([...tokenFields, ...(pathHint ? ['token', 'refreshToken', 'refresh_token', 'access_token'] : ['token'])])].slice(0, 4)
+      req.identityClaims = await identityClaims(env)
+      break
+    }
     case 'path_traversal_benign':
       req = buildProbeRequest(h, env); break
     case 'csrf_state_change': {
@@ -1939,9 +2537,15 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       // Try the encoding the surface advertised first, then the other one: some routes declare
       // JSON fields while their handler only parses form bodies (and vice versa).
       req.bodyEncodings = csrfBodyLocations.has('form') && !csrfBodyLocations.has('json') ? ['form', 'json'] : ['json', 'form']
+      // Create-shaped writes read the object they just created back through its detail route.
+      const createReadTemplate = h.csrfCreate
+        ? getPaths.find(p => {
+            if (!hasPathPlaceholder(p)) return false
+            const parts = p.split('?')[0].split('/').filter(Boolean)
+            return parts.slice(0, -1).join('/') === segs.join('/')
+          })
+        : undefined
       req.readPathCandidates = [...new Set([
-        // Detail view first: it exposes the state field at the top level, which is what a replay
-        // assertion can index (collection responses wrap records in an array).
         ...(idSlot ? (env.endpoints ?? [])
           .filter(e => e.method.toUpperCase() === 'GET' && hasPathPlaceholder(e.path))
           .filter(e => e.path.startsWith(`${parent}/`) && e.path.split('/').filter(Boolean).length === parent.split('/').filter(Boolean).length + 1)
@@ -1951,13 +2555,18 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         ...(collection ? [collection] : []),
       ])].map(tpl => hasPathPlaceholder(tpl) ? fillPlaceholders(tpl, encodeURIComponent(id)) : tpl)
       if (req.readPathCandidates.length > 0) req.readPath = req.readPathCandidates[0]
-      req.stateRecordId = id
+      if (idSlot && !createReadTemplate) req.stateRecordId = id
+      if (createReadTemplate) req.createReadTemplate = createReadTemplate
       const bodyNames = h.endpoint.params.filter(p => (p.location === 'json' || p.location === 'form') && !p.isCsrf).map(p => p.name)
       const stateHint = bodyNames.find(n => /^(?:status|state)$/i.test(n)) ??
-        bodyNames.find(n => /^(?:name|title|label|display_?name)$/i.test(n)) ??
+        bodyNames.find(n => /^(?:name|title|label|display_?name|amount|amount_?cents|value|total)$/i.test(n)) ??
         (/(trigger|confirm|approve|complete|activate|publish|status|state|workflow)/i.test(h.endpoint.path) ? 'status'
-          : /(settings|profile|account)/i.test(h.endpoint.path) ? 'name' : undefined)
-      if (stateHint) req.stateField = stateHint
+          : /(refund|credit|payment|payout|charge|transfer)/i.test(h.endpoint.path) ? 'amount'
+            : /(settings|profile|account)/i.test(h.endpoint.path) ? 'name' : undefined)
+      if (stateHint) {
+        req.stateField = stateHint
+        if (bodyNames.includes(stateHint) || /^(?:amount|status|name)$/.test(stateHint)) req.bodyField = stateHint
+      }
       req.csrfPrimePaths = [
         ...(env.endpoints ?? [])
           .filter(e => e.method.toUpperCase() === 'GET' && /(?:^|[/_-])(?:csrf|xsrf|token|session|nonce)(?:$|[/_-])/i.test(e.path))
@@ -1980,6 +2589,12 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
         req.readStateField = delivery.stateField
         req.readStateValue = delivery.stateValue
         req.webhookHeader = delivery.header
+      } else {
+        const body = await fallbackWebhookBody(h, env)
+        if (body) {
+          req.webhookBody = body
+          req.webhookHeader = h.endpoint.params.some(p => /signature|sig$|hmac/i.test(p.name)) ? 'x-webhook-signature' : 'x-hub-signature-256'
+        }
       }
       break
     }
