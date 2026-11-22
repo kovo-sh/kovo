@@ -1305,8 +1305,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return ep
     }
 
-    // 2a. Standard seed probes
+    // 2a. Standard seed probes. Reserve a small slice of the per-origin cap for JS chunk
+    // harvesting, otherwise a long seed list can starve the bundles that carry XHR/route evidence.
+    const jsReserve = perOriginCap > 4 ? Math.min(4, Math.floor(perOriginCap / 3)) : 0
+    const seedBudget = Math.max(1, perOriginCap - jsReserve)
+    let seedFetches = 0
     for (const seedPath of PHASE0_SEED_PATHS) {
+      if (seedFetches >= seedBudget) break
+      seedFetches += 1
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       if (seedPath === '/') {
         // On crash recovery, reuse any already-recorded GET / for this (runId, scopeRevision, origin)
