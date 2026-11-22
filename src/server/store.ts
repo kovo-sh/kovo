@@ -3355,7 +3355,7 @@ export class Store {
 
   upsertEndpoint(input: {
     runId: string
-    scopeRevision: number
+    scopeRevision?: number
     origin: string
     method: string
     pathTemplate: string
@@ -3380,6 +3380,9 @@ export class Store {
       typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : null
 
     return this.transaction(() => {
+      const resolvedScopeRev = typeof input.scopeRevision === 'number' && Number.isFinite(input.scopeRevision)
+        ? Math.max(0, Math.round(input.scopeRevision))
+        : (this.db.select({ scopeRevision: tables.runs.scopeRevision }).from(tables.runs).where(eq(tables.runs.id, input.runId)).get()?.scopeRevision ?? 1)
       const existing = this.db.select().from(tables.endpoints).where(and(
         eq(tables.endpoints.runId, input.runId),
         eq(tables.endpoints.origin, input.origin),
@@ -3392,7 +3395,7 @@ export class Store {
         const nextRisk = clampRisk(Math.max(existing.riskScore, input.riskScore ?? existing.riskScore))
         const nextCov = input.coveragePct !== undefined ? clampCoverage(input.coveragePct) : existing.coveragePct
         return this.db.update(tables.endpoints).set({
-          scopeRevision: Math.max(existing.scopeRevision, input.scopeRevision),
+          scopeRevision: Math.max(existing.scopeRevision, resolvedScopeRev),
           framework: input.framework ?? existing.framework,
           authRequirement: input.authRequirement ?? existing.authRequirement,
           ownershipGuard: input.ownershipGuard ?? existing.ownershipGuard,
@@ -3407,7 +3410,7 @@ export class Store {
       return this.db.insert(tables.endpoints).values({
         id: randomUUID(),
         runId: input.runId,
-        scopeRevision: input.scopeRevision,
+        scopeRevision: resolvedScopeRev,
         origin: input.origin,
         method,
         pathTemplate,
