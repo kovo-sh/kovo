@@ -3,9 +3,12 @@
 // integration (without booting Execution) and bounded/clean shutdown.
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
+import {
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -16,10 +19,13 @@ import type {
 } from '../benchmarks/realistic-bench/lib/types.ts'
 import { gradeRun } from '../benchmarks/realistic-bench/run.ts'
 import type { Finding } from '../src/domain.ts'
+import { privateModelProfiles } from '../src/server/model-settings.ts'
+import { Store } from '../src/server/store.ts'
 import {
   PreflightError, assertAgenticPreflight, briefingToOpenApi, buildTelemetry, cellKeys,
-  describeModelMode, detectWorkerSessions, endpointsFromReplaySpec, parseRealisticArgs,
-  pickLoginPath, planCell, probeLoginPath, stopEngine, summarizeAssignments, translateFindings,
+  describeModelMode, detectWorkerSessions, endpointsFromReplaySpec, isInertAgenticRun, openCellStore,
+  parseRealisticArgs, pickLoginPath, planCell, prepareIsolatedDataDir, probeLoginPath,
+  shouldIsolateDataDir, stopEngine, summarizeAssignments, translateFindings,
 } from '../scripts/benchmark-realistic.ts'
 
 const execFileAsync = promisify(execFile)
@@ -74,9 +80,14 @@ test('CLI: GUARDIAN_DATA_DIR is the default data dir and --allow-inert-workers p
   const args = parseRealisticArgs(['--allow-inert-workers'], { GUARDIAN_DATA_DIR: '/tmp/guardian-data' })
   assert.equal(args.dataDir, '/tmp/guardian-data')
   assert.equal(args.allowInertWorkers, true)
+  assert.equal(args.isolateDataDir, false)
+  assert.equal(args.keepDataDirs, false)
   const override = parseRealisticArgs(['--data-dir', '/tmp/explicit'], { GUARDIAN_DATA_DIR: '/tmp/guardian-data' })
   assert.equal(override.dataDir, '/tmp/explicit')
   assert.equal(override.allowInertWorkers, false)
+  const isolation = parseRealisticArgs(['--isolate-data-dir', '--keep-data-dirs'], {})
+  assert.equal(isolation.isolateDataDir, true)
+  assert.equal(isolation.keepDataDirs, true)
 })
 
 test('CLI: held-out requires salt and a held-out seed range', () => {
@@ -543,8 +554,7 @@ test('capability: worker sessions are probed by opening and closing a session', 
   assert.match(incapable.detail, /does not support worker sessions/)
 })
 
-test('diagnostics: assignment totals, investigation counters and top reasons are recorded', () => {
-  const summary = summarizeAssignments([
+test('diagnostics: assignment totals, investigation counters and top reasons are recorded', () => {  const summary = summarizeAssignments([
     { status: 'complete', phase: 'threat_model' },
     { status: 'complete', phase: 'verification' },
     { status: 'complete', phase: 'investigation' },
@@ -564,6 +574,139 @@ test('diagnostics: assignment totals, investigation counters and top reasons are
   assert.ok(summary.topFailureReasons.some(reason => reason.includes('broker denied')))
   assert.ok(!summary.topFailureReasons.some(reason => reason.includes('super-secret')))
   assert.ok(!summary.topFailureReasons.includes('fallback reason should not be used'))
+})
+
+test('inert detection: agentic runs with no completed investigation are never results', () => {
+  assert.equal(isInertAgenticRun({ agentic: true, submittedFindings: 0, facts: 0, investigationCompleted: 0 }), true)
+  assert.equal(isInertAgenticRun({ agentic: true, submittedFindings: 0, facts: 12, investigationCompleted: 0 }), false)
+  assert.equal(isInertAgenticRun({ agentic: true, submittedFindings: 1, facts: 0, investigationCompleted: 0 }), false)
+  assert.equal(isInertAgenticRun({ agentic: true, submittedFindings: 0, facts: 0, investigationCompleted: 2 }), false)
+  assert.equal(isInertAgenticRun({ agentic: false, submittedFindings: 0, facts: 0, investigationCompleted: 0 }), false)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Per-cell data-dir isolation (parallel agentic matrix)
+// ---------------------------------------------------------------------------------------------
+
+const KEY_CANARY = 'sk-or-v1-LEAKCANARY0123456789abcdef'
+
+test('isolation: defaults on for parallel cells with a source data dir', () => {
+  const base = parseRealisticArgs(['--data-dir', '/tmp/source'], {})
+  assert.equal(shouldIsolateDataDir(base), false)
+  assert.equal(shouldIsolateDataDir({ ...base, concurrency: 3 }), true)
+  assert.equal(shouldIsolateDataDir({ ...base, isolateDataDir: true }), true)
+  assert.equal(shouldIsolateDataDir({ ...base, concurrency: 3, noLlm: true }), false)
+  assert.equal(shouldIsolateDataDir({ ...base, dataDir: undefined, concurrency: 3 }), false)
+})
+function makeSourceDataDir(): { dir: string; credentialId: string; workspaceId: string; keep: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-iso-source-'))
+  const storage = new Store(dir)
+  const credentialId = randomUUID()
+  const workspaceId = storage.workspace.id
+  mkdirSync(join(dir, 'credentials'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(dir, 'credentials', credentialId), KEY_CANARY, { mode: 0o600 })
+  storage.client.prepare(
+    'insert into model_profiles (id, workspace_id, name, endpoint, model, protocol, credential_id, priority, '
+    + 'enabled, context_window, max_tokens, thinking_level, role_affinity, input_cost_per_mtok, '
+    + 'cached_input_cost_per_mtok, output_cost_per_mtok, health_state, cooldown_until, last_error, updated_at) '
+    + 'values (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, null, null, ?)',
+  ).run(
+    randomUUID(), storage.workspace.id, 'Isolated Test Profile', 'https://openrouter.ai/api/v1',
+    'test/isolated-model', 'responses', credentialId, 100, 128_000, 4_096, 'off', 'any', 0, 0, 0, 'closed', Date.now(),
+  )
+  storage.close()
+  return { dir, credentialId, workspaceId, keep: () => rmSync(dir, { recursive: true, force: true }) }
+}
+
+function walkFilesNoFollow(dir: string): string[] {
+  const files: string[] = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) files.push(...walkFilesNoFollow(path))
+    else if (entry.isFile()) files.push(path)
+  }
+  return files
+}
+
+test('isolation: two cell Stores run concurrently, profile visible, credentials symlinked, no key in out-dir', async () => {  const source = makeSourceDataDir()
+  const outDir = mkdtempSync(join(tmpdir(), 'guardian-iso-out-'))
+  try {
+    const targetA = join(outDir, 'data', 'acme-saas-seed1-grey-box')
+    const targetB = join(outDir, 'data', 'shopflow-seed1-grey-box')
+    const [a, b] = await Promise.all([
+      Promise.resolve().then(() => prepareIsolatedDataDir({ sourceDataDir: source.dir, targetDir: targetA })),
+      Promise.resolve().then(() => prepareIsolatedDataDir({ sourceDataDir: source.dir, targetDir: targetB })),
+    ])
+    assert.deepEqual(a.profileNames, ['Isolated Test Profile'])
+    assert.deepEqual(b.profileNames, ['Isolated Test Profile'])
+    assert.notEqual(a.directory, b.directory)
+
+    // Both Stores open at the same time: no "Another Guardian server" collision.
+    const storeA = openCellStore(a.directory)
+    const storeB = openCellStore(b.directory)
+    try {
+      assert.equal(privateModelProfiles(storeA).length, 1)
+      assert.equal(privateModelProfiles(storeB).length, 1)
+      assert.equal(privateModelProfiles(storeA)[0]?.name, 'Isolated Test Profile')
+      assert.equal(privateModelProfiles(storeB)[0]?.name, 'Isolated Test Profile')
+      assert.equal(storeA.workspace.id, source.workspaceId)
+      assert.equal(storeB.workspace.id, source.workspaceId)
+
+      for (const target of [targetA, targetB]) {
+        const link = join(target, 'credentials')
+        assert.ok(lstatSync(link).isSymbolicLink(), 'credentials must be a symlink')
+        const resolved = readlinkSync(link)
+        assert.equal(statSync(resolved).isDirectory(), true)
+        assert.equal(statSync(join(link, source.credentialId)).mode & 0o777, 0o600)
+      }
+    } finally {
+      storeA.close()
+      storeB.close()
+    }
+
+    // No key material in regular files under the isolated out-dir (symlinks are skipped).
+    const leaked = walkFilesNoFollow(outDir)
+      .filter(file => readFileSync(file, 'utf8').includes(KEY_CANARY))
+    assert.deepEqual(leaked, [])
+    const credentialLinks = walkFilesNoFollow(outDir)
+    assert.ok(!credentialLinks.includes(join(targetA, 'credentials', source.credentialId)))
+  } finally {
+    source.keep()
+    rmSync(outDir, { recursive: true, force: true })
+  }
+})
+
+test('isolation: a locked data dir suggests --isolate-data-dir with exit code 2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-iso-lock-'))
+  const first = new Store(dir)
+  try {
+    let caught: unknown
+    try { openCellStore(dir) } catch (error) { caught = error }
+    assert.ok(caught instanceof PreflightError)
+    assert.equal((caught as PreflightError).exitCode, 2)
+    assert.match((caught as Error).message, /--isolate-data-dir/)
+  } finally {
+    first.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('isolation: missing source profile fails before creating a run', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-iso-empty-'))
+  const outDir = mkdtempSync(join(tmpdir(), 'guardian-iso-empty-out-'))
+  try {
+    const storage = new Store(dir)
+    storage.close()
+    assert.throws(
+      () => prepareIsolatedDataDir({ sourceDataDir: dir, targetDir: join(outDir, 'data', 'cell') }),
+      /no enabled model profile/,
+    )
+    assert.equal(existsSync(join(outDir, 'data', 'cell')), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(outDir, { recursive: true, force: true })
+  }
 })
 
 test('shutdown: stopEngine aborts promptly and reports zero busy tasks', async () => {
