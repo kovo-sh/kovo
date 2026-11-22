@@ -28,16 +28,22 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
     : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(id)}`
   const parts: RequestParts = { method: method as RequestParts['method'], pathAndQuery: path, ...(mutating ? { jsonBody: {} } : {}) }
   const probePersona = otherHit ? other : null
-  const spec = {
-    ...baseFields(env, 'Cross-actor object or function access', 'CWE-639', 'broken-access-control', 'high',
-      `{ controlPassed: ${is2xx('c1')}, confirmed: (${is2xx('p1')} and ${sameAsControl('p1', 'c1')}), observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`),
-    kind: 'http_chain',
-    steps: [
-      stepOf(env, 'c1', 'control', 'Authorized actor performs the request', parts, owner),
-      stepOf(env, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the same request`, parts, probePersona),
-    ],
-  }
-  return [{ kind: 'http_chain', spec }]
+  // Primary: the probe actor received at least every field/value the owner control received
+  // (extra fields such as leak markers are expected). Fallback: byte/shape equality.
+  const supersetJq = `{ controlPassed: ${is2xx('c1')}, ` +
+    `confirmed: (${is2xx('p1')} and ((.steps.c1.json | type) == "object") and ((.steps.p1.json | type) == "object") and ` +
+    `(.steps.c1.json as $c | .steps.p1.json as $p | ([($c | to_entries[]) | select($p[.key] == .value)] | length) == ([$c | keys[]] | length)) and ` +
+    `(([$c | keys[]] | length) > 0)), ` +
+    `observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
+  const equalityJq = `{ controlPassed: ${is2xx('c1')}, confirmed: (${is2xx('p1')} and ${sameAsControl('p1', 'c1')}), observed: ("status=" + (.steps.p1.status | tostring)), expected: "non-owner denied" }`
+  const steps = [
+    stepOf(env, 'c1', 'control', 'Authorized actor performs the request', parts, owner),
+    stepOf(env, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the same request`, parts, probePersona),
+  ]
+  return [
+    { kind: 'http_chain', spec: { ...baseFields(env, 'Cross-actor object or function access', 'CWE-639', 'broken-access-control', 'high', supersetJq), kind: 'http_chain', steps } },
+    { kind: 'http_chain', spec: { ...baseFields(env, 'Cross-actor object or function access', 'CWE-639', 'broken-access-control', 'high', equalityJq), kind: 'http_chain', steps } },
+  ]
 }
 
 function massAssignmentValue(field: string, privileged: boolean): string | boolean {

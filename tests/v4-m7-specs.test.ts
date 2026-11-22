@@ -278,3 +278,70 @@ describe('M7 spec synthesis: state-changing classes', () => {
     assert.equal(synthesizeSpec(o, env()), null)
   })
 })
+
+describe('M7 spec synthesis: browser/web anomaly classes', () => {
+  test('second_order_xss plants a marker and asserts it unencoded on the read route', () => {
+    const ep = endpoint({
+      method: 'POST',
+      path: '/api/comments',
+      params: [{ name: 'body', location: 'json', isObjectId: false, isCsrf: false }],
+    })
+    const { built } = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'xss_context', location: 'json', method: 'POST' }),
+      anomalies: [{
+        type: 'second_order_xss', plantPath: '/api/comments', plantParam: 'body', plantLocation: 'json',
+        readPath: '/comments', context: 'html_body', unencodedChars: ['"', "'", '<', '>'], mediaType: 'text/html',
+      }],
+    }), 'http_chain')
+    const steps = built.spec.steps as Array<{ role: string; request: { method: string; pathAndQuery: string; jsonBody?: Record<string, unknown> } }>
+    assert.equal(steps.length, 3)
+    assert.equal(steps[1].request.method, 'POST')
+    assert.match(String(steps[1].request.jsonBody?.body), /^gxss[0-9a-f]+/)
+    assert.match(String(built.spec.assertionsJq), /contains\("gxss/)
+    assert.equal(steps[2].request.pathAndQuery, '/comments')
+  })
+
+  test('dom_xss_sink becomes a control/probe browser_chain with fill and click actions', () => {
+    const ep = endpoint({ path: '/wizard', params: [{ name: 'display-name', location: 'query', isObjectId: false, isCsrf: false }] })
+    const { built } = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'xss_context', location: 'query' }),
+      anomalies: [{
+        type: 'dom_xss_sink', path: '/wizard', sink: 'innerHTML',
+        actions: ['fill #display-name', 'click #continue', 'click #preview'], canaryTriggered: true,
+      }],
+    }), 'browser_chain')
+    const steps = built.spec.steps as Array<{ id: string; role: string; action?: string; selector?: string }>
+    assert.equal(steps[0].role, 'control')
+    assert.ok(steps.some(s => s.action === 'fill' && s.selector === '#display-name'))
+    assert.ok(steps.some(s => s.action === 'click' && s.selector === '#continue'))
+    assert.ok(steps.at(-1)?.action === 'dom_xss_sink_hook')
+    assert.match(String(built.spec.assertionsJq), /containsCanary/)
+  })
+
+  test('reflected xss_context with unencoded markup becomes an executable browser_chain', () => {
+    const ep = endpoint({ path: '/search', params: [{ name: 'q', location: 'query', isObjectId: false, isCsrf: false }] })
+    const { built } = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'xss_context', location: 'query' }),
+      anomalies: [{ type: 'xss_context', context: 'html_body', unencodedChars: ['"', "'", '<', '>'] }],
+    }), 'browser_chain')
+    const steps = built.spec.steps as Array<{ request?: unknown; pathAndQuery: string }>
+    assert.match(String(steps[1].pathAndQuery), /%3Cimg/)
+    assert.match(String(steps[1].pathAndQuery), /canary_token/)
+    assert.match(String(built.spec.assertionsJq), /canaryToken/)
+  })
+
+  test('oauth redirect differential without a corpus seed is rebuilt from the observed Location', () => {
+    const ep = endpoint({ path: '/oauth/authorize', params: [] })
+    const { built } = expectSpec(outcome({
+      hyp: hypothesis({ endpoint: ep, probeClass: 'auth_protocol_audit', param: undefined, location: undefined }),
+      anomalies: [{
+        type: 'oauth_redirect_differential', variant: 'userinfo_at', status: 302,
+        location: 'https://app.client.test@evil.invalid/cb?code=abc',
+      }],
+    }), 'auth_protocol_proof')
+    const steps = built.spec.steps as Array<{ role: string; request: { pathAndQuery: string } }>
+    assert.equal(built.spec.protocol, 'oauth')
+    assert.match(String(steps[0].request.pathAndQuery), /unrelated-control/)
+    assert.match(String(steps[1].request.pathAndQuery), /app\.client\.test%40evil\.invalid/)
+  })
+})

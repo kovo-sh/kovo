@@ -4,7 +4,7 @@
  * observations from the probe; nothing is derived from a benchmark manifest.
  */
 import { randomBytes } from 'node:crypto'
-import { baseFields, is2xx, jqStr, sessionFields, stepOf } from './benchmark-specs-common.ts'
+import { appendQuery, baseFields, is2xx, jqStr, sessionFields, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
 import { fillPlaceholders, hasPathPlaceholder, probePathFor } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
@@ -245,15 +245,21 @@ export function synthDomXss(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpe
     checkKind: 'dom_xss' as const,
     enableSinkHook: true,
   }
-  const jq = '{ controlPassed: (.steps.c1.status == 200 and (((.steps.c1.domSinkTraces // []) | length) == 0)), ' +
-    'confirmed: (([((.steps.p1.domSinkTraces // []) + (.steps.p2.domSinkTraces // []) + (.steps.p3.domSinkTraces // []) + (.steps.p4.domSinkTraces // []))[] | select(.containsCanary)] | length) >= 1), ' +
-    'observed: ("probe sink hits=" + (([((.steps.p1.domSinkTraces // []) + (.steps.p2.domSinkTraces // []) + (.steps.p3.domSinkTraces // []) + (.steps.p4.domSinkTraces // []))[] | select(.containsCanary)] | length) | tostring)), expected: "canary never reaches an executable DOM sink" }'
+  const stepIds = ['p1']
+  let n = 2
+  for (let i = 0; i < fills.length; i += 1) stepIds.push(`p${n++}`)
+  for (let i = 0; i < clicks.length; i += 1) stepIds.push(`p${n++}`)
+  stepIds.push(`p${n}`)
+  const tracesExpr = `[(${stepIds.map(id => `(.steps.${id}.domSinkTraces // [])`).join(' + ')})[] | select(.containsCanary)]`
+  const jq = '{ controlPassed: (.steps.c1.status == 200 and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
+    `confirmed: ((${tracesExpr} | length) >= 1), ` +
+    `observed: ("probe sink hits=" + (${tracesExpr} | length | tostring)), expected: "canary never reaches an executable DOM sink" }`
 
   const steps: Array<Record<string, unknown>> = [
     { id: 'c1', role: 'control', description: 'Render the page without interaction', ...stepBase, pathAndQuery: path, action: 'navigate', waitAfterLoadMs: 300 },
     { id: 'p1', role: 'probe', description: 'Render the page with the sink hook armed', ...stepBase, pathAndQuery: path, action: 'navigate', waitAfterLoadMs: 300 },
   ]
-  let n = 2
+  n = 2
   for (const fill of fills) {
     steps.push({
       id: `p${n}`, role: 'probe', description: `Fill ${fill.selector.slice(0, 80)} with the canary`,
@@ -279,6 +285,45 @@ export function synthDomXss(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpe
       ...baseFields(env, 'DOM-based cross-site scripting via interactive sink', 'CWE-79', 'xss', 'high', jq),
       kind: 'browser_chain',
       steps,
+    },
+  }]
+}
+
+// ---------------------------------------------------------------------------
+// Reflected XSS: replay the unencoded reflection in the scoped browser
+// ---------------------------------------------------------------------------
+
+/**
+ * The surface probe already proved the marker is reflected into a renderable context with dangerous
+ * characters unencoded. Confirmation replays an executable payload whose only visible effect is the
+ * verifier-minted canary token becoming the document title; encoded reflections leave the title alone.
+ */
+export function synthReflectedXss(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'xss_context')
+  if (!hit || !o.hyp.param || o.hyp.location !== 'query') return []
+  const context = String(hit.context ?? 'html_body')
+  const chars = Array.isArray(hit.unencodedChars) ? hit.unencodedChars.map(String) : []
+  // Only markup contexts where an injected tag actually parses; attribute/JS contexts need a
+  // different escape and are deliberately not synthesized from a plain tag payload.
+  if (context !== 'html_body' || !chars.includes('<') || !chars.includes('"')) return []
+  const basePath = o.hyp.endpoint.path
+  if (!basePath.startsWith('/')) return []
+  const controlPath = appendQuery(basePath, o.hyp.param.name, 'guardian')
+  const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
+  const probePath = appendQuery(basePath, o.hyp.param.name, payload)
+  const params = { origin: env.origin, ...(env.owner ? { persona: env.owner } : {}), ...sessionFields(env, o.hyp) }
+  const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
+    'confirmed: ((.steps.p1.status >= 200 and .steps.p1.status < 400) and ((.steps.p1.title == .canaryToken) or (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) >= 1))), ' +
+    'observed: ("probe title=" + (.steps.p1.title // "" | tostring)), expected: "reflected input is inert text" }'
+  return [{
+    kind: 'browser_chain',
+    spec: {
+      ...baseFields(env, 'Reflected cross-site scripting (executed marker)', 'CWE-79', 'xss', 'high', jq),
+      kind: 'browser_chain',
+      steps: [
+        { id: 'c1', role: 'control', description: 'Render the page with a benign parameter value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
+        { id: 'p1', role: 'probe', description: 'Render the page with an executable marker payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
+      ],
     },
   }]
 }

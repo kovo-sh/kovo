@@ -9,7 +9,7 @@ import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 import { synthAuthz, synthMassAssignment, synthSsrf, synthSsti, synthXxe } from './benchmark-specs-http.ts'
 import { synthAuthProtocol, synthCache } from './benchmark-specs-proto.ts'
 import { synthSqlBoolean, synthSqlTime } from './benchmark-specs-sql.ts'
-import { synthDomXss, synthGraphql, synthSecondOrderXss, synthWorkflow } from './benchmark-specs-web.ts'
+import { synthDomXss, synthGraphql, synthReflectedXss, synthSecondOrderXss, synthWorkflow } from './benchmark-specs-web.ts'
 import type { SynthesizedSpec } from './benchmark-specs-common.ts'
 
 export type { SynthesizedSpec } from './benchmark-specs-common.ts'
@@ -27,7 +27,7 @@ function build(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
     case 'cache_poison_deception': return synthCache(o, env)
     case 'graphql_audit': return synthGraphql(o, env)
     case 'workflow_invariant': return synthWorkflow(o, env)
-    case 'xss_context': return [...synthSecondOrderXss(o, env), ...synthDomXss(o, env)]
+    case 'xss_context': return [...synthSecondOrderXss(o, env), ...synthDomXss(o, env), ...synthReflectedXss(o, env)]
     case 'path_traversal_benign': return []
     default: return []
   }

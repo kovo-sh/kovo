@@ -333,9 +333,15 @@ export function buildProbeRequest(h: Hypothesis, env: ProbeEnv, extras: Partial<
   return req
 }
 
-function authzIds(env: ProbeEnv): string[] {
-  const ids = [...env.personaUserIds, '1', '2', '3']
-  return [...new Set(ids)].filter(i => /^[A-Za-z0-9_.:-]{1,128}$/.test(i)).slice(0, 8)
+function authzIds(env: ProbeEnv, pathTemplate?: string): string[] {
+  // Prefer concrete identifiers observed on the target's own surface, then numeric variants of the
+  // persona user ids (common `user-1234` -> `1234` object-id convention), then the personas themselves.
+  const mined = env.corpus && pathTemplate ? mineBaselines(env.corpus, 'id', pathTemplate) : []
+  const derived = env.personaUserIds
+    .map(id => id.replace(/^[A-Za-z]+[-_]/, ''))
+    .filter((id, i) => id.length > 0 && id !== env.personaUserIds[i])
+  const ids = [...mined, ...derived, ...env.personaUserIds, '1', '2', '3']
+  return [...new Set(ids)].filter(i => /^[A-Za-z0-9_.:-]{1,128}$/.test(i)).slice(0, 10)
 }
 
 export function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.owner, other = env.other): ProbeDifferentialRequest {
@@ -354,7 +360,7 @@ export function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.owner, ot
     otherPersona: other,
     includeAnonymous: true,
     includeHeaderBypass: false,
-    resourceIds: authzIds(env),
+    resourceIds: authzIds(env, h.endpoint.path),
     runId: env.runId,
     storage: env.storage,
     ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
@@ -365,7 +371,9 @@ const sqliClasses = new Set<string>(['sqli_boolean', 'sqli_time_diff'])
 
 async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedContext> {
   const cache = (env.ctxCache ??= new Map())
-  const key = `${h.endpoint.method}|${h.endpoint.path}|${h.param?.name ?? ''}|${h.location ?? ''}|${sqliClasses.has(h.probeClass) ? 'sql' : 'x'}`
+  // Probe class is part of the key: different classes on the same endpoint need different context
+  // (e.g. a path-traversal pass must not pre-populate an empty context for the auth-protocol pass).
+  const key = `${h.probeClass}|${h.endpoint.method}|${h.endpoint.path}|${h.param?.name ?? ''}|${h.location ?? ''}`
   const hit = cache.get(key)
   if (hit) return hit
   const ctx: ResolvedContext = {}

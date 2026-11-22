@@ -54,35 +54,61 @@ function jwtSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
 
 function oauthSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const seed = o.ctx?.seedQuery
-  if (!seed) return []
   const path = o.hyp.endpoint.path.split('?')[0]
   const challenge = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
   const withParams = (set: Record<string, string>) => {
-    const u = new URL(`${path}?${seed}`, 'http://guardian.invalid')
+    const u = new URL(seed ? `${path}?${seed}` : path, 'http://guardian.invalid')
     for (const [k, v] of Object.entries(set)) u.searchParams.set(k, v)
     return u.pathname + u.search
   }
-  const orig = (() => { try { return new URL(new URL(`${path}?${seed}`, 'http://guardian.invalid').searchParams.get('redirect_uri') ?? 'https://app.example.invalid/cb') } catch { return new URL('https://app.example.invalid/cb') } })()
-  const variants: Record<string, string> = {
+  const orig = (() => { try { return new URL(new URL(`${path}?${seed ?? ''}`, 'http://guardian.invalid').searchParams.get('redirect_uri') ?? 'https://app.example.invalid/cb') } catch { return new URL('https://app.example.invalid/cb') } })()
+  const seedVariants: Record<string, string> = {
     userinfo_at: `https://${orig.host}@evil.invalid/cb`,
     backslash_at: `https://${orig.host}\\@evil.invalid/cb`,
     subdomain_prefix: `https://${orig.hostname}.evil.invalid/cb`,
     suffix_match: `https://evil-${orig.hostname}/cb`,
   }
   const control: RequestParts = { method: 'GET', pathAndQuery: withParams({ redirect_uri: 'https://unrelated-control.invalid/cb', code_challenge_method: 'S256', code_challenge: challenge }) }
-  const out: SynthesizedSpec[] = []
-  for (const a of o.anomalies) {
-    let probePath: string | null = null
-    if (a.type === 'oauth_redirect_differential' && variants[String(a.variant)]) {
-      probePath = withParams({ redirect_uri: variants[String(a.variant)], code_challenge_method: 'S256', code_challenge: challenge })
-    } else if (a.type === 'pkce_downgrade') {
-      probePath = withParams({ redirect_uri: orig.href, code_challenge_method: 'plain', code_challenge: 'plain-challenge-token-123456' })
+
+  // When no seed query was mined, reconstruct the accepted redirect value (and the registered
+  // target) directly from the probe's observed Location header. Nothing here is target-specific.
+  const evidenceFromAnomaly = (a: Record<string, unknown>): { probePath: string; registeredHref?: string } | null => {
+    if (a.type !== 'oauth_redirect_differential') return null
+    let loc: URL
+    try { loc = new URL(String(a.location ?? '')) } catch { return null }
+    const variant = String(a.variant ?? '')
+    let value: string | null = null
+    let registered: string | null = null
+    if (variant === 'userinfo_at' && loc.username) {
+      value = `https://${loc.username}@evil.invalid${loc.pathname}`
+      registered = `https://${loc.username}${loc.pathname}`
+    } else if (variant === 'backslash_at' && loc.pathname.startsWith('/@')) {
+      const rest = loc.pathname.slice(1)
+      value = `${loc.origin}\\${rest}`
+      const tail = rest.split('/').slice(1).join('/')
+      registered = `${loc.origin}/${tail}`
+    } else if (variant === 'subdomain_prefix' && loc.hostname.endsWith('.evil.invalid')) {
+      const host = loc.hostname.slice(0, -'.evil.invalid'.length)
+      value = `https://${host}.evil.invalid${loc.pathname}`
+      registered = `https://${host}${loc.pathname}`
+    } else if (variant === 'suffix_match' && loc.hostname.startsWith('evil-')) {
+      const host = loc.hostname.slice('evil-'.length)
+      value = `https://evil-${host}${loc.pathname}`
+      registered = `https://${host}${loc.pathname}`
     }
-    if (!probePath) continue
+    if (!value) return null
+    return { probePath: withParams({ redirect_uri: value, code_challenge_method: 'S256', code_challenge: challenge }), ...(registered ? { registeredHref: registered } : {}) }
+  }
+
+  const out: SynthesizedSpec[] = []
+  const seen = new Set<string>()
+  const push = (label: string, probePath: string) => {
+    if (seen.has(probePath)) return
+    seen.add(probePath)
     out.push({
       kind: 'auth_protocol_proof',
       spec: {
-        ...baseFields(env, `OAuth authorization validation differential: ${String(a.variant ?? a.type)}`, 'CWE-601', 'broken-authentication', 'high',
+        ...baseFields(env, `OAuth authorization validation differential: ${label}`, 'CWE-601', 'broken-authentication', 'high',
           '{ controlPassed: (.steps.c1.status >= 400), confirmed: (.steps.p1.status < 400), observed: ("status=" + (.steps.p1.status | tostring)), expected: "authorize request rejected" }'),
         kind: 'auth_protocol_proof',
         protocol: 'oauth',
@@ -92,6 +118,20 @@ function oauthSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
         ],
       },
     })
+  }
+
+  const registeredHrefs: string[] = []
+  for (const a of o.anomalies) {
+    const derived = evidenceFromAnomaly(a)
+    if (derived) push(String(a.variant ?? a.type), derived.probePath)
+    if (derived?.registeredHref) registeredHrefs.push(derived.registeredHref)
+    if (seed && a.type === 'oauth_redirect_differential' && seedVariants[String(a.variant)]) {
+      push(String(a.variant), withParams({ redirect_uri: seedVariants[String(a.variant)], code_challenge_method: 'S256', code_challenge: challenge }))
+    }
+  }
+  if (o.anomalies.some(a => a.type === 'pkce_downgrade')) {
+    const target = registeredHrefs[0] ?? (seed ? orig.href : null)
+    if (target) push('pkce_plain', withParams({ redirect_uri: target, code_challenge_method: 'plain', code_challenge: 'plain-challenge-token-123456' }))
   }
   return out
 }
@@ -112,9 +152,10 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   if (poison) {
     const header = String(poison.header ?? '')
     if (!/^[A-Za-z0-9-]{1,64}$/.test(header) || /^(?:authorization|cookie|host)$/i.test(header)) return []
-    const value = header === 'X-Forwarded-Scheme' ? 'http' : header.endsWith('URL') ? `/${marker}` : 'poison-guardian.guardian.invalid'
+    const value = header === 'X-Forwarded-Scheme' ? 'http' : header.endsWith('URL') ? `/${marker}` : `${marker}.invalid`
+    const markerCheck = header === 'X-Forwarded-Scheme' ? '' : ` and (.verify.body | contains(${jqStr(marker)}))`
     const jq = '{ controlPassed: (.cacheProof.cacheHitObserved == true), ' +
-      `confirmed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.poisonPersistedToVictim == true) and (.verify.body | contains(${jqStr(marker)}))), ` +
+      `confirmed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.poisonPersistedToVictim == true)${markerCheck}), ` +
       'observed: ("hit=" + (.cacheProof.cacheHitObserved | tostring) + " age=" + ((.cacheProof.age // 0) | tostring)), expected: "poisoned response served from cache to a clean client" }'
     out.push({
       kind: 'cache_differential',

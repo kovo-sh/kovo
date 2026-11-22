@@ -1,5 +1,5 @@
 /** sql_boolean_diff / sql_time_diff spec synthesis from sqli probe signals. */
-import { baseFields } from './benchmark-specs-common.ts'
+import { baseFields, stepOf } from './benchmark-specs-common.ts'
 import type { SynthesizedSpec } from './benchmark-specs-common.ts'
 import { probePathFor } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
@@ -41,6 +41,13 @@ function injectionFields(o: HypothesisOutcome, env: ProbeEnv) {
   }
 }
 
+/** A setup request that lets the broker jar learn session cookies and CSRF tokens before the rounds. */
+function primingFields(env: ProbeEnv) {
+  return env.caps.sessionAndCsrf
+    ? { controlStep: stepOf(env, 'c0', 'setup', 'Load the entry page to bind session and CSRF cookies', { method: 'GET', pathAndQuery: '/' }, env.owner) }
+    : {}
+}
+
 const jqBoolean = '{ controlPassed: (.sqlDiff.controlPassed == true), confirmed: (.sqlDiff.passed == true), observed: ("passed=" + (.sqlDiff.passed | tostring)), expected: "boolean differential holds" }'
 const jqTime = '{ controlPassed: (.sqlTimeDiff.controlPassed == true), confirmed: (.sqlTimeDiff.passed == true), observed: ("deltaMs=" + (.sqlTimeDiff.deltaMedianMs | tostring)), expected: "time differential holds" }'
 
@@ -57,6 +64,7 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
         ...baseFields(env, 'Boolean-based SQL injection differential', 'CWE-89', 'injection-input', 'high', jqBoolean),
         kind: 'sql_boolean_diff',
         ...injectionFields(o, env),
+        ...primingFields(env),
         quoteStyle: s.quoteStyle,
         ...(s.valueTemplate ? { valueTemplate: s.valueTemplate } : {}),
       },
@@ -64,7 +72,7 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
   }
   const hasErrorSignal = o.anomalies.some(a => a.type === 'db_error_fingerprint')
   if (!hasErrorSignal) return []
-  if (o.hyp.location === 'xml' || o.hyp.location === 'graphql_var') return []
+  if (o.hyp.location === 'graphql_var') return []
   // Error fingerprint proves the value reaches a SQL string literal. A tautology baseline plus the
   // verifier's randomized `k=k` / `k=k+1` triplet still yields a genuine boolean differential.
   const out: SynthesizedSpec[] = [{
@@ -73,6 +81,7 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
       ...baseFields(env, 'SQL injection via string-literal breakout (error fingerprint)', 'CWE-89', 'injection-input', 'high', jqBoolean),
       kind: 'sql_boolean_diff',
       ...injectionFields(o, env),
+      ...primingFields(env),
       baselineValue: "x' OR 1=1-- -",
       quoteStyle: 'single',
       valueTemplate: "x' OR {{sql_expr}}-- -",
@@ -87,6 +96,7 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
         ...baseFields(env, 'Boolean-based SQL injection differential', 'CWE-89', 'injection-input', 'high', jqBoolean),
         kind: 'sql_boolean_diff',
         ...injectionFields(o, env),
+        ...primingFields(env),
         quoteStyle: s.quoteStyle,
         ...(s.valueTemplate ? { valueTemplate: s.valueTemplate } : {}),
       },
@@ -111,6 +121,7 @@ export function synthSqlTime(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
       ...baseFields(env, 'Time-based blind SQL injection differential', 'CWE-89', 'injection-input', 'high', jqTime),
       kind: 'sql_time_diff',
       ...injectionFields(o, env),
+      ...primingFields(env),
       quoteStyle: booleanStyle(style).quoteStyle,
       dialect,
       delayMs: Math.round(delay),
