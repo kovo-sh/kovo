@@ -9,7 +9,7 @@ import type { CanaryBroker } from './canary-broker.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { Store } from './store.ts'
-import { runSafeTemplates } from './surface-engine.ts'
+import { parseGraphqlIntrospection, runSafeTemplates } from './surface-engine.ts'
 
 export interface Phase0ReconParams {
   storage: Store
@@ -523,14 +523,17 @@ function detectTechTags(respHeaders: Record<string, string>, body: string): stri
   return [...tags]
 }
 
-function extractHtmlLinksAndScripts(html: string, origin: string): {
+export function extractHtmlLinksAndScripts(html: string, origin: string): {
   links: string[]
   scripts: string[]
-  forms: Array<{ action: string; method: string; inputs: string[] }>
+  forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }>
+  inputs: Array<{ name: string; id: string | null; type: string | null }>
 } {
   const links = new Set<string>()
   const scripts = new Set<string>()
-  const forms: Array<{ action: string; method: string; inputs: string[] }> = []
+  const forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }> = []
+  const inputs: Array<{ name: string; id: string | null; type: string | null }> = []
+  const seenInputs = new Set<string>()
 
   for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi)) {
     const clean = sanitizePathCandidate(m[1], origin)
@@ -545,18 +548,224 @@ function extractHtmlLinksAndScripts(html: string, origin: string): {
     const inner = m[2]
     const actionMatch = /\baction\s*=\s*["']([^"']+)["']/i.exec(attrs)
     const methodMatch = /\bmethod\s*=\s*["']([a-zA-Z]+)["']/i.exec(attrs)
+    const enctypeMatch = /\benctype\s*=\s*["']([^"']+)["']/i.exec(attrs)
     const action = sanitizePathCandidate(actionMatch?.[1] ?? '/', origin) ?? '/'
     const method = (methodMatch?.[1] ?? 'GET').toUpperCase()
-    const inputs: string[] = []
+    const inputsInForm: string[] = []
     for (const im of inner.matchAll(/<(?:input|select|textarea)\b[^>]*\bname\s*=\s*["']([^"']+)["']/gi)) {
-      if (im[1]) inputs.push(im[1])
+      if (im[1]) inputsInForm.push(im[1])
     }
-    forms.push({ action, method, inputs })
+    forms.push({ action, method, inputs: inputsInForm, enctype: (enctypeMatch?.[1] ?? 'application/x-www-form-urlencoded').toLowerCase() })
   }
-  return { links: [...links], scripts: [...scripts], forms }
+  // Standalone controls outside a <form> (common in SPA/wizard pages). Both name and id are
+  // recorded because scripted pages frequently drive inputs by id.
+  for (const tm of html.matchAll(/<(?:input|select|textarea)\b([^>]*)>/gi)) {
+    const attrs = tm[1]
+    const nameMatch = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const idMatch = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const name = (nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3] ?? idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? '').trim()
+    if (!name) continue
+    const id = (idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? null)
+    const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3] ?? null)
+    const key = `${name}|${id ?? ''}`
+    if (seenInputs.has(key)) continue
+    seenInputs.add(key)
+    inputs.push({ name, id: id ? id.trim() : null, type: type ? type.toLowerCase() : null })
+  }
+  return { links: [...links], scripts: [...scripts], forms, inputs }
 }
 
-function parseOpenApiDoc(
+/** Pull XML element names out of an error/echo response (e.g. "expected &lt;lookup&gt;&lt;name&gt;"). */
+export function extractXmlHintTags(body: string): string[] {
+  const decoded = body
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&apos;/g, "'")
+  const expectedIdx = decoded.search(/\b(?:expected|required|missing|invalid)\b/i)
+  const scope = expectedIdx >= 0 ? decoded.slice(expectedIdx, expectedIdx + 512) : decoded.slice(0, 512)
+  const tags: string[] = []
+  for (const m of scope.matchAll(/<\s*\/?\s*([A-Za-z_][A-Za-z0-9_.-]{0,31})\b[^>]*>/g)) {
+    const tag = m[1]
+    if (!tag) continue
+    if (/^(?:error|errors|html|body|head|request|response|root|result|results|message|status|code|detail|details)$/i.test(tag)) continue
+    if (!tags.includes(tag)) tags.push(tag)
+  }
+  return tags
+}
+
+/** Return the balanced `( ... )` slice starting at openParenIndex (quote-aware, bounded). */
+function sliceBalancedCall(code: string, openParenIndex: number, max = 1400): string {
+  let depth = 0
+  let quote: string | null = null
+  let escaped = false
+  for (let i = openParenIndex; i < code.length && i - openParenIndex < max; i += 1) {
+    const ch = code[i]
+    if (quote) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue }
+    if (ch === '(') depth += 1
+    else if (ch === ')') {
+      depth -= 1
+      if (depth === 0) return code.slice(openParenIndex, i + 1)
+    }
+  }
+  return code.slice(openParenIndex, openParenIndex + max)
+}
+
+export interface JsRequestParam {
+  name: string
+  location: 'query' | 'json' | 'form' | 'xml'
+}
+
+export interface JsRequestSpec {
+  method: string
+  path: string
+  params: JsRequestParam[]
+}
+
+const JS_RESERVED_BODY_KEYS = /^(?:query|variables|operationName|method|headers|body|mode|credentials|cache|redirect|referrer|integrity|keepalive|signal|url|data|params)$/i
+
+/**
+ * Bounded regex scan of client bundles for request literals: fetch()/axios()/XHR URLs, HTTP methods,
+ * JSON/urlencoded body keys, and XML element names adjacent to a concatenation. Deterministic and
+ * dependency-free (works when the AST parser is unavailable).
+ */
+export function harvestJsRequestParams(code: string): JsRequestSpec[] {
+  const out: JsRequestSpec[] = []
+  const seen = new Set<string>()
+  const pushSpec = (method: string, rawPath: string, params: JsRequestParam[]) => {
+    const path = rawPath.trim()
+    if (!path.startsWith('/') || path.startsWith('//') || path.length > 200 || /[\r\n\0\\]/.test(path)) return
+    const cleanPath = path.split('?')[0] ?? path
+    const deduped: JsRequestParam[] = []
+    const keys = new Set<string>()
+    for (const p of params) {
+      if (!p.name || !/^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/.test(p.name)) continue
+      const key = `${p.name}|${p.location}`
+      if (keys.has(key)) continue
+      keys.add(key)
+      deduped.push(p)
+    }
+    // Preserve query parameters that were already present in the URL literal.
+    const qIdx = path.indexOf('?')
+    if (qIdx >= 0) {
+      try {
+        for (const name of new URL(path, 'http://guardian.invalid').searchParams.keys()) {
+          if (!/^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/.test(name)) continue
+          const key = `${name}|query`
+          if (keys.has(key)) continue
+          keys.add(key)
+          deduped.push({ name, location: 'query' })
+        }
+      } catch { /* ignore malformed query */ }
+    }
+    const methodUpper = method.toUpperCase()
+    const key = `${methodUpper} ${cleanPath}`
+    if (seen.has(`${key}|${JSON.stringify(deduped)}`)) return
+    seen.add(`${key}|${JSON.stringify(deduped)}`)
+    if (out.length < 40) out.push({ method: methodUpper, path: cleanPath, params: deduped.slice(0, 20) })
+  }
+
+  const scanInit = (defaultMethod: string, path: string, initText: string) => {
+    const methodMatch = /\bmethod\s*:\s*['"`]([A-Za-z]+)['"`]/i.exec(initText)
+    const method = (methodMatch?.[1] ?? defaultMethod).toUpperCase()
+    const contentType = /content-type['"]?\s*:\s*['"]([^'"]+)['"]/i.exec(initText)?.[1]?.toLowerCase() ?? ''
+    if (contentType.includes('xml') || /\bapplication\/xml\b/i.test(initText)) {
+      const concatTag = /<([A-Za-z_][\w.-]{0,31})>\s*['"`]\s*\+/.exec(initText)?.[1]
+      const literalTags = [...initText.matchAll(/<([A-Za-z_][\w.-]{0,31})[^>]*>/g)]
+        .map(m => m[1])
+        .filter(t => !/^(?:request|root|guardian|envelope|body)$/i.test(t))
+      const name = concatTag ?? literalTags[literalTags.length - 1]
+      pushSpec(method, path, name ? [{ name, location: 'xml' }] : [])
+      return
+    }
+    const params: JsRequestParam[] = []
+    const collect = (block: string, location: 'json' | 'form', skipInitOptions: boolean) => {
+      for (const m of block.matchAll(/([A-Za-z_$][\w$]*)\s*:/g)) {
+        const name = m[1]
+        if (skipInitOptions && JS_RESERVED_BODY_KEYS.test(name)) continue
+        if (!skipInitOptions && /^(?:query|variables|operationName)$/i.test(name)) continue
+        params.push({ name, location })
+      }
+    }
+    // Keys inside an explicit serialize call are body fields (a field may legitimately be named "body").
+    for (const m of initText.matchAll(/JSON\.stringify\s*\(\s*\{([^{}]{0,500})\}/g)) collect(m[1], 'json', false)
+    // Other object-literal keys in the call init (direct axios data object, etc.); skip request options.
+    collect(initText, 'json', true)
+    for (const m of initText.matchAll(/URLSearchParams\s*\(\s*\{([^{}]{0,500})\}/g)) collect(m[1], 'form', false)
+    for (const m of initText.matchAll(/\b(new\s+FormData|FormData)\s*\(/g)) {
+      const tail = initText.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 400)
+      for (const am of tail.matchAll(/\.append\s*\(\s*['"]([^'"]+)['"]/g)) params.push({ name: am[1], location: 'form' })
+    }
+    pushSpec(method, path, params)
+  }
+
+  for (const m of code.matchAll(/fetch\s*\(\s*(['"`])([^'"`]{1,200})\1\s*(?:,\s*)?/g)) {
+    if (!m[2].startsWith('/')) continue
+    const openIdx = (m.index ?? 0) + m[0].indexOf('(')
+    scanInit('GET', m[2], sliceBalancedCall(code, openIdx))
+  }
+  for (const m of code.matchAll(/axios\.(?:get|post|put|patch|delete)\s*\(\s*(['"`])([^'"`]{1,200})\1\s*,?\s*/g)) {
+    if (!m[2].startsWith('/')) continue
+    const openIdx = (m.index ?? 0) + m[0].indexOf('(')
+    const method = /axios\.([a-z]+)/i.exec(m[0])?.[1] ?? 'GET'
+    scanInit(method, m[2], sliceBalancedCall(code, openIdx))
+  }
+  for (const m of code.matchAll(/\.open\s*\(\s*(['"`])([A-Za-z]+)\1\s*,\s*(['"`])([^'"`]{1,200})\3/g)) {
+    if (!m[4].startsWith('/')) continue
+    const callEnd = (m.index ?? 0) + m[0].length
+    const tail = code.slice(callEnd, Math.min(code.length, callEnd + 700))
+    const sendIdx = tail.search(/\.send\s*\(/)
+    scanInit(m[2], m[4], sendIdx >= 0 ? sliceBalancedCall(tail, sendIdx + tail.slice(sendIdx).indexOf('(')) : '')
+  }
+  return out
+}
+
+/** Record every query-string parameter of a discovered URL onto its endpoint. */
+function recordQueryParamsForEndpoint(input: {
+  rawPathAndQuery: string
+  origin: string
+  endpointId: string
+  source: string
+  storage: Store
+  runId: string
+  dynamicParams: Set<string>
+}): number {
+  const { rawPathAndQuery, endpointId, source, storage, runId, dynamicParams } = input
+  const qIdx = rawPathAndQuery.indexOf('?')
+  if (qIdx < 0) return 0
+  let names: string[] = []
+  try {
+    names = [...new URL(rawPathAndQuery, input.origin).searchParams.keys()]
+  } catch {
+    return 0
+  }
+  let count = 0
+  for (const name of names.slice(0, 12)) {
+    if (!name) continue
+    storage.upsertEndpointParam({
+      runId,
+      endpointId,
+      name,
+      location: 'query',
+      isCsrf: CSRF_PARAM_RE.test(name),
+      isObjectId: OBJECT_ID_PARAM_RE.test(name),
+      source,
+    })
+    dynamicParams.add(name)
+    count += 1
+  }
+  return count
+}
+
+export function parseOpenApiDoc(
   rawBody: string,
   origin: string,
   storage: Store,
@@ -627,24 +836,45 @@ function parseOpenApiDoc(
         dynamicParams.add(name)
         params += 1
       }
-      // Extract JSON requestBody properties if present
-      const reqBody = op.requestBody as { content?: Record<string, { schema?: { properties?: Record<string, { type?: string }> } }> } | undefined
-      const jsonProps = reqBody?.content?.['application/json']?.schema?.properties
-      if (jsonProps && typeof jsonProps === 'object') {
-        for (const [propName, propSchema] of Object.entries(jsonProps)) {
+      // Extract requestBody properties for JSON, XML and form/multipart content types.
+      type SchemaProp = { type?: string; xml?: { name?: string } }
+      const reqBody = op.requestBody as { content?: Record<string, { schema?: { properties?: Record<string, SchemaProp> } }> } | undefined
+      const addBodyProps = (props: Record<string, SchemaProp> | undefined, location: ParamLocation) => {
+        if (!props || typeof props !== 'object') return
+        for (const [propName, propSchema] of Object.entries(props)) {
+          if (!propName) continue
+          const xmlName = location === 'xml' && typeof propSchema?.xml?.name === 'string' && propSchema.xml.name.trim()
+            ? propSchema.xml.name.trim()
+            : propName
           storage.upsertEndpointParam({
             runId,
             endpointId: ep.id,
-            name: propName,
-            location: 'json',
+            name: xmlName,
+            location,
             inferredType: typeof propSchema?.type === 'string' ? propSchema.type : null,
-            isCsrf: CSRF_PARAM_RE.test(propName),
-            isObjectId: OBJECT_ID_PARAM_RE.test(propName),
+            isCsrf: CSRF_PARAM_RE.test(xmlName),
+            isObjectId: OBJECT_ID_PARAM_RE.test(xmlName),
             source: 'openapi',
           })
-          dynamicParams.add(propName)
+          dynamicParams.add(xmlName)
           params += 1
         }
+      }
+      const content = reqBody?.content ?? {}
+      for (const [mediaType, media] of Object.entries(content)) {
+        const lower = mediaType.toLowerCase()
+        const props = media?.schema?.properties
+        if (lower.includes('json')) addBodyProps(props, 'json')
+        else if (lower.includes('xml')) addBodyProps(props, 'xml')
+        else if (lower.includes('x-www-form-urlencoded') || lower.includes('multipart/form-data')) addBodyProps(props, 'form')
+      }
+      // Swagger 2 style parameters: in: body / formData with a schema.
+      for (const p of opParams) {
+        if (!p || typeof p !== 'object') continue
+        const rec = p as { in?: string; name?: string; schema?: { properties?: Record<string, SchemaProp> }; items?: unknown }
+        const inLoc = typeof rec.in === 'string' ? rec.in.toLowerCase() : ''
+        if (inLoc === 'body') addBodyProps(rec.schema?.properties, 'json')
+        else if (inLoc === 'formdata') addBodyProps(rec.schema?.properties, 'form')
       }
     }
   }
@@ -970,13 +1200,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
 
       const seenJsRoutes = new Set<string>()
-      const addJsEndpoint = (method: string, rawPath: string, bodyKeys: string[] = []) => {
-        if (seenJsRoutes.size >= 120) return
+      const addJsEndpoint = (method: string, rawPath: string, bodyKeys: string[] = []): string | null => {
+        if (seenJsRoutes.size >= 120) return null
         const clean = sanitizePathCandidate(rawPath, origin)
-        if (!clean || STATIC_ASSET_RE.test(clean)) return
+        if (!clean || STATIC_ASSET_RE.test(clean)) return null
         const tmpl = normalizeRouteTemplate(clean)
         const key = `${method.toUpperCase()} ${tmpl}`
-        if (seenJsRoutes.has(key)) return
+        if (seenJsRoutes.has(key)) return null
         seenJsRoutes.add(key)
         const ep = recordEndpoint(method, tmpl, 'js_ast')
         for (const bk of bodyKeys.slice(0, 20)) {
@@ -993,6 +1223,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           dynamicParams.add(bk)
           paramsDiscovered += 1
         }
+        return ep.id
       }
 
       for (const call of harvested.httpCalls ?? []) {
@@ -1003,6 +1234,25 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
       for (const r of harvested.routes ?? []) {
         if (r.path) addJsEndpoint('GET', r.path)
+      }
+      // Regex request-literal scan: fills in methods and body/XML parameter names even when the
+      // bundle AST parser is unavailable (fetch/axios/XHR init object literals).
+      for (const spec of harvestJsRequestParams(ex.body).slice(0, 24)) {
+        const epId = addJsEndpoint(spec.method, spec.path)
+        if (!epId) continue
+        for (const p of spec.params) {
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: epId,
+            name: p.name,
+            location: p.location,
+            isCsrf: CSRF_PARAM_RE.test(p.name),
+            isObjectId: OBJECT_ID_PARAM_RE.test(p.name),
+            source: 'js_ast',
+          })
+          dynamicParams.add(p.name)
+          paramsDiscovered += 1
+        }
       }
       if ((harvested.graphqlDocs?.length ?? 0) > 0) {
         recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
@@ -1071,8 +1321,116 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       if (candidate === '/' || STATIC_ASSET_RE.test(candidate)) continue
       const ex = await safeGet(candidate)
-      if (ex && ex.status < 400) {
-        recordEndpoint('GET', candidate, 'surface_probe')
+      // 401/403/405 means the route exists but is gated or method-restricted: still part of the surface.
+      if (ex && (ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405)) {
+        const ep = recordEndpoint('GET', candidate, 'surface_probe')
+        paramsDiscovered += recordQueryParamsForEndpoint({
+          rawPathAndQuery: candidate, origin, endpointId: ep.id, source: 'phase0_html',
+          storage, runId, dynamicParams,
+        })
+        if (ex.status < 400 && /<html\b|<input\b|<form\b/i.test(ex.body)) {
+          const parsed = extractHtmlLinksAndScripts(ex.body, origin)
+          for (const inp of parsed.inputs.slice(0, 8)) {
+            if (inp.type && /^(?:hidden|submit|button|reset|checkbox|radio|file|image)$/i.test(inp.type)) continue
+            storage.upsertEndpointParam({
+              runId,
+              endpointId: ep.id,
+              name: inp.name,
+              location: 'query',
+              isCsrf: CSRF_PARAM_RE.test(inp.name),
+              isObjectId: OBJECT_ID_PARAM_RE.test(inp.name),
+              source: 'phase0_html',
+            })
+            dynamicParams.add(inp.name)
+            paramsDiscovered += 1
+          }
+          for (const s of parsed.scripts) {
+            if (!jsQueue.includes(s)) jsQueue.push(s)
+          }
+        }
+      }
+    }
+
+    // 2d-bis. XML-accepting surface discovery: xml-ish routes frequently only reveal their element
+    // schema in a parse-error response. Send a benign probe document and learn the expected element.
+    const xmlish = /(?:xml|soap|wsdl|saml|rss|atom|svg|import|upload|feed|sitemap)/i
+    if (!originHalted && !signal.aborted && grant.canRead(origin)) {
+      const known = storage.listEndpoints(runId, { origin })
+      const xmlCandidates = [...new Set(known.map(e => e.pathTemplate))]
+        .filter(p => xmlish.test(p) && !/\{|\/:|\[/.test(p))
+        .slice(0, 3)
+      for (const xmlPath of xmlCandidates) {
+        if (originUsed >= perOriginCap - 2) break
+        const xmlEx = await safeGet(xmlPath, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/xml' },
+          body: '<?xml version="1.0" encoding="UTF-8"?><guardian><probe>guardian-shape</probe></guardian>',
+        })
+        if (!xmlEx || xmlEx.status === 404 || xmlEx.status === 405 || xmlEx.status === 415 || xmlEx.status === 501) continue
+        const xmlEp = recordEndpoint('POST', xmlPath, 'surface_probe')
+        if (xmlEx.status >= 400) {
+          const tags = extractXmlHintTags(xmlEx.body)
+          const learned = tags[tags.length - 1]
+          if (learned) {
+            storage.upsertEndpointParam({
+              runId,
+              endpointId: xmlEp.id,
+              name: learned,
+              location: 'xml',
+              isCsrf: CSRF_PARAM_RE.test(learned),
+              isObjectId: OBJECT_ID_PARAM_RE.test(learned),
+              source: 'phase0_xml',
+            })
+            dynamicParams.add(learned)
+            paramsDiscovered += 1
+          }
+        }
+      }
+    }
+
+    // 2d-ter. GraphQL argument discovery from live introspection so variable-level injection probes
+    // can be formed for root fields that accept user arguments.
+    if (!originHalted && !signal.aborted && grant.canRead(origin) && originUsed < perOriginCap - 1) {
+      const gqlEps = storage.listEndpoints(runId, { origin }).filter(e => /graphql/i.test(e.pathTemplate))
+      if (gqlEps.length > 0) {
+        const gqlPath = (gqlEps.find(e => e.method === 'POST') ?? gqlEps[0]).pathTemplate
+        const introEx = await safeGet(gqlPath, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: '{__schema{queryType{name} mutationType{name} types{name kind fields{name args{name type{kind name ofType{kind name}}}}}}}' }),
+        })
+        if (introEx && introEx.status < 400) {
+          let schemaObj: Record<string, unknown> | undefined
+          try {
+            const parsed = JSON.parse(introEx.body) as { data?: { __schema?: Record<string, unknown> } }
+            schemaObj = parsed.data?.__schema
+          } catch { /* not JSON */ }
+          if (schemaObj && Array.isArray((schemaObj as { types?: unknown[] }).types)) {
+            const gqlEp = recordEndpoint('POST', gqlPath, 'graphql', { framework: 'graphql', riskScore: 85 })
+            const schema = parseGraphqlIntrospection(schemaObj)
+            const roots = [schema.queryType, schema.mutationType].filter((t): t is string => Boolean(t))
+            const args = new Set<string>()
+            for (const rootType of roots) {
+              for (const field of schema.types[rootType] ?? []) {
+                for (const arg of field.args) args.add(arg.name)
+              }
+            }
+            for (const arg of [...args].slice(0, 24)) {
+              if (!arg || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(arg)) continue
+              storage.upsertEndpointParam({
+                runId,
+                endpointId: gqlEp.id,
+                name: arg,
+                location: 'graphql_var',
+                isCsrf: CSRF_PARAM_RE.test(arg),
+                isObjectId: OBJECT_ID_PARAM_RE.test(arg),
+                source: 'graphql',
+              })
+              dynamicParams.add(arg)
+              paramsDiscovered += 1
+            }
+          }
+        }
       }
     }
 
