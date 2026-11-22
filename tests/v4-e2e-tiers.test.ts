@@ -6634,17 +6634,22 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/slow') {
-        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 3000)
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 30000)
         return
       }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
     })
     let confirmedOnce = false
-    let slowSiblingStarted = false
+    let trialCalls = 0
     const llm = await startMockLlmServer(t, (call) => {
       const prompt = JSON.stringify(call.body)
-      if (!slowSiblingStarted && prompt.includes('BOLA T1')) {
-        slowSiblingStarted = true
+      const trialPrompt = prompt.includes('BOLA')
+      if (trialPrompt) trialCalls += 1
+      if (prompt.includes('c_slow_sibling_24b')) {
+        return { type: 'tool_call', callId: 'c_done_slow_24b', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
+      }
+      // First trial call becomes the slow sibling; the second proposes so early-stop cancels it.
+      if (trialPrompt && trialCalls === 1) {
         return {
           type: 'tool_call',
           callId: 'c_slow_sibling_24b',
@@ -6652,7 +6657,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
           argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
         }
       }
-      if (!confirmedOnce && prompt.includes('BOLA T0')) {
+      if (!confirmedOnce && trialPrompt) {
         confirmedOnce = true
         return {
           type: 'tool_call',
@@ -6684,7 +6689,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const { storage } = makeStore(t)
     await saveModelProfile({
       name: 'Tactical', endpoint: llm.endpoint, model: 'mock-t', protocol: 'responses', key: 'sk-24b-12345678',
-      priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'tactical',
+      priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'any',
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
@@ -6701,7 +6706,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 4_000
+      const deadline = Date.now() + 25_000
       while (Date.now() < deadline) {
         const sib = storage.client.prepare('SELECT status FROM chain_steps WHERE id = ?').get(s1) as { status: string }
         if (sib.status === 'canceled') break
@@ -8129,17 +8134,21 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/slow') {
-        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 8000)
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 30000)
         return
       }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
     })
     let done = false
-    let slowSiblingStarted = false
+    let trialCalls = 0
     const llm = await startMockLlmServer(t, (call) => {
       const prompt = JSON.stringify(call.body)
-      if (!slowSiblingStarted && prompt.includes('Crown Jewel Trial 1')) {
-        slowSiblingStarted = true
+      const trialPrompt = prompt.includes('Crown Jewel')
+      if (trialPrompt) trialCalls += 1
+      if (prompt.includes('c_slow_sibling')) {
+        return { type: 'tool_call', callId: 'c_done_slow_324', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
+      }
+      if (trialPrompt && trialCalls === 1) {
         return {
           type: 'tool_call',
           callId: 'c_slow_sibling',
@@ -8147,7 +8156,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
           argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
         }
       }
-      if (!done && prompt.includes('Trial 0')) {
+      if (!done && trialPrompt) {
         done = true
         return {
           type: 'tool_call', callId: 'c_win_324', name: 'propose_chain_finding',
@@ -8177,7 +8186,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     const { storage } = makeStore(t)
     await saveModelProfile({
       name: 'Tactical', endpoint: llm.endpoint, model: 'mock-t', protocol: 'responses', key: 'sk-324-12345678',
-      priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'tactical',
+      priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'any',
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
@@ -8193,7 +8202,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 10_000
+      const deadline = Date.now() + 25_000
       while (Date.now() < deadline) {
         const sib = storage.client.prepare('SELECT status FROM chain_steps WHERE id = ?').get(s1) as { status: string }
         if (sib.status === 'canceled') break

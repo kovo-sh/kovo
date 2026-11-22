@@ -50,10 +50,16 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
     },
     async stop(signal: NodeJS.Signals = 'SIGTERM') {
       const child = processHandle
-      if (child && child.exitCode === null && child.signalCode === null) {
-        const exited = once(child, 'exit')
-        child.kill(signal)
-        await exited
+      if (!child || child.exitCode !== null || child.signalCode !== null) return
+      const exited = once(child, 'exit')
+      child.kill(signal)
+      const timedOut = await Promise.race([
+        exited.then(() => false),
+        delay(3_000).then(() => true),
+      ])
+      if (timedOut && child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL')
+        await once(child, 'exit')
       }
     },
     async dispose() {

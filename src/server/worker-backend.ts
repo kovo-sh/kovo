@@ -31,9 +31,13 @@ export function workerProcessSessionId() {
   return processSessionId
 }
 let liveExitHookInstalled = false
-function removeLiveContainers() {
-  for (const container of liveContainers) {
-    try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: 5_000 }) } catch { /* best-effort */ }
+function removeLiveContainers(budgetMs = 4_000) {
+  const deadline = Date.now() + budgetMs
+  for (const container of [...liveContainers]) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
+    try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: Math.min(5_000, remaining) }) } catch { /* best-effort */ }
+    liveContainers.delete(container)
   }
 }
 function trackLiveContainer(name: string) {
@@ -42,10 +46,11 @@ function trackLiveContainer(name: string) {
   liveExitHookInstalled = true
   // Remove any container this process created but did not get to start/close
   // (for example an aborted session between `docker create` and `docker start`,
-  // or a Playwright-owned server terminated with SIGTERM).
-  process.once('exit', removeLiveContainers)
-  process.once('SIGTERM', () => { removeLiveContainers(); process.exit(143) })
-  process.once('SIGINT', () => { removeLiveContainers(); process.exit(130) })
+  // or a Playwright-owned server terminated with SIGTERM). Shutdown cleanup is strictly bounded so
+  // a slow/unreachable Docker daemon can never block process exit (and E2E teardown).
+  process.once('exit', () => removeLiveContainers(1_500))
+  process.once('SIGTERM', () => { removeLiveContainers(2_000); process.exit(143) })
+  process.once('SIGINT', () => { removeLiveContainers(2_000); process.exit(130) })
 }
 const workerName = /^guardian-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 

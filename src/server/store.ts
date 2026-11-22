@@ -1875,6 +1875,13 @@ export class Store {
   }
 
   updateChainStep(stepId: string, patch: Partial<ChainStep>): ChainStep {
+    const existing = this.db.select().from(tables.chainSteps).where(eq(tables.chainSteps.id, stepId)).get()
+    if (!existing) throw new Error('Chain step not found.')
+    // `canceled` is terminal: a sibling trial's worker can finish after early-stop and must not
+    // resurrect its step as complete/running.
+    if (existing.status === 'canceled' && patch.status && patch.status !== 'canceled') {
+      return existing as unknown as ChainStep
+    }
     const updated = this.db.update(tables.chainSteps).set({ ...patch, updatedAt: Date.now() })
       .where(eq(tables.chainSteps.id, stepId)).returning().get()
     if (!updated) throw new Error('Chain step not found.')
