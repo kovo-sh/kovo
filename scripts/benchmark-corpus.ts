@@ -137,6 +137,60 @@ export function mineBaselines(c: Corpus, name: string, pathTemplate: string): st
   return [...new Set(out.filter(plausible))].slice(0, 8)
 }
 
+/**
+ * Scalar values observed for an exact JSON field name anywhere on the target's own surface (docs,
+ * embedded bundle objects, fetched JSON pages). Used to seed write bodies and resource identifiers
+ * from the application's real data shapes instead of guessing constants.
+ */
+export function mineJsonFieldValues(c: Corpus, name: string, limit = 8): string[] {
+  const out: string[] = []
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 6 || !node) return
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 50)) walk(item, depth + 1)
+      return
+    }
+    if (typeof node !== 'object') return
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === name && (typeof value === 'string' || typeof value === 'number')) out.push(String(value))
+      else if (value && typeof value === 'object') walk(value, depth + 1)
+    }
+  }
+  for (const doc of c.json) walk(doc, 0)
+  // JSON fragments embedded in bundles/HTML (e.g. seed data or inline state).
+  const n = esc(name)
+  for (const m of c.all.matchAll(new RegExp(`["']${n}["']\\s*:\\s*["']([^"'\\\\]{1,80})["']`, 'g'))) out.push(clean(m[1]))
+  return [...new Set(out.filter(plausible))].slice(0, limit)
+}
+
+/** Object-id-shaped values observed anywhere on the surface (path segments, JSON ids, links). */
+export function mineObservedIds(c: Corpus, limit = 24): string[] {
+  const out: string[] = []
+  const idShaped = /^(?:[A-Za-z][-_][A-Za-z0-9_.:-]+|[A-Za-z0-9_.:-]*\d[A-Za-z0-9_.:-]*)$/
+  for (const m of c.all.matchAll(/\/([A-Za-z0-9][A-Za-z0-9_.:-]{1,63})(?=[/?"'\s<)#]|$)/g)) {
+    const v = m[1]
+    if (/^(?:api|app|static|public|assets?|v\d+|openapi|graphql|health|well-known|\.well-known)$/i.test(v)) continue
+    // Only identifier-shaped segments (digits, prefixed ids, dashed slugs), not dictionary words.
+    if (!idShaped.test(v)) continue
+    out.push(v)
+  }
+  for (const doc of c.json) {
+    const walk = (node: unknown, depth: number): void => {
+      if (depth > 5 || !node) return
+      if (Array.isArray(node)) { for (const item of node.slice(0, 50)) walk(item, depth + 1); return }
+      if (typeof node !== 'object') return
+      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+        if (/(?:^|_)(?:id|uuid|uid|sku|slug|key|ref|code|token)$/i.test(key) && (typeof value === 'string' || typeof value === 'number')) {
+          out.push(String(value))
+        }
+        if (value && typeof value === 'object') walk(value, depth + 1)
+      }
+    }
+    walk(doc, 0)
+  }
+  return [...new Set(out.filter(plausible))].slice(0, limit)
+}
+
 /** A realistic `path?query` seed observed in links/forms/JS for this exact path (e.g. OAuth authorize URLs). */
 export function mineSeedQuery(c: Corpus, path: string): string | null {
   const re = new RegExp(`${esc(path)}\\?([^"'\\s<>#\\\\]{3,400})`, 'g')

@@ -22,11 +22,17 @@ export function matchRoute(route: Route, parts: string[]): Record<string, string
 export const isHttpResult = (v: unknown): v is HttpResult =>
   typeof v === 'object' && v !== null && 'status' in v && 'body' in v && 'headers' in v
 
+/**
+ * True when a redirect target leaves the app's origin. Resolves the target the way a browser does,
+ * after normalising backslashes (browsers treat `\` as `/` for http(s) URLs, so an origin-relative
+ * `/\host` target is really `//host`). Any scheme that produces a different/empty host (absolute
+ * http(s), protocol-relative, non-http schemes such as javascript:) counts as off-origin.
+ */
 export function offOrigin(location: string, host: string): boolean {
   try {
-    if (location.startsWith('//')) return new URL(`http:${location}`).host !== host
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(location)) return new URL(location).host !== host
-    return false
+    const normalized = location.replace(/\\/g, '/')
+    const resolved = new URL(normalized, `http://${host}/`)
+    return resolved.host.toLowerCase() !== host.toLowerCase()
   } catch { return false }
 }
 

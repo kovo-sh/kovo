@@ -6,10 +6,10 @@
  */
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
-import { synthAuthz, synthMassAssignment, synthSsrf, synthSsti, synthXxe } from './benchmark-specs-http.ts'
+import { synthAuthz, synthCommandInjection, synthMassAssignment, synthSsrf, synthSsti, synthTraversal, synthXxe } from './benchmark-specs-http.ts'
 import { synthAuthProtocol, synthCache } from './benchmark-specs-proto.ts'
 import { synthSqlBoolean, synthSqlTime } from './benchmark-specs-sql.ts'
-import { synthDomXss, synthGraphql, synthReflectedXss, synthSecondOrderXss, synthWorkflow } from './benchmark-specs-web.ts'
+import { synthDomXss, synthGraphql, synthRace, synthReflectedXss, synthSecondOrderXss, synthUrlDomXss, synthWorkflow, synthWorkflowStepSkip } from './benchmark-specs-web.ts'
 import type { SynthesizedSpec } from './benchmark-specs-common.ts'
 
 export type { SynthesizedSpec } from './benchmark-specs-common.ts'
@@ -26,9 +26,11 @@ function build(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
     case 'auth_protocol_audit': return synthAuthProtocol(o, env)
     case 'cache_poison_deception': return synthCache(o, env)
     case 'graphql_audit': return synthGraphql(o, env)
-    case 'workflow_invariant': return synthWorkflow(o, env)
-    case 'xss_context': return [...synthSecondOrderXss(o, env), ...synthDomXss(o, env), ...synthReflectedXss(o, env)]
-    case 'path_traversal_benign': return []
+    case 'workflow_invariant': return [...synthWorkflowStepSkip(o, env), ...synthWorkflow(o, env)]
+    case 'xss_context': return [...synthSecondOrderXss(o, env), ...synthUrlDomXss(o, env), ...synthDomXss(o, env), ...synthReflectedXss(o, env)]
+    case 'path_traversal_benign': return synthTraversal(o, env)
+    case 'command_injection': return synthCommandInjection(o, env)
+    case 'race_burst': return synthRace(o, env)
     default: return []
   }
 }

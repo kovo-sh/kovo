@@ -69,14 +69,15 @@ same attempts produce **zero** matching events. Solvers live outside the materia
 
 ## Seeds
 - Dev seeds: integers `1..9999` (hill-climbing; freely reproducible).
-- Held-out seeds: integers `>= 1_000_000`; plan derivation mixes HMAC-SHA256 over `GUARDIAN_RB_HELDOUT_SALT` (env, ≥16 chars, never committed). Without the salt, held-out seeds are refused.
+- Held-out seeds: integers `>= 1_000_000`; plan derivation mixes HMAC-SHA256 over `GUARDIAN_RB_HELDOUT_SALT` (env, ≥16 chars, never committed). Without the salt, held-out seeds are refused. The salt is never written into `variant.json`, briefings, ground truth or any other artifact; only routes/params/idFormat/apiPrefix are scanner-visible.
 - Randomized per seed: api prefix, route nouns (vocab synonyms), param names, id format, persona emails/passwords, canary salt, which sites are hardened (count within `decoyCount`, chain members together, `canBeDecoy:false` respected).
 
 ## Grading
 - A finding **matches** an entry if one of its endpoints matches an entry endpoint or trigger endpoint (method optional; runtime path compared against route pattern with `:param` wildcards; concrete IDs allowed) AND its class is compatible (same `vulnClass`, or CWE in the same family per `grader/match.ts` table; missing class/CWE → endpoint+param match only).
-- **confirmed** = matched vuln + finding status `runtime_confirmed|confirmed` + ≥1 attributed oracle event with `ts <= submittedAtMs`. Matched w/o impact → `claimed_without_impact` (not TP, not FP). `static_verified` with matching `codeLocations` rootCause → `static_only` (counts only in `staticRecall`).
-- Any non-`ruled_out` finding matching a decoy → decoy FP (strict, regardless of status). Findings matching nothing → unmatched FP. Multiple findings on one root cause → 1 TP + duplicates.
-- Precision = TP findings / (TP + decoyFP + unmatchedFP).
+- **confirmed** = matched vuln + finding status `runtime_confirmed|confirmed` + ≥1 attributed oracle event whose `kind` and `routeKey` both belong to that entry, with `ts <= submittedAtMs`. Matched w/o impact → `claimed_without_impact` (not TP, not FP). `static_verified` with matching `codeLocations` rootCause → `static_only` (counts only in `staticRecall`).
+- Any non-`ruled_out` finding matching a decoy → decoy FP (strict, regardless of status). Findings matching nothing → unmatched FP. Multiple findings on one vulnerable site → 1 TP + duplicates; multiple findings on one decoy site → 1 decoy FP. A multi-endpoint finding binds to at most one vulnerable site but is charged for every decoy site it names.
+- Precision = confirmed TPs / (confirmed TPs + decoy sites with ≥1 claim + unmatched findings). Claims on vulnerable sites that lack impact are `claimed_without_impact` and do not enter this denominator.
+- Chains: `chainsTotal` counts only chains whose members are all vulnerable (a chain unit selected as a decoy is fully hardened); `chainsCompleted` requires every member confirmed.
 - Funnel per vuln: surfaceDiscovered (request log hit an entry route), hypothesisFormed (suspicious input to an entry route, or telemetry hypothesis), signalObserved (attributed oracle event), specSubmitted (matching finding), zeroLlmConfirmed (confirmed). Monotonic: each stage counts only vulns that passed the previous stage.
 - Failure bucket per non-confirmed vuln (first rule that applies): budget_exhausted (telemetry exhausted & no matching finding & surface not reached) → surface_miss → tier_blocked → csrf_blocked → form_encoding_missing → context_reset → hypothesis_miss → trigger_miss (second-order: payload stored but trigger route never requested after) → replay_spec_miss (signal observed, no confirmed finding) → jq_assertion_bug (telemetry assertion failure on matched finding). `spa_catchall_fp` is counted for unmatched FPs whose endpoint only ever hit SPA fallback.
 - Budget curve: confirmed count/recall with `costUsdAtSubmit <= usd` for each of $1/$5/$20.

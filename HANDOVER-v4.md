@@ -4,9 +4,21 @@
 **Branch:** `main` (`origin`: `https://github.com/wwwillchen/guardian.git`)  
 **Spec Reference:** [SPEC-v4.md](SPEC-v4.md)
 
+> **Status (2026-11-22): historical planning document, superseded by M7.**
+> M1–M7 are implemented and the release gate is complete. Read
+> [VERIFICATION-v4.md](VERIFICATION-v4.md) for the measured gate, recall,
+> held-out, patch-retest and realistic-bench results. The “remaining work” and
+> percentage estimates below describe the pre-M7 state and are kept for history.
+
 ---
 
 ## 1. Executive Summary & Current Build Health
+
+> **Superseded:** this section is a pre-M7 snapshot (it still lists M6/M7 as not
+> started and shows 44/45 on the milestone suites). See
+> [VERIFICATION-v4.md §2](VERIFICATION-v4.md#2-build-and-test-gate) for the final
+> 519/519 non-Docker gate, and [§3–§5](VERIFICATION-v4.md#3-recall-hill-climbing-on-xben-25)
+> for the recall and generalization results.
 
 Guardian v4 implementation is **~75% complete** with all foundational architecture, security boundaries, worker tooling, Phase-0/orchestration code, multi-container `LabRunner`, IAST telemetry, and Web UI already landed and compiling cleanly:
 
@@ -109,6 +121,8 @@ Check exact exported signatures expected by Features 26 & 27 + `T4-13` in `tests
    - Run **anti-overfitting generalization check** on Held-Out Modern SaaS Lab (`local-lab/saas-lab/`): target **`>= 18/20` confirmed (`runtime_confirmed`)**, **`0/6` decoy false positives**, and **`>= 14/20` verified patches** passing 6-gate review + `reproduced -> fixed`.
    - Re-run regression suites after any hill-climbing code edits.
 3. **Publish `VERIFICATION-v4.md`** documenting all release gates, hill-climbing iteration table (before -> after deltas), held-out generalization results, and zero-trust boundary verification.
+
+> **Completed:** see [VERIFICATION-v4.md](VERIFICATION-v4.md). Measured held-out recall was 10/20 (target `>=18/20`) and patch verification 9/20 (target `>=14/20`); the release document reports both without adjustment.
 
 ---
 

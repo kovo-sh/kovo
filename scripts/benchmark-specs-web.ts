@@ -6,7 +6,7 @@
 import { randomBytes } from 'node:crypto'
 import { appendQuery, baseFields, is2xx, jqStr, sessionFields, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
-import { fillPlaceholders, hasPathPlaceholder, probePathFor } from './benchmark-probes.ts'
+import { fillPlaceholders, hasPathPlaceholder, probePathFor, siblingValue } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
 // ---------------------------------------------------------------------------
@@ -25,24 +25,36 @@ export function synthGraphql(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
   const gqlStep = (id: string, role: 'control' | 'probe', description: string, query: string, actor?: string) =>
     stepOf(env, id, role, description, { method: 'POST', pathAndQuery: path, jsonBody: { query } }, actor)
 
-  // Cross-persona resolver exposure is the strongest evidence.
+  // Cross-persona resolver exposure is the strongest evidence. The probe records the exact operation
+  // and variables it used, so the replay reproduces the same object (id arg) and nested selection.
   if (hasCrossPersona && env.owner && env.other) {
     const anomaly = o.anomalies.find(a => a.type === 'graphql_cross_persona_access' || a.type === 'graphql_nested_bola')
-    const field = typeof anomaly?.field === 'string' ? anomaly.field : 'me'
-    const nested = Array.isArray(anomaly?.nestedPath) ? (anomaly?.nestedPath as string[]) : []
-    const selection = nested.length > 0 ? `${field}{${nested.join('{')}${'}'.repeat(nested.length)}}` : field
-    const query = `{${selection}}`
-    const jq = `{ controlPassed: ${is2xx('c1')}, ` +
-      `confirmed: (${is2xx('p1')} and (((.steps.p1.json.errors // []) | length) == 0) and ((.steps.p1.json.data // null) != null)), ` +
-      'observed: ("probe status=" + (.steps.p1.status | tostring)), expected: "resolver data reaches a non-owner actor" }'
+    const field = typeof anomaly?.field === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(anomaly.field) ? anomaly.field : null
+    const nested = Array.isArray(anomaly?.nestedPath)
+      ? (anomaly.nestedPath as unknown[]).filter((x): x is string => typeof x === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(x))
+      : []
+    const recordedQuery = typeof anomaly?.query === 'string' && anomaly.query.length <= 4000 ? anomaly.query : null
+    const variables = anomaly?.variables && typeof anomaly.variables === 'object' && !Array.isArray(anomaly.variables)
+      ? anomaly.variables as Record<string, unknown> : {}
+    if (!field || !recordedQuery) return []
+    const dataPath = ['data', field, ...nested].map(p => `[${jqStr(p)}]`).join('')
+    const nestedLen = (id: string) => `((.steps.${id}.json${dataPath} // []) | length)`
+    const errorsClean = (id: string) => `(((.steps.${id}.json.errors // []) | length) == 0)`
+    const jq = `{ controlPassed: (${is2xx('c1')} and ${errorsClean('c1')} and (${nestedLen('c1')} >= 1)), ` +
+      `confirmed: (${is2xx('p1')} and ${errorsClean('p1')} and (${nestedLen('p1')} >= 1) and (.steps.p1.json${dataPath} == .steps.c1.json${dataPath})), ` +
+      `observed: ("nested records=" + (${nestedLen('p1')} | tostring)), expected: "nested owned data reaches only its owner" }`
+    const step = (id: string, role: 'control' | 'probe', description: string, actor: string) =>
+      stepOf(env, id, role, description, {
+        method: 'POST', pathAndQuery: path, jsonBody: { query: recordedQuery, ...(Object.keys(variables).length > 0 ? { variables } : {}) },
+      }, actor)
     return [{
       kind: 'http_chain',
       spec: {
         ...baseFields(env, 'GraphQL resolver missing object authorization', 'CWE-639', 'broken-access-control', 'high', jq),
         kind: 'http_chain',
         steps: [
-          gqlStep('c1', 'control', 'Owner queries the resolver', query, env.owner),
-          gqlStep('p1', 'probe', 'Different actor queries the same resolver', query, env.other),
+          step('c1', 'control', 'Owner queries the resolver', env.owner),
+          step('p1', 'probe', 'Different actor queries the same resolver', env.other),
         ],
       },
     }]
@@ -132,6 +144,42 @@ export function synthWorkflow(o: HypothesisOutcome, env: ProbeEnv): SynthesizedS
   }]
 }
 
+/** Workflow step-skip: a later transition is accepted for a fresh object whose prerequisite flag is false. */
+export function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'workflow_step_skip')
+  if (!hit) return []
+  const createPath = typeof hit.createPath === 'string' && hit.createPath.startsWith('/') ? hit.createPath : null
+  const target = typeof hit.targetTemplate === 'string' && hit.targetTemplate.startsWith('/') ? hit.targetTemplate : null
+  const fromState = String(hit.fromState ?? '').toLowerCase()
+  const toState = String(hit.toState ?? '').toLowerCase()
+  if (!createPath || !target || !/^[a-z0-9_-]{1,32}$/.test(fromState) || !/^[a-z0-9_-]{1,32}$/.test(toState)) return []
+  const producerBody = hit.producerBody && typeof hit.producerBody === 'object' ? hit.producerBody : {}
+  const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
+  const prereqs = Array.isArray(hit.falsePrerequisites) ? hit.falsePrerequisites.filter(x => typeof x === 'string' && /^[A-Za-z0-9_]{1,40}$/.test(x)) : []
+  const prereqCheck = prereqs.map(k => `(.steps.p1.json[${jqStr(k)}] == false)`).join(' and ')
+  const createStep = {
+    ...stepOf(env, 'c1', 'control', 'Create a fresh object in its initial state', { method: 'POST', pathAndQuery: createPath, jsonBody: producerBody }),
+    extract: [{ varName: 'resource_id', from: 'json' as const, selector: 'id' }],
+  }
+  const jq = `{ controlPassed: (${is2xx('c1')} and ((.steps.c1.json.status // .steps.c1.json.state // "") | tostring | ascii_downcase) == ${jqStr(fromState)}), ` +
+    `confirmed: (${is2xx('p1')} and ((.steps.p1.json.status // .steps.p1.json.state // "") | tostring | ascii_downcase) == ${jqStr(toState)}` +
+    `${prereqCheck ? ` and ${prereqCheck}` : ''}), ` +
+    `observed: ("status=" + ((.steps.p1.json.status // .steps.p1.json.state // "") | tostring)), expected: "the prerequisite step must be completed first" }`
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...baseFields(env, 'Workflow step skipped (later transition accepted before prerequisite)', 'CWE-841', 'business-logic', 'high', jq),
+      kind: 'http_chain',
+      steps: [
+        createStep,
+        stepOf(env, 'p1', 'probe', 'Invoke the later transition directly', {
+          method, pathAndQuery: target.replace('{{id}}', '{{resource_id}}'), jsonBody: {},
+        }),
+      ],
+    },
+  }]
+}
+
 // ---------------------------------------------------------------------------
 // Second-order (stored) XSS: plant through the write route, read downstream
 // ---------------------------------------------------------------------------
@@ -144,7 +192,7 @@ function plantRequest(o: HypothesisOutcome, env: ProbeEnv, anom: Record<string, 
   const method = o.hyp.method === 'GET' ? 'POST' : o.hyp.method
   const siblings: Record<string, unknown> = {}
   for (const p of o.hyp.endpoint.params) {
-    if (p.name !== param && p.location === location && !p.isCsrf) siblings[p.name] = 'guardian'
+    if (p.name !== param && p.location === location && !p.isCsrf) siblings[p.name] = siblingValue(p.name, env)
   }
   switch (location) {
     case 'query': return { method, pathAndQuery: `${path}?${encodeURIComponent(param)}=${encodeURIComponent(value)}` }
@@ -204,6 +252,76 @@ export function synthSecondOrderXss(o: HypothesisOutcome, env: ProbeEnv): Synthe
         stepOf(env, 'c1', 'control', 'Read the downstream route before planting', { method: 'GET', pathAndQuery: readPath }, env.owner),
         stepOf(env, 'p1', 'probe', 'Plant the marker through the write route', plant, env.owner),
         stepOf(env, 'p2', 'probe', 'Re-read the downstream route', { method: 'GET', pathAndQuery: readPath }, env.owner),
+      ],
+    },
+  }]
+}
+
+/**
+ * Race/TOCTOU double-spend: replay one producer mint followed by a synchronized burst of consume
+ * requests carrying the same single-use value. Two or more 2xx acceptances prove the window.
+ */
+export function synthRace(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'race_double_spend')
+  if (!hit) return []
+  const producerPath = String(hit.producerPath ?? '')
+  const consumePath = String(hit.path ?? '')
+  const param = String(hit.param ?? '')
+  const body = hit.consumeBody
+  if (!producerPath.startsWith('/') || !consumePath.startsWith('/') || !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(param)) return []
+  if (!body || typeof body !== 'object') return []
+  const method = (o.hyp.method === 'PUT' ? 'PUT' : o.hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
+  const headers = { 'Content-Type': 'application/json' }
+  const burst = Array.from({ length: 4 }, () => ({
+    origin: env.origin, method, pathAndQuery: consumePath, headers,
+    ...(env.owner ? { persona: env.owner } : {}),
+    ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
+    jsonBody: body as Record<string, unknown>,
+  }))
+  const controlStep = stepOf(env, 'm1', 'control', 'Mint one single-use value', { method: 'POST', pathAndQuery: producerPath, jsonBody: {} }, env.owner)
+  const jq = `{ controlPassed: (.control.status >= 200 and .control.status < 300), ` +
+    'confirmed: (([(.burst.results // [])[] | select(.status >= 200 and .status < 300)] | length) >= 2), ' +
+    'observed: ("accepted=" + (([(.burst.results // [])[] | select(.status >= 200 and .status < 300)] | length) | tostring)), expected: "one single-use value is accepted exactly once" }'
+  return [{
+    kind: 'race_burst',
+    spec: {
+      ...baseFields(env, 'Race condition allows a single-use value to be consumed twice', 'CWE-362', 'business-logic', 'high', jq),
+      kind: 'race_burst',
+      controlStep: { ...controlStep, extract: [{ varName: 'code', from: 'json' as const, selector: param }] },
+      burst,
+      ...(typeof hit.parentPath === 'string' && hit.parentPath.startsWith('/')
+        ? { postCheckStep: stepOf(env, 'p1', 'probe', 'Read the balance after the burst', { method: 'GET', pathAndQuery: hit.parentPath }) }
+        : {}),
+    },
+  }]
+}
+
+// ---------------------------------------------------------------------------
+// DOM XSS: URL query source flowing into an executable script sink
+// ---------------------------------------------------------------------------
+
+export function synthUrlDomXss(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const hit = o.anomalies.find(a => a.type === 'dom_xss_url_sink')
+  if (!hit || hit.canaryTriggered !== true) return []
+  const basePath = String(hit.path ?? o.hyp.endpoint.path)
+  const param = String(hit.urlParam ?? o.hyp.param?.name ?? '')
+  if (!basePath.startsWith('/') || !/^[A-Za-z_][A-Za-z0-9_.-]{0,40}$/.test(param)) return []
+  const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
+  const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
+  const controlPath = appendQuery(basePath, param, 'guardian')
+  const probePath = appendQuery(basePath, param, encodedPayload, false)
+  const params = { origin: env.origin, ...(env.owner ? { persona: env.owner } : {}), ...sessionFields(env, o.hyp) }
+  const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
+    'confirmed: ((.steps.p1.status >= 200 and .steps.p1.status < 400) and ((.steps.p1.title == .canaryToken) or (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) >= 1))), ' +
+    'observed: ("probe sink hits=" + (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) | tostring)), expected: "URL input is rendered as inert text" }'
+  return [{
+    kind: 'browser_chain',
+    spec: {
+      ...baseFields(env, 'DOM-based cross-site scripting via URL query sink', 'CWE-79', 'xss', 'high', jq),
+      kind: 'browser_chain',
+      steps: [
+        { id: 'c1', role: 'control', description: 'Render the page with a benign query value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
+        { id: 'p1', role: 'probe', description: 'Render the page with an executable query payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 900 },
       ],
     },
   }]

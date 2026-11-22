@@ -65,6 +65,7 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
   const personaMap = new Map<string, ResolvedPersona>()
   const personaIds: string[] = []
   const userIds: string[] = []
+  const userIdByHandle = new Map<string, string>()
   let jwtPersona: string | undefined
   for (const [name, rec] of Object.entries(handle.personas)) {
     const spec = personaSpec(rec)
@@ -79,7 +80,10 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
       id: created.id, handle: h, roleLabel: rec.role ?? name, originAllowlist: [origin], authKind: spec.authKind,
       headerName: spec.headerName ?? null, secret: spec.secret, canaryMarkers: [],
     })
-    if (rec.userId) userIds.push(rec.userId)
+    if (rec.userId) {
+      userIds.push(rec.userId)
+      userIdByHandle.set(h, rec.userId)
+    }
     if (!jwtPersona && spec.secret.split('.').length === 3 && spec.secret.startsWith('eyJ')) jwtPersona = h
   }
 
@@ -118,7 +122,12 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
   const probeEnv: ProbeEnv = {
     origin, broker, grant, canaryBroker, storage, runId: run.id, signal: controller.signal, caps,
     owner, other, admin: pick('admin'), viewer: pick('viewer'), jwtPersona, personaUserIds: userIds, session: 'bench',
-    slowProbesLeft: opts.slowProbes ?? 12,
+    // Adaptive budget: enough slow probes to cover every plausible blind-SQLi parameter class while
+    // still bounding wall-clock (each hit costs ~3 interleaved delay rounds). The live pipeline
+    // recomputes this from the formed plan and the M7 orchestration config.
+    slowProbesLeft: opts.slowProbes ?? 20,
+    ...(owner && userIdByHandle.get(owner) ? { ownerUserId: userIdByHandle.get(owner)! } : {}),
+    ...(other && userIdByHandle.get(other) ? { otherUserId: userIdByHandle.get(other)! } : {}),
   }
   return {
     storage, broker, canaryBroker, grant, runId: run.id, scopeRevision, probeEnv, controller, requestsUsed: () => used,
@@ -143,12 +152,14 @@ export async function discoverEndpoints(env: EngineEnv, caps: ProfileCaps, onExc
     })
     const rows = env.storage.listEndpoints(env.runId)
     const params = env.storage.listEndpointParams(env.runId)
-    return rows.map(r => ({
+    const endpoints = rows.map(r => ({
       method: r.method.toUpperCase(),
       path: r.pathTemplate,
       source: r.source,
       params: params.filter(p => p.endpointId === r.id).map(p => ({ name: p.name, location: p.location, isObjectId: p.isObjectId, isCsrf: p.isCsrf })),
     }))
+    probeEnv.endpoints = endpoints
+    return endpoints
   }
   const paths = await probeSurface(
     { origin: probeEnv.origin, mode: 'paths', persona: probeEnv.owner, maxRequests: 150, onExchange: ex => { onExchange(ex) } },

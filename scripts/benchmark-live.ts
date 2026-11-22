@@ -16,7 +16,7 @@ import { createEngineEnv, discoverEndpoints } from './benchmark-env.ts'
 import type { EngineEnv } from './benchmark-env.ts'
 import { formHypotheses, needsCsrf, profileCaps, runHypothesis } from './benchmark-probes.ts'
 import type { Hypothesis, HypothesisOutcome } from './benchmark-probes.ts'
-import { endpointMatches, scoreManifest } from './benchmark-score.ts'
+import { compatibleClasses, endpointMatches, scoreManifest } from './benchmark-score.ts'
 import type { ScoredOutcome } from './benchmark-score.ts'
 import { synthesizeSpecs } from './benchmark-specs.ts'
 import {
@@ -66,6 +66,12 @@ export interface ConfirmedFinding {
   path: string
   probeClass: string
   spec: Record<string, unknown>
+  /**
+   * True when two targets could only be explained by the same spec (e.g. two distinct resolver
+   * flaws behind one GraphQL endpoint whose evidence was not separable). Such findings are reported
+   * for recall but are not used as patch fixed/regressed evidence.
+   */
+  ambiguousAttribution?: boolean
 }
 
 export interface LivePipelineOutcome {
@@ -418,19 +424,60 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
  * Map scored confirmations back onto the exact specs that produced them. This is bookkeeping on
  * results the pipeline already produced; the manifest is not consulted to choose or shape requests.
  */
+/** Prefer the probe class whose evidence type matches the target's vulnerability class. */
+function probePreference(vulnClass: string, probeClass: string): number {
+  const v = vulnClass.toLowerCase()
+  const p = probeClass.toLowerCase()
+  const wants = (...classes: string[]): boolean => classes.includes(p)
+  if (/(bola|idor|bfla|authz|access|authorization)/.test(v)) {
+    if (p === 'graphql_audit') return 0
+    if (p === 'authz_matrix') return 1
+  }
+  if (/(graphql)/.test(v) && /(sqli|sql|injection)/.test(v) && wants('sqli_boolean', 'sqli_time_diff')) return 0
+  if (/(sql|sqli|injection)/.test(v) && wants('sqli_boolean', 'sqli_time_diff')) return 0
+  if (/(xss|stored|dom|browser)/.test(v) && wants('xss_context')) return 0
+  if (/(race)/.test(v) && wants('race_burst')) return 0
+  if (/(command|rce)/.test(v) && wants('command_injection')) return 0
+  if (/(traversal)/.test(v) && wants('path_traversal_benign')) return 0
+  if (/(ssrf)/.test(v) && wants('ssrf_canary')) return 0
+  if (/(workflow|business)/.test(v) && wants('workflow_invariant')) return 0
+  if (/(mass)/.test(v) && wants('mass_assignment')) return 0
+  if (/(cache)/.test(v) && wants('cache_poison_deception')) return 0
+  if (/(jwt|oauth|auth)/.test(v) && wants('auth_protocol_audit')) return 0
+  if (/(xxe)/.test(v) && wants('xxe_canary')) return 0
+  if (/(ssti|template)/.test(v) && wants('ssti_math')) return 0
+  return 5
+}
+
 function collectConfirmedFindings(manifest: BenchmarkManifest, executed: readonly ExecutedOutcome[], traces: readonly TargetTrace[]): ConfirmedFinding[] {
   const byId = new Map(manifest.challenges.map(c => [c.id, c]))
   const seen = new Set<string>()
+  const usedSpecs = new Set<string>()
   const out: ConfirmedFinding[] = []
   for (const trace of traces) {
     if (!trace.confirmed || seen.has(trace.id)) continue
     const challenge = byId.get(trace.id)
     if (!challenge) continue
     const candidates = executed.filter(o => o.confirmed && o.spec && endpointMatches(challenge.endpoint, o.path))
-    const match = candidates.find(o => !trace.probeClass || o.probeClass === trace.probeClass) ?? candidates[0]
+    // A spec is attributable to at most one target. Prefer an unused spec whose probe class is
+    // compatible with this target; if every candidate was already claimed by another target on the
+    // same endpoint, the evidence is genuinely shared and is marked ambiguous.
+    const compatible = compatibleClasses(challenge.vulnClass)
+    const ranked = candidates
+      .filter(o => !compatible || compatible.includes(o.probeClass))
+      .sort((a, b) => probePreference(challenge.vulnClass, a.probeClass) - probePreference(challenge.vulnClass, b.probeClass))
+    const preferred = ranked.find(o => !usedSpecs.has(JSON.stringify(o.spec))) ??
+      candidates.find(o => !usedSpecs.has(JSON.stringify(o.spec)))
+    const match = preferred ?? ranked[0] ?? candidates[0]
     if (!match?.spec) continue
     seen.add(trace.id)
-    out.push({ id: trace.id, isDecoy: Boolean(challenge.isDecoy), path: match.path, probeClass: match.probeClass, spec: match.spec })
+    const specKey = JSON.stringify(match.spec)
+    const ambiguous = !preferred
+    usedSpecs.add(specKey)
+    out.push({
+      id: trace.id, isDecoy: Boolean(challenge.isDecoy), path: match.path, probeClass: match.probeClass, spec: match.spec,
+      ...(ambiguous ? { ambiguousAttribution: true } : {}),
+    })
   }
   return out.sort((a, b) => a.id.localeCompare(b.id))
 }
@@ -648,7 +695,8 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
 
   const findingById = new Map<string, ConfirmedFinding>()
   for (const f of baselineFindings) if (!findingById.has(f.id)) findingById.set(f.id, f)
-  const baselineVulnIds = new Set(baselineFindings.filter(f => !f.isDecoy).map(f => f.id))
+  const ambiguousIds = new Set(baselineFindings.filter(f => !f.isDecoy && f.ambiguousAttribution).map(f => f.id))
+  const baselineVulnIds = new Set(baselineFindings.filter(f => !f.isDecoy && !f.ambiguousAttribution).map(f => f.id))
   const decoyFalsePositivesBefore = new Set(baselineFindings.filter(f => f.isDecoy).map(f => f.id)).size
 
   const perPatch: PatchVerificationEntry[] = []
@@ -657,7 +705,8 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
 
   for (const group of groups) {
     const label = group.vulnIds.join(',')
-    const targets = group.vulnIds.map(id => findingById.get(id)).filter((f): f is ConfirmedFinding => Boolean(f))
+    const allTargets = group.vulnIds.map(id => findingById.get(id)).filter((f): f is ConfirmedFinding => Boolean(f))
+    const targets = allTargets.filter(f => !f.ambiguousAttribution)
     const entry: PatchVerificationEntry = {
       id: group.vulnIds[0] ?? group.patchId,
       patchId: group.patchId,
@@ -674,7 +723,12 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
       notes: [],
     }
     if (!targets.length) {
-      entry.notes?.push('Not confirmed by the baseline pipeline, so this patch could not be retested.')
+      if (allTargets.length > 0) {
+        entry.before = 'confirmed_ambiguous'
+        entry.notes?.push('Only evidence for this target was shared with another target on the same endpoint (attribution ambiguous); it is not counted as fixed or regressed.')
+      } else {
+        entry.notes?.push('Not confirmed by the baseline pipeline, so this patch could not be retested.')
+      }
       perPatch.push(entry)
       continue
     }
@@ -763,7 +817,11 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
     const allVulnIds = new Set(all.findings.filter(f => !f.isDecoy).map(f => f.id))
     const allDecoyIds = new Set(all.findings.filter(f => f.isDecoy).map(f => f.id))
     allPatches.stillConfirming = [...baselineVulnIds].filter(id => allVulnIds.has(id)).sort()
-    allPatches.newlyConfirming = [...allVulnIds].filter(id => !baselineVulnIds.has(id)).sort()
+    allPatches.newlyConfirming = [...allVulnIds].filter(id => !baselineVulnIds.has(id) && !ambiguousIds.has(id)).sort()
+    allPatches.ambiguous = [...ambiguousIds].sort()
+    if (ambiguousIds.size > 0) {
+      allPatches.notes.push(`Attribution ambiguous (shared evidence, excluded from patch verdict): ${[...ambiguousIds].sort().join(', ')}.`)
+    }
     allPatches.decoyFalsePositivesAfter = allDecoyIds.size
     allPatches.verdict = allPatches.stillConfirming.length === 0 && allDecoyIds.size === 0 ? 'fixed' : 'regressed'
     if (all.notes.length) allPatches.notes.push(...all.notes.slice(0, 5))

@@ -112,8 +112,11 @@ async function cmdServe(a: Record<string, string | boolean>): Promise<void> {
   const mode = (a.mode ? String(a.mode) : 'grey-box') as BenchMode
   const outDir = String(a['out-dir'] ?? join(HERE, 'out'))
   if (!isApp(app)) throw new Error(`--app must be one of ${appNames.join(', ')}`)
-  const salt = typeof a['held-out-salt'] === 'string' ? (a['held-out-salt'] as string) : undefined
-  const started = await startRealisticApp({ app, seed, heldOutSalt: salt })
+  if (a['held-out-salt'] !== undefined) {
+    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+  }
+  // Held-out salt is read from the environment by resolveSeed/generateVariant; never persist it.
+  const started = await startRealisticApp({ app, seed })
   const briefing = briefingFor(started, mode)
   process.stdout.write(`${JSON.stringify(briefing, null, 2)}\n`)
   const dump = () => {

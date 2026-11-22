@@ -7,7 +7,7 @@ export default function register(app: AppContext): void {
   const nextP = app.p('nextUrl')
   app.route('ssoCallback', (ctx: ReqCtx) => {
     const next = String(ctx.query[nextP] ?? '')
-    const local = next.startsWith('/') && !next.startsWith('//') && !next.startsWith('/\\')
+    const local = next.startsWith('/') && !next.startsWith('//') && !/[\\\s]/.test(next)
     const target = local ? next : '/dashboard'
     return ctx.redirect(target)
   })
