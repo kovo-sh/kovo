@@ -1,0 +1,1737 @@
+/**
+ * In-product deterministic closed loop.
+ *
+ * The benchmark pipeline proved that risk-ranked differential probing plus declarative replay
+ * verification can find real vulnerabilities without a model. This module moves that loop into the
+ * product engine: it risk-ranks the discovered surface, enumerates generic hypotheses from route
+ * and parameter shapes, harvests identifiers/fields from the target's own responses, runs the
+ * benign differential probes from `surface-engine.ts`, synthesizes identifier-bound
+ * `DeclarativeReplaySpec`s, and lets the normal `verifyReplaySpec` decide. Only
+ * ReplayVerifier-confirmed findings are handed to the persistence callback; signals that do not
+ * replay are emitted as leads (facts), never as findings.
+ *
+ * Everything is bounded by a request cap, a wall-clock cap (inside the run budget), the run's
+ * capability tier, assignment scope and the broker's RPS/destructive guards.
+ */
+import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
+import type { CanaryBroker } from './canary-broker.ts'
+import { declarativeReplaySpecSchema } from '../replay-spec.ts'
+import type { DeclarativeReplaySpec } from '../replay-spec.ts'
+import { probeDifferential, responseSimilarity } from './surface-engine.ts'
+import type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialRequest, SurfaceParamLocation } from './surface-engine.ts'
+import { verifyReplaySpec } from './replay-verifier.ts'
+import type { ReplayVerificationResult } from './replay-verifier.ts'
+import type { ScopedBrowser } from './scoped-browser.ts'
+import type { Store } from './store.ts'
+import type { WorkerBackend } from './worker-backend.ts'
+import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
+import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './deterministic-specs.ts'
+
+export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
+
+export const defaultEngineMaxRequests = 1600
+export const defaultEngineMaxDurationMs = 240_000
+export const defaultEngineMaxEndpoints = 100
+export const defaultEngineMaxHypotheses = 90
+export const defaultEnginePerProbeRequests = 28
+
+export const engineDisableEnv = 'GUARDIAN_DETERMINISTIC_ENGINE'
+
+/** The engine is on by default; `GUARDIAN_DETERMINISTIC_ENGINE=0|false|off` disables it. */
+export function deterministicEngineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[engineDisableEnv]
+  return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no')
+}
+
+export interface EnginePersona {
+  handle: string
+  roleLabel: string
+  privilege: 'admin' | 'viewer' | 'member'
+  tenant?: string
+}
+
+export interface EndpointHarvest {
+  ownerIds: string[]
+  otherIds: string[]
+  fields: string[]
+  values: Record<string, string[]>
+  otherValues: Record<string, string[]>
+  seedValues: string[]
+  /** Query parameter names whose benign value demonstrably changed the response. */
+  activeQueryParams: string[]
+}
+
+export interface EngineConfirmed {
+  hypothesis: EngineHypothesis
+  spec: DeclarativeReplaySpec
+  specRecord: SynthesizedEngineSpec
+  vulnClass: string
+  endpoint: string
+  result: ReplayVerificationResult
+  exchangeIds: string[]
+}
+
+export interface EngineLead {
+  hypothesis: EngineHypothesis
+  probe: DifferentialResult
+  summary: string
+}
+
+export interface DeterministicEngineInput {
+  runId: string
+  assignmentId: string
+  signal: AbortSignal
+  endpoints: readonly EngineEndpoint[]
+  personas: readonly EnginePersona[]
+  broker: RequestBroker
+  grant: Grant
+  backend: WorkerBackend
+  canaryBroker?: CanaryBroker
+  browser?: ScopedBrowser
+  storage?: Store
+  reposDir?: string
+  tier: number
+  maxRequests?: number
+  maxDurationMs?: number
+  maxEndpoints?: number
+  maxHypotheses?: number
+  classes?: ReadonlySet<string>
+  /** Injection points for tests; production uses the surface-engine probe and ReplayVerifier. */
+  probe?: typeof probeDifferential
+  verify?: typeof verifyReplaySpec
+  recordExchange?: (exchange: BrokerExchangeResult) => string | void
+  /** Persist a verified finding. Must create the finding as confirmed; never call for a lead. */
+  onConfirmed: (input: EngineConfirmed) => Promise<string | null> | string | null
+  onLead?: (lead: EngineLead) => void
+  log?: (kind: string, message: string, data?: Record<string, unknown>) => void
+}
+
+export interface EngineClassStats {
+  hypotheses: number
+  signals: number
+  specs: number
+  confirmed: number
+  rejected: number
+  requests: number
+}
+
+export interface DeterministicEngineReport {
+  requestsUsed: number
+  durationMs: number
+  endpointsConsidered: number
+  endpointsHarvested: number
+  hypothesesFormed: number
+  hypothesesRun: number
+  signals: number
+  specsSubmitted: number
+  confirmed: number
+  rejectedSpecs: number
+  leads: number
+  stoppedReason: 'budget' | 'time' | 'aborted' | 'complete' | 'disabled'
+  byClass: Record<string, EngineClassStats>
+  confirmedPairs: Array<{ endpoint: string; vulnClass: string }>
+  notes: string[]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Risk ranking
+// ---------------------------------------------------------------------------------------------
+
+const staticAssetPath = /\.(?:js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|avif|bmp|woff2?|ttf|eot|otf|mp4|webm|mp3|wav|pdf|zip|gz|tgz|tar|rar|7z|wasm|txt)$/i
+const baselinePath = /^(?:\/|)\/?(?:health|healthz|readyz|livez|app-config\.json|robots\.txt|sitemap\.xml|favicon\.ico|manifest\.json|\.well-known\/.*)$/i
+
+export function isStaticOrBaselinePath(path: string): boolean {
+  const bare = path.split('?')[0] || '/'
+  if (bare === '/' || bare === '') return true
+  if (staticAssetPath.test(bare)) return true
+  if (baselinePath.test(bare)) return true
+  return /(?:^|\/)(?:logout|signout)(?:\/|$)/i.test(bare)
+}
+
+const idSegmentRe = /(?:\/:[A-Za-z_][A-Za-z0-9_]*|\/\{\{id\}\}|\/\{[A-Za-z0-9_]+\}|\/\[[^\]]+\])/
+
+export function hasDynamicIdSegment(path: string): boolean {
+  return idSegmentRe.test(path.split('?')[0])
+}
+
+export function pathHasFileHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:download|downloads|file|files|asset|assets|view|serve|log|logs|journal|journals|billing[-_]?docs?|document|documents|attachment|attachments|backup|backups|archive|archives)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasUrlHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhook|webhooks|hook|hooks|callback|callbacks|integration|integrations|connector|connectors|proxy|proxies|fetch|remote|link|links|manifest|manifests)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasXmlHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:xml|import|imports|soap|saml|sso|svg|rss|wsdl|manifest|manifests|feed|feeds|upload|uploads|parse|backup|backups|archive|archives)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasTemplateHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:render|preview|template|templates|layout|layouts|report|reports|docs?|pages?|email|emails|snippet|snippets)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasSearchHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|browse|catalog)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasPrivilegedHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:admin|internal|manage|management|staff|superuser|privileged|permission|permissions|role|roles|impersonate|grant|feature[-_]?flag|backoffice)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasRedirectHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:redirect|return|callback|continue|resume|sso|oauth|authorize|checkout|download|export|next)(?:$|[/_.-])/i.test(path)
+}
+
+/** A ranking score for triage priority. Pure and stable; no network access. */
+export function endpointRiskScore(endpoint: EngineEndpoint): number {
+  const bare = endpoint.pathTemplate.split('?')[0] || '/'
+  if (isStaticOrBaselinePath(bare)) return -100
+  let score = typeof endpoint.riskScore === 'number' ? endpoint.riskScore : 30
+  const method = endpoint.method.toUpperCase()
+  const params = endpoint.params ?? []
+  if (params.length > 0) score += Math.min(15, params.length * 5)
+  if (hasDynamicIdSegment(bare)) score += 18
+  if (method === 'POST') score += 12
+  else if (method === 'PATCH' || method === 'PUT') score += 10
+  if (pathHasSearchHint(bare)) score += 18
+  if (pathHasFileHint(bare)) score += 16
+  if (pathHasUrlHint(bare)) score += 16
+  if (pathHasXmlHint(bare)) score += 20
+  if (/graphql/i.test(bare)) score += 25
+  if (pathHasTemplateHint(bare)) score += 14
+  if (pathHasPrivilegedHint(bare)) score += 14
+  if (pathHasRedirectHint(bare)) score += 10
+  if (/(?:token|tokens|key|keys|secret|secrets|activity|audit|config|settings)/i.test(bare)) score += 10
+  if (/(?:^|\/)(?:login|auth|token|sso|whoami|session)(?:\/|$)/i.test(bare)) score += 6
+  if ((endpoint.sinkKinds ?? []).length > 0) score += 10
+  const depth = bare.split('/').filter(Boolean).length
+  if (depth > 5) score -= 5
+  return score
+}
+
+/** Risk-rank the surface: static assets/soft baselines sink, injectable/id-bearing routes rise. */
+export function rankEndpoints(endpoints: readonly EngineEndpoint[]): EngineEndpoint[] {
+  return endpoints
+    .map(endpoint => ({ endpoint, score: endpointRiskScore(endpoint) }))
+    .filter(item => item.score > -50)
+    .sort((a, b) => b.score - a.score ||
+      a.endpoint.pathTemplate.length - b.endpoint.pathTemplate.length ||
+      a.endpoint.pathTemplate.localeCompare(b.endpoint.pathTemplate))
+    .map(item => item.endpoint)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Generic parameter inference (route semantics only; every candidate is still probe-verified)
+// ---------------------------------------------------------------------------------------------
+
+const placeholderSeg = /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/
+const protocolParam = /^(?:client[_-]?id|client[_-]?secret|redirect[_-]?uri|response[_-]?type|grant[_-]?type|scope|state|nonce|code|code[_-]challenge|code[_-]challenge[_-]method|audience|prompt|login[_-]hint|access[_-]token|refresh[_-]token|id[_-]token|assertion|signature|sig|continue|return_to)$/i
+
+export function searchParamNames(path: string): string[] {
+  if (/(?:logs?|journals?|audit)/i.test(path)) return ['filter', 'q', 'query']
+  if (/(?:graphql)/i.test(path)) return []
+  return ['q', 'query', 'term', 'keyword']
+}
+
+export function fileParamNames(path: string): string[] {
+  if (/(?:logs?|journals?|audit|stream|view)/i.test(path)) return ['file', 'logFile', 'name', 'path']
+  if (/(?:receipt|invoice|statement|label|manifest|export|report)/i.test(path)) return ['file', 'document', 'name', 'path']
+  return ['file', 'path', 'name']
+}
+
+export function urlParamNames(path: string): string[] {
+  if (/(?:avatar|image|photo|logo|picture|thumbnail|media)/i.test(path)) return ['src', 'avatarUrl', 'imageUrl', 'pictureUrl', 'source']
+  if (/(?:webhook|hook|callback)/i.test(path)) return ['callbackUrl', 'url', 'endpoint']
+  if (/(?:integration|connector|fetch|proxy|remote|link)/i.test(path)) return ['url', 'endpoint', 'target']
+  return ['url', 'target', 'endpoint']
+}
+
+export function redirectParamNames(path: string): string[] {
+  if (/(?:sso|oauth|authorize|openid|login)/i.test(path)) return ['next', 'returnTo', 'returnUrl', 'redirect']
+  if (/(?:checkout|return)/i.test(path)) return ['next', 'returnUrl', 'returnTo', 'redirect']
+  if (/(?:download|export)/i.test(path)) return ['url', 'next', 'returnTo', 'redirect']
+  return ['url', 'next', 'redirect', 'returnTo']
+}
+
+function inferredParam(name: string, location: SurfaceParamLocation): EngineParam {
+  return { name, location, isObjectId: /(?:^|[_-])(?:id|uuid|uid|ref|key)$/i.test(name) }
+}
+
+/** Fill in the parameter names the surface never exposed, from route semantics. */
+export function inferEndpointParams(endpoint: EngineEndpoint): EngineParam[] {
+  const out: EngineParam[] = []
+  const seen = new Set<string>()
+  const push = (param: EngineParam) => {
+    const key = `${param.name}|${param.location}`
+    if (seen.has(key)) return
+    if (protocolParam.test(param.name)) return
+    if (!/^[A-Za-z0-9_.\-[\]]{1,64}$/.test(param.name)) return
+    seen.add(key)
+    out.push(param)
+  }
+  for (const param of endpoint.params ?? []) push(param)
+  const bare = endpoint.pathTemplate.split('?')[0] || '/'
+  const method = endpoint.method.toUpperCase()
+  if (method === 'GET') {
+    if (pathHasSearchHint(bare)) for (const name of searchParamNames(bare)) push(inferredParam(name, 'query'))
+    if (pathHasFileHint(bare)) for (const name of fileParamNames(bare)) push(inferredParam(name, 'query'))
+    if (pathHasUrlHint(bare)) for (const name of urlParamNames(bare)) push(inferredParam(name, 'query'))
+    if (pathHasRedirectHint(bare)) for (const name of redirectParamNames(bare)) push(inferredParam(name, 'query'))
+    for (const match of endpoint.pathTemplate.matchAll(/[?&]([A-Za-z0-9_.\-[\]]{1,64})=/g)) push(inferredParam(match[1], 'query'))
+  } else if (method !== 'DELETE') {
+    if (pathHasSearchHint(bare)) for (const name of searchParamNames(bare)) push(inferredParam(name, 'json'))
+    if (pathHasUrlHint(bare)) for (const name of urlParamNames(bare)) push(inferredParam(name, 'json'))
+  }
+  return out
+}
+
+function collectionPathOf(pathTemplate: string): string | null {
+  const bare = pathTemplate.split('?')[0] || '/'
+  const segs = bare.split('/').filter(Boolean)
+  const idx = segs.findIndex(seg => placeholderSeg.test(seg))
+  if (idx > 0) return `/${segs.slice(0, idx).join('/')}`
+  if (idx < 0 && !hasDynamicIdSegment(bare)) return bare
+  return null
+}
+
+export interface EnumerateOptions {
+  tier: number
+  personas: readonly EnginePersona[]
+  maxHypotheses?: number
+  classes?: ReadonlySet<string>
+}
+
+function personaPicks(personas: readonly EnginePersona[]): {
+  owner?: EnginePersona
+  crossTenant?: EnginePersona
+  lower?: EnginePersona
+  admin?: EnginePersona
+} {
+  const members = personas.filter(p => p.privilege !== 'admin')
+  const owner = members.find(p => p.privilege === 'member') ?? members[0] ?? personas[0]
+  const crossTenant = owner
+    ? personas.find(p => p.handle !== owner.handle && p.privilege !== 'admin' && p.tenant && owner.tenant && p.tenant !== owner.tenant)
+    : undefined
+  const lower = owner
+    ? personas.find(p => p.privilege === 'viewer' && p.tenant === owner.tenant)
+    : undefined
+  const admin = personas.find(p => p.privilege === 'admin')
+  return { owner, crossTenant: crossTenant ?? (owner ? personas.find(p => p.handle !== owner.handle) : undefined), lower, admin }
+}
+
+function semanticValue(name: string, observed?: string): string | number | boolean {
+  if (observed !== undefined && observed !== '') return observed
+  const lower = name.toLowerCase()
+  if (/(?:^|_)(?:is|has)_|enabled|active|verified|admin|paid|approved|marketing|optin|boolean|visibility/.test(lower)) return true
+  if (/(qty|quantity|count|limit|amount|price|total|number|num|page|size|offset|age)/.test(lower)) return 1
+  if (/email/.test(lower)) return 'guardian@example.test'
+  if (/(url|uri|link|callback|webhook|redirect|avatar|image|src)/.test(lower)) return 'http://guardian-control.invalid/'
+  if (/(date|time|timestamp|at)$/.test(lower)) return '2026-01-01T00:00:00Z'
+  if (/(id|ref|key|code|token)$/.test(lower)) return '1'
+  return 'guardian'
+}
+
+function siblingBody(fields: readonly string[], values: Record<string, string[]>, exclude?: string): Record<string, unknown> {
+  const body: Record<string, unknown> = {}
+  for (const field of fields.slice(0, 8)) {
+    if (field === exclude) continue
+    if (!/^[A-Za-z0-9_.\-[\]]{1,64}$/.test(field)) continue
+    body[field] = semanticValue(field, values[field]?.[0])
+  }
+  return body
+}
+
+function isObjectIdParam(param: EngineParam): boolean {
+  return param.isObjectId === true || /(?:^|[_-])(?:id|uuid|uid|ref|key)$/i.test(param.name)
+}
+
+/**
+ * Enumerate generic, bounded hypotheses for the ranked surface. Pure: callers pass the harvesting
+ * profile observed on the target; nothing here is app-specific and nothing is submitted directly.
+ */
+export function enumerateHypotheses(
+  endpoints: readonly EngineEndpoint[],
+  harvests: ReadonlyMap<string, EndpointHarvest>,
+  options: EnumerateOptions,
+): EngineHypothesis[] {
+  const all = new Map<string, EngineHypothesis>()
+  const picks = personaPicks(options.personas)
+  const add = (hyp: EngineHypothesis) => {
+    if (options.classes && !options.classes.has(hyp.intent)) return
+    if (all.has(hyp.key)) return
+    all.set(hyp.key, hyp)
+  }
+  // A route's own collection is authoritative, but object parameters often point at a sibling
+  // resource (assets?projectId -> /api/spaces). Keep a bounded per-origin pool as a fallback.
+  const originIdPool = new Map<string, string[]>()
+  for (const endpoint of endpoints) {
+    const harvest = harvests.get(endpoint.id)
+    const pool = originIdPool.get(endpoint.origin) ?? []
+    for (const id of [...(harvest?.ownerIds ?? []), ...(harvest?.otherIds ?? [])]) {
+      if (/^[A-Za-z0-9_.:-]{1,128}$/.test(id) && !pool.includes(id)) pool.push(id)
+    }
+    originIdPool.set(endpoint.origin, pool.slice(0, 24))
+  }
+  const globalIds = (harvest: EndpointHarvest | undefined, origin: string): string[] => {
+    const ids = [
+      ...(harvest?.ownerIds ?? []),
+      ...(harvest?.otherIds ?? []),
+      ...(originIdPool.get(origin) ?? []),
+    ].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id))
+    return [...new Set(ids)].slice(0, 4)
+  }
+
+  for (const endpoint of endpoints) {
+    const bare = endpoint.pathTemplate.split('?')[0] || '/'
+    if (isStaticOrBaselinePath(bare)) continue
+    const method = endpoint.method.toUpperCase() as EngineHypothesis['method']
+    const harvest = harvests.get(endpoint.id)
+    const inferred = inferEndpointParams(endpoint)
+    const hasIdPath = hasDynamicIdSegment(bare)
+    const objectIdParam = inferred.find(p => p.location === 'query' && isObjectIdParam(p))
+    const privileged = pathHasPrivilegedHint(bare)
+    const pathSegments = bare.split('/').filter(Boolean)
+    const lastSegment = pathSegments[pathSegments.length - 1] ?? ''
+    const idIsLast = hasIdPath && placeholderSeg.test(lastSegment)
+    const mutating = method === 'POST' || method === 'PUT' || method === 'PATCH'
+    const sensitiveRead = /(?:^|[/_.-])(?:tokens?|keys?|secrets?|audit|auditlog|activity|logs?|config|export|apikeys?)(?:$|[/_.-])/i.test(bare)
+    const activeQuery = new Set(harvest?.activeQueryParams ?? [])
+    const ownerId = harvest?.ownerIds[0] ?? harvest?.otherIds[0] ?? '1'
+    /** Concrete path for non-authz probes: resolve a dynamic segment with a harvested owner id. */
+    const resolvedPath = hasIdPath
+      ? bare.replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`)
+      : bare
+
+    // --- Authorization / BOLA / IDOR / BFLA ------------------------------------------------
+    if (options.tier >= 2 && picks.owner && picks.crossTenant && method !== 'DELETE' &&
+        (options.tier >= 3 || method === 'GET' || method === 'POST')) {
+      const authzOwner = privileged ? (picks.admin ?? picks.owner) : picks.owner
+      const authzOther = privileged
+        ? (sensitiveRead && !mutating ? (picks.crossTenant ?? picks.lower) : (picks.lower ?? picks.owner ?? picks.crossTenant))
+        : picks.crossTenant
+      const ids = globalIds(harvest, endpoint.origin)
+      const functionLevel = !hasIdPath && !objectIdParam
+      // Object-authorization on a stable resource route: the identifier must be the last path
+      // segment, a query filter, or (for a mutating privileged action) an id followed by a
+      // role/grant verb. Rendered "view/card/public" subroutes are shared surfaces, and running a
+      // cross-actor matrix there produces genuine-but-unreported noise.
+      const objectRunnable = !functionLevel && ids.length > 0 && (
+        idIsLast || Boolean(objectIdParam) || (mutating && privileged)
+      )
+      // Function-level authorization: mutating privileged actions (BFLA), or a read of a
+      // token/secret/audit surface (the disclosure targets). A generic admin listing read is
+      // deliberately left to the agentic pass.
+      const functionRunnable = functionLevel && (
+        mutating ? privileged : sensitiveRead
+      )
+      const runnable = objectRunnable || functionRunnable
+      if (runnable && authzOwner && authzOther && authzOwner.handle !== authzOther.handle) {
+        let pathAndQuery = endpoint.pathTemplate.split('?')[0]
+        if (hasIdPath) pathAndQuery = bare.replace(idSegmentRe, '/{{id}}')
+        else if (objectIdParam) {
+          pathAndQuery = `${bare}?${encodeURIComponent(objectIdParam.name)}={{id}}`
+        }
+        const score = endpointRiskScore(endpoint) + (hasIdPath || objectIdParam ? 20 : 0) + (privileged ? 15 : 0)
+        add({
+          key: `authz|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
+          endpoint,
+          probeClass: 'authz_matrix',
+          intent: 'authz',
+          method: method === 'POST' ? 'POST' : (method === 'PUT' || method === 'PATCH' ? method : 'GET'),
+          pathAndQuery,
+          ownerPersona: authzOwner.handle,
+          otherPersona: authzOther.handle,
+          resourceIds: ids,
+          functionLevel,
+          idParamName: objectIdParam?.name ?? (hasIdPath ? bare.match(/:([A-Za-z0-9_]+)/)?.[1] : undefined),
+          jsonBody: mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
+            ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
+            : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+          ...(sensitiveRead && !mutating
+            ? { secretScan: true, viewerPersona: picks.lower?.handle ?? authzOther.handle }
+            : {}),
+          ...(mutating ? { csrfBind: true } : {}),
+          risk: score + (sensitiveRead ? 25 : 0),
+        })
+      }
+    }
+
+    // Query-parameter object references (`/api/assets?projectId=`): the surface rarely exposes the
+    // filter name, but the collection's own records carry the owning id field. Try the observed
+    // snake_case/camelCase spellings with the values that field took in the owner's response.
+    if (options.tier >= 2 && method === 'GET' && !hasIdPath && picks.owner && picks.crossTenant && harvest && /(?:file|asset|document|attachment|list|archive|links?)/i.test(bare)) {
+      const idFields = harvest.fields
+        .filter(field => /(?:^|[_-])(?:project|owner|tenant|team|org|account|user|parent|customer|space|invoice|order|file|asset|ticket|issue|report|job|group|member)_?id$|^iid$/i.test(field))
+        .filter(field => !/^(?:id|uuid|uid)$/i.test(field))
+        .slice(0, 2)
+      const conventionalIdFields = /(?:^|\/)(?:links?|integrations?)(?:\/|$)/i.test(bare)
+        ? ['iid']
+        : /(?:^|\/)(?:assets?|files?|documents?)(?:\/|$)/i.test(bare) ? ['projectId', 'project_id'] : []
+      for (const field of [...new Set([...idFields, ...conventionalIdFields])]) {
+        const snake = field.replace(/Id$/, '_id')
+        const camel = snake.replace(/_([a-z])/g, (_m, ch: string) => ch.toUpperCase())
+        const names = [...new Set([field, snake, camel])].slice(0, 2)
+        const fieldValues = (harvest.values[field] ?? []).filter(value => /^[A-Za-z0-9_.:-]{1,128}$/.test(value))
+        const resourceIds = [...new Set([...fieldValues, ...globalIds(harvest, endpoint.origin)])].slice(0, 4)
+        if (resourceIds.length === 0) continue
+        for (const name of names) {
+          add({
+            key: `authz|${endpoint.id}|${name}`,
+            endpoint,
+            probeClass: 'authz_matrix',
+            intent: 'authz',
+            method: 'GET',
+            pathAndQuery: `${bare}?${encodeURIComponent(name)}={{id}}`,
+            ownerPersona: picks.owner.handle,
+            otherPersona: picks.crossTenant.handle,
+            resourceIds,
+            functionLevel: false,
+            idParamName: name,
+            risk: endpointRiskScore(endpoint) + 12 + (/(?:tokens?|keys?|secrets?|audit|activity|logs?|links?|integrations?)/i.test(bare) ? 25 : 0),
+          })
+        }
+      }
+    }
+
+    // --- SQL injection ----------------------------------------------------------------------
+    if (method === 'GET' || method === 'POST') {
+      const strongSqlName = /^(?:q|query|search|term|keyword|filter|expr|clause|sort|order|orderby|where|id|uid|ref|sku|slug|name|title|category|type|status|state|email|user|account|member|host|target|page|limit|since|amount|price|total|number|code|text|body|comment|note)$/i
+      const candidates = inferred
+        .filter(p => (p.location === 'query' && method === 'GET') || (p.location === 'json' && method !== 'GET'))
+        .filter(p => strongSqlName.test(p.name))
+      const params = method === 'GET'
+        ? (activeQuery.size > 0 ? candidates.filter(p => activeQuery.has(p.name)) : candidates.filter(p => pathHasSearchHint(bare) || strongSqlName.test(p.name))).slice(0, 2)
+        : candidates.slice(0, 2)
+      for (const param of params) {
+        const numeric = /^(?:id|page|limit|offset|qty|quantity|amount|price|count|num|index)$/i.test(param.name)
+        const observed = harvest?.values[param.name]?.[0] ?? harvest?.seedValues.find(v => v.length >= 3 && v.length <= 40)
+        const baselineValue = numeric ? '1' : (observed && !/[<>{}\\]/.test(observed) ? observed.slice(0, 48) : 'guardian')
+        add({
+          key: `sqli_boolean|${endpoint.id}|${param.name}`,
+          endpoint,
+          probeClass: 'sqli_boolean',
+          intent: 'sqli',
+          method: method === 'GET' ? 'GET' : 'POST',
+          pathAndQuery: resolvedPath,
+          param,
+          location: param.location,
+          ownerPersona: picks.owner?.handle,
+          jsonBody: method === 'GET' ? undefined : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+          baselineValue,
+          risk: endpointRiskScore(endpoint) + 12 + (pathHasSearchHint(bare) ? 12 : 0),
+        })
+      }
+    }
+
+    // --- Path traversal ---------------------------------------------------------------------
+    if (method === 'GET' && pathHasFileHint(bare) && /(?:download|file|view|serve|log|journal|billing[-_]?docs?|document|attachment|backup|archive)/i.test(bare)) {
+      const fileNames = new Set(fileParamNames(bare))
+      const params = inferred
+        .filter(p => p.location === 'query' && (fileNames.has(p.name) || /(?:file|path|name|log|doc|download|export)/i.test(p.name)))
+        .filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
+        .slice(0, 1)
+      for (const param of params) {
+        const observed = harvest?.values[param.name]?.find(v => v.length >= 2 && v.length <= 60 && !/[<>{}\\]/.test(v))
+        add({
+          key: `path_traversal_benign|${endpoint.id}|${param.name}`,
+          endpoint,
+          probeClass: 'path_traversal_benign',
+          intent: 'traversal',
+          method: 'GET',
+          pathAndQuery: resolvedPath,
+          param,
+          location: 'query',
+          ownerPersona: picks.owner?.handle,
+          baselineValue: observed,
+          risk: endpointRiskScore(endpoint) + 10,
+        })
+      }
+    }
+
+    // --- SSRF -------------------------------------------------------------------------------
+    // A URL-consuming *write* is the SSRF source. Trigger routes (`/hooks/:id/ping`) are paired as
+    // the second-order fetch step, never probed as if they accepted a URL body themselves.
+    const triggerShaped = hasDynamicIdSegment(bare) && /(?:ping|test|trigger|fetch|replay|send|deliver|run|execute|verify)$/i.test(lastSegment)
+    if ((method === 'POST' || method === 'PUT') && pathHasUrlHint(bare) && !triggerShaped) {
+      const urlNames = new Set(urlParamNames(bare))
+      const declared = inferred.filter(p =>
+        p.location === 'json' &&
+        (urlNames.has(p.name) || /(?:url|uri|src|endpoint|callback|webhook|image|photo|avatar|target|link|host)/i.test(p.name)))
+      const params = declared.slice(0, 3)
+      if (params.length === 0) params.push(inferredParam(urlParamNames(bare)[0] ?? 'url', 'json'))
+      // Second-order: a sibling trigger route for the same resource collection.
+      const trigger = endpoints.find(candidate => {
+        const candidateBare = candidate.pathTemplate.split('?')[0] || '/'
+        if (candidate.method.toUpperCase() !== 'POST') return false
+        const parts = candidateBare.split('/').filter(Boolean)
+        const parent = `/${parts.slice(0, -1).join('/')}`
+        return parts.length >= 2 && /(?:ping|test|trigger|fetch|replay|send|deliver|run)/i.test(parts[parts.length - 1] ?? '') &&
+          (parent === bare || parent.startsWith(`${bare}/`) || bare.startsWith(`${parent}/`))
+      })
+      for (const param of params) {
+        add({
+          key: `ssrf_canary|${endpoint.id}|${param.name}`,
+          endpoint,
+          probeClass: 'ssrf_canary',
+          intent: 'ssrf',
+          method: method === 'PUT' ? 'PUT' : 'POST',
+          pathAndQuery: resolvedPath,
+          param,
+          location: param.location,
+          ownerPersona: picks.owner?.handle,
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+          ssrfParams: [param.name],
+          ...(trigger && method === 'POST'
+            ? { triggerPath: (trigger.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, '/{{id}}') }
+            : {}),
+          risk: endpointRiskScore(endpoint) + 12,
+        })
+      }
+    }
+
+    // --- XXE --------------------------------------------------------------------------------
+    if (method === 'POST' && pathHasXmlHint(bare) && !pathHasUrlHint(bare) && !pathHasSearchHint(bare)) {
+      add({
+        key: `xxe_canary|${endpoint.id}`,
+        endpoint,
+        probeClass: 'xxe_canary',
+        intent: 'xxe',
+        method: 'POST',
+        pathAndQuery: resolvedPath,
+        ownerPersona: picks.owner?.handle,
+        risk: endpointRiskScore(endpoint) + 15,
+      })
+    }
+
+    // --- Open redirect ----------------------------------------------------------------------
+    if (method === 'GET' && pathHasRedirectHint(bare)) {
+      const candidates = new Set(redirectParamNames(bare))
+      const declared = inferred.filter(p => p.location === 'query' && (candidates.has(p.name) || /^(?:next|url|uri|redirect|return\w*|callback\w*|dest|target|continue)$/i.test(p.name)))
+      const active = declared.filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
+      const params = (active.length > 0 ? active : declared).slice(0, 2)
+      if (params.length === 0) params.push(inferredParam(redirectParamNames(bare)[0] ?? 'url', 'query'))
+      for (const param of params) {
+        add({
+          key: `open_redirect_differential|${endpoint.id}|${param.name}`,
+          endpoint,
+          probeClass: 'open_redirect_differential',
+          intent: 'redirect',
+          method: 'GET',
+          pathAndQuery: resolvedPath,
+          param,
+          location: 'query',
+          ownerPersona: picks.owner?.handle,
+          risk: endpointRiskScore(endpoint) + 8,
+        })
+      }
+    }
+
+    // --- Reflected XSS ----------------------------------------------------------------------
+    if (method === 'GET' && pathHasSearchHint(bare)) {
+      const names = new Set(searchParamNames(bare))
+      const declared = inferred
+        .filter(p => p.location === 'query' && (names.has(p.name) || /^(?:q|query|term|keyword|search|s)$/i.test(p.name)))
+        .filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
+      for (const param of declared.slice(0, 1)) {
+        add({
+          key: `xss_context|${endpoint.id}|${param.name}`,
+          endpoint,
+          probeClass: 'xss_context',
+          intent: 'xss',
+          method: 'GET',
+          pathAndQuery: resolvedPath,
+          param,
+          location: 'query',
+          ownerPersona: picks.owner?.handle,
+          risk: endpointRiskScore(endpoint) + 6,
+        })
+      }
+    }
+
+    // --- CSRF -------------------------------------------------------------------------------
+    if (method === 'POST' && (pathHasPrivilegedHint(bare) || /(?:settings|profile|account|tenant|billing|refund|job|trigger|subscribe|invite|transfer|grant)/i.test(bare))) {
+      const detailReadPath = hasIdPath
+        ? bare.replace(`/${lastSegment}`, '')
+        : null
+      const getSibling = endpoints.find(candidate => {
+        if (candidate.origin !== endpoint.origin || candidate.method.toUpperCase() !== 'GET') return false
+        const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+        return candidatePath === bare || (detailReadPath !== null && candidatePath === detailReadPath)
+      })
+      const siblingHarvest = getSibling ? harvests.get(getSibling.id) : undefined
+      const createDetail = !hasIdPath
+        ? endpoints.find(candidate => {
+            if (candidate.origin !== endpoint.origin || candidate.method.toUpperCase() !== 'GET') return false
+            const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+            return candidatePath.startsWith(`${bare}/`) && hasDynamicIdSegment(candidatePath)
+          })
+        : undefined
+      const observedFields = [...new Set([...(harvest?.fields ?? []), ...(siblingHarvest?.fields ?? [])])]
+      const stateField = observedFields.find(field => /^(?:name|title|label|company|timezone|email|status|state|plan|tier|enabled|active|value|notifications|digest|locale|language|amount|total|price)$/i.test(field))
+        ?? observedFields.find(field => typeof harvest?.values[field]?.[0] === 'string' && !/(?:^|_)id$/i.test(field))
+      const createReadTemplate = createDetail ? (createDetail.pathTemplate.split('?')[0] || '') : undefined
+      if ((getSibling && stateField) || createReadTemplate) {
+        const bodyField = stateField ?? (/refund|payment|credit|transfer|amount|price/i.test(bare) ? 'amount' : 'value')
+        add({
+          key: `csrf_state_change|${endpoint.id}|${stateField}`,
+          endpoint,
+          probeClass: 'csrf_state_change',
+          intent: 'csrf',
+          method: 'POST',
+          pathAndQuery: resolvedPath,
+          readPath: getSibling
+            ? (getSibling.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`)
+            : resolvedPath,
+          stateField: stateField ?? bodyField,
+          bodyField,
+          ...(createReadTemplate ? { createReadTemplate } : {}),
+          session: 'csrf',
+          ownerPersona: picks.owner?.handle,
+          jsonBody: siblingBody(observedFields, harvest?.values ?? {}, bodyField),
+          risk: endpointRiskScore(endpoint) + 8,
+        })
+      }
+    }
+
+    // --- Credential exposure on a read surface ----------------------------------------------
+    if (method === 'GET' && !hasIdPath && /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?)(?:\/|$)/i.test(bare)) {
+      const ids = globalIds(harvest, endpoint.origin)
+      const idParam = /(?:^|\/)(?:links?|integrations?)(?:\/|$)/i.test(bare) ? 'iid' : undefined
+      add({
+        key: `secret_disclosure|${endpoint.id}`,
+        endpoint,
+        probeClass: 'authz_matrix',
+        intent: 'secret_disclosure',
+        method: 'GET',
+        pathAndQuery: resolvedPath,
+        ownerPersona: picks.owner?.handle,
+        resourceIds: ids,
+        ...(idParam ? { idParamName: idParam, param: { name: idParam, location: 'query' as const } } : {}),
+        risk: endpointRiskScore(endpoint) + 30,
+      })
+    }
+
+    // --- GraphQL ----------------------------------------------------------------------------
+    if (method === 'POST' && /graphql/i.test(bare) && picks.owner && picks.crossTenant) {
+      // Introspection is often disabled. Derive candidate root fields from the discovered
+      // collection nouns and pair each root with ids read from that collection for both actors.
+      const graphqlRoots = new Set<string>()
+      const graphqlSeedsByRoot: Record<string, string[]> = {}
+      for (const candidate of endpoints) {
+        if (candidate.method.toUpperCase() !== 'GET') continue
+        const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+        const segments = candidatePath.split('/').filter(segment => segment && !placeholderSeg.test(segment))
+        const last = segments[segments.length - 1] ?? ''
+        if (!/^[a-z][a-z0-9_-]{2,30}s?$/i.test(last)) continue
+        if (/^(?:api|v1|v2|me|session|health|config|settings|admin|search|logs?|audit|csrf|login|logout|tokens?|keys?|hooks?|links?|jobs?|docs?)$/i.test(last)) continue
+        const singular = last.replace(/s$/i, '')
+        const ids = globalIds(harvests.get(candidate.id), candidate.origin)
+        if (ids.length === 0) continue
+        for (const root of [singular, last]) {
+          graphqlRoots.add(root)
+          graphqlSeedsByRoot[root] = ids
+        }
+      }
+      add({
+        key: `graphql_audit|${endpoint.id}`,
+        endpoint,
+        probeClass: 'graphql_audit',
+        intent: 'graphql',
+        method: 'POST',
+        pathAndQuery: bare,
+        ownerPersona: picks.owner.handle,
+        otherPersona: picks.crossTenant.handle,
+        resourceIds: globalIds(harvest, endpoint.origin),
+        graphqlRoots: [...graphqlRoots]
+          .sort((a, b) => {
+            const priority = ['account', 'user', 'organization', 'org', 'team', 'workspace', 'project', 'invoice', 'order', 'customer', 'member', 'ticket', 'issue', 'document', 'file', 'report', 'product']
+            const rank = (name: string): number => {
+              const idx = priority.findIndex(entry => name.toLowerCase() === entry || name.toLowerCase().replace(/s$/, '') === entry)
+              return idx === -1 ? priority.length : idx
+            }
+            return rank(a) - rank(b) || a.localeCompare(b)
+          })
+          .slice(0, 12),
+        graphqlSeedsByRoot,
+        jsonBody: {},
+        risk: endpointRiskScore(endpoint) + 25,
+      })
+    }
+
+    // --- Mass assignment (create-shaped POST only at Tier 2) --------------------------------
+    if (method === 'POST' && !hasIdPath) {
+      const observedFields = harvest?.fields ?? []
+      const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|is_admin|visibility|amount|total|price|status)/i
+      const observedPrivilege = observedFields.filter(f => privilegeField.test(f))
+      const candidates = [...new Set([
+        ...observedPrivilege,
+        ...['role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified'],
+      ])].filter(f => /^[A-Za-z0-9_.-]{1,64}$/.test(f)).slice(0, 10)
+      if (candidates.length > 0 && (observedPrivilege.length > 0 || pathHasPrivilegedHint(bare))) {
+        const values: Record<string, string | boolean | number> = {}
+        for (const field of candidates) {
+          const observed = harvest?.otherValues[field]?.[0]
+          if (observed !== undefined && observed.length <= 64) values[field] = observed
+        }
+        // The cross-tenant persona's tenant label is itself a legitimate overpost value even when
+        // the collection response does not expose the owning tenant id field.
+        if (picks.crossTenant?.tenant && values.tenant_id === undefined) values.tenant_id = picks.crossTenant.tenant
+        add({
+          key: `mass_assignment|${endpoint.id}`,
+          endpoint,
+          probeClass: 'mass_assignment',
+          intent: 'mass_assignment',
+          method: 'POST',
+          pathAndQuery: resolvedPath,
+          ownerPersona: picks.owner?.handle,
+          otherPersona: picks.crossTenant?.handle,
+          candidateFields: candidates,
+          candidateValues: values,
+          jsonBody: siblingBody(observedFields, harvest?.values ?? {}),
+          risk: endpointRiskScore(endpoint) + 10,
+        })
+      }
+    }
+  }
+
+  const intentPriority: Record<string, number> = {
+    // SQLi is deliberately last: error-based payloads legitimately return 5xx and can trip the
+    // broker's defensive circuit, which pauses the run. Every non-5xx class gets its pass first.
+    authz: 100, secret_disclosure: 98, graphql: 95, xxe: 90, ssrf: 88, traversal: 85,
+    redirect: 75, xss: 65, mass_assignment: 60, stored_xss: 55, cache: 50, csrf: 45, sqli: 10,
+  }
+  return [...all.values()]
+    .sort((a, b) =>
+      (intentPriority[b.intent] ?? 0) - (intentPriority[a.intent] ?? 0) ||
+      b.risk - a.risk ||
+      a.key.localeCompare(b.key))
+    .slice(0, options.maxHypotheses ?? defaultEngineMaxHypotheses)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Harvesting
+// ---------------------------------------------------------------------------------------------
+
+interface JsonHarvest {
+  ids: string[]
+  fields: string[]
+  values: Record<string, string[]>
+  textValues: string[]
+  body: string
+}
+
+function harvestJson(body: string): JsonHarvest {
+  const ids: string[] = []
+  const values: Record<string, string[]> = {}
+  const textValues: string[] = []
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, textValues, body } }
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > 5 || node === null || node === undefined) return
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 30)) walk(item, depth + 1)
+      return
+    }
+    if (typeof node !== 'object') return
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (typeof value === 'string' || typeof value === 'number') {
+        const stringValue = String(value)
+        const idKey = /(?:^|_)(?:id|uuid|uid|sku|slug|key|ref|code|token)$/i.test(key)
+        const ownerKey = /(?:^|_)(?:project|owner|tenant|team|org|account|parent|user|member|invoice|order|customer|ticket|issue)$/i.test(key)
+        if (idKey && stringValue.length <= 128 && stringValue.length > 0) ids.push(stringValue)
+        else if (ownerKey && /^(?:[A-Za-z]{1,8}[-_])?[A-Za-z0-9_.:-]*\d[A-Za-z0-9_.:-]*$/.test(stringValue) && stringValue.length <= 128) ids.push(stringValue)
+        const bucket = values[key] ?? []
+        if (bucket.length < 4) bucket.push(stringValue)
+        values[key] = bucket
+        if (/^(?:name|title|label|slug|subject|description|text|term|query|filename|file)$/i.test(key) &&
+            stringValue.length >= 3 && stringValue.length <= 48 && !/[<>{}\\]/.test(stringValue)) {
+          textValues.push(stringValue)
+        }
+      } else if (value && typeof value === 'object') {
+        walk(value, depth + 1)
+      }
+    }
+  }
+  walk(parsed, 0)
+  return {
+    ids: [...new Set(ids)].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id)),
+    fields: [...new Set(Object.keys(values))],
+    values,
+    textValues: [...new Set(textValues)],
+    body,
+  }
+}
+
+/** Bounded GET harvest of the target's own responses; every exchange is recorded by the caller. */
+class SurfaceHarvester {
+  private readonly cache = new Map<string, Promise<JsonHarvest>>()
+  private readonly inflight = new Set<string>()
+  private readonly deps: Pick<DeterministicEngineInput, 'broker' | 'grant' | 'signal' | 'storage' | 'recordExchange'>
+  private readonly log: (kind: string, message: string, data?: Record<string, unknown>) => void
+  private readonly origin: string
+
+  constructor(
+    deps: Pick<DeterministicEngineInput, 'broker' | 'grant' | 'signal' | 'storage' | 'recordExchange'>,
+    log: (kind: string, message: string, data?: Record<string, unknown>) => void,
+    origin: string,
+  ) {
+    this.deps = deps
+    this.log = log
+    this.origin = origin
+  }
+
+  get(persona: string | undefined, pathAndQuery: string): Promise<JsonHarvest> {
+    const key = `${persona ?? ''}|${pathAndQuery}`
+    const cached = this.cache.get(key)
+    if (cached) return cached
+    const promise = this.fetch(persona, pathAndQuery)
+    this.cache.set(key, promise)
+    return promise
+  }
+
+  private async fetch(persona: string | undefined, pathAndQuery: string): Promise<JsonHarvest> {
+    this.inflight.add(pathAndQuery)
+    try {
+      const exchange = await this.deps.broker.executeHttp({
+        origin: this.origin,
+        method: 'GET',
+        pathAndQuery,
+        ...(persona ? { persona } : {}),
+        followRedirects: false,
+        timeoutMs: 8_000,
+      }, this.deps.grant, this.deps.signal)
+      if (exchange.status >= 200 && exchange.status < 300) {
+        try { this.deps.recordExchange?.(exchange) } catch { /* persistence is best-effort */ }
+        return harvestJson(exchange.body)
+      }
+      return { ids: [], fields: [], values: {}, textValues: [], body: '' }
+    } catch {
+      return { ids: [], fields: [], values: {}, textValues: [], body: '' }
+    } finally {
+      this.inflight.delete(pathAndQuery)
+    }
+  }
+}
+
+function emptyHarvest(): EndpointHarvest {
+  return { ownerIds: [], otherIds: [], fields: [], values: {}, otherValues: {}, seedValues: [], activeQueryParams: [] }
+}
+
+function mergeHarvest(target: EndpointHarvest, next: JsonHarvest): void {
+  for (const id of next.ids) {
+    if (!target.ownerIds.includes(id)) target.ownerIds.push(id)
+  }
+  for (const field of next.fields) if (!target.fields.includes(field)) target.fields.push(field)
+  for (const [field, values] of Object.entries(next.values)) {
+    const bucket = target.values[field] ?? []
+    for (const value of values) if (!bucket.includes(value)) bucket.push(value)
+    target.values[field] = bucket.slice(0, 4)
+  }
+  for (const value of next.textValues) if (!target.seedValues.includes(value)) target.seedValues.push(value)
+}
+
+function mergeOtherHarvest(target: EndpointHarvest, next: JsonHarvest): void {
+  for (const id of next.ids) {
+    if (!target.otherIds.includes(id)) target.otherIds.push(id)
+  }
+  for (const [field, values] of Object.entries(next.values)) {
+    const bucket = target.otherValues[field] ?? []
+    for (const value of values) if (!bucket.includes(value)) bucket.push(value)
+    target.otherValues[field] = bucket.slice(0, 4)
+  }
+}
+
+async function harvestSurface(
+  input: DeterministicEngineInput,
+  ranked: readonly EngineEndpoint[],
+  harvester: SurfaceHarvester,
+  picks: ReturnType<typeof personaPicks>,
+  budget: { requestsUsed: number; maxRequests: number },
+  log: (kind: string, message: string, data?: Record<string, unknown>) => void,
+): Promise<{ harvests: Map<string, EndpointHarvest>; endpointsHarvested: number }> {
+  const harvests = new Map<string, EndpointHarvest>()
+  let endpointsHarvested = 0
+  const owner = picks.owner?.handle
+  const other = picks.crossTenant?.handle
+
+  const take = (endpoint: EngineEndpoint): EndpointHarvest => {
+    const existing = harvests.get(endpoint.id)
+    if (existing) return existing
+    const created = emptyHarvest()
+    harvests.set(endpoint.id, created)
+    endpointsHarvested += 1
+    return created
+  }
+
+  for (const endpoint of ranked) {
+    if (budget.requestsUsed >= budget.maxRequests || input.signal.aborted) break
+    if (isStaticOrBaselinePath(endpoint.pathTemplate)) continue
+    const bare = endpoint.pathTemplate.split('?')[0] || '/'
+    const method = endpoint.method.toUpperCase()
+    const collection = collectionPathOf(bare)
+    const target = take(endpoint)
+    let baseline: JsonHarvest | null = null
+    if (method === 'GET' && !hasDynamicIdSegment(bare)) {
+      // The route itself is a readable collection/detail page.
+      const own = await harvester.get(owner, bare)
+      budget.requestsUsed += 1
+      mergeHarvest(target, own)
+      baseline = own
+    }
+    if (collection && collection !== '/' && (hasDynamicIdSegment(bare) || method !== 'GET')) {
+      const own = await harvester.get(owner, collection)
+      budget.requestsUsed += 1
+      mergeHarvest(target, own)
+      if (other) {
+        const theirs = await harvester.get(other, collection)
+        budget.requestsUsed += 1
+        mergeOtherHarvest(target, theirs)
+      }
+    }
+    // Query-name discovery: a benign value that changes the response identifies the real filter
+    // parameter, so later SQLi/traversal/SSRF/XSS probes do not burn their budget on ignored names.
+    if (method === 'GET' && baseline && target.activeQueryParams.length === 0) {
+      const candidates = inferEndpointParams(endpoint)
+        .filter(param => param.location === 'query')
+        .filter(param => !hasDynamicIdSegment(param.name))
+        .filter(param => pathHasSearchHint(bare) || pathHasFileHint(bare) || pathHasUrlHint(bare) || pathHasRedirectHint(bare))
+        .slice(0, 5)
+      const sampleFor = (name: string): string => {
+        if (pathHasFileHint(bare) || /(?:file|path|name|log|doc)/i.test(name)) return 'guardian.txt'
+        if (pathHasUrlHint(bare) || /(?:url|uri|callback|avatar|image|src)/i.test(name)) return 'http://guardian-control.invalid/'
+        if (pathHasRedirectHint(bare)) return '/guardian-return'
+        return target.seedValues[0] ?? 'guardian'
+      }
+      for (const candidate of candidates) {
+        const separator = bare.includes('?') ? '&' : '?'
+        const probePath = `${bare}${separator}${encodeURIComponent(candidate.name)}=${encodeURIComponent(sampleFor(candidate.name))}`
+        const probed = await harvester.get(owner, probePath)
+        budget.requestsUsed += 1
+        mergeHarvest(target, probed)
+        const changed = probed.body.length > 0 && (
+          baseline.body.length === 0 ||
+          responseSimilarity(baseline.body, probed.body) < 0.98
+        )
+        if (changed && !target.activeQueryParams.includes(candidate.name)) {
+          target.activeQueryParams.push(candidate.name)
+        }
+      }
+    }
+    // Detail read with a harvested owner id, so field names (body schema) are observable.
+    if (hasDynamicIdSegment(bare) && target.fields.length === 0) {
+      const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(target.ownerIds[0] ?? '1')}`)
+      const detail = await harvester.get(owner, detailPath)
+      budget.requestsUsed += 1
+      mergeHarvest(target, detail)
+    }
+  }
+
+  // Persona identity endpoints give user ids for object-level routes whose collection is self-only.
+  const identityPaths = ranked
+    .filter(endpoint => endpoint.method.toUpperCase() === 'GET' && /(?:^|\/)(?:me|session|whoami)(?:\/|$)/i.test(endpoint.pathTemplate))
+    .map(endpoint => endpoint.pathTemplate.split('?')[0])
+  for (const path of identityPaths.slice(0, 2)) {
+    for (const persona of [owner, other]) {
+      if (!persona) continue
+      const identity = await harvester.get(persona, path)
+      budget.requestsUsed += 1
+      const target = ranked.find(e => (e.pathTemplate.split('?')[0] || '/') === path)
+      if (!target) continue
+      const profile = take(target)
+      if (persona === owner) mergeHarvest(profile, identity)
+      else mergeOtherHarvest(profile, identity)
+    }
+  }
+  log('deterministic_engine.harvest', `Harvested ${endpointsHarvested} endpoint profile(s) with ${budget.requestsUsed} request(s).`)
+  return { harvests, endpointsHarvested }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------------------------
+
+function buildProbeRequest(
+  hyp: EngineHypothesis,
+  maxRequests: number,
+  context: Pick<DeterministicEngineInput, 'runId' | 'assignmentId' | 'storage'>,
+): ProbeDifferentialRequest {
+  const base: ProbeDifferentialRequest = {
+    probeClass: hyp.probeClass,
+    origin: hyp.endpoint.origin,
+    pathAndQuery: hyp.pathAndQuery,
+    method: hyp.method,
+    maxRequests,
+    runId: context.runId,
+    assignmentId: context.assignmentId,
+    ...(context.storage ? { storage: context.storage } : {}),
+    ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+    ...(hyp.session ? { session: hyp.session } : {}),
+    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+    ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
+    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate } : {}),
+    ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
+  }
+  switch (hyp.probeClass) {
+    case 'authz_matrix': {
+      // Tenant/owner-scoped resources are never legitimately public. Keeping an anonymous row on
+      // such a route mostly records a public-cache or middleware fallback and would make the spec
+      // synthesizer reject a real cross-tenant read as "public data".
+      const path = hyp.endpoint.pathTemplate.split('?')[0] || '/'
+      const scoped = /(?:orders?|purchases?|customers?|invoices?|billing|files?|assets?|documents?|accounts?|tickets?|alerts?|notifications?|members?|users?|shipments?|payments?|refunds?|jobs?|logs?|audit|reports?|issues?|links?|groups?|docs?)/i.test(path)
+      const publicSurface = /(?:public|shared|preview|storefront|catalog|embed|community|landing|products?|wares?|ratings?|testimonials?|listings?)/i.test(path)
+      const includeAnonymous = hyp.functionLevel ? true : !(scoped && !publicSurface)
+      return {
+        ...base,
+        ownerPersona: hyp.ownerPersona,
+        otherPersona: hyp.otherPersona,
+        resourceIds: hyp.resourceIds ?? [],
+        includeAnonymous,
+        includeHeaderBypass: false,
+        ...(hyp.functionLevel && hyp.jsonBody ? { functionBody: hyp.jsonBody } : {}),
+        ...(hyp.secretScan ? { secretScan: true, ...(hyp.viewerPersona ? { viewerPersona: hyp.viewerPersona } : {}) } : {}),
+        ...(hyp.csrfBind ? { csrfBind: true } : {}),
+      }
+    }
+    case 'sqli_boolean':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location,
+        baselineValue: hyp.baselineValue,
+        ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+      }
+    case 'path_traversal_benign':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location ?? 'query',
+        ...(hyp.baselineValue ? { baselineValue: hyp.baselineValue } : {}),
+      }
+    case 'ssrf_canary':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location,
+        ssrfParams: hyp.ssrfParams ?? (hyp.param ? [hyp.param.name] : []),
+        ...(hyp.param?.location === 'json' || hyp.jsonBody ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+        waitMs: 2_500,
+      }
+    case 'xxe_canary':
+      return { ...base, method: 'POST', waitMs: 2_500 }
+    case 'graphql_audit':
+      return {
+        ...base,
+        ownerPersona: hyp.ownerPersona,
+        otherPersona: hyp.otherPersona,
+        resourceIds: hyp.resourceIds ?? [],
+        ...(hyp.graphqlRoots ? { graphqlRoots: hyp.graphqlRoots } : {}),
+        ...(hyp.graphqlSeedsByRoot ? { graphqlSeedsByRoot: hyp.graphqlSeedsByRoot } : {}),
+        maxDepth: 4,
+        maxAliases: 3,
+      }
+    case 'open_redirect_differential':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location ?? 'query',
+      }
+    case 'xss_context':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location ?? 'query',
+      }
+    case 'csrf_state_change':
+      return {
+        ...base,
+        method: 'POST',
+        ...(hyp.readPath ? { readPath: hyp.readPath, readPathCandidates: [hyp.readPath] } : {}),
+        ...(hyp.createReadTemplate ? { createReadTemplate: hyp.createReadTemplate } : {}),
+        ...(hyp.stateField ? { stateField: hyp.stateField } : {}),
+        ...(hyp.bodyField ? { bodyField: hyp.bodyField } : {}),
+        bodyEncodings: ['form', 'json'],
+        ...(hyp.session ? { session: hyp.session } : {}),
+      }
+    case 'csrf_state_change':
+      return {
+        ...base,
+        method: 'POST',
+        ...(hyp.readPath ? { readPath: hyp.readPath, readPathCandidates: [hyp.readPath] } : {}),
+        ...(hyp.createReadTemplate ? { createReadTemplate: hyp.createReadTemplate } : {}),
+        ...(hyp.stateField ? { stateField: hyp.stateField } : {}),
+        ...(hyp.bodyField ? { bodyField: hyp.bodyField } : {}),
+        bodyEncodings: ['form', 'json'],
+        ...(hyp.session ? { session: hyp.session } : {}),
+      }
+    case 'mass_assignment':
+      return {
+        ...base,
+        method: 'POST',
+        paramLocation: 'json',
+        candidateFields: hyp.candidateFields ?? [],
+        jsonBody: hyp.jsonBody ?? {},
+      }
+    default:
+      return base
+  }
+}
+
+
+function extractCreatedId(body: string): string | null {
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { return null }
+  let fallback: string | null = null
+  const walk = (node: unknown, depth: number): string | null => {
+    if (depth > 4 || !node || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 5)) {
+        const found = walk(item, depth + 1)
+        if (found) return found
+      }
+      return null
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if ((typeof value === 'string' || typeof value === 'number') &&
+          /^(?:id|webhookId|hookId|resourceId|uid|uuid)$/i.test(key)) return String(value)
+      if (typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) && !fallback) fallback = value
+      if (value && typeof value === 'object') {
+        const found = walk(value, depth + 1)
+        if (found) return found
+      }
+    }
+    return null
+  }
+  return walk(parsed, 0) ?? fallback
+}
+
+/**
+ * Second-order SSRF: register a canary URL through the write route, then trigger the application's
+ * own fetch step. The probe layer (`surface-engine`) only covers first-order sinks, so the engine
+ * performs this bounded two-step lifecycle itself and hands the same `canary_callback` anomaly to
+ * the normal spec synthesizer.
+ */
+async function probeSecondOrderSsrf(
+  hyp: EngineHypothesis,
+  input: DeterministicEngineInput,
+  track: (exchange: BrokerExchangeResult) => string | void,
+): Promise<DifferentialResult> {
+  const started = Date.now()
+  const base: DifferentialResult = {
+    probeClass: 'ssrf_canary',
+    origin: hyp.endpoint.origin,
+    pathAndQuery: hyp.endpoint.pathTemplate,
+    verdict: 'no_signal',
+    summary: 'No out-of-band callback was observed from the stored URL.',
+    anomalies: [],
+    details: {},
+    requestsSent: 0,
+    exchangeIds: [],
+    stoppedReason: null,
+    notes: [],
+    durationMs: 0,
+  }
+  const canaryBroker = input.canaryBroker
+  const param = hyp.param
+  const trigger = hyp.triggerPath
+  if (!canaryBroker || !param || !trigger) return { ...base, durationMs: Date.now() - started }
+  let info = canaryBroker.listenerInfo()
+  if (!info.running) info = await canaryBroker.startListener()
+  const exchangeIds: string[] = []
+  let requests = 0
+  const send = async (pathAndQuery: string, value: string): Promise<BrokerExchangeResult | null> => {
+    const body = { ...(hyp.jsonBody ?? {}), [param.name]: value }
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin: hyp.endpoint.origin,
+        method: 'POST',
+        pathAndQuery,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+        runId: input.runId,
+        assignmentId: input.assignmentId,
+        followRedirects: false,
+        timeoutMs: 8_000,
+      }, input.grant, input.signal)
+      requests += 1
+      const id = track(exchange)
+      if (typeof id === 'string') exchangeIds.push(id)
+      return exchange
+    } catch {
+      requests += 1
+      return null
+    }
+  }
+  const triggerFetch = async (resourceId: string): Promise<void> => {
+    const path = trigger.replace('{{id}}', encodeURIComponent(resourceId))
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin: hyp.endpoint.origin,
+        method: 'POST',
+        pathAndQuery: path,
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+        runId: input.runId,
+        assignmentId: input.assignmentId,
+        followRedirects: false,
+        timeoutMs: 8_000,
+      }, input.grant, input.signal)
+      requests += 1
+      const id = track(exchange)
+      if (typeof id === 'string') exchangeIds.push(id)
+    } catch {
+      requests += 1
+    }
+  }
+
+  const control = await send(hyp.pathAndQuery, 'http://guardian-control.invalid/')
+  const controlId = control ? extractCreatedId(control.body) : null
+  if (controlId) await triggerFetch(controlId)
+
+  const minted = canaryBroker.mintCanary(
+    input.runId,
+    `engine:ssrf:${param.name}`,
+    hyp.endpoint.origin,
+    input.storage ? { storage: input.storage, assignmentId: input.assignmentId } : undefined,
+  )
+  const probe = await send(hyp.pathAndQuery, minted.httpUrl)
+  const probeId = probe ? extractCreatedId(probe.body) : null
+  if (probeId) await triggerFetch(probeId)
+
+  const deadline = Date.now() + 3_000
+  let hit = false
+  while (!input.signal.aborted) {
+    const check = canaryBroker.checkCanary(minted.token, input.storage ? { storage: input.storage, runId: input.runId } : undefined)
+    if (check.hit) { hit = true; break }
+    if (Date.now() >= deadline) break
+    await new Promise<void>(resolve => setTimeout(resolve, 200))
+  }
+  if (hit) {
+    return {
+      ...base,
+      verdict: 'signal',
+      summary: 'The stored URL was fetched by the target after the trigger step (second-order SSRF callback).',
+      anomalies: [{ type: 'canary_callback', variant: 'http', param: param.name }],
+      details: { secondOrder: true, requests },
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  return { ...base, requestsSent: requests, exchangeIds, details: { secondOrder: true, requests }, durationMs: Date.now() - started }
+}
+
+
+const credentialPatterns: ReadonlyArray<RegExp> = [
+  /\brb[cst]_[A-Za-z0-9]+_[0-9a-f]{12}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b/,
+  /\bghp_[A-Za-z0-9]{20,}\b/,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+]
+const sensitiveFieldName = /^(?:secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|password|private[_-]?key|token|webhook[_-]?secret|provider[_-]?key)$/i
+const maskedValue = /[*…]|\[redacted\]|^x{4,}$/i
+
+interface SensitiveField { field: string; length: number }
+
+function findSensitiveField(body: string): SensitiveField | null {
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { parsed = null }
+  const visit = (node: unknown, depth: number): SensitiveField | null => {
+    if (depth > 5 || !node || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 20)) {
+        const found = visit(item, depth + 1)
+        if (found) return found
+      }
+      return null
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (typeof value === 'string' && sensitiveFieldName.test(key) && value.length >= 10 && !maskedValue.test(value)) {
+        return { field: key, length: value.length }
+      }
+      if (value && typeof value === 'object') {
+        const found = visit(value, depth + 1)
+        if (found) return found
+      }
+    }
+    return null
+  }
+  return visit(parsed, 0)
+}
+
+/**
+ * Credential-inventory disclosure. Two generic shapes:
+ *  - integration/connector lists return a `secret` field for the caller's own team;
+ *  - token/key inventories expose a raw secret while their compact/preview control masks it.
+ * The latter requires a masked control before the spec is built, which keeps endpoints that always
+ * return masked metadata from being reported.
+ */
+async function probeSecretExposure(
+  hyp: EngineHypothesis,
+  input: DeterministicEngineInput,
+  track: (exchange: BrokerExchangeResult) => void | string,
+): Promise<DifferentialResult> {
+  const started = Date.now()
+  const base: DifferentialResult = {
+    probeClass: 'authz_matrix',
+    origin: hyp.endpoint.origin,
+    pathAndQuery: hyp.pathAndQuery,
+    verdict: 'no_signal',
+    summary: 'No unmasked credential-shaped value was returned.',
+    anomalies: [],
+    details: {},
+    requestsSent: 0,
+    exchangeIds: [],
+    stoppedReason: null,
+    notes: [],
+    durationMs: 0,
+  }
+  const exchangeIds: string[] = []
+  let requests = 0
+  const get = async (path: string): Promise<BrokerExchangeResult | null> => {
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin: hyp.endpoint.origin,
+        method: 'GET',
+        pathAndQuery: path,
+        ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+        followRedirects: false,
+        timeoutMs: 8_000,
+      }, input.grant, input.signal)
+      requests += 1
+      const id = track(exchange)
+      if (typeof id === 'string') exchangeIds.push(id)
+      return exchange
+    } catch { requests += 1; return null }
+  }
+  const integrationSurface = /(?:links?|integrations?|connectors?)/i.test(hyp.endpoint.pathTemplate)
+  const probePaths: string[] = []
+  if (hyp.param) {
+    for (const id of (hyp.resourceIds ?? []).slice(0, 4)) {
+      const separator = hyp.pathAndQuery.includes('?') ? '&' : '?'
+      probePaths.push(`${hyp.pathAndQuery}${separator}${encodeURIComponent(hyp.param.name)}=${encodeURIComponent(id)}`)
+    }
+  }
+  probePaths.push(hyp.pathAndQuery)
+  for (const path of [...new Set(probePaths)]) {
+    const probe = await get(path)
+    if (!probe || probe.status < 200 || probe.status >= 300) continue
+    const raw = findSensitiveField(probe.body)
+    const literal = credentialPatterns.find(candidate => candidate.test(probe.body))
+    if (!raw && !literal) continue
+    let controlPath = '/'
+    if (!integrationSurface) {
+      // Prefer a documented compact/preview toggle; without a masked control there is no proof
+      // that the value is meant to be hidden.
+      const separator = path.includes('?') ? '&' : '?'
+      const control = await get(`${path}${separator}reveal=0`)
+      if (!control || control.status < 200 || control.status >= 300) continue
+      if (!findSensitiveField(control.body) && !credentialPatterns.some(candidate => candidate.test(control.body))) {
+        return {
+          ...base,
+          verdict: 'signal',
+          summary: 'The raw credential is exposed while the compact/preview control masks it.',
+          anomalies: [{ type: 'secret_disclosed', path, controlPath: `${path}${separator}reveal=0`, ...(raw ? { field: raw.field } : { pattern: literal?.source }) }],
+          details: { mode: 'reveal_toggle', field: raw?.field ?? null },
+          requestsSent: requests,
+          exchangeIds,
+          durationMs: Date.now() - started,
+        }
+      }
+      continue
+    }
+    return {
+      ...base,
+      verdict: 'signal',
+      summary: 'A connector/integration read returned an unmasked credential field.',
+      anomalies: [{ type: 'secret_disclosed', path, controlPath, ...(raw ? { field: raw.field } : { pattern: literal?.source }) }],
+      details: { mode: 'integration_secret', field: raw?.field ?? null },
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+}
+
+function classStats(report: DeterministicEngineReport, intent: string): EngineClassStats {
+  const existing = report.byClass[intent]
+  if (existing) return existing
+  const created: EngineClassStats = { hypotheses: 0, signals: 0, specs: 0, confirmed: 0, rejected: 0, requests: 0 }
+  report.byClass[intent] = created
+  return created
+}
+
+export async function runDeterministicEngine(input: DeterministicEngineInput): Promise<DeterministicEngineReport> {
+  const started = Date.now()
+  const maxRequests = Math.max(0, input.maxRequests ?? defaultEngineMaxRequests)
+  const maxDurationMs = Math.max(1_000, input.maxDurationMs ?? defaultEngineMaxDurationMs)
+  const log = input.log ?? (() => {})
+  const report: DeterministicEngineReport = {
+    requestsUsed: 0,
+    durationMs: 0,
+    endpointsConsidered: 0,
+    endpointsHarvested: 0,
+    hypothesesFormed: 0,
+    hypothesesRun: 0,
+    signals: 0,
+    specsSubmitted: 0,
+    confirmed: 0,
+    rejectedSpecs: 0,
+    leads: 0,
+    stoppedReason: 'complete',
+    byClass: {},
+    confirmedPairs: [],
+    notes: [],
+  }
+
+  if (!deterministicEngineEnabled() || input.tier < 1) {
+    report.stoppedReason = 'disabled'
+    report.durationMs = Date.now() - started
+    return report
+  }
+
+  const ranked = rankEndpoints(input.endpoints).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
+  report.endpointsConsidered = ranked.length
+  if (ranked.length === 0) {
+    report.durationMs = Date.now() - started
+    return report
+  }
+
+  const picks = personaPicks(input.personas)
+  const origins = [...new Set(ranked.map(endpoint => endpoint.origin))]
+  const budget = { requestsUsed: 0, maxRequests }
+  /** Every brokered request (harvest, probe, replay) counts against the engine's request cap. */
+  const trackExchange = (exchange: BrokerExchangeResult): string | void => {
+    budget.requestsUsed += 1
+    report.requestsUsed = budget.requestsUsed
+    return input.recordExchange?.(exchange)
+  }
+
+  // Harvest each origin independently (the engine is per-run but a run may carry several assets).
+  const harvests = new Map<string, EndpointHarvest>()
+  for (const origin of origins) {
+    if (budget.requestsUsed >= maxRequests || input.signal.aborted) break
+    const originEndpoints = ranked.filter(endpoint => endpoint.origin === origin)
+    const harvester = new SurfaceHarvester({ ...input, recordExchange: trackExchange }, log, origin)
+    const result = await harvestSurface(input, originEndpoints, harvester, picks, budget, log)
+    report.endpointsHarvested += result.endpointsHarvested
+    for (const [id, harvest] of result.harvests) harvests.set(id, harvest)
+  }
+
+  const hypotheses = enumerateHypotheses(ranked, harvests, {
+    tier: input.tier,
+    personas: input.personas,
+    maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
+    ...(input.classes ? { classes: input.classes } : {}),
+  })
+  report.hypothesesFormed = hypotheses.length
+  for (const hyp of hypotheses) classStats(report, hyp.intent).hypotheses += 1
+
+  const perProbeRequestFloor = 6
+  const intentCaps: Record<string, number> = {
+    authz: 40,
+    sqli: 14,
+    traversal: 6,
+    ssrf: 8,
+    xxe: 4,
+    redirect: 6,
+    xss: 5,
+    graphql: 2,
+    mass_assignment: 6,
+  }
+  const intentUsed: Record<string, number> = {}
+  for (const hyp of hypotheses) {
+    if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
+    if (Date.now() - started >= maxDurationMs) { report.stoppedReason = 'time'; break }
+    if (budget.requestsUsed >= maxRequests) { report.stoppedReason = 'budget'; break }
+    const remaining = maxRequests - budget.requestsUsed
+    if (remaining < perProbeRequestFloor) { report.stoppedReason = 'budget'; break }
+    const cap = intentCaps[hyp.intent] ?? 6
+    if ((intentUsed[hyp.intent] ?? 0) >= cap) continue
+    intentUsed[hyp.intent] = (intentUsed[hyp.intent] ?? 0) + 1
+
+    const stats = classStats(report, hyp.intent)
+    const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(defaultEnginePerProbeRequests, remaining))
+    let probe: DifferentialResult
+    try {
+      probe = hyp.intent === 'secret_disclosure' && !input.probe
+        ? await probeSecretExposure(hyp, input, trackExchange)
+        : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && input.canaryBroker && !input.probe
+          ? await probeSecondOrderSsrf(hyp, input, trackExchange)
+          : await (input.probe ?? probeDifferential)(
+              { ...buildProbeRequest(hyp, maxProbeRequests, input), onExchange: trackExchange },
+              input.broker, input.grant, input.canaryBroker, input.signal,
+            )
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
+      report.notes.push(`${hyp.probeClass} ${hyp.endpoint.pathTemplate}: ${message}`)
+      log('deterministic_engine.probe_error', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}: ${message}`, {
+        intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, method: hyp.method,
+      })
+      if (/outside the current assignment scope|run is paused|circuit is open/i.test(message)) {
+        report.stoppedReason = 'aborted'
+        break
+      }
+      continue
+    }
+    report.hypothesesRun += 1
+    stats.requests += probe.requestsSent
+    log('deterministic_engine.probe', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}${hyp.param ? ` param=${hyp.param.name}` : ''} -> ${probe.verdict}`, {
+      intent: hyp.intent,
+      probeClass: hyp.probeClass,
+      endpoint: hyp.endpoint.pathTemplate,
+      method: hyp.method,
+      param: hyp.param?.name ?? null,
+      verdict: probe.verdict,
+      requests: probe.requestsSent,
+      anomalies: probe.anomalies.map(anomaly => String(anomaly.type)).slice(0, 6),
+      stoppedReason: probe.stoppedReason,
+      summary: probe.summary.slice(0, 200),
+    })
+    if (probe.verdict !== 'signal') continue
+    report.signals += 1
+    stats.signals += 1
+
+    const candidates = synthesizeEngineSpecs(hyp, probe).slice(0, 3)
+    if (candidates.length === 0) {
+      log('deterministic_engine.spec_skipped', `${hyp.probeClass} ${hyp.endpoint.pathTemplate}: signal had no schema-valid replay shape (${probe.anomalies.map(a => String(a.type)).join(',') || 'no anomaly'})`, {
+        intent: hyp.intent,
+        endpoint: hyp.endpoint.pathTemplate,
+      })
+    }
+    let confirmedThisHypothesis = false
+    for (const candidate of candidates) {
+      if (input.signal.aborted || budget.requestsUsed >= maxRequests) break
+      const parsed = declarativeReplaySpecSchema.safeParse(candidate.spec)
+      if (!parsed.success) {
+        log('deterministic_engine.spec_invalid', `${hyp.probeClass} ${hyp.endpoint.pathTemplate}: ${parsed.error.issues[0]?.path.join('.') ?? 'schema'} ${parsed.error.issues[0]?.message ?? ''}`.slice(0, 300), {
+          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate,
+        })
+        continue
+      }
+      report.specsSubmitted += 1
+      stats.specs += 1
+      let replay: ReplayVerificationResult
+      try {
+        replay = await (input.verify ?? verifyReplaySpec)({
+          spec: parsed.data,
+          broker: input.broker,
+          ...(input.browser ? { browser: input.browser } : {}),
+          ...(input.canaryBroker ? { canaryBroker: input.canaryBroker } : {}),
+          backend: input.backend,
+          ...(input.reposDir ? { reposDir: input.reposDir } : {}),
+          grant: input.grant,
+          signal: input.signal,
+          ...(input.storage ? { storage: input.storage } : {}),
+          runId: input.runId,
+          assignmentId: input.assignmentId,
+          onExchange: trackExchange,
+        })
+      } catch (error) {
+        report.notes.push(`verify ${candidate.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
+        continue
+      }
+      if (replay.verdict !== 'confirmed') {
+        log('deterministic_engine.spec_rejected', `${candidate.kind} ${hyp.endpoint.pathTemplate} -> ${replay.verdict}: ${(replay.outcome.reason ?? replay.outcome.observed).slice(0, 200)}`, {
+          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, kind: candidate.kind,
+          verdict: replay.verdict, controlPassed: replay.outcome.controlPassed,
+        })
+        report.rejectedSpecs += 1
+        stats.rejected += 1
+        continue
+      }
+      const vulnClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
+      let persistedId: string | null = null
+      try {
+        persistedId = await input.onConfirmed({
+          hypothesis: hyp,
+          spec: parsed.data,
+          specRecord: candidate,
+          vulnClass,
+          endpoint: hyp.endpoint.pathTemplate,
+          result: replay,
+          exchangeIds: [...new Set([...probe.exchangeIds, ...replay.exchangeIds])],
+        })
+      } catch (error) {
+        report.notes.push(`persist ${candidate.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
+        continue
+      }
+      // A null return means the persistence layer recognized a structural duplicate; do not count
+      // it as a new confirmation (and stop trying lower-priority specs for this hypothesis).
+      confirmedThisHypothesis = true
+      if (!persistedId) continue
+      report.confirmed += 1
+      stats.confirmed += 1
+      report.confirmedPairs.push({ endpoint: hyp.endpoint.pathTemplate, vulnClass })
+      break
+    }
+    if (!confirmedThisHypothesis && candidates.length > 0) {
+      report.leads += 1
+      try {
+        input.onLead?.({
+          hypothesis: hyp,
+          probe,
+          summary: probe.summary.slice(0, 240),
+        })
+      } catch { /* lead emission is best-effort */ }
+    }
+  }
+
+  if (report.stoppedReason === 'complete' && (Date.now() - started >= maxDurationMs)) report.stoppedReason = 'time'
+  report.durationMs = Date.now() - started
+  return report
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hide-confirmed helpers (shared with the Execution specialist queue)
+// ---------------------------------------------------------------------------------------------
+
+export function endpointClassPairKey(endpoint: string, vulnClass: string): string {
+  return `${endpoint}|${vulnClass}`
+}
+
+/** Class -> wording that specialist queue entries use. */
+export function engineClassKeywords(vulnClass: string): string[] {
+  switch (vulnClass) {
+    case 'bola': case 'idor': case 'bfla': case 'authz':
+      return ['access-control', 'authorization', 'authorisation', 'idor', 'bola', 'bfla', 'tenant', 'object-level', 'privilege escalation']
+    case 'sqli': return ['sql', 'injection-input']
+    case 'xxe': return ['xxe', 'xml external', 'xml entity']
+    case 'ssrf': return ['ssrf', 'server-side request']
+    case 'path_traversal': return ['traversal', 'path traversal', 'directory']
+    case 'open_redirect': return ['redirect', 'open-redirect']
+    case 'xss_reflected': case 'xss_stored': return ['xss', 'cross-site scripting', 'script injection']
+    case 'graphql_bola': return ['graphql', 'resolver']
+    case 'mass_assignment': return ['mass assignment', 'mass-assignment', 'overpost']
+    case 'cache_poisoning': case 'cache_deception': return ['cache']
+    case 'csrf': return ['csrf', 'state change']
+    default: return [vulnClass]
+  }
+}
+
+/** Normalise a path template to the static prefix a queue entry would mention. */
+export function stableEndpointKey(endpoint: string): string {
+  return endpoint.split('?')[0]
+    .replace(/\/:[^/]+/g, '')
+    .replace(/\/\{[^}]+\}/g, '')
+    .toLowerCase()
+}
+
+/** True when a specialist step's text already covers a deterministic (endpoint, class) confirmation. */
+export function stepCoveredByConfirmedPairs(stepText: string, pairs: Iterable<string>): boolean {
+  const text = stepText.toLowerCase()
+  for (const pair of pairs) {
+    const idx = pair.lastIndexOf('|')
+    if (idx <= 0) continue
+    const endpoint = pair.slice(0, idx)
+    const vulnClass = pair.slice(idx + 1)
+    const endpointKey = stableEndpointKey(endpoint)
+    if (!endpointKey || endpointKey === '/') continue
+    if (!text.includes(endpointKey)) continue
+    if (engineClassKeywords(vulnClass).some(keyword => text.includes(keyword))) return true
+  }
+  return false
+}

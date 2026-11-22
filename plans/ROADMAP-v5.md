@@ -148,3 +148,11 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Accepted:** rebuild the deterministic engine in `src/server/` (risk-ranked full surface → probe → spec → verifier), persist only verified findings, hide confirmed pairs from specialists, and treat real `Execution` as the primary product gate.
 - **Rejected:** merging the hybrid Phase-1.5 sweep (no lift, precision regression).
 - **Follow-up:** `engine-port` stream; interim framing = deterministic 50% / agentic 12%, not a shippable gate.
+
+### 2026-11-22 — engine-port: deterministic closed loop inside `Execution`
+
+- **Threshold:** real `Execution --no-llm` 0/59 → **25/59, 100% precision, 0 decoy/unmatched FP** (3-app realistic dev seed 1, grey-box, docker); agentic same cells **26/59, 100% precision, $0.206**. Deterministic vs procedural surfaces are now separate but both measured.
+- **Reviewer top points:** (1) conventional REST wordlists are overfitting-prone; prefer evidence-derived/JS-router discovery and gate wordlists to local-lab; (2) unlock Tier-3 local-lab first (PATCH/PUT/DELETE + rce/race) for +8–12; (3) reserve wall clock for specialists and run the fast wave first; (4) store dedupe by origin+CWE loses distinct same-class endpoints; hide-confirmed must not cancel chain steps.
+- **Accepted:** #1 wordlist gated to local-lab (public targets use discovered routes only); #3 deterministic pass kept at 240 s in both modes (a measured 180 s agentic cap lost 3 confirmations); #4 conservative chain/dependency guard on step cancellation; #2 and the store-dedupe fix filed as follow-ups for the next tier/dedupe streams.
+- **Rejected/deferred:** rebuilding the whole dedupe key in `store.ts` inside this stream (out of ownership; the per-endpoint persistence workaround is temporary and documented); workflow/business-logic heuristics stay with specialists.
+- **Commit:** `agents/engine-port` (see stream report).
