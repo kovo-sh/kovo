@@ -259,6 +259,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
   const capped = applyBenchmarkClassCaps(plan.hypotheses, config.classCaps)
   const hypotheses = capped.kept
   notes.push(`Discovered ${endpoints.length} endpoints; formed ${discoveredCount} hypotheses; class caps kept ${hypotheses.length}.`)
+  if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[paths] ${endpoints.map(e => `${e.method} ${e.path}`).join(' | ')}`)
 
   // Blind time-based SQLi is the only probe that deliberately sleeps on the target. Scale its
   // allowance with the candidate count, ranked by param/path plausibility, but execute the chosen
