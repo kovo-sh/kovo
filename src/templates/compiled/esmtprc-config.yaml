@@ -3,7 +3,7 @@ name: "eSMTP - Config Discovery"
 severity: "high"
 description: "eSMTP configuration was discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "esmtp"
   - "config"

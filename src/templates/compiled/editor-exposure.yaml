@@ -3,7 +3,7 @@ name: "Editor Configuration File - Detect"
 severity: "low"
 description: "Editor configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

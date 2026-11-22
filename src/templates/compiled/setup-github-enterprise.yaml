@@ -3,7 +3,7 @@ name: "Setup GitHub Enterprise - Detect"
 severity: "info"
 description: "Safe check derived from setup-github-enterprise: Setup GitHub Enterprise - Detect"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "installer"

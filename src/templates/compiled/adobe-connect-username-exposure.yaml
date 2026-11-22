@@ -3,7 +3,7 @@ name: "Adobe Connect Username Exposure"
 severity: "low"
 description: "Adobe Connect Username is exposed."
 tech:
-  - "generic"
+  - "adobe"
 tags:
   - "adobe"
   - "disclosure"

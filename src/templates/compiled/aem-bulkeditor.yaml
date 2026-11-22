@@ -3,7 +3,7 @@ name: "AEM BulkEditor"
 severity: "info"
 description: "Safe check derived from aem-bulkeditor: AEM BulkEditor"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

@@ -3,7 +3,7 @@ name: "Adobe AEM Installed OSGI Bundles"
 severity: "low"
 description: "Adobe AEM Installed OSGI Bundles leaked."
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

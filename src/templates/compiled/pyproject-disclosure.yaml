@@ -3,7 +3,7 @@ name: "Pyproject Disclosure"
 severity: "info"
 description: "Safe check derived from pyproject-disclosure: Pyproject Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

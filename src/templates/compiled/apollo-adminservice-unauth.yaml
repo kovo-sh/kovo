@@ -3,7 +3,7 @@ name: "Apollo Admin Service - Unauthenticated Access"
 severity: "medium"
 description: "ApolloAdminservice was able to be accessed without authentication."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "unauth"

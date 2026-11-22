@@ -3,7 +3,7 @@ name: "Platformio Config File Disclosure"
 severity: "low"
 description: "“platformio.ini” (Project Configuration File) was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

@@ -3,7 +3,7 @@ name: "WS FTP File Disclosure"
 severity: "low"
 description: "WS FTP file is disclosed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "ftp"

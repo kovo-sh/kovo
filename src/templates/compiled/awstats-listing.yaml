@@ -3,7 +3,7 @@ name: "AWStats Listing"
 severity: "low"
 description: "Searches for exposed awstats Internal Information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "aws"

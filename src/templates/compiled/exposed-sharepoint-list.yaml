@@ -3,7 +3,7 @@ name: "Sharepoint List - Detect"
 severity: "medium"
 description: "Sharepoint list was detected because of improper configuration. An anonymous user can access SharePoint Web Services."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "hackerone"
   - "config"

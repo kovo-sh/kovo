@@ -3,7 +3,7 @@ name: "Gitea Public Registration Enabled"
 severity: "medium"
 description: "A misconfiguration in GlitchTip allows arbitrary users to sign up."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "glitchtip"

@@ -3,7 +3,7 @@ name: "Open Akamai ARL - Cross-Site Scripting"
 severity: "high"
 description: "Open Akamai ARL contains a cross-site scripting vulnerability. An attacker can execute arbitrary script in the browser of an unsuspecting user in the context of the affected site."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "akamai"
   - "xss"

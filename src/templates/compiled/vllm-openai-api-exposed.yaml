@@ -3,7 +3,7 @@ name: "vLLM OpenAI-Compatible API - Unauthenticated Exposure"
 severity: "medium"
 description: "Detects a vLLM inference server exposing its OpenAI-compatible API without authentication. The /v1/models endpoint returns the list of served models and is reachable by any unauthenticated client, allowing model enumeration and unauthorized inference (resource abuse / cost and information exposure). vLLM does not enable an API key by default; it is only enforced when the server is started with --api-key."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "vllm"

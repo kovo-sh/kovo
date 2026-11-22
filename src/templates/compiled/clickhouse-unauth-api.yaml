@@ -3,7 +3,7 @@ name: "ClickHouse API Database Interface - Improper Authorization"
 severity: "high"
 description: "Clickhouse API Database is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "clickhouse"

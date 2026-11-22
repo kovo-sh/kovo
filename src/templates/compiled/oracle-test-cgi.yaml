@@ -3,7 +3,7 @@ name: "Oracle Application Server test-cgi Page"
 severity: "info"
 description: "Safe check derived from oracle-test-cgi: Oracle Application Server test-cgi Page"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "oracle"
   - "exposure"

@@ -3,7 +3,7 @@ name: "Webalizer Xtended Statistics Exposed"
 severity: "low"
 description: "Webalizer Xtended Statistics is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "stats"

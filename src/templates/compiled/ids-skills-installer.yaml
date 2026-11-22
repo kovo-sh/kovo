@@ -3,7 +3,7 @@ name: "IDP Skills Installer - Exposure"
 severity: "high"
 description: "Checks for the presence of an IDS Skills Installer page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "install"
   - "ids"

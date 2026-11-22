@@ -3,7 +3,7 @@ name: "HiveQueue Agent"
 severity: "low"
 description: "HiveQueue Agent is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "hivequeue"

@@ -3,7 +3,7 @@ name: "Firebase Debug Log File Exposure"
 severity: "low"
 description: "Firebase debug log file was exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "firebase"

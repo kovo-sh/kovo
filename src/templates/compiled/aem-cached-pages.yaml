@@ -3,7 +3,7 @@ name: "Invalidate / Flush Cached Pages on AEM"
 severity: "low"
 description: "Cached Pages on AEM can be Flushed."
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "aem"
   - "misconfig"

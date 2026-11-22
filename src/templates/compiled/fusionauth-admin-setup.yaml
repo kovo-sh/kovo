@@ -3,7 +3,7 @@ name: "FusionAuth Exposed Admin Setup"
 severity: "high"
 description: "FusionAuth Admin Setup is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "fusionauth"

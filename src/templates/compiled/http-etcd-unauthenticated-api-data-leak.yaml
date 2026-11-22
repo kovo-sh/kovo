@@ -3,7 +3,7 @@ name: "etcd Unauthenticated HTTP API Leak"
 severity: "high"
 description: "etcd HTTP API is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "hackerone"

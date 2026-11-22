@@ -3,7 +3,7 @@ name: "Rackup Configuration - Detect"
 severity: "info"
 description: "Rackup configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

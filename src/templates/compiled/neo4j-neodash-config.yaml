@@ -3,7 +3,7 @@ name: "Neo4j Neodash Config - Exposure"
 severity: "medium"
 description: "Detects the file config.json from Neo4j Neodash web application, it contains information about DB connection with Neo4J."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

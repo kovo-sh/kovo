@@ -3,7 +3,7 @@ name: "Test CGI Script - Detect"
 severity: "medium"
 description: "Test CGI script was detected. Response page returned by this CGI script exposes a list of server environment variables."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "cgi"

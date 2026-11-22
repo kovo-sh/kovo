@@ -3,7 +3,7 @@ name: "BitKeeper Configuration - Detect"
 severity: "low"
 description: "BitKeeper configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

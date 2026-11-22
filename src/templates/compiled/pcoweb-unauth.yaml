@@ -3,7 +3,7 @@ name: "pCOWeb - Unauth"
 severity: "high"
 description: "Safe check derived from pcoweb-unauth: pCOWeb - Unauth"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "pcoweb"
   - "unauth"

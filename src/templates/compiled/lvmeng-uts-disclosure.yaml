@@ -3,7 +3,7 @@ name: "Lvmeng - UTS Disclosure"
 severity: "high"
 description: "Lvmeng UTS was discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

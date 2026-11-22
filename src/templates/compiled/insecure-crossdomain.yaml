@@ -3,7 +3,7 @@ name: "Insecure cross-domain.xml file"
 severity: "info"
 description: "Safe check derived from insecure-crossdomain: Insecure cross-domain.xml file"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "generic"

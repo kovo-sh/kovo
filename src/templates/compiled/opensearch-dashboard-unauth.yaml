@@ -3,7 +3,7 @@ name: "OpenSearch Dashboard - Unauth Access"
 severity: "high"
 description: "OpenSearch Dashboard is a visualization and management tool for OpenSearch. This template detects instances that are accessible without authentication, potentially exposing sensitive data and system information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "opensearch"
   - "dashboard"

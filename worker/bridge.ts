@@ -121,7 +121,7 @@ const maxInputBytes = 16 * 1024 * 1024
 const maxOutputBytes = 256 * 1024
 const maxFileBytes = 2 * 1024 * 1024
 const maxScratchBytes = 16 * 1024 * 1024
-const maxSastFindingsReturned = 150
+const maxSastFindingsReturned = 400
 const maxScriptCodeBytes = 256 * 1024
 const maxToolCaptureBytes = 8 * 1024 * 1024
 const cleanPath = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/
@@ -465,7 +465,7 @@ function cmpSemver(a: [number, number, number], b: [number, number, number]): nu
 
 interface ScaAdvisory {
   id: string
-  ecosystem: 'npm' | 'pypi' | 'go'
+  ecosystem: 'npm' | 'pypi' | 'go' | 'java' | 'rubygems'
   package: string
   affectedRanges: Array<{ min: string; maxExclusive: string }>
   severity: SastSeverity
@@ -497,8 +497,8 @@ function runOfflineSca(repoRoot: string, targets: string[]): SastFinding[] {
   const findings: SastFinding[] = []
   const files = walkFiles(targets, 1500)
   for (const file of files) {
-    const base = file.split('/').pop() ?? ''
-    if (!['package.json', 'package-lock.json', 'requirements.txt', 'go.mod'].includes(base)) continue
+    const base = (file.split('/').pop() ?? '').toLowerCase()
+    if (!['package.json', 'package-lock.json', 'requirements.txt', 'pyproject.toml', 'pipfile', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gemfile', 'gemfile.lock'].includes(base.toLowerCase())) continue
     let text = ''
     try {
       const st = lstatSync(file)
@@ -604,6 +604,77 @@ function runOfflineSca(repoRoot: string, targets: string[]): SastFinding[] {
           }
         }
       })
+    } else if (base === 'pyproject.toml' || base === 'pipfile') {
+      lines.forEach((line, idx) => {
+        for (const m of line.matchAll(/([A-Za-z0-9_.-]+)\s*(?:==|>=|~=|\^)\s*["']?([0-9][0-9A-Za-z._-]*)/g)) {
+          const name = m[1].toLowerCase()
+          const ver = m[2]
+          for (const adv of advisories) {
+            if (adv.ecosystem !== 'pypi' || adv.package.toLowerCase() !== name) continue
+            if (versionAffected(ver, adv.affectedRanges)) {
+              findings.push({
+                engine: 'trivy-fs', ruleId: adv.id, severity: adv.severity, file: rel, line: idx + 1,
+                message: `${adv.message} (declared ${name}==${ver})`,
+                maskedPreview: `${name}==${ver}`, cwe: adv.cwe,
+              })
+            }
+          }
+        }
+      })
+    } else if (base === 'pom.xml') {
+      const artifactIds = [...text.matchAll(/<artifactId>\s*([A-Za-z0-9_.-]+)\s*<\/artifactId>/g)]
+      const versions = [...text.matchAll(/<version>\s*([0-9][0-9A-Za-z._-]*)\s*<\/version>/g)]
+      artifactIds.forEach((artifact, i) => {
+        const name = artifact[1].toLowerCase()
+        const ver = versions[i]?.[1]
+        if (!ver) return
+        for (const adv of advisories) {
+          if (adv.ecosystem !== 'java' || adv.package.toLowerCase() !== name) continue
+          if (versionAffected(ver, adv.affectedRanges)) {
+            findings.push({
+              engine: 'trivy-fs', ruleId: adv.id, severity: adv.severity, file: rel,
+              line: findLine(`<artifactId>${artifact[1]}</artifactId>`),
+              message: `${adv.message} (pom ${name}:${ver})`,
+              maskedPreview: `${name}:${ver}`, cwe: adv.cwe,
+            })
+          }
+        }
+      })
+    } else if (base === 'build.gradle' || base === 'build.gradle.kts') {
+      lines.forEach((line, idx) => {
+        for (const m of line.matchAll(/["']([a-zA-Z0-9_.-]+):([a-zA-Z0-9_.-]+):([0-9][0-9A-Za-z._-]*)["']/g)) {
+          const name = m[2].toLowerCase()
+          const ver = m[3]
+          for (const adv of advisories) {
+            if (adv.ecosystem !== 'java' || adv.package.toLowerCase() !== name) continue
+            if (versionAffected(ver, adv.affectedRanges)) {
+              findings.push({
+                engine: 'trivy-fs', ruleId: adv.id, severity: adv.severity, file: rel, line: idx + 1,
+                message: `${adv.message} (gradle ${name}:${ver})`,
+                maskedPreview: `${name}:${ver}`, cwe: adv.cwe,
+              })
+            }
+          }
+        }
+      })
+    } else if (base === 'gemfile' || base === 'gemfile.lock') {
+      lines.forEach((line, idx) => {
+        const m = line.match(/^\s*gem\s+["']([A-Za-z0-9_.-]+)["']\s*,?\s*["']?([0-9][0-9A-Za-z._-]*)?/)
+          ?? line.match(/^\s{4}([A-Za-z0-9_.-]+) \(([0-9][0-9A-Za-z._-]*)\)/)
+        if (!m || !m[2]) return
+        const name = m[1].toLowerCase()
+        const ver = m[2]
+        for (const adv of advisories) {
+          if (adv.ecosystem !== 'rubygems' || adv.package.toLowerCase() !== name) continue
+          if (versionAffected(ver, adv.affectedRanges)) {
+            findings.push({
+              engine: 'trivy-fs', ruleId: adv.id, severity: adv.severity, file: rel, line: idx + 1,
+              message: `${adv.message} (bundler ${name} ${ver})`,
+              maskedPreview: `${name} ${ver}`, cwe: adv.cwe,
+            })
+          }
+        }
+      })
     }
   }
   return findings
@@ -667,7 +738,7 @@ async function runOpengrepEngine(repoRoot: string, targets: string[], timeoutMs:
   const configDir = join(RULES_ROOT, 'opengrep')
   if (!existsSync(configDir)) return { findings: [], ok: false, note: 'Missing /opt/guardian-rules/opengrep' }
   const interfileArgs = [
-    'scan', '--config', configDir, '--enable-interfile', '--interfile-depth=3', '--interfile-timeout=15',
+    'scan', '--config', configDir, '--enable-interfile', '--interfile-depth=3', '--interfile-timeout=30',
     '--max-memory=1024', '--json', '--no-git-ignore', '--quiet', ...targets,
   ]
   let res = await execTool('opengrep', interfileArgs, { cwd: repoRoot, timeoutMs })
@@ -993,14 +1064,21 @@ async function runSastScan(
   if (engines.length === 0) throw new Error('At least one valid SAST engine must be specified.')
 
   const totalBudgetMs = Math.max(5_000, Math.min(req.timeoutMs ?? 60_000, 120_000))
-  const perEngineMs = Math.max(5_000, Math.floor(totalBudgetMs / engines.length))
+  // opengrep --enable-interfile is the highest-recall engine: give it a dedicated
+  // weighted slice (>= 50% of the total budget, minimum 30s) instead of an equal share.
+  const opengrepBudgetMs = engines.includes('opengrep')
+    ? Math.max(30_000, Math.floor(totalBudgetMs * 0.5))
+    : 0
+  const otherEngines = engines.filter(e => e !== 'opengrep')
+  const remainingBudgetMs = Math.max(5_000, totalBudgetMs - opengrepBudgetMs)
+  const perEngineMs = Math.max(5_000, Math.floor(remainingBudgetMs / Math.max(1, otherEngines.length)))
   const engineStatus: SastScanResult['engineStatus'] = {}
   const allFindings: SastFinding[] = []
 
   for (const engine of engines) {
     const t0 = Date.now()
     let outcome: { findings: SastFinding[]; ok: boolean; note?: string }
-    if (engine === 'opengrep') outcome = await runOpengrepEngine(repoRoot, targets, perEngineMs)
+    if (engine === 'opengrep') outcome = await runOpengrepEngine(repoRoot, targets, opengrepBudgetMs)
     else if (engine === 'ast-grep') outcome = await runAstGrepEngine(repoRoot, targets, perEngineMs)
     else if (engine === 'gitleaks') outcome = await runGitleaksEngine(repoRoot, targets, perEngineMs)
     else if (engine === 'trufflehog') outcome = await runTrufflehogEngine(repoRoot, targets, perEngineMs)

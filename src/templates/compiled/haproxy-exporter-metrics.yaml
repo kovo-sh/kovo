@@ -3,7 +3,7 @@ name: "Detect Haproxy Exporter"
 severity: "low"
 description: "Haproxy metrics is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "haproxy"
   - "exposure"

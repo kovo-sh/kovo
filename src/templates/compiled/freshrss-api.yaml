@@ -3,7 +3,7 @@ name: "FreshRSS Google Reader API Exposure"
 severity: "low"
 description: "Detected an exposed FreshRSS instance with the Google Reader API enabled, which could have allowed unauthorized access to RSS feeds and user-related data via accessible API endpoints."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "freshrss"

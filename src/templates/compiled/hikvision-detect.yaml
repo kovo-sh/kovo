@@ -3,7 +3,7 @@ name: "Hikvision Panel"
 severity: "info"
 description: "Safe check derived from hikvision-detect: Hikvision Panel"
 tech:
-  - "generic"
+  - "hikvision"
 tags:
   - "tech"
   - "hikvision"

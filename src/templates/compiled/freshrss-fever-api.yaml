@@ -3,7 +3,7 @@ name: "FreshRSS Fever API - Exposure"
 severity: "low"
 description: "Detected an exposed FreshRSS instance with the Fever API enabled, which could allow unauthorized access to RSS feed data and user-related information via accessible Fever-compatible API endpoints."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "freshrss"

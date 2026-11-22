@@ -3,7 +3,7 @@ name: "Redmine Issues - Exposure"
 severity: "medium"
 description: "Redmine instance exposed issues via the REST API without authentication. This could have leaked sensitive project information, issue details, and user data."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "redmine"

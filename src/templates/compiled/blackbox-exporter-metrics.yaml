@@ -3,7 +3,7 @@ name: "Blackbox Exporter Metrics Exposed"
 severity: "info"
 description: "Safe check derived from blackbox-exporter-metrics: Blackbox Exporter Metrics Exposed"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "blackbox"
   - "exposure"

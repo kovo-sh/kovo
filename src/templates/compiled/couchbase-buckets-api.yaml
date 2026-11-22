@@ -3,7 +3,7 @@ name: "Couchbase Buckets Unauthenticated REST API - Detect"
 severity: "medium"
 description: "Couchbase Buckets REST API without authentication was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "couchbase"

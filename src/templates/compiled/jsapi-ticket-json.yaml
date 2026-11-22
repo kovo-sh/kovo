@@ -3,7 +3,7 @@ name: "JsAPI Ticket Json"
 severity: "low"
 description: "JsAPI Ticket internal file is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "jsapi"

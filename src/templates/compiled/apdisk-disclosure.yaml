@@ -3,7 +3,7 @@ name: "Apdisk - File Disclosure"
 severity: "low"
 description: "Apdisk internal file is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

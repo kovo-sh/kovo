@@ -3,7 +3,7 @@ name: "Cisco Unified Communications Manager - Cluster Enumeration"
 severity: "low"
 description: "Enumerated Cisco UCM cluster nodes (servers) using the unauthenticated UDS API (XML), allowing identification of backend servers without authentication."
 tech:
-  - "generic"
+  - "cisco"
 tags:
   - "cisco"
   - "ucm"

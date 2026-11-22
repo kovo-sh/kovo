@@ -3,7 +3,7 @@ name: "Mlflow - Unauthenticated Access"
 severity: "high"
 description: "Unauthenticated Access to MLflow dashboard."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "unauth"
   - "mlflow"

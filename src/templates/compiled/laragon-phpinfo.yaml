@@ -3,7 +3,7 @@ name: "Laragon - phpinfo Disclosure"
 severity: "low"
 description: "Laragon phpinfo file was exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "laragon"
   - "exposure"

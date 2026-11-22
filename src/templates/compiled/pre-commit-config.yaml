@@ -3,7 +3,7 @@ name: "Pre-commit Configuration File - Detect"
 severity: "info"
 description: "Pre-commit configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "devops"

@@ -3,7 +3,7 @@ name: "NPM Debug Log Disclosure"
 severity: "low"
 description: "NPM Debug log file exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "npm"

@@ -3,7 +3,7 @@ name: "Adobe ColdFusion Detector"
 severity: "info"
 description: "With this template we can detect a running ColdFusion instance due to an error page."
 tech:
-  - "generic"
+  - "adobe"
 tags:
   - "adobe"
   - "coldfusion"

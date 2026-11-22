@@ -3,7 +3,7 @@ name: "Socks5 VPN - Sensitive File Disclosure"
 severity: "high"
 description: "Information Leakage in the Socks5 VPN login system of Wheilton e-Ditong, and the administrator account password can be obtained by visiting a specially crafted URL."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "esocks5"
   - "exposure"

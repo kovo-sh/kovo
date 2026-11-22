@@ -3,7 +3,7 @@ name: "uwsgi.ini File Exposure"
 severity: "info"
 description: "Safe check derived from uwsgi-ini: uwsgi.ini File Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "uwsgi"

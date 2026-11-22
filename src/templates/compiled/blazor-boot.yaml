@@ -3,7 +3,7 @@ name: "Blazor Boot File Disclosure"
 severity: "info"
 description: "Exposed Blazor Boot (a web framework developed by Microsoft) config file."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "blazor"
   - "boot"

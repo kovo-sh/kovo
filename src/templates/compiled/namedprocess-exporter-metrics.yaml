@@ -3,7 +3,7 @@ name: "Named Process Exporter"
 severity: "low"
 description: "Named process exporter is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "namedprocess"
   - "exposure"

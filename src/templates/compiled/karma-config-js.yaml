@@ -3,7 +3,7 @@ name: "Karma Configuration File - Detect"
 severity: "medium"
 description: "Karma configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

@@ -3,7 +3,7 @@ name: "Lighter - Config Exposed"
 severity: "medium"
 description: "Detects if the config page of the Lighter server is exposed, it is an opensource REST application for interacting with Apache Spark on Kubernetes or Apache Hadoop YARN."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "lighter"
   - "exacaster"

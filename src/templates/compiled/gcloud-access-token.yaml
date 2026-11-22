@@ -3,7 +3,7 @@ name: "Google Cloud Access Token"
 severity: "medium"
 description: "Internal Google Cloud access tokens are exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "google"
   - "cloud"

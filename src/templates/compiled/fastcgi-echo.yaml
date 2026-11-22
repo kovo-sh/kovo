@@ -3,7 +3,7 @@ name: "FastCGI Echo Endpoint Script - Detect"
 severity: "info"
 description: "FastCGI echo endpoint script was detected, which lists several kinds of sensitive information such as port numbers, server software versions, port numbers, and IP addresses."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "logs"

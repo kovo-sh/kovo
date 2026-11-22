@@ -3,8 +3,7 @@ name: "Adobe AEM CRX Browser Exposure"
 severity: "info"
 description: "Safe check derived from aem-crx-browser: Adobe AEM CRX Browser Exposure"
 tech:
-  - "tomcat"
-  - "java"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

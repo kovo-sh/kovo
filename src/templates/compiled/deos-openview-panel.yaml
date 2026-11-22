@@ -3,7 +3,7 @@ name: "DEOS OPENview Admin Panel Unauthenticated Access"
 severity: "high"
 description: "The DEOS OPENview administrative panel is accessible without authentication."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "openview"
   - "disclosure"

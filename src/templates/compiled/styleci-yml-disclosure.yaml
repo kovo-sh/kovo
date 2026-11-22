@@ -3,7 +3,7 @@ name: "StyleCi Yaml File Disclosure"
 severity: "info"
 description: "Safe check derived from styleci-yml-disclosure: StyleCi Yaml File Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

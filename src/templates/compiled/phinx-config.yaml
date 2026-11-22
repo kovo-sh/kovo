@@ -3,7 +3,7 @@ name: "Phinx Configuration Exposure"
 severity: "medium"
 description: "Phinx configuration file was exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

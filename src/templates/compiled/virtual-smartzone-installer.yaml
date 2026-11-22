@@ -3,7 +3,7 @@ name: "Virtual SmartZone Setup Wizard - Exposure"
 severity: "high"
 description: "Detects exposed Virtual SmartZone Installation page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

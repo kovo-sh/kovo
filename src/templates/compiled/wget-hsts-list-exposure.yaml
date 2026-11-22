@@ -3,7 +3,7 @@ name: "WGET HSTS List Exposure"
 severity: "info"
 description: "Safe check derived from wget-hsts-list-exposure: WGET HSTS List Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

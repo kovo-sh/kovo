@@ -3,7 +3,7 @@ name: "AWS Configuration - Detect"
 severity: "medium"
 description: "AWS config found via /.aws/config."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

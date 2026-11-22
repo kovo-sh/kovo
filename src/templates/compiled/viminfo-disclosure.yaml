@@ -3,7 +3,7 @@ name: "Viminfo - File Disclosure"
 severity: "low"
 description: "Viminfo file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

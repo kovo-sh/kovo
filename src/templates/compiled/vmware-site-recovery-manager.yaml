@@ -3,7 +3,7 @@ name: "VMware Site Recovery Manager Panel - Detect"
 severity: "info"
 description: "VMware Site Recovery Manger panel was detected."
 tech:
-  - "generic"
+  - "vmware"
 tags:
   - "panel"
   - "vmware"

@@ -3,7 +3,7 @@ name: "Multilaser Pro Setup Page - Detect"
 severity: "high"
 description: "This allows the user to access quick setup settings and configuration page through /wizard.htm."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "multilaser"

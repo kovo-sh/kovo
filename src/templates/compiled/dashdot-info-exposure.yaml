@@ -3,7 +3,7 @@ name: "Dashdot - Server Information Exposure"
 severity: "medium"
 description: "Dashdot is a self-hosted server dashboard that ships with no authentication by design, and its backend serves an unauthenticated /info endpoint returning static host information: operating system and kernel details, CPU brand and model, memory and storage layout, network interface details including the public IP, and the running Dashdot version. Any unauthenticated visitor to an internet-facing instance can read this host inventory without a credential."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "dashdot"
   - "exposure"

@@ -3,7 +3,7 @@ name: "Application Setting file disclosure"
 severity: "high"
 description: "appsetting.json file discloses the DB connection strings containing sensitive information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

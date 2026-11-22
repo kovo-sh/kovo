@@ -3,7 +3,7 @@ name: "Honeywell Scada Configuration File - Detect"
 severity: "low"
 description: "Honeywell Scada configuration file was detected. The downloaded file opens with the file name and contains critical information about the destination address."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "scada"
   - "config"

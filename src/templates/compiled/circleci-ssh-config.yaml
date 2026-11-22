@@ -3,7 +3,7 @@ name: "CircleCI SSH Configuration - Detect"
 severity: "medium"
 description: "CircleCI ssh-config file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

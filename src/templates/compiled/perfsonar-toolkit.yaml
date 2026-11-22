@@ -3,7 +3,7 @@ name: "perfSONAR Toolkit - Exposure"
 severity: "medium"
 description: "perfSONAR Toolkit is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "perfsonar"

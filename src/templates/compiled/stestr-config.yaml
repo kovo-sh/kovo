@@ -3,7 +3,7 @@ name: "Stestr Configuration File - Detect"
 severity: "info"
 description: "Stestr configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "stestr"

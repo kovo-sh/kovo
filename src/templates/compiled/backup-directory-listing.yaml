@@ -3,7 +3,7 @@ name: "Backup Directory Listing - Detect"
 severity: "low"
 description: "Backup Directory Listing folder was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "hackerone"
   - "backups"

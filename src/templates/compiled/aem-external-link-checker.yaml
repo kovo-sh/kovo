@@ -3,7 +3,7 @@ name: "Adobe AEM External Link Checker Exposure"
 severity: "info"
 description: "Safe check derived from aem-external-link-checker: Adobe AEM External Link Checker Exposure"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

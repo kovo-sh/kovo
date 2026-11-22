@@ -3,7 +3,7 @@ name: "bower.json File Disclosure"
 severity: "info"
 description: "Bower is a package manager which stores package information in the bower.json file"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

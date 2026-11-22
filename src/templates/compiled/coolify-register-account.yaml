@@ -3,7 +3,7 @@ name: "Coolify Register User Account - Enabled"
 severity: "medium"
 description: "Exposed Coolify user register page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "coolify"
   - "register"

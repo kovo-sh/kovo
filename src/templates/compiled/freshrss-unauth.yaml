@@ -3,7 +3,7 @@ name: "Freshrss Admin Dashboard - Exposed"
 severity: "high"
 description: "Freshrss Admin Dashboard has been exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "freshrss"
   - "misconfig"

@@ -3,7 +3,7 @@ name: "Kubeflow Unauth"
 severity: "high"
 description: "Kubeflow internal data is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "kubeflow"
   - "unauth"

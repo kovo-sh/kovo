@@ -3,7 +3,7 @@ name: "Clockwork Dashboard Exposure"
 severity: "high"
 description: "Clockwork Dashboard is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "unauth"

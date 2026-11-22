@@ -3,7 +3,7 @@ name: "pyproject.toml Configuration - Detect"
 severity: "info"
 description: "pyproject.toml configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "pyproject"

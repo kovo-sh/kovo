@@ -3,7 +3,7 @@ name: "Adobe AEM Sling User Info Servlet Exposure"
 severity: "info"
 description: "Safe check derived from aem-sling-userinfo: Adobe AEM Sling User Info Servlet Exposure"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

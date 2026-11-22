@@ -3,7 +3,7 @@ name: "NPM Anonymous CLI Metrics Exposure"
 severity: "info"
 description: "Safe check derived from npm-anonymous-cli: NPM Anonymous CLI Metrics Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "npm"

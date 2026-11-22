@@ -3,7 +3,7 @@ name: "Directus Server Info - Unauthenticated Fingerprint"
 severity: "info"
 description: "Directus /server/info endpoint is exposed without authentication, leaking project metadata and license configuration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "directus"
