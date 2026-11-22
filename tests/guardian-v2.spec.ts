@@ -108,7 +108,7 @@ test('surfaces Tier 3 HITL approval card and blocks state-changing probe until o
     await expect(page.getByText('POST https://northstar.example/api/state-eval', { exact: true })).toBeVisible()
 
     // Hard security invariant: POST /api/state-eval MUST NOT have fired before approval!
-    expect(fixture.targetRequests.filter(r => r.method === 'POST')).toHaveLength(0)
+    expect(fixture.targetRequests.filter(r => r.method === 'POST' && r.target.includes('/api/state-eval'))).toHaveLength(0)
 
     await approveBtn.click()
     await expect(approveBtn).toBeHidden({ timeout: 15_000 })

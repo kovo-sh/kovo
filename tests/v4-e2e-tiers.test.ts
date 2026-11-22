@@ -49,6 +49,7 @@ import { orderProfiles } from '../src/server/provider.ts'
 import { verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { buildSarifLog } from '../src/server/sarif-export.ts'
 import { ScopedBrowser } from '../src/server/scoped-browser.ts'
+import { extractProjectSecuritySpecAndRules, runValidatedDynamicRulesInWorker } from '../src/server/semantic-audit.ts'
 import { Store } from '../src/server/store.ts'
 import { probeDifferential, runSafeTemplates } from '../src/server/surface-engine.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
@@ -1607,11 +1608,16 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/auth.ts'), `export function requireSession(req: any) { return req.session }`)
     writeFileSync(join(appDir, 'src/db.ts'), `export function runUnsafe(prisma: any, id: string) { return prisma.$queryRawUnsafe("SELECT * FROM invoices WHERE id=" + id) }`)
-    const res = await runWorkerSast(backend as never, { repo: 'app', engines: ['opengrep'], reposDir: repoDir }) as {
-      engineStatus: Record<string, { ok: boolean }>; findings: unknown[]
-    }
-    assert.equal(res.engineStatus.opengrep.ok, true)
-    assert.match(JSON.stringify(res), /\$queryRawUnsafe|requireSession|invoices/i)
+    const session = await backend.openSession(randomUUID(), AbortSignal.timeout(30_000), { reposDir: repoDir })
+    t.after(() => session.close())
+    const signal = AbortSignal.timeout(60_000)
+    const stage1 = await extractProjectSecuritySpecAndRules({ signal } as never, 'app', session, { enableLlm: false })
+    assert.ok(stage1.spec.sources.length >= 1, 'ProjectSecuritySpec must capture HTTP request sources')
+    assert.ok(stage1.spec.authTenantGuards.some(g => g.patterns.includes('requireSession')), 'Expected custom requireSession guard')
+    assert.ok(stage1.spec.sanitizers.length >= 1, 'Expected numeric coercion sanitizers')
+    assert.ok(stage1.spec.sinks.some(s => s.patterns.some(p => p.includes('$queryRawUnsafe'))), 'Expected raw SQL sink inference')
+    assert.ok(stage1.spec.businessInvariants.some(i => i.requiredGuard === 'requireSession'), 'Expected tenant/auth dominance invariant')
+    assert.ok(stage1.rules.some(r => r.spec.id.includes('queryrawunsafe')), 'Expected a generated raw-SQL dynamic rule')
   })
 
   test('T1-13b: Stage-1 generates dynamic Opengrep rule YAML from custom ORM/auth wrapper spec', async (t) => {
@@ -1621,11 +1627,15 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const appDir = join(repoDir, 'app')
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/handler.ts'), `export function handle(req: any, customDb: any) { return customDb.unsafeExec("SELECT * FROM users WHERE q=" + req.query.q) }`)
-    const res = await runWorkerSast(backend as never, { repo: 'app', engines: ['opengrep'], reposDir: repoDir }) as {
-      engineStatus: Record<string, { ok: boolean }>; findings: unknown[]
-    }
-    assert.equal(res.engineStatus.opengrep.ok, true)
-    assert.ok(res.findings.length >= 1, 'Expected custom ORM wrapper sink to be flagged by Stage-1 dynamic audit')
+    const session = await backend.openSession(randomUUID(), AbortSignal.timeout(30_000), { reposDir: repoDir })
+    t.after(() => session.close())
+    const signal = AbortSignal.timeout(60_000)
+    const stage1 = await extractProjectSecuritySpecAndRules({ signal } as never, 'app', session, { enableLlm: false })
+    const rule = stage1.rules.find(r => r.spec.id.includes('unsafeexec'))
+    assert.ok(rule, 'Expected generated dynamic rule for customDb.unsafeExec')
+    assert.match(rule.yaml, /unsafeExec/, 'Dynamic rule YAML must target the custom ORM wrapper')
+    const dynFindings = await runValidatedDynamicRulesInWorker(session, 'app', stage1.rules, signal)
+    assert.ok(dynFindings.some(f => f.file.includes('handler.ts')), 'Dynamic rule must match custom ORM wrapper inside --network none worker')
   })
 
   test('T1-13c: Stage-2 suspect conversion lifts the v3 12-suspect cap (converts 25 suspects)', async (t) => {
@@ -1681,8 +1691,8 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { projectId, runId } = await setupApprovedRun(storage)
-    const targetRepo = join(dir, 'repos', projectId, 'app')
-    mkdirSync(join(dir, 'repos', projectId), { recursive: true })
+    const targetRepo = join(dir, 'repos', projectId, 'local', 'app')
+    mkdirSync(join(dir, 'repos', projectId, 'local'), { recursive: true })
     await exec('cp', ['-r', appDir, targetRepo])
 
     const engine = new Execution(storage)
@@ -4204,6 +4214,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
           kind: 'http_chain',
           assertionsJq: '{ controlPassed: (.steps.c1.status == 200), confirmed: (.steps.p1.status == 200 and .steps.p1.json.protectedOk == true), observed: ("protectedOk=" + (.steps.p1.json.protectedOk | tostring)), expected: "HTTP 403 or protectedOk=false" }',
           steps: [
+            { id: 'c0', role: 'setup', description: 'Prime CSRF session', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/csrf', session: 'rvjar' } as never },
             { id: 'c1', role: 'control', description: 'Get CSRF', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/csrf', session: 'rvjar' } as never },
             { id: 'p1', role: 'probe', description: 'POST with CSRF', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/admin', session: 'rvjar', csrfBind: true, jsonBody: { a: 1 } } as never },
           ],
@@ -5079,7 +5090,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       randomUUID(),
       {
         repo: 'app', file: 'src/orders.ts', startLine: 1, endLine: 3,
-        engine: 'ast-grep', ruleOrPattern: 'SELECT * FROM orders',
+        engine: 'ast-grep', ruleOrPattern: 'db.query($SQL)',
       },
       AbortSignal.timeout(45_000),
       { reposDir: repoDir },
@@ -5089,7 +5100,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       randomUUID(),
       {
         repo: 'app', file: 'src/orders.ts', startLine: 1, endLine: 3,
-        engine: 'ast-grep', ruleOrPattern: 'NON_EXISTENT_PATTERN_999',
+        engine: 'ast-grep', ruleOrPattern: 'exec($CMD)',
       },
       AbortSignal.timeout(45_000),
       { reposDir: repoDir },
@@ -5107,11 +5118,14 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/auth.ts'), `export function requireOrgMembership(req: any) { return req.user?.orgId }`)
     writeFileSync(join(appDir, 'src/db.ts'), `export function rawSql(prisma: any, q: string) { return prisma.$queryRawUnsafe("SELECT * FROM orgs WHERE q=" + q) }`)
-    const res = await runWorkerSast(backend as never, { repo: 'app', engines: ['opengrep'], reposDir: repoDir }) as {
-      engineStatus: Record<string, { ok: boolean }>; findings: unknown[]
-    }
-    assert.equal(res.engineStatus.opengrep.ok, true)
-    assert.match(JSON.stringify(res), /requireOrgMembership|\$queryRawUnsafe|rawSql|orgs/i)
+    const session = await backend.openSession(randomUUID(), AbortSignal.timeout(30_000), { reposDir: repoDir })
+    t.after(() => session.close())
+    const signal = AbortSignal.timeout(60_000)
+    const stage1 = await extractProjectSecuritySpecAndRules({ signal } as never, 'app', session, { enableLlm: false })
+    assert.ok(stage1.spec.authTenantGuards.some(g => g.name === 'requireOrgMembership' && g.kind === 'tenant_scope'), 'Expected custom tenant guard inference')
+    assert.ok(stage1.spec.sinks.some(s => s.patterns.some(p => p.includes('$queryRawUnsafe'))), 'Expected custom raw SQL sink inference')
+    assert.ok(stage1.spec.businessInvariants.some(i => i.requiredGuard === 'requireOrgMembership'), 'Expected guard dominance invariant')
+    assert.ok(stage1.rules.some(r => r.spec.id.includes('queryrawunsafe')), 'Expected generated dynamic rule for raw SQL wrapper')
   })
 
   test('T2-13b: Stage-2 sinkpoint-backward interprocedural traversal traces entrypoint -> helper -> SQL sink across 2 files', async (t) => {
@@ -5155,8 +5169,8 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { projectId, runId } = await setupApprovedRun(storage)
-    mkdirSync(join(dataDir, 'repos', projectId), { recursive: true })
-    await exec('cp', ['-r', dir, join(dataDir, 'repos', projectId, 'app')])
+    mkdirSync(join(dataDir, 'repos', projectId, 'local'), { recursive: true })
+    await exec('cp', ['-r', dir, join(dataDir, 'repos', projectId, 'local', 'app')])
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
@@ -5192,8 +5206,8 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { projectId, runId, run, assetIds } = await setupApprovedRun(storage, { seeds: ['http://127.0.0.1:9'] })
-    mkdirSync(join(dataDir, 'repos', projectId), { recursive: true })
-    await exec('cp', ['-r', appSrc, join(dataDir, 'repos', projectId, 'app')])
+    mkdirSync(join(dataDir, 'repos', projectId, 'local'), { recursive: true })
+    await exec('cp', ['-r', appSrc, join(dataDir, 'repos', projectId, 'local', 'app')])
     const aid = randomUUID()
     storage.client.prepare(`INSERT INTO assignments (id, run_id, phase, status, scope_revision, goal_revision, session_id, parent_fact_ids, source_origins, title, objective, created_at) VALUES (?, ?, 'investigation', 'complete', 1, 0, ?, '[]', '[]', 'inv', 'obj', ?)`)
       .run(aid, runId, randomUUID(), Date.now())
@@ -5214,7 +5228,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       id: fid, origin: 'http://127.0.0.1:9', title: 'SQL Injection in getOrder', status: 'confirmed',
       verificationTier: 'static_verified', severity: 'high',
       reason: 'Confirmed SQL injection in src/orders.ts:2', remediation: 'Use parameterized SQL.', evidenceIds: [], scopeRevision: 1,
-      codeLocations: [{ repo: 'app', file: 'src/orders.ts', startLine: 1, endLine: 3 }],
+      codeLocations: [{ repo: 'local/app', file: 'src/orders.ts', startLine: 1, endLine: 3 }],
     }, specRow.id, ['http://127.0.0.1:9'])
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
@@ -6606,28 +6620,42 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-24b: early-stop cancels sibling trials cleanly in SQLite when Trial 0 achieves confirmed', async (t) => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/slow') {
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 3000)
+        return
+      }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
     })
     let confirmedOnce = false
-    const llm = await startMockLlmServer(t, () => {
-      if (!confirmedOnce) {
+    let slowSiblingStarted = false
+    const llm = await startMockLlmServer(t, (call) => {
+      const prompt = JSON.stringify(call.body)
+      if (!slowSiblingStarted && prompt.includes('BOLA T1')) {
+        slowSiblingStarted = true
+        return {
+          type: 'tool_call',
+          callId: 'c_slow_sibling_24b',
+          name: 'http_request',
+          argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
+        }
+      }
+      if (!confirmedOnce && prompt.includes('BOLA T0')) {
         confirmedOnce = true
         return {
           type: 'tool_call',
           callId: 'c_win_24b',
           name: 'propose_chain_finding',
           argumentsJson: JSON.stringify({
-            title: 'Critical BOLA',
-            category: 'broken-access-control',
-            severity: 'critical',
-            origin: fx.origin,
-            reason: 'Confirmed BOLA',
-            remediation: 'Check ownership',
             counterevidence: 'Control endpoint returns false while probe leaks tenant secret',
             confidenceRationale: 'Deterministic replay differential confirmed status 200 leak',
-            evidenceIds: [],
+            chainFactIds: [],
+            exchangeIds: [],
+            verifyNow: true,
             replaySpec: {
               ...baseReplaySpecFields(fx.origin),
+              title: 'Critical BOLA',
+              category: 'broken-access-control',
+              severity: 'critical',
               kind: 'http_chain',
               assertionsJq: '{ controlPassed: (.steps.c1.json.leaked == false), confirmed: (.steps.p1.json.leaked == true), observed: (.steps.p1.json.leaked | tostring), expected: "false" }',
               steps: [
@@ -6719,28 +6747,42 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-24e: trial.early_stopped SSE event emitted upon sibling cancellation', async (t) => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/slow') {
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 3000)
+        return
+      }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
     })
     let done = false
-    const llm = await startMockLlmServer(t, () => {
-      if (!done) {
+    let slowSiblingStarted = false
+    const llm = await startMockLlmServer(t, (call) => {
+      const prompt = JSON.stringify(call.body)
+      if (!slowSiblingStarted && prompt.includes('Critical RCE Trial 1')) {
+        slowSiblingStarted = true
+        return {
+          type: 'tool_call',
+          callId: 'c_slow_sibling',
+          name: 'http_request',
+          argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
+        }
+      }
+      if (!done && prompt.includes('Trial 0')) {
         done = true
         return {
           type: 'tool_call',
           callId: 'c_win_24e',
           name: 'propose_chain_finding',
           argumentsJson: JSON.stringify({
-            title: 'Critical RCE',
-            category: 'injection-input',
-            severity: 'critical',
-            origin: fx.origin,
-            reason: 'Confirmed',
-            remediation: 'Fix',
             counterevidence: 'Control endpoint returns false while probe leaks secret payload',
             confidenceRationale: 'Deterministic replay differential confirmed status 200 leak',
-            evidenceIds: [],
+            chainFactIds: [],
+            exchangeIds: [],
+            verifyNow: true,
             replaySpec: {
               ...baseReplaySpecFields(fx.origin),
+              title: 'Critical RCE',
+              category: 'injection-input',
+              severity: 'critical',
               kind: 'http_chain',
               assertionsJq: '{ controlPassed: (.steps.c1.json.leaked == false), confirmed: (.steps.p1.json.leaked == true), observed: (.steps.p1.json.leaked | tostring), expected: "false" }',
               steps: [
@@ -6762,9 +6804,9 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
     const gid = randomUUID()
     const now = Date.now()
-    storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 1, 'T1', 'h', 'injection-input', 95, '[]', '[]', '[]', '[]', 'pending', ?, ?, 0, ?, ?)`)
+    storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 1, 'Critical RCE Trial 0', 'h', 'injection-input', 95, '[]', '[]', '[]', '[]', 'pending', ?, ?, 0, ?, ?)`)
       .run(randomUUID(), runId, JSON.stringify([fx.origin]), gid, now, now)
-    storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 2, 'T2', 'h', 'injection-input', 95, '[]', '[]', '[]', '[]', 'pending', ?, ?, 1, ?, ?)`)
+    storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 2, 'Critical RCE Trial 1', 'h', 'injection-input', 95, '[]', '[]', '[]', '[]', 'pending', ?, ?, 1, ?, ?)`)
       .run(randomUUID(), runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
@@ -7579,15 +7621,15 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { projectId, runId, run, assetIds } = await setupApprovedRun(storage, { seeds: ['http://127.0.0.1:9'] })
-    mkdirSync(join(dataDir, 'repos', projectId), { recursive: true })
-    await exec('cp', ['-r', srcRoot, join(dataDir, 'repos', projectId, 'app')])
+    mkdirSync(join(dataDir, 'repos', projectId, 'local'), { recursive: true })
+    await exec('cp', ['-r', srcRoot, join(dataDir, 'repos', projectId, 'local', 'app')])
     const aid = randomUUID()
     storage.client.prepare(`INSERT INTO assignments (id, run_id, phase, status, scope_revision, goal_revision, session_id, parent_fact_ids, source_origins, title, objective, created_at) VALUES (?, ?, 'investigation', 'complete', 1, 0, ?, '[]', '[]', 'inv', 'obj', ?)`)
       .run(aid, runId, randomUUID(), Date.now())
     const fid = randomUUID()
     const specRow = storage.createReplaySpec(run, storage.worker(aid), fid, {
       ...baseReplaySpecFields('http://127.0.0.1:9'),
-      kind: 'static_ast_proof', repo: 'app', file: 'src/invoices.ts', startLine: 1, endLine: 1,
+      kind: 'static_ast_proof', repo: 'local/app', file: 'src/invoices.ts', startLine: 1, endLine: 1,
       engine: 'ast-grep', ruleOrPattern: 'db.findUnique({ where: { id } })',
       runtimeProofGap: 'Verified statically in source AST; runtime proof pending.',
       assertionsJq: '{ controlPassed: true, confirmed: (.static.verified == true), observed: "matched", expected: "no match" }',
@@ -7596,7 +7638,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       id: fid, origin: 'http://127.0.0.1:9', title: 'BOLA in readInvoice', status: 'confirmed',
       verificationTier: 'static_verified', severity: 'high',
       reason: 'Confirmed BOLA on findUnique without tenant scope', remediation: 'Check tenantId', evidenceIds: [], scopeRevision: 1,
-      codeLocations: [{ repo: 'app', file: 'src/invoices.ts', startLine: 1, endLine: 1 }],
+      codeLocations: [{ repo: 'local/app', file: 'src/invoices.ts', startLine: 1, endLine: 1 }],
     }, specRow.id, ['http://127.0.0.1:9'])
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
@@ -8071,22 +8113,41 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
   test('T3-24: Crown-jewel lead spawns 2 parallel trials; first confirmation cancels sibling cleanly', async (t) => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
+      if (req.url === '/slow') {
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 8000)
+        return
+      }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
     })
     let done = false
-    const llm = await startMockLlmServer(t, () => {
-      if (!done) {
+    let slowSiblingStarted = false
+    const llm = await startMockLlmServer(t, (call) => {
+      const prompt = JSON.stringify(call.body)
+      if (!slowSiblingStarted && prompt.includes('Crown Jewel Trial 1')) {
+        slowSiblingStarted = true
+        return {
+          type: 'tool_call',
+          callId: 'c_slow_sibling',
+          name: 'http_request',
+          argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
+        }
+      }
+      if (!done && prompt.includes('Trial 0')) {
         done = true
         return {
           type: 'tool_call', callId: 'c_win_324', name: 'propose_chain_finding',
           argumentsJson: JSON.stringify({
-            title: 'Crown Jewel Auth Bypass', category: 'auth-session', severity: 'critical', origin: fx.origin,
-            reason: 'JWT alg none accepted', remediation: 'Reject alg none',
             counterevidence: 'Control endpoint returns false while probe leaks secret claim',
             confidenceRationale: 'Deterministic replay differential confirmed bypass',
-            evidenceIds: [],
+            chainFactIds: [],
+            exchangeIds: [],
+            verifyNow: true,
             replaySpec: {
-              ...baseReplaySpecFields(fx.origin), kind: 'http_chain',
+              ...baseReplaySpecFields(fx.origin),
+              title: 'Crown Jewel Auth Bypass',
+              category: 'auth-session',
+              severity: 'critical',
+              kind: 'http_chain',
               assertionsJq: '{ controlPassed: (.steps.c1.json.leaked == false), confirmed: (.steps.p1.json.leaked == true), observed: (.steps.p1.json.leaked | tostring), expected: "false" }',
               steps: [
                 { id: 'c1', role: 'control', description: 'Control', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/c' } },
@@ -8117,7 +8178,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 4_000
+      const deadline = Date.now() + 10_000
       while (Date.now() < deadline) {
         const sib = storage.client.prepare('SELECT status FROM chain_steps WHERE id = ?').get(s1) as { status: string }
         if (sib.status === 'canceled') break
