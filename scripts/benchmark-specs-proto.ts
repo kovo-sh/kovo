@@ -1,4 +1,5 @@
 /** auth_protocol_proof / cache_differential spec synthesis. */
+import { randomBytes } from 'node:crypto'
 import { appendQuery, baseFields, is2xx, jqStr, sameAsControl, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
 import { probePathFor } from './benchmark-probes.ts'
@@ -20,6 +21,73 @@ function mutationFor(name: string): Mutation | null {
 }
 
 const AUTH_PROTO_BASE = 'Authentication protocol differential'
+
+/**
+ * Body-token JWT routes (e.g. refresh/assertion endpoints) never expose the credential as a bearer
+ * header, so the broker's header-mutation primitive cannot reach them. Mint an unsigned token whose
+ * subject is the real victim identity observed by the probe, plus a control token with an unknown
+ * subject, and require a rejected control + an issued access token/session as the processed effect.
+ */
+function jwtBodySpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
+  const out: SynthesizedSpec[] = []
+  for (const a of o.anomalies) {
+    if (a.type !== 'jwt_body_token_bypass' && a.type !== 'jwt_body_token_forgery') continue
+    if (a.tokenTransport !== undefined && a.tokenTransport !== 'json' && a.tokenTransport !== 'form') continue
+    const path = String(a.path ?? o.hyp.endpoint.path)
+    const field = String(a.tokenField ?? a.field ?? 'token')
+    if (!path.startsWith('/') || !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(field)) continue
+    const subject = typeof a.subject === 'string' && /^[A-Za-z0-9@._:-]{1,128}$/.test(a.subject) ? a.subject : null
+    if (!subject) continue
+    const bogus = `guardian-no-such-subject-${randomBytes(4).toString('hex')}`
+    const method = String(a.method ?? 'POST').toUpperCase() === 'POST' ? 'POST' : 'POST'
+    const encoding = a.encoding === 'form' || a.bodyEncoding === 'form' ? 'form' : 'json'
+    const extra = a.body && typeof a.body === 'object' && !Array.isArray(a.body) ? a.body as Record<string, unknown> : {}
+    const body = (token: string) => {
+      const all = { ...extra, [field]: token }
+      if (encoding === 'form') {
+        return {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          textBody: Object.entries(all).map(([k, v]) => {
+            const raw = String(v)
+            return `${encodeURIComponent(k)}=${raw.includes('{{') ? raw : encodeURIComponent(raw)}`
+          }).join('&'),
+        }
+      }
+      return { headers: { 'Content-Type': 'application/json' }, jsonBody: all }
+    }
+    const tokenMints = [
+      { name: 'forged_body_token', header: { typ: 'JWT' }, payload: { sub: subject, iat: '{{now}}', exp: '{{now_plus_1h}}' }, signature: 'none' as const },
+      { name: 'bogus_body_token', header: { typ: 'JWT' }, payload: { sub: bogus, iat: '{{now}}', exp: '{{now_plus_1h}}' }, signature: 'none' as const },
+    ]
+    const effectPath = typeof a.effectPath === 'string' && a.effectPath.startsWith('/') ? a.effectPath : null
+    const steps: Array<Record<string, unknown>> = [
+      stepOf(env, 'c1', 'control', 'Unsigned token for an unknown subject is rejected', {
+        method, pathAndQuery: path, ...body('{{bogus_body_token}}'),
+      }, null, {}, [400, 401, 403]),
+      stepOf(env, 'p1', 'probe', 'Unsigned token for the victim subject is accepted', {
+        method, pathAndQuery: path, ...body('{{forged_body_token}}'),
+      }, null, {}, [200, 201, 202, 204]),
+    ]
+    if (effectPath) steps.push(stepOf(env, 'p2', 'probe', 'Read back the session bound by the forged token', { method: 'GET', pathAndQuery: effectPath }, null))
+    const confirmed = effectPath
+      ? `(${is2xx('p1')} and ${is2xx('p2')} and ((.steps.p2.body // "") | contains(${jqStr(subject)})))`
+      : `(${is2xx('p1')} and ((.steps.p1.bodyBytes // 0) > 0))`
+    const jq = `{ controlPassed: (.steps.c1.status >= 400 and .steps.c1.status < 500), ` +
+      `confirmed: ${confirmed}, ` +
+      `observed: ("forged status=" + (.steps.p1.status | tostring)), expected: "unsigned tokens are rejected regardless of subject" }`
+    out.push({
+      kind: 'auth_protocol_proof',
+      spec: {
+        ...baseFields(env, `${AUTH_PROTO_BASE}: unsigned JWT in the request body`, 'CWE-347', 'broken-authentication', 'high', jq),
+        kind: 'auth_protocol_proof',
+        protocol: 'jwt',
+        tokenMints,
+        steps,
+      },
+    })
+  }
+  return out
+}
 
 function jwtSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const persona = env.jwtPersona
@@ -137,7 +205,7 @@ function oauthSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
 }
 
 export function synthAuthProtocol(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
-  return [...jwtSpecs(o, env), ...oauthSpecs(o, env)]
+  return [...jwtBodySpecs(o, env), ...jwtSpecs(o, env), ...oauthSpecs(o, env)]
 }
 
 export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
@@ -148,6 +216,67 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   const path = basePath.replace(/\/+$/, '') || '/'
   const marker = 'guardian-cache-probe'
   const out: SynthesizedSpec[] = []
+
+  // Header-free cache: the lab cache emits no Age/X-Cache, so persistence is proven from the body
+  // differential across actors plus a repeat fetch. The probe supplies the warm route, the actor
+  // handles and (when available) a tenant marker/canary observed in the personalised body.
+  const bodyRepeat = Boolean(poison && (
+    poison.proof === 'body_repeat' ||
+    poison.actorDifferential === true ||
+    (typeof poison.marker === 'string' && poison.cacheHit !== true)
+  ))
+  if (poison && bodyRepeat) {
+    const warmRaw = typeof poison.path === 'string' && poison.path.startsWith('/')
+      ? poison.path
+      : typeof poison.probePath === 'string' && poison.probePath.startsWith('/') ? poison.probePath : path
+    const warmPath = warmRaw.split('#')[0]
+    const keyParam = typeof poison.cacheKeyParam === 'string' && /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(poison.cacheKeyParam)
+      ? poison.cacheKeyParam : null
+    const controlKey = typeof poison.controlKeyValue === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(poison.controlKeyValue)
+      ? poison.controlKeyValue : null
+    const explicitControl = typeof poison.controlPath === 'string' && poison.controlPath.startsWith('/') ? poison.controlPath : null
+    let controlWarmPath = explicitControl ?? warmPath
+    if (!explicitControl && keyParam && controlKey) {
+      const url = new URL(warmPath, 'http://guardian.invalid')
+      url.searchParams.set(keyParam, controlKey)
+      controlWarmPath = url.pathname + url.search
+    }
+    const stripGcb = (p: string): string => {
+      const url = new URL(p, 'http://guardian.invalid')
+      url.searchParams.delete('_gcb')
+      return url.pathname + (url.search || '')
+    }
+    const warmBase = stripGcb(warmPath)
+    const controlBase = stripGcb(controlWarmPath)
+    const suppliedMarker = typeof poison.marker === 'string' && poison.marker.length >= 4 && poison.marker.length <= 256 && !/[\r\n\0]/.test(poison.marker)
+      ? poison.marker : undefined
+    const asPersona = (v: unknown) => typeof v === 'string' && /^[a-z0-9_-]{1,32}$/.test(v) ? v : undefined
+    const poisonPersona = asPersona(poison.poisonPersona ?? poison.warmPersona) ?? env.other ?? env.owner
+    const verifyPersona = asPersona(poison.verifyPersona) ?? env.owner
+    if (!poisonPersona || !verifyPersona || poisonPersona === verifyPersona) return []
+    const jq = '{ controlPassed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.repeatBodyMatches == true)), ' +
+      'confirmed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.poisonPersistedToVictim == true) and (.cacheProof.repeatBodyMatches == true) and (.cacheProof.timingSignal == true)), ' +
+      'observed: ("verify=" + (.steps.verify.status | tostring) + " repeatMatch=" + ((.cacheProof.repeatBodyMatches // false) | tostring)), expected: "a personalised response is not served from the shared cache to another actor" }'
+    out.push({
+      kind: 'cache_differential',
+      spec: {
+        ...baseFields(env, 'Cross-actor cache serving of a personalised response', 'CWE-525', 'cache-poisoning', 'high', jq),
+        kind: 'cache_differential', targetOrigin: env.origin, mode: 'poison', method: 'GET',
+        proofMode: 'body_repeat',
+        controlPath: appendQuery(controlBase, '_gcb', '{{control_gcb}}', false),
+        probePath: appendQuery(warmBase, '_gcb', '{{probe_gcb}}', false),
+        verifyPath: appendQuery(warmBase, '_gcb', '{{probe_gcb}}', false),
+        repeatPath: appendQuery(warmBase, '_gcb', '{{repeat_gcb}}', false),
+        ...(suppliedMarker ? { marker: suppliedMarker } : {}),
+        poisonPersona,
+        verifyPersona,
+        controlPersona: verifyPersona,
+        ...(poison.headers && typeof poison.headers === 'object' && !Array.isArray(poison.headers)
+          ? { poisonHeaders: poison.headers as Record<string, string> } : {}),
+      },
+    })
+    return out
+  }
 
   if (poison) {
     const header = String(poison.header ?? '')
