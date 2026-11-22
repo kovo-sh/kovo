@@ -6643,7 +6643,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     let trialCalls = 0
     const llm = await startMockLlmServer(t, (call) => {
       const prompt = JSON.stringify(call.body)
-      const trialPrompt = prompt.includes('BOLA')
+      const trialPrompt = !prompt.includes('Stateless Coordinator Planner') && (prompt.includes('BOLA') || prompt.includes('broken-access-control'))
       if (trialPrompt) trialCalls += 1
       if (prompt.includes('c_slow_sibling_24b')) {
         return { type: 'tool_call', callId: 'c_done_slow_24b', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
@@ -6766,17 +6766,21 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/slow') {
-        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 3000)
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 30000)
         return
       }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
     })
     let done = false
-    let slowSiblingStarted = false
+    let trialCalls = 0
     const llm = await startMockLlmServer(t, (call) => {
       const prompt = JSON.stringify(call.body)
-      if (!slowSiblingStarted && prompt.includes('Critical RCE Trial 1')) {
-        slowSiblingStarted = true
+      const trialPrompt = !prompt.includes('Stateless Coordinator Planner') && prompt.includes('Critical RCE')
+      if (trialPrompt) trialCalls += 1
+      if (prompt.includes('c_slow_sibling')) {
+        return { type: 'tool_call', callId: 'c_done_slow_24e', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
+      }
+      if (trialPrompt && trialCalls === 1) {
         return {
           type: 'tool_call',
           callId: 'c_slow_sibling',
@@ -6784,7 +6788,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
           argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
         }
       }
-      if (!done && prompt.includes('Trial 0')) {
+      if (!done && trialPrompt) {
         done = true
         return {
           type: 'tool_call',
@@ -6816,7 +6820,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const { storage } = makeStore(t)
     await saveModelProfile({
       name: 'Tactical', endpoint: llm.endpoint, model: 'mock-t', protocol: 'responses', key: 'sk-24e-12345678',
-      priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'tactical',
+      priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'any',
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
@@ -6831,7 +6835,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 4_000
+      const deadline = Date.now() + 25_000
       while (Date.now() < deadline && !storage.eventsAfter(runId, 0, 50).some(e => e.kind === 'trial.early_stopped')) {
         await delay(50)
       }
@@ -8143,7 +8147,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     let trialCalls = 0
     const llm = await startMockLlmServer(t, (call) => {
       const prompt = JSON.stringify(call.body)
-      const trialPrompt = prompt.includes('Crown Jewel')
+      const trialPrompt = !prompt.includes('Stateless Coordinator Planner') && (prompt.includes('Crown Jewel') || prompt.includes('auth-session'))
       if (trialPrompt) trialCalls += 1
       if (prompt.includes('c_slow_sibling')) {
         return { type: 'tool_call', callId: 'c_done_slow_324', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
