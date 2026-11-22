@@ -38,6 +38,7 @@ import {
 } from '../src/server/dedupe.ts'
 import { Execution } from '../src/server/execution.ts'
 import { assessBflaImpact, buildInlineVerifyFeedback } from '../src/server/replay-verifier.ts'
+import { templateIdsForCves } from '../src/server/cve-broker.ts'
 import type { BrokerExchangeResult } from '../src/server/broker.ts'
 import { loadSkill, listSkills, selectPreInjectionSkills } from '../src/server/skills.ts'
 import { Store } from '../src/server/store.ts'
@@ -1064,4 +1065,37 @@ test('M1 worker reliability: docker failures report the real cause and never the
   assert.notEqual(message, 'The isolated worker failed. Build the local worker image and check Docker availability.')
   assert.match(message, /isolated worker failed|Docker Unix socket|ENOENT|docker/i)
   await backend.reclaimInactive().catch(() => undefined)
+})
+
+// ============================================================================
+// M4 hand-off wiring (templates, Stage-1 LLM, SCA CVEs, Patch Gate 6)
+// ============================================================================
+
+test('M4 wiring: safe templates receive CVE hypotheses and recon-discovered dynamic paths', () => {
+  assert.match(executionSource, /const cveIds = \[\.\.\.new Set\(/)
+  assert.match(executionSource, /kind: 'cve_hypothesis'/)
+  assert.match(executionSource, /templateIdsForCves\(cveIds\)/)
+  assert.match(executionSource, /discoveredPaths: \{ protectedPaths, apiPaths \}/)
+  assert.ok(executionSource.includes('(admin|account|billing|settings|invoice|dashboard)'))
+  assert.ok(executionSource.includes('^\\/(api|graphql|trpc)'))
+  assert.ok(templateIdsForCves(['CVE-2025-29927']).includes('nextjs-middleware-subrequest-bypass'), 'curated CVE→template mapping must resolve')
+})
+
+test('M4 wiring: Stage-1 LLM is enabled by default and receives live endpoints', () => {
+  assert.ok(!executionSource.includes('enableStage1Llm: false'))
+  assert.match(executionSource, /enableStage1Llm: process\.env\.GUARDIAN_STAGE1_LLM !== '0'/)
+  assert.match(executionSource, /liveEndpoints: this\.storage\.listEndpoints\(run\.id\)/)
+})
+
+test('M4 wiring: dependency correlation iterates all parsed packages with curated-advisory annotation', () => {
+  assert.ok(!executionSource.includes('highSignalPkgs'), 'the JS-only high-signal allowlist must be gone')
+  assert.match(executionSource, /hasCuratedAdvisory\(dep\.ecosystem, dep\.package\)/)
+  assert.match(executionSource, /trivy-fs flagged \$\{cve\}/)
+  assert.match(executionSource, /templateIds: templateIdsForCves\(\[cve\]\)/)
+})
+
+test('M4 wiring: Patch Gate 6 passes labRetest with an authorized baseline caller', () => {
+  assert.match(executionSource, /const labHandle = this\.getLabTargetHandle\(run\.id\)/)
+  assert.match(executionSource, /labRunner: this\.labRunner,[\s\S]{0,900}?baselineExpectStatus: \[200, 201, 204\]/)
+  assert.ok(executionSource.includes('...(labRetest ? { labRetest } : {}),'))
 })
