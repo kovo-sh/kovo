@@ -76,6 +76,7 @@ export interface RealisticArgs {
   concurrency: number
   dataDir?: string
   noLlm: boolean
+  allowInertWorkers: boolean
   verifier: 'auto' | 'docker' | 'local-jq'
   help: boolean
 }
@@ -98,15 +99,24 @@ Flags:
   --data-dir <path>       Guardian data dir (single cell: used verbatim, so an
                           existing model profile is picked up; multi-cell: base
                           directory, one isolated child dir per cell)
-                          (default: <out-dir>/data/<cell>; no profile => Zero-LLM)
-  --no-llm                require the deterministic/Zero-LLM path (fails if a model
-                          profile is configured in --data-dir)
+                          (default: $GUARDIAN_DATA_DIR or <out-dir>/data/<cell>)
+  --no-llm                force the deterministic/Zero-LLM path; the run uses an
+                          isolated data dir and never loads a model profile
+  --allow-inert-workers   allow an agentic run even when the verifier backend
+                          cannot open worker sessions (records an inert run;
+                          diagnostics still show zero completed assignments)
   --verifier <kind>       auto | docker | local-jq (default: auto)
   --help                  show this help
 
 Environment:
   GUARDIAN_ALLOW_LOCAL_LAB=1   required to boot loopback lab origins
   GUARDIAN_RB_HELDOUT_SALT     required for --held-out (never logged/committed)
+  GUARDIAN_DATA_DIR            default Guardian data dir (model profile source)
+
+Agentic runs need a worker-session-capable verifier:
+  model profile + --verifier local-jq  -> exit 2 (inert workers) unless --no-llm
+  model profile + --verifier docker    -> requires Docker socket access; run under
+                                          newgrp docker -c '<command>'
 
 Artifacts per cell:
   <out-dir>/<app>-seed<seed>-<mode>.json      Scorecard (benchmark grader schema)
@@ -167,7 +177,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
 
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
-    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'verifier', 'help',
+    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'allow-inert-workers', 'verifier', 'help',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
@@ -178,7 +188,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       apps: [...appNames], seeds: [1], mode: 'grey-box', heldOut: false,
       budgetUsd: DEFAULT_BUDGET_USD, maxDurationMs: DEFAULT_MAX_DURATION_MS,
       outDir: resolve('.guardian/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
-      noLlm: Boolean(a['no-llm']), verifier: 'auto', help: true,
+      noLlm: Boolean(a['no-llm']), allowInertWorkers: Boolean(a['allow-inert-workers']),
+      verifier: 'auto', help: true,
     }
   }
 
@@ -215,7 +226,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     ? DEFAULT_CONCURRENCY
     : parsePositiveInt(stringFlag(a, 'concurrency') ?? '', '--concurrency')
   const outDirRaw = stringFlag(a, 'out-dir') ?? '.guardian/realistic-bench'
-  const dataDirRaw = stringFlag(a, 'data-dir')
+  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.GUARDIAN_DATA_DIR
 
   return {
     apps: parseAppList(stringFlag(a, 'app')),
@@ -228,6 +239,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     concurrency,
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
     noLlm: a['no-llm'] === true,
+    allowInertWorkers: a['allow-inert-workers'] === true,
     verifier: verifierRaw,
     help: false,
   }
@@ -580,6 +592,158 @@ export function describeModelMode(profiles: ResolvedModelProfile[]): ModelInfo {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Backend capability + agentic preflight
+// ---------------------------------------------------------------------------------------------
+
+/** A configuration error that must terminate the harness with exit code 2. */
+export class PreflightError extends Error {
+  readonly exitCode = 2
+  constructor(message: string) {
+    super(message)
+    this.name = 'PreflightError'
+  }
+}
+
+export interface WorkerSessionCapability {
+  supported: boolean
+  detail: string
+}
+
+/**
+ * Prove worker-session support by actually opening (and closing) a session. This is
+ * deliberately not a name check: LocalJqBackend throws, and Docker fails here when the
+ * daemon/socket/image is unavailable.
+ */
+export async function detectWorkerSessions(
+  backend: Pick<WorkerBackend, 'openSession'>,
+  timeoutMs = 20_000,
+): Promise<WorkerSessionCapability> {
+  let session: Awaited<ReturnType<WorkerBackend['openSession']>> | undefined
+  try {
+    session = await backend.openSession(randomUUID(), AbortSignal.timeout(timeoutMs))
+    return { supported: true, detail: 'worker session opened and closed' }
+  } catch (error) {
+    const detail = redact(error instanceof Error ? error.message : String(error)).slice(0, 240)
+    return { supported: false, detail: detail || 'worker session could not be opened' }
+  } finally {
+    if (session) await session.close().catch(() => undefined)
+  }
+}
+
+export interface AgenticPreflightInput {
+  hasProfiles: boolean
+  noLlm: boolean
+  allowInertWorkers: boolean
+  backendKind: VerifierBackendKind
+  workerSessions: boolean
+  workerSessionsDetail?: string
+}
+
+/**
+ * Fail fast instead of producing an inert run: a model profile will send work to
+ * specialist workers, and only a worker-session-capable backend (docker) can run them.
+ */
+export function assertAgenticPreflight(input: AgenticPreflightInput): void {
+  if (!input.hasProfiles || input.noLlm || input.allowInertWorkers) return
+  if (input.workerSessions) return
+  const detail = input.workerSessionsDetail ? ` (${input.workerSessionsDetail})` : ''
+  if (input.backendKind === 'docker') {
+    throw new PreflightError(
+      `agentic Execution requires a worker-session-capable verifier backend; --verifier docker could not open a worker session${detail}. `
+      + 'Docker worker sessions need socket access: re-run under `newgrp docker -c \'<command>\'` and verify '
+      + '`docker images` contains guardian-worker:v4.',
+    )
+  }
+  throw new PreflightError(
+    'agentic Execution requires a worker-session-capable verifier backend (docker); '
+    + 'use --verifier docker or --no-llm'
+    + (input.allowInertWorkers ? '' : ' (or --allow-inert-workers to explicitly record an inert run)')
+    + ` — ${input.backendKind} cannot run worker sessions${detail}.`,
+  )
+}
+
+export interface AssignmentDiagnosticInput {
+  status: string
+  outcome?: string | null
+  title?: string
+  phase?: string
+}
+
+export interface AssignmentDiagnostics {
+  total: number
+  completed: number
+  failed: number
+  canceled: number
+  investigationTotal: number
+  investigationCompleted: number
+  investigationFailed: number
+  topFailureReasons: string[]
+}
+
+/** Summarize assignment outcomes without leaking secrets or raw payload strings. */
+export function summarizeAssignments(
+  assignments: readonly AssignmentDiagnosticInput[],
+  fallbackReasons: readonly string[] = [],
+  secrets: readonly NamedSecret[] = [],
+): AssignmentDiagnostics {
+  let completed = 0
+  let failed = 0
+  let canceled = 0
+  let investigationTotal = 0
+  let investigationCompleted = 0
+  let investigationFailed = 0
+  const reasons = new Map<string, number>()
+  const addReason = (raw: string | null | undefined) => {
+    if (!raw) return
+    const clean = redact(String(raw), secrets).replace(/\s+/g, ' ').trim().slice(0, 240)
+    if (!clean) return
+    reasons.set(clean, (reasons.get(clean) ?? 0) + 1)
+  }
+  for (const assignment of assignments) {
+    const investigation = assignment.phase === 'investigation'
+    if (investigation) investigationTotal += 1
+    if (assignment.status === 'complete') {
+      completed += 1
+      if (investigation) investigationCompleted += 1
+    } else if (assignment.status === 'failed') {
+      failed += 1
+      if (investigation) investigationFailed += 1
+      addReason(assignment.outcome)
+    } else if (assignment.status === 'canceled') {
+      canceled += 1
+      if (investigation) investigationFailed += 1
+      addReason(assignment.outcome)
+    }
+  }
+  if (failed + canceled > 0 && reasons.size === 0) {
+    for (const reason of fallbackReasons) addReason(reason)
+  }
+  const topFailureReasons = [...reasons.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 5)
+    .map(([reason]) => reason)
+  return {
+    total: assignments.length,
+    completed,
+    failed,
+    canceled,
+    investigationTotal,
+    investigationCompleted,
+    investigationFailed,
+    topFailureReasons,
+  }
+}
+
+function countTableRows(storage: Store, table: string): number {
+  try {
+    const row = storage.client.prepare(`select count(*) as c from ${table}`).get() as { c?: number } | undefined
+    return Number(row?.c ?? 0)
+  } catch {
+    return 0
+  }
+}
+
 export interface CellMeta {
   app: AppName
   seed: number
@@ -590,6 +754,8 @@ export interface CellMeta {
   gitSha: string
   model: ModelInfo
   verifierBackend: VerifierBackendKind
+  workerSessions: boolean
+  workerSessionsDetail: string
   budgetUsd: number
   maxDurationMs: number
   startedAt: number
@@ -607,6 +773,10 @@ export interface CellMeta {
   endpointParamsDiscovered: number
   brokerExchanges: number
   requestsOnDiscoveredRoutes: number
+  assignments: AssignmentDiagnostics
+  facts: number
+  boardMessages: number
+  inert: boolean
   requestCount: number
   oracleEventCount: number
   notes: string[]
@@ -720,12 +890,12 @@ export async function stopEngine(engine: Execution): Promise<number> {
 export async function runCell(args: RealisticArgs, app: AppName, seed: number, log: (line: string) => void): Promise<CellResult> {
   const startedAt = nowMs()
   const slug = cellSlug(app, seed, args.mode)
-  const sharedDataDir = args.dataDir && cellKeys(args).length === 1
-  const dataDir = sharedDataDir
-    ? args.dataDir!
-    : args.dataDir
-      ? join(args.dataDir, slug)
-      : join(args.outDir, 'data', slug)
+  // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
+  const baseDataDir = args.noLlm ? undefined : args.dataDir
+  const cellCount = cellKeys(args).length
+  const dataDir = baseDataDir
+    ? cellCount === 1 ? baseDataDir : join(baseDataDir, slug)
+    : join(args.outDir, 'data', slug)
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
 
@@ -746,6 +916,51 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   let runStartedAt = startedAt
 
   try {
+    // --- Preflight (before booting the app): model mode + real worker-session capability ---
+    let profiles: ResolvedModelProfile[] = []
+    try {
+      profiles = privateModelProfiles(storage)
+    } catch (error) {
+      notes.push(`model profile lookup failed: ${redact((error as Error).message).slice(0, 160)}`)
+    }
+    if (args.noLlm) notes.push('--no-llm: model profiles ignored; isolated deterministic data dir')
+    const model = describeModelMode(args.noLlm ? [] : profiles)
+    notes.push(model.mode === 'agentic'
+      ? `agentic model profile(s): ${model.profiles.map(p => p.model).join(', ')}`
+      : 'no model profile configured: deterministic Zero-LLM path (threat model -> verification)')
+
+    const selected = await (async () => {
+      try {
+        return await selectVerifierBackend(args.verifier)
+      } catch (error) {
+        const detail = redact(error instanceof Error ? error.message : String(error)).slice(0, 240)
+        if (args.verifier === 'docker') {
+          throw new PreflightError(
+            `--verifier docker is not usable from this process: ${detail}. Docker worker sessions need socket access; `
+            + 're-run under `newgrp docker -c \'<command>\'` and make sure guardian-worker:v4 is built.',
+          )
+        }
+        throw error
+      }
+    })()
+    backendKind = selected.kind
+    backend = selected.kind === 'docker'
+      // Tag containers with this workspace so a crashed run can be reclaimed, and so the
+      // harness leaves zero orphan containers after stop.
+      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
+      : selected.backend
+
+    const capability = await detectWorkerSessions(backend)
+    assertAgenticPreflight({
+      hasProfiles: model.mode === 'agentic',
+      noLlm: args.noLlm,
+      allowInertWorkers: args.allowInertWorkers,
+      backendKind,
+      workerSessions: capability.supported,
+      workerSessionsDetail: capability.detail,
+    })
+    notes.push(`verifier backend ${backendKind}; workerSessions=${capability.supported}${capability.supported ? '' : ` (${capability.detail})`}`)
+
     const listener = await canary.startListener({ host: '127.0.0.1', port: 0 })
     const oobPort = listener.port
     if (!oobPort) fail('canary listener did not bind a loopback port')
@@ -816,21 +1031,6 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       }
     }
 
-    // Model availability is read from the (isolated) store before the run starts.
-    let profiles: ResolvedModelProfile[] = []
-    try {
-      profiles = privateModelProfiles(storage)
-    } catch (error) {
-      notes.push(`model profile lookup failed: ${(error as Error).message.slice(0, 160)}`)
-    }
-    if (args.noLlm && profiles.length) {
-      fail('--no-llm requested but the data directory has an enabled model profile')
-    }
-    const model = describeModelMode(profiles)
-    notes.push(model.mode === 'agentic'
-      ? `agentic model profile(s): ${model.profiles.map(p => p.model).join(', ')}`
-      : 'no model profile configured: deterministic Zero-LLM path (threat model -> verification)')
-
     const createdRun = storage.createRun({
       requestId: randomUUID(),
       projectId,
@@ -864,15 +1064,6 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       budgetRequests: 2_000,
       maxRpsPerOrigin: 10,
     })
-
-    const selected = await selectVerifierBackend(args.verifier)
-    backend = selected.kind === 'docker'
-      // Tag containers with this workspace so a crashed run can be reclaimed, and so the
-      // harness leaves zero orphan containers after stop.
-      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
-      : selected.backend
-    backendKind = selected.kind
-    notes.push(`Zero-LLM verifier backend: ${backendKind}`)
 
     engine = new Execution(storage, {
       canaryBroker: canary,
@@ -945,6 +1136,25 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       )
     }
 
+    const failureEvents = storage.eventsAfter(runId, 0, 500)
+      .filter(event => event.kind === 'worker.failed' || event.kind === 'worker.canceled')
+      .map(event => event.message)
+    const assignmentDiagnostics = summarizeAssignments(detail.assignments, failureEvents, secrets)
+    const factsCount = detail.facts.length
+    const boardMessages = countTableRows(storage, 'board_messages')
+    const inert = model.mode === 'agentic'
+      && submitted.length === 0
+      && factsCount === 0
+      && (assignmentDiagnostics.investigationTotal > 0
+        ? assignmentDiagnostics.investigationCompleted === 0
+        : assignmentDiagnostics.total > 0 && assignmentDiagnostics.completed === 0)
+    if (inert) {
+      notes.push(
+        'INERT RUN: agentic mode produced no facts, no submitted findings and no completed investigation assignment; '
+        + 'the scorecard below is not evidence of an investigation.',
+      )
+    }
+
     const meta: CellMeta = {
       app,
       seed,
@@ -955,6 +1165,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       gitSha,
       model,
       verifierBackend: backendKind,
+      workerSessions: capability.supported,
+      workerSessionsDetail: capability.detail,
       budgetUsd: args.budgetUsd,
       maxDurationMs: args.maxDurationMs,
       startedAt,
@@ -972,6 +1184,10 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       endpointParamsDiscovered: detail.endpointParams.length,
       brokerExchanges: detail.exchangesSummary.length,
       requestsOnDiscoveredRoutes,
+      assignments: assignmentDiagnostics,
+      facts: factsCount,
+      boardMessages,
+      inert,
       requestCount: gradeInput.requestLog.length,
       oracleEventCount: gradeInput.oracleEvents.length,
       notes,
@@ -1012,6 +1228,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     let engineBusy = -1
     if (engine) {
       try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 }
+    }
+    if (backend instanceof LinuxWorkerBackend) {
+      try { await backend.reclaimInactive() } catch { /* best-effort */ }
     }
     try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
     if (started) {
@@ -1111,7 +1330,7 @@ async function main(): Promise<void> {
     process.stdout.write(`[realistic-bench] starting ${app} seed=${seed} ${args.mode}\n`)
     const result = finalizeCellResult(await runCell(args, app, seed, line => process.stdout.write(`${line}\n`)))
     const c = result.scorecard
-    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms\n`)
+    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}\n`)
     return result
   })
 
@@ -1122,16 +1341,26 @@ async function main(): Promise<void> {
     printSummary(ok)
     process.stdout.write(`\nwrote ${join(args.outDir, 'summary.json')}\n`)
   }
+  let exitCode = 0
   for (const failure of failed) {
     process.stderr.write(`error: ${failure.item.app} seed=${failure.item.seed}: ${failure.error.message}\n`)
+    exitCode = Math.max(exitCode, Number((failure.error as { exitCode?: number }).exitCode ?? 1))
   }
-  if (failed.length) process.exitCode = 1
+  const inert = ok.filter(result => result.meta.inert)
+  if (inert.length) {
+    process.stderr.write(
+      `error: ${inert.length} agentic cell(s) were inert (no facts, no findings, no completed investigation); `
+      + 'their scorecards are not investigation evidence\n',
+    )
+    exitCode = Math.max(exitCode, 2)
+  }
+  if (exitCode) process.exitCode = exitCode
 }
 
 const isMain = process.argv[1] ? import.meta.url === pathToFileURL(resolve(process.argv[1])).href : false
 if (isMain) {
   main().catch((error) => {
     process.stderr.write(`error: ${(error as Error).message}\n`)
-    process.exit(1)
+    process.exit(Number((error as { exitCode?: number }).exitCode ?? 1))
   })
 }

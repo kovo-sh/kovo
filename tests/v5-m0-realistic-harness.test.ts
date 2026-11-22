@@ -17,8 +17,9 @@ import type {
 import { gradeRun } from '../benchmarks/realistic-bench/run.ts'
 import type { Finding } from '../src/domain.ts'
 import {
-  briefingToOpenApi, buildTelemetry, cellKeys, describeModelMode, endpointsFromReplaySpec,
-  parseRealisticArgs, pickLoginPath, planCell, probeLoginPath, stopEngine, translateFindings,
+  PreflightError, assertAgenticPreflight, briefingToOpenApi, buildTelemetry, cellKeys,
+  describeModelMode, detectWorkerSessions, endpointsFromReplaySpec, parseRealisticArgs,
+  pickLoginPath, planCell, probeLoginPath, stopEngine, summarizeAssignments, translateFindings,
 } from '../scripts/benchmark-realistic.ts'
 
 const execFileAsync = promisify(execFile)
@@ -67,6 +68,15 @@ test('CLI: --app all expands to all three apps and dedupes seeds', () => {
     { app: 'shopflow', seed: 4 }, { app: 'shopflow', seed: 5 },
     { app: 'opsportal', seed: 4 }, { app: 'opsportal', seed: 5 },
   ])
+})
+
+test('CLI: GUARDIAN_DATA_DIR is the default data dir and --allow-inert-workers parses', () => {
+  const args = parseRealisticArgs(['--allow-inert-workers'], { GUARDIAN_DATA_DIR: '/tmp/guardian-data' })
+  assert.equal(args.dataDir, '/tmp/guardian-data')
+  assert.equal(args.allowInertWorkers, true)
+  const override = parseRealisticArgs(['--data-dir', '/tmp/explicit'], { GUARDIAN_DATA_DIR: '/tmp/guardian-data' })
+  assert.equal(override.dataDir, '/tmp/explicit')
+  assert.equal(override.allowInertWorkers, false)
 })
 
 test('CLI: held-out requires salt and a held-out seed range', () => {
@@ -464,6 +474,96 @@ test('model mode: an empty profile set is reported as deterministic, never simul
   ])
   assert.equal(info.mode, 'agentic')
   assert.deepEqual(info.profiles, [{ name: 'primary', model: 'vendor/model', protocol: 'responses' }])
+})
+
+// ---------------------------------------------------------------------------------------------
+// Agentic preflight / inert-run guard
+// ---------------------------------------------------------------------------------------------
+
+function preflight(overrides: Partial<Parameters<typeof assertAgenticPreflight>[0]> = {}) {
+  return assertAgenticPreflight({
+    hasProfiles: true,
+    noLlm: false,
+    allowInertWorkers: false,
+    backendKind: 'local-jq',
+    workerSessions: false,
+    workerSessionsDetail: 'LocalJqBackend does not support worker sessions.',
+    ...overrides,
+  })
+}
+
+test('preflight: model profile + local-jq fails fast with exit code 2', () => {
+  let caught: unknown
+  try { preflight() } catch (error) { caught = error }
+  assert.ok(caught instanceof PreflightError)
+  assert.equal((caught as PreflightError).exitCode, 2)
+  assert.match((caught as Error).message, /worker-session-capable verifier backend \(docker\)/)
+  assert.match((caught as Error).message, /use --verifier docker or --no-llm/)
+  assert.match((caught as Error).message, /LocalJqBackend does not support worker sessions/)
+})
+
+test('preflight: --no-llm + local-jq is allowed (deterministic path)', () => {
+  assert.doesNotThrow(() => preflight({ noLlm: true }))
+})
+
+test('preflight: --allow-inert-workers is the explicit override', () => {
+  assert.doesNotThrow(() => preflight({ allowInertWorkers: true }))
+})
+
+test('preflight: docker + model profile is allowed when a session really opens', () => {
+  assert.doesNotThrow(() => preflight({ backendKind: 'docker', workerSessions: true, workerSessionsDetail: 'ok' }))
+})
+
+test('preflight: docker without socket access points at newgrp docker', () => {
+  let caught: unknown
+  try {
+    preflight({ backendKind: 'docker', workerSessionsDetail: 'permission denied while trying to connect to the Docker daemon socket' })
+  } catch (error) { caught = error }
+  assert.ok(caught instanceof PreflightError)
+  assert.equal((caught as PreflightError).exitCode, 2)
+  assert.match((caught as Error).message, /newgrp docker -c/)
+})
+
+test('capability: worker sessions are probed by opening and closing a session', async () => {
+  let closed = 0
+  const capable = await detectWorkerSessions({
+    openSession: async () => ({
+      stage: async () => '', exec: async () => ({ exitCode: 0, stdout: '', stderr: '', outputs: {} }),
+      analyze: async () => ({}), sast: async () => ({} as never), runScript: async () => ({} as never),
+      verifyStaticAst: async () => ({} as never), close: async () => { closed += 1 },
+    }) as never,
+  })
+  assert.equal(capable.supported, true)
+  assert.equal(closed, 1)
+
+  const incapable = await detectWorkerSessions({
+    openSession: async () => { throw new Error('LocalJqBackend does not support worker sessions.') },
+  })
+  assert.equal(incapable.supported, false)
+  assert.match(incapable.detail, /does not support worker sessions/)
+})
+
+test('diagnostics: assignment totals, investigation counters and top reasons are recorded', () => {
+  const summary = summarizeAssignments([
+    { status: 'complete', phase: 'threat_model' },
+    { status: 'complete', phase: 'verification' },
+    { status: 'complete', phase: 'investigation' },
+    { status: 'failed', phase: 'investigation', outcome: 'LocalJqBackend does not support worker sessions.' },
+    { status: 'failed', phase: 'investigation', outcome: 'LocalJqBackend does not support worker sessions.' },
+    { status: 'failed', phase: 'investigation', outcome: 'broker denied: password=super-secret' },
+    { status: 'canceled', phase: 'investigation', outcome: 'run stopped' },
+  ], ['fallback reason should not be used'], [{ value: 'super-secret', placeholder: '[[secret]]' }])
+  assert.equal(summary.total, 7)
+  assert.equal(summary.completed, 3)
+  assert.equal(summary.failed, 3)
+  assert.equal(summary.canceled, 1)
+  assert.equal(summary.investigationTotal, 5)
+  assert.equal(summary.investigationCompleted, 1)
+  assert.equal(summary.investigationFailed, 4)
+  assert.equal(summary.topFailureReasons[0], 'LocalJqBackend does not support worker sessions.')
+  assert.ok(summary.topFailureReasons.some(reason => reason.includes('broker denied')))
+  assert.ok(!summary.topFailureReasons.some(reason => reason.includes('super-secret')))
+  assert.ok(!summary.topFailureReasons.includes('fallback reason should not be used'))
 })
 
 test('shutdown: stopEngine aborts promptly and reports zero busy tasks', async () => {
