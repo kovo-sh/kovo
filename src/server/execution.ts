@@ -2424,6 +2424,7 @@ export class Execution {
                 respHeaders: ex.respHeaders,
                 body: ex.body,
                 durationMs: ex.durationMs,
+                secretMatches: ex.secretMatches,
                 secrets,
               })
               return saved.id
@@ -2607,6 +2608,7 @@ export class Execution {
                 respHeaders: ex.respHeaders,
                 body: ex.body,
                 durationMs: ex.durationMs,
+                secretMatches: ex.secretMatches,
                 secrets,
               })
               capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
@@ -3855,6 +3857,7 @@ export class Execution {
         respHeaders: ex.respHeaders,
         body: ex.body,
         durationMs: ex.durationMs,
+        secretMatches: ex.secretMatches,
         secrets: currentSecrets(),
       })
       this.storage.trackExchangeResources({
@@ -5086,6 +5089,7 @@ export class Execution {
           respHeaders: res.respHeaders,
           body: res.body,
           durationMs: res.durationMs,
+          secretMatches: res.secretMatches,
           secrets: currentSecrets(),
         })
 
@@ -5204,6 +5208,7 @@ export class Execution {
             respHeaders: res.respHeaders,
             body: res.body,
             durationMs: res.durationMs,
+            secretMatches: res.secretMatches,
             secrets: currentSecrets(),
           })
           trackPersonaResources(curRun, res, saved.id)
@@ -5302,6 +5307,7 @@ export class Execution {
               respHeaders: res.respHeaders,
               body: res.body,
               durationMs: res.durationMs,
+              secretMatches: res.secretMatches,
               secrets: currentSecrets(),
             })
             trackPersonaResources(curRun, res, saved.id)
@@ -5374,6 +5380,7 @@ export class Execution {
                 respHeaders: ex.respHeaders,
                 body: ex.body,
                 durationMs: ex.durationMs,
+                secretMatches: ex.secretMatches,
                 secrets: currentSecrets(),
               })
               this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
@@ -5437,6 +5444,7 @@ export class Execution {
                   respHeaders: ex.respHeaders,
                   body: ex.body,
                   durationMs: ex.durationMs,
+                  secretMatches: ex.secretMatches,
                   secrets: currentSecrets(),
                 })
                 trackPersonaResources(curRun, ex, saved.id)
@@ -5598,6 +5606,7 @@ export class Execution {
                 respHeaders: ex.respHeaders,
                 body: ex.body,
                 durationMs: ex.durationMs,
+                secretMatches: ex.secretMatches,
                 secrets: currentSecrets(),
               })
               trackPersonaResources(curRun, ex, saved.id)
@@ -5724,6 +5733,7 @@ export class Execution {
                 respHeaders: ex.respHeaders,
                 body: ex.body,
                 durationMs: ex.durationMs,
+                secretMatches: ex.secretMatches,
                 secrets: currentSecrets(),
               })
               trackPersonaResources(curRun, ex, saved.id)
@@ -5830,6 +5840,7 @@ export class Execution {
                 respHeaders: ex.respHeaders,
                 body: ex.body,
                 durationMs: ex.durationMs,
+                secretMatches: ex.secretMatches,
                 secrets: currentSecrets(),
               })
               return saved.id
@@ -5908,6 +5919,7 @@ export class Execution {
             respHeaders: syntheticEx.respHeaders,
             body: syntheticEx.body,
             durationMs: syntheticEx.durationMs,
+            secretMatches: syntheticEx.secretMatches,
             secrets: currentSecrets(),
           })
           // Second-order markers can surface in WebSocket frames or upgrade headers.
@@ -7036,6 +7048,7 @@ export class Execution {
           respHeaders: ex.respHeaders,
           body: ex.body,
           durationMs: ex.durationMs,
+          secretMatches: ex.secretMatches,
           secrets: currentSecrets(),
         })
         this.storage.trackExchangeResources({
@@ -7395,6 +7408,7 @@ export class Execution {
           respHeaders: ex.respHeaders,
           body: ex.body,
           durationMs: ex.durationMs,
+          secretMatches: ex.secretMatches,
           secrets: params.currentSecrets(),
         })
         this.storage.trackExchangeResources({
@@ -8105,6 +8119,7 @@ export class Execution {
           respHeaders: ex.respHeaders,
           body: ex.body,
           durationMs: ex.durationMs,
+          secretMatches: ex.secretMatches,
           secrets: currentSecrets(),
         })
         return saved.id

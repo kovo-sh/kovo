@@ -17,8 +17,8 @@ import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
-import { redact, redactHeaders } from './redact.ts'
-import type { NamedSecret } from './redact.ts'
+import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
+import type { NamedSecret, SecretMatch } from './redact.ts'
 
 export interface PublicObservation extends PreparedObservation {
   origin: string
@@ -145,6 +145,13 @@ export interface BrokerExchangeResult {
   bodyBytes: number
   bodyTruncated: boolean
   durationMs: number
+  /**
+   * Redacted structural evidence that secret-shaped values were present in the raw response body
+   * or headers before scrubbing. Fingerprints only (no raw values); see `SecretMatch` in
+   * `redact.ts`. Probes should treat a non-empty list as "disclosure candidate" and correlate
+   * `sha256Prefix` against a locally held secret to prove unauthorized disclosure.
+   */
+  secretMatches?: SecretMatch[]
   tls?: TlsMetadata
   observation: PublicObservation
 }
@@ -2949,6 +2956,14 @@ export class RequestBroker {
         ...secrets,
         ...this.redactedSecrets.values(),
       ]
+      // Structural evidence must be captured from the pre-redaction bytes: redaction is correct
+      // for logs/LLMs but erases what a disclosure verifier needs. Only bounded fingerprints leave
+      // this scope; raw values stay in memory for the duration of the scan.
+      const rawResponseHeaders = normalizeHeaders(response.headers)
+      const secretMatches = [
+        ...scanSecrets(rawBody, { secrets: effectiveSecrets }),
+        ...scanSecretHeaders(rawResponseHeaders, { secrets: effectiveSecrets }),
+      ]
       const safeBody = redact(rawBody, effectiveSecrets)
       const bodySha256 = createHash('sha256').update(safeBody).digest('hex')
       const scrubbedReqHeaders = redactHeaders(normalizeHeaders(outboundHeaders), effectiveSecrets)
@@ -2965,7 +2980,7 @@ export class RequestBroker {
         status: response.status,
         mediaType: obs.mediaType,
         reqHeaders: scrubbedReqHeaders,
-        respHeaders: redactHeaders(normalizeHeaders(response.headers), effectiveSecrets),
+        respHeaders: redactHeaders(rawResponseHeaders, effectiveSecrets),
         setCookies: parseSetCookies(response.headers),
         bodyPreview: safeBody.slice(0, bodyPreviewLimit),
         body: safeBody,
@@ -2973,6 +2988,7 @@ export class RequestBroker {
         bodyBytes: response.bodyBytes ?? Buffer.byteLength(rawBody),
         bodyTruncated: Boolean(response.bodyTruncated),
         durationMs: Date.now() - started,
+        secretMatches,
         ...(response.tls ? { tls: response.tls } : {}),
         observation: obs,
       }

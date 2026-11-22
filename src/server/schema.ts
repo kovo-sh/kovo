@@ -9,6 +9,7 @@ import type {
   VerificationTier, WorkerPhase, WorkerStatus,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
+import type { SecretMatch } from './redact.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -244,6 +245,8 @@ export const brokerExchanges = sqliteTable('broker_exchanges', {
   bodyPreview: text('body_preview').notNull(),
   bodyArtifactId: text('body_artifact_id'),
   bodySha256: text('body_sha256').notNull(),
+  /** Redacted structural evidence from the pre-scrub response (fingerprints only). */
+  secretMatches: text('secret_matches', { mode: 'json' }).$type<SecretMatch[]>().notNull(),
   durationMs: integer('duration_ms').notNull(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('broker_exchanges_run').on(table.runId, table.origin)])

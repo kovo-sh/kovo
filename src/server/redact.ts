@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 export interface NamedSecret {
   value: string
   placeholder: string
@@ -26,6 +28,327 @@ export function redact(text: string, secrets: readonly NamedSecret[] = []): stri
     if (b64url !== secret.value && b64url !== b64 && b64url.length >= 4) out = out.replaceAll(b64url, secret.placeholder)
   }
   return credentialPatterns.reduce((value, pattern) => value.replace(pattern, '[redacted]'), out)
+}
+
+export const secretMatchKinds = [
+  'named_secret',
+  'credential',
+  'jwt',
+  'private_key',
+  'credential_header',
+  'bearer',
+  'key_value',
+] as const
+export type SecretMatchKind = typeof secretMatchKinds[number]
+
+/**
+ * Redacted structural evidence that a secret-shaped value appeared in a broker exchange.
+ *
+ * Safety contract: this shape never contains the raw secret, not even a substring. Only a
+ * truncated SHA-256 fingerprint is kept so a verifier that already holds the secret (e.g. from
+ * the persona vault) can prove the disclosed bytes match without the value ever leaving the
+ * broker, entering logs, the DB body artifact, or an LLM prompt.
+ */
+export interface SecretMatch {
+  kind: SecretMatchKind
+  /** First 12 hex chars of SHA-256(rawSecretValue). Enough for correlation, not reversal. */
+  sha256Prefix: string
+  /** Where the match was observed: `headers.<name>` or a bounded JSON path such as `body.items[0].key`. */
+  fieldPath?: string
+  /** Bounded occurrence count within that field path. */
+  count: number
+}
+
+export interface SecretScanOptions {
+  secrets?: readonly NamedSecret[]
+  /** Walk JSON bodies to attribute matches to key paths. Defaults to true. */
+  jsonPaths?: boolean
+  /** Maximum number of returned match entries. Defaults to 64. */
+  maxMatches?: number
+  /** Maximum occurrence count per entry. Defaults to 1000. */
+  maxCountPerMatch?: number
+}
+
+const defaultMaxMatches = 64
+const defaultMaxCountPerMatch = 1_000
+const maxScannedMatchLength = 16_384
+const maxJsonBodyScanBytes = 262_144
+const maxJsonNodes = 4_000
+const maxJsonDepth = 8
+const maxFieldPathLength = 256
+const maxHeaderScanLength = 8_192
+
+interface CredentialDescriptor {
+  kind: SecretMatchKind
+  pattern: RegExp
+  extract?: (match: string) => string | null
+  minValueLength: number
+}
+
+/**
+ * Structural detection mirrors `credentialPatterns` above: the same shapes that redaction
+ * scrubs are fingerprintable. Keep these two lists in sync when redaction patterns change.
+ */
+const credentialDescriptors: readonly CredentialDescriptor[] = [
+  { kind: 'credential', pattern: credentialPatterns[0]!, minValueLength: 0 },
+  { kind: 'jwt', pattern: credentialPatterns[1]!, minValueLength: 0 },
+  { kind: 'private_key', pattern: credentialPatterns[2]!, minValueLength: 0 },
+  { kind: 'credential_header', pattern: credentialPatterns[3]!, extract: extractHeaderValue, minValueLength: 6 },
+  { kind: 'bearer', pattern: credentialPatterns[4]!, extract: extractBearerValue, minValueLength: 6 },
+  { kind: 'key_value', pattern: credentialPatterns[5]!, extract: extractKeyValue, minValueLength: 6 },
+]
+
+/** True when the text itself contains a redactable credential shape (used to keep field paths clean). */
+function containsSecretShape(text: string): boolean {
+  if (!text) return false
+  for (const descriptor of credentialDescriptors) {
+    const pattern = new RegExp(descriptor.pattern.source, descriptor.pattern.flags)
+    for (const match of text.matchAll(pattern)) {
+      const raw = descriptor.extract ? descriptor.extract(match[0]) : match[0]
+      if (raw && raw.length >= descriptor.minValueLength) return true
+    }
+  }
+  return false
+}
+
+/** Stable fingerprint used by verifiers to compare against a locally held secret. */
+export function sha256Prefix(value: string): string {
+  const bounded = value.length > maxScannedMatchLength ? value.slice(0, maxScannedMatchLength) : value
+  return createHash('sha256').update(bounded, 'utf8').digest('hex').slice(0, 12)
+}
+
+/**
+ * Scans a pre-redaction text body for secret-shaped values and registered named secrets,
+ * returning redacted structural metadata only. Call this before `redact()`; the original
+ * string is never mutated and never returned.
+ */
+export function scanSecrets(text: string, options: SecretScanOptions = {}): SecretMatch[] {
+  if (!text) return []
+  const acc = new MatchAccumulator(options.maxMatches ?? defaultMaxMatches, options.maxCountPerMatch ?? defaultMaxCountPerMatch)
+  const named = options.secrets ?? []
+  const leaves = options.jsonPaths === false ? null : tryJsonStringLeaves(text)
+  if (leaves) {
+    for (const leaf of leaves) scanRegion(acc, leaf.text, leaf.path, named)
+    // Whole-body pass only fills in shapes that JSON leaves could not attribute
+    // (e.g. a PEM block spanning string boundaries, or malformed JSON).
+    scanRegion(acc, text, 'body', named, acc.fingerprints())
+    return acc.list()
+  }
+  scanRegion(acc, text, 'body', named)
+  return acc.list()
+}
+
+/** Same structural scan for response headers (pass the pre-redaction header map). */
+export function scanSecretHeaders(
+  headers: Record<string, string | string[] | undefined>,
+  options: SecretScanOptions = {},
+): SecretMatch[] {
+  const acc = new MatchAccumulator(options.maxMatches ?? defaultMaxMatches, options.maxCountPerMatch ?? defaultMaxCountPerMatch)
+  const named = options.secrets ?? []
+  for (const [name, rawValue] of Object.entries(headers)) {
+    if (rawValue === undefined) continue
+    const value = (Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)).slice(0, maxHeaderScanLength)
+    if (!value) continue
+    scanRegion(acc, value, `headers.${cleanPathSegment(name).toLowerCase()}`, named)
+  }
+  return acc.list()
+}
+
+class MatchAccumulator {
+  private readonly entries = new Map<string, SecretMatch>()
+  private readonly fingerprintsSeen = new Set<string>()
+  private readonly maxMatches: number
+  private readonly maxCount: number
+
+  constructor(maxMatches: number, maxCount: number) {
+    this.maxMatches = maxMatches
+    this.maxCount = maxCount
+  }
+
+  fingerprints(): ReadonlySet<string> {
+    return this.fingerprintsSeen
+  }
+
+  countCap(): number {
+    return this.maxCount
+  }
+
+  add(kind: SecretMatchKind, sha256PrefixValue: string, fieldPath: string, count = 1): void {
+    const key = `${kind}\u0000${sha256PrefixValue}\u0000${fieldPath}`
+    const existing = this.entries.get(key)
+    if (existing) {
+      existing.count = Math.min(this.maxCount, existing.count + count)
+      return
+    }
+    this.fingerprintsSeen.add(sha256PrefixValue)
+    if (this.entries.size >= this.maxMatches) return
+    this.entries.set(key, { kind, sha256Prefix: sha256PrefixValue, fieldPath, count: Math.min(count, this.maxCount) })
+  }
+
+  list(): SecretMatch[] {
+    return [...this.entries.values()]
+  }
+}
+
+function scanRegion(
+  acc: MatchAccumulator,
+  text: string,
+  fieldPath: string,
+  namedSecrets: readonly NamedSecret[],
+  skipFingerprints?: ReadonlySet<string>,
+): void {
+  if (!text) return
+  // Field paths derive from attacker-influenceable JSON keys / header names. Never let a secret
+  // value ride along inside structured metadata: drop to a generic path when the path itself looks
+  // like (or contains) a secret.
+  const safeFieldPath = isSafeMetadataPath(fieldPath, namedSecrets)
+    ? fieldPath
+    : (fieldPath.startsWith('headers.') ? 'headers' : 'body')
+  for (const descriptor of credentialDescriptors) {
+    const pattern = new RegExp(descriptor.pattern.source, descriptor.pattern.flags)
+    for (const match of text.matchAll(pattern)) {
+      const raw = descriptor.extract ? descriptor.extract(match[0]) : match[0]
+      if (!raw || raw.length < descriptor.minValueLength) continue
+      const fingerprint = sha256Prefix(raw)
+      if (skipFingerprints?.has(fingerprint)) continue
+      acc.add(descriptor.kind, fingerprint, safeFieldPath)
+    }
+  }
+  for (const secret of namedSecrets) {
+    if (!secret.value || secret.value.length < 4) continue
+    let occurrences = 0
+    for (const form of secretVariants(secret.value)) {
+      occurrences += countOccurrences(text, form, acc.countCap())
+      if (occurrences >= acc.countCap()) break
+    }
+    if (occurrences === 0) continue
+    const fingerprint = sha256Prefix(secret.value)
+    if (skipFingerprints?.has(fingerprint)) continue
+    acc.add('named_secret', fingerprint, safeFieldPath, occurrences)
+  }
+}
+
+const metadataPathPattern = /^[A-Za-z0-9_.\[\]<> -]{1,256}$/
+
+/**
+ * Field paths are attacker-influenced (JSON keys / header names), so metadata paths must be
+ * structurally boring: printable identifiers only, no secret shapes, no registered secrets, and no
+ * high-entropy blobs. Anything else is dropped by callers rather than persisted.
+ */
+export function isSafeMetadataPath(fieldPath: string, namedSecrets: readonly NamedSecret[] = []): boolean {
+  if (!fieldPath || !metadataPathPattern.test(fieldPath)) return false
+  if (containsSecretShape(fieldPath)) return false
+  if (looksHighEntropy(fieldPath)) return false
+  for (const secret of namedSecrets) {
+    if (secret.value && secret.value.length >= 4 && fieldPath.includes(secret.value)) return false
+  }
+  return true
+}
+
+function looksHighEntropy(segment: string): boolean {
+  if (segment.length < 24) return false
+  const digits = segment.match(/\d/g)?.length ?? 0
+  const letters = segment.match(/[A-Za-z]/g)?.length ?? 0
+  return digits >= 6 && letters >= 6
+}
+
+function secretVariants(value: string): string[] {
+  const forms = new Set<string>([value])
+  const encoded = encodeURIComponent(value)
+  if (encoded !== value && encoded.length >= 6) forms.add(encoded)
+  const b64 = Buffer.from(value, 'utf8').toString('base64')
+  if (b64 !== value && b64.length >= 4) forms.add(b64)
+  const b64url = Buffer.from(value, 'utf8').toString('base64url')
+  if (b64url !== value && b64url !== b64 && b64url.length >= 4) forms.add(b64url)
+  return [...forms]
+}
+
+function countOccurrences(haystack: string, needle: string, cap: number): number {
+  if (cap <= 0) return 0
+  let count = 0
+  let index = 0
+  while (count < cap) {
+    index = haystack.indexOf(needle, index)
+    if (index === -1) break
+    count += 1
+    index += needle.length
+  }
+  return count
+}
+
+function extractHeaderValue(match: string): string | null {
+  const index = match.indexOf(':')
+  if (index === -1) return null
+  const value = match.slice(index + 1).trim()
+  return value || null
+}
+
+function extractBearerValue(match: string): string | null {
+  const parsed = /^\s*Bearer\s+(\S+)\s*$/i.exec(match)
+  return parsed?.[1] ?? null
+}
+
+function extractKeyValue(match: string): string | null {
+  const separator = match.search(/[:=]/)
+  if (separator === -1) return null
+  let value = match.slice(separator + 1).trim()
+  if (value.length >= 2) {
+    const first = value[0]
+    const last = value[value.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) value = value.slice(1, -1)
+  }
+  return value || null
+}
+
+/**
+ * Parses a JSON body and returns its string leaves with bounded key paths. Returns null when the
+ * body is not JSON or exceeds the scan budget, in which case callers attribute matches to `body`.
+ */
+function tryJsonStringLeaves(text: string): Array<{ path: string; text: string }> | null {
+  const trimmed = text.trim()
+  if (trimmed.length < 2 || trimmed.length > maxJsonBodyScanBytes) return null
+  if (trimmed[0] !== '{' && trimmed[0] !== '[') return null
+  let root: unknown
+  try {
+    root = JSON.parse(trimmed)
+  } catch {
+    return null
+  }
+  const leaves: Array<{ path: string; text: string }> = []
+  let nodes = 0
+  const walk = (value: unknown, path: string, depth: number): void => {
+    if (nodes >= maxJsonNodes || depth > maxJsonDepth || path.length > maxFieldPathLength) return
+    nodes += 1
+    if (typeof value === 'string') {
+      if (value) leaves.push({ path, text: value })
+      return
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        walk(value[index], `${path}[${index}]`, depth + 1)
+        if (nodes >= maxJsonNodes) return
+      }
+      return
+    }
+    if (value && typeof value === 'object') {
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        const segment = cleanPathSegment(key)
+        if (!segment) continue
+        walk(child, path ? `${path}.${segment}` : segment, depth + 1)
+        if (nodes >= maxJsonNodes) return
+      }
+    }
+  }
+  walk(root, 'body', 0)
+  return leaves
+}
+
+function cleanPathSegment(key: string): string {
+  // Key names are attacker-influenced. Strip control characters, bound length, and replace
+  // high-entropy blobs so the metadata stays log-safe even when a response uses pathological keys.
+  const cleaned = key.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim()
+  if (looksHighEntropy(cleaned)) return '<key>'
+  return cleaned.slice(0, 48)
 }
 
 export function redactHeaders(headers: Record<string, string>, secrets: readonly NamedSecret[] = []): Record<string, string> {
