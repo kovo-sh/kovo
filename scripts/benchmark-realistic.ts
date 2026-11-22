@@ -55,6 +55,7 @@ import { Store } from '../src/server/store.ts'
 import { selectVerifierBackend } from './benchmark-backend.ts'
 import type { VerifierBackendKind } from './benchmark-backend.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
+import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 
 // ---------------------------------------------------------------------------------------------
 // CLI
@@ -602,6 +603,10 @@ export interface CellMeta {
   findingsPersisted: number
   findingsSubmitted: number
   baselineChecksExcluded: number
+  endpointsDiscovered: number
+  endpointParamsDiscovered: number
+  brokerExchanges: number
+  requestsOnDiscoveredRoutes: number
   requestCount: number
   oracleEventCount: number
   notes: string[]
@@ -861,7 +866,11 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     })
 
     const selected = await selectVerifierBackend(args.verifier)
-    backend = selected.backend
+    backend = selected.kind === 'docker'
+      // Tag containers with this workspace so a crashed run can be reclaimed, and so the
+      // harness leaves zero orphan containers after stop.
+      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
+      : selected.backend
     backendKind = selected.kind
     notes.push(`Zero-LLM verifier backend: ${backendKind}`)
 
@@ -923,6 +932,18 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const card = gradeRun(gradeInput)
     const endedAt = nowMs()
     const gitSha = resolveGitSha()
+    const requestsOnDiscoveredRoutes = gradeInput.requestLog.filter(req =>
+      detail.endpoints.some(ep => endpointMatches(
+        { method: req.method, path: req.path },
+        { method: ep.method, path: ep.pathTemplate },
+      )),
+    ).length
+    if (model.mode === 'deterministic-no-llm' && requestsOnDiscoveredRoutes === 0) {
+      notes.push(
+        'deterministic path requested none of the discovered endpoint templates '
+        + '(driveInvestigation returns without an LLM profile; Phase-0 only probes its fixed seed list)',
+      )
+    }
 
     const meta: CellMeta = {
       app,
@@ -947,6 +968,10 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       findingsPersisted: detail.findings.length,
       findingsSubmitted: submitted.length,
       baselineChecksExcluded: detail.findings.filter(f => f.findingKind === 'baseline_check').length,
+      endpointsDiscovered: detail.endpoints.length,
+      endpointParamsDiscovered: detail.endpointParams.length,
+      brokerExchanges: detail.exchangesSummary.length,
+      requestsOnDiscoveredRoutes,
       requestCount: gradeInput.requestLog.length,
       oracleEventCount: gradeInput.oracleEvents.length,
       notes,
