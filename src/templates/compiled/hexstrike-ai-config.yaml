@@ -3,7 +3,7 @@ name: "HexStrike AI MCP Agents - Config"
 severity: "info"
 description: "HexStrike AI MCP Agents server config page exposure."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

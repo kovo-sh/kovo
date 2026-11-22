@@ -3,7 +3,7 @@ name: "Rexify Configuration - Exposure"
 severity: "high"
 description: "Rexfile configuration from the Rex/Rexify automation framework was exposed. These files may contain SSH credentials, server hostnames, private key paths, and other sensitive data."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

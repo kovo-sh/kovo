@@ -3,7 +3,7 @@ name: "AdGuard - Installation"
 severity: "high"
 description: "AdGuard Installation panel has been exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "adguard"
   - "misconfig"

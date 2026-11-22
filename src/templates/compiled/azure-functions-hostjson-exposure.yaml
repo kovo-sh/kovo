@@ -3,7 +3,7 @@ name: "Azure Functions host.json Configuration Exposure"
 severity: "medium"
 description: "Detected exposed Azure Functions host.json configuration files. The exposed metadata revealed sensitive runtime, logging, extension, and infrastructure settings that could aid attackers in understanding the application architecture."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "azure"
   - "config"

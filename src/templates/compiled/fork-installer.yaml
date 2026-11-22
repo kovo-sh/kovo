@@ -3,7 +3,7 @@ name: "Fork CMS - Installer"
 severity: "critical"
 description: "Fork CMS installer page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "exposure"

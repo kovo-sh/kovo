@@ -3,7 +3,7 @@ name: "Zipkin Configuration - Exposure"
 severity: "low"
 description: "Detected the exposure of the Zipkin configuration endpoint (/config.json), which may reveal internal configuration details."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "zipkin"
   - "exposure"

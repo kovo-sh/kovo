@@ -3,7 +3,7 @@ name: "CodeClimate Configuration File - Exposure"
 severity: "info"
 description: "Detected CodeClimate configuration file, exposing code quality settings and excluded paths."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

@@ -3,7 +3,7 @@ name: "Gitea Public Registration Enabled"
 severity: "high"
 description: "A misconfiguration in Gitea allows arbitrary users to sign up and read code hosted on the service."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "gitea"

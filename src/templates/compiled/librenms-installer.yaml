@@ -3,7 +3,7 @@ name: "LibreNMS Installation Page - Exposure"
 severity: "high"
 description: "Detects exposed LibreNMS installation page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

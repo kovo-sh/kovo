@@ -3,7 +3,7 @@ name: "Sensitive Configuration Files Listing - Detect"
 severity: "medium"
 description: "Listing of sensitive configuration files containing items such as usernames, passwords, and IP addresses was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "listing"

@@ -3,7 +3,7 @@ name: "Cargo TOML File Disclosure"
 severity: "info"
 description: "Safe check derived from cargo-toml-file: Cargo TOML File Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

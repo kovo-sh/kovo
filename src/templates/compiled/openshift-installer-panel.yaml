@@ -3,7 +3,7 @@ name: "OpenShift Assisted Installer Panel - Detect"
 severity: "medium"
 description: "OpenShift Assisted Installer panel was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "panel"
   - "openshift"

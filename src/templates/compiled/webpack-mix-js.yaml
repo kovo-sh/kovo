@@ -3,7 +3,7 @@ name: "Webpack Mix File Disclosure"
 severity: "info"
 description: "Safe check derived from webpack-mix-js: Webpack Mix File Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

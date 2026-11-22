@@ -3,7 +3,7 @@ name: "CirCarLife - Installer"
 severity: "critical"
 description: "A CirCarLife admin panel was accessed. CirCarLife is an internet-connected electric vehicle charging station"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "scada"
   - "circontrol"

@@ -3,7 +3,7 @@ name: "Seafile API - Detect"
 severity: "info"
 description: "Seafile API was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "api"

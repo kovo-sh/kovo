@@ -3,7 +3,7 @@ name: "Vagrantfile Exposure"
 severity: "low"
 description: "Vagrantfile is exposed to external users."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

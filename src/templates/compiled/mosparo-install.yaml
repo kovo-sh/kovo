@@ -3,7 +3,7 @@ name: "mosparo Exposed Installation"
 severity: "high"
 description: "mosparo is susceptible to the Installation page exposure due to misconfiguration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "mosparo"

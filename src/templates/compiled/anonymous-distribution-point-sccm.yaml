@@ -3,7 +3,7 @@ name: "Microsoft SCCM - Anonymous Distribution Point Access"
 severity: "medium"
 description: "Microsoft System Center Configuration Manager (SCCM) can be configured to allow anonymous access to its distribution points.This can lead to sensitive data exposure and information gathering by unauthorized users.This misconfiguration is exploitable only via HTTP."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "microsoft"

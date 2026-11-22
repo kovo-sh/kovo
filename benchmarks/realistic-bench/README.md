@@ -100,6 +100,29 @@ The same scorecard can be produced from externally captured artifacts with
 `node benchmarks/realistic-bench/run.ts grade --truth gt.json --findings f.json --events ev.json
 --requests req.json --telemetry tel.json --md scorecard.md`.
 
+## Parallel agentic matrix (real `Execution` harness)
+
+`scripts/benchmark-realistic.ts` drives Guardian's real `Execution` loop. A parallel
+agentic matrix must not share one Guardian data dir (the second Store would fail with
+`Another Guardian server is using this data directory`). With `--concurrency > 1`,
+per-cell isolation is on by default:
+
+```sh
+# Run from the repo root. The key stays in the source data dir; only profile metadata
+# is copied and credentials/ is symlinked into each cell.
+GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=<guardian-data-dir> \
+newgrp docker -c 'cd <repo> && node scripts/benchmark-realistic.ts \
+  --app all --seeds 1 --mode grey-box --verifier docker \
+  --concurrency 3 --isolate-data-dir --budget-usd 3 \
+  --out-dir /tmp/rb-agentic-matrix'
+```
+
+Each cell creates `<out-dir>/data/<app>-seed<seed>-<mode>/`, initializes a fresh Guardian
+Store, copies only the enabled `model_profiles` rows (+ workspace identity), and symlinks
+`credentials/` to the source data dir. The key is never copied into the out-dir. Isolated
+dirs are removed after grading unless `--keep-data-dirs` is passed; `--isolate-data-dir`
+can also be forced for a single cell.
+
 **Current engine gap (do not misread as a benchmark bug):** as of repo `c345f46` / engine
 `ca992f6`, the full Guardian pipeline confirmed **0 vulnerabilities on every dev seed tried**
 (acme 0/22, 0/22, 0/20; shopflow 0/18, 0/19, 0/20; opsportal 0/16, 0/18, 0/17 for seeds

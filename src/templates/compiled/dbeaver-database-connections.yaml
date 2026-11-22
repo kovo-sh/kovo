@@ -3,7 +3,7 @@ name: "DBeaver Database Connections - Detect"
 severity: "info"
 description: "DBeaver database connections were detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "dbeaver"
   - "files"

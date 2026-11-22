@@ -3,7 +3,7 @@ name: "Guardfile Config - Detect"
 severity: "info"
 description: "Guardfile configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "file"

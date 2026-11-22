@@ -3,7 +3,7 @@ name: "mCloud Panel - Installer"
 severity: "critical"
 description: "mCloud installer was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "panel"
   - "mcloud"

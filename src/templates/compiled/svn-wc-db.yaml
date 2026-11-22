@@ -3,7 +3,7 @@ name: "SVN wc.db File Exposure"
 severity: "medium"
 description: "SVN wc.db file is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "msf"
   - "exposure"

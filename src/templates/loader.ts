@@ -6,13 +6,36 @@ import { containsDestructivePayload, containsWebshellSignature } from '../replay
 import { parseMiniYaml } from './yaml.ts'
 
 export const templateTechTags = [
-  'generic', 'nextjs', 'vite', 'express', 'django', 'fastapi', 'springboot', 'nestjs', 'graphql',
+  'generic', 'generic-web-exposure', 'nextjs', 'vite', 'express', 'django', 'fastapi', 'springboot', 'nestjs', 'graphql',
   'clerk', 'supabase', 'wordpress', 'nginx', 'apache', 'php', 'swagger', 'cloudflare', 'react', 'node',
   'rails', 'flask', 'laravel', 'symfony', 'drupal', 'jenkins', 'gitlab', 'grafana', 'prometheus',
   'kibana', 'elasticsearch', 'tomcat', 'iis', 'traefik', 'keycloak', 'auth0', 'oidc',
   'java', 'go', 'python', 'dotnet', 'actuator', 'nuxt', 'vue', 'angular', 'vercel', 's3', 'kubernetes', 'docker',
+  // Vendor / appliance families: never selected unless the live target or mounted repo
+  // fingerprint matches the vendor explicitly. This keeps consumer web stacks (Express,
+  // Next.js, FastAPI) from burning the template cap on camera/NAS/appliance probes.
+  'cisco', 'aem', 'adobe', '3cx', 'avtech', 'hikvision', 'dahua', 'axis', 'fortinet', 'citrix',
+  'vmware', 'sonicwall', 'juniper', 'mikrotik', 'zyxel', 'synology', 'qnap', 'dlink', 'tplink',
+  'netgear', 'draytek', 'grandstream', 'polycom', 'f5', 'paloalto', 'sophos', 'zywave',
 ] as const
 export type TemplateTechTag = typeof templateTechTags[number]
+
+/** Appliance/vendor families that only run when the target explicitly fingerprints them. */
+export const vendorApplianceTechTags: ReadonlySet<string> = new Set([
+  'cisco', 'aem', 'adobe', '3cx', 'avtech', 'hikvision', 'dahua', 'axis', 'fortinet', 'citrix',
+  'vmware', 'sonicwall', 'juniper', 'mikrotik', 'zyxel', 'synology', 'qnap', 'dlink', 'tplink',
+  'netgear', 'draytek', 'grandstream', 'polycom', 'f5', 'paloalto', 'sophos', 'zywave',
+])
+
+/** Universal exposure checks that are safe/meaningful on any web origin. */
+export const genericWebExposureTag = 'generic-web-exposure' as const
+
+/** Dynamic, discovery-derived path placeholders resolved per origin at runtime. */
+export const dynamicTemplatePathPlaceholders = [
+  'discovered_protected_path',
+  'discovered_api_path',
+] as const
+export type DynamicTemplatePathPlaceholder = typeof dynamicTemplatePathPlaceholders[number]
 
 export const defaultCompiledTemplateLimit = 150
 export const compiledTemplateLimitCeiling = 400
@@ -88,7 +111,7 @@ export class TemplateValidationError extends Error {
 
 const thirdPartyOastPattern = /(?:interact\.sh|interactsh|oast\.(?:pro|live|site|online|fun|me)|oast\.[a-z]{2,10}\b|burpcollaborator|requestbin|pipedream|webhook\.site|ngrok|canarytokens|dnslog|ceye\.io|oastify|beeceptor|requestcatcher|dnsbin\.|bxss\.me|xss\.ht)/i
 const privateHostPattern = /(?:\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\b169\.254\.\d{1,3}\.\d{1,3}\b|\b0\.0\.0\.0\b|\blocalhost\b|\[::1?\]|::ffff:|metadata\.google\.internal|metadata\.azure\.internal|100\.100\.100\.200|\b2852039166\b|\b0xa9fea9fe\b|\bfd[0-9a-f]{2}:)/i
-const allowedPlaceholders = /\{\{(?:rand|guardian_canary_http|guardian_canary_dns)\}\}/g
+const allowedPlaceholders = /\{\{(?:rand|guardian_canary_http|guardian_canary_dns|discovered_protected_path|discovered_api_path)\}\}/g
 const originLikeHeaders = /^(?:origin|referer)$/i
 
 function decodeLoose(text: string): string {
@@ -98,7 +121,7 @@ function decodeLoose(text: string): string {
 function assertRequestFieldSafe(label: string, value: string, headerName?: string) {
   const stripped = value.replace(allowedPlaceholders, 'X')
   if (/\{\{[^}]*\}\}/.test(stripped)) {
-    throw new TemplateValidationError(`${label} uses an unknown {{placeholder}}; only rand, guardian_canary_http and guardian_canary_dns are allowed.`)
+    throw new TemplateValidationError(`${label} uses an unknown {{placeholder}}; only rand, guardian_canary_http, guardian_canary_dns, discovered_protected_path and discovered_api_path are allowed.`)
   }
   const decoded = decodeLoose(decodeLoose(stripped))
   if (/[\r\n\0]/.test(decoded)) throw new TemplateValidationError(`${label} contains control characters.`)
@@ -146,7 +169,11 @@ export function assertTemplateSafety(t: SafeTemplate): void {
       throw new TemplateValidationError(`Method ${method} is only allowed in templates marked requiresTier3: true.`)
     }
     if (request.path !== undefined) {
-      if (!request.path.startsWith('/') || request.path.startsWith('//')) {
+      const startsWithDynamic = /^\{\{discovered_[a-z_]+\}\}/.test(request.path)
+      if (!request.path.startsWith('/') && !startsWithDynamic) {
+        throw new TemplateValidationError('Template request paths must start with a single "/" (or a discovered_* placeholder).')
+      }
+      if (request.path.startsWith('//')) {
         throw new TemplateValidationError('Template request paths must start with a single "/".')
       }
       assertRequestFieldSafe('path', request.path)
@@ -199,7 +226,11 @@ export function validateSafeTemplate(raw: unknown, sourceFile?: string): SafeTem
     throw new TemplateValidationError(`${issue?.path.join('.') || 'template'}: ${issue?.message ?? 'invalid'}`)
   }
   const { 'matchers-condition': matchersCondition, ...rest } = parsed.data
-  const template: SafeTemplate = { ...rest, matchersCondition, ...(sourceFile ? { sourceFile } : {}) }
+  // Backwards-compatible tag alias: legacy tooling/tests look for the `generic` bucket,
+  // while v5 splits universal exposure checks into `generic-web-exposure`.
+  const tech = [...rest.tech]
+  if (tech.includes(genericWebExposureTag) && !tech.includes('generic') && tech.length < 6) tech.push('generic')
+  const template: SafeTemplate = { ...rest, tech, matchersCondition, ...(sourceFile ? { sourceFile } : {}) }
   assertTemplateSafety(template)
   return template
 }
@@ -269,6 +300,98 @@ export interface TemplateSelection {
   skipped: Array<{ id: string; reason: string }>
 }
 
+/**
+ * Score/rank a template for a concrete fingerprint. Lower is better.
+ *   0  curated custom + explicit tech match
+ *   1  explicit tech match + modern CVE (>= 2021)
+ *   2  curated custom generic
+ *   3  explicit tech match (legacy / no CVE)
+ *   4  generic-web-exposure (universal)
+ *   5  plain generic
+ *   6  legacy CVE (< 2021)
+ */
+function templateGroupRank(t: SafeTemplate, tags: ReadonlySet<string>): number {
+  const curated = Boolean(t.sourceFile && !/(?:^|\/)compiled\//.test(t.sourceFile.replaceAll('\\', '/')))
+  const explicitTech = t.tech.some(x => x !== 'generic' && x !== genericWebExposureTag && tags.has(x))
+  const cveYear = Number(t.cve?.split('-')[1] ?? 0)
+  if (curated) return explicitTech ? 0 : 2
+  if (explicitTech && cveYear >= 2021) return 1
+  if (explicitTech) return 3
+  if (t.tech.includes(genericWebExposureTag)) return 4
+  if (cveYear > 0 && cveYear < 2021) return 6
+  return 5
+}
+
+export function isVendorApplianceTemplate(t: SafeTemplate): boolean {
+  return t.tech.some(x => vendorApplianceTechTags.has(x))
+}
+
+export function selectSafeTemplates(
+  templates: readonly SafeTemplate[],
+  options: {
+    techTags?: readonly string[]
+    templateIds?: readonly string[]
+    cveIds?: readonly string[]
+    tier: number
+    maxTemplates: number
+  },
+): TemplateSelection {
+  const tags = normalizeTechTagSet(options.techTags)
+  const wantIds = options.templateIds?.length ? new Set(options.templateIds) : null
+  const wantCves = options.cveIds?.length ? new Set(options.cveIds.map(c => c.toUpperCase())) : null
+  const selected: SafeTemplate[] = []
+  const skipped: Array<{ id: string; reason: string }> = []
+  for (const t of templates) {
+    if (wantIds && !wantIds.has(t.id)) continue
+    if (wantCves && !(t.cve && wantCves.has(t.cve.toUpperCase())) && !wantIds) continue
+    if (t.requiresTier3 && options.tier < 3) { skipped.push({ id: t.id, reason: 'requires Tier 3' }); continue }
+    // Vendor appliances are excluded unless the fingerprint names the vendor explicitly.
+    const vendorTags = t.tech.filter(x => vendorApplianceTechTags.has(x))
+    if (vendorTags.length > 0 && !vendorTags.some(x => tags.has(x))) {
+      skipped.push({ id: t.id, reason: 'vendor appliance not fingerprinted' })
+      continue
+    }
+    const techMatch = t.tech.includes('generic') || t.tech.includes(genericWebExposureTag) || t.tech.some(x => tags.has(x))
+    if (!wantIds && !techMatch) { skipped.push({ id: t.id, reason: 'tech mismatch' }); continue }
+    selected.push(t)
+  }
+  const severityRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
+  selected.sort((a, b) =>
+    templateGroupRank(a, tags) - templateGroupRank(b, tags) ||
+    severityRank[a.severity] - severityRank[b.severity] ||
+    Number(b.cve?.split('-')[1] ?? 0) - Number(a.cve?.split('-')[1] ?? 0) ||
+    (a.cve ? 0 : 1) - (b.cve ? 0 : 1) ||
+    a.id.localeCompare(b.id))
+  if (selected.length > options.maxTemplates) {
+    for (const t of selected.splice(options.maxTemplates)) skipped.push({ id: t.id, reason: 'template cap' })
+  }
+  return { selected, skipped }
+}
+
+export function selectTemplatesForTech(
+  templates: readonly SafeTemplate[],
+  options: { techTags?: readonly string[]; templateIds?: readonly string[]; cveIds?: readonly string[]; tier: number; maxTemplates?: number },
+): TemplateSelection {
+  const rawMax = options.maxTemplates ?? defaultCompiledTemplateLimit
+  const clampedMax = Number.isFinite(rawMax)
+    ? Math.max(1, Math.min(Math.round(rawMax), compiledTemplateLimitCeiling))
+    : defaultCompiledTemplateLimit
+  return selectSafeTemplates(templates, { ...options, maxTemplates: clampedMax })
+}
+
+/** Map known CVE ids to compiled/curated template ids for targeted template runs. */
+export function selectTemplateIdsForCves(
+  templates: readonly SafeTemplate[],
+  cveIds: readonly string[],
+): string[] {
+  const wanted = new Set(cveIds.map(c => c.toUpperCase()))
+  const ids: string[] = []
+  for (const t of templates) {
+    if (t.cve && wanted.has(t.cve.toUpperCase()) && !ids.includes(t.id)) ids.push(t.id)
+  }
+  return ids.slice(0, 40)
+}
+
 const techAliases: Record<string, TemplateTechTag> = {
   next: 'nextjs', nextjs: 'nextjs',
   spring: 'springboot', springboot: 'springboot',
@@ -287,6 +410,11 @@ const techAliases: Record<string, TemplateTechTag> = {
   rubyonrails: 'rails', rails: 'rails',
   springactuator: 'actuator', actuator: 'actuator',
   aspnet: 'dotnet', csharp: 'dotnet',
+  exposure: 'generic-web-exposure', exposures: 'generic-web-exposure',
+  discovery: 'generic-web-exposure',
+  'adobe-experience-manager': 'aem', experiencemanager: 'aem', aem: 'aem',
+  '3cx': '3cx', threesixty: '3cx', avtech: 'avtech', cisco: 'cisco',
+  'adobe-coldfusion': 'adobe', coldfusion: 'adobe',
 }
 
 export function normalizeTechTagSet(techTags?: readonly string[]): Set<string> {
@@ -295,46 +423,4 @@ export function normalizeTechTagSet(techTags?: readonly string[]): Set<string> {
     if (techAliases[t]) tags.add(techAliases[t])
   }
   return tags
-}
-
-export function selectSafeTemplates(
-  templates: readonly SafeTemplate[],
-  options: { techTags?: readonly string[]; templateIds?: readonly string[]; tier: number; maxTemplates: number },
-): TemplateSelection {
-  const tags = normalizeTechTagSet(options.techTags)
-  const wantIds = options.templateIds?.length ? new Set(options.templateIds) : null
-  const selected: SafeTemplate[] = []
-  const skipped: Array<{ id: string; reason: string }> = []
-  for (const t of templates) {
-    if (wantIds && !wantIds.has(t.id)) continue
-    if (t.requiresTier3 && options.tier < 3) { skipped.push({ id: t.id, reason: 'requires Tier 3' }); continue }
-    const techMatch = t.tech.includes('generic') || t.tech.some(x => tags.has(x))
-    if (!wantIds && !techMatch) { skipped.push({ id: t.id, reason: 'tech mismatch' }); continue }
-    selected.push(t)
-  }
-  const severityRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
-  const explicitMatchRank = (t: SafeTemplate): number => {
-    if (tags.size === 0) return 0
-    return t.tech.some(x => x !== 'generic' && tags.has(x)) ? 0 : 1
-  }
-  selected.sort((a, b) =>
-    explicitMatchRank(a) - explicitMatchRank(b) ||
-    severityRank[a.severity] - severityRank[b.severity] ||
-    (a.cve ? 0 : 1) - (b.cve ? 0 : 1) ||
-    a.id.localeCompare(b.id))
-  if (selected.length > options.maxTemplates) {
-    for (const t of selected.splice(options.maxTemplates)) skipped.push({ id: t.id, reason: 'template cap' })
-  }
-  return { selected, skipped }
-}
-
-export function selectTemplatesForTech(
-  templates: readonly SafeTemplate[],
-  options: { techTags?: readonly string[]; templateIds?: readonly string[]; tier: number; maxTemplates?: number },
-): TemplateSelection {
-  const rawMax = options.maxTemplates ?? defaultCompiledTemplateLimit
-  const clampedMax = Number.isFinite(rawMax)
-    ? Math.max(1, Math.min(Math.round(rawMax), compiledTemplateLimitCeiling))
-    : defaultCompiledTemplateLimit
-  return selectSafeTemplates(templates, { ...options, maxTemplates: clampedMax })
 }

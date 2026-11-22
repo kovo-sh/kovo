@@ -3,7 +3,7 @@ name: "mysql.initial Config - Detect"
 severity: "info"
 description: "mysql.initial configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

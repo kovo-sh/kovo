@@ -3,7 +3,7 @@ name: "nopCommerce Installer - Detect"
 severity: "critical"
 description: "nopCommerce installer panel was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "nopcommerce"

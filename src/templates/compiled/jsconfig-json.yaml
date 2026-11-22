@@ -3,7 +3,7 @@ name: "Visual Studio Code jsconfig.json - Detect"
 severity: "info"
 description: "Visual Studio Code jsconfig.json was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

@@ -3,7 +3,7 @@ name: "Azure Pipelines Configuration File Disclosure"
 severity: "medium"
 description: "Azure Pipelines internal critical file is disclosed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

@@ -3,7 +3,7 @@ name: "Grav Register Admin User - Detect"
 severity: "high"
 description: "Exposed Grav admin user register page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "grav"
   - "register"

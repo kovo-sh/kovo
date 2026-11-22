@@ -3,7 +3,7 @@ name: "NuGet Package.config File Disclosure"
 severity: "info"
 description: "Safe check derived from nuget-package-config: NuGet Package.config File Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "sass"

@@ -3,7 +3,7 @@ name: "cAdvisor - Detect"
 severity: "medium"
 description: "cAdvisor page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "misconfig"

@@ -3,7 +3,7 @@ name: "Matrix Server Detect"
 severity: "info"
 description: "Detects Matrix servers based on .well-known entries. See https://en.wikipedia.org/wiki/Matrix_(protocol)"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "tech"
   - "matrix"

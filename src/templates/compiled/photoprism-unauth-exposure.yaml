@@ -3,7 +3,7 @@ name: "PhotoPrism - Unauthenticated Exposure"
 severity: "high"
 description: "PhotoPrism instance is running in public mode with authentication disabled (PHOTOPRISM_AUTH_MODE=public), exposing all photos, albums, GPS locations, face recognition data, and server configuration to unauthenticated users."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "photoprism"
   - "exposure"

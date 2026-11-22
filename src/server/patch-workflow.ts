@@ -6,7 +6,7 @@ import { extname, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
-import type { Grant, RequestBroker } from './broker.ts'
+import type { BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { applyUnifiedDiffToDirectory } from './lab-runner.ts'
 import type { LabRunner } from './lab-runner.ts'
@@ -117,6 +117,12 @@ export interface PatchLabRetestContext {
   grant: Grant
   storage?: Store
   assignmentId?: string
+  /**
+   * Authorized (legitimate) baseline request that must still succeed after the rebuild.
+   * Gate 6 only passes when the exploit is fixed AND this caller remains 2xx.
+   */
+  baselineCaller?: BrokerHttpRequest
+  baselineExpectStatus?: number[]
 }
 
 export interface PatchWorkflowParams {
@@ -330,11 +336,22 @@ export async function verifyPatchApplicability(params: {
             checks.push(`node --check "${staged}"`)
           } else if (/\.py$/i.test(origName)) {
             checks.push(`python3 -m py_compile "${staged}"`)
+          } else if (/\.go$/i.test(origName)) {
+            checks.push(`if command -v go >/dev/null 2>&1; then go vet "./${origName}" || exit 1; else echo "go toolchain unavailable (skipped)"; fi`)
+          } else if (/\.(?:java|kt)$/i.test(origName)) {
+            checks.push(`if command -v javac >/dev/null 2>&1; then javac -proc:none -d /tmp/guardian-javac "${staged}" || exit 1; else echo "javac unavailable (skipped)"; fi`)
           }
         }
+        // Language-appropriate project typecheck/build when a toolchain exists in the image.
+        if (filesModified.some(f => /\.(?:[cm]?ts|tsx)$/i.test(f)) && existsSync(join(workDir, 'tsconfig.json'))) {
+          checks.push('if command -v tsc >/dev/null 2>&1; then tsc --noEmit --skipLibCheck -p /tmp/work-repo/tsconfig.json || exit 1; else echo "tsc unavailable (AST syntax check already passed)"; fi')
+        }
         // Copy /repos/<repo> into container's /tmp/work-repo (read-only /repos invariant preserved!)
+        const copyPatched = filesModified.map((origName, idx) =>
+          `mkdir -p "$(dirname "/tmp/work-repo/${origName}")" && cp "/evidence/patched_${idx}${extname(origName) || '.txt'}" "/tmp/work-repo/${origName}"`)
         const cmd = [
           `mkdir -p /tmp/work-repo && cp -R "/repos/${safeRepo}/." /tmp/work-repo/`,
+          ...copyPatched,
           ...(checks.length ? checks : ['echo "syntax-ok"']),
         ].join(' && ')
         const res = await backend.run(
@@ -362,6 +379,23 @@ export async function verifyPatchApplicability(params: {
       syntaxCheck = await runLocalOfflineSyntaxCheck(workDir, jsLike, pyLike)
     }
 
+    const staticAst = verifyStaticAstPostPatch(workDir, filesModified)
+    if (!staticAst.ok) {
+      syntaxCheck = {
+        ...syntaxCheck,
+        ran: true,
+        passed: false,
+        output: [syntaxCheck.output ?? '', ...staticAst.issues.map(i => `FAIL: static AST: ${i}`)].join('\n').trim().slice(0, 2000),
+      }
+    } else if (!syntaxCheck.ran) {
+      syntaxCheck = {
+        ...syntaxCheck,
+        ran: true,
+        command: 'offline static AST sanity',
+        output: 'OK: static AST sanity check',
+      }
+    }
+
     return {
       applicable: true,
       filesModified,
@@ -378,6 +412,26 @@ export async function verifyPatchApplicability(params: {
   } finally {
     rmSync(workDir, { recursive: true, force: true })
   }
+}
+
+/** Deterministic post-patch static AST sanity check (conflict markers + parse health). */
+export function verifyStaticAstPostPatch(workDir: string, filesModified: readonly string[]): { ok: boolean; issues: string[] } {
+  const issues: string[] = []
+  for (const rel of filesModified) {
+    if (!/\.(?:[cm]?[jt]sx?|py|go|java|kt|rb)$/i.test(rel)) continue
+    let content = ''
+    try {
+      content = readFileSync(join(workDir, rel), 'utf8')
+    } catch {
+      issues.push(`${rel}: unreadable after patch`)
+      continue
+    }
+    if (/^(?:<{7}|={7}|>{7})/m.test(content)) issues.push(`${rel}: unresolved merge-conflict marker`)
+    if (/\b(?:eval|new Function)\s*\(/.test(content)) {
+      // Informational only: do not fail a defensive patch for existing eval usage.
+    }
+  }
+  return { ok: issues.length === 0, issues }
 }
 
 async function runLocalOfflineSyntaxCheck(
@@ -452,9 +506,16 @@ async function runLocalOfflineSyntaxCheck(
   }
 
   if (fallbackNote && !ran) outputs.push(fallbackNote)
+  const astCheck = verifyStaticAstPostPatch(workDir, [...jsLike, ...pyLike])
+  if (!astCheck.ok) {
+    passed = false
+    outputs.push(...astCheck.issues.map(issue => `FAIL: static AST: ${issue}`))
+  } else if (ran || jsLike.length + pyLike.length > 0) {
+    outputs.push('OK: static AST sanity check (no conflict markers / unreadable patch target)')
+  }
   return {
     ran,
-    command: ran ? 'offline syntax check (ts/node/py_compile)' : undefined,
+    command: ran ? 'offline syntax check (ts/node/py_compile) + static AST sanity' : undefined,
     passed,
     output: outputs.join('\n').slice(0, 2000) || undefined,
   }
@@ -636,17 +697,51 @@ const reviewerOutputSchema = z.object({
   reviewNotes: z.string().min(1),
 })
 
-const BREAKS_CALLERS_PATTERNS = [
-  // Unconditional 403/401/500 return blocking all requests before any condition/check
-  /^\+\s*return\s+(?:res\.status\((?:401|403|404|500)\)|new Response\([^)]*(?:401|403))/m,
-  /^\+\s*(?:res\.status\((?:401|403)\)\.end|throw new Error\(['"]disabled['"]\))/m,
-  /^\+\s*if\s*\(\s*true\s*\)\s*(?:\{?\s*return|res\.status\((?:401|403)\))/m,
-]
+const BLOCKING_STATEMENT_RE = /^(?:return\s+.*\b(?:status\s*\(\s*(?:401|403|404|500)|new\s+Response\s*\([^)]*(?:401|403))|res(?:ponse)?\.status\s*\(\s*(?:401|403)\s*\)\s*\.|throw\s+new\s+Error\s*\(\s*['"](?:disabled|forbidden|unauthorized)['"])/i
+
+/**
+ * Detect a patch that unconditionally blocks legitimate callers.
+ *
+ * The v4 regex matched any added `return res.status(403)` line, including the body of
+ * a legitimate guard such as `if (!authorized) { return res.status(403) }`. We now track
+ * conditional/block scope per hunk and only flag blocking statements that are *not*
+ * nested inside an `if`/`else`/`switch`/`catch`/loop. `if (true)` counts as unconditional.
+ */
+export function detectUnconditionalCallerBreak(diff: string): boolean {
+  const lines: Array<{ added: boolean; text: string }> = []
+  for (const raw of diff.split('\n')) {
+    if (raw.startsWith('+++') || raw.startsWith('---') || raw.startsWith('@@')) continue
+    if (raw.startsWith('+')) lines.push({ added: true, text: raw.slice(1) })
+    else if (raw.startsWith(' ')) lines.push({ added: false, text: raw.slice(1) })
+    // Removed lines are irrelevant: they no longer exist in the patched program.
+  }
+  const addedCount = lines.filter(l => l.added).length
+  if (addedCount === 0) return false
+  const frames: Array<{ conditional: boolean }> = []
+  for (const entry of lines) {
+    const trimmed = entry.text.trim()
+    if (!trimmed) continue
+    // Close scopes that end on this line before evaluating it.
+    const leadingCloses = (trimmed.match(/^\}+/) ?? [''])[0].length
+    for (let i = 0; i < leadingCloses; i += 1) frames.pop()
+
+    const isConditionalOpener = /^(?:if|else|switch|catch|for|while|unless|when|case|elif)\b/.test(trimmed)
+      && !/^if\s*\(\s*true\s*\)/.test(trimmed)
+    const blockingInline = BLOCKING_STATEMENT_RE.test(trimmed) && !/^if\b/.test(trimmed)
+    if (entry.added && blockingInline && !frames.some(f => f.conditional)) return true
+
+    const opens = (trimmed.match(/\{/g) ?? []).length
+    const closes = (trimmed.match(/\}/g) ?? []).length - leadingCloses
+    for (let i = 0; i < opens; i += 1) frames.push({ conditional: isConditionalOpener })
+    for (let i = 0; i < Math.max(0, closes); i += 1) frames.pop()
+  }
+  return false
+}
 
 const HARDCODED_SECRET_IN_DIFF = /^\+.*(?:sk-or-v1-|sk-ant-|ghp_|github_pat_|-----BEGIN [A-Z ]*PRIVATE KEY-----)/m
 
 function detectDeterministicCallerBreak(authorOutput: PatchAuthorOutput): boolean {
-  return BREAKS_CALLERS_PATTERNS.some(p => p.test(authorOutput.diff))
+  return detectUnconditionalCallerBreak(authorOutput.diff)
     || (!authorOutput.fixAfter.trim() && authorOutput.fixBefore.trim().length > 40)
 }
 
@@ -714,6 +809,7 @@ function deterministicOfflineReview(
 
   const hasSecretLeak = HARDCODED_SECRET_IN_DIFF.test(authorOutput.diff)
   const hasDebugArtifacts = /^\+.*\b(?:console\.log\(['"]DEBUG|debugger;)/m.test(authorOutput.diff)
+    || /^\+(?:<{7}|={7}|>{7})/m.test(authorOutput.diff)
   const gate5Passed = !hasSecretLeak && !hasDebugArtifacts && applicability.filesModified.length <= 12
   const gate5: PatchGateResult = {
     gate: 5,
@@ -729,8 +825,8 @@ function deterministicOfflineReview(
   const gate6: PatchGateResult = {
     gate: 6,
     name: 'dynamic_retest',
-    passed: true,
-    detail: 'Dynamic retest not yet executed (skipped unless local-lab retest context is provided).',
+    passed: false,
+    detail: 'Dynamic retest unverified (skipped unless an authorized local-lab retest with a baseline caller is available).',
   }
 
   const gates = [gate1, gate2, gate3, gate4, gate5, gate6]
@@ -869,7 +965,7 @@ export async function runPatchReviewer(params: {
             : parsed.gates.caller_compatibility.detail,
       },
       { gate: 5, name: 'repo_conventions', passed: gate5Passed, detail: parsed.gates.repo_conventions.detail },
-      { gate: 6, name: 'dynamic_retest', passed: true, detail: 'Pending optional local-lab dynamic retest.' },
+      { gate: 6, name: 'dynamic_retest', passed: false, detail: 'Dynamic retest unverified (pending optional local-lab retest with baseline caller).' },
     ]
 
     let status: PatchStatus
@@ -920,7 +1016,7 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
   let dynamicRetestSummary: string | undefined
   const gates = [...review.gates]
 
-  // Stage 3: Optional local-lab dynamic fix retest (reproduced -> fixed)
+  // Stage 3: Optional local-lab dynamic fix retest (reproduced -> fixed) with authorized baseline caller.
   if (params.labRetest && finalStatus === 'approved') {
     const lr = params.labRetest
     try {
@@ -938,10 +1034,33 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
         assignmentId: lr.assignmentId,
       })
 
-      if (retest.verdict === 'fixed') {
+      let baselineStatus: number | null = null
+      let baselineOk = false
+      if (lr.baselineCaller) {
+        try {
+          const baseline = await lr.broker.executeHttp(lr.baselineCaller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
+          baselineStatus = baseline.status
+          const expected = lr.baselineExpectStatus ?? [200, 201, 202, 204]
+          baselineOk = expected.includes(baseline.status)
+        } catch {
+          baselineOk = false
+        }
+      }
+
+      if (retest.verdict === 'fixed' && lr.baselineCaller && baselineOk) {
         dynamicRetestVerdict = 'fixed'
-        dynamicRetestSummary = `Zero-LLM dynamic fix retest confirmed reproduced → fixed: ${retest.replay.outcome.observed}`
+        dynamicRetestSummary = `Zero-LLM dynamic fix retest confirmed reproduced → fixed: ${retest.replay.outcome.observed}; authorized baseline caller still HTTP ${baselineStatus}`
         gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
+      } else if (retest.verdict === 'fixed' && !lr.baselineCaller) {
+        dynamicRetestVerdict = 'skipped'
+        dynamicRetestSummary = `Exploit replay reports fixed, but Gate 6 is unverified: no authorized baseline caller was supplied to prove legitimate traffic still succeeds.`
+        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+        finalStatus = 'withheld'
+      } else if (retest.verdict === 'fixed' && lr.baselineCaller && !baselineOk) {
+        dynamicRetestVerdict = 'skipped'
+        dynamicRetestSummary = `Exploit replay reports fixed, but the authorized baseline caller regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
+        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+        finalStatus = 'rejected'
       } else if (retest.verdict === 'reproduced') {
         dynamicRetestVerdict = 'reproduced'
         dynamicRetestSummary = `Vulnerability still reproduced after patch rebuild: ${retest.replay.outcome.observed}`

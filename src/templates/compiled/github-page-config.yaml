@@ -3,7 +3,7 @@ name: "Github pages config file"
 severity: "info"
 description: "Find github pages config file."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "github"
   - "exposure"

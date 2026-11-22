@@ -3,7 +3,7 @@ name: "UVDesk Helpdesk Installation Page - Exposure"
 severity: "high"
 description: "Detects exposed UVDesk Helpdesk Installation page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

@@ -3,7 +3,7 @@ name: "AEM Dump Content Node Properties"
 severity: "medium"
 description: "Node Properties are exposed in AEM Dump."
 tech:
-  - "node"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

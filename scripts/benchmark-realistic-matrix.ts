@@ -35,22 +35,42 @@ interface CellResult {
   error?: string
 }
 
+type MatrixSuite = 'realistic' | 'xben-25' | 'held-out-saas'
+
 const KNOWN_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
+const KNOWN_SUITES: MatrixSuite[] = ['realistic', 'xben-25', 'held-out-saas']
 
 function parseArgs(argv: readonly string[]): {
-  apps: string[]; seeds: number[]; split: 'dev' | 'heldout'; concurrency: number
+  suite: MatrixSuite; apps: string[]; seeds: number[]; split: 'dev' | 'heldout'; concurrency: number
   outDir: string; timeoutMs: number; mode: string; profileMode: string
+  maxRequests?: number; probeConcurrency?: number; verifyConcurrency?: number; slowProbes?: number
 } {
   const out = {
+    suite: 'realistic' as MatrixSuite,
     apps: [...KNOWN_APPS] as string[], seeds: [42, 1, 2], split: 'dev' as 'dev' | 'heldout',
     concurrency: Math.min(9, Math.max(1, availableParallelism() - 1)),
     outDir: '/tmp/rb-matrix', timeoutMs: 600_000, mode: 'grey-box', profileMode: 'v4-full',
+    maxRequests: undefined as number | undefined,
+    probeConcurrency: undefined as number | undefined,
+    verifyConcurrency: undefined as number | undefined,
+    slowProbes: undefined as number | undefined,
+  }
+  const int = (arg: string, value: string, min: number, max: number): number => {
+    const n = Number(value)
+    if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${arg} must be an integer in ${min}..${max}`)
+    return n
   }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     const value = argv[i + 1]
     const take = () => { if (value === undefined) throw new Error(`${arg} requires a value`); i += 1; return value }
     switch (arg) {
+      case '--suite': {
+        const v = take() as MatrixSuite
+        if (!KNOWN_SUITES.includes(v)) throw new Error('--suite must be realistic, xben-25 or held-out-saas')
+        out.suite = v
+        break
+      }
       case '--apps': out.apps = take().split(',').map(s => s.trim()).filter(Boolean); break
       case '--seeds': out.seeds = take().split(',').map(s => Number(s.trim())).filter(n => Number.isInteger(n)); break
       case '--split': {
@@ -64,16 +84,22 @@ function parseArgs(argv: readonly string[]): {
       case '--timeout-ms': out.timeoutMs = Math.max(1000, Number(take())); break
       case '--mode': out.mode = take(); break
       case '--profile-mode': out.profileMode = take(); break
+      case '--max-requests': out.maxRequests = int(arg, take(), 1, 1_000_000); break
+      case '--probe-concurrency': out.probeConcurrency = int(arg, take(), 1, 8); break
+      case '--verify-concurrency': out.verifyConcurrency = int(arg, take(), 1, 4); break
+      case '--slow-probes': out.slowProbes = int(arg, take(), 0, 64); break
       case '--help': case '-h':
-        console.log('Usage: node scripts/benchmark-realistic-matrix.ts [--apps a,b] [--seeds 1,2] [--split dev|heldout] [--concurrency N] [--out-dir DIR] [--timeout-ms N] [--mode grey-box] [--profile-mode v4-full]')
+        console.log('Usage: node scripts/benchmark-realistic-matrix.ts [--suite realistic|xben-25|held-out-saas] [--apps a,b] [--seeds 1,2] [--split dev|heldout] [--concurrency N] [--out-dir DIR] [--timeout-ms N] [--mode grey-box] [--profile-mode v4-full] [--max-requests N] [--probe-concurrency 1-8] [--verify-concurrency 1-4] [--slow-probes N]')
         process.exit(0)
         break
       default: throw new Error(`Unknown option: ${arg}`)
     }
   }
-  if (out.apps.length === 0) throw new Error('No apps selected')
-  if (out.seeds.length === 0) throw new Error('No seeds selected')
-  if (out.split === 'heldout' && (process.env.GUARDIAN_RB_HELDOUT_SALT ?? '').length < 16) {
+  if (out.suite === 'realistic') {
+    if (out.apps.length === 0) throw new Error('No apps selected')
+    if (out.seeds.length === 0) throw new Error('No seeds selected')
+  }
+  if (out.suite === 'realistic' && out.split === 'heldout' && (process.env.GUARDIAN_RB_HELDOUT_SALT ?? '').length < 16) {
     throw new Error('heldout requires GUARDIAN_RB_HELDOUT_SALT (>=16 chars)')
   }
   return out
@@ -84,30 +110,49 @@ function readScorecard(file: string): Partial<CellResult> | null {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
     const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+    // realistic-bench scorecards use `targets`; recall benchmarks use `targetsTotal`/`confirmedCount`.
+    const funnel = (c.funnel ?? c.funnelCounts) as Record<string, number> | undefined
     return {
-      confirmed: num(c.confirmed), targets: num(c.targets), recall: num(c.recall),
-      precision: num(c.precision), decoyFp: num(c.decoyFalsePositives), decoys: num(c.decoys),
+      confirmed: num(c.confirmed ?? c.confirmedCount), targets: num(c.targets ?? c.targetsTotal), recall: num(c.recall),
+      precision: num(c.precision), decoyFp: num(c.decoyFalsePositives ?? c.falsePositiveCount), decoys: num(c.decoys ?? c.decoysTotal),
       unmatchedFp: num(c.unmatchedFalsePositives),
-      funnel: (c.funnel && typeof c.funnel === 'object' ? c.funnel : undefined) as Record<string, number> | undefined,
+      funnel: funnel && typeof funnel === 'object' ? funnel : undefined,
     }
   } catch { return null }
 }
 
+function orchestrationEnv(opts: ReturnType<typeof parseArgs>): Record<string, string> {
+  const env: Record<string, string> = { GUARDIAN_ALLOW_LOCAL_LAB: '1' }
+  if (opts.maxRequests !== undefined) env.GUARDIAN_BENCH_MAX_REQUESTS = String(opts.maxRequests)
+  if (opts.probeConcurrency !== undefined) env.GUARDIAN_BENCH_PROBE_CONCURRENCY = String(opts.probeConcurrency)
+  if (opts.verifyConcurrency !== undefined) env.GUARDIAN_BENCH_VERIFY_CONCURRENCY = String(opts.verifyConcurrency)
+  if (opts.slowProbes !== undefined) env.GUARDIAN_BENCH_SLOW_PROBES = String(opts.slowProbes)
+  return env
+}
+
 function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellResult> {
-  const json = resolve(opts.outDir, `${cell.app}-${cell.seed}.json`)
-  const findings = resolve(opts.outDir, `${cell.app}-${cell.seed}.findings.json`)
-  const log = resolve(opts.outDir, `${cell.app}-${cell.seed}.log`)
+  const suiteTag = opts.suite === 'realistic' ? cell.app : opts.suite
+  const json = resolve(opts.outDir, `${suiteTag}-${cell.seed}.json`)
+  const findings = resolve(opts.outDir, `${suiteTag}-${cell.seed}.findings.json`)
+  const log = resolve(opts.outDir, `${suiteTag}-${cell.seed}.log`)
   const started = Date.now()
-  const args = [
-    'benchmarks/realistic-bench/benchmark-realistic.ts',
-    '--app', cell.app, '--seed', String(cell.seed), '--split', opts.split,
-    '--profile-mode', opts.profileMode, '--mode', opts.mode,
-    '--out-json', json, '--out-findings', findings,
-  ]
+  const args = opts.suite === 'realistic'
+    ? [
+        'benchmarks/realistic-bench/benchmark-realistic.ts',
+        '--app', cell.app, '--seed', String(cell.seed), '--split', opts.split,
+        '--profile-mode', opts.profileMode, '--mode', opts.mode,
+        '--out-json', json, '--out-findings', findings,
+      ]
+    : [
+        'scripts/benchmark-recall.ts',
+        '--suite', opts.suite, '--profile-mode', opts.profileMode,
+        '--db', resolve(opts.outDir, `${opts.suite}-db`),
+        '--out-json', json, '--out-md', resolve(opts.outDir, `${opts.suite}.md`),
+      ]
   return new Promise(resolvePromise => {
     const child = spawn(process.execPath, args, {
       cwd: resolve(import.meta.dirname, '..'),
-      env: { ...process.env, GUARDIAN_ALLOW_LOCAL_LAB: '1' },
+      env: { ...process.env, ...orchestrationEnv(opts) },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let logText = ''
@@ -137,13 +182,18 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
 
 async function main(): Promise<number> {
   const opts = parseArgs(process.argv.slice(2))
-  if (opts.split === 'heldout' && !process.env.GUARDIAN_RB_HELDOUT_SALT) {
+  if (opts.suite === 'realistic' && opts.split === 'heldout' && !process.env.GUARDIAN_RB_HELDOUT_SALT) {
     console.error('heldout split requires GUARDIAN_RB_HELDOUT_SALT')
     return 2
   }
   mkdirSync(opts.outDir, { recursive: true })
   const cells: Cell[] = []
-  for (const app of opts.apps) for (const seed of opts.seeds) cells.push({ app, seed })
+  if (opts.suite === 'realistic') {
+    for (const app of opts.apps) for (const seed of opts.seeds) cells.push({ app, seed })
+  } else {
+    // Recall suites are deterministic single runs; the seed label is only a report tag.
+    cells.push({ app: opts.suite, seed: opts.seeds[0] ?? 42 })
+  }
 
   const results: CellResult[] = []
   let next = 0
@@ -167,7 +217,7 @@ async function main(): Promise<number> {
   const totalDecoyFp = results.reduce((n, r) => n + r.decoyFp, 0)
   const totalUnmatched = results.reduce((n, r) => n + r.unmatchedFp, 0)
   const failures = results.filter(r => !r.ok).length
-  console.log(`[matrix] cells=${results.length} failed=${failures} confirmed=${totalConfirmed}/${totalTargets} recall=${totalTargets ? ((totalConfirmed / totalTargets) * 100).toFixed(1) : '0.0'}% decoyFP=${totalDecoyFp} unmatchedFP=${totalUnmatched} out=${opts.outDir}`)
+  console.log(`[matrix] suite=${opts.suite} cells=${results.length} failed=${failures} confirmed=${totalConfirmed}/${totalTargets} recall=${totalTargets ? ((totalConfirmed / totalTargets) * 100).toFixed(1) : '0.0'}% decoyFP=${totalDecoyFp} unmatchedFP=${totalUnmatched} out=${opts.outDir}`)
   return failures === 0 ? 0 : 1
 }
 

@@ -3,7 +3,7 @@ name: "AVTECH Video Surveillance Product - Authentication Bypass"
 severity: "high"
 description: "AVTECH Video Surveillance Products password disclosure through /cgi-bin/user/Config.cgi."
 tech:
-  - "generic"
+  - "avtech"
 tags:
   - "exposure"
   - "avtech"

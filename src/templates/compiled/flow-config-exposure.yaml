@@ -3,7 +3,7 @@ name: "Flow Configuration - Exposure"
 severity: "medium"
 description: "Detects an exposed Flow configuration file. These files may contain sensitive information such as credentials, internal endpoints, or environment settings."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

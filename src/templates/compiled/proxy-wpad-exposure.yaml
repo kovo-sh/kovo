@@ -3,7 +3,7 @@ name: "Web Proxy Auto-Discovery Configuration File - Detect"
 severity: "info"
 description: "Web Proxy Auto-Discovery configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

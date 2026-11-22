@@ -3,7 +3,7 @@ name: "Atlassian Bamboo Build Dashboard"
 severity: "info"
 description: "Safe check derived from atlassian-bamboo-build: Atlassian Bamboo Build Dashboard"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "atlassian"

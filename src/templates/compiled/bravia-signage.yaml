@@ -3,7 +3,7 @@ name: "BRAVIA Signage - Exposure"
 severity: "medium"
 description: "Bravia Signage is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "exposure"

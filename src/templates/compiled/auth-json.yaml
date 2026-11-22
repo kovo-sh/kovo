@@ -3,7 +3,7 @@ name: "Auth.json File - Disclosure"
 severity: "high"
 description: "auth.json file is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

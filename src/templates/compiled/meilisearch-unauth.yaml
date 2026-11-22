@@ -3,7 +3,7 @@ name: "Meilisearch - Unauthenticated Index Exposure"
 severity: "medium"
 description: "Meilisearch ships without a master key by default. Instances deployed without one expose the index API to any network-reachable client: an unauthenticated GET /indexes returns the full index listing, and the same unauthenticated access allows searching the documents inside those indexes."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "meilisearch"
   - "exposure"

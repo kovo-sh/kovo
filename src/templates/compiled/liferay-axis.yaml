@@ -3,7 +3,7 @@ name: "Liferay /api/axis - API Exposed"
 severity: "info"
 description: "Safe check derived from liferay-axis: Liferay /api/axis - API Exposed"
 tech:
-  - "generic"
+  - "axis"
 tags:
   - "misconfig"
   - "exposure"

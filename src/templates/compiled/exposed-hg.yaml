@@ -3,7 +3,7 @@ name: "HG Configuration - Detect"
 severity: "medium"
 description: "HG configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

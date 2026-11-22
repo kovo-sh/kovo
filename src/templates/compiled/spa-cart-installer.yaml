@@ -3,7 +3,7 @@ name: "SPA Cart - Installer"
 severity: "high"
 description: "SPA Cart installer was found."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "spa-cart"
   - "exposure"

@@ -3,7 +3,7 @@ name: "AVTECH DVR - SSRF"
 severity: "medium"
 description: "AVTECH DVR device, Search.cgi can be accessed directly. Search.cgi is responsible for searching and accessing cameras in the local network. Search.cgi provides the cgi_query function."
 tech:
-  - "generic"
+  - "avtech"
 tags:
   - "ssrf"
   - "avtech"

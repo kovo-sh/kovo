@@ -3,7 +3,7 @@ name: "HAProxy Statistics Page - Detect"
 severity: "medium"
 description: "HAProxy statistics page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "logs"
   - "haproxy"

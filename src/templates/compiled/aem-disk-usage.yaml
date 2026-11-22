@@ -3,7 +3,7 @@ name: "Adobe AEM Disk Usage Information Disclosure"
 severity: "low"
 description: "Adobe AEM Disk Usage Information is exposed."
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

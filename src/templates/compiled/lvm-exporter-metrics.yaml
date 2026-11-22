@@ -3,7 +3,7 @@ name: "LVM Exporter Metrics"
 severity: "low"
 description: "LVM Exporter Metrics is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "lvm"
   - "exposure"

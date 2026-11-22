@@ -3,7 +3,7 @@ name: "Check Point Mobile SSL VPN - Detect"
 severity: "info"
 description: "Check Point Mobile SSL VPN was detected."
 tech:
-  - "generic"
+  - "sonicwall"
 tags:
   - "panel"
   - "checkpoint"

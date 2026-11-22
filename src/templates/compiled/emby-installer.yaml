@@ -3,7 +3,7 @@ name: "Emby Installation Page - Exposure"
 severity: "high"
 description: "Checks for the presence of a Emby Installer Page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "install"
   - "emby"

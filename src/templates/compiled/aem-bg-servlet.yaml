@@ -3,7 +3,7 @@ name: "AEM BG-Servlets"
 severity: "info"
 description: "Safe check derived from aem-bg-servlet: AEM BG-Servlets"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "aem"
   - "misconfig"

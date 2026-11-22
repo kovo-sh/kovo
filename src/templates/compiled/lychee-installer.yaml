@@ -3,7 +3,7 @@ name: "Lychee Installer"
 severity: "high"
 description: "Lychee is susceptible to the Installation page exposure due to misconfiguration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "lychee"

@@ -3,7 +3,7 @@ name: "Ruckus SmartZone Exposed Installation"
 severity: "high"
 description: "Ruckus SmartZone is susceptible to the Installation page exposure due to misconfiguration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "ruckus"

@@ -3,7 +3,7 @@ name: "PgHero Dashboard Exposure Panel - Detect"
 severity: "medium"
 description: "PgHero Dashboard Exposure panel was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "panel"

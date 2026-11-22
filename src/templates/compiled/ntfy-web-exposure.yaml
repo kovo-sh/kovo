@@ -3,7 +3,7 @@ name: "NTFY Web - Exposure"
 severity: "medium"
 description: "Publicly exposed NTFY web interface allowing unauthorized publish or subscribe access."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "ntfy"

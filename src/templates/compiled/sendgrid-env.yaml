@@ -3,7 +3,7 @@ name: "SendGrid Env File Exposure"
 severity: "medium"
 description: "SendGrid file is exposed containing environment variables."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "sendgrid"

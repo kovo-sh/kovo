@@ -3,7 +3,7 @@ name: "Easy Installer by ViserLab - Exposure"
 severity: "high"
 description: "Checks for the presence of a Easy Installer by ViserLab."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "install"
   - "easy"

@@ -3,7 +3,7 @@ name: "Hikvision Configuration File - Detect"
 severity: "medium"
 description: "Hikvision configuration file was detected."
 tech:
-  - "generic"
+  - "hikvision"
 tags:
   - "exposure"
   - "config"

@@ -3,7 +3,7 @@ name: "Pantheon upstream.yml Disclosure"
 severity: "low"
 description: "Public Pantheon YAML Configuration Files might include sensitive info"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "devops"

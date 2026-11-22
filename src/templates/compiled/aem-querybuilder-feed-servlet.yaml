@@ -3,7 +3,7 @@ name: "AEM QueryBuilder Feed Servlet"
 severity: "info"
 description: "Safe check derived from aem-querybuilder-feed-servlet: AEM QueryBuilder Feed Servlet"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "aem"
   - "misconfig"

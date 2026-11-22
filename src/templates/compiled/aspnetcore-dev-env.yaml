@@ -3,7 +3,7 @@ name: "ASP.NET Core Development Environment - Exposure"
 severity: "info"
 description: "The ASP.NET Core application is running in Development mode, which could exposes detailed error messages and stack traces on the '/Error' page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "aspnetcore"

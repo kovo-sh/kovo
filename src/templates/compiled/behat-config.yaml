@@ -3,7 +3,7 @@ name: "Behat Configuration File - Detect"
 severity: "medium"
 description: "Behat configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "behat"

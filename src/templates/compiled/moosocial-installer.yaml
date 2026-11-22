@@ -3,7 +3,7 @@ name: "mooSocial Installation - Exposure"
 severity: "high"
 description: "Safe check derived from moosocial-installer: mooSocial Installation - Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "moosocial"

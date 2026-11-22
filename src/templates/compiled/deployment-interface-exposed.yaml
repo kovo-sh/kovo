@@ -3,7 +3,7 @@ name: "Deployment Management Interface - Exposed"
 severity: "medium"
 description: "Deployment Management Interface is exposed. This exposure could potentially allow unauthorized access to the management interface"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "deployment"
   - "management"

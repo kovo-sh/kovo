@@ -3,7 +3,7 @@ name: "HP iLO Serial Key - Detect"
 severity: "medium"
 description: "HP iLO serial key was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

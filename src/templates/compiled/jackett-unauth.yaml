@@ -3,7 +3,7 @@ name: "Jackett UI - Unauthenticated"
 severity: "high"
 description: "The Jackett UI can be accessed without authentication, potentially exposing sensitive information and configuration settings to unauthorized users."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "unauth"
   - "misconfig"

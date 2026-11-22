@@ -79,6 +79,16 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 
 Known v4 blockers carried into v5: trigger quality on real apps; authz ID-binding precision; patch attribution ambiguity on shared `/graphql`; budget exhaustion on phlow-style flows.
 
+### Agentic (`Execution`) baseline — acme-saas seed 1, grey-box
+
+| Run | Wall | Spend | Confirmed | Precision | Notes |
+|---|---|---:|---:|---:|---|
+| deterministic | 11 s | $0 | 0/22 | 100% | 43 endpoints discovered, no probing |
+| agentic, 10 min | 600 s | $0.17 | 0/22 | 0% (1 unmatched) | 65 facts, 24 steps, 12 oracle events, 3 worker bootstrap failures |
+| agentic, 20 min | 1200 s | $0.47 | **2/22 (9.1%)** | 66.7% | planted legacy-auth-bypass + inbox BOLA; 1 novel admin-activity BFLA (oracle-evidenced, not planted) |
+
+Agentic reality: 59 endpoints, 663 requests, 43 oracle impacts, 7 findings persisted / 3 submitted. Wall-clock, not `--budget-usd`, is the limiter. Recurring **worker bootstrap failure** (3–4 assignments, 0 turns) and the **single-process data-dir lock** block parallel cells; both have owners (M1-core, M0 harness isolation).
+
 ---
 
 ## 6. Milestone Acceptance (condensed)

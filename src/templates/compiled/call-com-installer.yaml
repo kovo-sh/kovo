@@ -3,7 +3,7 @@ name: "Call.com Setup Page - Exposure"
 severity: "high"
 description: "Detects exposed Call.com Setup page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

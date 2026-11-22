@@ -3,7 +3,7 @@ name: "ProfitTrailer Setup Page - Exposure"
 severity: "high"
 description: "Detects exposed ProfitTrailer Setup page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

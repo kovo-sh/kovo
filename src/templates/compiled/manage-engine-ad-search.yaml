@@ -3,7 +3,7 @@ name: "Manage Engine AD Search"
 severity: "high"
 description: "Manage Engine AD Manager service can be configured to allow anonymous users to browse the AD list remotely."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "unauth"
   - "misconfig"

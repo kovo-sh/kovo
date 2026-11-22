@@ -3,7 +3,7 @@ name: "Confluence Installation Page - Exposure"
 severity: "high"
 description: "Confluence is susceptible to the Installation page exposure due to misconfiguration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "exposure"

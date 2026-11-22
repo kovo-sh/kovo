@@ -3,7 +3,7 @@ name: "Publicly accessible NPM Log file"
 severity: "low"
 description: "NPM log file is exposed to external users."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "npm"
   - "logs"

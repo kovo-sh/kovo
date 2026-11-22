@@ -3,7 +3,7 @@ name: "Atom remote-ssh ftpconfig Exposure"
 severity: "high"
 description: "Created by remote-ssh for Atom, contains SFTP/SSH server details and credentials"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "atom"
   - "ftp"

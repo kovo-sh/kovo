@@ -3,7 +3,7 @@ name: "Subrion CMS Web Installer - Exposure"
 severity: "high"
 description: "Subrion CMS Web Installer has been exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "subrion"
   - "cms"

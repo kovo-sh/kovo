@@ -3,7 +3,7 @@ name: "NetMizer LogManagement System Data - Directory Exposure"
 severity: "high"
 description: "Directory Exposure vulnerability in the NetMizer log management system of Beijing Lingzhou Network Technology Co., Ltd. Due to the loose control of /data, attackers can use this vulnerability to obtain sensitive information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "netmizer"
   - "exposure"
