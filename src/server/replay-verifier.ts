@@ -2144,13 +2144,140 @@ function toStepStatusItem(
   }
 }
 
+export interface InlineExchangeHeaderSummary {
+  stepId: string
+  status: number
+  contentType?: string
+  location?: string
+  cacheControl?: string
+  xCache?: string
+  age?: string
+  vary?: string
+  accessControl?: string
+  setCookie?: Array<{ name: string; secure: boolean; httpOnly: boolean; sameSite: string | null }>
+}
+
+export interface InlineStepBodyPreview {
+  stepId: string
+  status: number
+  mediaType?: string
+  preview: string
+  truncated: boolean
+}
+
+export interface InlineSqlRoundSummary {
+  round: number
+  pass?: boolean
+  baselineStatus?: number | null
+  trueStatus?: number | null
+  falseStatus?: number | null
+  delayProbeStatus?: number | null
+  similarityBaselineTrue?: number
+  similarityTrueFalse?: number
+  baselineMs?: number
+  probeMs?: number
+}
+
+/**
+ * Enriched inline verification feedback. Extra fields are additive on top of the persisted
+ * `InlineVerifyFeedback` contract (the domain schema strips nothing on read), so older consumers
+ * and stored rows keep working while the repairing agent gets actionable evidence.
+ */
+export interface EnrichedInlineVerifyFeedback extends InlineVerifyFeedback {
+  replayExchangeIds?: string[]
+  keyResponseHeaders?: InlineExchangeHeaderSummary[]
+  stepBodyPreviews?: InlineStepBodyPreview[]
+  extractedVars?: Array<{ key: string; preview: string }>
+  sqlRoundSummaries?: InlineSqlRoundSummary[]
+  verificationKind?: string
+}
+
+const inlinePreviewBytes = 512
+const maxInlineExchanges = 8
+const maxInlineExtractedVars = 12
+
+function sanitizeInlinePreview(text: string, secrets: readonly NamedSecret[]): { preview: string; truncated: boolean } {
+  const redacted = redact(text, secrets)
+  const cleaned = redacted
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (Buffer.byteLength(cleaned, 'utf8') <= inlinePreviewBytes) return { preview: cleaned, truncated: false }
+  const sliced = Buffer.from(cleaned, 'utf8').subarray(0, inlinePreviewBytes).toString('utf8').replace(/\uFFFD+$/, '')
+  return { preview: `${sliced}…`, truncated: true }
+}
+
+function headerValue(headers: Record<string, string>, name: string): string | undefined {
+  const key = Object.keys(headers).find(k => k.toLowerCase() === name)
+  return key ? headers[key] : undefined
+}
+
+function summarizeKeyResponseHeaders(
+  exchanges: readonly BrokerExchangeResult[],
+  stepIds: readonly string[],
+  secrets: readonly NamedSecret[],
+): InlineExchangeHeaderSummary[] {
+  const out: InlineExchangeHeaderSummary[] = []
+  for (const [idx, ex] of exchanges.slice(0, maxInlineExchanges).entries()) {
+    const headers = ex.respHeaders ?? {}
+    const accessControl = Object.entries(headers)
+      .filter(([k]) => k.toLowerCase().startsWith('access-control-'))
+      .map(([k, v]) => `${k.toLowerCase()}: ${redact(v, secrets).slice(0, 120)}`)
+      .sort()
+      .join('; ')
+    const setCookie = (ex.setCookies ?? []).slice(0, 8).map(c => ({
+      name: c.name,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      sameSite: c.sameSite,
+    }))
+    out.push({
+      stepId: stepIds[idx] ?? `exchange-${idx + 1}`,
+      status: ex.status,
+      ...(headerValue(headers, 'content-type') ? { contentType: redact(headerValue(headers, 'content-type')!, secrets).slice(0, 120) } : {}),
+      ...(headerValue(headers, 'location') ? { location: redact(headerValue(headers, 'location')!, secrets).slice(0, 240) } : {}),
+      ...(headerValue(headers, 'cache-control') ? { cacheControl: redact(headerValue(headers, 'cache-control')!, secrets).slice(0, 160) } : {}),
+      ...(headerValue(headers, 'x-cache') ? { xCache: redact(headerValue(headers, 'x-cache')!, secrets).slice(0, 80) } : {}),
+      ...(headerValue(headers, 'age') ? { age: redact(headerValue(headers, 'age')!, secrets).slice(0, 40) } : {}),
+      ...(headerValue(headers, 'vary') ? { vary: redact(headerValue(headers, 'vary')!, secrets).slice(0, 160) } : {}),
+      ...(accessControl ? { accessControl } : {}),
+      ...(setCookie.length ? { setCookie } : {}),
+    })
+  }
+  return out
+}
+
+function summarizeSqlRounds(payload: Record<string, unknown>): InlineSqlRoundSummary[] {
+  const sqlDiff = payload.sqlDiff as { rounds?: Array<Record<string, unknown>> } | undefined
+  const sqlTimeDiff = payload.sqlTimeDiff as { rounds?: Array<Record<string, unknown>> } | undefined
+  const rounds = Array.isArray(sqlDiff?.rounds) ? sqlDiff!.rounds : Array.isArray(sqlTimeDiff?.rounds) ? sqlTimeDiff!.rounds : []
+  const num = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined
+  const status = (value: unknown): number | null =>
+    value && typeof value === 'object' && typeof (value as { status?: unknown }).status === 'number'
+      ? (value as { status: number }).status
+      : null
+  return rounds.slice(0, 5).map((r, idx) => ({
+    round: num(r.round) ?? idx + 1,
+    ...(typeof r.pass === 'boolean' ? { pass: r.pass } : {}),
+    baselineStatus: status(r.baseline),
+    trueStatus: status(r.true),
+    falseStatus: status(r.false),
+    ...(r.delayProbe !== undefined ? { delayProbeStatus: status(r.delayProbe) } : {}),
+    ...(num(r.similarityBaselineTrue) !== undefined ? { similarityBaselineTrue: num(r.similarityBaselineTrue)! } : {}),
+    ...(num(r.similarityTrueFalse) !== undefined ? { similarityTrueFalse: num(r.similarityTrueFalse)! } : {}),
+    ...(num(r.baselineMs) !== undefined ? { baselineMs: Math.round(num(r.baselineMs)!) } : {}),
+    ...(num(r.probeMs) !== undefined ? { probeMs: Math.round(num(r.probeMs)!) } : {}),
+  }))
+}
+
 export function buildInlineVerifyFeedback(
   spec: DeclarativeReplaySpec | unknown,
   replay: ReplayVerificationResult,
   attemptCount: number,
   maxRetries = maxInlineVerifyRetries,
   secrets: readonly NamedSecret[] = [],
-): InlineVerifyFeedback {
+): EnrichedInlineVerifyFeedback {
   const maxAttempts = 1 + Math.max(0, maxRetries)
   const retriesRemaining = Math.max(0, maxAttempts - attemptCount)
   const payload = replay.evidencePayload ?? {}
@@ -2294,7 +2421,44 @@ export function buildInlineVerifyFeedback(
     ...(reason ? { reason: redact(reason, secrets).slice(0, 400) } : {}),
   }
 
-  const rawFeedback: InlineVerifyFeedback = {
+  // --- M1.5 enrichment: actionable, bounded, redacted evidence for the repairing agent ---
+  const enrichedHeaders = summarizeKeyResponseHeaders(replay.exchanges ?? [], stepStatuses.map(s => s.id), secrets)
+  const bodyPreviews: InlineStepBodyPreview[] = []
+  if (replay.verdict !== 'confirmed' && replay.verdict !== 'static_verified') {
+    const failedIds = new Set<string>()
+    if (failedStepId) failedIds.add(failedStepId)
+    for (const step of stepStatuses) {
+      if (step.id === failedStepId || step.status === null || step.status === 0 || step.status >= 400) failedIds.add(step.id)
+    }
+    for (const [idx, ex] of (replay.exchanges ?? []).slice(0, maxInlineExchanges).entries()) {
+      const stepId = stepStatuses[idx]?.id ?? `exchange-${idx + 1}`
+      if (failedIds.size && !failedIds.has(stepId)) continue
+      if (!ex.body) continue
+      const { preview, truncated } = sanitizeInlinePreview(ex.body, secrets)
+      if (!preview) continue
+      bodyPreviews.push({
+        stepId,
+        status: ex.status,
+        ...(ex.mediaType ? { mediaType: ex.mediaType } : {}),
+        preview,
+        truncated,
+      })
+      if (bodyPreviews.length >= 4) break
+    }
+  }
+
+  const extractedVarSummaries: Array<{ key: string; preview: string }> = []
+  const rawExtractedVars = payload.extractedVars
+  if (rawExtractedVars && typeof rawExtractedVars === 'object' && !Array.isArray(rawExtractedVars)) {
+    for (const [key, value] of Object.entries(rawExtractedVars as Record<string, unknown>).slice(0, maxInlineExtractedVars)) {
+      const { preview } = sanitizeInlinePreview(String(value ?? ''), secrets)
+      extractedVarSummaries.push({ key, preview })
+    }
+  }
+
+  const sqlRounds = kind === 'sql_boolean_diff' || kind === 'sql_time_diff' ? summarizeSqlRounds(payload) : []
+
+  const rawFeedback: EnrichedInlineVerifyFeedback = {
     verdict: replay.verdict,
     ...(replay.verificationTier ? { verificationTier: replay.verificationTier } : {}),
     ...(failedStepId ? { failedStepId: redact(failedStepId, secrets) } : {}),
@@ -2307,8 +2471,16 @@ export function buildInlineVerifyFeedback(
     assertionSummary,
     stepStatuses,
     retriesRemaining,
+    ...(replay.exchangeIds?.length ? { replayExchangeIds: replay.exchangeIds.slice(0, maxInlineExchanges) } : {}),
+    ...(enrichedHeaders.length ? { keyResponseHeaders: enrichedHeaders } : {}),
+    ...(bodyPreviews.length ? { stepBodyPreviews: bodyPreviews } : {}),
+    ...(extractedVarSummaries.length ? { extractedVars: extractedVarSummaries } : {}),
+    ...(sqlRounds.length ? { sqlRoundSummaries: sqlRounds } : {}),
+    ...(kind ? { verificationKind: kind } : {}),
   }
 
+  // Enrichment is built from already-redacted exchanges; this final pass catches anything that
+  // slipped through and guarantees the persisted feedback never carries live credentials.
   return redactJsonValue(rawFeedback, secrets)
 }
 

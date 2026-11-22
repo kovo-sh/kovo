@@ -45,6 +45,7 @@ import {
   loadSkill,
   resolveSpecialistProfile,
   routeStepToSpecialist,
+  selectPreInjectionSkills,
   runAgentSession,
   threatModelPrompt,
   workerInvestigationPrompt,
@@ -65,7 +66,8 @@ import {
   websocketResultToExchange,
 } from './broker.ts'
 import type { BrokerExchangeResult, Grant, PublicObservation } from './broker.ts'
-import { CanaryBroker } from './canary-broker.ts'
+import { CanaryBroker, scanSecondOrderMarkers } from './canary-broker.ts'
+import type { SecondOrderStore } from './canary-broker.ts'
 import { ColdGraphCompactor } from './compactor.ts'
 import { queryCves } from './cve-broker.ts'
 import {
@@ -125,6 +127,8 @@ const hardChainStepsCeiling = 300
 const diminishingReturnsDryThreshold = 6
 const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
+/** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
+const maxPhase3RefinementJobs = 10
 
 export function computeDynamicStepBudget(storage: Store, runId: string): number {
   const endpoints = storage.listEndpoints(runId)
@@ -684,18 +688,20 @@ function isSafeIdempotentPost(pathAndQuery: string, body?: string): boolean {
   return !/\bmutation\b/i.test(body)
 }
 
-function createBroker() {
+function createBroker(options: { storage: SecondOrderStore; canaryBroker: CanaryBroker }) {
   const target = process.env.GUARDIAN_NETWORK_FIXTURE
   if (!target) {
     return process.env.GUARDIAN_OFFLINE === '1'
-      ? new RequestBroker({ resolve: async () => [] })
-      : new RequestBroker()
+      ? new RequestBroker({ resolve: async () => [], storage: options.storage, canaryBroker: options.canaryBroker })
+      : new RequestBroker({ storage: options.storage, canaryBroker: options.canaryBroker })
   }
   const fixture = new URL(target)
   if (fixture.origin !== target || fixture.hostname !== '127.0.0.1' || fixture.protocol !== 'http:' || !fixture.port) {
     throw new Error('GUARDIAN_NETWORK_FIXTURE must identify a loopback HTTP origin.')
   }
   return new RequestBroker({
+    storage: options.storage,
+    canaryBroker: options.canaryBroker,
     source: 'fixture response',
     resolve: async host => host.endsWith('.private-fixture.example')
       ? [{ address: '127.0.0.1', family: 4 }]
@@ -759,6 +765,8 @@ export class Execution {
   private readonly variantSweptFindings = new Set<string>()
   private readonly variantSweepInFlight = new Set<string>()
   private readonly pendingTier3ApprovalKeys = new Set<string>()
+  /** runId → replay spec ids whose inline failure is eligible for bounded Phase-3 refinement. */
+  private readonly refinementEligible = new Map<string, Set<string>>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -766,9 +774,10 @@ export class Execution {
 
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
-    this.broker = options.broker ?? createBroker()
-    this.browser = options.browser ?? new ScopedBrowser(this.broker)
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
+    this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
+    // `storage` activates second-order canary scanning inside the browser context too.
+    this.browser = options.browser ?? new ScopedBrowser(this.broker, { storage })
     this.backend = options.backend ?? new LinuxWorkerBackend({
       workspace: { id: storage.workspace.id, directory: storage.directory },
     })
@@ -940,6 +949,18 @@ export class Execution {
       allowLocalLab,
       personas,
       secrets,
+      // Second-order canary scanning needs both the store and the minting broker; without these
+      // the broker/browser silently skip `scanSecondOrderMarkers`.
+      storage: this.storage,
+      canaryBroker: this.canaryBroker,
+      scopeRevision: run.scopeRevision,
+      mintCanary: (purpose, origin) => {
+        const minted = this.canaryBroker.mintCanary(run.id, purpose, origin, {
+          storage: this.storage,
+          assignmentId: job.assignment.id,
+        })
+        return { httpUrl: minted.httpUrl, url: minted.url }
+      },
       canRead: origin => {
         if (!this.authorize(job)) return false
         const fresh = this.storage.run(run.id)
@@ -1006,6 +1027,96 @@ export class Execution {
       },
     }
     return { grant, secrets, currentSecrets }
+  }
+
+  /**
+   * Scan a brokered HTTP exchange (response body + headers) for second-order canary markers.
+   * Runs in Execution (not only inside RequestBroker) so injected/custom brokers are covered too.
+   */
+  private scanSecondOrderExchange(
+    run: Run,
+    assignmentId: string,
+    res: Pick<BrokerExchangeResult, 'origin' | 'pathAndQuery' | 'personaHandle' | 'mediaType' | 'respHeaders' | 'body'>,
+    exchangeId: string | null,
+    mediaTypeOverride?: string,
+  ) {
+    const headerText = Object.entries(res.respHeaders ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n')
+    const body = typeof res.body === 'string' ? res.body : ''
+    if (!body.includes('gn2o_') && !headerText.includes('gn2o_')) return
+    scanSecondOrderMarkers({
+      text: `${headerText}\n${body}`,
+      runId: run.id,
+      assignmentId,
+      origin: res.origin,
+      endpoint: res.pathAndQuery,
+      persona: res.personaHandle,
+      mediaType: mediaTypeOverride ?? res.mediaType,
+      exchangeId,
+      storage: this.storage,
+    })
+  }
+
+  private markRefinementEligible(runId: string, replaySpecId: string) {
+    let set = this.refinementEligible.get(runId)
+    if (!set) {
+      set = new Set<string>()
+      this.refinementEligible.set(runId, set)
+    }
+    set.add(replaySpecId)
+  }
+
+  private isRefinementEligible(runId: string, replaySpecId: string): boolean {
+    return this.refinementEligible.get(runId)?.has(replaySpecId) === true
+  }
+
+  /** Number of Phase-3 refinement jobs already dispatched for this run (complete or active). */
+  private refinementJobsDispatched(runId: string): number {
+    return this.storage.workerList(runId).filter(w => w.stepId?.startsWith('refine:')).length
+  }
+
+  private refinementBudgetRemaining(runId: string): number {
+    return Math.max(0, maxPhase3RefinementJobs - this.refinementJobsDispatched(runId))
+  }
+
+  /**
+   * Strong pre-verification signal gate for bounded Phase-3 reasoning refinement: only findings
+   * backed by an observed differential anomaly, a canary/OOB trigger, a second-order surface, or a
+   * high-confidence SAST suspect are worth an extra LLM pass. Everything else stays deterministic.
+   */
+  private hasStrongPreVerificationSignal(
+    run: Run,
+    findingRow: { finding: Finding },
+    specRow: ReplaySpecRow,
+    feedback?: InlineVerifyFeedback | null,
+  ): boolean {
+    if (specRow.spec.kind === 'static_ast_proof') return false
+    if (findingRow.finding.codeLocations?.length) return true
+    if (feedback?.canaryTriggered === true) return true
+    const controlPassed = feedback?.controlPassed === true
+    const differentialKinds = new Set([
+      'sql_boolean_diff', 'sql_time_diff', 'cache_differential', 'auth_protocol_proof', 'rce_proof', 'race_burst',
+    ])
+    if (controlPassed && differentialKinds.has(specRow.spec.kind)) return true
+
+    const linkedIds = new Set(findingRow.finding.chainFactIds ?? [])
+    if (linkedIds.size === 0) return false
+    let facts: Fact[] = []
+    try {
+      facts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+    } catch {
+      return false
+    }
+    const multiPersona = run.capabilityTier >= 2
+    for (const fact of facts) {
+      if (!linkedIds.has(fact.id)) continue
+      const subkind = typeof fact.data?.subkind === 'string' ? fact.data.subkind : ''
+      if (subkind === 'code_audit_suspect' || subkind === 'second_order_surface') return true
+      if ((fact.kind as string) === 'cve_hypothesis') return true
+      if (fact.kind === 'dns' || fact.kind === 'tls') return true
+      if (fact.data?.triggered === true || fact.data?.anomaly === true || fact.data?.differential === true) return true
+      if (multiPersona && subkind === 'persona_resource') return true
+    }
+    return false
   }
 
   private async waitForTier3Approval(
@@ -2868,6 +2979,57 @@ export class Execution {
       }
     }
 
+    const secondOrderCanaries = this.storage.listSecondOrderCanaries(run.id).slice(0, 30)
+      .map(c => ({
+        marker: c.marker,
+        status: c.status,
+        injectedOrigin: c.injectedOrigin,
+        injectedEndpoint: c.injectedEndpoint,
+        injectedParam: c.injectedParam,
+        injectedPersona: c.injectedPersona,
+        surfacedOrigin: c.surfacedOrigin,
+        surfacedEndpoint: c.surfacedEndpoint,
+        surfacedPersona: c.surfacedPersona,
+      }))
+    const secondOrderSurfaceFacts = allUntaintedFacts
+      .filter(f => f.data?.subkind === 'second_order_surface' && afterRound.capabilityTier >= 1)
+      .slice(0, 20)
+
+    // Auto-enqueue a high-priority verification step for each new cross-persona or active-HTML
+    // second-order surface, so a surfaced canary is never left as an unexamined fact.
+    let secondOrderAutoSteps = 0
+    for (const fact of secondOrderSurfaceFacts) {
+      if (allSteps.length + bolaAutoSteps + secondOrderAutoSteps >= dynamicStepBudget) break
+      const marker = typeof fact.data?.marker === 'string' ? fact.data.marker : ''
+      const surfacedOrigin = typeof fact.data?.surfacedOrigin === 'string' ? fact.data.surfacedOrigin : fact.origin
+      const surfacedEndpoint = typeof fact.data?.surfacedEndpoint === 'string' ? fact.data.surfacedEndpoint : '/'
+      const surfacedMediaType = typeof fact.data?.surfacedMediaType === 'string' ? fact.data.surfacedMediaType : ''
+      const crossPersona = fact.data?.crossPersona === true
+      const activeHtml = /html/i.test(surfacedMediaType)
+      if (!marker || !approvedOrigins.has(surfacedOrigin) || (!crossPersona && !activeHtml)) continue
+      const alreadyPlanned = allSteps.some(s =>
+        (s.dependsOnFactIds ?? []).includes(fact.id) ||
+        (s.title.includes(marker) && s.sourceOrigins.includes(surfacedOrigin)),
+      )
+      if (alreadyPlanned) continue
+      const asset = afterRound.candidates.find(c => c.origin === surfacedOrigin && afterRound.approved.includes(c.id))
+      if (!asset) continue
+      this.storage.addChainStep(afterRound, {
+        title: `Second-order canary verification · ${marker} → ${new URL(surfacedOrigin).hostname}${surfacedEndpoint.slice(0, 40)}`,
+        hypothesis: `Second-order canary ${marker} planted via ${String(fact.data?.injectedEndpoint ?? '/')} (param ${String(fact.data?.injectedParam ?? 'input')}, persona ${String(fact.data?.injectedPersona ?? 'anonymous')}) resurfaced on ${surfacedOrigin}${surfacedEndpoint} as persona ${String(fact.data?.surfacedPersona ?? 'anonymous')} with media type ${surfacedMediaType || 'unknown'}${crossPersona ? ' (cross-persona)' : ''}${activeHtml ? ' (active HTML render)' : ''}. Re-read the surfaced endpoint with a control persona, prove the injected marker is persisted and rendered to a different principal, then submit a ${activeHtml ? 'browser_chain' : 'http_chain'} DeclarativeReplaySpec whose probe step renders the marker verbatim and whose control step does not.`,
+        category: crossPersona ? 'broken-access-control' : 'cors-client-side',
+        priority: 95,
+        targetAssetIds: [asset.id],
+        skills: crossPersona
+          ? ['oob-ssrf-browser-chain', 'bola-idor-race', 'false-positive-elimination']
+          : ['client-side-xss-postmessage', 'oob-ssrf-browser-chain'],
+        dependsOnFactIds: [fact.id],
+        sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(o => approvedOrigins.has(o)),
+        specialistProfile: crossPersona ? 'bola-bfla-specialist' : 'client-browser-dom-specialist',
+      })
+      secondOrderAutoSteps += 1
+    }
+
     const uncoveredEndpoints = this.storage.listEndpoints(run.id, { orderBy: 'coverage', limit: 25 })
       .filter(ep => approvedOrigins.has(ep.origin))
       .map(ep => ({
@@ -2921,6 +3083,7 @@ export class Execution {
           proofGapReason: g.proofGapReason ?? g.summary,
         })),
       pendingFindings: pendingFindings.map(f => ({ id: f.id, origin: f.origin, title: f.title, status: f.status, severity: f.severity })),
+      secondOrderCanaries,
       uncoveredEndpoints,
       dynamicStepBudget,
       budgetRemaining: {
@@ -3239,6 +3402,14 @@ export class Execution {
           body,
           multipartParts: args.multipartParts,
           persona: args.persona,
+          session: args.session,
+          csrfBind: args.csrfBind,
+          authMutation: args.authMutation,
+          probeClass: args.probeClass,
+          traceId: args.traceId,
+          runId: curRun.id,
+          assignmentId: job.assignment.id,
+          scopeRevision: curRun.scopeRevision,
           followRedirects: args.followRedirects ?? false,
         }, grant, signal)
 
@@ -3297,6 +3468,7 @@ export class Execution {
 
         // Priority #3: Auto-track persona_resource facts when Tier >= 2 and >= 2 personas are approved
         trackPersonaResources(curRun, res, saved.id)
+        this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
 
         let stagedPath: string | null = null
         try {
@@ -3345,6 +3517,14 @@ export class Execution {
             headers,
             body,
             persona: r.persona,
+            session: r.session,
+            csrfBind: r.csrfBind,
+            authMutation: r.authMutation,
+            probeClass: r.probeClass,
+            traceId: r.traceId,
+            runId: curRun.id,
+            assignmentId: job.assignment.id,
+            scopeRevision: curRun.scopeRevision,
             followRedirects: r.followRedirects ?? false,
           }
         })
@@ -3402,6 +3582,7 @@ export class Execution {
             secrets: currentSecrets(),
           })
           trackPersonaResources(curRun, res, saved.id)
+        this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
           return {
             exchangeId: saved.id,
             origin: res.origin,
@@ -3454,7 +3635,11 @@ export class Execution {
             }
             return {
               origin: r.origin, method: r.method, pathAndQuery: r.pathAndQuery,
-              headers, body, persona: r.persona, followRedirects: r.followRedirects ?? false,
+              headers, body, persona: r.persona, session: r.session,
+              csrfBind: r.csrfBind, authMutation: r.authMutation, probeClass: r.probeClass,
+              traceId: r.traceId, runId: curRun.id, assignmentId: job.assignment.id,
+              scopeRevision: curRun.scopeRevision,
+              followRedirects: r.followRedirects ?? false,
             }
           })
           const results = await this.broker.executeBatch(brokerReqs, grant, signal)
@@ -3478,6 +3663,7 @@ export class Execution {
               secrets: currentSecrets(),
             })
             trackPersonaResources(curRun, res, saved.id)
+        this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
             return {
               exchangeId: saved.id, status: res.status, durationMs: res.durationMs,
               bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
@@ -3518,6 +3704,10 @@ export class Execution {
             origin: args.origin,
             pathAndQuery: args.pathAndQuery,
             persona: args.persona,
+            session: args.session,
+            runId: curRun.id,
+            assignmentId: job.assignment.id,
+            traceId: randomUUID(),
             checkKind: args.domCheck && args.domCheck !== 'none' ? args.domCheck : undefined,
             actions: args.actions,
             enableSinkHook: args.enableSinkHook,
@@ -3542,6 +3732,7 @@ export class Execution {
                 durationMs: ex.durationMs,
                 secrets: currentSecrets(),
               })
+              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
               return saved.id
             },
           }, grant, signal)
@@ -3604,6 +3795,7 @@ export class Execution {
                   secrets: currentSecrets(),
                 })
                 trackPersonaResources(curRun, ex, saved.id)
+              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
                 return saved.id
               },
             })),
@@ -3726,6 +3918,7 @@ export class Execution {
                 secrets: currentSecrets(),
               })
               trackPersonaResources(curRun, ex, saved.id)
+              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
               return saved.id
             },
           }, this.broker, grant, signal)
@@ -3808,6 +4001,7 @@ export class Execution {
                 secrets: currentSecrets(),
               })
               trackPersonaResources(curRun, ex, saved.id)
+              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
               return saved.id
             },
           }, this.broker, grant, this.canaryBroker, signal)
@@ -3955,6 +4149,24 @@ export class Execution {
             durationMs: syntheticEx.durationMs,
             secrets: currentSecrets(),
           })
+          // Second-order markers can surface in WebSocket frames or upgrade headers.
+          const wsScanText = [
+            ...Object.entries(wsRes.upgradeHeaders ?? {}).map(([k, v]) => `${k}: ${v}`),
+            ...wsRes.frames.map(frame => frame.data),
+          ].join('\n')
+          if (wsScanText.includes('gn2o_')) {
+            scanSecondOrderMarkers({
+              text: wsScanText,
+              runId: curRun.id,
+              assignmentId: job.assignment.id,
+              origin: wsRes.origin,
+              endpoint: wsRes.pathAndQuery,
+              persona: wsRes.personaHandle,
+              mediaType: 'websocket',
+              exchangeId: saved.id,
+              storage: this.storage,
+            })
+          }
           const ev = this.storage.addArtifact(curRun, job.assignment, 'ws',
             `WebSocket probe · ${wsRes.origin}${wsRes.pathAndQuery.slice(0, 60)}`,
             JSON.stringify({ exchangeId: saved.id, ...wsRes }, null, 2), undefined, currentSecrets())
@@ -4026,17 +4238,34 @@ export class Execution {
         mint_second_order_canary: async (args) => {
           const curRun = this.check(job)
           const cleanOrigin = this.parseOriginForRun(curRun, args.injectedOrigin)
-          const marker = `gn2o_${randomUUID().replaceAll('-', '').slice(0, 8)}`
-          const row = this.storage.insertSecondOrderCanary({
+          const project = this.storage.project(curRun.projectId)
+          if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && isLocalLabEnvEnabled())) {
+            await this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() })
+          }
+          // Route through the CanaryBroker so the marker is registered for OOB callback
+          // correlation and for multi-surface second-order scanning.
+          const minted = this.canaryBroker.mintSecondOrderCanary({
             runId: curRun.id,
             assignmentId: job.assignment.id,
-            marker,
             injectedOrigin: cleanOrigin,
             injectedEndpoint: args.injectedEndpoint,
             injectedParam: args.injectedParam,
             injectedPersona: args.injectedPersona ?? null,
+            storage: this.storage,
           })
-          return { id: row.id, marker }
+          return {
+            canaryId: minted.id ?? null,
+            id: minted.id ?? null,
+            marker: minted.marker,
+            httpUrl: minted.httpUrl,
+            dnsHost: minted.dnsHost,
+            injectedOrigin: minted.injectedOrigin,
+            injectedEndpoint: minted.injectedEndpoint,
+            injectedParam: minted.injectedParam,
+            injectedPersona: minted.injectedPersona,
+            listenerActive: this.canaryBroker.listenerInfo().running,
+            note: 'Place the marker verbatim in a stored field, then inspect list_second_order_canaries after other personas/renders read it back. A surfaced cross-persona or HTML surface is a high-priority lead, not a confirmed finding.',
+          }
         },
 
         list_second_order_canaries: async ({ status }) => {
@@ -4197,6 +4426,8 @@ export class Execution {
               endpoint: existingFields?.endpoint ?? null,
               authState: existingFields?.authState ?? null,
               specKind: existingFields?.specKind ?? null,
+              method: existingFields?.method ?? null,
+              param: existingFields?.param ?? null,
               reason: row.finding.reason,
               impact: row.finding.impact,
               remediation: row.finding.remediation,
@@ -4222,6 +4453,8 @@ export class Execution {
               endpoint: specDedupeFields.endpoint,
               authState: specDedupeFields.authState,
               specKind: specDedupeFields.specKind,
+              method: specDedupeFields.method,
+              param: specDedupeFields.param,
               reason: parsed.severityRationale,
               impact: parsed.impact,
               remediation: parsed.remediation,
@@ -4600,6 +4833,24 @@ export class Execution {
       const specialistConfig = resolveSpecialistProfile(specialistProfileId)
       const scopedHandlers = filterHandlersForSpecialist(handlers, specialistConfig)
 
+      const techTags = this.storage.listFacts(run.id, { includeTainted: false, kind: 'tech_fingerprint', limit: 30 })
+        .flatMap(f => {
+          const tags = f.data?.tags
+          return Array.isArray(tags) ? tags.filter((t): t is string => typeof t === 'string') : []
+        })
+      const sinkKind = parentFacts
+        .map(f => (typeof f.data?.sinkKind === 'string' ? f.data.sinkKind : ''))
+        .find(Boolean)
+      const preInjectedSkills = selectPreInjectionSkills({
+        profileSkills: specialistConfig.skills,
+        techTags: [...new Set(techTags)],
+        ...(sinkKind ? { sinkKind } : {}),
+        category: step.category,
+        title: step.title,
+        hypothesis: step.hypothesis,
+        limit: 2,
+      })
+
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: job.assignment.sessionId,
@@ -4624,6 +4875,7 @@ export class Execution {
           })),
           specsSummary: stagedSpecs,
           mountedRepos,
+          preInjectedSkills,
         }),
         signal: job.controller.signal,
         maxTurns: job.assignment.maxTurns,
@@ -4729,6 +4981,57 @@ export class Execution {
       for (const s of this.storage.listReplaySpecs(run.id)) {
         if (ownedRefineSpecIds.has(s.id)) refinedFindingIds.add(s.findingId)
       }
+    }
+
+    // 1b. Bounded Phase-3 reasoning refinement for inline-failed findings with strong pre-signals.
+    // This is what re-connects refinement after an inline `dismissed`/`inconclusive`: those rows are
+    // never `pending`, so the normal verification queue would otherwise never look at them again.
+    const eligibleRefineSpecIds = new Set<string>()
+    const refinementBudget = this.refinementBudgetRemaining(run.id)
+    if (refinementBudget > 0 && privateModelProfiles(this.storage).length > 0) {
+      const specById = new Map(this.storage.listReplaySpecs(run.id).map(s => [s.id, s]))
+      const rowsById = new Map(this.storage.db.select().from(findings).where(and(
+        eq(findings.runId, run.id),
+        eq(findings.goalRevision, run.goalRevision),
+      )).all().map(r => [r.id, r]))
+      let dispatched = 0
+      for (const specId of [...(this.refinementEligible.get(run.id) ?? [])]) {
+        if (dispatched >= refinementBudget) break
+        if (ownedRefineSpecIds.has(specId)) continue
+        const specRow = specById.get(specId)
+        if (!specRow) continue
+        const row = rowsById.get(specRow.findingId)
+        if (!row) continue
+        const status = row.finding.status
+        if (status === 'confirmed' || status === 'static_verified') continue
+        if (status !== 'pending' && status !== 'inconclusive' && status !== 'dismissed') continue
+        if (!row.sourceOrigins.every(o => approvedOrigins.has(o))) continue
+        if (!specRow.sourceOrigins.every(o => approvedOrigins.has(o))) continue
+        const asset = run.candidates.find(c => c.id === row.assetId)
+        this.storage.makeWorker(
+          run,
+          'verification',
+          asset,
+          `Refine replay · ${specRow.spec.title.slice(0, 75)}`,
+          `Bounded 8-turn Phase-3 refinement for inline-failed ${specRow.spec.kind} spec ${specId} with a strong pre-verification signal.`,
+          {
+            stepId: `refine:${specId}`,
+            sourceOrigins: specRow.sourceOrigins,
+            maxTurns: 8,
+          },
+        )
+        eligibleRefineSpecIds.add(specId)
+        refinedFindingIds.add(specRow.findingId)
+        dispatched += 1
+      }
+    }
+    if (eligibleRefineSpecIds.size > 0) {
+      this.storage.event(
+        run.id,
+        'refinement.dispatched',
+        `Dispatched ${eligibleRefineSpecIds.size} bounded Phase-3 refinement job(s) for inline-failed specs.`,
+        { specIds: [...eligibleRefineSpecIds], cap: maxPhase3RefinementJobs },
+      )
     }
 
     for (const row of pendingFindings) {
@@ -5028,11 +5331,15 @@ export class Execution {
         const alreadyQueuedRefine = this.storage.workerList(current.id).some(w =>
           w.phase === 'verification' && w.stepId === refineStepId,
         )
+        const strongPreSignal = this.hasStrongPreVerificationSignal(current, findingRow, specRow, rawFeedback)
+        if (strongPreSignal) this.markRefinementEligible(current.id, specRow.id)
         const canRefine =
           current.capabilityTier > 0 &&
           !this.storage.checkBudgetExceeded(current.id) &&
           privateModelProfiles(this.storage).length > 0 &&
           !alreadyQueuedRefine &&
+          strongPreSignal &&
+          this.refinementBudgetRemaining(current.id) > 0 &&
           specRow.sourceOrigins.every(o => permittedAtAdmission.has(o))
         if (canRefine) {
           const asset = current.candidates.find(c => c.id === findingRow.assetId)
@@ -5369,6 +5676,11 @@ export class Execution {
         )).get()
         if (refreshedRow) this.scheduleVariantSweepForFinding(latestRun, refreshedRow)
       } else {
+        if (this.hasStrongPreVerificationSignal(latestRun, findingRow, updatedSpec, normalizedFeedback)) {
+          // Phase-2 inline failure with a strong pre-verification signal: eligible for one bounded
+          // Phase-3 reasoning refinement (dispatched by driveVerification, <=10 per run).
+          this.markRefinementEligible(latestRun.id, updatedSpec.id)
+        }
         this.storage.updateProposedFinding(latestRun, findingRow.id, {
           replaySpecId: updatedSpec.id,
           sourceOrigins: mergedOrigins,

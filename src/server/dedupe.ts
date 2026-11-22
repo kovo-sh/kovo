@@ -15,6 +15,18 @@ export interface FindingFingerprintInput {
   endpoint?: string | null
   authState?: string | null
   specKind?: string | null
+  /** HTTP verb of the probed step. Defaults to `any` so findings without a method never fragment. */
+  method?: string | null
+  /** Primary injectable/read parameter (query/body/header name). Empty when the route itself is the unit. */
+  param?: string | null
+}
+
+export interface SpecDedupeFields {
+  endpoint: string
+  authState: string
+  specKind: string
+  method: string
+  param: string
 }
 
 export interface ComputedFindingFingerprint {
@@ -33,6 +45,8 @@ export interface DedupeCandidate {
   endpoint?: string | null
   authState?: string | null
   specKind?: string | null
+  method?: string | null
+  param?: string | null
   reason?: string
   impact?: string
   remediation?: string
@@ -51,6 +65,8 @@ export interface ExistingFindingRef {
   endpoint?: string | null
   authState?: string | null
   specKind?: string | null
+  method?: string | null
+  param?: string | null
   reason?: string
   impact?: string
   remediation?: string
@@ -220,30 +236,80 @@ export function computeFindingFingerprint(input: FindingFingerprintInput): Compu
   const normalizedEndpoint = normalizeEndpointTemplate(input.endpoint)
   const authState = (input.authState?.trim().toLowerCase() || 'anonymous')
   const specKind = (input.specKind?.trim().toLowerCase() || 'http_chain')
-  const key = `${origin}|${cwe}|${normalizedEndpoint}|${authState}|${specKind}`
+  const method = (input.method?.trim().toUpperCase() || 'ANY')
+  const param = (input.param?.trim().toLowerCase() || '')
+  // `(method, param)` participate in the key so GET vs DELETE BOLA/IDOR on one route and two
+  // distinct injectable parameters on one route do not collapse into a single fingerprint.
+  const key = `${origin}|${cwe}|${method}|${normalizedEndpoint}|${param}|${authState}|${specKind}`
   const hash = createHash('sha256').update(key).digest('hex')
   return { key, hash, normalizedEndpoint }
 }
 
-export function extractSpecDedupeFields(spec: unknown): { endpoint: string; authState: string; specKind: string } {
+/** Extract the first parameter name from a pathAndQuery string (`?a=1&b=2` → `a`). */
+function firstQueryParam(pathAndQuery: string | undefined | null): string {
+  if (!pathAndQuery) return ''
+  const qIdx = pathAndQuery.indexOf('?')
+  if (qIdx < 0) return ''
+  const query = pathAndQuery.slice(qIdx + 1).split('#')[0]
+  for (const pair of query.split('&')) {
+    const name = pair.split('=')[0]?.trim()
+    if (name) return decodeURIComponentSafe(name)
+  }
+  return ''
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function firstJsonKey(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const key = Object.keys(value as Record<string, unknown>)[0]
+  return typeof key === 'string' ? key : ''
+}
+
+/** Resolve the primary parameter for a ReplaySpec step (request body → query string). */
+function primaryParamForRequest(request: { pathAndQuery?: string; jsonBody?: unknown; textBody?: string } | undefined): string {
+  if (!request) return ''
+  const jsonKey = firstJsonKey(request.jsonBody)
+  if (jsonKey) return jsonKey
+  const queryParam = firstQueryParam(request.pathAndQuery)
+  if (queryParam) return queryParam
+  if (typeof request.textBody === 'string') {
+    const formParams = new URLSearchParams(request.textBody)
+    const first = [...formParams.keys()][0]
+    if (first) return first
+  }
+  return ''
+}
+
+function personaAuthState(personas: readonly (string | undefined)[]): string {
+  const unique = [...new Set(personas.filter((p): p is string => Boolean(p && p.trim())))].sort()
+  return unique.length ? `persona:${unique.join(',')}` : 'anonymous'
+}
+
+export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
   if (!spec || typeof spec !== 'object') {
-    return { endpoint: '/', authState: 'anonymous', specKind: 'http_chain' }
+    return { endpoint: '/', authState: 'anonymous', specKind: 'http_chain', method: 'ANY', param: '' }
   }
   const s = spec as Record<string, unknown>
   const specKind = typeof s.kind === 'string' && s.kind.trim() ? s.kind.trim() : 'http_chain'
 
   if (specKind === 'http_chain' && Array.isArray(s.steps)) {
-    const steps = s.steps as Array<{ role?: string; request?: { pathAndQuery?: string; persona?: string } }>
+    const steps = s.steps as Array<{
+      role?: string
+      request?: { pathAndQuery?: string; persona?: string; method?: string; jsonBody?: unknown; textBody?: string }
+    }>
     const probeStep = steps.find(st => st?.role === 'probe') ?? steps[0]
     const endpoint = probeStep?.request?.pathAndQuery ?? '/'
-    const personas = [...new Set(
-      steps
-        .filter(st => st?.role === 'probe')
-        .map(st => st?.request?.persona?.trim())
-        .filter((p): p is string => Boolean(p)),
-    )].sort()
-    const authState = personas.length ? `persona:${personas.join(',')}` : 'anonymous'
-    return { endpoint, authState, specKind }
+    const authState = personaAuthState(steps.filter(st => st?.role === 'probe').map(st => st?.request?.persona))
+    const method = probeStep?.request?.method ?? 'ANY'
+    const param = primaryParamForRequest(probeStep?.request)
+    return { endpoint, authState, specKind, method, param }
   }
 
   if (specKind === 'browser_chain' && Array.isArray(s.steps)) {
@@ -251,34 +317,87 @@ export function extractSpecDedupeFields(spec: unknown): { endpoint: string; auth
     const probeStep = steps.find(st => st?.role === 'probe') ?? steps[0]
     const endpoint = probeStep?.pathAndQuery ?? '/'
     const authState = probeStep?.persona ? `persona:${probeStep.persona}` : 'anonymous'
-    return { endpoint, authState, specKind }
+    return {
+      endpoint,
+      authState,
+      specKind,
+      method: 'ANY',
+      param: firstQueryParam(endpoint),
+    }
   }
 
   if (specKind === 'browser_dom') {
     const endpoint = typeof s.probePath === 'string' ? s.probePath : '/'
     const authState = typeof s.persona === 'string' && s.persona ? `persona:${s.persona}` : 'anonymous'
-    return { endpoint, authState, specKind }
+    return { endpoint, authState, specKind, method: 'ANY', param: firstQueryParam(endpoint) }
   }
 
   if (specKind === 'race_burst' && Array.isArray(s.burst)) {
-    const first = s.burst[0] as { pathAndQuery?: string; persona?: string } | undefined
+    const first = s.burst[0] as { pathAndQuery?: string; persona?: string; method?: string } | undefined
     const endpoint = first?.pathAndQuery ?? '/'
     const authState = first?.persona ? `persona:${first.persona}` : 'anonymous'
-    return { endpoint, authState, specKind }
+    return { endpoint, authState, specKind, method: first?.method ?? 'ANY', param: firstQueryParam(endpoint) }
   }
 
   if (specKind === 'rce_proof') {
-    const probeStep = s.probeStep as { request?: { pathAndQuery?: string; persona?: string } } | undefined
+    const probeStep = s.probeStep as { request?: { pathAndQuery?: string; persona?: string; method?: string; jsonBody?: unknown } } | undefined
     const endpoint = probeStep?.request?.pathAndQuery ?? '/'
     const authState = probeStep?.request?.persona ? `persona:${probeStep.request.persona}` : 'anonymous'
-    return { endpoint, authState, specKind }
+    return {
+      endpoint,
+      authState,
+      specKind,
+      method: probeStep?.request?.method ?? 'ANY',
+      param: primaryParamForRequest(probeStep?.request),
+    }
   }
 
   if (specKind === 'sql_boolean_diff') {
-    const probe = (s.probeRequest ?? s.targetRequest ?? s.request) as { pathAndQuery?: string; persona?: string } | undefined
+    const probe = (s.probeRequest ?? s.targetRequest ?? s.request) as { pathAndQuery?: string; persona?: string; method?: string } | undefined
     const endpoint = (typeof s.pathAndQuery === 'string' ? s.pathAndQuery : probe?.pathAndQuery) ?? '/'
     const persona = (typeof s.persona === 'string' ? s.persona : probe?.persona)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind }
+    const method = (typeof s.method === 'string' ? s.method : probe?.method) ?? 'ANY'
+    const param = typeof s.paramName === 'string' ? s.paramName : firstQueryParam(endpoint)
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param }
+  }
+
+  if (specKind === 'sql_time_diff') {
+    const endpoint = typeof s.pathAndQuery === 'string' ? s.pathAndQuery : '/'
+    const persona = typeof s.persona === 'string' && s.persona
+      ? `persona:${s.persona}`
+      : typeof s.session === 'string' && s.session ? `session:${s.session}` : 'anonymous'
+    const method = typeof s.method === 'string' ? s.method : 'ANY'
+    const param = typeof s.paramName === 'string'
+      ? s.paramName
+      : firstJsonKey(s.jsonBody) || firstQueryParam(endpoint)
+    return { endpoint, authState: persona, specKind, method, param }
+  }
+
+  if (specKind === 'auth_protocol_proof' && Array.isArray(s.steps)) {
+    const steps = s.steps as Array<{
+      role?: string
+      request?: { pathAndQuery?: string; persona?: string; method?: string; jsonBody?: unknown; authMutation?: { kind?: string } }
+    }>
+    const probeStep = steps.find(st => st?.role === 'probe') ?? steps[0]
+    const endpoint = probeStep?.request?.pathAndQuery ?? '/'
+    const authState = personaAuthState(steps.filter(st => st?.role === 'probe').map(st => st?.request?.persona))
+    const method = probeStep?.request?.method ?? 'ANY'
+    const mutationKind = probeStep?.request?.authMutation?.kind
+    const param = mutationKind ? `auth:${mutationKind}` : primaryParamForRequest(probeStep?.request)
+    return { endpoint, authState, specKind, method, param }
+  }
+
+  if (specKind === 'cache_differential') {
+    const endpoint = typeof s.probePath === 'string' ? s.probePath : '/'
+    const persona = typeof s.poisonPersona === 'string' && s.poisonPersona
+      ? `persona:${s.poisonPersona}`
+      : 'anonymous'
+    const method = typeof s.method === 'string' ? s.method : 'ANY'
+    const headers = s.poisonHeaders && typeof s.poisonHeaders === 'object' && !Array.isArray(s.poisonHeaders)
+      ? Object.keys(s.poisonHeaders as Record<string, unknown>).map(k => k.toLowerCase()).sort()
+      : []
+    const param = headers[0] ?? firstQueryParam(endpoint)
+    return { endpoint, authState: persona, specKind, method, param }
   }
 
   if (specKind === 'ws_chain' && Array.isArray(s.steps)) {
@@ -286,29 +405,37 @@ export function extractSpecDedupeFields(spec: unknown): { endpoint: string; auth
     const probeStep = steps.find(st => st?.role === 'probe') ?? steps[0]
     const endpoint = (typeof s.pathAndQuery === 'string' ? s.pathAndQuery : probeStep?.pathAndQuery) ?? '/'
     const persona = (typeof s.persona === 'string' ? s.persona : probeStep?.persona)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind }
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method: 'ANY', param: firstQueryParam(endpoint) }
   }
 
   if (specKind === 'upload_probe') {
-    const uploadReq = (s.uploadRequest ?? s.uploadStep) as { pathAndQuery?: string; persona?: string; request?: { pathAndQuery?: string; persona?: string } } | undefined
+    const uploadReq = (s.uploadRequest ?? s.uploadStep) as { pathAndQuery?: string; persona?: string; method?: string; fieldName?: string; request?: { pathAndQuery?: string; persona?: string; method?: string } } | undefined
     const endpoint = uploadReq?.pathAndQuery ?? uploadReq?.request?.pathAndQuery ?? (typeof s.uploadPath === 'string' ? s.uploadPath : '/')
     const persona = uploadReq?.persona ?? uploadReq?.request?.persona ?? (typeof s.persona === 'string' ? s.persona : undefined)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind }
+    const method = uploadReq?.method ?? uploadReq?.request?.method ?? 'ANY'
+    const param = typeof uploadReq?.fieldName === 'string' ? uploadReq.fieldName : firstQueryParam(endpoint)
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param }
   }
 
   if (specKind === 'static_ast_proof') {
     const repo = typeof s.repo === 'string' ? s.repo : ''
     const file = typeof s.file === 'string' ? s.file : ''
     const endpoint = file ? `/${[repo, file].filter(Boolean).join('/')}` : '/'
-    return { endpoint, authState: 'static', specKind }
+    const startLine = typeof s.startLine === 'number' ? String(s.startLine) : ''
+    return { endpoint, authState: 'static', specKind, method: 'ANY', param: startLine }
   }
 
   if (specKind === 'dns_takeover') {
     const endpoint = typeof s.probePath === 'string' ? s.probePath : '/'
-    return { endpoint, authState: 'anonymous', specKind }
+    return { endpoint, authState: 'anonymous', specKind, method: 'ANY', param: '' }
   }
 
-  return { endpoint: '/', authState: 'anonymous', specKind }
+  if (specKind === 'tls_audit') {
+    // TLS posture is origin-wide by definition; `/` is the correct unit of work here.
+    return { endpoint: '/', authState: 'anonymous', specKind, method: 'ANY', param: '' }
+  }
+
+  return { endpoint: '/', authState: 'anonymous', specKind, method: 'ANY', param: '' }
 }
 
 function activeExistingFindings(
@@ -338,6 +465,8 @@ export function checkStructuralDuplicate(
     endpoint: candidate.endpoint,
     authState: candidate.authState,
     specKind: candidate.specKind,
+    method: candidate.method,
+    param: candidate.param,
   })
   const candidateHash = candidate.fingerprintHash || fingerprint.hash
   const active = activeExistingFindings(existingFindings, excludeFindingId ?? candidate.id)
@@ -350,6 +479,8 @@ export function checkStructuralDuplicate(
       endpoint: existing.endpoint,
       authState: existing.authState,
       specKind: existing.specKind,
+      method: existing.method,
+      param: existing.param,
     }).hash
     return existingFp === candidateHash || existingFp === fingerprint.hash
   })
@@ -446,6 +577,17 @@ function deterministicSemanticFallback(
     const sameOrigin = candOrigin === exOrigin
     const sameCwe = candCwe !== 'unknown' && candCwe === exCwe
     const sameEndpoint = candEndpoint === exEndpoint
+    // Two probes that explicitly name different verbs or different injectable parameters on the
+    // same route are distinct attack surfaces (GET vs DELETE BOLA, two injectable params).
+    const methodConflict = Boolean(
+      candidate.method && existing.method &&
+      candidate.method.trim().toUpperCase() !== existing.method.trim().toUpperCase(),
+    )
+    const paramConflict = Boolean(
+      candidate.param && existing.param &&
+      candidate.param.trim().toLowerCase() !== existing.param.trim().toLowerCase(),
+    )
+    const probeConflict = methodConflict || paramConflict
     const shouldUpgrade = severityRank(candidate.severity) > severityRank(existing.severity)
 
     // Same origin + origin-wide CWE (e.g., CORS / CSP / HSTS / TLS / cookies):
@@ -461,7 +603,7 @@ function deterministicSemanticFallback(
     }
 
     // Same origin + same CWE + same normalized endpoint template (even if authState/specKind differs)
-    if (sameOrigin && sameCwe && sameEndpoint) {
+    if (sameOrigin && sameCwe && sameEndpoint && !probeConflict) {
       return {
         isDuplicate: true,
         duplicateOfId: existing.id,
@@ -472,7 +614,7 @@ function deterministicSemanticFallback(
     }
 
     // Same origin + same CWE + very high title/reason token overlap
-    if (sameOrigin && sameCwe) {
+    if (sameOrigin && sameCwe && !probeConflict) {
       const exTokens = tokenize(`${existing.title} ${existing.reason ?? ''}`)
       const sim = jaccardSimilarity(candTokens, exTokens)
       if (sim >= 0.6) {
@@ -555,6 +697,8 @@ export async function judgeSemanticDuplicate(
       endpoint: normalizeEndpointTemplate(candidate.endpoint),
       authState: candidate.authState ?? 'anonymous',
       specKind: candidate.specKind ?? 'http_chain',
+      method: candidate.method ?? 'ANY',
+      param: candidate.param ?? null,
       reason: (candidate.reason ?? '').slice(0, 600),
       impact: (candidate.impact ?? '').slice(0, 400),
       remediation: (candidate.remediation ?? '').slice(0, 400),
@@ -570,6 +714,8 @@ export async function judgeSemanticDuplicate(
       endpoint: normalizeEndpointTemplate(f.endpoint),
       authState: f.authState ?? 'anonymous',
       specKind: f.specKind ?? 'http_chain',
+      method: f.method ?? 'ANY',
+      param: f.param ?? null,
       reason: (f.reason ?? '').slice(0, 400),
       remediation: (f.remediation ?? '').slice(0, 300),
     })),
