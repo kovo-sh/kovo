@@ -6,7 +6,7 @@ import type { CanaryBroker } from './canary-broker.ts'
 import type { HttpMethod } from '../domain.ts'
 import { containsDestructivePayload, universalParamLocations } from '../replay-spec.ts'
 import type { CsrfBind, UniversalParamLocation } from '../replay-spec.ts'
-import { loadSafeTemplates, selectSafeTemplates } from '../templates/loader.ts'
+import { loadSafeTemplates, selectSafeTemplates, selectTemplateIdsForCves } from '../templates/loader.ts'
 import type { SafeTemplate, TemplateMatcher } from '../templates/loader.ts'
 import type { Store } from './store.ts'
 
@@ -161,13 +161,27 @@ function setQueryParam(pathAndQuery: string, name: string, value: string): strin
 
 function setJsonPath(target: Record<string, unknown>, dotPath: string, value: unknown) {
   const parts = dotPath.split('.')
-  let cur = target
+  let cur: Record<string, unknown> | unknown[] = target
   for (let i = 0; i < parts.length - 1; i += 1) {
-    const next = cur[parts[i]]
-    if (!next || typeof next !== 'object' || Array.isArray(next)) cur[parts[i]] = {}
-    cur = cur[parts[i]] as Record<string, unknown>
+    const part = parts[i]
+    const nextIsIndex = /^\d{1,3}$/.test(parts[i + 1] ?? '')
+    if (Array.isArray(cur)) {
+      const index = /^\d{1,3}$/.test(part) ? Number(part) : 0
+      const existing = cur[index]
+      if (!existing || typeof existing !== 'object') cur[index] = nextIsIndex ? [] : {}
+      cur = cur[index] as Record<string, unknown> | unknown[]
+    } else {
+      const existing = cur[part]
+      if (!existing || typeof existing !== 'object') cur[part] = nextIsIndex ? [] : {}
+      cur = cur[part] as Record<string, unknown> | unknown[]
+    }
   }
-  cur[parts[parts.length - 1]] = value
+  const last = parts[parts.length - 1]
+  if (Array.isArray(cur)) {
+    cur[/^\d{1,3}$/.test(last) ? Number(last) : 0] = value
+  } else {
+    cur[last] = value
+  }
 }
 
 const forbiddenParamHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-guardian-trace-id)$/i
@@ -3035,6 +3049,13 @@ export interface RunSafeTemplatesRequest {
   /** tech_fingerprint tags + /repos dependency tags used to auto-filter templates */
   techFingerprint?: string[]
   templateIds?: string[]
+  /** CVE ids from lockfile/trivy/curated advisories; auto-selects matching templates. */
+  cveIds?: string[]
+  /** Discovery-derived paths used to resolve {{discovered_protected_path}} / {{discovered_api_path}}. */
+  discoveredPaths?: {
+    protectedPaths?: string[]
+    apiPaths?: string[]
+  }
   maxTemplates?: number
   maxRequests?: number
   persona?: string
@@ -3084,10 +3105,23 @@ export const defaultTemplateLimit = 60
 export const templateLimitCeiling = 250
 
 function substitute(text: string, vars: Record<string, string>, encode: boolean): string {
-  return text.replace(/\{\{(rand|guardian_canary_http|guardian_canary_dns)\}\}/g, (_m, name: string) => {
+  return text.replace(/\{\{(rand|guardian_canary_http|guardian_canary_dns|discovered_protected_path|discovered_api_path)\}\}/g, (_m, name: string) => {
     const value = vars[name] ?? ''
-    return encode ? encodeURIComponent(value) : value
+    // Discovered paths are complete, already-safe path templates: never percent-encode the leading "/".
+    return encode && !name.startsWith('discovered_') ? encodeURIComponent(value) : value
   })
+}
+
+function templateNeedsDiscoveredPath(template: SafeTemplate): boolean {
+  const serialized = `${template.request.path} ${template.control?.path ?? ''}`
+  return /\{\{discovered_(?:protected|api)_path\}\}/.test(serialized)
+}
+
+function pathResolves(template: SafeTemplate, vars: Record<string, string>): boolean {
+  const resolved = substitute(template.request.path, vars, true)
+  if (!resolved || resolved.includes('{{')) return false
+  if (!resolved.startsWith('/') && !/^https?:\/\//.test(resolved)) return false
+  return true
 }
 
 function matcherPartText(part: 'body' | 'header' | 'all', ex: BrokerExchangeResult): string {
@@ -3156,12 +3190,26 @@ export async function runSafeTemplates(
   const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange)
   const loaded = loadSafeTemplates({ dir: req.templatesDir })
   const limit = Math.max(1, Math.min(req.maxTemplates ?? defaultTemplateLimit, templateLimitCeiling))
+  const cveTemplateIds = req.cveIds?.length
+    ? selectTemplateIdsForCves(loaded.templates, req.cveIds)
+    : []
+  const templateIds = [...new Set([...(req.templateIds ?? []), ...cveTemplateIds])]
   const selection = selectSafeTemplates(loaded.templates, {
-    techTags: req.techFingerprint, templateIds: req.templateIds, tier, maxTemplates: limit,
+    techTags: req.techFingerprint,
+    ...(templateIds.length ? { templateIds } : {}),
+    ...(req.cveIds?.length ? { cveIds: req.cveIds } : {}),
+    tier,
+    maxTemplates: limit,
   })
   const matches: TemplateMatch[] = []
   const suppressed: RunSafeTemplatesResult['suppressed'] = []
   const skipped = [...selection.skipped]
+  const protectedPaths = (req.discoveredPaths?.protectedPaths ?? []).filter(p => p.startsWith('/')).slice(0, 6)
+  const apiPaths = (req.discoveredPaths?.apiPaths ?? []).filter(p => p.startsWith('/')).slice(0, 6)
+  const dynamicVars: Record<string, string> = {
+    ...(protectedPaths[0] ? { discovered_protected_path: protectedPaths[0] } : {}),
+    ...(apiPaths[0] ? { discovered_api_path: apiPaths[0] } : {}),
+  }
   let templatesRun = 0
   let calibration: SurfaceCalibration | null = null
 
@@ -3169,9 +3217,20 @@ export async function runSafeTemplates(
     const cal = await calibrateOrigin(runner, origin)
     calibration = cal
     const runId = req.runId ?? 'surface-engine'
+    const assignment = req.storage && req.assignmentId ? req.storage.worker(req.assignmentId) : undefined
+    const run = req.storage && req.runId ? req.storage.run(req.runId) : undefined
 
     await runner.pool(selection.selected, async template => {
-      const vars: Record<string, string> = { rand: randToken(8), guardian_canary_http: '', guardian_canary_dns: '' }
+      const vars: Record<string, string> = {
+        rand: randToken(8),
+        guardian_canary_http: '',
+        guardian_canary_dns: '',
+        ...dynamicVars,
+      }
+      if (templateNeedsDiscoveredPath(template) && !pathResolves(template, vars)) {
+        skipped.push({ id: template.id, reason: 'no discovered path for dynamic placeholder' })
+        return
+      }
       let canaryToken: string | null = null
       if (template.matchers.some(m => m.type === 'canary')) {
         if (!canaryBroker) { skipped.push({ id: template.id, reason: 'canary unavailable' }); return }
@@ -3242,7 +3301,8 @@ export async function runSafeTemplates(
         }
       }
 
-      matches.push({
+      const exchangeId = runner.stage(ex)
+      const match: TemplateMatch = {
         templateId: template.id,
         name: template.name,
         severity: template.severity,
@@ -3255,9 +3315,36 @@ export async function runSafeTemplates(
         status: ex.status,
         evidence: evaluation.evidence,
         controlStatus,
-        exchangeId: runner.stage(ex),
+        exchangeId,
         note: 'Template match is a lead only; confirm via a Declarative Replay Spec (never auto-confirmed).',
-      })
+      }
+      matches.push(match)
+      if (req.storage && assignment && run) {
+        const summary = template.cve
+          ? `${template.cve}: ${template.name} matched on ${template.request.method} ${path} (HTTP ${ex.status}).`
+          : `${template.name} lead matched on ${template.request.method} ${path} (HTTP ${ex.status}).`
+        try {
+          req.storage.addFact(run, assignment, {
+            kind: match.factKind === 'cve_hypothesis' ? 'cve_hypothesis' : 'note',
+            origin,
+            summary,
+            data: {
+              templateId: template.id,
+              ...(template.cve ? { cveId: template.cve } : {}),
+              ...(template.cwe ? { cwe: template.cwe } : {}),
+              endpoint: path,
+              method: template.request.method,
+              status: ex.status,
+              evidence: evaluation.evidence.slice(0, 3),
+              confidence: 'low',
+            },
+            ...(exchangeId ? { exchangeIds: [exchangeId] } : {}),
+            sourceOrigins: [origin],
+          })
+        } catch {
+          // Fact persistence is best-effort; a match is still returned to the caller.
+        }
+      }
     })
   } catch (err) {
     if (!(err instanceof StopProbe) && !(err instanceof BrokerDenied)) throw err

@@ -3,7 +3,7 @@ name: "Gradle Library Version Disclosure"
 severity: "info"
 description: "Safe check derived from gradle-libs: Gradle Library Version Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "file"
   - "gradle"

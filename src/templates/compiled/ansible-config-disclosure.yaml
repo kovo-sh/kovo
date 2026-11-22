@@ -3,7 +3,7 @@ name: "Ansible Configuration Page - Detect"
 severity: "medium"
 description: "Ansible configuration page was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

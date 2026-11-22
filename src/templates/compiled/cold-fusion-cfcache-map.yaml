@@ -3,7 +3,7 @@ name: "Discover Cold Fusion cfcache.map Files"
 severity: "low"
 description: "Adobe Cold Fusion cfcache.map file is exposed."
 tech:
-  - "generic"
+  - "adobe"
 tags:
   - "exposure"
   - "coldfusion"

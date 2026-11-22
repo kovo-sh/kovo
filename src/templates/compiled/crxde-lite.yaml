@@ -3,8 +3,7 @@ name: "CRXDE Lite - Exposure"
 severity: "low"
 description: "CRXDE Lite exposure was detected."
 tech:
-  - "tomcat"
-  - "java"
+  - "aem"
 tags:
   - "aem"
   - "crxde"

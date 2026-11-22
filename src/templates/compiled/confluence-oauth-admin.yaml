@@ -3,7 +3,7 @@ name: "Confluence OAuth Administration Endpoint"
 severity: "info"
 description: "Safe check derived from confluence-oauth-admin: Confluence OAuth Administration Endpoint"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "jira"

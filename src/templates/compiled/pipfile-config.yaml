@@ -3,7 +3,7 @@ name: "Pipfile Config - Detect"
 severity: "info"
 description: "Pipfile configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "pip"

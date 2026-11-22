@@ -3,7 +3,7 @@ name: "JustFans Installation Page - Exposure"
 severity: "high"
 description: "Detects exposed JustFans Setup page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

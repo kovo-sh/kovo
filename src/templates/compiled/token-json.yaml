@@ -3,7 +3,7 @@ name: "Token Json File Disclosure"
 severity: "low"
 description: "Internal token.json file is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "cloud"

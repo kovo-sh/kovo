@@ -3,7 +3,7 @@ name: "Authentication.asmx - Detect"
 severity: "info"
 description: "Authentication Web Service authentication.asmx file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

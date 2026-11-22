@@ -3,7 +3,7 @@ name: "Indegy Sensor Setup - Installer"
 severity: "high"
 description: "Indegy Sensor is susceptible to the Installation page exposure due to misconfiguration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "indegy"

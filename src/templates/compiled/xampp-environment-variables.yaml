@@ -3,7 +3,7 @@ name: "XAMPP Environment Variables Exposure"
 severity: "low"
 description: "printenv.pl file is exposed in XAMPP leaking environment variables."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "xampp"

@@ -3,7 +3,7 @@ name: "Rancher - Incomplete Setup Exposure"
 severity: "low"
 description: "Detected Rancher installation was found with an incomplete first-time setup. The bootstrap login page was publicly accessible at /dashboard/auth/login, indicating an unconfigured instance that could have been targeted for unauthorized setup completion."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "rancher"
   - "misconfig"

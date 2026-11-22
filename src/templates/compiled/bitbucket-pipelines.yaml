@@ -3,7 +3,7 @@ name: "BitBucket Pipelines Configuration Exposure"
 severity: "info"
 description: "Safe check derived from bitbucket-pipelines: BitBucket Pipelines Configuration Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "bitbucket"

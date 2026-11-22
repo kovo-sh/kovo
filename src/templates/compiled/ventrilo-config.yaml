@@ -3,7 +3,7 @@ name: "Ventrilo Configuration File - Detect"
 severity: "high"
 description: "Ventrilo configuration file was detected, The file discloses the application's Adminpassword and Password."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "ventrilo"
   - "config"

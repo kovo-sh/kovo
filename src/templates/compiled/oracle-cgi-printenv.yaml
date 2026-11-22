@@ -3,7 +3,7 @@ name: "Oracle CGI printenv - Information Disclosure"
 severity: "medium"
 description: "Oracle CGI printenv component is susceptible to an information disclosure vulnerability."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "oracle"

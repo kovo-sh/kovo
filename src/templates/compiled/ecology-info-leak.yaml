@@ -3,7 +3,7 @@ name: "Ecology - Information Exposure"
 severity: "high"
 description: "The \"ecology\" component exposes a file that contains sensitive database credentials (dbuser/dbpass)."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "ecology"
   - "unauth"

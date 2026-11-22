@@ -3,7 +3,7 @@ name: "Oracle EBS - SQL Log Disclosure"
 severity: "medium"
 description: "An Oracle EBS SQL log was discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "oracle"
   - "ebs"

@@ -6,18 +6,17 @@ import type { ApprovalPolicy } from '../domain.ts'
 import { FormError, Status, useAction } from './common.tsx'
 import { EvidenceDialog } from './evidence-dialog.tsx'
 import { RunExchanges } from './run-exchanges.tsx'
+import { RunBoard } from './run-board.tsx'
 import { RunOverview } from './run-overview.tsx'
 import type { Command } from './run-overview.tsx'
 import { RunReport } from './run-report.tsx'
 import { RunSurface } from './run-surface.tsx'
 import { approvalPolicyMeta, capabilityTierMeta, formatUsd, phaseNames } from './run-state.ts'
 import type { RunDetail } from './run-state.ts'
-import { ThreadTranscript } from './thread-transcript.tsx'
 import { Button } from './ui/button.tsx'
 import { Checkbox } from './ui/checkbox.tsx'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/dropdown-menu.tsx'
 import { Input, Textarea } from './ui/input.tsx'
-import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from './ui/input-group.tsx'
 import { WorkerInspector } from './worker-inspector.tsx'
 import { WorkflowTrace } from './workflow-trace.tsx'
 
@@ -59,12 +58,11 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
 
   const [reconnecting, setReconnecting] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
-  const [showCoordinator, setShowCoordinator] = useState(false)
+  const [paneMode, setPaneMode] = useState<'board' | 'worker'>('board')
   const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH)
   const [draggingSplit, setDraggingSplit] = useState(false)
 
   const [revising, setRevising] = useState(false)
-  const [draft, setDraft] = useState('')
   const [query, setQuery] = useState('')
   const [zoom, setZoom] = useState(1)
   const [artifact, setArtifact] = useState<string>()
@@ -84,12 +82,19 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   cursor.current = Math.max(cursor.current, detail.cursor)
 
   const selectedWorker = assignments.find(item => item.id === workerId)
-  const worker = showCoordinator ? undefined : selectedWorker
-  const threadId = worker?.id ?? run.coordinatorId
-  const coordinatorMessages = detail.messages.filter(item => item.threadId === run.coordinatorId)
+  const activePaneMode = paneMode === 'worker' && selectedWorker ? 'worker' : 'board'
+  const worker = activePaneMode === 'worker' ? selectedWorker : undefined
   const workerHistoryLabel = worker && history.get(worker.id)
   const artifactWorkerId = artifact && detail.evidence.find(item => item.id === artifact)?.assignmentId
   const pendingApprovals = approvals.filter(item => item.status === 'pending')
+  const latestBoardSeq = detail.boardMessages.reduce((max, item) => Math.max(max, item.seq), 0)
+  const [seenBoardSeq, setSeenBoardSeq] = useState(latestBoardSeq)
+  const unreadBoardCount = activePaneMode === 'board' ? 0 : detail.boardMessages.filter(
+    item => item.seq > seenBoardSeq && item.authorRole !== 'operator',
+  ).length
+  useEffect(() => {
+    if (activePaneMode === 'board') setSeenBoardSeq(latestBoardSeq)
+  }, [activePaneMode, latestBoardSeq])
   const verifiedFindingCount = detail.findings.filter(
     f => (f.status === 'confirmed' || f.status === 'static_verified') && !f.supersededByFindingId,
   ).length
@@ -196,7 +201,7 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
   useEffect(() => {
     if (workerId) {
       setChatOpen(true)
-      setShowCoordinator(false)
+      setPaneMode('worker')
     }
   }, [workerId])
 
@@ -241,6 +246,11 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
 
   function closeWorker() {
     void navigate({ to: '/runs/$runId', params: { runId: run.id }, search: { view } })
+  }
+
+  function inspectWorker(nextWorkerId: string) {
+    setPaneMode('worker')
+    void navigate({ to: '/runs/$runId/workers/$workerId', params: { runId: run.id, workerId: nextWorkerId }, search: { view } })
   }
 
   function fitGraph() {
@@ -599,21 +609,24 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
         <aside
           className="chat-pane"
           style={{ width: panelWidth }}
-          aria-label={worker ? 'Worker inspector' : 'Coordinator chat'}
+          aria-label={activePaneMode === 'worker' ? 'Worker inspector' : 'Board'}
         >
           <div className="chat-header">
             <div className="panel-mode-tabs">
               <button
                 type="button"
-                className={`panel-mode-btn${!worker ? ' active' : ''}`}
-                onClick={() => setShowCoordinator(true)}
+                className={`panel-mode-btn${activePaneMode === 'board' ? ' active' : ''}`}
+                aria-pressed={activePaneMode === 'board'}
+                onClick={() => setPaneMode('board')}
               >
-                Coordinator
+                Board
+                {unreadBoardCount > 0 && <span className="panel-mode-badge" data-testid="board-unread-badge">{unreadBoardCount}</span>}
               </button>
               {selectedWorker && <button
                 type="button"
-                className={`panel-mode-btn${Boolean(worker) ? ' active' : ''}`}
-                onClick={() => setShowCoordinator(false)}
+                className={`panel-mode-btn${activePaneMode === 'worker' ? ' active' : ''}`}
+                aria-pressed={activePaneMode === 'worker'}
+                onClick={() => setPaneMode('worker')}
               >
                 Worker Inspector
               </button>}
@@ -621,52 +634,18 @@ export function RunWorkspace({ detail: routeDetail, view, workerId }: {
             <Button variant="ghost" size="icon" className="close-pane" onClick={() => setChatOpen(false)} aria-label="Close panel">×</Button>
           </div>
 
-          {worker ? <WorkerInspector
+          {activePaneMode === 'worker' && worker ? <WorkerInspector
             detail={detail}
             worker={worker}
             historyLabel={workerHistoryLabel}
             openEvidence={setArtifact}
-          /> : <div className="coordinator-pane">
-            {pendingApprovals.length > 0 && <div aria-label="Coordinator approval prompts" className="coord-approvals">
-              {pendingApprovals.map(item => <div key={item.id} className="approval-card approval-card-compact">
-                <div className="inline-badges">
-                  <strong>Tier 3 approval</strong>
-                  <span className="badge badge-attention">{item.method}</span>
-                </div>
-                <p className="approval-target"><code>{item.origin}{item.pathAndQuery}</code></p>
-                <p className="muted">{item.rationale}</p>
-                <div className="approval-actions">
-                  <Button className="btn-danger" disabled={action.pending} onClick={() => {
-                    execute({ action: 'decide_approval', approvalId: item.id, decision: 'denied' })
-                  }}>Deny</Button>
-                  <Button variant="ghost" disabled={action.pending} onClick={() => {
-                    execute({ action: 'approve_similar_endpoint', approvalId: item.id })
-                  }}>Approve similar</Button>
-                  <Button variant="default" disabled={action.pending} onClick={() => {
-                    execute({ action: 'decide_approval', approvalId: item.id, decision: 'approved' })
-                  }}>Approve</Button>
-                </div>
-              </div>)}
-            </div>}
-            <div className="thread-content" key={threadId}>
-              <ThreadTranscript messages={coordinatorMessages} attachments={[]} openEvidence={setArtifact} />
-            </div>
-            <form className="composer" onSubmit={event => {
-              event.preventDefault()
-              if (draft.trim()) execute({ action: 'message', message: draft }, () => setDraft(''))
-            }}>
-              <InputGroup>
-                <InputGroupTextarea rows={1} value={draft} onChange={event => setDraft(event.target.value)} aria-label="Message coordinator"
-                  placeholder="Message coordinator or steer investigation…" maxLength={8000} onKeyDown={event => {
-                    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
-                    event.preventDefault()
-                    event.currentTarget.form?.requestSubmit()
-                  }} />
-                <InputGroupAddon><InputGroupButton type="submit" variant="default" aria-label="Send message"
-                  disabled={action.pending || !draft.trim()}>↑</InputGroupButton></InputGroupAddon>
-              </InputGroup>
-            </form>
-          </div>}
+          /> : <RunBoard
+            detail={detail}
+            pending={action.pending}
+            execute={execute}
+            inspectWorker={inspectWorker}
+            openEvidence={setArtifact}
+          />}
         </aside>
       </>}
     </div>

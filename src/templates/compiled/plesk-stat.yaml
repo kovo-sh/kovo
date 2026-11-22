@@ -3,7 +3,7 @@ name: "Webalizer Log Analyzer Configuration - Detect"
 severity: "medium"
 description: "Webalizer log analyzer configuration was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

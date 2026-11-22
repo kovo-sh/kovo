@@ -3,7 +3,7 @@ name: "ModX CMS - Unfinished Installation"
 severity: "high"
 description: "Detected accessible ModX CMS installation or setup pages that indicated an incomplete installation.An exposed installation interface allowed attackers to complete the setup process and gain administrative access."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "modx"
   - "install"

@@ -3,7 +3,7 @@ name: "Atom SFTP Configuration File - Detect"
 severity: "high"
 description: "Atom SFTP deployment configuration file was detected. File contains server details and credentials."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "sftp"
   - "atom"

@@ -3,7 +3,7 @@ name: "Milesight Industrial Cellular Routers - Information Disclosure"
 severity: "high"
 description: "A critical security vulnerability has been identified in Milesight Industrial Cellular Routers, compromising the security discovered that it was publicly disclosing system logs, which included internal information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "milesight"
   - "log"

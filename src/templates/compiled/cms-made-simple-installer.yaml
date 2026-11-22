@@ -3,7 +3,7 @@ name: "CMS Made Simple Installation Page - Exposure"
 severity: "high"
 description: "Detects exposed CMS Made Simple Installation page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

@@ -3,7 +3,7 @@ name: "Snipe-IT Setup Page - Exposure"
 severity: "high"
 description: "Detects exposed Snipe-IT Setup page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

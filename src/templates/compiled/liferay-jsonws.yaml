@@ -3,7 +3,7 @@ name: "Liferay /api/jsonws - API Exposed"
 severity: "low"
 description: "Liferay /api/jsonws - API is Exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "liferay"
   - "exposure"

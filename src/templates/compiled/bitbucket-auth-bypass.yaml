@@ -3,7 +3,7 @@ name: "Bitbucket Server > 4.8 - Authentication Bypass"
 severity: "critical"
 description: "There is a permission bypass vulnerability through %20, which allows arbitrary users to obtain sensitive data"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "atlassian"

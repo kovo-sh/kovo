@@ -921,6 +921,8 @@ export interface CallGraphTaintPathOut {
   isInjectionUnsanitized: boolean
   /** Either of the two independent findings above (backwards-compatible aggregate). */
   isUnguardedPath: boolean
+  /** Data-layer sink lacks a tenant/org/user ownership predicate (cross-tenant exposure candidate). */
+  missingTenantScope?: boolean
   authCheck: string
   ownershipCheck: string
   severity: 'critical' | 'high' | 'medium' | 'low'
@@ -939,13 +941,18 @@ const DEFAULT_OWNERSHIP_GUARD_RE = /\b(?:require(?:Tenant|Org|OrgMembership|Owne
 const DEFAULT_SANITIZER_RE = /\b(?:parseInt|Number|Boolean|DOMPurify\.sanitize|escapeHtml|sanitizeHtml|path\.basename|encodeURIComponent|zod|safeParse|parameterize)\b/
 
 const BUILTIN_SINK_PATTERNS: Array<{ re: RegExp; sinkKind: CallGraphSinkKind; label: string }> = [
-  { re: /\b(?:db|pool|client|knex|prisma|sql|sequelize|conn|cursor|stmt)\s*\.\s*(?:query|execute|raw|\$queryRawUnsafe|\$executeRawUnsafe|executeQuery|executeUpdate)\b/i, sinkKind: 'db_query', label: 'sql_query' },
+  { re: /\b(?:db|pool|client|knex|prisma|sql|sequelize|conn|cursor|stmt|repository|repo|manager)\s*\.\s*(?:query|execute|raw|\$queryRawUnsafe|\$executeRawUnsafe|\$queryRaw|\$executeRaw|executeQuery|executeUpdate|whereRaw|havingRaw|createQueryBuilder)\b/i, sinkKind: 'db_query', label: 'sql_query' },
+  // SQLAlchemy `text(...)` / `from_statement(...)` and Drizzle `sql.raw(...)` templates.
+  { re: /\b(?:sql\s*\.\s*raw|text|from_statement)\s*\(/, sinkKind: 'db_query', label: 'sql_text_raw' },
   { re: /\b(?:exec|execSync|spawn|spawnSync|os\.system|subprocess\.(?:run|Popen|call|check_output))\b/, sinkKind: 'other', label: 'cmd_exec' },
   { re: /\b(?:fetch|axios\.(?:get|post|put|patch|delete)|requests\.(?:get|post)|http\.(?:Get|NewRequest)|got)\s*\(/, sinkKind: 'outbound_fetch', label: 'outbound_fetch' },
   { re: /\b(?:res\.redirect|NextResponse\.redirect|redirect)\s*\(/, sinkKind: 'redirect', label: 'http_redirect' },
-  { re: /\b(?:fs\.readFile(?:Sync)?|fs\.writeFile(?:Sync)?|res\.sendFile|send_from_directory)\s*\(/, sinkKind: 'upload_storage', label: 'fs_path' },
+  { re: /\b(?:fs\.readFile(?:Sync)?|fs\.writeFile(?:Sync)?|res\.sendFile|send_from_directory|readFile|writeFile)\s*\(/, sinkKind: 'upload_storage', label: 'fs_path' },
   { re: /\b(?:render_template_string|ejs\.render|pug\.render|nunjucks\.renderString|innerHTML|dangerouslySetInnerHTML)\b/, sinkKind: 'postmessage_iframe', label: 'template_or_dom' },
 ]
+
+/** Sink kinds where a missing tenant/org/user predicate indicates cross-tenant data exposure. */
+const TENANT_SCOPE_RE = /\b(?:tenantId|tenant_id|orgId|org_id|organizationId|accountId|account_id|ownerId|owner_id|userId|user_id|workspaceId|workspace_id|membership)\b/i
 
 function resolveRelativeImportPath(fromFile: string, spec: string, allFiles: Set<string>): string | null {
   if (!spec.startsWith('.')) return null
@@ -956,16 +963,183 @@ function resolveRelativeImportPath(fromFile: string, spec: string, allFiles: Set
     else dirParts.push(seg)
   }
   const base = dirParts.join('/')
+  // TypeScript ESM convention: source imports use `./x.js` but the file on disk is `x.ts`.
+  const stem = base.replace(/\.(?:jsx?|mjs|cjs)$/i, '')
   const candidates = [
     base,
     `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}.jsx`, `${base}.mjs`, `${base}.cjs`,
-    `${base}/index.ts`, `${base}/index.tsx`, `${base}/index.js`,
+    `${stem}.ts`, `${stem}.tsx`, `${stem}.js`, `${stem}.jsx`, `${stem}.mjs`, `${stem}.cjs`,
+    `${base}/index.ts`, `${base}/index.tsx`, `${base}/index.js`, `${base}/index.jsx`,
+    `${stem}/index.ts`, `${stem}/index.tsx`, `${stem}/index.js`,
   ]
   for (const c of candidates) {
     if (allFiles.has(c)) return c
   }
   return null
 }
+
+interface TsPathConfig {
+  baseUrl: string
+  aliases: Array<{ prefix: string; suffix: string; targets: string[] }>
+}
+
+function parseTsconfigPaths(files: ReadonlyArray<CallGraphFileInput>): TsPathConfig {
+  const config = files.find(f => /(?:^|\/)tsconfig(?:\.[a-z]+)?\.json$/i.test(f.file))
+  if (!config) return { baseUrl: '', aliases: [] }
+  let json: { compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> } } = {}
+  try {
+    const stripped = config.content.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    json = JSON.parse(stripped) as typeof json
+  } catch {
+    return { baseUrl: '', aliases: [] }
+  }
+  const baseUrl = (json.compilerOptions?.baseUrl ?? '.').replace(/^\.\/?/, '').replace(/\/$/, '')
+  const aliases = Object.entries(json.compilerOptions?.paths ?? {})
+    .filter(([pattern]) => pattern.includes('*'))
+    .map(([pattern, targets]) => {
+      const [prefix, suffix] = pattern.split('*')
+      return { prefix, suffix: suffix ?? '', targets: targets.map(t => t.replace('*', '')) }
+    })
+  return { baseUrl, aliases }
+}
+
+function resolveImportSpec(
+  fromFile: string,
+  spec: string,
+  allFiles: Set<string>,
+  tsPaths: TsPathConfig,
+): string | null {
+  if (spec.startsWith('.')) return resolveRelativeImportPath(fromFile, spec, allFiles)
+  for (const alias of tsPaths.aliases) {
+    if (!spec.startsWith(alias.prefix) || !spec.endsWith(alias.suffix)) continue
+    const middle = spec.slice(alias.prefix.length, spec.length - alias.suffix.length)
+    for (const target of alias.targets) {
+      const raw = [tsPaths.baseUrl, `${target}${middle}`].filter(Boolean).join('/').replace(/\/+/g, '/')
+      const base = raw.replace(/^\.?\//, '')
+      const candidates = [
+        base,
+        `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}.jsx`, `${base}.mjs`, `${base}.cjs`,
+        `${base}/index.ts`, `${base}/index.tsx`, `${base}/index.js`, `${base}/index.jsx`,
+      ]
+      for (const candidate of candidates) {
+        if (allFiles.has(candidate)) return candidate
+      }
+    }
+  }
+  return null
+}
+
+function joinRoutePath(prefix: string, routePath: string): string {
+  const left = prefix.trim() === '/' ? '' : prefix.trim().replace(/\/+$/, '')
+  const right = routePath.trim()
+  if (!right || right === '/') return left || '/'
+  const joined = `${left}/${right.replace(/^\/+/, '')}`
+  return joined.startsWith('/') ? joined : `/${joined}`
+}
+
+const GUARD_NAME_RE = /(?:auth(?:oriz|entic)?|guard|middleware|session|permission|ownership|csrf|xsrf|jwt|oauth|rbac|acl|passport|protected|depends|isAdmin|isAuthed|^(?:require|verify|check|assert)[A-Z_]|(?:require|verify|check|assert)(?:Auth|User|Admin|Role|Tenant|Org|Permission|Owner|Session|Csrf|Jwt|Signature|Token|Login))/i
+
+function isGuardLikeName(name: string): boolean {
+  return GUARD_NAME_RE.test(name) || DEFAULT_GUARD_RE.test(name)
+}
+
+function collectRouteGuardNames(args: ReadonlyArray<unknown>): string[] {
+  const guards: string[] = []
+  const visit = (node: unknown, depth = 0): void => {
+    if (depth > 6) return
+    if (Array.isArray(node)) { for (const item of node) visit(item, depth + 1); return }
+    if (!isAstNode(node)) return
+    if (node.type === 'Identifier' || node.type === 'MemberExpression') {
+      const parts = getCalleeParts(node)
+      const last = parts[parts.length - 1] ?? ''
+      if (last && isGuardLikeName(last) && !guards.includes(last)) guards.push(last)
+      return
+    }
+    if (node.type === 'CallExpression') {
+      const parts = getCalleeParts(node.callee)
+      const name = parts[parts.length - 1] ?? ''
+      if (name && (isGuardLikeName(name) || /^with[A-Z]/.test(name)) && !guards.includes(name)) guards.push(name)
+      for (const arg of getCallArgs(node)) visit(arg, depth + 1)
+      return
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'loc' || key === 'span' || key === 'start' || key === 'end') continue
+      visit(value, depth + 1)
+    }
+  }
+  for (const arg of args) visit(arg)
+  return guards.slice(0, 12)
+}
+
+function decoratorNodes(node: AstNode): AstNode[] {
+  const direct = Array.isArray(node.decorators) ? node.decorators as unknown[] : []
+  const fn = node.function && typeof node.function === 'object' ? node.function as Record<string, unknown> : null
+  const fnDecorators = fn && Array.isArray(fn.decorators) ? fn.decorators as unknown[] : []
+  return [...direct, ...fnDecorators].filter(isAstNode)
+}
+
+function decoratorInfo(node: AstNode): Array<{ name: string; args: unknown[]; argStrings: string[] }> {
+  const out: Array<{ name: string; args: unknown[]; argStrings: string[] }> = []
+  for (const dec of decoratorNodes(node)) {
+    const expr = dec.expression ?? dec.callee ?? dec
+    if (!isAstNode(expr)) continue
+    if (expr.type === 'CallExpression') {
+      const parts = getCalleeParts(expr.callee)
+      const args = getCallArgs(expr)
+      const argStrings = args.map(a => resolveStringValue(a)).filter((s): s is string => Boolean(s))
+      out.push({ name: parts[parts.length - 1] ?? '', args, argStrings })
+    } else {
+      const parts = getCalleeParts(expr)
+      out.push({ name: parts[parts.length - 1] ?? '', args: [], argStrings: [] })
+    }
+  }
+  return out
+}
+
+const NEST_ROUTE_DECORATORS: Record<string, string> = {
+  Get: 'GET', Post: 'POST', Put: 'PUT', Patch: 'PATCH', Delete: 'DELETE',
+  Options: 'OPTIONS', Head: 'HEAD', All: 'ALL', RequestMapping: 'GET',
+}
+
+function nextRoutePathFromFile(file: string): { routePath: string; kind: 'app' | 'pages' } | null {
+  const normalized = file.replaceAll('\\', '/')
+  const appIdx = normalized.search(/(?:^|\/)app\//)
+  if (appIdx >= 0 && /\/(?:route|page)\.[jt]sx?$/i.test(normalized)) {
+    const rel = normalized.slice(appIdx).replace(/^\/?app\//, '')
+    const withoutFile = rel.replace(/\/(?:route|page)\.[jt]sx?$/i, '')
+    const cleaned = withoutFile
+      .split('/')
+      .filter(seg => seg && !/^\(.*\)$/.test(seg))
+      .map(seg => seg.replace(/^\[\[?(?:\.\.\.)?([^\]]+)\]\]?$/, ':$1'))
+      .join('/')
+    return { routePath: cleaned ? `/${cleaned}` : '/', kind: 'app' }
+  }
+  const pagesIdx = normalized.search(/(?:^|\/)pages\//)
+  if (pagesIdx >= 0) {
+    const rel = normalized.slice(pagesIdx).replace(/^\/?pages\//, '').replace(/\.[jt]sx?$/i, '')
+    if (!rel.startsWith('api/')) return null
+    const routePath = '/' + rel.split('/').map(seg => seg.replace(/^\[\[?(?:\.\.\.)?([^\]]+)\]\]?$/, ':$1')).join('/')
+    return { routePath, kind: 'pages' }
+  }
+  return null
+}
+
+interface ExtractedRoute {
+  file: string
+  line: number
+  endLine?: number
+  text: string
+  method?: string
+  routePath: string
+  symbol: string
+  kind: 'entrypoint' | 'function' | 'sink' | 'middleware'
+  guards: string[]
+  sinks: Array<{ label: string; sinkKind: CallGraphSinkKind }>
+  calls: string[]
+  paramNames?: string[]
+  owner?: string
+}
+
 
 /**
  * Blank out comments and string/template literals while preserving offsets and
@@ -1122,6 +1296,384 @@ function extractBodyRange(node: AstNode, content: string): { startLine: number; 
   return { startLine, endLine, text }
 }
 
+function extractJsFallbackRoutes(
+  file: string,
+  content: string,
+  options: CallGraphBuildOptions,
+): ExtractedRoute[] {
+  const routes: ExtractedRoute[] = []
+  const lines = content.split('\n')
+  const localPrefix = new Map<string, { prefix: string; guards: string[] }>()
+  const globals: string[] = []
+  const blockFrom = (index: number, limit = 26): { endLine: number; text: string } => {
+    const text = lines.slice(index, Math.min(lines.length, index + limit)).join('\n')
+    return { endLine: Math.min(lines.length, index + limit), text }
+  }
+  const push = (r: ExtractedRoute) => routes.push(r)
+
+  // Mounts must be known before routes are emitted.
+  for (const [index, line] of lines.entries()) {
+    const use = line.match(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.use\s*\(\s*(["'])([^"']+)\2\s*,?\s*([^)]*)/)
+    if (use) {
+      const guards = collectTextGuardNames(use[4])
+      const routerVar = use[4].match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*$/)?.[1]
+      if (routerVar) localPrefix.set(routerVar, { prefix: use[3], guards })
+      continue
+    }
+    const pathless = line.match(/\b[A-Za-z_$][A-Za-z0-9_$]*\.use\s*\(\s*([A-Za-z_$][A-Za-z0-9_$.]*)\s*(?:,\s*([A-Za-z_$][A-Za-z0-9_$.]*))?\s*\)/)
+    if (pathless) globals.push(...collectTextGuardNames(pathless[1]))
+    void index
+  }
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    const call = line.match(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.(get|post|put|patch|delete|all)\s*\(\s*(["'])([^"']+)\3\s*,?\s*(.*)$/)
+    if (call) {
+      const owner = call[1]
+      const method = call[2].toUpperCase()
+      const mount = localPrefix.get(owner)
+      const routePath = mount ? joinRoutePath(mount.prefix, call[4]) : call[4]
+      const block = blockFrom(i)
+      const guards = uniq([...(mount?.guards ?? []), ...globals, ...collectTextGuardNames(call[5])], 20)
+      push({
+        file, line: i + 1, endLine: block.endLine, text: block.text,
+        method, routePath, symbol: `${method} ${routePath}`, kind: 'entrypoint',
+        guards,
+        sinks: detectSinksInText(block.text, options.customSinkPatterns),
+        calls: textCalls(block.text),
+        owner,
+      })
+      continue
+    }
+
+    // NestJS-style decorated controllers.
+    const controller = line.match(/@Controller\s*\(\s*["']?([^"')]*)["']?\s*\)/)
+    if (controller) {
+      const prefix = controller[1] ?? ''
+      for (let j = i + 1; j < Math.min(lines.length, i + 80); j += 1) {
+        const deco = lines[j].match(/@(Get|Post|Put|Patch|Delete|Options|Head|All|RequestMapping)\s*\(\s*["']?([^"')]*)["']?\s*\)/)
+        if (!deco) continue
+        const method = NEST_ROUTE_DECORATORS[deco[1]] ?? 'GET'
+        const routePath = joinRoutePath(prefix, deco[2] ?? '')
+        const guardText = lines.slice(Math.max(0, i - 2), Math.min(lines.length, j + 6)).join('\n')
+        const block = blockFrom(j, 22)
+        push({
+          file, line: j + 1, endLine: block.endLine, text: `${guardText}\n${block.text}`,
+          method, routePath, symbol: `${method} ${routePath}`, kind: 'entrypoint',
+          guards: collectTextGuardNames(guardText),
+          sinks: detectSinksInText(block.text, options.customSinkPatterns),
+          calls: textCalls(block.text),
+        })
+      }
+    }
+
+    const fn = line.match(/^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)/)
+      ?? line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\(?[^=]*?\)?\s*=>/)
+    if (fn) {
+      const block = blockFrom(i, 30)
+      const gs = detectGuardsAndSanitizers(block.text, options.customGuardPatterns, options.customSanitizerPatterns)
+      const sinks = detectSinksInText(block.text, options.customSinkPatterns)
+      push({
+        file, line: i + 1, endLine: block.endLine, text: block.text,
+        routePath: fn[1], symbol: fn[1],
+        kind: sinks.length > 0 ? 'sink' : 'function',
+        guards: gs.guards,
+        sinks,
+        calls: textCalls(block.text),
+      })
+    }
+  }
+  return routes
+}
+
+function textCalls(text: string): string[] {
+  const calls: string[] = []
+  for (const match of text.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) calls.push(match[1])
+  return uniq(calls, 40)
+}
+
+function pythonIndent(line: string): number {
+  return line.length - line.trimStart().length
+}
+
+function pythonBlock(lines: string[], defIndex: number, maxLines = 60): string {
+  const defIndent = pythonIndent(lines[defIndex] ?? '')
+  const out: string[] = []
+  for (let i = defIndex; i < Math.min(lines.length, defIndex + maxLines); i += 1) {
+    const line = lines[i]
+    if (i > defIndex && line.trim() !== '' && pythonIndent(line) <= defIndent && !/^\s*[)\]}]/.test(line)) break
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+function quotedStrings(text: string): string[] {
+  return [...text.matchAll(/["']([^"']{1,256})["']/g)].map(m => m[1])
+}
+
+/**
+ * Structural, language-aware route extraction for non-JS/TS stacks. This replaces
+ * the v4 25-line regex fallback which only recognised literal `.get('/x')` calls.
+ */
+function extractNonJsRoutes(
+  file: string,
+  content: string,
+  options: CallGraphBuildOptions,
+): ExtractedRoute[] {
+  const routes: ExtractedRoute[] = []
+  const lines = content.split('\n')
+  const ext = file.split('.').pop()?.toLowerCase() ?? ''
+  const base = file.split('/').pop() ?? ''
+  const push = (input: {
+    line: number
+    method?: string
+    routePath: string
+    symbol: string
+    text: string
+    guards?: string[]
+    sinkText?: string
+  }) => {
+    const text = input.text
+    const gs = detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns)
+    const calls: string[] = []
+    for (const match of text.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) calls.push(match[1])
+    routes.push({
+      file,
+      line: input.line,
+      text,
+      ...(input.method ? { method: input.method } : {}),
+      routePath: input.routePath,
+      symbol: input.symbol,
+      kind: 'entrypoint',
+      guards: uniq([...(input.guards ?? []), ...gs.guards], 20),
+      sinks: detectSinksInText(input.sinkText ?? text, options.customSinkPatterns),
+      calls: uniq(calls, 40),
+    })
+  }
+
+  if (['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs'].includes(ext)) {
+    return extractJsFallbackRoutes(file, content, options)
+  }
+
+  if (ext === 'py') {
+    const prefixes = new Map<string, string>()
+    for (const line of lines) {
+      const m = line.match(/([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:APIRouter|Blueprint)\s*\(([\s\S]*)/)
+      if (m) {
+        const prefix = m[2].match(/(?:prefix|url_prefix)\s*=\s*["']([^"']+)["']/)?.[1]
+        if (prefix) prefixes.set(m[1], prefix.startsWith('/') ? prefix : `/${prefix}`)
+      }
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]
+      const deco = line.match(/^\s*@([A-Za-z_][A-Za-z0-9_]*)\.(get|post|put|patch|delete|route|api_route)\s*\((.*)$/)
+      if (deco) {
+        let argText = deco[3]
+        let lookahead = 1
+        while (!argText.includes(')') && i + lookahead < lines.length && lookahead < 4) {
+          argText += ' ' + lines[i + lookahead]
+          lookahead += 1
+        }
+        const path = quotedStrings(argText)[0]
+        if (!path) continue
+        let defIndex = -1
+        for (let j = i + 1; j < Math.min(lines.length, i + 8); j += 1) {
+          if (/^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.test(lines[j])) { defIndex = j; break }
+        }
+        if (defIndex < 0) continue
+        const fnName = lines[defIndex].match(/def\s+([A-Za-z_][A-Za-z0-9_]*)/)?.[1] ?? `handler_${i}`
+        const block = pythonBlock(lines, defIndex)
+        const prefix = prefixes.get(deco[1]) ?? ''
+        const methods = deco[2].toLowerCase() === 'route'
+          ? (argText.match(/methods\s*=\s*\[([^\]]+)\]/)?.[1].match(/["']([A-Za-z]+)["']/g) ?? ['GET'])
+            .map(s => s.replace(/["']/g, '').toUpperCase())
+          : [deco[2].toUpperCase()]
+        const guardNames = [
+          ...(argText.match(/Depends\(\s*([A-Za-z_][A-Za-z0-9_.]*)/g) ?? []).map(s => s.replace(/Depends\(\s*/, '')),
+          ...(block.match(/Depends\(\s*([A-Za-z_][A-Za-z0-9_.]*)/g) ?? []).map(s => s.replace(/Depends\(\s*/, '')),
+          ...(/login_required|permission_required|requires_auth|authenticated/i.test(argText + block) ? ['auth-decorator'] : []),
+        ]
+        const fullPath = joinRoutePath(prefix, path)
+        for (const method of methods) {
+          push({
+            line: defIndex + 1,
+            method,
+            routePath: fullPath,
+            symbol: `${method} ${fullPath}`,
+            text: `${lines[i]}\n${block}`,
+            guards: guardNames,
+          })
+        }
+        continue
+      }
+      if (base === 'urls.py' || /urlpatterns/.test(line)) {
+        const dj = line.match(/(?:path|re_path)\s*\(\s*r?["']([^"']+)["']\s*,\s*([A-Za-z_][A-Za-z0-9_.]*)/)
+        if (dj) {
+          const routePath = dj[1].startsWith('/') ? dj[1] : `/${dj[1]}`
+          push({ line: i + 1, routePath, symbol: `ANY ${routePath}`, text: lines.slice(i, i + 8).join('\n'), guards: [] })
+        }
+      }
+      const drf = line.match(/router\.register\s*\(\s*r?["']([^"']+)["']\s*,\s*([A-Za-z_][A-Za-z0-9_]*)/)
+      if (drf) {
+        const collection = `/${drf[1].replace(/^\/+/, '')}`
+        push({ line: i + 1, method: 'GET', routePath: collection, symbol: `GET ${collection}`, text: line, guards: [] })
+        push({ line: i + 1, method: 'POST', routePath: collection, symbol: `POST ${collection}`, text: line, guards: [] })
+        push({ line: i + 1, method: 'GET', routePath: `${collection}/:id`, symbol: `GET ${collection}/:id`, text: line, guards: [] })
+        push({ line: i + 1, method: 'PATCH', routePath: `${collection}/:id`, symbol: `PATCH ${collection}/:id`, text: line, guards: [] })
+      }
+      const djRest = line.match(/(?:path|re_path)\s*\(\s*r?["']([^"']+)["'][\s\S]*?\.as_view\s*\(\s*\{([^}]*)\}/)
+      if (djRest) {
+        const routePath = djRest[1].startsWith('/') ? djRest[1] : `/${djRest[1]}`
+        for (const m of djRest[2].matchAll(/["'](get|post|put|patch|delete)["']/g)) {
+          push({ line: i + 1, method: m[1].toUpperCase(), routePath, symbol: `${m[1].toUpperCase()} ${routePath}`, text: lines.slice(i, i + 6).join('\n') })
+        }
+      }
+    }
+    return routes
+  }
+
+  if (ext === 'java' || ext === 'kt') {
+    const classPrefix = content.match(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/)?.[1] ?? ''
+    const classGuards = [
+      ...(content.match(/@PreAuthorize\s*\(([^)]*)\)/g) ?? []).map(s => s),
+      ...(content.match(/@(?:Secured|RolesAllowed)\s*\(([^)]*)\)/g) ?? []).map(s => s.replace(/@(?:Secured|RolesAllowed)\s*\(/, '')),
+    ]
+    const mappingMethods: Record<string, string> = {
+      GetMapping: 'GET', PostMapping: 'POST', PutMapping: 'PUT', PatchMapping: 'PATCH',
+      DeleteMapping: 'DELETE', RequestMapping: 'ANY',
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      const deco = lines[i].match(/@(Get|Post|Put|Patch|Delete|Request)Mapping\s*(?:\(([^)]*)\))?/)
+      if (!deco) continue
+      const argText = deco[2] ?? ''
+      const path = quotedStrings(argText)[0] ?? ''
+      let methodIndex = -1
+      for (let j = i + 1; j < Math.min(lines.length, i + 8); j += 1) {
+        if (/\b(?:public|private|protected)\b[\w<>\[\], .?]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.test(lines[j])) { methodIndex = j; break }
+      }
+      if (methodIndex < 0) continue
+      const methodName = lines[methodIndex].match(/\s([A-Za-z_][A-Za-z0-9_]*)\s*\(/)?.[1] ?? `handler_${i}`
+      const text = lines.slice(Math.max(0, i - 3), Math.min(lines.length, methodIndex + 30)).join('\n')
+      const methodGuards = [
+        ...(lines.slice(Math.max(0, i - 3), i).join('\n').match(/@(?:PreAuthorize|Secured|RolesAllowed)\s*\(([^)]*)\)/g) ?? []),
+        ...classGuards,
+      ]
+      const methods = deco[1] === 'Request' ? ['ANY'] : [mappingMethods[`${deco[1]}Mapping`]]
+      for (const method of methods) {
+        const fullPath = joinRoutePath(classPrefix, path)
+        push({ line: methodIndex + 1, method, routePath: fullPath, symbol: `${method} ${fullPath}`, text, guards: methodGuards })
+      }
+    }
+    return routes
+  }
+
+  if (ext === 'go') {
+    const groups = new Map<string, { prefix: string; guards: string[] }>()
+    for (const line of lines) {
+      const g = line.match(/([A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*([A-Za-z_][A-Za-z0-9_]*)\.(?:Group|Route)\s*\(\s*["']([^"']+)["']\s*,?\s*([^)]*)/)
+      if (g) groups.set(g[1], { prefix: g[3], guards: collectTextGuardNames(g[4]) })
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]
+      const httpRoute = line.match(/http\.(?:HandleFunc|Handle)\s*\(\s*["']([^"']+)["']\s*,\s*([A-Za-z_][A-Za-z0-9_.]*)/)
+      if (httpRoute) {
+        const routePath = httpRoute[1]
+        push({ line: i + 1, routePath, symbol: `ANY ${routePath}`, text: lines.slice(i, Math.min(lines.length, i + 12)).join('\n'), guards: [] })
+        continue
+      }
+      const call = line.match(/\b([A-Za-z_][A-Za-z0-9_]*)\.(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Get|Post|Put|Patch|Delete|HandleFunc|Handle)\s*\(\s*["']([^"']+)["']\s*,?\s*([^)]*)/)
+      if (!call) continue
+      const group = groups.get(call[1])
+      const prefix = group?.prefix ?? ''
+      const routePath = joinRoutePath(prefix, call[3])
+      const methodRaw = call[2].toUpperCase()
+      const method = methodRaw === 'HANDLEFUNC' || methodRaw === 'HANDLE' ? undefined : methodRaw
+      impactGuardScan: {
+        // Inline middleware arguments (gin/chi/echo) inherit as guards when they look auth-related.
+      }
+      const guards = uniq([...(group?.guards ?? []), ...collectTextGuardNames(call[4])], 12)
+      push({
+        line: i + 1,
+        ...(method ? { method } : {}),
+        routePath,
+        symbol: `${method ?? 'ANY'} ${routePath}`,
+        text: lines.slice(i, Math.min(lines.length, i + 14)).join('\n'),
+        guards,
+      })
+    }
+    return routes
+  }
+
+  if (ext === 'rb' || base === 'routes.rb') {
+    // routes.rb -> controller#action lookup table
+    const routeTable = new Map<string, { path: string; method: string }>()
+    for (const line of lines) {
+      const r = line.match(/^\s*(get|post|put|patch|delete)\s+["']([^"']+)["'](?:[\s\S]*?to:\s*["']([A-Za-z0-9_]+)#([A-Za-z0-9_]+)["'])?/)
+      if (r) {
+        const path = r[2].startsWith('/') ? r[2] : `/${r[2]}`
+        if (r[3] && r[4]) routeTable.set(`${r[3]}#${r[4]}`, { path, method: r[1].toUpperCase() })
+        routes.push({
+          file, line: 1, text: line, method: r[1].toUpperCase(), routePath: path,
+          symbol: `${r[1].toUpperCase()} ${path}`, kind: 'entrypoint', guards: [],
+          sinks: detectSinksInText(line, options.customSinkPatterns), calls: textCalls(line),
+        })
+      }
+      const res = line.match(/^\s*resources?\s+:([A-Za-z0-9_]+)/)
+      if (res) {
+        const collection = `/${res[1]}`
+        for (const [method, p] of [['GET', collection], ['POST', collection], ['GET', `${collection}/:id`], ['PATCH', `${collection}/:id`], ['DELETE', `${collection}/:id`]] as Array<[string, string]>) {
+          routes.push({
+            file, line: 1, text: line, method, routePath: p, symbol: `${method} ${p}`,
+            kind: 'entrypoint', guards: [], sinks: [], calls: [],
+          })
+        }
+      }
+    }
+    const controllerName = base.replace(/_controller\.rb$/i, '')
+    if (controllerName !== base) {
+      const beforeActions = [...content.matchAll(/before_action\s+:([A-Za-z0-9_!?]+)/g)].map(m => m[1])
+      for (let i = 0; i < lines.length; i += 1) {
+        const def = lines[i].match(/^\s*def\s+([A-Za-z0-9_!?]+)/)
+        if (!def) continue
+        const action = def[1]
+        const mapped = routeTable.get(`${controllerName}#${action}`)
+        const routePath = mapped?.path ?? `/${controllerName}/${action}`
+        const method = mapped?.method ?? 'ANY'
+        const text = lines.slice(i, Math.min(lines.length, i + 25)).join('\n')
+        routes.push({
+          file, line: i + 1, text, ...(method !== 'ANY' ? { method } : {}), routePath,
+          symbol: `${method} ${routePath}`, kind: 'entrypoint',
+          guards: uniq([...beforeActions, ...detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns).guards], 12),
+          sinks: detectSinksInText(text, options.customSinkPatterns),
+          calls: uniq([...text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map(m => m[1]), 40),
+        })
+      }
+      return routes
+    }
+    return routes
+  }
+
+  if (ext === 'php') {
+    for (let i = 0; i < lines.length; i += 1) {
+      const r = lines[i].match(/Route::(get|post|put|patch|delete|any)\s*\(\s*["']([^"']+)["']\s*,\s*([^)]*)/)
+      if (!r) continue
+      const routePath = r[2].startsWith('/') ? r[2] : `/${r[2]}`
+      push({ line: i + 1, method: r[1].toUpperCase(), routePath, symbol: `${r[1].toUpperCase()} ${routePath}`, text: lines.slice(i, i + 15).join('\n'), guards: collectTextGuardNames(r[3]) })
+    }
+    return routes
+  }
+
+  return routes
+}
+
+function collectTextGuardNames(text: string): string[] {
+  const out: string[] = []
+  for (const match of text.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+    if (isGuardLikeName(match[1]) && !out.includes(match[1])) out.push(match[1])
+  }
+  return out.slice(0, 8)
+}
+
 export function buildCallGraphFromFiles(
   files: readonly CallGraphFileInput[],
   options: CallGraphBuildOptions = {},
@@ -1143,6 +1695,83 @@ export function buildCallGraphFromFiles(
     nodesBySymbol.set(n.symbol, list)
   }
 
+  const tsPaths = parseTsconfigPaths(files)
+  const fileMounts = new Map<string, Array<{ prefix: string; guards: string[] }>>()
+  const localMounts = new Map<string, { prefix: string; guards: string[] }>()
+  const fileGlobals = new Map<string, string[]>()
+  const pendingRoutes: Array<ExtractedRoute & { owner?: string }> = []
+  const registeredRouteKeys = new Set<string>()
+  const contentByFile = new Map(files.map(f => [f.file, f.content]))
+
+  const sanitizersFor = (text: string): string[] =>
+    detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns).sanitizers
+
+  const registerExtractedRoute = (r: ExtractedRoute & { owner?: string }) => {
+    const dedupeKey = `${r.file}:${r.line}:${r.method ?? 'ANY'}:${r.routePath}:${r.symbol}`
+    if (registeredRouteKeys.has(dedupeKey)) return
+    registeredRouteKeys.add(dedupeKey)
+    let routePath = r.routePath || r.symbol
+    let guards = [...r.guards]
+    if (r.owner) {
+      const local = localMounts.get(`${r.file}::${r.owner}`)
+      const targetFile = fileImports.get(r.file)?.get(r.owner)
+      const mounts = [
+        ...(local ? [local] : []),
+        ...(fileMounts.get(r.file) ?? []),
+        ...(targetFile ? (fileMounts.get(targetFile) ?? []) : []),
+      ]
+      const best = mounts
+        .filter(m => m.prefix)
+        .sort((a, b) => b.prefix.length - a.prefix.length)[0]
+      if (best && !routePath.startsWith(best.prefix)) routePath = joinRoutePath(best.prefix, routePath)
+      for (const mount of mounts) guards.push(...mount.guards)
+      guards.push(...(fileGlobals.get(r.file) ?? []))
+      if (targetFile) guards.push(...(fileGlobals.get(targetFile) ?? []))
+    }
+    guards = uniq(guards, 20)
+    const sinks = r.sinks.length > 0 ? r.sinks : detectSinksInText(r.text, options.customSinkPatterns)
+    const node: CallGraphNodeOut = {
+      id: `${r.file}:${r.line}:${r.symbol}`,
+      file: r.file,
+      line: r.line,
+      ...(r.endLine ? { endLine: r.endLine } : {}),
+      symbol: r.symbol,
+      kind: r.kind,
+      ...(r.method && r.method !== 'ANY' ? { httpMethod: r.method } : {}),
+      routePath,
+      ...(sinks[0] ? { sinkKind: sinks[0].sinkKind } : {}),
+      guards,
+      sanitizers: sanitizersFor(r.text),
+      calls: uniq(r.calls, 40),
+    }
+    registerNode(node)
+    if (sinks.length > 0 && node.kind === 'entrypoint') {
+      const sinkNode: CallGraphNodeOut = {
+        id: `${r.file}:${r.line}:sink:${sinks[0].label}`,
+        file: r.file,
+        line: r.line,
+        ...(r.endLine ? { endLine: r.endLine } : {}),
+        symbol: sinks[0].label,
+        kind: 'sink',
+        sinkKind: sinks[0].sinkKind,
+        guards,
+        sanitizers: sanitizersFor(r.text),
+        calls: [],
+      }
+      registerNode(sinkNode)
+      edges.push({ fromId: node.id, toId: sinkNode.id, file: r.file, line: r.line })
+    }
+  }
+
+  const callsInText = (text: string): string[] => {
+    const calls: string[] = []
+    for (const match of text.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\.\s*([A-Za-z_$][A-Za-z0-9_$]*))?\s*\(/g)) {
+      calls.push(match[2] ?? match[1])
+      if (match[2]) calls.push(`${match[1]}.${match[2]}`)
+    }
+    return uniq(calls, 40)
+  }
+
   for (const f of files) {
     const lines = f.content.split('\n')
     fileLineTexts.set(f.file, lines)
@@ -1153,11 +1782,11 @@ export function buildCallGraphFromFiles(
     if (isJsTs) {
       const { ast } = parseJsTsAst(f.content)
       if (ast) {
-        // Collect imports
+        // Imports, require() bindings and env string constants.
         walkAst(ast, node => {
           if (node.type === 'ImportDeclaration' && isAstNode(node.source)) {
             const spec = resolveStringValue(node.source)
-            const resolved = spec ? resolveRelativeImportPath(f.file, spec, allFilePaths) : null
+            const resolved = spec ? resolveImportSpec(f.file, spec, allFilePaths, tsPaths) : null
             if (resolved && Array.isArray(node.specifiers)) {
               for (const sp of node.specifiers) {
                 if (!isAstNode(sp)) continue
@@ -1166,68 +1795,214 @@ export function buildCallGraphFromFiles(
               }
             }
           }
+          if (node.type === 'VariableDeclarator' && isAstNode(node.init) && node.init.type === 'CallExpression') {
+            const callee = getCalleeParts(node.init.callee)
+            if (callee[callee.length - 1] === 'require') {
+              const spec = resolveStringValue(getCallArgs(node.init)[0])
+              const resolved = spec ? resolveImportSpec(f.file, spec, allFilePaths, tsPaths) : null
+              const local = getPropName(node.id)
+              if (resolved && local) importMap.set(local, resolved)
+            }
+          }
         })
 
-        // Extract functions & route entrypoints
-        const seenRanges = new Set<string>()
         walkAst(ast, (node, ancestors) => {
-          // Express/Fastify route calls: app.get('/api/...', handler)
+          // Express/Fastify-style route registration: app.get('/x', mw, handler)
           if (node.type === 'CallExpression') {
             const parts = getCalleeParts(node.callee)
             const last = parts[parts.length - 1] ?? ''
-            if (parts.length === 2 && ['get', 'post', 'put', 'patch', 'delete', 'all', 'use'].includes(last)) {
+            const owner = parts.length === 2 ? parts[0] : undefined
+            const routeMethods = ['get', 'post', 'put', 'patch', 'delete', 'all', 'options', 'head']
+            if (owner && routeMethods.includes(last.toLowerCase())) {
               const args = getCallArgs(node)
               const routePath = resolveStringValue(args[0])
               if (routePath && routePath.startsWith('/')) {
                 const { startLine, endLine, text } = extractBodyRange(node, f.content)
-                const calls: string[] = []
-                walkAst(args.slice(1), inner => {
-                  if (inner.type === 'CallExpression') {
-                    const cp = getCalleeParts(inner.callee)
-                    if (cp.length) calls.push(cp[cp.length - 1])
-                  } else if (inner.type === 'Identifier') {
-                    const nm = getPropName(inner)
-                    if (nm && !['req', 'res', 'next'].includes(nm)) calls.push(nm)
-                  }
-                })
-                const gs = detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns)
-                const sinks = detectSinksInText(text, options.customSinkPatterns)
-                const sym = `${last.toUpperCase()} ${routePath}`
-                const epNode: CallGraphNodeOut = {
-                  id: `${f.file}:${startLine}:${sym}`,
+                pendingRoutes.push({
                   file: f.file,
                   line: startLine,
                   endLine,
-                  symbol: sym,
-                  kind: 'entrypoint',
-                  httpMethod: last.toUpperCase(),
+                  text,
+                  method: last.toUpperCase(),
                   routePath,
-                  ...(sinks[0] ? { sinkKind: sinks[0].sinkKind } : {}),
-                  guards: gs.guards,
-                  sanitizers: gs.sanitizers,
-                  calls: uniq(calls, 40),
+                  symbol: `${last.toUpperCase()} ${routePath}`,
+                  kind: 'entrypoint',
+                  guards: collectRouteGuardNames(args.slice(1)),
+                  sinks: detectSinksInText(text, options.customSinkPatterns),
+                  calls: callsInText(text),
+                  owner,
+                })
+              }
+            } else if (owner && last === 'use') {
+              const args = getCallArgs(node)
+              const prefix = resolveStringValue(args[0])
+              const middlewareArgs = prefix && prefix.startsWith('/') ? args.slice(1) : args
+              const guards = collectRouteGuardNames(middlewareArgs)
+              const lastArg = middlewareArgs[middlewareArgs.length - 1]
+              const routerVar = isAstNode(lastArg) && (lastArg.type === 'Identifier' || lastArg.type === 'MemberExpression')
+                ? getCalleeParts(lastArg).pop()
+                : undefined
+              const isPathful = Boolean(prefix && prefix.startsWith('/'))
+              if (routerVar) {
+                if (!isPathful) {
+                  const globals = fileGlobals.get(f.file) ?? []
+                  fileGlobals.set(f.file, uniq([...globals, ...guards], 12))
                 }
-                registerNode(epNode)
-                if (sinks.length > 0) {
-                  registerNode({
-                    id: `${f.file}:${startLine}:sink:${sinks[0].label}`,
-                    file: f.file,
-                    line: startLine,
-                    endLine,
-                    symbol: sinks[0].label,
-                    kind: 'sink',
-                    sinkKind: sinks[0].sinkKind,
-                    guards: gs.guards,
-                    sanitizers: gs.sanitizers,
-                    calls: [],
+                const existingLocal = localMounts.get(`${f.file}::${routerVar}`)
+                const localMount = {
+                  prefix: isPathful ? prefix! : (existingLocal?.prefix ?? ''),
+                  guards: uniq([...(existingLocal?.guards ?? []), ...guards], 12),
+                }
+                if (localMount.prefix || localMount.guards.length) localMounts.set(`${f.file}::${routerVar}`, localMount)
+                const targetFile = importMap.get(routerVar)
+                if (targetFile && (localMount.prefix || localMount.guards.length)) {
+                  const list = fileMounts.get(targetFile) ?? []
+                  list.push({ prefix: localMount.prefix, guards: localMount.guards })
+                  fileMounts.set(targetFile, list)
+                }
+              } else if (!isPathful) {
+                const globals = fileGlobals.get(f.file) ?? []
+                fileGlobals.set(f.file, uniq([...globals, ...guards], 12))
+              }
+            }
+
+            // tRPC router procedures: router({ orders: protectedProcedure.input(...).query(...) })
+            if (['router', 'createTRPCRouter'].includes(last)) {
+              const obj = getCallArgs(node)[0]
+              if (isAstNode(obj) && obj.type === 'ObjectExpression') {
+                const parent = ancestors[ancestors.length - 1]
+                const routerName = parent && parent.type === 'VariableDeclarator' ? (getPropName(parent.id) ?? 'router') : 'router'
+                for (const prop of getObjectProps(obj)) {
+                  let op = 'query'
+                  let protectedProc = false
+                  const paramNames: string[] = []
+                  walkAst(prop.value, inner => {
+                    if (inner.type !== 'CallExpression') return
+                    const cp = getCalleeParts(inner.callee)
+                    const name = cp[cp.length - 1] ?? ''
+                    if (['query', 'mutation', 'subscription'].includes(name)) op = name
+                    if (cp.some(p => /protectedProcedure|authedProcedure|privateProcedure|isAuthed/i.test(p))) protectedProc = true
+                    if (name === 'input') {
+                      for (const arg of getCallArgs(inner)) {
+                        if (isAstNode(arg) && (arg.type === 'ObjectExpression' || arg.type === 'CallExpression')) {
+                          walkAst(arg, a => {
+                            if (a.type === 'ObjectExpression') {
+                              for (const p2 of getObjectProps(a)) paramNames.push(p2.key)
+                            }
+                          })
+                        }
+                      }
+                    }
                   })
-                  edges.push({ fromId: epNode.id, toId: `${f.file}:${startLine}:sink:${sinks[0].label}`, file: f.file, line: startLine })
+                  if (protectedProc) importMap.set('__trpcProtected', '__trpcProtected')
+                  pendingRoutes.push({
+                    file: f.file,
+                    line: nodeLine(node, f.content) ?? 1,
+                    text: f.content.split('\n').slice((nodeLine(node, f.content) ?? 1) - 1, (nodeLine(node, f.content) ?? 1) + 24).join('\n'),
+                    method: 'POST',
+                    routePath: `/trpc/${routerName}.${prop.key}`,
+                    symbol: `TRPC ${routerName}.${prop.key}`,
+                    kind: 'entrypoint',
+                    guards: protectedProc ? ['protectedProcedure'] : [],
+                    sinks: detectSinksInText(prop.value && isAstNode(prop.value) ? f.content : '', options.customSinkPatterns),
+                    calls: paramNames.length ? [] : [],
+                    owner: undefined,
+                  })
                 }
               }
             }
           }
 
-          // Named function declarations / exported arrow functions
+          // NestJS controllers: @Controller('users') class UserController { @Get(':id') ... }
+          if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') {
+            const classDecs = decoratorInfo(node)
+            const controller = classDecs.find(d => d.name === 'Controller')
+            const classPrefix = controller?.argStrings[0] ?? ''
+            const classGuards = classDecs
+              .filter(d => /Guard|Roles|Secured|PreAuthorize|UseGuards/i.test(d.name))
+              .flatMap(d => [d.name, ...d.argStrings, ...collectRouteGuardNames(d.args)])
+            const className = getPropName(node.identifier ?? node.id) ?? 'AnonymousClass'
+            const bodyNode = isAstNode(node.body) ? node.body : undefined
+            const membersRaw: unknown[] = Array.isArray(node.body)
+              ? node.body as unknown[]
+              : bodyNode && Array.isArray(bodyNode.body)
+                ? bodyNode.body as unknown[]
+                : bodyNode
+                  ? Object.values(bodyNode).filter(v => isAstNode(v) && String((v as AstNode).type).startsWith('Class'))
+                  : []
+            for (const rawMember of membersRaw) {
+              if (!isAstNode(rawMember)) continue
+              if (!['ClassMethod', 'ClassProperty', 'MethodDefinition', 'PropertyDefinition'].includes(String(rawMember.type))) continue
+              const methodName = getPropName(rawMember.key ?? rawMember.id) ?? 'method'
+              const mDecs = decoratorInfo(rawMember)
+              const routeDec = mDecs.find(d => NEST_ROUTE_DECORATORS[d.name])
+              const { startLine, endLine, text } = extractBodyRange(rawMember, f.content)
+              const methodGuards = mDecs
+                .filter(d => /Guard|Roles|Secured|PreAuthorize|UseGuards|Auth/i.test(d.name))
+                .flatMap(d => [d.name, ...d.argStrings, ...collectRouteGuardNames(d.args)])
+              const gs = detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns)
+              const guards = uniq([...classGuards, ...methodGuards, ...gs.guards], 20)
+              if (routeDec) {
+                pendingRoutes.push({
+                  file: f.file,
+                  line: startLine,
+                  endLine,
+                  text,
+                  method: NEST_ROUTE_DECORATORS[routeDec.name],
+                  routePath: joinRoutePath(classPrefix, routeDec.argStrings[0] ?? ''),
+                  symbol: `${routeDec.name.toUpperCase()} ${joinRoutePath(classPrefix, routeDec.argStrings[0] ?? '')}`,
+                  kind: 'entrypoint',
+                  guards,
+                  sinks: detectSinksInText(text, options.customSinkPatterns),
+                  calls: callsInText(text),
+                })
+              } else {
+                const sinks = detectSinksInText(text, options.customSinkPatterns)
+                if (!registeredRouteKeys.has(`${f.file}:${startLine}:${methodName}`)) {
+                  registeredRouteKeys.add(`${f.file}:${startLine}:${methodName}`)
+                  registerNode({
+                    id: `${f.file}:${startLine}:${className}.${methodName}`,
+                    file: f.file,
+                    line: startLine,
+                    endLine,
+                    symbol: methodName,
+                    kind: sinks.length > 0 ? 'sink' : 'function',
+                    ...(sinks[0] ? { sinkKind: sinks[0].sinkKind } : {}),
+                    guards,
+                    sanitizers: gs.sanitizers,
+                    calls: callsInText(text),
+                  })
+                }
+              }
+            }
+          }
+
+          // GraphQL resolvers: { Query: { order: (...) => ... }, Mutation: {...} }
+          if (node.type === 'ObjectExpression') {
+            for (const prop of getObjectProps(node)) {
+              if (!['Query', 'Mutation', 'Subscription', 'Resolver'].includes(prop.key)) continue
+              if (!isAstNode(prop.value) || prop.value.type !== 'ObjectExpression') continue
+              for (const resolver of getObjectProps(prop.value)) {
+                const resolverValue = isAstNode(resolver.value) ? resolver.value : node
+                const line = nodeLine(resolverValue, f.content) ?? nodeLine(node, f.content) ?? 1
+                const text = f.content.split('\n').slice(line - 1, line + 24).join('\n')
+                pendingRoutes.push({
+                  file: f.file,
+                  line,
+                  text,
+                  method: prop.key === 'Mutation' ? 'POST' : 'POST',
+                  routePath: `/graphql#${prop.key}.${resolver.key}`,
+                  symbol: `GraphQL ${prop.key}.${resolver.key}`,
+                  kind: 'entrypoint',
+                  guards: detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns).guards,
+                  sinks: detectSinksInText(text, options.customSinkPatterns),
+                  calls: callsInText(text),
+                })
+              }
+            }
+          }
+
+          // Named functions / exported arrow functions / Next.js route handlers.
           let fnName: string | null = null
           let fnNode: AstNode | null = null
           if (node.type === 'FunctionDeclaration') {
@@ -1241,11 +2016,14 @@ export function buildCallGraphFromFiles(
           if (fnName && fnNode) {
             const { startLine, endLine, text } = extractBodyRange(fnNode, f.content)
             const rangeKey = `${f.file}:${startLine}:${fnName}`
-            if (seenRanges.has(rangeKey)) return
-            seenRanges.add(rangeKey)
+            if (registeredRouteKeys.has(rangeKey)) return
+            registeredRouteKeys.add(rangeKey)
 
             const isExported = ancestors.some(a => a.type === 'ExportDeclaration' || a.type === 'ExportNamedDeclaration' || a.type === 'ExportDefaultDeclaration')
-            const isNextRouteMethod = isExported && /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(fnName)
+            const nextRoute = nextRoutePathFromFile(f.file)
+            const isHttpVerb = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(fnName)
+            const isNextRouteMethod = isExported && isHttpVerb && Boolean(nextRoute)
+            const isNextPagesDefault = Boolean(nextRoute) && nextRoute?.kind === 'pages' && isExported && /^(?:default|handler)$/i.test(fnName)
             const isServerAction = isExported && f.content.includes('use server')
             const calls: string[] = []
             walkAst(fnNode.body ?? fnNode, inner => {
@@ -1259,63 +2037,133 @@ export function buildCallGraphFromFiles(
             })
             const gs = detectGuardsAndSanitizers(text, options.customGuardPatterns, options.customSanitizerPatterns)
             const sinks = detectSinksInText(text, options.customSinkPatterns)
-            const kind: CallGraphNodeOut['kind'] = (isNextRouteMethod || isServerAction)
-              ? 'entrypoint'
-              : sinks.length > 0
-                ? 'sink'
-                : gs.guards.length > 0 && fnName.toLowerCase().includes('require')
-                  ? 'guard'
-                  : 'function'
-            registerNode({
-              id: rangeKey,
-              file: f.file,
-              line: startLine,
-              endLine,
-              symbol: fnName,
-              kind,
-              ...(isNextRouteMethod ? { httpMethod: fnName, routePath: `/${f.file.replace(/^src\/app\/|\/route\.[jt]sx?$/g, '')}` } : {}),
-              ...(isServerAction ? { routePath: `action:${fnName}`, sinkKind: 'server_action' } : {}),
-              ...(sinks[0] ? { sinkKind: sinks[0].sinkKind } : {}),
-              guards: gs.guards,
-              sanitizers: gs.sanitizers,
-              calls: uniq(calls, 40),
-            })
+            if (isNextRouteMethod || isNextPagesDefault) {
+              pendingRoutes.push({
+                file: f.file,
+                line: startLine,
+                endLine,
+                text,
+                method: isNextRouteMethod ? fnName : 'ANY',
+                routePath: nextRoute!.routePath,
+                symbol: `${isNextRouteMethod ? fnName : 'ANY'} ${nextRoute!.routePath}`,
+                kind: 'entrypoint',
+                guards: gs.guards,
+                sinks,
+                calls: uniq(calls, 40),
+              })
+            } else {
+              const kind: CallGraphNodeOut['kind'] = isServerAction
+                ? 'entrypoint'
+                : sinks.length > 0
+                  ? 'sink'
+                  : gs.guards.length > 0 && fnName.toLowerCase().includes('require')
+                    ? 'guard'
+                    : 'function'
+              registerNode({
+                id: rangeKey,
+                file: f.file,
+                line: startLine,
+                endLine,
+                symbol: fnName,
+                kind,
+                ...(isServerAction ? { routePath: `action:${fnName}`, sinkKind: 'server_action' } : {}),
+                ...(sinks[0] ? { sinkKind: sinks[0].sinkKind } : {}),
+                guards: gs.guards,
+                sanitizers: gs.sanitizers,
+                calls: uniq(calls, 40),
+              })
+            }
           }
         })
+
+        // Next.js middleware matcher -> protect matching routes.
+        if (/(?:^|\/)middleware\.[jt]sx?$/i.test(f.file)) {
+          const matchers = [...f.content.matchAll(/matcher\s*:\s*\[([^\]]+)\]/g)]
+            .flatMap(m => [...m[1].matchAll(/['"]([^'"]+)['"]/g)].map(x => x[1]))
+          const prefixGuards = matchers.map(m => m.replace(/\/:path\*?$/, '').replace(/\/\(\.\*\)$/, ''))
+          for (const route of pendingRoutes) {
+            if (prefixGuards.some(prefix => prefix === '/' || route.routePath.startsWith(prefix))) {
+              route.guards = uniq([...route.guards, 'next-middleware'], 20)
+            }
+          }
+          registerNode({
+            id: `${f.file}:1:MIDDLEWARE`,
+            file: f.file,
+            line: 1,
+            symbol: 'MIDDLEWARE',
+            kind: 'middleware',
+            routePath: '/*',
+            guards: ['next-middleware'],
+            sanitizers: [],
+            calls: callsInText(f.content),
+          })
+        }
         continue
+      }
+      // Malformed/minified JS or worker deps unavailable: regex fallback still resolves
+      // imports, aliases and router mounts so the graph stays useful.
+      for (const match of f.content.matchAll(/(?:import\s+[^'"]*?from\s*|import\s*|require\s*\(\s*)["']([^"']+)["']/g)) {
+        const spec = match[1]
+        const resolved = resolveImportSpec(f.file, spec, allFilePaths, tsPaths)
+        if (!resolved) continue
+        const localName = match[0].match(/\bas\s+([A-Za-z_$][A-Za-z0-9_$]*)/)?.[1]
+          ?? match[0].match(/^\s*import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from/)?.[1]
+        if (localName) importMap.set(localName, resolved)
+        const named = match[0].match(/\{([^}]*)\}/)?.[1]
+        if (named) {
+          for (const part of named.split(',')) {
+            const [imported, alias] = part.trim().split(/\s+as\s+/)
+            const name = (alias ?? imported)?.trim()
+            if (name && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) importMap.set(name, resolved)
+          }
+        }
+        const requireBinding = match[0].match(/^\s*(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/)
+        if (requireBinding) importMap.set(requireBinding[1], resolved)
+      }
+      for (const use of f.content.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.use\s*\(\s*["']([^"']+)["']\s*,?\s*([^)]*)/g)) {
+        const guards = collectTextGuardNames(use[3])
+        const routerVar = use[3].match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*$/)?.[1]
+        if (!routerVar) continue
+        localMounts.set(`${f.file}::${routerVar}`, { prefix: use[2], guards })
+        const targetFile = importMap.get(routerVar)
+        if (targetFile) {
+          const list = fileMounts.get(targetFile) ?? []
+          list.push({ prefix: use[2], guards })
+          fileMounts.set(targetFile, list)
+        }
       }
     }
 
-    // Structural fallback for Python / Go / Java / PHP / Ruby / malformed JS
-    lines.forEach((lineText, idx) => {
-      const lineNo = idx + 1
-      const pyMatch = lineText.match(/^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/)
-      const goMatch = lineText.match(/^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/)
-      const routeMatch = lineText.match(/\.(?:get|post|put|patch|delete|route)\s*\(\s*["']([^"']+)["']/)
-      const sym = pyMatch?.[1] ?? goMatch?.[1] ?? (routeMatch ? `ROUTE ${routeMatch[1]}` : null)
-      if (sym) {
-        const block = lines.slice(idx, Math.min(lines.length, idx + 25)).join('\n')
-        const gs = detectGuardsAndSanitizers(block, options.customGuardPatterns, options.customSanitizerPatterns)
-        const sinks = detectSinksInText(block, options.customSinkPatterns)
-        const calls = [...block.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map(m => m[1]).filter(c => c !== sym)
-        registerNode({
-          id: `${f.file}:${lineNo}:${sym}`,
-          file: f.file,
-          line: lineNo,
-          symbol: sym,
-          kind: routeMatch ? 'entrypoint' : sinks.length > 0 ? 'sink' : 'function',
-          ...(routeMatch ? { routePath: routeMatch[1] } : {}),
-          ...(sinks[0] ? { sinkKind: sinks[0].sinkKind } : {}),
-          guards: gs.guards,
-          sanitizers: gs.sanitizers,
-          calls: uniq(calls, 30),
-        })
-      }
-    })
+    // Language-aware structural extraction for Python / Java / Go / Ruby / PHP.
+    for (const route of extractNonJsRoutes(f.file, f.content, options)) {
+      pendingRoutes.push(route)
+    }
   }
+
+  for (const route of pendingRoutes) registerExtractedRoute(route)
 
   // Link callEdges across files
   const edgeKeys = new Set<string>()
+  const resolveBarrelExports = (file: string, symbol: string, depth = 0): string[] => {
+    if (depth > 2) return []
+    const content = contentByFile.get(file)
+    if (!content) return []
+    const targets: string[] = []
+    for (const match of content.matchAll(/export\s*(?:\{[^}]*\}|(?:\*|\w+)\s+as\s+\w+[^;]*?)\s*from\s*["']([^"']+)["']/g)) {
+      const resolved = resolveImportSpec(file, match[1], allFilePaths, tsPaths)
+      if (resolved && !targets.includes(resolved)) targets.push(resolved)
+    }
+    for (const match of content.matchAll(/export\s*\*\s*from\s*["']([^"']+)["']/g)) {
+      const resolved = resolveImportSpec(file, match[1], allFilePaths, tsPaths)
+      if (resolved && !targets.includes(resolved)) targets.push(resolved)
+    }
+    const out: string[] = []
+    for (const target of targets) {
+      if (nodesByFileAndSymbol.has(`${target}::${symbol}`)) out.push(target)
+      else out.push(...resolveBarrelExports(target, symbol, depth + 1))
+    }
+    return out
+  }
   for (const caller of nodes) {
     const imps = fileImports.get(caller.file)
     for (const calleeSym of caller.calls) {
@@ -1325,6 +2173,12 @@ export function buildCallGraphFromFiles(
       if (targetFile) {
         const exact = nodesByFileAndSymbol.get(`${targetFile}::${calleeSym}`)
         if (exact) candidates.push(exact)
+        else {
+          for (const viaBarrel of resolveBarrelExports(targetFile, calleeSym)) {
+            const hit = nodesByFileAndSymbol.get(`${viaBarrel}::${calleeSym}`)
+            if (hit) candidates.push(hit)
+          }
+        }
       }
       const sameFile = nodesByFileAndSymbol.get(`${caller.file}::${calleeSym}`)
       if (sameFile) candidates.push(sameFile)
@@ -1463,10 +2317,20 @@ export function buildCallGraphFromFiles(
     const sinkKind = sink.sinkKind ?? 'other'
     const dominatingSetFor = (
       occurrencesFor: (node: CallGraphNodeOut) => PatternOccurrence[],
+      includeInheritedGuards: boolean,
     ): Array<Set<string>> => group.map(g => {
       const set = new Set<string>()
       for (let i = 0; i < g.chain.length; i += 1) {
         const node = g.chain[i]
+        // Framework-inherited guards (Express mount middleware, NestJS @UseGuards,
+        // FastAPI Depends, middleware.ts matchers) are pre-handler by construction,
+        // so they dominate the sink even though their text lives in another file.
+        if (includeInheritedGuards && (node.kind === 'entrypoint' || node.kind === 'middleware')) {
+          for (const guard of node.guards) set.add(guard)
+        }
+        if (!includeInheritedGuards) {
+          for (const sanitizer of node.sanitizers) set.add(sanitizer)
+        }
         const limit = dominanceLimitOffset(g.chain, i, g.sink, sinkKind)
         for (const occurrence of occurrencesFor(node)) {
           if (limit === null || occurrence.offset < limit) set.add(occurrence.name)
@@ -1474,8 +2338,8 @@ export function buildCallGraphFromFiles(
       }
       return set
     })
-    const guardSets = dominatingSetFor(guardOccurrencesFor)
-    const sanSets = dominatingSetFor(sanitizerOccurrencesFor)
+    const guardSets = dominatingSetFor(guardOccurrencesFor, true)
+    const sanSets = dominatingSetFor(sanitizerOccurrencesFor, false)
     const allGuards = uniq(guardSets.flatMap(s => [...s]), 20)
     const dominatingGuards = allGuards.filter(g => guardSets.every(s => s.has(g)))
     const partialGuards = allGuards.filter(g => !dominatingGuards.includes(g))
@@ -1528,6 +2392,9 @@ export function buildCallGraphFromFiles(
       isAuthUnguarded,
       isInjectionUnsanitized,
       isUnguardedPath,
+      ...(sinkKind === 'db_query'
+        ? { missingTenantScope: !TENANT_SCOPE_RE.test(nodeTextFor(sink)) }
+        : {}),
       authCheck,
       ownershipCheck,
       severity,
@@ -1724,11 +2591,80 @@ export function dnsTakeoverAnalyze(input: {
   }
 }
 
+const TECH_TAG_PACKAGE_RULES: Array<{ re: RegExp; tags: string[] }> = [
+  { re: /^(?:next|@next\/)/i, tags: ['nextjs', 'react', 'node'] },
+  { re: /^react/i, tags: ['react'] },
+  { re: /^@nestjs\//i, tags: ['nestjs', 'node'] },
+  { re: /^(?:express|fastify|koa)$/i, tags: ['express', 'node'] },
+  { re: /^vite$/i, tags: ['vite'] },
+  { re: /^(?:vue|nuxt|@nuxt\/)/i, tags: ['vue', 'nuxt'] },
+  { re: /^@angular\//i, tags: ['angular'] },
+  { re: /^(?:graphql|@apollo\/|apollo-server)/i, tags: ['graphql'] },
+  { re: /^@clerk\//i, tags: ['clerk'] },
+  { re: /^@supabase\//i, tags: ['supabase'] },
+  { re: /^(?:django|djangorestframework)$/i, tags: ['django', 'python'] },
+  { re: /^(?:fastapi|starlette)$/i, tags: ['fastapi', 'python'] },
+  { re: /^(?:flask|flask-)/i, tags: ['flask', 'python'] },
+  { re: /^spring-|^org\.springframework/i, tags: ['springboot', 'java'] },
+  { re: /^(?:rails|railties|actionpack)$/i, tags: ['rails'] },
+  { re: /^(?:laravel\/|symfony\/)/i, tags: ['laravel', 'php'] },
+  { re: /^(?:gin-gonic|go-chi|gorm\.io)/i, tags: ['go'] },
+]
+
+function techTagsForPackage(packageName: string): string[] {
+  const tags: string[] = []
+  for (const rule of TECH_TAG_PACKAGE_RULES) {
+    if (rule.re.test(packageName)) tags.push(...rule.tags)
+  }
+  return [...new Set(tags)]
+}
+
+function manifestDeps(fileName: string, content: string): Array<{ ecosystem: string; package: string; version?: string }> {
+  const base = fileName.split('/').pop()?.toLowerCase() ?? ''
+  const deps: Array<{ ecosystem: string; package: string; version?: string }> = []
+  if (base === 'package.json') {
+    try {
+      const pkg = JSON.parse(content) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }
+      for (const [name, ver] of Object.entries({ ...pkg.dependencies, ...pkg.devDependencies })) {
+        deps.push({ ecosystem: 'npm', package: name, version: ver.replace(/^[^\d]*/, '') || undefined })
+      }
+    } catch { /* ignore */ }
+  } else if (base === 'requirements.txt') {
+    for (const line of content.split('\n')) {
+      const clean = line.split('#')[0].trim()
+      const m = clean.match(/^([A-Za-z0-9_.-]+)\s*(?:==|>=|~=|<=)?\s*([0-9][\w.+-]*)?/)
+      if (m) deps.push({ ecosystem: 'pypi', package: m[1], ...(m[2] ? { version: m[2] } : {}) })
+    }
+  } else if (base === 'pyproject.toml' || base === 'pipfile') {
+    for (const m of content.matchAll(/([A-Za-z0-9_.-]+)\s*(?:==|>=|~=|\^|<=)\s*["']?([0-9][\w.+-]*)/g)) {
+      deps.push({ ecosystem: 'pypi', package: m[1], version: m[2] })
+    }
+  } else if (base === 'go.mod') {
+    for (const m of content.matchAll(/^\s*(?:require\s+)?([a-z0-9.-]+\.[a-z]{2,}\/[^\s]+)\s+v([\d.]+)/gim)) {
+      deps.push({ ecosystem: 'go', package: m[1], version: m[2] })
+    }
+  } else if (base === 'pom.xml') {
+    const artifacts = [...content.matchAll(/<artifactId>\s*([A-Za-z0-9_.-]+)\s*<\/artifactId>/g)].map(m => m[1])
+    const versions = [...content.matchAll(/<version>\s*([0-9][\w.-]*)\s*<\/version>/g)].map(m => m[1])
+    artifacts.forEach((name, i) => deps.push({ ecosystem: 'java', package: name, ...(versions[i] ? { version: versions[i] } : {}) }))
+  } else if (base === 'build.gradle' || base === 'build.gradle.kts') {
+    for (const m of content.matchAll(/["']([a-zA-Z0-9_.-]+):([a-zA-Z0-9_.-]+):([0-9][\w.+-]*)["']/g)) {
+      deps.push({ ecosystem: 'java', package: m[2], version: m[3] })
+    }
+  } else if (base === 'gemfile' || base === 'gemfile.lock') {
+    for (const m of content.matchAll(/^\s*gem\s+["']([A-Za-z0-9_.-]+)["']\s*,?\s*["']?([0-9][\w.+-]*)?/gm)) {
+      deps.push({ ecosystem: 'rubygems', package: m[1], ...(m[2] ? { version: m[2] } : {}) })
+    }
+  }
+  return deps
+}
+
 export function techFingerprint(input: {
   headers?: Record<string, string>
   body?: string
   url?: string
   packageJson?: string
+  manifests?: ReadonlyArray<{ name: string; content: string }>
 }): Record<string, unknown> {
   const headers = Object.fromEntries(Object.entries(input.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]))
   const body = input.body ?? ''
@@ -1776,7 +2712,18 @@ export function techFingerprint(input: {
       // ignore invalid packageJson
     }
   }
-  return { url: input.url, count: detected.length, technologies: detected.slice(0, 100) }
+  if (input.manifests) {
+    for (const manifest of input.manifests) {
+      for (const dep of manifestDeps(manifest.name, manifest.content)) {
+        add(dep.ecosystem, dep.package, dep.version, 'high', `${manifest.name} dependency ${dep.package}${dep.version ? `@${dep.version}` : ''}`)
+      }
+    }
+  }
+  const techTags = [...new Set(detected.flatMap(item => [
+    ...techTagsForPackage(item.package),
+    ...(item.ecosystem === 'npm' && item.package === 'express' ? ['express', 'node'] : []),
+  ]))]
+  return { url: input.url, count: detected.length, technologies: detected.slice(0, 100), techTags }
 }
 
 export function runAnalyzer(tool: AnalyzerName, args: Record<string, unknown>, readEvidence: (name: string) => string): Record<string, unknown> {

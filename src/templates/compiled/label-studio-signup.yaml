@@ -3,7 +3,7 @@ name: "Label Studio - Sign-up Detect"
 severity: "info"
 description: "Detects the presence of the Label Studio sign-up."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "label-studio"
   - "sign-up"

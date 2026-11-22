@@ -3,7 +3,7 @@ name: "Trilium Notes Installer - Exposure"
 severity: "high"
 description: "Detects if the Trilium Notes setup page is accessible."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "trilium"
   - "setup"

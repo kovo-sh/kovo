@@ -3,7 +3,7 @@ name: "MongoD Server - Exposure"
 severity: "low"
 description: "Safe check derived from mongod-exposure: MongoD Server - Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "mongod"
   - "exposure"

@@ -3,8 +3,7 @@ name: "Adobe AEM CRX Namespace Editor Exposure"
 severity: "low"
 description: "Adobe AEM CRX Namespace Editor is exposed."
 tech:
-  - "tomcat"
-  - "java"
+  - "aem"
 tags:
   - "exposure"
   - "aem"

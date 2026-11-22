@@ -3,7 +3,7 @@ name: "Rubocop Configuration - Detect"
 severity: "info"
 description: "Rubocop configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "files"

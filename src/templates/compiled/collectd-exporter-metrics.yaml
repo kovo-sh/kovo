@@ -3,7 +3,7 @@ name: "Collectd Exporter Metrics"
 severity: "low"
 description: "Collectd Exporter Metrics is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "collectd"
   - "exposure"

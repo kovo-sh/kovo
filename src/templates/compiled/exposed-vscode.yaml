@@ -3,7 +3,7 @@ name: "Visual Studio Code Directories - Detect"
 severity: "medium"
 description: "Visual Studio Code directories were detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "vscode"
   - "exposure"

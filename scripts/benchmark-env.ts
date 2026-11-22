@@ -49,7 +49,12 @@ function personaSpec(rec: PersonaRecord): { authKind: 'bearer' | 'header' | 'coo
   return null
 }
 
-export async function createEngineEnv(handle: BenchmarkServerHandle, caps: ProfileCaps, assignmentLabel: string): Promise<EngineEnv> {
+export interface EngineEnvOptions {
+  /** Initial blind-SQLi allowance; the live pipeline recomputes it once hypotheses are known. */
+  slowProbes?: number
+}
+
+export async function createEngineEnv(handle: BenchmarkServerHandle, caps: ProfileCaps, assignmentLabel: string, opts: EngineEnvOptions = {}): Promise<EngineEnv> {
   const dir = mkdtempSync(join(tmpdir(), 'guardian-bench-run-'))
   const storage = new Store(dir)
   const origin = new URL(handle.origin).origin
@@ -118,8 +123,9 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
     origin, broker, grant, canaryBroker, storage, runId: run.id, signal: controller.signal, caps,
     owner, other, admin: pick('admin'), viewer: pick('viewer'), jwtPersona, personaUserIds: userIds, session: 'bench',
     // Adaptive budget: enough slow probes to cover every plausible blind-SQLi parameter class while
-    // still bounding wall-clock (each hit costs ~3 interleaved delay rounds).
-    slowProbesLeft: 20,
+    // still bounding wall-clock (each hit costs ~3 interleaved delay rounds). The live pipeline
+    // recomputes this from the formed plan and the M7 orchestration config.
+    slowProbesLeft: opts.slowProbes ?? 20,
     ...(owner && userIdByHandle.get(owner) ? { ownerUserId: userIdByHandle.get(owner)! } : {}),
     ...(other && userIdByHandle.get(other) ? { otherUserId: userIdByHandle.get(other)! } : {}),
   }

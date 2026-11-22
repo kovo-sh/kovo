@@ -3,7 +3,7 @@ name: "Liferay /api/liferay - API Exposed"
 severity: "info"
 description: "Safe check derived from liferay-api: Liferay /api/liferay - API Exposed"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "liferay"
   - "exposure"

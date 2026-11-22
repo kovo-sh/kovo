@@ -3,7 +3,7 @@ name: "Filestash Admin Password Configuration"
 severity: "high"
 description: "Filestash is susceptible to the Admin Password Configuration page exposure due to misconfiguration."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "filestash"

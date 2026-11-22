@@ -3,7 +3,7 @@ name: "Invoice Ninja Setup Page - Exposure"
 severity: "high"
 description: "Detects exposed Invoice Ninja Setup page."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

@@ -3,7 +3,7 @@ name: "owncloud Config - Detect"
 severity: "info"
 description: "owncloud configuration information was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

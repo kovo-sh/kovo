@@ -211,6 +211,12 @@ export interface SemanticAuditSuspect {
   sourceToSinkTrace?: string
   invariantId?: string
   ruleId?: string
+  /** Param names parsed from the enclosing route template (`:id`, `{order_id}`, `<int:id>`). */
+  paramNames?: string[]
+  /** Symbol of the resolved enclosing HTTP entrypoint. */
+  entrypointSymbol?: string
+  /** Phase-0 live endpoint that this suspect reconciles to (when discovered). */
+  reconciledEndpoint?: string
   data: CodeAuditSuspectData
 }
 
@@ -221,12 +227,47 @@ export interface GitSecurityCommitSignal {
   matchedKeywords: string[]
   touchedFiles: string[]
   removedChecksOrGuards: string[]
+  /** Exact removed-guard locations parsed from `git show --unified=3`. */
+  removedGuardLocations?: Array<{ file: string; line: number; snippet: string }>
   candidatePatterns: Array<{
     file: string
     line: number
     snippet: string
     reason: string
   }>
+}
+
+const REMOVED_GUARD_RE = /\b(?:auth|authorize|authenticate|require[A-Z_]|require\s*\(|session|permission|ownership|tenant(?:Id|_id)?|org(?:Id|_id)?|csrf|xsrf|sanitiz|escape|validate|validateOrThrow|allowlist|whitelist|isAdmin|role|roles|acl|rbac|policy|req\.user|currentUser)\b/i
+
+/** Parse `git show --unified=3` output for removed authorization/sanitizer lines. */
+export function extractRemovedGuardsFromDiff(
+  diff: string,
+  maxResults = 12,
+): Array<{ file: string; line: number; snippet: string }> {
+  const out: Array<{ file: string; line: number; snippet: string }> = []
+  let currentFile = ''
+  let newLine = 0
+  for (const raw of diff.split('\n')) {
+    if (raw.startsWith('+++ b/')) {
+      currentFile = raw.slice(6).trim()
+      continue
+    }
+    const hunk = raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+    if (hunk) {
+      newLine = Number(hunk[1])
+      continue
+    }
+    if (raw.startsWith('-') && !raw.startsWith('---')) {
+      const snippet = raw.slice(1).trim()
+      if (snippet && REMOVED_GUARD_RE.test(snippet) && currentFile && !/^\s*(?:#|\/\/|\*)/.test(snippet)) {
+        out.push({ file: currentFile, line: Math.max(1, newLine), snippet: snippet.slice(0, 240) })
+        if (out.length >= maxResults) return out
+      }
+      continue
+    }
+    if (!raw.startsWith('-')) newLine += 1
+  }
+  return out
 }
 
 export interface GitHistoryMiningResult {
@@ -274,6 +315,8 @@ export interface SemanticAuditContext {
   storage?: Store
   assignment?: Assignment
   onUsage?: UsageCallback
+  /** Live Phase-0 endpoints for reconciling code-derived routes to runnable HTTP targets. */
+  liveEndpoints?: ReadonlyArray<{ method: string; path: string }>
   signal: AbortSignal
 }
 
@@ -575,11 +618,11 @@ const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.venv',
 const exts = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.php', '.rb', '.json']);
 const files = [];
 function walk(d) {
-  if (files.length >= 200) return;
+  if (files.length >= 400) return;
   let ents = [];
   try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
   for (const e of ents) {
-    if (files.length >= 200) break;
+    if (files.length >= 400) break;
     if (skip.has(e.name)) continue;
     const full = path.join(d, e.name);
     if (e.isSymbolicLink()) continue;
@@ -588,6 +631,20 @@ function walk(d) {
   }
 }
 walk(repoRoot);
+// Security relevance: routes/controllers/middleware/auth/DB/GraphQL first, docs/config last.
+const relevance = (f) => {
+  const rel = path.relative(repoRoot, f).toLowerCase();
+  let score = 0;
+  if (/(route|router|controller|handler|endpoint|api)/.test(rel)) score += 8;
+  if (/(middleware|auth|session|login|jwt|oauth|permission|rbac|acl)/.test(rel)) score += 7;
+  if (/(db|database|orm|query|repository|model|schema|migration)/.test(rel)) score += 5;
+  if (/(graphql|resolver|trpc)/.test(rel)) score += 6;
+  if (/(server|app|main|index)\\./.test(rel)) score += 3;
+  if (/(test|spec|mock|fixture)/.test(rel)) score -= 7;
+  if (/(readme|license|changelog|docs?\\/)/.test(rel)) score -= 8;
+  return score;
+};
+files.sort((a, b) => relevance(b) - relevance(a) || a.localeCompare(b));
 const langs = new Set();
 const snippets = [];
 let total = 0;
@@ -871,27 +928,35 @@ export async function runValidatedDynamicRulesInWorker(
   const ogRules = rules.filter(r => r.spec.engine === 'opengrep')
   const sgRules = rules.filter(r => r.spec.engine === 'ast-grep')
 
-  const code = `
+  const buildScript = (
+    engine: 'opengrep' | 'ast-grep',
+    engineRules: ReadonlyArray<ValidatedDynamicRule>,
+  ): string => {
+    const items = engineRules.map(r => ({
+      id: r.spec.id,
+      cwe: r.spec.cwe,
+      yaml: r.yaml,
+    }))
+    if (engine === 'opengrep') {
+      return `
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-
 const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
-const ogYamls = ${JSON.stringify(ogRules.map(r => ({ id: r.spec.id, sinkKind: r.spec.sinkKind, cwe: r.spec.cwe, yaml: r.yaml })))};
-const sgYamls = ${JSON.stringify(sgRules.map(r => ({ id: r.spec.id, sinkKind: r.spec.sinkKind, cwe: r.spec.cwe, yaml: r.yaml })))};
+const rules = ${JSON.stringify(items)};
 const findings = [];
 const tmpFiles = [];
 try {
   fs.mkdirSync('/tmp/.config', { recursive: true });
   fs.mkdirSync('/tmp/.cache', { recursive: true });
-  for (const og of ogYamls) {
+  for (const rule of rules) {
     const p = '/tmp/guardian-dyn-og-' + randomUUID() + '.yaml';
     tmpFiles.push(p);
-    fs.writeFileSync(p, og.yaml, { mode: 0o600 });
+    fs.writeFileSync(p, rule.yaml, { mode: 0o600 });
     try {
       const out = execFileSync('opengrep', ['scan', '--config', p, '--json', '--no-git-ignore', '--quiet', repoRoot], {
-        encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024,
+        encoding: 'utf8', timeout: 45000, maxBuffer: 4 * 1024 * 1024,
         env: { ...process.env, HOME: '/tmp', XDG_CONFIG_HOME: '/tmp/.config', XDG_CACHE_HOME: '/tmp/.cache', OPENGREP_SEND_METRICS: 'off' }
       });
       const parsed = JSON.parse(out || '{}');
@@ -899,39 +964,12 @@ try {
         const sevRaw = String(r.extra?.severity || '').toLowerCase();
         const severity = sevRaw === 'error' ? 'high' : sevRaw === 'warning' ? 'medium' : 'info';
         findings.push({
-          engine: 'opengrep',
-          ruleId: String(r.check_id || og.id),
-          severity,
-          file: path.relative(repoRoot, r.path || ''),
-          line: Number(r.start?.line || 1),
+          engine: 'opengrep', ruleId: String(r.check_id || rule.id), severity,
+          file: path.relative(repoRoot, r.path || ''), line: Number(r.start?.line || 1),
           endLine: r.end?.line ? Number(r.end.line) : undefined,
           message: String(r.extra?.message || 'Dynamic rule match').slice(0, 400),
           maskedPreview: String(r.extra?.lines || '').trim().slice(0, 240),
-          cwe: og.cwe || undefined,
-        });
-      }
-    } catch {}
-  }
-  for (const sg of sgYamls) {
-    const p = '/tmp/guardian-dyn-sg-' + randomUUID() + '.yaml';
-    tmpFiles.push(p);
-    fs.writeFileSync(p, sg.yaml, { mode: 0o600 });
-    try {
-      const out = execFileSync('ast-grep', ['scan', '--rule', p, '--json=compact', repoRoot], {
-        encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024
-      });
-      const arr = JSON.parse(out || '[]');
-      for (const m of Array.isArray(arr) ? arr : []) {
-        findings.push({
-          engine: 'ast-grep',
-          ruleId: String(m.ruleId || sg.id),
-          severity: 'high',
-          file: path.relative(repoRoot, m.file || ''),
-          line: Number(m.range?.start?.line || 0) + 1,
-          endLine: m.range?.end?.line !== undefined ? Number(m.range.end.line) + 1 : undefined,
-          message: String(m.message || 'Dynamic ast-grep match').slice(0, 400),
-          maskedPreview: String(m.text || '').trim().replace(/\\s+/g, ' ').slice(0, 240),
-          cwe: sg.cwe || undefined,
+          cwe: rule.cwe || undefined,
         });
       }
     } catch {}
@@ -941,17 +979,67 @@ try {
 }
 process.stdout.write(JSON.stringify(findings));
 `
-  try {
-    const res = await session.runScript({ runtime: 'node', code, timeoutMs: 45_000 }, signal)
-    const raw = JSON.parse(res.stdout || '[]') as SastFinding[]
-    return (Array.isArray(raw) ? raw : []).map(f => ({
-      ...f,
-      message: redact(f.message, secrets),
-      maskedPreview: redact(f.maskedPreview, secrets),
-    }))
-  } catch {
-    return []
+    }
+    return `
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
+const rules = ${JSON.stringify(items)};
+const findings = [];
+const tmpFiles = [];
+try {
+  for (const rule of rules) {
+    const p = '/tmp/guardian-dyn-sg-' + randomUUID() + '.yaml';
+    tmpFiles.push(p);
+    fs.writeFileSync(p, rule.yaml, { mode: 0o600 });
+    try {
+      const out = execFileSync('ast-grep', ['scan', '--rule', p, '--json=compact', repoRoot], {
+        encoding: 'utf8', timeout: 45000, maxBuffer: 4 * 1024 * 1024
+      });
+      const arr = JSON.parse(out || '[]');
+      for (const m of Array.isArray(arr) ? arr : []) {
+        findings.push({
+          engine: 'ast-grep', ruleId: String(m.ruleId || rule.id), severity: 'high',
+          file: path.relative(repoRoot, m.file || ''), line: Number(m.range?.start?.line || 0) + 1,
+          endLine: m.range?.end?.line !== undefined ? Number(m.range.end.line) + 1 : undefined,
+          message: String(m.message || 'Dynamic ast-grep match').slice(0, 400),
+          maskedPreview: String(m.text || '').trim().replace(/\\s+/g, ' ').slice(0, 240),
+          cwe: rule.cwe || undefined,
+        });
+      }
+    } catch {}
   }
+} finally {
+  for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch {} }
+}
+process.stdout.write(JSON.stringify(findings));
+`
+  }
+
+  const runOne = async (engine: 'opengrep' | 'ast-grep', engineRules: ReadonlyArray<ValidatedDynamicRule>): Promise<SastFinding[]> => {
+    if (engineRules.length === 0) return []
+    try {
+      // Reuse the warm session; each engine runs independently (never short-circuited by grep).
+      const res = await session.runScript({ runtime: 'node', code: buildScript(engine, engineRules), timeoutMs: 60_000 }, signal)
+      const raw = JSON.parse(res.stdout || '[]') as SastFinding[]
+      return (Array.isArray(raw) ? raw : []).map(f => ({
+        ...f,
+        message: redact(f.message, secrets),
+        maskedPreview: redact(f.maskedPreview, secrets),
+      }))
+    } catch {
+      return []
+    }
+  }
+
+  // opengrep and ast-grep rules run on the same warm worker session; the session
+  // protocol is single-flight, so execute engines sequentially but never gate one on
+  // literal grep results. Both always run for the requested rule set.
+  const ogFindings = await runOne('opengrep', ogRules)
+  const sgFindings = await runOne('ast-grep', sgRules)
+  return [...ogFindings, ...sgFindings]
 }
 
 // ============================================================================
@@ -1193,6 +1281,116 @@ export function analyzeSinkBackwardPaths(
   return results
 }
 
+export interface ResolvedEntrypoint {
+  routePath: string
+  httpMethod?: string
+  symbol: string
+  file: string
+  line: number
+  paramNames: string[]
+  matchedBy: 'range' | 'nearest' | 'none'
+  reconciledEndpoint?: string
+}
+
+const ROUTE_PARAM_RE = /(?::([A-Za-z_][A-Za-z0-9_]*)|[{<]([A-Za-z_][A-Za-z0-9_]*)[}>])/g
+
+/** Extract parameter names from any common route-template syntax. */
+export function routeTemplateParamNames(routePath: string): string[] {
+  const names: string[] = []
+  for (const match of routePath.matchAll(ROUTE_PARAM_RE)) {
+    const name = match[1] ?? match[2]
+    if (name && !names.includes(name)) names.push(name)
+  }
+  return names
+}
+
+/** Normalize Next.js app-router paths and route-template syntax for reconciliation. */
+export function normalizeReconRoute(routePath: string): string {
+  let path = routePath.trim()
+  path = path.replace(/^[a-z]+:\/\/[^/]+/i, '')
+  path = path.replace(/^(?:\.?\/)?(?:src\/)?app\//, '/')
+  path = path.split('/').filter(seg => !/^\(.*\)$/.test(seg)).join('/')
+  path = path.replace(/\[\[?(?:\.\.\.)?([^\]]+)\]\]?/g, ':$1')
+  path = path.replace(/[{<]([A-Za-z_][A-Za-z0-9_]*)[}>]/g, ':$1')
+  path = path.replace(/\/+/g, '/')
+  if (!path.startsWith('/')) path = `/${path}`
+  return path.length > 1 ? path.replace(/\/$/, '') : '/'
+}
+
+function routeSegmentsMatch(left: string, right: string): boolean {
+  const a = left.split('/')
+  const b = right.split('/')
+  if (a.length !== b.length) return false
+  return a.every((seg, i) => {
+    const other = b[i]
+    if (seg === other) return true
+    return seg.startsWith(':') && other.startsWith(':')
+  })
+}
+
+/** Reconcile a code-derived route template with live Phase-0 endpoints. */
+export function reconcileSuspectWithEndpoints(
+  httpMethod: string | undefined,
+  routePath: string,
+  endpoints: ReadonlyArray<{ method: string; path: string }> | undefined,
+): string | undefined {
+  if (!endpoints?.length) return undefined
+  const target = normalizeReconRoute(routePath)
+  const method = httpMethod?.toUpperCase()
+  for (const endpoint of endpoints) {
+    if (method && endpoint.method.toUpperCase() !== method && endpoint.method.toUpperCase() !== 'ANY') continue
+    const candidate = normalizeReconRoute(endpoint.path)
+    if (candidate === target || routeSegmentsMatch(candidate, target)) return `${endpoint.method.toUpperCase()} ${endpoint.path}`
+  }
+  return undefined
+}
+
+/**
+ * Map a `file:line` SAST suspect backwards to its enclosing HTTP entrypoint.
+ * Resolution order: containing function span -> nearest preceding entrypoint in
+ * the same file -> none (caller keeps the raw file target).
+ */
+export function resolveSuspectEntrypoint(
+  graph: CallGraphIndex | undefined,
+  target: { file: string; line: number },
+  liveEndpoints?: ReadonlyArray<{ method: string; path: string }>,
+): ResolvedEntrypoint | null {
+  if (!graph) return null
+  const entrypoints = graph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath)
+  const inFile = entrypoints.filter(n => n.file === target.file)
+  const sorted = [...inFile].sort((a, b) => a.line - b.line)
+  let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' } | null = null
+  for (const node of sorted) {
+    const end = node.endLine ?? node.line
+    if (target.line >= node.line && target.line <= end) {
+      best = { node, matchedBy: 'range' }
+      break
+    }
+    if (node.line <= target.line) best = { node, matchedBy: 'nearest' }
+  }
+  if (!best) {
+    // Sink may live in a helper file; follow one reverse call-graph hop to a route.
+    const nodeById = new Map(graph.nodes.map(n => [n.id, n]))
+    const callerIds = graph.edges.filter(e => inFile.some(n => n.id === e.toId) || e.toId.startsWith(`${target.file}:`)).map(e => e.fromId)
+    const caller = callerIds.map(id => nodeById.get(id)).find(n => n?.kind === 'entrypoint' && n.routePath)
+    if (!caller) return null
+    best = { node: caller, matchedBy: 'nearest' }
+  }
+  const routePath = best.node.routePath ?? best.node.symbol
+  const reconciled = reconcileSuspectWithEndpoints(best.node.httpMethod, routePath, liveEndpoints)
+  return {
+    routePath,
+    ...(best.node.httpMethod ? { httpMethod: best.node.httpMethod } : {}),
+    symbol: best.node.symbol,
+    file: best.node.file,
+    line: best.node.line,
+    paramNames: routeTemplateParamNames(routePath),
+    matchedBy: best.matchedBy,
+    ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
+  }
+}
+
+
 function mapSinkToSpecialist(sinkKind: AuditSinkKind, cwe?: string): SpecialistProfile {
   if (sinkKind === 'postmessage_iframe') return 'client-browser-dom-specialist'
   if (sinkKind === 'webhook' || sinkKind === 'auth_config' || cwe === 'CWE-287' || cwe === 'CWE-347') {
@@ -1268,6 +1466,8 @@ export function scoreAndBuildSuspects(params: {
   dynamicFindings: readonly SastFinding[]
   backwardPaths: readonly SinkBackwardPath[]
   hostTiers?: Record<string, HostTier>
+  callGraph?: CallGraphIndex
+  liveEndpoints?: ReadonlyArray<{ method: string; path: string }>
 }): SemanticAuditSuspect[] {
   const suspects: SemanticAuditSuspect[] = []
   if (params.approvedOrigins.length === 0) return suspects
@@ -1280,6 +1480,7 @@ export function scoreAndBuildSuspects(params: {
     const sinkKind = inferSinkKindFromFinding(f)
     const sev: SemanticAuditSuspect['severity'] = f.severity === 'info' ? 'low' : f.severity
     const corroborated = backwardByFile.has(`${f.file}:${f.line}`)
+    const resolved = resolveSuspectEntrypoint(params.callGraph, { file: f.file, line: f.line }, params.liveEndpoints)
     const priorityScore = computePriorityScore({
       severity: sev,
       isUnguarded: true,
@@ -1289,9 +1490,9 @@ export function scoreAndBuildSuspects(params: {
       hostTiers: params.hostTiers,
       corroborated,
     })
-    const routeOrAction = f.file
+    const routeOrAction = resolved?.routePath ?? f.file
     const fingerprint = makeSuspectFingerprint(origin, params.repo, f.file, f.line, sinkKind, routeOrAction)
-    const hypothesis = `${f.message}${f.maskedPreview ? ` (${f.maskedPreview})` : ''}`
+    const hypothesis = `${f.message}${f.maskedPreview ? ` (${f.maskedPreview})` : ''}${resolved && resolved.matchedBy !== 'none' ? ` [entrypoint ${resolved.httpMethod ?? 'ANY'} ${resolved.routePath}${resolved.paramNames.length ? ` params: ${resolved.paramNames.join(', ')}` : ''}]` : ''}`
     const data: CodeAuditSuspectData = {
       subkind: 'code_audit_suspect',
       repo: params.repo,
@@ -1314,6 +1515,9 @@ export function scoreAndBuildSuspects(params: {
       line: Math.max(1, f.line),
       ...(f.endLine ? { endLine: f.endLine } : {}),
       routeOrAction,
+      ...(resolved?.httpMethod ? { httpMethod: resolved.httpMethod } : {}),
+      ...(resolved ? { paramNames: resolved.paramNames, entrypointSymbol: resolved.symbol } : {}),
+      ...(resolved?.reconciledEndpoint ? { reconciledEndpoint: resolved.reconciledEndpoint } : {}),
       authCheck: data.authCheck,
       ownershipCheck: data.ownershipCheck,
       sinkKind,
@@ -1358,6 +1562,7 @@ export function scoreAndBuildSuspects(params: {
     ].filter((value): value is string => value !== null)
     const hypothesis = `Backward taint path ${trace} reaches ${bp.sinkKind} sink without dominating ${missingControls.join(' or ') || 'control'}.`
     const fingerprint = makeSuspectFingerprint(origin, params.repo, bp.sinkFile, bp.sinkLine, bp.sinkKind, bp.routeOrAction)
+    const reconciled = reconcileSuspectWithEndpoints(bp.httpMethod, bp.routeOrAction, params.liveEndpoints)
     const data: CodeAuditSuspectData = {
       subkind: 'code_audit_suspect',
       repo: params.repo,
@@ -1380,6 +1585,9 @@ export function scoreAndBuildSuspects(params: {
       line: Math.max(1, bp.sinkLine),
       routeOrAction: bp.routeOrAction,
       ...(bp.httpMethod ? { httpMethod: bp.httpMethod } : {}),
+      paramNames: routeTemplateParamNames(bp.routeOrAction),
+      entrypointSymbol: bp.entrypointSymbol,
+      ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
       authCheck,
       ownershipCheck,
       sinkKind: bp.sinkKind,
@@ -1475,10 +1683,18 @@ for (const block of logOut.split('===COMMIT===').slice(1)) {
   const touchedFiles = lines.slice(1).map(s => s.trim()).filter(Boolean).slice(0, 40);
   commits.push({ sha, committedAt, subject, touchedFiles });
 }
+// Inspect real unified diffs for removed guards/sanitizers (bounded to first 30 commits).
+for (let i = 0; i < Math.min(commits.length, 30); i += 1) {
+  try {
+    commits[i].diff = execFileSync('git', [...baseArgs, 'show', '--unified=3', '--no-color', '--format=', commits[i].sha], {
+      encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
+    }).slice(0, 30000);
+  } catch { commits[i].diff = ''; }
+}
 process.stdout.write(JSON.stringify({ available: true, commits }));
 `
 
-  let parsed: { available?: boolean; reason?: string; commits?: Array<{ sha: string; committedAt?: string; subject: string; touchedFiles: string[] }> } = {}
+  let parsed: { available?: boolean; reason?: string; commits?: Array<{ sha: string; committedAt?: string; subject: string; touchedFiles: string[]; diff?: string }> } = {}
   try {
     const res = await session.runScript({ runtime: 'node', code: script, timeoutMs: 20_000 }, ctx.signal)
     parsed = JSON.parse(res.stdout || '{}')
@@ -1513,27 +1729,43 @@ process.stdout.write(JSON.stringify({ available: true, commits }));
     const kwMatch = c.subject.match(SECURITY_COMMIT_RE)
     if (!kwMatch) continue
     const matchedKeywords = [...new Set(c.subject.match(new RegExp(SECURITY_COMMIT_RE.source, 'gi')) ?? [])].map(k => k.toLowerCase())
+    const removedGuards = c.diff ? extractRemovedGuardsFromDiff(c.diff) : []
+    const redactedRemoved = removedGuards.map(g => ({
+      ...g,
+      snippet: redact(g.snippet, ctx.secrets),
+    }))
     const signalEntry: GitSecurityCommitSignal = {
       commitSha: c.sha,
       subject: redact(c.subject, ctx.secrets),
       committedAt: c.committedAt,
       matchedKeywords,
       touchedFiles: c.touchedFiles,
-      removedChecksOrGuards: [],
-      candidatePatterns: c.touchedFiles.slice(0, 4).map(f => ({
-        file: f,
-        line: 1,
-        snippet: redact(c.subject, ctx.secrets),
-        reason: `Historical security fix commit (${matchedKeywords.join(', ')})`,
+      removedChecksOrGuards: redactedRemoved.map(g => `${g.file}:${g.line} ${g.snippet}`),
+      ...(redactedRemoved.length ? { removedGuardLocations: redactedRemoved } : {}),
+      candidatePatterns: (redactedRemoved.length > 0
+        ? redactedRemoved.slice(0, 4)
+        : c.touchedFiles.slice(0, 4).map(f => ({ file: f, line: 1, snippet: redact(c.subject, ctx.secrets), reason: 'touched file' }))
+      ).map(g => ({
+        file: g.file,
+        line: g.line,
+        snippet: g.snippet,
+        reason: `Historical security fix commit (${matchedKeywords.join(', ')})${redactedRemoved.length ? ' removed guard/sanitizer' : ''}`,
       })),
     }
     securityCommits.push(signalEntry)
 
-    if (origin && c.touchedFiles.length > 0) {
-      const targetFile = c.touchedFiles[0]
-      const sinkKind: AuditSinkKind = /idor|bola|bfla|tenant|ownership|auth/i.test(c.subject) ? 'api_route' : 'db_query'
-      const hypothesis = `Historical security fix (${c.sha.slice(0, 8)}: "${redact(c.subject, ctx.secrets)}") touched ${targetFile}; audit sibling routes/handlers for incomplete patch or regression.`
-      const fp = makeSuspectFingerprint(origin, cleanRepo, targetFile, 1, sinkKind, targetFile)
+    const target = redactedRemoved[0]
+      ?? (c.touchedFiles.length > 0 ? { file: c.touchedFiles[0], line: 1, snippet: '' } : null)
+    if (origin && target) {
+      const targetFile = target.file
+      const targetLine = Math.max(1, target.line)
+      const sinkKind: AuditSinkKind = /idor|bola|bfla|tenant|ownership|auth/i.test(c.subject) || REMOVED_GUARD_RE.test(target.snippet)
+        ? 'api_route'
+        : 'db_query'
+      const hypothesis = redactedRemoved.length > 0
+        ? `Historical security fix (${c.sha.slice(0, 8)}: "${redact(c.subject, ctx.secrets)}") removed a guard/sanitizer at ${targetFile}:${targetLine} ("${redact(target.snippet, ctx.secrets).slice(0, 120)}"); audit sibling routes/handlers for an incomplete patch or regression.`
+        : `Historical security fix (${c.sha.slice(0, 8)}: "${redact(c.subject, ctx.secrets)}") touched ${targetFile}; audit sibling routes/handlers for incomplete patch or regression.`
+      const fp = makeSuspectFingerprint(origin, cleanRepo, targetFile, targetLine, sinkKind, targetFile)
       suspects.push({
         id: randomUUID(),
         fingerprint: fp,
@@ -1541,7 +1773,7 @@ process.stdout.write(JSON.stringify({ available: true, commits }));
         origin,
         repo: cleanRepo,
         file: targetFile,
-        line: 1,
+        line: targetLine,
         routeOrAction: targetFile,
         authCheck: 'unknown (historical security patch)',
         ownershipCheck: 'unknown',
@@ -1562,7 +1794,7 @@ process.stdout.write(JSON.stringify({ available: true, commits }));
           subkind: 'code_audit_suspect',
           repo: cleanRepo,
           file: targetFile,
-          line: 1,
+          line: targetLine,
           routeOrAction: targetFile,
           authCheck: 'unknown (historical security patch)',
           ownershipCheck: 'unknown',
@@ -1609,7 +1841,12 @@ export async function generateVariantSweepQueries(
       sinkKind: spec?.sinks[0]?.sinkKind ?? 'db_query',
       message: `Variant sweep for ${finding.title}: sibling ${methodPart}(...) sink`,
       mode: 'pattern',
-      patterns: [`$OBJ.${methodPart}($ARG + $OTHER, ...)`, `$OBJ.${methodPart}(\`...\${$X}...\`, ...)`, `$OBJ.${methodPart}($ARG)`],
+      patterns: [
+        `$OBJ.${methodPart}($ARG + $OTHER, ...)`,
+        `$OBJ.${methodPart}(\`...\${$X}...\`, ...)`,
+        `$OBJ.${methodPart}($REQ.$FIELD, ...)`,
+        `$OBJ.${methodPart}($INPUT[$$KEY], ...)`,
+      ],
     })
   } else {
     candidates.push({
@@ -1976,7 +2213,8 @@ export async function runThreeStageSemanticAudit(
 
       // Stage 1: IRIS-style Spec + Dynamic Rule Scan
       const stage1 = await extractProjectSecuritySpecAndRules(ctx, cleanRepo, session, {
-        enableLlm: options.enableStage1Llm,
+        enableLlm: options.enableStage1Llm
+          ?? (ctx.modelProfiles?.length ? process.env.GUARDIAN_STAGE1_LLM !== '0' : false),
       })
       specsByRepo[cleanRepo] = stage1.spec
       dynamicRulesCount += stage1.rules.length
@@ -2008,6 +2246,8 @@ export async function runThreeStageSemanticAudit(
         dynamicFindings,
         backwardPaths,
         hostTiers: ctx.hostTiers,
+        callGraph: graph,
+        ...(ctx.liveEndpoints ? { liveEndpoints: ctx.liveEndpoints } : {}),
       }))
 
       // Stage 3: Big Sleep/Aardvark-style Git Security Miner

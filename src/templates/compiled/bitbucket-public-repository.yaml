@@ -3,7 +3,7 @@ name: "Atlassian Bitbucket Public Repository Exposure"
 severity: "low"
 description: "Bitbucket Public Repository is exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "bitbucket"

@@ -3,7 +3,7 @@ name: "Joomla! Database File List"
 severity: "medium"
 description: "A Joomla! database directory /libraries/joomla/database/ was found exposed and has directory indexing enabled."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "joomla"

@@ -3,7 +3,7 @@ name: "Intelbras DVR - Unrestricted Access"
 severity: "low"
 description: "The HTTP GET request to /cap.js on the server Intelbras DVR reveals several potentially sensitive pieces of information that are not properly protected or encrypted."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "unauth"
   - "intelbras"

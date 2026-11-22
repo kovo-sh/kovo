@@ -3,7 +3,7 @@ name: "ASP.NET Trace.AXD - Exposure"
 severity: "low"
 description: "ASP.NET Trace.AXD information was exposed."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "logs"
   - "asp"

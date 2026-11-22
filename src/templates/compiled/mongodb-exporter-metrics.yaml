@@ -3,7 +3,7 @@ name: "MongoDB Exporter - Detect"
 severity: "medium"
 description: "MongoDB exporter was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "mongodb"
   - "exposure"

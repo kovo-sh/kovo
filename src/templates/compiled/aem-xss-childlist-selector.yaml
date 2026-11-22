@@ -3,7 +3,7 @@ name: "Adobe Experience Manager - Cross-Site Scripting"
 severity: "high"
 description: "Adobe Experience Manager contains a cross-site scripting vulnerability via requests using the selector childlist when the dispatcher does not respect the content-type responded by AEM and flips from application/json to text/html. As a consequence, the reflected suffix is executed and interpreted in the browser."
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "xss"
   - "aem"

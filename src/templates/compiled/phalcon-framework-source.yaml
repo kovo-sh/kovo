@@ -3,7 +3,7 @@ name: "Phalcon Framework - Source Code Leakage"
 severity: "high"
 description: "Phalcon Framework source code was discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "debug"

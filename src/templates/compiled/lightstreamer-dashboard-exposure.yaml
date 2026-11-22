@@ -3,7 +3,7 @@ name: "Lightstreamer Dashboard Exposure"
 severity: "medium"
 description: "Detected exposed Lightstreamer Server dashboard that may reveal server configuration,real-time monitoring data, session information, and internal infrastructure details."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "lightstreamer"

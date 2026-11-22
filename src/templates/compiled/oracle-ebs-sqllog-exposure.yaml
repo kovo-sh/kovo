@@ -3,7 +3,7 @@ name: "Oracle EBS SQL Log - Exposure"
 severity: "medium"
 description: "Detected exposure of the sqlnet.log file in Oracle E-Business Suite (EBS), which often contained sensitive information such as database connection details, TNS entries, usernames, and error logs."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "oracle"
   - "ebs"

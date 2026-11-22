@@ -3,7 +3,7 @@ name: "desktop.ini exposure"
 severity: "info"
 description: "Safe check derived from desktop-ini-exposure: desktop.ini exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

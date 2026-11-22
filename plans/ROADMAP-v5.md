@@ -10,12 +10,12 @@
 
 | # | Milestone | Objective (short) | Status | Owner / worktree | Depends on |
 |---|---|---|---|---|---|
-| **M0** | True E2E realistic-bench harness | Drive real `Execution` loop, baseline scorecard, `benchmark:realistic` CLI | **RUNNING** | `m5-m0` / `agents/m0` | — |
-| **M1** | P0 wiring & correctness | broker/browser args, second-order/OOB canaries, dedupe + route templates, specialist routing/skills, `InlineVerifyFeedback` + Phase-3, guard/sanitizer, CVE semver | **RUNNING** (split) | `m5-m1-core` / `agents/m1-core`; `m5-m1-static` / `agents/m1-static` | M0 baseline preferred, not blocking |
-| **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **PARTIAL** | M2.2/M2.3 in `m7-spa` (running); M2.4 in `m5-m2-auth` (running); M2.1 queued | M1 for execution/store hooks |
-| **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **QUEUED** | probes partly in `m7-heldout2` (running); verifier kinds after M1 | M1 (replay-verifier), SPA (surface-engine) |
-| **M4** | Templates, AST, SAST→DAST, Patch Gate 6 | 2021–2026 corpus, multi-framework AST, bridge, real patch retest | **QUEUED** | — | M1 (static/analyzers/cve-broker) |
-| **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 RUNNING** | `m5-board` / `agents/board-ui` | M1 for poster wiring (Phase 1b) |
+| **M0** | True E2E realistic-bench harness | Drive real `Execution` loop, baseline scorecard, `benchmark:realistic` CLI | **DONE** (deterministic baseline; agentic run needs model profile) | `m5-m0` / `agents/m0` | — |
+| **M1** | P0 wiring & correctness | broker/browser args, second-order/OOB canaries, dedupe + route templates, specialist routing/skills, `InlineVerifyFeedback` + Phase-3, guard/sanitizer, CVE semver | **PARTIAL** — static DONE; core RUNNING | `m5-m1-core` / `agents/m1-core`; `m5-m1-static` DONE | M0 baseline |
+| **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **PARTIAL** — M2.2/2.3 DONE, M2.4 DONE; M2.1 queued | `m7-spa` DONE; `m5-m2-auth` DONE | M1 for execution/store hooks |
+| **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **RUNNING** | `m5-m3-probes`; spec contracts merged (specs2) | M1-core for verifier/schema additions |
+| **M4** | Templates, AST, SAST→DAST, Patch Gate 6 | 2021–2026 corpus, multi-framework AST, bridge, real patch retest | **DONE** (merged; execution/recon wiring pending) | `m5-m4` / `agents/m4` | — |
+| **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 DONE**; Phase 1b after M1-core | `m5-board` / `agents/board-ui` DONE | M1 for poster wiring (Phase 1b) |
 | **M6** | Hill-climb + anti-overfitting + v5 gate | dev seeds, salted held-out, `VERIFICATION-v5.md` | **READY** (v4 baseline met; awaits M0–M5) | — | M0–M5 |
 
 ---
@@ -25,16 +25,18 @@
 | Stream | Worktree | Files owned | Maps to |
 |---|---|---|---|
 | heldout2 (merged) | `m7-heldout2` | `scripts/benchmark-probes.ts` | M3 probes complete: IDs/state/race/second-order/BFLA; 20/20 held-out, 25/25 xben |
-| spa | `m7-spa` | `src/server/phase0-recon.ts`, `src/server/surface-engine.ts` | M2.2, M2.3, M1.3 `normalizeDiscoveryTemplate` |
-| specs2 | `m7-specs2` | `scripts/benchmark-specs*.ts` | M3 spec synthesis (benchmark side) |
-| orch | `m7-orch` | `scripts/benchmark-live.ts`, `benchmark-recall.ts`, `benchmark-env.ts`, `benchmark-core.ts`, `benchmark-realistic-matrix.ts` | M6 speed/budget |
-| **m0** | `m5-m0` | `scripts/benchmark-realistic.ts` (new), `package.json`, `tests/v5-m0-*.test.ts` | M0 |
-| **m1-core** | `m5-m1-core` | `src/server/execution.ts`, `canary-broker.ts`, `dedupe.ts`, `agent-session.ts`, `replay-verifier.ts`, `skills.ts`, `src/skills/**`, `tests/v5-m1-*.test.ts` | M1.1, 1.2, 1.3 (dedupe), 1.4, 1.5 |
-| **m1-static** | `m5-m1-static` | `worker/analyzers.ts`, `src/server/semantic-audit.ts`, `src/server/cve-broker.ts`, `tests/v5-m1-static.test.ts` | M1.6 |
-| **m2-auth** | `m5-m2-auth` | `src/server/broker.ts`, `scoped-browser.ts`, `persona-auth.ts`, `approval-judge.ts`, `tests/v5-m2-auth.test.ts` | M2.4 |
-| **board-ui** | `m5-board` | `src/domain.ts`, `src/actions.ts`, `src/server/schema.ts`, `src/server/store.ts`, `src/components/run-board.tsx` (new), `run-workspace.tsx`, `run-state.ts`, `src/app.css`, `src/routes/api.runs.$runId.events.ts`, `tests/v5-board-*.test.ts` | M5 Phase 1 (UI/schema only) |
+| spa (merged) | `m7-spa` | `src/server/phase0-recon.ts`, `src/server/surface-engine.ts` | M2.2/M2.3 done: route maps, soft-404, auth pass, YAML/$ref, tRPC; `normalizeDiscoveryTemplate` |
+| specs2 (merged) | `m7-specs2` | `scripts/benchmark-specs*.ts` | M3 benchmark synthesis + identifier-bound authz: realistic precision 100% (dev 17/172, held-out 15/171), 0 unmatched/decoy FPs |
+| m3-probes | `m5-m3-probes` | `scripts/benchmark-probes.ts`, `src/server/surface-engine.ts` | M3 probes: CSRF state-change, webhook forgery, open redirect, write-BOLA, NoSQLi, noise tolerance |
+| m4 (merged) | `m5-m4` | `scripts/transpile-nuclei-templates.ts`, `src/templates/**`, `worker/**`, `semantic-audit.ts`, `cve-broker.ts`, `patch-workflow.ts`, `surface-engine.ts` | M4 done: 1,724 templates / 492 CVEs ≥2021, multi-framework AST, bridge, Gate 6 |
+| orch | `m7-orch` | `scripts/benchmark-live.ts`, `benchmark-recall.ts`, `benchmark-env.ts`, `benchmark-core.ts`, `benchmark-realistic-matrix.ts` | M6 speed/budget + all-patches attribution |
+| m0 (merged) | `m5-m0` | `scripts/benchmark-realistic.ts` (new), `package.json`, `tests/v5-m0-*.test.ts` | M0 |
+| m1-core | `m5-m1-core` | `src/server/execution.ts`, `canary-broker.ts`, `dedupe.ts`, `agent-session.ts`, `replay-verifier.ts`, `skills.ts`, `src/skills/**`, `tests/v5-m1-*.test.ts` | M1.1, 1.2, 1.3 (dedupe), 1.4, 1.5 |
+| m1-static (merged) | `m5-m1-static` | `worker/analyzers.ts`, `src/server/semantic-audit.ts`, `src/server/cve-broker.ts`, `tests/v5-m1-static.test.ts` | M1.6 done |
+| m2-auth (merged) | `m5-m2-auth` | `src/server/broker.ts`, `scoped-browser.ts`, `persona-auth.ts`, `approval-judge.ts`, `tests/v5-m2-auth.test.ts` | M2.4 done |
+| board-ui (merged) | `m5-board` | `src/domain.ts`, `src/actions.ts`, `src/server/schema.ts`, `src/server/store.ts`, `src/components/run-board.tsx` (new), `run-workspace.tsx`, `run-state.ts`, `src/app.css`, SSE route, board tests | M5 Phase 1 done |
 
-Retired/merged: `agents/heldout2` (v4 climb: 20/20 held-out, 25/25 xben, 20/20 patches), `agents/rb` (realistic-bench hardening), `agents/docs` (VERIFICATION-v4).
+Retired/merged: `agents/heldout2` (v4 climb: 20/20 held-out, 25/25 xben, 20/20 patches), `agents/rb` (realistic-bench hardening), `agents/docs` (VERIFICATION-v4), `agents/m0` (M0 harness + isolation), `agents/m1-static`, `agents/m2-auth`, `agents/spa`, `agents/board-ui` (M5 Phase 1), `agents/specs2` (M3 synthesis + authz precision), `agents/orch` (speed + all-patches fix), `agents/m4` (templates/AST/bridge/Gate 6).
 
 Open discrepancy: held-out `allPatches=regressed` is a phantom — fresh synthesis re-confirms always-on GraphQL introspection and credits it to both GraphQL challenges. Per-patch retests are 20/20 fixed. The orchestration stream owns replaying baseline attributed specs for the all-patches pass.
 
@@ -72,11 +74,21 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 |---|---|---|
 | xben-25 | **25/25 (100%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed** | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | 0/172 confirmed, 0 decoy FPs, precision poor from unmatched authz | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
-| realistic-bench held-out | 3/171 confirmed, 0 decoy FPs | within 10% of dev |
+| realistic-bench dev | **18/172 matched (10.5%), precision 100%**, 0 decoy/unmatched FPs; 9 cells in ~100 s at concurrency 9 | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
+| realistic-bench held-out | **15/171 matched, precision 100%**, 0 decoy/unmatched FPs (was 3 matched / precision 0.20) | within 10% of dev |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
 Known v4 blockers carried into v5: trigger quality on real apps; authz ID-binding precision; patch attribution ambiguity on shared `/graphql`; budget exhaustion on phlow-style flows.
+
+### Agentic (`Execution`) baseline — acme-saas seed 1, grey-box
+
+| Run | Wall | Spend | Confirmed | Precision | Notes |
+|---|---|---:|---:|---:|---|
+| deterministic | 11 s | $0 | 0/22 | 100% | 43 endpoints discovered, no probing |
+| agentic, 10 min | 600 s | $0.17 | 0/22 | 0% (1 unmatched) | 65 facts, 24 steps, 12 oracle events, 3 worker bootstrap failures |
+| agentic, 20 min | 1200 s | $0.47 | **2/22 (9.1%)** | 66.7% | planted legacy-auth-bypass + inbox BOLA; 1 novel admin-activity BFLA (oracle-evidenced, not planted) |
+
+Agentic reality: 59 endpoints, 663 requests, 43 oracle impacts, 7 findings persisted / 3 submitted. Wall-clock, not `--budget-usd`, is the limiter. Recurring **worker bootstrap failure** (3–4 assignments, 0 turns) and the **single-process data-dir lock** block parallel cells; both have owners (M1-core, M0 harness isolation).
 
 ---
 

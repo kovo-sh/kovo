@@ -3,7 +3,7 @@ name: "JBoss Web Service Console - Detect"
 severity: "low"
 description: "The JBoss Web Service console discloses the details of the remote system, The console displays all the web services and exposed by the system leading to a potential information disclosure."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "jboss"
   - "misconfig"

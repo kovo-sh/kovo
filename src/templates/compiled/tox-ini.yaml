@@ -3,7 +3,7 @@ name: "Tox Configuration File - Detect"
 severity: "info"
 description: "Tox configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

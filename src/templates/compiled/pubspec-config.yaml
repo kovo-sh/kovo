@@ -3,7 +3,7 @@ name: "Pubspec YAML Configuration File - Detect"
 severity: "info"
 description: "Pubspec YAML configuration file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "devops"

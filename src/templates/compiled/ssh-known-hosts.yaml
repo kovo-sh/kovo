@@ -3,7 +3,7 @@ name: "SSH Known Hosts File - Detect"
 severity: "info"
 description: "SSH known hosts file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "config"
   - "exposure"

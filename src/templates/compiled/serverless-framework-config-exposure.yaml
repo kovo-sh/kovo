@@ -3,7 +3,7 @@ name: "Serverless Framework - Configuration Exposure"
 severity: "medium"
 description: "A Serverless Framework configuration file (serverless.yml) was found exposed on the web server. The file describes the service, cloud provider, functions and often provider level environment variables, IAM statements and plugin settings, which can disclose the application architecture and occasionally hardcoded secrets to an unauthenticated visitor."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "config"

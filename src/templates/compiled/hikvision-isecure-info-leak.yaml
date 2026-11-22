@@ -3,7 +3,7 @@ name: "HIKVISION iSecure Center - Information Leak"
 severity: "high"
 description: "HIKVISION iSecure Center comprehensive security management platform is an \"integrated\" and \"intelligent\" platform. By accessing equipment such as video surveillance, all-in-one card, parking lot, alarm detection and other systems, Hikvision comprehensive security management platform information exists Information leakage (internal network centralized account password) vulnerability can be decrypted through decryption software, username and password."
 tech:
-  - "generic"
+  - "hikvision"
 tags:
   - "infoleak"
   - "iot"

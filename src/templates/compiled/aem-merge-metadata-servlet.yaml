@@ -3,7 +3,7 @@ name: "AEM MergeMetadataServlet"
 severity: "info"
 description: "Safe check derived from aem-merge-metadata-servlet: AEM MergeMetadataServlet"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "aem"
   - "misconfig"

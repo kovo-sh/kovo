@@ -3,7 +3,7 @@ name: "CoreBos - .htaccess File Exposure"
 severity: "info"
 description: "CoreBos was discovered to have .htaccess file exposed to public which includes sensitive information."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "corebos"

@@ -3,7 +3,7 @@ name: "StrongShop Installer - Exposure"
 severity: "high"
 description: "Detects the exposure of the StrongShop installer page, which could allow unauthorized setup or reinstallation of the application."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "strongshop"
   - "installer"

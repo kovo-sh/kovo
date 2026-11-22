@@ -3,7 +3,7 @@ name: "DWR detect test page detection"
 severity: "low"
 description: "The index contains the list of exposed Java classes. From here one can navigate to the test page of each class where every callable method is described and can be easily tested. This is a great way to find out what methods are exposed and learn how they function."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "tech"
   - "misconfig"

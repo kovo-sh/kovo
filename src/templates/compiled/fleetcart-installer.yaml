@@ -3,7 +3,7 @@ name: "FleetCart Installation Page - Exposure"
 severity: "high"
 description: "Detects exposed FleetCart setup installation pages which could allow unauthorized access or information disclosure."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "install"

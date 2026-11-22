@@ -3,7 +3,7 @@ name: "SABnzbd Quick-Start Wizard - Exposure"
 severity: "high"
 description: "Default installation wizard page of SABnzbd was discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "sabnzbd"
   - "wizard"

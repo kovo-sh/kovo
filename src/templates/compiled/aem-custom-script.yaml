@@ -3,7 +3,7 @@ name: "Adobe AEM Custom Scripts Exposure"
 severity: "info"
 description: "Safe check derived from aem-custom-script: Adobe AEM Custom Scripts Exposure"
 tech:
-  - "generic"
+  - "aem"
 tags:
   - "misconfig"
   - "aem"

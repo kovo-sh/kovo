@@ -3,7 +3,7 @@ name: "qdPM 9.2 - DB Credentials Exposure"
 severity: "high"
 description: "qdPM 9.2 database credentials were discovered."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "qdpm"
   - "exposure"

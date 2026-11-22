@@ -3,7 +3,7 @@ name: "Puppetserver Detection"
 severity: "info"
 description: "Safe check derived from puppetserver-detect: Puppetserver Detection"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "tech"
   - "puppet"

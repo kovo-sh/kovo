@@ -3,7 +3,7 @@ name: "IBM WebSphere Application - Source File Exposure"
 severity: "medium"
 description: "Disclose application specific files contained within the war file, including files under the web-inf and meta-inf directories."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "ibm"
   - "websphere"

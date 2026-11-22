@@ -3,7 +3,7 @@ name: "3CX Management Console - Local File Inclusion"
 severity: "high"
 description: "3CX Management Console is vulnerable to local file inclusion."
 tech:
-  - "generic"
+  - "3cx"
 tags:
   - "3cx"
   - "lfi"

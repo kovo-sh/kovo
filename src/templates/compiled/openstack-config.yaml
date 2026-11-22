@@ -3,7 +3,7 @@ name: "Openstack - Infomation Disclosure"
 severity: "low"
 description: "Openstack exposing Configuration or settings related to the Swift object storage system."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "misconfig"

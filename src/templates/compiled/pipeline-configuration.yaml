@@ -3,7 +3,7 @@ name: "Pipeline Configuration Exposure"
 severity: "info"
 description: "Safe check derived from pipeline-configuration: Pipeline Configuration Exposure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "devops"
   - "exposure"

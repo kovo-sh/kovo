@@ -3,7 +3,7 @@ name: "db.xml File - Detect"
 severity: "medium"
 description: "db.xml file was detected."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "misconfig"
   - "db"

@@ -3,7 +3,7 @@ name: "Brickcom Camera - Unauthenticated Snapshot Access"
 severity: "high"
 description: "Detected Brickcom IP cameras was exposed live camera snapshots without authentication via the ONVIF media endpoint."
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "iot"
   - "camera"

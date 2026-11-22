@@ -3,7 +3,7 @@ name: "Pipfile.lock Disclosure"
 severity: "info"
 description: "Safe check derived from pipfile-lock: Pipfile.lock Disclosure"
 tech:
-  - "generic"
+  - "generic-web-exposure"
 tags:
   - "exposure"
   - "pip"

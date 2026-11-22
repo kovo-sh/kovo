@@ -16,6 +16,12 @@ rules:
       - pattern: req.query.$X
       - pattern: req.body.$X
       - pattern: req.params.$X
+      - pattern: request.args
+      - pattern: request.form
+      - pattern: request.json
+      - pattern: request.get_json()
+      - pattern: $FORM.get($FIELD)
+      - pattern: $SEARCHPARAMS.get($FIELD)
     pattern-sanitizers:
       - pattern: parseInt(...)
       - pattern: Number(...)
@@ -24,8 +30,14 @@ rules:
       - pattern: $DB.query($SINK, ...)
       - pattern: $DB.execute($SINK, ...)
       - pattern: $DB.raw($SINK, ...)
+      - pattern: sql.raw($SINK)
+      - pattern: $KNEX.whereRaw($SINK, ...)
+      - pattern: $KNEX.havingRaw($SINK, ...)
+      - pattern: $ORM.query($SINK, ...)
       - pattern: $PRISMA.$queryRawUnsafe($SINK, ...)
       - pattern: $PRISMA.$executeRawUnsafe($SINK, ...)
+      - pattern: text($SINK)
+      - pattern: $SESSION.execute($SINK)
 
   - id: guardian.taint.js.cmd-exec
     languages: [javascript, typescript]
@@ -60,12 +72,32 @@ rules:
       - pattern: $REQ.body
       - pattern: $REQ.params
     pattern-sanitizers:
-      - pattern: new URL(...)
+      - pattern: $ALLOW_HOST($SINK)
+      - pattern: validateUrl(...)
     pattern-sinks:
       - pattern: fetch($SINK, ...)
       - pattern: axios.get($SINK, ...)
       - pattern: axios.post($SINK, ...)
       - pattern: got($SINK, ...)
+
+  - id: guardian.taint.js.server-action-sqli
+    languages: [javascript, typescript]
+    mode: taint
+    severity: ERROR
+    message: "Interprocedural taint: Next.js Server Action formData input flows into a database query."
+    metadata:
+      cwe: "CWE-89"
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: $FORM.get($FIELD)
+      - pattern: formData.get($FIELD)
+      - pattern: $REQ.formData()
+    pattern-sinks:
+      - pattern: $DB.query($SINK, ...)
+      - pattern: $DB.execute($SINK, ...)
+      - pattern: sql.raw($SINK)
+      - pattern: $PRISMA.$queryRawUnsafe($SINK, ...)
 
   - id: guardian.taint.js.path-traversal
     languages: [javascript, typescript]
@@ -254,3 +286,45 @@ rules:
       - pattern: $STMT.executeQuery($SINK)
       - pattern: $STMT.executeUpdate($SINK)
       - pattern: $STMT.execute($SINK)
+
+  - id: guardian.rule.js.orm-unsafe-raw
+    languages: [javascript, typescript]
+    mode: search
+    severity: ERROR
+    message: "Unsafe ORM raw SQL API (Drizzle sql.raw / Knex whereRaw / TypeORM query / Prisma $queryRawUnsafe). Verify the interpolated value is a trusted constant."
+    metadata:
+      cwe: "CWE-89"
+    patterns:
+      - pattern-either:
+          - pattern: sql.raw($SQL)
+          - pattern: $KNEX.whereRaw($SQL)
+          - pattern: $KNEX.havingRaw($SQL)
+          - pattern: $TYPEORM.query($SQL)
+          - pattern: $PRISMA.$queryRawUnsafe($SQL, ...)
+          - pattern: $PRISMA.$executeRawUnsafe($SQL, ...)
+
+  - id: guardian.rule.py.sqlalchemy-text
+    languages: [python]
+    mode: search
+    severity: WARNING
+    message: "SQLAlchemy text()/from_statement() executes a textual SQL clause; confirm it is not built from request input."
+    metadata:
+      cwe: "CWE-89"
+    patterns:
+      - pattern-either:
+          - pattern: text($SQL)
+          - pattern: from_statement($SQL)
+
+  - id: guardian.rule.py.fastapi-typed-param
+    languages: [python]
+    mode: search
+    severity: INFO
+    message: "FastAPI typed request parameter (Query/Body/Path) — trace into SQL/command/template sinks."
+    metadata:
+      cwe: "CWE-20"
+    patterns:
+      - pattern-either:
+          - pattern: $P = Query(...)
+          - pattern: $P = Body(...)
+          - pattern: $P = Path(...)
+          - pattern: $P = Depends(...)
