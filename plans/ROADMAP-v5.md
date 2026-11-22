@@ -85,9 +85,9 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 
 | Gate | v4 result | v5 target |
 |---|---|---|
-| xben-25 | **24/25 (96%)**, 0 FP, 25/25 signals | ≥23/25 |
+| xben-25 | **25/25 (100%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed**, allPatches=fixed | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | **24/172 matched (14.0%), precision 100%**, 0 decoy/unmatched FPs; 9 cells in ~100 s at concurrency 9 | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
+| realistic-bench dev | **62/172 matched (36.0%), precision 100%**, 0 decoy/unmatched FPs; 9 cells at concurrency 9 | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
 | realistic-bench held-out | **26/171 matched (15.2%), precision 100%**, 0 decoy/unmatched FPs; dev→held-out gap **+1.2 pp** (absolute) | within 10 pp of dev |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
