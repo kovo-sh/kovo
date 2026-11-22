@@ -103,6 +103,20 @@ Known v4 blockers carried into v5: trigger quality on real apps; authz ID-bindin
 
 Agentic reality: 59 endpoints, 663 requests, 43 oracle impacts, 7 findings persisted / 3 submitted. Wall-clock, not `--budget-usd`, is the limiter. Recurring **worker bootstrap failure** (3–4 assignments, 0 turns) and the **single-process data-dir lock** block parallel cells; both have owners (M1-core, M0 harness isolation).
 
+### M6 agentic matrix (6 cells, Docker, isolated data dirs, $5 & 20 min caps, concurrency 3)
+
+| Metric | Value |
+|---|---|
+| Confirmed | **12/117 (10.3%)** |
+| Precision | 66.7% (5 unmatched, **1/39 decoy FP**) |
+| Cost | **$1.848 total, $0.154/finding** |
+| Matrix wall | 2065 s (cell-wall sum 5608 s) |
+| Funnel | 117 → 71 surface → 31 hypothesis → 24 signal → 13 spec → 12 confirmed |
+| Assignments | 37 completed / **24 failed (39.3%)** |
+| Splits | dev 5/59 (8.5%, 55.6% precision); held-out 7/58 (12.1%, 77.8%) |
+
+Root cause of the worker failures: Docker removal race in `src/server/worker-backend.ts` (`--rm` + explicit `rm --force` + double removal on close) → daemon "removal already in progress", session failed, runs can end `complete` while truncated. Dominant funnel stall: **surface → hypothesis (43.7%)**, then spec synthesis.
+
 ---
 
 ## 6. Milestone Acceptance (condensed)
