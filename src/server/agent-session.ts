@@ -612,27 +612,30 @@ export function routeStepToSpecialist(input: {
   endpoint?: string
   sinkKind?: string
 }): SpecialistProfile {
-  const text = `${input.title ?? ''} ${input.hypothesis ?? ''} ${input.endpoint ?? ''} ${(input.skills ?? []).join(' ')}`.toLowerCase()
+  const primaryText = `${input.title ?? ''} ${input.hypothesis ?? ''} ${input.endpoint ?? ''}`.toLowerCase()
+  const skillsSet = new Set((input.skills ?? []).map(s => s.toLowerCase()))
   const cat = (input.category ?? '').toLowerCase()
   const sink = (input.sinkKind ?? '').toLowerCase()
 
-  if (/\bgraphql\b|\/graphql\b|gql\b|nested resolver/.test(text)) return 'graphql-api-specialist'
-  if (/\b(?:race|toctou|coupon|double[- ]?spend|workflow|step[- ]?skip|checkout|refund|invariant|business[- ]logic)\b/.test(text) || cat === 'business-logic-race') {
-    return 'business-logic-race-specialist'
+  if (/\bgraphql\b|\/graphql\b|gql\b|nested resolver/.test(primaryText) || skillsSet.has('api-rest-graphql')) {
+    return 'graphql-api-specialist'
   }
-  if (/\b(?:cache|poison|deception|x-forwarded-host|smuggl|desync|dns|takeover|tls|ssl|header|edge|protocol)\b/.test(text)) {
+  if (/\b(?:cache|poison|deception|x-forwarded-host|smuggl|desync|dns|takeover|tls|ssl|header|edge|protocol)\b/.test(primaryText) || skillsSet.has('cache-smuggling-desync')) {
     return 'protocol-cache-edge-specialist'
   }
-  if (/\b(?:xss|dom|innerhtml|postmessage|websocket|cswsh|browser|client-side|spa|prototype)\b/.test(text) || cat === 'cors-client-side' || sink === 'postmessage_iframe') {
+  if (/\b(?:race|toctou|coupon|double[- ]?spend|workflow|step[- ]?skip|checkout|refund|invariant|business[- ]logic)\b/.test(primaryText) || cat === 'business-logic-race') {
+    return 'business-logic-race-specialist'
+  }
+  if (/\b(?:xss|dom|innerhtml|postmessage|websocket|cswsh|browser|client-side|spa|prototype)\b/.test(primaryText) || cat === 'cors-client-side' || sink === 'postmessage_iframe' || skillsSet.has('xss-dom-prototype')) {
     return 'client-browser-dom-specialist'
   }
-  if (/\b(?:jwt|oauth|oidc|saml|pkce|session|cookie|login|mfa|alg.?none|jwks|auth_protocol)\b/.test(text) || cat === 'auth-identity' || cat === 'auth-session' || sink === 'auth_config' || sink === 'webhook') {
+  if (/\b(?:jwt|oauth|oidc|saml|pkce|session|cookie|login|mfa|alg.?none|jwks|auth_protocol)\b/.test(primaryText) || cat === 'auth-identity' || cat === 'auth-session' || sink === 'auth_config' || sink === 'webhook' || skillsSet.has('jwt-oauth-saml') || skillsSet.has('auth-oauth-oidc')) {
     return 'auth-session-oauth-specialist'
   }
-  if (/\b(?:sqli|sql|xxe|ssti|rce|command|nosql|deserial|traversal|ssrf|upload|injection|parser|db_query)\b/.test(text) || cat === 'injection-input' || cat === 'ssrf-redirects' || cat === 'upload-storage' || sink === 'db_query' || sink === 'outbound_fetch' || sink === 'redirect' || sink === 'upload_storage') {
+  if (/\b(?:sqli|sql|xxe|ssti|rce|command|nosql|deserial|traversal|ssrf|upload|injection|parser|db_query)\b/.test(primaryText) || cat === 'injection-input' || cat === 'ssrf-redirects' || cat === 'upload-storage' || sink === 'db_query' || sink === 'outbound_fetch' || sink === 'redirect' || sink === 'upload_storage' || skillsSet.has('sqli-parser-injection')) {
     return 'injection-parser-specialist'
   }
-  if (/\b(?:bola|bfla|idor|cross-tenant|ownership|tenant|access[- ]control|permission|orders|invoices)\b/.test(text) || cat === 'broken-access-control' || sink === 'api_route' || sink === 'server_action') {
+  if (/\b(?:bola|bfla|idor|cross-tenant|ownership|tenant|access[- ]control|permission|orders|invoices)\b/.test(primaryText) || cat === 'broken-access-control' || sink === 'api_route' || sink === 'server_action') {
     return 'bola-bfla-specialist'
   }
   if (cat === 'misconfig-exposure' || cat === 'transport-crypto') return 'protocol-cache-edge-specialist'

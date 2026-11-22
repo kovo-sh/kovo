@@ -831,9 +831,9 @@ test('M2.7 & M2.8 universal encodings + expanded sqli_boolean + sql_time_diff (#
   const grant = makeLabGrant(fx.origin, { tier: 3, isIdempotentPostAllowed: () => true })
   const sig = AbortSignal.timeout(45_000)
 
-  // Verify agent-session constants include all 7 encodings & 13 probe classes
+  // Verify agent-session constants include all 7 encodings & 14 probe classes
   assert.equal(probeParamLocations.length, 7)
-  assert.equal(differentialProbeClasses.length, 13)
+  assert.equal(differentialProbeClasses.length, 14)
 
   await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
     for (const loc of ['form', 'xml'] as const) {
