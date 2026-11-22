@@ -1,7 +1,15 @@
 import { expect, test } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { createApp } from './app.ts'
 import { configureModel, downloadReport, openScopeReview, openView, saveScope } from './browser-flows.ts'
 import { createV2FixtureServer, E2E_COOKIE_SECRET, E2E_CREDENTIAL } from './v2-fixture-server.ts'
+
+function withDb<T>(directory: string, fn: (db: DatabaseSync) => T): T {
+  const db = new DatabaseSync(join(directory, 'guardian.sqlite'))
+  try { return fn(db) } finally { db.close() }
+}
 
 test.setTimeout(90_000)
 
@@ -94,6 +102,7 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
 })
 
 test('surfaces Tier 3 HITL approval card and blocks state-changing probe until operator clicks Approve probe', async ({ page }) => {
+  test.setTimeout(180_000)
   const fixture = await createV2FixtureServer({ scenario: 'tier3_approval' })
   const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
 
@@ -109,10 +118,28 @@ test('surfaces Tier 3 HITL approval card and blocks state-changing probe until o
     await openScopeReview(page, 'Validate benign Tier 3 state probe with explicit operator approval.', 3)
     await saveScope(page)
 
-    // Wait for the Tier 3 approval pinned on the board (right pane, Overview)
+    // Deterministic E2E setup: seed the Tier-3 state-probe step. The planner mock is intentionally
+    // inert in v5, so waiting for it to synthesize this step would make the test depend on LLM
+    // prompt wording. The engine's wake loop picks the pending step up within ~2 s.
+    withDb(app.directory, db => {
+      const run = db.prepare('SELECT id, goal_revision AS goalRevision, scope_revision AS scopeRevision, approved FROM runs LIMIT 1').get() as
+        { id: string; goalRevision: number; scopeRevision: number; approved: string } | undefined
+      if (!run) return
+      const now = Date.now()
+      db.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority,
+        target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?, 95, ?, '[]', '[]', '[]', 'pending', ?, ?, ?)`).run(
+        randomUUID(), run.id, run.goalRevision, run.scopeRevision,
+        'Tier 3 state probe', 'Verify HITL approval gates POST /api/state-eval.', 'broken-access-control',
+        run.approved, JSON.stringify(['https://northstar.example']), now, now,
+      )
+    })
+
+    // Approvals are pinned in the Board pane (the redesigned right pane), not Overview.
+    await page.getByRole('button', { name: /^Board/ }).first().click()
     const approvalRow = page.getByTestId('board-approvals').locator('.ap', { hasText: '/api/state-eval' })
     const approveBtn = approvalRow.getByRole('button', { name: 'Approve', exact: true })
-    await expect(approveBtn).toBeVisible({ timeout: 30_000 })
+    await expect(approveBtn).toBeVisible({ timeout: 90_000 })
     await expect(approvalRow).toContainText('POST')
 
     // Hard security invariant: POST /api/state-eval MUST NOT have fired before approval!

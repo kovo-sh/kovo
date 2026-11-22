@@ -161,6 +161,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
       input?: Array<Record<string, unknown>>
     }
     const toolNames = new Set((body.tools ?? []).map(t => t.name ?? ''))
+    const httpTool = toolNames.has('http_request') ? 'http_request' : 'request_http'
     const serializedInput = JSON.stringify(body.input ?? [])
 
     let sseBody: string
@@ -168,7 +169,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
     if (toolNames.has('guardian_connection')) {
       modelCalls.push('connection')
       sseBody = sseMessage('', [{ name: 'guardian_connection', args: { status: 'ready' } }])
-    } else if (toolNames.has('request_http') && toolNames.has('complete_intent')) {
+    } else if ((toolNames.has('request_http') || toolNames.has('http_request')) && toolNames.has('complete_intent')) {
       // Worker investigation turn! Count how many function_call_output entries are in input
       const outputs = (body.input ?? []).filter(item => item.type === 'function_call_output')
       const alreadyCompleted = (body.input ?? []).some(
@@ -181,7 +182,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
         if (outputs.length === 0) {
           modelCalls.push('worker:tier3_post')
           sseBody = sseMessage('', [{
-            name: 'request_http',
+            name: httpTool,
             args: {
               origin: 'https://northstar.example',
               method: 'POST',
@@ -218,7 +219,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
         if (outputs.length === 0) {
           modelCalls.push('worker:harvest_js')
           sseBody = sseMessage('', [{
-            name: 'request_http',
+            name: httpTool,
             args: {
               origin: targetHost,
               method: 'GET',
