@@ -1,0 +1,68 @@
+/* Queue and Findings view styles, owned by Agent Q. Scope every rule under .rw.
+   F's CSS for these views is already in ../run.css; this adds only what is missing. */
+
+/* ---- queue list ---- */
+.rw .qrow{cursor:pointer}
+.rw .qrow .qurl{font-size:12px}
+.rw .qrow .qurl .m{color:var(--warn);font-weight:600;margin-right:6px}
+.rw .qrow .qurl .pq{color:var(--fg-3)}
+.rw .qrow .meta .qm{display:inline-flex;align-items:center;gap:8px}
+.rw .qrow .meta .qdot{color:var(--fg-4)}
+.rw .qrow .meta .tag{height:18px;font-size:11px}
+.rw .qrow.done .title{color:var(--fg-2)}
+.rw .qrow.done .qurl .m{color:var(--fg-3)}
+.rw .qrow.done:hover .meta,.rw .qrow.done.cur .meta{opacity:1}
+.rw .qrow .acts .kbd{pointer-events:none}
+.rw .qsub{height:30px;display:flex;align-items:center;gap:8px;padding:0 18px 0 44px;border-bottom:1px solid var(--line);color:var(--fg-2);font-size:12px;font-weight:500;background:color-mix(in srgb,var(--sunk) 55%,transparent)}
+.rw .qsub .ico{color:var(--fg-3)}
+.rw .qsub .ct{color:var(--fg-3);font-weight:400}
+.rw .qsub .sub{color:var(--fg-3);font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rw .dec .ico{width:13px;height:13px}
+
+/* ---- action bar stamp (sits on top of the buttons) ---- */
+.rw .abar .rstamp .rstamp-sub{font-weight:400;opacity:.7}
+.rw .abar .rstamp:empty{display:none}
+.rw .abar .rstamp.stampl{right:12px;left:12px;height:auto}
+
+/* ---- reading view ---- */
+.rw .ctx-strong{font-weight:500;color:var(--fg)}
+.rw .ctx-item .ctx-a{margin:0;font-size:11.5px;display:inline-flex;vertical-align:baseline}
+.rw .ctx-item .ctx-a .ico{width:12px;height:12px}
+.rw .qf-note{font-size:12px!important;color:var(--fg-3)!important;margin:2px 0 6px!important}
+.rw .qf-more{font-size:12px!important;color:var(--fg-3)!important;margin:4px 0 8px!important}
+.rw .qf-hosts{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;font-size:12px;color:var(--fg-2);margin-bottom:10px}
+.rw .qf-hosts span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rw .linkrow.qx .r{max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rw .qx-chev{color:var(--fg-3);display:inline-flex;flex:none;transform:rotate(-90deg);transition:transform var(--d2) var(--ease)}
+.rw .qx-chev.open{transform:none}
+.rw .qx-det{padding:2px 0 4px;animation:rw-fade var(--d2) var(--ease)}
+.rw .qx-det .hdrs{margin:4px 0 8px}
+.rw .qx-det .hdrs tr.hl td{color:var(--fg)}
+.rw .qx-det .hdrs tr.hl td:first-child{font-weight:600}
+
+/* ---- findings list ---- */
+.rw .frow{cursor:pointer}
+.rw .frow>.tag{flex:none}
+.rw .frow .fdec{flex:none;white-space:nowrap}
+.rw .ghead .gtally{display:inline-flex;gap:5px;align-items:center}
+.rw .fgrp{position:relative}
+.rw .fvirt .ghead{position:absolute}
+.rw .fpin{position:sticky;top:0;height:0;z-index:3}
+.rw .fpin .ghead{position:relative}
+
+/* ---- finding inspector ---- */
+.rw .props .v .fspans{white-space:normal;word-break:break-all;font-size:11.5px}
+.rw .fnoobs{color:var(--fg-3);font-family:var(--font, Inter, system-ui, sans-serif)}
+.rw .fretest{display:grid;grid-template-columns:14px minmax(0,1fr);gap:8px;padding:6px 0;font-size:12px;line-height:18px;color:var(--fg-2)}
+.rw .fretest b{font-weight:500;color:var(--fg)}
+.rw .fretest .muted{color:var(--fg-3)}
+.rw .fretest+.fretest{border-top:1px dashed var(--line)}
+.rw .fverify{display:flex;align-items:center;gap:10px;margin:6px 0 12px}
+.rw .fverify .muted{color:var(--fg-3);font-size:12px}
+.rw .floc{margin-bottom:10px}
+.rw .floc-h{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--fg-2);min-height:24px}
+.rw .floc-h .ico{color:var(--fg-3);flex:none}
+.rw .floc-h .p{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rw .floc-h .r{color:var(--fg-3);flex:none}
+.rw .floc-l{font-size:12px;color:var(--fg-3);margin:0 0 4px 22px}
+.rw .floc pre.block{margin-top:4px;max-height:200px}

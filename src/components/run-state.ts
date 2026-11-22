@@ -1,7 +1,5 @@
 import type { runData } from '../actions.ts'
-import type {
-  ApprovalPolicy, BoardMemberState, BoardMessageKind, CapabilityTier, OwaspCategory, Phase, WorkerPhase,
-} from '../domain.ts'
+import type { ApprovalPolicy, BoardMemberState, BoardMessageKind, CapabilityTier, OwaspCategory, Phase } from '../domain.ts'
 
 export type RunDetail = Awaited<ReturnType<typeof runData>>
 export type Worker = RunDetail['assignments'][number]
@@ -15,16 +13,6 @@ export const phaseNames: Record<Phase, string> = {
   verification: 'Verification',
   complete: 'Complete',
 }
-
-export const workerPhaseNames: Record<WorkerPhase, string> = {
-  discovery: 'Discovery',
-  threat_model: 'Threat model',
-  investigation: 'Investigation',
-  verification: 'Verification',
-  retest: 'Fix verification',
-}
-
-export const workerPhases: WorkerPhase[] = ['discovery', 'threat_model', 'investigation', 'verification']
 
 export const capabilityTierMeta: Record<CapabilityTier, { name: string; short: string; summary: string }> = {
   0: {

@@ -2795,7 +2795,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const bare = clean.split('?')[0] || '/'
       const surfaceStatus = ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405
       if (!surfaceStatus) continue
-      if (!isJson && !/^\/(?:api|rest|v\d|graphql|trpc)\//i.test(bare) && !/\.json$/i.test(bare)) continue
+      if (!isJson && !/^\/(?:api|rest|v\d|graphql|trpc)\//i.test(bare) && !/\.json$/i.test(bare)) {
+        // HTML pages reached only through links are real surface too (soft-404 already filtered the
+        // SPA catch-all above). Record them instead of silently dropping every non-API navigation hit.
+        if (!/html/i.test(ex.mediaType)) continue
+      }
       const ep = recordEndpoint('GET', bare, 'spa_crawl', {
         authRequirement: discoveryPersona ? `persona:${discoveryPersona}` : null,
         riskScore: 60,

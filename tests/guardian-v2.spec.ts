@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { createApp } from './app.ts'
-import { configureModel, downloadReport, openScopeReview, saveScope } from './browser-flows.ts'
+import { configureModel, downloadReport, openScopeReview, openView, saveScope } from './browser-flows.ts'
 import { createV2FixtureServer, E2E_COOKIE_SECRET, E2E_CREDENTIAL } from './v2-fixture-server.ts'
 
 test.setTimeout(90_000)
@@ -48,7 +48,7 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
     await saveScope(page)
 
     // 4. Inspect Report once Zero-LLM Replay Verifier confirms the chain finding
-    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    await openView(page, 'Report')
     const report = page.getByRole('article', { name: 'Complete report' })
     await expect(report).toBeVisible({ timeout: 45_000 })
     await expect(report).toContainText('Next.js Middleware Auth Bypass (CVE-2025-29927)')
@@ -66,14 +66,16 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
     await verifyBtn.click()
     await expect(report).toContainText('Verified fixed', { timeout: 25_000 })
 
-    // 6. Inspect Workflow Trace (List default + Graph DAG toggle)
-    await page.getByRole('link', { name: /^Trace/ }).click()
-    await expect(page.getByLabel('Worker timeline list')).toBeVisible()
-    await page.getByRole('button', { name: 'Graph', exact: true }).click()
-    await expect(page.locator('.trace-canvas')).toBeVisible()
+    // 6. Inspect the Workflow (graph by default, list toggle, back to the graph)
+    await openView(page, 'Workflow')
+    await expect(page.getByLabel(/^Workflow graph/)).toBeVisible()
+    await page.getByRole('radio', { name: 'List', exact: true }).click()
+    await expect(page.getByRole('region', { name: 'Worker list' })).toBeVisible()
+    await page.getByRole('radio', { name: 'Graph', exact: true }).click()
+    await expect(page.getByLabel(/^Workflow graph/)).toBeVisible()
 
     // 7. Export portable Markdown with evidence & verify zero secret leaks
-    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    await openView(page, 'Report')
     const exported = await downloadReport(page, 'Markdown with evidence')
     expect(exported.content).toContain('Next.js Middleware Auth Bypass (CVE-2025-29927)')
     expect(exported.content).toContain('## Executive summary')
@@ -102,19 +104,21 @@ test('surfaces Tier 3 HITL approval card and blocks state-changing probe until o
     await openScopeReview(page, 'Validate benign Tier 3 state probe with explicit operator approval.', 3)
     await saveScope(page)
 
-    // Wait for inline Tier 3 Approval Card in Overview
-    const approveBtn = page.getByRole('button', { name: 'Approve probe', exact: true })
+    // Wait for the Tier 3 approval pinned on the board (right pane, Overview)
+    const approvalRow = page.getByTestId('board-approvals').locator('.ap', { hasText: '/api/state-eval' })
+    const approveBtn = approvalRow.getByRole('button', { name: 'Approve', exact: true })
     await expect(approveBtn).toBeVisible({ timeout: 30_000 })
-    await expect(page.getByText('POST https://northstar.example/api/state-eval', { exact: true })).toBeVisible()
+    await expect(approvalRow).toContainText('POST')
 
     // Hard security invariant: POST /api/state-eval MUST NOT have fired before approval!
     expect(fixture.targetRequests.filter(r => r.method === 'POST' && r.target.includes('/api/state-eval'))).toHaveLength(0)
 
+    // Approving stamps immediately and sends decide_approval when the 6 s undo window closes
     await approveBtn.click()
     await expect(approveBtn).toBeHidden({ timeout: 15_000 })
 
     // Run completes cleanly after operator approves probe
-    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    await openView(page, 'Report')
     await expect(page.getByRole('article', { name: 'Complete report' })).toBeVisible({ timeout: 40_000 })
     expect(fixture.targetRequests.filter(r => r.method === 'POST' && r.target.includes('/api/state-eval'))).toHaveLength(1)
   } finally {
@@ -158,7 +162,7 @@ test('recovers cleanly from SIGKILL crash into paused and resumes without duplic
     expect(fixture.targetRequests.filter(r => r.target === 'https://northstar.example/').length).toBe(1)
 
     await resumeBtn.click()
-    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    await openView(page, 'Report')
     await expect(page.getByRole('article', { name: 'Complete report' })).toBeVisible({ timeout: 45_000 })
 
     // Baseline GET / was never duplicated across crash + resume!
@@ -187,16 +191,27 @@ test('enforces mid-chain scope revocation and omits revoked host from subsequent
 
     await fixture.targetHeld
 
-    // Open Review scope while run is active and revoke northstar.example
-    await page.getByRole('button', { name: 'Review scope', exact: true }).click()
+    // Open the scope editor while the run is active and revoke northstar.example
+    const openScopePopover = async () => {
+      await page.getByRole('button', { name: 'More actions' }).click()
+      await page.getByRole('menu').getByRole('button', { name: /^Scope hosts/ }).click()
+    }
+    await openScopePopover()
+    await page.getByRole('dialog', { name: 'Scope' }).getByRole('button', { name: /Edit scope/ }).click()
     await page.getByRole('checkbox', { name: 'Include northstar.example', exact: true }).uncheck()
     await saveScope(page, 'Save scope revision')
-    await expect(page.getByText(/1 approved host · Revision 2/)).toBeVisible({ timeout: 15_000 })
+    // The revision is sent when the undo window closes; the scope popover then reports it
+    await expect(async () => {
+      await page.keyboard.press('Escape')
+      await openScopePopover()
+      await expect(page.getByRole('dialog', { name: 'Scope' })).toContainText('1 host · revision 2', { timeout: 1_000 })
+    }).toPass({ timeout: 15_000 })
+    await page.keyboard.press('Escape')
 
     // Release hold so remaining approved host finishes cleanly
     fixture.releaseTargetHold()
 
-    await page.getByRole('link', { name: 'Report', exact: true }).click()
+    await openView(page, 'Report')
     const report = page.getByRole('article', { name: 'Complete report' })
     await expect(report).toBeVisible({ timeout: 45_000 })
     await expect(report).toContainText('api.northstar.example')
