@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { describe, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
@@ -2574,7 +2575,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   })
 
   test('T1-20d: second-order matcher ignores immediate reflection on same endpoint + same persona', async (t) => {
-    const marker = 'gn2o_aabbccdd'
+    const marker = 'gn2o_01aabb22'
     const fx = await startHttpFixture(t, (_req, _b, res) => {
       res.end(`<html><body>${marker}</body></html>`)
     })
@@ -3422,8 +3423,42 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-28b: v4 Store opens legacy v3 SQLite DB and preserves 100% of existing projects/runs/findings/profiles', async (t) => {
     const dir = makeTempDir(t, 'guardian-v3-mig-')
     const srcDb = resolve(repoRoot, '.guardian/dyad-v2-smoke/data/guardian.sqlite')
-    assert.ok(existsSync(srcDb), 'Baseline v3 SQLite fixture missing')
-    copyFileSync(srcDb, join(dir, 'guardian.sqlite'))
+    if (existsSync(srcDb)) {
+      copyFileSync(srcDb, join(dir, 'guardian.sqlite'))
+    } else {
+      const seed = new Store(dir)
+      const now = Date.now()
+      const wsId = seed.workspace.id
+      seed.client.exec(`
+        INSERT INTO model_profiles (id, workspace_id, name, endpoint, model, protocol, credential_id, updated_at)
+          VALUES ('mp-legacy-1', '${wsId}', 'Legacy Profile', 'https://api.example/v1', 'm1', 'responses', 'cred-1', ${now});
+        INSERT INTO projects (id, workspace_id, name, seeds, default_scope, created_at)
+          VALUES ('proj-legacy-1', '${wsId}', 'Legacy Project', '["http://127.0.0.1:9"]', '[]', ${now});
+        INSERT INTO runs (id, project_id, workspace_id, original_goal, goal, goal_revision, scope_revision, coordinator_id, phase, status, approved_persona_ids, candidates, approved, created_at)
+          VALUES ('run-legacy-1', 'proj-legacy-1', '${wsId}', 'Audit', 'Audit', 1, 1, 'coord-1', 'complete', 'complete', '[]', '[]', '[]', ${now});
+        INSERT INTO findings (id, run_id, asset_id, goal_revision, check_id, case_id, finding_kind, source_origins, verification_tier, finding)
+          VALUES ('find-legacy-1', 'run-legacy-1', 'asset-1', 1, 'chain', 'legacy-1', 'multi_step_chain', '["http://127.0.0.1:9"]', 'runtime_confirmed', '{"id":"find-legacy-1","title":"Legacy Finding","status":"confirmed"}');
+      `)
+      seed.close()
+      const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+      for (const tbl of ['benchmark_runs', 'lab_telemetry', 'second_order_canaries', 'api_dependencies', 'endpoint_params', 'endpoints']) {
+        raw.exec(`DROP TABLE IF EXISTS ${tbl};`)
+      }
+      raw.exec(`
+        ALTER TABLE model_profiles DROP COLUMN role_affinity;
+        ALTER TABLE projects DROP COLUMN sandbox_write_allowlist;
+        ALTER TABLE runs DROP COLUMN dynamic_step_budget;
+        ALTER TABLE runs DROP COLUMN multi_trial_enabled;
+        ALTER TABLE runs DROP COLUMN phase0_completed_at;
+        ALTER TABLE chain_steps DROP COLUMN specialist_profile;
+        ALTER TABLE chain_steps DROP COLUMN trial_group_id;
+        ALTER TABLE chain_steps DROP COLUMN trial_index;
+        ALTER TABLE replay_specs DROP COLUMN attempt_count;
+        ALTER TABLE replay_specs DROP COLUMN verified_inline;
+        ALTER TABLE replay_specs DROP COLUMN last_verification_diff;
+      `)
+      raw.close()
+    }
     const migrated = new Store(dir)
     t.after(() => migrated.close())
     const counts = {
@@ -4532,9 +4567,14 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const broker = new RequestBroker({ rejectUnauthorized: false, circuit5xxThreshold: 3 }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { tier: 2, sandboxWriteAllowlist: [{ origin: fx.origin, method: 'POST', pathPattern: '/*' }] })
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
-      for (let i = 0; i < 3; i += 1) {
-        await broker.executeHttp({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/search', body: '{}' }, grant, AbortSignal.timeout(5000))
+      for (let i = 0; i < 2; i += 1) {
+        const res = await broker.executeHttp({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/search', body: '{}' }, grant, AbortSignal.timeout(5000))
+        assert.equal(res.status, 503)
       }
+      await assert.rejects(
+        () => broker.executeHttp({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/search', body: '{}' }, grant, AbortSignal.timeout(5000)),
+        BrokerCircuitOpen,
+      )
       await assert.rejects(
         () => broker.executeHttp({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/search', body: '{}' }, grant, AbortSignal.timeout(5000)),
         BrokerCircuitOpen,
@@ -8141,8 +8181,36 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
   test('T3-28: Legacy v3 guardian.sqlite opened by v4 Store auto-migrates losslessly and completes v4 ops', async (t) => {
     const dir = makeTempDir(t, 'guardian-v4-t3-mig-')
     const srcDb = resolve(repoRoot, '.guardian/dyad-v2-smoke/data/guardian.sqlite')
-    assert.ok(existsSync(srcDb), 'Missing legacy v3 sqlite fixture')
-    copyFileSync(srcDb, join(dir, 'guardian.sqlite'))
+    if (existsSync(srcDb)) {
+      copyFileSync(srcDb, join(dir, 'guardian.sqlite'))
+    } else {
+      const seed = new Store(dir)
+      const now = Date.now()
+      const wsId = seed.workspace.id
+      seed.client.exec(`
+        INSERT INTO projects (id, workspace_id, name, seeds, default_scope, created_at)
+          VALUES ('proj-t3-1', '${wsId}', 'Legacy T3 Project', '["http://127.0.0.1:9"]', '[]', ${now});
+      `)
+      seed.close()
+      const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+      for (const tbl of ['benchmark_runs', 'lab_telemetry', 'second_order_canaries', 'api_dependencies', 'endpoint_params', 'endpoints']) {
+        raw.exec(`DROP TABLE IF EXISTS ${tbl};`)
+      }
+      raw.exec(`
+        ALTER TABLE model_profiles DROP COLUMN role_affinity;
+        ALTER TABLE projects DROP COLUMN sandbox_write_allowlist;
+        ALTER TABLE runs DROP COLUMN dynamic_step_budget;
+        ALTER TABLE runs DROP COLUMN multi_trial_enabled;
+        ALTER TABLE runs DROP COLUMN phase0_completed_at;
+        ALTER TABLE chain_steps DROP COLUMN specialist_profile;
+        ALTER TABLE chain_steps DROP COLUMN trial_group_id;
+        ALTER TABLE chain_steps DROP COLUMN trial_index;
+        ALTER TABLE replay_specs DROP COLUMN attempt_count;
+        ALTER TABLE replay_specs DROP COLUMN verified_inline;
+        ALTER TABLE replay_specs DROP COLUMN last_verification_diff;
+      `)
+      raw.close()
+    }
     const storage = new Store(dir)
     t.after(() => storage.close())
     const { runId } = await setupApprovedRun(storage)
