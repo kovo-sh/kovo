@@ -129,7 +129,7 @@ export function RunHeader() {
             toast.undoable({ message: `Approving ${plural(pendingApprovals.length, 'pending request')}`, icon: 'check', sub: 'Sends when this closes', commit: () => send({ action: 'approve_all_pending' }) })
           })}
           <div className="menu-sep" />
-          {item('chat', 'Message the coordinator', () => { setPop(null); nav.openChat(null) }, { right: 'C' })}
+          {item('chat', 'Open the board', () => { setPop(null); nav.openChat(null) }, { right: 'C' })}
           {model.report && item('download', 'Download report (Markdown)', () => {
             setPop(null)
             downloadReportMarkdown({ data: { runId: r.id, reportId: model.report!.id } }).then(res => download(res.content, res.filename, 'text/markdown; charset=utf-8'), () => toast.show('Could not export the report', { tone: 'error' }))

@@ -15,6 +15,7 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { readArtifact } from '../../actions.ts'
+import { useBoardUnread } from './coordinator.tsx'
 import { useFullExchange, useRun, useRunModel } from './data.tsx'
 import { EmptyState, LinkRow, Props, Section } from './display.tsx'
 import { fmtDate, host, short } from './format.ts'
@@ -29,10 +30,14 @@ export type InspectorMap = Record<string, (props: InspectorProps) => ReactNode>
 
 export function PaneHeader({ title, sub, extra }: { title: ReactNode; sub?: ReactNode; extra?: ReactNode }) {
   const nav = useNav()
+  const unread = useBoardUnread()
   return <div className="pane-h">
     {nav.stack.length > 0 && <button type="button" className="icon-btn" onClick={() => nav.back()} title="Back (Esc)" aria-label="Back"><Icon name="arrowL" /></button>}
     <span className="t">{title}{sub != null && <> <span className="muted">{sub}</span></>}</span>
     {extra}
+    <button type="button" className="icon-btn b-btn" onClick={() => nav.openChat(null)} title={'Board (C)' + (unread ? ` · ${unread} new` : '')} aria-label="Board">
+      <Icon name="chat" />{unread > 0 && <span className="b-badge num" data-testid="board-unread-badge">{unread}</span>}
+    </button>
     <button type="button" className="icon-btn" onClick={() => nav.close()} title="Close (Esc)" aria-label="Close"><Icon name="close" /></button>
   </div>
 }

@@ -953,3 +953,55 @@
 .rw .lab-note.err{color:var(--bad)}
 .rw .consent .ov-sec.lab{margin-top:26px;border-top:1px solid var(--line)}
 .rw .ov-sec.lab .props .v{white-space:normal}
+
+/* board pane (coordinator.tsx): pane tabs, roster, filters, kind pills, refs, mentions */
+.rw .board{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}
+.rw .ptabs{display:flex;gap:2px;flex:1;min-width:0}
+.rw .ptab{height:26px;padding:0 9px;border-radius:6px;display:inline-flex;align-items:center;gap:6px;color:var(--fg-3);font-weight:500;white-space:nowrap}
+.rw .ptab:hover{color:var(--fg);background:var(--hover)}
+.rw .ptab.on{color:var(--fg);background:var(--press)}
+.rw .ptab .ct{color:var(--fg-3);font-weight:400;font-size:12px}
+.rw .b-roster{flex:none;display:flex;gap:4px;overflow-x:auto;padding:8px 12px;border-bottom:1px solid var(--line);scrollbar-width:none}
+.rw .b-mem{flex:none;display:inline-flex;align-items:center;height:24px;border-radius:12px;box-shadow:inset 0 0 0 1px var(--line-2);color:var(--fg-2);font-size:12px;overflow:hidden}
+.rw .b-mem>button{height:24px;display:inline-flex;align-items:center;gap:5px;padding:0 9px 0 8px;border-radius:12px}
+.rw .b-mem>button:hover{background:var(--hover);color:var(--fg)}
+.rw .b-mem.on{box-shadow:inset 0 0 0 1px var(--sel-line);background:var(--sel);color:var(--fg)}
+.rw .b-mem .b-st{font-size:10.5px;color:var(--fg-3)}
+.rw .b-mem .b-go{padding:0 7px 0 2px;color:var(--fg-3);border-radius:0}
+.rw .b-mem .b-go:hover{color:var(--fg)}
+.rw .b-dot{width:7px;height:7px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--fg-4);flex:none}
+.rw .b-mem.st-working .b-dot{background:var(--ok);box-shadow:none;animation:rw-dotPulse 1.6s var(--ease) infinite}
+@keyframes rw-dotPulse{0%,100%{opacity:1}50%{opacity:.35}}
+.rw .b-mem.st-paused .b-dot{background:var(--warn);box-shadow:none}
+.rw .b-mem.st-retired{opacity:.6}
+.rw .b-mem.st-retired .b-dot{background:var(--fg-4);box-shadow:none}
+.rw .b-filters{flex:none;display:flex;gap:2px;overflow-x:auto;padding:6px 10px;border-bottom:1px solid var(--line);scrollbar-width:none}
+.rw .b-f{flex:none;height:22px;padding:0 8px;border-radius:6px;color:var(--fg-3);font-size:12px;white-space:nowrap}
+.rw .b-f:hover{color:var(--fg);background:var(--hover)}
+.rw .b-f.on{color:var(--fg);background:var(--press)}
+.rw .b-kind{height:16px;padding:0 5px;border-radius:4px;display:inline-flex;align-items:center;font-size:9.5px;font-weight:600;letter-spacing:.04em;color:var(--fg-2);background:var(--sunk);box-shadow:inset 0 0 0 1px var(--line-2)}
+.rw .b-kind.k-handoff,.rw .b-kind.k-lead,.rw .b-kind.k-claim{color:var(--fg);box-shadow:inset 0 0 0 1px var(--line-strong)}
+.rw .b-kind.k-verdict{color:var(--ok);background:var(--ok-soft);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ok) 35%,transparent)}
+.rw .b-kind.k-blocker{color:var(--bad);background:var(--bad-soft);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--bad) 35%,transparent)}
+.rw .b-kind.k-approval{color:var(--warn);background:var(--warn-soft);box-shadow:inset 0 0 0 1px var(--warn-line)}
+.rw .b-msg.tainted .body{text-decoration:line-through;text-decoration-color:var(--fg-4);color:var(--fg-3)}
+.rw .b-meta{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.rw .b-men,.rw .b-ref{height:20px;padding:0 7px;border-radius:5px;display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--fg-2);box-shadow:inset 0 0 0 1px var(--line-2);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rw .b-ref{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;font-size:11px}
+.rw .b-men:hover,.rw .b-ref:hover{color:var(--fg);background:var(--hover)}
+.rw .b-men.on,.rw .b-ref.on{background:var(--sel);box-shadow:inset 0 0 0 1px var(--sel-line);color:var(--fg)}
+.rw .b-ref-d{margin-top:6px;padding:8px 10px;border-radius:7px;background:var(--sunk);box-shadow:inset 0 0 0 1px var(--line);font-size:12px;line-height:18px;overflow-wrap:anywhere}
+.rw .b-ref-d b{font-weight:500;color:var(--fg)}
+.rw .b-ref-d p{margin:2px 0 0;color:var(--fg-2)}
+.rw .b-ref-d .linkbtn{margin:4px 0 0}
+.rw .b-apin{margin-top:6px;border-radius:8px;box-shadow:var(--shadow-card);background:var(--raise);overflow:hidden}
+.rw .b-apin-h{display:flex;align-items:center;gap:6px;padding:6px 10px 2px;font-size:11.5px;color:var(--warn);font-weight:500}
+.rw .b-apin-h .muted{color:var(--fg-3);font-weight:400}
+.rw .b-empty{margin:8px 2px;color:var(--fg-3);font-size:12.5px}
+.rw .board .composer{position:relative}
+.rw .b-mention{position:absolute;left:12px;right:12px;bottom:calc(100% - 4px);z-index:20;padding:4px;border-radius:10px;background:var(--raise);box-shadow:var(--shadow-pop);max-height:240px;overflow:auto;animation:rw-pop var(--d2) var(--ease)}
+.rw .b-mention .pi{width:100%;text-align:left}
+.rw .b-mention .pi .r{font-size:11.5px}
+.rw .pane-h .b-btn{position:relative}
+.rw .b-badge{position:absolute;top:1px;right:0;min-width:15px;height:15px;padding:0 4px;border-radius:8px;background:var(--accent);color:#fff;font-size:9.5px;font-weight:600;display:inline-grid;place-items:center;line-height:1}
+.rw .b-roster,.rw .b-filters{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);padding-right:28px}

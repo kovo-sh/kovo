@@ -104,9 +104,11 @@ test('surfaces Tier 3 HITL approval card and blocks state-changing probe until o
     await openScopeReview(page, 'Validate benign Tier 3 state probe with explicit operator approval.', 3)
     await saveScope(page)
 
-    // Wait for the Tier 3 approval pinned in the coordinator pane (Overview)
-    const approveBtn = page.getByRole('button', { name: 'Approve POST northstar.example/api/state-eval', exact: true })
+    // Wait for the Tier 3 approval pinned on the board (right pane, Overview)
+    const approvalRow = page.getByTestId('board-approvals').locator('.ap', { hasText: '/api/state-eval' })
+    const approveBtn = approvalRow.getByRole('button', { name: 'Approve', exact: true })
     await expect(approveBtn).toBeVisible({ timeout: 30_000 })
+    await expect(approvalRow).toContainText('POST')
 
     // Hard security invariant: POST /api/state-eval MUST NOT have fired before approval!
     expect(fixture.targetRequests.filter(r => r.method === 'POST' && r.target.includes('/api/state-eval'))).toHaveLength(0)

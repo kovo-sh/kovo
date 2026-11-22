@@ -107,7 +107,9 @@ links.queueItem(key) · links.event(id) · links.evidence(id) (opens in the curr
 ```
 
 Views own their selection highlight: a row is "current" when `nav.sel?.kind === yourKind && nav.sel.id === row.id`.
-When nothing is selected (and on Overview/Report) the pane shows the coordinator.
+When nothing is selected (and on Overview/Report) the pane shows the Board (`coordinator.tsx`: roster, pinned
+approvals, filters, board posts merged with the coordinator thread, composer). `useBoardUnread()` feeds the Board
+button badge in `PaneHeader`.
 **Queue**: the run lands on Queue when approvals are pending; select the first open item on mount if `nav.sel` is empty.
 
 Inspector skeleton (F's `.d` content, `.sec` sections, `.props` grid, `.linkrow` links):

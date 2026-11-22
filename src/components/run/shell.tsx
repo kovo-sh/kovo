@@ -3,7 +3,7 @@
 import { useNavigate } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { CoordinatorPane } from './coordinator.tsx'
+import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
 import type { Detail } from './model.ts'
 import { DecisionsProvider, useDecisions } from './decisions.tsx'
@@ -78,6 +78,7 @@ function Workspace() {
     if (saved >= PANE_MIN && saved <= PANE_MAX) setPaneW(saved)
   }, [])
   useGlobalShortcuts()
+  useBoardSeen()
   const View = VIEW_COMPONENTS[nav.view]
   const rm = useReducedMotion()
   return <div className="app" style={paneW ? { ['--pane-w' as string]: paneW + 'px' } : undefined}>
@@ -130,7 +131,7 @@ function PaneContent() {
   const Inspector = !showChat ? INSPECTORS[sel!.kind] ?? FallbackInspector : null
   const anim = rm ? '' : nav.paneAnim === 'left' ? ' pane-in-l' : ' pane-in'
   return <div key={key} className={'pane-tx' + anim}>
-    {showChat ? <CoordinatorPane /> : Inspector && <Inspector sel={sel!} />}
+    {showChat ? <BoardPane /> : Inspector && <Inspector sel={sel!} />}
   </div>
 }
 
