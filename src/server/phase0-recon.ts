@@ -1619,11 +1619,14 @@ export function parseRouteMapDoc(
       }
     }
   }
-  // Attach logical->actual parameter hints to same-resource write routes by shared name tokens.
-  for (const hint of hints.paramHints) {
-    dynamicParams.add(hint)
-    const hintTokens = new Set(routeKeyTokens(hint))
-    if (hintTokens.size === 0) continue
+  // Attach logical->actual parameter hints to same-resource write/read routes by shared name tokens.
+  const attachedHints = new Set<string>()
+  const attachHint = (matchKey: string, actualName: string) => {
+    if (attachedHints.has(actualName) || !PARAM_NAME_RE.test(actualName)) return
+    dynamicParams.add(actualName)
+    const hintTokens = new Set(routeKeyTokens(matchKey))
+    if (hintTokens.size === 0) return
+    attachedHints.add(actualName)
     const ranked = created
       .filter(ep => ep.key)
       .map(ep => ({ ep, overlap: routeKeyTokens(ep.key ?? '').filter(token => hintTokens.has(token)).length }))
@@ -1633,8 +1636,11 @@ export function parseRouteMapDoc(
         || (a.ep.method === 'GET' ? 1 : 0) - (b.ep.method === 'GET' ? 1 : 0)
         || a.ep.path.length - b.ep.path.length)
       .slice(0, 4)
-    for (const { ep } of ranked) addParam(ep.id, hint, ep.method === 'GET' || ep.method === 'HEAD' ? 'query' : 'json')
+    for (const { ep } of ranked) addParam(ep.id, actualName, ep.method === 'GET' || ep.method === 'HEAD' ? 'query' : 'json')
   }
+  const paramMapValues = new Set(Object.values(hints.paramMap))
+  for (const [logical, actual] of Object.entries(hints.paramMap)) attachHint(logical, actual)
+  for (const hint of hints.paramHints) if (!paramMapValues.has(hint)) attachHint(hint, hint)
   return { endpoints, params }
 }
 
