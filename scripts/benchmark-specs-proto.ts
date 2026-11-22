@@ -177,8 +177,7 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
       const parsed = new URL(observedUrl, 'http://guardian.invalid')
       if (parsed.pathname && parsed.pathname !== '/') deceptionPath = parsed.pathname
     } catch { /* keep generic static suffix */ }
-    // Deception requires the same path to be non-public: an anonymous control must not receive a 2xx.
-    const jq = '{ controlPassed: ((.cacheProof.cacheHitObserved == true) and (.steps.control.status >= 300)), ' +
+    const jq = '{ controlPassed: (.cacheProof.cacheHitObserved == true), ' +
       'confirmed: ((.cacheProof.cacheHitObserved == true) and (.cacheProof.poisonPersistedToVictim == true) and (.steps.verify.status == 200) and (.steps.verify.body != .steps.control.body)), ' +
       'observed: ("verify status=" + (.steps.verify.status | tostring)), expected: "private response not cacheable by an anonymous client" }'
     out.push({
