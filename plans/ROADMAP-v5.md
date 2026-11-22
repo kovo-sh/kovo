@@ -1,5 +1,18 @@
 # Guardian v5 — Active Build Roadmap & Ownership Board
 
+**GOAL (binding):** Complete v5 such that every release gate below passes, measured on `main`, with 0 false positives and 0 benchmark hardcoding:
+- xben-25 ≥ 23/25; held-out-saas ≥ 18/20 with 0/6 decoy FPs and ≥ 14/20 verified patches
+- realistic-bench dev: High/Critical recall ≥ 65% grey-box / ≥ 80% white-box; precision ≥ 95%; decoy FP ≤ 5%; chain completion ≥ 50%
+- realistic-bench salted held-out: within 10% of dev recall, precision ≥ 95%, 0 unattributed FPs
+- 100% of v2/v3/v4/v5 unit, boundary, E2E and Board UI suites; 0 skips; 0 Docker orphans
+- `VERIFICATION-v5.md` records every before/after iteration honestly
+
+**Swarm lanes (parallel, exclusive leases):**
+1. **Engine recall** — probes/specs/state-graph; owns `benchmark-probes.ts`, `surface-engine.ts`, `benchmark-specs*.ts`, `execution.ts`, `store.ts`, `phase0-recon.ts` (one stream at a time per file).
+2. **Orchestration & UI** — board tools/posters/warm specialists; owns `agent-session.ts`, board components, `schema.ts`.
+3. **Validation & docs** — gate suites, agentic matrix evaluation, `VERIFICATION-v5.md`; owns `tests/**` and docs, never engine files.
+4. **Integration** — coordinator merges each stream, re-runs xben/held-out/realistic after every merge, and reverts any change that loses a floor.
+
 **Sources:** [`plans/v5.md`](v5.md) (M0–M6), [`plans/message-board.md`](message-board.md) (M5 sub-spec)
 **Status snapshot:** 2026-11-22 (v4/M7 final gates met on merged main @ `9793d2d`: xben 25/25, held-out 20/20, patches 20/20; v5 M0/M1/M2/M5 running)
 **Rule:** one exclusive file lease per stream. A stream must not edit another stream's files. New work is added only by taking an unowned file or by explicit hand-off.
