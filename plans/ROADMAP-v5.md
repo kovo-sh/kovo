@@ -28,7 +28,7 @@
 | **M2** | State graph, recon, auth/session | endpoint_params/api_dependencies, soft-404/auth recon, state-graph crawl, jars/CSRF/subdomain/401/circuit | **DONE** (2.1–2.4 merged) | `m7-spa`, `m5-m2-auth`, `m5-m2-state` | — |
 | **M3** | Real-world probes & verifiers | CSRF state-change, webhook forgery, open redirect, write-BOLA, race setup, noise normalization | **RUNNING** | `m5-m3-probes`; spec contracts merged (specs2) | M1-core for verifier/schema additions |
 | **M4** | Templates, AST, SAST→DAST, Patch Gate 6 | 2021–2026 corpus, multi-framework AST, bridge, real patch retest | **DONE** (merged; execution/recon wiring pending) | `m5-m4` / `agents/m4` | — |
-| **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI now; deterministic posters after M1; warm specialists/handoffs later | **PHASE 1 + TOOLS DONE** (UI, board_post/read, deltas, warm controller); execution wiring next | `m5-board`, `m5-board2` | M1 for poster wiring |
+| **M5** | Swarm Message Board + Board UI | schema/store/SSE/UI, deterministic posters, warm specialists, operator routing | **DONE** (UI, tools, posters, warm lifecycle merged) | `m5-board`, `m5-board2` | — |
 | **M6** | Hill-climb + anti-overfitting + v5 gate | dev seeds, salted held-out, `VERIFICATION-v5.md` | **READY** (v4 baseline met; awaits M0–M5) | — | M0–M5 |
 
 ---
