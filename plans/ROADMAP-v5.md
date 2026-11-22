@@ -26,7 +26,7 @@
 |---|---|---|---|
 | heldout2 (merged) | `m7-heldout2` | `scripts/benchmark-probes.ts` | M3 probes complete: IDs/state/race/second-order/BFLA; 20/20 held-out, 25/25 xben |
 | spa (merged) | `m7-spa` | `src/server/phase0-recon.ts`, `src/server/surface-engine.ts` | M2.2/M2.3 done: route maps, soft-404, auth pass, YAML/$ref, tRPC; `normalizeDiscoveryTemplate` |
-| specs2 | `m7-specs2` | `scripts/benchmark-specs*.ts` | M3 spec synthesis (benchmark side) |
+| specs2 (merged) | `m7-specs2` | `scripts/benchmark-specs*.ts` | M3 benchmark synthesis + identifier-bound authz: realistic precision 100% (dev 17/172, held-out 15/171), 0 unmatched/decoy FPs |
 | orch | `m7-orch` | `scripts/benchmark-live.ts`, `benchmark-recall.ts`, `benchmark-env.ts`, `benchmark-core.ts`, `benchmark-realistic-matrix.ts` | M6 speed/budget + all-patches attribution |
 | m0 (merged) | `m5-m0` | `scripts/benchmark-realistic.ts` (new), `package.json`, `tests/v5-m0-*.test.ts` | M0 |
 | m1-core | `m5-m1-core` | `src/server/execution.ts`, `canary-broker.ts`, `dedupe.ts`, `agent-session.ts`, `replay-verifier.ts`, `skills.ts`, `src/skills/**`, `tests/v5-m1-*.test.ts` | M1.1, 1.2, 1.3 (dedupe), 1.4, 1.5 |
@@ -34,7 +34,7 @@
 | m2-auth (merged) | `m5-m2-auth` | `src/server/broker.ts`, `scoped-browser.ts`, `persona-auth.ts`, `approval-judge.ts`, `tests/v5-m2-auth.test.ts` | M2.4 done |
 | board-ui (merged) | `m5-board` | `src/domain.ts`, `src/actions.ts`, `src/server/schema.ts`, `src/server/store.ts`, `src/components/run-board.tsx` (new), `run-workspace.tsx`, `run-state.ts`, `src/app.css`, SSE route, board tests | M5 Phase 1 done |
 
-Retired/merged: `agents/heldout2` (v4 climb: 20/20 held-out, 25/25 xben, 20/20 patches), `agents/rb` (realistic-bench hardening), `agents/docs` (VERIFICATION-v4), `agents/m0` (M0 harness), `agents/m1-static`, `agents/m2-auth`, `agents/spa`, `agents/board-ui` (M5 Phase 1).
+Retired/merged: `agents/heldout2` (v4 climb: 20/20 held-out, 25/25 xben, 20/20 patches), `agents/rb` (realistic-bench hardening), `agents/docs` (VERIFICATION-v4), `agents/m0` (M0 harness), `agents/m1-static`, `agents/m2-auth`, `agents/spa`, `agents/board-ui` (M5 Phase 1), `agents/specs2` (M3 synthesis + authz precision).
 
 Open discrepancy: held-out `allPatches=regressed` is a phantom — fresh synthesis re-confirms always-on GraphQL introspection and credits it to both GraphQL challenges. Per-patch retests are 20/20 fixed. The orchestration stream owns replaying baseline attributed specs for the all-patches pass.
 
@@ -72,8 +72,8 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 |---|---|---|
 | xben-25 | **25/25 (100%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed** | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | 0/172 confirmed, 0 decoy FPs, precision poor from unmatched authz | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
-| realistic-bench held-out | 3/171 confirmed, 0 decoy FPs | within 10% of dev |
+| realistic-bench dev | **17/172 matched, precision 100%**, 0 decoy/unmatched FPs (was 0 matched / 12 unmatched) | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% |
+| realistic-bench held-out | **15/171 matched, precision 100%**, 0 decoy/unmatched FPs (was 3 matched / precision 0.20) | within 10% of dev |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
 Known v4 blockers carried into v5: trigger quality on real apps; authz ID-binding precision; patch attribution ambiguity on shared `/graphql`; budget exhaustion on phlow-style flows.
