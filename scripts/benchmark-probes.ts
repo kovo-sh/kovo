@@ -383,9 +383,16 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
         ...(!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder ? { writePathRead: true } : {}),
       })
     }
-    // Collection routes that filter by a foreign object id (e.g. ?projectId=…): the filter must stay
-    // inside the caller's tenant. The surface rarely exposes these filter names, so plausible
-    // owner-ish id parameters are tried as authorization probes.
+    // Role/permission transition routes: any authenticated member reaching a privileged role change is
+    // an authorization failure; probe with a privileged value and compare actors.
+    if (caps.newProbeClasses && !isGet && pathHasPlaceholder && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(ep.path) &&
+        !params.some(p => /^(?:role|grant|level)$/i.test(p.name))) {
+      const roleParam: DiscoveredParam = { name: 'role', location: 'json', isObjectId: false, isCsrf: false }
+      add({
+        endpoint: { ...ep, params: [...ep.params, roleParam] },
+        probeClass: 'authz_matrix', param: roleParam, location: 'json', method: writeMethod(ep),
+      })
+    }
     const recordCollection = /(?:^|[/_.-])(?:files?|assets?|documents?|attachments?|records?|entries|items?|notes?|comments?|listings?|media|logs?|events?)(?:$|[/_.-])/i
     if (isGet && !pathHasPlaceholder && recordCollection.test(ep.path) && !params.some(p => p.location === 'query') && filterAuthzHypotheses < 2) {
       for (const name of ['projectId', 'projId', 'workspaceId', 'ownerId']) {
@@ -964,6 +971,12 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     }
   }
   const requestBody = functionLevel ? undefined : (mutating ? writeBodyFor(h.endpoint, env, 'json') : undefined)
+  // Role-transition actions need a privileged value to prove the missing role check.
+  if (mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(h.endpoint.path)) {
+    const privileged = { role: 'admin', grant: 'admin', level: 'admin' }
+    if (requestBody) Object.assign(requestBody, privileged)
+    if (functionBody && typeof functionBody === 'object' && !Array.isArray(functionBody)) Object.assign(functionBody as Record<string, unknown>, privileged)
+  }
   // Object ids from both sides: a cross-tenant read often keys on the *other* actor's object, whose
   // id never appears in the owner's own collection.
   const ownerIds = functionLevel ? [] : await idPool(env, h.endpoint.path, owner)
@@ -982,6 +995,7 @@ export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.own
     includeAnonymous,
     includeHeaderBypass: false,
     resourceIds,
+    ...(env.caps.sessionAndCsrf && mutating ? { csrfBind: true } : {}),
     ...(functionBody !== undefined ? { functionBody } : {}),
     ...(requestBody && Object.keys(requestBody).length > 0 ? { jsonBody: requestBody } : {}),
     runId: env.runId,
@@ -1208,6 +1222,13 @@ async function primeSessionOnce(h: Hypothesis, env: ProbeEnv): Promise<number> {
   env.primedSessions.add(env.session)
   const paths = new Set<string>(['/'])
   if (h.method === 'GET') paths.add(h.endpoint.path)
+  // Token-issuing read routes: the session jar must hold a CSRF token before a mutating probe.
+  if (h.method !== 'GET') {
+    for (const ep of (env.endpoints ?? []).filter(e => e.method.toUpperCase() === 'GET')) {
+      if (paths.size >= 3) break
+      if (/(?:^|[/_-])(?:me|csrf|session|settings|token|nonce|xsrf)(?:$|[/_-])/i.test(ep.path) && !hasPathPlaceholder(ep.path)) paths.add(ep.path)
+    }
+  }
   let sent = 0
   for (const p of paths) {
     if (env.signal.aborted) break
