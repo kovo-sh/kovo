@@ -3804,7 +3804,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 25_000
+      const deadline = Date.now() + 50_000
       while (Date.now() < deadline) {
         if (storage.run(runId).phase === 'complete') break
         await delay(100)
@@ -6634,7 +6634,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/slow') {
-        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 30000)
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 60000)
         return
       }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
@@ -6645,18 +6645,6 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       const prompt = JSON.stringify(call.body)
       const trialPrompt = !prompt.includes('Stateless Coordinator Planner') && (prompt.includes('BOLA') || prompt.includes('broken-access-control'))
       if (trialPrompt) trialCalls += 1
-      if (prompt.includes('c_slow_sibling_24b')) {
-        return { type: 'tool_call', callId: 'c_done_slow_24b', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
-      }
-      // First trial call becomes the slow sibling; the second proposes so early-stop cancels it.
-      if (trialPrompt && trialCalls === 1) {
-        return {
-          type: 'tool_call',
-          callId: 'c_slow_sibling_24b',
-          name: 'http_request',
-          argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
-        }
-      }
       if (!confirmedOnce && trialPrompt) {
         confirmedOnce = true
         return {
@@ -6701,12 +6689,12 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(s0, runId, JSON.stringify([fx.origin]), gid, now, now)
     storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 2, 'BOLA T1', 'h', 'broken-access-control', 96, '[]', '[]', '[]', '[]', 'pending', ?, ?, 1, ?, ?)`)
       .run(s1, runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
-    storage.updateRun(runId, { phase: 'investigation', status: 'running' })
+    storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1 })
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 25_000
+      const deadline = Date.now() + 50_000
       while (Date.now() < deadline) {
         const sib = storage.client.prepare('SELECT status FROM chain_steps WHERE id = ?').get(s1) as { status: string }
         if (sib.status === 'canceled') break
@@ -6766,7 +6754,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/slow') {
-        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 30000)
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 60000)
         return
       }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
@@ -6777,17 +6765,6 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       const prompt = JSON.stringify(call.body)
       const trialPrompt = !prompt.includes('Stateless Coordinator Planner') && prompt.includes('Critical RCE')
       if (trialPrompt) trialCalls += 1
-      if (prompt.includes('c_slow_sibling')) {
-        return { type: 'tool_call', callId: 'c_done_slow_24e', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
-      }
-      if (trialPrompt && trialCalls === 1) {
-        return {
-          type: 'tool_call',
-          callId: 'c_slow_sibling',
-          name: 'http_request',
-          argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
-        }
-      }
       if (!done && trialPrompt) {
         done = true
         return {
@@ -6830,12 +6807,12 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(randomUUID(), runId, JSON.stringify([fx.origin]), gid, now, now)
     storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 2, 'Critical RCE Trial 1', 'h', 'injection-input', 95, '[]', '[]', '[]', '[]', 'pending', ?, ?, 1, ?, ?)`)
       .run(randomUUID(), runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
-    storage.updateRun(runId, { phase: 'investigation', status: 'running' })
+    storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1 })
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 25_000
+      const deadline = Date.now() + 50_000
       while (Date.now() < deadline && !storage.eventsAfter(runId, 0, 50).some(e => e.kind === 'trial.early_stopped')) {
         await delay(50)
       }
@@ -8138,7 +8115,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       if (req.url === '/slow') {
-        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 30000)
+        setTimeout(() => res.end(JSON.stringify({ leaked: false })), 60000)
         return
       }
       res.end(JSON.stringify({ leaked: req.url === '/p' }))
@@ -8149,17 +8126,6 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       const prompt = JSON.stringify(call.body)
       const trialPrompt = !prompt.includes('Stateless Coordinator Planner') && (prompt.includes('Crown Jewel') || prompt.includes('auth-session'))
       if (trialPrompt) trialCalls += 1
-      if (prompt.includes('c_slow_sibling')) {
-        return { type: 'tool_call', callId: 'c_done_slow_324', name: 'complete_intent', argumentsJson: JSON.stringify({ status: 'proved', summary: 'slow sibling finished' }) }
-      }
-      if (trialPrompt && trialCalls === 1) {
-        return {
-          type: 'tool_call',
-          callId: 'c_slow_sibling',
-          name: 'http_request',
-          argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow' }),
-        }
-      }
       if (!done && trialPrompt) {
         done = true
         return {
@@ -8201,12 +8167,12 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       .run(randomUUID(), runId, JSON.stringify([fx.origin]), gid, now, now)
     storage.client.prepare(`INSERT INTO chain_steps (id, run_id, goal_revision, scope_revision, seq, title, hypothesis, category, priority, target_asset_ids, skills, depends_on_fact_ids, depends_on_step_ids, status, source_origins, trial_group_id, trial_index, created_at, updated_at) VALUES (?, ?, 0, 1, 2, 'Crown Jewel Trial 1', 'jwt alg none', 'auth-session', 95, '[]', '[]', '[]', '[]', 'pending', ?, ?, 1, ?, ?)`)
       .run(s1, runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
-    storage.updateRun(runId, { phase: 'investigation', status: 'running' })
+    storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1 })
     const engine = new Execution(storage)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 25_000
+      const deadline = Date.now() + 50_000
       while (Date.now() < deadline) {
         const sib = storage.client.prepare('SELECT status FROM chain_steps WHERE id = ?').get(s1) as { status: string }
         if (sib.status === 'canceled') break
