@@ -82,8 +82,8 @@ import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { listProjectPersonas } from './persona-vault.ts'
-import { redact, redactHeaders, redactJsonValue } from './redact.ts'
-import type { NamedSecret } from './redact.ts'
+import { isSafeMetadataPath, redact, redactHeaders, redactJsonValue, secretMatchKinds } from './redact.ts'
+import type { NamedSecret, SecretMatch } from './redact.ts'
 import { responseCapture, restrictAccessVerification } from './report-evidence.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks } from './review-plan.ts'
@@ -427,6 +427,37 @@ export function extractResourceRefsFromExchange(ex: ResourceHarvestExchange): Ex
   return found
 }
 
+const secretMatchKindSet: ReadonlySet<string> = new Set(secretMatchKinds)
+
+/**
+ * Whitelist-projects caller-supplied secret metadata before persistence. This is the last line of
+ * defense: even if a caller mistakenly populates an extra field, only `kind`, `sha256Prefix`,
+ * `fieldPath`, and `count` can reach the database, so raw tokens cannot be smuggled into storage.
+ */
+function sanitizeSecretMatches(matches: readonly SecretMatch[] | undefined, secrets: readonly NamedSecret[]): SecretMatch[] {
+  if (!matches?.length) return []
+  const out: SecretMatch[] = []
+  for (const match of matches.slice(0, 64)) {
+    if (!match || typeof match !== 'object') continue
+    if (!secretMatchKindSet.has(match.kind)) continue
+    const sha256Prefix = typeof match.sha256Prefix === 'string' ? match.sha256Prefix : ''
+    if (!/^[0-9a-f]{12}$/.test(sha256Prefix)) continue
+    let fieldPath = typeof match.fieldPath === 'string'
+      ? match.fieldPath.replace(/[^\x20-\x7e]/g, '').slice(0, 256)
+      : ''
+    // Field paths are attacker-influenced. Drop the path rather than persist a secret-shaped key.
+    if (fieldPath && !isSafeMetadataPath(fieldPath, secrets)) fieldPath = ''
+    const count = Number.isFinite(match.count) ? Math.max(1, Math.min(1_000, Math.round(match.count))) : 1
+    out.push({
+      kind: match.kind,
+      sha256Prefix,
+      ...(fieldPath ? { fieldPath } : {}),
+      count,
+    })
+  }
+  return out
+}
+
 export class Store {
   readonly db
   readonly client: DatabaseSync
@@ -523,6 +554,9 @@ export class Store {
     ensureColumn('canaries', 'protocol', `TEXT NOT NULL DEFAULT 'http'`)
     ensureColumn('canaries', 'dns_host', 'TEXT')
     ensureColumn('canaries', 'hit_count', 'INTEGER NOT NULL DEFAULT 0')
+
+    // broker_exchanges v5 secret-disclosure metadata (redacted fingerprints; no raw values)
+    ensureColumn('broker_exchanges', 'secret_matches', `TEXT NOT NULL DEFAULT '[]'`)
 
     // v3 tables & indexes
     this.client.exec(`
@@ -1635,6 +1669,8 @@ export class Store {
     body: string
     durationMs: number
     secrets?: readonly NamedSecret[]
+    /** Redacted structural evidence captured pre-scrub by the broker. Fingerprints only. */
+    secretMatches?: readonly SecretMatch[]
   }): BrokerExchange {
     const secrets = input.secrets ?? []
     const cleanBody = redact(input.body, secrets)
@@ -1670,6 +1706,7 @@ export class Store {
       bodyPreview,
       bodyArtifactId,
       bodySha256,
+      secretMatches: sanitizeSecretMatches(input.secretMatches, secrets),
       durationMs: Math.max(0, Math.round(input.durationMs)),
       createdAt: Date.now(),
     }
