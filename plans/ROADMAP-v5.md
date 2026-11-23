@@ -301,3 +301,14 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Coordinator MVP (accepted):** `graph-coordinator.ts` ~350–500 LOC with `query_endpoints`, `query_program_graph`, `query_facts`, `query_findings`, `dispatch_investigations`; deterministic ~80-LOC scheduler guard outside the LLM; typed chain primitives + explicit chaining round; delete ~1,200 LOC in the same PR (net −700).
 - **Red flags accepted:** replay-verifier still has live legacy guards (−49 LOC only); pending_oob must be drained before `writeReport`; floor and agent must share only per-worker cloned sessions.
 - **Streams launched:** v6-delete (storms, dry-step, OOB drain, session isolation), v6-fluid (capability bundles), graphwire steering (two-tier ranking).
+
+### 2026-11-23 — agentic precision triage (acme unmatched findings)
+
+- **Result:** both reported unmatched findings were **agentic over-claims**, not missing truth. No targets added (that would inflate recall).
+  - Viewer same-tenant `PATCH` is in-policy (object boundary is tenant, not row owner); cross-tenant `DELETE` returns 200 but is a no-op; no oracle event.
+  - Plan "mass assignment" echoed the free-tier catalog price (`price:0`), not an injected field; `billing-tamper` was mounted hardened; seat event no longer borrowable.
+  - A third pattern (CSRF on `POST /api/projects`) was also an over-claim: `SameSite=Lax` cookie attached regardless of foreign Origin, and only `updateSettings` owns the CSRF oracle.
+- **Truth-side fix (merged `93a10e6`):** seat `invariant_violation` fires only when `seats_used` is mutated, so a plan downgrade can no longer borrow another site's impact; `truth/POLICY.md` + `acme-policy.test.ts` pin the object/role/pricing policy. 144/144 benchmark tests, procedural acme 15/22, xben 25/25.
+- **Measured after:** acme agentic sample 8/22 at 100% precision, 0 unmatched, $0.259 (stochastic; the engine was not changed).
+- **Verifier gaps accepted for immediate fix:** (1) `assessBflaImpact` accepts any 2xx; (2) a denied control is treated as a spec error instead of boundary proof; (3) no role hierarchy (`owner>admin>member>viewer`); (4) mass assignment confirmed by `ok` echo without an impact event; (5) CSRF ignores `SameSite`/bearer.
+- **Stream launched:** v6-verifier-harden (replay-verifier) with `expectControlDenied` evidence support and tests derived from the merged policy fixture.
