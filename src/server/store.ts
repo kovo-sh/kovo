@@ -2170,6 +2170,12 @@ export class Store {
     return row
   }
 
+  /**
+   * Append an audit row for an automatic Tier-3 decision. These rows are deliberately NOT an
+   * authorization source: the broker fast path only accepts an exact, single-use fingerprint from
+   * the Execution ledger (see approval-judge.authorizeStateChange). `expiresAt` here only bounds
+   * how long the audit row is considered recent for operator review; it never grants a later probe.
+   */
   recordAutoApprovalDecision(run: Run, assignment: Assignment, input: {
     origin: string
     method: string

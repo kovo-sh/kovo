@@ -6,8 +6,57 @@
 **Plan:** [plans/ROADMAP-v5.md](plans/ROADMAP-v5.md) · [plans/v5.md](plans/v5.md)
 **Prior release:** [VERIFICATION-v4.md](VERIFICATION-v4.md)
 **Handover:** [HANDOVER-v5.md](HANDOVER-v5.md)
+**v5.1 integration:** in progress behind a default-off flag — see [§0](#0-v51-integration-in-progress). The v5.0 scorecards in §2–§3 are unchanged and remain the shipped numbers.
 
 > The two scorecards are not interchangeable. Scorecard B is the deterministic engine harness. Scorecard A is the shipped `Execution` runtime. The 25/59 and 28/59 runtime numbers are a **v5.1 candidate**, not v5.0.
+
+---
+
+## 0. v5.1 integration (in progress)
+
+> This section is **new in v5.1**. It does not revise the v5.0 freeze record. v5.0 is frozen at the scorecards in §2–§3 (deterministic dev **115/172**, held-out **111/171**, runtime agentic **7/59**, `--no-llm` **0/59**). Nothing below changes those numbers until the integration flag is flipped on `main` and the pre-flip gates in §0.3 pass.
+
+### 0.1 Status
+
+- **v5.0 is frozen.** Release gate **992/992 PASS**, 0 failures, 0 skips, 0 orphans; deterministic floors and Scorecards A/B stand as recorded in §2–§3.
+- **The engine-port was reverted** from `main` (`a73f07e`). It delivered 25/59 `--no-llm` and 28/59 agentic at 100% precision, but regressed **25 existing Execution/E2E tests**: planner budgets, specialist tools, multi-trial, and M1 fallback. It remains preserved on `agents/engine-port` for reference only.
+- **Integration restarted in five slices** rather than re-merging the branch. The integration lands behind a **default-off** flag so `main` stays at v5.0 behavior until parity is proven. Slices **1–2 are in progress**; slices 3–5 are gated on their results.
+
+### 0.2 The five slices
+
+| # | Slice | Scope | Status |
+| :--- | :--- | :--- | :--- |
+| 1 | Standalone engine modules + structural dedupe | Extract the engine out of the request path into testable modules; structural dedupe key `(origin, endpoint, method, param/resolver, cwe)` so distinct same-class endpoints are not collapsed | **IN PROGRESS** |
+| 2 | Deterministic-only path | Explicit `deterministicOnly` path outside the M1 fallback; persist verified findings only; emit `det_lead` facts for unconfirmed leads | **IN PROGRESS** |
+| 3 | Non-blocking agentic lane | Concurrent lane behind a **default-off** flag; seeded-step guard, 30% / 180 s cap, K=6 and per-lane budget isolation, **no step cancellation** | **NOT STARTED** (gated on 1–2) |
+| 4 | Verifier proof strength | Replace the specialist deterministic-pair scope guard with `ReplayVerifier` proof-strength + endpoint binding | **NOT STARTED** |
+| 5 | Flip default + parity | Port remaining parity gaps, run the pre-flip gate, then flip the default on `main` | **NOT STARTED** |
+
+### 0.3 Pre-flip gates
+
+All of these must pass **with the integration flag forced ON** before slice 5 flips the default:
+
+1. **Full suite green** with the flag ON — 0 failures, 0 skips, 0 orphans (`docs/reverify-v5.sh --full`).
+2. **Budget invariants:** `dynamicStepBudget` / **K=6** / M1 fallback behavior unchanged; per-lane budget isolation holds.
+3. **Deterministic floor:** `Execution --no-llm` **≥ 25/59 at 100% precision** on the 3-app grey-box dev cells.
+4. **Agentic is strictly additive:** **≥ 95% precision** and **≤ 10 pp held-out gap**, with no loss of already-confirmed findings versus the flag-off control.
+5. **Legacy floors hold:** XBEN **25/25**, held-out-saas **20/20** + **20/20 patches**, deterministic dev **115/172**, deterministic held-out **111/171**, and **0 orphans**.
+
+A slice result that misses a gate is recorded as a failed candidate, not a shipped number. v5.1 figures are **not shipped until the flag flips**.
+
+### 0.4 Chain-safety rules
+
+The integration must preserve chained and white-box findings. These rules are release-blocking:
+
+- **No step cancellation.** The deterministic pass never cancels a specialist step, and never hides a confirmed route from the agentic lane — either would break multi-step chains.
+- **Read-only “Already Confirmed” context.** Specialists receive confirmed findings as read-only context for chaining, not as a signal to skip work.
+- **Preserve white-box findings.** `static_verified` findings survive the integration; the deterministic lane must not overwrite or suppress them.
+- **Persist unconfirmed leads.** Unconfirmed deterministic candidates are stored as `det_lead` facts rather than silently dropped, so later steps can promote them.
+- **Per-endpoint structural dedupe.** Dedupe on `(origin, endpoint, method, param/resolver, cwe)`; origin+CWE-only dedupe is rejected because it discards distinct endpoints.
+
+### 0.5 Reporting rule
+
+Scorecards in §2 (runtime) and §3 (deterministic harness) are **v5.0 history and stay unchanged**. The 25/59 and 28/59 candidate results and any slice measurements are **reference only**; they are not v5.1 shipped numbers until the flag is on by default and §0.3 is green.
 
 ---
 
@@ -168,6 +217,8 @@ The 25/59 and 28/59 numbers are **not** in this table because they are not shipp
 
 ## 9. Known limitations / v5.1 priorities
 
+### 9.1 v5.0 limitations (frozen record)
+
 1. **No deterministic floor in shipped `Execution`.** The port exists on `agents/engine-port`; rebuild it without the 25 regressions.
 2. **Port regressions to fix:** planner budgets, specialist tools, multi-trial, fallback.
 3. **Surface ingestion:** v5.0 runtime sees 25/59; full ingestion is required.
@@ -178,6 +229,17 @@ The 25/59 and 28/59 numbers are **not** in this table because they are not shipp
 8. Release gate is **PASS (992/992)** on the freeze tree.
 9. **Patch evidence** includes 2 inconclusive-after retests and a replay-based all-patches pass.
 10. **No external targets, secrets, or salts.**
+
+### 9.2 v5.1 integration limitations (current, in progress)
+
+1. **Flag is default-off.** `main` still behaves as v5.0; the deterministic floor only exists on integration branches until slice 5.
+2. **Slices 1–2 are in progress.** Modules/dedupe and the `deterministicOnly` path are not yet merged; slices 3–5 have not started.
+3. **No v5.1 numbers are shipped.** Candidate 25/59 / 28/59 remain reference results; slice measurements are not release claims.
+4. **Scope guard is still in the candidate.** Until slice 4 lands, deterministic-pair scoping can blind novel logic, workflow, chain, and white-box recall.
+5. **Chain safety is unverified end-to-end.** The no-cancellation, read-only confirmed context, `static_verified` preservation, and `det_lead` rules must be proven by the flag-ON suite.
+6. **Wall-clock split is unresolved.** Slice 3's 30% / 180 s lane cap and K=6 isolation are design targets, not measured behavior.
+7. **Held-out parity is unmeasured for the integration.** The ≤ 10 pp gap gate is a pre-flip requirement, not a result.
+8. **Release gate still applies to v5.0.** Any integration run that is not flag-ON and 0-skip is not a release gate.
 
 ---
 
@@ -229,24 +291,68 @@ npm run benchmark:realistic -- \
 unset GUARDIAN_RB_HELDOUT_SALT
 ```
 
-### 10.3 v5.1 candidate (branch only)
+### 10.3 v5.1 candidate (branch only, historical)
 
 ```bash
 git switch agents/engine-port
 # Same Scorecard A commands; the candidate reports 25/59 no-LLM and 28/59 agentic.
-# Do not merge until the 25 Execution/E2E regressions are fixed.
+# Do not merge: this branch regressed 25 Execution/E2E tests. Integration now proceeds
+# in slices behind a default-off flag — see §10.5.
 ```
 
 ### 10.4 Freeze gate, Tier-3 safety, OOB, secrets
 
 ```bash
-newgrp docker -c 'bash docs/reverify-v5.sh --full'          # 992/992 PASS
+newgrp docker -c 'bash docs/reverify-v5.sh --full'          # v5.0 release gate: 992/992 PASS
 
 GUARDIAN_ALLOW_LOCAL_LAB=1 \
   node --test tests/v5-tier3-safety.test.ts tests/approval-judge.test.ts   # 15/15
 ```
 
 OOB callbacks bind one **loopback** canary listener; the harness passes that exact port to the app allowlist. Pin with loopback-only `GUARDIAN_CANARY_PORT` / `GUARDIAN_CANARY_DNS_PORT`; never bind off-loopback. `secretMatches` is `{kind, sha256Prefix, fieldPath?, count}` only; correlate against a locally held secret, never log the raw value.
+
+### 10.5 v5.1 integration loop and pre-flip gate
+
+```bash
+# Between tweaks: smoke tier (realistic seed 42 + agentic --smoke + typecheck, parallel).
+newgrp docker -c 'bash scripts/hillclimb-loop.sh'
+
+# Once per batch: validation tier (3 dev seeds + 600 s agentic matrix).
+newgrp docker -c 'bash scripts/hillclimb-loop.sh --full'
+
+# Pre-flip release gate. Slice 3 introduces the opt-in flag; force it ON for the
+# whole run so the flag-ON suite, 0-skip, and orphan checks are meaningful.
+# The flag is default-off; its name is pinned by slice 3 (do not guess it here).
+newgrp docker -c 'bash docs/reverify-v5.sh --full'
+
+# Deterministic floor on the flag-ON tree: expect >= 25/59 at 100% precision.
+newgrp docker -c '
+  cd /path/to/guardian &&
+  export GUARDIAN_ALLOW_LOCAL_LAB=1 NODE_OPTIONS=--max-old-space-size=2048 &&
+  node scripts/benchmark-realistic.ts \
+    --app all --seeds 1 --mode grey-box --no-llm \
+    --verifier docker --isolate-data-dir --concurrency 3 \
+    --budget-usd 2 --max-duration-ms 600000 \
+    --out-dir /tmp/v51-no-llm
+'
+
+# Agentic parity: control (flag off) vs variant (same cells, flag on).
+# Pass condition: >= 95% precision, <= 10 pp held-out gap, no confirmed findings lost.
+newgrp docker -c '
+  cd /path/to/guardian &&
+  export GUARDIAN_ALLOW_LOCAL_LAB=1 \
+         GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \
+         NODE_OPTIONS=--max-old-space-size=2048 &&
+  node scripts/benchmark-realistic.ts \
+    --app all --seeds 1 --mode grey-box \
+    --verifier docker --isolate-data-dir --concurrency 3 \
+    --budget-usd 2 --max-duration-ms 600000 \
+    --out-dir /tmp/v51-parity-control
+'
+# Repeat the same command with the slice-3 flag exported and --out-dir /tmp/v51-parity-variant.
+```
+
+Until the flag flips, a v5.1 run is a **candidate measurement**, not a release result. Keep v5.0 scorecards in §2–§3 as the shipped numbers.
 
 ---
 
@@ -272,3 +378,5 @@ OOB callbacks bind one **loopback** canary listener; the harness passes that exa
 6. **Chains are 1/6**, below 50%; G8 open.
 7. Freeze gate is **PASS (992/992)**; the earlier `GtumGa` failures were mid-change and are superseded.
 8. **Final deterministic rerun:** dev holds at 115/172; held-out is 111/171, one below the earlier 112. The document uses the final rerun values.
+9. **v5.1 integration is sliced, not a re-merge.** Slices 1–2 are in progress behind a default-off flag; the reverted branch is reference only. See §0.
+10. **No v5.1 number is shipped.** The 25/59 / 28/59 candidate and any slice measurement become citable only after the flag flips and §0.3 is green.

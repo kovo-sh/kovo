@@ -37,6 +37,32 @@ H/C: **70.9% dev**, **67.7% held-out**. Chains: **1/6** both splits. Final deter
 
 ---
 
+## 1b. v5.1 integration (in progress)
+
+**Status:** **v5.0 stays frozen.** The engine-port was reverted (`a73f07e`) after 25 Execution/E2E regressions, and integration restarted as **five slices behind a default-off flag**. Slices **1–2 are in progress**; slices 3–5 are gated on their results. No v5.1 number is shipped until the flag flips.
+
+| # | Slice | Status |
+| :--- | :--- | :--- |
+| 1 | Standalone engine modules + structural dedupe `(origin, endpoint, method, param/resolver, cwe)` | **IN PROGRESS** |
+| 2 | `deterministicOnly` path outside M1 fallback; verified-only persistence + `det_lead` facts | **IN PROGRESS** |
+| 3 | Non-blocking concurrent agentic lane, default-off flag, seeded-step guard, 30% / 180 s cap, K=6/budget isolation, no step cancellation | **NOT STARTED** |
+| 4 | Replace specialist scope guard with `ReplayVerifier` proof-strength + endpoint binding | **NOT STARTED** |
+| 5 | Flip the default + parity port | **NOT STARTED** |
+
+**Pre-flip gates (all with the flag ON):**
+
+1. Full suite green, 0 failures / 0 skips / 0 orphans.
+2. `dynamicStepBudget` / K=6 / M1 fallback invariants hold.
+3. `Execution --no-llm` **≥ 25/59 at 100% precision**.
+4. Agentic **strictly additive**: ≥ 95% precision, ≤ 10 pp held-out gap, no lost confirmations.
+5. Legacy floors: XBEN 25/25, held-out-saas 20/20 + 20/20 patches, deterministic dev 115/172, held-out 111/171, 0 orphans.
+
+**Chain-safety rules (release-blocking):** never cancel a specialist step or hide a confirmed route (chains break); give specialists read-only “Already Confirmed” context; preserve white-box `static_verified` findings; persist unconfirmed candidates as `det_lead` facts; dedupe per endpoint, never origin+CWE only.
+
+Full detail: [VERIFICATION-v5.md §0](VERIFICATION-v5.md#0-v51-integration-in-progress).
+
+---
+
 ## 2. Convergence gap
 
 **v5.0: the product has no deterministic floor.** Shipped runtime is 7/59 agentic (11.9%) and 0/59 no-LLM; procedural is 115/172 (66.9%) — a **55 pp** gap. The ported engine exists on `agents/engine-port` but is deferred; its gap to procedural is ~19 pp.
@@ -77,7 +103,7 @@ Tests: **8/8** Tier-3 safety; **15/15** with `approval-judge`.
 | G10 release gate | **PENDING** — freeze run not clean; last clean 980/980 pre-revert |
 | G11 orphan hygiene | **PASS** direct check (0 stale, 0 networks); gate pending |
 
-**Do not quote Scorecard B as the runtime result.**
+**Do not quote Scorecard B as the runtime result.** The final v5.0 gate recorded in [VERIFICATION-v5.md §6](VERIFICATION-v5.md#6-release-gates) is **PASS 992/992**; the table above preserves the earlier pre-final snapshot.
 
 ---
 
@@ -89,13 +115,15 @@ M0–M5 **DONE**; M6 **PARTIAL** — deterministic matrix measured, runtime has 
 
 ## 6. v5.1 priorities
 
-1. Rebuild the engine-port without the 25 Execution/E2E regressions.
-2. Port remaining JWT/mass converters and close surface ingestion.
-3. Replace the specialist scope guard with proof-strength + endpoint-binding guards.
-4. Fix wall-clock allocation and opsportal early stop.
-5. Run salted held-out and white-box `Execution` matrices.
+These are now executed as the five slices in §1b, in order; slices 3–5 stay gated on 1–2.
+
+1. Land slices 1–2 (standalone engine modules + structural dedupe; `deterministicOnly` path + `det_lead` facts).
+2. Land slice 3 behind the default-off flag without step cancellation or confirmed-route hiding.
+3. Replace the specialist scope guard with proof-strength + endpoint-binding guards (slice 4).
+4. Run the flag-ON pre-flip gate: floor ≥25/59, agentic additive ≥95% precision / ≤10 pp gap, 0 orphans, legacy floors.
+5. Flip the default only after parity (slice 5), then run salted held-out and white-box `Execution` matrices.
 6. Raise chains from 1/6 to ≥50%.
-7. Finalize the release gate and preserve artifacts.
+7. Preserve artifacts and update the v5.1 verification record.
 
 ---
 
@@ -110,8 +138,11 @@ newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 GUAR
 # No-LLM baseline (0/59 on v5.0)
 newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 && node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/v5-runtime-no-llm'
 
-# Freeze gate (PENDING at this snapshot)
+# Freeze gate (v5.0: PASS 992/992)
 newgrp docker -c 'bash docs/reverify-v5.sh --full'
+
+# v5.1 integration loop (smoke; use --full once per batch)
+newgrp docker -c 'bash scripts/hillclimb-loop.sh'
 
 # Tier-3 safety
 GUARDIAN_ALLOW_LOCAL_LAB=1 node --test tests/v5-tier3-safety.test.ts tests/approval-judge.test.ts
@@ -136,4 +167,6 @@ OOB listeners are loopback-only; pin with `GUARDIAN_CANARY_PORT` / `GUARDIAN_CAN
 
 ## 9. Honest limitations
 
-v5.0 ships the deterministic engine harness at 66.9% dev / 64.9% held-out (G4/G9 met), but the real `Execution` path is 11.9% agentic / 0% no-LLM because the port was reverted. Chains are 1/6, white-box is unmeasured, salted/white-box runtime matrices are v5.1, the final gate is pending, and patch evidence includes two inconclusive-after retests plus a replay-based all-patches pass.
+**v5.0 (shipped record):** the deterministic engine harness is 66.9% dev / 64.9% held-out (G4/G9 met), but the real `Execution` path is 11.9% agentic / 0% no-LLM because the port was reverted. Chains are 1/6, white-box is unmeasured, salted/white-box runtime matrices are v5.1, and patch evidence includes two inconclusive-after retests plus a replay-based all-patches pass.
+
+**v5.1 (in progress):** the integration flag is default-off, so `main` still behaves as v5.0. Slices 1–2 are in progress and 3–5 have not started. Candidate 25/59 / 28/59 is reference only; no v5.1 number is shipped. The scope guard still blinds novel/workflow/chain/white-box recall until slice 4, chain-safety is not yet proven end-to-end, and wall-clock/held-out parity are unmeasured design targets. Only a flag-ON, 0-skip run that passes the §1b gates qualifies as a v5.1 release gate.

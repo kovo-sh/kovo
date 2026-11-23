@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
@@ -380,7 +380,36 @@ export function determineExitCode(
   return 0
 }
 
-function mountLocalReposReadOnlyCopy(repos: readonly string[], destReposDir: string): string[] {
+/**
+ * Skip symlinks when copying a repository into the project's read-only mount. A repository can
+ * contain a link to /etc/passwd or to a directory outside the tree; following it would make the
+ * host read/write through the link when the copy later serves scans or patch checks.
+ */
+function isNonSymlinkCopyEntry(src: string): boolean {
+  try {
+    return !lstatSync(src).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
+/** Defense in depth: fail closed if a link slipped through the copy filter (e.g. a race). */
+function assertNoSymlinksUnder(root: string): void {
+  const stack: string[] = [root]
+  while (stack.length > 0) {
+    const dir = stack.pop()!
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      const st = lstatSync(full)
+      if (st.isSymbolicLink()) {
+        throw new Error(`Refusing to mount repository copy containing a symlink: ${entry.name}`)
+      }
+      if (st.isDirectory()) stack.push(full)
+    }
+  }
+}
+
+export function mountLocalReposReadOnlyCopy(repos: readonly string[], destReposDir: string): string[] {
   mkdirSync(destReposDir, { recursive: true, mode: 0o700 })
   const mountedNames: string[] = []
   for (const repoPath of repos) {
@@ -392,12 +421,20 @@ function mountLocalReposReadOnlyCopy(repos: readonly string[], destReposDir: str
     const target = join(destReposDir, name)
     cpSync(repoReal, target, {
       recursive: true,
+      dereference: false,
+      verbatimSymlinks: false,
       filter: src => {
         const base = basename(src)
         if (base === '.git' || base === 'node_modules' || /^\.env(?:\..+)?$/i.test(base)) return false
-        return true
+        return isNonSymlinkCopyEntry(src)
       },
     })
+    try {
+      assertNoSymlinksUnder(target)
+    } catch (err) {
+      rmSync(target, { recursive: true, force: true })
+      throw err
+    }
     mountedNames.push(name)
   }
   return mountedNames

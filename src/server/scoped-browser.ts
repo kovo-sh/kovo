@@ -229,6 +229,7 @@ interface PlaywrightContext {
     expires?: number
   }>): Promise<void>
   route(url: string, handler: (route: PlaywrightRoute) => Promise<void> | void): Promise<void>
+  routeWebSocket?(url: string, handler: (ws: PlaywrightWebSocketRoute) => Promise<void> | void): Promise<void>
   newPage(): Promise<PlaywrightPage>
   close(): Promise<void>
 }
@@ -280,24 +281,97 @@ function captureXhrJsonBody(input: {
   return { mediaType: exchange.mediaType, bodyPreview }
 }
 
+/** Chromium launch hardening shared by every ScopedBrowser context. */
+export interface ChromiumLaunchOptions {
+  /** Explicit insecure opt-in (GUARDIAN_INSECURE_NO_SANDBOX=1). */
+  insecureNoSandbox?: boolean
+}
+
+/**
+ * Sandboxing is on by default. Target JavaScript must not be able to reach loopback/LAN/metadata
+ * directly: resolver rules fail closed for every non-brokered name, and WebRTC's non-proxied UDP
+ * paths are disabled. HTTP is still fulfilled through Playwright's request interception.
+ */
+export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[] {
+  const args = [
+    '--disable-dev-shm-usage',
+    '--disable-background-networking',
+    '--host-resolver-rules=MAP * ~NOTFOUND',
+    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+  ]
+  if (options.insecureNoSandbox) args.push('--no-sandbox')
+  return args
+}
+
+/** Neutralise WebRTC constructors for target JS even if a platform ignores the launch flags. */
+export const browserWebRtcGuardScript = `(() => {
+  const deny = function () { throw new Error('WebRTC is disabled inside Guardian browser sessions.'); };
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection']) {
+    try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
+  }
+})();`
+
+export interface PlaywrightWebSocketRoute {
+  url(): string
+  close(options?: { code?: number; reason?: string }): Promise<void> | void
+  connectToServer?(): Promise<void> | void
+}
+
+/**
+ * HTTP interception does not cover WebSocket upgrades. Route every socket through an explicit
+ * scope check and only call `connectToServer()` for in-scope wss/ws origins.
+ */
+export async function installWebSocketGuard(
+  context: Pick<PlaywrightContext, 'routeWebSocket'>,
+  options: {
+    canRead: (origin: string) => boolean
+    allowLocalLab: boolean
+    audit?: (decision: 'denied', origin: string) => void
+  },
+): Promise<void> {
+  if (typeof context.routeWebSocket !== 'function') return
+  await context.routeWebSocket('**/*', async ws => {
+    let origin: string
+    try {
+      const url = new URL(ws.url())
+      const secure = url.protocol === 'wss:'
+      if (!secure && !(options.allowLocalLab && url.protocol === 'ws:')) {
+        options.audit?.('denied', url.origin)
+        await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+        return
+      }
+      origin = `${secure ? 'https:' : 'http:'}//${url.host}`
+    } catch {
+      await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+      return
+    }
+    if (!options.canRead(origin)) {
+      options.audit?.('denied', origin)
+      await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+      return
+    }
+    await ws.connectToServer?.()
+  })
+}
+
 async function launchChromium(): Promise<PlaywrightBrowserLike> {
+  const insecureNoSandbox = process.env.GUARDIAN_INSECURE_NO_SANDBOX === '1'
+  if (insecureNoSandbox) {
+    console.warn('WARNING: Chromium sandbox disabled (GUARDIAN_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
+  }
+  const args = chromiumLaunchArgs({ insecureNoSandbox })
   try {
     const coreName = 'playwright-core'
     const coreMod = await import(/* @vite-ignore */ coreName) as { chromium?: { launch: (opts: Record<string, unknown>) => Promise<PlaywrightBrowserLike> } }
     if (coreMod.chromium) {
-      return await coreMod.chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking'],
-      })
+      return await coreMod.chromium.launch({ headless: true, args })
     }
   } catch {
     // Fallback to @playwright/test
   }
   const pw = await import('@playwright/test')
-  return await pw.chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking'],
-  }) as unknown as PlaywrightBrowserLike
+  return await pw.chromium.launch({ headless: true, args }) as unknown as PlaywrightBrowserLike
 }
 
 const postMessageInstrumentationScript = `
@@ -663,6 +737,12 @@ export class ScopedBrowser {
         userAgent: 'Guardian/3 scoped headless inspector',
       })
       await context.addInitScript(postMessageInstrumentationScript)
+      await context.addInitScript(browserWebRtcGuardScript)
+      await installWebSocketGuard(context, {
+        canRead: origin => grant.canRead(origin),
+        allowLocalLab,
+        audit: (decision, origin) => grant.audit(decision, origin),
+      })
 
       const shouldInstallSinkHook = Boolean(
         req.enableSinkHook ||
@@ -1500,6 +1580,12 @@ export class ScopedBrowser {
             userAgent: 'Guardian/4 scoped headless session inspector',
           })
           await context.addInitScript(postMessageInstrumentationScript)
+          await context.addInitScript(browserWebRtcGuardScript)
+          await installWebSocketGuard(context, {
+            canRead: origin => grant.canRead(origin),
+            allowLocalLab,
+            audit: (decision, origin) => grant.audit(decision, origin),
+          })
           if (groupNeedsSinkHook) {
             await context.addInitScript(buildDomSinkHookScript(groupCanaryToken))
             sinkHookInstalled = true
