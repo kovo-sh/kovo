@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BACKGROUND_CONTEXT, withAbortSignal } from '@earendil-works/chord/context'
@@ -46,6 +46,7 @@ import {
 } from './board-tools.ts'
 import type { BoardPostArgs, BoardReadArgs } from './board-tools.ts'
 import type { BrokerMultipartPart, PublicObservation } from './broker.ts'
+import type { AgentTrace } from './agent-trace.ts'
 import { isProfileHealthy, resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import {
@@ -58,11 +59,21 @@ import {
 import type { CallRecorder, ProviderConfig, ProviderOptions, UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import {
+  describeProofTools,
+  proveAuthzReadDiff,
+  proveBusinessInvariant,
+  proveCanaryOrRedirect,
+  proveStateMutationDiff,
+  validateProofInput,
+} from './proof-tools.ts'
+import type { CompiledProof, ProofToolName } from './proof-tools.ts'
 import { responseEvidence } from './response-checks.ts'
 import type { BrowserInteractiveAction, BrowserSessionStep } from './scoped-browser.ts'
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from './skills.ts'
 import type { DifferentialProbeClass, SurfaceWordlistName } from './surface-engine.ts'
 import type { SastEngine } from './worker-backend.ts'
+import type { MissionKind } from './assignment-brief.ts'
 
 export const defaultInlineToolOutputBytes = 24 * 1024
 export const maxInlineToolOutputBytes = 64 * 1024
@@ -71,6 +82,100 @@ export const defaultPlannerMaxTurns = 20
 export const defaultCodeAuditMaxTurns = 30
 export const defaultPatchMaxTurns = 20
 export const maxEmptyTurnNudges = 2
+
+/**
+ * Agentic lane budgets (v5.1). Flash-class models do well on short, batched micro-tasks and badly on
+ * long open exploration. These are exported so the lane can wire 8-10 turns / 75-90 s without
+ * touching tests that assert the legacy defaults; `runAgentSession` still honors an explicit
+ * `maxTurns` and adds an opt-in `wallClockMs`.
+ */
+export const AGENTIC_SPECIALIST_MAX_TURNS = 9
+export const AGENTIC_UPGRADE_MAX_TURNS = 7
+export const AGENTIC_MIN_MAX_TURNS = 6
+export const AGENTIC_MAX_MAX_TURNS = 10
+export const AGENTIC_SPECIALIST_WALL_CLOCK_MS = 80_000
+export const AGENTIC_DET_LEAD_LIMIT = 8
+
+export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
+  switch (missionKind) {
+    case 'det_lead_upgrade':
+    case 'chain_step_2':
+      return AGENTIC_UPGRADE_MAX_TURNS
+    default:
+      return AGENTIC_SPECIALIST_MAX_TURNS
+  }
+}
+
+/** Hard settlement nudge at N-2 turns (independent of the 85% network-revocation threshold). */
+export function settlementNudgeTurnFor(maxTurns: number): number {
+  return Math.max(1, Math.floor(maxTurns) - 2)
+}
+
+/**
+ * Single settlement predicate shared by the turn hook and tests. Settlement is due when it was
+ * already triggered, when the turn threshold is reached, when the caller's external trigger fires,
+ * or when the optional wall-clock budget has elapsed.
+ */
+export function settlementDue(input: {
+  turnsUsed: number
+  settlementTurn: number
+  settled: boolean
+  shouldSettle?: () => boolean
+  wallClockDeadline?: number
+  now?: () => number
+}): boolean {
+  if (input.settled) return true
+  if (input.turnsUsed >= input.settlementTurn) return true
+  try {
+    if (input.shouldSettle?.()) return true
+  } catch {
+    // An external trigger must never break the run.
+  }
+  return input.wallClockDeadline !== undefined && (input.now?.() ?? Date.now()) >= input.wallClockDeadline
+}
+
+/** N-2 nudge: tells the worker to submit a proof (typed when available) or finish the intent. */
+export function settlementNudgeMessage(input: {
+  turn: number
+  maxTurns: number
+  proofTools?: readonly string[]
+}): string {
+  const typed = (input.proofTools ?? []).filter(name => name.trim())
+  const proofPath = typed.length
+    ? `submit your proof now via a typed proof tool (${typed.join(', ')}) or the raw-spec fallback propose_chain_finding/update_proposed_finding`
+    : 'submit your best proof now via propose_chain_finding/update_proposed_finding'
+  return [
+    `[GUARDIAN SETTLEMENT NUDGE — Turn ${input.turn}/${input.maxTurns}]`,
+    `Hard settlement starts at turn ${settlementNudgeTurnFor(input.maxTurns)} (N-2). ${proofPath}, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
+  ].join(' ')
+}
+
+/** 85% settlement banner: network tools are revoked, offline wrap-up only. */
+export function settlementBannerMessage(input: {
+  turnsUsed: number
+  maxTurns: number
+  proofTools?: readonly string[]
+}): string {
+  const typed = (input.proofTools ?? []).filter(name => name.trim())
+  const proofPath = typed.length
+    ? `submit or update any ready candidate findings via ${typed.join('/')} or propose_chain_finding/update_proposed_finding`
+    : 'submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding'
+  return [
+    `[GUARDIAN SETTLEMENT NOTICE — Turn ${input.turnsUsed}/${input.maxTurns}]`,
+    'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
+    `Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) ${proofPath}, and (4) call complete_intent with your final status and summary.`,
+  ].join(' ')
+}
+
+/**
+ * The 3-line contract injected verbatim into specialist and planner prompts. Keep wording
+ * forward-compatible with the typed proof compilers landing in a follow-up stream.
+ */
+export const AGENTIC_CONTRACT_LINES = [
+  'Never re-submit an (endpoint, method, param, cwe) listed in alreadyConfirmed; you MAY chain or escalate it.',
+  'Prioritize det_lead upgrades and workflow/numeric/chain routes over single-param fuzzing.',
+  'Use typed proof tools (control-vs-probe differentials and state deltas); status-only claims fail verification.',
+] as const
 
 const NETWORK_TOOLS = new Set([
   'request_http',
@@ -358,6 +463,22 @@ export interface VerifyReplaySpecArgs {
   replaySpecId?: string
 }
 
+/**
+ * Typed proof tools compile a structured proof description into an identifier-bound replay spec
+ * (see proof-tools.ts). The session validates the model's arguments before compiling, so the
+ * handler always receives a proof that already passed `validateProofInput`.
+ */
+export type ProofToolHandler = (proof: CompiledProof, signal: AbortSignal) => Promise<unknown>
+
+export const proofToolHandlerNames = [
+  'prove_authz_read_diff',
+  'prove_state_mutation_diff',
+  'prove_business_invariant',
+  'prove_canary_or_redirect',
+] as const
+
+export type ProofToolHandlerName = typeof proofToolHandlerNames[number]
+
 export interface WorkerToolHandlers {
   /** Spill oversized tool outputs (>24 KiB) to `/evidence/tool-output/<id>.txt` inside the worker container. */
   spillOutput?: (id: string, content: string, signal: AbortSignal) => Promise<string>
@@ -467,6 +588,11 @@ export interface WorkerToolHandlers {
     args: VerifyReplaySpecArgs,
     signal: AbortSignal,
   ) => Promise<unknown>
+  /** Typed proof compiler handlers. Each is registered only when supplied; absent handlers remove the tool. */
+  prove_authz_read_diff?: ProofToolHandler
+  prove_state_mutation_diff?: ProofToolHandler
+  prove_business_invariant?: ProofToolHandler
+  prove_canary_or_redirect?: ProofToolHandler
   /** v5 M5 Swarm Board: post a concise claim/handoff/lead/blocker/status/note (redacted, capped). */
   board_post?: (args: BoardPostArgs, signal: AbortSignal) => Promise<unknown>
   /** v5 M5 Swarm Board: read untainted, in-scope, redacted peer posts. */
@@ -494,6 +620,10 @@ export interface SpecialistProfileConfig {
 export const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
   'spillOutput',
   'verify_replay_spec',
+  'prove_authz_read_diff',
+  'prove_state_mutation_diff',
+  'prove_business_invariant',
+  'prove_canary_or_redirect',
   'propose_chain_finding',
   'update_proposed_finding',
   'record_fact',
@@ -983,6 +1113,222 @@ const scenarioInstructions: Record<AgentScenario, string> = {
 const fallbackCommand = "jq -c '{status, mediaType, transportMaxAge, includeSubDomains}' /evidence/observed.json > /work/result.txt"
 
 // ---------------------------------------------------------------------------
+// Agentic prompt contract (read-only context + batched micro-task guidance)
+// ---------------------------------------------------------------------------
+
+export interface AlreadyConfirmedRef {
+  origin?: string | null
+  method?: string | null
+  path: string
+  param?: string | null
+  cwe?: string | null
+  probeClass?: string | null
+}
+
+export interface UnconfirmedSurfaceRef {
+  method?: string | null
+  path: string
+  reason?: string | null
+  category?: string | null
+}
+
+export interface DetLeadSummary {
+  probeClass: string
+  endpoint?: string | null
+  method?: string | null
+  param?: string | null
+  exchangeId?: string | null
+  signalSummary?: string | null
+  verifyFailureReason?: string | null
+}
+
+export interface AgenticPromptContextInput {
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
+}
+
+function cleanPromptValue(value: unknown, maxBytes: number): string {
+  if (typeof value !== 'string') return ''
+  return truncateUtf8Head(value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), maxBytes)
+}
+
+/**
+ * Derive already-confirmed references from facts already passed to the specialist prompt
+ * (`parentFacts`). The deterministic engine persists replay-verified findings with
+ * `data.subkind === 'deterministic_engine_confirmed'`; this keeps the block read-only and
+ * requires no new execution wiring.
+ */
+export function confirmedRefsFromParentFacts(
+  parentFacts?: readonly { data?: Record<string, unknown> }[],
+): AlreadyConfirmedRef[] {
+  const refs: AlreadyConfirmedRef[] = []
+  const seen = new Set<string>()
+  for (const fact of parentFacts ?? []) {
+    const data = fact.data
+    if (!data || data.subkind !== 'deterministic_engine_confirmed') continue
+    const path = typeof data.endpoint === 'string' ? cleanPromptValue(data.endpoint, 160) : ''
+    if (!path) continue
+    const method = typeof data.method === 'string' ? cleanPromptValue(data.method, 10).toUpperCase() : ''
+    const param = typeof data.param === 'string' ? cleanPromptValue(data.param, 48) : ''
+    const cwe = typeof data.cwe === 'string' ? cleanPromptValue(data.cwe, 24) : ''
+    const probeClass = typeof data.vulnClass === 'string'
+      ? cleanPromptValue(data.vulnClass, 48)
+      : typeof data.probeClass === 'string'
+        ? cleanPromptValue(data.probeClass, 48)
+        : ''
+    const key = `${method} ${path} ${param} ${cwe}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    refs.push({
+      ...(method ? { method } : {}),
+      path,
+      ...(param ? { param } : {}),
+      ...(cwe ? { cwe } : {}),
+      ...(probeClass ? { probeClass } : {}),
+    })
+  }
+  return refs.slice(0, 10)
+}
+
+/**
+ * Derive top-K det_lead summaries from facts already passed to the specialist prompt
+ * (`parentFacts`). The deterministic engine persists these with `data.kind === 'det_lead'`;
+ * no new storage or execution wiring is required.
+ */
+export function detLeadsFromParentFacts(
+  parentFacts?: readonly { kind?: string; data?: Record<string, unknown> }[],
+): DetLeadSummary[] {
+  const leads: Array<DetLeadSummary & { signalScore: number }> = []
+  for (const fact of parentFacts ?? []) {
+    const data = fact.data
+    if (!data || data.kind !== 'det_lead') continue
+    const anomalies = Array.isArray(data.anomalies) ? data.anomalies : []
+    const anomalyTypes = anomalies
+      .map(a => (a && typeof a === 'object' && typeof (a as { type?: unknown }).type === 'string'
+        ? (a as { type: string }).type
+        : ''))
+      .filter(Boolean)
+    const reason = typeof data.reason === 'string'
+      ? data.reason
+      : typeof data.summary === 'string'
+        ? data.summary
+        : ''
+    const signalSummary = cleanPromptValue(
+      reason || anomalyTypes.join(', ') || `${String(data.probeClass ?? 'unknown')} lead`,
+      220,
+    )
+    const verifyFailureReason = typeof data.verifyFailureReason === 'string'
+      ? data.verifyFailureReason
+      : typeof data.failureReason === 'string'
+        ? data.failureReason
+        : typeof data.verdict === 'string' && data.verdict !== 'confirmed'
+          ? data.verdict
+          : null
+    leads.push({
+      probeClass: cleanPromptValue(data.probeClass, 48) || 'unknown',
+      ...(typeof data.endpoint === 'string' ? { endpoint: cleanPromptValue(data.endpoint, 160) } : {}),
+      ...(typeof data.method === 'string' ? { method: cleanPromptValue(data.method, 10).toUpperCase() } : {}),
+      ...(typeof data.param === 'string' ? { param: cleanPromptValue(data.param, 48) } : {}),
+      ...(typeof data.exchangeId === 'string' ? { exchangeId: cleanPromptValue(data.exchangeId, 64) } : {}),
+      signalSummary,
+      ...(verifyFailureReason ? { verifyFailureReason: cleanPromptValue(verifyFailureReason, 120) } : {}),
+      signalScore: anomalyTypes.length * 10 + (data.canaryId ? 6 : 0) + (data.exchangeId ? 2 : 0),
+    })
+  }
+  return leads
+    .sort((a, b) => {
+      if (a.signalScore !== b.signalScore) return b.signalScore - a.signalScore
+      const left = `${a.endpoint ?? ''} ${a.method ?? ''} ${a.probeClass}`
+      const right = `${b.endpoint ?? ''} ${b.method ?? ''} ${b.probeClass}`
+      return left < right ? -1 : left > right ? 1 : 0
+    })
+    .slice(0, Math.min(10, AGENTIC_DET_LEAD_LIMIT + 2))
+    .map(({ signalScore: _score, ...lead }) => lead)
+}
+
+/**
+ * Build the read-only agentic context injected into specialist and planner prompts.
+ * The contract is always present; the data blocks appear only when data exists.
+ */
+export function buildAgenticPromptContext(input: AgenticPromptContextInput = {}): Record<string, unknown> {
+  const limit = Math.max(1, Math.min(10, Math.floor(input.detLeadLimit ?? AGENTIC_DET_LEAD_LIMIT)))
+
+  const alreadyConfirmed = (input.alreadyConfirmed ?? [])
+    .map(ref => ({
+      ...(ref.method ? { method: cleanPromptValue(ref.method, 10).toUpperCase() } : {}),
+      path: cleanPromptValue(ref.path, 160),
+      ...(ref.param ? { param: cleanPromptValue(ref.param, 48) } : {}),
+      ...(ref.cwe ? { cwe: cleanPromptValue(ref.cwe, 24) } : {}),
+      ...(ref.probeClass ? { probeClass: cleanPromptValue(ref.probeClass, 48) } : {}),
+    }))
+    .filter(ref => ref.path)
+
+  const unconfirmedHardSurface = (input.unconfirmedHardSurface ?? [])
+    .map(ref => ({
+      ...(ref.method ? { method: cleanPromptValue(ref.method, 10).toUpperCase() } : {}),
+      path: cleanPromptValue(ref.path, 160),
+      ...(ref.category ? { category: cleanPromptValue(ref.category, 48) } : {}),
+      ...(ref.reason ? { reason: cleanPromptValue(ref.reason, 160) } : {}),
+    }))
+    .filter(ref => ref.path)
+
+  const detLeads = (input.detLeads ?? [])
+    .slice(0, limit)
+    .map(lead => ({
+      probeClass: cleanPromptValue(lead.probeClass, 48) || 'unknown',
+      ...(lead.endpoint ? { endpoint: cleanPromptValue(lead.endpoint, 160) } : {}),
+      ...(lead.method ? { method: cleanPromptValue(lead.method, 10).toUpperCase() } : {}),
+      ...(lead.param ? { param: cleanPromptValue(lead.param, 48) } : {}),
+      ...(lead.exchangeId ? { exchangeId: cleanPromptValue(lead.exchangeId, 64) } : {}),
+      ...(lead.signalSummary ? { signal: cleanPromptValue(lead.signalSummary, 220) } : {}),
+      ...(lead.verifyFailureReason ? { verifyFailureReason: cleanPromptValue(lead.verifyFailureReason, 120) } : {}),
+    }))
+
+  const brief = input.assignmentBrief
+    ? truncateUtf8Head(input.assignmentBrief, 1536)
+    : ''
+
+  return {
+    contract: [...AGENTIC_CONTRACT_LINES],
+    ...(alreadyConfirmed.length
+      ? {
+          alreadyConfirmedReadOnly: {
+            label: 'Already Confirmed (do not duplicate; MAY chain/escalate)',
+            items: alreadyConfirmed,
+          },
+        }
+      : {}),
+    ...(unconfirmedHardSurface.length
+      ? {
+          unconfirmedHardSurface: {
+            label: 'Unconfirmed Hard Surface',
+            items: unconfirmedHardSurface,
+          },
+        }
+      : {}),
+    ...(detLeads.length
+      ? {
+          detLeadSummary: {
+            label: 'Unconfirmed det_lead summary (upgrade priority, top-K)',
+            items: detLeads,
+          },
+        }
+      : {}),
+    microTaskGuidance: {
+      batching: 'Use request_http_batch for 4-8 independent probes per turn on baseline+differential turns; use a single request_http only for a sequential dependency.',
+      parallelReadOnly: 'Issue independent read-only tool calls (get_exchange, search_facts, search_exchanges, board_read, derive_evidence) together in one turn.',
+      assignmentTarget: 'One assignment = one hypothesis cluster (1-3 linked routes) or one det_lead upgrade.',
+      turnBudget: '8-10 turns; 6-8 turns for det_lead upgrades and chain step 2.',
+      settlement: 'At turn N-2, submit your proof via a typed prove_* tool (or propose_chain_finding/update_proposed_finding) or call complete_intent; do not start new exploration.',
+    },
+    ...(brief ? { evidenceBrief: brief } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Prompt Builders
 // ---------------------------------------------------------------------------
 
@@ -1017,6 +1363,11 @@ export function threatModelPrompt(input: {
   observations?: readonly Record<string, unknown>[]
   hostTiers?: Record<string, HostTier>
   availableSkills?: readonly { name: string; title: string; summary: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }): string {
   const hostTiers: Record<string, HostTier> = {}
   for (const origin of input.approvedOrigins) {
@@ -1037,6 +1388,13 @@ export function threatModelPrompt(input: {
     mountedRepos: input.mountedRepos ?? [],
     observations: input.observations ?? [],
     availableSkills: input.availableSkills ?? listSkills().map(s => ({ name: s.name, title: s.title, summary: s.summary })),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed: input.alreadyConfirmed,
+      unconfirmedHardSurface: input.unconfirmedHardSurface,
+      detLeads: input.detLeads,
+      detLeadLimit: input.detLeadLimit,
+      assignmentBrief: input.assignmentBrief,
+    }),
   })
 }
 
@@ -1098,6 +1456,11 @@ export interface CrossHostSynthesizerPromptInput {
   }[]>
   existingSteps?: readonly { id: string; title: string; status: string; origins?: readonly string[] }[]
   availableSkills?: readonly { name: string; title: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }
 
 export function crossHostSynthesizerPrompt(input: CrossHostSynthesizerPromptInput): string {
@@ -1141,6 +1504,13 @@ export function crossHostSynthesizerPrompt(input: CrossHostSynthesizerPromptInpu
     factsByOrigin,
     existingSteps: input.existingSteps ?? [],
     availableSkills: input.availableSkills ?? listSkills().map(s => ({ name: s.name, title: s.title })),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed: input.alreadyConfirmed,
+      unconfirmedHardSurface: input.unconfirmedHardSurface,
+      detLeads: input.detLeads,
+      detLeadLimit: input.detLeadLimit,
+      assignmentBrief: input.assignmentBrief,
+    }),
   })
 }
 
@@ -1189,6 +1559,11 @@ export function chainPlannerPrompt(input: {
   operatorHints?: readonly string[]
   budgetRemaining?: { usd: number; requests: number | 'unlimited' }
   availableSkills?: readonly { name: string; title: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }): string {
   const hostTiers: Record<string, HostTier> = {}
   for (const origin of input.approvedOrigins) {
@@ -1198,11 +1573,31 @@ export function chainPlannerPrompt(input: {
   const openProofGaps = input.openProofGaps ?? (input.coverageEntries ?? [])
     .filter(e => e.status === 'needs_follow_up')
     .map(e => ({ origin: e.origin, category: e.category, summary: e.summary, proofGapReason: e.proofGapReason ?? null }))
+  const {
+    alreadyConfirmed,
+    unconfirmedHardSurface,
+    detLeads,
+    detLeadLimit,
+    assignmentBrief,
+    ...plannerInput
+  } = input
+  // Reuse the planner's own uncovered-endpoint rollup as the Unconfirmed Hard Surface block:
+  // high-risk or under-covered routes are exactly what the next steps should target.
+  const derivedHardSurface: readonly UnconfirmedSurfaceRef[] = unconfirmedHardSurface ?? (input.uncoveredEndpoints ?? [])
+    .filter(endpoint => endpoint.riskScore >= 60 || endpoint.coveragePct < 100)
+    .sort((a, b) => (b.riskScore - a.riskScore) || (a.pathTemplate < b.pathTemplate ? -1 : a.pathTemplate > b.pathTemplate ? 1 : 0))
+    .slice(0, 8)
+    .map(endpoint => ({
+      method: endpoint.method,
+      path: endpoint.pathTemplate,
+      ...(endpoint.testedClasses.length ? {} : { category: 'untested' }),
+      reason: `risk ${endpoint.riskScore}; coverage ${endpoint.coveragePct}%`,
+    }))
   return JSON.stringify({
     task: 'stateless chain planner update (80/20 crown-jewel prioritization + 3-state closure review)',
     openProofGaps,
     coverageEntries: input.coverageEntries ?? [],
-    ...input,
+    ...plannerInput,
     hostTiers,
     uncoveredEndpoints: input.uncoveredEndpoints ?? [],
     budgetAllocationPolicy: {
@@ -1213,6 +1608,13 @@ export function chainPlannerPrompt(input: {
     codeAuditSuspects: input.codeAuditSuspects ?? [],
     mountedRepos: input.mountedRepos ?? [],
     availableSkills: input.availableSkills ?? listSkills().map(s => ({ name: s.name, title: s.title })),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed,
+      unconfirmedHardSurface: derivedHardSurface,
+      detLeads,
+      detLeadLimit,
+      assignmentBrief,
+    }),
   })
 }
 
@@ -1339,10 +1741,20 @@ export function workerInvestigationPrompt(input: {
   mountedRepos?: readonly string[]
   availableSkills?: readonly string[]
   preInjectedSkills?: readonly { name: string; title: string; summary: string; tags: readonly string[]; excerpt: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }): string {
   const specialistConfig = input.step.specialistProfile
     ? SPECIALIST_PROFILES[input.step.specialistProfile]
     : undefined
+  const detLeads = input.detLeads ?? detLeadsFromParentFacts(input.parentFacts)
+  const alreadyConfirmed = input.alreadyConfirmed ?? confirmedRefsFromParentFacts(input.parentFacts)
+  // Slim the skill catalog: a specialist only needs its own matching playbooks. The 41-skill
+  // catalog dump was pure schema/token cost on every turn.
+  const matchingSkills = specialistConfig ? [...new Set(specialistConfig.skills)] : undefined
   return JSON.stringify({
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
@@ -1352,6 +1764,7 @@ export function workerInvestigationPrompt(input: {
     capabilityTier: input.capabilityTier,
     maxTurns: input.maxTurns,
     settlementStartsAtTurn: Math.max(1, Math.floor(input.maxTurns * 0.85)),
+    settlementNudgeAtTurn: settlementNudgeTurnFor(input.maxTurns),
     personas: input.personas ?? [],
     bolaTestQueue: input.bolaTestQueue ?? [],
     parentFacts: input.parentFacts ?? [],
@@ -1366,7 +1779,14 @@ export function workerInvestigationPrompt(input: {
       tags: [...s.tags],
       excerpt: s.excerpt,
     })),
-    availableSkills: input.availableSkills ?? listSkills().map(s => s.name),
+    availableSkills: input.availableSkills ?? matchingSkills ?? listSkills().map(s => s.name),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed,
+      unconfirmedHardSurface: input.unconfirmedHardSurface,
+      detLeads,
+      detLeadLimit: input.detLeadLimit,
+      assignmentBrief: input.assignmentBrief,
+    }),
   })
 }
 
@@ -1443,6 +1863,127 @@ async function formatToolOutput(
   const headBytes = Math.floor(available * 0.55)
   const tailBytes = Math.max(0, available - headBytes)
   return truncateUtf8Head(safe, headBytes) + notice + (tailBytes > 0 ? truncateUtf8Tail(safe, tailBytes) : '')
+}
+
+// ---------------------------------------------------------------------------
+// Typed proof tools & verifier repair feedback
+// ---------------------------------------------------------------------------
+
+const proofCompilers: Record<ProofToolHandlerName, (input: unknown) => CompiledProof> = {
+  prove_authz_read_diff: proveAuthzReadDiff as (input: unknown) => CompiledProof,
+  prove_state_mutation_diff: proveStateMutationDiff as (input: unknown) => CompiledProof,
+  prove_business_invariant: proveBusinessInvariant as (input: unknown) => CompiledProof,
+  prove_canary_or_redirect: proveCanaryOrRedirect as (input: unknown) => CompiledProof,
+}
+
+function proofToolParameters(name: ProofToolName): Record<string, unknown> {
+  const description = describeProofTools().find(tool => tool.name === name)
+  if (!description) throw new Error(`Missing proof tool description for ${name}.`)
+  return {
+    type: 'object',
+    required: [...description.inputSchema.required],
+    properties: { ...description.inputSchema.properties },
+    additionalProperties: true,
+  }
+}
+
+export const proofRepairBodyPreviewBytes = 512
+
+/**
+ * Structured, repairable verifier feedback surfaced to the worker when inline verification fails.
+ * `null` when the result is not a verification outcome, so successes are never rewritten.
+ */
+export interface VerifierRepairFeedback {
+  failedRule: string | null
+  stepStatuses: unknown
+  keyHeaders: unknown
+  bodyPreview: string | null
+  extractedVars: unknown
+  suggestedFix: string | null
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function previewText(value: unknown, maxBytes = proofRepairBodyPreviewBytes): string | null {
+  if (value === undefined || value === null) return null
+  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  if (!text) return null
+  return truncateUtf8Head(text, maxBytes)
+}
+
+function derivedRepairFix(result: Record<string, unknown>): string {
+  const jqError = typeof result.jqError === 'string' ? result.jqError : ''
+  const failedStepId = typeof result.failedStepId === 'string' ? result.failedStepId : ''
+  const reason = isPlainRecord(result.assertionSummary) && typeof result.assertionSummary.reason === 'string'
+    ? result.assertionSummary.reason
+    : ''
+  if (jqError) {
+    return `Fix assertionsJq so it emits {"confirmed":bool,"controlPassed":bool,"observed":string,"expected":string}. jq error: ${jqError}`
+  }
+  if (result.spaCatchallMatched === true) {
+    return 'The control matched the SPA catchall shell. Target a concrete API route with a body distinct from the shell, then re-verify with verify_replay_spec.'
+  }
+  if (failedStepId) {
+    return `Repair step ${failedStepId}: keep the control non-error and make the probe expose the identifier/marker (status alone is not proof); then re-run verify_replay_spec.`
+  }
+  if (reason) {
+    return `Tighten the assertion so observed/expected bind the identifier or marker. Verifier reason: ${reason}`
+  }
+  return 'Keep the control non-error and make the probe expose the identifier/marker in the body; then re-run verify_replay_spec.'
+}
+
+const verifierFeedbackKeys = ['inlineVerifyFeedback', 'verifierFeedback', 'verification', 'feedback'] as const
+
+function verificationOutcome(result: Record<string, unknown>): Record<string, unknown> | null {
+  for (const key of verifierFeedbackKeys) {
+    const nested = result[key]
+    if (isPlainRecord(nested)) return nested
+  }
+  return result
+}
+
+export function verifierRepairFeedback(result: unknown): VerifierRepairFeedback | null {
+  if (!isPlainRecord(result)) return null
+  const outcome = verificationOutcome(result)
+  if (!outcome) return null
+  const verdict = typeof outcome.verdict === 'string' ? outcome.verdict : null
+  const hasFailureSignal =
+    verdict === 'dismissed' ||
+    verdict === 'inconclusive' ||
+    typeof outcome.jqError === 'string' ||
+    typeof outcome.failedRule === 'string' ||
+    typeof outcome.failedStepId === 'string' ||
+    outcome.spaCatchallMatched === true ||
+    outcome.controlPassed === false ||
+    Array.isArray(outcome.stepStatuses)
+  if (!hasFailureSignal) return null
+  const failedRule = typeof outcome.failedRule === 'string'
+    ? outcome.failedRule
+    : typeof outcome.failedStepId === 'string'
+      ? `step:${outcome.failedStepId}`
+      : verdict === 'dismissed' || verdict === 'inconclusive'
+        ? `verdict:${verdict}`
+        : null
+  return {
+    failedRule,
+    stepStatuses: outcome.stepStatuses ?? null,
+    keyHeaders: outcome.keyHeaders ?? null,
+    bodyPreview: previewText(outcome.bodyPreview ?? outcome.body ?? (isPlainRecord(outcome.assertionSummary) ? outcome.assertionSummary.observed : undefined)),
+    extractedVars: outcome.extractedVars ?? null,
+    suggestedFix: typeof outcome.suggestedFix === 'string' && outcome.suggestedFix.trim()
+      ? outcome.suggestedFix
+      : derivedRepairFix(outcome),
+  }
+}
+
+/** Attach repair feedback to a failed verification outcome; non-verification results pass through. */
+export function withVerifierRepairFeedback(result: unknown): unknown {
+  if (!isPlainRecord(result)) return result
+  const feedback = verifierRepairFeedback(result)
+  if (!feedback) return result
+  return { ...result, repair: feedback }
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,7 +2065,7 @@ const browserInteractiveActionSchema = obj({
   timeoutMs: opt(int({ minimum: 100, maximum: 15000 })),
 })
 
-function buildWorkerTools(
+export function buildWorkerTools(
   handlers: WorkerToolHandlers,
   scrub: (value: string) => string,
   rootSignal: AbortSignal,
@@ -1600,17 +2141,6 @@ function buildWorkerTools(
       execute: (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
         return wrapExec('request_http', () => fn(normalizeHttpArgs(args), signal), signal)
-      },
-    }))
-    tools.push(defineTool({
-      name: 'http_request',
-      description: 'Alias for request_http: send a scoped HTTP request through Guardian’s RequestBroker.',
-      parameters: httpRequestSchema,
-      replay: 'unsafe',
-      outputLimits,
-      execute: (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('http_request', () => fn(normalizeHttpArgs(args), signal), signal)
       },
     }))
   }
@@ -2293,6 +2823,34 @@ function buildWorkerTools(
     }))
   }
 
+  for (const name of proofToolHandlerNames) {
+    const handler = handlers[name]
+    if (!handler) continue
+    const description = describeProofTools().find(tool => tool.name === name)
+    if (!description) continue
+    tools.push(defineTool({
+      name,
+      description: `${description.usage} Arguments are validated before compilation; a failure returns { ok: false, errors: [{ field, code, message, fix }] } and the handler is not called.`,
+      parameters: unsafe<Record<string, unknown>>(proofToolParameters(name)),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        const validation = validateProofInput(name, args)
+        if (!validation.ok) {
+          return {
+            output: [{
+              type: 'text' as const,
+              text: JSON.stringify({ ok: false, errors: validation.errors }, null, 2),
+            }],
+          }
+        }
+        const compiled = proofCompilers[name](args)
+        return wrapExec(name, () => handler(compiled, signal), signal)
+      },
+    }))
+  }
+
   if (handlers.propose_chain_finding) {
     const fn = handlers.propose_chain_finding
     tools.push(defineTool({
@@ -2379,7 +2937,7 @@ function buildWorkerTools(
           severityChangeConditions: args.severityChangeConditions?.trim() ? scrub(args.severityChangeConditions.trim()) : undefined,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow ?? true,
-        }, signal), signal)
+        }, signal).then(withVerifierRepairFeedback), signal)
       },
     }))
   }
@@ -2434,7 +2992,7 @@ function buildWorkerTools(
           replaySpec: parsedSpec,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow,
-        }, signal), signal)
+        }, signal).then(withVerifierRepairFeedback), signal)
       },
     }))
   }
@@ -2486,7 +3044,7 @@ function buildWorkerTools(
           replaySpec: parsed.data,
           findingId: args.findingId?.trim() || undefined,
           replaySpecId: args.replaySpecId?.trim() || undefined,
-        }, signal), signal)
+        }, signal).then(withVerifierRepairFeedback), signal)
       },
     }))
   }
@@ -2586,6 +3144,123 @@ function buildWorkerTools(
 // High-Limit Multi-Turn Pi Durable Runner
 // ---------------------------------------------------------------------------
 
+/** Identifiers stamped on trace events. Defaults to the request/session/scenario handles. */
+export interface AgentTraceContext {
+  runId?: string
+  assignmentId?: string
+  specialistProfile?: string
+}
+
+/** Structural view of a pi-ai message, so tracing does not depend on the provider package types. */
+interface TraceableMessage {
+  role: string
+  content?: unknown
+  timestamp?: number
+}
+
+function traceMessageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part
+      if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+        return (part as { text: string }).text
+      }
+      return ''
+    })
+    .join('')
+}
+
+function promptPrefixHashFor(messages: readonly TraceableMessage[]): string | null {
+  const systemText = messages
+    .filter(message => message.role === 'system')
+    .map(message => traceMessageText(message.content))
+    .filter(text => text.length > 0)
+    .join('\n')
+  // Providers keep instructions outside the message list; fall back to the stable leading text.
+  const prefix = systemText || messages
+    .map(message => traceMessageText(message.content))
+    .find(text => text.length > 0) || ''
+  if (!prefix) return null
+  return createHash('sha256').update(prefix, 'utf8').digest('hex')
+}
+
+function deltaMessagesFor(messages: readonly TraceableMessage[], previousCount: number): TraceableMessage[] {
+  const delta = messages.length >= previousCount ? messages.slice(previousCount) : messages
+  return delta.map(message => ({
+    role: message.role,
+    content: message.content,
+    ...(message.timestamp !== undefined ? { timestamp: message.timestamp } : {}),
+  }))
+}
+
+function assistantToolCalls(assistant: { content?: unknown }): Array<{ callId: string; name: string; args: unknown }> {
+  if (!Array.isArray(assistant.content)) return []
+  return assistant.content
+    .filter((part): part is { type: 'toolCall'; id: string; name: string; arguments?: unknown } =>
+      Boolean(part && typeof part === 'object' && (part as { type?: unknown }).type === 'toolCall'))
+    .map(part => ({ callId: part.id, name: part.name, args: part.arguments ?? {} }))
+}
+
+function assistantOutputText(assistant: { content?: unknown }): string {
+  if (!Array.isArray(assistant.content)) return ''
+  return assistant.content
+    .filter((part): part is { type: 'text'; text: string } =>
+      Boolean(part && typeof part === 'object' && (part as { type?: unknown }).type === 'text'))
+    .map(part => part.text)
+    .join('\n')
+    .trim()
+}
+
+function toolResultText(output: unknown): string {
+  if (typeof output === 'string') return output
+  if (!Array.isArray(output)) return ''
+  return output
+    .filter((part): part is { type: 'text'; text: string } =>
+      Boolean(part && typeof part === 'object' && (part as { type?: unknown }).type === 'text'))
+    .map(part => part.text)
+    .join('\n')
+}
+
+function toolResultSummary(text: string): unknown {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      // Truncated or non-JSON output: keep a bounded preview instead.
+    }
+  }
+  return { text: trimmed.slice(0, 2000) }
+}
+
+function idListFrom(summary: unknown, keys: readonly string[]): string[] {
+  if (!summary || typeof summary !== 'object') return []
+  const record = summary as Record<string, unknown>
+  const ids: string[] = []
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value) ids.push(value)
+    else if (Array.isArray(value)) {
+      for (const entry of value) if (typeof entry === 'string' && entry) ids.push(entry)
+    }
+  }
+  return [...new Set(ids)]
+}
+
+function verifierFeedbackFrom(summary: unknown): unknown {
+  if (!summary || typeof summary !== 'object') return undefined
+  const record = summary as Record<string, unknown>
+  if (isPlainRecord(record.repair)) return record.repair
+  for (const key of verifierFeedbackKeys) {
+    if (isPlainRecord(record[key])) return record[key]
+  }
+  if (verifierRepairFeedback(record)) return record
+  return undefined
+}
+
 export interface RunAgentSessionOptions {
   directory: string
   sessionId: string
@@ -2606,6 +3281,8 @@ export interface RunAgentSessionOptions {
   enableSettlement?: boolean
   /** Optional external settlement trigger (e.g., 85% wall-clock or request budget reached). */
   shouldSettle?: () => boolean
+  /** Optional wall-clock budget for the session; settlement starts at 85% of it. */
+  wallClockMs?: number
   /** Require complete_intent before finishing (with up to 2 empty-turn nudges; default: true when complete_intent handler is present). */
   requireCompleteIntent?: boolean
   handlers?: WorkerToolHandlers
@@ -2619,6 +3296,10 @@ export interface RunAgentSessionOptions {
   onTurnStart?: (turn: number, maxTurns: number) => { messages?: readonly string[] } | void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
+  /** Opt-in agentic trace writer (see createAgentTrace). Nothing is recorded when omitted. */
+  trace?: AgentTrace
+  /** Identifiers stamped on trace events; defaults to requestId/sessionId/scenario. */
+  traceContext?: AgentTraceContext
 }
 
 export interface AgentSessionResult {
@@ -2696,16 +3377,39 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const enableSettlement = options.enableSettlement ?? Boolean(handlers.complete_intent && maxTurns >= 4)
   const requireCompleteIntent = options.requireCompleteIntent ?? Boolean(handlers.complete_intent)
   const settlementTurn = Math.max(1, Math.floor(maxTurns * 0.85))
+  const settlementNudgeTurn = settlementNudgeTurnFor(maxTurns)
+  const wallClockDeadline = options.wallClockMs && options.wallClockMs > 0
+    ? Date.now() + Math.floor(options.wallClockMs)
+    : undefined
 
   let turnsUsed = 0
   let nudgesUsed = 0
   let settled = false
   let completion: IntentCompletion | undefined
 
+  const registeredProofTools = proofToolHandlerNames.filter(name => Boolean(handlers[name]))
+  const trace = options.trace
+  const traceRunId = options.traceContext?.runId ?? options.requestId
+  const traceAssignmentId = options.traceContext?.assignmentId ?? options.sessionId
+  const traceSpecialistProfile = options.traceContext?.specialistProfile ?? options.scenario
+  let lastTraceMessageCount = 0
+  let pendingTurnTrace: {
+    turnIdx: number
+    startedAtMs: number
+    promptPrefixHash: string | null
+    deltaMessages: TraceableMessage[]
+  } | undefined
+  const toolStartedAt = new Map<string, number>()
+
   const isSettling = () => {
     if (!enableSettlement) return false
-    if (settled) return true
-    if (turnsUsed >= settlementTurn || options.shouldSettle?.()) {
+    if (settlementDue({
+      turnsUsed,
+      settlementTurn,
+      settled,
+      shouldSettle: options.shouldSettle,
+      wallClockDeadline,
+    })) {
       settled = true
       return true
     }
@@ -2724,17 +3428,30 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const hooks = [
     hook(GenerationTask, {
       beforeRequest(request) {
+        pendingTurnTrace = {
+          turnIdx: turnsUsed + 1,
+          startedAtMs: Date.now(),
+          promptPrefixHash: promptPrefixHashFor(request.messages as readonly TraceableMessage[]),
+          deltaMessages: deltaMessagesFor(request.messages as readonly TraceableMessage[], lastTraceMessageCount),
+        }
+        lastTraceMessageCount = request.messages.length
         const turnStart = options.onTurnStart?.(turnsUsed + 1, maxTurns)
         const extraMessages = (turnStart?.messages ?? []).map(content => ({
           role: 'user' as const, content, timestamp: Date.now(),
         }))
-        if (isSettling()) {
-          const settlementBanner = [
-            `[GUARDIAN SETTLEMENT NOTICE — Turn ${turnsUsed}/${maxTurns}]`,
-            'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
-            'Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding, and (4) call complete_intent with your final status and summary.',
-          ].join(' ')
-          extraMessages.push({ role: 'user' as const, content: settlementBanner, timestamp: Date.now() })
+        const settlingNow = isSettling()
+        if (settlingNow) {
+          extraMessages.push({
+            role: 'user' as const,
+            content: settlementBannerMessage({ turnsUsed, maxTurns, proofTools: registeredProofTools }),
+            timestamp: Date.now(),
+          })
+        } else if (handlers.complete_intent && turnsUsed + 1 === settlementNudgeTurn) {
+          extraMessages.push({
+            role: 'user' as const,
+            content: settlementNudgeMessage({ turn: turnsUsed + 1, maxTurns, proofTools: registeredProofTools }),
+            timestamp: Date.now(),
+          })
         }
         if (!extraMessages.length) return undefined
         return {
@@ -2744,8 +3461,58 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           ],
         }
       },
-      afterResponse() {
+      afterResponse(message) {
         turnsUsed += 1
+        const pending = pendingTurnTrace
+        pendingTurnTrace = undefined
+        if (trace) {
+          const assistant = message as unknown as {
+            content?: unknown
+            model?: string
+            thinkingLevel?: string | null
+            usage?: {
+              input?: number
+              cacheRead?: number
+              output?: number
+              reasoning?: number
+              cost?: { total?: number }
+            }
+            stopReason?: string | null
+            durationMs?: number
+          }
+          const outputText = assistantOutputText(assistant)
+          try {
+            trace.recordTurn({
+              runId: traceRunId,
+              assignmentId: traceAssignmentId,
+              specialistProfile: traceSpecialistProfile,
+              turnIdx: pending?.turnIdx ?? turnsUsed,
+              promptPrefixHash: pending?.promptPrefixHash ?? undefined,
+              deltaMessages: pending?.deltaMessages,
+              model: assistant.model ?? primarySettings.model,
+              modelParams: {
+                temperature: null,
+                thinkingLevel: assistant.thinkingLevel ?? effectiveThinking,
+                maxTokens: primarySettings.maxTokens ?? DEFAULT_PROVIDER.maxTokens,
+                protocol: primarySettings.protocol,
+              },
+              ttftMs: null,
+              latencyMs: assistant.durationMs ?? (pending ? Date.now() - pending.startedAtMs : null),
+              usage: {
+                input: assistant.usage?.input ?? 0,
+                cachedInput: assistant.usage?.cacheRead ?? 0,
+                output: assistant.usage?.output ?? 0,
+                reasoning: assistant.usage?.reasoning ?? 0,
+                costUsd: assistant.usage?.cost?.total ?? 0,
+              },
+              stopReason: assistant.stopReason ?? null,
+              outputText,
+              toolCalls: assistantToolCalls(assistant),
+            })
+          } catch {
+            // Tracing must never break an investigation run.
+          }
+        }
         const nowSettling = isSettling()
         options.onTurn?.(turnsUsed, maxTurns, nowSettling)
       },
@@ -2763,9 +3530,37 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }),
     hook(ToolTask, {
       beforeTool(call) {
+        if (!call.parent) toolStartedAt.set(call.id, Date.now())
         if (isSettling() && NETWORK_TOOLS.has(call.name)) {
           return {
             block: `Settlement wrap-up active (${turnsUsed}/${maxTurns} turns). ${call.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`,
+          }
+        }
+        return undefined
+      },
+      afterTool(call, result) {
+        if (trace && !call.parent) {
+          const startedAt = toolStartedAt.get(call.id)
+          toolStartedAt.delete(call.id)
+          try {
+            const summary = toolResultSummary(toolResultText(result.output))
+            const diagnostic = (result.diagnostics ?? []).find(item => item.severity === 'error')
+            trace.recordToolResult({
+              assignmentId: traceAssignmentId,
+              turnIdx: Math.max(1, turnsUsed),
+              callId: call.id,
+              name: call.name,
+              durationMs: startedAt === undefined ? null : Date.now() - startedAt,
+              ok: !result.isError,
+              errorCode: diagnostic?.code ?? null,
+              summaryJson: summary,
+              exchangeIds: idListFrom(summary, ['exchangeIds', 'exchangeId']),
+              factIds: idListFrom(summary, ['factIds', 'factId']),
+              findingIds: idListFrom(summary, ['findingIds', 'findingId']),
+              verifierFeedback: verifierFeedbackFrom(summary),
+            })
+          } catch {
+            // Tracing must never break an investigation run.
           }
         }
         return undefined
