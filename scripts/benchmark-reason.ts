@@ -2190,7 +2190,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 const isMain = process.argv[1] ? import.meta.url === pathToFileURL(resolve(process.argv[1])).href : false
 if (isMain) {
   main()
-    .then(code => { if (code) process.exitCode = code })
+    .then(code => {
+      process.exitCode = code
+      // Deterministic CLI teardown: engine timers/sockets can outlive a completed run.
+      // Artifacts are written synchronously, so exit once the current turn drains.
+      setImmediate(() => process.exit(code))
+    })
     .catch(error => {
       process.stderr.write(`error: ${(error as Error).message}\n`)
       process.exit(Number((error as { exitCode?: number }).exitCode ?? 1))
