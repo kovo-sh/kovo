@@ -334,9 +334,9 @@ export function captureRunSnapshot(input: CaptureRunSnapshotInput): CaptureRunSn
     security: {
       secretsIncluded: false,
       sessionValuesIncluded: false,
-      note: 'Checkpoint state only: DB rows the engine already redacted + coordinator counters + '
-        + 'app/seed/mode rehydration spec. No cookies, session values, bearer tokens, passwords, '
-        + 'canaries or provider keys are written.',
+      note: 'Checkpoint state only: the DB copy holds rows the engine already redacted; snapshot.json/'
+        + 'target.json hold coordinator counters and the app/seed/mode rehydration spec. No cookies, '
+        + 'session values, bearer tokens, passwords or provider keys are written to either JSON file.',
     },
     capturedAt: now,
   }
