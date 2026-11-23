@@ -198,3 +198,28 @@ it would excuse genuinely wrong labels. The fix is evidence-first labelling in t
 No truth change; the target already existed. After the fix the finding matches
 `acme.project-mass-assign` as a duplicate of the confirmed TP.
 
+## Fifth triage round (K=6 rerun): report-name and SPA-sink XSS claims
+
+Two further runtime-confirmed XSS claims carried no target endpoint:
+
+- *Stored XSS via report name in `GET /api/reports/:id/render`* (CWE-79) — the vulnerable and hardened
+  **SSTI twins both** interpolated `row.name` into `<h2>` without escaping. Unlike the safe default
+  (`htmlEscape(row.name)`), that made unescaped markup a uniform twin defect rather than a planted
+  site, and the impact oracle only models stored XSS on `renderProjectCard` (no event here).
+- *Stored HTML injection into an innerHTML sink* (CWE-79) — `ui/views.js` assigned
+  `p.description` to `innerHTML`, so the SPA sink stayed live even on a seed where the server-rendered
+  project card is the hardened twin. The planted target is the server-side card, not the SPA.
+
+Both are **fixture defects, not missing targets**: adding truth would either make the hardened twin
+unsound (report name) or duplicate the planted card target through a UI path the oracle does not
+model. Hardened the fixture instead:
+
+- `sites/acme.report-ssti/{vulnerable,hardened}.ts`: escape the report name in `<h2>` (matching the
+  safe default). The planted SSTI vector (the stored *template* body evaluated at render) is
+  unchanged.
+- `ui/views.js`: project descriptions are assigned with `textContent`; the SPA no longer interprets
+  tenant-authored data as HTML. The server-rendered card target (`acme.project-stored-xss`) is
+  unchanged and still fires on its vulnerable twin.
+
+No truth changes.
+

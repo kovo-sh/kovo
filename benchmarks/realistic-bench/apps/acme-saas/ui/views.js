@@ -1,5 +1,5 @@
-// View renderers. Project descriptions are stored as rich HTML and rendered with innerHTML so teams
-// can format their workspace notes.
+// View renderers. Project descriptions are tenant-authored data and are always assigned as text so
+// stored markup can never reach an HTML sink in the SPA.
 export function el(html) {
   const t = document.createElement('template')
   t.innerHTML = html.trim()
@@ -32,7 +32,7 @@ export function dashboardView(data) {
   for (const p of data.projects) {
     const row = el(`<article class="project"><h3></h3><div class="desc"></div></article>`)
     row.querySelector('h3').textContent = p.name
-    row.querySelector('.desc').innerHTML = p.description || ''
+    row.querySelector('.desc').textContent = p.description || ''
     rows.append(row)
   }
   node.append(list)
