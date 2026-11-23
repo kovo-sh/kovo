@@ -20,6 +20,17 @@
 
 5. **Iterate with the smoke tier, not full matrices.** Use `scripts/hillclimb-loop.sh` (realistic seed 42 + agentic `--smoke` + typecheck, in parallel) between tweaks; run `--full`/`reverify-v5.sh --full` only once per batch or at milestones. Batch 3–5 related fixes before validating.
 
+## Parallelization by default
+
+1. **Split before starting.** Enumerate the files a task touches and carve them into disjoint leases. If there are **two or more independent sets, launch two or more agents in separate worktrees immediately**. Serial execution is allowed only when edits share a file or a hard dependency exists — and the coordinator must state the reason.
+2. **One writer per file.** Use unique branches (`agents/<stream>`). Two streams must never edit the same file; if they must, split the file by section or serialize with an explicit handoff.
+3. **Checkpoint, don't run silent.** Every stream commits a WIP checkpoint within ~15 minutes or at each milestone and reports concise status. A long-running stream with no commit is a process bug, not progress.
+4. **Merge as streams finish.** Do not batch merges behind the slowest stream; integrate each completed stream and re-run the smoke floor.
+5. **Parallelize validation too.** Independent suites and benchmark legs (dev, held-out, agentic) run concurrently with isolated dirs. Use the smoke tier between tweaks; full matrices/gates only at batch boundaries.
+6. **Report the plan.** Before dispatching, state the parallel streams, their file leases, the merge order, and any serialization exception.
+
+Read-only audits, compatibility analysis, docs, and verifier-only changes are usually parallelizable even when the main engine is busy — use them.
+
 ## Gemini Coding Guidelines
 
 1. **Never `read_file` or `cat` raw debug dumps or benchmark logs (main session OR sub-agents):**

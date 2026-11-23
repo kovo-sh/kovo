@@ -20,6 +20,32 @@ reviewer with raw benchmark data.
 
 Do not consult for tiny edits or while a benchmark matrix is still running.
 
+## Parallelization playbook (default, not optional)
+
+Before starting any hill-climb or integration batch:
+
+1. **List files → lease table.** Group by file ownership. If ≥2 disjoint groups exist,
+   dispatch ≥2 agents in separate worktrees *before* doing any serial work.
+2. **Name streams and branches uniquely** (`agents/<stream>`); never reuse another
+   orchestrator's branch names. Symlink `node_modules` per worktree; never commit it.
+3. **Pick a split pattern:**
+   - *Layer split*: engine / verifier / harness / docs (when files are disjoint).
+   - *Class split*: one agent per vulnerability class or benchmark suite.
+   - *Vertical split*: one app/seed per agent, then an integration agent.
+   - *Read-only audit + writer*: run compatibility/analysis in parallel with the writer.
+4. **Require checkpoints:** every stream commits within ~15 min or at each milestone and
+   reports a 5-line status. Long silent runs are forbidden.
+5. **Merge queue:** merge each finished stream immediately, run the smoke floor, then start
+   dependent work. Do not wait for all streams if one is slow.
+6. **Validation in parallel:** dev/held-out/agentic legs with isolated data dirs; smoke tier
+   between tweaks, full matrices only at batch boundaries.
+7. **State exceptions explicitly:** same-file edits (e.g. `execution.ts` across slices 2/3/5)
+   are the only legitimate serialization; say so and sequence them.
+
+Anti-patterns: one agent editing several contested files “to avoid conflicts”; full 9-cell or
+600 s matrices after every tweak; waiting silently on a long stream; mixing benchmark and
+engine writes in one uncommitted worktree.
+
 ## Acceleration playbook (use this, not full matrices, between tweaks)
 
 - **Two tiers only.** `--smoke` is the iteration tier: realistic seed 42 + agentic
