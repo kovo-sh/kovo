@@ -352,3 +352,14 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Grader contract (accepted):** `confirmed_findings` may contain only `verificationStatus === 'confirmed'`; `static_only`/`open_proof_gap` go to a separate advisories bucket (≤10/app, never recall/precision); a static item leaking into confirmed counts as an FP. Fix the product boundary, never the grader.
 - **Universal default-deny (accepted):** every auth/access/bypass claim needs a transcript-verified denied/challenged control plus a boundary-crossing variant with state/data proof, regardless of label — closes label whack-a-mole (e.g. “2FA bypass” on an account without 2FA).
 - **Order confirmed:** determinism → realism #2 → #3 → #4 → #1 → `v6-retire-dsl` (≥1,800 LOC). Do not run the full n=3 matrix until static/advisory separation and the default-deny control land.
+
+### 2026-11-23 — xben restored; held-out-saas regression isolated
+
+- **xben 25/25 restored** (`19a6fdd`): mutating authz specs now emit actor pre-read → low-priv mutation → separate post-read, with `requiredRole` and a function-level observe step; harness parity got the same rule plus a fresh self-service victim and `{id}` placeholder fix. Procedural acme 42 improved 15 → 16/22 at 100%.
+- **Held-out-saas regression confirmed on main:** `benchmark-recall --suite held-out-saas` = **18/20 (90%), 0 FP, patches 16/20** vs baseline 9fe4c99 20/20 + 20/20. Funnel reaches 20 specs; failures are confirmation/inference, not discovery.
+  - `hos-03`: function-state delta (feature flag) has no protected field for the readback gate.
+  - `hos-05`: server action's observable read is a sibling `GET /api/v1/org` not inferred.
+  - `hos-02`: patched app not reported fixed (spec/step mismatch after readback change).
+  - `hos-09`: shared-endpoint attribution ambiguity → patch retest skipped.
+- **Fix stream launched:** `hos-restore` (generic function-state delta evidence, sibling-read inference from the route map, patch/spec reconciliation, mutated-field disambiguation) with a hard gate: **20/20 + 20/20 patches at 100%** without weakening `oracle-invariants`/`replay-verifier`; stop and report if a target cannot be proven honestly.
+- **Sequencing unchanged:** provenance merge → realism #2/#3/#4 → `v6-retire-dsl` → certification; held-out 20/20 is a hard regression gate before cert.
