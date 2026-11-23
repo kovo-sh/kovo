@@ -802,6 +802,11 @@ export function enumerateHypotheses(
   // resource (assets?projectId -> /api/spaces). Keep a bounded per-origin pool as a fallback.
   const originIdPool = new Map<string, string[]>()
   const readRoutesByOrigin = buildReadRouteIndex(endpoints)
+  // Destructive authz proofs must leave at least one live object for the replay: the probe matrix
+  // exercises identifiers, so a probe that deletes the very id the replay needs produces a
+  // "control read 404" rejection. Reserve one record-family identifier up front and keep it out of
+  // every destructive matrix (see `reservedVictimId`).
+  const reservedDestructiveIds = new Set<string>()
   for (const endpoint of endpoints) {
     const harvest = harvests.get(endpoint.id)
     const pool = originIdPool.get(endpoint.origin) ?? []
@@ -933,8 +938,42 @@ export function enumerateHypotheses(
       const authzOther = privileged
         ? (sensitiveRead && !mutating ? (picks.crossTenant ?? picks.lower) : (picks.lower ?? picks.owner ?? picks.crossTenant))
         : picks.crossTenant
-      const ids = globalIds(harvest, endpoint.origin)
+      let ids = globalIds(harvest, endpoint.origin)
       const functionLevel = !hasIdPath && !objectIdParam
+      // A destructive matrix consumes the objects it addresses. Exclude ids already reserved by a
+      // sibling destructive hypothesis, then reserve one live record-family victim for this chain.
+      if (method === 'DELETE') ids = ids.filter(id => !reservedDestructiveIds.has(id))
+      let reservedVictimId: string | undefined
+      if (method === 'DELETE' && privileged && idIsLast) {
+        const placeholderIdx = pathSegments.findIndex(segment => placeholderSeg.test(segment))
+        const noun = placeholderIdx > 0 ? pathSegments[placeholderIdx - 1] : undefined
+        const family: string[] = []
+        if (noun) {
+          const singular = noun.replace(/s$/i, '')
+          for (const candidate of endpoints) {
+            if (candidate.origin !== endpoint.origin || candidate.method.toUpperCase() !== 'GET') continue
+            const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+            if (hasDynamicIdSegment(candidatePath)) continue
+            const candidateSegments = candidatePath.split('/').filter(Boolean)
+            const last = (candidateSegments[candidateSegments.length - 1] ?? '').replace(/s$/i, '')
+            if (last !== singular) continue
+            for (const id of harvests.get(candidate.id)?.ownerIds ?? []) {
+              if (/^[A-Za-z0-9_.:-]{1,128}$/.test(id) && !family.includes(id)) family.push(id)
+            }
+          }
+        }
+        const viewerOwned = originViewerIds.get(endpoint.origin) ?? []
+        const pool = family.filter(id => !viewerOwned.includes(id))
+        // Skip the first record (usually the tenant principal, which a role-scoped delete refuses)
+        // and any id the lower actor owns, so the reserved victim is a genuinely deletable colleague.
+        const pick = pool[1] ?? pool[0] ?? family[1] ?? family[0]
+        // Keep at least one other id so the matrix can still establish the route signal.
+        if (pick && ids.length > 1) {
+          reservedVictimId = pick
+          reservedDestructiveIds.add(pick)
+          ids = ids.filter(id => id !== pick)
+        }
+      }
       // Object-authorization on a stable resource route: the identifier must be the last path
       // segment, a query filter, or (for a mutating privileged action) an id followed by a
       // role/grant verb. Rendered "view/card/public" subroutes are shared surfaces, and running a
@@ -986,6 +1025,7 @@ export function enumerateHypotheses(
           ...(readback ? { readbackPath: readback.path } : {}),
           ...(readback?.persona ? { readbackPersona: readback.persona } : {}),
           ...(requiredRole ? { authzRequiredRole: requiredRole } : {}),
+          ...(reservedVictimId ? { reservedVictimId } : {}),
           jsonBody: mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
             ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
             : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
@@ -1405,6 +1445,9 @@ export function enumerateHypotheses(
         secretScan: true,
         ...((picks.lower?.handle ?? picks.crossTenant?.handle)
           ? { viewerPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
+          : {}),
+        ...((picks.lower?.handle ?? picks.crossTenant?.handle)
+          ? { otherPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
           : {}),
         risk: endpointRiskScore(endpoint) + (credentialSurface ? 34 : 18),
       })

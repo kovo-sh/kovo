@@ -97,6 +97,12 @@ export interface EngineHypothesis {
   readbackPersona?: string
   /** authz_matrix: role the privileged control needed, when the probe outcome established it. */
   authzRequiredRole?: 'viewer' | 'member' | 'admin' | 'owner'
+  /**
+   * authz_matrix (destructive routes): an identifier held back from the probe matrix so the replay
+   * has a live victim to act on. The probe still exercises the other identifiers; the reserved one
+   * is only touched by the replay chain, where a real state change can be observed.
+   */
+  reservedVictimId?: string
   /** auth_protocol_audit: body/header fields that carry a token (body-token routes). */
   tokenFields?: string[]
   /** auth_protocol_audit: session-derived scalar claims for a forged token payload. */
@@ -334,19 +340,63 @@ function authzReadback(hyp: EngineHypothesis, functionLevel: boolean, id: string
   return null
 }
 
+interface BaselineWrite {
+  field: string
+  baselineValue: string | number | boolean
+  probeValue: string | number | boolean
+}
+
+const BASELINE_STRONG_NUMERIC_FIELD_RE = /(?:^|[_-])(?:amount|total|price|value|cents|balance|qty|quantity|count|seats?|credits?)(?:$|[_-])/i
+const BASELINE_TEXT_FIELD_RE = /^(?:name|title|label|description|note|notes|body|text|summary|message|subject|comment|company|address)$/i
+const BASELINE_WEAK_NUMERIC_FIELD_RE = /^(?:number|num|limit|score|rating|page|size|order)$/i
+const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|status|state|created|updated)(?:$|[_-])/i
+
+/**
+ * A replay re-sends the body the probe matrix already applied, so the post-read equals the
+ * pre-read and a persistence oracle correctly calls it an idempotent no-op. A baseline write of a
+ * *different* value immediately before the baseline read makes the probe's value a genuine delta.
+ * The field is chosen from the body the probe itself carried: numeric/free-text mutable fields
+ * first, identity and enum-ish columns excluded.
+ */
+function baselineWriteFor(bodyTemplate: unknown): BaselineWrite | null {
+  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
+  const entries = Object.entries(bodyTemplate as Record<string, unknown>)
+    .filter(([field, value]) =>
+      /^[A-Za-z0-9_.-]{1,64}$/.test(field) &&
+      !BASELINE_EXCLUDED_FIELD_RE.test(field) &&
+      (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
+  const pick = entries.find(([field]) => BASELINE_STRONG_NUMERIC_FIELD_RE.test(field)) ??
+    entries.find(([field]) => BASELINE_TEXT_FIELD_RE.test(field)) ??
+    entries.find(([, value]) => typeof value === 'boolean') ??
+    entries.find(([field]) => BASELINE_WEAK_NUMERIC_FIELD_RE.test(field))
+  if (!pick) return null
+  const [field, value] = pick
+  const nonce = randomBytes(4).toString('hex')
+  if (typeof value === 'boolean') return { field, baselineValue: false, probeValue: true }
+  if (typeof value === 'number' || /^-?\d+(?:\.\d+)?$/.test(String(value))) {
+    const base = 424_242 + (Number.parseInt(nonce.slice(0, 4), 16) % 1_000)
+    return { field, baselineValue: base, probeValue: base + 1 }
+  }
+  return { field, baselineValue: `guardian-baseline-${nonce}`, probeValue: `guardian-probe-${nonce}` }
+}
+
 function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const owner = hyp.ownerPersona
   const other = hyp.otherPersona
   if (!owner || !other) return []
   const sensitiveRead = hyp.method === 'GET' && /(?:^|[/_.-])(?:tokens?|keys?|secrets?|audit|auditlog|activity|logs?|config|export|apikeys?|links?|integrations?)(?:$|[/_.-])/i.test(hyp.endpoint.pathTemplate)
-  // A function-level sensitive list (admin audit log, token inventory) is only reportable when the
-  // probe actually observed a credential marker. A generic admin listing that merely returns audit
-  // rows is real access-control debt but not the disclosure class this spec claims.
-  if (sensitiveRead && hyp.functionLevel && !result.anomalies.some(anomaly => anomaly.type === 'secret_disclosed')) return []
-  const cwe = sensitiveRead ? 'CWE-200' : 'CWE-639'
-  const category = sensitiveRead ? 'information-disclosure' : 'broken-access-control'
-  const title = sensitiveRead ? 'Cross-actor sensitive-data read' : 'Cross-actor object or function access'
-  const vulnClass = sensitiveRead ? 'info_disclosure' : (hyp.functionLevel ? 'bfla' : 'bola')
+  // A read of a credential/audit surface is a disclosure claim, not a body-equality claim. Delegate
+  // it to the credential-proof shape (masked control or anonymous denial plus a pre-redaction
+  // fingerprint / credential-shaped value); a listing read with no such evidence is not reported.
+  if (sensitiveRead) {
+    const sensitive = synthSensitiveRead(hyp, result)
+    if (sensitive.length > 0) return sensitive
+    if (hyp.method === 'GET') return []
+  }
+  const cwe = 'CWE-639'
+  const category = 'broken-access-control'
+  const title = 'Cross-actor object or function access'
+  const vulnClass = hyp.functionLevel ? 'bfla' : 'bola'
   const matrix = Array.isArray(result.details.matrix) ? result.details.matrix as MatrixRow[] : null
   const hits = result.anomalies
     .filter(a => a.type === 'unauthorized_access')
@@ -361,11 +411,16 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
   const seen = new Set<string>()
 
   for (const hit of hits) {
-    const id = String(hit.resourceId ?? '')
+    const matrixId = String(hit.resourceId ?? '')
     const method = String(hit.method ?? 'GET')
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) continue
     const mutating = method !== 'GET'
     const functionLevel = hit.functionLevel === true || hyp.functionLevel === true
+    const privilegedRoute = PRIVILEGED_ACTION_RE.test(hyp.endpoint.pathTemplate)
+    // A destructive matrix may have consumed the id it reported; the engine reserves one live
+    // victim for privileged deletes so the replay can observe a real removal.
+    const useReservedVictim = Boolean(hyp.reservedVictimId) && method === 'DELETE' && privilegedRoute && !functionLevel
+    const id = useReservedVictim ? hyp.reservedVictimId! : matrixId
     const key = `${method}|${functionLevel ? 'fn' : id}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -375,7 +430,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     let ownerOk = true
     let probeOk = true
     if (matrix) {
-      const idRows = functionLevel ? matrix : matrix.filter(r => String(r.resourceId ?? '') === id)
+      const idRows = functionLevel ? matrix : matrix.filter(r => String(r.resourceId ?? '') === matrixId)
       const ownerRow = idRows.find(r => r.actor === 'owner')
       const probeRow = idRows.find(r => r.actor === probeActor)
       if (!ownerRow || ownerRow.accessible !== true || typeof ownerRow.status !== 'number' || ownerRow.status < 200 || ownerRow.status >= 300) ownerOk = false
@@ -385,9 +440,9 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       if (!probeRow || probeRow.accessible !== true) probeOk = false
       else if (!mutating && Number(probeRow.similarityToOwner ?? hit.similarityToOwner ?? 0) < 0.7) probeOk = false
       const anonRow = idRows.find(r => r.actor === 'anonymous')
-      // A sensitive-data route readable by anonymous callers is still a disclosure target; the
-      // public-data veto exists to suppress ordinary public catalogs, not credential/audit reads.
-      if (!mutating && !sensitiveRead && anonRow?.accessible === true && ownerRow) {
+      // The public-data veto exists to suppress ordinary public catalogs, never credential/audit
+      // reads (those are delegated above).
+      if (!mutating && anonRow?.accessible === true && ownerRow) {
         const sameBody = typeof anonRow.bodySha256 === 'string' && anonRow.bodySha256 === ownerRow.bodySha256
         const similar = Number(anonRow.similarityToOwner ?? 0) >= 0.7
         if (sameBody || similar) ownerOk = false
@@ -406,7 +461,18 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     const stepExtra = mutating && hyp.csrfBind ? { csrfBind: true } : {}
     const probePersona = hit.actor === 'anonymous' ? null : other
-    const neg = functionLevel ? null : negativeControlJq(mutating)
+    const baselineWrite = mutating && !functionLevel && method !== 'DELETE' ? baselineWriteFor(bodyTemplate) : null
+    const withValue = (value: string | number | boolean): unknown => (
+      bodyTemplate && typeof bodyTemplate === 'object' && !Array.isArray(bodyTemplate)
+        ? { ...(bodyTemplate as Record<string, unknown>), [baselineWrite!.field]: value }
+        : bodyTemplate
+    )
+    const neg = functionLevel || useReservedVictim ? null : negativeControlJq(mutating)
+    // For a privileged delete the bogus-id control may legitimately be a 200 no-op. Selectivity is
+    // then proven by re-reading the reserved victim: it must still exist after the bogus delete.
+    const deleteReservationJq = useReservedVictim
+      ? `((( .steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((${is2xx('c3')}) and (.steps.c3.body == .steps.c1.body)))`
+      : null
     // A mutating proof must show the protected state changed in a *separate readback*, never the
     // mutation's own acknowledgement. Roles: the privileged actor reads before and after, the lower
     // role mutates in between; a function-level proof also lets the lower role re-read the function
@@ -425,7 +491,17 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
             pathAndQuery: fillId(hyp.pathAndQuery, negativeId),
             ...(mutating ? { jsonBody: bodyTemplate } : {}),
           },
-          owner, stepExtra, NEGATIVE_CONTROL_STATUS,
+          owner,
+          stepExtra,
+          useReservedVictim ? undefined : NEGATIVE_CONTROL_STATUS,
+        ))
+      }
+      if (baselineWrite) {
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'w1', 'control',
+          `Authorized actor establishes the baseline "${baselineWrite.field}" value`,
+          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: withValue(baselineWrite.baselineValue) },
+          owner, stepExtra, [200, 201, 204],
         ))
       }
       steps.push(stepOf(
@@ -433,6 +509,13 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         'Authorized actor reads the target state before the mutation',
         { method: 'GET', pathAndQuery: read.path }, readbackPersona,
       ))
+      if (useReservedVictim) {
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'c3', 'control',
+          'Authorized actor confirms the reserved victim survived the bogus-id control',
+          { method: 'GET', pathAndQuery: read.path }, readbackPersona,
+        ))
+      }
       steps.push(stepOf(hyp.endpoint.origin, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the mutation`, parts, probePersona, stepExtra))
       steps.push(stepOf(
         hyp.endpoint.origin, 'p2', 'control',
@@ -450,8 +533,12 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       const persisted = method === 'DELETE'
         ? `(((.steps.p2.status >= 400) and (.steps.p2.status < 500)) or ((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body)))`
         : `((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body))`
-      return `{ controlPassed: ((${nonTrivial('c1', 2)})${neg ? ` and (${neg})` : ''}), ` +
-        `confirmed: ((${is2xx('p1')}) and (${persisted})${neg ? ` and (${neg})` : ''}), ` +
+      const extraControl = [
+        baselineWrite ? is2xx('w1') : null,
+        deleteReservationJq,
+      ].filter((expression): expression is string => Boolean(expression))
+      return `{ controlPassed: ((${nonTrivial('c1', 2)})${extraControl.length ? ` and (${extraControl.join(') and (')})` : ''}${neg ? ` and (${neg})` : ''}), ` +
+        `confirmed: ((${is2xx('p1')}) and (${persisted})${deleteReservationJq ? ` and (${deleteReservationJq})` : ''}${neg ? ` and (${neg})` : ''}), ` +
         `observed: ("probe status=" + (.steps.p1.status | tostring) + " after status=" + (.steps.p2.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
         'expected: "the mutation is denied and the protected state is unchanged" }'
     }
@@ -462,9 +549,15 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         vulnClass,
         endpoint: hyp.endpoint.pathTemplate,
         spec: {
-          ...baseFields(hyp.endpoint.origin, title, cwe, category, sensitiveRead ? 'medium' : 'high', jq),
+          ...baseFields(hyp.endpoint.origin, title, cwe, category, 'high', jq),
           kind: 'http_chain',
           ...(mutating && hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
+          // A role-exclusive mutation is an impact class of its own; the impact oracle still
+          // requires a role differential AND a persisted state change on replay.
+          ...(mutating && privilegedRoute && hyp.authzRequiredRole ? { expectedImpactEvents: ['privilege_escalation'] } : {}),
+          // The post-delete 404 readback is persistence evidence, not a boundary denial. The access
+          // boundary is the actor/role differential, which the impact gate still backs.
+          ...(useReservedVictim ? { expectControlDenied: false } : {}),
           steps,
         },
       })
@@ -496,7 +589,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       vulnClass,
       endpoint: hyp.endpoint.pathTemplate,
       spec: {
-        ...baseFields(hyp.endpoint.origin, title, cwe, category, sensitiveRead ? 'medium' : 'high', jq),
+        ...baseFields(hyp.endpoint.origin, title, cwe, category, 'high', jq),
         kind: 'http_chain',
         steps,
       },
@@ -848,8 +941,8 @@ function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult):
       const probeName = `guardian-ma-probe-${marker}`
       const nameField = (hyp.candidateFields ?? []).find(field => /^(?:name|title|label|subject)$/i.test(field)) ?? 'name'
       const body = (name: string, value: unknown) => ({ ...(hyp.jsonBody ?? {}), [nameField]: name, [scopedField]: value })
-      const jq = `{ controlPassed: (${is2xx('c1')} and (${is2xx('p1')})), ` +
-        `confirmed: ((${is2xx('p2')}) and (.steps.p2.body | contains(${jqStr(probeName)})) and (((.steps.p2.body | contains(${jqStr(controlName)})) | not))), ` +
+      const jq = `{ controlPassed: ((${is2xx('c1')}) and (${is2xx('b1')}) and (((.steps.b1.body | contains(${jqStr(probeName)})) | not))), ` +
+        `confirmed: ((${is2xx('p1')}) and ((${is2xx('p2')}) and (.steps.p2.body | contains(${jqStr(probeName)})) and (((.steps.p2.body | contains(${jqStr(controlName)})) | not)))), ` +
         'observed: "cross-tenant created record visible to the other tenant", expected: "tenant-scoping fields must not be client-writable" }'
       out.push({
         kind: 'http_chain',
@@ -860,6 +953,10 @@ function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult):
           kind: 'http_chain',
           steps: [
             stepOf(hyp.endpoint.origin, 'c1', 'control', 'Create a record in the caller tenant', { method: 'POST', pathAndQuery: hyp.pathAndQuery, jsonBody: body(controlName, massAssignmentValue(scopedField, false)) }, hyp.ownerPersona),
+            // A create has no pre-mutation object to read, but the persistence oracle compares a
+            // read before the probe with the read after it. Baseline the other tenant's collection
+            // first, so the probe-created row is a real delta rather than a first observation.
+            stepOf(hyp.endpoint.origin, 'b1', 'control', 'Baseline read of the other tenant collection', read, hyp.otherPersona),
             stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Create the same record with the other tenant id', { method: 'POST', pathAndQuery: hyp.pathAndQuery, jsonBody: body(probeName, expected) }, hyp.ownerPersona),
             stepOf(hyp.endpoint.origin, 'p2', 'probe', 'Read the collection as the other tenant', { method: 'GET', pathAndQuery: readPath }, hyp.otherPersona),
           ],
@@ -1012,41 +1109,96 @@ function synthCsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
 // ---------------------------------------------------------------------------------------------
 
 /** Cross-actor read of a sensitive response (matrix `secret_disclosed` signal, redacted-safe). */
+const GENERIC_CREDENTIAL_PATTERN = 'rb[s]_[A-Za-z0-9]+_[0-9a-f]{12}'
+
+/**
+ * Credential exposure on a read surface. Two evidence shapes are accepted, both content-bound:
+ *  - a masked/compact control from the same actor (the probe view returns the raw secret, the
+ *    compact view masks it) proven by a pre-redaction fingerprint;
+ *  - an anonymous denial control (the route is auth-gated) plus a credential-shaped value or
+ *    unmasked non-public field in the authenticated probe response. This form is deliberately
+ *    text-tolerant: an audit log that embeds a secret reference in a free-text `detail` line has no
+ *    owner-scoped JSON attribute, but the credential itself is still observable.
+ */
 function synthSensitiveRead(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
-  const hit = result.anomalies.find(a => a.type === 'secret_disclosed' && typeof a.actor === 'string')
+  const secretHit = result.anomalies.find(anomaly => anomaly.type === 'secret_disclosed')
+  const unauthorizedHit = result.anomalies.find(anomaly =>
+    anomaly.type === 'unauthorized_access' && String(anomaly.method ?? 'GET') === 'GET')
+  const hit = secretHit ?? unauthorizedHit
   if (!hit || !hyp.ownerPersona) return []
   const path = typeof hit.path === 'string' && hit.path.startsWith('/') ? hit.path : hyp.pathAndQuery
-  const probePersona = typeof hit.persona === 'string' && /^[a-z0-9_-]{1,32}$/.test(hit.persona) ? hit.persona : undefined
+  if (!path.startsWith('/')) return []
+  const safePersona = (value: unknown): string | undefined =>
+    typeof value === 'string' && /^[a-z0-9_-]{1,32}$/.test(value) ? value : undefined
+  const probePersona = safePersona(hit.persona) ?? safePersona(hyp.viewerPersona) ?? safePersona(hyp.otherPersona)
   if (!probePersona || probePersona === hyp.ownerPersona) return []
-  const pattern = typeof hit.secretPattern === 'string' ? hit.secretPattern : ''
-  const fingerprints = Array.isArray(hit.secretFingerprints)
-    ? hit.secretFingerprints.filter(value => typeof value === 'string' && /^[0-9a-f]{8,64}$/i.test(value))
-    : []
-  const fingerprintProof = fingerprints.length > 0 || hit.secretEvidence === 'fingerprint'
-  // Bodies are scrubbed before they reach a spec, so a body-pattern assertion cannot prove a
-  // disclosure. The broker's pre-redaction fingerprints can: the unentitled view carries the same
-  // secret fingerprint the entitled control carried.
-  const proofJq = fingerprintProof
-    ? '(((.steps.p1.secretMatches // []) | length) > 0) and (.steps.p1.secretMatches[0].sha256Prefix as $fp | (([.steps.c1.secretMatches[]?.sha256Prefix] | index($fp)) != null))'
-    : pattern
-      ? `((.steps.p1.body | test(${jqStr(pattern)})) or (.steps.p1.body | contains("[redacted]")))`
-      : '((.steps.p1.body | length) > 2)'
-  const controlJq = fingerprintProof
-    ? '(((.steps.c1.secretMatches // []) | length) > 0)'
-    : '((.steps.c1.body | length) > 2)'
-  const jq = `{ controlPassed: ((${is2xx('c1')}) and ${controlJq}), ` +
-    `confirmed: ((${is2xx('p1')}) and ${proofJq}), ` +
-    'observed: ("probe status=" + (.steps.p1.status | tostring)), expected: "sensitive data is restricted to the authorized actor" }'
+  const controlPath = typeof hit.controlPath === 'string' && hit.controlPath.startsWith('/') && hit.controlPath !== path
+    ? hit.controlPath
+    : null
+  const maskedControl = controlPath !== null
+  const controlPersona = maskedControl ? probePersona : null
+  const knownControlStatus = typeof hit.controlStatus === 'number' ? hit.controlStatus : null
+  const controlStatuses = knownControlStatus && knownControlStatus >= 400 && knownControlStatus < 500
+    ? [knownControlStatus]
+    : [401, 403]
+  const field = typeof hit.field === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.field) ? hit.field : ''
+  const pattern = typeof hit.secretPattern === 'string' && hit.secretPattern.length > 3 && hit.secretPattern.length < 200
+    ? hit.secretPattern
+    : GENERIC_CREDENTIAL_PATTERN
+  const sensitiveSelector = field
+    ? `select(.key == ${jqStr(field)})`
+    : 'select(.key | test("secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|password|private[_-]?key"; "i"))'
+  const rawSelector = `([.steps.%s.json | .. | objects | to_entries[] | ${sensitiveSelector} | select(.value | type == "string") | select((.value | length) > 8) | select((.value | test("[*…]|\\\\[redacted\\\\]"; "i")) | not)] | length)`
+  const credentialEvidence = (id: string): string =>
+    `((((.steps.${id}.secretMatches // []) | length) > 0) or ` +
+    `((.steps.${id}.body // "") | test(${jqStr(pattern)})) or ` +
+    `((${rawSelector.replaceAll('%s', id)}) >= 1))`
+  const bodyPattern = (id: string): string => `((.steps.${id}.body // "") | test(${jqStr(pattern)}))`
+  const fieldEvidence = (id: string): string => `((${rawSelector.replaceAll('%s', id)}) >= 1)`
+  const fingerprintEvidence = (id: string): string => `(((.steps.${id}.secretMatches // []) | length) > 0)`
+  // A compact control masks the value but the broker still fingerprints the redacted field, so the
+  // masked and raw views share a field but not a pre-redaction fingerprint. Require a fingerprint
+  // the control did not carry (or a credential-shaped/unmasked field the mask removed).
+  const distinctFingerprint =
+    `(.steps.p1.secretMatches[0].sha256Prefix as $fp | (([.steps.c1.secretMatches[]?.sha256Prefix] | index($fp)) == null))`
+  const proof = maskedControl
+    ? `((${bodyPattern('p1')}) or (${fieldEvidence('p1')}) or ((${fingerprintEvidence('p1')}) and ${distinctFingerprint}))`
+    : credentialEvidence('p1')
+  const control = maskedControl
+    ? `(${is2xx('c1')})`
+    : `((.steps.c1.status == ${controlStatuses.map(status => status.toString()).join(' or .steps.c1.status == ')}))`
+  const jq = `{ controlPassed: ${control}, ` +
+    `confirmed: ((${is2xx('p1')}) and ${proof}), ` +
+    `observed: ("probe status=" + (.steps.p1.status | tostring) + " credential=" + ((${proof}) | tostring)), ` +
+    'expected: "sensitive data is restricted to the authorized actor" }'
+  const logSurface = /(?:audit|activity|logs?|events?)/i.test(hyp.endpoint.pathTemplate)
   return [{
     kind: 'http_chain',
     vulnClass: 'info_disclosure',
     endpoint: hyp.endpoint.pathTemplate,
     spec: {
-      ...baseFields(hyp.endpoint.origin, 'Cross-actor sensitive-data read', 'CWE-200', 'information-disclosure', 'medium', jq),
+      ...baseFields(
+        hyp.endpoint.origin,
+        logSurface ? 'Credential reference exposed in an audit/activity read' : 'Credential exposure on an unentitled read',
+        logSurface ? 'CWE-532' : 'CWE-200',
+        'sensitive-data-exposure',
+        'high',
+        jq,
+      ),
+      // This claim is credential exposure, not an access-control claim: keep the impact text out of
+      // the authorization classifier so the proof is judged by the credential evidence itself.
+      impact: 'An attacker can read sensitive credentials or audit records they are not entitled to see.',
       kind: 'http_chain',
       steps: [
-        stepOf(hyp.endpoint.origin, 'c1', 'control', 'Authorized actor reads the sensitive response', { method: 'GET', pathAndQuery: path }, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Lower-privileged actor reads the same response', { method: 'GET', pathAndQuery: path }, probePersona),
+        stepOf(
+          hyp.endpoint.origin, 'c1', 'control',
+          maskedControl ? 'Lower-privileged actor reads the compact (masked) view' : 'Unauthenticated caller reads the sensitive route',
+          { method: 'GET', pathAndQuery: controlPath ?? path },
+          controlPersona,
+          {},
+          maskedControl ? [200] : controlStatuses,
+        ),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Lower-privileged actor reads the sensitive response', { method: 'GET', pathAndQuery: path }, probePersona),
       ],
     },
   }]
