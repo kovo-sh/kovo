@@ -363,3 +363,10 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
   - `hos-09`: shared-endpoint attribution ambiguity → patch retest skipped.
 - **Fix stream launched:** `hos-restore` (generic function-state delta evidence, sibling-read inference from the route map, patch/spec reconciliation, mutated-field disambiguation) with a hard gate: **20/20 + 20/20 patches at 100%** without weakening `oracle-invariants`/`replay-verifier`; stop and report if a target cannot be proven honestly.
 - **Sequencing unchanged:** provenance merge → realism #2/#3/#4 → `v6-retire-dsl` → certification; held-out 20/20 is a hard regression gate before cert.
+
+### 2026-11-23 — realism #2 (WAN/OOB) measured: capability gap, not wiring
+
+- **Result:** FAIL at `investigation`: 0 TP / 0 FP, 0% recall; floor used 467 requests with 0 confirmed and 0 leads; chain `wan-oob-exfil` 0/3; async false-negative **100%**.
+- **Diagnostic:** fixture callbacks `sqli=true, ssrf=false, xxe=false, webhook=false` — the product never triggered the async sinks, so `pending_oob` promotion was **not exercised**. This is not the "run closes early with a relay hit" wiring signature; it is route-shape/probe selection on this fixture (Layer-3 capability).
+- **Not claimed:** OOB wiring is neither passed nor failed by this run; it remains covered by unit tests (`v6-verify-loop` fake-clock promotion) and needs an agentic #2 run once the floor/agent can reach the sinks.
+- **Next:** realism #3 (staging safety) for the certifiable wiring properties (`approval_blocks=0`, `broker_denied_mutations=0`, `leaked_entities=0`, H2 burst), then #4 (scale/ranking).
