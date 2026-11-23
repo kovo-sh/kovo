@@ -19,6 +19,8 @@ export interface FindingFingerprintInput {
   method?: string | null
   /** Primary injectable/read parameter (query/body/header name). Empty when the route itself is the unit. */
   param?: string | null
+  /** GraphQL root field/resolver when the route itself is a single `/graphql` endpoint. */
+  graphqlField?: string | null
 }
 
 export interface SpecDedupeFields {
@@ -27,6 +29,7 @@ export interface SpecDedupeFields {
   specKind: string
   method: string
   param: string
+  graphqlField: string
 }
 
 export interface ComputedFindingFingerprint {
@@ -47,6 +50,7 @@ export interface DedupeCandidate {
   specKind?: string | null
   method?: string | null
   param?: string | null
+  graphqlField?: string | null
   reason?: string
   impact?: string
   remediation?: string
@@ -67,6 +71,7 @@ export interface ExistingFindingRef {
   specKind?: string | null
   method?: string | null
   param?: string | null
+  graphqlField?: string | null
   reason?: string
   impact?: string
   remediation?: string
@@ -146,6 +151,25 @@ const ORIGIN_WIDE_CWES = new Set([
   'CWE-1004', // Sensitive Cookie without HttpOnly
   'CWE-1275', // Sensitive Cookie SameSite
 ])
+
+/** True for vulnerability classes whose root cause is shared by every route on an origin. */
+export function isOriginWideCwe(cwe?: string | null, category?: string | null): boolean {
+  return ORIGIN_WIDE_CWES.has(normalizeCwe(cwe, category))
+}
+
+/**
+ * Extract the first root field/resolver name from a GraphQL operation string. The `/graphql`
+ * route is shared by every resolver, so the root field (not the path) is the dedupe unit.
+ * Returns an empty string when the payload is not a recognisable GraphQL operation.
+ */
+export function extractGraphqlRootField(query?: string | null): string {
+  if (typeof query !== 'string' || !query.trim()) return ''
+  const stripped = query.replace(/#[^\n\r]*/g, ' ')
+  const match = stripped.match(
+    /^\s*(?:(?:query|mutation|subscription)\b(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*(?:\([^)]*\))?\s*)?\{\s*([A-Za-z_][A-Za-z0-9_]*)/,
+  )
+  return match?.[1]?.toLowerCase() ?? ''
+}
 
 const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MONGO_ID_SEGMENT = /^[0-9a-f]{24}$/i
@@ -234,13 +258,15 @@ export function computeFindingFingerprint(input: FindingFingerprintInput): Compu
   const origin = normalizeOrigin(input.origin)
   const cwe = normalizeCwe(input.cwe, input.category)
   const normalizedEndpoint = normalizeEndpointTemplate(input.endpoint)
-  const authState = (input.authState?.trim().toLowerCase() || 'anonymous')
-  const specKind = (input.specKind?.trim().toLowerCase() || 'http_chain')
   const method = (input.method?.trim().toUpperCase() || 'ANY')
-  const param = (input.param?.trim().toLowerCase() || '')
-  // `(method, param)` participate in the key so GET vs DELETE BOLA/IDOR on one route and two
-  // distinct injectable parameters on one route do not collapse into a single fingerprint.
-  const key = `${origin}|${cwe}|${method}|${normalizedEndpoint}|${param}|${authState}|${specKind}`
+  const graphqlField = (input.graphqlField?.trim().toLowerCase() || '')
+  // The `/graphql` route is shared by every resolver, so the root field is the dedupe unit there.
+  // Otherwise the primary injectable/read parameter disambiguates two parameters on one route.
+  const paramOrGraphqlField = graphqlField ? `gql:${graphqlField}` : (input.param?.trim().toLowerCase() || '')
+  // Deliberately exclude authState/specKind: one root cause observed through two personas or two
+  // replay shapes is still the same finding. `(method, paramOrGraphqlField)` keep distinct attack
+  // surfaces (GET vs DELETE BOLA, two parameters, two resolvers) on one route separate.
+  const key = `${origin}|${normalizedEndpoint}|${method}|${paramOrGraphqlField}|${cwe}`
   const hash = createHash('sha256').update(key).digest('hex')
   return { key, hash, normalizedEndpoint }
 }
@@ -294,7 +320,7 @@ function personaAuthState(personas: readonly (string | undefined)[]): string {
 
 export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
   if (!spec || typeof spec !== 'object') {
-    return { endpoint: '/', authState: 'anonymous', specKind: 'http_chain', method: 'ANY', param: '' }
+    return { endpoint: '/', authState: 'anonymous', specKind: 'http_chain', method: 'ANY', param: '', graphqlField: '' }
   }
   const s = spec as Record<string, unknown>
   const specKind = typeof s.kind === 'string' && s.kind.trim() ? s.kind.trim() : 'http_chain'
@@ -308,8 +334,19 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const endpoint = probeStep?.request?.pathAndQuery ?? '/'
     const authState = personaAuthState(steps.filter(st => st?.role === 'probe').map(st => st?.request?.persona))
     const method = probeStep?.request?.method ?? 'ANY'
-    const param = primaryParamForRequest(probeStep?.request)
-    return { endpoint, authState, specKind, method, param }
+    const body = probeStep?.request?.jsonBody
+    const graphqlQuery = body && typeof body === 'object' && !Array.isArray(body)
+      ? (body as Record<string, unknown>).query
+      : undefined
+    const graphqlField = extractGraphqlRootField(typeof graphqlQuery === 'string' ? graphqlQuery : '')
+    return {
+      endpoint,
+      authState,
+      specKind,
+      method,
+      param: graphqlField ? '' : primaryParamForRequest(probeStep?.request),
+      graphqlField,
+    }
   }
 
   if (specKind === 'browser_chain' && Array.isArray(s.steps)) {
@@ -323,20 +360,21 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
       specKind,
       method: 'ANY',
       param: firstQueryParam(endpoint),
+      graphqlField: '',
     }
   }
 
   if (specKind === 'browser_dom') {
     const endpoint = typeof s.probePath === 'string' ? s.probePath : '/'
     const authState = typeof s.persona === 'string' && s.persona ? `persona:${s.persona}` : 'anonymous'
-    return { endpoint, authState, specKind, method: 'ANY', param: firstQueryParam(endpoint) }
+    return { endpoint, authState, specKind, method: 'ANY', param: firstQueryParam(endpoint), graphqlField: '' }
   }
 
   if (specKind === 'race_burst' && Array.isArray(s.burst)) {
     const first = s.burst[0] as { pathAndQuery?: string; persona?: string; method?: string } | undefined
     const endpoint = first?.pathAndQuery ?? '/'
     const authState = first?.persona ? `persona:${first.persona}` : 'anonymous'
-    return { endpoint, authState, specKind, method: first?.method ?? 'ANY', param: firstQueryParam(endpoint) }
+    return { endpoint, authState, specKind, method: first?.method ?? 'ANY', param: firstQueryParam(endpoint), graphqlField: '' }
   }
 
   if (specKind === 'rce_proof') {
@@ -349,6 +387,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
       specKind,
       method: probeStep?.request?.method ?? 'ANY',
       param: primaryParamForRequest(probeStep?.request),
+      graphqlField: '',
     }
   }
 
@@ -358,7 +397,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const persona = (typeof s.persona === 'string' ? s.persona : probe?.persona)
     const method = (typeof s.method === 'string' ? s.method : probe?.method) ?? 'ANY'
     const param = typeof s.paramName === 'string' ? s.paramName : firstQueryParam(endpoint)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param }
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param, graphqlField: '' }
   }
 
   if (specKind === 'sql_time_diff') {
@@ -370,7 +409,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const param = typeof s.paramName === 'string'
       ? s.paramName
       : firstJsonKey(s.jsonBody) || firstQueryParam(endpoint)
-    return { endpoint, authState: persona, specKind, method, param }
+    return { endpoint, authState: persona, specKind, method, param, graphqlField: '' }
   }
 
   if (specKind === 'auth_protocol_proof' && Array.isArray(s.steps)) {
@@ -384,7 +423,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const method = probeStep?.request?.method ?? 'ANY'
     const mutationKind = probeStep?.request?.authMutation?.kind
     const param = mutationKind ? `auth:${mutationKind}` : primaryParamForRequest(probeStep?.request)
-    return { endpoint, authState, specKind, method, param }
+    return { endpoint, authState, specKind, method, param, graphqlField: '' }
   }
 
   if (specKind === 'cache_differential') {
@@ -397,7 +436,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
       ? Object.keys(s.poisonHeaders as Record<string, unknown>).map(k => k.toLowerCase()).sort()
       : []
     const param = headers[0] ?? firstQueryParam(endpoint)
-    return { endpoint, authState: persona, specKind, method, param }
+    return { endpoint, authState: persona, specKind, method, param, graphqlField: '' }
   }
 
   if (specKind === 'ws_chain' && Array.isArray(s.steps)) {
@@ -405,7 +444,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const probeStep = steps.find(st => st?.role === 'probe') ?? steps[0]
     const endpoint = (typeof s.pathAndQuery === 'string' ? s.pathAndQuery : probeStep?.pathAndQuery) ?? '/'
     const persona = (typeof s.persona === 'string' ? s.persona : probeStep?.persona)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method: 'ANY', param: firstQueryParam(endpoint) }
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method: 'ANY', param: firstQueryParam(endpoint), graphqlField: '' }
   }
 
   if (specKind === 'upload_probe') {
@@ -414,7 +453,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const persona = uploadReq?.persona ?? uploadReq?.request?.persona ?? (typeof s.persona === 'string' ? s.persona : undefined)
     const method = uploadReq?.method ?? uploadReq?.request?.method ?? 'ANY'
     const param = typeof uploadReq?.fieldName === 'string' ? uploadReq.fieldName : firstQueryParam(endpoint)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param }
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param, graphqlField: '' }
   }
 
   if (specKind === 'static_ast_proof') {
@@ -422,20 +461,20 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const file = typeof s.file === 'string' ? s.file : ''
     const endpoint = file ? `/${[repo, file].filter(Boolean).join('/')}` : '/'
     const startLine = typeof s.startLine === 'number' ? String(s.startLine) : ''
-    return { endpoint, authState: 'static', specKind, method: 'ANY', param: startLine }
+    return { endpoint, authState: 'static', specKind, method: 'ANY', param: startLine, graphqlField: '' }
   }
 
   if (specKind === 'dns_takeover') {
     const endpoint = typeof s.probePath === 'string' ? s.probePath : '/'
-    return { endpoint, authState: 'anonymous', specKind, method: 'ANY', param: '' }
+    return { endpoint, authState: 'anonymous', specKind, method: 'ANY', param: '', graphqlField: '' }
   }
 
   if (specKind === 'tls_audit') {
     // TLS posture is origin-wide by definition; `/` is the correct unit of work here.
-    return { endpoint: '/', authState: 'anonymous', specKind, method: 'ANY', param: '' }
+    return { endpoint: '/', authState: 'anonymous', specKind, method: 'ANY', param: '', graphqlField: '' }
   }
 
-  return { endpoint: '/', authState: 'anonymous', specKind, method: 'ANY', param: '' }
+  return { endpoint: '/', authState: 'anonymous', specKind, method: 'ANY', param: '', graphqlField: '' }
 }
 
 function activeExistingFindings(
@@ -467,6 +506,7 @@ export function checkStructuralDuplicate(
     specKind: candidate.specKind,
     method: candidate.method,
     param: candidate.param,
+    graphqlField: candidate.graphqlField,
   })
   const candidateHash = candidate.fingerprintHash || fingerprint.hash
   const active = activeExistingFindings(existingFindings, excludeFindingId ?? candidate.id)
@@ -481,6 +521,7 @@ export function checkStructuralDuplicate(
       specKind: existing.specKind,
       method: existing.method,
       param: existing.param,
+      graphqlField: existing.graphqlField,
     }).hash
     return existingFp === candidateHash || existingFp === fingerprint.hash
   })
@@ -541,26 +582,6 @@ export function findNearbyFindings(
   return sortExistingByPrecedence(nearby).slice(0, 12)
 }
 
-function tokenize(text: string): Set<string> {
-  const stop = new Set(['the', 'and', 'for', 'with', 'from', 'that', 'this', 'via', 'into', 'missing', 'allows', 'endpoint', 'check'])
-  const tokens = text
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .split(/\s+/)
-    .filter(tok => tok.length >= 3 && !stop.has(tok))
-  return new Set(tokens)
-}
-
-function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
-  if (!a.size && !b.size) return 0
-  let intersection = 0
-  for (const tok of a) {
-    if (b.has(tok)) intersection++
-  }
-  const union = a.size + b.size - intersection
-  return union === 0 ? 0 : intersection / union
-}
-
 function deterministicSemanticFallback(
   candidate: DedupeCandidate,
   nearbyFindings: readonly ExistingFindingRef[],
@@ -568,7 +589,6 @@ function deterministicSemanticFallback(
   const candOrigin = normalizeOrigin(candidate.origin)
   const candCwe = normalizeCwe(candidate.cwe, candidate.category)
   const candEndpoint = normalizeEndpointTemplate(candidate.endpoint)
-  const candTokens = tokenize(`${candidate.title} ${candidate.reason ?? ''}`)
 
   for (const existing of nearbyFindings) {
     const exOrigin = normalizeOrigin(existing.origin)
@@ -577,8 +597,9 @@ function deterministicSemanticFallback(
     const sameOrigin = candOrigin === exOrigin
     const sameCwe = candCwe !== 'unknown' && candCwe === exCwe
     const sameEndpoint = candEndpoint === exEndpoint
-    // Two probes that explicitly name different verbs or different injectable parameters on the
-    // same route are distinct attack surfaces (GET vs DELETE BOLA, two injectable params).
+    // Two probes that explicitly name different verbs, different injectable parameters or different
+    // GraphQL root fields on the same route are distinct attack surfaces (GET vs DELETE BOLA, two
+    // parameters, two resolvers).
     const methodConflict = Boolean(
       candidate.method && existing.method &&
       candidate.method.trim().toUpperCase() !== existing.method.trim().toUpperCase(),
@@ -587,7 +608,11 @@ function deterministicSemanticFallback(
       candidate.param && existing.param &&
       candidate.param.trim().toLowerCase() !== existing.param.trim().toLowerCase(),
     )
-    const probeConflict = methodConflict || paramConflict
+    const fieldConflict = Boolean(
+      candidate.graphqlField && existing.graphqlField &&
+      candidate.graphqlField.trim().toLowerCase() !== existing.graphqlField.trim().toLowerCase(),
+    )
+    const probeConflict = methodConflict || paramConflict || fieldConflict
     const shouldUpgrade = severityRank(candidate.severity) > severityRank(existing.severity)
 
     // Same origin + origin-wide CWE (e.g., CORS / CSP / HSTS / TLS / cookies):
@@ -602,7 +627,9 @@ function deterministicSemanticFallback(
       }
     }
 
-    // Same origin + same CWE + same normalized endpoint template (even if authState/specKind differs)
+    // Same origin + same CWE + same normalized endpoint template. Cross-endpoint title similarity
+    // is deliberately NOT a duplicate signal: two BOLA routes or two resolvers on one host are
+    // separate findings even when the prose is near-identical.
     if (sameOrigin && sameCwe && sameEndpoint && !probeConflict) {
       return {
         isDuplicate: true,
@@ -610,21 +637,6 @@ function deterministicSemanticFallback(
         shouldUpgrade,
         rationale: `Deterministic fallback: same origin (${candOrigin}), ${candCwe}, and normalized endpoint (${candEndpoint}) as existing finding ${existing.id}.`,
         usedLlm: false,
-      }
-    }
-
-    // Same origin + same CWE + very high title/reason token overlap
-    if (sameOrigin && sameCwe && !probeConflict) {
-      const exTokens = tokenize(`${existing.title} ${existing.reason ?? ''}`)
-      const sim = jaccardSimilarity(candTokens, exTokens)
-      if (sim >= 0.6) {
-        return {
-          isDuplicate: true,
-          duplicateOfId: existing.id,
-          shouldUpgrade,
-          rationale: `Deterministic fallback: same origin and ${candCwe} with high semantic token overlap (${sim.toFixed(2)}) with finding ${existing.id}.`,
-          usedLlm: false,
-        }
       }
     }
   }
