@@ -461,7 +461,10 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     isSuccess(control.status) &&
     control.json !== undefined &&
     Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
-  const crossTenant = Boolean((resourceTenant && probe.actor.tenant && resourceTenant !== probe.actor.tenant) || crossTenantControlRead)
+  // A claim-declared `resourceTenant` is model-supplied; it only counts when a signed control arm
+  // corroborates the boundary (a denial on the same route, or a read served to the other tenant).
+  const crossTenant = crossTenantControlRead ||
+    Boolean(resourceTenant && probe.actor.tenant && resourceTenant !== probe.actor.tenant && boundaryControlDenied)
   const vertical = input.impactClass === 'bfla'
 
   let roleDifferential = false
@@ -543,6 +546,22 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     }
   }
   if (crossTenant) {
+    // A route that declares itself public (`/public`, `/share`, `/embed`, …) is readable by anyone
+    // who holds the link; serving it to another tenant or anonymously is by design. Such a claim
+    // needs owner-scoped private data, not merely a cross-tenant 200.
+    const publicRoute = steps.some(step => PUBLIC_ROUTE_RE.test(step.route ?? ''))
+    if (publicRoute) {
+      const disclosure = assessReadDisclosure({ steps, probe })
+      base.disclosureFields = disclosure.fields
+      if (!disclosure.satisfied) {
+        return {
+          required: true,
+          satisfied: false,
+          reason: `Cross-tenant claim dismissed: the route declares itself public and ${disclosure.reason}`,
+          evidence: base,
+        }
+      }
+    }
     return {
       required: true,
       satisfied: true,
@@ -842,6 +861,26 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     labels.changedFields = [...delta.changed, ...delta.added, ...delta.removed]
   }
   labels.protectedFields = labels.changedFields.filter(isProtectedField)
+  // K=6 cross-talk guard: a delta caused by another worker's write is not this probe's impact.
+  // The after-read must reflect a value this probe sent (or a marker it injected).
+  const sent = new Set<string>()
+  if (mutatingProbe.requestJson !== undefined) {
+    for (const value of flattenJson(mutatingProbe.requestJson).values()) {
+      sent.add(value)
+      for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) sent.add(token)
+    }
+  }
+  const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
+  const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
+    (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token)))
+  if (labels.persisted && !attributable && !labels.oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `The state delta (${labels.changedFields.slice(0, 6).join(', ')}) does not reflect any value this probe sent; a concurrent writer cannot be excluded, so it is not this proof's impact.`,
+      evidence: labels,
+    }
+  }
   labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
   if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
     return {
@@ -1071,6 +1110,8 @@ export function routeFamily(pathAndQuery: string | null | undefined): string {
 
 const MFA_CHALLENGE_RE = /\b(?:two[- ]?factor|2fa|mfa|otp|totp|one[- ]?time[- ]?(?:pass(?:word|code)?|code)|verification code|authenticator|challenge[- ]?required|mfa_required|step[- ]?up)\b/i
 const LOGIN_REDIRECT_RE = /\/(?:login|signin|sign-in|sso|auth|session|mfa|2fa|verify)\b/i
+/** Share-style routes: readable by anyone holding the link, so cross-tenant reads are by design. */
+const PUBLIC_ROUTE_RE = /\/(?:public|share|shared|embed|preview|open|link)(?:\/|$)/i
 
 export type BoundaryArm = 'control_denied' | 'actor_differential' | null
 
@@ -1357,7 +1398,9 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   }
 
   // access
-  if (controlDenied && (!escape || strict)) {
+  // `expectControlDenied: false` is model-supplied and must never *disable* the gate: an observed
+  // denial always has to be crossed by the variant. The flag only documents intent.
+  if (controlDenied) {
     if (!crossed) {
       return {
         required: true, satisfied: false, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,

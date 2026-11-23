@@ -1356,6 +1356,7 @@ test('parity: guardian_verify dismisses the K=6 business-logic, markup and discl
     const logicExplicit: VerifyClaim[] = [...logicNaive, {
       kind: 'impact', impactClass: 'business_logic', probeExchangeId: patch,
       controlExchangeIds: [before], afterExchangeId: after, actorRoles: { persona_a: 'owner' },
+      requestBody: { status: 'paid' },
     }]
     const logicExplicitResult = oracleFor(server, logicTitle, logicExplicit)
     assert.equal(logicExplicitResult.passed, false)
@@ -1398,4 +1399,118 @@ test('parity: executable markup still backs a markup claim', async () => {
     await server.close()
     await fx.close()
   }
+})
+
+// ---------------------------------------------------------------------------
+// 11. Reviewer audit: gamed controls, helper trust, and K=6 cross-talk
+// ---------------------------------------------------------------------------
+
+test('audit: expectControlDenied:false cannot skip crossing an observed denial', () => {
+  const viewer = { handle: 'viewer', role: 'viewer' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const admin = { handle: 'admin', role: 'admin' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const unrelated = assessBoundary({
+    impactClass: 'authorization',
+    boundaryClass: 'access',
+    // Model pairs a denied admin control with a 200 on an unrelated route and asks to skip the gate.
+    expectControlDenied: false,
+    steps: [
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewer },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/invoices/i1', status: 200, actor: admin, json: { id: 'i1', amount_cents: 4200 } },
+    ],
+  })
+  assert.equal(unrelated.satisfied, false, 'an observed denial must be crossed on the same route family')
+  assert.match(unrelated.reason, /no variant exchange on the same route family|not a bypass/i)
+
+  const crossed = assessBoundary({
+    impactClass: 'authorization',
+    boundaryClass: 'access',
+    steps: [
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewer },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/admin/audit', status: 200, actor: admin, json: { rows: [{ actor: 'admin' }] } },
+    ],
+  })
+  assert.equal(crossed.satisfied, true, crossed.reason)
+  assert.equal(crossed.arm, 'control_denied')
+})
+
+test('audit: a concurrent writer cannot fake a business-logic delta (no nonce match)', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  // Another worker flipped the same invoice; the after-read does not reflect this probe's value.
+  const crossTalk = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', status: 'draft' } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/invoices/i1', status: 200, actor: owner, requestJson: { status: 'paid' }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', status: 'refunded' } },
+    ],
+  })
+  assert.equal(crossTalk.satisfied, false)
+  assert.match(crossTalk.reason, /does not reflect any value this probe sent|concurrent writer/i)
+
+  // Same shape, own value: attributable, but a non-protected self-service field is still not impact.
+  const ownValue = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', status: 'draft' } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/invoices/i1', status: 200, actor: owner, requestJson: { status: 'paid' }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', status: 'paid' } },
+    ],
+  })
+  assert.equal(ownValue.satisfied, false)
+  assert.match(ownValue.reason, /self-service|non-protected/i)
+})
+
+test('audit: script-reported booleans and fabricated actor labels cannot confirm', async () => {
+  // A result that only asserts success in prose/booleans has no claims: the host rejects it.
+  assert.throws(
+    () => parseVerifyScriptResult({ title: 'Cross-tenant BOLA', confirmed: true, verified: true, claims: [] }),
+    /no claims|stdout alone/i,
+    'the host ignores script-reported booleans',
+  )
+
+  const fx = await startFixture()
+  const server = await startRpc(fx)
+  try {
+    const id = (res: RpcResponse) => (res.result as { exchangeId: string }).exchangeId
+    // The script fabricates owner/globex labels and a resource tenant; the signed label says viewer/acme.
+    const read = id(await rpc(server, 'http', { path: '/api/reports/9f1/public', persona: 'viewer' }))
+    const claims: VerifyClaim[] = [
+      { kind: 'status', exchangeId: read, expected: 200 },
+      { kind: 'impact', impactClass: 'authorization', probeExchangeId: read, resourceTenant: 'globex',
+        actorRoles: { viewer: 'owner' }, actorTenants: { viewer: 'globex' } },
+    ]
+    const res = oracleFor(server, 'Cross-tenant BOLA on GET /api/reports/:reportId/public', claims)
+    assert.equal(res.passed, false, 'fabricated role/tenant labels must not create a differential')
+    const impact = res.checks.find(check => check.claim.kind === 'impact')
+    assert.equal(impact?.passed, false)
+    const observed = impact?.observed as { crossTenant?: boolean; roleDifferential?: boolean } | undefined
+    assert.equal(observed?.crossTenant, false)
+    assert.equal(observed?.roleDifferential, false)
+  } finally {
+    await server.close()
+    await fx.close()
+  }
+})
+
+test('audit: cross-tenant read on a declared public route needs private owner-scoped data', () => {
+  const a = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const b = { handle: 'persona_b', role: 'owner' as const, tenant: 'globex', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const publicShare = assessAuthorizationImpact({
+    impactClass: 'authorization',
+    steps: [
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/reports/r1/public', status: 200, actor: a, json: { id: 'r1', name: 'Quarterly', workspace: 'acme', ref: 'rbc_acme_0123456789ab' } },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/reports/r1/public', status: 200, actor: b, json: { id: 'r1', name: 'Quarterly', workspace: 'acme', ref: 'rbc_acme_0123456789ab' } },
+    ],
+  })
+  assert.equal(publicShare.satisfied, false, publicShare.reason)
+  assert.match(publicShare.reason, /declares itself public/i)
+
+  const privateRead = assessAuthorizationImpact({
+    impactClass: 'authorization',
+    steps: [
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: a, json: { id: 'i1', owner_id: 'persona_a', amount_cents: 4200 } },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/invoices/i1', status: 200, actor: b, json: { id: 'i1', owner_id: 'persona_a', amount_cents: 4200 } },
+    ],
+  })
+  assert.equal(privateRead.satisfied, true, privateRead.reason)
 })

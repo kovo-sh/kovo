@@ -88,6 +88,8 @@ export interface VerifyTranscriptRequest {
   bodySha256: string
   personaHandle?: string | null
   sessionRole?: string | null
+  /** Host-resolved persona role label (e.g. "owner (acme)"); signed, never script-supplied. */
+  actorRoleLabel?: string | null
   nonce: string
 }
 
@@ -805,8 +807,14 @@ function transcriptImpactStep(
     try { json = JSON.parse(body) } catch { json = undefined }
   }
   const handle = record.request?.personaHandle ?? null
-  const role = normalizeRole(claim.actorRoles?.[handle ?? '']) ?? normalizeRole(handle)
-  const tenant = claim.actorTenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant
+  // Host-signed persona label wins; a script cannot manufacture a role or tenant differential.
+  const signedLabel = record.request?.actorRoleLabel ?? null
+  const role = signedLabel !== null
+    ? normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null
+    : normalizeRole(handle) ?? normalizeRole(claim.actorRoles?.[handle ?? '']) ?? null
+  const tenant = signedLabel !== null
+    ? parseRoleLabel(signedLabel).tenant ?? parseRoleLabel(handle).tenant ?? null
+    : parseRoleLabel(handle).tenant ?? claim.actorTenants?.[handle ?? ''] ?? null
   const actor: ActorIdentity = {
     handle,
     role,
@@ -1964,6 +1972,7 @@ export class VerifyRpcServer {
         bodySha256: createHash('sha256').update(body ?? '').digest('hex'),
         personaHandle: persona ?? null,
         sessionRole: role ?? null,
+        actorRoleLabel: (persona ? this.options.grant.personas?.get(persona)?.roleLabel ?? null : null),
         nonce: this.nonce,
       },
     }
