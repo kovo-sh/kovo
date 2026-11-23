@@ -1314,6 +1314,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               expectControlDenied: spec.expectControlDenied,
               oracleEvents,
               targetOrigin: spec.origin,
+              credentialPatterns: spec.proofPatterns ?? null,
             })
         // Universal default-deny boundary gate: auth/bypass claims always need a challenged control
         // (401/403, login redirect, MFA challenge, negative id) plus a crossing variant; access

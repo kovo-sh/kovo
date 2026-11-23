@@ -140,6 +140,13 @@ export interface ImpactInput {
   oracleEvents?: readonly string[]
   catalogPrices?: readonly number[]
   targetOrigin?: string | null
+  /**
+   * Credential value shapes the proof itself asserts (the replay spec's `proofPatterns`). The host
+   * re-tests each one against the recorded bodies: it must match the probe response and no control
+   * response. This is evidence, not a declaration — an unmatched or control-echoing pattern does
+   * nothing.
+   */
+  credentialPatterns?: readonly string[] | null
 }
 
 export interface ImpactAssessment {
@@ -402,6 +409,46 @@ function hasOracle(events: readonly string[] | undefined, kinds: readonly string
   return events.some(event => wanted.has(event))
 }
 
+/** Reject patterns that would match anything: the host must re-observe the value, not trust a claim. */
+function isSpecificCredentialPattern(pattern: unknown): pattern is string {
+  if (typeof pattern !== 'string') return false
+  const value = pattern.trim()
+  if (value.length < 8 || value.length > 200) return false
+  if (/\.\*|\.\+|\\s\*|\\s\+|\(\?/.test(value)) return false
+  try {
+    // Must compile; a broken pattern is not evidence.
+    new RegExp(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Credential-shaped values declared by the proof: a pattern that matches the probe response and no
+ * control response. Returned patterns are the evidence; the caller still requires an authorization
+ * boundary (a denied sibling arm or a role differential) before treating it as a disclosure.
+ */
+function credentialPatternEvidence(
+  patterns: readonly string[] | null | undefined,
+  probe: ImpactStep,
+  controls: readonly ImpactStep[],
+): string[] {
+  if (!patterns?.length) return []
+  const probeBody = typeof probe.body === 'string' ? probe.body : ''
+  if (!probeBody) return []
+  const controlBodies = controls.map(control => (typeof control.body === 'string' ? control.body : '')).join('\n')
+  const matched: string[] = []
+  for (const pattern of patterns) {
+    if (!isSpecificCredentialPattern(pattern)) continue
+    const expression = new RegExp(pattern)
+    if (!expression.test(probeBody)) continue
+    if (controlBodies && expression.test(controlBodies)) continue
+    matched.push(pattern)
+  }
+  return matched.slice(0, 4)
+}
+
 // ---------------------------------------------------------------------------
 // Authorization / BFLA
 // ---------------------------------------------------------------------------
@@ -590,6 +637,19 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       required: true,
       satisfied: true,
       reason: `Credential-shaped value(s) disclosed: ${disclosedFingerprints.length} pre-redaction secret fingerprint(s) appear in the probe response and not in any entitled control.`,
+      evidence: base,
+    }
+  }
+  // A credential-bearing response proves disclosure only when the caller was outside the route's
+  // entitlement at the same time: a denied sibling arm on the same route, or a role differential.
+  // The pattern is re-tested against the recorded bodies, so a declared-but-absent value (or one a
+  // control also returns, i.e. a public constant) never confirms.
+  const patternEvidence = credentialPatternEvidence(input.credentialPatterns, probe, controls)
+  if (patternEvidence.length > 0 && probe.actor.handle !== null && (boundaryControlDenied || roleDifferential)) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: `Credential-shaped value disclosed: the probe response matches ${patternEvidence.length} declared credential shape(s) absent from every control, under a ${boundaryControlDenied ? 'denied sibling control' : 'role differential'}.`,
       evidence: base,
     }
   }
@@ -1367,9 +1427,15 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   const controlSteps = steps.filter(step => step.arm === 'control')
   const successes = steps.filter(step => isSuccess(step.status))
   const successFamilies = new Set(successes.map(step => routeFamily(step.route ?? '')).filter(Boolean))
+  // A denied arm only proves the caller was outside an entitlement *before* the crossing action.
+  // A 404/403 readback recorded after the successful probe is persistence evidence (the object is
+  // gone) or a consequence of the mutation, not a boundary the probe crossed — reading it as one
+  // lets a legitimate post-delete readback mask a real actor differential.
+  const firstProbeIndex = steps.findIndex(step => step.arm === 'probe')
   const signals = steps
     .map(step => boundarySignalOf(step, successFamilies))
     .filter((signal): signal is BoundarySignal => signal !== null)
+    .filter(signal => firstProbeIndex < 0 || steps.indexOf(signal.step) < firstProbeIndex)
   const probeActor = steps.find(step => step.arm === 'probe')?.actor ?? null
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   const peerSignal = signals.find(entry => {

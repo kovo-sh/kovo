@@ -1311,6 +1311,9 @@ function synthSensitiveRead(hyp: EngineHypothesis, result: DifferentialResult): 
       // the authorization classifier so the proof is judged by the credential evidence itself.
       impact: 'An attacker can read sensitive credentials or audit records they are not entitled to see.',
       kind: 'http_chain',
+      // The credential value shape the probe observed. The host re-tests it against the replayed
+      // bodies (probe matches, no control matches); it is never accepted on the claim alone.
+      ...(pattern ? { proofPatterns: [pattern] } : {}),
       steps: [
         stepOf(
           hyp.endpoint.origin, 'c1', 'control',
