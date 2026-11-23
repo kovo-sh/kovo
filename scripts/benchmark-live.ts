@@ -16,7 +16,7 @@ import { createEngineEnv, discoverEndpoints } from './benchmark-env.ts'
 import type { EngineEnv } from './benchmark-env.ts'
 import { formHypotheses, needsCsrf, profileCaps, runHypothesis } from './benchmark-probes.ts'
 import type { Hypothesis, HypothesisOutcome } from './benchmark-probes.ts'
-import { compatibleClasses, endpointMatches, scoreManifest } from './benchmark-score.ts'
+import { compatibleClasses, endpointKey, endpointMatches, scoreManifest, sharedEndpointKeys, specBindsParam, specSubjectOf } from './benchmark-score.ts'
 import type { ScoredOutcome } from './benchmark-score.ts'
 import { synthesizeSpecs } from './benchmark-specs.ts'
 import {
@@ -339,6 +339,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       const settled = await Promise.all(batch.map(async synth => {
         scored.specSubmitted = true
         scored.spec = synth.spec
+        scored.specSubject = specSubjectOf(synth.spec)
         try {
           const res = await verifyWithProfile(env, synth.spec, verifier.backend, caps.inlineRetries, watch)
           return { synth, res }
@@ -418,6 +419,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
     outcomes: executed,
     encodingSkipPaths: plan.encodingSkips.map(s => s.path),
     budgetSkippedPaths: [...budgetSkipped],
+    sharedEndpointKeys: sharedEndpointKeys(args.manifest.challenges),
   })
   notes.push(`Requests used: ${env.requestsUsed()} / ${config.maxRequests}; hypotheses=${discoveredCount}; executed=${executed.length}; budgetSkipped=${budgetSkipped.size}`)
   const executeWallMs = Math.max(1, Date.now() - executeStarted)
@@ -457,6 +459,7 @@ function probePreference(vulnClass: string, probeClass: string): number {
 
 function collectConfirmedFindings(manifest: BenchmarkManifest, executed: readonly ExecutedOutcome[], traces: readonly TargetTrace[]): ConfirmedFinding[] {
   const byId = new Map(manifest.challenges.map(c => [c.id, c]))
+  const shared = sharedEndpointKeys(manifest.challenges)
   const seen = new Set<string>()
   const usedSpecs = new Set<string>()
   const out: ConfirmedFinding[] = []
@@ -464,7 +467,9 @@ function collectConfirmedFindings(manifest: BenchmarkManifest, executed: readonl
     if (!trace.confirmed || seen.has(trace.id)) continue
     const challenge = byId.get(trace.id)
     if (!challenge) continue
-    const candidates = executed.filter(o => o.confirmed && o.spec && endpointMatches(challenge.endpoint, o.path))
+    const strictBinding = shared.has(endpointKey(challenge.endpoint))
+    const candidates = executed.filter(o => o.confirmed && o.spec && endpointMatches(challenge.endpoint, o.path) &&
+      (!strictBinding || specBindsParam(o.specSubject, challenge.param)))
     // A spec is attributable to at most one target. Prefer an unused spec whose probe class is
     // compatible with this target; if every candidate was already claimed by another target on the
     // same endpoint, the evidence is genuinely shared and is marked ambiguous.

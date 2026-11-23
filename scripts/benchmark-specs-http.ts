@@ -242,6 +242,73 @@ function stateDeltaSpec(
   }]
 }
 
+/**
+ * Function-level state delta: a privileged control actor sets a benign baseline, the lower-privileged
+ * actor invokes the function, and a separate read of the function's own status route (or an inferred
+ * sibling read) shows the state actually changed. Identifier binding is asserted when the read body
+ * exposes the resource the function targeted. A mutation echo alone can never satisfy this proof.
+ */
+interface FunctionStateObservation {
+  path: string
+  controlBody: unknown
+  probeBody: unknown
+  fieldPath: string[]
+  controlValue?: unknown
+  probeValue: unknown
+  bindingPath?: string[]
+  bindingValue?: string
+}
+
+function jqAccessor(stepId: string, path: readonly string[]): string {
+  return path.reduce((acc, segment) => (/^\d+$/.test(segment) ? `${acc}[${segment}]` : `${acc}[${jqStr(segment)}]`), `.steps.${stepId}.json`)
+}
+
+function jqLiteral(value: unknown): string {
+  if (value === undefined || value === null) return 'null'
+  return JSON.stringify(value)
+}
+
+function functionStateDeltaSpec(
+  o: HypothesisOutcome,
+  env: ProbeEnv,
+  state: FunctionStateObservation,
+  controlActor: string,
+  probeActor: string | null,
+  vertical: boolean,
+): SynthesizedSpec[] {
+  if (!state.fieldPath.length || !state.path.startsWith('/')) return []
+  const stepExtra = env.caps.sessionAndCsrf ? { csrfBind: true } : {}
+  const writeMethod: 'POST' | 'PUT' | 'PATCH' = o.hyp.method === 'PUT' || o.hyp.method === 'PATCH' ? o.hyp.method : 'POST'
+  const actionPath = probePathFor(o.hyp)
+  const readAccessor = jqAccessor('c1', state.fieldPath)
+  const afterAccessor = jqAccessor('p2', state.fieldPath)
+  const controlLit = jqLiteral(state.controlValue)
+  const probeLit = jqLiteral(state.probeValue)
+  const binding = state.bindingPath && state.bindingValue
+    ? ` and (${jqAccessor('c1', state.bindingPath)} == ${jqStr(state.bindingValue)}) and (${jqAccessor('p2', state.bindingPath)} == ${jqStr(state.bindingValue)})`
+    : ''
+  const jq = `{ controlPassed: ((${is2xx('c1')}) and ((.steps.c1.body | length) > 2) and (${readAccessor} == ${controlLit})${binding}), ` +
+    `confirmed: ((${is2xx('p1')}) and (${is2xx('p2')}) and (${afterAccessor} == ${probeLit}) and (${readAccessor} == ${controlLit}) and (.steps.p2.body != .steps.c1.body)${binding}), ` +
+    `observed: ("probe status=" + (.steps.p1.status | tostring) + " state=" + (${afterAccessor} | tostring)), expected: "only the privileged role may change function state" }`
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...baseFields(env,
+        vertical ? 'Vertical BFLA: privileged function invocation (state delta)' : 'Cross-actor function state change (state delta)',
+        vertical ? 'CWE-285' : 'CWE-639', 'broken-access-control', 'high', jq),
+      kind: 'http_chain',
+      ...(vertical ? { requiredRole: 'admin' as const } : {}),
+      ...(vertical ? { expectedImpactEvents: ['state_delta'] } : {}),
+      steps: [
+        stepOf(env, 'w1', 'control', 'Authorized actor sets the function state to a benign baseline', { method: writeMethod, pathAndQuery: actionPath, jsonBody: state.controlBody }, controlActor),
+        stepOf(env, 'c1', 'control', 'Authorized actor reads the function state', { method: 'GET', pathAndQuery: state.path }, controlActor),
+        stepOf(env, 'p1', 'probe', `${probeActor ? 'Lower-privileged actor' : 'Unauthenticated caller'} invokes the privileged function`, { method: writeMethod, pathAndQuery: actionPath, jsonBody: state.probeBody }, probeActor, stepExtra),
+        stepOf(env, 'p2', 'control', 'Authorized actor re-reads the function state', { method: 'GET', pathAndQuery: state.path }, controlActor),
+      ],
+    },
+  }]
+}
+
 export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const owner = o.pair?.owner ?? env.owner
   const other = o.pair?.other ?? env.other
@@ -304,6 +371,13 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
     // credential is the control actor.
     const vertical = Boolean(env.admin && owner === env.admin && mutatingActor && mutatingActor !== env.admin)
     const requiredRole = vertical ? 'admin' as const : undefined
+    // A function-level mutation proves persistence only through a separate read of the function's
+    // observable state; the probe observed the exact delta (and its benign baseline) already.
+    const functionState = o.details.functionState as FunctionStateObservation | undefined
+    if (mutating && probeOk && functionLevel && functionState && !o.hyp.deleteMethod) {
+      out.push(...functionStateDeltaSpec(o, env, functionState, owner, mutatingActor, vertical && method !== 'DELETE'))
+      continue
+    }
     // A mutating route that acknowledges with a trivial `{ok:true}` body, or an elevated action whose
     // response is only an echo, has real impact only when a separate read shows the state change.
     if (mutating && probeOk && elevated && (ownerTrivial || ownerOk)) {
