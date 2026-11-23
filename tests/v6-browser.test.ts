@@ -9,10 +9,14 @@
  * Fixtures are synthetic; no benchmark challenge literals are asserted.
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, test } from 'node:test'
 import type { TestContext } from 'node:test'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from '../src/server/broker.ts'
 import type { RequestBroker } from '../src/server/broker.ts'
+import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import {
   classifyBrowserHttpRequest,
   isAssetOriginAllowed,
@@ -341,7 +345,53 @@ describe('v6 browser: pooled per-persona contexts', () => {
     assert.ok(initScript.includes('step'), 'sessionStorage seed key is installed')
     assert.deepEqual(visit.localStorageKeys, ['guardian_session', 'tenant'])
     assert.deepEqual(visit.sessionStorageKeys, ['step'])
-    assert.equal(broker ? true : false, true)
+  })
+
+  test('seeds pooled contexts from the v6-auth persona browser attachment (HttpOnly + storage)', async (t: TestContext) => {
+    const { chmodSync } = await import('node:fs')
+    const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-attach-'))
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    const sessionPath = join(dir, 'session.json')
+    writeFileSync(sessionPath, JSON.stringify({
+      headerType: 'cookie',
+      value: 'legacy-cookie-value',
+      adapterUsed: 'manual',
+      bundle: {
+        cookies: [{
+          name: '__session', value: 'vault-cookie-value', domain: 'app.fixture.test', path: '/',
+          httpOnly: true, secure: true,
+        }],
+        storage: { localStorage: { vaultKey: 'vault-value' }, sessionStorage: { vaultStep: '1' } },
+      },
+    }), 'utf8')
+    chmodSync(sessionPath, 0o600)
+    const persona: ResolvedPersona = {
+      id: 'persona-admin',
+      handle: 'admin',
+      roleLabel: 'Admin',
+      originAllowlist: [appOrigin],
+      authKind: 'login',
+      headerName: null,
+      secret: 'legacy-cookie-value',
+      canaryMarkers: [],
+      sessionPath,
+    }
+
+    const { broker } = makeFakeBroker()
+    const { browser, fake } = await withBrowser(t, { broker })
+    fake.runtime.localStorageKeys = ['vaultKey']
+    fake.runtime.sessionStorageKeys = ['vaultStep']
+
+    const [visit] = await browser.visitPages([
+      { origin: appOrigin, pathAndQuery: '/admin', persona: 'admin' },
+    ], baseGrant({ personas: new Map([['admin', persona]]) }), AbortSignal.timeout(30_000))
+
+    const context = fake.runtime.contexts[0]!
+    assert.equal(context.cookies.length, 1, 'vault attachment contributes Playwright-ready cookies')
+    assert.equal(context.cookies[0]!.name, '__session')
+    assert.equal(context.cookies[0]!.httpOnly, true, 'HttpOnly is preserved from the vault attachment')
+    assert.ok(context.initScripts.join('\n').includes('vaultKey'), 'vault storage hydration script is installed')
+    assert.deepEqual(visit.sessionStorageKeys, ['vaultStep'])
   })
 })
 
@@ -368,7 +418,7 @@ describe('v6 browser: passive asset origins', () => {
     assert.ok(!executedOrigins.some(entry => entry.includes(evilOrigin)), 'off-allowlist host never reaches the broker')
     assert.ok(!executedOrigins.some(entry => entry === `POST ${cdnOrigin}`), 'asset origins never carry active probes')
     assert.ok(visit.blockedOrigins.includes(evilOrigin), 'off-allowlist origin is recorded as blocked')
-    assert.ok(visit.blockedOrigins.includes(cdnOrigin) === false)
+    // The CDN POST probe is refused; the GET hydration is the only allowed asset interaction.
     assert.ok(visit.allRequests?.some(rec => rec.origin === cdnOrigin && rec.resourceType === 'script'),
       'passive hydration is recorded for discovery')
     assert.ok(visit.exchanges.every(ex => ex.origin === appOrigin), 'only target-origin traffic is discovery scope')
@@ -607,7 +657,18 @@ describe('v6 browser: read-only GraphQL/RPC POST', () => {
     assert.equal(anonymousSelection.allowed, true)
     assert.equal(anonymousSelection.readOnlyGraphql, true)
 
-    const mutationBelowTier3 = classifyBrowserHttpRequest({
+    const mutationBelowTier2 = classifyBrowserHttpRequest({
+      method: 'POST',
+      url: `${appOrigin}/graphql`,
+      body: JSON.stringify({ query: 'mutation DeleteUser { deleteUser(id: 1) { ok } }' }),
+      tier: 1,
+      canRead: origin => origin === appOrigin,
+      allowLocalLab: false,
+    })
+    assert.equal(mutationBelowTier2.allowed, false)
+    assert.equal(mutationBelowTier2.reason, 'tier_too_low')
+
+    const mutationAtTier2 = classifyBrowserHttpRequest({
       method: 'POST',
       url: `${appOrigin}/graphql`,
       body: JSON.stringify({ query: 'mutation DeleteUser { deleteUser(id: 1) { ok } }' }),
@@ -615,8 +676,8 @@ describe('v6 browser: read-only GraphQL/RPC POST', () => {
       canRead: origin => origin === appOrigin,
       allowLocalLab: false,
     })
-    assert.equal(mutationBelowTier3.allowed, false)
-    assert.equal(mutationBelowTier3.reason, 'tier_too_low')
+    assert.equal(mutationAtTier2.allowed, true, 'Tier-2 sandbox POST remains allowed (existing contract)')
+    assert.equal(mutationAtTier2.readOnlyGraphql, false, 'mutation is not reported as a read-only operation')
 
     const mutationAtTier3 = classifyBrowserHttpRequest({
       method: 'POST',

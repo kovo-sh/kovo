@@ -3527,7 +3527,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
 
   const visibleToPersonas: Record<string, string[]> = {}
-  for (const [key, set] of visibleToPersonasUnion) visibleToPersonas[key] = [...set].sort()
+  for (const [key, set] of visibleToPersonasUnion) {
+    if (Object.keys(visibleToPersonas).length >= 300) break
+    visibleToPersonas[key] = [...set].sort()
+  }
   if (privilegedSurface.length > 0) {
     storage.event(runId, 'phase0.privileged_surface',
       `Surfaced ${privilegedSurface.length} privileged/role-restricted route(s) from the persona union.`,
@@ -4007,6 +4010,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
 
   const visibleToPersonas: Record<string, string[]> = {}
   for (const [key, set] of visibility) {
+    if (Object.keys(visibleToPersonas).length >= 200) break
     const spaceAt = key.indexOf(' ')
     const method = key.slice(0, spaceAt)
     const pathTemplate = key.slice(spaceAt + 1)
