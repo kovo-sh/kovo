@@ -109,12 +109,23 @@ recall. Each one is a verifier-side gap (see the bullets above), owned by `src/s
    protocol; it confirms on `anon 401 / authed 200 {ok:true}` alone.
 
 5. *"Missing vertical role check on `/api/admin/activity` exposes rotated org secret to read-only
-   viewer"* (CWE-863, `open_proof_gap`) — **real endpoint, wrong label; not a false alarm**. The
-   endpoint is the `adminAuditLog` route owned by the vulnerable `acme.auditlog-secret` target (seed 1
-   mounts it vulnerable): a viewer reads the admin activity log and the response carries the tenant
-   secret canary. The finding is labelled `bfla`/CWE-863 (authz family), which is class-incompatible
-   with the entry's `info_disclosure`/CWE-532 (disclosure family), and the verifier honestly declined
-   to confirm the BFLA framing (no role differential beyond the route itself, no state delta). The
-   grader now records this as a **misclassified location hit** (`misclassifiedFindingIds`): the site
-   is not clean, so it is not a false positive, and wrong-class claims never earn recall. The endpoint
-   itself is already truth; no new target is added.
+   viewer"* (CWE-863, `open_proof_gap`) — **real endpoint, wrong label, unproven claim: charged as an
+   FP**. The endpoint is the `adminAuditLog` route owned by the vulnerable `acme.auditlog-secret`
+   target (seed 1 mounts it vulnerable): a viewer reads the admin activity log and the response
+   carries the tenant secret canary, while `/admin/orgs`, `/admin/orgs/:id` and `PATCH
+   /billing/current` are `403` for the same viewer. The claim is labelled `bfla`/CWE-863 (authz
+   family) against the entry's `info_disclosure`/CWE-532 (disclosure family) and the verifier declined
+   to confirm the BFLA framing. Under the reviewer-approved grader policy an **unverified** claim is a
+   contract leak and stays an FP, even on a documented sibling pair; it is also counted in
+   `incompatibleClassCount`, which must be `0` for Phase-1. The engine-side fix is to confirm the
+   disclosure class (the oracle fires on that request) or drop the unproven note — not to widen truth.
+
+### Grader policy for incompatible classes (reviewer-steered)
+
+`incompatibleClassCount` counts every active finding that hits a planted vulnerable entry's endpoint
+without a class-compatible match (any status, any label). An incompatible claim is left *uncharged*
+only when it is runtime-confirmed **and** the labels are a documented close-sibling pair
+(`bola ↔ idor ↔ bfla ↔ graphql_bola`, `mass_assignment ↔ bfla`, `mass_assignment ↔ business_logic`,
+`business_logic ↔ race_condition`, `info_disclosure ↔ bfla`). It never earns recall, it still enters
+`strictPrecision = TP / (TP + FP + misclassified)`, and Phase-1 requires `incompatibleClassCount === 0`.
+Non-sibling labels and every `static_verified`/`proposed`/`open_proof_gap` claim stay FPs.

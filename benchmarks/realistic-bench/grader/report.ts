@@ -19,6 +19,8 @@ function headlineTable(s: Scorecard): string {
     row(['---', '---']),
     row(['recall', `${pct(s.recall)} (${s.confirmed}/${s.targets})`]),
     row(['precision', pct(s.precision)]),
+    row(['strict precision', pct(s.strictPrecision)]),
+    row(['incompatible class claims', `${s.incompatibleClassCount}`]),
     row(['decoyFP', `${s.decoyFalsePositives}/${s.decoys}`]),
     row(['unmatchedFP', `${s.unmatchedFalsePositives}`]),
     ...((s.misclassifiedFindingIds?.length ?? 0) > 0

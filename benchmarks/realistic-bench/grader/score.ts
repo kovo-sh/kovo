@@ -4,7 +4,7 @@ import type {
   Scorecard, Severity, SubmittedFinding, VulnOutcome, VulnResult,
 } from '../lib/types.ts'
 import { failureTaxonomyBuckets } from '../lib/types.ts'
-import { classCompatible, endpointMatches, findingHitsEntry, matchFindingToEntries } from './match.ts'
+import { classCompatible, endpointMatches, findingHitsEntry, matchFindingToEntries, siblingClassPair } from './match.ts'
 import type { GradeEntry } from './match.ts'
 import { attributeEvent, classifyFailure, computeFunnel } from './attribution.ts'
 import type { FailureContext, FunnelStage } from './attribution.ts'
@@ -62,11 +62,15 @@ export function gradeRun(input: GradeInput): Scorecard {
   const vulnMatched = new Map<string, SubmittedFinding[]>()
   const decoyMatched = new Map<string, SubmittedFinding[]>()
   const unmatched: SubmittedFinding[] = []
-  // A subclass/class-family mismatch on a planted vulnerable endpoint is a *misclassified location
-  // hit*: the site is not clean, so it is neither a false positive nor a confirmation. It never
-  // earns recall (a TP still needs class compatibility) but it must not be charged as an alarm on a
-  // clean endpoint. Decoys and non-target endpoints are unaffected: a claim there is still an FP.
+  // Narrow, reviewer-gated tolerance: a class-incompatible claim is left *uncharged* only when
+  // (a) it hits a planted vulnerable entry's endpoint, (b) the two labels are a documented
+  // close-sibling taxonomy pair, and (c) the claim is runtime-confirmed. It still never earns
+  // recall, it is still counted in `incompatibleClassCount` (Phase-1 requires 0), and it still
+  // enters `strictPrecision`. Unverified (static/proposed/open-proof-gap) leaks and non-sibling
+  // labels stay plain false positives.
   const misclassified: SubmittedFinding[] = []
+  let incompatibleClassCount = 0
+  const runtimeConfirmed = new Set(['runtime_confirmed', 'confirmed'])
   for (const f of active) {
     const vulnMatch = matchFindingToEntries(f, vulnEntries)
     if (vulnMatch) {
@@ -83,8 +87,15 @@ export function gradeRun(input: GradeInput): Scorecard {
       list.push(f)
       decoyMatched.set(ge.entry.siteId, list)
     }
+    // Endpoint hit on a planted vulnerable entry with no class-compatible match anywhere: the claim
+    // is mislabelled. Count it for the certificate, then decide whether the documented sibling
+    // tolerance applies.
+    const incompatibleTargets = vulnMatch ? [] : vulnEntries.filter((ge) => findingHitsEntry(f, ge.entry))
+    if (incompatibleTargets.length > 0) incompatibleClassCount++
     if (!vulnMatch && decoySites.size === 0) {
-      if (vulnEntries.some((ge) => findingHitsEntry(f, ge.entry))) misclassified.push(f)
+      const unchargeable = runtimeConfirmed.has(f.status) &&
+        incompatibleTargets.some((ge) => siblingClassPair(f, ge.entry))
+      if (unchargeable) misclassified.push(f)
       else unmatched.push(f)
     }
   }
@@ -202,6 +213,11 @@ export function gradeRun(input: GradeInput): Scorecard {
 
   const denom = tp + decoyFalsePositives + unmatchedFalsePositives
   const precision = findings.length === 0 ? 1 : denom === 0 ? 1 : tp / denom
+  // Reviewer-mandated conservative metric: the sibling tolerance is never free. Strict precision
+  // charges every uncharged misclassification exactly once, so a run cannot improve strict numbers
+  // by mislabelling; Phase-1 also requires `incompatibleClassCount === 0`.
+  const strictDenom = denom + misclassified.length
+  const strictPrecision = findings.length === 0 ? 1 : strictDenom === 0 ? 1 : tp / strictDenom
 
   const recallBySeverity = {} as Scorecard['recallBySeverity']
   for (const sev of severities) {
@@ -239,6 +255,8 @@ export function gradeRun(input: GradeInput): Scorecard {
     recallByClass,
     staticRecall: targets > 0 ? (confirmed + staticOnly) / targets : 0,
     precision,
+    strictPrecision,
+    incompatibleClassCount,
     decoys: gt.decoys.length,
     decoyFalsePositives,
     unmatchedFalsePositives,

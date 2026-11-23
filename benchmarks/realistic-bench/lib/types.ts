@@ -265,11 +265,17 @@ export interface Scorecard {
   recallByClass: Record<string, { targets: number; confirmed: number }>
   staticRecall: number // (confirmed + static_only) / targets — white-box informational metric
   precision: number // confirmedTP findings / (TP + decoyFP + unmatchedFP), 1 when no findings
+  /** Conservative precision that also charges every uncharged misclassification:
+   *  TP / (TP + decoyFP + unmatchedFP + misclassified). Phase-1 gates use this. */
+  strictPrecision: number
+  /** Findings that hit a planted vulnerable entry's endpoint under an incompatible class, whatever
+   *  their status or sibling-pair eligibility. Phase-1 requires 0. */
+  incompatibleClassCount: number
   decoys: number
   decoyFalsePositives: number
   unmatchedFalsePositives: number
-  /** Findings that hit a vulnerable target's endpoint under an incompatible class: real location,
-   *  wrong label — not a TP and not a false alarm. Excluded from the precision denominator. */
+  /** Class-incompatible findings left uncharged by the documented sibling allowlist + runtime proof.
+   *  Not a TP, but excluded from the standard precision denominator; strictPrecision charges them. */
   misclassifiedFindingIds?: string[]
   duplicateFindings: number
   chainsTotal: number

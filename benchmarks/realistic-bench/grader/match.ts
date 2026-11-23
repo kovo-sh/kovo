@@ -75,6 +75,55 @@ export function classCompatible(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Close-sibling class pairs (explicit allowlist, see CONTRACTS.md "Grading")
+// ---------------------------------------------------------------------------------------------
+// A grader must never invent tolerance: an incompatible label is only forgiven when it is one of
+// the documented sibling *taxonomy* pairs below AND the claim is runtime-confirmed on a planted
+// vulnerable entry with the same endpoint. Everything else stays a false positive.
+const cweClassKey = new Map<number, string>([
+  [639, 'bola'], [284, 'bfla'], [285, 'bfla'], [862, 'bfla'], [863, 'bfla'], [566, 'bfla'], [269, 'bfla'],
+  [915, 'mass_assignment'],
+  [472, 'business_logic'], [840, 'business_logic'], [841, 'business_logic'],
+  [362, 'race_condition'], [367, 'race_condition'],
+  [200, 'info_disclosure'], [359, 'info_disclosure'], [522, 'info_disclosure'], [532, 'info_disclosure'],
+])
+
+/** Canonical taxonomy key for a claim/entry label (vulnClass first, else its CWE). */
+export function classKey(label: { vulnClass?: string; cwe?: string }): string | null {
+  if (label.vulnClass) return label.vulnClass
+  const n = cweNumber(label.cwe)
+  return n != null ? cweClassKey.get(n) ?? null : null
+}
+
+/** Documented sibling pairs. Symmetric; both directions are accepted. */
+export const siblingClassPairs: ReadonlyArray<readonly [string, string]> = [
+  // object vs function-level authorization (and their GraphQL spelling)
+  ['bola', 'idor'], ['bola', 'bfla'], ['idor', 'bfla'],
+  ['bola', 'graphql_bola'], ['idor', 'graphql_bola'], ['bfla', 'graphql_bola'],
+  // privileged-field writes can be reported as function-level authz
+  ['mass_assignment', 'bfla'],
+  // protected-field overpost can be reported as business logic
+  ['mass_assignment', 'business_logic'],
+  // invariant / double-spend logic vs. concurrency framing
+  ['business_logic', 'race_condition'],
+  // a role-gated data read can be reported as missing function-level authz
+  ['info_disclosure', 'bfla'],
+]
+
+const siblingPairKeys = new Set(siblingClassPairs.map(([a, b]) => (a < b ? `${a}|${b}` : `${b}|${a}`)))
+
+/** True when the two labels are a documented close-sibling taxonomy pair. */
+export function siblingClassPair(
+  finding: { vulnClass?: string; cwe?: string },
+  entry: Pick<GroundTruthEntry, 'vulnClass' | 'cwe'>,
+): boolean {
+  const a = classKey(finding)
+  const b = classKey(entry)
+  if (!a || !b || a === b) return false
+  return siblingPairKeys.has(a < b ? `${a}|${b}` : `${b}|${a}`)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Path / endpoint matching
 // ---------------------------------------------------------------------------------------------
 /** Strip http://127.0.0.1:PORT origin and query/hash, collapse trailing slash. */
