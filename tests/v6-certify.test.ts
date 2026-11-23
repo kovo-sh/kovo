@@ -60,6 +60,9 @@ interface RunOverrides {
   confirmed?: number
   targets?: number
   precision?: number
+  strictPrecision?: number
+  incompatibleClassCount?: number
+  misclassifiedFindingIds?: string[]
   floorConfirmed?: number | null
   floorLeadsEmitted?: number | null
   floorLeadsConsumed?: number | null
@@ -102,6 +105,9 @@ function realismRun(overrides: RunOverrides = {}): RealismRun {
     confirmed,
     recall: confirmed / targets,
     precision: overrides.precision ?? 1,
+    strictPrecision: overrides.strictPrecision ?? overrides.precision ?? 1,
+    incompatibleClassCount: overrides.incompatibleClassCount ?? 0,
+    misclassifiedFindingIds: overrides.misclassifiedFindingIds ?? [],
     decoyFalsePositives: 0,
     unmatchedFalsePositives: 0,
     confirmedKeys: confirmedTargetKeys(vulns, app),
@@ -462,6 +468,47 @@ describe('secret hygiene', () => {
 
   test('refuses to write text that still contains the salt', () => {
     assert.throws(() => assertSecretFree(`oops ${salt}`, [salt]), /secret/)
+  })
+})
+
+describe('class hygiene gate', () => {
+  test('an incompatible class claim fails the certificate even at 100% standard precision', () => {
+    const runs = passRuns()
+    runs[0] = { ...runs[0]!, incompatibleClassCount: 1, strictPrecision: runs[0]!.precision }
+    const cert = evaluate(runs)
+    const gate = criterion(cert, 'class_hygiene')
+    assert.equal(gate.status, 'FAIL')
+    assert.match(gate.observed, /1 incompatible class claim/)
+    assert.equal(cert.verdict, 'FAIL')
+    assert.equal(cert.hygiene.incompatibleClassCount, 1)
+  })
+
+  test('sibling tolerance is visible: strict precision falls and the gate fails at 0 incompatible', () => {
+    const runs = passRuns()
+    runs[0] = { ...runs[0]!, misclassifiedFindingIds: ['misfiled'], strictPrecision: 0.5 }
+    const cert = evaluate(runs)
+    assert.equal(cert.hygiene.worstStrictPrecision, 0.5)
+    assert.equal(cert.hygiene.misclassifiedRuns, 1)
+    assert.equal(criterion(cert, 'class_hygiene').status, 'FAIL')
+  })
+
+  test('an artifact without the hygiene field fails (unmeasured, not assumed clean)', () => {
+    const runs = passRuns()
+    runs[0] = { ...runs[0]!, incompatibleClassCount: null }
+    const cert = evaluate(runs)
+    const gate = criterion(cert, 'class_hygiene')
+    assert.equal(gate.status, 'FAIL')
+    assert.match(gate.observed, /1 unmeasured/)
+    assert.equal(cert.hygiene.incompatibleClassUnmeasured, 1)
+    assert.equal(cert.verdict, 'FAIL')
+  })
+
+  test('clean matrix reports zero incompatible claims', () => {
+    const cert = evaluate(passRuns())
+    assert.equal(cert.hygiene.incompatibleClassCount, 0)
+    assert.equal(cert.hygiene.worstStrictPrecision, 1)
+    assert.equal(cert.hygiene.misclassifiedRuns, 0)
+    assert.equal(criterion(cert, 'class_hygiene').status, 'PASS')
   })
 })
 

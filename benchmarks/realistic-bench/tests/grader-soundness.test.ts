@@ -57,7 +57,7 @@ const XSS = (siteId: string): GroundTruthEntry => entry({
   oracle: { kinds: ['stored_xss_rendered'], routeKeys: ['card.view'] },
 })
 
-test('class mismatch (authz claim on an XSS site) never confirms and never double-charges', () => {
+test('class mismatch (authz claim on an XSS site) never confirms and is charged', () => {
   const authzClaim = { vulnClass: 'idor', cwe: 'CWE-639' }
   const vuln = gradeRun(mk({
     groundTruth: gt([XSS('xss-vuln')]),
@@ -65,8 +65,9 @@ test('class mismatch (authz claim on an XSS site) never confirms and never doubl
     oracleEvents: [event({ seq: 1, kind: 'stored_xss_rendered', routeKey: 'card.view' })],
   }))
   assert.equal(vuln.confirmed, 0)
-  assert.equal(vuln.unmatchedFalsePositives, 0, 'a hit on a planted vuln surface is a misclassified location hit')
-  assert.deepEqual(vuln.misclassifiedFindingIds, ['f'])
+  assert.equal(vuln.unmatchedFalsePositives, 1, 'authz is not a sibling of xss: charged')
+  assert.deepEqual(vuln.misclassifiedFindingIds ?? [], [])
+  assert.equal(vuln.incompatibleClassCount, 1)
   assert.equal(vuln.decoyFalsePositives, 0)
 
   const decoy = gradeRun(mk({
@@ -181,15 +182,17 @@ test('finding partition: every active finding lands in exactly one bucket', () =
   const misclassified = s.misclassifiedFindingIds ?? []
   assert.deepEqual([...vulnMatched].sort(), ['tp', 'tp-dup'])
   assert.deepEqual(decoyMatched, ['decoy'])
-  assert.deepEqual([...unmatched].sort(), ['decoy-wrong-class', 'unplanted'])
-  assert.deepEqual(misclassified, ['misfiled'])
+  assert.deepEqual([...unmatched].sort(), ['decoy-wrong-class', 'misfiled', 'unplanted'])
+  assert.deepEqual(misclassified, [], 'xss is not a sibling of bola: charged')
   const union = [...vulnMatched, ...decoyMatched, ...unmatched, ...misclassified]
   assert.equal(new Set(union).size, union.length, 'a finding was counted in two buckets')
   assert.deepEqual([...union].sort(), [...active].sort(), 'a finding vanished from accounting')
   assert.equal(s.duplicateFindings, 1)
   assert.equal(s.decoyFalsePositives, 1)
-  assert.equal(s.unmatchedFalsePositives, 2)
-  assert.equal(s.precision, 0.25) // 1 TP / (1 TP + 1 decoy site + 2 unmatched findings)
+  assert.equal(s.unmatchedFalsePositives, 3)
+  assert.equal(s.incompatibleClassCount, 1, 'the misfiled claim hit a planted target endpoint')
+  assert.equal(s.precision, 0.2) // 1 TP / (1 TP + 1 decoy site + 3 unmatched findings)
+  assert.equal(s.strictPrecision, 0.2, 'nothing uncharged, so strict equals standard')
 })
 
 test('duplicate claims on one decoy count once', () => {
