@@ -1031,6 +1031,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     replayedAt: new Date().toISOString(),
   }
   let forcedInconclusiveReason: string | null = null
+  // Proof-strength / endpoint-binding failures are recorded separately: they only veto a spec that
+  // WOULD confirm. A spec that already evaluates to confirmed=false must keep its dismissed/fixed
+  // semantics (e.g. "Verify Fix" after a patch), so the guard never runs ahead of the assertion.
+  let proofGuardFailure: string | null = null
   let deterministicProofPassed = true
   let proofFailureReason = ''
 
@@ -1235,8 +1239,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               ...summarizeExchange(catchallEx),
               comparisons,
             }
-            if (matchedProbes === htmlProbes.length && !forcedInconclusiveReason) {
-              forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route; set spaCatchallControl: true to verify against a real endpoint baseline.'
+            if (matchedProbes === htmlProbes.length && !proofGuardFailure) {
+              proofGuardFailure = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route; set spaCatchallControl: true to verify against a real endpoint baseline.'
             }
           }
         }
@@ -1245,11 +1249,11 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const stepSnapshots = snapshotHttpChainSteps(spec, stepsOut, stepExchanges)
         const proofStrength = assessHttpChainProofStrength(spec, stepSnapshots)
         const endpointBinding = assessHttpChainEndpointBinding(spec, stepRequests, stepExchanges)
-        if (proofStrength.claim === 'authorization' && !proofStrength.satisfied && !forcedInconclusiveReason) {
-          forcedInconclusiveReason = proofStrength.reason
+        if (proofStrength.claim === 'authorization' && !proofStrength.satisfied && !proofGuardFailure) {
+          proofGuardFailure = proofStrength.reason
         }
-        if (!endpointBinding.bound && !forcedInconclusiveReason) {
-          forcedInconclusiveReason = endpointBinding.reason
+        if (!endpointBinding.bound && !proofGuardFailure) {
+          proofGuardFailure = endpointBinding.reason
         }
         let proofMatches: Record<string, boolean[]> | undefined
         if (spec.proofPatterns?.length) {
@@ -2822,6 +2826,21 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     }
   }
 
+  if (proofGuardFailure && outcome.controlPassed && outcome.confirmed) {
+    return {
+      verdict: 'inconclusive',
+      outcome: {
+        ...outcome,
+        confirmed: false,
+        reason: proofGuardFailure,
+      },
+      exchangeIds,
+      exchanges,
+      evidencePayload,
+      evidenceSha256,
+    }
+  }
+
   if (!deterministicProofPassed) {
     return {
       verdict: outcome.controlPassed ? 'dismissed' : 'inconclusive',
@@ -2966,6 +2985,8 @@ export interface EnrichedInlineVerifyFeedback extends InlineVerifyFeedback {
   endpointBindingFailed?: boolean
   /** Method + origin + path of the endpoint the verifier actually observed. */
   verifiedEndpoint?: string
+  /** True when a catch-all baseline matched and the spec must opt in to spaCatchallControl. */
+  spaCatchallRequired?: boolean
 }
 
 const inlinePreviewBytes = 512
@@ -3172,6 +3193,15 @@ export function buildInlineVerifyFeedback(
     }
   }
 
+  let spaCatchallRequired: boolean | undefined
+  if (payload.spaCatchallAuto && typeof payload.spaCatchallAuto === 'object') {
+    const auto = payload.spaCatchallAuto as { requiresControl?: unknown; matchedProbes?: unknown; probeCount?: unknown }
+    if (auto.requiresControl === true && typeof auto.matchedProbes === 'number' &&
+        typeof auto.probeCount === 'number' && auto.matchedProbes === auto.probeCount) {
+      spaCatchallRequired = true
+    }
+  }
+
   let canaryTriggered: boolean | undefined
   const proofObj = payload.proof as { canaryProbeTriggered?: unknown } | undefined
   const probeObj = payload.probe as { canaryCheck?: { triggered?: unknown } } | undefined
@@ -3263,6 +3293,7 @@ export function buildInlineVerifyFeedback(
     controlPassed: replay.outcome.controlPassed,
     ...(requireControlNonErrorTriggered ? { requireControlNonErrorTriggered } : {}),
     ...(spaCatchallMatched !== undefined ? { spaCatchallMatched } : {}),
+    ...(spaCatchallRequired ? { spaCatchallRequired } : {}),
     ...(spaSimilarityScore !== undefined ? { spaSimilarityScore } : {}),
     ...(canaryTriggered !== undefined ? { canaryTriggered } : {}),
     ...(jqError ? { jqError } : {}),

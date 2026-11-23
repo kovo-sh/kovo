@@ -22,6 +22,7 @@ import {
   assessHttpChainProofStrength,
   buildInlineVerifyFeedback,
   classifyHttpChainAssertion,
+  retestReplaySpec,
   verifyReplaySpec,
 } from '../src/server/replay-verifier.ts'
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
@@ -152,11 +153,20 @@ test('guards: vulnerable cross-actor read still confirms and records the verifie
   } finally { await fx.close() }
 })
 
-test('guards: hardened non-owner denial never confirms (guard does not weaken control semantics)', async () => {
+test('guards: hardened non-owner denial dismisses (not inconclusive) so Verify Fix still reports fixed', async () => {
   const fx = await ordersFixture(true)
   try {
-    const res = await verify(crossActorSpec(fx.origin, crossActorJq), grantFor([fx.origin]))
-    assert.notEqual(res.verdict, 'confirmed')
+    const spec = crossActorSpec(fx.origin, crossActorJq)
+    const res = await verify(spec, grantFor([fx.origin]))
+    assert.equal(res.verdict, 'dismissed', String(res.outcome.reason))
+    const retest = await retestReplaySpec({
+      spec,
+      broker: new RequestBroker({ rejectUnauthorized: false }),
+      backend: new LocalJqBackend(),
+      grant: grantFor([fx.origin]),
+      signal: AbortSignal.timeout(20_000),
+    })
+    assert.equal(retest.verdict, 'fixed')
   } finally { await fx.close() }
 })
 
@@ -231,6 +241,8 @@ test('guards: catch-all HTML response cannot confirm without a real endpoint bas
     const auto = res.evidencePayload.spaCatchallAuto as { requiresControl?: boolean; matchedProbes?: number } | undefined
     assert.equal(auto?.requiresControl, true)
     assert.equal(auto?.matchedProbes, 1)
+    const feedback = buildInlineVerifyFeedback(spec, res, 1)
+    assert.equal(feedback.spaCatchallRequired, true)
 
     // Opting in to the explicit catch-all control must still reject the same shell.
     const explicit = await verify({ ...spec, spaCatchallControl: true }, grantFor([fx.origin]))
