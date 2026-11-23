@@ -342,6 +342,23 @@ test('budget split: meta ingestion reports both budgets and measured consumption
   assert.equal(meta.terminationReason, 'agent_budget_exhausted')
 })
 
+test('budget split: wall-stopped Phase B ingests its spend from the floor settle event', () => {
+  const meta = summarizeRequestBudgets({
+    events: [
+      { kind: 'request_budget.floor_settled', detail: { floorRequests: 1_242, spentRequestsAtSettle: 1_300 } },
+    ],
+    spentRequests: 2_396,
+    floorRequestBudget: 6_000,
+    agentRequestBudget: 25_000,
+    totalRequestBudget: 31_000,
+  })
+  assert.equal(meta.mode, 'split')
+  assert.equal(meta.floorRequests, 1_242)
+  assert.equal(meta.agentRequests, 1_096, 'no phase_ended event yet, so the settle delta is used')
+  assert.equal(meta.agentBudgetExhausted, false)
+  assert.equal(meta.terminationReason, null)
+})
+
 test('budget split: legacy artifacts without phase events still ingest the engine-reported floor', () => {
   const meta = summarizeRequestBudgets({
     events: [{ kind: 'deterministic_engine.summary', detail: { requestsUsed: 1_161 } }],
