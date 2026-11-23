@@ -16,3 +16,8 @@ reads the target plan by id but trusts a price field in the body instead of the 
 
 ## Solver approach
 owner switches plan while supplying a mismatched price and the invariant monitor sees plan price inconsistent with the catalog.
+
+## Hardened-twin silence
+the hardened twin writes the catalog price (a no-op update) and ignores `price`/`amount`/
+`seat_limit`/`credits`, so it emits no `(invariant_violation, updatePlan)` event — including for a
+downgrade that leaves `seats_used` above the new tier's limit (see `truth/POLICY.md`).
