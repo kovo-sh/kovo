@@ -2614,15 +2614,15 @@ export interface TolerantOpenApiOperation {
 export const DEFAULT_TOLERANT_OP_CAP = 300
 
 /**
- * Extract every operation a malformed/truncated reference textually exposes, without a cap.
- * Callers decide whether a bound applies; `harvestTolerantOpenApiOperations` slices this.
+ * Extract every operation a malformed/truncated reference textually exposes, without the ingestion
+ * cap. A generous hard ceiling bounds pathological input; callers decide the real bound.
  */
-function harvestTolerantOperationsUncapped(content: string): TolerantOpenApiOperation[] {
+function harvestTolerantOperationsUncapped(content: string, hardCeiling = 100_000): TolerantOpenApiOperation[] {
   const pathKeyRe = /"(\/[A-Za-z0-9_\-{}\/.:$\[\]]{0,300})"\s*:\s*\{/g
   const matches = [...content.matchAll(pathKeyRe)]
   if (matches.length === 0) return []
   const out: TolerantOpenApiOperation[] = []
-  for (let idx = 0; idx < matches.length; idx += 1) {
+  for (let idx = 0; idx < matches.length && out.length < hardCeiling; idx += 1) {
     const match = matches[idx]!
     const rawPath = match[1]!
     if (!rawPath.startsWith('/') || rawPath.length > 300) continue
