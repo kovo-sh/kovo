@@ -2,7 +2,6 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, realpathSync, statSync } from 'node:fs'
-import { createInterface } from 'node:readline'
 import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
 
@@ -311,6 +310,73 @@ export function formatWorkerFailure(stderr: string, exitCode: number | null): st
 }
 
 const maxDockerStderrBytes = 8 * 1024
+
+/** Per-line cap for worker NDJSON responses (a single flood line must not exhaust memory). */
+export const MAX_WORKER_LINE_BYTES = 64 * 1024
+/** Total stdout cap for a long-lived worker session. */
+export const MAX_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024
+
+export class WorkerOutputStreamError extends Error {
+  readonly limit: 'line' | 'total'
+  constructor(limit: 'line' | 'total', message: string) {
+    super(message)
+    this.name = 'WorkerOutputStreamError'
+    this.limit = limit
+  }
+}
+
+/**
+ * Bounded NDJSON line decoder for a worker container's stdout. Caps both an individual line and
+ * the cumulative stream so a hostile/flooding worker cannot grow host memory without limit; the
+ * session terminates on overflow instead of buffering the whole stream.
+ */
+export class BoundedLineDecoder {
+  private pending: Buffer = Buffer.alloc(0)
+  private total = 0
+  private readonly maxLineBytes: number
+  private readonly maxTotalBytes: number
+
+  constructor(limits: { maxLineBytes?: number; maxTotalBytes?: number } = {}) {
+    this.maxLineBytes = limits.maxLineBytes ?? MAX_WORKER_LINE_BYTES
+    this.maxTotalBytes = limits.maxTotalBytes ?? MAX_WORKER_OUTPUT_BYTES
+  }
+
+  get totalBytes(): number {
+    return this.total
+  }
+
+  get pendingBytes(): number {
+    return this.pending.length
+  }
+
+  push(chunk: Buffer | string): string[] {
+    const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+    this.total += buf.length
+    if (this.total > this.maxTotalBytes) {
+      throw new WorkerOutputStreamError('total', `Worker output exceeded the ${this.maxTotalBytes}-byte session limit.`)
+    }
+    const combined = this.pending.length === 0 ? buf : Buffer.concat([this.pending, buf])
+    if (combined.indexOf(10) === -1 && combined.length > this.maxLineBytes) {
+      throw new WorkerOutputStreamError('line', `Worker output line exceeded the ${this.maxLineBytes}-byte line limit.`)
+    }
+    const lines: string[] = []
+    let start = 0
+    for (let idx = combined.indexOf(10); idx !== -1; idx = combined.indexOf(10, start)) {
+      const raw = combined.subarray(start, idx)
+      if (raw.length > this.maxLineBytes) {
+        throw new WorkerOutputStreamError('line', `Worker output line exceeded the ${this.maxLineBytes}-byte line limit.`)
+      }
+      const withoutCr = raw.length > 0 && raw[raw.length - 1] === 13 ? raw.subarray(0, raw.length - 1) : raw
+      lines.push(withoutCr.toString('utf8'))
+      start = idx + 1
+    }
+    this.pending = start === 0 ? combined : combined.subarray(start)
+    if (this.pending.length > this.maxLineBytes) {
+      throw new WorkerOutputStreamError('line', `Worker output line exceeded the ${this.maxLineBytes}-byte line limit.`)
+    }
+    return lines
+  }
+}
 
 function docker(args: string[], signal: AbortSignal, input?: string) {
   signal.throwIfAborted()
@@ -636,8 +702,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
       pending.clear()
     }
 
-    const rl = createInterface({ input: cli.stdout!, crlfDelay: Infinity })
-    rl.on('line', line => {
+    const decoder = new BoundedLineDecoder()
+    const handleLine = (line: string) => {
       const trimmed = line.trim()
       if (!trimmed) return
       try {
@@ -650,6 +716,18 @@ export class LinuxWorkerBackend implements WorkerBackend {
       } catch {
         // Ignore malformed noise
       }
+    }
+    cli.stdout?.on('data', (chunk: Buffer) => {
+      let lines: string[]
+      try {
+        lines = decoder.push(chunk)
+      } catch (err) {
+        // Flood / oversized line: terminate the session rather than buffering unbounded output.
+        failAll(err instanceof Error ? err : new Error(String(err)))
+        void close()
+        return
+      }
+      for (const line of lines) handleLine(line)
     })
     cli.once('close', code => {
       closed = true
@@ -679,7 +757,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         } catch { /* ignore */ }
         try { cli.kill() } catch { /* ignore */ }
         failAll(new Error('Isolated worker session closed.'))
-        rl.close()
+        cli.stdout?.removeAllListeners('data')
         await this.removeContainer(name)
         this.activeContainers.delete(name)
       liveContainers.delete(name)

@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { closeSync, constants as fsConstants, cpSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { extname, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
@@ -141,6 +141,32 @@ export interface PatchWorkflowParams {
   onUsage?: UsageCallback
 }
 
+const NO_FOLLOW = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0
+
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
+/** Read a file only if it is a regular file, never following a symlink (O_NOFOLLOW closes races). */
+function readRegularFileNoFollow(path: string): string | null {
+  let fd: number | undefined
+  try {
+    if (!lstatSync(path).isFile()) return null
+    fd = openSync(path, fsConstants.O_RDONLY | NO_FOLLOW)
+    return readFileSync(fd, 'utf8')
+  } catch {
+    return null
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* already closed */ }
+    }
+  }
+}
+
 function validateRepoPath(reposDir: string, repo: string): string {
   const cleanRepo = repo.replace(/^\/+|\/+$/g, '')
   if (!cleanRepo || cleanRepo.includes('\0') || cleanRepo.split('/').some(seg => seg === '..' || seg === '.')) {
@@ -152,6 +178,11 @@ function validateRepoPath(reposDir: string, repo: string): string {
   if (rel.startsWith('..') || !existsSync(target) || !statSync(target).isDirectory()) {
     throw new Error(`Mounted repository not found: ${cleanRepo}`)
   }
+  // A project mount may be replaced by a link to an outside directory; patch authoring must not
+  // read or write through it.
+  if (isSymlink(target)) {
+    throw new Error(`Mounted repository is a symlink and cannot be patched: ${cleanRepo}`)
+  }
   return realpathSync(target)
 }
 
@@ -160,8 +191,33 @@ function safeReadRepoFile(repoRoot: string, relFile: string): string | null {
   if (!clean || clean.includes('\0') || clean.split('/').some(seg => seg === '..')) return null
   const full = resolve(repoRoot, clean)
   const rel = relative(repoRoot, full)
-  if (rel.startsWith('..') || !existsSync(full) || !statSync(full).isFile()) return null
-  return readFileSync(full, 'utf8')
+  if (rel.startsWith('..') || !existsSync(full)) return null
+  return readRegularFileNoFollow(full)
+}
+
+/**
+ * Copy a repo into an isolated work dir without following links. A repository may contain a link
+ * to /etc/passwd or to an outside directory; following it in the patch work copy would let a diff
+ * read or write host files. `dereference: false` keeps entries as links, and the filter drops them.
+ */
+export function copyRepoTreeWithoutSymlinks(repoRoot: string, destRoot: string): void {
+  cpSync(repoRoot, destRoot, {
+    recursive: true,
+    dereference: false,
+    verbatimSymlinks: false,
+    filter: src => !isSymlink(src),
+  })
+  const stack: string[] = [destRoot]
+  while (stack.length > 0) {
+    const dir = stack.pop()!
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (isSymlink(full)) {
+        throw new Error(`Refusing patch work copy containing a symlink: ${entry.name}`)
+      }
+      if (entry.isDirectory()) stack.push(full)
+    }
+  }
 }
 
 function extractJsonBlock(raw: string): unknown {
@@ -310,7 +366,7 @@ export async function verifyPatchApplicability(params: {
   // Test applying unified diff in an isolated temporary clone (never mutating /repos!).
   const workDir = mkdtempSync(join(tmpdir(), 'guardian-patch-check-'))
   try {
-    cpSync(repoRoot, workDir, { recursive: true })
+    copyRepoTreeWithoutSymlinks(repoRoot, workDir)
     const { filesModified } = applyUnifiedDiffToDirectory(workDir, diff)
 
     // Run offline syntax check inside air-gapped --network none worker container if backend provided,
