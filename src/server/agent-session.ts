@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BACKGROUND_CONTEXT, withAbortSignal } from '@earendil-works/chord/context'
@@ -46,6 +46,7 @@ import {
 } from './board-tools.ts'
 import type { BoardPostArgs, BoardReadArgs } from './board-tools.ts'
 import type { BrokerMultipartPart, PublicObservation } from './broker.ts'
+import type { AgentTrace } from './agent-trace.ts'
 import { isProfileHealthy, resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import {
@@ -58,6 +59,15 @@ import {
 import type { CallRecorder, ProviderConfig, ProviderOptions, UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import {
+  describeProofTools,
+  proveAuthzReadDiff,
+  proveBusinessInvariant,
+  proveCanaryOrRedirect,
+  proveStateMutationDiff,
+  validateProofInput,
+} from './proof-tools.ts'
+import type { CompiledProof, ProofToolName } from './proof-tools.ts'
 import { responseEvidence } from './response-checks.ts'
 import type { BrowserInteractiveAction, BrowserSessionStep } from './scoped-browser.ts'
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from './skills.ts'
@@ -99,6 +109,62 @@ export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
 /** Hard settlement nudge at N-2 turns (independent of the 85% network-revocation threshold). */
 export function settlementNudgeTurnFor(maxTurns: number): number {
   return Math.max(1, Math.floor(maxTurns) - 2)
+}
+
+/**
+ * Single settlement predicate shared by the turn hook and tests. Settlement is due when it was
+ * already triggered, when the turn threshold is reached, when the caller's external trigger fires,
+ * or when the optional wall-clock budget has elapsed.
+ */
+export function settlementDue(input: {
+  turnsUsed: number
+  settlementTurn: number
+  settled: boolean
+  shouldSettle?: () => boolean
+  wallClockDeadline?: number
+  now?: () => number
+}): boolean {
+  if (input.settled) return true
+  if (input.turnsUsed >= input.settlementTurn) return true
+  try {
+    if (input.shouldSettle?.()) return true
+  } catch {
+    // An external trigger must never break the run.
+  }
+  return input.wallClockDeadline !== undefined && (input.now?.() ?? Date.now()) >= input.wallClockDeadline
+}
+
+/** N-2 nudge: tells the worker to submit a proof (typed when available) or finish the intent. */
+export function settlementNudgeMessage(input: {
+  turn: number
+  maxTurns: number
+  proofTools?: readonly string[]
+}): string {
+  const typed = (input.proofTools ?? []).filter(name => name.trim())
+  const proofPath = typed.length
+    ? `submit your proof now via a typed proof tool (${typed.join(', ')}) or the raw-spec fallback propose_chain_finding/update_proposed_finding`
+    : 'submit your best proof now via propose_chain_finding/update_proposed_finding'
+  return [
+    `[GUARDIAN SETTLEMENT NUDGE — Turn ${input.turn}/${input.maxTurns}]`,
+    `Hard settlement starts at turn ${settlementNudgeTurnFor(input.maxTurns)} (N-2). ${proofPath}, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
+  ].join(' ')
+}
+
+/** 85% settlement banner: network tools are revoked, offline wrap-up only. */
+export function settlementBannerMessage(input: {
+  turnsUsed: number
+  maxTurns: number
+  proofTools?: readonly string[]
+}): string {
+  const typed = (input.proofTools ?? []).filter(name => name.trim())
+  const proofPath = typed.length
+    ? `submit or update any ready candidate findings via ${typed.join('/')} or propose_chain_finding/update_proposed_finding`
+    : 'submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding'
+  return [
+    `[GUARDIAN SETTLEMENT NOTICE — Turn ${input.turnsUsed}/${input.maxTurns}]`,
+    'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
+    `Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) ${proofPath}, and (4) call complete_intent with your final status and summary.`,
+  ].join(' ')
 }
 
 /**
@@ -397,6 +463,22 @@ export interface VerifyReplaySpecArgs {
   replaySpecId?: string
 }
 
+/**
+ * Typed proof tools compile a structured proof description into an identifier-bound replay spec
+ * (see proof-tools.ts). The session validates the model's arguments before compiling, so the
+ * handler always receives a proof that already passed `validateProofInput`.
+ */
+export type ProofToolHandler = (proof: CompiledProof, signal: AbortSignal) => Promise<unknown>
+
+export const proofToolHandlerNames = [
+  'prove_authz_read_diff',
+  'prove_state_mutation_diff',
+  'prove_business_invariant',
+  'prove_canary_or_redirect',
+] as const
+
+export type ProofToolHandlerName = typeof proofToolHandlerNames[number]
+
 export interface WorkerToolHandlers {
   /** Spill oversized tool outputs (>24 KiB) to `/evidence/tool-output/<id>.txt` inside the worker container. */
   spillOutput?: (id: string, content: string, signal: AbortSignal) => Promise<string>
@@ -506,6 +588,11 @@ export interface WorkerToolHandlers {
     args: VerifyReplaySpecArgs,
     signal: AbortSignal,
   ) => Promise<unknown>
+  /** Typed proof compiler handlers. Each is registered only when supplied; absent handlers remove the tool. */
+  prove_authz_read_diff?: ProofToolHandler
+  prove_state_mutation_diff?: ProofToolHandler
+  prove_business_invariant?: ProofToolHandler
+  prove_canary_or_redirect?: ProofToolHandler
   /** v5 M5 Swarm Board: post a concise claim/handoff/lead/blocker/status/note (redacted, capped). */
   board_post?: (args: BoardPostArgs, signal: AbortSignal) => Promise<unknown>
   /** v5 M5 Swarm Board: read untainted, in-scope, redacted peer posts. */
@@ -533,6 +620,10 @@ export interface SpecialistProfileConfig {
 export const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
   'spillOutput',
   'verify_replay_spec',
+  'prove_authz_read_diff',
+  'prove_state_mutation_diff',
+  'prove_business_invariant',
+  'prove_canary_or_redirect',
   'propose_chain_finding',
   'update_proposed_finding',
   'record_fact',
@@ -1231,7 +1322,7 @@ export function buildAgenticPromptContext(input: AgenticPromptContextInput = {})
       parallelReadOnly: 'Issue independent read-only tool calls (get_exchange, search_facts, search_exchanges, board_read, derive_evidence) together in one turn.',
       assignmentTarget: 'One assignment = one hypothesis cluster (1-3 linked routes) or one det_lead upgrade.',
       turnBudget: '8-10 turns; 6-8 turns for det_lead upgrades and chain step 2.',
-      settlement: 'At turn N-2, submit your proof (propose_chain_finding/update_proposed_finding) or call complete_intent; do not start new exploration.',
+      settlement: 'At turn N-2, submit your proof via a typed prove_* tool (or propose_chain_finding/update_proposed_finding) or call complete_intent; do not start new exploration.',
     },
     ...(brief ? { evidenceBrief: brief } : {}),
   }
@@ -1775,6 +1866,127 @@ async function formatToolOutput(
 }
 
 // ---------------------------------------------------------------------------
+// Typed proof tools & verifier repair feedback
+// ---------------------------------------------------------------------------
+
+const proofCompilers: Record<ProofToolHandlerName, (input: unknown) => CompiledProof> = {
+  prove_authz_read_diff: proveAuthzReadDiff as (input: unknown) => CompiledProof,
+  prove_state_mutation_diff: proveStateMutationDiff as (input: unknown) => CompiledProof,
+  prove_business_invariant: proveBusinessInvariant as (input: unknown) => CompiledProof,
+  prove_canary_or_redirect: proveCanaryOrRedirect as (input: unknown) => CompiledProof,
+}
+
+function proofToolParameters(name: ProofToolName): Record<string, unknown> {
+  const description = describeProofTools().find(tool => tool.name === name)
+  if (!description) throw new Error(`Missing proof tool description for ${name}.`)
+  return {
+    type: 'object',
+    required: [...description.inputSchema.required],
+    properties: { ...description.inputSchema.properties },
+    additionalProperties: true,
+  }
+}
+
+export const proofRepairBodyPreviewBytes = 512
+
+/**
+ * Structured, repairable verifier feedback surfaced to the worker when inline verification fails.
+ * `null` when the result is not a verification outcome, so successes are never rewritten.
+ */
+export interface VerifierRepairFeedback {
+  failedRule: string | null
+  stepStatuses: unknown
+  keyHeaders: unknown
+  bodyPreview: string | null
+  extractedVars: unknown
+  suggestedFix: string | null
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function previewText(value: unknown, maxBytes = proofRepairBodyPreviewBytes): string | null {
+  if (value === undefined || value === null) return null
+  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  if (!text) return null
+  return truncateUtf8Head(text, maxBytes)
+}
+
+function derivedRepairFix(result: Record<string, unknown>): string {
+  const jqError = typeof result.jqError === 'string' ? result.jqError : ''
+  const failedStepId = typeof result.failedStepId === 'string' ? result.failedStepId : ''
+  const reason = isPlainRecord(result.assertionSummary) && typeof result.assertionSummary.reason === 'string'
+    ? result.assertionSummary.reason
+    : ''
+  if (jqError) {
+    return `Fix assertionsJq so it emits {"confirmed":bool,"controlPassed":bool,"observed":string,"expected":string}. jq error: ${jqError}`
+  }
+  if (result.spaCatchallMatched === true) {
+    return 'The control matched the SPA catchall shell. Target a concrete API route with a body distinct from the shell, then re-verify with verify_replay_spec.'
+  }
+  if (failedStepId) {
+    return `Repair step ${failedStepId}: keep the control non-error and make the probe expose the identifier/marker (status alone is not proof); then re-run verify_replay_spec.`
+  }
+  if (reason) {
+    return `Tighten the assertion so observed/expected bind the identifier or marker. Verifier reason: ${reason}`
+  }
+  return 'Keep the control non-error and make the probe expose the identifier/marker in the body; then re-run verify_replay_spec.'
+}
+
+const verifierFeedbackKeys = ['inlineVerifyFeedback', 'verifierFeedback', 'verification', 'feedback'] as const
+
+function verificationOutcome(result: Record<string, unknown>): Record<string, unknown> | null {
+  for (const key of verifierFeedbackKeys) {
+    const nested = result[key]
+    if (isPlainRecord(nested)) return nested
+  }
+  return result
+}
+
+export function verifierRepairFeedback(result: unknown): VerifierRepairFeedback | null {
+  if (!isPlainRecord(result)) return null
+  const outcome = verificationOutcome(result)
+  if (!outcome) return null
+  const verdict = typeof outcome.verdict === 'string' ? outcome.verdict : null
+  const hasFailureSignal =
+    verdict === 'dismissed' ||
+    verdict === 'inconclusive' ||
+    typeof outcome.jqError === 'string' ||
+    typeof outcome.failedRule === 'string' ||
+    typeof outcome.failedStepId === 'string' ||
+    outcome.spaCatchallMatched === true ||
+    outcome.controlPassed === false ||
+    Array.isArray(outcome.stepStatuses)
+  if (!hasFailureSignal) return null
+  const failedRule = typeof outcome.failedRule === 'string'
+    ? outcome.failedRule
+    : typeof outcome.failedStepId === 'string'
+      ? `step:${outcome.failedStepId}`
+      : verdict === 'dismissed' || verdict === 'inconclusive'
+        ? `verdict:${verdict}`
+        : null
+  return {
+    failedRule,
+    stepStatuses: outcome.stepStatuses ?? null,
+    keyHeaders: outcome.keyHeaders ?? null,
+    bodyPreview: previewText(outcome.bodyPreview ?? outcome.body ?? (isPlainRecord(outcome.assertionSummary) ? outcome.assertionSummary.observed : undefined)),
+    extractedVars: outcome.extractedVars ?? null,
+    suggestedFix: typeof outcome.suggestedFix === 'string' && outcome.suggestedFix.trim()
+      ? outcome.suggestedFix
+      : derivedRepairFix(outcome),
+  }
+}
+
+/** Attach repair feedback to a failed verification outcome; non-verification results pass through. */
+export function withVerifierRepairFeedback(result: unknown): unknown {
+  if (!isPlainRecord(result)) return result
+  const feedback = verifierRepairFeedback(result)
+  if (!feedback) return result
+  return { ...result, repair: feedback }
+}
+
+// ---------------------------------------------------------------------------
 // Tool Registration Builder
 // ---------------------------------------------------------------------------
 
@@ -1853,7 +2065,7 @@ const browserInteractiveActionSchema = obj({
   timeoutMs: opt(int({ minimum: 100, maximum: 15000 })),
 })
 
-function buildWorkerTools(
+export function buildWorkerTools(
   handlers: WorkerToolHandlers,
   scrub: (value: string) => string,
   rootSignal: AbortSignal,
@@ -2611,6 +2823,34 @@ function buildWorkerTools(
     }))
   }
 
+  for (const name of proofToolHandlerNames) {
+    const handler = handlers[name]
+    if (!handler) continue
+    const description = describeProofTools().find(tool => tool.name === name)
+    if (!description) continue
+    tools.push(defineTool({
+      name,
+      description: `${description.usage} Arguments are validated before compilation; a failure returns { ok: false, errors: [{ field, code, message, fix }] } and the handler is not called.`,
+      parameters: unsafe<Record<string, unknown>>(proofToolParameters(name)),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        const validation = validateProofInput(name, args)
+        if (!validation.ok) {
+          return {
+            output: [{
+              type: 'text' as const,
+              text: JSON.stringify({ ok: false, errors: validation.errors }, null, 2),
+            }],
+          }
+        }
+        const compiled = proofCompilers[name](args)
+        return wrapExec(name, () => handler(compiled, signal), signal)
+      },
+    }))
+  }
+
   if (handlers.propose_chain_finding) {
     const fn = handlers.propose_chain_finding
     tools.push(defineTool({
@@ -2697,7 +2937,7 @@ function buildWorkerTools(
           severityChangeConditions: args.severityChangeConditions?.trim() ? scrub(args.severityChangeConditions.trim()) : undefined,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow ?? true,
-        }, signal), signal)
+        }, signal).then(withVerifierRepairFeedback), signal)
       },
     }))
   }
@@ -2752,7 +2992,7 @@ function buildWorkerTools(
           replaySpec: parsedSpec,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow,
-        }, signal), signal)
+        }, signal).then(withVerifierRepairFeedback), signal)
       },
     }))
   }
@@ -2804,7 +3044,7 @@ function buildWorkerTools(
           replaySpec: parsed.data,
           findingId: args.findingId?.trim() || undefined,
           replaySpecId: args.replaySpecId?.trim() || undefined,
-        }, signal), signal)
+        }, signal).then(withVerifierRepairFeedback), signal)
       },
     }))
   }
@@ -2904,6 +3144,123 @@ function buildWorkerTools(
 // High-Limit Multi-Turn Pi Durable Runner
 // ---------------------------------------------------------------------------
 
+/** Identifiers stamped on trace events. Defaults to the request/session/scenario handles. */
+export interface AgentTraceContext {
+  runId?: string
+  assignmentId?: string
+  specialistProfile?: string
+}
+
+/** Structural view of a pi-ai message, so tracing does not depend on the provider package types. */
+interface TraceableMessage {
+  role: string
+  content?: unknown
+  timestamp?: number
+}
+
+function traceMessageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part
+      if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+        return (part as { text: string }).text
+      }
+      return ''
+    })
+    .join('')
+}
+
+function promptPrefixHashFor(messages: readonly TraceableMessage[]): string | null {
+  const systemText = messages
+    .filter(message => message.role === 'system')
+    .map(message => traceMessageText(message.content))
+    .filter(text => text.length > 0)
+    .join('\n')
+  // Providers keep instructions outside the message list; fall back to the stable leading text.
+  const prefix = systemText || messages
+    .map(message => traceMessageText(message.content))
+    .find(text => text.length > 0) || ''
+  if (!prefix) return null
+  return createHash('sha256').update(prefix, 'utf8').digest('hex')
+}
+
+function deltaMessagesFor(messages: readonly TraceableMessage[], previousCount: number): TraceableMessage[] {
+  const delta = messages.length >= previousCount ? messages.slice(previousCount) : messages
+  return delta.map(message => ({
+    role: message.role,
+    content: message.content,
+    ...(message.timestamp !== undefined ? { timestamp: message.timestamp } : {}),
+  }))
+}
+
+function assistantToolCalls(assistant: { content?: unknown }): Array<{ callId: string; name: string; args: unknown }> {
+  if (!Array.isArray(assistant.content)) return []
+  return assistant.content
+    .filter((part): part is { type: 'toolCall'; id: string; name: string; arguments?: unknown } =>
+      Boolean(part && typeof part === 'object' && (part as { type?: unknown }).type === 'toolCall'))
+    .map(part => ({ callId: part.id, name: part.name, args: part.arguments ?? {} }))
+}
+
+function assistantOutputText(assistant: { content?: unknown }): string {
+  if (!Array.isArray(assistant.content)) return ''
+  return assistant.content
+    .filter((part): part is { type: 'text'; text: string } =>
+      Boolean(part && typeof part === 'object' && (part as { type?: unknown }).type === 'text'))
+    .map(part => part.text)
+    .join('\n')
+    .trim()
+}
+
+function toolResultText(output: unknown): string {
+  if (typeof output === 'string') return output
+  if (!Array.isArray(output)) return ''
+  return output
+    .filter((part): part is { type: 'text'; text: string } =>
+      Boolean(part && typeof part === 'object' && (part as { type?: unknown }).type === 'text'))
+    .map(part => part.text)
+    .join('\n')
+}
+
+function toolResultSummary(text: string): unknown {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      // Truncated or non-JSON output: keep a bounded preview instead.
+    }
+  }
+  return { text: trimmed.slice(0, 2000) }
+}
+
+function idListFrom(summary: unknown, keys: readonly string[]): string[] {
+  if (!summary || typeof summary !== 'object') return []
+  const record = summary as Record<string, unknown>
+  const ids: string[] = []
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value) ids.push(value)
+    else if (Array.isArray(value)) {
+      for (const entry of value) if (typeof entry === 'string' && entry) ids.push(entry)
+    }
+  }
+  return [...new Set(ids)]
+}
+
+function verifierFeedbackFrom(summary: unknown): unknown {
+  if (!summary || typeof summary !== 'object') return undefined
+  const record = summary as Record<string, unknown>
+  if (isPlainRecord(record.repair)) return record.repair
+  for (const key of verifierFeedbackKeys) {
+    if (isPlainRecord(record[key])) return record[key]
+  }
+  if (verifierRepairFeedback(record)) return record
+  return undefined
+}
+
 export interface RunAgentSessionOptions {
   directory: string
   sessionId: string
@@ -2939,6 +3296,10 @@ export interface RunAgentSessionOptions {
   onTurnStart?: (turn: number, maxTurns: number) => { messages?: readonly string[] } | void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
+  /** Opt-in agentic trace writer (see createAgentTrace). Nothing is recorded when omitted. */
+  trace?: AgentTrace
+  /** Identifiers stamped on trace events; defaults to requestId/sessionId/scenario. */
+  traceContext?: AgentTraceContext
 }
 
 export interface AgentSessionResult {
@@ -3026,10 +3387,29 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   let settled = false
   let completion: IntentCompletion | undefined
 
+  const registeredProofTools = proofToolHandlerNames.filter(name => Boolean(handlers[name]))
+  const trace = options.trace
+  const traceRunId = options.traceContext?.runId ?? options.requestId
+  const traceAssignmentId = options.traceContext?.assignmentId ?? options.sessionId
+  const traceSpecialistProfile = options.traceContext?.specialistProfile ?? options.scenario
+  let lastTraceMessageCount = 0
+  let pendingTurnTrace: {
+    turnIdx: number
+    startedAtMs: number
+    promptPrefixHash: string | null
+    deltaMessages: TraceableMessage[]
+  } | undefined
+  const toolStartedAt = new Map<string, number>()
+
   const isSettling = () => {
     if (!enableSettlement) return false
-    if (settled) return true
-    if (turnsUsed >= settlementTurn || options.shouldSettle?.() || (wallClockDeadline !== undefined && Date.now() >= wallClockDeadline)) {
+    if (settlementDue({
+      turnsUsed,
+      settlementTurn,
+      settled,
+      shouldSettle: options.shouldSettle,
+      wallClockDeadline,
+    })) {
       settled = true
       return true
     }
@@ -3048,24 +3428,30 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const hooks = [
     hook(GenerationTask, {
       beforeRequest(request) {
+        pendingTurnTrace = {
+          turnIdx: turnsUsed + 1,
+          startedAtMs: Date.now(),
+          promptPrefixHash: promptPrefixHashFor(request.messages as readonly TraceableMessage[]),
+          deltaMessages: deltaMessagesFor(request.messages as readonly TraceableMessage[], lastTraceMessageCount),
+        }
+        lastTraceMessageCount = request.messages.length
         const turnStart = options.onTurnStart?.(turnsUsed + 1, maxTurns)
         const extraMessages = (turnStart?.messages ?? []).map(content => ({
           role: 'user' as const, content, timestamp: Date.now(),
         }))
         const settlingNow = isSettling()
         if (settlingNow) {
-          const settlementBanner = [
-            `[GUARDIAN SETTLEMENT NOTICE — Turn ${turnsUsed}/${maxTurns}]`,
-            'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
-            'Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding, and (4) call complete_intent with your final status and summary.',
-          ].join(' ')
-          extraMessages.push({ role: 'user' as const, content: settlementBanner, timestamp: Date.now() })
+          extraMessages.push({
+            role: 'user' as const,
+            content: settlementBannerMessage({ turnsUsed, maxTurns, proofTools: registeredProofTools }),
+            timestamp: Date.now(),
+          })
         } else if (handlers.complete_intent && turnsUsed + 1 === settlementNudgeTurn) {
-          const nudge = [
-            `[GUARDIAN SETTLEMENT NUDGE — Turn ${turnsUsed + 1}/${maxTurns}]`,
-            `Hard settlement starts at turn ${settlementNudgeTurn} (N-2). Submit your best proof now via propose_chain_finding/update_proposed_finding, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
-          ].join(' ')
-          extraMessages.push({ role: 'user' as const, content: nudge, timestamp: Date.now() })
+          extraMessages.push({
+            role: 'user' as const,
+            content: settlementNudgeMessage({ turn: turnsUsed + 1, maxTurns, proofTools: registeredProofTools }),
+            timestamp: Date.now(),
+          })
         }
         if (!extraMessages.length) return undefined
         return {
@@ -3075,8 +3461,58 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           ],
         }
       },
-      afterResponse() {
+      afterResponse(message) {
         turnsUsed += 1
+        const pending = pendingTurnTrace
+        pendingTurnTrace = undefined
+        if (trace) {
+          const assistant = message as unknown as {
+            content?: unknown
+            model?: string
+            thinkingLevel?: string | null
+            usage?: {
+              input?: number
+              cacheRead?: number
+              output?: number
+              reasoning?: number
+              cost?: { total?: number }
+            }
+            stopReason?: string | null
+            durationMs?: number
+          }
+          const outputText = assistantOutputText(assistant)
+          try {
+            trace.recordTurn({
+              runId: traceRunId,
+              assignmentId: traceAssignmentId,
+              specialistProfile: traceSpecialistProfile,
+              turnIdx: pending?.turnIdx ?? turnsUsed,
+              promptPrefixHash: pending?.promptPrefixHash ?? undefined,
+              deltaMessages: pending?.deltaMessages,
+              model: assistant.model ?? primarySettings.model,
+              modelParams: {
+                temperature: null,
+                thinkingLevel: assistant.thinkingLevel ?? effectiveThinking,
+                maxTokens: primarySettings.maxTokens ?? DEFAULT_PROVIDER.maxTokens,
+                protocol: primarySettings.protocol,
+              },
+              ttftMs: null,
+              latencyMs: assistant.durationMs ?? (pending ? Date.now() - pending.startedAtMs : null),
+              usage: {
+                input: assistant.usage?.input ?? 0,
+                cachedInput: assistant.usage?.cacheRead ?? 0,
+                output: assistant.usage?.output ?? 0,
+                reasoning: assistant.usage?.reasoning ?? 0,
+                costUsd: assistant.usage?.cost?.total ?? 0,
+              },
+              stopReason: assistant.stopReason ?? null,
+              outputText,
+              toolCalls: assistantToolCalls(assistant),
+            })
+          } catch {
+            // Tracing must never break an investigation run.
+          }
+        }
         const nowSettling = isSettling()
         options.onTurn?.(turnsUsed, maxTurns, nowSettling)
       },
@@ -3094,9 +3530,37 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }),
     hook(ToolTask, {
       beforeTool(call) {
+        if (!call.parent) toolStartedAt.set(call.id, Date.now())
         if (isSettling() && NETWORK_TOOLS.has(call.name)) {
           return {
             block: `Settlement wrap-up active (${turnsUsed}/${maxTurns} turns). ${call.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`,
+          }
+        }
+        return undefined
+      },
+      afterTool(call, result) {
+        if (trace && !call.parent) {
+          const startedAt = toolStartedAt.get(call.id)
+          toolStartedAt.delete(call.id)
+          try {
+            const summary = toolResultSummary(toolResultText(result.output))
+            const diagnostic = (result.diagnostics ?? []).find(item => item.severity === 'error')
+            trace.recordToolResult({
+              assignmentId: traceAssignmentId,
+              turnIdx: Math.max(1, turnsUsed),
+              callId: call.id,
+              name: call.name,
+              durationMs: startedAt === undefined ? null : Date.now() - startedAt,
+              ok: !result.isError,
+              errorCode: diagnostic?.code ?? null,
+              summaryJson: summary,
+              exchangeIds: idListFrom(summary, ['exchangeIds', 'exchangeId']),
+              factIds: idListFrom(summary, ['factIds', 'factId']),
+              findingIds: idListFrom(summary, ['findingIds', 'findingId']),
+              verifierFeedback: verifierFeedbackFrom(summary),
+            })
+          } catch {
+            // Tracing must never break an investigation run.
           }
         }
         return undefined
