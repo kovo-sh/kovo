@@ -13,7 +13,7 @@ import { join, dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type {
   AppName, AppModule, BenchMode, Briefing, SeedSet, StartedApp, VariantPlan, GroundTruth, ApiRef,
-  GradeInput, Scorecard,
+  GradeInput, Scorecard, SolverCtx, PersonaId,
 } from './lib/types.ts'
 import { appNames } from './lib/types.ts'
 import { assertLocalLabAllowed } from './lib/safety.ts'
@@ -200,18 +200,13 @@ async function cmdSelftest(a: Record<string, string | boolean>): Promise<void> {
   const appArg = String(a.app ?? 'all')
   const apps = appArg === 'all' ? appNames.slice() : [appArg]
   const seeds = String(a.seeds ?? '1,2,3').split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n))
+  const siteIds = a.site ? String(a.site).split(',').map((s) => s.trim()).filter(Boolean) : undefined
   let anyFail = false
   for (const app of apps) {
     if (!isApp(app)) throw new Error(`--app must be one of ${appNames.join(', ')} or 'all'`)
-    let selftest: { runSiteMatrix?: (o: { seeds: number[]; siteIds?: string[] }) => Promise<SelftestResult> }
-    try {
-      selftest = (await import(pathToFileURL(join(APPS_ROOT, app, 'truth', 'selftest.ts')).href)) as typeof selftest
-    } catch {
-      process.stdout.write(`[${app}] no selftest available\n`)
-      continue
-    }
-    if (!selftest.runSiteMatrix) { process.stdout.write(`[${app}] selftest has no runSiteMatrix\n`); continue }
-    const result = await selftest.runSiteMatrix({ seeds })
+    // Generic runner: works as soon as a site dir has a solver, so site streams can validate
+    // their twins without waiting for an app-level truth/selftest.ts.
+    const result = await genericSiteMatrix(app, seeds, siteIds)
     process.stdout.write(`[${app}] ${result.summary}\n`)
     for (const row of result.rows) {
       if (!row.ok) { anyFail = true; process.stdout.write(`  FAIL ${row.siteId} seed=${row.seed} mode=${row.mode}: ${row.detail}\n`) }
@@ -219,6 +214,91 @@ async function cmdSelftest(a: Record<string, string | boolean>): Promise<void> {
   }
   if (anyFail) process.exit(2)
   process.stdout.write('selftest OK\n')
+}
+
+/** Run every discovered solver against a plan that forces just that site vulnerable/hardened. */
+async function genericSiteMatrix(app: AppName, seeds: number[], siteIds?: string[]): Promise<SelftestResult> {
+  const mod = await loadModule(app)
+  const blueprint = validateBlueprint(mod.blueprint)
+  const rows: SelftestResult['rows'] = []
+  let failures = 0
+  for (const seed of seeds) {
+    const base = generateVariant(blueprint, seed)
+    for (const site of blueprint.sites) {
+      if (siteIds && !siteIds.includes(site.id)) continue
+      for (const mode of ['vulnerable', 'hardened'] as const) {
+        const plan: VariantPlan = { ...base, sites: { ...base.sites, [site.id]: mode } }
+        const groundTruth = buildGroundTruth(blueprint, plan)
+        const started = await mod.start({ plan, groundTruth })
+        let ok = false
+        let detail = ''
+        try {
+          const solverFile = join(APPS_ROOT, app, 'sites', site.id, 'solver.ts')
+          const solverMod = (await import(pathToFileURL(solverFile).href)) as { solve?: (ctx: SolverCtx) => Promise<void> }
+          if (!solverMod.solve) throw new Error(`sites/${site.id}/solver.ts must export solve(ctx)`)
+          await solverMod.solve(await solverContext(started))
+          const matched = started.oracle.events().filter((e) =>
+            (site.oracle.kinds as readonly string[]).includes(e.kind) && site.oracle.routeKeys.includes(e.routeKey ?? ''))
+          ok = mode === 'vulnerable' ? matched.length > 0 : matched.length === 0
+          detail = `events=${matched.length}`
+        } catch (err) {
+          detail = (err as Error).message.slice(0, 160)
+        } finally {
+          await started.stop()
+        }
+        if (!ok) failures += 1
+        rows.push({ siteId: site.id, seed, mode, ok, detail })
+      }
+    }
+  }
+  return { summary: `${rows.length - failures}/${rows.length} twin checks pass`, rows }
+}
+
+async function solverContext(app: StartedApp): Promise<SolverCtx> {
+  const routeKey = app.plan.routes.login ? 'login' : 'auth.login'
+  const loginRoute = app.plan.routes[routeKey]
+  const cookies = new Map<PersonaId, string>()
+  const login = async (id: PersonaId): Promise<Record<string, string>> => {
+    if (!loginRoute) throw new Error('plan has no login route')
+    const cred = app.plan.personas[id]
+    if (!cred) throw new Error(`unknown persona ${id}`)
+    const res = await fetch(app.origin + loginRoute.path, {
+      method: loginRoute.method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: cred.email, password: cred.password }),
+      redirect: 'manual',
+    })
+    if (res.status >= 400) throw new Error(`login ${id} failed: ${res.status}`)
+    const raw = res.headers.getSetCookie?.() ?? []
+    const cookie = raw.map((c) => c.split(';')[0]!).join('; ')
+    if (cookie) cookies.set(id, cookie)
+    return cookie ? { cookie } : {}
+  }
+  return {
+    origin: app.origin,
+    plan: app.plan,
+    persona: (id) => app.plan.personas[id]!,
+    login,
+    request: async (input) => {
+      const res = await fetch(app.origin + input.path, {
+        method: input.method,
+        headers: { ...(input.headers ?? {}) },
+        body: input.body === undefined ? undefined
+          : typeof input.body === 'string' ? input.body
+          : JSON.stringify(input.body),
+        redirect: 'manual',
+      })
+      const headers: Record<string, string> = {}
+      res.headers.forEach((v, k) => { headers[k] = v })
+      const text = await res.text()
+      return {
+        status: res.status,
+        headers,
+        body: text,
+        json<T = unknown>(): T { return JSON.parse(text) as T },
+      }
+    },
+  }
 }
 
 interface SelftestResult {
