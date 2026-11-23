@@ -10,8 +10,15 @@ wait_s="${2:-180}"
 
 pane="${HC_PANE:-}"
 if [[ -z "$pane" ]]; then
-  pane="$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' \
-    | awk '$2 == "agy" { print $1; exit }')"
+  # Operator preference: the review pane is 0:2.1 (%11) when it is running agy.
+  # Fall back to the first agy pane so this stays environment-agnostic.
+  if tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' \
+      | awk '$2 == "agy" {print $1}' | grep -qx '0:2.1'; then
+    pane='0:2.1'
+  else
+    pane="$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}' \
+      | awk '$2 == "agy" { print $1; exit }')"
+  fi
 fi
 [[ -n "$pane" ]] || { echo "no agy pane found (set HC_PANE)" >&2; exit 3; }
 

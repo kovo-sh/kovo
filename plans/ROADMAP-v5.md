@@ -277,3 +277,15 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Wordlist-off floor (new honest number):** dev seed 1 **26/59 (44.1%)**, 100% precision, 0 decoy/unmatched (acme 8/22, shopflow 10/19, opsportal 8/18). Wordlist ON remains 35/59 (59.3%). Salted held-out (wordlists off) 22/58 (37.9%) → **gap 6.2pp**, inside the ≤8pp gate but below the ≥50% held-out bar.
 - **Interpretation:** the previous +9pp dev move was largely conventional-noun inflation; the structural intents + declared-surface ingestion hold the held-out floor and narrow the gap. No English route/param heuristics may be reintroduced to recover dev points.
 - **Merged:** agentic Slice 3 lane (`3df2821`) — acme seed 1 flag OFF 1/22 → ON 7/22 at 100% precision, $0.39; held-out generalization `ae3308d`.
+
+### 2026-11-23 — hourly v6 architecture check-in (reviewer pane 0:2.1)
+
+- **Trigger:** first hourly architecture review of the v6 pivot (~65% code merged, ~45% wired).
+- **Reviewer verdict (accepted):** velocity is good, but the loud risk is "dual-architecture cake bloat" — v6 primitives sit unwired beside the v5 path while `execution.ts` grew 9.5K→10.25K and `store.ts` 4.8K→5.7K. Freeze net-new features; flip defaults and delete v5 paths in the same PR.
+- **Accepted ordering:** (1) floor + Layer-1 contract wiring in `execution.ts` (scopePolicy, envMode, approvalLeases, park/resume, floor default-on); (2) verify-loop (expose `guardian_verify`, make it the default agentic proof path, delete the OOB poll); (3) graphwire into recon/store; (4) realism baseline through shipped Execution; (5) Graph Coordinator + v5 deletion.
+- **Accepted gates:** Phase 1 = (a) agentic ≥ `--no-llm` on **every** app, dev + salted held-out, 100% precision, and (b) ≥ **+10pp** aggregate lift on dev, ≥ **+8pp** on held-out, plus ≥25–30% agentic on reason-bench while `--no-llm` stays **0/28**.
+- **Held-out ruling:** do **not** add deterministic heuristics for race/business_logic/workflow (v5 overfitting trap). Fix only mechanical misses in Layer 2; judge semantic classes on combined Layer-2+3 (`Execution` target ≥60% held-out, ≤8pp gap).
+- **Chains:** defer truth-side causal-artifact wiring until verify-loop + coordinator land, then wire credit before the Phase-4 chain gate (≥4/6).
+- **Always-on floor traps (accepted):** filter mutating hypotheses under `prod_readonly`; cap staging floor budget 15–25% requests / 60–90 s with run-tag cleanup; a parked HITL item must never block the floor sweep.
+- **Deletion gate (accepted):** remove `runChainPlanner`, `ColdGraphCompactor`, `filterHandlersForSpecialist` strips, 6-dry-step kill, keyword escalation storms, synchronous approval waits, and the 4 JSON proof compilers from agentic exposure; **`execution.ts` < 7.5K LOC by end of Phase 4** is a release requirement.
+- **Reviewer LOC estimate:** ~75–80% of total product investment carries forward; ~20–25% of backend (~14K LOC) is throwaway — mostly the replay VM/compilers (~5.5K), monolithic orchestrator glue (~4K), tool silos/compaction (~2K), keyword HITL (~1K), brittle lab/benchmark scaffolding (~1.5–2K).
