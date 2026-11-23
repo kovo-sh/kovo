@@ -162,8 +162,8 @@ export function settlementBannerMessage(input: {
     : 'submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding'
   return [
     `[GUARDIAN SETTLEMENT NOTICE — Turn ${input.turnsUsed}/${input.maxTurns}]`,
-    'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
-    `Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) ${proofPath}, and (4) call complete_intent with your final status and summary.`,
+    'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked; graph/query tools and guardian_verify remain available until the final turn.',
+    `Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script or query recorded facts/exchanges, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) ${proofPath} and verify with guardian_verify, and (4) call complete_intent with your final status and summary.`,
   ].join(' ')
 }
 
@@ -177,18 +177,21 @@ export const AGENTIC_CONTRACT_LINES = [
   'Use typed proof tools (control-vs-probe differentials and state deltas) or a guardian_verify script; status-only claims fail verification.',
 ] as const
 
-const NETWORK_TOOLS = new Set([
-  'request_http',
-  'request_http_batch',
-  'request_http_race',
-  'browser_visit',
-  'browser_session',
-  'probe_surface',
-  'probe_differential',
-  'run_safe_templates',
-  'probe_websocket',
-  'guardian_verify',
-])
+/** Settlement: probe tools revoked at 85%; read/query/verify kept until the final turn. */
+const SETTLEMENT_REVOKED_TOOLS = new Set(['request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit', 'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket'])
+const SETTLEMENT_WRAPUP_TOOLS = new Set(['guardian_verify', 'verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill'])
+
+/** Pure settlement gate shared by the tool hook and tests. */
+export function settlementToolBlock(input: { name: string; settling: boolean; turnsUsed: number; maxTurns: number }): string | undefined {
+  if (!input.settling) return undefined
+  if (SETTLEMENT_REVOKED_TOOLS.has(input.name)) {
+    return `Settlement wrap-up active (${input.turnsUsed}/${input.maxTurns} turns). ${input.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`
+  }
+  if (input.turnsUsed >= input.maxTurns && SETTLEMENT_WRAPUP_TOOLS.has(input.name)) {
+    return `Final settlement turn (${input.turnsUsed}/${input.maxTurns}). ${input.name} is disabled on the final turn; commit results and call complete_intent.`
+  }
+  return undefined
+}
 
 export const factKinds = [
   'endpoint', 'auth', 'header', 'cors', 'cookie', 'object_ref', 'redirect',
@@ -730,7 +733,8 @@ export interface SpecialistProfileConfig {
   defaultMaxTurns: number
   maxTurnsCeiling: number
   roleAffinity: RoleAffinity
-  allowedTools: readonly (keyof WorkerToolHandlers)[]
+  /** Additive capability bundles for this hypothesis shape (base bundle is always attached). */
+  capabilities?: readonly CapabilityBundle[]
   skills: readonly string[]
   focusPrompt: string
 }
@@ -761,6 +765,36 @@ export const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
 /** v5 M5 board tools available to every specialist profile and capability tier. */
 export const boardSpecialistTools = ['board_post', 'board_read'] as const
 
+// v6 fluid bundles (plans/better-architecture.md §3.3): base + additive capabilities, no allowlist.
+export type CapabilityBundle = 'http' | 'browser' | 'oob' | 'race' | 'http2' | 'sast'
+export const BASE_INVESTIGATOR_TOOLS: readonly (keyof WorkerToolHandlers)[] = [...SPECIALIST_COMMON_TOOLS,
+  'request_http', 'request_http_batch', 'probe_surface', 'run_sast_scan', 'derive_evidence', 'analyze_artifact', 'query_cves', 'suggest_candidate_host']
+
+const TOOL_BUNDLES: Record<CapabilityBundle, readonly (keyof WorkerToolHandlers)[]> = {
+  http: ['probe_differential', 'run_safe_templates'],
+  browser: ['browser_visit', 'browser_session', 'crawl_state_graph', 'probe_websocket'],
+  oob: ['mint_canary', 'check_canary', 'mint_second_order_canary', 'list_second_order_canaries'],
+  race: ['request_http_race', 'requestHttpRace'],
+  http2: ['request_http_race', 'requestHttpRace', 'inspect_dns', 'inspect_tls', 'run_safe_templates'],
+  sast: ['run_offline_script', 'query_cves'],
+}
+
+const BUNDLE_HINTS: ReadonlyArray<readonly [CapabilityBundle, RegExp]> = [
+  ['browser', /\b(?:xss|dom|innerhtml|postmessage|client[- ]side|spa|stored|localstorage|sessionstorage|document\.cookie|websocket|cswsh)\b/i],
+  ['oob', /\b(?:blind|oob|out[- ]of[- ]band|callback|ssrf|xxe|canary|dns[- ]exfil|remote fetch)\b/i],
+  ['race', /\b(?:race|toctou|double[- ]?spend|concurren\w*|idempoten\w*|step[- ]?skip|workflow|parallel burst)\b/i],
+  ['http2', /\b(?:http\/2|http2|h2|smuggl\w*|desync|request splitting|transport)\b/i],
+  ['sast', /\b(?:static|source[- ]to[- ]sink|sast|code[- ]audit|suspect|semgrep|ast-grep|source code)\b/i],
+]
+
+export function capabilityBundlesFor(hypothesisText = '', explicit: readonly CapabilityBundle[] = []): CapabilityBundle[] {
+  return [...new Set<CapabilityBundle>(['http', ...explicit, ...BUNDLE_HINTS.filter(([, re]) => re.test(hypothesisText)).map(([bundle]) => bundle)])]
+}
+
+export function investigatorTools(bundles: readonly CapabilityBundle[]): readonly (keyof WorkerToolHandlers)[] {
+  return [...new Set<keyof WorkerToolHandlers>([...BASE_INVESTIGATOR_TOOLS, ...bundles.flatMap(bundle => TOOL_BUNDLES[bundle])])]
+}
+
 // Re-exported so execution.ts can wire turn-start deltas/guardrails without a second import site.
 export {
   buildBoardDelta,
@@ -781,10 +815,6 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 30,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'request_http', 'request_http_batch', 'probe_differential', 'derive_evidence', 'run_sast_scan',
-    ],
     skills: ['bola-idor-race', 'source-first-audit', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding with a multi-persona http_chain DeclarativeReplaySpec. BFLA needs IMPACT: a 2xx from a lower-privileged actor on a read-only route is not escalation by itself - include a privileged mutation that succeeds (2xx) or a same-route role differential (one actor gets data, another is denied), otherwise the Zero-LLM verifier will dismiss it.',
   },
@@ -794,12 +824,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 35,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'request_http', 'probe_differential', 'probe_surface', 'mint_canary', 'check_canary',
-      'mint_second_order_canary', 'list_second_order_canaries', 'run_sast_scan', 'run_offline_script',
-      'derive_evidence', 'analyze_artifact',
-    ],
+    capabilities: ['oob'],
     skills: ['sqli-boolean-differential', 'ssti-non-destructive', 'xxe-canary-proof', 'injection-benign-proof', 'path-traversal-canonicalization', 'source-first-audit', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on SQLi (boolean/time/error across query/json/form/path/header/xml/graphql_var), NoSQLi, SSTI, XXE, SSRF, path traversal, and command injection. Confirm via sql_boolean_diff, sql_time_diff, rce_proof, or http_chain.',
   },
@@ -809,11 +834,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 30,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'request_http', 'probe_differential', 'mint_canary', 'check_canary',
-      'browser_visit', 'browser_session', 'analyze_artifact', 'run_offline_script', 'derive_evidence',
-    ],
+    capabilities: ['oob', 'browser'],
     skills: ['jwt-session-security', 'auth-oauth-oidc', 'clerk-auth0-oidc', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on JWT authMutation flaws (alg_none, strip_signature, kid_inject, rs256_to_hs256_jwks, jku_x5u_canary, expired_replay), OAuth redirect_uri parser differentials, PKCE downgrades, CSRF, and session fixation. Confirm via auth_protocol_proof or http_chain.',
   },
@@ -823,12 +844,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 30,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'browser_visit', 'browser_session', 'crawl_state_graph', 'probe_websocket', 'probe_differential',
-      'request_http', 'mint_canary', 'check_canary', 'mint_second_order_canary', 'list_second_order_canaries',
-      'analyze_artifact',
-    ],
+    capabilities: ['browser', 'oob'],
     skills: ['client-side-xss-postmessage', 'prototype-pollution-dom-server', 'cors-csrf-cross-origin', 'websocket-cswsh', 'oob-ssrf-browser-chain', 'cross-host-chaining', 'recon-modern-spa'],
     focusPrompt: 'Focus strictly on Reflected/DOM/Stored XSS, postMessage origin bypass, CSWSH WebSocket hijacking, and client-side state/storage leaks. Confirm via browser_chain (dom_xss_sink_hook/postmessage_probe) or ws_chain.',
   },
@@ -838,10 +854,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 30,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'request_http', 'probe_differential', 'probe_surface', 'analyze_artifact', 'derive_evidence',
-    ],
+    capabilities: ['sast'],
     skills: ['api-rest-graphql', 'bola-idor-race', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on GraphQL schema introspection/SDL analysis, nested-edge resolver BOLA/BFLA, mutation authorization, alias batching/depth limits, and scalar argument injection via graphql_var.',
   },
@@ -851,11 +864,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 30,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace',
-      'probe_differential', 'derive_evidence',
-    ],
+    capabilities: ['race', 'browser'],
     skills: ['business-logic-workflows', 'mass-assignment-overposting', 'bola-idor-race', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on workflow step-skip (e.g. draft -> refund), quantity/price invariant violations (-1, 0, overflow), mass assignment, and TOCTOU double-spend races. Confirm via race_burst or http_chain.',
   },
@@ -865,11 +874,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     defaultMaxTurns: 25,
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
-    allowedTools: [
-      ...SPECIALIST_COMMON_TOOLS,
-      'request_http', 'inspect_dns', 'inspect_tls', 'probe_surface', 'probe_differential',
-      'run_safe_templates', 'query_cves', 'analyze_artifact', 'suggest_candidate_host',
-    ],
+    capabilities: ['http2', 'sast'],
     skills: ['cache-smuggling-desync', 'cve-runtime-correlation', 'cors-csrf-cross-origin', 'false-positive-elimination'],
     focusPrompt: 'Focus strictly on shared cache poisoning/deception (mandatory ?_gcb=), CORS/header misconfigurations, DNS takeover, TLS posture, and tech-matched CVE runtime reachability. Confirm via cache_differential, dns_takeover, tls_audit, or http_chain.',
   },
@@ -1043,23 +1048,12 @@ export function routeStepToSpecialist(input: {
   return best
 }
 
-export function filterHandlersForSpecialist(
-  handlers: WorkerToolHandlers,
-  profile: SpecialistProfileConfig,
-): WorkerToolHandlers {
-  const allowed = new Set<keyof WorkerToolHandlers>(profile.allowedTools)
-  // Script-first default: when the Layer-3 runner is available, agents verify with executable
-  // guardian_verify scripts; the four JSON-only proof compilers are not exposed.
-  if (allowed.has('guardian_verify')) {
-    for (const name of proofToolHandlerNames) allowed.delete(name)
-  }
-  const filtered: WorkerToolHandlers = {}
-  for (const key of Object.keys(handlers) as (keyof WorkerToolHandlers)[]) {
-    if (allowed.has(key)) {
-      ;(filtered as Record<string, unknown>)[key] = handlers[key]
-    }
-  }
-  return filtered
+/** Additive scoping: base + profile + hypothesis bundles; `hypothesis` stays optional for callers. */
+export function filterHandlersForSpecialist(handlers: WorkerToolHandlers, profile: SpecialistProfileConfig, hypothesis = ''): WorkerToolHandlers {
+  const allowed = new Set<keyof WorkerToolHandlers>(investigatorTools(capabilityBundlesFor(hypothesis, profile.capabilities ?? [])))
+  // Script-first default: with the Layer-3 runner, agents verify via guardian_verify; hide JSON compilers.
+  if (handlers.guardian_verify) for (const name of proofToolHandlerNames) allowed.delete(name)
+  return Object.fromEntries(Object.entries(handlers).filter(([name]) => allowed.has(name as keyof WorkerToolHandlers))) as WorkerToolHandlers
 }
 
 export type AgentScenario =
@@ -3310,8 +3304,12 @@ export function buildWorkerTools(
     }))
   }
 
-  return tools
+  // v6 Phase 4: read/query tools run concurrently; network/mutation tools stay sequential.
+  return tools.map(tool => ({ ...tool, executionMode: PARALLEL_READ_ONLY_TOOLS.has(tool.name) ? 'parallel' as const : 'sequential' as const }))
 }
+
+/** Read-only tools safe to execute concurrently inside a single tool round. */
+export const PARALLEL_READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill', 'list_second_order_canaries'])
 
 // ---------------------------------------------------------------------------
 // High-Limit Multi-Turn Pi Durable Runner
@@ -3598,7 +3596,11 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     inlineLimit,
     result => { completion = result },
   )
-  const allTools: ToolRegistration[] = [...builtTools, ...(options.extraTools ?? [])]
+  // Extra tools have unknown semantics: keep them sequential so a round that calls one never races.
+  const allTools: ToolRegistration[] = [
+    ...builtTools,
+    ...(options.extraTools ?? []).map(tool => ({ ...tool, executionMode: tool.executionMode ?? 'sequential' as const })),
+  ]
 
   const hooks = [
     hook(GenerationTask, {
@@ -3706,12 +3708,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     hook(ToolTask, {
       beforeTool(call) {
         if (!call.parent) toolStartedAt.set(call.id, Date.now())
-        if (isSettling() && NETWORK_TOOLS.has(call.name)) {
-          return {
-            block: `Settlement wrap-up active (${turnsUsed}/${maxTurns} turns). ${call.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`,
-          }
-        }
-        return undefined
+        const block = settlementToolBlock({ name: call.name, settling: isSettling(), turnsUsed, maxTurns })
+        return block ? { block } : undefined
       },
       afterTool(call, result) {
         if (trace && !call.parent) {
@@ -3774,7 +3772,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       compaction: compactionEnabled
         ? { enabled: true, reserveTokens, keepRecentTokens, backgroundTokens }
         : { enabled: false },
-      toolExecution: 'sequential',
+      toolExecution: 'parallel',
       progress: { partialIntervalMs: 250, persistWithinMs: 350 },
     },
   }, BACKGROUND_CONTEXT)

@@ -19,6 +19,8 @@ import {
   AGENTIC_SPECIALIST_MAX_TURNS,
   SPECIALIST_PROFILES,
   buildWorkerTools,
+  capabilityBundlesFor,
+  investigatorTools,
   proofToolHandlerNames,
   settlementDue,
   settlementNudgeMessage,
@@ -131,12 +133,15 @@ test('legacy raw-spec submission tools are never removed', () => {
   assert.ok(toolByName(tools, 'verify_replay_spec'))
 })
 
-test('proof tools join the common set without re-expanding the slim skill catalog', () => {
+test('proof tools join the base bundle without re-expanding the slim skill catalog', () => {
+  // v6 fluid bundles replaced the per-profile `allowedTools` allowlist (plans/better-architecture.md
+  // §3.3), so the typed-proof guarantee is asserted through the resolved bundle instead.
   for (const [id, profile] of Object.entries(SPECIALIST_PROFILES)) {
-    assert.ok(profile.allowedTools.includes('prove_authz_read_diff'), `${id} must allow typed proofs through the common set`)
+    const tools = investigatorTools(capabilityBundlesFor('', profile.capabilities))
+    assert.ok(tools.includes('prove_authz_read_diff'), `${id} must allow typed proofs through the base bundle`)
     assert.ok(profile.skills.length >= 2 && profile.skills.length < 10, `${id} keeps a slim skill list`)
     assert.equal(new Set(profile.skills).size, profile.skills.length, `${id} has no duplicate skills`)
-    assert.equal(new Set(profile.allowedTools).size, profile.allowedTools.length, `${id} has no duplicate tool entries`)
+    assert.equal(new Set(tools).size, tools.length, `${id} has no duplicate bundle tool entries`)
   }
 })
 
