@@ -25,7 +25,7 @@ import type {
 } from './program-graph.ts'
 import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
-import type { Store } from './store.ts'
+import type { EndpointRow, Store } from './store.ts'
 import { parseGraphqlIntrospection, runSafeTemplates } from './surface-engine.ts'
 
 export interface Phase0ReconParams {
@@ -76,7 +76,7 @@ export interface Phase0ReconResult {
   /** Candidate routes rejected by soft-404 / SPA catch-all calibration. */
   soft404Rejected?: number
   /** Declared operations ingested offline from the imported OpenAPI/API reference. */
-  declaredSurface?: { specs: number; endpoints: number; params: number; methods: Record<string, number> }
+  declaredSurface?: DeclaredSurfaceSummary
   /** Sibling detail routes derived from observed collections / Location headers (passive, no probe). */
   siblingEndpoints?: number
   /** Allowed methods learned from OPTIONS/405 `Allow` headers and validation 400/422 bodies. */
@@ -2375,14 +2375,15 @@ export function parseOpenApiDoc(
   scopeRevision: number,
   dynamicPaths: Set<string>,
   dynamicParams: Set<string>,
-): { endpoints: number; params: number } {
+): { endpoints: number; params: number; operations: Array<{ method: string; pathTemplate: string }> } {
   const parsed = parseJsonOrYaml(rawBody)
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { endpoints: 0, params: 0 }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { endpoints: 0, params: 0, operations: [] }
   const doc = parsed as Record<string, unknown>
   const pathsObj = doc.paths
-  if (!pathsObj || typeof pathsObj !== 'object' || Array.isArray(pathsObj)) return { endpoints: 0, params: 0 }
+  if (!pathsObj || typeof pathsObj !== 'object' || Array.isArray(pathsObj)) return { endpoints: 0, params: 0, operations: [] }
   let endpoints = 0
   let params = 0
+  const operations: Array<{ method: string; pathTemplate: string }> = []
   const validMethods = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
 
   // OpenAPI `servers[].url` / Swagger 2 `basePath` may carry a deployment prefix.
@@ -2563,6 +2564,7 @@ export function parseOpenApiDoc(
         riskScore: scoreEndpointRisk(method, pathTemplate),
       })
       endpoints += 1
+      operations.push({ method, pathTemplate })
       const op = resolveNode(opVal) ?? {}
       const opParams = [...pathLevelParams, ...(Array.isArray(op.parameters) ? op.parameters : [])]
       const declared = new Set<string>()
@@ -2594,7 +2596,7 @@ export function parseOpenApiDoc(
       }
     }
   }
-  return { endpoints, params }
+  return { endpoints, params, operations }
 }
 
 /**
@@ -2608,12 +2610,19 @@ export interface TolerantOpenApiOperation {
   params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' }>
 }
 
-export function harvestTolerantOpenApiOperations(content: string, maxOps = 300): TolerantOpenApiOperation[] {
+/** Cap for malformed/truncated references only; the lossless JSON/YAML path stays uncapped. */
+export const DEFAULT_TOLERANT_OP_CAP = 300
+
+/**
+ * Extract every operation a malformed/truncated reference textually exposes, without a cap.
+ * Callers decide whether a bound applies; `harvestTolerantOpenApiOperations` slices this.
+ */
+function harvestTolerantOperationsUncapped(content: string): TolerantOpenApiOperation[] {
   const pathKeyRe = /"(\/[A-Za-z0-9_\-{}\/.:$\[\]]{0,300})"\s*:\s*\{/g
   const matches = [...content.matchAll(pathKeyRe)]
   if (matches.length === 0) return []
   const out: TolerantOpenApiOperation[] = []
-  for (let idx = 0; idx < matches.length && out.length < maxOps; idx += 1) {
+  for (let idx = 0; idx < matches.length; idx += 1) {
     const match = matches[idx]!
     const rawPath = match[1]!
     if (!rawPath.startsWith('/') || rawPath.length > 300) continue
@@ -2643,7 +2652,70 @@ export function harvestTolerantOpenApiOperations(content: string, maxOps = 300):
     }
     for (const method of methods) out.push({ method, pathTemplate, params })
   }
-  return out.slice(0, maxOps)
+  return out
+}
+
+/**
+ * Bounded tolerant harvest for malformed references. The cap exists so a redacted/truncated blob
+ * cannot balloon ingestion; when it binds the caller logs it and treats the result as incomplete.
+ */
+export function harvestTolerantOpenApiOperations(
+  content: string,
+  maxOps = DEFAULT_TOLERANT_OP_CAP,
+): TolerantOpenApiOperation[] {
+  const ops = harvestTolerantOperationsUncapped(content)
+  const cap = Number.isFinite(maxOps) ? Math.max(0, Math.round(maxOps)) : ops.length
+  return ops.slice(0, cap)
+}
+
+/** Declared operation count a malformed reference exposes, uncapped, so callers can detect cap binding. */
+export function countTolerantOpenApiOperations(content: string): number {
+  return harvestTolerantOperationsUncapped(content).length
+}
+
+/**
+ * Page size for lossless full-store reads. `listEndpoints` falls back to 500 rows, which silently
+ * truncates ingestion and probe-selection views on large surfaces; 1,000 keeps pages cheap.
+ */
+export const ENDPOINT_PAGE_SIZE = 1000
+
+export type EndpointListFilter = NonNullable<Parameters<Store['listEndpoints']>[1]>
+
+/**
+ * Read every endpoint matching `filter` through the store's stable (risk, coverage, id) ordering.
+ * Pages until a short page proves the read is complete, so no fixed page cap can truncate a caller.
+ */
+export function listEndpointsPaged(
+  storage: Pick<Store, 'listEndpoints'>,
+  runId: string,
+  filter?: EndpointListFilter,
+  pageSize: number = ENDPOINT_PAGE_SIZE,
+): EndpointRow[] {
+  const limit = Math.max(1, Math.round(pageSize))
+  const start = Math.max(0, Math.round(filter?.offset ?? 0))
+  const out: EndpointRow[] = []
+  for (let offset = start; ; offset += limit) {
+    const rows = storage.listEndpoints(runId, { ...filter, limit, offset })
+    out.push(...rows)
+    if (rows.length < limit) break
+  }
+  return out
+}
+
+/**
+ * Declared-surface ingestion metrics. `seen` counts distinct declared operations enumerated from
+ * the references; `matched` counts those present in the store after ingestion. They must agree for
+ * the lossless path — a gap means the ingestion view or the store dropped rows.
+ */
+export type DeclaredSurfaceSummary = {
+  specs: number
+  endpoints: number
+  params: number
+  methods: Record<string, number>
+  declaredOpsSeen: number
+  declaredOpsMatched: number
+  /** Malformed references whose tolerant scan was truncated by the safety cap. */
+  declaredTolerantCapped: number
 }
 
 /**
@@ -2659,8 +2731,11 @@ export function ingestDeclaredApiSurface(input: {
   origin: string
   dynamicPaths?: Set<string>
   dynamicParams?: Set<string>
-}): { specs: number; endpoints: number; params: number; methods: Record<string, number> } {
-  const result = { specs: 0, endpoints: 0, params: 0, methods: {} as Record<string, number> }
+}): DeclaredSurfaceSummary {
+  const result: DeclaredSurfaceSummary = {
+    specs: 0, endpoints: 0, params: 0, methods: {},
+    declaredOpsSeen: 0, declaredOpsMatched: 0, declaredTolerantCapped: 0,
+  }
   const { storage, runId, scopeRevision, origin } = input
   let specs: Array<{ kind: string; content: string }> = []
   try {
@@ -2669,16 +2744,27 @@ export function ingestDeclaredApiSurface(input: {
   } catch {
     return result
   }
+  // Full paged view: the dedupe baseline must include every stored row, not just the first page.
   const known = new Set<string>()
   try {
-    for (const endpoint of storage.listEndpoints(runId, { origin })) {
+    for (const endpoint of listEndpointsPaged(storage, runId, { origin })) {
       known.add(`${origin}|${endpoint.method.toUpperCase()}|${endpoint.pathTemplate}`)
     }
   } catch { /* empty run: no known endpoints */ }
   const dynamicPaths = input.dynamicPaths ?? new Set<string>()
   const dynamicParams = input.dynamicParams ?? new Set<string>()
+  const seen = new Set<string>()
+  const noteDeclared = (method: string, pathTemplate: string) => {
+    const normalized = method.trim().toUpperCase()
+    const key = `${origin}|${normalized}|${pathTemplate}`
+    seen.add(key)
+    if (known.has(key)) return
+    known.add(key)
+    result.endpoints += 1
+    result.methods[normalized] = (result.methods[normalized] ?? 0) + 1
+  }
 
-  for (const spec of specs.slice(0, 6)) {
+  for (const [specIndex, spec] of specs.slice(0, 6).entries()) {
     const head = spec.content.slice(0, 400)
     const looksOpenApi = /openapi|swagger/i.test(spec.kind)
       || /"(?:openapi|swagger)"\s*:/.test(head)
@@ -2687,51 +2773,67 @@ export function ingestDeclaredApiSurface(input: {
     result.specs += 1
     const parsed = parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
     result.params += parsed.params
-    if (parsed.endpoints === 0) {
-      // Stored references can be truncated or carry a redaction placeholder, so JSON/YAML parsing
-      // fails. Fall back to the tolerant textual scan used by the route-derivation port; it keeps
-      // every declared operation with its declared method.
-      for (const op of harvestTolerantOpenApiOperations(spec.content)) {
-        const ep = storage.upsertEndpoint({
+    if (parsed.endpoints > 0) {
+      // Lossless path: no operation cap. Enumerate exactly what the parser persisted.
+      for (const op of parsed.operations) noteDeclared(op.method, op.pathTemplate)
+      continue
+    }
+    // Stored references can be truncated or carry a redaction placeholder, so JSON/YAML parsing
+    // fails. Fall back to the tolerant textual scan used by the route-derivation port; it keeps
+    // every declared operation with its declared method, bounded by a safety cap that is logged.
+    const tolerantOps = harvestTolerantOpenApiOperations(spec.content)
+    const declaredTolerantOps = countTolerantOpenApiOperations(spec.content)
+    if (declaredTolerantOps > tolerantOps.length) {
+      result.declaredTolerantCapped += 1
+      try {
+        storage.event(
           runId,
-          scopeRevision,
-          origin,
-          method: op.method,
-          pathTemplate: op.pathTemplate,
+          'phase0.declared_surface_capped',
+          `Tolerant API-reference scan truncated at ${tolerantOps.length} of ${declaredTolerantOps} declared operation(s) (malformed/redacted reference).`,
+          { specIndex, cap: tolerantOps.length, declaredTolerantOps, origin },
+        )
+      } catch { /* metrics only */ }
+    }
+    for (const op of tolerantOps) {
+      const ep = storage.upsertEndpoint({
+        runId,
+        scopeRevision,
+        origin,
+        method: op.method,
+        pathTemplate: op.pathTemplate,
+        source: 'openapi',
+        riskScore: scoreEndpointRisk(op.method, op.pathTemplate),
+      })
+      dynamicPaths.add(op.pathTemplate)
+      for (const p of op.params) {
+        storage.upsertEndpointParam({
+          runId,
+          endpointId: ep.id,
+          name: p.name,
+          location: p.location,
+          isCsrf: CSRF_PARAM_RE.test(p.name),
+          isObjectId: p.location === 'path' || OBJECT_ID_PARAM_RE.test(p.name),
           source: 'openapi',
-          riskScore: scoreEndpointRisk(op.method, op.pathTemplate),
         })
-        dynamicPaths.add(op.pathTemplate)
-        for (const p of op.params) {
-          storage.upsertEndpointParam({
-            runId,
-            endpointId: ep.id,
-            name: p.name,
-            location: p.location,
-            isCsrf: CSRF_PARAM_RE.test(p.name),
-            isObjectId: p.location === 'path' || OBJECT_ID_PARAM_RE.test(p.name),
-            source: 'openapi',
-          })
-          dynamicParams.add(p.name)
-          result.params += 1
-        }
+        dynamicParams.add(p.name)
+        result.params += 1
       }
+      noteDeclared(op.method, op.pathTemplate)
     }
-    // Count only operations that were not already present (parseOpenApiDoc upserts, so re-running
-    // on an existing run is idempotent and must not inflate the discovery counters).
-    let current: Array<{ method: string; pathTemplate: string }> = []
+  }
+
+  // Integrity read: `seen` must be fully visible through the same paged ingestion view.
+  // `endpoints` above stays incremental (idempotent re-ingestion reports 0), while these two
+  // metrics describe the declared surface itself.
+  result.declaredOpsSeen = seen.size
+  if (seen.size > 0) {
     try {
-      current = storage.listEndpoints(runId, { origin }).map(endpoint => ({
-        method: endpoint.method.toUpperCase(), pathTemplate: endpoint.pathTemplate,
-      }))
-    } catch { /* ignore */ }
-    for (const endpoint of current) {
-      const key = `${origin}|${endpoint.method}|${endpoint.pathTemplate}`
-      if (known.has(key)) continue
-      known.add(key)
-      result.endpoints += 1
-      result.methods[endpoint.method] = (result.methods[endpoint.method] ?? 0) + 1
-    }
+      const persisted = new Set(listEndpointsPaged(storage, runId, { origin }).map(endpoint =>
+        `${origin}|${endpoint.method.toUpperCase()}|${endpoint.pathTemplate}`))
+      let matched = 0
+      for (const key of seen) if (persisted.has(key)) matched += 1
+      result.declaredOpsMatched = matched
+    } catch { /* metrics only */ }
   }
   return result
 }
@@ -2934,8 +3036,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     })
     endpointsDiscovered += declaredSurface.endpoints
     paramsDiscovered += declaredSurface.params
-    if (declaredSurface.endpoints > 0) {
-      storage.event(runId, 'phase0.declared_surface', `Ingested ${declaredSurface.endpoints} declared operation(s) from the API reference.`, declaredSurface)
+    if (declaredSurface.declaredOpsSeen > 0) {
+      storage.event(
+        runId,
+        'phase0.declared_surface',
+        `Ingested ${declaredSurface.endpoints} new declared operation(s); ${declaredSurface.declaredOpsMatched}/${declaredSurface.declaredOpsSeen} declared operation(s) are visible in the store.`,
+        declaredSurface,
+      )
     }
   }
   let siblingEndpoints = 0
@@ -2944,13 +3051,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   // the mounted AST or the declared API reference already describes the surface, speculative
   // collection->item derivation is disabled (the declared truth is strictly better evidence).
   const siblingDerivationRequested = /^(?:1|true|on|yes)$/i.test((process.env.GUARDIAN_RECON_SIBLINGS ?? '').trim())
-  const declaredOrAstSurfacePresent = (repoStaticExtraction?.mergedRoutes ?? 0) > 0 || (declaredSurface?.endpoints ?? 0) > 0
+  const declaredOrAstSurfacePresent = (repoStaticExtraction?.mergedRoutes ?? 0) > 0 || (declaredSurface?.declaredOpsMatched ?? 0) > 0
   const siblingDerivationEnabled = siblingDerivationRequested && !declaredOrAstSurfacePresent
   const siblingDerivationSuppressed = siblingDerivationRequested && declaredOrAstSurfacePresent ? 'declared_surface' as const : undefined
   if (siblingDerivationSuppressed) {
     storage.event(runId, 'phase0.siblings_suppressed',
       'Speculative sibling derivation disabled: AST/declared surface is available for this origin.',
-      { astRoutes: repoStaticExtraction?.mergedRoutes ?? 0, declared: declaredSurface?.endpoints ?? 0 })
+      { astRoutes: repoStaticExtraction?.mergedRoutes ?? 0, declared: declaredSurface?.declaredOpsMatched ?? declaredSurface?.endpoints ?? 0 })
   }
 
   // Tier 0: zero live HTTP requests
