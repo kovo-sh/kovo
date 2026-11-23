@@ -23,7 +23,7 @@ export async function solve(ctx: SolverCtx): Promise<void> {
   await ctx.request({
     method: receive.method,
     path: receive.path,
-    headers: { 'content-type': 'application/json', 'x-timestamp': timestamp, 'x-signature': signature },
+    headers: { ...headers, 'content-type': 'application/json', 'x-timestamp': timestamp, 'x-signature': signature },
     body,
   })
 }
