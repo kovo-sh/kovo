@@ -164,4 +164,11 @@ do not transcribe expected or simulated numbers.
 
 | Date | Commit | Fixture | Mode / lane | Gate | Stage | Key measurements | Artifact |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| — | — | — | — | — | — | — | — |
+| 2026-11-23 | `91a4be1` | `enterprise-spa` | grey-box / `--no-llm` | FAIL | `investigation` | route 16/24 (66.7%); authz no; stored XSS no; chain 0/2; TP 0 / FP 0 / submitted 0; 79 endpoints; 822 engine requests, 0 confirmed / 0 leads; 108.7 s | `realism-gate-1-final` (local out-dir) |
+| 2026-11-23 | `91a4be1` | `staging-concurrency` | grey-box / `--no-llm`, `staging_isolated` | FAIL | `investigation` | write-BOLA no; h2 race no; checkout no; leaked 0 (no tagged mutations; cleanup removed 0 / restored 0); TP 0 / FP 0; 32 endpoints; 539 engine requests, 0 confirmed / 0 leads; 49.1 s | `realism-gate-3-final` (local out-dir) |
+| 2026-11-23 | `91a4be1` | `wan-oob` | grey-box / `--no-llm`, **smoke** (`--callback-delay-ms 1000,2000`) | FAIL | `timeout` | blind SQLi / async SSRF / async XXE: no product confirmations; async FN 100%; fixture-side `sqli` callback observed, `ssrf`/`xxe` not; TP 0 / FP 0; 36 endpoints; 120 s cap | `realism-gate-2-smoke` (local out-dir) |
+| 2026-11-23 | `91a4be1` | `monorepo-whitebox` | white-box / `--no-llm`, **smoke** (120 s cap) | FAIL | `investigation` | SAST suspects 0 (link n/a); persisted 62 / retrieved 62 / declared 2,565 (under 2,500); 4-hop 0/3; chain 0/2; TP 0 / FP 0; 611 engine requests, 2 rejected / 1 lead; 88.3 s | `realism-gate-4-smoke` (local out-dir) |
+
+Smoke rows are harness-validation runs, not gate evidence: the WAN row uses a shortened
+callback delay and the monorepo row uses a shortened wall-clock cap. The #1 and #3 rows use
+the gate configuration (`--no-llm`, grey-box, 180 s cap, default WAN settings where applicable).
