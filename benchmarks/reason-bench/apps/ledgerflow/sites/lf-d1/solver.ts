@@ -1,5 +1,5 @@
-// Basket walkthrough: open the seeded basket, apply the workspace promotion, remove the larger line,
-// and read the basket back to see whether the promotion survived the re-price.
+// Basket walkthrough: open the seeded basket, apply the workspace promotion, reprice the larger line
+// down to a nominal amount, and read the basket back to see whether the promotion survived.
 import type { SolverCtx, SolverResponse } from '../../../../lib/types.ts'
 
 interface CartItem { id?: unknown; unit?: unknown; qty?: unknown }
@@ -32,6 +32,8 @@ export async function solve(ctx: SolverCtx): Promise<void> {
   }), 'apply coupon')
   const items = [...(cart.items ?? [])].sort((a, b) => Number(b.unit) - Number(a.unit))
   const itemId = String(items[0]?.id ?? '')
-  await ctx.request({ method: 'DELETE', path: url(ctx, 'deleteCartItem', { cartId, itemId }), headers: session })
+  await ctx.request({
+    method: 'PATCH', path: url(ctx, 'patchCartItem', { cartId, itemId }), headers: session, body: { unit: 1, qty: 1 },
+  })
   await ctx.request({ method: 'GET', path: url(ctx, 'getCart', { cartId }), headers: session })
 }
