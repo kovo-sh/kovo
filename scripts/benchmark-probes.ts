@@ -1407,6 +1407,280 @@ async function serverActionBodies(h: Hypothesis, env: ProbeEnv): Promise<unknown
   return [positional, objectBody]
 }
 
+// ---------------------------------------------------------------------------
+// Function-state readback inference
+// ---------------------------------------------------------------------------
+
+/**
+ * Verbs carried by a function/server-action name. Only resource/state nouns remain after filtering,
+ * so `updateOrgPlan` yields `org`,`plan` without any app-specific vocabulary.
+ */
+const functionVerbToken = /^(?:update|create|make|set|get|do|handle|save|change|toggle|the|for|with|new|add|edit|apply|enable|disable|remove|delete|reset|assign|invite|grant|revoke|submit|send|start|stop|run|test|trigger|verify|approve|reject|publish|archive|restore|move|rename|copy|sync|refresh|reload|clear|close|open|lock|unlock|validate|confirm|cancel|complete|finish|promote|demote|ban|unban|suspend|activate|deactivate|mark|patch|put|post|exec|invoke)$/i
+/** Request fields that select *which* resource a function acts on (never the state under test). */
+const selectorField = /^(?:id|ref|key|code|token|name|flag|field|type|kind|slug|resource|record|object|entity|uid|uuid|org|tenant|team|account|workspace|project|user|owner|target|selector|path|url|email)$/i
+/** Request fields that carry the state a function changes. */
+const stateField = /(?:enabled|active|status|state|plan|tier|role|value|amount|price|total|count|qty|quantity|mode|level|visibility|public|private|locked|verified|admin|feature|setting|config|seats?|credits?|balance)$/i
+/** Values that legitimately change between two reads without proving a state mutation. */
+const volatileField = /^(?:updated?at|updated?_?on|created?at|created?_?on|timestamp|ts|etag|last_?modified|request_?id|trace_?id|nonce|csrf|xsrf|expires?|exp|iat|jti|date|time|version|revision|hash|signature|token)$/i
+
+/** Resource/state tokens carried by a function's own name (`updateOrgPlan` -> `org`, `plan`). */
+export function actionStateTokens(actionPath: string): string[] {
+  return lastPathSegment(actionPath)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .map(token => token.toLowerCase())
+    .filter(token => token.length > 1 && !functionVerbToken.test(token))
+}
+
+/**
+ * Sibling GET routes that can expose the state a function mutates, derived only from the target's
+ * own route map: the discovered reads whose path segments name the same resource/state as the
+ * function name (`updateOrgPlan` -> `/api/v1/org`, `/api/v1/org/:id`). Collections rank before
+ * deeper paths so a concrete status route wins over an unrelated nested listing.
+ */
+export function inferObservableReadRoutes(actionPath: string, getPaths: readonly string[]): string[] {
+  const tokens = actionStateTokens(actionPath)
+  if (tokens.length === 0) return []
+  const scored: Array<{ path: string; score: number; depth: number }> = []
+  const bare = actionPath.split('?')[0]
+  for (const candidate of getPaths) {
+    const candidatePath = candidate.split('?')[0]
+    if (candidatePath === bare) continue
+    const segments = candidatePath.split('/').filter(Boolean).map(segment => segment.toLowerCase())
+    if (segments.length === 0) continue
+    let score = 0
+    for (const token of tokens) {
+      const singular = token.replace(/s$/, '')
+      if (segments.some(segment => segment === token || segment.replace(/s$/, '') === singular)) score += 2
+    }
+    if (score === 0) continue
+    scored.push({ path: candidatePath, score, depth: segments.length })
+  }
+  return scored
+    .sort((a, b) => b.score - a.score || a.depth - b.depth || a.path.length - b.path.length || a.path.localeCompare(b.path))
+    .map(candidate => candidate.path)
+}
+
+/** Flatten a JSON value to scalar paths (NUL-joined) with their raw values (bounded). */
+export function flattenScalars(value: unknown, prefix: string[] = [], out: Map<string, unknown> = new Map()): Map<string, unknown> {
+  if (out.size >= 256 || prefix.length > 8) return out
+  if (Array.isArray(value)) {
+    value.slice(0, 16).forEach((child, index) => flattenScalars(child, [...prefix, String(index)], out))
+    return out
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) flattenScalars(child, [...prefix, key], out)
+    return out
+  }
+  if (value !== null && value !== undefined) out.set(prefix.join('\u0000'), value)
+  return out
+}
+
+/** A distinct, format-preserving counterpart of a mutated value (never destructive). */
+export function alternateStateValue(value: unknown, tag: string): unknown {
+  const suffix = tag.replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'alt'
+  if (typeof value === 'boolean') return !value
+  if (typeof value === 'number' && Number.isFinite(value)) return value === 0 ? 1 : Math.trunc(value) + 1
+  if (typeof value === 'string') {
+    if (/^\d{1,10}$/.test(value)) return String(Number(value) + 9_000_001).slice(0, 12)
+    if (value.length > 0 && value.length <= 24 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(value)) return `${value}_${suffix}`
+    return `guardian_${suffix}`
+  }
+  return value
+}
+
+function isSelectorField(key: string): boolean {
+  return selectorField.test(key) || /(?:Id|_id|ID)$/.test(key) || /^[a-z]+id$/i.test(key)
+}
+
+/**
+ * Build a benign control body and the state-changing probe body from the observed write body.
+ * Selectors (the resource the function targets) are preserved; state fields are alternated so the
+ * control read and the post-probe read are guaranteed to differ. Returns null when no field can be
+ * safely varied.
+ */
+export function buildStateVariants(
+  body: unknown,
+  readPaths: ReadonlySet<string>,
+): { controlBody: unknown; probeBody: unknown } | null {
+  const seenKey = new Set<string>()
+  for (const path of readPaths) for (const part of path.split('\u0000')) seenKey.add(part.toLowerCase())
+  const keep = (key: string, value: unknown): boolean =>
+    isSelectorField(key) || (typeof value === 'string' && seenKey.has(value.toLowerCase()) && !stateField.test(key))
+  if (Array.isArray(body)) {
+    // RPC convention: the first positional argument names the target resource, the rest are state.
+    if (body.length < 2) return null
+    const [target, ...rest] = body
+    if (rest.every(value => value === undefined)) return null
+    return {
+      controlBody: [target, ...rest.map(value => alternateStateValue(value, 'ctrl'))],
+      probeBody: [...body],
+    }
+  }
+  if (body && typeof body === 'object') {
+    const entries = Object.entries(body as Record<string, unknown>)
+    if (entries.length === 0) return null
+    const controlBody: Record<string, unknown> = {}
+    const probeBody: Record<string, unknown> = {}
+    let varied = 0
+    for (const [key, value] of entries) {
+      probeBody[key] = value
+      if (keep(key, value)) {
+        controlBody[key] = value
+        continue
+      }
+      controlBody[key] = alternateStateValue(value, 'ctrl')
+      varied += 1
+    }
+    return varied > 0 ? { controlBody, probeBody } : null
+  }
+  return null
+}
+
+export interface FunctionStateReadback {
+  /** Concrete GET route that reports the mutated function state. */
+  path: string
+  controlBody: unknown
+  probeBody: unknown
+  /** Scalar path inside the read body that changed (e.g. ["flags","guardian"]). */
+  fieldPath: string[]
+  controlValue?: unknown
+  probeValue: unknown
+  /** Identifier binding: a read-body field whose value is the function's target resource id. */
+  bindingPath?: string[]
+  bindingValue?: string
+}
+
+function selectorOf(body: unknown): string | null {
+  if (Array.isArray(body)) {
+    const first = body[0]
+    return typeof first === 'string' && first.length > 0 && first.length <= 128 ? first : null
+  }
+  if (body && typeof body === 'object') {
+    for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+      if (!isSelectorField(key)) continue
+      if (typeof value === 'string' && value.length > 0 && value.length <= 128) return value
+    }
+  }
+  return null
+}
+
+/** First scalar path in the read body whose leaf names a resource id and equals the selector. */
+function bindingFor(readJson: unknown, selector: string | null): { path: string[]; value: string } | null {
+  if (!selector) return null
+  for (const [flat, value] of flattenScalars(readJson)) {
+    if (String(value) !== selector) continue
+    const path = flat.split('\u0000')
+    const leaf = path[path.length - 1] ?? ''
+    if (/^(?:id|ref|key|code|uid|uuid|slug)$/i.test(leaf) || /(?:Id|_id)$/.test(leaf)) return { path, value: selector }
+  }
+  return null
+}
+
+interface ScalarDelta { path: string[]; before?: unknown; after?: unknown }
+
+/** Scalars that differ between two reads, preferring explicit state fields over noisy metadata. */
+export function scalarDeltas(before: unknown, after: unknown): ScalarDelta[] {
+  const left = flattenScalars(before)
+  const right = flattenScalars(after)
+  const out: ScalarDelta[] = []
+  for (const [flat, value] of right) {
+    const path = flat.split('\u0000')
+    if (volatileField.test(path[path.length - 1] ?? '')) continue
+    if (!left.has(flat)) out.push({ path, after: value })
+    else if (left.get(flat) !== value) out.push({ path, before: left.get(flat), after: value })
+  }
+  for (const [flat] of left) {
+    if (right.has(flat)) continue
+    const path = flat.split('\u0000')
+    if (volatileField.test(path[path.length - 1] ?? '')) continue
+    out.push({ path, before: left.get(flat) })
+  }
+  const rank = (delta: ScalarDelta): number => {
+    const leaf = delta.path[delta.path.length - 1] ?? ''
+    return (stateField.test(leaf) ? 0 : 2) + (delta.before !== undefined && delta.after !== undefined ? 0 : 1)
+  }
+  return out.sort((a, b) => rank(a) - rank(b) || a.path.length - b.path.length || a.path.join('.').localeCompare(b.path.join('.')))
+}
+
+/**
+ * Observe a mutating function's own state: read its observable status route (or a sibling read
+ * inferred from the function name), drive a benign control value, invoke the same function as the
+ * lower-privileged actor, and read the state again. A non-empty delta is the persistence evidence a
+ * mutation echo can never provide. Only GET reads are used for the checkpoints.
+ */
+async function observeFunctionStateReadback(
+  h: Hypothesis,
+  env: ProbeEnv,
+  owner: string | undefined,
+  other: string | undefined,
+  anomalies: readonly Record<string, unknown>[],
+  watch: (ex: BrokerExchangeResult) => void,
+): Promise<FunctionStateReadback | null> {
+  if (!owner || !other) return null
+  const bodyTemplate = anomalies.find(anomaly => anomaly.type === 'unauthorized_access' && String(anomaly.method ?? '') !== 'GET')?.bodyTemplate
+  if (bodyTemplate === undefined || bodyTemplate === null) return null
+  const getPaths = [...new Set((env.endpoints ?? []).filter(endpoint => endpoint.method.toUpperCase() === 'GET').map(endpoint => endpoint.path))]
+  const ownPath = h.endpoint.path.split('?')[0]
+  const candidates = [ownPath, ...inferObservableReadRoutes(ownPath, getPaths)]
+    .filter((candidate, index, all) => all.indexOf(candidate) === index && !candidate.startsWith('//'))
+    .slice(0, 3)
+  const selector = selectorOf(bodyTemplate)
+  const stateWriteMethod: 'POST' | 'PUT' | 'PATCH' = h.method === 'PUT' || h.method === 'PATCH' ? h.method : 'POST'
+  const send = async (method: 'GET' | 'POST' | 'PUT' | 'PATCH', pathAndQuery: string, persona: string, body?: unknown) => {
+    const ex = await env.broker.executeHttp({
+      origin: env.origin, method, pathAndQuery, persona,
+      ...(body !== undefined ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
+      ...(env.caps.sessionAndCsrf ? { session: env.session } : {}),
+      followRedirects: false, timeoutMs: 8_000,
+    }, env.grant, env.signal)
+    watch(ex)
+    return ex
+  }
+  for (const candidate of candidates) {
+    const readPath = hasPathPlaceholder(candidate)
+      ? (selector ? fillPlaceholders(candidate, encodeURIComponent(selector)) : null)
+      : candidate
+    if (!readPath) continue
+    let initial: BrokerExchangeResult
+    try { initial = await send('GET', readPath, owner) } catch { continue }
+    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} candidate=${candidate} initial=${initial.status}\n`)
+    if (initial.status < 200 || initial.status >= 300) continue
+    let initialJson: unknown
+    try { initialJson = JSON.parse(initial.body) } catch { continue }
+    if (!initialJson || typeof initialJson !== 'object') continue
+    const readPaths = new Set(flattenScalars(initialJson).keys())
+    const variants = buildStateVariants(bodyTemplate, readPaths)
+    if (!variants) continue
+    const binding = bindingFor(initialJson, selector)
+    // Control write sets a distinct benign baseline, so the probe delta is attributable and the
+    // post-probe read is never identical just because an earlier probe already wrote this value.
+    try { await send(stateWriteMethod, ownPath, owner, variants.controlBody) } catch { continue }
+    let before: BrokerExchangeResult
+    try { before = await send('GET', readPath, owner) } catch { continue }
+    if (before.status < 200 || before.status >= 300) continue
+    let beforeJson: unknown
+    try { beforeJson = JSON.parse(before.body) } catch { continue }
+    let write: BrokerExchangeResult
+    try { write = await send(stateWriteMethod, ownPath, other, variants.probeBody) } catch { continue }
+    if (write.status < 200 || write.status >= 300) continue
+    let after: BrokerExchangeResult
+    try { after = await send('GET', readPath, owner) } catch { continue }
+    if (after.status < 200 || after.status >= 300) continue
+    let afterJson: unknown
+    try { afterJson = JSON.parse(after.body) } catch { continue }
+    const delta = scalarDeltas(beforeJson, afterJson)[0]
+    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} ${readPath} control=${before.status} probe=${write.status} after=${after.status} delta=${delta ? delta.path.join('.') : 'none'} before=${before.body.slice(0, 200)} after=${after.body.slice(0, 200)}\n`)
+    if (!delta) continue
+    return {
+      path: readPath, controlBody: variants.controlBody, probeBody: variants.probeBody,
+      fieldPath: delta.path, ...(delta.before !== undefined ? { controlValue: delta.before } : {}), probeValue: delta.after,
+      ...(binding ? { bindingPath: binding.path, bindingValue: binding.value } : {}),
+    }
+  }
+  return null
+}
+
 export async function authzRequest(h: Hypothesis, env: ProbeEnv, owner = env.owner, other = env.other): Promise<ProbeDifferentialRequest> {
   const idSlot = hasPathPlaceholder(h.endpoint.path)
   const idParam = h.endpoint.params.find(p => (p.isObjectId || idName.test(p.name)) && p.location === 'query')
@@ -2923,6 +3197,19 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       out.verdict = 'signal'
       out.anomalies = [...out.anomalies, ...dom.anomalies]
       out.summary = 'Canary reached an executable DOM sink after scripted interaction on a rendered page.'
+    }
+  }
+
+  // Function-level mutation (BFLA / server action): the mutation response is an echo, so observe the
+  // function's own status route (or a sibling read inferred from its name) across a controlled state
+  // transition. Only a real readback delta can support a persistence claim.
+  const functionLevelMutation = h.probeClass === 'authz_matrix' && h.method !== 'GET' && !h.deleteMethod &&
+    !hasPathPlaceholder(h.endpoint.path) &&
+    !h.endpoint.params.some(p => (p.isObjectId || idName.test(p.name)) && p.location === 'query')
+  if (functionLevelMutation && out.verdict === 'signal' && !out.tierBlocked && !env.signal.aborted) {
+    const stateReadback = await observeFunctionStateReadback(h, env, out.pair?.owner, out.pair?.other, out.anomalies, watch)
+    if (stateReadback) {
+      out.details = { ...out.details, functionState: stateReadback }
     }
   }
   return out

@@ -158,6 +158,35 @@ export function isReadMethod(method: string | null | undefined): boolean {
   return READ_METHODS.has((method ?? '').toUpperCase())
 }
 
+/**
+ * A POST that carries only a read-only GraphQL *query* does not mutate the target. GraphQL clients
+ * send queries over POST, so the verb alone cannot classify the exchange as state-changing; doing so
+ * would demand a persisted readback that a read can never produce. Only an explicit `query`
+ * operation (or the shorthand selection-set form `{ ... }`) counts, and an opaque/absent body is
+ * never assumed read-only. Documents containing `mutation`/`subscription` stay mutating.
+ */
+export function isReadOnlyGraphqlRequest(step: Pick<ImpactStep, 'method' | 'requestJson'>): boolean {
+  if ((step.method ?? '').toUpperCase() !== 'POST') return false
+  const body = step.requestJson
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false
+  const query = (body as { query?: unknown }).query
+  if (typeof query !== 'string') return false
+  const text = query.trim()
+  if (text.length === 0 || text.length > 16_384) return false
+  if (!/^(?:query\b|\{)/.test(text)) return false
+  return !/\b(?:mutation|subscription)\b/.test(text)
+}
+
+/** True when this step changes target state (method mutates and it is not a read-only GraphQL query). */
+export function stepMutatesState(step: Pick<ImpactStep, 'method' | 'requestJson'>): boolean {
+  return isMutatingMethod(step.method) && !isReadOnlyGraphqlRequest(step)
+}
+
+/** True when this step reads target state (an explicit read verb or a read-only GraphQL query). */
+export function stepReadsState(step: Pick<ImpactStep, 'method' | 'requestJson'>): boolean {
+  return isReadMethod(step.method) || isReadOnlyGraphqlRequest(step)
+}
+
 function isSuccess(status: number | null): boolean {
   return status !== null && status >= 200 && status < 300
 }
@@ -382,7 +411,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     probeSuccesses.some(probe => sameRoute(control, probe)))
   const requiredRole = normalizeRole(input.requiredRole)
   const requiredRank = roleRank(requiredRole)
-  const mutatingProbe = probeSuccesses.find(step => isMutatingMethod(step.method)) ?? null
+  const mutatingProbe = probeSuccesses.find(step => stepMutatesState(step)) ?? null
   const probe = mutatingProbe ?? probeSuccesses.find(step => isReadMethod(step.method)) ?? probeSuccesses[0] ?? probes[0]
 
   const base = {
@@ -1059,8 +1088,8 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     step.id !== signal.step.id &&
     routeFamily(step.route ?? '') === signalFamily &&
     step.arm === 'probe' &&
-    ((isReadMethod(step.method) && ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ||
-      (isMutatingMethod(step.method) && isSuccess(step.status)))))
+    ((stepReadsState(step) && ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ||
+      (stepMutatesState(step) && isSuccess(step.status)))))
   const distinctActors = new Set(steps.map(step => step.actor.handle).filter((handle): handle is string => Boolean(handle)))
   const roleOrTenantDifferential = steps.some(a => steps.some(b =>
     a !== b &&
