@@ -412,9 +412,15 @@ export function enumerateHypotheses(
   // body-field spelling as a scalar value). Bounded and evidence-derived: it never invents a name
   // the target did not itself expose; the route-semantic fallbacks stay last.
   const originSchemaPool = new Map<string, string[]>()
+  const originViewerIds = new Map<string, string[]>()
   for (const endpoint of endpoints) {
     const harvest = harvests.get(endpoint.id)
     if (!harvest) continue
+    if (harvest.viewerIds?.length) {
+      const ids = originViewerIds.get(endpoint.origin) ?? []
+      for (const id of harvest.viewerIds) if (!ids.includes(id)) ids.push(id)
+      originViewerIds.set(endpoint.origin, ids.slice(0, 4))
+    }
     const pool = originSchemaPool.get(endpoint.origin) ?? []
     for (const value of [...harvest.fields, ...Object.values(harvest.values).flat(), ...harvest.seedValues]) {
       if (value.length < 2 || value.length > 40) continue
@@ -940,12 +946,23 @@ export function enumerateHypotheses(
         // A role/privilege write must be performed by a genuinely lower-privileged actor on that
         // actor's own record: an owner editing its own row cannot demonstrate escalation.
         const roleField = candidates.find(f => /^(?:role|roles|permission|permissions|privilege|grant|level|is_admin|isAdmin|admin)$/i.test(f))
-        const viewerTarget = isUpdate && roleField && picks.lower && (harvest?.viewerIds?.length ?? 0) > 0
-          ? harvest!.viewerIds![0]
+        const viewerIds = originViewerIds.get(endpoint.origin) ?? []
+        const viewerTarget = isUpdate && roleField && picks.lower && viewerIds.length > 0
+          ? viewerIds[0]
           : null
+        // The impact monitor evaluates the writer's role after the mutation, so a self-escalation
+        // cannot demonstrate an escalation. Choose a colleague from the same collection, skipping
+        // the first (owning) record and the viewer's own id.
+        const listIds = (harvest?.ownerIds ?? []).filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id))
+        const colleagueTarget = viewerTarget
+          ? (listIds.filter(id => id !== viewerTarget && id !== listIds[0])[0]
+            ?? listIds.find(id => id !== viewerTarget)
+            ?? viewerTarget)
+          : null
+        const roleTarget = colleagueTarget ?? viewerTarget
         const writer = viewerTarget ? picks.lower!.handle : picks.owner?.handle
-        const targetPath = viewerTarget && hasIdPath
-          ? bare.replace(idSegmentRe, `/${encodeURIComponent(viewerTarget)}`)
+        const targetPath = roleTarget && hasIdPath
+          ? bare.replace(idSegmentRe, `/${encodeURIComponent(roleTarget)}`)
           : massPath
         add({
           key: `mass_assignment|${endpoint.id}`,
@@ -1778,7 +1795,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(defaultEnginePerProbeRequests, remaining))
     let probe: DifferentialResult
     try {
-      probe = hyp.intent === 'secret_disclosure' && !input.probe
+      probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
         ? await probeSecretExposure(hyp, input, trackExchange)
         : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && input.canaryBroker && !input.probe
           ? await probeSecondOrderSsrf(hyp, input, trackExchange)

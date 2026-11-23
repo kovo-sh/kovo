@@ -898,9 +898,23 @@ function synthSensitiveRead(hyp: EngineHypothesis, result: DifferentialResult): 
   const probePersona = typeof hit.persona === 'string' && /^[a-z0-9_-]{1,32}$/.test(hit.persona) ? hit.persona : undefined
   if (!probePersona || probePersona === hyp.ownerPersona) return []
   const pattern = typeof hit.secretPattern === 'string' ? hit.secretPattern : ''
-  const jq = `{ controlPassed: ((${is2xx('c1')}) and ((.steps.c1.body | length) > 2)), ` +
-    `confirmed: ((${is2xx('p1')}) and (.steps.p1.body == .steps.c1.body) and ` +
-    `${pattern ? `((.steps.p1.body | test(${jqStr(pattern)})) or (.steps.p1.body | contains("[redacted]")))` : '((.steps.p1.body | length) > 2)'}), ` +
+  const fingerprints = Array.isArray(hit.secretFingerprints)
+    ? hit.secretFingerprints.filter(value => typeof value === 'string' && /^[0-9a-f]{8,64}$/i.test(value))
+    : []
+  const fingerprintProof = fingerprints.length > 0 || hit.secretEvidence === 'fingerprint'
+  // Bodies are scrubbed before they reach a spec, so a body-pattern assertion cannot prove a
+  // disclosure. The broker's pre-redaction fingerprints can: the unentitled view carries the same
+  // secret fingerprint the entitled control carried.
+  const proofJq = fingerprintProof
+    ? '(((.steps.p1.secretMatches // []) | length) > 0) and (.steps.p1.secretMatches[0].sha256Prefix as $fp | (([.steps.c1.secretMatches[]?.sha256Prefix] | index($fp)) != null))'
+    : pattern
+      ? `((.steps.p1.body | test(${jqStr(pattern)})) or (.steps.p1.body | contains("[redacted]")))`
+      : '((.steps.p1.body | length) > 2)'
+  const controlJq = fingerprintProof
+    ? '(((.steps.c1.secretMatches // []) | length) > 0)'
+    : '((.steps.c1.body | length) > 2)'
+  const jq = `{ controlPassed: ((${is2xx('c1')}) and ${controlJq}), ` +
+    `confirmed: ((${is2xx('p1')}) and ${proofJq}), ` +
     'observed: ("probe status=" + (.steps.p1.status | tostring)), expected: "sensitive data is restricted to the authorized actor" }'
   return [{
     kind: 'http_chain',

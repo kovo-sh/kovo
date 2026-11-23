@@ -119,16 +119,16 @@ describe('new hypothesis enumeration', () => {
     assert.ok(mass.candidateFields?.includes('role'))
   })
 
-  test('a role overpost runs as the viewer on the viewer own record', () => {
+  test('a role overpost runs as the viewer against a colleague record', () => {
     const surface = [endpoint({ method: 'PATCH', pathTemplate: '/api/people/:personId' })]
     const harvests = new Map<string, EndpointHarvest>([
-      ['PATCH:/api/people/:personId', harvest({ ownerIds: ['per_owner'], viewerIds: ['per_viewer'], fields: ['id', 'name', 'role'] })],
+      ['PATCH:/api/people/:personId', harvest({ ownerIds: ['per_owner', 'per_admin'], viewerIds: ['per_viewer'], fields: ['id', 'name', 'role'] })],
     ])
     const hypotheses = enumerateHypotheses(surface, harvests, { tier: 3, personas })
     const mass = hypotheses.find(hyp => hyp.intent === 'mass_assignment')
     assert.ok(mass)
     assert.equal(mass.ownerPersona, 'viewer')
-    assert.equal(mass.pathAndQuery, '/api/people/per_viewer')
+    assert.equal(mass.pathAndQuery, '/api/people/per_admin')
   })
 
   test('a credential-bearing collection read enables the viewer secret scan', () => {
@@ -265,6 +265,36 @@ describe('new replay-spec converters', () => {
     }))
     assert.ok(specs.length >= 2)
     assert.equal((specs[1].spec as { baselineValue?: string }).baselineValue, '')
+  })
+
+  test('a fingerprint-proven disclosure does not rely on the scrubbed body', () => {
+    const hyp: EngineHypothesis = {
+      key: 'secret',
+      endpoint: endpoint({ method: 'GET', pathTemplate: '/api/links' }),
+      probeClass: 'authz_matrix',
+      intent: 'secret_disclosure',
+      method: 'GET',
+      pathAndQuery: '/api/links',
+      ownerPersona: 'persona-a',
+      functionLevel: true,
+      secretScan: true,
+      viewerPersona: 'viewer',
+      risk: 90,
+    }
+    const result = signal({
+      probeClass: 'authz_matrix',
+      pathAndQuery: '/api/links',
+      anomalies: [{
+        type: 'secret_disclosed', path: '/api/links', persona: 'viewer', actor: 'viewer_persona',
+        secretPattern: '\\brb[cst]_[A-Za-z0-9]+_[0-9a-f]{12}\\b',
+        secretFingerprints: ['ff86d8824e34'], secretEvidence: 'fingerprint',
+      }],
+    })
+    const specs = synthesizeEngineSpecs(hyp, result)
+    assert.equal(specs.length, 1)
+    assert.equal(specs[0].vulnClass, 'info_disclosure')
+    assert.equal(declarativeReplaySpecSchema.safeParse(specs[0].spec).success, true)
+    assert.ok((specs[0].spec.assertionsJq as string).includes('secretMatches'))
   })
 
   test('a repeated terminal transition becomes a schema-valid step-skip chain', () => {
