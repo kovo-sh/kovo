@@ -172,3 +172,29 @@ Verifier changes (product side, `src/server/oracle-invariants.ts`, `verify-rpc.t
 No truth changes: none of the behaviours is a planted target, and the real bugs on those endpoints
 (cross-tenant invoice write, cross-tenant report cache) are already covered.
 
+## Fourth triage round (K=6 run 2): tenant_id overpost reported as BOLA
+
+`9cebbab5…` — *"Mass assignment of tenant_id on POST /api/spaces plants attacker-controlled objects
+inside another tenant"* — CWE-639 / broken-access-control, runtime-confirmed, charged as unmatched.
+
+**The app is genuinely vulnerable**: `POST /api/{projects}` merges the request body after defaulting
+`tenant_id` from the session, so an attacker-created space lands in the victim tenant (victim list
+gains the record and can read it; the attacker then gets `404` on its own object). The impact oracle
+confirms it (`mass_assignment` events) and the behaviour is exactly `acme.project-mass-assign`
+(`mass_assignment`, CWE-915) — the run's *other* finding on that endpoint was already the TP.
+
+So this is a **mislabeled class of a planted target**, not a grader gap and not a new bug. The
+canonical label is mass assignment (a protected identity field persisted from the request body), not
+BOLA/CWE-639; `bola ↔ mass_assignment` is deliberately **not** on the sibling allowlist, and widening
+it would excuse genuinely wrong labels. The fix is evidence-first labelling in the engine:
+
+- `replay-verifier` computes the impact class *evidence-first*: a create-time overpost that persists
+  a protected body field is mass assignment regardless of the model's title/CWE, and the gate runs on
+  that class; the evidence payload records `evidenceClass` when the gate is satisfied.
+- on confirmation, `execution` aligns the persisted finding's CWE/category with the verified
+  evidence class (mass assignment → CWE-915; csrf/markup/disclosure/business-logic likewise;
+  authorization/BFLA never relabel; an already in-family label is left untouched).
+
+No truth change; the target already existed. After the fix the finding matches
+`acme.project-mass-assign` as a duplicate of the confirmed TP.
+
