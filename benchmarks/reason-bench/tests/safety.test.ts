@@ -104,7 +104,10 @@ test('node:fs is confined to allowlisted tooling/static files', () => {
     if (f.endsWith('.html') || relative(ROOT, f).startsWith('tests/')) continue
     const rel = relative(ROOT, f)
     const code = stripComments(readFileSync(f, 'utf8'))
-    if (/from\s+['"]node:fs['"]/.test(code) && !FS_ALLOWED.includes(rel)) offenders.push(rel)
+    // Host-side app wiring (index.ts, truth/) drives materialization/discovery and is never
+    // copied into the materialized tree; only apps/*/src and apps/*/ui are leakage-scanned.
+    const hostSide = /^apps\/[^/]+\/(index\.ts|truth\/)/.test(rel)
+    if (/from\s+['"]node:fs['"]/.test(code) && !FS_ALLOWED.includes(rel) && !hostSide) offenders.push(rel)
   }
   assert.deepEqual(offenders, [], `unexpected node:fs import (lab runtime must use lib/vfs):\n${offenders.join('\n')}`)
 })

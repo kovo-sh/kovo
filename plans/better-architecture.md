@@ -1,235 +1,214 @@
-# Guardian Real-World Architecture Assessment & Redesign Plan
+# Guardian v6 Architecture: From Local-Benchmark Cage to Real-World Security Engine
 
 > **Date:** 2026-11-22
-> **Scope:** End-to-end architectural audit of Guardian (`src/server/`, `worker/`, `src/templates/`, `src/replay-spec.ts`, `plans/`, `VERIFICATION-v5.md`, `HANDOVER-v5.md`) evaluating structural ceilings that limit real-world vulnerability detection, verification, and operational scale.
-> **Framing:** Defensive QA / authorized security verification architecture.
+> **Status:** Strategic Architecture Blueprint
+> **Scope:** First-principles diagnosis of Guardian v5 (`src/server/`, `worker/`, `src/templates/`, `src/replay-spec.ts`) and a concrete 3-layer redesign targeting high-signal vulnerability discovery on real-world enterprise and production-grade web applications.
+> **Framing:** Defensive QA & authorized security verification architecture.
 
 ---
 
-## 1. Executive Summary
+## 1. Executive Thesis: Why Incremental Patches Are Not Enough
 
-Guardian achieves strong recall on local benchmark harnesses (~65–67% on realistic-bench dev and salted held-out suites), yet faces a steep drop-off when pointed at real-world staging or production applications. That gap is driven less by missing individual probe signatures and more by **seven interlocking architectural assumptions** inherited from single-origin, loopback, disposable local-lab benchmarks:
+Guardian v5 achieves strong recall on local benchmark harnesses (~65–67% on `realistic-bench` dev and salted held-out suites), yet faces a dramatic drop-off on real-world web applications. An end-to-end audit of the codebase shows this gap is **not** primarily caused by missing probe signatures. It is caused by **six interlocking paradigm mistakes** baked into v5's architecture:
 
-1. **Mutually exclusive deterministic vs. agentic execution lanes**, leaving the deterministic differential floor unwired from LLM specialist runs.
-2. **Single-origin, single-header, redirect-hostile auth**, which breaks federated SSO/OIDC/SAML, MFA, hybrid cookie+JWT SPAs, and concurrent session refreshes.
-3. **Asset-starved, non-interactive `ScopedBrowser` crawling**, which fails to hydrate CDN-backed SPAs or pass auth to split `app.`/`api.` origins.
-4. **HTTP/1.1-only normalized transport & loopback 1.5s OOB canaries**, blinding Guardian to HTTP/2/gRPC, WAN races, WAF-fronted apps, external blind callbacks, and async queues.
-5. **Noise-intolerant, JSON-only, siloed verification & coarse dedupe**, which reject valid real-world findings (already >70% of harness misses are `replay_spec_miss`) and collapse distinct bugs on multi-field or RPC endpoints.
-6. **Binary local-lab vs. public approval cliff**, causing synchronous HITL approval storms that starve worker pools and leases without providing test-entity isolation or cleanup.
-7. **Truncated stateless planning, English-REST heuristic gates, and single-process synchronous SQLite persistence**, which silently drop surface area, clobber multi-resource IDs, and stall on large targets.
+1. **The Maximum-Friction Agent Cage:** Guardian tries to be an autonomous multi-agent researcher while wrapping the LLM in a rigid DAST bureaucracy (7 regex-stripped tool silos, forbidden headers, air-gapped scripts with no network bridge, closed proof schemas, synchronous keyword approval popups). The result is the worst of both worlds: the deterministic engine does almost all the real work (66.9% in harness), while the LLM adds minimal lift (+3 findings over `--no-llm`, 1/6 on chains, 34/52 misses `budget_exhausted`) at 100× the cost and latency—yet the two lanes are mutually exclusive in `src/server/execution.ts:3922-3928`.
+2. **Conflating "Reproducible Evidence" with a Closed Declarative DSL:** Over **70% of misses are `replay_spec_miss`** (`VERIFICATION-v5.md:143-145`). By forcing every vulnerability proof into a closed TypeScript union (`DeclarativeReplaySpec`) interpreted by a 3,415-line custom VM (`replay-verifier.ts`), Guardian enforces safety by *crippling expressiveness* instead of enforcing safety at the *network boundary*. Open-ended real-world bugs (complex auth/OIDC flaws, multi-step business logic, hybrid API→UI flows, non-JSON/HTML/binary responses, noisy WAN timing) cannot fit through the keyhole.
+3. **Black-Box-First Discovery Instead of Code-First Runtime Fusion:** Even when source code is provided, Guardian clones with `--depth 1` and deletes `.git` (making Stage-3 git-history mining permanently dead at `github-connector.ts:810-829`), feeds 16 × 900B snippets to rule synthesis, extracts routes with prefix-blind regexes, stops at 1 reverse call-graph hop (`semantic-audit.ts:1353-1391`), and spends 90% of runtime guessing endpoints blindly over HTTP.
+4. **Benchmark-Driven Overfitting to a Toy World:** Local-lab benchmarks are loopback (`127.0.0.1`), single-origin, HTTP/1.1, disposable-state, English-named REST apps with zero WAN latency, zero WAF, zero CDN-hosted SPAs, zero external OIDC IdPs, instant (<1.5s) callbacks, and `local-lab` auto-approval. Optimizing against that world caused two pipelines to drift apart (harness vs. shipped `Execution`), leaked benchmark regexes into core engine code (`rb[cst]_`, `?reveal=0`, English path regexes in `deterministic-engine.ts:162-193, 1557, 1659`), and left real-world blockers invisible to the fitness function.
+5. **Solving Production Safety with Per-Request Regex Popups:** `approval-judge.ts:94-99, 649-715` scans request paths/bodies for common words (`role`, `admin`, `delete`, `invoice`, `webhook`, `password`, `reset`) and blocks worker coroutines waiting for single-use, 60s exact-body-hash human approvals. This provides *false safety* (a dangerous endpoint without those words passes; benign staging tests deadlock worker pools and expire leases) instead of enforcing safety via clear environment contracts.
+6. **40,000+ LOC of Monolithic Orchestration Overhead:** `execution.ts` (9.5K LOC), `store.ts` (4.8K LOC), `agent-session.ts` (3.8K LOC), `phase0-recon.ts` (3.6K LOC), `broker.ts` (3.5K LOC), `replay-verifier.ts` (3.4K LOC), `semantic-audit.ts` (2.3K LOC), `scoped-browser.ts` (2.3K LOC), `lab-runner.ts` (2.0K LOC), and `persona-auth.ts` (1.9K LOC) form an opaque funnel where genuine findings silently die at any of ~10 overlapping gates (circuit breaker, approval storm, dropped board wake, dry-step halt, planner snapshot truncation, `replay_spec_miss`, `assessBflaImpact`, first-key dedupe collision, `writeReport` exact-origin drop).
 
-This document catalogs every verified structural limitation with code locations and defines a phased architectural redesign to close the local-lab-to-real-world chasm.
+### What We Keep vs. What We Invert
 
----
-
-## 2. Structural Limitations Audit
-
-### Tier 1 — Critical Architectural Ceilings
-
-#### 1. Dual-Pipeline Split & Mutually Exclusive Deterministic vs. Agentic Lanes
-* **Locations:**
-  * `src/server/execution.ts:3169-3357, 3921-3928, 4742-4980, 5923-5927, 7739-7770`
-  * `src/server/assignment-brief.ts:345-452`
-  * `src/server/agent-session.ts:92-107, 1744-1790`
-  * `VERIFICATION-v5.md:15-56, 89-168`; `plans/ENGINE-PORT-COMPAT.md:50-122, 208`
-* **Mechanism:**
-  * In `driveInvestigation()` (`execution.ts:3922-3928`), `driveEngineInvestigation()` / `driveDeterministicInvestigation()` execute **only when `!profiles.length`**, and the in-product deterministic engine remains behind a default-off feature flag (`ENGINE-PORT-COMPAT.md:208`).
-  * Whenever a model profile is configured, Guardian skips the deterministic differential floor completely (even emitting a `post-floor` checkpoint at `execution.ts:3354` without having run the floor) and launches LLM specialists from an initial 12-step threat model (`execution.ts:3297`).
-  * Handoff scaffolding already built for v5.1—`buildAssignmentBrief` (`assignment-brief.ts:345`), `resolveAgenticTurnBudget` / `AGENTIC_SPECIALIST_WALL_CLOCK_MS` (`agent-session.ts:92-107`), and `alreadyConfirmed` / `detLeads` prompt slots (`agent-session.ts:1744-1790`)—is not wired into `execution.ts`. `startInvestigationStep` (`5923-5927`) forces a 25–35 turn minimum with no `wallClockMs` cap below the 25.5-minute lease (`7739-7770`).
-* **Real-World Impact:** Agentic runs burn wall-clock budget (historically 2–4 assignments per 600s, with 34/52 misses in `budget_exhausted`) rediscovering baseline differential classes instead of investigating business logic and multi-step chains, while routes outside the 12-step cap receive no systematic coverage.
+| Keep (Core Guardian Strengths) | Invert / Retire in v6 |
+|---|---|
+| Hard, non-bypassable scope & rate enforcement at the proxy boundary | Closed-world `DeclarativeReplaySpec` as the sole confirmation mechanism |
+| Zero-hallucination standard: every confirmed finding requires independent re-execution & recorded evidence | Mutually exclusive deterministic vs. agentic lanes |
+| Multi-persona differential authorization testing (BOLA/BFLA/tenant isolation) | Per-request keyword HITL popups blocking worker coroutines |
+| Defense-in-depth worker sandboxing & secret redaction | Regex-stripped specialist tool silos & stateless truncated planning |
+| Curated verification skills & safe template catalog | Benchmark-shaped English REST regex gates & black-box-first white-box truncation |
 
 ---
 
-#### 2. Enterprise Identity, Multi-Origin Auth & Concurrent Session Lifecycle Ceiling
-* **Locations:**
-  * `src/domain.ts:493-526`
-  * `src/server/persona-auth.ts:121-130, 402-411, 622, 629-637, 685, 806-830, 888-916, 1558-1622, 1696-1706, 1789-1823, 1910-1915`
-  * `src/server/persona-vault.ts:33-47, 136-187, 362, 461-474`
-  * `src/server/broker.ts:2792-2794, 2855-2905`
-  * `src/server/phase0-recon.ts:2204-2245`
-* **Mechanism:**
-  * **No federated SSO/OIDC/SAML or MFA:** Auth adapters are restricted to `clerk | supabase | json | form` (`domain.ts:496`). HTTP login adapters abort on any `3xx` (`persona-auth.ts:622, 629-637`), `assertCredentialTarget` rejects origins outside `originAllowlist` or on shared PaaS suffixes (`*.vercel.app`, `*.github.io`, `806-830`), and `authenticateForm` DNS-pins Chromium (`MAP * ~NOTFOUND`, `402-411, 1558-1573`) and aborts cross-origin navigations/POSTs (`1696-1706`). External IdP flows (Okta, Auth0, Entra ID, Cognito, Google/GitHub OAuth, SAML ACS) are structurally blocked. MFA/TOTP hard-aborts (`121-130, 1581-1622`), and any passive CAPTCHA script tag aborts login even when not enforced for test accounts (`1606-1610, 1668-1672`).
-  * **Single-header credential abstraction:** `MintedPersonaSession` (`persona-vault.ts:33-47, 461-474`) stores a single `Cookie` **or** `Bearer` **or** custom header. Form login discards harvested Bearer JWTs whenever *any* cookie is set (`persona-auth.ts:1789-1823`), breaking hybrid cookie+Bearer SPAs and multi-tenant headers (`X-Tenant-Id` / `X-Org-Id`). Cross-origin redirects strip persona credentials unconditionally (`broker.ts:2794`).
-  * **Shared mutable session + 60s re-auth throttle:** Concurrent workers share one `.session` file (`persona-vault.ts:136-187, 362`) and one per-handle re-auth slot throttled to `<=1/60s` (`persona-auth.ts:685, 888-916`, not reset in `stopRunRefreshers:1910-1915`), with no proactive refresher for cookie/form sessions (`1818-1823`). One session-invalidating probe or token rotation causes a 60s cascade of `401`s across sibling workers; Phase-0 permanently disables `discoveryPersona` on the first `BrokerDenied` (`phase0-recon.ts:2239-2245`). Rotating CSRF (`broker.ts:2855-2905`) requires explicit `session` + `csrfBind`, neither of which Phase-0 or `crawlStateGraph` passes.
-* **Real-World Impact:** Blinds Guardian to authenticated attack surfaces on enterprise SSO/OIDC/SAML/MFA apps, PaaS-hosted apps, hybrid SPAs, multi-tenant org-switching flows, and CSRF-protected state machines.
+## 2. The v6 Target Architecture: Three Sharp Layers
+
+Instead of a 40K-LOC monolithic state machine, Guardian v6 separates concerns into **three clean, composable layers** with explicit contracts between them.
+
+```mermaid
+flowchart TD
+    L1["Layer 1: Hard Safety & Execution Proxy (3-Tier Scope, HTTP/2, Session Vault, Pooled Browser, Async OOB Relay)"]
+    S["Shared Application & Evidence Graph (WAL SQLite + Sharded Artifacts + Program AST/Call Graph)"]
+    L2["Layer 2: Always-On Floor (Code-First Program Analysis + Schema/Behavior Deterministic Engine)"]
+    L3["Layer 3: Uncaged Hypothesis Agent (Graph Query Tools + Proxy-Sandboxed Verification Scripts)"]
+    V["Independent Verifier (Fresh Re-Execution of Proof Script Through Layer 1 + Signed Transcript Oracle)"]
+
+    L2 -->|"Routes, Auth Rules, Leads, Confirmed Floor"| S
+    L2 -->|"All Traffic Through"| L1
+    S -->|"Query Tools & Uncovered Surface"| L3
+    L3 -->|"Custom Proof Scripts & Hybrid Browser Flows"| L1
+    L3 -->|"Candidate Proof Script + Oracle"| V
+    V -->|"Clean-Session Re-Run Through"| L1
+    V -->|"Verified Findings & Auditable Transcripts"| S
+```
 
 ---
 
-#### 3. ScopedBrowser & SPA Crawler Cannot Hydrate or Traverse Real Modern SPAs
-* **Locations:**
-  * `src/server/scoped-browser.ts:254, 295-308, 358-383, 590-628, 742-841, 888-893, 1608`
-  * `src/server/broker.ts:1853-1884, 2381-2385`
-  * `src/server/phase0-recon.ts:2022-2025, 2160, 2328, 2427, 2550, 2699, 2881, 2902, 3004, 3055-3132, 3300-3446`
-  * `src/server/surface-engine.ts:25-27, 145-147, 243-287, 376-384, 428-472, 538`
-* **Mechanism:**
-  * **CDN/asset starvation:** Chromium launches with `MAP * ~NOTFOUND`, `serviceWorkers: 'block'`, and aborts every subresource request outside `grant.canRead` (`scoped-browser.ts:299, 764, 802-808`). Apps serving JS chunks from CDNs (`cdn.*`, `*.cloudfront.net`, `assets.*`) fail to boot and render blank shells.
-  * **Broken browser auth & split-origin APIs:** `ScopedBrowser` strips `Authorization`/`Cookie` and `sec-fetch-*`/`sec-ch-*` (`254, 822-826`), strips `Set-Cookie` on fulfill (`594`), never seeds `localStorage`/`sessionStorage`, mirrors only non-`HttpOnly` cookies (`broker.ts:1867`, returning `[]` when `req.session` is omitted as in `crawlStateGraph`), and attaches persona headers only to `initialOrigin` (`scoped-browser.ts:830-841`)—never to sibling allowlisted API origins (`app.example.com` → `api.example.com`).
-  * **Non-interactive, heavily capped crawl:** `crawlStateGraph` (`phase0-recon.ts:3300-3358`) starts and kills a full Chromium process per page (`scoped-browser.ts:742, 752`), settles only `120ms` after `domcontentloaded` (`phase0-recon.ts:3340`), never clicks SPA UI controls, caps Phase-0 at `min(0.15 * budget, 250)` requests / `<=10` crawl pages / `32` JS chunks, runs HTTP discovery only as `personas[0]` (`2160, 2427`, missing role-exclusive admin routes), and blocks non-allowlisted `POST`s (e.g., GraphQL/RPC bootstraps).
-  * **Protocol/encoding blind spots:** `ParamLocation` (`domain.ts:161`) omits `multipart`, binary/protobuf, gRPC, WebSocket, and SSE. `ScopedBrowser` WebSockets bypass `context.route` without frame capture (`scoped-browser.ts:358-383`, making `phase0-recon.ts:3444` dead code). GraphQL discovery depends solely on live `__schema` introspection (`phase0-recon.ts:3055-3097`), and `surface-engine.ts` skips `/` completely (`145-147, 376-384`) and calibrates soft-404s only at `/` (`243-287`).
-* **Real-World Impact:** Modern React/Next/Vue/Angular SPAs with CDN bundles, `app.`/`api.` splits, `localStorage` tokens, interactive routing, multi-role APIs, production GraphQL (introspection off), or multipart/WebSocket/gRPC surfaces yield minimal discovered endpoints.
+### Layer 1 — The Hard Boundary: Scope Proxy, Auth Vault, SPA Runtime & Async OOB
+
+**Principle:** *All safety, scope, credential custody, rate control, and transcript logging live in Layer 1. Because Layer 1 is unbypassable, Layers 2 and 3 can be dramatically simpler and far more expressive.*
+
+#### 1.1 Three-Tier Origin Scope Model
+Replace v5's binary `approvedOrigins` check (`store.ts:3394-3533, 3727-3800`) with three explicit origin roles:
+- **`targetOrigins`** — Active probing, mutation (when environment mode permits), and verification are allowed.
+- **`authOrigins`** — External SSO/IdP origins (Okta, Auth0, Entra ID, Cognito, Google/GitHub OAuth) permitted strictly for persona authentication redirects and token exchange. Active probing is forbidden.
+- **`assetOrigins`** — CDN/static hosts (`cdn.*`, `*.cloudfront.net`, `assets.*`) permitted strictly for passive `GET` asset hydration inside Playwright. Active probing is forbidden.
+- **Provenance rule:** `writeReport()` and transitive revocation treat hops through `authOrigins` and `assetOrigins` as benign infrastructure, never dropping valid findings on `targetOrigins`.
+
+#### 1.2 Environment Safety Contracts (Replacing Per-Request Regex HITL)
+Retire `approval-judge.ts`'s blocking keyword escalation storms (`approval-judge.ts:94-99, 649-715`, `execution.ts:2441-2483`). Replace them with **three explicit engagement modes**:
+1. **`prod_readonly` (Live Production):** Strictly non-mutating requests (`GET`, `HEAD`, `OPTIONS`, verified read-only GraphQL `query` operations), passive/config/header/auth-read/read-BOLA checks, and full white-box code analysis. **Zero mutations, zero HITL popups.**
+2. **`staging_isolated` (Staging / Dedicated Test Tenant):** Pre-authorized synthetic test tenants with mandatory run-scoped entity tagging (`guardian-qa-<runId>-`), first-class `setup`/`cleanup` teardown hooks, and optional route denylist (e.g., `/billing/charge`, `/email/broadcast`). Autonomous stateful testing runs freely without approval deadlocks.
+3. **`ephemeral_lab` (Disposable Local / CI PR Preview):** Full autonomous testing including high-impact active verification, backed by disposable containers/databases.
+
+If an operator still opts into explicit human gates for a specific sensitive route pattern, waiting **parks the task in SQLite (`awaiting_approval`) and releases the worker slot and container immediately**, and approval grants a **durable route-scoped lease** (valid across probe iterations and independent replay) instead of a 60s exact-body-hash token.
+
+#### 1.3 Composite Per-Worker Session Vault & Enterprise Identity
+Redesign `persona-vault.ts` and `persona-auth.ts` around real-world identity topologies:
+- **Composite credential bundle:** A session stores *simultaneously* `cookies[]` (including `HttpOnly`), `headers` (`Authorization`, `X-Tenant-Id`, `X-Org-Id`, custom CSRF headers), `storage` (`localStorage`, `sessionStorage`), and per-origin attachment rules (so `app.example.com` and sibling `api.example.com` both receive the right credentials).
+- **Enterprise login flows:** Support interactive Playwright-driven OIDC/OAuth2/SAML flows traversing `authOrigins`, optional TOTP seed generation, and operator session-state import (`storageState` / HAR) for passkey/hardware-MFA apps. Treat CAPTCHA as blocking *only* if login submission actually fails a challenge, never merely because a script tag exists in DOM.
+- **Per-worker session isolation:** Give concurrent workers independent session clones with coordinated single-flight refresh (removing the 60s global lockout at `persona-auth.ts:888-916` and preventing one logout/token-rotation probe from cascading `401`s across sibling workers).
+
+#### 1.4 Modern Transport & Error-Safe Circuit Breakers
+Upgrade `broker.ts`:
+- **HTTP/2 & realistic egress:** Move `defaultTransport` to `undici` / `node:http2` with connection pooling, **HTTP/2 single-packet / last-byte TCP synchronization** for `executeRaceBurst`, optional corporate HTTP/SOCKS egress proxy, mTLS client certs, and configurable authorized `User-Agent`/header profiles (removing hardcoded `Guardian/2...` + stripped `sec-fetch-*` fingerprints where authorized).
+- **Stateful WebSockets & opt-in raw framing:** Turn-aware WebSocket sessions (awaiting server frames, continuation reassembly, session cookie attachment) and an opt-in Tier-3 raw-framing transport for authorized Host-header / HTTP desync verification.
+- **Error-aware circuit breakers:** Separate target `5xx` responses triggered during active injection/parser probes from transport failures/429s so error-inducing probes do not self-block their own verification (`broker.ts:1966-1997`). Replace permanent run pauses (`execution.ts:1282-1314`) with per-origin exponential backoff and automatic recovery.
+
+#### 1.5 Pooled Interactive SPA Crawler & Multi-Persona Discovery
+Upgrade `scoped-browser.ts` and `phase0-recon.ts`:
+- **Pooled Playwright contexts** per persona (no cold Chromium boot per page), seeded with `HttpOnly` cookies + `localStorage`/`sessionStorage`, allowing `assetOrigins` JS bundles to hydrate cleanly and forwarding persona auth to sibling `targetOrigins` APIs.
+- **Interactive state traversal:** Wait on network-idle/DOM-stability instead of `120ms`, safely exercise non-destructive SPA navigation (tabs, drawers, pagination, filters), capture WebSockets via CDP `Network.webSocket*` events, and allow read-only GraphQL/RPC `POST` queries below Tier 3.
+- **Multi-persona union discovery:** Run discovery across *all* configured role personas (not just `personas[0]` as in `phase0-recon.ts:2160, 2427`), tagging endpoints with `visibleToPersonas` to surface admin/privileged routes immediately. Remove the `/` skip and root-only soft-404 calibration in `surface-engine.ts:145-147, 243-287`.
+
+#### 1.6 Externally Routable Async OOB Relay
+Upgrade `canary-broker.ts`:
+- Support a deployable/managed public OOB relay profile (**HTTP + ACME HTTPS + authoritative UDP/TCP DNS**, extensible to SMTP) alongside loopback mode.
+- Replace the synchronous `10 × 150ms = 1.5s` poll (`replay-verifier.ts:1193-1196`) with **two-stage async OOB correlation**: a short 3s immediate check followed by a durable `pending_oob` subscription active for the rest of the run (or configurable window, e.g., 15–30 minutes) that automatically promotes late callbacks (background jobs, PDF/email/webhook workers) into verified findings.
 
 ---
 
-#### 4. HTTP/1.1-Only Normalized Transport & Loopback-First 1.5s OOB Canaries
-* **Locations:**
-  * `src/server/broker.ts:3-9, 346, 892-899, 1012-1280, 1350-1481, 2141-2165, 2413-2424, 3149-3248`
-  * `src/server/canary-broker.ts:177-178, 642-809, 948-964`
-  * `src/server/replay-verifier.ts:741-810, 1191-1197, 1894-1901, 2325-2331`
-  * `HANDOVER-v5.md:151`; `VERIFICATION-v5.md:343`
-* **Mechanism:**
-  * **Transport ceiling:** `defaultTransport` (`broker.ts:1350-1481`) uses `node:http`/`node:https` with `agent: false` (fresh TCP+TLS handshake per request), enforces normalized HTTP/1.1 with computed `Content-Length`, hardcodes `User-Agent: Guardian/2...` + default OpenSSL TLS stack, and blocks caller-supplied `Host`, `Content-Length`, `Transfer-Encoding`, `Cookie`, and `Authorization` (`forbiddenCallerHeaders`, `346, 2415`). No HTTP/2, HTTP/3, gRPC, mTLS client certificates, or corporate egress proxy support exists. `executeRaceBurst` (`3208-3216`) executes `Promise.all` across independent HTTP/1.1 sockets (no H2 single-packet or last-byte TCP sync). `defaultWsTransport` (`1012-1280`) blasts all `sendMessages` immediately without awaiting server turns, caps idle wait at 1200ms, and lacks continuation-frame reassembly.
-  * **Local-only, synchronous 1.5s OOB canaries:** `CanaryBroker` defaults to plain `node:http` on `127.0.0.1:0` (`canary-broker.ts:732-735, 808`) with DNS off by default (`723-729`), `udp4`-only (`654`), no built-in TLS termination, no TCP DNS/SMTP/LDAP/ICMP listeners, and no managed public relay. Furthermore, all OOB verification paths (`replay-verifier.ts:1193-1196, 1896-1900, 2327-2330`) poll synchronously for only `10 × 150ms = 1.5s` before finalizing `dismissed`/`inconclusive`.
-* **Real-World Impact:** Blinds Guardian to HTTP desync/request smuggling, Host-header routing attacks, gRPC/H2-only APIs, sub-10ms WAN race conditions, WAF/bot-managed origins (trivial JA3/JA4 + UA blocking), mTLS/proxy-gated staging targets, blind SSRF/XXE/RCE/JWKS on public internet targets without custom ops relays, and any async/queued callback slower than 1.5s (webhook workers, PDF/email/cron pipelines).
+### Layer 2 — Always-On Floor: Code-First Graph + Schema/Behavior Deterministic Engine
+
+**Principle:** *Never guess over blind HTTP what source code, OpenAPI/GraphQL schemas, HAR traces, or runtime responses already tell you. Run the fast deterministic floor unconditionally before/alongside agentic work.*
+
+#### 2.1 Code-First Program Graph (When Source Is Mounted/Synced)
+Promote white-box analysis from a truncated Phase-0 sidecar into a first-class **Program Graph** stored in the shared graph:
+- **Preserve git history:** Clone with bounded history (e.g., `--depth 100`) without deleting `.git` (or extract security-relevant commit diffs before cleanup), reviving Stage-3 regression/patch mining (`github-connector.ts:810-829`, `semantic-audit.ts:1656-1661`).
+- **AST & router-mount-aware route graph:** Replace single-file regex route extraction (`phase0-recon.ts:368-618`) with framework-aware AST parsing (Express/Fastify/Next/Nest, FastAPI/Django/Flask, Spring, Go/Gin/Chi, Rails) that resolves full mounted path prefixes (`app.use('/v2', router)`, `APIRouter(prefix=...)`, `include()`), exact HTTP methods, input schemas, and **attached auth/RBAC middleware chains**.
+- **Multi-hop reverse call-graph binding:** Extend `resolveSuspectEntrypoint` (`semantic-audit.ts:1353-1391`) from 1 hop to depth 6–8 across `route -> controller -> service -> repository/ORM`, and map monorepo services to their exact `targetOrigin` via ingress/Dockerfile/service config instead of defaulting to `origins[0]`.
+- **Direct Code-to-Runtime Hypotheses:** Automatically emit high-precision hypotheses directly from structural diffs in the program graph (e.g., *route in `/admin/*` missing `requireAdmin` middleware*, *mutation handler reading `:id` without tenant scope check*, *new/modified route in recent git diff touching raw SQL/outbound fetch/template sink*).
+
+#### 2.2 Schema- & Behavior-Driven Deterministic Engine (Always-On)
+Make `deterministic-engine.ts` run **unconditionally** as the fast floor of every `Execution` run (feeding confirmed findings and prioritized leads directly into Layer 3):
+- **Eliminate benchmark overfitting:** Strip `rb[cst]_` token regexes (`deterministic-engine.ts:1557`), `?reveal=0` assumptions (`1659`), and mandatory English URL regex gates (`pathHasUrlHint`, `pathHasXmlHint`, `strongSqlName`, `actionVerb` at `162-193, 547, 711`).
+- **Drive hypotheses from observed types & runtime behavior:** Trigger SSRF/XXE/traversal/injection/authz probes whenever an endpoint's OpenAPI/GraphQL/AST schema or live runtime traffic carries URL-shaped, path-shaped, XML/content-type, object-ID, or query-filter inputs—or exhibits parser/DB error differentials—using path names only as a soft priority tie-breaker.
+- **Dynamic CVE-to-template correlation:** Index all compiled templates by CVE ID dynamically instead of the 1-entry `CVE_TEMPLATE_IDS` map (`cve-broker.ts:449-453`), and fix `pom.xml` parsing (`514-516`) to parse per-`<dependency>` blocks.
+
+#### 2.3 Scalable Graph & Persistence Foundation
+Fix `store.ts` and `schema.ts` so large real-world targets (2,000–10,000 endpoints, multi-hour scans) do not stall or silently truncate:
+- **Fix `resource_samples` clobbering:** Change uniqueness from `UNIQUE(run_id, owner_persona, resource_key, origin)` (`store.ts:816, 4384`) to `UNIQUE(run_id, owner_persona, origin, collection_path, resource_key)` so `/invoices`, `/orders`, and `/tickets` preserve distinct entity IDs.
+- **Remove truncation & write amplification:** Enable `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`, batch exchange writes asynchronously off the hot HTTP path, shard `artifacts/<runId>/<bucket>/`, make full-body FTS5 trigram indexing bounded/opt-in with retention GC, and paginate `listEndpoints()`, `listFacts()`, and `runDetail()` (eliminating the 500/2,000 cap at `store.ts:4209-4234`).
+- **Complete crash recovery:** Persist refinement queues, board wakeups, `LabRunner` container IDs, and scoped approval leases in SQLite; fix `Store.recover()` (`961-973`) to reset stuck `board_members`, reap orphaned containers, and avoid re-queuing permanently failed assignments.
 
 ---
 
-#### 5. Rigid Verification, Proof-Compiler & Deduplication False-Negative Traps
-* **Locations:**
-  * `src/server/replay-verifier.ts:184-254, 440-655, 1381-1475, 1980-2025, 2698-2750, 2870-2925`
-  * `src/server/proof-tools.ts:176, 360-366, 450-454, 756-758, 1174-1185`
-  * `src/replay-spec.ts:238-380, 633-683, 705, 722-737`
-  * `src/server/dedupe.ts:142-172, 257-350, 554-583, 620-641`
-  * `VERIFICATION-v5.md:143-145`
-* **Mechanism:**
-  * Over **70% of realistic-bench misses are `replay_spec_miss`** (41/57 dev, 46/60 held-out), and internet targets amplify these failure modes:
-  * **Noise-intolerant statistical checks:** `sql_time_diff` caps delay at 1500–3000ms over 3 rounds and requires strict non-overlap (`minProbeMs > maxBaselineMs`) plus `deltaMedianMs >= 0.85 * delayMs` (`replay-verifier.ts:2737-2745`); a single WAN jitter spike fails verification. `sql_boolean_diff` requires `>=0.90` baseline similarity and `<=0.75` true-vs-false (`2008-2010`), failing on dynamic nonces/timestamps or small diffs inside large HTML shells.
-  * **JSON-only, same-path, same-origin proof constraints:** All `proof-tools.ts` compilers bind strictly to dotted JSON keys (`JSON_PATH_RE`, `176, 756-758`—no array indexing, HTML/XML/CSV/binary/header extraction), require `beforeRead.pathAndQuery === afterRead.pathAndQuery` (`452`), and lack general `setup/cleanup` isolation for one-shot tokens or non-idempotent state transitions. `assessHttpChainEndpointBinding` (`replay-verifier.ts:626-633`) rejects probes whose `finalOrigin` differs from `spec.origin`; `assessBflaImpact` (`234-253`) drops compact (`<64B`) or single-persona/unauthenticated BFLA; `cache_differential` mandates `?_gcb=<hex>` (`replay-spec.ts:633-683`), failing on CDNs that ignore query keys or only cache queryless URLs.
-  * **HTTP vs. Browser verification silo:** `http_chain` and `browser_chain`/`browser_dom` are mutually exclusive (`replay-spec.ts:722-737`). `browser_chain` caps at 8 steps and 6 built-in DOM checks; `stored_xss` compiles to an `http_chain` raw-body substring match (`proof-tools.ts:1174-1185`) without verifying browser execution or CSP bypass. Second-order tracking (`canary-broker.ts:501-564`) scans raw HTTP bodies for literal `gn2o_` markers and emits an advisory fact without launching cross-persona verification.
-  * **First-key parameter dedupe collisions:** `primaryParamForRequest` (`dedupe.ts:302-314`) extracts `Object.keys(jsonBody)[0]` or the first query parameter rather than the mutated parameter, colliding distinct vulnerabilities on endpoints starting with boilerplate fields (`tenantId`, `action`). `extractGraphqlRootField` (`165-172`) only regex-matches the first root field; single-URL RPC frameworks (tRPC, JSON-RPC, Next.js Server Actions) collapse onto `/`; `ORIGIN_WIDE_CWES` (`142-153, 620-628`) merges distinct microservices sharing a reverse proxy.
-* **Real-World Impact:** Valid real-world blind SQLi, HTML/binary IDORs, non-idempotent workflow bugs, cross-subdomain authz flaws, SPA stored/DOM XSS, and distinct bugs on multi-field/RPC endpoints are downgraded to `inconclusive`/`dismissed` or silently deduplicated away.
+### Layer 3 — Uncaged Hypothesis Agent & Executable Script Verification
+
+**Principle:** *Give the LLM full read/query access to the code + runtime graph and let it write short, deterministic verification scripts executed through Layer 1. Replace declarative-DSL gymnastics with independent script re-execution + proxy-signed transcript verification.*
+
+#### 3.1 Proxy-Sandboxed Executable Verification Scripts (Replacing the `DeclarativeReplaySpec` Bottleneck)
+Instead of forcing every novel bug into a closed `DeclarativeReplaySpec` union:
+- **How it works:**
+  1. Guardian provides a tiny, ergonomic verification SDK (`guardian_verify` in Python and TypeScript) inside the `--network none` worker sandbox.
+  2. Every HTTP, HTTP/2, WebSocket, Playwright browser, and OOB canary call made by the SDK crosses a local Unix-socket RPC bridge into **Layer 1 (`Broker`)**. Layer 1 injects persona credentials (workers never see raw secrets), enforces 3-tier origin scope, environment mode (`prod_readonly` vs `staging_isolated`), rate limits, and records a **tamper-evident, proxy-signed transcript** of every exchange.
+  3. A candidate verification script implements a standard 3-hook contract:
+     - `setup(ctx)` — optional synthetic entity creation (tagged with `guardian-qa-<runId>-`)
+     - `verify(ctx) -> ProofResult` — executes control vs. variant requests (HTTP, HTTP/2 race, browser DOM, or hybrid HTTP→browser), evaluates an explicit oracle (JSONPath, HTML/CSS selector, header/status diff, DOM execution sentinel, OOB callback ID, or statistical jitter-tolerant timing helper), and returns structured assertions referencing proxy-recorded `exchangeIds`
+     - `cleanup(ctx)` — optional teardown of created entities
+  4. **Independent Confirmation (`Verifier`):** To confirm a finding, Guardian runs the **submitted verification script twice from scratch in a clean sandbox** (with freshly minted control/variant nonces and clean sessions) through Layer 1, validates that every claimed assertion matches the **proxy's independent transcript** (not just script stdout—preventing LLM-fabricated passes), and confirms the oracle passes deterministically.
+- **Why this is strictly better:**
+  - **Zero reduction in safety or anti-hallucination guarantees:** Scope, credentials, non-destructive mode, and ground-truth HTTP/DOM evidence remain 100% enforced by Layer 1 outside the agent's control.
+  - **Eliminates the 70% `replay_spec_miss` ceiling:** Hybrid API-write → Playwright-render stored XSS, non-JSON/HTML/binary IDORs, HMAC/protobuf/gRPC request signing, multi-step business-logic state machines, cross-subdomain OAuth/SSO chains, and custom race conditions are all natively expressible in ~25–60 lines of clean Python/TS.
+  - **Reusable primitives:** Existing fast deterministic probes (from Layer 2) can still emit lightweight built-in proof recipes for common classes, while Layer 3 uses executable scripts for everything else.
+
+#### 3.2 Statistical & Noise-Tolerant Verification Helpers
+Built directly into the `guardian_verify` SDK and verified against Layer-1 transcripts:
+- **Jitter-tolerant timing oracle:** Replaces 3-round `minProbe > maxBaseline` (`replay-verifier.ts:2737-2745`) with 5–7 interleaved control/probe pairs evaluated via Mann-Whitney U + median/MAD separation.
+- **Structural boolean/content diffing:** Strips dynamic tokens (CSRF nonces, UUIDs, timestamps, request IDs) before computing structural DOM/JSON/token similarity (`replay-verifier.ts:2008-2010`), so small differentials inside large HTML shells verify reliably.
+- **Hybrid HTTP + Browser verification:** Native `ctx.http(...)` followed by `ctx.browser(persona=...)` (with full `HttpOnly` cookie and `localStorage` hydration) inside one proof script—closing the stored/DOM XSS and second-order admin-UI verification gap.
+
+#### 3.3 Tool-Equipped Graph Coordinator & Fluid Investigator Sessions
+Replace `execution.ts`'s stateless single-shot `runChainPlanner` + 7 regex-stripped specialist silos:
+- **Stateful Graph Coordinator:** Equip the coordinator with paginated read tools (`query_endpoints`, `query_code_graph`, `query_facts`, `query_findings`, `expand_digest`) so large apps (>25 uncovered endpoints / >80 facts) are never truncated out of planning, and early low-severity primitives remain retrievable for late-round multi-step chains.
+- **Fluid Capability Bundles:** Stop regex-stripping tools (`agent-session.ts:658-939`). Every investigator has access to code/graph search, batched HTTP, and the `guardian_verify` script runner, dynamically attaching Playwright or OOB capabilities when a hypothesis involves client-side sinks or blind callbacks.
+- **Chunked IPC & Non-Fatal Timeouts:** Pass tool outputs >64 KiB via mounted tmpfs file pointers instead of terminating the container over NDJSON (`worker-backend.ts:315-378, 724-728`), cancel timed-out commands without `process.exit(124)`, and allow parallel execution of pure read-only tools.
+- **Accurate Deduplication (`dedupe.ts`):** Key deduplication on the **explicitly mutated input/header/GraphQL operation/RPC procedure + verified endpoint/handler** reported by the proof script and confirmed in the Layer-1 transcript—eliminating `Object.keys(jsonBody)[0]` collisions (`dedupe.ts:302-314`) and reverse-proxy microservice over-merging.
 
 ---
 
-#### 6. Staging/Production State-Safety Chasm & Synchronous Approval-Storm Deadlocks
-* **Locations:**
-  * `src/server/approval-judge.ts:94-99, 343-395, 451-486, 649-715, 813-864`
-  * `src/server/execution.ts:2281-2518, 3945, 6132-6161, 7770, 8074, 8414`
-  * `src/server/store.ts:2130-2226, 2265-2393`; `src/server/schema.ts:48, 52, 104-106`
-  * `VERIFICATION-v5.md:171-184`; `plans/ROADMAP-v5.md:139, 155, 165, 203`
-* **Mechanism:**
-  * Outside `local-lab` (`approval-judge.ts:813`), `detectHardEscalationReason` (`649-715`) executes **before** operator-approved endpoint patterns (`451-466, 827-864`). Any `DELETE`, `multipart/*`, `Content-Encoding`, body >64 KiB, or common substring anywhere in path or body (`role`, `permission`, `password`, `reset`, `revoke`, `admin`, `delete`, `remove`, `cancel`, `transfer`, `invoice`, `subscription`, `webhook`, `trial`; `94-99`) forces human escalation even when pre-approved.
-  * Approval grants are single-use, exact-body-hash, 60s-TTL, and strictly in-memory (`343-395, 468-483`), so probe iteration and Phase-3 replay verification (`execution.ts:8074, 8414`) re-escalate. While waiting, `waitForTier3Approval` (`2441-2483`) blocks the worker coroutine synchronously, occupying a `workerConcurrency` slot (`3945`), keeping the Docker container alive, and burning the worker lease (`7770`).
-  * Conversely, Guardian lacks **test-entity prefix isolation, idempotency tracking, or automatic cleanup hooks** for shared live databases.
-* **Real-World Impact:** On real staging/production apps, write-BOLA, BFLA, account recovery, file upload, mass assignment, CSRF, and billing/workflow checks either deadlock behind HITL approval storms or (in `yolo` mode) risk irreversible state pollution, outbound emails/webhooks, and cross-probe interference.
+## 3. What We Explicitly Retire (Complexity Reduction)
 
----
+A strategic redesign should make the codebase **smaller and easier to reason about**, not layer v6 on top of v5. The following v5 machinery is explicitly targeted for retirement once replaced:
 
-#### 7. Stateless Truncated Planning, Heuristic-Gated Detection & Single-Process SQLite Scale Limits
-* **Locations:**
-  * `src/server/execution.ts:192-223, 3963-3990, 5390-5425, 5572-5894`; `src/server/agent-session.ts:3785-3821`; `src/server/compactor.ts:53, 138-141, 268-358`
-  * `src/server/deterministic-engine.ts:33-37, 148-221, 546-770, 1556-1687`
-  * `src/server/store.ts:477-494, 802-817, 874-884, 1435-1528, 1571-1612, 1655-1740, 2018-2042, 4209-4234, 4384-4535`
-* **Mechanism:**
-  * **Truncated stateless planner & chaining ceiling (1/6 on chains):** `runChainPlanner` (`execution.ts:5809-5821`) invokes `agentTurn` with **no tools**, a fresh `sessionId` per round, and a 16 KB output cap over a truncated graph snapshot (max 80 active facts, 30 findings, 30 suspects, 25 uncovered endpoints). `ColdGraphCompactor` (`compactor.ts:138-141, 268, 303`) lossily summarizes facts idle for 4 rounds without an `expand_digest` tool. Any planner JSON parse error sets `plannerDoneRound` (`5826-5839`), and 6 consecutive dry steps globally halt investigation (`192-223, 3963-3973`).
-  * **English-REST heuristic-gated detection:** `deterministic-engine.ts` caps at 120 endpoints / 120 hypotheses (`35-36`) and gates SSRF, XXE, path traversal, SSTI, command injection, open redirect, and workflow hypotheses behind English REST naming regexes (`162-193, 547, 711`), probes `?reveal=0` (`1659`), and embeds realistic-bench token regexes (`1557`). `workflow_invariant` (`708-746`) only models a 1-step repeat transition on `POST /<collection>/:id/<actionVerb>`. Opaque/non-English routes, RPC APIs, and multi-step business-logic invariants never generate hypotheses.
-  * **Single-process SQLite bottlenecks & data-model clobbering:** `process-lock.sqlite` holds `BEGIN EXCLUSIVE` for process lifetime (`store.ts:477-483`). `DatabaseSync` runs on the main thread with `PRAGMA synchronous = FULL` (`492-493`); every HTTP exchange synchronously calls `writeFileSync(..., { flush: true })` into an unsharded `artifacts/` dir (`1603-1606`) and updates an FTS5 **trigram** index (`874-884, 1717-1723`) with zero GC/retention. `listEndpoints()` hard-truncates at 500 (max 2,000; `4209-4234`), `runDetail()` hydrates unbounded rows across ~20 tables (`1435-1528`), and `resource_samples` defines `UNIQUE(run_id, owner_persona, resource_key, origin)` keyed by JSON field name (`id`, `816, 4384, 4495`)—causing `/invoices`, `/orders`, and `/tickets` on one origin to overwrite each other's entity IDs.
-* **Real-World Impact:** Enterprise targets (>500 endpoints, multi-hour runs, 10k+ exchanges) suffer main-thread stalls, disk/FTS5 bloat, OOM on report generation, silent endpoint truncation, BOLA ID clobbering, lossy chain context, and missed vulnerabilities on non-conventional routes.
-
----
-
-### Tier 2 — High-Impact Secondary Limitations
-
-| # | Limitation | Exact Locations | Mechanism & Real-World Impact |
+| v5 Component / Pattern | Locations | Why Retire | Replaced By |
 |---|---|---|---|
-| **8** | **Rigid specialist tool silos & dropped board handoffs** | `agent-session.ts:658-757, 867-939, 1321-1322`; `execution.ts:1658-1748, 5429-5570`; `board-tools.ts:44-47, 538-555, 879-1042` | Regex routing hard-strips tools per specialist (`bola-bfla` lacks browser/scripts/race; `injection-parser` lacks `request_http_batch`; `dom` lacks SAST/scripts). `wakeBoardMember` silently drops wakes when target is busy; warm sessions retire on any failure and accumulate token counts additively toward the 60% ceiling. Multi-channel chains stall or drop. |
-| **9** | **Air-gapped scripting & fragile NDJSON pipe** | `worker-backend.ts:274-280, 315-378, 574-603, 720-809`; `worker/bridge.ts:122-123, 1442-1527`; `worker/Dockerfile:62`; `agent-session.ts:3602` | Workers run `--network none` with only `PyJWT`/`cryptography`, decoupled from host HTTP/browser; any >64 KiB NDJSON line or >4 MiB cumulative session stdout kills the container; `execCommand` timeout calls `process.exit(124)` wiping `/tmp`; `toolExecution` is forced `'sequential'`. Blocks HMAC/request-signing, protobuf/encrypted APIs, and large SAST outputs. |
-| **10** | **White-box ingestion & thin CVE correlation** | `github-connector.ts:76-78, 651, 810, 829`; `semantic-audit.ts:620-671, 861-864, 1213, 1332-1391, 1448-1460, 1656-1661, 2066`; `phase0-recon.ts:289-618, 2058-2065`; `cve-broker.ts:449-453, 514-516` | `cloneGithubRepos` clones `--depth 1` and deletes `.git`, making Stage-3 `mineGitSecurityHistory` permanently dead. Static route regexes lose mount prefixes (`app.use('/v2', ...)`), `resolveSuspectEntrypoint` traverses <=1 reverse call-graph hop, multi-origin repos bind to `origins[0]`, `pom.xml` parsing misaligns `<artifactId>`/`<version>`, and `CVE_TEMPLATE_IDS` maps only 1 CVE (`CVE-2025-29927`). |
-| **11** | **Brittle `LabRunner` containerization** | `lab-runner.ts:70, 162, 331-464, 1054-1077, 1310-1407, 1576, 1614-1620`; `plans/SECURITY-REAUDIT-2026-11-22.md:202` | Hard cap of 6 containers, regex Compose parser, `docker build --network none`, forced `--read-only` + 64MB `/tmp` (breaks DBs), `docker exec ... node -e` readiness checks (breaks Postgres/Redis/Go/Python), and per-TCP-connection `docker exec` proxying (fails distroless/compiled images, risks `pidsLimit: 128` exhaustion). Breaks local-lab white-box & Patch Gate 6 on real stacks. |
-| **12** | **Coarse origin provenance & aggressive 5xx/WAF circuit breakers** | `store.ts:3394-3533, 3727-3800`; `broker.ts:1966-1997, 2042, 2463-2707`; `execution.ts:1282-1314`; `response-checks.ts:139-176` | Exact-origin provenance drops findings touching third-party IdP/CDN redirect hops (`writeReport`). Non-JWT auth tokens cannot be mutated (`broker.ts:2463-2707`). Five `5xx` responses in 30s trip a route circuit breaker, and origin circuit trips permanently pause runs with no cooldown recovery—causing error-inducing probes to self-block verification. |
-| **13** | **Incomplete crash recovery & ephemeral runtime state** | `store.ts:961-973, 2173-2177, 3351-3363`; `execution.ts:956-999, 7887-7928`; `lab-runner.ts:1523` | `Store.recover()` leaves `board_members` stuck `working`, orphans `LabRunner` containers/tmpdirs, loses in-memory refinement queues, approval ledgers, session/CSRF jars, and canary bindings, and unconditionally re-queues permanently `failed` assignments on resume. |
+| Mutually exclusive `!profiles.length` lane gate | `execution.ts:3921-3928` | Starves agentic runs of deterministic floor | Always-on Layer-2 floor streaming into Layer 3 |
+| Per-request keyword HITL escalation & synchronous worker blocking | `approval-judge.ts:94-99, 649-715`; `execution.ts:2441-2483` | Approval storms + false safety | Layer-1 environment modes + non-blocking durable leases |
+| Closed `DeclarativeReplaySpec` compiler proliferation (4 JSON-only compilers + 3.4K LOC VM) | `proof-tools.ts`; `replay-verifier.ts` | >70% `replay_spec_miss`; blocks novel bugs | Layer-3 `guardian_verify` scripts + Layer-1 transcript oracle |
+| Regex-stripped 7-specialist tool silos & in-memory dropped board wakes | `agent-session.ts:658-939`; `execution.ts:1658-1748` | Breaks cross-channel exploit chains | Fluid capability bundles + durable SQLite wake queue |
+| Tool-less single-shot `runChainPlanner` + 6-dry-step global kill switch | `execution.ts:192-223, 5572-5894` | Blind beyond 25 routes / 80 facts; premature halts | Stateful tool-equipped Graph Coordinator |
+| Benchmark regexes & English path-name gates in core engine | `deterministic-engine.ts:162-193, 1557, 1659` | Overfit to local-lab naming; misses real apps | Schema-, AST-, and behavior-driven hypothesis planning |
+| Custom regex Compose parser & per-TCP `docker exec` proxy | `lab-runner.ts:331-464, 1310-1407` | Breaks DBs, Go/Java/distroless stacks, race load | Proper YAML Compose parser + shared Docker-network proxy |
+| Per-exchange sync `fsync` + full-table `runDetail` hydration | `store.ts:492-493, 1435-1528, 1603-1740` | Stalls & OOMs on large targets | WAL + async batched writes + paginated queries |
 
 ---
 
-## 3. Target Architecture & Redesign Blueprint
+## 4. Strangler-Fig Migration Roadmap & Realism Gates
 
-To close the real-world gap without sacrificing Guardian's core safety invariants (strict scope enforcement, non-destructive verification, zero-hallucination evidence), refactor along **five decoupled workstreams**.
+Do **not** execute a multi-month dark rewrite. Migrate incrementally in four phases, measuring every phase on **shipped `Execution`** (never standalone harnesses) against both existing regression suites and a new **Real-World Realism Suite**.
 
-### Workstream A — Unified Floor + Tool-Augmented Graph Planner (Fixes #1, #7, #8, #9)
+### The New North Star: Real-World Realism Suite
+Before optimizing recall further, build a compact, deterministic integration suite (`benchmarks/realism-suite/`) that encodes the real-world conditions v5's benchmarks hid:
+1. **Modern Enterprise SPA Fixture:** CDN-hosted JS chunks (`assets.local` → `app.local` → `api.local`), external OIDC IdP redirect (`idp.local`), hybrid `HttpOnly` cookie + Bearer + `X-Tenant-Id`, GraphQL with introspection disabled, interactive tab/modal routes, and a stored XSS rendered only in an authenticated admin browser view.
+2. **WAN & Async-OOB Fixture:** Proxy injecting 50–300ms random WAN latency jitter + dynamic HTML nonces, plus a background worker triggering SSRF/XXE/webhook callbacks 15–30 seconds *after* HTTP response.
+3. **Staging-Safety & Concurrency Fixture:** Shared stateful DB under `staging_isolated` mode testing write-BOLA, HTTP/2 single-packet race condition, and multi-step checkout workflow with assertion that zero orphan test records remain after cleanup.
+4. **Enterprise Monorepo White-Box Fixture:** Multi-service repo with preserved `.git` history, nested router mounts (`app.use('/v2', ...)`), 4-hop `route -> controller -> service -> repo` authz/SQLi sinks, and 2,500+ routes to validate scale and store latency.
 
-1. **Always-On Bounded Deterministic Floor (`execution.ts`, `assignment-brief.ts`, `agent-session.ts`):**
-   * Remove the `!profiles.length` gate in `driveInvestigation()`. Run a bounded deterministic floor (configurable budget, e.g., 15–25% of run request budget, non-blocking via progressive streaming of `EngineConfirmed` and `EngineLead` records to the store) *before* or *concurrently with* agentic lanes.
-   * Wire `buildAssignmentBrief()`, `alreadyConfirmed`, `detLeads`, and `resolveAgenticTurnBudget()` + explicit `wallClockMs` caps into `startInvestigationStep()` so LLM specialists never waste turns re-probing confirmed findings and prioritize unresolved high-signal leads and business-logic/chaining hypotheses.
-2. **Stateful Tool-Equipped Chain Planner (`execution.ts`, `compactor.ts`):**
-   * Replace the tool-less single-shot `runChainPlanner` prompt with a compact, persistent planner session equipped with read-only graph tools: `query_endpoints`, `query_facts`, `query_findings`, `expand_digest(digestId)`, and `list_uncovered_routes(cursor, limit)`.
-   * Never terminate investigation on a single malformed planner JSON response (retry with schema feedback) or on parallel dry steps (count dry *rounds* with zero new coverage rather than raw step completions).
-3. **Capability-Based Specialist Profiles & Reliable Board Delivery (`agent-session.ts`, `execution.ts`, `board-tools.ts`):**
-   * Replace rigid regex-stripped tool silos with additive capability bundles (every specialist retains read-only graph/SAST query + `request_http_batch`, with browser/race/canary/script capabilities granted when the hypothesis or peer handoff demands them).
-   * Persist board wakeups in a durable per-member queue in SQLite (delivered when the member transitions `working -> waiting`) instead of dropping wakes in memory; separate per-step context tokens from lifetime cumulative tokens.
-4. **Resilient Worker Bridge & Networked Helper Proxy (`worker-backend.ts`, `worker/bridge.ts`):**
-   * Raise NDJSON transport framing to chunked/file-backed IPC (spill tool payloads >64 KiB to mounted tmpfs with pointer passing instead of killing the container) and handle command timeouts via child-process cancellation rather than `process.exit(124)`.
-   * Enable parallel execution for pure read-only tool calls and expose a scoped host-mediated `broker_rpc` bridge inside `run_offline_script` (strictly routed through `Broker` scope/tier/rate-limit enforcement) so custom Python/Node scripts can perform dynamic request signing, HMAC/protobuf serialization, and multi-step challenge-response without breaking `--network none` isolation.
+### Phased Rollout
 
----
-
-### Workstream B — Enterprise Auth, Modern SPA Hydration & Three-Tier Origin Scope (Fixes #2, #3, #12)
-
-1. **Three-Tier Scope Model (`schema.ts`, `broker.ts`, `scoped-browser.ts`, `store.ts`):**
-   * Separate origins into three explicit classes on every engagement:
-     * `targetOrigins` (active probing & verification allowed up to `capabilityTier`)
-     * `authOrigins` (read/form/OAuth redirect traversal allowed strictly for persona authentication; active probing forbidden)
-     * `assetOrigins` (passive `GET` allowed for JS/CSS/font/map hydration in `ScopedBrowser`; active probing forbidden)
-   * Update `writeReport()` and transitive revocation so benign redirect hops through `authOrigins` / `assetOrigins` never suppress valid findings on `targetOrigins`.
-2. **Composite Per-Worker Session Vault & OIDC/MFA Support (`persona-vault.ts`, `persona-auth.ts`, `broker.ts`):**
-   * Upgrade `MintedPersonaSession` to a composite credential bundle (`cookies[]` including `HttpOnly` + `headers: Record<string, string>` + `storage: { localStorage, sessionStorage }` + `originBindings`) so hybrid Cookie + Bearer + `X-Tenant-Id` apps work seamlessly across `app.` and `api.` origins.
-   * Add: (a) standard OIDC/OAuth2/SAML interactive Playwright login flow permitting `authOrigins` redirects, (b) optional TOTP seed support and interactive cookie/storage-state import for MFA/passkey/SSO apps, and (c) **per-worker isolated session clones** with coordinated single-flight refresh (replacing the global 60s re-auth lockout and preventing one destructive/logout probe from poisoning sibling workers).
-   * Only treat CAPTCHA as blocking when an interactive challenge actually prevents login submission, not when a script tag is merely present in DOM.
-3. **Interactive Pooled SPA Crawler & Multi-Persona Discovery (`scoped-browser.ts`, `phase0-recon.ts`, `surface-engine.ts`):**
-   * Reuse a pooled Playwright browser context per persona (instead of cold-booting Chromium per URL), seed `HttpOnly` cookies + `localStorage`/`sessionStorage`, attach persona headers to all allowlisted sibling API origins, and wait on network-idle / DOM-stability heuristics rather than `120ms`.
-   * Add safe interactive state exploration (clicking nav items, tabs, pagination, read-only dropdowns/filters) and allow read-only GraphQL/RPC `POST` queries (`operationType === 'query'`) below Tier 3.
-   * Run Phase-0 discovery across **all distinct role personas** (unioning role-exclusive endpoints and tagging `visibleToPersonas`), capture WebSocket handshakes/frames via Playwright CDP `Network.webSocket*` events, support `multipart/form-data` & per-prefix soft-404 calibration, and stop skipping `/` in `surface-engine.ts`.
+| Phase | Deliverables | Key Files | Concrete Exit Gate |
+|---|---|---|---|
+| **Phase 1: Unify Floor, Fix Scale & Data Integrity** | Always-on Layer-2 deterministic floor feeding `Execution` agentic lane; fix `resource_samples` collection key; SQLite WAL + async batched exchange writes + paginated `listEndpoints`/`runDetail`; fix `Store.recover()`; mutated-param dedupe; remove benchmark regex leakage from `deterministic-engine.ts`. | `execution.ts`, `deterministic-engine.ts`, `store.ts`, `schema.ts`, `dedupe.ts` | Shipped `Execution` agentic recall >= `Execution --no-llm` on dev & salted held-out; 2,500-endpoint run has zero endpoint truncation and <50ms p99 main-thread store stall; zero `resource_samples` clobbering across multi-resource apps. |
+| **Phase 2: Layer-1 Boundary — 3-Tier Scope, Enterprise Auth, SPA & Environment Modes** | Implement `targetOrigins` / `authOrigins` / `assetOrigins`; composite per-worker session vault + OIDC/SAML/TOTP interactive login; pooled interactive multi-persona Playwright crawler with CDP WebSocket capture; replace per-request keyword HITL blocking with `prod_readonly` / `staging_isolated` / `ephemeral_lab` + non-blocking durable leases. | `schema.ts`, `broker.ts`, `persona-auth.ts`, `persona-vault.ts`, `scoped-browser.ts`, `phase0-recon.ts`, `approval-judge.ts`, `store.ts` | Realism Fixture #1 (CDN SPA + split `app.`/`api.` + external OIDC + hybrid auth + `HttpOnly` admin view) reaches >=80% route discovery and confirms cross-origin authz + browser-executed stored XSS; `staging_isolated` runs zero approval deadlocks. |
+| **Phase 3: Layer-3 Paradigm Shift — Executable Proof Scripts, HTTP/2 & Async Public OOB** | Ship `guardian_verify` SDK + Unix-socket Layer-1 RPC bridge inside worker sandbox; independent clean-session script re-runner + proxy-signed transcript oracle; jitter-tolerant timing & structural boolean helpers; HTTP/2 transport + single-packet race sync + proxy/mTLS + error-safe circuit breakers; public HTTPS/DNS OOB relay with durable `pending_oob` late promotion; chunked IPC removing 64 KiB container kills. | `worker-backend.ts`, `worker/bridge.ts`, `broker.ts`, `canary-broker.ts`, `replay-verifier.ts`, `agent-session.ts` | `replay_spec_miss` drops by >=60% on realistic-bench; Realism Fixture #2 (WAN jitter + 15–30s async callbacks) confirms blind SQLi + async SSRF/XXE with <5% false negatives; Realism Fixture #3 confirms HTTP/2 race & stateful write-BOLA with zero leaked test entities. |
+| **Phase 4: Code-First Program Graph, Tool-Equipped Coordinator & `LabRunner` Cleanup** | Preserve `.git` history in repo sync; AST/mount-aware route + middleware + multi-hop (depth 6–8) sink call graph + monorepo origin mapping; dynamic CVE-to-template indexing + fixed `pom.xml` parser; replace stateless `runChainPlanner` & regex tool silos with tool-equipped Graph Coordinator + fluid investigators; replace `LabRunner` regex Compose parser & `docker exec` TCP proxy. | `github-connector.ts`, `semantic-audit.ts`, `cve-broker.ts`, `execution.ts`, `compactor.ts`, `board-tools.ts`, `lab-runner.ts` | Realism Fixture #4 (4-hop monorepo + `.git` regression + nested mounts) links >=85% of SAST suspects to live endpoints and confirms via Layer-3 scripts; multi-step chain recall rises from 1/6 to >=4/6 on realistic-bench; `execution.ts` LOC reduced by >=30% via retired v5 gates. |
 
 ---
 
-### Workstream C — Modern Transport, Public Async OOB & Noise-Tolerant Verification (Fixes #4, #5)
+## 5. Traceability Matrix: Audited v5 Gaps → v6 Resolution
 
-1. **HTTP/2-Capable Transport & Configurable Egress (`broker.ts`):**
-   * Add an `undici` / `node:http2` transport backend supporting HTTP/2 multiplexing, **single-packet / last-byte synchronized `executeRaceBurst`**, optional corporate HTTP/SOCKS egress proxy, mTLS client certificates, configurable realistic `User-Agent` / header profiles for authorized WAF-fronted targets, and turn-aware stateful WebSocket sessions (awaiting server frames + continuation reassembly).
-   * Add a controlled Tier-3 raw-framing capability (explicitly opt-in for authorized targets) for Host-header and HTTP desync/smuggling verification without weakening scope pinning.
-   * Distinguish target `5xx` responses triggered by active injection/parser probes from transport failures/429s so error-based probing does not trip its own verification circuit breaker; add exponential-backoff cooldown recovery instead of permanently halting runs.
-2. **Externally Routable Async OOB Relay (`canary-broker.ts`, `replay-verifier.ts`, `execution.ts`):**
-   * Support a lightweight deployable/managed public OOB relay mode (HTTP + automated ACME/TLS HTTPS + authoritative UDP/TCP DNS, with optional SMTP listener) alongside local loopback mode, configured via a single engagement relay profile.
-   * Replace the synchronous `1.5s` poll loop with **two-stage async OOB correlation**: a short immediate check (e.g., 2–3s) followed by durable `pending_oob` state that stays subscribed to the relay for the remainder of the run (or configurable delay window, e.g., 5–30 minutes) and automatically promotes matching late callbacks into verified findings.
-3. **Flexible, Noise-Tolerant Verification & Accurate Deduplication (`replay-verifier.ts`, `proof-tools.ts`, `replay-spec.ts`, `dedupe.ts`):**
-   * **Hybrid `http_browser_chain` specs:** Allow a single declarative spec to mutate/seed state via HTTP (or persona A) and verify DOM execution/CSP bypass or cross-persona UI rendering in Playwright (with full `HttpOnly` cookie bridging).
-   * **Rich extractors & jitter-resilient statistics:** Extend `proof-tools.ts` extractors beyond flat dotted JSON keys to JSONPath/array indices, regex/CSS-selector HTML/XML extraction, and response headers. Replace brittle 3-round `minProbe > maxBaseline` checks in `sql_time_diff` with adaptive baseline sampling (e.g., 5–7 interleaved control/probe pairs using Mann-Whitney U / median-MAD separation) and structural DOM/token-diffing (stripping dynamic nonces/timestamps) in `sql_boolean_diff`.
-   * **Mutated-parameter dedupe:** Derive dedupe fingerprints from the **explicitly mutated parameter/header/GraphQL operation/RPC procedure** recorded in the replay spec rather than `Object.keys(jsonBody)[0]`, and scope `ORIGIN_WIDE_CWES` by service path prefix when distinct backend headers/cookies indicate reverse-proxied microservices.
-
----
-
-### Workstream D — Production-Safe Mutations & Non-Blocking Scoped Approvals (Fixes #6)
-
-1. **Non-Blocking Approval Queue & Scoped Policy Grants (`approval-judge.ts`, `execution.ts`, `store.ts`):**
-   * Evaluate explicit operator-approved endpoint/method/class policies **before** keyword heuristics, reserving unconditional hard escalation strictly for genuinely destructive/out-of-policy operations.
-   * Support **scoped durable approval leases** (e.g., `(runId, origin, normalizedRoute, method, vulnClass)` valid across probe iterations and Phase-3 replay verification) persisted in SQLite instead of single-use 60s exact-body-hash in-memory grants.
-   * Decouple HITL waiting from worker execution: when a step requires human approval, park the step in `awaiting_approval`, release the `workerConcurrency` slot and container immediately, pause its lease timer, and re-enqueue on approval.
-2. **Test-Entity Isolation & Teardown Contract (`replay-spec.ts`, `proof-tools.ts`, `execution.ts`):**
-   * Add first-class `setup` / `cleanup` steps and a run-scoped entity prefix (`guardian-qa-<runShortId>-`) to `http_chain` and `workflow_invariant` specs so stateful verification creates, mutates, verifies, and deletes its own test records instead of colliding with shared staging data or burning one-shot records.
-
----
-
-### Workstream E — Scalable Persistence, Behavior-Driven Detection & White-Box Repair (Fixes #7, #10, #11, #13)
-
-1. **Scalable Store & Relational Entity Model (`store.ts`, `schema.ts`):**
-   * Move SQLite to `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`, batch exchange writes asynchronously off the hot HTTP path, shard `artifacts/<runId>/<bucket>/`, replace full-body FTS5 trigram indexing on every exchange with opt-in/bounded indexing + TTL/retention cleanup, and paginate `listEndpoints`, `listFacts`, and `runDetail` (removing the silent 500/2,000 endpoint truncation).
-   * Fix `resource_samples` uniqueness from `UNIQUE(run_id, owner_persona, resource_key, origin)` to `UNIQUE(run_id, owner_persona, origin, collection_path, resource_key)` so distinct collections (`/invoices`, `/orders`, `/tickets`) never clobber each other's IDs.
-   * Harden `Store.recover()` to reset stuck `board_members`, persist refinement queues and approval leases, track active `LabRunner` container IDs in SQLite for orphan reaping on startup, and distinguish retryable failures from permanent failures on resume.
-2. **Schema- & Response-Driven Hypothesis Generation (`deterministic-engine.ts`, `cve-broker.ts`):**
-   * Decouple hypothesis planning from English URL regexes (`pathHasUrlHint`, `pathHasXmlHint`, etc.) by prioritizing **observed OpenAPI/GraphQL/HAR/runtime parameter types and response shapes** (e.g., any parameter observed holding a URL/UUID/XML/template/file-like value or triggering backend parser errors), while keeping path hints only as tie-breaking priority boosts. Remove benchmark-specific regexes (`rb[cst]_`, `?reveal=0` assumptions) from core engine code.
-   * Expand CVE-to-verification coverage by indexing compiled templates dynamically by CVE ID (replacing the 1-entry `CVE_TEMPLATE_IDS` map) and fixing `pom.xml` dependency block parsing to parse per-`<dependency>` XML element rather than parallel global regexes.
-3. **White-Box & `LabRunner` Productionization (`github-connector.ts`, `semantic-audit.ts`, `lab-runner.ts`):**
-   * Preserve shallow git history (e.g., `--depth 100` without deleting `.git`, or fetch security-relevant commit logs via API before cleanup) so Stage-3 `mineGitSecurityHistory` actually runs.
-   * Replace single-file static route regexes with AST/router-mount-aware extraction (preserving `app.use` / `APIRouter` / `include()` prefixes), extend `resolveSuspectEntrypoint` to multi-hop reverse call-graph traversal (depth 5–8), and bind monorepo services to their matching origin via service config / Dockerfile / ingress mapping instead of `origins[0]`.
-   * Replace `LabRunner`'s regex Compose parser and per-TCP `docker exec` proxy with a proper YAML Compose parser, configurable build/writable-mount overlays for DB sidecars, native TCP health probes from a shared Docker network, and a persistent lightweight forwarder (removing the `node`/`python3` requirement inside target containers).
-
----
-
-## 4. Prioritized Rollout Order & Realism Verification Gates
-
-Execute in four phases so every merge delivers measurable real-world gains on shipped `Execution` (never harness-only):
-
-| Phase | Workstreams | Concrete Exit / Realism Gate |
-|---|---|---|
-| **Phase 1: Core Product Unification & Data Integrity** | A1 (unified deterministic floor + `buildAssignmentBrief`), E1 (`resource_samples` key fix, pagination >500 endpoints, WAL/async writes, `Store.recover`), C3 (mutated-param dedupe) | `Execution` agentic recall >= `Execution --no-llm` + significant chain/logic lift on both dev and salted held-out; 2,500-endpoint synthetic scale run completes with zero truncation and <50ms p99 main-thread store stall. |
-| **Phase 2: Enterprise Auth, SPA & Scope** | B1 (3-tier origin model), B2 (OIDC/SAML/MFA + composite per-worker session vault), B3 (pooled interactive SPA crawler + multi-persona discovery) | New realistic integration fixture: CDN-hosted React SPA + split `app.`/`api.` origins + external OIDC IdP + hybrid Cookie+Bearer + `HttpOnly` admin view achieves >=80% endpoint discovery and authenticated verification. |
-| **Phase 3: Modern Transport, Public OOB & Noise-Tolerant Proofs** | C1 (HTTP/2 + single-packet race + proxy/mTLS + error-safe circuit breaker), C2 (public HTTPS/DNS OOB relay + async late-callback promotion), C3 (hybrid HTTP+browser specs, rich extractors, jitter-tolerant timing/diff) | WAN-jitter (50–300ms injected latency) and delayed-callback (10–60s async webhook/worker) integration tests verify blind SQLi, blind SSRF/XXE, HTTP/2 race, and SPA stored XSS with <5% false negatives. |
-| **Phase 4: Production Safety, Behavior-Driven Detection & White-Box** | D1–D2 (non-blocking scoped approvals + entity setup/cleanup), A2–A4 (tool-equipped planner, durable board wakes, chunked IPC + broker RPC), E2–E3 (schema-driven hypotheses, live git-history + multi-hop SAST binding, `LabRunner` network proxy) | Staging-mode (`environment: 'public'`) run verifies stateful write-BOLA/workflow/CSRF classes without deadlocking worker slots or leaking test entities; multi-hop monorepo white-box run confirms SAST suspects against live endpoints. |
+| v5 Audited Limitation | Severity | Primary v5 Code Locations | v6 Resolution | Phase |
+|---|---|---|---|---|
+| 1. Mutually exclusive deterministic vs. agentic lanes; unwired handoff | Critical | `execution.ts:3333-3357, 3921-3928`; `assignment-brief.ts:345-452` | Always-on Layer-2 floor streaming leads & confirmed set to Layer 3 | Phase 1 |
+| 2. Enterprise SSO/OIDC/MFA blocked; single-header sessions; 60s re-auth cascade | Critical | `persona-auth.ts:121-130, 622-637, 806-916, 1696-1823`; `persona-vault.ts:33-47` | `authOrigins` + composite per-worker Session Vault + OIDC/TOTP capture | Phase 2 |
+| 3. `ScopedBrowser` CDN starvation, stripped `HttpOnly`/split-origin auth, shallow non-interactive crawl | Critical | `scoped-browser.ts:254, 742-841`; `phase0-recon.ts:2022-2427, 3100-3446` | `assetOrigins` + pooled interactive multi-persona Playwright crawler + CDP WS | Phase 2 |
+| 4. HTTP/1.1-only normalized transport; naive race bursts; loopback 1.5s OOB canaries | Critical | `broker.ts:346, 1012-1481, 3208-3216`; `canary-broker.ts:642-809`; `replay-verifier.ts:1191-1197` | `undici`/HTTP/2 + single-packet race + public HTTPS/DNS relay + async `pending_oob` | Phase 3 |
+| 5. `DeclarativeReplaySpec` >70% `replay_spec_miss`; noise-intolerant stats; JSON-only/siloed proofs; first-key dedupe collisions | Critical | `replay-verifier.ts:184-254, 626-633, 1980-2025, 2737-2745`; `proof-tools.ts:176, 452, 1174`; `dedupe.ts:142-172, 302-350` | `guardian_verify` scripts + Layer-1 transcript oracle + jitter-tolerant/hybrid helpers + mutated-param dedupe | Phases 1 & 3 |
+| 6. Blocking keyword HITL approval storms vs. no staging entity isolation/cleanup | Critical | `approval-judge.ts:94-99, 343-395, 649-715`; `execution.ts:2441-2483` | Environment contracts (`prod_readonly` / `staging_isolated` / `ephemeral_lab`) + setup/cleanup + non-blocking leases | Phase 2 |
+| 7. Stateless truncated planner; English-REST/benchmark detection gates; sync SQLite & 500-endpoint cap; `resource_samples` clobbering | Critical | `execution.ts:192-223, 5572-5894`; `deterministic-engine.ts:33-37, 162-193, 1557, 1659`; `store.ts:477-494, 816, 1655-1740, 4209-4234` | Tool-equipped Graph Coordinator; schema/AST/behavior hypotheses; WAL + pagination + collection-scoped `resource_samples` | Phases 1 & 4 |
+| 8. Regex-stripped specialist silos & dropped board wakeups | High | `agent-session.ts:658-939`; `execution.ts:1658-1748`; `board-tools.ts:44-47` | Fluid capability bundles + durable SQLite wake queue | Phase 4 |
+| 9. Air-gapped scripting with no broker bridge; 64 KiB NDJSON container crashes; sequential tools | High | `worker-backend.ts:315-378, 720-809`; `worker/bridge.ts:1442-1527`; `agent-session.ts:3602` | Layer-1 Unix-socket RPC SDK + tmpfs chunked IPC + parallel read tools | Phase 3 |
+| 10. Dead git-history stage; prefix-blind route regexes; 1-hop SAST binding; 1-entry CVE template map | High | `github-connector.ts:810-829`; `semantic-audit.ts:1353-1391, 1656-1661`; `cve-broker.ts:449-453, 514-516` | Preserved shallow `.git` + AST mount-aware multi-hop Program Graph + dynamic CVE template index | Phase 4 |
+| 11. Brittle `LabRunner` regex Compose parser, read-only DB breakage & `docker exec` TCP proxy | High | `lab-runner.ts:162, 331-464, 1054-1077, 1310-1407` | Real YAML Compose parser + writable DB overlays + native Docker-network proxy | Phase 4 |
+| 12. Exact-origin provenance drops IdP/CDN findings; 5xx probe self-circuit-trips & permanent pauses | High | `store.ts:3727-3800`; `broker.ts:1966-1997`; `execution.ts:1282-1314` | 3-tier origin provenance + probe-aware circuit breakers with exponential cooldown | Phases 2 & 3 |
+| 13. Incomplete `Store.recover()` (stuck board members, orphaned labs, lost refinement/approval state) | High | `store.ts:961-973, 3351-3363`; `execution.ts:956-999`; `lab-runner.ts:1523` | Persisted runtime queues/leases/container IDs + clean recovery state machine | Phase 1 |
