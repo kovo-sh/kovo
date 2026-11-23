@@ -18,6 +18,31 @@ import { Store } from '../src/server/store.ts'
 import type { BenchmarkServerHandle } from './benchmark-recall.ts'
 import type { DiscoveredEndpoint, ProbeEnv, ProfileCaps } from './benchmark-probes.ts'
 
+/**
+ * In-run worker concurrency (how many investigation assignments `Execution` may run at once) is
+ * independent of benchmark *cell* concurrency (how many app/seed cells run in parallel). A cell
+ * with one worker slot cannot use the steps the planner authored, so the agentic default is 6;
+ * the deterministic (`--no-llm`) lane is sequential and stays at 1.
+ */
+export const DEFAULT_AGENTIC_WORKER_CONCURRENCY = 6
+export const DEFAULT_NO_LLM_WORKER_CONCURRENCY = 1
+/** Engine-side ceiling (`maxWorkerConcurrency` in src/domain.ts). */
+export const MAX_RUN_WORKER_CONCURRENCY = 16
+
+export function defaultWorkerConcurrency(noLlm: boolean): number {
+  return noLlm ? DEFAULT_NO_LLM_WORKER_CONCURRENCY : DEFAULT_AGENTIC_WORKER_CONCURRENCY
+}
+
+/** Clamp a requested in-run worker concurrency to the engine ceiling; never returns < 1. */
+export function resolveWorkerConcurrency(
+  requested: number | null | undefined,
+  opts: { noLlm?: boolean } = {},
+): number {
+  const fallback = defaultWorkerConcurrency(Boolean(opts.noLlm))
+  if (typeof requested !== 'number' || !Number.isFinite(requested)) return fallback
+  return Math.max(1, Math.min(MAX_RUN_WORKER_CONCURRENCY, Math.trunc(requested)))
+}
+
 export interface EngineEnv {
   storage: Store
   broker: RequestBroker
@@ -66,6 +91,8 @@ export interface EngineEnvOptions {
    * on a single reachable callback endpoint.
    */
   oobCallbackPorts?: number[]
+  /** In-run investigation worker slots (default: agentic 6). Never the cell concurrency. */
+  workerConcurrency?: number
 }
 
 /**
@@ -130,7 +157,7 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
   const run = storage.createRun({
     requestId: randomUUID(), projectId: project.id, goal: 'Recall benchmark: discover and verify surface', sourceMode: 'public',
     capabilityTier: caps.tier, approvalPolicy: 'auto_review', approvedPersonaIds: personaIds, budgetUsd: 25, budgetRequests,
-    maxRpsPerOrigin: 20, workerConcurrency: 4, workerMaxTurns: 40, multiTrialEnabled: true,
+    maxRpsPerOrigin: 20, workerConcurrency: resolveWorkerConcurrency(opts.workerConcurrency), workerMaxTurns: 40, multiTrialEnabled: true,
   } as unknown as Parameters<Store['createRun']>[0])
   storage.command({ requestId: randomUUID(), runId: run.id, action: 'discover', consent: true })
   const assetIds = storage.runDetail(run.id).run.candidates.map(c => c.id)
