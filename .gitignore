@@ -2,6 +2,7 @@ node_modules/
 dist/app.js
 
 /build/
+# Local run state, incl. opt-in agentic traces (.guardian/traces/<traceId>/)
 /.guardian/
 /playwright-report/
 /test-results/
