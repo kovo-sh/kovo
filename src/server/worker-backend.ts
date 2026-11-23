@@ -302,10 +302,29 @@ export interface WorkerSessionOptions {
   rpcMountDir?: string
 }
 
+/** Container-reuse counters for one backend/pool (diagnostic seam; no secrets). */
+export interface WorkerContainerStats {
+  /** `container create` round-trips that succeeded (cold creates + warm prewarm). */
+  created: number
+  /** Sessions served by a container that had already been used at least once. */
+  reused: number
+  /** Sessions served in total by this backend (warm or cold). */
+  sessions: number
+  /** Cold `container create` calls for sessions (warm-pool misses). */
+  coldSessions: number
+  /** Idle warm containers currently available for the next assignment. */
+  idle: number
+  capacity: number
+}
+
 export interface WorkerBackend {
   run(job: WorkerJob, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerResult>
   openSession(assignmentId: string, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerSession>
   verifyStaticAst(assignmentId: string, req: AstVerifyRequest, signal: AbortSignal, options?: WorkerSessionOptions): Promise<AstVerifyResult>
+  /** Container-reuse counters (diagnostic seam; optional for test/fake backends). */
+  containerStats?(): WorkerContainerStats | undefined
+  /** Size the warm idle pool to the run's worker-slot count (one container per slot). */
+  setWarmCapacity?(slots: number): void
 }
 
 function clamp(val: number | undefined, fallback: number, min: number, max: number): number {
@@ -512,7 +531,7 @@ function docker(args: string[], signal: AbortSignal, input?: string) {
   })
 }
 
-type DockerRunner = (args: string[], signal: AbortSignal, input?: string) => Promise<string>
+export type DockerRunner = (args: string[], signal: AbortSignal, input?: string) => Promise<string>
 /** The real CLI executor, exported so Docker-gated tests can wrap it (e.g. force a start failure). */
 export const dockerCliRunner: DockerRunner = docker
 
@@ -643,6 +662,20 @@ export function warmWorkersEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return value !== '0' && value !== 'false' && value !== 'off'
 }
 
+/** Idle warm containers kept per cell (one per worker slot); bounded 1..8. */
+export function warmPoolCapacity(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.GUARDIAN_WARM_SLOTS)
+  if (!Number.isFinite(raw) || raw <= 0) return 1
+  return Math.max(1, Math.min(8, Math.floor(raw)))
+}
+
+/**
+ * Scratch reset executed inside a pooled container before it is returned to the pool. `/tmp` is
+ * the container tmpfs that backs `/evidence` and the scratch workspace, so clearing it gives the
+ * next assignment a fresh filesystem without paying for a `container create` round-trip.
+ */
+export const WARM_SCRATCH_RESET_COMMAND = 'rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; true'
+
 /**
  * One pool per (cell, image) per process: Execution may construct more than one backend, and a
  * cell must not accumulate one idle container per backend.
@@ -655,7 +688,7 @@ function sharedWarmPool(input: {
   runLabel: string
   owner?: string
 }): WarmWorkerPool {
-  const key = `${input.cell}\0${input.image}`
+  const key = `${input.cell}\0${input.image}\0${input.runLabel}`
   const existing = warmPools.get(key)
   if (existing) return existing
   const pool = new WarmWorkerPool(input)
@@ -664,10 +697,12 @@ function sharedWarmPool(input: {
 }
 
 /**
- * Best-effort warm session pool: one pre-created `--session` container per cell. The container is
- * never started until a session takes it; after the session ends it is removed and a fresh one is
- * pre-created for the next assignment (tmpfs scratch is therefore fresh every time). Any create
- * failure disables the pool and callers fall back to the cold create path unchanged.
+ * Best-effort warm session pool: pre-created `--session` containers, one per worker slot
+ * (`setCapacity`), reused across assignments inside a run. A container is never started until a
+ * session takes it; when the session ends cleanly the backend resets `/tmp` and returns the
+ * stopped container to the pool, so the next assignment pays only a `container start` instead of
+ * a cold `create`. Any create/reuse failure permanently disables the pool and callers fall back to
+ * the cold create path unchanged.
  */
 export class WarmWorkerPool {
   readonly cell: string
@@ -677,12 +712,20 @@ export class WarmWorkerPool {
   private readonly owner?: string
   private readonly options: WorkerSessionOptions
   private readonly signature: string
-  private ready?: string
-  private pending?: Promise<string | null>
+  private capacity: number
+  private readonly idle: string[] = []
+  private readonly inflight = new Set<Promise<void>>()
+  private readonly used = new Set<string>()
+  /** Containers currently held by a session (excluding idle and in-flight creates). */
+  private readonly outstanding = new Set<string>()
   private disabled = false
   private closed = false
-  private prewarmed = 0
+  private created = 0
   private failures = 0
+  private reused = 0
+  private returned = 0
+  private discarded = 0
+  private removed = 0
 
   constructor(input: {
     cell: string
@@ -691,6 +734,7 @@ export class WarmWorkerPool {
     runLabel: string
     owner?: string
     options?: WorkerSessionOptions
+    capacity?: number
   }) {
     this.cell = input.cell
     this.image = input.image
@@ -700,83 +744,180 @@ export class WarmWorkerPool {
     this.options = { ...(input.options ?? {}) }
     delete this.options.reposDir
     this.signature = workerOptionsSignature(this.options)
+    this.capacity = Math.max(1, Math.min(8, Math.floor(input.capacity ?? warmPoolCapacity())))
   }
 
   get enabled(): boolean { return !this.disabled && !this.closed }
   get state(): 'warming' | 'ready' | 'disabled' | 'closed' {
     if (this.closed) return 'closed'
     if (this.disabled) return 'disabled'
-    return this.ready ? 'ready' : 'warming'
+    return this.idle.length ? 'ready' : 'warming'
   }
-  get stats(): { state: string; prewarmed: number; failures: number } {
-    return { state: this.state, prewarmed: this.prewarmed, failures: this.failures }
+  get stats(): {
+    state: string
+    capacity: number
+    idle: number
+    prewarmed: number
+    failures: number
+    created: number
+    reused: number
+    returned: number
+    discarded: number
+    removed: number
+  } {
+    return {
+      state: this.state,
+      capacity: this.capacity,
+      idle: this.idle.length,
+      prewarmed: this.created,
+      failures: this.failures,
+      created: this.created,
+      reused: this.reused,
+      returned: this.returned,
+      discarded: this.discarded,
+      removed: this.removed,
+    }
   }
 
-  /** Ensure one idle session container exists; resolves to its name or null. */
-  warm(): Promise<string | null> {
-    if (!this.enabled) return Promise.resolve(null)
-    if (this.ready) return Promise.resolve(this.ready)
-    if (this.pending) return this.pending
+  /** Resize the idle pool to one container per worker slot; never shrinks below `idle.length`. */
+  setCapacity(slots: number): void {
+    const next = Math.max(1, Math.min(8, Math.floor(slots)))
+    if (next === this.capacity) return
+    this.capacity = next
+    this.fill()
+  }
+
+  /** True when the pool currently owns an idle container with this name. */
+  owns(name: string): boolean {
+    return this.idle.includes(name)
+  }
+
+  /** A pooled container died or was removed mid-session: stop accounting for it and refill. */
+  forget(name: string): void {
+    this.outstanding.delete(name)
+    this.used.delete(name)
+    this.fill()
+  }
+
+  private fill(): void {
+    if (!this.enabled) return
+    // Total live pool containers (idle + in a session + being created) never exceeds capacity.
+    // A container returning from a session therefore becomes the next assignment's spare, instead
+    // of racing a speculative prewarm that would be discarded.
+    while (this.idle.length + this.outstanding.size + this.inflight.size < this.capacity) {
+      let pending: Promise<void>
+      pending = this.create().finally(() => { this.inflight.delete(pending) })
+      this.inflight.add(pending)
+    }
+  }
+
+  private async create(): Promise<void> {
     const name = 'guardian-' + randomUUID()
-    this.pending = (async () => {
-      try {
-        await this.docker(workerContainerCreateArgs({
-          image: this.image,
-          name,
-          assignmentId: `warm-${randomUUID()}`,
-          extraArgs: ['--session'],
-          runLabel: this.runLabel,
-          ...(this.owner ? { owner: this.owner } : {}),
-          cell: this.cell,
-          warm: true,
-          options: this.options,
-        }), AbortSignal.timeout(15_000))
-        if (this.closed) {
-          await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
-          return null
-        }
-        trackLiveContainer(name)
-        this.ready = name
-        this.prewarmed += 1
-        return name
-      } catch (error) {
-        this.failures += 1
-        this.disabled = true
-        if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
-          console.error('[worker-pool] prewarm failed; falling back to cold create:', error instanceof Error ? error.message.slice(0, 160) : String(error))
-        }
-        return null
-      } finally {
-        this.pending = undefined
+    try {
+      await this.docker(workerContainerCreateArgs({
+        image: this.image,
+        name,
+        assignmentId: `warm-${randomUUID()}`,
+        extraArgs: ['--session'],
+        runLabel: this.runLabel,
+        ...(this.owner ? { owner: this.owner } : {}),
+        cell: this.cell,
+        warm: true,
+        options: this.options,
+      }), AbortSignal.timeout(15_000))
+      if (this.closed) {
+        await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+        this.removed += 1
+        return
       }
-    })()
-    return this.pending
+      this.created += 1
+      if (this.idle.length >= this.capacity) {
+        this.discarded += 1
+        await this.removeIdle(name)
+        return
+      }
+      this.idle.push(name)
+      trackLiveContainer(name)
+    } catch (error) {
+      this.failures += 1
+      this.disabled = true
+      if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+        console.error('[worker-pool] prewarm failed; falling back to cold create:', error instanceof Error ? error.message.slice(0, 160) : String(error))
+      }
+    }
   }
 
-  /** Take the idle container when it matches the caller's session shape; null means cold create. */
+  /** Ensure an idle session container exists; resolves to its name or null. */
+  async warm(): Promise<string | null> {
+    if (!this.enabled) return null
+    if (this.idle.length) return this.idle[0]
+    this.fill()
+    while (this.inflight.size) {
+      await Promise.all([...this.inflight])
+      if (this.idle.length) break
+    }
+    return this.idle[0] ?? null
+  }
+
+  /** Take an idle container when it matches the caller's session shape; null means cold create. */
   async take(signal: AbortSignal, options?: WorkerSessionOptions): Promise<string | null> {
     if (!this.enabled) return null
     if (workerOptionsSignature(options) !== this.signature) return null
-    const name = this.ready ?? await this.warm()
+    if (!this.idle.length) await this.warm()
     signal.throwIfAborted()
-    if (!name || this.ready !== name) return null
-    this.ready = undefined
+    const name = this.idle.shift()
+    if (!name) return null
     liveContainers.delete(name)
-    void this.warm()
+    this.outstanding.add(name)
+    if (this.used.has(name)) this.reused += 1
+    else this.used.add(name)
     return name
   }
 
-  /** Container left the pool (session ended): it is already removed; prewarm a replacement. */
-  recycled(): void { void this.warm() }
+  /** Remove one idle container (pool disabled, oversized, or failed reuse). */
+  private async removeIdle(name: string): Promise<void> {
+    liveContainers.delete(name)
+    await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+    this.removed += 1
+  }
+
+  /**
+   * Return a cleanly stopped container to the pool. The caller has already reset `/tmp`; a
+   * container that is not stopped, or a pool that is full/disabled, is removed instead.
+   */
+  async release(name: string): Promise<boolean> {
+    this.outstanding.delete(name)
+    if (!this.enabled) {
+      this.discarded += 1
+      await this.removeIdle(name)
+      return false
+    }
+    let status = ''
+    try {
+      status = (await this.docker(['container', 'inspect', '-f', '{{.State.Status}}', name], AbortSignal.timeout(5_000))).trim()
+    } catch {
+      status = ''
+    }
+    if (status !== 'exited' && status !== 'created') {
+      this.discarded += 1
+      await this.removeIdle(name)
+      return false
+    }
+    if (this.idle.length >= this.capacity) {
+      this.discarded += 1
+      await this.removeIdle(name)
+      return false
+    }
+    this.idle.push(name)
+    this.returned += 1
+    trackLiveContainer(name)
+    return true
+  }
 
   async close(): Promise<void> {
     this.closed = true
-    const name = this.ready
-    this.ready = undefined
-    if (name) {
-      liveContainers.delete(name)
-      await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
-    }
+    const idle = this.idle.splice(0)
+    await Promise.all(idle.map(name => this.removeIdle(name)))
   }
 }
 
@@ -791,6 +932,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly pooled = new Set<string>()
   private readonly activeContainers = new Set<string>()
   private readonly removals = new Map<string, Promise<void>>()
+  private sessionsServed = 0
+  private coldSessionCreates = 0
   private reclaiming?: Promise<void>
 
   constructor({ image = 'guardian-worker:v4', workspace, runId, dockerRunner, staleCreatedMs, cell }: {
@@ -816,9 +959,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (workspace) {
       this.owner = createHash('sha256').update(workspace.id).update('\0').update(realpathSync(workspace.directory)).digest('hex')
     }
-    if (this.cell && warmWorkersEnabled()) {
+    // Pool key: an explicit cell, else the workspace. A bare test backend (no workspace, no cell)
+    // never prewarms, so lifecycle stubs only see the calls they trigger.
+    const poolCell = this.cell ?? (this.owner ? `ws-${this.owner.slice(0, 12)}` : undefined)
+    if (poolCell && warmWorkersEnabled()) {
       this.warmPool = sharedWarmPool({
-        cell: this.cell,
+        cell: poolCell,
         image: this.image,
         dockerRunner: this.docker,
         runLabel: this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`),
@@ -830,8 +976,26 @@ export class LinuxWorkerBackend implements WorkerBackend {
   }
 
   /** Warm-pool state (test/diagnostic seam; never contains secrets). */
-  get warmPoolStats(): { state: string; prewarmed: number; failures: number } | undefined {
+  get warmPoolStats(): WarmWorkerPool['stats'] | undefined {
     return this.warmPool?.stats
+  }
+
+  /** Container-reuse counters for the run's diagnostics event. */
+  containerStats(): WorkerContainerStats {
+    const pool = this.warmPool?.stats
+    return {
+      created: (pool?.created ?? 0) + this.coldSessionCreates,
+      reused: (pool?.reused ?? 0),
+      sessions: this.sessionsServed,
+      coldSessions: this.coldSessionCreates,
+      idle: pool?.idle ?? 0,
+      capacity: pool?.capacity ?? 0,
+    }
+  }
+
+  /** One warm idle container per worker slot (called by Execution after slot planning). */
+  setWarmCapacity(slots: number): void {
+    this.warmPool?.setCapacity(slots)
   }
 
   /**
@@ -861,15 +1025,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private removeContainer(name: string) {
     // Coalesce concurrent removals: `finally` + the session close/error handlers can race,
     // and a second `docker rm` reports "removal ... already in progress" instead of a clean exit.
+    if (this.warmPool?.owns(name)) return Promise.resolve()
+    if (this.pooled.delete(name)) this.warmPool?.forget(name)
     const existing = this.removals.get(name)
     if (existing) return existing
     const removal = this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000))
       .then(() => undefined, () => undefined)
-      .then(() => {
-        // A pool-issued container was consumed by a session: replace it so the next assignment
-        // starts without a create round-trip. Recycling is best-effort and never blocks removal.
-        if (this.pooled.delete(name)) this.warmPool?.recycled()
-      })
+      .then(() => { this.pooled.delete(name) })
       .finally(() => { this.removals.delete(name) })
     this.removals.set(name, removal)
     return removal
@@ -899,7 +1061,9 @@ export class LinuxWorkerBackend implements WorkerBackend {
       if (!row) continue
       const [id, name, createdLabel, createdAt] = row.split('\t')
       if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) continue
-      if (this.activeContainers.has(name)) continue
+      // Never reap a container this process created: pool-parked idle containers sit in `created`
+      // state between assignments and are removed by the pool, not by the stale sweep.
+      if (this.activeContainers.has(name) || liveContainers.has(name)) continue
       const stamped = Number(createdLabel)
       const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
       if (!Number.isFinite(age) || age < this.staleCreatedMs) continue
@@ -1024,7 +1188,9 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const warm = this.warmPool && !options?.rpcMountDir ? await this.warmPool.take(signal, options) : null
     const pooled = warm !== null
     const name = warm ?? 'guardian-' + randomUUID()
+    this.sessionsServed += 1
     if (pooled) this.pooled.add(name)
+    else this.coldSessionCreates += 1
     this.activeContainers.add(name)
     trackLiveContainer(name)
     if (!pooled) {
@@ -1066,6 +1232,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (err: Error) => void }>()
     let closed = false
     let closing: Promise<void> | undefined
+    let exited = false
+    let resolveExit: (() => void) | undefined
+    const exitPromise = new Promise<void>(resolve => { resolveExit = resolve })
+    // Set while a pooled container is being handed back: the child `close` handler must not
+    // remove a container the pool is about to reuse.
+    let preserveOnExit = false
 
     const failAll = (err: Error) => {
       for (const [, waiter] of pending) waiter.reject(err)
@@ -1119,16 +1291,24 @@ export class LinuxWorkerBackend implements WorkerBackend {
     })
     cli.once('close', code => {
       closed = true
+      exited = true
+      resolveExit?.()
       failAll(new Error(formatWorkerFailure(Buffer.concat(sessionStderr).toString('utf8'), code).replace(/^The isolated worker failed/, 'Isolated worker session exited unexpectedly')))
       // A session that never reached `close()` (crash, image pull, OOM) could leave a container in
-      // `created` state; always remove it here so abandoned workers do not accumulate.
+      // `created` state; always remove it here so abandoned workers do not accumulate. Pooled
+      // containers taking the graceful stop path are released by `close()` instead and stay live.
       this.activeContainers.delete(name)
-      liveContainers.delete(name)
-      void removeContainer()
+      if (!preserveOnExit) {
+        liveContainers.delete(name)
+        void removeContainer()
+      }
     })
     cli.once('error', error => {
       closed = true
+      exited = true
+      resolveExit?.()
       failAll(error)
+      preserveOnExit = false
       this.activeContainers.delete(name)
       liveContainers.delete(name)
       void removeContainer()
@@ -1138,6 +1318,38 @@ export class LinuxWorkerBackend implements WorkerBackend {
       if (closing) return closing
       closing = (async () => {
         closed = true
+        // Warm reuse: a clean session (no pending op, process still alive) resets `/tmp` first,
+        // then asks the worker to shut down so the stopped container can serve the next
+        // assignment without a cold `container create`.
+        const reusable = pooled && this.warmPool?.enabled === true && pending.size === 0 && !exited
+        let recycled = false
+        if (reusable) {
+          // 1) Reset the tmpfs scratch while the bridge is still running; 2) stop the container
+          // (the session protocol's shutdown is advisory — the bridge can keep stdin open, so the
+          // container is explicitly stopped and then verified by the pool before reuse).
+          const reset = await this.docker(
+            ['container', 'exec', name, 'sh', '-c', WARM_SCRATCH_RESET_COMMAND],
+            AbortSignal.timeout(4_000),
+          ).then(() => true, () => false)
+          if (reset && !exited) {
+            preserveOnExit = true
+            try {
+              if (cli.stdin && !cli.stdin.writableEnded && !cli.stdin.destroyed) {
+                cli.stdin.write(JSON.stringify({ id: 'shutdown', op: 'shutdown' }) + '\n')
+              }
+            } catch { /* ignore */ }
+            try {
+              await this.docker(['container', 'stop', '--time', '1', name], AbortSignal.timeout(10_000))
+            } catch { /* fall through: release() verifies the state and removes a live container */ }
+            let timer: NodeJS.Timeout | undefined
+            await Promise.race([
+              exitPromise,
+              new Promise<void>(resolve => { timer = setTimeout(resolve, 2_000); timer.unref?.() }),
+            ])
+            if (timer) clearTimeout(timer)
+            recycled = true
+          }
+        }
         try {
           if (cli.stdin && !cli.stdin.writableEnded && !cli.stdin.destroyed) {
             cli.stdin.end(JSON.stringify({ id: 'shutdown', op: 'shutdown' }) + '\n')
@@ -1146,9 +1358,20 @@ export class LinuxWorkerBackend implements WorkerBackend {
         try { cli.kill() } catch { /* ignore */ }
         failAll(new Error('Isolated worker session closed.'))
         cli.stdout?.removeAllListeners('data')
+        if (recycled && this.warmPool) {
+          const kept = await this.warmPool.release(name)
+          if (kept) {
+            this.pooled.delete(name)
+            this.activeContainers.delete(name)
+            // release() re-tracks the container as live: the pool (not this session) owns it now.
+            return
+          }
+        }
+        preserveOnExit = false
         await this.removeContainer(name)
+        this.pooled.delete(name)
         this.activeContainers.delete(name)
-      liveContainers.delete(name)
+        liveContainers.delete(name)
       })()
       return closing
     }
