@@ -118,10 +118,11 @@ Flags:
   --max-duration-ms <n>     wall-clock cap per fixture (default: ${DEFAULT_MAX_DURATION_MS})
   --out-dir <path>          artifact directory (default: .guardian/realism-bench)
   --data-dir <path>         Guardian data dir with an enabled model profile
-                            (default: $GUARDIAN_DATA_DIR). Single fixture: used
-                            verbatim; multiple fixtures: isolated child dir per cell.
-  --isolate-data-dir        copy only enabled profiles + credentials symlink into
-                            <out-dir>/data/<cell> (default: on when >1 fixture)
+                            (default: $GUARDIAN_DATA_DIR). Agentic cells always run
+                            from an isolated copy under <out-dir>/data/<cell>.
+  --isolate-data-dir        accepted for parity; agentic cells are always isolated
+                            from the source data dir (profiles copied, credentials
+                            symlinked, key never copied)
   --keep-data-dirs          keep isolated per-cell data dirs after the run
   --target-origin <label>   override the primary target origin label (e.g. api)
   --realism-seed <n>        fixture seed (default: ${DEFAULT_REALISM_SEED})
@@ -1255,7 +1256,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     const sourceDataDir = args.noLlm ? undefined : args.dataDir
     let dataDir = join(args.outDir, 'data', slug)
     let isolated = false
-    const isolate = Boolean(sourceDataDir && (args.isolateDataDir || args.fixtures.length > 1))
+    const isolate = Boolean(sourceDataDir)
     if (sourceDataDir && isolate) {
       const prepared = prepareIsolatedDataDir({ sourceDataDir, targetDir: dataDir })
       isolated = true
