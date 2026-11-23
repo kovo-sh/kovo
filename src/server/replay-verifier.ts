@@ -1284,6 +1284,14 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           impact: spec.impact,
         })
         const distinctActors = new Set(spec.steps.map(step => step.request.persona ?? step.request.session ?? 'anonymous'))
+        // A control arm that binds a CSRF token is the engine's declared anti-CSRF defence for the
+        // route, equivalent to the route's `csrf_state_change` oracle. It is a requirement, not
+        // evidence: the persisted readback is still demanded below.
+        const declaredImpactEvents = spec.expectedImpactEvents ?? []
+        const csrfModelled = impactClass === 'csrf' && spec.steps.some(step => Boolean(step.request.csrfBind))
+        const oracleEvents = csrfModelled && !declaredImpactEvents.includes('csrf_state_change')
+          ? [...declaredImpactEvents, 'csrf_state_change']
+          : declaredImpactEvents
         const gateApplies = impactClass === 'mass_assignment' || impactClass === 'csrf' ||
           (impactClass === 'authorization' && (distinctActors.size > 1 || Boolean(spec.requiredRole) || Boolean(spec.resourceTenant)))
         const impactGate = !gateApplies
@@ -1294,7 +1302,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               requiredRole: spec.requiredRole ?? null,
               resourceTenant: spec.resourceTenant ?? null,
               expectControlDenied: spec.expectControlDenied,
-              oracleEvents: spec.expectedImpactEvents,
+              oracleEvents,
               targetOrigin: spec.origin,
             })
         if (impactGate?.required && !impactGate.satisfied && !proofGuardFailure) {

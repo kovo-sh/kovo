@@ -786,7 +786,8 @@ function implicitReadDisclosure(
       ...(record.seq !== undefined ? { seq: record.seq } : {}),
     } as ImpactStep & { seq: number })
   }
-  const probe = steps.find(step => step.arm === 'probe') ?? steps.find(step => step.json !== undefined)
+  const probe = steps.find(step => step.arm === 'probe') ??
+    [...steps].reverse().find(step => step.json !== undefined && step.json !== null)
   if (!probe) return { satisfied: false, reason: 'no probe exchange carries a JSON body to inspect for an owner-scoped disclosure' }
   const disclosure = assessReadDisclosure({ steps, probe })
   return { satisfied: disclosure.satisfied, reason: disclosure.reason }

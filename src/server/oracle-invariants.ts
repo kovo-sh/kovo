@@ -283,6 +283,10 @@ export function collectCatalogPrices(steps: readonly ImpactStep[]): number[] {
 // Readback / persistence discovery
 // ---------------------------------------------------------------------------
 
+function step_isCleanRead(after: ImpactStep, probe: ImpactStep): boolean {
+  return isReadMethod(after.method) && after.id !== probe.id && (after.arm === 'control' || after.actor.handle !== probe.actor.handle)
+}
+
 interface PersistenceProof {
   persisted: boolean
   reason: string
@@ -296,10 +300,12 @@ interface PersistenceProof {
 function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): PersistenceProof {
   const reads = steps.filter(step => isReadMethod(step.method) && step.json !== undefined && step.json !== null)
   const before = [...reads].reverse().find(step => step.status !== null && isSuccess(step.status) && steps.indexOf(step) < steps.indexOf(probe)) ?? null
+  // The readback must be a *separate GET* after the mutation (never the mutation response echo).
+  // A different actor is preferred, but a same-actor self-service read is still a clean GET: the
+  // mutation response itself is excluded because it is not a read method.
   const after = reads.find(step => steps.indexOf(step) > steps.indexOf(probe) &&
-    step.actor.handle !== probe.actor.handle &&
     (step.arm === 'control' || isSuccess(step.status) || step.status === 404 || step.status === 410)) ?? null
-  const clean = Boolean(after && (after.arm === 'control' || after.actor.handle !== probe.actor.handle))
+  const clean = Boolean(after && step_isCleanRead(after, probe))
   const delta = before && after ? stateDelta(before.json, after.json, after.status) : null
   // A control mutation must leave the field unchanged; if it changed, the delta is unattributable.
   const controlProbe = steps.find(step => step.arm === 'control' && isMutatingMethod(step.method) && isSuccess(step.status))
@@ -310,7 +316,7 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
     if (controlBefore && controlAfter) controlDelta = stateDelta(controlBefore.json, controlAfter.json, controlAfter.status)
   }
   if (!before) return { persisted: false, reason: 'no pre-mutation readback exists; a mutation response echo cannot prove persistence', before, after, delta, clean, controlDelta }
-  if (!after) return { persisted: false, reason: 'no clean post-mutation readback by a control/victim arm exists; the mutation echo alone is not persistence', before, after, delta, clean, controlDelta }
+  if (!after) return { persisted: false, reason: 'no separate post-mutation GET readback exists; the mutation echo alone is not persistence', before, after, delta, clean, controlDelta }
   const changed = delta ? [...delta.changed, ...delta.added, ...delta.removed] : []
   if (delta?.deleted) return { persisted: true, reason: 'the readback resource was removed', before, after, delta, clean, controlDelta }
   if (changed.length === 0) return { persisted: false, reason: 'the post-mutation readback is identical to the baseline (idempotent no-op)', before, after, delta, clean, controlDelta }
@@ -467,6 +473,14 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       evidence: base,
     }
   }
+  if (crossTenant) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: `Cross-tenant read: the probe actor (tenant ${probe.actor.tenant ?? 'unknown'}) received a record served to a control actor in another tenant; the tenant boundary is the disclosure.`,
+      evidence: base,
+    }
+  }
   const disclosure = assessReadDisclosure({ steps, probe })
   base.disclosureFields = disclosure.fields
   if (!disclosure.satisfied) {
@@ -487,7 +501,7 @@ export interface ReadDisclosureResult {
 }
 
 const OWNER_SCOPED_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|created_?by|author)$/i
-const PRIVATE_DATA_RE = /^(?:[a-z0-9]+[_-])*(?:private(?:_?note)?|internal|secret|api_?key|access_?token|token|ssn|phone|address|note)$/i
+const PRIVATE_DATA_RE = /^(?:[a-z0-9]+[_-])*(?:private(?:_?note)?|internal|secret|api_?key|access_?token|token|ssn|phone|address|note|text|body|content|message|title|email|subject)$/i
 
 /**
  * Response values are scrubbed before they leave the broker, so an identity that happened to equal
@@ -611,6 +625,28 @@ export function assessMassAssignmentImpact(input: ImpactInput): MassAssignmentAs
   }
   const evidence = { injected, persisted, protectedFields, catalogSuppressed }
   if (persisted.length === 0) {
+    // Create-shaped overposting: the created record is scoped to another actor/tenant, so the
+    // caller's own readback cannot show it. The other actor reading the caller-supplied marker back
+    // is persistence evidence for the protected field, provided the marker does not appear in a
+    // control arm and a protected identity field was supplied.
+    const requestFields = bodyFields
+    const markerHits = [...requestFields.entries()]
+      .filter(([path, value]) => !isProtectedField(path) && !isPriceField(path) && value.length >= 8 && !/^\d+$/.test(value))
+    const scopedBodyFields = [...requestFields.keys()].filter(isProtectedField)
+    const otherActorRead = steps.find(step =>
+      isReadMethod(step.method) &&
+      steps.indexOf(step) > steps.indexOf(mutatingProbe) &&
+      step.actor.handle !== mutatingProbe.actor.handle &&
+      typeof step.body === 'string' &&
+      markerHits.some(([, value]) => step.body!.includes(value)))
+    if (scopedBodyFields.length > 0 && otherActorRead) {
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Create-time mass assignment: the caller-supplied protected field(s) ${scopedBodyFields.join(', ')} persisted into another actor's scope (${otherActorRead.actor.handle ?? 'other'}) with the probe marker, confirming tenant/owner mass assignment.`,
+        evidence: { ...evidence, persisted: scopedBodyFields, protectedFields: scopedBodyFields },
+      }
+    }
     const why = catalogSuppressed.length
       ? `the only injected value(s) match the catalog price (${catalogSuppressed.join(', ')}); a catalog-authoritative price is not mass assignment`
       : 'no injected field was read back from the server; the response echo is not persistence'
