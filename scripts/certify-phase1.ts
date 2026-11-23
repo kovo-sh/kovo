@@ -54,6 +54,7 @@ import {
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
+import { MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Constants and contract types
@@ -156,8 +157,16 @@ export interface FindingRecord {
 
 export interface FloorMetrics {
   floorConfirmed: number | null
+  /**
+   * Leads that reached a verdict (investigated). Queue-time counts live in
+   * `floorLeadsQueued`; this field no longer means "queued".
+   */
   floorLeadsConsumed: number | null
   floorLeadsEmitted: number | null
+  /** Leads queued as upgrade steps (the old `floorLeadsConsumed` meaning). */
+  floorLeadsQueued: number | null
+  /** Leads whose upgrade assignment completed (verdict). */
+  floorLeadsInvestigated: number | null
   source: string
 }
 
@@ -174,6 +183,10 @@ export interface RealismRun {
   confirmed: number
   recall: number
   precision: number
+  /** Harness cell concurrency (parallel app/seed cells; scheduling only). */
+  cellConcurrency: number | null
+  /** In-run investigation worker slots handed to Execution for this cell. */
+  workerConcurrency: number | null
   strictPrecision: number
   /** null = the artifact predates the class-hygiene field (gate treats it as unmeasured). */
   incompatibleClassCount: number | null
@@ -235,6 +248,10 @@ function asNumber(value: unknown, fallback = 0): number {
 
 function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function ratio(numerator: number, denominator: number): number {
@@ -581,6 +598,8 @@ interface RawFloorMetrics {
   floorConfirmed?: number
   floorLeadsConsumed?: number
   floorLeadsEmitted?: number
+  floorLeadsQueued?: number
+  floorLeadsInvestigated?: number
 }
 
 function pickFloorMetrics(source: unknown): RawFloorMetrics | null {
@@ -593,42 +612,73 @@ function pickFloorMetrics(source: unknown): RawFloorMetrics | null {
       found = true
     }
   }
+  for (const key of ['floorLeadsQueued', 'floorLeadsInvestigated'] as const) {
+    if (typeof source[key] === 'number' && Number.isFinite(source[key])) {
+      out[key] = source[key] as number
+      found = true
+    }
+  }
+  // The harness records the corrected funnel as meta.leadFunnel with short keys
+  // (`{emitted, queued, dispatched, investigated}`); accept long-form keys too.
+  if (isRecord(source.leadFunnel)) {
+    for (const [from, to] of [
+      ['leadsEmitted', 'floorLeadsEmitted'],
+      ['emitted', 'floorLeadsEmitted'],
+      ['leadsQueued', 'floorLeadsQueued'],
+      ['queued', 'floorLeadsQueued'],
+      ['leadsInvestigated', 'floorLeadsInvestigated'],
+      ['investigated', 'floorLeadsInvestigated'],
+    ] as const) {
+      const value = source.leadFunnel[from]
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        out[to] = value
+        found = true
+      }
+    }
+  }
   return found ? out : null
+}
+
+function floorMetricsFrom(picked: RawFloorMetrics, source: string): FloorMetrics {
+  // `floorLeadsConsumed` is the corrected investigated count. Older artifacts may only carry the
+  // queue-time value; then it is surfaced as `floorLeadsQueued` and consumed stays unmeasured,
+  // because a queued lead is not evidence of investigation.
+  const investigated = picked.floorLeadsInvestigated
+    ?? (picked.floorLeadsQueued === undefined ? picked.floorLeadsConsumed : undefined)
+  return {
+    floorConfirmed: picked.floorConfirmed ?? null,
+    floorLeadsConsumed: investigated ?? null,
+    floorLeadsEmitted: picked.floorLeadsEmitted ?? null,
+    floorLeadsQueued: picked.floorLeadsQueued
+      ?? (picked.floorLeadsInvestigated === undefined ? picked.floorLeadsConsumed : null)
+      ?? null,
+    floorLeadsInvestigated: investigated ?? null,
+    source,
+  }
 }
 
 function metaFloorMetrics(meta: Record<string, unknown> | null, card: ScorecardLike): FloorMetrics {
   if (meta) {
-    for (const candidate of [meta.floorMetrics, meta.deterministicLane, meta.deterministic_lane, meta.floor]) {
+    for (const candidate of [
+      meta.floorMetrics, meta.deterministicLane, meta.deterministic_lane, meta.floor,
+      { leadFunnel: meta.leadFunnel },
+    ]) {
       const picked = pickFloorMetrics(candidate)
-      if (picked) {
-        return {
-          floorConfirmed: picked.floorConfirmed ?? null,
-          floorLeadsConsumed: picked.floorLeadsConsumed ?? null,
-          floorLeadsEmitted: picked.floorLeadsEmitted ?? null,
-          source: 'meta',
-        }
-      }
+      if (picked) return floorMetricsFrom(picked, 'meta')
     }
     const direct = pickFloorMetrics(meta)
-    if (direct) {
-      return {
-        floorConfirmed: direct.floorConfirmed ?? null,
-        floorLeadsConsumed: direct.floorLeadsConsumed ?? null,
-        floorLeadsEmitted: direct.floorLeadsEmitted ?? null,
-        source: 'meta',
-      }
-    }
+    if (direct) return floorMetricsFrom(direct, 'meta')
   }
   const cardLevel = pickFloorMetrics(card)
-  if (cardLevel) {
-    return {
-      floorConfirmed: cardLevel.floorConfirmed ?? null,
-      floorLeadsConsumed: cardLevel.floorLeadsConsumed ?? null,
-      floorLeadsEmitted: cardLevel.floorLeadsEmitted ?? null,
-      source: 'summary',
-    }
+  if (cardLevel) return floorMetricsFrom(cardLevel, 'summary')
+  return {
+    floorConfirmed: null,
+    floorLeadsConsumed: null,
+    floorLeadsEmitted: null,
+    floorLeadsQueued: null,
+    floorLeadsInvestigated: null,
+    source: 'none',
   }
-  return { floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: null, source: 'none' }
 }
 
 function findRunDatabase(dir: string, slug: string): string | null {
@@ -676,6 +726,91 @@ interface RunDatabaseEvidence {
   findings: FindingRecord[]
 }
 
+interface DerivedLeadFunnel {
+  emitted: number
+  queued: number
+  dispatched: number
+  investigated: number
+}
+
+/**
+ * Derive the corrected lead funnel from an existing events DB. The engine's persisted
+ * `floorLeadsConsumed` is a queue-time counter (execution.ts increments it inside
+ * `queueDetLeadUpgradeSteps` when it emits `deterministic_lane.lead_consumed`), so this recomputes
+ * "investigated" as the lead's bound step reaching a completed assignment (a verdict).
+ */
+function deriveLeadFunnelFromDatabase(db: DatabaseSync): DerivedLeadFunnel | null {
+  try {
+    const emitted = db.prepare(
+      "select count(*) as n from events where kind = 'deterministic_engine.lead'",
+    ).get() as { n?: unknown } | undefined
+    const rows = db.prepare(
+      "select detail from events where kind = 'deterministic_lane.lead_consumed'",
+    ).all() as Array<{ detail?: unknown }>
+    const queued = new Map<string, { factId: string | null; stepId: string | null }>()
+    for (const row of rows) {
+      const detail = typeof row.detail === 'string' ? JSON.parse(row.detail) as unknown : row.detail
+      if (!isRecord(detail)) continue
+      const factId = typeof detail.factId === 'string' ? detail.factId : null
+      const stepId = typeof detail.stepId === 'string' ? detail.stepId : null
+      const key = factId ?? stepId
+      if (key) queued.set(key, { factId, stepId })
+    }
+    // No lead events at all: the legacy metrics payload is the only evidence available.
+    if (queued.size === 0 && emitted?.n === 0) return null
+
+    const upgradeStepsByFact = new Map<string, string[]>()
+    try {
+      const steps = db.prepare('select id, title, depends_on_fact_ids from chain_steps').all() as Array<{
+        id?: unknown; title?: unknown; depends_on_fact_ids?: unknown
+      }>
+      for (const step of steps) {
+        if (typeof step.id !== 'string' || typeof step.title !== 'string') continue
+        if (!step.title.startsWith('det_lead upgrade')) continue
+        const raw = typeof step.depends_on_fact_ids === 'string'
+          ? JSON.parse(step.depends_on_fact_ids) as unknown
+          : step.depends_on_fact_ids
+        if (!Array.isArray(raw)) continue
+        for (const factId of raw) {
+          if (typeof factId !== 'string') continue
+          const list = upgradeStepsByFact.get(factId) ?? []
+          list.push(step.id)
+          upgradeStepsByFact.set(factId, list)
+        }
+      }
+    } catch { /* chain_steps unavailable in older stores */ }
+
+    const statuses = new Map<string, string[]>()
+    const assignments = db.prepare('select step_id, status from assignments').all() as Array<{ step_id?: unknown; status?: unknown }>
+    for (const row of assignments) {
+      if (typeof row.step_id !== 'string' || typeof row.status !== 'string') continue
+      const list = statuses.get(row.step_id) ?? []
+      list.push(row.status)
+      statuses.set(row.step_id, list)
+    }
+    let dispatched = 0
+    let investigated = 0
+    for (const entry of queued.values()) {
+      const candidateSteps = new Set<string>()
+      if (entry.stepId) candidateSteps.add(entry.stepId)
+      if (entry.factId) for (const stepId of upgradeStepsByFact.get(entry.factId) ?? []) candidateSteps.add(stepId)
+      if (!candidateSteps.size) continue
+      const values = [...candidateSteps].flatMap(stepId => statuses.get(stepId) ?? [])
+      if (!values.length) continue
+      dispatched += 1
+      if (values.includes('complete')) investigated += 1
+    }
+    return {
+      emitted: typeof emitted?.n === 'number' ? emitted.n : 0,
+      queued: queued.size,
+      dispatched,
+      investigated,
+    }
+  } catch {
+    return null
+  }
+}
+
 function readMetricsFromDatabase(dbPath: string): RunDatabaseEvidence | null {
   let db: DatabaseSync | null = null
   try {
@@ -692,21 +827,33 @@ function readMetricsFromDatabase(dbPath: string): RunDatabaseEvidence | null {
     } catch { /* facts/data shape unavailable */ }
 
     let floor: FloorMetrics | null = null
+    const derived = deriveLeadFunnelFromDatabase(db)
     if (!latest) {
-      if (emitted !== null) {
+      if (emitted !== null || derived) {
         floor = {
-          floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: emitted, source: 'events-db',
+          floorConfirmed: null,
+          floorLeadsConsumed: derived ? derived.investigated : null,
+          floorLeadsEmitted: derived?.emitted ?? emitted,
+          floorLeadsQueued: derived?.queued ?? null,
+          floorLeadsInvestigated: derived ? derived.investigated : null,
+          source: 'events-db',
         }
       }
     } else {
       const detail = typeof latest.detail === 'string' ? JSON.parse(latest.detail) as unknown : latest.detail
       if (isRecord(detail)) {
+        // The persisted count is queue-time; prefer the derived verdict count when available.
+        const investigated = derived ? derived.investigated : null
         floor = {
           floorConfirmed: typeof detail.floorConfirmed === 'number' ? detail.floorConfirmed : null,
-          floorLeadsConsumed: typeof detail.floorLeadsConsumed === 'number' ? detail.floorLeadsConsumed : null,
+          floorLeadsConsumed: investigated
+            ?? (typeof detail.floorLeadsConsumed === 'number' ? detail.floorLeadsConsumed : null),
           floorLeadsEmitted: typeof detail.floorLeadsEmitted === 'number'
             ? detail.floorLeadsEmitted
-            : emitted,
+            : (derived?.emitted ?? emitted),
+          floorLeadsQueued: derived?.queued
+            ?? (typeof detail.floorLeadsConsumed === 'number' ? detail.floorLeadsConsumed : null),
+          floorLeadsInvestigated: investigated,
           source: 'events-db',
         }
       }
@@ -732,7 +879,14 @@ function readMetricsFromDatabase(dbPath: string): RunDatabaseEvidence | null {
 
     if (!floor && !findings.length) return null
     return {
-      floor: floor ?? { floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: null, source: 'events-db' },
+      floor: floor ?? {
+        floorConfirmed: null,
+        floorLeadsConsumed: null,
+        floorLeadsEmitted: null,
+        floorLeadsQueued: null,
+        floorLeadsInvestigated: null,
+        source: 'events-db',
+      },
       findings,
     }
   } catch {
@@ -753,6 +907,8 @@ function mergeFloorMetrics(meta: Record<string, unknown> | null, card: Scorecard
     floorConfirmed: fromMeta.floorConfirmed ?? db?.floor.floorConfirmed ?? null,
     floorLeadsConsumed: fromMeta.floorLeadsConsumed ?? db?.floor.floorLeadsConsumed ?? null,
     floorLeadsEmitted: fromMeta.floorLeadsEmitted ?? db?.floor.floorLeadsEmitted ?? null,
+    floorLeadsQueued: fromMeta.floorLeadsQueued ?? db?.floor.floorLeadsQueued ?? null,
+    floorLeadsInvestigated: fromMeta.floorLeadsInvestigated ?? db?.floor.floorLeadsInvestigated ?? null,
     source: fromMeta.source !== 'none' ? fromMeta.source : (db?.floor.source ?? 'none'),
   }
 }
@@ -832,6 +988,8 @@ function realismRunFromCard(
     confirmed: card.confirmed,
     recall,
     precision: evidence.precision,
+    cellConcurrency: asFiniteNumber(meta?.cellConcurrency),
+    workerConcurrency: asFiniteNumber(meta?.workerConcurrency),
     strictPrecision: asNumber(card.strictPrecision, asNumber(card.precision, 1)),
     incompatibleClassCount: typeof card.incompatibleClassCount === 'number' ? card.incompatibleClassCount : null,
     misclassifiedFindingIds: Array.isArray(card.misclassifiedFindingIds) ? card.misclassifiedFindingIds.map(String) : [],
@@ -1057,6 +1215,13 @@ export interface Certificate {
   }
   floor: { dev: SplitStats['floor']; heldout: SplitStats['floor']; spread: Record<string, number | null> }
   unified: { dev: SplitStats['unified']; heldout: SplitStats['unified'] }
+  /** Harness concurrency, recorded separately: cells in parallel vs. workers inside a cell. */
+  concurrency: {
+    cell: { dev: number | null; heldout: number | null; runs: number; unmeasured: number }
+    worker: { dev: number | null; heldout: number | null; runs: number; unmeasured: number }
+    /** Unified agentic cells that ran with a single in-run worker slot (dispatch starvation). */
+    singleWorkerRuns: string[]
+  }
   lift: { dev: SplitStats['lift']; heldout: SplitStats['lift']; source: 'provenance' }
   provenance: {
     complete: boolean
@@ -1473,6 +1638,30 @@ export function evaluateCertification(
   const contractLeaks = sum(unifiedAll.map(run => run.contractLeaks))
   const worstAdvisory = Math.max(0, ...Object.values(advisoryPerApp).map(row => Math.max(row.devWorst, row.heldoutWorst)))
 
+  // Harness concurrency, reported separately from cell scheduling. A cell that runs alone can
+  // still use several workers; the failure mode this records is cell concurrency leaking into
+  // `runs.worker_concurrency` (one worker slot for a whole investigation).
+  const concurrencyStat = (runsForStat: RealismRun[], key: 'cellConcurrency' | 'workerConcurrency') => {
+    const values = runsForStat
+      .map(run => run[key])
+      .filter((value): value is number => value !== null)
+    return {
+      median: median(values),
+      runs: values.length,
+      unmeasured: runsForStat.length - values.length,
+    }
+  }
+  const cellDev = concurrencyStat(unifiedDev, 'cellConcurrency')
+  const cellHeldout = concurrencyStat(unifiedHeldout, 'cellConcurrency')
+  const workerDev = concurrencyStat(unifiedDev, 'workerConcurrency')
+  const workerHeldout = concurrencyStat(unifiedHeldout, 'workerConcurrency')
+  const singleWorkerRuns = unifiedAll
+    .filter(run => run.workerConcurrency !== null && run.workerConcurrency <= 1)
+    .map(run => `${run.app}@${run.seed} (${run.seedSet})`)
+  const workerValues = unifiedAll
+    .map(run => run.workerConcurrency)
+    .filter((value): value is number => value !== null)
+
   const informational: InformationalMetric[] = [{
     id: 'reason_bench_agentic_baseline',
     description: 'Reason-bench agentic baseline (Phase 3; non-blocking in Phase 1)',
@@ -1481,6 +1670,14 @@ export function evaluateCertification(
       ? `${reasonAgentic.recall === null ? 'unmeasured' : pct(reasonAgentic.recall)} (${reasonAgentic.confirmed}/${reasonAgentic.targets}), worst precision ${reasonAgentic.precision === null ? 'n/a' : reasonAgentic.precision.toFixed(3)}`
       : 'unmeasured (no agentic reason cells ingested)',
     status: !reasonAgenticCells.length ? 'UNMEASURED' : (reasonAgenticMeets ? 'MEETS' : 'BELOW'),
+  }, {
+    id: 'agentic_worker_concurrency',
+    description: 'In-run investigation worker slots for unified agentic cells (dispatch capacity; non-blocking)',
+    target: '>= 3 per cell',
+    observed: workerValues.length
+      ? `median ${median(workerValues) ?? 'n/a'} (${singleWorkerRuns.length}/${workerValues.length} single-slot run(s))`
+      : 'unmeasured (no workerConcurrency in cell meta)',
+    status: !workerValues.length ? 'UNMEASURED' : (singleWorkerRuns.length === 0 ? 'MEETS' : 'BELOW'),
   }]
 
   const criteria: Criterion[] = [
@@ -1608,6 +1805,21 @@ export function evaluateCertification(
     },
     floor: { dev: dev.floor, heldout: heldout.floor, spread },
     unified: { dev: dev.unified, heldout: heldout.unified },
+    concurrency: {
+      cell: {
+        dev: cellDev.median,
+        heldout: cellHeldout.median,
+        runs: cellDev.runs + cellHeldout.runs,
+        unmeasured: cellDev.unmeasured + cellHeldout.unmeasured,
+      },
+      worker: {
+        dev: workerDev.median,
+        heldout: workerHeldout.median,
+        runs: workerDev.runs + workerHeldout.runs,
+        unmeasured: workerDev.unmeasured + workerHeldout.unmeasured,
+      },
+      singleWorkerRuns,
+    },
     lift: { dev: dev.lift, heldout: heldout.lift, source: 'provenance' },
     provenance: {
       complete: provenanceComplete,
@@ -1686,6 +1898,14 @@ export function renderCertificateMarkdown(cert: Certificate): string {
   lines.push(`- generated: ${cert.generatedAt}`)
   lines.push(`- git: \`${cert.gitSha}\``)
   lines.push(`- realism cells: ${cert.precision.runs}, reason agentic baseline cells: ${cert.reason.agentic.cells}`)
+  lines.push('')
+  lines.push('## Harness concurrency')
+  lines.push('')
+  lines.push(`- cells in parallel (median): dev ${cert.concurrency.cell.dev ?? 'unmeasured'}, held-out ${cert.concurrency.cell.heldout ?? 'unmeasured'} (${cert.concurrency.cell.unmeasured} unmeasured)`)
+  lines.push(`- workers inside each cell (median): dev ${cert.concurrency.worker.dev ?? 'unmeasured'}, held-out ${cert.concurrency.worker.heldout ?? 'unmeasured'} (${cert.concurrency.worker.unmeasured} unmeasured)`)
+  if (cert.concurrency.singleWorkerRuns.length) {
+    lines.push(`- single-worker runs: ${cert.concurrency.singleWorkerRuns.join(', ')}`)
+  }
   lines.push('')
   lines.push('## Criteria')
   lines.push('')
@@ -1838,11 +2058,16 @@ export interface RunPlanOptions {
   maxDurationMs: number
   reasonRuns: number
   mode: string
+  /** In-run worker slots passed to every agentic cell (null: harness default). */
+  workerConcurrency?: number | null
 }
 
 export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
   const cells: RunPlanCell[] = []
   const base = ['--mode', options.mode, '--verifier', options.verifier, '--keep-data-dirs']
+  const workerArgs = options.workerConcurrency
+    ? ['--worker-concurrency', String(options.workerConcurrency)]
+    : []
   const realistic = (args: string[]) => [resolve(import.meta.dirname, 'benchmark-realistic.ts'), ...args]
 
   for (const app of options.apps) {
@@ -1870,7 +2095,7 @@ export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
         args: realistic([
           '--app', app, '--seed', String(options.devSeed), '--out-dir', outDir, ...base,
           '--isolate-data-dir', '--budget-usd', String(options.budgetUsd),
-          '--max-duration-ms', String(options.maxDurationMs),
+          '--max-duration-ms', String(options.maxDurationMs), ...workerArgs,
           ...(options.dataDir ? ['--data-dir', options.dataDir] : []),
         ]),
       })
@@ -1883,7 +2108,7 @@ export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
         args: realistic([
           '--app', app, '--seed', String(options.heldoutSeed), '--out-dir', outDir, ...base,
           '--isolate-data-dir', '--budget-usd', String(options.budgetUsd),
-          '--max-duration-ms', String(options.maxDurationMs), '--held-out',
+          '--max-duration-ms', String(options.maxDurationMs), '--held-out', ...workerArgs,
           ...(options.dataDir ? ['--data-dir', options.dataDir] : []),
         ]),
       })
@@ -2071,6 +2296,8 @@ interface CliOptions {
   floorHeldoutRuns: number
   heldoutRuns: number
   concurrency: number
+  /** In-run worker slots per agentic cell; null lets the harness default (6 agentic / 1 floor). */
+  workerConcurrency: number | null
   dataDir: string | null
   verifier: 'auto' | 'docker' | 'local-jq'
   useNewgrp: boolean
@@ -2102,7 +2329,9 @@ Flags:
   --dev-runs <n>            floor and unified runs per app on dev (default 3)
   --floor-heldout-runs <n>  floor runs per app on held-out (default 1)
   --heldout-runs <n>        unified runs per app on held-out (default 2)
-  --concurrency <n>         concurrent harness processes (default 3)
+  --concurrency <n>         concurrent harness processes (default 3) — cell scheduling only
+  --worker-concurrency <n>  in-run worker slots per agentic cell (default: harness default:
+                            6 agentic / 1 deterministic). Independent of --concurrency.
   --data-dir <path>         Guardian data dir with an enabled model profile
                             (default $GUARDIAN_DATA_DIR); required for --run agentic
   --verifier <kind>         auto | docker | local-jq (default docker for --run)
@@ -2144,6 +2373,17 @@ function parsePositiveInt(raw: string, flag: string): number {
   return value
 }
 
+/** In-run worker slots are optional here: absent means "use the harness default". */
+function parseOptionalWorkerConcurrency(raw: unknown): number | null {
+  if (raw === undefined) return null
+  if (raw === true) fail('--worker-concurrency requires a number')
+  const value = parsePositiveInt(String(raw), '--worker-concurrency')
+  if (value > MAX_RUN_WORKER_CONCURRENCY) {
+    fail(`--worker-concurrency must be between 1 and ${MAX_RUN_WORKER_CONCURRENCY} (got '${String(raw)}')`)
+  }
+  return value
+}
+
 function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOptions {
   const a: Record<string, string | boolean | string[]> = {}
   for (let i = 0; i < argv.length; i += 1) {
@@ -2168,7 +2408,7 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
 
   const known = new Set([
     'run', 'dry-run', 'from-dir', 'out-dir', 'json', 'md', 'apps', 'dev-seed', 'heldout-seed',
-    'dev-runs', 'floor-heldout-runs', 'heldout-runs', 'concurrency', 'data-dir', 'verifier',
+    'dev-runs', 'floor-heldout-runs', 'heldout-runs', 'concurrency', 'worker-concurrency', 'data-dir', 'verifier',
     'use-newgrp', 'budget-usd', 'max-duration-ms', 'reason-runs', 'skip-reason', 'keep-data-dirs',
     'no-matrix-check', 'help',
   ])
@@ -2177,7 +2417,7 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
     return {
       fromDirs: [], run: false, dryRun: false, outDir: resolve('.guardian/certify-phase1'),
       jsonPath: null, mdPath: null, apps: [...CERTIFY_APPS], devSeed: DEV_SEED, heldoutSeed: HELDOUT_SEED,
-      devRuns: 3, floorHeldoutRuns: 1, heldoutRuns: 2, concurrency: 3, dataDir: null,
+      devRuns: 3, floorHeldoutRuns: 1, heldoutRuns: 2, concurrency: 3, workerConcurrency: null, dataDir: null,
       verifier: 'docker', useNewgrp: false, budgetUsd: 5, maxDurationMs: 600_000, reasonRuns: 1,
       skipReason: false, keepDataDirs: false, checkMatrix: true, help: true,
     }
@@ -2208,6 +2448,7 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
     floorHeldoutRuns: parsePositiveInt(typeof a['floor-heldout-runs'] === 'string' ? a['floor-heldout-runs'] : '1', '--floor-heldout-runs'),
     heldoutRuns: parsePositiveInt(typeof a['heldout-runs'] === 'string' ? a['heldout-runs'] : '2', '--heldout-runs'),
     concurrency: parsePositiveInt(typeof a.concurrency === 'string' ? a.concurrency : '3', '--concurrency'),
+    workerConcurrency: parseOptionalWorkerConcurrency(a['worker-concurrency']),
     dataDir,
     verifier,
     useNewgrp: a['use-newgrp'] === true,
@@ -2269,9 +2510,10 @@ async function main(): Promise<void> {
         maxDurationMs: cli.maxDurationMs,
         reasonRuns: cli.skipReason ? 0 : cli.reasonRuns,
         mode: 'grey-box',
+        workerConcurrency: cli.workerConcurrency,
       })
       if (cli.dryRun) {
-        process.stdout.write(`${JSON.stringify({ cells: plan, concurrency: cli.concurrency }, null, 2)}\n`)
+        process.stdout.write(`${JSON.stringify({ cells: plan, concurrency: cli.concurrency, workerConcurrency: cli.workerConcurrency }, null, 2)}\n`)
         return
       }
       const salt = process.env.GUARDIAN_RB_HELDOUT_SALT ?? ''
@@ -2284,7 +2526,7 @@ async function main(): Promise<void> {
       }
       mkdirSync(cli.outDir, { recursive: true, mode: 0o700 })
       cleanupUseNewgrp = cli.useNewgrp
-      process.stdout.write(`[certify] executing ${plan.length} cell(s) with concurrency ${cli.concurrency}\n`)
+      process.stdout.write(`[certify] executing ${plan.length} cell(s) with concurrency ${cli.concurrency} (worker-concurrency ${cli.workerConcurrency ?? 'harness default'})\n`)
       const results = await executeRunPlan(plan, {
         useNewgrp: cli.useNewgrp,
         concurrency: cli.concurrency,

@@ -48,7 +48,7 @@ import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
 import type { EndpointSource, Finding, ParamLocation } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
-import { resolveOobCallbackPorts } from './benchmark-env.ts'
+import { resolveOobCallbackPorts, defaultWorkerConcurrency, resolveWorkerConcurrency, MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
@@ -84,6 +84,7 @@ import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 
 export const DEFAULT_BUDGET_USD = 5
 export const DEFAULT_MAX_DURATION_MS = 15 * 60_000
+/** How many app/seed cells run in parallel. Scheduling only; never the in-run worker count. */
 export const DEFAULT_CONCURRENCY = 1
 
 export interface RealisticArgs {
@@ -94,7 +95,13 @@ export interface RealisticArgs {
   budgetUsd: number
   maxDurationMs: number
   outDir: string
+  /** Parallel app/seed cells. */
   concurrency: number
+  /**
+   * In-run investigation worker slots handed to `Execution` (`runs.worker_concurrency`).
+   * Independent of `concurrency`: a cell may run one at a time and still use 6 workers.
+   */
+  workerConcurrency: number
   dataDir?: string
   noLlm: boolean
   /** Conventional noun/action route wordlists (local-lab convenience). Default ON. */
@@ -135,6 +142,11 @@ Flags:
   --max-duration-ms <n>   wall-clock cap per cell (default: ${DEFAULT_MAX_DURATION_MS})
   --out-dir <path>        artifact directory (default: .guardian/realistic-bench)
   --concurrency <n>       parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
+  --worker-concurrency <n>
+                          in-run investigation worker slots handed to Execution
+                          (default: 6 agentic, 1 with --no-llm). Independent of
+                          --concurrency: it changes how many assignments one cell
+                          runs at once, never how many cells run at once.
   --data-dir <path>       Guardian data dir (single cell: used verbatim, so an
                           existing model profile is picked up; multi-cell: base
                           directory, one isolated child dir per cell)
@@ -186,6 +198,8 @@ Parallel agentic matrix:
   --concurrency 3 --isolate-data-dir  gives each cell its own Store under
   <out-dir>/data/<cell>/ with copied profile metadata and a credentials symlink,
   so cells never contend for the source data-dir lock. The key is never copied.
+  --worker-concurrency controls worker slots *inside* each cell and is unrelated
+  to how many cells run in parallel.
 
 Agentic runs need a worker-session-capable verifier:
   model profile + --verifier local-jq  -> exit 2 (inert workers) unless --no-llm
@@ -240,6 +254,15 @@ function parsePositiveInt(raw: string, flag: string): number {
   return n
 }
 
+/** In-run worker slots: engine ceiling is 16, and 0 would make the run inert. */
+export function parseWorkerConcurrency(raw: string): number {
+  const n = parsePositiveInt(raw, '--worker-concurrency')
+  if (n > MAX_RUN_WORKER_CONCURRENCY) {
+    fail(`--worker-concurrency must be between 1 and ${MAX_RUN_WORKER_CONCURRENCY} (got '${raw}')`)
+  }
+  return n
+}
+
 function parseAppList(raw: string | undefined): AppName[] {
   if (!raw || raw === 'all') return [...appNames]
   if (!(appNames as readonly string[]).includes(raw)) {
@@ -276,7 +299,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
 
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
-    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
+    'out-dir', 'concurrency', 'worker-concurrency', 'data-dir', 'no-llm', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
     'allow-heldout-snapshot',
@@ -290,6 +313,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       apps: [...appNames], seeds: [1], mode: 'grey-box', heldOut: false,
       budgetUsd: DEFAULT_BUDGET_USD, maxDurationMs: DEFAULT_MAX_DURATION_MS,
       outDir: resolve('.guardian/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
+      workerConcurrency: defaultWorkerConcurrency(Boolean(a['no-llm'])),
       noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
       conventionalWordlist: a['no-conventional-wordlist'] !== true,
       keepDataDirs: Boolean(a['keep-data-dirs']),
@@ -353,9 +377,14 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   const concurrency = a.concurrency === undefined
     ? DEFAULT_CONCURRENCY
     : parsePositiveInt(stringFlag(a, 'concurrency') ?? '', '--concurrency')
+  const noLlm = a['no-llm'] === true
+  // Cell concurrency (--concurrency) never sets the in-run worker count: an agentic cell needs
+  // several investigation slots even when it is the only cell running.
+  const workerConcurrency = a['worker-concurrency'] === undefined
+    ? defaultWorkerConcurrency(noLlm)
+    : parseWorkerConcurrency(stringFlag(a, 'worker-concurrency') ?? '')
   const outDirRaw = stringFlag(a, 'out-dir') ?? '.guardian/realistic-bench'
   const dataDirRaw = stringFlag(a, 'data-dir') ?? env.GUARDIAN_DATA_DIR
-  const noLlm = a['no-llm'] === true
   if (resumeSnapshotRaw && noLlm) {
     fail('--resume-snapshot requires the live agentic model; drop --no-llm')
   }
@@ -369,6 +398,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     maxDurationMs,
     outDir: isAbsolute(outDirRaw) ? outDirRaw : resolve(outDirRaw),
     concurrency,
+    workerConcurrency,
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
     noLlm,
     conventionalWordlist: a['no-conventional-wordlist'] !== true,
@@ -832,6 +862,76 @@ export interface AssignmentDiagnostics {
   topFailureReasons: string[]
 }
 
+/**
+ * Corrected det_lead funnel. `floorLeadsConsumed` used to increment when a lead was *queued*, so
+ * "emitted > 0 => consumed > 0" could pass with zero investigation. `investigated` counts leads
+ * whose bound upgrade step reached a completed assignment (a verdict); `dispatched` additionally
+ * counts leads whose step reached any assignment, and `queued` preserves the queue-time count.
+ */
+export interface LeadFunnelMetrics {
+  emitted: number
+  queued: number
+  dispatched: number
+  investigated: number
+  source: 'events'
+}
+
+export function summarizeLeadFunnel(input: {
+  events: ReadonlyArray<{ kind: string; detail?: Record<string, unknown> | null }>
+  assignments: ReadonlyArray<{ stepId?: string | null; status: string }>
+  /** Chain steps, used to follow a lead fact into a re-queued/multi-trial upgrade step. */
+  steps?: ReadonlyArray<{ id: string; title?: string | null; dependsOnFactIds?: readonly string[] | null }>
+}): LeadFunnelMetrics {
+  let emitted = 0
+  const queued = new Map<string, { factId: string | null; stepId: string | null }>()
+  for (const event of input.events) {
+    if (event.kind === 'deterministic_engine.lead') {
+      emitted += 1
+      continue
+    }
+    if (event.kind !== 'deterministic_lane.lead_consumed') continue
+    const detail = event.detail ?? {}
+    const factId = typeof detail.factId === 'string' ? detail.factId : null
+    const stepId = typeof detail.stepId === 'string' ? detail.stepId : null
+    const key = factId ?? stepId
+    if (key) queued.set(key, { factId, stepId })
+  }
+  // A lead may be re-bound to a multi-trial (`[trial 2]`) upgrade step instead of the step that
+  // was queued, so follow the fact into det_lead upgrade steps only (never broad planner steps,
+  // which would count an unrelated verdict as lead investigation).
+  const upgradeStepsByFact = new Map<string, string[]>()
+  for (const step of input.steps ?? []) {
+    if (!step.title?.startsWith('det_lead upgrade')) continue
+    for (const factId of step.dependsOnFactIds ?? []) {
+      const list = upgradeStepsByFact.get(factId) ?? []
+      list.push(step.id)
+      upgradeStepsByFact.set(factId, list)
+    }
+  }
+  const statusesByStep = new Map<string, string[]>()
+  for (const assignment of input.assignments) {
+    if (!assignment.stepId) continue
+    const statuses = statusesByStep.get(assignment.stepId) ?? []
+    statuses.push(assignment.status)
+    statusesByStep.set(assignment.stepId, statuses)
+  }
+  let dispatched = 0
+  let investigated = 0
+  for (const entry of queued.values()) {
+    const candidateSteps = new Set<string>()
+    if (entry.stepId) candidateSteps.add(entry.stepId)
+    if (entry.factId) for (const stepId of upgradeStepsByFact.get(entry.factId) ?? []) candidateSteps.add(stepId)
+    if (!candidateSteps.size) continue
+    const statuses = [...candidateSteps].flatMap(stepId => statusesByStep.get(stepId) ?? [])
+    if (!statuses.length) continue
+    dispatched += 1
+    // A verdict requires the assignment to close normally; killed/canceled/failed work did not
+    // investigate the lead to an outcome (partial closure is reported separately by the engine).
+    if (statuses.includes('complete')) investigated += 1
+  }
+  return { emitted, queued: queued.size, dispatched, investigated, source: 'events' }
+}
+
 /** An agentic run that never completed an investigation assignment is inert, not a result. */
 export function isInertAgenticRun(input: {
   agentic: boolean
@@ -899,8 +999,29 @@ export function summarizeAssignments(
   }
 }
 
-function countTableRows(storage: Store, table: string): number {
-  try {
+/** Paginate every event for a run (a deep floor emits >3k rows; a single page truncates). */
+function collectRunEvents(
+  storage: Store,
+  runId: string,
+): Array<{ kind: string; detail?: Record<string, unknown> | null }> {
+  const out: Array<{ kind: string; detail?: Record<string, unknown> | null }> = []
+  let after = 0
+  for (;;) {
+    const page = storage.eventsAfter(runId, after, 1_000)
+    if (!page.length) break
+    for (const event of page) {
+      out.push({
+        kind: event.kind,
+        detail: (event.detail ?? null) as Record<string, unknown> | null,
+      })
+    }
+    after = page[page.length - 1]!.id
+    if (page.length < 1_000) break
+  }
+  return out
+}
+
+function countTableRows(storage: Store, table: string): number {  try {
     const row = storage.client.prepare(`select count(*) as c from ${table}`).get() as { c?: number } | undefined
     return Number(row?.c ?? 0)
   } catch {
@@ -924,8 +1045,26 @@ export function openCellStore(directory: string): Store {
   }
 }
 
-export interface IsolatedDataDirResult {
-  directory: string
+/**
+ * Effective in-run worker slots for this invocation. `--concurrency` (parallel cells) must never
+ * leak into this: the benchmark used to pass cell concurrency into `runs.worker_concurrency`,
+ * leaving an agentic cell with one slot for 20+ ready steps.
+ */
+export function runWorkerConcurrency(args: Pick<RealisticArgs, 'workerConcurrency' | 'noLlm'>): number {
+  return resolveWorkerConcurrency(args.workerConcurrency, { noLlm: args.noLlm })
+}
+
+/** The two concurrency values recorded in cell meta, kept separate by construction. */
+export function concurrencyMeta(
+  args: Pick<RealisticArgs, 'concurrency' | 'workerConcurrency' | 'noLlm'>,
+): { cellConcurrency: number; workerConcurrency: number } {
+  return {
+    cellConcurrency: Math.max(1, Math.trunc(args.concurrency)),
+    workerConcurrency: runWorkerConcurrency(args),
+  }
+}
+
+export interface IsolatedDataDirResult {  directory: string
   source: string
   profileNames: string[]
 }
@@ -1911,6 +2050,12 @@ export interface CellMeta {
   dataDirKept: boolean
   budgetUsd: number
   maxDurationMs: number
+  /** Parallel app/seed cells in this invocation (scheduling only, never worker slots). */
+  cellConcurrency: number
+  /** In-run investigation worker slots handed to `Execution` (`runs.worker_concurrency`). */
+  workerConcurrency: number
+  /** Corrected det_lead funnel (queued vs. investigated to a verdict). */
+  leadFunnel: LeadFunnelMetrics
   reconCache: ReconCacheMeta
   snapshot: SnapshotRunMeta
   /** Checkpoint directory this run resumed from (null for a cold run). */
@@ -2355,7 +2500,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         budgetUsd: args.budgetUsd,
         budgetRequests: 2_000,
         maxRpsPerOrigin: 10,
-        workerConcurrency: Math.min(4, Math.max(1, args.concurrency)),
+        workerConcurrency: runWorkerConcurrency(args),
         workerMaxTurns: 30,
         multiTrialEnabled: true,
       })
@@ -2603,6 +2748,11 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
 
     const finalRun = storage.run(runId)
     const detail = storage.runDetail(runId)
+    const leadFunnel = summarizeLeadFunnel({
+      events: collectRunEvents(storage, runId),
+      assignments: detail.assignments,
+      steps: detail.chainSteps,
+    })
 
     // Product contract: only runtime_confirmed findings are submittable evidence. Static,
     // pending-OOB, open-proof-gap and dismissed rows are advisories and must never be graded
@@ -2690,6 +2840,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       conventionalWordlist: args.conventionalWordlist,
       model,
       verifierBackend: backendKind,
+      ...concurrencyMeta(args),
+      leadFunnel,
       workerSessions: capability.supported,
       workerSessionsDetail: capability.detail,
       dataDirIsolated: Boolean(isolated),
@@ -2739,6 +2891,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         llm: model.mode,
         profiles: model.profiles,
         verifierBackend: backendKind,
+        cellConcurrency: args.concurrency,
+        workerConcurrency: runWorkerConcurrency(args),
         budgetUsd: args.budgetUsd,
         timedOut: wait.timedOut,
         reconCache: recon.requested
@@ -2885,7 +3039,7 @@ async function main(): Promise<void> {
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
 
   const cells = cellKeys(args)
-  process.stdout.write(`[realistic-bench] ${cells.length} cell(s): ${cells.map(c => `${c.app}@${c.seed}`).join(', ')} mode=${args.mode} budget=$${args.budgetUsd}\n`)
+  process.stdout.write(`[realistic-bench] ${cells.length} cell(s): ${cells.map(c => `${c.app}@${c.seed}`).join(', ')} mode=${args.mode} budget=$${args.budgetUsd} cells-in-parallel=${args.concurrency} workers-per-cell=${runWorkerConcurrency(args)}\n`)
 
   const results = await runWithConcurrency(cells, args.concurrency, async ({ app, seed }) => {
     process.stdout.write(`[realistic-bench] starting ${app} seed=${seed} ${args.mode}\n`)
