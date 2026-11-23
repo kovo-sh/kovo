@@ -581,8 +581,14 @@ function buildReadRouteIndex(endpoints: readonly EngineEndpoint[]): Map<string, 
     const segments = raw.map(segment => (placeholderSeg.test(segment) ? '{{id}}' : segment))
     const path = `/${segments.join('/')}`
     const list = index.get(endpoint.origin) ?? []
-    if (list.some(route => route.path === path)) continue
     const paramName = placeholderIndex >= 0 ? readRouteParamName(raw[placeholderIndex]!) : undefined
+    const existing = list.find(route => route.path === path)
+    if (existing) {
+      // Same shape discovered with different identifier spellings (`:id` / `:invoiceId`): keep a
+      // canonical name so the index does not depend on arrival order.
+      if (paramName && (!existing.paramName || paramName.localeCompare(existing.paramName) < 0)) existing.paramName = paramName
+      continue
+    }
     list.push({ path, segments, placeholderIndex, ...(paramName ? { paramName } : {}) })
     index.set(endpoint.origin, list)
   }
