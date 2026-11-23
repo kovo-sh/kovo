@@ -117,3 +117,44 @@ export function seedCodeToRuntimeLeads(
   }
   return created
 }
+
+const SEVERITY_RISK: Record<string, number> = { critical: 98, high: 92, medium: 84, low: 70 }
+
+export interface GraphLeadTarget {
+  origin: string
+  method: string
+  pathTemplate: string
+  riskScore: number
+  source: string
+  params: Array<{ name: string; location: string }>
+}
+
+/**
+ * Turn persisted Program-Graph `det_lead` facts into high-priority engine targets. The floor lane
+ * probes these first (severity-ranked) without changing endpoint dedupe or engine invariants.
+ */
+export function graphLeadTargets(
+  facts: readonly { origin: string; data?: Record<string, unknown> }[],
+): GraphLeadTarget[] {
+  const targets: GraphLeadTarget[] = []
+  const seen = new Set<string>()
+  for (const fact of facts) {
+    if (fact.data?.kind !== 'det_lead' || fact.data.source !== 'program_graph') continue
+    const method = typeof fact.data.method === 'string' ? fact.data.method.toUpperCase() : ''
+    const path = typeof fact.data.endpoint === 'string' ? fact.data.endpoint : ''
+    if (!method || !path.startsWith('/')) continue
+    const key = `${fact.origin}|${method}|${path}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const severity = typeof fact.data.severity === 'string' ? fact.data.severity : 'medium'
+    targets.push({
+      origin: fact.origin,
+      method,
+      pathTemplate: path,
+      riskScore: SEVERITY_RISK[severity] ?? 84,
+      source: 'program_graph',
+      params: [],
+    })
+  }
+  return targets
+}

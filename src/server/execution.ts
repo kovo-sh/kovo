@@ -38,15 +38,13 @@ import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
   authorizeStateChange,
-  buildStateChangeFingerprint,
   computeStateChangeBodyHash,
-  evaluateTier3Approval,
   hasDeclaredMultipartContentType,
   isLocalLabAutoApprovalOrigin,
-  STATE_CHANGE_APPROVAL_TTL_MS,
+  evaluateTier3Approval,
   StateChangeApprovalLedger,
 } from './approval-judge.ts'
-import type { MultipartBodyPart, StateChangeFingerprintInput } from './approval-judge.ts'
+import type { StateChangeFingerprintInput } from './approval-judge.ts'
 import {
   AGENTIC_SPECIALIST_MAX_TURNS,
   AGENTIC_SPECIALIST_WALL_CLOCK_MS,
@@ -149,9 +147,9 @@ import { drainPendingOob, scheduleFinalReport } from './oob-drain.ts'
 import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
 import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
-import { seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
+import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
-import type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
+import type { Phase0GraphwireExtras } from './probe-plan.ts'
 export { selectRankedProbeTargets } from './probe-plan.ts'
 export type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
 import { BudgetExceededError } from './provider.ts'
@@ -5516,6 +5514,8 @@ export class Execution {
           ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
           // Conventional action/noun wordlists are a local-lab convenience: on a real target the
           // engine relies on discovered routes, JS/router harvesting and the API reference.
+          // Graphwire: Program-Graph code→runtime hypotheses are probed first by the floor.
+          ...graphLeadTargets(this.storage.listFacts(current.id, { includeTainted: false, limit: 200 })),
           ...(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
             ? [...approvedOrigins].flatMap(origin =>
                 this.expandConventionalSurfaceTargets(
