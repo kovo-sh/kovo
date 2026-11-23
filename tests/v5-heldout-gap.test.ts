@@ -12,6 +12,7 @@ import { describe, test } from 'node:test'
 import type { TestContext } from 'node:test'
 
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
+import { parseRealisticArgs } from '../scripts/benchmark-realistic.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import {
   collapseRouteVariants,
@@ -54,6 +55,13 @@ describe('conventional wordlist switch', () => {
     ]
     assert.deepEqual(engineWordlistSurface(surface, true).map(e => e.pathTemplate), ['/api/declared', '/api/wordlist'])
     assert.deepEqual(engineWordlistSurface(surface, false).map(e => e.pathTemplate), ['/api/declared'])
+  })
+
+  test('the product harness flag records the effective switch', () => {
+    const off = parseRealisticArgs(['--app', 'acme-saas', '--no-conventional-wordlist'], {})
+    assert.equal(off.conventionalWordlist, false)
+    const on = parseRealisticArgs(['--app', 'acme-saas'], {})
+    assert.equal(on.conventionalWordlist, true)
   })
 
   test('renamed placeholders of one route collapse to a single triage endpoint', () => {
