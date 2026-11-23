@@ -21,6 +21,14 @@ import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
+import {
+  createHttpTransport,
+  extractTlsMetadata,
+  RaceBarrier,
+  resolveTransportConfig,
+  WebSocketSession,
+} from './transport.ts'
+import type { TransportConfig } from './transport.ts'
 
 export interface PublicObservation extends PreparedObservation {
   origin: string
@@ -100,6 +108,19 @@ export interface BrokerWebsocketRequest {
   maxBytes?: number
   timeoutMs?: number
   secrets?: readonly NamedSecret[]
+  /**
+   * Opt-in turn-aware session script. Requires `BrokerOptions.wsSessionEnabled`; when unset the
+   * legacy single-shot probe path runs unchanged.
+   */
+  turns?: BrokerWebsocketTurn[]
+}
+
+export interface BrokerWebsocketTurn {
+  /** Text payload to send before awaiting server frames. */
+  send?: string
+  /** Number of complete server messages to await (continuations reassembled). Defaults to 1. */
+  awaitMessages?: number
+  timeoutMs?: number
 }
 
 export interface BrokerWebsocketFrame {
@@ -227,6 +248,8 @@ export type Transport = (
     maxBodyBytes?: number
     readBody?: boolean
     rejectUnauthorized?: boolean
+    /** Present only for HTTP/2 race bursts; releases synchronized stream headers. */
+    raceBarrier?: RaceBarrier
   },
 ) => Promise<RawHttpResponse>
 
@@ -316,6 +339,13 @@ export type BrokerOptions = {
   circuitWindowMs?: number
   /** Half-open route cooldown in ms (clamped to 15–30s). Defaults to 15s. */
   circuitCooldownMs?: number
+  /**
+   * Exponential per-origin backoff: first cooldown after a trip, doubled per consecutive trip.
+   * `circuitCooldownMs` (the legacy any-trip cooldown) takes precedence for route circuits.
+   */
+  circuitBackoffBaseMs?: number
+  /** Ceiling for the per-origin exponential backoff. Defaults to 30s. */
+  circuitBackoffMaxMs?: number
   rejectUnauthorized?: boolean
   storage?: SecondOrderStore
   canaryBroker?: CanaryBroker
@@ -323,6 +353,14 @@ export type BrokerOptions = {
   maxCookiesPerJar?: number
   /** Injectable clock (test-only) used by circuit-breaker accounting. */
   now?: () => number
+  /**
+   * Layer-1 transport configuration. Merged over `GUARDIAN_HTTP2` / `GUARDIAN_EGRESS_PROXY` /
+   * `GUARDIAN_MTLS_*` / `GUARDIAN_USER_AGENT` / `GUARDIAN_AUTHORIZED_HEADERS` (/`GUARDIAN_UA_PROFILE`).
+   * Invalid configuration fails closed at construction time.
+   */
+  transportConfig?: Partial<TransportConfig>
+  /** Opt-in turn-aware WebSocket sessions; unset keeps the legacy single-shot probe path. */
+  wsSessionEnabled?: boolean
   /**
    * Rate-limited persona re-authentication invoked by the broker on a persona-bound 401.
    * Returning true retries the request once with freshly resolved persona headers.
@@ -742,6 +780,16 @@ export class BrokerApprovalRequired extends Error {
     this.method = method
     this.pathAndQuery = pathAndQuery
   }
+}
+
+/**
+ * Probe classes whose payloads legitimately provoke parser/DB/template errors. A 5xx from these
+ * is target evidence, so it must not feed the availability circuit breaker.
+ */
+const errorInducingProbePattern = /(?:sqli|ssti|xxe|xpath|ldap|nosql|injection|traversal|deserial|template|expression|parser)/i
+
+function isErrorInducingProbe(probeClass: string | undefined): boolean {
+  return Boolean(probeClass && errorInducingProbePattern.test(probeClass))
 }
 
 function hasDestructiveContent(text: string): boolean {
@@ -1279,74 +1327,6 @@ function defaultWsTransport(
   })
 }
 
-function certObjectToRecord(obj: unknown): Record<string, string> {
-  if (!obj || typeof obj !== 'object') return {}
-  const out: Record<string, string> = {}
-  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    if (typeof v === 'string') out[k] = v.slice(0, 256)
-    else if (Array.isArray(v)) out[k] = v.map(String).join(', ').slice(0, 256)
-  }
-  return out
-}
-
-function hostnameMatchesPattern(hostname: string, pattern: string): boolean {
-  const h = hostname.toLowerCase()
-  const p = pattern.toLowerCase()
-  if (p === h) return true
-  if (p.startsWith('*.')) {
-    const suffix = p.slice(1) // ".example.com"
-    const rest = h.slice(0, -suffix.length)
-    return h.endsWith(suffix) && rest.length > 0 && !rest.includes('.')
-  }
-  return false
-}
-
-function extractTlsMetadata(socket: TLSSocket, hostname: string): TlsMetadata {
-  const protocol = socket.getProtocol() ?? null
-  const cipherObj = socket.getCipher()
-  const cipher = cipherObj?.name ?? null
-  const cert = socket.getPeerCertificate(false) as DetailedPeerCertificate | Record<string, never>
-  const hasCert = Boolean(cert && Object.keys(cert).length > 0)
-  const subject = hasCert ? certObjectToRecord(cert.subject) : {}
-  const issuer = hasCert ? certObjectToRecord(cert.issuer) : {}
-  const rawSans = hasCert && typeof cert.subjectaltname === 'string' ? cert.subjectaltname : ''
-  const sans = rawSans
-    .split(',')
-    .map(entry => entry.trim())
-    .filter(Boolean)
-    .map(entry => entry.replace(/^(?:DNS|IP Address):/i, '').trim())
-    .slice(0, 64)
-  const validFrom = hasCert && typeof cert.valid_from === 'string' ? cert.valid_from : null
-  const validTo = hasCert && typeof cert.valid_to === 'string' ? cert.valid_to : null
-  const expiryMs = validTo ? Date.parse(validTo) : NaN
-  const daysUntilExpiry = Number.isFinite(expiryMs)
-    ? Math.floor((expiryMs - Date.now()) / (24 * 60 * 60 * 1000))
-    : null
-  const expired = Number.isFinite(expiryMs) ? expiryMs < Date.now() : false
-  const cn = subject.CN
-  const hostnameMatchesSan = sans.length > 0
-    ? sans.some(san => hostnameMatchesPattern(hostname, san))
-    : Boolean(cn && hostnameMatchesPattern(hostname, cn))
-  const weakProtocol = Boolean(protocol && /^(?:SSLv|TLSv1(?:\.0|\.1)?$)/i.test(protocol))
-  return {
-    protocol,
-    cipher,
-    authorized: Boolean(socket.authorized),
-    authorizationError: socket.authorizationError ? String(socket.authorizationError) : null,
-    subject,
-    issuer,
-    sans,
-    validFrom,
-    validTo,
-    fingerprint256: hasCert && typeof cert.fingerprint256 === 'string' ? cert.fingerprint256 : null,
-    serialNumber: hasCert && typeof cert.serialNumber === 'string' ? cert.serialNumber : null,
-    daysUntilExpiry,
-    expired,
-    hostnameMatchesSan,
-    weakProtocol,
-  }
-}
-
 function defaultTransport(
   url: URL,
   address: PublicAddress,
@@ -1604,6 +1584,12 @@ type OriginHealth = {
   errors429: number[]
   openReason?: string
   openUntil?: number
+  /** Consecutive trips drive the per-origin exponential backoff. */
+  consecutiveOpens: number
+  /** Last computed backoff (exposed for tests/diagnostics). */
+  backoffMs: number
+  /** 5xx observations attributable to our own active injection/parser probes (never trips). */
+  probeInduced5xx: number[]
   tokens: number
   lastRefill: number
   inFlight: number
@@ -1628,10 +1614,38 @@ export class RequestBroker {
   private readonly sessionJars = new Map<string, SessionJar>()
   private readonly redactedSecrets = new Map<string, NamedSecret>()
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
+  private readonly transportConfig: TransportConfig
+  private readonly httpTransport: Transport
   private latestScopeRevision = 0
 
   constructor(options: BrokerOptions = {}) {
     this.options = options
+    this.transportConfig = resolveTransportConfig(process.env, options.transportConfig)
+    this.httpTransport = options.transport ?? createHttpTransport(this.transportConfig, defaultTransport)
+  }
+
+  /** Non-secret transport summary for diagnostics and tests. */
+  getTransportSummary(): {
+    http2: boolean
+    mode: 'http2' | 'http1'
+    proxy: string | null
+    mtls: boolean
+    authorizedUserAgent: string | null
+  } {
+    return {
+      http2: this.transportConfig.http2,
+      mode: this.transportConfig.http2 ? 'http2' : 'http1',
+      proxy: this.transportConfig.proxy
+        ? `${this.transportConfig.proxy.protocol}//${this.transportConfig.proxy.host}:${this.transportConfig.proxy.port}`
+        : null,
+      mtls: Boolean(this.transportConfig.mtls),
+      authorizedUserAgent: this.transportConfig.headerProfile?.userAgent ?? null,
+    }
+  }
+
+  closeTransport(): void {
+    const transport = this.httpTransport as Transport & { close?: () => void }
+    transport.close?.()
   }
 
   getStorage(): SecondOrderStore | undefined {
@@ -1897,6 +1911,9 @@ export class RequestBroker {
         lastRefill: this.now(),
         inFlight: 0,
         batchActive: false,
+        consecutiveOpens: 0,
+        backoffMs: 0,
+        probeInduced5xx: [],
       }
       this.origins.set(origin, state)
     }
@@ -1915,6 +1932,55 @@ export class RequestBroker {
       return false
     }
     return true
+  }
+
+  /** Read-only breaker snapshot (tests/diagnostics); never contains request content. */
+  getCircuitState(origin: string): {
+    open: boolean
+    reason: string | null
+    openUntil: number | null
+    backoffMs: number
+    consecutiveOpens: number
+    failures5xx: number
+    errors429: number
+    probeInduced5xx: number
+    adaptiveRps: number | null
+    retryAfterUntil: number | null
+  } {
+    const state = this.origins.get(origin)
+    const now = this.now()
+    const windowMs = this.options.circuitWindowMs ?? 30_000
+    const inWindow = (ts: number) => now - ts < windowMs
+    return {
+      open: this.isCircuitOpen(origin),
+      reason: state?.openReason ?? null,
+      openUntil: state?.openUntil ?? null,
+      backoffMs: state?.backoffMs ?? 0,
+      consecutiveOpens: state?.consecutiveOpens ?? 0,
+      failures5xx: state?.errors5xx.filter(inWindow).length ?? 0,
+      errors429: state?.errors429.filter(inWindow).length ?? 0,
+      probeInduced5xx: state?.probeInduced5xx.filter(inWindow).length ?? 0,
+      adaptiveRps: state?.adaptiveRps ?? null,
+      retryAfterUntil: state?.retryAfterUntil ?? null,
+    }
+  }
+
+  /** Route-scoped breaker snapshot (tests/diagnostics). */
+  getRouteCircuitState(origin: string, routeTemplate: string): {
+    open: boolean
+    openUntil: number | null
+    cooldownMs: number
+    consecutiveOpens: number
+    failures: number
+  } {
+    const route = this.routeCircuits.get(`${origin}\0${routeTemplate}`)
+    return {
+      open: this.isRouteCircuitOpen(origin, routeTemplate),
+      openUntil: route?.openUntil ?? null,
+      cooldownMs: route?.cooldownMs ?? 0,
+      consecutiveOpens: route?.consecutiveOpens ?? 0,
+      failures: route?.failures.length ?? 0,
+    }
   }
 
   /** Route-scoped circuit for ordinary 5xx responses. */
@@ -1940,6 +2006,9 @@ export class RequestBroker {
         h.openUntil = undefined
         h.retryAfterUntil = undefined
         h.adaptiveRps = undefined
+        h.consecutiveOpens = 0
+        h.backoffMs = 0
+        h.probeInduced5xx = []
       }
       for (const key of [...this.routeCircuits.keys()]) {
         if (key.startsWith(`${origin}\0`)) this.routeCircuits.delete(key)
@@ -1950,9 +2019,16 @@ export class RequestBroker {
     }
   }
 
+  /**
+   * Per-origin exponential backoff. A first trip waits `base`; each consecutive re-trip doubles
+   * the wait up to `max`, after which the circuit half-opens automatically (see `isCircuitOpen`).
+   * A successful recovery response resets the sequence to zero.
+   */
   private cooldownMs(consecutiveOpens: number): number {
-    const base = Math.max(15_000, Math.min(this.options.circuitCooldownMs ?? 15_000, 30_000))
-    return Math.min(30_000, base * Math.max(1, Math.min(consecutiveOpens, 2)))
+    const base = Math.max(1, this.options.circuitCooldownMs ?? this.options.circuitBackoffBaseMs ?? 1_000)
+    const max = Math.max(base, this.options.circuitBackoffMaxMs ?? 30_000)
+    const exponent = Math.min(16, Math.max(0, consecutiveOpens - 1))
+    return Math.min(max, Math.round(base * 2 ** exponent))
   }
 
   private assertRouteCircuit(origin: string, routeTemplate: string): void {
@@ -2005,7 +2081,9 @@ export class RequestBroker {
     state.errors5xx.push(now)
     if (state.errors5xx.length >= threshold) {
       state.openReason = `Observed ${state.errors5xx.length} connection resets/timeouts within ${Math.round(windowMs / 1000)}s.`
-      state.openUntil = now + this.cooldownMs(2)
+      state.consecutiveOpens += 1
+      state.backoffMs = this.cooldownMs(state.consecutiveOpens)
+      state.openUntil = now + state.backoffMs
       audit('circuit_open', origin)
       throw new BrokerCircuitOpen(origin, state.openReason)
     }
@@ -2071,7 +2149,13 @@ export class RequestBroker {
     origin: string,
     status: number,
     audit: Grant['audit'],
-    meta?: { routeTemplate?: string; headers?: IncomingHttpHeaders; configuredRps?: number },
+    meta?: {
+      routeTemplate?: string
+      headers?: IncomingHttpHeaders
+      configuredRps?: number
+      /** Present on active probe traffic; error-inducing classes are excluded from breaker trips. */
+      probeClass?: string
+    },
   ) {
     const state = this.health(origin, meta?.configuredRps ?? 5)
     const now = this.now()
@@ -2080,6 +2164,14 @@ export class RequestBroker {
     const threshold429 = this.options.circuit429Threshold ?? 8
     state.errors5xx = state.errors5xx.filter(ts => now - ts < windowMs)
     state.errors429 = state.errors429.filter(ts => now - ts < windowMs)
+    state.probeInduced5xx = state.probeInduced5xx.filter(ts => now - ts < windowMs)
+
+    // A 5xx produced by our own injection/parser payload is *evidence*, not target
+    // unavailability: count it separately so the probe cannot block its own verification.
+    if (status >= 500 && status <= 599 && isErrorInducingProbe(meta?.probeClass)) {
+      state.probeInduced5xx.push(now)
+      return
+    }
 
     if (status === 429) {
       const retryAfter = parseRetryAfterSeconds(meta?.headers)
@@ -2091,7 +2183,9 @@ export class RequestBroker {
       state.errors429.push(now)
       if (state.errors429.length >= threshold429) {
         state.openReason = `Observed ${state.errors429.length} HTTP 429 rate-limit responses within ${Math.round(windowMs / 1000)}s.`
-        state.openUntil = now + this.cooldownMs(2)
+        state.consecutiveOpens += 1
+        state.backoffMs = this.cooldownMs(state.consecutiveOpens)
+        state.openUntil = now + state.backoffMs
         audit('circuit_open', origin, status)
         throw new BrokerCircuitOpen(origin, state.openReason)
       }
@@ -2103,7 +2197,9 @@ export class RequestBroker {
       state.errors5xx.push(now)
       if (state.errors5xx.length >= threshold5xx) {
         state.openReason = `Observed ${state.errors5xx.length} HTTP ${status} responses within ${Math.round(windowMs / 1000)}s.`
-        state.openUntil = now + this.cooldownMs(2)
+        state.consecutiveOpens += 1
+        state.backoffMs = this.cooldownMs(state.consecutiveOpens)
+        state.openUntil = now + state.backoffMs
         audit('circuit_open', origin, status)
         throw new BrokerCircuitOpen(origin, state.openReason)
       }
@@ -2118,6 +2214,13 @@ export class RequestBroker {
 
     // Healthy response: recover an adaptive RPS cap toward the configured ceiling.
     if (status < 400) {
+      // A real success closes the origin breaker and restarts the backoff sequence.
+      state.consecutiveOpens = 0
+      state.backoffMs = 0
+      if (state.openUntil === undefined || now >= state.openUntil) {
+        state.openReason = undefined
+        state.openUntil = undefined
+      }
       const configured = Math.max(1, meta?.configuredRps ?? 5)
       if (state.adaptiveRps !== undefined) {
         state.adaptiveRps = Math.min(configured, state.adaptiveRps + 1)
@@ -2171,7 +2274,7 @@ export class RequestBroker {
 
     const localLab = allowLocalLab(grant)
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
-    const transport = this.options.transport ?? defaultTransport
+    const transport = this.httpTransport
     let url = new URL('/', grant.origin)
     const deny = (message: string): never => {
       grant.audit('denied', url.origin)
@@ -2717,6 +2820,7 @@ export class RequestBroker {
       reauthAttempted?: boolean
       refreshedPersonaHeaders?: Record<string, string>
       raceBurst?: boolean
+      raceBarrier?: RaceBarrier
     },
   ): Promise<BrokerExchangeResult> {
     await this.applyAuthMutationIfNeeded(prepared, req, grant, signal)
@@ -2737,7 +2841,7 @@ export class RequestBroker {
 
     const started = Date.now()
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-    const transport = this.options.transport ?? defaultTransport
+    const transport = this.httpTransport
 
     const redirectOrigins = new Set<string>([url.origin])
     const redirectPaths: string[] = []
@@ -2960,6 +3064,7 @@ export class RequestBroker {
           maxBodyBytes: Math.min(req.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes),
           readBody: true,
           rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+          ...(options.raceBarrier ? { raceBarrier: options.raceBarrier } : {}),
         })
       } catch (err) {
         if (!deadline.aborted) this.recordTransportFailure(url.origin, grant.audit)
@@ -2973,6 +3078,7 @@ export class RequestBroker {
         routeTemplate: hopRouteTemplate,
         headers: response.headers,
         configuredRps: maxRps,
+        probeClass: req.probeClass,
       })
 
       const requestOriginHeader = cleanHeaders['Origin'] ?? cleanHeaders['origin']
@@ -3205,12 +3311,17 @@ export class RequestBroker {
         markedOrigins.push(origin)
         state.tokens = Math.max(state.tokens, count)
       }
+      // HTTP/2 bursts share one pooled connection and release every stream header at the same
+      // barrier turn (single-packet / last-byte style). The HTTP/1.1 path ignores the barrier.
+      const usesNativeHttp2 = this.transportConfig.http2 && this.options.transport === undefined
+      const raceBarrier = usesNativeHttp2 ? new RaceBarrier(preparedList.length) : undefined
       results = await Promise.all(
         preparedList.map(({ req, prepared }) =>
           this.executePreparedHttp(prepared, req, grant, signal, {
             bypassConcurrency: true,
             preResolvedAddresses: resolvedByHost.get(prepared.url.hostname),
             raceBurst: true,
+            ...(raceBarrier ? { raceBarrier } : {}),
           }),
         ),
       )
@@ -3430,21 +3541,77 @@ export class RequestBroker {
     const release = await this.acquireSlot(initialOrigin, maxRps, deadline)
 
     const wsTransport = this.options.wsTransport ?? defaultWsTransport
+    const sessionMode = Boolean(req.turns?.length) && this.options.wsSessionEnabled === true
     let raw
     try {
       grant.audit('allowed', initialOrigin)
-      raw = await wsTransport(url, chosen, deadline, {
-        headers: {
-          ...cleanHeaders,
-          ...(resolvedPersonaHeaders ?? {}),
-        },
-        subprotocols: req.subprotocols,
-        sendMessages: sendMessages.slice(0, maxFrames),
-        maxFrames,
-        maxBytes,
-        timeoutMs,
-        rejectUnauthorized: this.options.rejectUnauthorized ?? true,
-      })
+      if (sessionMode) {
+        const frames: BrokerWebsocketFrame[] = []
+        let connected = false
+        let upgradeStatus: number | null = null
+        let upgradeHeaders: Record<string, string> = {}
+        let subprotocol: string | null = null
+        let closeCode: number | null = null
+        let closeReason: string | null = null
+        let errorMsg: string | null = null
+        const session = await WebSocketSession.connect(url, chosen, {
+          headers: { ...cleanHeaders, ...(resolvedPersonaHeaders ?? {}) },
+          subprotocols: req.subprotocols,
+          rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+          timeoutMs,
+        })
+        try {
+          upgradeStatus = session.handshake.status
+          upgradeHeaders = session.handshake.headers
+          subprotocol = session.handshake.subprotocol
+          connected = session.handshake.accepted
+          if (!connected) {
+            errorMsg = `WebSocket upgrade rejected (status ${upgradeStatus}).`
+          } else {
+            for (const turn of req.turns ?? []) {
+              if (frames.length >= maxFrames * 2) break
+              if (turn.send !== undefined) {
+                await session.sendText(turn.send)
+                frames.push({
+                  direction: 'sent',
+                  opcode: 'text',
+                  data: turn.send,
+                  bytes: Buffer.byteLength(turn.send),
+                  timestamp: Date.now(),
+                })
+              }
+              const wanted = Math.max(0, Math.min(turn.awaitMessages ?? 1, maxFrames * 2 - frames.length))
+              for (let i = 0; i < wanted; i += 1) {
+                const message = await session.nextMessage(Math.max(100, turn.timeoutMs ?? Math.min(timeoutMs, 5_000)))
+                if (!message) break
+                frames.push({
+                  direction: 'received',
+                  opcode: message.opcode,
+                  data: message.text,
+                  bytes: message.data.length,
+                  timestamp: message.timestamp,
+                })
+              }
+            }
+          }
+        } finally {
+          session.close()
+        }
+        raw = { connected, upgradeStatus, upgradeHeaders, subprotocol, frames, closeCode, closeReason, error: errorMsg }
+      } else {
+        raw = await wsTransport(url, chosen, deadline, {
+          headers: {
+            ...cleanHeaders,
+            ...(resolvedPersonaHeaders ?? {}),
+          },
+          subprotocols: req.subprotocols,
+          sendMessages: sendMessages.slice(0, maxFrames),
+          maxFrames,
+          maxBytes,
+          timeoutMs,
+          rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+        })
+      }
     } finally {
       release()
     }
