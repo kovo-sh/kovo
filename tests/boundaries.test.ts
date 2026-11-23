@@ -233,7 +233,10 @@ test('enforces Tiers 0-3 capabilities and Tier 3 HITL approval requests', async 
     /Tier 2 or Tier 3/,
   )
 
-  // Tier 2 allows synchronized executeBatch (2..10) and allowlisted idempotent POST, blocks non-idempotent POST
+  // Tier 2 allows synchronized executeBatch (2..10) and an explicitly allowlisted sandbox POST,
+  // blocks non-idempotent/non-allowlisted POST. (The legacy path-substring "idempotent POST"
+  // predicate no longer bypasses authorization: a Tier-2 write needs the operator's explicit
+  // sandboxWriteAllowlist entry, which is what this regression now uses.)
   const batch = await broker.executeBatch([
     { origin: northstar, method: 'GET', pathAndQuery: '/r1' },
     { origin: northstar, method: 'GET', pathAndQuery: '/r2' },
@@ -243,7 +246,10 @@ test('enforces Tiers 0-3 capabilities and Tier 3 HITL approval requests', async 
 
   const gqlOk = await broker.executeHttp(
     { origin: northstar, method: 'POST', pathAndQuery: '/graphql', body: '{"query":"{ __typename }"}' },
-    makeGrant({ tier: 2, isIdempotentPostAllowed: (_o, p) => p === '/graphql' }),
+    makeGrant({
+      tier: 2,
+      sandboxWriteAllowlist: [{ origin: northstar, method: 'POST', pathPattern: '/graphql' }],
+    }),
     sig,
   )
   assert.equal(gqlOk.status, 200)

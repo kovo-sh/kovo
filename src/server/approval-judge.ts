@@ -36,6 +36,7 @@ export interface Tier3ApprovalInput {
   hasMultipart?: boolean
   isRceProof?: boolean
   isRaceBurst?: boolean
+  hasCompressedBody?: boolean
   environment?: 'public' | 'local-lab'
   approvedPatterns?: readonly ApprovedEndpointPattern[]
   llmCall?: SafetyJudgeLlmCall
@@ -69,6 +70,25 @@ const NUMERIC_SEGMENT = /^\d+$/
 const LONG_HEX_SEGMENT = /^[0-9a-f]{16,}$/i
 const PREFIXED_ID_SEGMENT = /^[a-z]{2,10}_[a-zA-Z0-9]{8,}$/
 const OPAQUE_TOKEN_SEGMENT = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
+const PLACEHOLDER_SEGMENT = /^(?::[A-Za-z0-9_]+|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]+\])$/
+
+/**
+ * True only for genuinely identifier-shaped path segments (numeric, UUID, Mongo id, long hex,
+ * prefixed id, or a high-entropy opaque token). A wildcard in an approved endpoint pattern must
+ * never match a sibling verb or a literal path word: that is how an approval for
+ * `POST /api/items/<id>` used to cover `POST /api/items/delete`.
+ */
+function isIdLikeSegment(segment: string): boolean {
+  return (
+    PLACEHOLDER_SEGMENT.test(segment) ||
+    UUID_SEGMENT.test(segment) ||
+    MONGO_ID_SEGMENT.test(segment) ||
+    NUMERIC_SEGMENT.test(segment) ||
+    LONG_HEX_SEGMENT.test(segment) ||
+    PREFIXED_ID_SEGMENT.test(segment) ||
+    OPAQUE_TOKEN_SEGMENT.test(segment)
+  )
+}
 
 // Financial / destructive / irreversible state mutations — always escalate regardless of auth
 const ALWAYS_HIGH_RISK_PATTERN =
@@ -122,24 +142,35 @@ export function normalizeApprovalPathPattern(pathAndQuery: string): string {
   const segments = pathname.split('/').map((seg, idx) => {
     if (idx === 0 && seg === '') return ''
     if (!seg) return ''
-    if (seg === '*') return '*'
-    if (
-      seg.startsWith(':') ||
-      (seg.startsWith('{') && seg.endsWith('}')) ||
-      (seg.startsWith('[') && seg.endsWith(']')) ||
-      UUID_SEGMENT.test(seg) ||
-      MONGO_ID_SEGMENT.test(seg) ||
-      NUMERIC_SEGMENT.test(seg) ||
-      LONG_HEX_SEGMENT.test(seg) ||
-      PREFIXED_ID_SEGMENT.test(seg) ||
-      OPAQUE_TOKEN_SEGMENT.test(seg)
-    ) {
-      return '*'
-    }
+    if (seg === '*' || seg === '**') return seg
+    if (isIdLikeSegment(seg)) return '*'
     return seg.toLowerCase()
   })
 
   return segments.join('/') || '/'
+}
+
+/**
+ * Normalized segment view used for pattern matching. `wildcard` is true only for `*` and for
+ * segments that are genuinely identifier-shaped; literals must match exactly (case-insensitively).
+ * `**` is reserved for an explicit operator-approved prefix pattern and is only honoured as the
+ * final segment.
+ */
+interface ApprovalPathSegment {
+  value: string
+  wildcard: boolean
+}
+
+function parseApprovalPathSegments(pathAndQuery: string): ApprovalPathSegment[] {
+  const normalized = normalizeApprovalPathPattern(pathAndQuery)
+  return normalized
+    .split('/')
+    .filter(Boolean)
+    .map(segment => {
+      if (segment === '**') return { value: '**', wildcard: false }
+      if (segment === '*') return { value: '*', wildcard: true }
+      return { value: segment, wildcard: false }
+    })
 }
 
 function normalizeOriginKey(origin: string): string {
@@ -208,24 +239,38 @@ export function matchesApprovedEndpointPattern(
   if (!patterns?.length) return undefined
   const targetOrigin = normalizeOriginKey(target.origin)
   const targetMethod = target.method.toUpperCase()
-  const targetNorm = normalizeApprovalPathPattern(target.pathAndQuery)
-  const targetSegs = targetNorm.split('/').filter(Boolean)
+  const targetSegs = parseApprovalPathSegments(target.pathAndQuery)
 
   for (const pattern of patterns) {
     if (normalizeOriginKey(pattern.origin) !== targetOrigin) continue
     if (pattern.method.toUpperCase() !== targetMethod) continue
-    const patNorm = normalizeApprovalPathPattern(pattern.pathPattern)
-    if (patNorm === targetNorm) return pattern
-    const patSegs = patNorm.split('/').filter(Boolean)
-    if (patSegs.length === targetSegs.length) {
-      const matched = patSegs.every((seg, i) => seg === '*' || seg === targetSegs[i])
-      if (matched) return pattern
+    const patSegs = parseApprovalPathSegments(pattern.pathPattern)
+    if (patSegs.length === 0) continue
+
+    const prefixWildcard = patSegs[patSegs.length - 1]!.value === '**'
+    // `**` is an explicit operator-approved prefix pattern. It is only valid as the last segment
+    // and only when the operator actually wrote it; a trailing `*` never matches arbitrary depth.
+    if (patSegs.some((seg, i) => seg.value === '**' && i !== patSegs.length - 1)) continue
+    const fixedLength = prefixWildcard ? patSegs.length - 1 : patSegs.length
+    if (prefixWildcard ? targetSegs.length < fixedLength : targetSegs.length !== fixedLength) continue
+
+    let matched = true
+    for (let i = 0; i < fixedLength; i += 1) {
+      const pat = patSegs[i]!
+      const seg = targetSegs[i]!
+      if (pat.wildcard) {
+        // Wildcards (explicit `*`, `:id`, `{id}`, or an ID-like literal normalized to `*`) only
+        // cover genuinely identifier-shaped targets. They never cover a sibling verb.
+        if (!seg.wildcard) {
+          matched = false
+          break
+        }
+      } else if (pat.value !== seg.value) {
+        matched = false
+        break
+      }
     }
-    // Trailing wildcard prefix match (e.g., /api/v1/items/* matches /api/v1/items/123/sub)
-    if (patSegs.length > 0 && patSegs[patSegs.length - 1] === '*' && targetSegs.length >= patSegs.length) {
-      const prefixMatched = patSegs.slice(0, -1).every((seg, i) => seg === '*' || seg === targetSegs[i])
-      if (prefixMatched) return pattern
-    }
+    if (matched) return pattern
   }
   return undefined
 }
@@ -250,6 +295,8 @@ export interface StateChangeApprovalContext {
   hasMultipart?: boolean
   isRaceBurst?: boolean
   isRceProof?: boolean
+  /** True when the caller declared a non-identity Content-Encoding (gzip/br/deflate/...). */
+  hasCompressedBody?: boolean
 }
 
 export interface StateChangeFingerprintInput extends StateChangeApprovalContext {
@@ -395,9 +442,22 @@ export function authorizeStateChange(input: {
     return { approved: true, via: 'local_lab' }
   }
 
-  // Operator-approved endpoint patterns may match multiple segments, but they never authorize an
-  // RCE proof-of-execution probe.
-  if (!input.context?.isRceProof) {
+  const context = input.context
+  // Hard escalations are evaluated before patterns: multipart/upload, DELETE, RCE, race bursts,
+  // compressed or over-cap bodies, and destructive/privileged keyword payloads can never be
+  // pre-authorized by a broad operator pattern. Patterns additionally require the caller to supply
+  // the exact request context — a context-less call (e.g. a replay retry that cannot describe the
+  // request) fails closed instead of inheriting a pattern grant.
+  const hardEscalation = !context || Boolean(detectHardEscalationReason({
+    method: input.method.toUpperCase(),
+    pathAndQuery: input.pathAndQuery,
+    personaHandle: context?.personaHandle,
+    bodyPreview: context?.body ?? null,
+    hasMultipart: context?.hasMultipart,
+    isRceProof: context?.isRceProof,
+    hasCompressedBody: context?.hasCompressedBody,
+  }))
+  if (context && !context.isRaceBurst && !hardEscalation) {
     const pattern = matchesApprovedEndpointPattern(
       { origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery },
       input.approvedPatterns,
@@ -405,19 +465,19 @@ export function authorizeStateChange(input: {
     if (pattern) return { approved: true, via: 'operator_pattern', pattern }
   }
 
-  if (input.context && input.ledger) {
+  if (context && input.ledger) {
     const consumed = input.ledger.consume({
       runId: input.runId,
       origin: input.origin,
       method: input.method,
       pathAndQuery: input.pathAndQuery,
       scopeRevision: input.scopeRevision,
-      personaHandle: input.context.personaHandle ?? null,
-      bodyHash: input.context.bodyHash,
-      body: input.context.body,
-      hasMultipart: input.context.hasMultipart,
-      isRaceBurst: input.context.isRaceBurst,
-      isRceProof: input.context.isRceProof,
+      personaHandle: context.personaHandle ?? null,
+      bodyHash: context.bodyHash,
+      body: context.body,
+      hasMultipart: context.hasMultipart,
+      isRaceBurst: context.isRaceBurst,
+      isRceProof: context.isRceProof,
     }, input.now)
     if (consumed) return { approved: true, via: 'one_shot' }
   }
@@ -477,9 +537,68 @@ export function detectMultipartRequest(input: {
   return 'multipart'
 }
 
+/**
+ * Duplicate-aware top-level key scan. `JSON.parse` is last-wins, so a body with two `query` keys
+ * (one mutation, one read-only document) could be classified as benign by Guardian while a target
+ * parser executes the other value. Returns `undefined` for malformed JSON.
+ */
+function topLevelJsonKeys(raw: string): string[] | undefined {
+  const text = raw.trim()
+  if (!text.startsWith('{')) return undefined
+  const keys: string[] = []
+  let depth = 0
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]!
+    if (ch === '"') {
+      let j = i + 1
+      let value = ''
+      let closed = false
+      while (j < text.length) {
+        const c = text[j]!
+        if (c === '\\') {
+          value += text.slice(j, j + 2)
+          j += 2
+          continue
+        }
+        if (c === '"') {
+          closed = true
+          j += 1
+          break
+        }
+        value += c
+        j += 1
+      }
+      if (!closed) return undefined
+      if (depth === 1) {
+        let k = j
+        while (k < text.length && /\s/.test(text[k]!)) k += 1
+        if (text[k] === ':') keys.push(value)
+      }
+      i = j
+      continue
+    }
+    if (ch === '{' || ch === '[') depth += 1
+    else if (ch === '}' || ch === ']') {
+      depth -= 1
+      if (depth < 0) return undefined
+    }
+    i += 1
+  }
+  if (depth !== 0) return undefined
+  return keys
+}
+
+function hasDuplicateTopLevelJsonKeys(raw: string): boolean {
+  const keys = topLevelJsonKeys(raw)
+  if (!keys) return false
+  return new Set(keys).size !== keys.length
+}
+
 function parseJsonObjectBody(body: string | null | undefined): Record<string, unknown> | undefined {
   const trimmed = (body ?? '').trim()
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined
+  if (hasDuplicateTopLevelJsonKeys(trimmed)) return undefined
   try {
     const parsed = JSON.parse(trimmed) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
@@ -520,6 +639,10 @@ function isReadOnlySearchPost(pathAndQuery: string, body: string | null | undefi
   if (!READONLY_SEARCH_PATH_PATTERN.test(pathAndQuery)) return false
   const trimmed = (body ?? '').trim().slice(0, MAX_KEYWORD_SCAN_CHARS)
   if (!trimmed) return true
+  // JSON search bodies must be well-formed and duplicate-key-free, so the exact document the
+  // judge classified is the document the target will parse.
+  if (trimmed.startsWith('{') && !parseJsonObjectBody(trimmed)) return false
+  if (hasDuplicateTopLevelJsonKeys(trimmed)) return false
   return !MUTATION_BODY_HINT.test(trimmed)
 }
 
@@ -531,9 +654,17 @@ function detectHardEscalationReason(input: {
   headers?: Record<string, string>
   hasMultipart?: boolean
   isRceProof?: boolean
+  hasCompressedBody?: boolean
 }): string | null {
   if (input.isRceProof) {
     return 'RCE proof-of-execution probe always requires explicit human approval.'
+  }
+  const contentEncoding = (headerLookup(input.headers, 'content-encoding') ?? '').trim()
+  if (input.hasCompressedBody || (contentEncoding && !/^identity$/i.test(contentEncoding))) {
+    return 'Compressed (Content-Encoding) request bodies cannot be classified and always require explicit human approval.'
+  }
+  if ((input.bodyPreview?.length ?? 0) > MAX_KEYWORD_SCAN_CHARS) {
+    return `Request body exceeds the ${Math.round(MAX_KEYWORD_SCAN_CHARS / 1024)} KiB classification cap and always requires explicit human approval.`
   }
   const multipartKind = detectMultipartRequest(input)
   if (multipartKind === 'malformed_multipart') {
@@ -690,8 +821,32 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Check operator-approved endpoint pattern (except RCE proof which always escalates unless explicitly approved)
-  const matchedPattern = !input.isRceProof
+  // Stage 1A — Hard Escalation Patterns (ALWAYS escalate to human). These run BEFORE operator
+  // pattern matching: a broad pattern can never pre-approve multipart/DELETE/RCE/upload/race
+  // probes, compressed or over-cap bodies, or destructive/privileged payload keywords.
+  const hardEscalationReason = detectHardEscalationReason({
+    method,
+    pathAndQuery,
+    personaHandle: input.personaHandle,
+    bodyPreview: input.bodyPreview,
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+    isRceProof: input.isRceProof,
+    hasCompressedBody: input.hasCompressedBody,
+  })
+  if (hardEscalationReason) {
+    return {
+      decision: 'escalate_human',
+      decidedBy: 'operator',
+      riskLevel: 'high',
+      reason: hardEscalationReason,
+      usedLlm: false,
+      stage: 'hard_escalation',
+    }
+  }
+
+  // Stage 1B — Operator-approved endpoint pattern (only after hard escalations passed).
+  const matchedPattern = !input.isRceProof && !input.isRaceBurst
     ? matchesApprovedEndpointPattern(
         { origin: input.origin, method, pathAndQuery },
         input.approvedPatterns,
@@ -708,28 +863,7 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Stage 1A — Hard Escalation Patterns (ALWAYS escalate to human)
-  const hardEscalationReason = detectHardEscalationReason({
-    method,
-    pathAndQuery,
-    personaHandle: input.personaHandle,
-    bodyPreview: input.bodyPreview,
-    headers: input.headers,
-    hasMultipart: input.hasMultipart,
-    isRceProof: input.isRceProof,
-  })
-  if (hardEscalationReason) {
-    return {
-      decision: 'escalate_human',
-      decidedBy: 'operator',
-      riskLevel: 'high',
-      reason: hardEscalationReason,
-      usedLlm: false,
-      stage: 'hard_escalation',
-    }
-  }
-
-  // Stage 1B — Deterministic Benign Fast-Path (zero LLM cost)
+  // Stage 1C — Deterministic Benign Fast-Path (zero LLM cost)
   if (method === 'POST' && !input.isRaceBurst) {
     if (isGraphqlReadOnlyQuery(pathAndQuery, input.bodyPreview)) {
       return {

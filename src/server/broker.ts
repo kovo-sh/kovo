@@ -133,6 +133,10 @@ export interface BrokerExchangeResult {
   origin: string
   finalOrigin: string
   redirectOrigins: string[]
+  /** Path + query of the final hop actually requested (differs from `pathAndQuery` after redirects). */
+  finalPathAndQuery?: string
+  /** Every redirect target path + query followed during this exchange, in order. */
+  redirectPaths?: string[]
   method: string
   pathAndQuery: string
   personaHandle: string | null
@@ -256,6 +260,11 @@ export type Grant = {
   canaryBroker?: CanaryBroker
   mintCanary?: (purpose: string, origin?: string) => { httpUrl?: string; url?: string } | null
   canRead: (origin: string) => boolean
+  /**
+   * @deprecated Never consulted for authorization. Tier-3 state changes are always authorized by
+   * `isStateChangeApproved`; a path-substring "idempotent POST" predicate must not skip approvals.
+   * Retained only for source compatibility with older grant builders.
+   */
   isIdempotentPostAllowed?: (origin: string, pathAndQuery: string, body?: string) => boolean
   /**
    * Exact-fingerprint Tier-3 authorization. The optional context carries the bytes/flags of the
@@ -2220,6 +2229,7 @@ export class RequestBroker {
     preparedBody: string | undefined
     secrets: NamedSecret[]
     followRedirects: boolean
+    hasCompressedBody: boolean
     maxRps: number
     timeoutMs: number
   } {
@@ -2356,20 +2366,25 @@ export class RequestBroker {
       }
     }
 
-    const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS'
+    const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD' ||
+      (req.method === 'OPTIONS' && (req.body === undefined || req.body === ''))
     const callerContentType = Object.entries(req.headers ?? {})
       .find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? ''
+    const callerContentEncoding = Object.entries(req.headers ?? {})
+      .find(([k]) => k.toLowerCase() === 'content-encoding')?.[1] ?? ''
     const hasMultipartContentType = /^\s*multipart\//i.test(callerContentType)
+    const hasCompressedBody = callerContentEncoding.trim() !== '' && !/^identity$/i.test(callerContentEncoding.trim())
     if (!isReadOnlyMethod || hasMultipart) {
-      const idempotentPostAllowed = !hasMultipart && !hasMultipartContentType && req.method === 'POST' && tier >= 2 &&
-        Boolean(grant.isIdempotentPostAllowed?.(initialOrigin, req.pathAndQuery, req.body))
-      const sandboxPostAllowed = !idempotentPostAllowed && !hasMultipart && !hasMultipartContentType &&
+      // The only pre-approval fast path is the explicit Tier-2 sandbox write allowlist (an operator
+      // configuration), never a caller-supplied path heuristic. Every other non-GET/HEAD request
+      // goes through the exact-fingerprint approval hook.
+      const sandboxPostAllowed = !hasMultipart && !hasMultipartContentType &&
         req.method === 'POST' && tier === 2 && (
           grant.sandboxWriteAllowlist !== undefined
             ? matchesSandboxWriteAllowlist(initialOrigin, url.pathname, req.pathAndQuery, grant.sandboxWriteAllowlist)
             : localLab
         )
-      if (!idempotentPostAllowed && !sandboxPostAllowed) {
+      if (!sandboxPostAllowed) {
         if (tier < 3) {
           grant.audit('denied', initialOrigin)
           throw new BrokerDenied(
@@ -2384,6 +2399,7 @@ export class RequestBroker {
           bodyHash: computeStateChangeBodyHash(req.body, req.multipartParts),
           hasMultipart: hasMultipart || hasMultipartContentType,
           isRaceBurst: options.raceBurst === true,
+          hasCompressedBody,
         }
         const approved = grant.isStateChangeApproved
           ? grant.isStateChangeApproved(initialOrigin, req.method, req.pathAndQuery, approvalContext)
@@ -2438,6 +2454,7 @@ export class RequestBroker {
       preparedBody,
       secrets,
       followRedirects,
+      hasCompressedBody,
       maxRps,
       timeoutMs,
     }
@@ -2699,6 +2716,7 @@ export class RequestBroker {
       preResolvedAddresses?: PublicAddress[]
       reauthAttempted?: boolean
       refreshedPersonaHeaders?: Record<string, string>
+      raceBurst?: boolean
     },
   ): Promise<BrokerExchangeResult> {
     await this.applyAuthMutationIfNeeded(prepared, req, grant, signal)
@@ -2709,6 +2727,7 @@ export class RequestBroker {
       cleanHeaders,
       secrets,
       followRedirects,
+      hasCompressedBody,
       maxRps,
       timeoutMs,
     } = prepared
@@ -2721,6 +2740,7 @@ export class RequestBroker {
     const transport = this.options.transport ?? defaultTransport
 
     const redirectOrigins = new Set<string>([url.origin])
+    const redirectPaths: string[] = []
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
     let includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
@@ -2734,6 +2754,35 @@ export class RequestBroker {
       if (!safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(url.origin)) {
         this.purgeSessionJars(undefined, url.origin)
         deny('Destination is outside the current assignment scope.')
+      }
+    }
+    /**
+     * 307/308 preserve the method and body. A state-changing redirect therefore needs a fresh
+     * exact-fingerprint authorization for the *target* (origin + method + path/query + body):
+     * the approval that covered the first path must never be re-sent to a different one. GET/HEAD
+     * redirects stay read-only and are followed without another approval.
+     */
+    const authorizeRedirectTarget = (target: URL, bodyForHop: string | undefined): void => {
+      if (activeMethod === 'GET' || activeMethod === 'HEAD' ||
+          (activeMethod === 'OPTIONS' && (activeBody === undefined || activeBody === ''))) return
+      const targetPathAndQuery = `${target.pathname}${target.search}`
+      const multipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
+      const context: StateChangeApprovalContext = {
+        personaHandle: includePersona ? (personaHandle ?? null) : null,
+        body: multipart ? null : (bodyForHop ?? null),
+        bodyHash: multipart
+          ? computeStateChangeBodyHash(req.body, req.multipartParts)
+          : computeStateChangeBodyHash(bodyForHop ?? null),
+        hasMultipart: multipart,
+        isRaceBurst: options.raceBurst === true,
+        hasCompressedBody,
+      }
+      const approved = grant.isStateChangeApproved
+        ? grant.isStateChangeApproved(target.origin, activeMethod, targetPathAndQuery, context)
+        : localLab
+      if (!approved) {
+        grant.audit('denied', target.origin)
+        throw new BrokerApprovalRequired(target.origin, activeMethod, targetPathAndQuery)
       }
     }
 
@@ -2972,7 +3021,12 @@ export class RequestBroker {
         if (response.status === 301 || response.status === 302 || response.status === 303) {
           activeMethod = 'GET'
           activeBody = undefined
+        } else {
+          // 307/308 re-send the same method and body. Re-authorize the exact redirect target before
+          // a single byte is sent there; fail closed with the target in BrokerApprovalRequired.
+          authorizeRedirectTarget(url, hopBody ?? activeBody)
         }
+        redirectPaths.push(`${url.pathname}${url.search}`)
         continue
       }
 
@@ -3012,6 +3066,8 @@ export class RequestBroker {
         origin: initialOrigin,
         finalOrigin: url.origin,
         redirectOrigins: [...redirectOrigins],
+        finalPathAndQuery: redact(`${url.pathname}${url.search}`, effectiveSecrets),
+        redirectPaths: redirectPaths.map(p => redact(p, effectiveSecrets)),
         method: req.method,
         pathAndQuery: redact(req.pathAndQuery, effectiveSecrets),
         personaHandle: personaHandle ?? null,
@@ -3154,6 +3210,7 @@ export class RequestBroker {
           this.executePreparedHttp(prepared, req, grant, signal, {
             bypassConcurrency: true,
             preResolvedAddresses: resolvedByHost.get(prepared.url.hostname),
+            raceBurst: true,
           }),
         ),
       )
@@ -3437,6 +3494,8 @@ export function websocketResultToExchange(result: BrokerWebsocketResult): Broker
     origin: result.origin,
     finalOrigin: result.origin,
     redirectOrigins: [result.origin],
+    finalPathAndQuery: result.pathAndQuery,
+    redirectPaths: [],
     method: 'WS',
     pathAndQuery: result.pathAndQuery,
     personaHandle: result.personaHandle,
