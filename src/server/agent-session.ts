@@ -63,6 +63,7 @@ import type { BrowserInteractiveAction, BrowserSessionStep } from './scoped-brow
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from './skills.ts'
 import type { DifferentialProbeClass, SurfaceWordlistName } from './surface-engine.ts'
 import type { SastEngine } from './worker-backend.ts'
+import type { MissionKind } from './assignment-brief.ts'
 
 export const defaultInlineToolOutputBytes = 24 * 1024
 export const maxInlineToolOutputBytes = 64 * 1024
@@ -71,6 +72,44 @@ export const defaultPlannerMaxTurns = 20
 export const defaultCodeAuditMaxTurns = 30
 export const defaultPatchMaxTurns = 20
 export const maxEmptyTurnNudges = 2
+
+/**
+ * Agentic lane budgets (v5.1). Flash-class models do well on short, batched micro-tasks and badly on
+ * long open exploration. These are exported so the lane can wire 8-10 turns / 75-90 s without
+ * touching tests that assert the legacy defaults; `runAgentSession` still honors an explicit
+ * `maxTurns` and adds an opt-in `wallClockMs`.
+ */
+export const AGENTIC_SPECIALIST_MAX_TURNS = 9
+export const AGENTIC_UPGRADE_MAX_TURNS = 7
+export const AGENTIC_MIN_MAX_TURNS = 6
+export const AGENTIC_MAX_MAX_TURNS = 10
+export const AGENTIC_SPECIALIST_WALL_CLOCK_MS = 80_000
+export const AGENTIC_DET_LEAD_LIMIT = 8
+
+export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
+  switch (missionKind) {
+    case 'det_lead_upgrade':
+    case 'chain_step_2':
+      return AGENTIC_UPGRADE_MAX_TURNS
+    default:
+      return AGENTIC_SPECIALIST_MAX_TURNS
+  }
+}
+
+/** Hard settlement nudge at N-2 turns (independent of the 85% network-revocation threshold). */
+export function settlementNudgeTurnFor(maxTurns: number): number {
+  return Math.max(1, Math.floor(maxTurns) - 2)
+}
+
+/**
+ * The 3-line contract injected verbatim into specialist and planner prompts. Keep wording
+ * forward-compatible with the typed proof compilers landing in a follow-up stream.
+ */
+export const AGENTIC_CONTRACT_LINES = [
+  'Never re-submit an (endpoint, method, param, cwe) listed in alreadyConfirmed; you MAY chain or escalate it.',
+  'Prioritize det_lead upgrades and workflow/numeric/chain routes over single-param fuzzing.',
+  'Use typed proof tools (control-vs-probe differentials and state deltas); status-only claims fail verification.',
+] as const
 
 const NETWORK_TOOLS = new Set([
   'request_http',
@@ -983,6 +1022,222 @@ const scenarioInstructions: Record<AgentScenario, string> = {
 const fallbackCommand = "jq -c '{status, mediaType, transportMaxAge, includeSubDomains}' /evidence/observed.json > /work/result.txt"
 
 // ---------------------------------------------------------------------------
+// Agentic prompt contract (read-only context + batched micro-task guidance)
+// ---------------------------------------------------------------------------
+
+export interface AlreadyConfirmedRef {
+  origin?: string | null
+  method?: string | null
+  path: string
+  param?: string | null
+  cwe?: string | null
+  probeClass?: string | null
+}
+
+export interface UnconfirmedSurfaceRef {
+  method?: string | null
+  path: string
+  reason?: string | null
+  category?: string | null
+}
+
+export interface DetLeadSummary {
+  probeClass: string
+  endpoint?: string | null
+  method?: string | null
+  param?: string | null
+  exchangeId?: string | null
+  signalSummary?: string | null
+  verifyFailureReason?: string | null
+}
+
+export interface AgenticPromptContextInput {
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
+}
+
+function cleanPromptValue(value: unknown, maxBytes: number): string {
+  if (typeof value !== 'string') return ''
+  return truncateUtf8Head(value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), maxBytes)
+}
+
+/**
+ * Derive already-confirmed references from facts already passed to the specialist prompt
+ * (`parentFacts`). The deterministic engine persists replay-verified findings with
+ * `data.subkind === 'deterministic_engine_confirmed'`; this keeps the block read-only and
+ * requires no new execution wiring.
+ */
+export function confirmedRefsFromParentFacts(
+  parentFacts?: readonly { data?: Record<string, unknown> }[],
+): AlreadyConfirmedRef[] {
+  const refs: AlreadyConfirmedRef[] = []
+  const seen = new Set<string>()
+  for (const fact of parentFacts ?? []) {
+    const data = fact.data
+    if (!data || data.subkind !== 'deterministic_engine_confirmed') continue
+    const path = typeof data.endpoint === 'string' ? cleanPromptValue(data.endpoint, 160) : ''
+    if (!path) continue
+    const method = typeof data.method === 'string' ? cleanPromptValue(data.method, 10).toUpperCase() : ''
+    const param = typeof data.param === 'string' ? cleanPromptValue(data.param, 48) : ''
+    const cwe = typeof data.cwe === 'string' ? cleanPromptValue(data.cwe, 24) : ''
+    const probeClass = typeof data.vulnClass === 'string'
+      ? cleanPromptValue(data.vulnClass, 48)
+      : typeof data.probeClass === 'string'
+        ? cleanPromptValue(data.probeClass, 48)
+        : ''
+    const key = `${method} ${path} ${param} ${cwe}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    refs.push({
+      ...(method ? { method } : {}),
+      path,
+      ...(param ? { param } : {}),
+      ...(cwe ? { cwe } : {}),
+      ...(probeClass ? { probeClass } : {}),
+    })
+  }
+  return refs.slice(0, 10)
+}
+
+/**
+ * Derive top-K det_lead summaries from facts already passed to the specialist prompt
+ * (`parentFacts`). The deterministic engine persists these with `data.kind === 'det_lead'`;
+ * no new storage or execution wiring is required.
+ */
+export function detLeadsFromParentFacts(
+  parentFacts?: readonly { kind?: string; data?: Record<string, unknown> }[],
+): DetLeadSummary[] {
+  const leads: Array<DetLeadSummary & { signalScore: number }> = []
+  for (const fact of parentFacts ?? []) {
+    const data = fact.data
+    if (!data || data.kind !== 'det_lead') continue
+    const anomalies = Array.isArray(data.anomalies) ? data.anomalies : []
+    const anomalyTypes = anomalies
+      .map(a => (a && typeof a === 'object' && typeof (a as { type?: unknown }).type === 'string'
+        ? (a as { type: string }).type
+        : ''))
+      .filter(Boolean)
+    const reason = typeof data.reason === 'string'
+      ? data.reason
+      : typeof data.summary === 'string'
+        ? data.summary
+        : ''
+    const signalSummary = cleanPromptValue(
+      reason || anomalyTypes.join(', ') || `${String(data.probeClass ?? 'unknown')} lead`,
+      220,
+    )
+    const verifyFailureReason = typeof data.verifyFailureReason === 'string'
+      ? data.verifyFailureReason
+      : typeof data.failureReason === 'string'
+        ? data.failureReason
+        : typeof data.verdict === 'string' && data.verdict !== 'confirmed'
+          ? data.verdict
+          : null
+    leads.push({
+      probeClass: cleanPromptValue(data.probeClass, 48) || 'unknown',
+      ...(typeof data.endpoint === 'string' ? { endpoint: cleanPromptValue(data.endpoint, 160) } : {}),
+      ...(typeof data.method === 'string' ? { method: cleanPromptValue(data.method, 10).toUpperCase() } : {}),
+      ...(typeof data.param === 'string' ? { param: cleanPromptValue(data.param, 48) } : {}),
+      ...(typeof data.exchangeId === 'string' ? { exchangeId: cleanPromptValue(data.exchangeId, 64) } : {}),
+      signalSummary,
+      ...(verifyFailureReason ? { verifyFailureReason: cleanPromptValue(verifyFailureReason, 120) } : {}),
+      signalScore: anomalyTypes.length * 10 + (data.canaryId ? 6 : 0) + (data.exchangeId ? 2 : 0),
+    })
+  }
+  return leads
+    .sort((a, b) => {
+      if (a.signalScore !== b.signalScore) return b.signalScore - a.signalScore
+      const left = `${a.endpoint ?? ''} ${a.method ?? ''} ${a.probeClass}`
+      const right = `${b.endpoint ?? ''} ${b.method ?? ''} ${b.probeClass}`
+      return left < right ? -1 : left > right ? 1 : 0
+    })
+    .slice(0, Math.min(10, AGENTIC_DET_LEAD_LIMIT + 2))
+    .map(({ signalScore: _score, ...lead }) => lead)
+}
+
+/**
+ * Build the read-only agentic context injected into specialist and planner prompts.
+ * The contract is always present; the data blocks appear only when data exists.
+ */
+export function buildAgenticPromptContext(input: AgenticPromptContextInput = {}): Record<string, unknown> {
+  const limit = Math.max(1, Math.min(10, Math.floor(input.detLeadLimit ?? AGENTIC_DET_LEAD_LIMIT)))
+
+  const alreadyConfirmed = (input.alreadyConfirmed ?? [])
+    .map(ref => ({
+      ...(ref.method ? { method: cleanPromptValue(ref.method, 10).toUpperCase() } : {}),
+      path: cleanPromptValue(ref.path, 160),
+      ...(ref.param ? { param: cleanPromptValue(ref.param, 48) } : {}),
+      ...(ref.cwe ? { cwe: cleanPromptValue(ref.cwe, 24) } : {}),
+      ...(ref.probeClass ? { probeClass: cleanPromptValue(ref.probeClass, 48) } : {}),
+    }))
+    .filter(ref => ref.path)
+
+  const unconfirmedHardSurface = (input.unconfirmedHardSurface ?? [])
+    .map(ref => ({
+      ...(ref.method ? { method: cleanPromptValue(ref.method, 10).toUpperCase() } : {}),
+      path: cleanPromptValue(ref.path, 160),
+      ...(ref.category ? { category: cleanPromptValue(ref.category, 48) } : {}),
+      ...(ref.reason ? { reason: cleanPromptValue(ref.reason, 160) } : {}),
+    }))
+    .filter(ref => ref.path)
+
+  const detLeads = (input.detLeads ?? [])
+    .slice(0, limit)
+    .map(lead => ({
+      probeClass: cleanPromptValue(lead.probeClass, 48) || 'unknown',
+      ...(lead.endpoint ? { endpoint: cleanPromptValue(lead.endpoint, 160) } : {}),
+      ...(lead.method ? { method: cleanPromptValue(lead.method, 10).toUpperCase() } : {}),
+      ...(lead.param ? { param: cleanPromptValue(lead.param, 48) } : {}),
+      ...(lead.exchangeId ? { exchangeId: cleanPromptValue(lead.exchangeId, 64) } : {}),
+      ...(lead.signalSummary ? { signal: cleanPromptValue(lead.signalSummary, 220) } : {}),
+      ...(lead.verifyFailureReason ? { verifyFailureReason: cleanPromptValue(lead.verifyFailureReason, 120) } : {}),
+    }))
+
+  const brief = input.assignmentBrief
+    ? truncateUtf8Head(input.assignmentBrief, 1536)
+    : ''
+
+  return {
+    contract: [...AGENTIC_CONTRACT_LINES],
+    ...(alreadyConfirmed.length
+      ? {
+          alreadyConfirmedReadOnly: {
+            label: 'Already Confirmed (do not duplicate; MAY chain/escalate)',
+            items: alreadyConfirmed,
+          },
+        }
+      : {}),
+    ...(unconfirmedHardSurface.length
+      ? {
+          unconfirmedHardSurface: {
+            label: 'Unconfirmed Hard Surface',
+            items: unconfirmedHardSurface,
+          },
+        }
+      : {}),
+    ...(detLeads.length
+      ? {
+          detLeadSummary: {
+            label: 'Unconfirmed det_lead summary (upgrade priority, top-K)',
+            items: detLeads,
+          },
+        }
+      : {}),
+    microTaskGuidance: {
+      batching: 'Use request_http_batch for 4-8 independent probes per turn on baseline+differential turns; use a single request_http only for a sequential dependency.',
+      parallelReadOnly: 'Issue independent read-only tool calls (get_exchange, search_facts, search_exchanges, board_read, derive_evidence) together in one turn.',
+      assignmentTarget: 'One assignment = one hypothesis cluster (1-3 linked routes) or one det_lead upgrade.',
+      turnBudget: '8-10 turns; 6-8 turns for det_lead upgrades and chain step 2.',
+      settlement: 'At turn N-2, submit your proof (propose_chain_finding/update_proposed_finding) or call complete_intent; do not start new exploration.',
+    },
+    ...(brief ? { evidenceBrief: brief } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Prompt Builders
 // ---------------------------------------------------------------------------
 
@@ -1017,6 +1272,11 @@ export function threatModelPrompt(input: {
   observations?: readonly Record<string, unknown>[]
   hostTiers?: Record<string, HostTier>
   availableSkills?: readonly { name: string; title: string; summary: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }): string {
   const hostTiers: Record<string, HostTier> = {}
   for (const origin of input.approvedOrigins) {
@@ -1037,6 +1297,13 @@ export function threatModelPrompt(input: {
     mountedRepos: input.mountedRepos ?? [],
     observations: input.observations ?? [],
     availableSkills: input.availableSkills ?? listSkills().map(s => ({ name: s.name, title: s.title, summary: s.summary })),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed: input.alreadyConfirmed,
+      unconfirmedHardSurface: input.unconfirmedHardSurface,
+      detLeads: input.detLeads,
+      detLeadLimit: input.detLeadLimit,
+      assignmentBrief: input.assignmentBrief,
+    }),
   })
 }
 
@@ -1098,6 +1365,11 @@ export interface CrossHostSynthesizerPromptInput {
   }[]>
   existingSteps?: readonly { id: string; title: string; status: string; origins?: readonly string[] }[]
   availableSkills?: readonly { name: string; title: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }
 
 export function crossHostSynthesizerPrompt(input: CrossHostSynthesizerPromptInput): string {
@@ -1141,6 +1413,13 @@ export function crossHostSynthesizerPrompt(input: CrossHostSynthesizerPromptInpu
     factsByOrigin,
     existingSteps: input.existingSteps ?? [],
     availableSkills: input.availableSkills ?? listSkills().map(s => ({ name: s.name, title: s.title })),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed: input.alreadyConfirmed,
+      unconfirmedHardSurface: input.unconfirmedHardSurface,
+      detLeads: input.detLeads,
+      detLeadLimit: input.detLeadLimit,
+      assignmentBrief: input.assignmentBrief,
+    }),
   })
 }
 
@@ -1189,6 +1468,11 @@ export function chainPlannerPrompt(input: {
   operatorHints?: readonly string[]
   budgetRemaining?: { usd: number; requests: number | 'unlimited' }
   availableSkills?: readonly { name: string; title: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }): string {
   const hostTiers: Record<string, HostTier> = {}
   for (const origin of input.approvedOrigins) {
@@ -1198,11 +1482,31 @@ export function chainPlannerPrompt(input: {
   const openProofGaps = input.openProofGaps ?? (input.coverageEntries ?? [])
     .filter(e => e.status === 'needs_follow_up')
     .map(e => ({ origin: e.origin, category: e.category, summary: e.summary, proofGapReason: e.proofGapReason ?? null }))
+  const {
+    alreadyConfirmed,
+    unconfirmedHardSurface,
+    detLeads,
+    detLeadLimit,
+    assignmentBrief,
+    ...plannerInput
+  } = input
+  // Reuse the planner's own uncovered-endpoint rollup as the Unconfirmed Hard Surface block:
+  // high-risk or under-covered routes are exactly what the next steps should target.
+  const derivedHardSurface: readonly UnconfirmedSurfaceRef[] = unconfirmedHardSurface ?? (input.uncoveredEndpoints ?? [])
+    .filter(endpoint => endpoint.riskScore >= 60 || endpoint.coveragePct < 100)
+    .sort((a, b) => (b.riskScore - a.riskScore) || (a.pathTemplate < b.pathTemplate ? -1 : a.pathTemplate > b.pathTemplate ? 1 : 0))
+    .slice(0, 8)
+    .map(endpoint => ({
+      method: endpoint.method,
+      path: endpoint.pathTemplate,
+      ...(endpoint.testedClasses.length ? {} : { category: 'untested' }),
+      reason: `risk ${endpoint.riskScore}; coverage ${endpoint.coveragePct}%`,
+    }))
   return JSON.stringify({
     task: 'stateless chain planner update (80/20 crown-jewel prioritization + 3-state closure review)',
     openProofGaps,
     coverageEntries: input.coverageEntries ?? [],
-    ...input,
+    ...plannerInput,
     hostTiers,
     uncoveredEndpoints: input.uncoveredEndpoints ?? [],
     budgetAllocationPolicy: {
@@ -1213,6 +1517,13 @@ export function chainPlannerPrompt(input: {
     codeAuditSuspects: input.codeAuditSuspects ?? [],
     mountedRepos: input.mountedRepos ?? [],
     availableSkills: input.availableSkills ?? listSkills().map(s => ({ name: s.name, title: s.title })),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed,
+      unconfirmedHardSurface: derivedHardSurface,
+      detLeads,
+      detLeadLimit,
+      assignmentBrief,
+    }),
   })
 }
 
@@ -1339,10 +1650,20 @@ export function workerInvestigationPrompt(input: {
   mountedRepos?: readonly string[]
   availableSkills?: readonly string[]
   preInjectedSkills?: readonly { name: string; title: string; summary: string; tags: readonly string[]; excerpt: string }[]
+  alreadyConfirmed?: readonly AlreadyConfirmedRef[]
+  unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
+  detLeads?: readonly DetLeadSummary[]
+  detLeadLimit?: number
+  assignmentBrief?: string
 }): string {
   const specialistConfig = input.step.specialistProfile
     ? SPECIALIST_PROFILES[input.step.specialistProfile]
     : undefined
+  const detLeads = input.detLeads ?? detLeadsFromParentFacts(input.parentFacts)
+  const alreadyConfirmed = input.alreadyConfirmed ?? confirmedRefsFromParentFacts(input.parentFacts)
+  // Slim the skill catalog: a specialist only needs its own matching playbooks. The 41-skill
+  // catalog dump was pure schema/token cost on every turn.
+  const matchingSkills = specialistConfig ? [...new Set(specialistConfig.skills)] : undefined
   return JSON.stringify({
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
@@ -1352,6 +1673,7 @@ export function workerInvestigationPrompt(input: {
     capabilityTier: input.capabilityTier,
     maxTurns: input.maxTurns,
     settlementStartsAtTurn: Math.max(1, Math.floor(input.maxTurns * 0.85)),
+    settlementNudgeAtTurn: settlementNudgeTurnFor(input.maxTurns),
     personas: input.personas ?? [],
     bolaTestQueue: input.bolaTestQueue ?? [],
     parentFacts: input.parentFacts ?? [],
@@ -1366,7 +1688,14 @@ export function workerInvestigationPrompt(input: {
       tags: [...s.tags],
       excerpt: s.excerpt,
     })),
-    availableSkills: input.availableSkills ?? listSkills().map(s => s.name),
+    availableSkills: input.availableSkills ?? matchingSkills ?? listSkills().map(s => s.name),
+    agenticContext: buildAgenticPromptContext({
+      alreadyConfirmed,
+      unconfirmedHardSurface: input.unconfirmedHardSurface,
+      detLeads,
+      detLeadLimit: input.detLeadLimit,
+      assignmentBrief: input.assignmentBrief,
+    }),
   })
 }
 
@@ -1600,17 +1929,6 @@ function buildWorkerTools(
       execute: (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
         return wrapExec('request_http', () => fn(normalizeHttpArgs(args), signal), signal)
-      },
-    }))
-    tools.push(defineTool({
-      name: 'http_request',
-      description: 'Alias for request_http: send a scoped HTTP request through Guardian’s RequestBroker.',
-      parameters: httpRequestSchema,
-      replay: 'unsafe',
-      outputLimits,
-      execute: (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('http_request', () => fn(normalizeHttpArgs(args), signal), signal)
       },
     }))
   }
@@ -2606,6 +2924,8 @@ export interface RunAgentSessionOptions {
   enableSettlement?: boolean
   /** Optional external settlement trigger (e.g., 85% wall-clock or request budget reached). */
   shouldSettle?: () => boolean
+  /** Optional wall-clock budget for the session; settlement starts at 85% of it. */
+  wallClockMs?: number
   /** Require complete_intent before finishing (with up to 2 empty-turn nudges; default: true when complete_intent handler is present). */
   requireCompleteIntent?: boolean
   handlers?: WorkerToolHandlers
@@ -2696,6 +3016,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const enableSettlement = options.enableSettlement ?? Boolean(handlers.complete_intent && maxTurns >= 4)
   const requireCompleteIntent = options.requireCompleteIntent ?? Boolean(handlers.complete_intent)
   const settlementTurn = Math.max(1, Math.floor(maxTurns * 0.85))
+  const settlementNudgeTurn = settlementNudgeTurnFor(maxTurns)
+  const wallClockDeadline = options.wallClockMs && options.wallClockMs > 0
+    ? Date.now() + Math.floor(options.wallClockMs)
+    : undefined
 
   let turnsUsed = 0
   let nudgesUsed = 0
@@ -2705,7 +3029,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const isSettling = () => {
     if (!enableSettlement) return false
     if (settled) return true
-    if (turnsUsed >= settlementTurn || options.shouldSettle?.()) {
+    if (turnsUsed >= settlementTurn || options.shouldSettle?.() || (wallClockDeadline !== undefined && Date.now() >= wallClockDeadline)) {
       settled = true
       return true
     }
@@ -2728,13 +3052,20 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         const extraMessages = (turnStart?.messages ?? []).map(content => ({
           role: 'user' as const, content, timestamp: Date.now(),
         }))
-        if (isSettling()) {
+        const settlingNow = isSettling()
+        if (settlingNow) {
           const settlementBanner = [
             `[GUARDIAN SETTLEMENT NOTICE — Turn ${turnsUsed}/${maxTurns}]`,
             'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked.',
             'Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding, and (4) call complete_intent with your final status and summary.',
           ].join(' ')
           extraMessages.push({ role: 'user' as const, content: settlementBanner, timestamp: Date.now() })
+        } else if (handlers.complete_intent && turnsUsed + 1 === settlementNudgeTurn) {
+          const nudge = [
+            `[GUARDIAN SETTLEMENT NUDGE — Turn ${turnsUsed + 1}/${maxTurns}]`,
+            `Hard settlement starts at turn ${settlementNudgeTurn} (N-2). Submit your best proof now via propose_chain_finding/update_proposed_finding, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
+          ].join(' ')
+          extraMessages.push({ role: 'user' as const, content: nudge, timestamp: Date.now() })
         }
         if (!extraMessages.length) return undefined
         return {
