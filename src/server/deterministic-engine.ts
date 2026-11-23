@@ -266,7 +266,34 @@ export function endpointRiskScore(endpoint: EngineEndpoint): number {
   return score
 }
 
-/** Risk-rank the surface: static assets/soft baselines sink, injectable/id-bearing routes rise. */
+/** Collapse `<collection>/:id`, `<collection>/{id}` and renamed-placeholder variants of one route. */
+export function collapseRouteVariants(endpoints: readonly EngineEndpoint[]): EngineEndpoint[] {
+  const shapeOf = (pathTemplate: string): string => (pathTemplate.split('?')[0] || '/')
+    .replace(/\/(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])/g, '/:id')
+  const byShape = new Map<string, EngineEndpoint>()
+  for (const endpoint of endpoints) {
+    const key = `${endpoint.origin}|${endpoint.method.toUpperCase()}|${shapeOf(endpoint.pathTemplate)}`
+    const prior = byShape.get(key)
+    if (!prior) {
+      byShape.set(key, endpoint)
+      continue
+    }
+    const preferCurrent = endpoint.params.length > prior.params.length ||
+      (endpoint.params.length === prior.params.length && (endpoint.riskScore ?? 0) > (prior.riskScore ?? 0))
+    const keep = preferCurrent ? endpoint : prior
+    const other = preferCurrent ? prior : endpoint
+    const mergedParams = [...keep.params]
+    for (const param of other.params) {
+      if (!mergedParams.some(existing => existing.name === param.name && existing.location === param.location)) {
+        mergedParams.push(param)
+      }
+    }
+    byShape.set(key, { ...keep, params: mergedParams })
+  }
+  return [...byShape.values()]
+}
+
+/** Rank-risk the surface: static assets/soft baselines sink, injectable/id-bearing routes rise. */
 export function rankEndpoints(endpoints: readonly EngineEndpoint[]): EngineEndpoint[] {
   return endpoints
     .map(endpoint => ({ endpoint, score: endpointRiskScore(endpoint) }))
@@ -310,7 +337,7 @@ export function urlParamNames(path: string): string[] {
 }
 
 export function redirectParamNames(path: string): string[] {
-  if (/(?:sso|oauth|authorize|openid|login)/i.test(path)) return ['next', 'returnTo', 'returnUrl', 'redirect']
+  if (/(?:sso|oauth|authorize|openid|login)/i.test(path)) return ['next', 'returnTo', 'returnUrl', 'redirect', 'redirect_uri']
   if (/(?:checkout|return)/i.test(path)) return ['next', 'returnUrl', 'returnTo', 'redirect']
   if (/(?:download|export)/i.test(path)) return ['url', 'next', 'returnTo', 'redirect']
   return ['url', 'next', 'redirect', 'returnTo']
@@ -378,6 +405,8 @@ export interface EnumerateOptions {
   tier: number
   personas: readonly EnginePersona[]
   maxHypotheses?: number
+  /** Request budget the probe loop may spend; used to size class quotas fairly. */
+  maxRequests?: number
   classes?: ReadonlySet<string>
 }
 
@@ -697,7 +726,7 @@ export function enumerateHypotheses(
           location: 'query',
           ownerPersona: picks.owner?.handle,
           baselineValue: observed,
-          risk: endpointRiskScore(endpoint) + 10,
+          risk: endpointRiskScore(endpoint) + (/(?:^|\/)(?:download|downloads|file|files|export|exports)(?:\/|$)/i.test(bare) ? 44 : pathHasFileHint(bare) ? 26 : 12) + (/^(?:filepath|path|document|file|name)$/i.test(param.name) ? 8 : 0),
         })
       }
     }
@@ -855,7 +884,7 @@ export function enumerateHypotheses(
     // --- Open redirect ----------------------------------------------------------------------
     // URL/redirect-shaped declared or observed parameter, independent of the route noun.
     const redirectShapedParams = inferred.filter(p => p.location === 'query' &&
-      /^(?:next|url|uri|redirect|redirect_uri|redirecturl|return|returnurl|returnto|return_to|callback|callbackurl|dest|destination|target|continue|continueurl)$/i.test(p.name))
+      /^(?:next|redirect|redirect_uri|redirecturl|return|returnurl|returnto|return_to|dest|destination|continue|continueurl)$/i.test(p.name))
     if (method === 'GET' && (pathHasRedirectHint(bare) || redirectShapedParams.length > 0)) {
       const candidates = new Set(redirectParamNames(bare))
       const declared = inferred.filter(p => p.location === 'query' && (candidates.has(p.name) || /^(?:next|url|uri|redirect|return\w*|callback\w*|dest|target|continue)$/i.test(p.name)))
@@ -873,7 +902,7 @@ export function enumerateHypotheses(
           param,
           location: 'query',
           ownerPersona: picks.owner?.handle,
-          risk: endpointRiskScore(endpoint) + 8,
+          risk: endpointRiskScore(endpoint) + (pathHasRedirectHint(bare) ? 26 : 10),
         })
       }
     }
@@ -882,12 +911,17 @@ export function enumerateHypotheses(
     // Any string query parameter the target actually reads is a reflection candidate; the probe
     // itself is the benign canary, so a parameter that is not reflected simply costs one request.
     const xssCandidates = inferred.filter(p => p.location === 'query' &&
-      (pathHasSearchHint(bare) || activeQuery.has(p.name) || isTextualParam(p.name)))
+      (pathHasSearchHint(bare) || activeQuery.has(p.name) ||
+        (isTextualParam(p.name) && (observedValues[p.name]?.length ?? 0) > 0)))
     if (method === 'GET' && xssCandidates.length > 0) {
-      const ordered = [...xssCandidates].sort((a, b) =>
-        Number(activeQuery.has(b.name)) - Number(activeQuery.has(a.name)) ||
-        Number(/^(?:q|query|term|keyword|search|s)$/i.test(b.name)) - Number(/^(?:q|query|term|keyword|search|s)$/i.test(a.name)))
-      for (const param of ordered.slice(0, 1)) {
+      const rank = (name: string): number => {
+        if (activeQuery.has(name)) return 0
+        if (/^(?:q|query|search)$/i.test(name)) return 1
+        if (/^(?:term|keyword|s)$/i.test(name)) return 2
+        return 3
+      }
+      const ordered = [...xssCandidates].sort((a, b) => rank(a.name) - rank(b.name))
+      for (const param of ordered.slice(0, pathHasSearchHint(bare) ? 3 : 1)) {
         add({
           key: `xss_context|${endpoint.id}|${param.name}`,
           endpoint,
@@ -898,7 +932,7 @@ export function enumerateHypotheses(
           param,
           location: 'query',
           ownerPersona: picks.owner?.handle,
-          risk: endpointRiskScore(endpoint) + 6,
+          risk: endpointRiskScore(endpoint) + (pathHasSearchHint(bare) || activeQuery.has(param.name) ? 30 : 8) + (pathHasSearchHint(bare) && !hasIdPath ? 12 : 0),
         })
       }
     }
@@ -956,7 +990,7 @@ export function enumerateHypotheses(
     // A read that the target itself publishes credential-shaped values from is scanned with a
     // non-entitled viewer actor; the anonymous denial in the same matrix is the control. The
     // selection is response-evidence driven (secret fingerprints) or a credential-surface route.
-    const credentialSurface = /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?|audit|auditlog|config|settings|credentials?|secrets?|exports?)(?:\/|$)/i.test(bare)
+    const credentialSurface = /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?|audit|auditlog|activity|logs?|config|settings|credentials?|secrets?|exports?)(?:\/|$)/i.test(bare)
     const secretEvidence = (observedEvidence.sensitiveFields?.length ?? 0) > 0 ||
       (observedEvidence.headerNames ?? []).some(name => /^(?:set-cookie|authorization|x-api-key)$/i.test(name))
     if (method === 'GET' && (credentialSurface || secretEvidence)) {
@@ -973,7 +1007,7 @@ export function enumerateHypotheses(
         ...((picks.lower?.handle ?? picks.crossTenant?.handle)
           ? { viewerPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
           : {}),
-        risk: endpointRiskScore(endpoint) + 30,
+        risk: endpointRiskScore(endpoint) + (credentialSurface ? 34 : 18),
       })
     }
 
@@ -1027,6 +1061,70 @@ export function enumerateHypotheses(
         graphqlSeedsByRoot,
         jsonBody: {},
         risk: endpointRiskScore(endpoint) + 25,
+      })
+    }
+
+    // --- Auth-protocol / JWT ----------------------------------------------------------------
+    // Evidence: the target returned 3-segment base64url values (or a session/token surface whose
+    // response carries them). The probe mutates the persona's own token; when the persona session
+    // is not a JWT, the broker refuses the mutation, so this cannot manufacture a finding.
+    const identityClaims: Record<string, string> = {}
+    for (const field of ['email', 'mail', 'sub', 'userId', 'id', 'tenant', 'org', 'store', 'workspace', 'team', 'role']) {
+      const value = observedValues[field]?.[0]
+      if (value && value.length <= 120) identityClaims[field] = value
+    }
+    const jwtEvidence = options.tier >= 2 && method === 'GET' && picks.owner &&
+      ((observedEvidence.jwtValues?.length ?? 0) > 0 || credentialSurface)
+    if (jwtEvidence) {
+      add({
+        key: `auth_protocol|${endpoint.id}`,
+        endpoint,
+        probeClass: 'auth_protocol_audit',
+        intent: 'auth_protocol',
+        method: 'GET',
+        pathAndQuery: resolvedPath,
+        ownerPersona: picks.owner?.handle,
+        tokenFields: Object.keys(observedValues).filter(field => /(?:token|jwt|auth|credential)/i.test(field)).slice(0, 3),
+        ...(Object.keys(identityClaims).length > 0 ? { identityClaims } : {}),
+        risk: endpointRiskScore(endpoint) + 18 +
+          ((observedEvidence.jwtValues?.length ?? 0) > 0 ? 40 : 0) +
+          (/(?:^|\/)(?:session|tokens?|auth|whoami|me)(?:\/|$)/i.test(bare) ? 16 : 0),
+      })
+    }
+
+    // --- Webhook signature bypass -----------------------------------------------------------
+    // Evidence: a mutating route that declares a signature/HMAC header, or a receiver-shaped write
+    // route with a readable detail/collection sibling. Delivery bodies are built from observed
+    // fields; the probe itself requires an accepted unsigned delivery plus a read-back/ack.
+    const signatureHeader = inferred.find(p => p.location === 'header' && /signature|hmac|^x-.*sig/i.test(p.name))?.name
+    const receiverShaped = method === 'POST' && !hasIdPath && !graphqlShaped && !pathHasUrlHint(bare) &&
+      (Boolean(signatureHeader) || /(?:webhook|hooks?|receive|deliver|callback|events?)/i.test(bare))
+    if (receiverShaped && picks.owner) {
+      const delivery: Record<string, unknown> = {}
+      for (const field of observedFields.slice(0, 8)) delivery[field] = semanticValue(field, observedValues[field]?.[0])
+      if (Object.keys(delivery).length === 0) {
+        delivery.event = 'guardian.verification'
+        delivery.type = 'guardian.verification'
+      }
+      const detail = endpoints.find(candidate => {
+        const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+        return candidate.origin === endpoint.origin && candidate.method.toUpperCase() === 'GET' &&
+          candidatePath.startsWith(`${bare}/`) && hasDynamicIdSegment(candidatePath)
+      })
+      const stateField = observedFields.find(field => /^(?:status|state|processed|received|ok|count|total|events?)$/i.test(field))
+      add({
+        key: `webhook_signature_bypass|${endpoint.id}`,
+        endpoint,
+        probeClass: 'webhook_signature_bypass',
+        intent: 'webhook',
+        method: 'POST',
+        pathAndQuery: resolvedPath,
+        ownerPersona: picks.owner?.handle,
+        webhookBody: delivery,
+        ...(signatureHeader ? { webhookHeader: signatureHeader } : {}),
+        ...(detail ? { readPath: (detail.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`) } : {}),
+        ...(stateField ? { stateField } : {}),
+        risk: endpointRiskScore(endpoint) + 16 + (/(?:webhook|hooks?|receive|deliver|callback)(?:\/|$)/i.test(bare) ? 34 : 0),
       })
     }
 
@@ -1118,12 +1216,22 @@ export function enumerateHypotheses(
   }
   // Quota selection, not a pure global slice: late classes (SQLi in particular) must not be
   // starved when a richer surface forms more authz/xxe/ssrf hypotheses than the cap.
-  const quotas: Record<string, number> = {
-    authz: 52, secret_disclosure: 4, graphql: 2, xxe: 6, ssrf: 8, traversal: 6, redirect: 6,
-    xss: 5, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
-    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 14,
+  const baseQuotas: Record<string, number> = {
+    // Quotas reserve breadth: an authz-heavy surface must not starve the other classes when the
+    // global hypothesis cap is reached.
+    authz: 26, secret_disclosure: 5, graphql: 2, xxe: 5, ssrf: 7, traversal: 6, redirect: 6,
+    xss: 6, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
+    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 10,
   }
-  const max = options.maxHypotheses ?? defaultEngineMaxHypotheses
+  const baseMax = options.maxHypotheses ?? defaultEngineMaxHypotheses
+  // A probe costs ~11 requests (control/probe variants + read-back). Spend the request budget
+  // instead of starving late classes behind a fixed hypothesis count.
+  const slots = Math.min(150, Math.max(baseMax, Math.floor((options.maxRequests ?? defaultEngineMaxRequests) / 11)))
+  const scale = Math.max(1, slots / baseMax)
+  const quotas: Record<string, number> = Object.fromEntries(
+    Object.entries(baseQuotas).map(([intent, quota]) => [intent, Math.max(quota, Math.ceil(quota * scale))]),
+  )
+  const max = slots
   const used: Record<string, number> = {}
   const selected: EngineHypothesis[] = []
   for (const hyp of [...all.values()].sort((a, b) =>
@@ -1577,6 +1685,21 @@ function buildProbeRequest(
         candidateFields: hyp.candidateFields ?? [],
         jsonBody: hyp.jsonBody ?? {},
       }
+    case 'auth_protocol_audit':
+      return {
+        ...base,
+        ...(hyp.tokenFields?.length ? { tokenFields: hyp.tokenFields } : {}),
+        ...(hyp.identityClaims ? { identityClaims: hyp.identityClaims } : {}),
+      }
+    case 'webhook_signature_bypass':
+      return {
+        ...base,
+        method: 'POST',
+        webhookBody: hyp.webhookBody ?? {},
+        ...(hyp.webhookHeader ? { webhookHeader: hyp.webhookHeader } : {}),
+        ...(hyp.readPath ? { readPath: hyp.readPath } : {}),
+        ...(hyp.stateField ? { readStateField: hyp.stateField } : {}),
+      }
     default:
       return base
   }
@@ -1906,7 +2029,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   if (!conventionalWordlist && candidateEndpoints.length !== input.endpoints.length) {
     report.notes.push(`conventional wordlist OFF: ${input.endpoints.length - candidateEndpoints.length} wordlist-only endpoint(s) excluded`)
   }
-  const ranked = rankEndpoints(candidateEndpoints).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
+  const ranked = rankEndpoints(collapseRouteVariants(candidateEndpoints)).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
   report.endpointsConsidered = ranked.length
   if (ranked.length === 0) {
     report.durationMs = Date.now() - started
@@ -1938,6 +2061,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     tier: input.tier,
     personas: input.personas,
     maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
+    maxRequests,
     ...(input.classes ? { classes: input.classes } : {}),
   })
   report.hypothesesFormed = hypotheses.length
@@ -1946,21 +2070,26 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   for (const hyp of hypotheses) classStats(report, hyp.intent).hypotheses += 1
 
   const perProbeRequestFloor = 6
+  const probeSlots = Math.min(150, Math.max(defaultEngineMaxHypotheses, Math.floor(maxRequests / 11)))
+  const capScale = Math.max(1, probeSlots / defaultEngineMaxHypotheses)
+  const cap = (value: number): number => Math.max(value, Math.ceil(value * capScale))
   const intentCaps: Record<string, number> = {
-    authz: 52,
-    secret_disclosure: 4,
-    sqli: 14,
-    traversal: 6,
-    ssrf: 8,
-    xxe: 4,
-    redirect: 6,
-    xss: 5,
-    graphql: 2,
-    mass_assignment: 6,
-    csrf: 4,
-    workflow: 3,
-    ssti: 3,
-    command_injection: 3,
+    authz: cap(26),
+    secret_disclosure: cap(5),
+    sqli: cap(10),
+    traversal: cap(6),
+    ssrf: cap(6),
+    xxe: cap(4),
+    redirect: cap(6),
+    xss: cap(6),
+    graphql: cap(2),
+    mass_assignment: cap(6),
+    csrf: cap(4),
+    workflow: cap(3),
+    ssti: cap(3),
+    command_injection: cap(3),
+    webhook: cap(2),
+    auth_protocol: cap(2),
   }
   const intentUsed: Record<string, number> = {}
   for (const hyp of hypotheses) {
