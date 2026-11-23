@@ -2682,6 +2682,22 @@ export const ENDPOINT_PAGE_SIZE = 1000
 export type EndpointListFilter = NonNullable<Parameters<Store['listEndpoints']>[1]>
 
 /**
+ * One discovery phase's paged endpoint read. `considered` counts every stored row the phase saw,
+ * `used` counts the rows that became planning input for that phase, and `truncated` is always false:
+ * the read pages until a short page proves completeness, so no phase can be silently capped at the
+ * store's default 500-row page.
+ */
+export type PagedReadMetric = {
+  phase: string
+  origin: string
+  considered: number
+  used: number
+  truncated: boolean
+  reads: number
+  pages: number
+}
+
+/**
  * Read every endpoint matching `filter` through the store's stable (risk, coverage, id) ordering.
  * Pages until a short page proves the read is complete, so no fixed page cap can truncate a caller.
  */
@@ -2878,6 +2894,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   const techFingerprint = new Set<string>()
   const dynamicPaths = new Set<string>()
   const dynamicParams = new Set<string>()
+  // Per-phase paged-read metrics for the discovery planning reads (nav, GraphQL, sibling derivation).
+  const readPagedMetrics: PagedReadMetric[] = []
 
   const normalizedOrigins: string[] = []
   for (const raw of params.origins) {
@@ -3126,6 +3144,24 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     let originHalted = false
     let personaRejected = false
     let softCalibration: SoftNotFoundCalibration | null = null
+
+    // Surface-planning reads (nav targets, GraphQL, sibling derivation, dependency inference) must
+    // see the whole stored surface. `storage.listEndpoints(runId, { origin })` pages at 500 rows by
+    // default and silently truncates large apps, so every planning read goes through
+    // `listEndpointsPaged` and contributes a `phase0.read_paged` metric for its phase.
+    const readPaged = (phase: string, countUsed?: (rows: EndpointRow[]) => number): EndpointRow[] => {
+      const rows = listEndpointsPaged(storage, runId, { origin })
+      let metric = readPagedMetrics.find(entry => entry.phase === phase && entry.origin === origin)
+      if (!metric) {
+        metric = { phase, origin, considered: 0, used: 0, truncated: false, reads: 0, pages: 0 }
+        readPagedMetrics.push(metric)
+      }
+      metric.considered += rows.length
+      metric.used += countUsed ? countUsed(rows) : rows.length
+      metric.reads += 1
+      metric.pages += Math.max(1, Math.ceil(rows.length / ENDPOINT_PAGE_SIZE))
+      return rows
+    }
 
     const personaForOrigin = (handle: string | undefined): string | undefined => {
       if (!handle || personaRejected) return undefined
@@ -3747,7 +3783,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (!/^\/(?:api|rest|graphql|trpc|v\d+)(?:\/|$)/i.test(bare)) return
         if (templateApiPaths.size < 6) templateApiPaths.add(bare)
       }
-      for (const ep of storage.listEndpoints(runId, { origin })) considerApiPath(ep.pathTemplate)
+      for (const ep of readPaged('template_api_paths')) considerApiPath(ep.pathTemplate)
       for (const p of discoveredCandidatePaths) considerApiPath(p)
       let stagedTemplateExchanges = 0
       try {
@@ -3836,7 +3872,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // Strictly within perOriginCap; template routes are probed later with concrete ids.
     const siblingSeen = new Set<string>()
     const detailMethodsSeen = new Set<string>()
-    for (const ep of storage.listEndpoints(runId, { origin })) {
+    for (const ep of readPaged('detail_methods')) {
       const template = ep.pathTemplate.split('?')[0] || '/'
       const detailBase = /^(.+)\/(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.exec(template)?.[1]
       if (detailBase) detailMethodsSeen.add(`${detailBase}|${ep.method.toUpperCase()}`)
@@ -4016,7 +4052,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // per-origin capped; only JSON/API responses become endpoints (SPA shell HTML is not recorded).
     const navVisited = new Set<string>()
     const navQueue = navSeeds.slice(0, 32)
-    const navGetTemplates = [...new Set(storage.listEndpoints(runId, { origin })
+    const navGetTemplates = [...new Set(readPaged('nav_targets',
+      rows => rows.filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2).length)
       .filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2)
       .map(ep => ep.pathTemplate))]
     const navCap = Math.min(28, Math.max(0, perOriginCap + navOverflow - originUsed))
@@ -4029,18 +4066,22 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const priority = (name: string): number =>
         /(url|uri|link|callback|redirect|endpoint|token|role|plan|price|amount|name|query|filter|template)/i.test(name) ? 0 : 1
       const ranked = [...fields].sort((a, b) => priority(a) - priority(b))
-      const paramsByEndpoint = new Map<string, number>()
-      for (const row of storage.listEndpointParams(runId)) {
-        paramsByEndpoint.set(row.endpointId, (paramsByEndpoint.get(row.endpointId) ?? 0) + 1)
-      }
-      const targets = storage.listEndpoints(runId, { origin }).filter(ep =>
+      // Paged surface read: a write target may sit far past the store's default 500-row page on a
+      // large app, so read the whole origin surface and filter to the collection's write methods.
+      const targets = readPaged('observed_fields', rows => rows.filter(ep =>
         ['POST', 'PUT', 'PATCH'].includes(ep.method)
-        && (ep.pathTemplate === baseTemplate || ep.pathTemplate.startsWith(`${baseTemplate}/`))
-        && (paramsByEndpoint.get(ep.id) ?? 0) === 0)
-      for (const target of targets.slice(0, 4)) {
-        if (observedFieldAttachments >= 12) break
+        && (ep.pathTemplate === baseTemplate || ep.pathTemplate.startsWith(`${baseTemplate}/`))).length)
+        .filter(ep =>
+          ['POST', 'PUT', 'PATCH'].includes(ep.method)
+          && (ep.pathTemplate === baseTemplate || ep.pathTemplate.startsWith(`${baseTemplate}/`)))
+      let attached = 0
+      for (const target of targets.slice(0, 24)) {
+        if (observedFieldAttachments >= 12 || attached >= 4) break
+        // Per-endpoint param lookup keeps the full-scan cost off the navigation hot path.
+        if (storage.listEndpointParams(runId, target.id).length > 0) continue
         recordParams(target.id, ranked.slice(0, 4).map(name => ({ name, location: 'json' as const })), 'openapi')
         observedFieldAttachments += 1
+        attached += 1
       }
     }
     for (let navIndex = 0; navIndex < navQueue.length && navigationRequests < navCap; navIndex += 1) {
@@ -4141,7 +4182,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // schema in a parse-error response. Send a benign probe document and learn the expected element.
     const xmlish = /(?:xml|soap|wsdl|saml|rss|atom|svg|import|upload|feed|sitemap)/i
     if (!originHalted && !signal.aborted && grant.canRead(origin)) {
-      const known = storage.listEndpoints(runId, { origin })
+      const known = readPaged('xml_surface', rows =>
+        rows.filter(e => xmlish.test(e.pathTemplate) && !/\{|\/:|\[/.test(e.pathTemplate)).length)
       const xmlCandidates = [...new Set(known.map(e => e.pathTemplate))]
         .filter(p => xmlish.test(p) && !/\{|\/:|\[/.test(p))
         .slice(0, 3)
@@ -4177,7 +4219,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2d-ter. GraphQL argument discovery from live introspection so variable-level injection probes
     // can be formed for root fields that accept user arguments.
     if (!originHalted && !signal.aborted && grant.canRead(origin) && originUsed < perOriginCap - 1) {
-      const gqlEps = storage.listEndpoints(runId, { origin }).filter(e => /graphql/i.test(e.pathTemplate))
+      // Paged read: a GraphQL root can be recorded far past the default 500-row page, and the
+      // introspection argument pass must still find it.
+      const gqlEps = readPaged('graphql_args', rows => rows.filter(e => /graphql/i.test(e.pathTemplate)).length)
+        .filter(e => /graphql/i.test(e.pathTemplate))
       if (gqlEps.length > 0) {
         const gqlPath = (gqlEps.find(e => e.method === 'POST') ?? gqlEps[0]).pathTemplate
         const introEx = await safeGet(gqlPath, {
@@ -4299,7 +4344,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
     // 2f. Infer producer-consumer api_dependencies edges from discovered collection -> item endpoints
     try {
-      const originEndpoints = storage.listEndpoints(runId, { origin })
+      const originEndpoints = readPaged('api_dependencies')
       const byBase = new Map<string, typeof originEndpoints>()
       for (const ep of originEndpoints) {
         const clean = ep.pathTemplate.replace(/\/+$/, '') || '/'
@@ -4343,6 +4388,12 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     // 2g. Persona-union visibility: persist `visibleToPersonas` on discovered endpoints and surface
     // admin/privileged routes immediately instead of waiting for a later probe pass.
+    // One paged snapshot instead of a full-store read per visibility key.
+    const endpointsByRouteKey = new Map<string, EndpointRow>()
+    for (const ep of readPaged('persona_visibility')) {
+      const routeKey = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
+      if (!endpointsByRouteKey.has(routeKey)) endpointsByRouteKey.set(routeKey, ep)
+    }
     for (const [key, set] of phase0Visibility) {
       const spaceAt = key.indexOf(' ')
       const method = key.slice(0, spaceAt)
@@ -4361,8 +4412,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         privilegedSurface.push({ method, pathTemplate, personas, reason: reasons.join('+') })
       }
       try {
-        const existing = storage.listEndpoints(runId, { origin })
-          .find(ep => ep.method === method && ep.pathTemplate === pathTemplate)
+        const existing = endpointsByRouteKey.get(entryKey)
         if (existing) {
           storage.upsertEndpoint({
             runId,
@@ -4376,6 +4426,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       } catch { /* visibility tagging is best-effort */ }
     }
+  }
+
+  // Paged-read accounting: every phase reads to completion, so `truncated` is always false. A
+  // non-zero `used` shortfall is a planning filter, never a dropped page.
+  for (const metric of readPagedMetrics) {
+    storage.event(runId, 'phase0.read_paged',
+      `Phase-0 ${metric.phase} read ${metric.considered} endpoint row(s) across ${metric.pages} page(s); ${metric.used} used.`,
+      metric)
   }
 
   const visibleToPersonas: Record<string, string[]> = {}
@@ -4398,6 +4456,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     authRequests,
     soft404Rejected,
     stoppedReason,
+    readPaged: readPagedMetrics,
   })
   storage.updateRunPhase0Completed(runId, Date.now())
 
