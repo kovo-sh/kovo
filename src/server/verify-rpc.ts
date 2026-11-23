@@ -37,6 +37,7 @@ import { structuralDiff, intersectStructuralDeltas } from './verify-support.ts'
 import {
   assessBoundary,
   assessImpactEvidence,
+  assessMarkupImpact,
   assessMfaBypass,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
@@ -508,7 +509,7 @@ function isClaim(value: unknown): value is VerifyClaim {
       return Array.isArray(rec.exchangeIds) && rec.exchangeIds.length >= 2 &&
         rec.exchangeIds.every(v => typeof v === 'string')
     case 'impact': {
-      const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf'])
+      const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf', 'business_logic', 'markup', 'disclosure'])
       return typeof rec.probeExchangeId === 'string' &&
         typeof rec.impactClass === 'string' && knownClasses.has(rec.impactClass) &&
         (rec.controlExchangeIds === undefined || (Array.isArray(rec.controlExchangeIds) && rec.controlExchangeIds.every(v => typeof v === 'string'))) &&
@@ -982,6 +983,32 @@ function evaluateImpactClaim(
     detail: assessment.reason,
     ...(assessment.evidence ? { observed: assessment.evidence } : {}),
   }
+}
+
+/** Active-markup evidence over the exchanges a proof already asserts (never a bare tag). */
+function implicitMarkupEvidence(
+  store: TranscriptStore,
+  claims: readonly VerifyClaim[],
+  context: VerifyClaimContext,
+): { satisfied: boolean; reason: string } {
+  const steps: ImpactStep[] = []
+  for (const id of claimedExchangeIds(claims)) {
+    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
+    const record = store.get(id)
+    if (!record) continue
+    const body = store.body(id) ?? ''
+    steps.push({
+      id,
+      arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
+      method: (record.request?.method ?? 'GET').toUpperCase(),
+      route: (record.request?.pathAndQuery ?? '/').split('?')[0],
+      status: record.response?.status ?? null,
+      actor: { handle: record.request?.personaHandle ?? null, role: normalizeRole(record.request?.personaHandle ?? null), tenant: null, auth: 'unknown', sameSite: null },
+      body,
+    })
+  }
+  const assessment = assessMarkupImpact({ impactClass: 'markup', steps, oracleEvents: [] })
+  return { satisfied: assessment.satisfied, reason: assessment.reason }
 }
 
 /** Claims that reference a recorded exchange id (used for implicit read-disclosure checks). */
@@ -1463,15 +1490,21 @@ export function evaluateClaims(
   const boundaryClaimPassed = checks.some(check => check.passed && check.claim.kind === 'boundary')
   const impactBacked = checks.some(check =>
     check.passed && check.claim.kind === 'impact' &&
-    (check.claim.impactClass === claimed || (claimed === 'bfla' && check.claim.impactClass === 'authorization')))
+    (check.claim.impactClass === claimed ||
+      ((claimed === 'bfla' || claimed === 'disclosure') && check.claim.impactClass === 'authorization')))
   if (claimed && claimed !== 'other' && !impactBacked) {
-    if (claimed === 'authorization') {
+    if (claimed === 'authorization' || claimed === 'disclosure') {
       const disclosure = implicitReadDisclosure(store, claims, context)
       if (!disclosure.satisfied && !boundaryClaimPassed) {
-        failures.push(`impact: authorization claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
+        failures.push(`impact: ${claimed} claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
+      }
+    } else if (claimed === 'markup') {
+      const markup = implicitMarkupEvidence(store, claims, context)
+      if (!markup.satisfied) {
+        failures.push(`impact: markup claim dismissed — ${markup.reason}`)
       }
     } else {
-      failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim (role/tenant differential plus a clean persisted readback); status and echo claims are insufficient.`)
+      failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim for its class (boundary differential, repeated transition, protected-field readback or invariant event); status and echo claims are insufficient.`)
     }
   }
   // Universal default-deny: authentication/bypass claims confirm only with a signed, challenged
@@ -1493,7 +1526,8 @@ export function evaluateClaims(
   const failedCheck = checks.find(check => !check.passed) ?? null
   const missingEvidence = new Set<string>()
   for (const check of checks) for (const item of describeMissingEvidence(check)) missingEvidence.add(item)
-  if (failures.some(failure => /impact: authorization claim dismissed/.test(failure))) missingEvidence.add('owner_scoped_disclosure')
+  if (failures.some(failure => /impact: (?:authorization|disclosure) claim dismissed/.test(failure))) missingEvidence.add('owner_scoped_disclosure')
+  if (failures.some(failure => /markup claim dismissed/.test(failure))) missingEvidence.add('executable_markup')
   if (failures.some(failure => /impact: .* requires a passing impact-evidence claim/.test(failure))) missingEvidence.add('impact_claim')
   if (failures.some(failure => /^boundary: authentication/.test(failure))) missingEvidence.add('boundary_claim')
   if (failures.some(failure => /^boundary: MFA/.test(failure))) missingEvidence.add('mfa_claim')
@@ -2559,7 +2593,10 @@ async function runAttempt(
     const oracle = evaluateClaims(session.transcript, parsed.claims, {
       ...(options.canary ? { canary: options.canary } : {}),
       allowedExchangeIds: new Set(session.transcript.list().map(record => record.exchangeId)),
-      claimedImpact: classifyImpactDescriptor({ title: parsed.title }),
+      claimedImpact: classifyImpactDescriptor({
+        title: parsed.title,
+        description: parsed.description,
+      }),
       claimedBoundary: classifyBoundaryClaim({ title: parsed.title }),
     })
     const causal = causalFingerprints(session.transcript, oracle.checks, nonce)

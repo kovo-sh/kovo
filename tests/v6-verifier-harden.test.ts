@@ -26,7 +26,9 @@ import {
   ROLE_RANK,
   assessAuthorizationImpact,
   assessBoundary,
+  assessBusinessLogicImpact,
   assessCsrfImpact,
+  assessMarkupImpact,
   assessMassAssignmentImpact,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
@@ -56,6 +58,8 @@ interface FixtureOptions {
   csrfTokenBypass?: boolean
   /** Planted admin BFLA: a viewer may reach /api/admin/audit. */
   adminBfla?: boolean
+  /** Render stored markup as an executable payload instead of an inert presentation tag. */
+  reportActiveMarkup?: boolean
 }
 
 interface Fixture {
@@ -231,6 +235,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: Fixture[
       }
       return json(res, 401, { error: 'unauthenticated' })
     }
+  }
+  if (url.pathname === '/api/reports/9f1/render') {
+    if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end(`<section class="report"><h2>${options.reportActiveMarkup ? '<img src=x onerror="alert(1)">' : '<b>gnmarker</b>'}</h2></section>`)
+    return
+  }
+  if (url.pathname === '/api/reports/9f1/public') {
+    // Public share route by design: id/name/summary/workspace + a tenant label reference.
+    return json(res, 200, { id: '9f1', name: 'Quarterly', summary: 'internal', workspace: 'guardian_state_acme', ref: 'rbc_acme_0123456789ab' })
   }
   if (url.pathname === '/api/admin/audit') {
     if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
@@ -845,7 +859,15 @@ test('units: impact classification and role hierarchy are mechanical', () => {
   assert.equal(classifyImpactDescriptor({ title: 'Cross-tenant invoice read' }), 'authorization')
   assert.equal(classifyImpactDescriptor({ title: 'Boolean SQL injection' }), 'other')
   assert.equal(classifyImpactDescriptor({ title: 'Cache poisoning' }), 'other')
-  assert.equal(classifyImpactDescriptor({ title: 'Stored XSS on the card' }), 'other')
+  // Unmodelled classes are now gated by their own evidence model instead of falling to 'other'.
+  assert.equal(classifyImpactDescriptor({ title: 'Stored XSS on the card' }), 'markup')
+  assert.equal(classifyImpactDescriptor({ title: 'Stored HTML injection via report name' }), 'markup')
+  assert.equal(classifyImpactDescriptor({ cwe: 'CWE-79' }), 'markup')
+  assert.equal(classifyImpactDescriptor({ title: 'Invoice workflow step-skip: draft -> paid' }), 'business_logic')
+  assert.equal(classifyImpactDescriptor({ cwe: 'CWE-841' }), 'business_logic')
+  assert.equal(classifyImpactDescriptor({ title: 'Unauthenticated report disclosure via /public' }), 'disclosure')
+  assert.equal(classifyImpactDescriptor({ cwe: 'CWE-200', category: 'information-disclosure' }), 'disclosure')
+  assert.equal(classifyImpactDescriptor({ cwe: 'CWE-200', category: 'broken-access-control' }), 'authorization')
   assert.deepEqual(parseRoleLabel('admin (globex)'), { role: 'admin', tenant: 'globex' })
 })
 
@@ -1233,4 +1255,147 @@ test('regression: an authz read with a denied anonymous control still confirms (
     assert.equal(gate?.satisfied, true)
     assert.equal(gate?.arm, 'control_denied')
   } finally { await fx.close() }
+})
+
+// ---------------------------------------------------------------------------
+// 10. Phase-B K=6 triage: business-logic, markup and anonymous-disclosure over-claims
+// ---------------------------------------------------------------------------
+
+const ownerActor = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+const anonActor = { handle: null, role: null, tenant: null, auth: 'cookie' as const, sameSite: 'Lax' as const }
+
+test('units: a self-service workflow transition is not business-logic impact (K=6 FP)', () => {
+  // Owner PATCHes its own invoice draft -> paid: a state echo by an entitled actor.
+  const selfService = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: ownerActor, json: { id: 'i1', status: 'draft' } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/invoices/i1', status: 200, actor: ownerActor, requestJson: { status: 'paid' }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: ownerActor, json: { id: 'i1', status: 'paid' } },
+    ],
+  })
+  assert.equal(selfService.required, true)
+  assert.equal(selfService.satisfied, false)
+  assert.match(selfService.reason, /self-service|non-protected/i)
+
+  // The planted billing tamper moves a *protected* price field: still impact.
+  const protectedPrice = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/billing', status: 200, actor: ownerActor, json: { plan: 'pro', price: 4900 } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/billing', status: 200, actor: ownerActor, requestJson: { price: 1 }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/billing', status: 200, actor: ownerActor, json: { plan: 'pro', price: 1 } },
+    ],
+  })
+  assert.equal(protectedPrice.satisfied, true, protectedPrice.reason)
+
+  // The workflow step-skip shape: the identical terminal transition accepted twice.
+  const repeated = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'first', arm: 'control', method: 'POST', route: '/api/invites/accept', status: 200, actor: ownerActor, requestJson: { token: 't1' } },
+      { id: 'repeat', arm: 'probe', method: 'POST', route: '/api/invites/accept', status: 200, actor: ownerActor, requestJson: { token: 't1' } },
+    ],
+  })
+  assert.equal(repeated.satisfied, true, repeated.reason)
+})
+
+test('units: markup needs executable content (K=6 FP)', () => {
+  const inert = assessMarkupImpact({
+    impactClass: 'markup',
+    steps: [{ id: 'p', arm: 'probe', method: 'GET', route: '/api/reports/9f1/render', status: 200, actor: ownerActor, body: '<section><h2><b>gnmarker</b></h2></section>' }],
+  })
+  assert.equal(inert.satisfied, false)
+  assert.match(inert.reason, /executable content|not script execution/i)
+
+  const active = assessMarkupImpact({
+    impactClass: 'markup',
+    steps: [{ id: 'p', arm: 'probe', method: 'GET', route: '/api/reports/9f1/render', status: 200, actor: ownerActor, body: '<section><h2><img src=x onerror="alert(1)"></h2></section>' }],
+  })
+  assert.equal(active.satisfied, true, active.reason)
+})
+
+test('units: anonymous public-route reads need owner-scoped or credential evidence (K=6 FP)', () => {
+  const labelsOnly = assessAuthorizationImpact({
+    impactClass: 'disclosure',
+    steps: [
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/reports/none/public', status: 404, actor: anonActor },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/reports/9f1/public', status: 200, actor: anonActor, json: { id: '9f1', name: 'Quarterly', summary: 'internal', workspace: 'guardian_state_acme', ref: 'rbc_acme_0123456789ab' } },
+    ],
+  })
+  assert.equal(labelsOnly.satisfied, false)
+
+  const credential = assessAuthorizationImpact({
+    impactClass: 'disclosure',
+    steps: [
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/reports/none/public', status: 404, actor: anonActor },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/reports/9f1/public', status: 200, actor: anonActor, json: { data_ref: '[redacted]' }, secretMatches: ['abcdef1234'] },
+    ],
+  })
+  assert.equal(credential.satisfied, true, credential.reason)
+})
+
+test('parity: guardian_verify dismisses the K=6 business-logic, markup and disclosure over-claims', async () => {
+  const fx = await startFixture()
+  const server = await startRpc(fx)
+  try {
+    const id = (res: RpcResponse) => (res.result as { exchangeId: string }).exchangeId
+    const before = id(await rpc(server, 'http', { path: '/api/invoices/i1', persona: 'persona_a' }))
+    const patch = id(await rpc(server, 'http', { path: '/api/invoices/i1', method: 'PATCH', body: JSON.stringify({ status: 'paid' }), persona: 'persona_a' }))
+    const after = id(await rpc(server, 'http', { path: '/api/invoices/i1', persona: 'persona_a' }))
+    const logicNaive: VerifyClaim[] = [
+      { kind: 'status', exchangeId: patch, expected: 200 },
+      { kind: 'jsonpath', exchangeId: after, path: 'status', equals: 'paid' },
+    ]
+    const logicTitle = 'Invoice workflow step-skip: client PATCH sets status draft->paid without payment'
+    const logic = oracleFor(server, logicTitle, logicNaive)
+    assert.equal(logic.passed, false)
+    assert.match(logic.failures.join(' '), /impact: business_logic claim requires/i)
+
+    // Even a declared impact claim fails the shared validator for a non-protected self-service field.
+    const logicExplicit: VerifyClaim[] = [...logicNaive, {
+      kind: 'impact', impactClass: 'business_logic', probeExchangeId: patch,
+      controlExchangeIds: [before], afterExchangeId: after, actorRoles: { persona_a: 'owner' },
+    }]
+    const logicExplicitResult = oracleFor(server, logicTitle, logicExplicit)
+    assert.equal(logicExplicitResult.passed, false)
+    assert.equal(logicExplicitResult.checks.find(check => check.claim.kind === 'impact')?.passed, false)
+    assert.match(logicExplicitResult.failures.join(' '), /self-service|non-protected/i)
+
+    const render = id(await rpc(server, 'http', { path: '/api/reports/9f1/render', persona: 'persona_a' }))
+    const markup = oracleFor(server, 'Stored HTML injection via unescaped report name in GET /api/reports/:reportId/render', [
+      { kind: 'status', exchangeId: render, expected: 200 },
+      { kind: 'body_contains', exchangeId: render, text: '<b>gnmarker</b>' },
+    ])
+    assert.equal(markup.passed, false)
+    assert.match(markup.failures.join(' '), /markup claim dismissed/i)
+
+    const pub = id(await rpc(server, 'http', { path: '/api/reports/9f1/public' }))
+    const disclosure = oracleFor(server, 'Unauthenticated report disclosure via /api/reports/:reportId/public (internal workspace + owner ref leaked, no visibility gate)', [
+      { kind: 'status', exchangeId: pub, expected: 200 },
+      { kind: 'body_contains', exchangeId: pub, text: 'guardian_state_acme' },
+    ])
+    assert.equal(disclosure.passed, false)
+    assert.match(disclosure.failures.join(' '), /disclosure claim dismissed/i)
+  } finally {
+    await server.close()
+    await fx.close()
+  }
+})
+
+test('parity: executable markup still backs a markup claim', async () => {
+  const fx = await startFixture({ reportActiveMarkup: true })
+  const server = await startRpc(fx)
+  try {
+    const render = (await rpc(server, 'http', { path: '/api/reports/9f1/render', persona: 'persona_a' })).result as { exchangeId: string }
+    const claims: VerifyClaim[] = [
+      { kind: 'status', exchangeId: render.exchangeId, expected: 200 },
+      { kind: 'impact', impactClass: 'markup', probeExchangeId: render.exchangeId },
+    ]
+    const res = oracleFor(server, 'Stored XSS via unescaped report name in render', claims)
+    assert.equal(res.passed, true, res.failures.join('; '))
+  } finally {
+    await server.close()
+    await fx.close()
+  }
 })

@@ -233,6 +233,9 @@ export function impactStepsFromStepsOut(
       } satisfies ActorIdentity,
       json: entryJson,
       body: typeof entry?.body === 'string' ? entry.body : '',
+      ...(Array.isArray(entry?.secretMatches)
+        ? { secretMatches: (entry.secretMatches as Array<Record<string, unknown>>).map(match => String(match.sha256Prefix ?? '')).filter(Boolean) }
+        : {}),
       requestJson: step.request.jsonBody,
       requestHeaders: step.request.headers ?? null,
       responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
@@ -1277,17 +1280,17 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           proofGuardFailure = endpointBinding.reason
         }
         // Shared semantic impact gate for every class the differential machinery can over-claim:
-        // horizontal authorization (read disclosure / persisted cross-tenant write), mass assignment
-        // and CSRF. Vertical BFLA is covered by `assessBflaImpact` above (same validators). The gate
-        // only applies when the spec actually carries an actor/role/tenant reference; a same-actor
-        // deterministic field probe is judged by the proof-strength gate alone.
+        // horizontal authorization (read disclosure / persisted cross-tenant write), mass assignment,
+        // CSRF, business-logic/workflow, markup/scripting and disclosure. Vertical BFLA is covered by
+        // `assessBflaImpact` above (same validators). Unmodelled classes ('other') stay ungated; every
+        // class the gate understands is gated regardless of actor count, so a single anonymous actor
+        // cannot bypass the authorization read-disclosure check.
         const impactClass = classifyImpactDescriptor({
           cwe: spec.cwe,
           category: spec.category,
           title: spec.title,
           impact: spec.impact,
         })
-        const distinctActors = new Set(spec.steps.map(step => step.request.persona ?? step.request.session ?? 'anonymous'))
         // A control arm that binds a CSRF token is the engine's declared anti-CSRF defence for the
         // route, equivalent to the route's `csrf_state_change` oracle. It is a requirement, not
         // evidence: the persisted readback is still demanded below.
@@ -1296,7 +1299,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const oracleEvents = csrfModelled && !declaredImpactEvents.includes('csrf_state_change')
           ? [...declaredImpactEvents, 'csrf_state_change']
           : declaredImpactEvents
+        const distinctActors = new Set(spec.steps.map(step => step.request.persona ?? step.request.session ?? 'anonymous'))
         const gateApplies = impactClass === 'mass_assignment' || impactClass === 'csrf' ||
+          impactClass === 'business_logic' || impactClass === 'markup' || impactClass === 'disclosure' ||
           (impactClass === 'authorization' && (distinctActors.size > 1 || Boolean(spec.requiredRole) || Boolean(spec.resourceTenant)))
         const impactSteps = impactStepsFromStepsOut(spec, stepsOut)
         const impactGate = !gateApplies
