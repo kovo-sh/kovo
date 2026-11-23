@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import {
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { and, asc, desc, eq, gt, inArray, or, sql } from 'drizzle-orm'
@@ -101,7 +103,129 @@ import type { EnvironmentMode, OriginRole, ScopePolicy } from './scope-policy.ts
 import * as tables from './schema.ts'
 
 /** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
-export const STORE_SCHEMA_VERSION = 6
+export const STORE_SCHEMA_VERSION = 7
+
+/**
+ * Full-body FTS5 indexing modes (v6.2):
+ * - `off`     — no FTS rows are written; `searchExchanges` uses the bounded LIKE fallback.
+ * - `preview` — default. Index the stored redacted preview (≤ 8 KiB/column) and cap the indexed
+ *               body text at `ftsMaxBodyBytes`, preserving pre-v6 search behaviour.
+ * - `full`    — index the whole redacted body up to `ftsMaxBodyBytes` (operator opt-in; refused
+ *               above `maxFullFtsDbBytes` unless explicitly forced).
+ */
+export type FtsMode = 'off' | 'preview' | 'full'
+
+export const ftsModes: readonly FtsMode[] = ['off', 'preview', 'full']
+export const DEFAULT_FTS_MODE: FtsMode = 'preview'
+/** Hard per-exchange cap on the bytes of body text handed to the FTS index (default 8 KiB). */
+export const DEFAULT_FTS_MAX_BODY_BYTES = 8 * 1024
+export const MIN_FTS_MAX_BODY_BYTES = 512
+export const MAX_FTS_MAX_BODY_BYTES = 1024 * 1024
+/** A `full` index is refused above this DB size unless `forceFullFts` is set (default 512 MiB). */
+export const DEFAULT_MAX_FULL_FTS_DB_BYTES = 512 * 1024 * 1024
+/** Default exchange retention window applied by `Store.prune()`. */
+export const DEFAULT_EXCHANGE_RETENTION_DAYS = 14
+
+export interface StoreOptions {
+  /** FTS indexing mode; defaults to `preview` (pre-v6 behaviour, bounded by `ftsMaxBodyBytes`). */
+  ftsMode?: FtsMode
+  /** Per-exchange cap on the body text indexed by FTS. Default 8 KiB. */
+  ftsMaxBodyBytes?: number
+  /** Refuse `ftsMode: 'full'` when the main DB file is larger than this. Default 512 MiB. */
+  maxFullFtsDbBytes?: number
+  /** Explicit operator override for the `full` size guard. */
+  forceFullFts?: boolean
+}
+
+/** Thrown when `ftsMode: 'full'` is refused by the DB size guard. */
+export class FtsModeRefusedError extends Error {
+  readonly code = 'FTS_FULL_REFUSED'
+  readonly dbBytes: number
+  readonly maxFullFtsDbBytes: number
+  constructor(dbBytes: number, maxFullFtsDbBytes: number) {
+    super(
+      `ftsMode 'full' refused: database is ${dbBytes} bytes (cap ${maxFullFtsDbBytes}). `
+      + 'Pass { forceFullFts: true } or raise maxFullFtsDbBytes to opt in.',
+    )
+    this.name = 'FtsModeRefusedError'
+    this.dbBytes = dbBytes
+    this.maxFullFtsDbBytes = maxFullFtsDbBytes
+  }
+}
+
+export interface PruneExchangesOptions {
+  runId: string
+  /** Delete exchanges older than this many milliseconds (relative to `now`). */
+  olderThanMs?: number
+  /** Always keep the newest N exchanges of the run, regardless of age. */
+  keepLatest?: number
+  /** Rows deleted per IMMEDIATE transaction batch. Default 500 (max 5,000). */
+  batchSize?: number
+  now?: number
+  /** Emit the structured `retention.pruned` note (default true; `prune()` aggregates instead). */
+  emitEvent?: boolean
+}
+
+export interface PruneExchangesResult {
+  runId: string
+  /** Exchange rows deleted. */
+  exchanges: number
+  /** FTS5 rows deleted (0 when the index was never created). */
+  ftsRows: number
+  /** Content-addressed blob files deleted (unreferenced after the row delete). */
+  blobs: number
+  /** Bytes reclaimed from deleted blob files. */
+  blobBytes: number
+  /** Number of bounded delete batches committed. */
+  batches: number
+  /** Created-at cutoff actually applied (`now - olderThanMs`), or null when age was unbounded. */
+  cutoff: number | null
+  keepLatest: number
+}
+
+export interface PruneOptions {
+  /** Age window in days applied per run. Default 14; `<= 0` disables pruning. */
+  retentionDays?: number
+  /** Always keep the newest N exchanges of every run. Default 0. */
+  keepLatest?: number
+  /** Restrict pruning to one run (default: every run). */
+  runId?: string
+  /** Skip runs that are actively executing (default true). */
+  skipActiveRuns?: boolean
+  batchSize?: number
+  now?: number
+}
+
+export interface PruneResult {
+  runs: number
+  exchanges: number
+  ftsRows: number
+  blobs: number
+  blobBytes: number
+  batches: number
+  retentionDays: number
+  keepLatest: number
+  perRun: Array<{ runId: string; exchanges: number; ftsRows: number; blobs: number; blobBytes: number }>
+}
+
+export interface StoreFootprint {
+  directory: string
+  /** `guardian.sqlite` main file size. */
+  mainDbBytes: number
+  walBytes: number
+  shmBytes: number
+  /** main + WAL + SHM. */
+  dbBytes: number
+  /** Every file under `artifacts/` (evidence + exchange blobs). */
+  artifactBytes: number
+  /** Content-addressed exchange body blobs only. */
+  blobBytes: number
+  ftsRows: number
+  exchangeRows: number
+  ftsMode: FtsMode
+  ftsMaxBodyBytes: number
+  maxFullFtsDbBytes: number
+}
 
 export type Run = typeof tables.runs.$inferSelect
 export type Assignment = typeof tables.assignments.$inferSelect
@@ -537,6 +661,8 @@ function sanitizeSecretMatches(matches: readonly SecretMatch[] | undefined, secr
 /** One queued exchange write; `row` is fully redacted and safe to persist at flush time. */
 interface PendingExchangeWrite {
   row: typeof tables.brokerExchanges.$inferInsert
+  /** Bounded body text for the FTS row (`preview` body or capped full body); null when FTS is off. */
+  ftsBody: string | null
   eventMessage: string
   eventDetail: Record<string, unknown>
 }
@@ -546,9 +672,17 @@ export class Store {
   readonly client: DatabaseSync
   readonly workspace
   readonly directory: string
+  /** FTS indexing mode recorded in `store_settings` and honoured on every exchange write. */
+  readonly ftsMode: FtsMode
+  /** Bounded per-exchange body cap handed to FTS. */
+  readonly ftsMaxBodyBytes: number
+  /** DB size threshold above which `ftsMode: 'full'` is refused (unless forced). */
+  readonly maxFullFtsDbBytes: number
   private readonly processLock: DatabaseSync
   private readonly emitter = new EventEmitter()
   private ftsAvailable = false
+  /** True whenever the FTS5 virtual table exists, even if the active mode is `off`. */
+  private ftsTableExists = false
   private txDepth = 0
   /** Bounded async write queue for broker exchanges (flushed by microtask/size boundary). */
   private pendingExchanges: PendingExchangeWrite[] = []
@@ -557,8 +691,18 @@ export class Store {
   private flushError: unknown = null
   private static readonly maxPendingExchanges = 128
 
-  constructor(directory: string) {
+  constructor(directory: string, options: StoreOptions = {}) {
     this.directory = directory
+    const requestedMode = options.ftsMode ?? DEFAULT_FTS_MODE
+    if (!ftsModes.includes(requestedMode)) {
+      throw new Error(`Invalid ftsMode '${String(requestedMode)}' (expected ${ftsModes.join('|')}).`)
+    }
+    this.ftsMode = requestedMode
+    this.ftsMaxBodyBytes = Math.round(Math.min(
+      MAX_FTS_MAX_BODY_BYTES,
+      Math.max(MIN_FTS_MAX_BODY_BYTES, options.ftsMaxBodyBytes ?? DEFAULT_FTS_MAX_BODY_BYTES),
+    ))
+    this.maxFullFtsDbBytes = Math.max(0, options.maxFullFtsDbBytes ?? DEFAULT_MAX_FULL_FTS_DB_BYTES)
     this.emitter.setMaxListeners(256)
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     mkdirSync(join(directory, 'artifacts'), { recursive: true, mode: 0o700 })
@@ -608,6 +752,18 @@ export class Store {
     this.initV4Schema()
     this.initV5Schema()
     this.initV6Schema()
+    // v6.2 full-body FTS size guard: refuse to switch on an expensive index over a database that is
+    // already large unless the operator explicitly forced it. Release the process lock so a
+    // subsequent correctly-configured reopen can proceed.
+    if (this.ftsMode === 'full' && !options.forceFullFts) {
+      const dbBytes = safeFileSize(path)
+      if (dbBytes > this.maxFullFtsDbBytes) {
+        try { rawClient.close() } catch { /* teardown is best-effort */ }
+        try { this.processLock.exec('ROLLBACK') } catch { /* ignore */ }
+        try { this.processLock.close() } catch { /* ignore */ }
+        throw new FtsModeRefusedError(dbBytes, this.maxFullFtsDbBytes)
+      }
+    }
     this.initFts()
     const current = this.db.select().from(tables.workspaces).limit(1).get()
     this.workspace = current ?? this.db.insert(tables.workspaces).values({
@@ -616,6 +772,7 @@ export class Store {
       name: 'Personal workspace',
       createdAt: Date.now(),
     }).returning().get()
+    this.recordStoreSettings()
     this.recover()
   }
 
@@ -1063,14 +1220,42 @@ export class Store {
       CREATE INDEX IF NOT EXISTS approval_leases_run ON approval_leases (run_id, status);
 
       CREATE INDEX IF NOT EXISTS broker_exchanges_run_created ON broker_exchanges (run_id, created_at);
+      CREATE INDEX IF NOT EXISTS broker_exchanges_body_artifact ON broker_exchanges (body_artifact_id);
       CREATE INDEX IF NOT EXISTS facts_run_created ON facts (run_id, created_at);
       CREATE INDEX IF NOT EXISTS endpoints_run_updated ON endpoints (run_id, updated_at);
       CREATE INDEX IF NOT EXISTS evidence_run_created ON evidence (run_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS store_settings (
+        key TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
   }
 
+  /** Durably record the storage/FTS configuration this DB was opened with. */
+  private recordStoreSettings() {
+    const upsert = this.client.prepare(
+      'INSERT INTO store_settings (key, value, updated_at) VALUES (?, ?, ?) '
+      + 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+    )
+    const now = Date.now()
+    upsert.run('fts_mode', this.ftsMode, now)
+    upsert.run('fts_max_body_bytes', String(this.ftsMaxBodyBytes), now)
+  }
+
   private initFts() {
+    // Mode `off`: do not create a new index and do not write/query FTS rows. A pre-existing table
+    // (from an earlier `preview`/`full` process) is preserved so re-enabling search is lossless.
+    if (this.ftsMode === 'off') {
+      const existing = this.client.prepare(
+        "SELECT count(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'broker_exchanges_fts'",
+      ).get() as { c?: number } | undefined
+      this.ftsTableExists = Number(existing?.c ?? 0) > 0
+      this.ftsAvailable = false
+      return
+    }
     try {
       this.client.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS broker_exchanges_fts USING fts5(
@@ -1105,6 +1290,7 @@ export class Store {
         this.ftsAvailable = false
       }
     }
+    this.ftsTableExists = this.ftsAvailable
   }
 
   close() {
@@ -1187,9 +1373,12 @@ export class Store {
         `INSERT INTO broker_exchanges_fts (exchange_id, run_id, origin, method, path_and_query, req_headers, resp_headers, body_preview)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      for (const row of rows) {
+      for (const [index, row] of rows.entries()) {
+        // `ftsBody` is capped at `ftsMaxBodyBytes` by recordExchange(); a null means FTS is off.
+        const ftsBody = batch[index]?.ftsBody
+        if (ftsBody == null) continue
         fts.run(row.id, row.runId, row.origin, row.method, row.pathAndQuery,
-          JSON.stringify(row.reqHeaders ?? {}), JSON.stringify(row.respHeaders ?? {}), row.bodyPreview)
+          JSON.stringify(row.reqHeaders ?? {}), JSON.stringify(row.respHeaders ?? {}), ftsBody)
       }
     }
     const byRun = new Map<string, number>()
@@ -2396,6 +2585,9 @@ export class Store {
 
     this.enqueueExchange({
       row,
+      ftsBody: this.ftsMode === 'off'
+        ? null
+        : capUtf8Bytes(this.ftsMode === 'full' ? cleanBody : bodyPreview, this.ftsMaxBodyBytes),
       eventMessage: `${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)} → ${row.status}`,
       eventDetail: {
         exchangeId: row.id,
@@ -2467,6 +2659,252 @@ export class Store {
       }
       return true
     }).slice(0, limit)
+  }
+
+  // --- Retention GC & storage footprint (v6.2) ---
+
+  /**
+   * Delete aged exchanges (rows + FTS rows + unreferenced sharded body blobs) for one run in
+   * bounded IMMEDIATE batches. `olderThanMs` bounds the age, `keepLatest` always preserves the
+   * newest N exchanges. An unbounded delete (no cutoff and no keepLatest) is a no-op.
+   */
+  pruneExchanges(options: PruneExchangesOptions): PruneExchangesResult {
+    const result = this.pruneExchangeRows(options)
+    if (options.emitEvent !== false && result.exchanges > 0) {
+      this.event(result.runId, 'retention.pruned',
+        `Pruned ${result.exchanges} exchange row(s) from run ${result.runId}.`, {
+          scope: 'run',
+          runId: result.runId,
+          exchanges: result.exchanges,
+          ftsRows: result.ftsRows,
+          blobs: result.blobs,
+          blobBytes: result.blobBytes,
+          batches: result.batches,
+          cutoff: result.cutoff,
+          keepLatest: result.keepLatest,
+        })
+    }
+    return result
+  }
+
+  /**
+   * Apply per-run exchange retention (`retentionDays`, default 14) across the workspace, or one
+   * run. Skips actively running runs by default so a live scan keeps its verification evidence,
+   * and emits a single aggregated `retention.pruned` note with counts.
+   */
+  prune(options: PruneOptions = {}): PruneResult {
+    this.flushNow()
+    const retentionDays = options.retentionDays ?? DEFAULT_EXCHANGE_RETENTION_DAYS
+    const keepLatest = Math.max(0, Math.trunc(options.keepLatest ?? 0))
+    const now = options.now ?? Date.now()
+    const result: PruneResult = {
+      runs: 0, exchanges: 0, ftsRows: 0, blobs: 0, blobBytes: 0, batches: 0,
+      retentionDays, keepLatest, perRun: [],
+    }
+    if (!(retentionDays > 0)) return result
+    let runIds: string[]
+    if (options.runId) {
+      runIds = [this.run(options.runId).id]
+    } else {
+      const rows = this.client.prepare('SELECT id, status FROM runs').all() as Array<{ id: string; status: string }>
+      runIds = rows
+        .filter(row => !(options.skipActiveRuns ?? true) || row.status !== 'running')
+        .map(row => row.id)
+    }
+    for (const runId of runIds) {
+      const pruned = this.pruneExchangeRows({
+        runId,
+        olderThanMs: retentionDays * 24 * 60 * 60_000,
+        keepLatest,
+        batchSize: options.batchSize,
+        now,
+        emitEvent: false,
+      })
+      if (pruned.exchanges === 0) continue
+      result.runs += 1
+      result.exchanges += pruned.exchanges
+      result.ftsRows += pruned.ftsRows
+      result.blobs += pruned.blobs
+      result.blobBytes += pruned.blobBytes
+      result.batches += pruned.batches
+      result.perRun.push({
+        runId, exchanges: pruned.exchanges, ftsRows: pruned.ftsRows, blobs: pruned.blobs, blobBytes: pruned.blobBytes,
+      })
+    }
+    if (result.exchanges > 0) {
+      this.event(options.runId ?? null, 'retention.pruned',
+        `Pruned ${result.exchanges} exchange row(s) across ${result.runs} run(s) `
+        + `(retention ${retentionDays}d, keepLatest ${keepLatest}).`, {
+          scope: options.runId ? 'run' : 'workspace',
+          retentionDays,
+          keepLatest,
+          runs: result.runs,
+          exchanges: result.exchanges,
+          ftsRows: result.ftsRows,
+          blobs: result.blobs,
+          blobBytes: result.blobBytes,
+          batches: result.batches,
+          perRun: result.perRun.slice(0, 20),
+        })
+    }
+    return result
+  }
+
+  /** Current on-disk DB/WAL/artifact sizes plus FTS/exchange row counts. */
+  storeFootprint(): StoreFootprint {
+    this.flushNow()
+    const mainDbBytes = safeFileSize(join(this.directory, 'guardian.sqlite'))
+    const walBytes = safeFileSize(join(this.directory, 'guardian.sqlite-wal'))
+    const shmBytes = safeFileSize(join(this.directory, 'guardian.sqlite-shm'))
+    const { total: artifactBytes, blobs: blobBytes } = boundedArtifactSize(join(this.directory, 'artifacts'))
+    let ftsRows = 0
+    if (this.ftsTableExists) {
+      try {
+        const row = this.client.prepare('SELECT count(*) AS c FROM broker_exchanges_fts').get() as { c?: number } | undefined
+        ftsRows = Number(row?.c ?? 0)
+      } catch { ftsRows = 0 }
+    }
+    const exchangeRow = this.client.prepare('SELECT count(*) AS c FROM broker_exchanges').get() as { c?: number } | undefined
+    return {
+      directory: this.directory,
+      mainDbBytes,
+      walBytes,
+      shmBytes,
+      dbBytes: mainDbBytes + walBytes + shmBytes,
+      artifactBytes,
+      blobBytes,
+      ftsRows,
+      exchangeRows: Number(exchangeRow?.c ?? 0),
+      ftsMode: this.ftsMode,
+      ftsMaxBodyBytes: this.ftsMaxBodyBytes,
+      maxFullFtsDbBytes: this.maxFullFtsDbBytes,
+    }
+  }
+
+  /** Rowid of the oldest exchange that must be kept by `keepLatest` (null when the run is short). */
+  private keepBoundaryRowid(runId: string, keepLatest: number): number | null {
+    const row = this.client.prepare(
+      'SELECT rowid AS r FROM broker_exchanges WHERE run_id = ? ORDER BY rowid DESC LIMIT 1 OFFSET ?',
+    ).get(runId, Math.max(0, keepLatest - 1)) as { r?: number } | undefined
+    return row?.r === undefined ? null : Number(row.r)
+  }
+
+  private pruneExchangeRows(options: PruneExchangesOptions): PruneExchangesResult {
+    this.flushNow()
+    const run = this.run(options.runId)
+    const batchSize = clampInteger(options.batchSize ?? 500, 1, 5000)
+    const now = options.now ?? Date.now()
+    const keepLatest = Math.max(0, Math.trunc(options.keepLatest ?? 0))
+    const cutoff = options.olderThanMs === undefined ? null : now - Math.max(0, options.olderThanMs)
+    const result: PruneExchangesResult = {
+      runId: run.id, exchanges: 0, ftsRows: 0, blobs: 0, blobBytes: 0, batches: 0, cutoff, keepLatest,
+    }
+    // Safety: never delete a whole run's history without an age bound or a keepLatest floor.
+    if (cutoff === null && keepLatest === 0) return result
+    const keepRowid = keepLatest > 0 ? this.keepBoundaryRowid(run.id, keepLatest) : null
+    if (keepLatest > 0 && keepRowid === null) return result
+    const blobIds = new Set<string>()
+    let cursor = 0
+    for (;;) {
+      const batch = this.pruneExchangeBatch(run.id, { cursor, cutoff, keepRowid, batchSize })
+      if (!batch) break
+      result.exchanges += batch.rows
+      result.ftsRows += batch.ftsRows
+      result.batches += 1
+      cursor = batch.lastRowid
+      for (const id of batch.blobIds) blobIds.add(id)
+      if (batch.rows < batchSize) break
+    }
+    const runDirs = uniqueArtifactRunDirs(this.directory)
+    for (const blobId of blobIds) {
+      const removed = this.deleteBlobIfUnreferenced(run.id, blobId, runDirs)
+      if (removed.deleted) {
+        result.blobs += 1
+        result.blobBytes += removed.bytes
+      }
+    }
+    return result
+  }
+
+  private pruneExchangeBatch(
+    runId: string,
+    state: { cursor: number; cutoff: number | null; keepRowid: number | null; batchSize: number },
+  ): { rows: number; ftsRows: number; lastRowid: number; blobIds: string[] } | null {
+    const conditions = ['run_id = ?']
+    const params: Array<string | number> = [runId]
+    if (state.cursor > 0) {
+      conditions.push('rowid > ?')
+      params.push(state.cursor)
+    }
+    if (state.keepRowid !== null) {
+      conditions.push('rowid < ?')
+      params.push(state.keepRowid)
+    }
+    if (state.cutoff !== null) {
+      conditions.push('created_at < ?')
+      params.push(state.cutoff)
+    }
+    const rows = this.client.prepare(
+      `SELECT rowid AS rowid, id, body_artifact_id FROM broker_exchanges
+       WHERE ${conditions.join(' AND ')} ORDER BY rowid ASC LIMIT ?`,
+    ).all(...params, state.batchSize) as Array<{ rowid: number; id: string; body_artifact_id: string | null }>
+    if (!rows.length) return null
+    const ids = rows.map(row => row.id)
+    const placeholders = ids.map(() => '?').join(', ')
+    let ftsRows = 0
+    this.transaction(() => {
+      if (this.ftsTableExists) {
+        const info = this.client.prepare(
+          `DELETE FROM broker_exchanges_fts WHERE exchange_id IN (${placeholders})`,
+        ).run(...ids)
+        ftsRows = Number(info.changes ?? 0)
+      }
+      this.client.prepare(
+        `DELETE FROM broker_exchanges WHERE run_id = ? AND id IN (${placeholders})`,
+      ).run(runId, ...ids)
+    })
+    return {
+      rows: rows.length,
+      ftsRows,
+      lastRowid: Number(rows[rows.length - 1]!.rowid),
+      blobIds: rows.map(row => row.body_artifact_id).filter((id): id is string => typeof id === 'string' && id.length > 0),
+    }
+  }
+
+  /**
+   * Remove a content-addressed exchange body blob once no exchange row anywhere references it.
+   * Blobs are shared by hash across runs, so every shard copy is scanned before deletion.
+   */
+  private deleteBlobIfUnreferenced(
+    runId: string,
+    blobId: string,
+    artifactRunDirs: readonly string[] = uniqueArtifactRunDirs(this.directory),
+  ): { deleted: boolean; bytes: number } {
+    const referenced = this.client.prepare(
+      'SELECT 1 AS hit FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1',
+    ).get(blobId) as { hit?: number } | undefined
+    if (referenced?.hit) return { deleted: false, bytes: 0 }
+    const candidates = new Set<string>([join(this.directory, 'artifacts', blobId + '.txt')])
+    const bucket = this.artifactBucket(blobId)
+    const runDirs = new Set<string>([runId, ...artifactRunDirs])
+    for (const dir of runDirs) {
+      candidates.add(join(this.directory, 'artifacts', dir, 'blobs', bucket, blobId + '.txt'))
+    }
+    let bytes = 0
+    let deleted = false
+    for (const file of candidates) {
+      try {
+        const info = lstatSync(file)
+        if (!info.isFile()) continue
+        bytes += info.size
+        unlinkSync(file)
+        deleted = true
+      } catch { /* missing or already removed */ }
+    }
+    if (deleted) {
+      try { rmdirSync(join(this.directory, 'artifacts', runId, 'blobs', bucket)) } catch { /* non-empty */ }
+    }
+    return { deleted, bytes }
   }
 
   // --- Threat Models, Chain Steps, Facts, Graph Edges, Digests ---
@@ -5686,6 +6124,77 @@ export class Store {
 }
 
 export type StoreRunDetail = ReturnType<Store['runDetail']>
+
+/** Best-effort file size (0 when absent). */
+function safeFileSize(path: string): number {
+  try {
+    const info = lstatSync(path)
+    return info.isFile() ? info.size : 0
+  } catch {
+    return 0
+  }
+}
+
+function clampInteger(value: number, min: number, max: number): number {
+  const numeric = Number.isFinite(value) ? value : min
+  return Math.round(Math.min(max, Math.max(min, numeric)))
+}
+
+/** Cap a string at `maxBytes` of UTF-8 without splitting a code point mid-sequence. */
+function capUtf8Bytes(text: string, maxBytes: number): string {
+  if (text.length === 0) return text
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  return Buffer.from(text, 'utf8').subarray(0, Math.max(0, maxBytes)).toString('utf8')
+}
+
+/** Directory names directly under `artifacts/` (sharded run dirs), bounded and symlink-free. */
+function uniqueArtifactRunDirs(directory: string): string[] {
+  const out: string[] = []
+  try {
+    for (const entry of readdirSync(join(directory, 'artifacts'), { withFileTypes: true })) {
+      if (!entry.isDirectory() || out.length >= 500) continue
+      out.push(entry.name)
+    }
+  } catch { /* empty artifacts dir */ }
+  return out
+}
+
+/** Bounded recursive size of `artifacts/`, split into all files vs content-addressed blobs. */
+function boundedArtifactSize(root: string): { total: number; blobs: number } {
+  const maxEntries = 50_000
+  let total = 0
+  let blobs = 0
+  let seen = 0
+  const stack: Array<{ path: string; relative: string }> = [{ path: root, relative: '' }]
+  while (stack.length > 0 && seen < maxEntries) {
+    const current = stack.pop()!
+    let entries
+    try {
+      entries = readdirSync(current.path, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      seen += 1
+      if (seen >= maxEntries) break
+      const full = join(current.path, entry.name)
+      const relative = current.relative ? `${current.relative}/${entry.name}` : entry.name
+      try {
+        const info = lstatSync(full)
+        if (info.isSymbolicLink()) continue
+        if (info.isDirectory()) {
+          stack.push({ path: full, relative })
+        } else if (info.isFile()) {
+          total += info.size
+          if (relative.includes('/blobs/') || entry.name.startsWith('blob-')) blobs += info.size
+        }
+      } catch {
+        // Best-effort accounting.
+      }
+    }
+  }
+  return { total, blobs }
+}
 
 let instance: Store | undefined
 export function store() {
