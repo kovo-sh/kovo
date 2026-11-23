@@ -1,0 +1,13 @@
+services:
+  forgecloud:
+    build:
+      context: ../../../..
+      dockerfile: benchmarks/reason-bench/apps/forgecloud/Dockerfile
+    environment:
+      GUARDIAN_ALLOW_LOCAL_LAB: "1"
+    networks:
+      - lab
+    # No ports, binds, volumes or privileged capabilities: the lab server is loopback-only.
+networks:
+  lab:
+    internal: true
