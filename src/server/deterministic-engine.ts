@@ -3482,19 +3482,21 @@ export function trackFloorCanarySubscriptions(
     if (observed.size > 0) {
       try { promotions = canaryBroker.promoteLate({ runId: input.runId }) } catch { promotions = [] }
     }
+    for (const promotion of promotions) {
+      log('deterministic_engine.oob_promoted',
+        `Floor canary ${promotion.subscription.canaryId} callback promoted (${promotion.stage}, ${promotion.latencyMs} ms after mint).`,
+        {
+          canaryId: promotion.subscription.canaryId,
+          subscriptionId: promotion.subscription.id,
+          stage: promotion.stage,
+          latencyMs: promotion.latencyMs,
+        })
+    }
     for (const record of byToken.values()) {
       const promotion = promotions.find(item => item.subscription.id === record.subscriptionId)
       if (promotion) {
         record.stage = promotion.stage
         record.promoted = true
-        log('deterministic_engine.oob_promoted',
-          `Floor canary ${record.canaryId} callback promoted (${promotion.stage}, ${promotion.latencyMs} ms after mint).`,
-          {
-            canaryId: record.canaryId,
-            subscriptionId: record.subscriptionId,
-            stage: promotion.stage,
-            latencyMs: promotion.latencyMs,
-          })
       } else if (observed.has(record.token)) {
         // The probe observed the callback in memory but the relay could not promote it (already
         // claimed, rejected at ingest, or no relay). Record the observation without claiming a
