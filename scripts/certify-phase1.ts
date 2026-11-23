@@ -138,7 +138,8 @@ export interface RealismRun {
   recall: number
   precision: number
   strictPrecision: number
-  incompatibleClassCount: number
+  /** null = the artifact predates the class-hygiene field (gate treats it as unmeasured). */
+  incompatibleClassCount: number | null
   misclassifiedFindingIds: string[]
   decoyFalsePositives: number
   unmatchedFalsePositives: number
@@ -532,7 +533,7 @@ function realismRunFromCard(
     recall,
     precision: asNumber(card.precision, 1),
     strictPrecision: asNumber(card.strictPrecision, asNumber(card.precision, 1)),
-    incompatibleClassCount: asNumber(card.incompatibleClassCount),
+    incompatibleClassCount: typeof card.incompatibleClassCount === 'number' ? card.incompatibleClassCount : null,
     misclassifiedFindingIds: Array.isArray(card.misclassifiedFindingIds) ? card.misclassifiedFindingIds.map(String) : [],
     decoyFalsePositives: asNumber(card.decoyFalsePositives),
     unmatchedFalsePositives: asNumber(card.unmatchedFalsePositives),
@@ -749,6 +750,8 @@ export interface Certificate {
   hygiene: {
     /** Class-incompatible claims on planted target endpoints. Must be 0 for Phase-1. */
     incompatibleClassCount: number
+    /** Runs whose artifact predates the hygiene field (gate fails rather than assuming 0). */
+    incompatibleClassUnmeasured: number
     /** Worst-run strict precision (charges uncharged misclassifications). */
     worstStrictPrecision: number
     /** Runs that relied on the documented sibling tolerance (should be 0 for Phase-1). */
@@ -990,7 +993,8 @@ export function evaluateCertification(
   const unmatchedFP = sum(runs.map(run => run.unmatchedFalsePositives))
   // Class-label hygiene (reviewer gate): incompatible class claims on planted targets and the
   // conservative precision that charges every uncharged sibling misclassification.
-  const incompatibleClassCount = sum(runs.map(run => run.incompatibleClassCount))
+  const incompatibleClassUnmeasured = runs.filter(run => run.incompatibleClassCount === null).length
+  const incompatibleClassCount = sum(runs.map(run => run.incompatibleClassCount ?? 0))
   const misclassifiedRuns = runs.filter(run => run.misclassifiedFindingIds.length > 0).length
   const misclassifiedFindingIds = runs.flatMap(run => run.misclassifiedFindingIds)
   const worstStrictPrecision = precisionRuns.length
@@ -1084,8 +1088,8 @@ export function evaluateCertification(
       'class_hygiene',
       'Class-label hygiene: incompatible class claims on planted targets must be 0; strict precision charges sibling tolerance',
       'incompatible_class_count == 0 (worst strict precision == 1)',
-      `${incompatibleClassCount} incompatible class claim(s) across ${precisionRuns.length} run(s); worst strict precision ${worstStrictPrecision.toFixed(3)}; ${misclassifiedFindingIds.length} uncharged misclassification(s) in ${misclassifiedRuns} run(s)`,
-      incompatibleClassCount === 0 && worstStrictPrecision >= thresholds.worstPrecision,
+      `${incompatibleClassCount} incompatible class claim(s) across ${precisionRuns.length} run(s), ${incompatibleClassUnmeasured} unmeasured; worst strict precision ${worstStrictPrecision.toFixed(3)}; ${misclassifiedFindingIds.length} uncharged misclassification(s) in ${misclassifiedRuns} run(s)`,
+      incompatibleClassCount === 0 && incompatibleClassUnmeasured === 0 && worstStrictPrecision >= thresholds.worstPrecision,
     ),
     criterion(
       'agentic_lift_dev',
@@ -1177,7 +1181,7 @@ export function evaluateCertification(
       keyBased: { dev: keyPreservation('dev'), heldout: keyPreservation('held-out') },
     },
     precision: { worst: worstPrecision, worstRun: worstRun?.id ?? null, decoyFalsePositives: decoyFP, unmatchedFalsePositives: unmatchedFP, runs: runs.length },
-    hygiene: { incompatibleClassCount, worstStrictPrecision, misclassifiedRuns, misclassifiedFindingIds },
+    hygiene: { incompatibleClassCount, incompatibleClassUnmeasured, worstStrictPrecision, misclassifiedRuns, misclassifiedFindingIds },
     leads: { checkedRuns: leadsChecked, unmeasuredRuns: leadsUnmeasured, violations: leadViolations },
     reason: {
       floor: { confirmed: reasonFloor.confirmed, targets: reasonFloor.targets, recall: reasonFloor.recall },
@@ -1273,7 +1277,7 @@ export function renderCertificateMarkdown(cert: Certificate): string {
     + ` (${cert.preservation.ratios.length} measured, ${cert.preservation.unmeasuredRuns} unmeasured)`)
   lines.push(`- key-based floor retention: dev ${cert.preservation.keyBased.dev === null ? 'n/a' : pct(cert.preservation.keyBased.dev)}, held-out ${cert.preservation.keyBased.heldout === null ? 'n/a' : pct(cert.preservation.keyBased.heldout)}`)
   lines.push(`- worst-run precision: ${cert.precision.worst.toFixed(3)}; decoy FP ${cert.precision.decoyFalsePositives}; unmatched FP ${cert.precision.unmatchedFalsePositives}`)
-  lines.push(`- class hygiene: ${cert.hygiene.incompatibleClassCount} incompatible class claim(s); worst strict precision ${cert.hygiene.worstStrictPrecision.toFixed(3)}; ${cert.hygiene.misclassifiedFindingIds.length} uncharged misclassification(s) in ${cert.hygiene.misclassifiedRuns} run(s)`)
+  lines.push(`- class hygiene: ${cert.hygiene.incompatibleClassCount} incompatible class claim(s) (${cert.hygiene.incompatibleClassUnmeasured} unmeasured); worst strict precision ${cert.hygiene.worstStrictPrecision.toFixed(3)}; ${cert.hygiene.misclassifiedFindingIds.length} uncharged misclassification(s) in ${cert.hygiene.misclassifiedRuns} run(s)`)
   lines.push(`- leads invariant: ${cert.leads.violations.length} violation(s), ${cert.leads.unmeasuredRuns} unmeasured, ${cert.leads.checkedRuns} checked`)
   lines.push('')
   lines.push('## Reason-bench')

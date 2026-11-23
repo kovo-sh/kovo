@@ -387,6 +387,17 @@ describe('class hygiene gate', () => {
     assert.equal(criterion(cert, 'class_hygiene').status, 'FAIL')
   })
 
+  test('an artifact without the hygiene field fails (unmeasured, not assumed clean)', () => {
+    const runs = passRuns()
+    runs[0] = { ...runs[0]!, incompatibleClassCount: null }
+    const cert = evaluate(runs)
+    const gate = criterion(cert, 'class_hygiene')
+    assert.equal(gate.status, 'FAIL')
+    assert.match(gate.observed, /1 unmeasured/)
+    assert.equal(cert.hygiene.incompatibleClassUnmeasured, 1)
+    assert.equal(cert.verdict, 'FAIL')
+  })
+
   test('clean matrix reports zero incompatible claims', () => {
     const cert = evaluate(passRuns())
     assert.equal(cert.hygiene.incompatibleClassCount, 0)
