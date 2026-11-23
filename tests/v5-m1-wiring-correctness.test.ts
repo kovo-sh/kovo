@@ -962,31 +962,52 @@ test('M1 precision: read-only BFLA with only a 2xx cannot confirm (impact gate)'
   assert.match(flat.reason, /lacks impact evidence/i)
 })
 
-test('M1 precision: BFLA confirms with a denied sibling actor or a successful privileged mutation', () => {
+test('M1 precision: BFLA confirms with a denied sibling actor or a persisted privileged mutation', () => {
   const spec = bflaSpec()
   const differential = assessBflaImpact(spec, {
     ctrl: { id: 'ctrl', role: 'control', status: 403, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"error":"forbidden"}' },
-    prb: { id: 'prb', role: 'probe', status: 200, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"rows":[{"actor":"admin","action":"delete-user","target":"user-42"},{"actor":"admin","action":"rotate-key"}]}' },
+    prb: { id: 'prb', role: 'probe', status: 200, method: 'GET', pathAndQuery: '/api/admin/auditlogs', body: '{"rows":[{"owner":"admin-user","action":"delete-user","target":"user-42"},{"owner":"admin-user","action":"rotate-key"}]}' },
   })
   assert.equal(differential.required, true)
   assert.equal(differential.satisfied, true)
-  assert.match(differential.reason, /Role differential/i)
+  assert.match(differential.reason, /admin|below|disclos|differential/i)
 
   const mutatingSpec = {
     ...bflaSpec({ probeMethod: 'DELETE', cwe: 'CWE-269' }),
+    requiredRole: 'admin' as const,
+    steps: [
+      { id: 'before', role: 'control' as const, description: 'Read the target user', request: { origin: fakeOrigin, method: 'GET' as const, pathAndQuery: '/api/admin/users/42', persona: 'admin', followRedirects: false } },
+      { id: 'ctrl', role: 'control' as const, description: 'Admin call', request: { origin: fakeOrigin, method: 'GET' as const, pathAndQuery: '/api/admin/users', persona: 'admin', followRedirects: false } },
+      { id: 'prb', role: 'probe' as const, description: 'Viewer delete', request: { origin: fakeOrigin, method: 'DELETE' as const, pathAndQuery: '/api/admin/users/42', persona: 'viewer', followRedirects: false } },
+      { id: 'after', role: 'control' as const, description: 'Read the target user after the mutation', request: { origin: fakeOrigin, method: 'GET' as const, pathAndQuery: '/api/admin/users/42', persona: 'admin', followRedirects: false } },
+    ],
     assertionsJq: '{ controlPassed: (.steps.ctrl.status == 200), confirmed: (.steps.prb.status == 204), observed: "deleted", expected: "denied" }',
   }
+  // A 2xx mutation alone is not impact: the actor must be below the required role *and* a clean
+  // readback must show the row was actually removed.
   const mutation = assessBflaImpact(mutatingSpec as never, {
+    before: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users/42', body: '{"id":42,"role":"member"}' },
     ctrl: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users' },
     prb: { status: 204, method: 'DELETE', pathAndQuery: '/api/admin/users/42', body: '' },
+    after: { status: 404, method: 'GET', pathAndQuery: '/api/admin/users/42', body: '{"error":"not_found"}' },
   })
   assert.equal(mutation.required, true)
   assert.equal(mutation.satisfied, true)
-  assert.match(mutation.reason, /mutating step/i)
+  assert.match(mutation.reason, /removed|persisted|below/i)
+
+  const echoOnly = assessBflaImpact({ ...mutatingSpec, steps: mutatingSpec.steps.filter(step => step.id !== 'before' && step.id !== 'after') } as never, {
+    ctrl: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users' },
+    prb: { status: 204, method: 'DELETE', pathAndQuery: '/api/admin/users/42', body: '' },
+  })
+  assert.equal(echoOnly.required, true)
+  assert.equal(echoOnly.satisfied, false)
+  assert.match(echoOnly.reason, /readback|persist|echo/i)
 
   const failedMutation = assessBflaImpact(mutatingSpec as never, {
+    before: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users/42', body: '{"id":42,"role":"member"}' },
     ctrl: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users' },
     prb: { status: 403, method: 'DELETE', pathAndQuery: '/api/admin/users/42', body: '{"error":"forbidden"}' },
+    after: { status: 200, method: 'GET', pathAndQuery: '/api/admin/users/42', body: '{"id":42,"role":"member"}' },
   })
   assert.equal(failedMutation.satisfied, false)
 })

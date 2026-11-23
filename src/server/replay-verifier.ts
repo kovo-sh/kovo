@@ -31,6 +31,13 @@ import {
 import type { CanaryWaitOutcome, EphemeralCanarySession } from './verify-support.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
+import {
+  actorFromPersona,
+  assessImpactEvidence,
+  classifyImpactDescriptor,
+  normalizeRole,
+} from './oracle-invariants.ts'
+import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource } from './oracle-invariants.ts'
 
 // Re-exported for tests and callers that only import the verifier.
 export {
@@ -179,10 +186,7 @@ export interface BflaImpactAssessment {
   required: boolean
   satisfied: boolean
   reason: string
-}
-
-function readStepField(entry: Record<string, unknown> | undefined, key: string): unknown {
-  return entry && typeof entry === 'object' ? entry[key] : undefined
+  evidence?: Record<string, unknown>
 }
 
 function normalizedReplayPath(value: string | undefined): string {
@@ -191,11 +195,53 @@ function normalizedReplayPath(value: string | undefined): string {
 }
 
 /**
+ * Map recorded replay steps onto the shared evidence model. Role/tenant/auth metadata is enriched
+ * into each step summary at record time (see `personaActorFields`), so the same validators can run
+ * on a spec whose persona handles are opaque.
+ */
+export function impactStepsFromStepsOut(
+  spec: DeclarativeReplaySpec,
+  stepsOut: Record<string, unknown>,
+): ImpactStep[] {
+  if (spec.kind !== 'http_chain') return []
+  return spec.steps.map(step => {
+    const entry = stepsOut[step.id] as Record<string, unknown> | undefined
+    const handle = (typeof entry?.personaHandle === 'string' ? entry.personaHandle : null) ?? step.request.persona ?? null
+    const declaredRole = typeof entry?.actorRole === 'string' ? normalizeRole(entry.actorRole) : null
+    let entryJson = entry?.json ?? null
+    if (entryJson === null && typeof entry?.body === 'string') {
+      // Unit-level callers may provide only the recorded body; parse it so the shared validators
+      // see the same shape the wire recorder produces.
+      try { entryJson = JSON.parse(entry.body) } catch { entryJson = null }
+    }
+    return {
+      id: step.id,
+      arm: step.role,
+      method: step.request.method.toUpperCase(),
+      route: normalizedReplayPath(step.request.pathAndQuery),
+      status: typeof entry?.status === 'number' ? entry.status : null,
+      actor: {
+        handle,
+        role: declaredRole ?? normalizeRole(step.request.persona),
+        tenant: typeof entry?.actorTenant === 'string' ? entry.actorTenant : null,
+        auth: (typeof entry?.ambientAuth === 'string' ? entry.ambientAuth : 'unknown') as AmbientAuth,
+        sameSite: typeof entry?.sessionSameSite === 'string' ? entry.sessionSameSite : null,
+      } satisfies ActorIdentity,
+      json: entryJson,
+      body: typeof entry?.body === 'string' ? entry.body : '',
+      requestJson: step.request.jsonBody,
+      requestHeaders: step.request.headers ?? null,
+      responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
+    }
+  })
+}
+
+/**
  * Vertical (function-level) BFLA needs *impact*, not just a 2xx from a lower-privileged actor.
  * A read-only route that every authenticated role may legitimately read must never confirm as
- * privilege escalation: the deterministic replay has to show either a successful privileged
- * mutation or a same-route role differential (one actor 2xx with real data, another actor denied).
- * Object-level BOLA (CWE-639) is intentionally unaffected.
+ * privilege escalation: the replay must show a role/tenant differential *and* a real side effect
+ * (or an owner-scoped disclosure for reads). Object-level BOLA (CWE-639) is handled by the shared
+ * impact gate, not here.
  */
 export function assessBflaImpact(
   spec: DeclarativeReplaySpec,
@@ -209,63 +255,20 @@ export function assessBflaImpact(
   if (!vertical || spec.steps.length < 2) {
     return { required: false, satisfied: true, reason: 'Not a function-level BFLA proof.' }
   }
-
-  const steps = spec.steps.map(step => {
-    const entry = stepsOut[step.id] as Record<string, unknown> | undefined
-    const status = readStepField(entry, 'status')
-    const body = readStepField(entry, 'body')
-    return {
-      id: step.id,
-      role: step.role,
-      method: step.request.method.toUpperCase(),
-      persona: step.request.persona ?? null,
-      path: normalizedReplayPath(step.request.pathAndQuery),
-      status: typeof status === 'number' ? status : null,
-      bodyBytes: typeof body === 'string' ? body.length : 0,
-    }
+  const assessment = assessImpactEvidence({
+    impactClass: 'bfla',
+    steps: impactStepsFromStepsOut(spec, stepsOut),
+    requiredRole: spec.requiredRole ?? null,
+    resourceTenant: spec.resourceTenant ?? null,
+    expectControlDenied: spec.expectControlDenied,
+    oracleEvents: spec.expectedImpactEvents,
+    targetOrigin: spec.origin,
   })
-
-  const mutating = steps.filter(step => MUTATING_REPLAY_METHODS.has(step.method))
-  if (mutating.length > 0) {
-    const succeeded = mutating.find(step => step.status !== null && step.status >= 200 && step.status < 300)
-    if (succeeded) {
-      return {
-        required: true,
-        satisfied: true,
-        reason: `Privileged mutating step "${succeeded.id}" returned HTTP ${succeeded.status}.`,
-      }
-    }
-    return {
-      required: true,
-      satisfied: false,
-      reason: 'BFLA mutating step did not succeed, so no privileged side effect was demonstrated.',
-    }
-  }
-
-  if (!steps.every(step => READ_ONLY_REPLAY_METHODS.has(step.method))) {
-    return { required: true, satisfied: false, reason: 'BFLA proof used a non-read method without a 2xx mutation.' }
-  }
-
-  // Same-route role differential: a different actor is denied while the probe actor receives data.
-  for (const probe of steps) {
-    if (probe.status === null || probe.status < 200 || probe.status >= 300 || probe.bodyBytes < 64) continue
-    for (const other of steps) {
-      if (other.id === probe.id) continue
-      if (other.path !== probe.path) continue
-      if (other.status === null || other.status < 400) continue
-      if (other.persona === probe.persona && other.role === probe.role) continue
-      return {
-        required: true,
-        satisfied: true,
-        reason: `Role differential: "${probe.id}" (${probe.persona ?? 'anonymous'}) received HTTP ${probe.status} while "${other.id}" (${other.persona ?? 'anonymous'}) was denied with HTTP ${other.status}.`,
-      }
-    }
-  }
-
   return {
     required: true,
-    satisfied: false,
-    reason: 'Read-only BFLA proof lacks impact evidence: a 2xx from one actor on a read-only route is not privilege escalation unless another actor is denied on the same route or the response exposes data the actor cannot otherwise access. Add a same-route role-differential or a privileged mutation step.',
+    satisfied: assessment.satisfied,
+    reason: assessment.reason,
+    ...(assessment.evidence ? { evidence: assessment.evidence } : {}),
   }
 }
 
@@ -1002,6 +1005,16 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     }
   }
   const guardControlErrors = spec.requireControlNonError ?? defaultRequireControlNonError(spec)
+  // Persona credential context for the shared impact validators (role label, tenant, ambient auth
+  // and session-cookie SameSite). Built from the approved persona vault only; never from the spec.
+  const personaSources: PersonaCredentialSource[] = [...(grant.personas?.values() ?? [])].map(persona => ({
+    handle: persona.handle,
+    roleLabel: persona.roleLabel,
+    authKind: persona.authKind,
+    headerType: persona.session?.headerType ?? null,
+    cookies: (persona.session?.bundle?.cookies ?? []).map(cookie => ({ name: cookie.name, sameSite: cookie.sameSite ?? null })),
+  }))
+  const declaredActorRoles = spec.kind === 'http_chain' ? spec.actorRoles : undefined
 
   // 3. Fresh Replay Execution
   let evidencePayload: Record<string, unknown> = {
@@ -1033,6 +1046,17 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       const replayJarPrefix = randomUUID().slice(0, 8)
       let firstControlStep: Record<string, unknown> | undefined
       let firstProbeStep: Record<string, unknown> | undefined
+
+      const actorContextFor = (step: ReplayStep): Record<string, unknown> => {
+        const actor = actorFromPersona(step.request.persona ?? null, personaSources, { roles: declaredActorRoles ?? null })
+        if (!actor.handle) return {}
+        return {
+          ...(actor.role ? { actorRole: actor.role } : {}),
+          ...(actor.tenant ? { actorTenant: actor.tenant } : {}),
+          ...(actor.auth !== 'unknown' ? { ambientAuth: actor.auth } : {}),
+          ...(actor.sameSite ? { sessionSameSite: actor.sameSite } : {}),
+        }
+      }
 
       const serializedSteps = JSON.stringify(spec.steps)
       const needsCanary = /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps) ||
@@ -1081,6 +1105,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               statuses: batchResults.map(r => r.status),
               responses: batchResults.map(summarizeExchange),
               ...(first ? summarizeExchange(first) : {}),
+              ...actorContextFor(step),
             }
             stepsOut[step.id] = stepEntry
             if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
@@ -1097,6 +1122,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               id: step.id,
               role: step.role,
               ...summarizeExchange(ex),
+              ...actorContextFor(step),
             }
             stepsOut[step.id] = stepEntry
             if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
@@ -1112,6 +1138,17 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             if (step.role !== 'control' && step.role !== 'probe') continue
             const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
             if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
+              // A control that is *supposed* to be denied (a cross-tenant boundary probe) is proof
+              // of the boundary, not a spec error. Dropping it would leave the chain with only the
+              // weaker arm, so it is tolerated when declared or when the probe arm on the same route
+              // succeeded.
+              if (step.role === 'control' && (status === 401 || status === 403 || status === 404)) {
+                const probeSucceededOnRoute = spec.steps.some(other =>
+                  other.role === 'probe' &&
+                  routeKey(other.request.pathAndQuery) === routeKey(step.request.pathAndQuery) &&
+                  isSuccessStatus(((stepsOut[other.id] as { status?: number } | undefined)?.status) ?? null))
+                if (spec.expectControlDenied || probeSucceededOnRoute) continue
+              }
               // On probe steps, allow error status if assertionsJq explicitly asserts that error status
               // (e.g. error-based SQLi testing `.steps.p1.status == 500` while control step is 200).
               if (step.role === 'probe') {
@@ -1235,6 +1272,42 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         if (!endpointBinding.bound && !proofGuardFailure) {
           proofGuardFailure = endpointBinding.reason
         }
+        // Shared semantic impact gate for every class the differential machinery can over-claim:
+        // horizontal authorization (read disclosure / persisted cross-tenant write), mass assignment
+        // and CSRF. Vertical BFLA is covered by `assessBflaImpact` above (same validators). The gate
+        // only applies when the spec actually carries an actor/role/tenant reference; a same-actor
+        // deterministic field probe is judged by the proof-strength gate alone.
+        const impactClass = classifyImpactDescriptor({
+          cwe: spec.cwe,
+          category: spec.category,
+          title: spec.title,
+          impact: spec.impact,
+        })
+        const distinctActors = new Set(spec.steps.map(step => step.request.persona ?? step.request.session ?? 'anonymous'))
+        // A control arm that binds a CSRF token is the engine's declared anti-CSRF defence for the
+        // route, equivalent to the route's `csrf_state_change` oracle. It is a requirement, not
+        // evidence: the persisted readback is still demanded below.
+        const declaredImpactEvents = spec.expectedImpactEvents ?? []
+        const csrfModelled = impactClass === 'csrf' && spec.steps.some(step => Boolean(step.request.csrfBind))
+        const oracleEvents = csrfModelled && !declaredImpactEvents.includes('csrf_state_change')
+          ? [...declaredImpactEvents, 'csrf_state_change']
+          : declaredImpactEvents
+        const gateApplies = impactClass === 'mass_assignment' || impactClass === 'csrf' ||
+          (impactClass === 'authorization' && (distinctActors.size > 1 || Boolean(spec.requiredRole) || Boolean(spec.resourceTenant)))
+        const impactGate = !gateApplies
+          ? null
+          : assessImpactEvidence({
+              impactClass,
+              steps: impactStepsFromStepsOut(spec, stepsOut),
+              requiredRole: spec.requiredRole ?? null,
+              resourceTenant: spec.resourceTenant ?? null,
+              expectControlDenied: spec.expectControlDenied,
+              oracleEvents,
+              targetOrigin: spec.origin,
+            })
+        if (impactGate?.required && !impactGate.satisfied && !proofGuardFailure) {
+          proofGuardFailure = impactGate.reason
+        }
         let proofMatches: Record<string, boolean[]> | undefined
         if (spec.proofPatterns?.length) {
           proofMatches = {}
@@ -1265,11 +1338,17 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(spaCatchall ? { spaCatchall } : {}),
           ...(spaCatchallAuto ? { spaCatchallAuto } : {}),
           bflaImpact,
+          ...(impactGate ? { impactGate } : {}),
           proofStrength,
           endpointBinding,
         }
         if (bflaImpact.required && !bflaImpact.satisfied && !forcedInconclusiveReason) {
           forcedInconclusiveReason = bflaImpact.reason
+        }
+        if (impactGate?.required && !impactGate.satisfied && !proofGuardFailure) {
+          // Vetoes only a would-be confirmation; a spec whose assertion already fails keeps its
+          // dismissed/fixed semantics (Verify Fix must still report `fixed`).
+          proofGuardFailure = impactGate.reason
         }
       } finally {
         await canarySession?.close()

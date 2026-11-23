@@ -195,6 +195,25 @@ const replayBase = z.object({
   recheckInstructions: z.string().trim().min(5).max(1000),
   assertionsJq: z.string().trim().min(1).max(4096),
   requireControlNonError: z.boolean().optional(),
+  /**
+   * Denied-control evidence path: a control that is *supposed* to be denied (cross-tenant 404/403)
+   * is proof of the boundary, not a spec error. Declaring it stops the verifier from encouraging a
+   * chain that drops its strongest control; the impact gate still requires a persisted side effect.
+   */
+  expectControlDenied: z.boolean().optional(),
+  /** Minimum role the endpoint is supposed to require (viewer < member < admin < owner). */
+  requiredRole: z.enum(['viewer', 'member', 'admin', 'owner']).optional(),
+  /** Tenant that owns the acted-on resource; a probe actor from another tenant is a differential. */
+  resourceTenant: z.string().trim().min(1).max(64).optional(),
+  /** Effective app roles for persona handles (overrides a role label the verifier cannot parse). */
+  actorRoles: z.record(personaHandle, z.enum(['viewer', 'member', 'admin', 'owner'])).optional(),
+  /**
+   * Impact-oracle events this endpoint is modelled to raise (e.g. `cross_tenant_write`,
+   * `privilege_escalation`, `mass_assignment`, `invariant_violation`, `csrf_state_change`).
+   * A declared event is a requirement, never evidence by itself: the verifier still demands the
+   * persisted readback that the event would represent.
+   */
+  expectedImpactEvents: z.array(z.string().trim().min(1).max(48)).max(8).optional(),
   expectedStatus: expectedStatusSchema.optional(),
   /**
    * Non-secret regex shapes used for proof. The verifier reports which step bodies matched each
