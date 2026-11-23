@@ -106,8 +106,12 @@ import {
 } from './dedupe.ts'
 import type { ExistingFindingRef } from './dedupe.ts'
 import {
+  cleanupStagedEntities,
+  extractCreatedId,
   intentFamily,
   runDeterministicEngine,
+  stagingProbeTag,
+  tagStagingEntityBody,
 } from './deterministic-engine.ts'
 import type { EngineConfirmed, EngineEndpoint, EngineLead, EnginePersona } from './deterministic-engine.ts'
 import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
@@ -236,6 +240,7 @@ import { responseReview } from './response-checks.ts'
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
+import { tenantTagForRun } from './scope-policy.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
 import { assessmentAssignments, extractResourceRefsFromExchange, isOpaqueResourceId, store } from './store.ts'
 import type {
@@ -252,6 +257,7 @@ import type {
   Store,
 } from './store.ts'
 import { probeDifferential, probeSurface, runSafeTemplates } from './surface-engine.ts'
+import type { DifferentialProbeClass } from './surface-engine.ts'
 import { LinuxWorkerBackend } from './worker-backend.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
@@ -1318,6 +1324,13 @@ export class Execution {
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
+  /** v6 staging counters (per run): tagged mutations, locally skipped untaggable probes, cleanup. */
+  private readonly stagingTaggedMutations = new Map<string, number>()
+  private readonly stagingUntaggedSkipped = new Map<string, number>()
+  private readonly stagingCleaned = new Map<string, number>()
+  private readonly stagingCreatedEntities = new Map<string, Set<string>>()
+  /** runId → grant captured while tagging, so teardown can call the run-scoped cleanup hook. */
+  private readonly stagingGrants = new Map<string, Grant>()
   private readonly boardHandleByAssignment = new Map<string, string>()
   private readonly boardAssignmentTokens = new Map<string, number>()
   private readonly boardHandleTokens = new Map<string, number>()
@@ -1417,6 +1430,36 @@ export class Execution {
         try { this.recordFloorMetrics(runId, 'finalize') } catch { /* metrics are best-effort */ }
       }
     } catch { /* store may be unavailable during teardown */ }
+    // v6 staging: agent-tool mutations captured a grant while tagging; hand the run tag back to the
+    // target's declared cleanup hook so no tagged entity outlives the run. Best-effort only.
+    if (this.stagingGrants.size > 0) {
+      for (const [runId, grant] of this.stagingGrants) {
+        try {
+          if ((this.stagingTaggedMutations.get(runId) ?? 0) <= 0) continue
+          const removed = await cleanupStagedEntities({
+            endpoints: this.storage.listEndpoints(runId),
+            runId,
+            broker: this.broker,
+            grant,
+            signal: AbortSignal.timeout(8_000),
+            log: (kind, message, data) => {
+              try { this.storage.event(runId, kind, message, data ?? {}) } catch { /* run may be gone */ }
+            },
+          })
+          if (removed > 0) this.stagingCleaned.set(runId, (this.stagingCleaned.get(runId) ?? 0) + removed)
+          this.storage.event(runId, 'staging.teardown', `Staging teardown cleaned ${removed} tagged entit${removed === 1 ? 'y' : 'ies'}.`, {
+            stagingTaggedMutations: this.stagingTaggedMutations.get(runId) ?? 0,
+            stagingUntaggedSkipped: this.stagingUntaggedSkipped.get(runId) ?? 0,
+            stagingCleaned: this.stagingCleaned.get(runId) ?? 0,
+          })
+        } catch { /* teardown is best-effort; never block shutdown */ }
+      }
+      this.stagingGrants.clear()
+      this.stagingCreatedEntities.clear()
+      this.stagingTaggedMutations.clear()
+      this.stagingUntaggedSkipped.clear()
+      this.stagingCleaned.clear()
+    }
     this.wakeScheduled = false
     this.unsubWake?.()
     this.unsubWake = undefined
@@ -5623,6 +5666,77 @@ export class Execution {
   }
 
   /**
+   * v6 staging: apply the run tag to an agent-tool request (headers + entity-creating values).
+   * Returns a skip reason for a mutation that cannot be tagged safely; callers must not send it.
+   */
+  private stagingTagAgentRequest(input: {
+    runId: string
+    grant: Grant
+    mode: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
+    entityTag: string
+    method: string
+    pathAndQuery: string
+    probeClass?: string
+    jsonBody?: unknown
+  }): { headers: Record<string, string>; jsonBody?: unknown; skipped?: string } {
+    const staging = stagingProbeTag({
+      environmentMode: input.mode,
+      entityTag: input.entityTag,
+      runId: input.runId,
+      method: input.method,
+      probeClass: (input.probeClass as DifferentialProbeClass | undefined) ?? 'mass_assignment',
+      pathAndQuery: input.pathAndQuery,
+      mutates: !/^(?:GET|HEAD|OPTIONS)$/i.test(input.method),
+      ...(input.jsonBody && typeof input.jsonBody === 'object' && !Array.isArray(input.jsonBody)
+        ? { jsonBody: input.jsonBody as Record<string, unknown> }
+        : {}),
+    })
+    if (staging.action === 'skip') {
+      this.stagingUntaggedSkipped.set(input.runId, (this.stagingUntaggedSkipped.get(input.runId) ?? 0) + 1)
+      this.storage.event(input.runId, 'staging.untagged_skipped',
+        `Skipped ${input.method} ${input.pathAndQuery.split('?')[0]} in staging_isolated: ${staging.reason}.`,
+        { method: input.method, path: input.pathAndQuery.split('?')[0], reason: staging.reason, surface: 'agent_tool' })
+      return { headers: {}, skipped: staging.reason }
+    }
+    if (staging.action !== 'tag') return { headers: {} }
+    this.stagingTaggedMutations.set(input.runId, (this.stagingTaggedMutations.get(input.runId) ?? 0) + 1)
+    this.stagingGrants.set(input.runId, input.grant)
+    return { headers: staging.headers ?? {}, ...(staging.jsonBody ? { jsonBody: staging.jsonBody } : {}) }
+  }
+
+  /** v6 staging: tag every mutating request in an agent race burst (headers + JSON body values). */
+  private stageAgentRaceBurst(
+    runId: string,
+    grant: Grant,
+    mode: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab',
+    entityTag: string | null,
+    requests: readonly BrokerHttpRequest[],
+  ): BrokerHttpRequest[] {
+    if (!entityTag) return [...requests]
+    return requests.map(request => {
+      if (/^(?:GET|HEAD|OPTIONS)$/i.test(request.method)) return request
+      const headers = { ...(request.headers ?? {}) }
+      let parsed: unknown
+      try { parsed = request.body ? JSON.parse(request.body) as unknown : undefined } catch { parsed = undefined }
+      const tagged = this.stagingTagAgentRequest({
+        runId, grant, mode, entityTag,
+        method: request.method,
+        pathAndQuery: request.pathAndQuery,
+        probeClass: request.probeClass ?? 'workflow_invariant',
+        ...(parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? { jsonBody: parsed as Record<string, unknown> }
+          : {}),
+      })
+      if (tagged.skipped) {
+        throw new BrokerDenied(`staging_isolated cannot safely tag this race burst (${tagged.skipped}); skipped without sending.`)
+      }
+      Object.assign(headers, tagged.headers)
+      const body = tagged.jsonBody !== undefined ? JSON.stringify(tagged.jsonBody) : request.body
+      return { ...request, headers, ...(body !== undefined ? { body } : {}) }
+    })
+  }
+
+  /**
    * Explicit `--no-llm` deterministic closed loop. Risk-ranks the discovered surface, harvests
    * identifiers/fields from the target's own responses, runs the benign differential probes, turns
    * strong signals into identifier-bound DeclarativeReplaySpecs and lets the normal ReplayVerifier
@@ -5646,8 +5760,9 @@ export class Execution {
     // function-level authorization hypothesis for them (the engine owns the tier gate).
     // Graphwire: read the full store (lossless), probe only the Phase-0 ranked subset when one
     // exists; otherwise use the risk-ranked cap. The store is never trimmed or rewritten.
+    const allEndpoints = listEndpointsPaged(this.storage, current.id, { orderBy: 'risk' })
     const probeSelection = selectProbeCandidates({
-      endpoints: listEndpointsPaged(this.storage, current.id, { orderBy: 'risk' }),
+      endpoints: allEndpoints,
       probePlan: this.probePlans.get(this.storage, current.id),
       cap: ENGINE_PROBE_CAP,
       approvedOrigins,
@@ -5853,7 +5968,7 @@ export class Execution {
       // v6 environment contract: shared staging gets a short, tightly capped floor pass so it can
       // never dominate the engagement budget, and every created entity carries the run tag.
       const environmentMode = this.storage.scopePolicy(current).mode
-      const entityTag = environmentMode === 'staging_isolated' ? `guardian-qa-${current.id}-` : undefined
+      const entityTag = environmentMode === 'staging_isolated' ? tenantTagForRun(current.id) : undefined
       const stagingCap = environmentMode === 'staging_isolated'
         ? Math.max(50, Math.floor((current.budgetRequests > 0 ? current.budgetRequests : requestCap) * 0.2))
         : requestCap
@@ -5895,6 +6010,7 @@ export class Execution {
         maxHypotheses,
         environmentMode,
         ...(entityTag ? { entityTag } : {}),
+        ...(entityTag ? { cleanupEndpoints: allEndpoints } : {}),
         recordExchange,
         log: (kind, message, data) => {
           try { this.storage.event(current.id, kind, message, data ?? {}) } catch { /* run may be gone */ }
@@ -5921,6 +6037,30 @@ export class Execution {
       const byClass = Object.entries(report.byClass)
         .map(([intent, stats]) => `${intent}:${stats.confirmed}/${stats.hypotheses}`)
         .join(' ')
+      if (report.stagingTaggedMutations > 0 || report.stagingUntaggedSkipped > 0 || report.stagingCleaned > 0) {
+        this.stagingTaggedMutations.set(current.id,
+          (this.stagingTaggedMutations.get(current.id) ?? 0) + report.stagingTaggedMutations)
+        this.stagingUntaggedSkipped.set(current.id,
+          (this.stagingUntaggedSkipped.get(current.id) ?? 0) + report.stagingUntaggedSkipped)
+        this.stagingCleaned.set(current.id,
+          (this.stagingCleaned.get(current.id) ?? 0) + report.stagingCleaned)
+        if (report.stagingCreatedEntityIds.length > 0) {
+          const set = this.stagingCreatedEntities.get(current.id) ?? new Set<string>()
+          for (const id of report.stagingCreatedEntityIds) set.add(id)
+          this.stagingCreatedEntities.set(current.id, set)
+        }
+        this.storage.event(
+          current.id,
+          'staging.mutations',
+          `Staging pass tagged ${report.stagingTaggedMutations} mutation(s), skipped ${report.stagingUntaggedSkipped} untaggable, cleaned ${report.stagingCleaned}.`,
+          {
+            stagingTaggedMutations: report.stagingTaggedMutations,
+            stagingUntaggedSkipped: report.stagingUntaggedSkipped,
+            stagingCleaned: report.stagingCleaned,
+            createdEntityIds: report.stagingCreatedEntityIds.slice(0, 50),
+          },
+        )
+      }
       this.storage.event(
         current.id,
         'deterministic_engine.summary',
@@ -5939,6 +6079,9 @@ export class Execution {
           stoppedReason: report.stoppedReason,
           durationMs: report.durationMs,
           byClass,
+          stagingTaggedMutations: report.stagingTaggedMutations,
+          stagingUntaggedSkipped: report.stagingUntaggedSkipped,
+          stagingCleaned: report.stagingCleaned,
         },
       )
       this.storage.message(
@@ -6938,11 +7081,37 @@ export class Execution {
           throw new BudgetExceededError('Run spend or request budget exceeded.')
         }
         const headers = { ...(args.headers ?? {}) }
+        let jsonBody: unknown = args.jsonBody
         let body: string | undefined
+        // v6 staging: every agent mutation carries the run tag on entity-creating values and on
+        // request headers, so the tenant contract stays strict while the probe is attributable.
+        const scopePolicy = this.storage.scopePolicy(curRun)
+        const stagingEntityTag = scopePolicy.mode === 'staging_isolated' ? tenantTagForRun(curRun.id) : null
+        if (stagingEntityTag) {
+          const tagged = this.stagingTagAgentRequest({
+            runId: curRun.id, grant, mode: scopePolicy.mode, entityTag: stagingEntityTag,
+            method: args.method, pathAndQuery: args.pathAndQuery,
+            ...(args.probeClass ? { probeClass: args.probeClass } : {}),
+            ...(jsonBody !== undefined ? { jsonBody } : {}),
+          })
+          if (tagged.skipped) {
+            throw new BrokerDenied(`staging_isolated cannot safely tag this mutation (${tagged.skipped}); skipped without sending.`)
+          }
+          Object.assign(headers, tagged.headers)
+          if (tagged.jsonBody !== undefined) jsonBody = tagged.jsonBody
+        }
         if (args.textBody !== undefined) {
           body = args.textBody
-        } else if (args.jsonBody !== undefined) {
-          body = JSON.stringify(args.jsonBody)
+          if (headers['x-guardian-tenant-tag'] && jsonBody === undefined) {
+            try {
+              const parsed = JSON.parse(args.textBody) as unknown
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                body = JSON.stringify(tagStagingEntityBody(parsed as Record<string, unknown>, stagingEntityTag!))
+              }
+            } catch { /* non-JSON text bodies stay byte-identical; headers still carry the tag */ }
+          }
+        } else if (jsonBody !== undefined) {
+          body = JSON.stringify(jsonBody)
           if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json'
         }
 
@@ -7025,6 +7194,15 @@ export class Execution {
         boardTools.noteEvidence()
         this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
         this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
+        // v6 staging: record what a tagged mutation created so the run-scoped cleanup can audit it.
+        if (stagingEntityTag && /^(?:POST|PUT|PATCH)$/i.test(args.method) && res.status >= 200 && res.status < 300) {
+          const created = extractCreatedId(res.body)
+          if (created) {
+            const set = this.stagingCreatedEntities.get(curRun.id) ?? new Set<string>()
+            set.add(created)
+            this.stagingCreatedEntities.set(curRun.id, set)
+          }
+        }
 
         let stagedPath: string | null = null
         try {
@@ -7058,7 +7236,9 @@ export class Execution {
         if (curRun.budgetRequests > 0 && curRun.spentRequests + args.requests.length > curRun.budgetRequests) {
           throw new BudgetExceededError('Race burst would exceed run request budget.')
         }
-        const brokerReqs = args.requests.map(r => {
+        const racePolicy = this.storage.scopePolicy(curRun)
+        const raceEntityTag = racePolicy.mode === 'staging_isolated' ? tenantTagForRun(curRun.id) : null
+        const brokerReqs: BrokerHttpRequest[] = args.requests.map(r => {
           const headers = { ...(r.headers ?? {}) }
           let body: string | undefined
           if (r.textBody !== undefined) body = r.textBody
@@ -7084,15 +7264,16 @@ export class Execution {
             followRedirects: r.followRedirects ?? false,
           }
         })
+        const stagedReqs = this.stageAgentRaceBurst(curRun.id, grant, racePolicy.mode, raceEntityTag, brokerReqs)
 
         // One synchronized decision covers every instance of the burst. Identical requests
         // register one single-use instance each (never one shared grant), so the legitimate
         // 3x/5x/10x burst no longer loops through fresh approval cards after the first consume.
-        const burst = await this.executeApprovedRaceBurst(job, brokerReqs, grant, signal, {
+        const burst = await this.executeApprovedRaceBurst(job, stagedReqs, grant, signal, {
           stepTitle: step.title,
           rationale: args.rationale,
           secrets: currentSecrets(),
-          execute: () => this.broker.executeRaceBurst(brokerReqs, grant, signal),
+          execute: () => this.broker.executeRaceBurst(stagedReqs, grant, signal),
         })
 
         const summaries = burst.results.map(res => {
