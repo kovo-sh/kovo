@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, extname, join, relative } from 'node:path'
@@ -52,6 +52,27 @@ export interface OfflineScriptRequest {
 export interface OfflineScriptResult {
   runtime: 'python' | 'node'
   exitCode: number
+  stdout: string
+  stderr: string
+  durationMs: number
+  timedOut: boolean
+}
+
+/** guardian_verify script execution (Layer-3 SDK staged into the sandbox at call time). */
+export interface VerifyScriptRequest {
+  runtime: 'ts' | 'python'
+  code: string
+  nonce: string
+  /** SDK source files (zero-dep TS/Python) written next to the script. */
+  sdkFiles?: Array<{ name: string; content: string }>
+  timeoutMs?: number
+}
+
+export interface VerifyScriptResult {
+  runtime: 'ts' | 'python'
+  exitCode: number
+  /** Parsed proof document (claims only; stdout is never evidence). */
+  result: unknown
   stdout: string
   stderr: string
   durationMs: number
@@ -113,6 +134,7 @@ type SessionMessage =
   | { id: string; op: 'analyze'; tool: AnalyzerName; args: Record<string, unknown> }
   | ({ id: string; op: 'sast' } & SastScanRequest)
   | ({ id: string; op: 'script' } & OfflineScriptRequest)
+  | ({ id: string; op: 'verify' } & VerifyScriptRequest)
   | ({ id: string; op: 'ast_verify' } & AstVerifyRequest)
   | ({ id: string; op: 'call_graph' } & CallGraphRequest)
   | { id: string; op: 'shutdown' }
@@ -124,6 +146,12 @@ const maxScratchBytes = 16 * 1024 * 1024
 const maxSastFindingsReturned = 400
 const maxScriptCodeBytes = 256 * 1024
 const maxToolCaptureBytes = 8 * 1024 * 1024
+// Chunked IPC: an NDJSON response above this size is written to the container tmpfs and the
+// host receives a file pointer instead. The host's BoundedLineDecoder kills sessions at 64 KiB,
+// so the spill threshold must stay meaningfully below that.
+const IPC_SPILL_THRESHOLD = 48 * 1024
+const IPC_SPILL_DIR = process.env.GUARDIAN_IPC_DIR || '/tmp/guardian-ipc'
+const cleanSdkName = /^guardian_verify\.(?:ts|py)$/
 const cleanPath = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/
 const cleanOutputName = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/
 const cleanRepoName = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}){0,3}$/
@@ -1203,6 +1231,69 @@ async function runOfflineScript(req: OfflineScriptRequest, inputDirectory: strin
 }
 
 // ============================================================================
+// Layer-3 guardian_verify script runner (3-hook SDK, transcript-backed claims)
+// ============================================================================
+
+async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptResult> {
+  if (req.runtime !== 'ts' && req.runtime !== 'python') throw new Error('Unsupported verification runtime.')
+  if (typeof req.code !== 'string' || !req.code.trim()) throw new Error('Verification script code must be non-empty.')
+  if (Buffer.byteLength(req.code) > maxScriptCodeBytes) throw new Error('Verification script exceeds 256 KiB limit.')
+  if (typeof req.nonce !== 'string' || !/^[a-f0-9]{16,128}$/i.test(req.nonce)) throw new Error('Verification nonce is invalid.')
+  const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? 90_000, 120_000))
+  const dir = await mkdtemp(join(tmpdir(), 'guardian-verify-'))
+  const resultPath = join(dir, 'result.json')
+  const extension = req.runtime === 'python' ? '.py' : '.ts'
+  const scriptPath = join(dir, 'candidate' + extension)
+  try {
+    await writeFile(scriptPath, req.code, { mode: 0o600 })
+    let sdkBytes = 0
+    for (const file of req.sdkFiles ?? []) {
+      if (!cleanSdkName.test(file.name)) throw new Error('Invalid verification SDK file name.')
+      if (typeof file.content !== 'string') throw new Error('Verification SDK file content must be a string.')
+      sdkBytes += Buffer.byteLength(file.content)
+      if (sdkBytes > 512 * 1024) throw new Error('Verification SDK files exceed the size limit.')
+      await writeFile(join(dir, file.name), file.content, { mode: 0o600 })
+    }
+    const cmd = req.runtime === 'python'
+      ? (existsSync(join(VENV_BIN, 'python3')) ? join(VENV_BIN, 'python3') : 'python3')
+      : process.execPath
+    const args = req.runtime === 'python'
+      ? ['-s', scriptPath]
+      : ['--max-old-space-size=256', scriptPath]
+    const res = await execTool(cmd, args, {
+      cwd: dir,
+      timeoutMs,
+      maxBytes: maxOutputBytes,
+      env: {
+        GUARDIAN_RPC_SOCKET: process.env.GUARDIAN_RPC_SOCKET ?? '/guardian-rpc/verify.sock',
+        GUARDIAN_RPC_TOKEN_FILE: process.env.GUARDIAN_RPC_TOKEN_FILE ?? '/guardian-rpc/token',
+        GUARDIAN_RPC_CONTEXT_FILE: process.env.GUARDIAN_RPC_CONTEXT_FILE ?? '/guardian-rpc/context.json',
+        GUARDIAN_VERIFY_NONCE: req.nonce,
+        GUARDIAN_PROOF_RESULT_FILE: resultPath,
+      },
+    })
+    let result: unknown = null
+    try {
+      const raw = await readFile(resultPath, 'utf8')
+      if (Buffer.byteLength(raw) <= 1024 * 1024) result = JSON.parse(raw)
+    } catch {
+      result = null
+    }
+    return {
+      runtime: req.runtime,
+      exitCode: res.exitCode,
+      result,
+      stdout: secretMask(res.stdout).slice(0, maxOutputBytes),
+      stderr: secretMask(res.stderr).slice(0, maxOutputBytes),
+      durationMs: res.durationMs,
+      timedOut: res.timedOut,
+    }
+  } finally {
+    try { await unlink(scriptPath) } catch { /* ignore */ }
+  }
+}
+
+// ============================================================================
 // Deterministic Static AST Re-Verification (op: 'ast_verify')
 // ============================================================================
 
@@ -1439,6 +1530,39 @@ async function stageFile(root: string, name: string, content: string) {
   await writeFile(full, content, { mode: 0o400 })
 }
 
+function spillPayload(payload: Record<string, unknown>): { path: string; bytes: number; sha256: string } {
+  mkdirSync(IPC_SPILL_DIR, { recursive: true, mode: 0o700 })
+  const path = join(IPC_SPILL_DIR, `${randomUUID()}.json`)
+  const text = JSON.stringify(payload)
+  // 0644: one-shot spills are read by the host through a tmpfs bind; sessions read via exec.
+  writeFileSync(path, text, { mode: 0o644 })
+  return { path, bytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') }
+}
+
+/**
+ * Emit one NDJSON response. Oversized payloads become a tmpfs file pointer so the host's
+ * 64 KiB line guard never has to terminate the session (and the full output survives).
+ */
+function respondNdjson(payload: Record<string, unknown>) {
+  const line = JSON.stringify(payload)
+  if (Buffer.byteLength(line) <= IPC_SPILL_THRESHOLD) {
+    process.stdout.write(line + '\n')
+    return
+  }
+  const resultRef = spillPayload(payload)
+  process.stdout.write(JSON.stringify({ id: payload.id, ok: payload.ok, resultRef }) + '\n')
+}
+
+/** One-shot responses keep their legacy shape unless they exceed the NDJSON line budget. */
+function writeOneShot(result: unknown) {
+  const line = JSON.stringify(result)
+  if (Buffer.byteLength(line) <= IPC_SPILL_THRESHOLD) {
+    process.stdout.write(line)
+    return
+  }
+  process.stdout.write(JSON.stringify({ resultRef: spillPayload(result as Record<string, unknown>) }))
+}
+
 async function execCommand(
   shell: Bash,
   scratch: InMemoryFs,
@@ -1447,13 +1571,33 @@ async function execCommand(
   timeoutMs = 60_000,
 ) {
   const capped = Math.max(1_000, Math.min(timeoutMs, 120_000))
+  const controller = new AbortController()
+  let timedOut = false
   const timer = setTimeout(() => {
-    process.stderr.write('Worker command exceeded its deadline.\n')
-    process.exit(124)
+    timedOut = true
+    // Cooperative cancellation only: the container and session stay alive. The previous
+    // `process.exit(124)` killed the worker for a single slow command.
+    controller.abort(new Error('Worker command exceeded its deadline.'))
   }, capped)
   timer.unref()
   try {
-    const result = await shell.exec(command)
+    const execPromise = shell.exec(command, { signal: controller.signal })
+    let guard: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<null>(resolve => {
+      guard = setTimeout(() => resolve(null), capped)
+      guard.unref()
+    })
+    execPromise.finally(() => { if (guard) clearTimeout(guard) }).catch(() => undefined)
+    const result = await Promise.race([execPromise, timeoutPromise])
+    if (result === null || timedOut) {
+      return {
+        exitCode: 124,
+        stdout: '',
+        stderr: 'Worker command exceeded its deadline and was cancelled.',
+        outputs: {},
+        timedOut: true,
+      }
+    }
     const outputs: Record<string, string> = {}
     for (const name of outputNames) {
       const path = '/work/' + name
@@ -1468,7 +1612,19 @@ async function execCommand(
       stdout: result.stdout.slice(0, maxOutputBytes),
       stderr: result.stderr.slice(0, maxOutputBytes),
       outputs,
+      timedOut: false,
     }
+  } catch (error) {
+    if (timedOut || controller.signal.aborted) {
+      return {
+        exitCode: 124,
+        stdout: '',
+        stderr: 'Worker command exceeded its deadline and was cancelled.',
+        outputs: {},
+        timedOut: true,
+      }
+    }
+    throw error
   } finally {
     clearTimeout(timer)
   }
@@ -1540,7 +1696,7 @@ async function runOneShot() {
     await stageFile(inputDirectory, input.name, input.content)
   }
   const result = await execCommand(shell, scratch, job.command, job.outputs, job.timeoutMs ?? 60_000)
-  process.stdout.write(JSON.stringify(result))
+  writeOneShot(result)
 }
 
 async function runSession() {
@@ -1548,7 +1704,7 @@ async function runSession() {
   const stagedContents = new Map<string, string>()
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
   const respond = (payload: Record<string, unknown>) => {
-    process.stdout.write(JSON.stringify(payload) + '\n')
+    respondNdjson(payload)
   }
   for await (const line of rl) {
     const trimmed = line.trim()
@@ -1593,6 +1749,9 @@ async function runSession() {
         respond({ id: msg.id, ok: true, result })
       } else if (msg.op === 'script') {
         const result = await runOfflineScript(msg, inputDirectory)
+        respond({ id: msg.id, ok: true, result })
+      } else if (msg.op === 'verify') {
+        const result = await runVerifyScript(msg)
         respond({ id: msg.id, ok: true, result })
       } else if (msg.op === 'ast_verify') {
         const result = await runAstVerify(msg)

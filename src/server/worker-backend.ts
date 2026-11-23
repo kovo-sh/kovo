@@ -1,9 +1,21 @@
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, realpathSync, statSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
+import {
+  VERIFY_RPC_CONTAINER_DIR,
+  VERIFY_RPC_CONTEXT_ENV,
+  VERIFY_RPC_CONTEXT_NAME,
+  VERIFY_RPC_SOCKET_ENV,
+  VERIFY_RPC_SOCKET_NAME,
+  VERIFY_RPC_TOKEN_ENV,
+  VERIFY_RPC_TOKEN_NAME,
+} from './verify-rpc.ts'
 
 const pathSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/)
 const outputNameSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/)
@@ -69,6 +81,7 @@ const resultSchema = z.object({
   stdout: z.string().max(256 * 1024),
   stderr: z.string().max(256 * 1024),
   outputs: z.record(outputNameSchema, z.string().max(256 * 1024)),
+  timedOut: z.boolean().optional(),
 })
 
 export const sastEngineSchema = z.enum(['opengrep', 'ast-grep', 'gitleaks', 'trufflehog', 'trivy-fs', 'bandit'])
@@ -120,6 +133,23 @@ export const offlineScriptRequestSchema = z.object({
 export const offlineScriptResultSchema = z.object({
   runtime: z.enum(['python', 'node']),
   exitCode: z.number().int(),
+  stdout: z.string().max(256 * 1024),
+  stderr: z.string().max(256 * 1024),
+  durationMs: z.number().int().min(0),
+  timedOut: z.boolean(),
+})
+
+export const verifyScriptRequestSchema = z.object({
+  runtime: z.enum(['ts', 'python']),
+  code: z.string().min(1).max(256 * 1024),
+  nonce: z.string().regex(/^[a-f0-9]{16,128}$/i),
+  timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
+})
+
+export const verifyScriptResultSchema = z.object({
+  runtime: z.enum(['ts', 'python']),
+  exitCode: z.number().int(),
+  result: z.unknown(),
   stdout: z.string().max(256 * 1024),
   stderr: z.string().max(256 * 1024),
   durationMs: z.number().int().min(0),
@@ -239,6 +269,8 @@ export type SastScanRequest = z.input<typeof sastScanRequestSchema>
 export type SastScanResult = z.output<typeof sastScanResultSchema>
 export type OfflineScriptRequest = z.input<typeof offlineScriptRequestSchema>
 export type OfflineScriptResult = z.output<typeof offlineScriptResultSchema>
+export type VerifyScriptRequest = z.input<typeof verifyScriptRequestSchema>
+export type VerifyScriptResult = z.output<typeof verifyScriptResultSchema>
 export type AstVerifyRequest = z.input<typeof astVerifyRequestSchema>
 export type AstVerifyResult = z.output<typeof astVerifyResultSchema>
 export type CallGraphRequest = z.input<typeof callGraphRequestSchema>
@@ -250,6 +282,8 @@ export interface WorkerSession {
   analyze(tool: AnalyzerName, args: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>>
   sast(req: SastScanRequest, signal: AbortSignal): Promise<SastScanResult>
   runScript(req: OfflineScriptRequest, signal: AbortSignal): Promise<OfflineScriptResult>
+  /** Layer-3 `guardian_verify` script; claims are oracle-checked host-side. */
+  verifyScript?(req: VerifyScriptRequest, signal: AbortSignal): Promise<VerifyScriptResult>
   verifyStaticAst(req: AstVerifyRequest, signal: AbortSignal): Promise<AstVerifyResult>
   callGraph?(req: CallGraphRequest, signal: AbortSignal): Promise<CallGraphResult>
   close(): Promise<void>
@@ -261,6 +295,11 @@ export interface WorkerSessionOptions {
   cpus?: number
   pidsLimit?: number
   tmpfsMb?: number
+  /**
+   * Host directory holding the Layer-1 verification RPC socket/token/context. Mounted read-only
+   * at `/guardian-rpc`; the rest of the container filesystem stays read-only.
+   */
+  rpcMountDir?: string
 }
 
 export interface WorkerBackend {
@@ -318,6 +357,55 @@ const maxDockerStderrBytes = 8 * 1024
 export const MAX_WORKER_LINE_BYTES = 64 * 1024
 /** Total stdout cap for a long-lived worker session. */
 export const MAX_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024
+/** Cap for a spilled (file-pointer) worker payload; larger refs are rejected as hostile. */
+export const MAX_WORKER_REF_BYTES = 8 * 1024 * 1024
+
+const workerRefPath = /^\/tmp\/guardian-ipc\/[a-f0-9-]{36}\.json$/
+const oneShotRefPath = /^\/guardian-ipc\/[a-f0-9-]{36}\.json$/
+const resultRefSchema = z.object({
+  path: z.string().regex(workerRefPath),
+  bytes: z.number().int().positive().max(MAX_WORKER_REF_BYTES),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+})
+const oneShotRefSchema = resultRefSchema.extend({ path: z.string().regex(oneShotRefPath) })
+
+/** Per-one-shot tmpfs directory bind-mounted at `/guardian-ipc` (host-readable). */
+function makeOneShotIpcDir(): string {
+  const base = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
+  const dir = mkdtempSync(join(base, 'guardian-ipc-'))
+  chmodSync(dir, 0o777)
+  return dir
+}
+
+function readOneShotRef(dir: string, rawRef: unknown): Record<string, unknown> {
+  const ref = oneShotRefSchema.parse(rawRef)
+  const path = join(dir, basename(ref.path))
+  const file = readFileSync(path)
+  if (file.length !== ref.bytes) throw new Error('Worker result pointer size mismatch.')
+  const digest = createHash('sha256').update(file).digest('hex')
+  if (digest !== ref.sha256) throw new Error('Worker result pointer checksum mismatch.')
+  const parsed = JSON.parse(file.toString('utf8')) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Worker result pointer payload is invalid.')
+  return parsed as Record<string, unknown>
+}
+
+const verifySdkFiles = ['guardian_verify.ts', 'guardian_verify.py'] as const
+/**
+ * The worker image predates the SDK, so the host stages it per call. This keeps the container
+ * filesystem immutable and makes the SDK version auditable alongside the verifier that ran it.
+ */
+export function readVerifySdkFiles(): Array<{ name: string; content: string }> {
+  const dir = process.env.GUARDIAN_VERIFY_SDK_DIR ?? join(dirname(fileURLToPath(import.meta.url)), '../../worker/guardian_verify')
+  const files: Array<{ name: string; content: string }> = []
+  for (const name of verifySdkFiles) {
+    const path = join(dir, name)
+    if (!existsSync(path)) continue
+    if (statSync(path).size > 256 * 1024) throw new Error('guardian_verify SDK file exceeds the size limit.')
+    files.push({ name, content: readFileSync(path, 'utf8') })
+  }
+  if (files.length === 0) throw new Error('guardian_verify SDK files are unavailable on this host.')
+  return files
+}
 
 export class WorkerOutputStreamError extends Error {
   readonly limit: 'line' | 'total'
@@ -428,6 +516,21 @@ type DockerRunner = (args: string[], signal: AbortSignal, input?: string) => Pro
 /** The real CLI executor, exported so Docker-gated tests can wrap it (e.g. force a start failure). */
 export const dockerCliRunner: DockerRunner = docker
 
+/** Binary CLI executor used to stream `docker cp` archives out of a container. */
+
+/** Fetch, size/checksum-validate and parse a tmpfs-spilled worker response from a running container. */
+async function readResultRef(container: string, rawRef: unknown, signal: AbortSignal, run: DockerRunner): Promise<Record<string, unknown>> {
+  const ref = resultRefSchema.parse(rawRef)
+  const text = await run(['exec', container, 'cat', ref.path], signal)
+  const file = Buffer.from(text, 'utf8')
+  if (file.length !== ref.bytes) throw new Error('Worker result pointer size mismatch.')
+  const digest = createHash('sha256').update(file).digest('hex')
+  if (digest !== ref.sha256) throw new Error('Worker result pointer checksum mismatch.')
+  const parsed = JSON.parse(text) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Worker result pointer payload is invalid.')
+  return parsed as Record<string, unknown>
+}
+
 /** Session options that change the container shape; warm containers only serve exact matches. */
 export function workerOptionsSignature(options?: WorkerSessionOptions): string {
   return JSON.stringify({
@@ -436,6 +539,7 @@ export function workerOptionsSignature(options?: WorkerSessionOptions): string {
     pidsLimit: options?.pidsLimit ?? null,
     tmpfsMb: options?.tmpfsMb ?? null,
     reposDir: options?.reposDir ?? null,
+    rpcMountDir: options?.rpcMountDir ?? null,
   })
 }
 
@@ -449,6 +553,8 @@ interface ContainerArgsInput {
   cell?: string
   warm?: boolean
   options?: WorkerSessionOptions
+  /** One-shot only: host tmpfs dir bind-mounted at /guardian-ipc for large-output pointers. */
+  ipcDir?: string
 }
 
 function resolveReposMountArgs(reposDir?: string): string[] {
@@ -466,6 +572,27 @@ function resolveReposMountArgs(reposDir?: string): string[] {
     throw new Error('Invalid resolved repository mount path.')
   }
   return ['--mount', `type=bind,source=${resolved},target=/repos,readonly`]
+}
+
+/**
+ * Mount the per-session verification RPC directory read-only at `/guardian-rpc`. The socket is
+ * the only egress a `--network none` verification script needs; the rest of the container stays
+ * read-only and the script never receives a persona credential (Layer 1 injects it).
+ */
+function resolveRpcMountArgs(rpcDir?: string): string[] {
+  if (!rpcDir) return []
+  if (/[\0,\r\n]/.test(rpcDir)) throw new Error('Invalid verification RPC mount path.')
+  if (!existsSync(rpcDir)) throw new Error('Verification RPC mount path does not exist.')
+  const st = statSync(rpcDir)
+  if (!st.isDirectory()) throw new Error('Verification RPC mount path must be a directory.')
+  const resolved = realpathSync(rpcDir)
+  if (/[\0,\r\n]/.test(resolved)) throw new Error('Invalid resolved verification RPC mount path.')
+  return [
+    '--mount', `type=bind,source=${resolved},target=${VERIFY_RPC_CONTAINER_DIR},readonly`,
+    '--env', `${VERIFY_RPC_SOCKET_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_SOCKET_NAME}`,
+    '--env', `${VERIFY_RPC_TOKEN_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_TOKEN_NAME}`,
+    '--env', `${VERIFY_RPC_CONTEXT_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_CONTEXT_NAME}`,
+  ]
 }
 
 /**
@@ -491,6 +618,13 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
     '--memory', `${memoryMb}m`, '--memory-swap', `${memoryMb}m`,
     '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
     ...resolveReposMountArgs(options?.reposDir),
+    ...resolveRpcMountArgs(options?.rpcMountDir),
+    ...(input.ipcDir
+      ? [
+          '--mount', `type=bind,source=${realpathSync(input.ipcDir)},target=/guardian-ipc`,
+          '--env', 'GUARDIAN_IPC_DIR=/guardian-ipc',
+        ]
+      : []),
     '--label', `${assignmentNamespace}=` + input.assignmentId,
     '--label', `${runNamespace}=${input.runLabel}`,
     ...(input.owner ? ['--label', `${workerNamespace}=${input.owner}`] : []),
@@ -806,7 +940,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await this.docker(['container', 'rm', '--force', ...inactive], signal).catch(() => undefined)
   }
 
-  private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions) {
+  private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions, ipcDir?: string) {
     // Every container is attributable even when the caller did not supply a run id:
     // `run` falls back to the workspace hash or this process's ad-hoc session.
     const runLabelValue = this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`)
@@ -819,6 +953,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       ...(this.owner ? { owner: this.owner } : {}),
       ...(this.cell ? { cell: this.cell } : {}),
       ...(options ? { options } : {}),
+      ...(ipcDir ? { ipcDir } : {}),
     })
   }
 
@@ -832,13 +967,21 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const name = 'guardian-' + randomUUID()
     const timeoutMs = (job.timeoutMs ?? 60_000) + 10_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+    // One-shot containers exit before a pointer can be read via `docker exec`, so bind a host
+    // tmpfs and read the spilled payload directly (validated by size + sha256).
+    const ipcDir = makeOneShotIpcDir()
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], options), deadline)
+      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], options, ipcDir), deadline)
       const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
-      return resultSchema.parse(JSON.parse(result))
+      const parsed = JSON.parse(result) as Record<string, unknown>
+      if (parsed.resultRef) {
+        return resultSchema.parse(readOneShotRef(ipcDir, parsed.resultRef))
+      }
+      return resultSchema.parse(parsed)
     } finally {
+      try { rmSync(ipcDir, { recursive: true, force: true }) } catch { /* ignore */ }
       await this.removeContainer(name)
       this.activeContainers.delete(name)
       liveContainers.delete(name)
@@ -878,7 +1021,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     signal.throwIfAborted()
     // Warm pool first (best-effort): a pre-created session container skips the create
     // round-trip. Mismatched options or an unavailable pool fall back to the cold path.
-    const warm = this.warmPool ? await this.warmPool.take(signal, options) : null
+    const warm = this.warmPool && !options?.rpcMountDir ? await this.warmPool.take(signal, options) : null
     const pooled = warm !== null
     const name = warm ?? 'guardian-' + randomUUID()
     if (pooled) this.pooled.add(name)
@@ -930,6 +1073,26 @@ export class LinuxWorkerBackend implements WorkerBackend {
     }
 
     const decoder = new BoundedLineDecoder()
+    const settleLine = (msg: { id?: string; ok?: boolean; error?: string } & Record<string, unknown>, waiter: { resolve: (value: Record<string, unknown>) => void; reject: (err: Error) => void }) => {
+      if (!msg.resultRef) {
+        pending.delete(msg.id!)
+        if (msg.ok) waiter.resolve(msg)
+        else waiter.reject(new Error(msg.error ?? 'Worker session operation failed.'))
+        return
+      }
+      // Oversized payload: fetch the tmpfs file pointer, validate size + sha256, then settle.
+      void readResultRef(name, msg.resultRef, AbortSignal.timeout(30_000), this.docker).then(hydrated => {
+        pending.delete(msg.id!)
+        if (hydrated.ok === false) waiter.reject(new Error(typeof hydrated.error === 'string' ? hydrated.error : 'Worker session operation failed.'))
+        else waiter.resolve({ ...hydrated, id: msg.id, ok: true })
+      }, error => {
+        pending.delete(msg.id!)
+        waiter.reject(error instanceof Error ? error : new Error(String(error)))
+        // A broken pointer indicates a tampered/truncated worker response: end the session.
+        failAll(new Error('Worker result pointer could not be verified.'))
+        void close()
+      })
+    }
     const handleLine = (line: string) => {
       const trimmed = line.trim()
       if (!trimmed) return
@@ -937,9 +1100,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         const msg = JSON.parse(trimmed) as { id?: string; ok?: boolean; error?: string } & Record<string, unknown>
         const waiter = msg.id ? pending.get(msg.id) : undefined
         if (!waiter) return
-        pending.delete(msg.id!)
-        if (msg.ok) waiter.resolve(msg)
-        else waiter.reject(new Error(msg.error ?? 'Worker session operation failed.'))
+        settleLine(msg, waiter)
       } catch {
         // Ignore malformed noise
       }
@@ -1061,6 +1222,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
         const timeoutMs = (parsed.timeoutMs ?? 30_000) + 10_000
         const res = await request({ op: 'script', ...parsed }, opSignal, timeoutMs)
         return offlineScriptResultSchema.parse(res.result)
+      },
+      async verifyScript(rawReq, opSignal) {
+        const parsed = verifyScriptRequestSchema.parse(rawReq)
+        const timeoutMs = (parsed.timeoutMs ?? 90_000) + 15_000
+        const res = await request({ op: 'verify', ...parsed, sdkFiles: readVerifySdkFiles() }, opSignal, timeoutMs)
+        return verifyScriptResultSchema.parse(res.result)
       },
       async verifyStaticAst(rawReq, opSignal) {
         const parsed = astVerifyRequestSchema.parse(rawReq)
