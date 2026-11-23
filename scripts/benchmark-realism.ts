@@ -2326,7 +2326,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       shutdown,
       failureStage,
       failureDetail: detailText,
-      gatePassed: capabilityPassed,
+      gatePassed: passed,
       capabilityPassed,
       wiringPassed: wiringOk,
     }
