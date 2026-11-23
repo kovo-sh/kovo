@@ -509,6 +509,22 @@ export function detLeadEvidenceGate(data: Record<string, unknown> | null | undef
   if (!data || data.kind !== 'det_lead') return { admitted: false, reason: 'not_a_det_lead' }
   if (data.controlPassed === false) return { admitted: false, reason: 'control_collapsed' }
   if (data.contrast === false || data.differsFromControl === false) return { admitted: false, reason: 'no_contrast' }
+  // `detlane-leads` contract: emitted leads carry the promotion evidence that justified them. The
+  // three kinds are exactly "a boundary was observed but not yet bound into a replay".
+  const evidenceKind = typeof data.leadEvidenceKind === 'string' ? data.leadEvidenceKind : ''
+  if (evidenceKind === 'near_miss' || evidenceKind === 'denied_control' || evidenceKind === 'data_delta') {
+    return { admitted: true, reason: 'failed_control_or_near_miss' }
+  }
+  if (evidenceKind === 'bare_anomaly' || evidenceKind === 'none') {
+    return { admitted: false, reason: 'no_contrast_evidence' }
+  }
+  const failureCode = typeof data.verifyFailureCode === 'string' ? data.verifyFailureCode : ''
+  if (/^(?:status_only|missing_control_differential|control_failed)$/.test(failureCode)) {
+    return { admitted: false, reason: 'no_control_contrast' }
+  }
+  if (/^(?:missing_identifier_binding|missing_state_delta|missing_probe_binding)$/.test(failureCode)) {
+    return { admitted: true, reason: 'failed_control_or_near_miss' }
+  }
   const failure = typeof data.verifyFailureReason === 'string'
     ? data.verifyFailureReason
     : typeof data.failureReason === 'string'
@@ -575,7 +591,10 @@ export interface RoundRobinDispatchPlan<T extends DispatchLaneStep> {
 /** A det_lead upgrade is identified by its title/hypothesis contract, not by numeric priority. */
 export function isDetLeadDispatchStep(step: Pick<DispatchLaneStep, 'title' | 'hypothesis'>): boolean {
   const text = `${step.title} ${step.hypothesis ?? ''}`
-  return /\bdet[_ ]lead\b/i.test(text) || /deterministic floor observed an unproven/i.test(text)
+  return /\bdet[_ ]lead\b/i.test(text) ||
+    /deterministic floor observed an unproven/i.test(text) ||
+    /\bunproven\b[^.]{0,80}\blead\b/i.test(text) ||
+    /\blead upgrade\b/i.test(text)
 }
 
 /** Map a step onto the round-robin lane it competes in. */
@@ -5170,6 +5189,13 @@ export class Execution {
     const readySteps = steps
       .filter(s => s.status === 'ready')
       .filter(s => !(s.assignedWorkerId && this.active.has(s.assignedWorkerId)))
+      .filter(s => {
+        if (s.sourceOrigins.length > 0 && s.sourceOrigins.every(o => this.broker.isCircuitOpen(o))) {
+          this.storage.updateChainStep(s.id, { status: 'blocked' })
+          return false
+        }
+        return true
+      })
 
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
     const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
@@ -5192,10 +5218,6 @@ export class Execution {
     })
     let dispatched = 0
     for (const step of dispatchPlan.ordered) {
-      if (step.sourceOrigins.length > 0 && step.sourceOrigins.every(o => this.broker.isCircuitOpen(o))) {
-        this.storage.updateChainStep(step.id, { status: 'blocked' })
-        continue
-      }
       this.startInvestigationStep(run, step, profiles)
       dispatched += 1
     }

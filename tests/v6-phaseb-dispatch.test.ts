@@ -115,6 +115,16 @@ test('lead gate admits a failed control or near-miss evidence', () => {
   for (const gate of admitted) assert.equal(gate.admitted, true, gate.reason)
 })
 
+test('lead gate consumes the detlane-leads evidence contract', () => {
+  for (const leadEvidenceKind of ['near_miss', 'denied_control', 'data_delta']) {
+    assert.equal(detLeadEvidenceGate({ kind: 'det_lead', leadEvidenceKind }).admitted, true)
+  }
+  assert.equal(detLeadEvidenceGate({ kind: 'det_lead', leadEvidenceKind: 'bare_anomaly' }).admitted, false)
+  assert.equal(detLeadEvidenceGate({ kind: 'det_lead', verifyFailureCode: 'status_only' }).admitted, false)
+  assert.equal(detLeadEvidenceGate({ kind: 'det_lead', verifyFailureCode: 'missing_control_differential' }).admitted, false)
+  assert.equal(detLeadEvidenceGate({ kind: 'det_lead', verifyFailureCode: 'missing_identifier_binding' }).admitted, true)
+})
+
 test('lead detection is contract-based, not priority-based', () => {
   assert.equal(isDetLeadDispatchStep(lead('step-1')), true)
   assert.equal(isDetLeadDispatchStep(step({ id: 'step-2', title: 'Cross-persona BOLA/IDOR matrix' })), false)
