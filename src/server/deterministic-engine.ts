@@ -3169,7 +3169,7 @@ async function probeSecondOrderSsrf(
       ...base,
       verdict: 'signal',
       summary: 'The stored URL was fetched by the target after the trigger step (second-order SSRF callback).',
-      anomalies: [{ type: 'canary_callback', variant: 'http', param: param.name }],
+      anomalies: [{ type: 'canary_callback', variant: 'http', param: param.name, token: minted.token, canaryId: minted.id }],
       details: { secondOrder: true, requests },
       requestsSent: requests,
       exchangeIds,
@@ -3351,6 +3351,195 @@ export function floorHypothesesForEnvironment(
     if (hyp.intent === 'graphql') return true // query-only audit
     return hyp.method === 'GET'
   })
+}
+
+// ---------------------------------------------------------------------------
+// Durable OOB subscriptions for floor canary probes
+// ---------------------------------------------------------------------------
+
+/**
+ * Synchronous window a floor canary probe already polls for a callback on its own. A callback that
+ * arrives inside it is an `immediate` hit; anything after it is a `late` hit that must be promoted
+ * from the durable `pending_oob` row by the run-level drain.
+ */
+export const floorOobImmediateMs = 3_000
+
+/**
+ * Durable window a floor canary subscription stays promotable. Bounded (instead of the relay's
+ * 15 minute default) but long enough to outlive a normal probe→verification→finalize gap, so a
+ * callback delivered 15–30 s after the `202` is still promotable when the run-level drain runs.
+ */
+export const floorOobWindowMs = 180_000
+
+/** Probe classes whose probe layer mints canary URLs and therefore needs durable OOB correlation. */
+export function floorCanaryClass(probeClass: DifferentialProbeClass): boolean {
+  return probeClass === 'ssrf_canary' || probeClass === 'xxe_canary'
+}
+
+/** One floor canary and the durable `pending_oob` row that will catch its (possibly late) callback. */
+export interface FloorCanarySubscription {
+  token: string
+  canaryId: string
+  label: string
+  subscriptionId: string | null
+  stage: 'immediate' | 'late' | 'pending' | 'none'
+  promoted: boolean
+}
+
+export interface FloorCanaryTracker {
+  /** CanaryBroker facade that registers a durable subscription on every mint. */
+  broker: CanaryBroker
+  subscriptions: () => FloorCanarySubscription[]
+  /** Correlate the probe outcome, promote an observed hit, and annotate the evidence. */
+  finalize: (result: DifferentialResult) => void
+}
+
+/**
+ * Wrap the run's CanaryBroker so every canary a floor probe mints is also registered as a durable
+ * `pending_oob` subscription **before** the probe can put the canary URL on the wire.
+ *
+ * The probe layer keeps its own short poll: a callback inside `floorOobImmediateMs` is promoted
+ * immediately, while a miss deliberately leaves the subscription pending so the run-level drain
+ * can promote a late callback (the async-SSRF/XXE case). Subscriptions are keyed by
+ * `(runId, canary token)`; the relay's own `(run, canary, artifact)` uniqueness plus this map's
+ * guard mean a repeated mint for the same token can never double-register or double-count.
+ */
+export function trackFloorCanarySubscriptions(
+  canaryBroker: CanaryBroker,
+  input: {
+    runId: string
+    assignmentId: string
+    log?: (kind: string, message: string, data?: Record<string, unknown>) => void
+  },
+): FloorCanaryTracker {
+  const log = input.log ?? (() => {})
+  const byToken = new Map<string, FloorCanarySubscription>()
+  const registered = new Set<string>()
+
+  const broker = new Proxy(canaryBroker, {
+    get(target, prop) {
+      if (prop === 'mintCanary') {
+        return (...args: Parameters<CanaryBroker['mintCanary']>) => {
+          const minted = target.mintCanary(...args)
+          const key = `${minted.runId}\u0000${minted.token}`
+          if (registered.has(key)) return minted
+          registered.add(key)
+          let subscriptionId: string | null = null
+          try {
+            subscriptionId = target.subscribe({
+              runId: minted.runId,
+              assignmentId: input.assignmentId,
+              canaryId: minted.id,
+              token: minted.token,
+              // Empty artifact: a real async callback does not carry Guardian's artifact marker,
+              // and a truthy artifact would reject it at ingest. Token↔canary binding is the link.
+              artifact: '',
+              immediateMs: floorOobImmediateMs,
+              windowMs: floorOobWindowMs,
+            }).id
+          } catch {
+            // A relay that cannot persist must not break a synchronous canary proof.
+            subscriptionId = null
+          }
+          byToken.set(minted.token, {
+            token: minted.token,
+            canaryId: minted.id,
+            label: minted.label.slice(0, 120),
+            subscriptionId,
+            stage: subscriptionId ? 'pending' : 'none',
+            promoted: false,
+          })
+          log('deterministic_engine.oob_subscribed',
+            subscriptionId
+              ? `Durable pending_oob subscription ${subscriptionId} registered for floor canary ${minted.id}.`
+              : `Floor canary ${minted.id} could not register a durable pending_oob subscription.`,
+            {
+              canaryId: minted.id,
+              subscriptionId,
+              label: minted.label.slice(0, 120),
+              immediateMs: floorOobImmediateMs,
+              windowMs: floorOobWindowMs,
+            })
+          return minted
+        }
+      }
+      const value = Reflect.get(target, prop, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as CanaryBroker
+
+  const finalize = (result: DifferentialResult): void => {
+    if (byToken.size === 0) return
+    const observed = new Set<string>()
+    for (const anomaly of result.anomalies) {
+      const token = [anomaly.token, anomaly.canaryToken, anomaly.canaryId]
+        .find((value): value is string => typeof value === 'string' && byToken.has(value))
+      if (token) observed.add(token)
+    }
+    // Only an observed hit is promoted here: a miss must stay pending for the run-level drain,
+    // and a global sweep on every probe would rob the drain of the late callback it exists for.
+    let promotions: ReturnType<CanaryBroker['promoteLate']> = []
+    if (observed.size > 0) {
+      try { promotions = canaryBroker.promoteLate({ runId: input.runId }) } catch { promotions = [] }
+    }
+    for (const promotion of promotions) {
+      log('deterministic_engine.oob_promoted',
+        `Floor canary ${promotion.subscription.canaryId} callback promoted (${promotion.stage}, ${promotion.latencyMs} ms after mint).`,
+        {
+          canaryId: promotion.subscription.canaryId,
+          subscriptionId: promotion.subscription.id,
+          stage: promotion.stage,
+          latencyMs: promotion.latencyMs,
+        })
+    }
+    for (const record of byToken.values()) {
+      const promotion = promotions.find(item => item.subscription.id === record.subscriptionId)
+      if (promotion) {
+        record.stage = promotion.stage
+        record.promoted = true
+      } else if (observed.has(record.token)) {
+        // The probe observed the callback in memory but the relay could not promote it (already
+        // claimed, rejected at ingest, or no relay). Record the observation without claiming a
+        // durable promotion that did not happen.
+        record.stage = 'immediate'
+        record.promoted = false
+      } else {
+        record.stage = record.subscriptionId ? 'pending' : 'none'
+      }
+    }
+
+    for (const anomaly of result.anomalies) {
+      const token = [anomaly.token, anomaly.canaryToken, anomaly.canaryId]
+        .find((value): value is string => typeof value === 'string' && byToken.has(value))
+      if (!token) continue
+      const record = byToken.get(token)!
+      anomaly.oobSubscriptionId = record.subscriptionId
+      anomaly.canaryProbeStage = record.stage
+      anomaly.promoted = record.promoted
+    }
+
+    const records = [...byToken.values()]
+    const primary = records.find(record => record.stage === 'late')
+      ?? records.find(record => record.stage === 'immediate')
+      ?? records[0]
+    result.details = {
+      ...result.details,
+      oob: records.map(record => ({
+        token: record.token,
+        canaryId: record.canaryId,
+        label: record.label,
+        subscriptionId: record.subscriptionId,
+        stage: record.stage,
+        promoted: record.promoted,
+      })),
+      ...(primary?.subscriptionId ? { oobSubscriptionId: primary.subscriptionId } : {}),
+      ...(primary ? { oobCanaryId: primary.canaryId } : {}),
+      ...(primary ? { canaryProbeStage: primary.stage } : {}),
+      promoted: records.some(record => record.promoted),
+    }
+  }
+
+  return { broker, subscriptions: () => [...byToken.values()], finalize }
 }
 
 export async function runDeterministicEngine(input: DeterministicEngineInput): Promise<DeterministicEngineReport> {
@@ -3536,15 +3725,22 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       continue
     }
     if (staging.action === 'tag') report.stagingTaggedMutations += 1
+    // Layer-2 floor canaries register a durable `pending_oob` subscription before the probe sends
+    // the canary URL, so a callback that arrives after the probe's short poll is promoted by the
+    // run-level drain instead of being lost.
+    const canaryTracker = input.canaryBroker && floorCanaryClass(hyp.probeClass)
+      ? trackFloorCanarySubscriptions(input.canaryBroker, { runId: input.runId, assignmentId: input.assignmentId, log })
+      : null
+    const probeCanaryBroker = canaryTracker?.broker ?? input.canaryBroker
     let probe: DifferentialResult
     try {
       probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
         ? await probeSecretExposure(hyp, input, trackExchange)
-        : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && input.canaryBroker && !input.probe
-          ? await probeSecondOrderSsrf(hyp, input, trackExchange)
+        : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && probeCanaryBroker && !input.probe
+          ? await probeSecondOrderSsrf(hyp, { ...input, canaryBroker: probeCanaryBroker }, trackExchange)
           : await (input.probe ?? probeDifferential)(
               { ...buildProbeRequest(hyp, maxProbeRequests, input, staging), onExchange: trackExchange },
-              input.broker, input.grant, input.canaryBroker, input.signal,
+              input.broker, input.grant, probeCanaryBroker, input.signal,
             )
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
@@ -3558,6 +3754,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       }
       continue
     }
+    canaryTracker?.finalize(probe)
     report.hypothesesRun += 1
     stats.requests += probe.requestsSent
     log('deterministic_engine.probe', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}${hyp.param ? ` param=${hyp.param.name}` : ''} -> ${probe.verdict}`, {

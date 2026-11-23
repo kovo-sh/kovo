@@ -134,6 +134,13 @@ export interface SynthesizedEngineSpec {
   vulnClass: string
   endpoint: string
   spec: Record<string, unknown>
+  /**
+   * Runtime evidence the probe collected for this spec: the durable `pending_oob` subscription
+   * ids and the callback stage (`immediate` / `late` / `pending`). It is deliberately outside the
+   * persisted replay-spec schema; persistence and the run-level drain read it to correlate a late
+   * callback with the finding it belongs to.
+   */
+  evidence?: Record<string, unknown>
 }
 
 interface RequestParts {
@@ -754,22 +761,72 @@ const xxeBodies: Record<string, string> = {
 const canaryJq = (control: string) =>
   `{ controlPassed: (.steps.${control}.status < 500), confirmed: (.canary.triggered == true), observed: ("probeCallback=" + ((.canary.probeTriggered // false) | tostring)), expected: "no out-of-band callback" }`
 
+/**
+ * Durable-OOB correlation the floor canary probe recorded on its result (see
+ * `trackFloorCanarySubscriptions`): subscription/canary ids and the callback stage. Absent for an
+ * older caller or a relay that could not persist, in which case nothing is added.
+ */
+export function canaryOobEvidence(result: DifferentialResult): Record<string, unknown> | null {
+  const stage = typeof result.details.canaryProbeStage === 'string' ? result.details.canaryProbeStage : null
+  const subscriptionId = typeof result.details.oobSubscriptionId === 'string' ? result.details.oobSubscriptionId : null
+  const canaryId = typeof result.details.oobCanaryId === 'string' ? result.details.oobCanaryId : null
+  const promoted = result.details.promoted === true
+  const subscriptions = Array.isArray(result.details.oob)
+    ? (result.details.oob as Array<Record<string, unknown>>)
+      .filter(item => item !== null && typeof item === 'object')
+      .map(item => ({
+        token: typeof item.token === 'string' ? item.token : null,
+        canaryId: typeof item.canaryId === 'string' ? item.canaryId : null,
+        subscriptionId: typeof item.subscriptionId === 'string' ? item.subscriptionId : null,
+        stage: typeof item.stage === 'string' ? item.stage : null,
+        promoted: item.promoted === true,
+      }))
+    : []
+  if (!stage && !subscriptionId && subscriptions.length === 0) return null
+  return {
+    // Keys the ReplayVerifier already emits for its own two-stage canary wait (`canaryProbeStage`,
+    // `canaryProbePromoted`, `canarySubscriptionId`) plus the durable ids this floor probe minted.
+    ...(stage ? { canaryProbeStage: stage } : {}),
+    canaryProbePromoted: promoted,
+    ...(subscriptionId ? { oobSubscriptionId: subscriptionId, canarySubscriptionId: subscriptionId } : {}),
+    ...(canaryId ? { oobCanaryId: canaryId } : {}),
+    promoted,
+    ...(subscriptions.length ? { subscriptions } : {}),
+  }
+}
+
+/** Probe-step note that carries the OOB correlation into the persisted replay spec. */
+export function canaryOobStepTag(result: DifferentialResult): string {
+  const stage = typeof result.details.canaryProbeStage === 'string' ? result.details.canaryProbeStage : null
+  const subscriptionId = typeof result.details.oobSubscriptionId === 'string' ? result.details.oobSubscriptionId : null
+  const canaryId = typeof result.details.oobCanaryId === 'string' ? result.details.oobCanaryId : null
+  if (!stage && !subscriptionId) return ''
+  const parts: string[] = []
+  if (stage) parts.push(`stage=${stage}`)
+  if (result.details.promoted === true) parts.push('promoted')
+  if (subscriptionId) parts.push(`sub=${subscriptionId}`)
+  if (canaryId) parts.push(`canary=${canaryId}`)
+  return ` [oob ${parts.join(' ')}]`
+}
+
 function synthXxe(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const hit = result.anomalies.find(a => a.type === 'xxe_canary_callback')
   if (!hit) return []
   const body = xxeBodies[String(hit.variant)] ?? xxeBodies.general_entity
   const headers = { 'Content-Type': 'application/xml' }
   const method = hyp.method === 'GET' ? 'POST' : hyp.method
+  const evidence = canaryOobEvidence(result)
   return [{
     kind: 'http_chain',
     vulnClass: 'xxe',
     endpoint: hyp.endpoint.pathTemplate,
+    ...(evidence ? { evidence } : {}),
     spec: {
       ...baseFields(hyp.endpoint.origin, 'XML external entity injection (out-of-band callback)', 'CWE-611', 'xxe', 'high', canaryJq('c1')),
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign XML document', { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: xmlBenign }, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', 'XML document with external entity to Guardian canary', { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: body }, hyp.ownerPersona),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `XML document with external entity to Guardian canary${canaryOobStepTag(result)}`, { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: body }, hyp.ownerPersona),
       ],
     },
   }]
@@ -782,6 +839,8 @@ function synthXxe(hyp: EngineHypothesis, result: DifferentialResult): Synthesize
 function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const direct = result.anomalies.find(a => a.type === 'canary_callback' && a.variant === 'http')
   if (!direct) return []
+  const evidence = canaryOobEvidence(result)
+  const tag = canaryOobStepTag(result)
   if (hyp.triggerPath) {
     const control = requestParts(hyp, 'http://guardian-control.invalid/')
     const probe = requestParts(hyp, '{{canary_url}}')
@@ -790,7 +849,7 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
     const steps = [
       stepOf(hyp.endpoint.origin, 'c1', 'control', 'Register a benign URL (no callback expected)', control, hyp.ownerPersona),
       {
-        ...stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Register the canary URL through the write route', probe, hyp.ownerPersona),
+        ...stepOf(hyp.endpoint.origin, 'p1', 'probe', `Register the canary URL through the write route${tag}`, probe, hyp.ownerPersona),
         extract: [{ varName: 'resource_id', from: 'json' as const, selector: 'id' }],
       },
       stepOf(hyp.endpoint.origin, 'p2', 'probe', 'Trigger the stored URL fetch', { method: 'POST', pathAndQuery: trigger, jsonBody: {} }, hyp.ownerPersona),
@@ -799,6 +858,7 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
       kind: 'http_chain',
       vulnClass: 'ssrf',
       endpoint: hyp.endpoint.pathTemplate,
+      ...(evidence ? { evidence } : {}),
       spec: {
         ...baseFields(hyp.endpoint.origin, 'Second-order server-side request forgery (stored URL fetched later)', 'CWE-918', 'ssrf', 'high', canaryJq('c1')),
         kind: 'http_chain',
@@ -813,12 +873,13 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
     kind: 'http_chain',
     vulnClass: 'ssrf',
     endpoint: hyp.endpoint.pathTemplate,
+    ...(evidence ? { evidence } : {}),
     spec: {
       ...baseFields(hyp.endpoint.origin, 'Server-side request forgery (out-of-band callback)', 'CWE-918', 'ssrf', 'high', canaryJq('c1')),
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign URL value (no callback expected)', control, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Guardian canary URL value', probe, hyp.ownerPersona),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Guardian canary URL value${tag}`, probe, hyp.ownerPersona),
       ],
     },
   }]
