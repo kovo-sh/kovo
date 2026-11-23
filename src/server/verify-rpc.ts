@@ -33,6 +33,7 @@ import { lookup } from 'node:dns/promises'
 import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildPersonaHeader } from './persona-vault.ts'
+import { structuralDiff, intersectStructuralDeltas } from './verify-support.ts'
 import {
   assessBoundary,
   assessImpactEvidence,
@@ -74,7 +75,7 @@ const MAX_HEADER_VALUE = 4096
 // Transcript
 // ---------------------------------------------------------------------------
 
-export type VerifyExchangeOp = 'http' | 'http2' | 'browser' | 'oob' | 'transcript'
+export type VerifyExchangeOp = 'http' | 'http2' | 'browser' | 'oob' | 'transcript' | 'race'
 
 export interface VerifyTranscriptRequest {
   origin: string
@@ -134,6 +135,11 @@ export interface TranscriptSummary {
   durationMs: number
   error: string | null
   signature: string
+  /** Session-group/proof role the oracle reads (`control`, `probe`, `setup`, `pending_oob`, ...). */
+  role?: string
+  personaHandle?: string | null
+  /** OOB callbacks are the only artifact whose hit is known after the record is signed. */
+  hit?: boolean
 }
 
 export class TranscriptStore {
@@ -210,18 +216,28 @@ export class TranscriptStore {
   }
 
   summaries(): TranscriptSummary[] {
-    return this.list().map(record => ({
-      exchangeId: record.exchangeId,
-      seq: record.seq,
-      op: record.op,
-      method: record.request?.method ?? null,
-      pathAndQuery: record.request?.pathAndQuery ?? null,
-      origin: record.request?.origin ?? null,
-      status: record.response?.status ?? null,
-      durationMs: record.durationMs,
-      error: record.error ?? null,
-      signature: record.signature,
-    }))
+    return this.list().map(record => {
+      const method = record.request?.method ?? null
+      const role = record.request?.sessionRole
+        ?? (record.op === 'oob'
+          ? (method === 'MINT' ? 'oob_mint' : method === 'SUBSCRIBE' ? 'pending_oob' : method === 'WAIT' ? 'oob_wait' : 'oob_check')
+          : record.op === 'browser' ? 'browser' : record.op === 'race' ? 'race' : 'setup')
+      return {
+        exchangeId: record.exchangeId,
+        seq: record.seq,
+        op: record.op,
+        method,
+        pathAndQuery: record.request?.pathAndQuery ?? null,
+        origin: record.request?.origin ?? null,
+        status: record.response?.status ?? null,
+        durationMs: record.durationMs,
+        error: record.error ?? null,
+        signature: record.signature,
+        role,
+        personaHandle: record.request?.personaHandle ?? null,
+        ...(record.artifact?.hit !== undefined ? { hit: record.artifact.hit } : {}),
+      }
+    })
   }
 
   /** HMAC over every signed record; stable for a fixed transcript, changes on tamper/append. */
@@ -259,6 +275,34 @@ export type VerifyClaim =
   | { kind: 'dom_sentinel'; exchangeId: string; sentinel: string; mode?: 'source' | 'executed'; message?: string }
   | { kind: 'oob'; exchangeId: string; expectHit?: boolean; message?: string }
   | { kind: 'timing'; controlIds: string[]; variantIds: string[]; minPairs?: number; maxPValue?: number; message?: string }
+  /**
+   * Boolean/content differential: two interleaved arms whose noise-normalized bodies are stable
+   * within each arm and differ between arms by a stable token set. Per-request nonces, UUIDs,
+   * timestamps and opaque ids are stripped first, so a rotating token cannot fake a differential.
+   */
+  | {
+      kind: 'structural_diff'
+      controlIds: string[]
+      variantIds: string[]
+      minRounds?: number
+      minDeltaTokens?: number
+      /** Minimum token-set similarity the two arms may share (0 disables the ceiling). */
+      maxSimilarity?: number
+      message?: string
+    }
+  /**
+   * Race/TOCTOU burst evidence: a synchronized burst of the same operation produced divergent
+   * outcomes. `mode` records whether the broker released the burst on its HTTP/2 single-packet
+   * barrier or fell back to HTTP/1.1.
+   */
+  | {
+      kind: 'race'
+      exchangeIds: string[]
+      mode?: 'h2-single-packet' | 'http1-fallback'
+      minDistinctOutcomes?: number
+      expectAllSuccess?: boolean
+      message?: string
+    }
   /**
    * Impact-evidence claim: binds an impact class to the exchanges that prove it. Evaluated by the
    * same pure validators as the declarative replay path (`oracle-invariants.ts`), so a status-only
@@ -332,6 +376,12 @@ export interface VerifyOracleResult {
   checks: VerifyClaimCheck[]
   failures: string[]
   transcriptDigest: string
+  /** First validator/claim that rejected the proof (null when it passed). */
+  rejectedBy?: string | null
+  /** Exact transcript roles/preconditions a repair must add, e.g. `control_denied`. */
+  missingEvidence?: string[]
+  /** Compact role-labelled transcript so a repair can be made in one turn. */
+  transcriptSummary?: TranscriptSummary[]
 }
 
 export interface VerifyClaimContext {
@@ -354,6 +404,28 @@ export interface VerifyCanaryCheck {
   hit: boolean
   triggered: boolean
   hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }>
+  detail?: Record<string, unknown> | null
+}
+
+/** Structural subset of the durable OOB relay surface (CanaryBroker satisfies it). */
+export interface VerifyOobSubscriptionView {
+  id: string
+  token?: string
+  status?: string
+  createdAt?: number
+  expiresAt?: number
+  windowMs?: number
+  immediateMs?: number
+}
+
+export interface VerifyOobAwaitView {
+  matched: boolean
+  callback: { receivedAt?: number; token?: string; detail?: Record<string, unknown> | null } | null
+}
+
+export interface VerifyOobPromotionView {
+  subscription: { id: string; token?: string }
+  callback: { receivedAt?: number; token?: string; detail?: Record<string, unknown> | null }
 }
 
 export interface VerifyCanaryBroker {
@@ -365,6 +437,24 @@ export interface VerifyCanaryBroker {
     label?: string
   }
   checkCanary(token: string, options?: { runId?: string }): VerifyCanaryCheck
+  /**
+   * Durable OOB correlation. When present, `prove_oob_callback` registers a `pending_oob`
+   * subscription *before* injecting, then waits/promotes so a late callback is not lost.
+   */
+  subscribe?(input: {
+    runId: string
+    assignmentId: string
+    canaryId: string
+    token: string
+    artifact?: string
+    immediateMs?: number
+    windowMs?: number
+  }): VerifyOobSubscriptionView
+  awaitAny?(
+    query: { token?: string; canaryId?: string; runId?: string; assignmentId?: string },
+    options?: { timeoutMs?: number; pollMs?: number },
+  ): Promise<VerifyOobAwaitView>
+  promoteLate?(options?: { runId?: string; now?: number }): VerifyOobPromotionView[]
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +501,12 @@ function isClaim(value: unknown): value is VerifyClaim {
     case 'timing':
       return Array.isArray(rec.controlIds) && Array.isArray(rec.variantIds) &&
         rec.controlIds.every(v => typeof v === 'string') && rec.variantIds.every(v => typeof v === 'string')
+    case 'structural_diff':
+      return Array.isArray(rec.controlIds) && Array.isArray(rec.variantIds) &&
+        rec.controlIds.every(v => typeof v === 'string') && rec.variantIds.every(v => typeof v === 'string')
+    case 'race':
+      return Array.isArray(rec.exchangeIds) && rec.exchangeIds.length >= 2 &&
+        rec.exchangeIds.every(v => typeof v === 'string')
     case 'impact': {
       const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf'])
       return typeof rec.probeExchangeId === 'string' &&
@@ -892,7 +988,17 @@ function evaluateImpactClaim(
 function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
   const ids = new Set<string>()
   for (const claim of claims) {
-    if (claim.kind === 'timing' || claim.kind === 'impact') continue
+    if (claim.kind === 'timing') continue
+    if (claim.kind === 'structural_diff') {
+      for (const id of claim.controlIds) ids.add(id)
+      for (const id of claim.variantIds) ids.add(id)
+      continue
+    }
+    if (claim.kind === 'race') {
+      for (const id of claim.exchangeIds) ids.add(id)
+      continue
+    }
+    if (claim.kind === 'impact') continue
     if (claim.kind === 'boundary') {
       ids.add(claim.controlExchangeId)
       ids.add(claim.probeExchangeId)
@@ -1149,9 +1255,201 @@ function evaluateClaim(
         },
       }
     }
+    case 'structural_diff': {
+      const minRounds = Math.max(2, Math.min(claim.minRounds ?? 3, 10))
+      if (claim.controlIds.length < minRounds || claim.variantIds.length < minRounds) {
+        return { claim, passed: false, detail: `structural_diff needs ${minRounds} control and ${minRounds} variant exchanges; got ${claim.controlIds.length}/${claim.variantIds.length}.` }
+      }
+      const bodyOf = (id: string): string | null => {
+        if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
+        const record = requireRecord(id)
+        if (!record?.response) return null
+        return store.body(id) ?? ''
+      }
+      const controlBodies = claim.controlIds.map(bodyOf)
+      const variantBodies = claim.variantIds.map(bodyOf)
+      if (controlBodies.some(body => body === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed control exchange.' }
+      if (variantBodies.some(body => body === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed variant exchange.' }
+      const controls = controlBodies as string[]
+      const variants = variantBodies as string[]
+      const unstableControl = controls.some(body => !structuralDiff(controls[0]!, body).normalizedEqual)
+      const unstableVariant = variants.some(body => !structuralDiff(variants[0]!, body).normalizedEqual)
+      if (unstableControl || unstableVariant) {
+        return {
+          claim,
+          passed: false,
+          detail: `structural_diff needs a stable response within each arm after token stripping; ${unstableControl ? 'control' : 'variant'} arm drifted between rounds.`,
+          observed: { stableControl: !unstableControl, stableVariant: !unstableVariant },
+        }
+      }
+      const roundDeltas = controls.map((body, index) => structuralDiff(body, variants[index] ?? variants[0]!).changedTokens)
+      const stableDelta = intersectStructuralDeltas(roundDeltas)
+      const cross = structuralDiff(controls[0]!, variants[0]!)
+      const minDelta = Math.max(1, Math.min(claim.minDeltaTokens ?? 1, 32))
+      const maxSimilarity = claim.maxSimilarity ?? 1
+      const distinct = !cross.normalizedEqual && stableDelta.length >= minDelta && cross.similarity < maxSimilarity
+      // A changed token must be present in the same direction in every round: intersect alone can
+      // keep tokens that rotate between two unrelated arms, so require the first arm's delta.
+      return {
+        claim,
+        passed: distinct,
+        detail: distinct
+          ? `Structural differential: ${stableDelta.length} stable token(s) changed between arms (similarity ${cross.similarity.toFixed(3)}).`
+          : `No stable structural differential: ${stableDelta.length} stable changed token(s), similarity ${cross.similarity.toFixed(3)}; ${cross.normalizedEqual ? 'the arms are identical after token stripping' : 'the delta is not stable across rounds'}.`,
+        observed: {
+          stableDelta: stableDelta.slice(0, 16),
+          similarity: Number(cross.similarity.toFixed(4)),
+          rounds: controls.length,
+          stableControl: !unstableControl,
+          stableVariant: !unstableVariant,
+        },
+      }
+    }
+    case 'race': {
+      const minDistinct = Math.max(2, Math.min(claim.minDistinctOutcomes ?? 2, claim.exchangeIds.length))
+      if (claim.exchangeIds.length < 2 || claim.exchangeIds.length > 10) {
+        return { claim, passed: false, detail: `race needs between 2 and 10 exchanges; got ${claim.exchangeIds.length}.` }
+      }
+      const records: VerifyTranscriptRecord[] = []
+      for (const id of claim.exchangeIds) {
+        const record = requireRecord(id)
+        if (!record?.response) return { claim, passed: false, detail: `Unknown or failed race exchange ${id}.` }
+        records.push(record)
+      }
+      if (claim.mode === 'h2-single-packet' && records.some(record => record.op !== 'http2')) {
+        return { claim, passed: false, detail: 'race claims an HTTP/2 single-packet barrier but the transcript recorded an HTTP/1.1 fallback exchange.' }
+      }
+      if (claim.expectAllSuccess !== false && records.some(record => (record.response?.status ?? 0) < 200 || (record.response?.status ?? 0) >= 300)) {
+        return {
+          claim,
+          passed: false,
+          detail: 'race burst expected every participant to succeed; at least one exchange was denied or errored, so no duplicate effect is attributable to the burst.',
+          observed: { statuses: records.map(record => record.response?.status ?? null) },
+        }
+      }
+      const distinctBodies = new Set(records.map(record => record.response?.bodySha256 ?? '')).size
+      const distinctStatuses = new Set(records.map(record => record.response?.status ?? 0)).size
+      const distinctOutcomes = Math.max(distinctBodies, distinctStatuses)
+      const passed = distinctOutcomes >= minDistinct
+      return {
+        claim,
+        passed,
+        detail: passed
+          ? `Race burst produced ${distinctOutcomes} distinct outcome(s) across ${records.length} synchronized exchanges (${claim.mode ?? 'mode-unspecified'}); a serialized/idempotent handler would return one outcome.`
+          : `Race burst produced one idempotent outcome across ${records.length} synchronized exchanges; duplicate-effect evidence is missing.`,
+        observed: {
+          distinctBodies,
+          distinctStatuses,
+          distinctOutcomes,
+          statuses: records.map(record => record.response?.status ?? null),
+          mode: claim.mode ?? null,
+          ops: [...new Set(records.map(record => record.op))],
+        },
+      }
+    }
     default:
       return { claim, passed: false, detail: 'Unsupported claim.' }
   }
+}
+
+/**
+ * Translate a failed claim into the exact missing transcript role/precondition. The strings are
+ * stable tokens (not prose) so an agent can repair the script in one turn: add the named arm and
+ * re-run, instead of inferring what an opaque boolean meant.
+ */
+export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
+  if (check.passed) return []
+  const missing = new Set<string>()
+  const observed = check.observed ?? {}
+  const detail = check.detail ?? ''
+  const claim = check.claim
+  const bool = (key: string): boolean | null => typeof observed[key] === 'boolean' ? observed[key] as boolean : null
+  switch (claim.kind) {
+    case 'boundary': {
+      if (bool('controlDenied') === false) missing.add('control_denied')
+      if (bool('crossed') === false) missing.add('variant_crossed')
+      if (bool('actorDifferential') === false && bool('controlDenied') !== true) missing.add('actor_differential')
+      break
+    }
+    case 'impact': {
+      if (claim.impactClass === 'mass_assignment') {
+        if (Array.isArray(observed.persisted) && observed.persisted.length === 0) missing.add('persisted_field_delta')
+        if (Array.isArray(observed.protectedFields) && observed.protectedFields.length === 0) missing.add('protected_field_delta')
+        if (!Array.isArray(observed.persisted)) {
+          if (/pre-mutation readback/.test(detail)) missing.add('before_get')
+          if (/separate post-mutation GET/.test(detail)) missing.add('after_get')
+          if (/request body/.test(detail)) missing.add('mutation_request_body')
+          if (/catalog/.test(detail)) missing.add('catalog_baseline')
+          if (/echo|persistence/.test(detail) && !/request body/.test(detail)) missing.add('persisted_field_delta')
+        }
+      } else if (claim.impactClass === 'csrf') {
+        if (bool('persisted') === false) missing.add('persisted_state_change')
+        if (typeof observed.ambient === 'string' && observed.ambient !== 'cookie') missing.add('ambient_cookie_auth')
+        if (typeof observed.sameSite === 'string' && observed.sameSite.toLowerCase() !== 'none') missing.add('samesite_none_cookie')
+        if (bool('crossSite') === false) missing.add('cross_site_origin')
+        if (bool('oracleDeclared') === false) missing.add('impact_oracle_event')
+      } else {
+        if (bool('persisted') === false) {
+          if (/pre-mutation readback/.test(detail)) missing.add('before_get')
+          else if (/separate post-mutation GET/.test(detail)) missing.add('after_get')
+          else missing.add('persisted_field_delta')
+        }
+        if (bool('roleDifferential') === false && bool('crossTenant') === false) missing.add('role_or_tenant_differential')
+        if (bool('boundaryControlDenied') === false && bool('roleDifferential') !== true && bool('crossTenant') !== true) missing.add('control_denied')
+        if (Array.isArray(observed.disclosureFields) && observed.disclosureFields.length === 0 && /disclosure/.test(detail)) missing.add('owner_scoped_disclosure')
+        if (Array.isArray(observed.changedFields) && observed.changedFields.length === 0 && /persisted impact/.test(detail)) missing.add('field_delta')
+        if (/oracle event/.test(detail)) missing.add('impact_oracle_event')
+        if (/control arm/.test(detail)) missing.add('control_arm')
+      }
+      if (/no probe step/.test(detail)) missing.add('probe_arm')
+      break
+    }
+    case 'mfa': {
+      if (bool('enrolled') === false) missing.add('enrolled_control')
+      if (bool('preDenied') === false) missing.add('pre_challenge_denied')
+      if (bool('postGranted') === false) missing.add('post_challenge_granted')
+      if (bool('sameActor') === false) missing.add('same_actor')
+      if (bool('sameRoute') === false) missing.add('same_route')
+      if (bool('decorative') === true) missing.add('gated_control')
+      break
+    }
+    case 'timing': {
+      if (/interleav/.test(detail)) missing.add('interleaved_pairs')
+      else if (/got \d+\/\d+/.test(detail)) missing.add('control_variant_pairs')
+      else missing.add('timing_separation')
+      break
+    }
+    case 'structural_diff': {
+      if (bool('stableControl') === false) missing.add('stable_control_arm')
+      if (bool('stableVariant') === false) missing.add('stable_variant_arm')
+      if (Array.isArray(observed.stableDelta) && observed.stableDelta.length === 0) missing.add('stable_variant_delta')
+      if (/identical after token stripping/.test(detail)) missing.add('arm_differential')
+      if (/needs \d+ control/.test(detail)) missing.add('control_variant_rounds')
+      break
+    }
+    case 'race': {
+      if (typeof observed.distinctOutcomes === 'number' && observed.distinctOutcomes < (claim.minDistinctOutcomes ?? 2)) missing.add('duplicate_effect')
+      if (/HTTP\/1\.1 fallback/.test(detail)) missing.add('h2_single_packet_barrier')
+      if (/expected every participant to succeed/.test(detail)) missing.add('all_participants_success')
+      if (/needs between 2 and 10/.test(detail)) missing.add('race_requests')
+      break
+    }
+    case 'oob':
+      missing.add('oob_callback_hit')
+      break
+    case 'status':
+    case 'header':
+    case 'body_contains':
+    case 'jsonpath':
+    case 'css':
+    case 'dom_sentinel':
+      missing.add(`${claim.kind}_claim`)
+      break
+    default:
+      break
+  }
+  if (missing.size === 0) missing.add('claim_evidence')
+  return [...missing]
 }
 
 export function evaluateClaims(
@@ -1192,11 +1490,27 @@ export function evaluateClaims(
       failures.push('boundary: access-control claim requires a denied/challenged control plus a crossing variant, or an actor/precondition differential backed by data/state evidence.')
     }
   }
+  const failedCheck = checks.find(check => !check.passed) ?? null
+  const missingEvidence = new Set<string>()
+  for (const check of checks) for (const item of describeMissingEvidence(check)) missingEvidence.add(item)
+  if (failures.some(failure => /impact: authorization claim dismissed/.test(failure))) missingEvidence.add('owner_scoped_disclosure')
+  if (failures.some(failure => /impact: .* requires a passing impact-evidence claim/.test(failure))) missingEvidence.add('impact_claim')
+  if (failures.some(failure => /^boundary: authentication/.test(failure))) missingEvidence.add('boundary_claim')
+  if (failures.some(failure => /^boundary: MFA/.test(failure))) missingEvidence.add('mfa_claim')
+  if (failures.some(failure => /^boundary: access-control/.test(failure))) missingEvidence.add('boundary_or_disclosure')
+  const rejectedBy = failedCheck
+    ? failedCheck.claim.kind
+    : failures.length > 0
+      ? (failures.some(failure => failure.startsWith('boundary:')) ? 'boundary_gate' : failures.some(failure => failure.startsWith('impact:')) ? 'impact_gate' : 'oracle')
+      : null
   return {
     passed: checks.length > 0 && failures.length === 0,
     checks,
     failures,
     transcriptDigest: store.digest(),
+    rejectedBy,
+    ...(failures.length > 0 ? { missingEvidence: [...missingEvidence] } : { missingEvidence: [] }),
+    transcriptSummary: store.summaries(),
   }
 }
 
@@ -1275,6 +1589,28 @@ export function causalFingerprints(
         path: pathFingerprint(probe?.request?.pathAndQuery),
         status: probe?.response?.status ?? null,
         expectation: { boundaryClass: claim.boundaryClass },
+        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+      }
+    }
+    if (claim.kind === 'structural_diff') {
+      const probe = store.get(claim.variantIds[0])
+      return {
+        kind: claim.kind,
+        method: probe?.request?.method ?? '',
+        path: pathFingerprint(probe?.request?.pathAndQuery),
+        status: probe?.response?.status ?? null,
+        expectation: { minRounds: claim.minRounds ?? 3, minDeltaTokens: claim.minDeltaTokens ?? 1 },
+        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+      }
+    }
+    if (claim.kind === 'race') {
+      const probe = store.get(claim.exchangeIds[0])
+      return {
+        kind: claim.kind,
+        method: probe?.request?.method ?? '',
+        path: pathFingerprint(probe?.request?.pathAndQuery),
+        status: probe?.response?.status ?? null,
+        expectation: { mode: claim.mode ?? null, minDistinctOutcomes: claim.minDistinctOutcomes ?? 2 },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
     }
@@ -1509,6 +1845,7 @@ export class VerifyRpcServer {
     if (op === 'http2') return this.handleHttp2(args, nonce)
     if (op === 'browser') return this.handleBrowser(args, nonce)
     if (op === 'oob') return this.handleOob(args)
+    if (op === 'race') return this.handleRace(args, nonce)
     throw new Error(`Unsupported verification RPC operation: ${String(op)}`)
   }
 
@@ -1893,7 +2230,68 @@ export class VerifyRpcServer {
     }
   }
 
-  private handleOob(args: Record<string, unknown>): unknown {
+  private async handleRace(args: Record<string, unknown>, nonce: string): Promise<unknown> {
+    const rawRequests = args.requests
+    if (!Array.isArray(rawRequests) || rawRequests.length < 2 || rawRequests.length > 10) {
+      throw new Error('race requires between 2 and 10 request objects.')
+    }
+    const parsed = rawRequests.map((item, index) => {
+      const record = asRecord(item)
+      if (!record) throw new Error(`race request ${index + 1} must be an object.`)
+      return this.parseHttpArgs({ sessionGroupRole: 'probe', ...record })
+    })
+    const mode = (() => {
+      const summary = this.options.broker.getTransportSummary()
+      return summary.http2 && !summary.proxy
+        ? { mode: 'h2-single-packet' as const, fallbackReason: null as string | null }
+        : { mode: 'http1-fallback' as const, fallbackReason: summary.proxy ? 'proxy transport disables the HTTP/2 single-packet barrier' : 'HTTP/2 transport is unavailable; the burst runs on the HTTP/1.1 fallback' }
+    })()
+    const started = Date.now()
+    try {
+      const burst = await this.options.broker.executeRaceBurst(
+        parsed.map(item => item.brokerRequest),
+        this.options.grant,
+        AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000),
+      )
+      const results = burst.results.map((result, index) => {
+        const meta = parsed[index]!.requestMeta
+        const body = this.scrub(result.body)
+        const record = this.transcript.record({
+          op: mode.mode === 'h2-single-packet' ? 'http2' : 'http',
+          startedAt: started,
+          durationMs: result.durationMs,
+          request: { ...meta, nonce },
+          response: {
+            status: result.status,
+            headers: this.scrubRecord(result.respHeaders),
+            bodyBytes: result.bodyBytes,
+            bodySha256: result.bodySha256,
+            mediaType: result.mediaType,
+          },
+          body,
+        })
+        return this.exchangeView(record, { ...result, body })
+      })
+      return this.scrubRecord({
+        mode: mode.mode,
+        fallbackReason: mode.fallbackReason,
+        summary: burst.summary,
+        results,
+      })
+    } catch (error) {
+      const record = this.transcript.record({
+        op: 'race',
+        startedAt: started,
+        durationMs: Date.now() - started,
+        request: { ...parsed[0]!.requestMeta, nonce },
+        error: error instanceof Error ? error.message : 'Race burst failed.',
+        errorCode: /scope|denied|approval|forbidden|outside|header|tier/i.test(error instanceof Error ? error.message : '') ? 'denied' : 'failed',
+      })
+      throw new Error(`${record.exchangeId}: ${error instanceof Error ? error.message : 'Race burst failed.'}`)
+    }
+  }
+
+  private async handleOob(args: Record<string, unknown>): Promise<unknown> {
     const canary = this.options.canary ?? (this.options.grant as Grant & { canaryBroker?: VerifyCanaryBroker }).canaryBroker
     if (!canary) throw new Error('OOB canaries are not available for this run.')
     const action = typeof args.action === 'string' ? args.action : 'mint'
@@ -1910,6 +2308,96 @@ export class VerifyRpcServer {
         artifact: { kind: 'oob-mint', token: minted.token, url: minted.httpUrl, dnsHost: minted.dnsHost, hit: false },
       })
       return this.scrubRecord({ exchangeId: record.exchangeId, token: minted.token, url: minted.httpUrl, dnsHost: minted.dnsHost })
+    }
+    if (action === 'subscribe') {
+      const token = typeof args.token === 'string' ? args.token.trim().toLowerCase() : ''
+      if (!token) throw new Error('oob subscribe requires a canary token.')
+      if (!canary.subscribe) {
+        throw new Error('OOB relay does not expose durable pending_oob subscriptions; a late callback cannot be promoted.')
+      }
+      const exchangeId = typeof args.exchangeId === 'string' ? args.exchangeId : ''
+      const immediateMs = typeof args.immediateMs === 'number' ? Math.max(0, Math.min(args.immediateMs, 30_000)) : undefined
+      const windowMs = typeof args.windowMs === 'number' ? Math.max(1_000, Math.min(args.windowMs, 30 * 60_000)) : undefined
+      const started = Date.now()
+      const subscription = canary.subscribe({
+        runId: this.options.runId,
+        assignmentId: this.options.assignmentId,
+        canaryId: typeof args.canaryId === 'string' && args.canaryId ? args.canaryId : token,
+        token,
+        artifact: exchangeId,
+        ...(immediateMs !== undefined ? { immediateMs } : {}),
+        ...(windowMs !== undefined ? { windowMs } : {}),
+      })
+      this.transcript.record({
+        op: 'oob',
+        startedAt: started,
+        durationMs: Date.now() - started,
+        request: { origin: '', method: 'SUBSCRIBE', pathAndQuery: `/oob/pending/${subscription.id}`, headers: {}, bodyBytes: 0, bodySha256: createHash('sha256').update(subscription.id).digest('hex'), nonce: this.nonce },
+        artifact: { kind: 'oob-mint', token, hit: false },
+      })
+      return this.scrubRecord({
+        subscriptionId: subscription.id,
+        token,
+        status: subscription.status ?? 'pending',
+        createdAt: subscription.createdAt ?? started,
+        expiresAt: subscription.expiresAt ?? null,
+        immediateMs: subscription.immediateMs ?? immediateMs ?? null,
+        windowMs: subscription.windowMs ?? windowMs ?? null,
+      })
+    }
+    if (action === 'wait') {
+      const token = typeof args.token === 'string' ? args.token.trim().toLowerCase() : ''
+      if (!token) throw new Error('oob wait requires a canary token.')
+      const subscriptionId = typeof args.subscriptionId === 'string' ? args.subscriptionId : null
+      const subscriptionCreatedAt = typeof args.subscriptionCreatedAt === 'number' ? args.subscriptionCreatedAt : null
+      const immediateMs = typeof args.immediateMs === 'number' ? Math.max(0, Math.min(args.immediateMs, 30_000)) : 3_000
+      const timeoutMs = typeof args.timeoutMs === 'number' ? Math.max(0, Math.min(args.timeoutMs, 60_000)) : immediateMs
+      const immediateDeadline = (subscriptionCreatedAt ?? Date.now()) + immediateMs
+      const t0 = Date.now()
+      let check = canary.checkCanary(token, { runId: this.options.runId })
+      let callbackReceivedAt: number | null = null
+      let promoted = false
+      let matched = check.hit
+      if (!matched && canary.awaitAny) {
+        try {
+          const awaited = await canary.awaitAny({ token, runId: this.options.runId }, { timeoutMs, pollMs: 100 })
+          matched = awaited.matched
+          callbackReceivedAt = awaited.callback?.receivedAt ?? null
+        } catch { /* fall through to the recorded in-memory check */ }
+      }
+      const promotions = (() => {
+        try { return canary.promoteLate?.({ runId: this.options.runId }) ?? [] } catch { return [] }
+      })()
+      const promotion = promotions.find(item => item.subscription.token === token || item.subscription.id === subscriptionId)
+      if (promotion) {
+        promoted = true
+        matched = true
+        callbackReceivedAt = callbackReceivedAt ?? promotion.callback.receivedAt ?? null
+      }
+      check = canary.checkCanary(token, { runId: this.options.runId })
+      const hit = Boolean(matched || check.hit)
+      const receivedAt = callbackReceivedAt ?? (typeof check.detail?.timestamp === 'number' ? check.detail.timestamp : null)
+      const stage: 'immediate' | 'late' | 'pending' | 'none' = hit
+        ? (receivedAt !== null && receivedAt > immediateDeadline ? 'late' : 'immediate')
+        : (subscriptionId ? 'pending' : 'none')
+      const record = this.transcript.record({
+        op: 'oob',
+        startedAt: t0,
+        durationMs: Date.now() - t0,
+        request: { origin: '', method: 'WAIT', pathAndQuery: subscriptionId ? `/oob/pending/${subscriptionId}` : '/oob/wait', headers: {}, bodyBytes: 0, bodySha256: createHash('sha256').update(token).digest('hex'), nonce: this.nonce },
+        artifact: { kind: 'oob-mint', token, hit },
+      })
+      return this.scrubRecord({
+        exchangeId: record.exchangeId,
+        checkExchangeId: record.exchangeId,
+        subscriptionId: promotion?.subscription.id ?? subscriptionId,
+        token,
+        hit,
+        stage,
+        promoted,
+        receivedAt,
+        hits: check.hits.slice(-5),
+      })
     }
     if (action === 'check') {
       const token = typeof args.token === 'string' ? args.token : ''
@@ -1986,6 +2474,14 @@ export interface VerifyAttemptReport {
   causal: CausalFingerprint[]
   title: string | null
   nonceMismatch: boolean
+  /** First validator that rejected this attempt, so a repair can target it directly. */
+  rejectedBy: string | null
+  /** Exact missing transcript roles/preconditions. */
+  missingEvidence: string[]
+  /** Role-labelled transcript summary (control/probe/... ids, statuses, personas). */
+  transcriptSummary: TranscriptSummary[]
+  /** Last 2 KiB of script stderr, useful when the helper throws before returning claims. */
+  stderr?: string
 }
 
 export interface VerifyVerdict {
@@ -1995,6 +2491,9 @@ export interface VerifyVerdict {
   attempts: VerifyAttemptReport[]
   disagreements: string[]
   claimTitle: string | null
+  rejectedBy: string | null
+  missingEvidence: string[]
+  transcriptSummary: TranscriptSummary[]
 }
 
 export interface VerifyScriptOptions {
@@ -2037,19 +2536,23 @@ async function runAttempt(
       failures: [] as string[],
       claimCount: 0,
       nonceMismatch: false,
+      rejectedBy: null as string | null,
+      missingEvidence: [] as string[],
+      transcriptSummary: session.transcript.summaries(),
+      stderr: execution.stderr.slice(0, 2_000),
     }
     if (execution.timedOut) {
-      return { report: { ...base, failures: ['Verification script timed out.'] }, fingerprints: [] }
+      return { report: { ...base, failures: ['Verification script timed out.'], rejectedBy: 'execution', missingEvidence: ['script_completion'] }, fingerprints: [] }
     }
     let parsed: VerifyScriptResult
     try {
       parsed = parseVerifyScriptResult(execution.result)
     } catch (error) {
-      return { report: { ...base, failures: [error instanceof Error ? error.message : 'Invalid result.'] }, fingerprints: [] }
+      return { report: { ...base, failures: [error instanceof Error ? error.message : 'Invalid result.'], rejectedBy: 'claims', missingEvidence: ['valid_proof_document'] }, fingerprints: [] }
     }
     if (typeof parsed.nonce === 'string' && parsed.nonce !== nonce) {
       return {
-        report: { ...base, title: parsed.title ?? null, claimCount: parsed.claims.length, nonceMismatch: true, failures: ['Proof document nonce does not match this attempt; a stale result was replayed.'] },
+        report: { ...base, title: parsed.title ?? null, claimCount: parsed.claims.length, nonceMismatch: true, failures: ['Proof document nonce does not match this attempt; a stale result was replayed.'], rejectedBy: 'nonce', missingEvidence: ['fresh_nonce'] },
         fingerprints: [],
       }
     }
@@ -2060,14 +2563,23 @@ async function runAttempt(
       claimedBoundary: classifyBoundaryClaim({ title: parsed.title }),
     })
     const causal = causalFingerprints(session.transcript, oracle.checks, nonce)
+    const missingEvidence = oracle.missingEvidence ?? []
+    const repairFeedback = oracle.passed ? [] : [
+      `rejected-by: ${oracle.rejectedBy ?? 'unknown'}`,
+      ...missingEvidence.map(item => `missing-evidence: ${item}`),
+      ...session.transcript.summaries().slice(0, 16).map(entry =>
+        `transcript-role: ${entry.role ?? 'setup'} ${entry.exchangeId} ${entry.method ?? '-'} ${entry.pathAndQuery ?? '-'} -> ${entry.status ?? 'error'}${entry.personaHandle ? ` persona=${entry.personaHandle}` : ''}`),
+    ]
     return {
       report: {
         ...base,
         title: parsed.title ?? null,
         oraclePassed: oracle.passed,
-        failures: oracle.failures,
+        failures: [...oracle.failures, ...repairFeedback],
         claimCount: parsed.claims.length,
         causal,
+        rejectedBy: oracle.rejectedBy ?? null,
+        missingEvidence,
       },
       fingerprints: causal.map(describeFingerprint),
     }
@@ -2099,6 +2611,9 @@ async function runAttemptSafe(
         causal: [],
         title: null,
         nonceMismatch: false,
+        rejectedBy: 'execution',
+        missingEvidence: [error instanceof Error ? error.message.slice(0, 120) : 'attempt_start'],
+        transcriptSummary: [],
       },
       fingerprints: [],
     }
@@ -2119,31 +2634,44 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
   const second = await runAttemptSafe(options, 2, nonces[1])
   const attempts = [first.report, second.report]
   const detailBase = `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=${second.report.oraclePassed ? 'pass' : 'fail'}`
+  // The repair contract: name the rejecting validator, the exact missing evidence, and the
+  // role-labelled transcript, so the agent can repair in one turn instead of guessing.
+  const feedback = () => {
+    const failed = attempts.filter(report => !report.oraclePassed)
+    const source = failed.length > 0 ? failed : attempts
+    return {
+      rejectedBy: source.find(report => report.rejectedBy !== null)?.rejectedBy ?? null,
+      missingEvidence: [...new Set(source.flatMap(report => report.missingEvidence))],
+      transcriptSummary: source[0]?.transcriptSummary ?? [],
+    }
+  }
+  const withFeedback = <T extends Omit<VerifyVerdict, 'rejectedBy' | 'missingEvidence' | 'transcriptSummary'>>(value: T): VerifyVerdict =>
+    ({ ...value, ...feedback() })
 
   if (first.report.nonce === second.report.nonce) {
-    return { confirmed: false, reason: 'nonce_reuse', detail: 'Both attempts used the same nonce; sessions were not fresh.', attempts, disagreements: [], claimTitle: first.report.title }
+    return withFeedback({ confirmed: false, reason: 'nonce_reuse', detail: 'Both attempts used the same nonce; sessions were not fresh.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (attempts.some(a => a.nonceMismatch)) {
-    return { confirmed: false, reason: 'nonce_mismatch', detail: 'A proof document did not match its fresh attempt nonce.', attempts, disagreements: [], claimTitle: first.report.title }
+    return withFeedback({ confirmed: false, reason: 'nonce_mismatch', detail: 'A proof document did not match its fresh attempt nonce.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (attempts.some(a => a.claimCount === 0)) {
-    return { confirmed: false, reason: 'claims_missing', detail: 'At least one run returned no transcript-backed claims.', attempts, disagreements: [], claimTitle: first.report.title }
+    return withFeedback({ confirmed: false, reason: 'claims_missing', detail: 'At least one run returned no transcript-backed claims.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (attempts.some(a => a.exitCode !== 0)) {
-    return { confirmed: false, reason: 'execution_failed', detail: `A verification run exited non-zero (${detailBase}).`, attempts, disagreements: [], claimTitle: first.report.title }
+    return withFeedback({ confirmed: false, reason: 'execution_failed', detail: `A verification run exited non-zero (${detailBase}).`, attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (!attempts.every(a => a.signaturesValid)) {
-    return { confirmed: false, reason: 'transcript_mismatch', detail: 'A transcript failed signature verification.', attempts, disagreements: [], claimTitle: first.report.title }
+    return withFeedback({ confirmed: false, reason: 'transcript_mismatch', detail: 'A transcript failed signature verification.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (!attempts.every(a => a.oraclePassed)) {
-    return {
+    return withFeedback({
       confirmed: false,
       reason: 'oracle_failed',
       detail: `Claims did not survive transcript re-check (${detailBase}).`,
       attempts,
       disagreements: [],
       claimTitle: first.report.title,
-    }
+    })
   }
   const disagreements: string[] = []
   if (first.fingerprints.length !== second.fingerprints.length) {
@@ -2156,33 +2684,33 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
     }
   }
   if (disagreements.length > 0) {
-    return {
+    return withFeedback({
       confirmed: false,
       reason: 'transcript_mismatch',
       detail: 'Both runs passed, but their transcripts disagree on the causal artifact.',
       attempts,
       disagreements,
       claimTitle: first.report.title,
-    }
+    })
   }
   if (!first.report.title || !second.report.title || first.report.title !== second.report.title) {
-    return {
+    return withFeedback({
       confirmed: false,
       reason: 'transcript_mismatch',
       detail: 'Runs reported different proof titles.',
       attempts,
       disagreements: [`title: ${String(first.report.title)} vs ${String(second.report.title)}`],
       claimTitle: first.report.title,
-    }
+    })
   }
-  return {
+  return withFeedback({
     confirmed: true,
     reason: 'confirmed',
     detail: `Both fresh runs passed the transcript oracle with identical causal artifacts (${detailBase}).`,
     attempts,
     disagreements: [],
     claimTitle: first.report.title,
-  }
+  })
 }
 
 // ---------------------------------------------------------------------------
