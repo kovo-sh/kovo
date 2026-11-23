@@ -2906,8 +2906,14 @@ async function main(): Promise<void> {
 
 const isMain = process.argv[1] ? import.meta.url === pathToFileURL(resolve(process.argv[1])).href : false
 if (isMain) {
-  main().catch((error) => {
-    process.stderr.write(`error: ${(error as Error).message}\n`)
-    process.exit(Number((error as { exitCode?: number }).exitCode ?? 1))
-  })
+  main()
+    .then(() => {
+      // The engine can leave timers/server handles open after a completed cell; artifacts are
+      // already flushed, so exit deterministically instead of lingering as an orphan run.
+      setImmediate(() => process.exit(process.exitCode ?? 0))
+    })
+    .catch((error) => {
+      process.stderr.write(`error: ${(error as Error).message}\n`)
+      process.exit(Number((error as { exitCode?: number }).exitCode ?? 1))
+    })
 }
