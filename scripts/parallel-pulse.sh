@@ -63,6 +63,10 @@ printf '%s' "$rows" | while IFS='|' read -r b a s age w; do
   printf '  %-30s %s\n' "$b" "${files:-<no committed files yet>}"
 done
 
+printf 'stale benchmark processes (>25 min; a 600 s cell should never run this long):\n'
+stale="$(ps -eo pid,etimes,args 2>/dev/null | grep -E 'benchmark-(realistic|recall|reason)|floor-repeat' | grep -v grep | awk '$2>1500 {print "  pid " $1 " age " int($2/60) "m"}')"
+if [[ -n "$stale" ]]; then printf '%s\n' "$stale"; else printf '  none\n'; fi
+
 cat <<'CHECK'
 pulse questions:
   1. Any active stream clean and ahead? Merge it, run worker-gate, push.

@@ -159,6 +159,11 @@ export interface DeterministicEngineInput {
   environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
   /** v6: mandatory run-scoped tag applied to benign entity values the floor creates. */
   entityTag?: string
+  /**
+   * v6 staging: full declared-surface rows used only to discover the run-scoped cleanup hook.
+   * Probe selection may deliberately exclude a low-risk cleanup route from the probed subset.
+   */
+  cleanupEndpoints?: readonly StagingCleanupEndpoint[]
   classes?: ReadonlySet<string>
   /** Injection points for tests; production uses the surface-engine probe and ReplayVerifier. */
   probe?: typeof probeDifferential
@@ -198,6 +203,14 @@ export interface DeterministicEngineReport {
   touchedPairs: string[]
   /** Reporting for the conventional-noun wordlist switch (expansion is ON unless disabled). */
   conventionalWordlist: boolean
+  /** v6 staging: mutating hypotheses that carried the run tag (per-probe count). */
+  stagingTaggedMutations: number
+  /** v6 staging: mutating hypotheses refused locally because they cannot be tagged safely. */
+  stagingUntaggedSkipped: number
+  /** v6 staging: run-tagged entities removed by the fixture run-scoped cleanup hook. */
+  stagingCleaned: number
+  /** v6 staging: entity ids observed in tagged 2xx create responses (cleanup audit trail). */
+  stagingCreatedEntityIds: string[]
   notes: string[]
 }
 
@@ -802,6 +815,11 @@ export function enumerateHypotheses(
   // resource (assets?projectId -> /api/spaces). Keep a bounded per-origin pool as a fallback.
   const originIdPool = new Map<string, string[]>()
   const readRoutesByOrigin = buildReadRouteIndex(endpoints)
+  // Destructive authz proofs must leave at least one live object for the replay: the probe matrix
+  // exercises identifiers, so a probe that deletes the very id the replay needs produces a
+  // "control read 404" rejection. Reserve one record-family identifier up front and keep it out of
+  // every destructive matrix (see `reservedVictimId`).
+  const reservedDestructiveIds = new Set<string>()
   for (const endpoint of endpoints) {
     const harvest = harvests.get(endpoint.id)
     const pool = originIdPool.get(endpoint.origin) ?? []
@@ -933,8 +951,42 @@ export function enumerateHypotheses(
       const authzOther = privileged
         ? (sensitiveRead && !mutating ? (picks.crossTenant ?? picks.lower) : (picks.lower ?? picks.owner ?? picks.crossTenant))
         : picks.crossTenant
-      const ids = globalIds(harvest, endpoint.origin)
+      let ids = globalIds(harvest, endpoint.origin)
       const functionLevel = !hasIdPath && !objectIdParam
+      // A destructive matrix consumes the objects it addresses. Exclude ids already reserved by a
+      // sibling destructive hypothesis, then reserve one live record-family victim for this chain.
+      if (method === 'DELETE') ids = ids.filter(id => !reservedDestructiveIds.has(id))
+      let reservedVictimId: string | undefined
+      if (method === 'DELETE' && privileged && idIsLast) {
+        const placeholderIdx = pathSegments.findIndex(segment => placeholderSeg.test(segment))
+        const noun = placeholderIdx > 0 ? pathSegments[placeholderIdx - 1] : undefined
+        const family: string[] = []
+        if (noun) {
+          const singular = noun.replace(/s$/i, '')
+          for (const candidate of endpoints) {
+            if (candidate.origin !== endpoint.origin || candidate.method.toUpperCase() !== 'GET') continue
+            const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+            if (hasDynamicIdSegment(candidatePath)) continue
+            const candidateSegments = candidatePath.split('/').filter(Boolean)
+            const last = (candidateSegments[candidateSegments.length - 1] ?? '').replace(/s$/i, '')
+            if (last !== singular) continue
+            for (const id of harvests.get(candidate.id)?.ownerIds ?? []) {
+              if (/^[A-Za-z0-9_.:-]{1,128}$/.test(id) && !family.includes(id)) family.push(id)
+            }
+          }
+        }
+        const viewerOwned = originViewerIds.get(endpoint.origin) ?? []
+        const pool = family.filter(id => !viewerOwned.includes(id))
+        // Skip the first record (usually the tenant principal, which a role-scoped delete refuses)
+        // and any id the lower actor owns, so the reserved victim is a genuinely deletable colleague.
+        const pick = pool[1] ?? pool[0] ?? family[1] ?? family[0]
+        // Keep at least one other id so the matrix can still establish the route signal.
+        if (pick && ids.length > 1) {
+          reservedVictimId = pick
+          reservedDestructiveIds.add(pick)
+          ids = ids.filter(id => id !== pick)
+        }
+      }
       // Object-authorization on a stable resource route: the identifier must be the last path
       // segment, a query filter, or (for a mutating privileged action) an id followed by a
       // role/grant verb. Rendered "view/card/public" subroutes are shared surfaces, and running a
@@ -986,6 +1038,7 @@ export function enumerateHypotheses(
           ...(readback ? { readbackPath: readback.path } : {}),
           ...(readback?.persona ? { readbackPersona: readback.persona } : {}),
           ...(requiredRole ? { authzRequiredRole: requiredRole } : {}),
+          ...(reservedVictimId ? { reservedVictimId } : {}),
           jsonBody: mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
             ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
             : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
@@ -1956,27 +2009,162 @@ async function harvestSurface(
 // Execution
 // ---------------------------------------------------------------------------------------------
 
+/** Run-scoped synthetic-tenant marker carried on every staging mutation (scope-policy contract). */
+export const STAGING_TENANT_HEADER = 'x-guardian-tenant-tag'
+/** Fixture/run journal key: lets the target attribute created rows to this run for teardown. */
+export const STAGING_RUN_HEADER = 'x-guardian-run-id'
+
 /**
- * Apply the mandatory run-scoped entity tag to benign, human-visible fields the floor creates in a
- * staging/isolated environment, so every test entity is attributable and cleanable.
+ * Benign, human-visible fields the floor creates in a staging/isolated environment. Injecting the
+ * run tag into these values keeps every test entity attributable and cleanable. Entity identifiers
+ * of pre-existing owner rows are never rewritten: only values that create things are tagged.
  */
-function tagEntityBody(body: Record<string, unknown>, tag?: string): Record<string, unknown> {
-  if (!tag) return body
+const stagingEntityFieldPattern =
+  /^(?:name|title|label|slug|subject|description|notes?|body|text|company|email|memos?|message|comment|display[_-]?name|first[_-]?name|last[_-]?name|full[_-]?name|username|handle)$/i
+
+/**
+ * Routes where injecting a tag would corrupt a pre-existing identity (login/session/token flows).
+ * A mutation there cannot be tagged safely, so a staging probe must skip it instead of letting it
+ * reach the scope policy and be refused as an untagged mutation.
+ */
+const stagingUntaggablePathPattern =
+  /(?:^|\/)(?:login|logout|signin|sign-in|signup|sign-up|register|session|sessions|auth|oauth|token|tokens|password|passwords|reset|forgot|otp|mfa|verify|verification)(?:\/|$)/i
+
+/** Apply the mandatory run-scoped tag to benign string fields that create entities. */
+export function tagStagingEntityBody(
+  body: Record<string, unknown>,
+  tag?: string | null,
+): Record<string, unknown> {
+  const prefix = (tag ?? '').trim()
+  if (!prefix) return body
   const out: Record<string, unknown> = { ...body }
   for (const key of Object.keys(out)) {
-    if (!/^(?:name|title|label|slug|subject|description|note|notes|body|text|company)$/i.test(key)) continue
+    if (!stagingEntityFieldPattern.test(key)) continue
     const value = out[key]
-    if (typeof value !== 'string' || value.startsWith(tag)) continue
-    out[key] = `${tag}-${value}`.slice(0, 160)
+    if (typeof value !== 'string' || value.startsWith(prefix)) continue
+    out[key] = `${prefix}${value}`.slice(0, 160)
   }
   return out
 }
 
-function buildProbeRequest(
+/** Matching form-encoded tagger for probes that send `application/x-www-form-urlencoded`. */
+export function tagStagingEntityForm(
+  form: Record<string, string>,
+  tag?: string | null,
+): Record<string, string> {
+  const prefix = (tag ?? '').trim()
+  if (!prefix) return form
+  const out: Record<string, string> = { ...form }
+  for (const key of Object.keys(out)) {
+    if (!stagingEntityFieldPattern.test(key)) continue
+    const value = out[key]
+    if (typeof value !== 'string' || value.startsWith(prefix)) continue
+    out[key] = `${prefix}${value}`.slice(0, 160)
+  }
+  return out
+}
+
+/** Probe classes that can write even when the base hypothesis method is a read. */
+const stagingMutatingProbeClasses = new Set<DifferentialProbeClass>([
+  'csrf_state_change',
+  'mass_assignment',
+  'workflow_invariant',
+  'xxe_canary',
+  'webhook_signature_bypass',
+  'ssrf_canary',
+])
+
+/** Probe classes that can rewrite state on their control/restore legs regardless of the base verb. */
+const stagingConditionallyMutatingClasses = new Set<DifferentialProbeClass>([
+  'authz_matrix',
+  'graphql_audit',
+])
+
+/** Whether this hypothesis can issue a state-changing request (base verb or probe family semantics). */
+export function probeHypothesisMutates(hyp: Pick<EngineHypothesis, 'probeClass'> & {
+  method?: string
+  intent?: EngineHypothesis['intent']
+  functionLevel?: boolean
+  csrfBind?: boolean
+}): boolean {
+  const method = (hyp.method ?? 'GET').toUpperCase()
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') return true
+  if (stagingMutatingProbeClasses.has(hyp.probeClass)) return true
+  if (hyp.intent === 'ssrf' || hyp.intent === 'xxe' || hyp.intent === 'webhook' ||
+      hyp.intent === 'csrf' || hyp.intent === 'mass_assignment' || hyp.intent === 'workflow') return true
+  if (stagingConditionallyMutatingClasses.has(hyp.probeClass)) {
+    return hyp.functionLevel === true || hyp.csrfBind === true
+  }
+  return false
+}
+
+export interface StagingProbeTag {
+  action: 'tag' | 'skip' | 'none'
+  reason: 'tagged' | 'read_only' | 'not_staging' | 'missing_tag' | 'pre_existing_identity'
+  headers?: Record<string, string>
+  jsonBody?: Record<string, unknown>
+  formBody?: Record<string, string>
+}
+
+/**
+ * Decide how a probe request satisfies the `staging_isolated` tenant-tag contract.
+ *
+ * - `none`: not staging, or a genuinely read-only probe (never tagged).
+ * - `tag`: mutating probe; headers carry the run tag and entity-creating string fields are tagged.
+ * - `skip`: mutating probe that cannot carry the tag without corrupting a pre-existing identity
+ *   (login/session/token routes); the caller must refuse to send it and count the skip.
+ */
+export function stagingProbeTag(input: {
+  environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
+  entityTag?: string | null
+  runId?: string | null
+  method?: string
+  probeClass: DifferentialProbeClass
+  pathAndQuery: string
+  mutates?: boolean
+  jsonBody?: Record<string, unknown>
+  formBody?: Record<string, string>
+}): StagingProbeTag {
+  const entityTag = (input.entityTag ?? '').trim()
+  const runId = (input.runId ?? '').trim()
+  const mutating = input.mutates ??
+    probeHypothesisMutates({ method: input.method ?? 'GET', probeClass: input.probeClass })
+  if (input.environmentMode !== 'staging_isolated') {
+    return { action: 'none', reason: 'not_staging' }
+  }
+  if (!mutating) return { action: 'none', reason: 'read_only' }
+  if (!entityTag || !runId) return { action: 'skip', reason: 'missing_tag' }
+  const path = (input.pathAndQuery.split('?')[0] || '/')
+  if (stagingUntaggablePathPattern.test(path)) return { action: 'skip', reason: 'pre_existing_identity' }
+  return {
+    action: 'tag',
+    reason: 'tagged',
+    headers: { [STAGING_RUN_HEADER]: runId, [STAGING_TENANT_HEADER]: entityTag },
+    ...(input.jsonBody ? { jsonBody: tagStagingEntityBody(input.jsonBody, entityTag) } : {}),
+    ...(input.formBody ? { formBody: tagStagingEntityForm(input.formBody, entityTag) } : {}),
+  }
+}
+
+/** Build the probe request for a hypothesis, applying the staging tag decision when present. */
+export function buildProbeRequest(
   hyp: EngineHypothesis,
   maxRequests: number,
   context: Pick<DeterministicEngineInput, 'runId' | 'assignmentId' | 'storage' | 'entityTag'>,
+  staging: StagingProbeTag = stagingProbeTag({
+    environmentMode: context.entityTag ? 'staging_isolated' : 'ephemeral_lab',
+    entityTag: context.entityTag,
+    runId: context.runId,
+    method: hyp.method,
+    probeClass: hyp.probeClass,
+    pathAndQuery: hyp.pathAndQuery,
+    mutates: probeHypothesisMutates(hyp),
+    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+    ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
+  }),
 ): ProbeDifferentialRequest {
+  const tagged = staging.action === 'tag'
+  const jsonBody = tagged ? staging.jsonBody : hyp.jsonBody
+  const formBody = tagged ? staging.formBody : hyp.formBody
   const base: ProbeDifferentialRequest = {
     probeClass: hyp.probeClass,
     origin: hyp.endpoint.origin,
@@ -1988,8 +2176,9 @@ function buildProbeRequest(
     ...(context.storage ? { storage: context.storage } : {}),
     ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
     ...(hyp.session ? { session: hyp.session } : {}),
-    ...(hyp.jsonBody ? { jsonBody: tagEntityBody(hyp.jsonBody, context.entityTag) } : {}),
-    ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
+    ...(tagged && staging.headers ? { headers: staging.headers } : {}),
+    ...(jsonBody ? { jsonBody } : {}),
+    ...(formBody ? { formBody } : {}),
     ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate } : {}),
     ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
   }
@@ -2133,7 +2322,7 @@ function buildProbeRequest(
 }
 
 
-function extractCreatedId(body: string): string | null {
+export function extractCreatedId(body: string): string | null {
   let parsed: unknown
   try { parsed = JSON.parse(body) } catch { return null }
   let fallback: string | null = null
@@ -2158,6 +2347,107 @@ function extractCreatedId(body: string): string | null {
     return null
   }
   return walk(parsed, 0) ?? fallback
+}
+
+/**
+ * Find the fixture/application run-scoped cleanup hook. Only a declared `POST …/cleanup` route is
+ * used, and the run id is passed as a query parameter so teardown can never address a broad sweep.
+ */
+export interface StagingCleanupEndpoint { origin: string; method: string; pathTemplate: string }
+
+export function stagingCleanupTarget(
+  endpoints: readonly StagingCleanupEndpoint[],
+  runId: string,
+): { origin: string; pathAndQuery: string } | null {
+  if (!runId) return null
+  for (const endpoint of endpoints) {
+    if ((endpoint.method || '').toUpperCase() !== 'POST') continue
+    const bare = (endpoint.pathTemplate.split('?')[0] || '/')
+    if (!/(?:^|\/)cleanup$/i.test(bare)) continue
+    return {
+      origin: endpoint.origin,
+      pathAndQuery: `${bare}?runId=${encodeURIComponent(runId)}`,
+    }
+  }
+  return null
+}
+
+/**
+ * Every in-scope origin that can host the declared run-scoped cleanup hook. Declared-surface label
+ * mapping can associate the hook with any approved target origin (e.g. an app origin that was
+ * discovered alongside an h2 origin), so teardown tries each until one acknowledges the run id.
+ */
+export function stagingCleanupTargets(
+  endpoints: readonly StagingCleanupEndpoint[],
+  runId: string,
+): Array<{ origin: string; pathAndQuery: string }> {
+  const target = stagingCleanupTarget(endpoints, runId)
+  if (!target) return []
+  const origins = [...new Set([target.origin, ...endpoints.map(endpoint => endpoint.origin)])]
+    .filter((origin, index, all) => Boolean(origin) && all.indexOf(origin) === index)
+  return origins.map(origin => ({ origin, pathAndQuery: target.pathAndQuery }))
+}
+
+/**
+ * Invoke the run-scoped cleanup hook with an explicit `cleanup` scope context (allowed by the
+ * staging contract without weakening it). Returns the number of tagged entities the target removed.
+ */
+export async function cleanupStagedEntities(input: {
+  endpoints: readonly StagingCleanupEndpoint[]
+  runId: string
+  broker: RequestBroker
+  grant: Grant
+  signal: AbortSignal
+  assignmentId?: string
+  log?: (kind: string, message: string, data?: Record<string, unknown>) => void
+}): Promise<number> {
+  const targets = stagingCleanupTargets(input.endpoints, input.runId)
+  if (!targets.length) return 0
+  let lastStatus: number | null = null
+  for (const target of targets) {
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin: target.origin,
+        method: 'POST',
+        pathAndQuery: target.pathAndQuery,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId: input.runId }),
+        scopeHook: 'cleanup',
+        runId: input.runId,
+        ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+        followRedirects: false,
+        timeoutMs: 10_000,
+      }, input.grant, input.signal)
+      if (exchange.status < 200 || exchange.status >= 300) {
+        lastStatus = exchange.status
+        continue
+      }
+      let removed = 0
+      try {
+        const parsed = JSON.parse(exchange.body) as { removed?: unknown }
+        if (typeof parsed.removed === 'number' && Number.isFinite(parsed.removed)) removed = Math.max(0, parsed.removed)
+      } catch { /* non-JSON cleanup ack: nothing countable */ }
+      input.log?.('staging.cleanup', `Run-scoped cleanup removed ${removed} tagged entit${removed === 1 ? 'y' : 'ies'}.`, {
+        hook: target.pathAndQuery.split('?')[0],
+        origin: target.origin,
+        removed,
+      })
+      return removed
+    } catch (error) {
+      input.log?.('staging.cleanup_error', `Run-scoped cleanup hook failed: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`, {
+        hook: target.pathAndQuery.split('?')[0],
+        origin: target.origin,
+      })
+    }
+  }
+  if (lastStatus !== null) {
+    input.log?.('staging.cleanup_error', `Run-scoped cleanup hook returned HTTP ${lastStatus} on every candidate origin.`, {
+      hook: targets[0].pathAndQuery.split('?')[0],
+      status: lastStatus,
+      origins: targets.length,
+    })
+  }
+  return 0
 }
 
 /**
@@ -2190,18 +2480,35 @@ async function probeSecondOrderSsrf(
   const param = hyp.param
   const trigger = hyp.triggerPath
   if (!canaryBroker || !param || !trigger) return { ...base, durationMs: Date.now() - started }
+  // The two-step lifecycle posts create-shaped bodies itself, so it must carry the same run tag as
+  // the generic probe path or the scope policy would (correctly) refuse the write.
+  const staging = stagingProbeTag({
+    environmentMode: input.environmentMode,
+    entityTag: input.entityTag,
+    runId: input.runId,
+    method: 'POST',
+    probeClass: 'ssrf_canary',
+    pathAndQuery: hyp.pathAndQuery,
+    mutates: true,
+    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+  })
+  if (staging.action === 'skip') {
+    return { ...base, notes: ['staging_untagged_skipped'], durationMs: Date.now() - started }
+  }
+  const stagingHeaders = staging.action === 'tag' ? (staging.headers ?? {}) : {}
+  const stagingBody = staging.action === 'tag' ? (staging.jsonBody ?? {}) : (hyp.jsonBody ?? {})
   let info = canaryBroker.listenerInfo()
   if (!info.running) info = await canaryBroker.startListener()
   const exchangeIds: string[] = []
   let requests = 0
   const send = async (pathAndQuery: string, value: string): Promise<BrokerExchangeResult | null> => {
-    const body = { ...(hyp.jsonBody ?? {}), [param.name]: value }
+    const body = { ...stagingBody, [param.name]: value }
     try {
       const exchange = await input.broker.executeHttp({
         origin: hyp.endpoint.origin,
         method: 'POST',
         pathAndQuery,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...stagingHeaders },
         body: JSON.stringify(body),
         ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
         runId: input.runId,
@@ -2225,7 +2532,7 @@ async function probeSecondOrderSsrf(
         origin: hyp.endpoint.origin,
         method: 'POST',
         pathAndQuery: path,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...stagingHeaders },
         body: '{}',
         ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
         runId: input.runId,
@@ -2475,6 +2782,10 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     confirmedPairs: [],
     touchedPairs: [],
     conventionalWordlist,
+    stagingTaggedMutations: 0,
+    stagingUntaggedSkipped: 0,
+    stagingCleaned: 0,
+    stagingCreatedEntityIds: [],
     notes: [],
   }
 
@@ -2498,10 +2809,23 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   const picks = personaPicks(input.personas)
   const origins = [...new Set(ranked.map(endpoint => endpoint.origin))]
   const budget = { requestsUsed: 0, maxRequests }
-  /** Every brokered request (harvest, probe, replay) counts against the engine's request cap. */
+  const createdEntityIds = new Set<string>()
+  const stagingTag = (input.entityTag ?? '').trim()
+  /**
+   * Every brokered request (harvest, probe, replay) counts against the engine's request cap. Tagged
+   * create responses are recorded so teardown can attribute and audit what the floor created.
+   */
   const trackExchange = (exchange: BrokerExchangeResult): string | void => {
     budget.requestsUsed += 1
     report.requestsUsed = budget.requestsUsed
+    if (stagingTag && /^(?:POST|PUT|PATCH)$/i.test(exchange.method)) {
+      const carriesTag = Object.values(exchange.reqHeaders ?? {})
+        .some(value => typeof value === 'string' && value.toLowerCase().includes(stagingTag.toLowerCase()))
+      if (carriesTag && exchange.status >= 200 && exchange.status < 300) {
+        const id = extractCreatedId(exchange.body)
+        if (id) createdEntityIds.add(id)
+      }
+    }
     return input.recordExchange?.(exchange)
   }
 
@@ -2575,6 +2899,32 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
 
     const stats = classStats(report, hyp.intent)
     const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(defaultEnginePerProbeRequests, remaining))
+    // v6 staging contract: mutating probes must carry the run tag on their created/updated values.
+    // A mutation that cannot be tagged without corrupting a pre-existing identity is skipped here,
+    // so the scope policy never sees an untagged write (safety stays exactly as strict).
+    const staging = stagingProbeTag({
+      environmentMode,
+      entityTag: input.entityTag,
+      runId: input.runId,
+      method: hyp.method,
+      probeClass: hyp.probeClass,
+      pathAndQuery: hyp.pathAndQuery,
+      mutates: probeHypothesisMutates(hyp),
+      ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+      ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
+    })
+    if (staging.action === 'skip') {
+      report.stagingUntaggedSkipped += 1
+      log('staging.untagged_skipped', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}: ${staging.reason}`, {
+        intent: hyp.intent,
+        probeClass: hyp.probeClass,
+        endpoint: hyp.endpoint.pathTemplate,
+        method: hyp.method,
+        reason: staging.reason,
+      })
+      continue
+    }
+    if (staging.action === 'tag') report.stagingTaggedMutations += 1
     let probe: DifferentialResult
     try {
       probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
@@ -2582,7 +2932,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && input.canaryBroker && !input.probe
           ? await probeSecondOrderSsrf(hyp, input, trackExchange)
           : await (input.probe ?? probeDifferential)(
-              { ...buildProbeRequest(hyp, maxProbeRequests, input), onExchange: trackExchange },
+              { ...buildProbeRequest(hyp, maxProbeRequests, input, staging), onExchange: trackExchange },
               input.broker, input.grant, input.canaryBroker, input.signal,
             )
     } catch (error) {
@@ -2701,6 +3051,27 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   }
 
   if (report.stoppedReason === 'complete' && (Date.now() - started >= hardDeadlineMs)) report.stoppedReason = 'time'
+  report.stagingCreatedEntityIds = [...createdEntityIds]
+  // v6 staging teardown: hand the run tag back to the target's declared cleanup hook so tagged
+  // entities never outlive the floor pass. Best-effort and only when this pass actually wrote.
+  if (environmentMode === 'staging_isolated' && stagingTag && report.stagingTaggedMutations > 0) {
+    let cleanupEndpoints: readonly StagingCleanupEndpoint[] = input.cleanupEndpoints ?? input.endpoints
+    if (!stagingCleanupTarget(cleanupEndpoints, input.runId)) {
+      cleanupEndpoints = [...cleanupEndpoints, ...input.endpoints]
+    }
+    if (!stagingCleanupTarget(cleanupEndpoints, input.runId) && input.storage) {
+      try { cleanupEndpoints = [...cleanupEndpoints, ...input.storage.listEndpoints(input.runId)] } catch { /* keep probe slice */ }
+    }
+    report.stagingCleaned = await cleanupStagedEntities({
+      endpoints: cleanupEndpoints,
+      runId: input.runId,
+      broker: input.broker,
+      grant: input.grant,
+      signal: input.signal,
+      ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+      log,
+    })
+  }
   report.durationMs = Date.now() - started
   return report
 }

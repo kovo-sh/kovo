@@ -518,4 +518,6 @@ function isEntrypoint(): boolean {
 
 if (isEntrypoint()) {
   process.exitCode = await runBenchmarkCli(process.argv.slice(2))
+  // Artifacts are flushed; exit deterministically so the process never lingers as an orphan.
+  setImmediate(() => process.exit(process.exitCode ?? 0))
 }
