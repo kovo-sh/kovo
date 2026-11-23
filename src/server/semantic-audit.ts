@@ -1190,6 +1190,7 @@ process.stdout.write(JSON.stringify({ filesScanned: files.length, nodes, edges }
 export function analyzeSinkBackwardPaths(
   graph: CallGraphIndex,
   spec: ProjectSecuritySpec,
+  options: { maxDepth?: number } = {},
 ): SinkBackwardPath[] {
   const nodeById = new Map<string, CallGraphNode>(graph.nodes.map(n => [n.id, n]))
   const callersOf = new Map<string, CallGraphNode[]>()
@@ -1207,8 +1208,8 @@ export function analyzeSinkBackwardPaths(
   })
 
   const rawPaths: Array<{ ep: CallGraphNode; sink: CallGraphNode; chain: CallGraphNode[] }> = []
+  const maxDepth = Math.max(1, Math.min(options.maxDepth ?? 7, 16))
   for (const sink of sinkNodes) {
-    const maxDepth = 12
     const dfs = (cur: CallGraphNode, visited: Set<string>, chainRev: CallGraphNode[]) => {
       if (rawPaths.length >= 400) return
       const callers = callersOf.get(cur.id) ?? []
@@ -1288,7 +1289,7 @@ export interface ResolvedEntrypoint {
   file: string
   line: number
   paramNames: string[]
-  matchedBy: 'range' | 'nearest' | 'none'
+  matchedBy: 'range' | 'nearest' | 'reverse' | 'none'
   reconciledEndpoint?: string
 }
 
@@ -1354,12 +1355,14 @@ export function resolveSuspectEntrypoint(
   graph: CallGraphIndex | undefined,
   target: { file: string; line: number },
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>,
+  options: { maxHops?: number } = {},
 ): ResolvedEntrypoint | null {
   if (!graph) return null
+  const maxHops = Math.max(1, Math.min(options.maxHops ?? 7, 16))
   const entrypoints = graph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath)
   const inFile = entrypoints.filter(n => n.file === target.file)
   const sorted = [...inFile].sort((a, b) => a.line - b.line)
-  let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' } | null = null
+  let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' | 'reverse' } | null = null
   for (const node of sorted) {
     const end = node.endLine ?? node.line
     if (target.line >= node.line && target.line <= end) {
@@ -1369,12 +1372,40 @@ export function resolveSuspectEntrypoint(
     if (node.line <= target.line) best = { node, matchedBy: 'nearest' }
   }
   if (!best) {
-    // Sink may live in a helper file; follow one reverse call-graph hop to a route.
+    // Multi-hop reverse call graph: sink/helper -> service -> controller -> route (depth 6-8).
     const nodeById = new Map(graph.nodes.map(n => [n.id, n]))
-    const callerIds = graph.edges.filter(e => inFile.some(n => n.id === e.toId) || e.toId.startsWith(`${target.file}:`)).map(e => e.fromId)
-    const caller = callerIds.map(id => nodeById.get(id)).find(n => n?.kind === 'entrypoint' && n.routePath)
-    if (!caller) return null
-    best = { node: caller, matchedBy: 'nearest' }
+    const incoming = new Map<string, CallGraphEdge[]>()
+    for (const edge of graph.edges) {
+      const list = incoming.get(edge.toId) ?? []
+      list.push(edge)
+      incoming.set(edge.toId, list)
+    }
+    const sameFileNodes = graph.nodes
+      .filter(n => n.file === target.file && n.kind !== 'entrypoint')
+      .sort((a, b) => (a.kind === 'sink' ? -1 : 1) - (b.kind === 'sink' ? -1 : 1) || b.line - a.line)
+    const start = sameFileNodes.find(n => target.line >= n.line && target.line <= (n.endLine ?? n.line))
+      ?? sameFileNodes.find(n => n.line <= target.line)
+    if (start) {
+      let found: { node: CallGraphNode; hops: number } | null = null
+      const walk = (current: CallGraphNode, hops: number, visited: Set<string>) => {
+        if (found && hops >= found.hops) return
+        if (current.kind === 'entrypoint' && current.routePath) {
+          found = { node: current, hops }
+          return
+        }
+        if (hops >= maxHops) return
+        for (const edge of incoming.get(current.id) ?? []) {
+          const caller = nodeById.get(edge.fromId)
+          if (!caller || visited.has(caller.id)) continue
+          visited.add(caller.id)
+          walk(caller, hops + 1, visited)
+          visited.delete(caller.id)
+        }
+      }
+      walk(start, 0, new Set([start.id]))
+      if (found) best = { node: (found as { node: CallGraphNode }).node, matchedBy: 'reverse' }
+    }
+    if (!best) return null
   }
   const routePath = best.node.routePath ?? best.node.symbol
   const reconciled = reconcileSuspectWithEndpoints(best.node.httpMethod, routePath, liveEndpoints)

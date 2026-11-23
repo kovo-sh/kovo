@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import {
   accessSync,
@@ -13,11 +13,13 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, relative, resolve, sep } from 'node:path'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import { mineSecurityRelevantCommitDiffs, type CommitDiffSignal } from './program-graph.ts'
 
 export const DEFAULT_GITHUB_PAT_PATH = join(homedir(), '.config', 'guardian-fixtures', 'github.pat')
 
@@ -57,6 +59,13 @@ export interface SyncedGithubRepo {
   localPath?: string
   commitSha?: string
   topLevelDirs?: string[]
+  /** Bounded git history retained for code-first regression mining. */
+  gitHistory?: {
+    depth: number
+    commitsScanned: number
+    commitDiffs: CommitDiffSignal[]
+    metadataPreserved: boolean
+  }
 }
 
 export interface GithubSyncOptions {
@@ -69,6 +78,12 @@ export interface GithubSyncOptions {
   maxFileBytes?: number
   maxRepoBytes?: number
   cloneTimeoutMs?: number
+  /** Bounded clone history depth (default 100). `.git` is preserved unless explicitly stripped. */
+  historyDepth?: number
+  /** Mine security-relevant diffs, then remove `.git` from the mounted checkout. */
+  stripGitMetadata?: boolean
+  /** Maximum commits inspected for diffs during sync (default 20). */
+  maxCommitDiffs?: number
 }
 
 const repoFullNamePattern = /^[a-zA-Z0-9_.-]{1,100}\/[a-zA-Z0-9_.-]{1,100}$/
@@ -78,6 +93,8 @@ const defaultMaxFileBytes = 512 * 1024
 const defaultMaxRepoBytes = 2 * 1024 * 1024
 const defaultMaxLockfileBytes = 8 * 1024 * 1024
 const defaultCloneTimeoutMs = 120_000
+const defaultHistoryDepth = 100
+const defaultMaxCommitDiffs = 20
 
 const skippedDirNames = new Set([
   '.git',
@@ -649,7 +666,9 @@ function walkClonedRepo(
 
       if (lstat.isDirectory()) {
         if (entry.name === '.git') {
-          rmSync(fullPath, { recursive: true, force: true })
+          // Preserve bounded history for Stage-3 regression mining; sanitize + make readable.
+          sanitizeGitMetadata(fullPath)
+          chmodTreeReadable(fullPath)
           continue
         }
         if (depth === 0) topLevelDirs.push(entry.name)
@@ -737,6 +756,115 @@ function chmodTreeReadable(dirPath: string): void {
   } catch { /* best-effort */ }
 }
 
+
+function stripGitSymlinks(dirPath: string): void {
+  let entries
+  try {
+    entries = readdirSync(dirPath, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    const fullPath = join(dirPath, entry.name)
+    try {
+      if (lstatSync(fullPath).isSymbolicLink()) {
+        rmSync(fullPath, { force: true })
+      } else if (entry.isDirectory()) {
+        stripGitSymlinks(fullPath)
+      }
+    } catch { /* best-effort */ }
+  }
+}
+
+/** Strip credentials/headers from `.git/config` and neutralize hooks before mounting. */
+function sanitizeGitMetadata(gitDir: string): void {
+  stripGitSymlinks(gitDir)
+  const configPath = join(gitDir, 'config')
+  try {
+    if (!existsSync(configPath)) return
+    const raw = readFileSync(configPath, 'utf8')
+    const sections: string[] = []
+    let skippingCredentialSection = false
+    for (const line of raw.split('\n')) {
+      const section = /^\s*\[([^\]]+)\]\s*$/.exec(line)
+      if (section) {
+        skippingCredentialSection = /^credential(?:\s|$)/i.test(section[1])
+        if (!skippingCredentialSection) sections.push(line)
+        continue
+      }
+      if (skippingCredentialSection) continue
+      if (/extraheader/i.test(line) || /^\s*(?:username|password|token)\s*=/i.test(line)) continue
+      sections.push(line.replace(/(https?:\/\/)[^/@\s]+@/gi, '$1'))
+    }
+    writeFileSync(configPath, sections.join('\n'), { mode: 0o644 })
+    chmodSync(configPath, 0o644)
+  } catch { /* best-effort: mount remains read-only */ }
+  const hooksDir = join(gitDir, 'hooks')
+  try {
+    if (existsSync(hooksDir)) {
+      for (const entry of readdirSync(hooksDir, { withFileTypes: true })) {
+        if (entry.isFile()) chmodSync(join(hooksDir, entry.name), 0o644)
+      }
+    }
+  } catch { /* best-effort */ }
+}
+
+export interface RepoCommitDiffMining {
+  available: boolean
+  reason?: string
+  commitsScanned: number
+  commitDiffs: CommitDiffSignal[]
+}
+
+/**
+ * Mine a bounded, credential-free git history for security-relevant commit diffs.
+ * Pure server-side operation; never emits raw diffs or repository contents.
+ */
+export function readRepoCommitDiffs(
+  repoDir: string,
+  options: { maxCommits?: number; diffBase?: string; maxDiffBytes?: number } = {},
+): RepoCommitDiffMining {
+  const gitDir = join(repoDir, '.git')
+  if (!existsSync(gitDir)) return { available: false, reason: 'No .git directory in mounted repository.', commitsScanned: 0, commitDiffs: [] }
+  const maxCommits = Math.max(1, Math.min(options.maxCommits ?? defaultMaxCommitDiffs, 200))
+  const maxDiffBytes = Math.max(16_384, Math.min(options.maxDiffBytes ?? 262_144, 1024 * 1024))
+  const baseArgs = ['-C', repoDir, '-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']
+  try {
+    execFileSync('git', [...baseArgs, 'rev-parse', '--git-dir'], { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
+  } catch {
+    return { available: false, reason: 'Invalid git repository.', commitsScanned: 0, commitDiffs: [] }
+  }
+  const safeBase = options.diffBase && /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/.test(options.diffBase) ? options.diffBase : undefined
+  const range = safeBase ? `${safeBase}..HEAD` : undefined
+  let logOut = ''
+  try {
+    const args = [...baseArgs, 'log', '-n', String(maxCommits), '--no-merges', '--pretty=format:===COMMIT===%H%x09%aI%x09%s', '--name-only']
+    if (range) args.push(range)
+    logOut = execFileSync('git', args, { encoding: 'utf8', timeout: 10_000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] })
+  } catch {
+    return { available: false, reason: 'git log failed.', commitsScanned: 0, commitDiffs: [] }
+  }
+  const commits: Array<{ sha: string; subject: string; committedAt?: string; diff: string }> = []
+  for (const block of logOut.split('===COMMIT===').slice(1)) {
+    const lines = block.trim().split('\n')
+    const [sha, committedAt, ...subjectParts] = (lines[0] ?? '').split('\t')
+    if (!sha) continue
+    commits.push({ sha, subject: subjectParts.join('\t'), ...(committedAt ? { committedAt } : {}), diff: '' })
+  }
+  for (const commit of commits) {
+    try {
+      commit.diff = execFileSync('git', [...baseArgs, 'show', '--unified=3', '--no-color', '--format=', commit.sha], {
+        encoding: 'utf8', timeout: 8_000, maxBuffer: maxDiffBytes + 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      }).slice(0, maxDiffBytes)
+    } catch { commit.diff = '' }
+  }
+  return {
+    available: true,
+    commitsScanned: commits.length,
+    commitDiffs: mineSecurityRelevantCommitDiffs(commits, { maxSignals: 100, maxLinesPerFile: 12 }),
+  }
+}
+
 export async function cloneGithubRepos(
   repoFullNames: readonly string[],
   targetRootDir: string,
@@ -761,6 +889,9 @@ export async function cloneGithubRepos(
   }
   const maxFileBytes = Math.max(1024, Math.min(options.maxFileBytes ?? defaultMaxFileBytes, 2 * 1024 * 1024))
   const cloneTimeoutMs = Math.max(5_000, Math.min(options.cloneTimeoutMs ?? defaultCloneTimeoutMs, 600_000))
+  const historyDepth = Math.max(1, Math.min(Math.floor(options.historyDepth ?? defaultHistoryDepth), 1000))
+  const stripGitMetadata = options.stripGitMetadata === true
+  const maxCommitDiffs = Math.max(0, Math.min(Math.floor(options.maxCommitDiffs ?? defaultMaxCommitDiffs), 200))
 
   mkdirSync(targetRootDir, { recursive: true, mode: 0o755 })
   chmodSync(targetRootDir, 0o755)
@@ -807,7 +938,7 @@ export async function cloneGithubRepos(
 
     try {
       await runGit(
-        ['clone', '--depth', '1', '--single-branch', '--no-tags', '--', repoUrl, stagingDir],
+        ['clone', '--depth', String(historyDepth), '--single-branch', '--no-tags', '--', repoUrl, stagingDir],
         gitEnv,
         secrets,
         signal,
@@ -825,11 +956,19 @@ export async function cloneGithubRepos(
         if (sha.stdout.trim()) commitSha = sha.stdout.trim()
       } catch { /* optional */ }
 
-      // Strip .git completely so zero git metadata, hooks, or config ever reach the container mount
-      rmSync(join(stagingDir, '.git'), { recursive: true, force: true })
+      // Sanitize retained git metadata (strip credentials, symlinks, executable hooks).
+      sanitizeGitMetadata(join(stagingDir, '.git'))
 
       // Walk full tree: strip escaping symlinks, set a+rX permissions for uid 10001:10001, extract all dependencies
       const walked = walkClonedRepo(stagingDir, secrets, maxFileBytes, warnings)
+
+      // Mine security-relevant diffs from the bounded history before any optional cleanup.
+      const mined = maxCommitDiffs > 0
+        ? readRepoCommitDiffs(stagingDir, { maxCommits: maxCommitDiffs })
+        : { available: false, commitsScanned: 0, commitDiffs: [] as CommitDiffSignal[] }
+      if (stripGitMetadata) {
+        rmSync(join(stagingDir, '.git'), { recursive: true, force: true })
+      }
 
       // Atomically swap staged directory into final destination
       let movedOld = false
@@ -878,6 +1017,12 @@ export async function cloneGithubRepos(
         localPath: finalDir,
         commitSha,
         topLevelDirs: walked.topLevelDirs,
+        gitHistory: {
+          depth: historyDepth,
+          commitsScanned: mined.commitsScanned,
+          commitDiffs: mined.commitDiffs,
+          metadataPreserved: !stripGitMetadata,
+        },
       })
     } finally {
       rmSync(stagingDir, { recursive: true, force: true })
