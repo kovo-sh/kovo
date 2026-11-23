@@ -87,8 +87,8 @@ M4 (templates/AST/bridge/patch) ──────────┘   (after M1-st
 |---|---|---|
 | xben-25 | **25/25 (100%)**, 0 FP, 25/25 signals | ≥23/25 |
 | held-out-saas | **20/20 (100%)**, 0/6 decoys, **20/20 patches fixed**, allPatches=fixed | ≥18/20, ≥14/20 patches |
-| realistic-bench dev | **111/172 matched (64.5%), precision 100%**, 0 decoy/unmatched FPs | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% (1 confirmation short) |
-| realistic-bench held-out | **109/171 matched (63.7%)**, precision **100%**, 0 decoy/unmatched FPs | within 10 pp ✓ |
+| realistic-bench dev | **115/172 matched (66.9%), precision 100%**, 0 decoy/unmatched FPs | H/C recall ≥65% grey-box / ≥80% white-box, precision ≥95% (G4 MET) |
+| realistic-bench held-out | **112/171 matched (65.5%)**, precision **100%**, 0 decoy/unmatched FPs; dev gap **−1.4 pp** | within 10 pp ✓ |
 | Gate suites | 519/519, 0 skip | 100% + v5 suites |
 
 Known v4 blockers carried into v5: trigger quality on real apps; authz ID-binding precision; patch attribution ambiguity on shared `/graphql`; budget exhaustion on phlow-style flows.
@@ -164,3 +164,11 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Reviewer rejected:** broad wordlist discovery on public targets; benchmark-specific literals.
 - **Next (owners):** Tier-3 local-lab unlock (harness now sets tier 3 for realistic grey-box), proper structural dedupe key, JS/router surface discovery, generic race/workflow/JWT/cache/webhook probes.
 - **Procedural position:** dev 111/172 (64.5%), held-out 109/171 (63.7%), 100% precision — one confirmation short of the 65% gate.
+
+
+### 2026-11-22 — procedural gate crossed; freeze decision
+
+- **Threshold:** dev **115/172 (66.9%)**, salted held-out **112/171 (65.5%)**, 100% precision, 0 decoys/unmatched; xben 25/25; held-out-saas 20/20 + 20/20 patches. G4 (≥65%) MET.
+- **Reviewer verdict:** **freeze v5 now** with two scorecards — (A) real `Execution` (--no-llm 25/59; agentic 28/59, 100%, 0 worker failures) and (B) deterministic engine harness (procedural results). Document the ~19 pp convergence gap and the temporary specialist scope guard; neither is release-blocking.
+- **Accepted:** freeze; two-scorecard framing; Tier-3 safety not blocking; scope guard documented as a v5.0 precision guardrail.
+- **Follow-ups (v5.1):** port remaining procedural engine converters + full surface ingestion into `src/server`; replace scope guard with ReplayVerifier proof-strength guards; fix agentic wall-clock allocation/opsportal early stop; salted/white-box Execution matrices.
