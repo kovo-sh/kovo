@@ -10,6 +10,8 @@ import { type CodeAuditSuspectData, type HostTier, classifyHostTier } from './ag
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import { providerPool, type UsageCallback } from './provider.ts'
 import { type NamedSecret, redact } from './redact.ts'
+import { resolveRouteForLocation } from './program-graph.ts'
+import type { ProgramGraph, ProgramNode, ProgramSinkKind } from './program-graph.ts'
 import type { Assignment, Run, Store } from './store.ts'
 import type {
   CallGraphResult,
@@ -1346,20 +1348,96 @@ export function reconcileSuspectWithEndpoints(
   return undefined
 }
 
+const PROGRAM_SINK_KIND_MAP: Record<ProgramSinkKind, AuditSinkKind> = {
+  db_query: 'db_query',
+  outbound_fetch: 'outbound_fetch',
+  template: 'other',
+  file: 'upload_storage',
+  command: 'other',
+  redirect: 'redirect',
+  other: 'other',
+}
+
+function programNodeToCallGraphNode(node: ProgramNode, graph: ProgramGraph): CallGraphNode {
+  if (node.kind === 'route') {
+    const route = graph.routes.find(candidate => candidate.id === node.id)
+    return {
+      id: node.id,
+      file: node.file,
+      line: node.line,
+      ...(node.endLine !== undefined ? { endLine: node.endLine } : {}),
+      symbol: route?.handler ?? node.symbol,
+      kind: 'entrypoint',
+      ...(route?.method ? { httpMethod: route.method } : {}),
+      ...(route?.path ? { routePath: route.path } : {}),
+      guards: [...node.guards],
+      sanitizers: [],
+      calls: [...node.calls],
+    }
+  }
+  return {
+    id: node.id,
+    file: node.file,
+    line: node.line,
+    ...(node.endLine !== undefined ? { endLine: node.endLine } : {}),
+    symbol: node.symbol,
+    kind: node.kind,
+    ...(node.httpMethod ? { httpMethod: node.httpMethod } : {}),
+    ...(node.routePath ? { routePath: node.routePath } : {}),
+    ...(node.sinkKind ? { sinkKind: PROGRAM_SINK_KIND_MAP[node.sinkKind] ?? 'other' } : {}),
+    guards: [...node.guards],
+    sanitizers: [],
+    calls: [...node.calls],
+  }
+}
+
+/** Adapt a mounted Program Graph into the Stage-2 call-graph shape (route/sink edges preserved). */
+export function callGraphFromProgramGraph(graph: ProgramGraph, options: { repo?: string } = {}): CallGraphIndex {
+  const nodes = graph.nodes.map(node => programNodeToCallGraphNode(node, graph))
+  return {
+    repo: options.repo ?? graph.repo ?? 'unknown',
+    filesScanned: graph.filesScanned,
+    nodes,
+    edges: graph.edges.map(edge => ({ fromId: edge.fromId, toId: edge.toId, file: edge.file, line: edge.line })),
+    analyzerSource: 'offline_script_fallback',
+  }
+}
+
+/** Union two call graphs, keeping the primary analyzer provenance and deduping nodes/edges by id. */
+export function combineCallGraphs(primary: CallGraphIndex | undefined, supplement: CallGraphIndex | undefined): CallGraphIndex | undefined {
+  if (!primary) return supplement
+  if (!supplement) return primary
+  const nodes = new Map<string, CallGraphNode>()
+  for (const node of [...supplement.nodes, ...primary.nodes]) nodes.set(node.id, node)
+  const edges = new Map<string, CallGraphEdge>()
+  for (const edge of [...supplement.edges, ...primary.edges]) edges.set(`${edge.fromId}|${edge.toId}|${edge.file}|${edge.line}`, edge)
+  return {
+    repo: primary.repo || supplement.repo,
+    filesScanned: primary.filesScanned + supplement.filesScanned,
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    analyzerSource: primary.nodes.length > 0 ? primary.analyzerSource : supplement.analyzerSource,
+  }
+}
+
 /**
  * Map a `file:line` SAST suspect backwards to its enclosing HTTP entrypoint.
  * Resolution order: containing function span -> nearest preceding entrypoint in
- * the same file -> none (caller keeps the raw file target).
+ * the same file -> multi-hop reverse call graph (depth 6-8) -> Program Graph
+ * reverse route resolution -> none (caller keeps the raw file target).
  */
 export function resolveSuspectEntrypoint(
   graph: CallGraphIndex | undefined,
   target: { file: string; line: number },
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>,
-  options: { maxHops?: number } = {},
+  options: { maxHops?: number; programGraph?: ProgramGraph } = {},
 ): ResolvedEntrypoint | null {
-  if (!graph) return null
-  const maxHops = Math.max(1, Math.min(options.maxHops ?? 7, 16))
-  const entrypoints = graph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath)
+  const effectiveGraph = combineCallGraphs(graph, options.programGraph ? callGraphFromProgramGraph(options.programGraph) : undefined)
+  if (!effectiveGraph) return null
+  // A mounted Program Graph carries resolved mount/controller edges, so the budget opens to 8
+  // hops when it is available (4-hop route -> controller -> service -> repository is common).
+  const maxHops = Math.max(1, Math.min(options.maxHops ?? (options.programGraph ? 8 : 7), 16))
+  const entrypoints = effectiveGraph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath)
   const inFile = entrypoints.filter(n => n.file === target.file)
   const sorted = [...inFile].sort((a, b) => a.line - b.line)
   let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' | 'reverse' } | null = null
@@ -1373,14 +1451,14 @@ export function resolveSuspectEntrypoint(
   }
   if (!best) {
     // Multi-hop reverse call graph: sink/helper -> service -> controller -> route (depth 6-8).
-    const nodeById = new Map(graph.nodes.map(n => [n.id, n]))
+    const nodeById = new Map(effectiveGraph.nodes.map(n => [n.id, n]))
     const incoming = new Map<string, CallGraphEdge[]>()
-    for (const edge of graph.edges) {
+    for (const edge of effectiveGraph.edges) {
       const list = incoming.get(edge.toId) ?? []
       list.push(edge)
       incoming.set(edge.toId, list)
     }
-    const sameFileNodes = graph.nodes
+    const sameFileNodes = effectiveGraph.nodes
       .filter(n => n.file === target.file && n.kind !== 'entrypoint')
       .sort((a, b) => (a.kind === 'sink' ? -1 : 1) - (b.kind === 'sink' ? -1 : 1) || b.line - a.line)
     const start = sameFileNodes.find(n => target.line >= n.line && target.line <= (n.endLine ?? n.line))
@@ -1388,7 +1466,7 @@ export function resolveSuspectEntrypoint(
     if (start) {
       let found: { node: CallGraphNode; hops: number } | null = null
       const walk = (current: CallGraphNode, hops: number, visited: Set<string>) => {
-        if (found && hops >= found.hops) return
+        if (found && hops >= (found as { node: CallGraphNode; hops: number }).hops) return
         if (current.kind === 'entrypoint' && current.routePath) {
           found = { node: current, hops }
           return
@@ -1404,6 +1482,28 @@ export function resolveSuspectEntrypoint(
       }
       walk(start, 0, new Set([start.id]))
       if (found) best = { node: (found as { node: CallGraphNode }).node, matchedBy: 'reverse' }
+    }
+    if (!best && options.programGraph) {
+      // Clean fallback: use the Program Graph's own reverse route resolution (still 1..maxHops),
+      // then the nearest preceding route in the same file.
+      const routed = resolveRouteForLocation(options.programGraph, target, { maxDepth: maxHops })
+      if (routed) {
+        const routePath = routed.route.path
+        const httpMethod = routed.route.method
+        return {
+          routePath,
+          ...(httpMethod ? { httpMethod } : {}),
+          symbol: routed.route.handler,
+          file: routed.route.file,
+          line: routed.route.line,
+          paramNames: routeTemplateParamNames(routePath),
+          matchedBy: routed.matchedBy === 'nearest' ? 'nearest' : 'reverse',
+          ...(() => {
+            const reconciled = reconcileSuspectWithEndpoints(httpMethod, routePath, liveEndpoints)
+            return reconciled ? { reconciledEndpoint: reconciled } : {}
+          })(),
+        }
+      }
     }
     if (!best) return null
   }
@@ -1498,6 +1598,8 @@ export function scoreAndBuildSuspects(params: {
   backwardPaths: readonly SinkBackwardPath[]
   hostTiers?: Record<string, HostTier>
   callGraph?: CallGraphIndex
+  /** Mounted Program Graph used to extend the reverse route binding past one hop. */
+  programGraph?: ProgramGraph
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>
 }): SemanticAuditSuspect[] {
   const suspects: SemanticAuditSuspect[] = []
@@ -1511,7 +1613,9 @@ export function scoreAndBuildSuspects(params: {
     const sinkKind = inferSinkKindFromFinding(f)
     const sev: SemanticAuditSuspect['severity'] = f.severity === 'info' ? 'low' : f.severity
     const corroborated = backwardByFile.has(`${f.file}:${f.line}`)
-    const resolved = resolveSuspectEntrypoint(params.callGraph, { file: f.file, line: f.line }, params.liveEndpoints)
+    const resolved = resolveSuspectEntrypoint(params.callGraph, { file: f.file, line: f.line }, params.liveEndpoints, {
+      ...(params.programGraph ? { programGraph: params.programGraph } : {}),
+    })
     const priorityScore = computePriorityScore({
       severity: sev,
       isUnguarded: true,

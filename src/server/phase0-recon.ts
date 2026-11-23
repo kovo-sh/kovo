@@ -9,6 +9,20 @@ import { BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
+import { listMountedRepos } from './github-connector.ts'
+import {
+  deriveCodeToRuntimeHypotheses,
+  extractProgramGraph,
+  mapServicesToOrigins,
+} from './program-graph.ts'
+import type {
+  CodeToRuntimeHypothesis,
+  CommitDiffSignal,
+  MonorepoService,
+  ProgramGraph,
+  ProgramRoute,
+  ServiceOriginMapping,
+} from './program-graph.ts'
 import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { Store } from './store.ts'
@@ -71,6 +85,40 @@ export interface Phase0ReconResult {
   visibleToPersonas?: Record<string, string[]>
   /** Admin/privileged or role-restricted routes surfaced immediately from the persona union. */
   privilegedEndpoints?: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }>
+  /** Code-to-runtime hypotheses derived from the mounted Program Graph (planner/engine input). */
+  codeToRuntimeHypotheses?: CodeToRuntimeHypothesis[]
+  /** Mounted-repo Program Graph extraction summary (AST primary, regex fallback). */
+  repoStaticExtraction?: RepoStaticExtractionSummary
+  /**
+   * Ranked probe plan over the losslessly stored AST surface. Every route stays in the store;
+   * this only reports the prioritized/sampled subset a consumer may probe first.
+   */
+  probePlan?: {
+    totalRoutes: number
+    priority: number
+    schemaTyped: number
+    longTail: number
+    clusters: number
+    representatives: number
+    probeSubset: number
+    /** First probe-subset keys (`METHOD pathTemplate`), bounded for artifact size. */
+    sample: string[]
+  }
+  /** Set when speculative sibling derivation was disabled because declared/AST routes exist. */
+  siblingDerivationSuppressed?: 'declared_surface'
+}
+
+export interface RepoStaticExtractionSummary {
+  astRoutes: number
+  regexFallbackRoutes: number
+  mergedRoutes: number
+  duplicateRoutes: number
+  frameworks: string[]
+  /** Service -> origin resolution reused for AST route attribution. */
+  originMappings: ServiceOriginMapping[]
+  /** `METHOD pathTemplate` -> origin provenance for AST routes (multi-origin targets). */
+  routeOrigins: Record<string, { origin: string; confidence: ServiceOriginMapping['confidence']; service?: string; evidence: string[] }>
+  warnings: string[]
 }
 
 export interface CrawlStateGraphParams {
@@ -119,6 +167,24 @@ export interface StaticExtractedRoute {
   riskScore: number
   params: Array<{ name: string; location: ParamLocation; isObjectId: boolean }>
   codeLocation: CodeLocation
+  /** AST (Program Graph) extraction is authoritative; regex stays an explicit fallback. */
+  extraction?: 'ast' | 'regex'
+  /** Resolved auth/RBAC/tenant class for this route. */
+  authClass?: 'admin' | 'tenant' | 'auth' | 'unguarded'
+  /** Effective guard chain (router global -> mount -> route). */
+  guards?: string[]
+  /** Full middleware chain in declaration order. */
+  middleware?: string[]
+  /** Mount prefixes resolved by the AST. */
+  mountedFrom?: string[]
+  /** Monorepo service root that owns this route file. */
+  service?: string
+  /** Target origin this route was attributed to (multi-origin targets). */
+  origin?: string
+  /** How the origin attribution was established. */
+  originConfidence?: ServiceOriginMapping['confidence']
+  /** Program Graph route id (links code-to-runtime hypotheses back to the route). */
+  routeId?: string
 }
 
 const CSRF_PARAM_RE = /^(?:_csrf|csrf[_-]?token|xsrf[_-]?token|csrfmiddlewaretoken|__requestverificationtoken|authenticity_token|_token)$/i
@@ -386,7 +452,7 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
     if (seen.has(key)) return
     seen.add(key)
     frameworks.add(r.framework)
-    routes.push(r)
+    routes.push({ ...r, extraction: r.extraction ?? 'regex' })
   }
 
   for (const fullPath of files) {
@@ -650,6 +716,460 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
   }
 
   return { routes, frameworks: [...frameworks] }
+}
+
+// ============================================================================
+// Program Graph ingestion (AST-primary routes, guard chains, hypotheses, origins)
+// ============================================================================
+
+const GRAPH_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.go', '.rb'])
+
+/** Guard-chain classifiers mirroring the Program Graph's middleware taxonomy. */
+const ADMIN_CHAIN_RE = /\b(?:admin\w*|isAdmin|requireAdmin\w*|superuser\w*|staff\w*|role\w*|rbac|permission\w*|privilege\w*|policy\w*|hasRole|hasAuthority)/i
+const TENANT_CHAIN_RE = /(?:tenant|organization|organisation|orgId|org_id|account|workspace|membership|ownership|ownerId|owner_id|scopeCheck|belongsTo)/i
+
+interface RepoGraphInputs {
+  sourceFiles: Array<{ path: string; content: string }>
+  dockerfiles: Array<{ path: string; content: string }>
+  manifests: Array<{ path: string; content: string }>
+  compose?: string
+  ingress?: string
+  mountedRepos: string[]
+}
+
+/**
+ * Bounded walk of the mounted `/repos` tree collecting Program Graph inputs. Symlinks are never
+ * followed and file sizes are capped, so graph extraction can run on an untrusted mount.
+ */
+function collectRepoGraphInputs(reposDir: string, maxFiles = 2500): RepoGraphInputs | null {
+  const inputs: RepoGraphInputs = { sourceFiles: [], dockerfiles: [], manifests: [], mountedRepos: [] }
+  if (!reposDir || !existsSync(reposDir)) return null
+  let rootReal: string
+  try {
+    rootReal = realpathSync(reposDir)
+  } catch {
+    return null
+  }
+  inputs.mountedRepos = listMountedRepos(reposDir)
+    .map(mounted => mounted.replace(/^\/repos\//, ''))
+    .filter(mounted => mounted && (existsSync(join(rootReal, mounted)) || !mounted.includes('/')))
+  const stack: string[] = [rootReal]
+  let visited = 0
+  while (stack.length > 0 && visited < maxFiles) {
+    const dir = stack.pop()!
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of entries) {
+      if (visited >= maxFiles) break
+      if (SKIP_DIRS.has(name) || name.startsWith('.git')) continue
+      const full = join(dir, name)
+      let st
+      try {
+        st = lstatSync(full)
+      } catch {
+        continue
+      }
+      if (st.isSymbolicLink()) continue
+      if (st.isDirectory()) {
+        if (isRealPathUnder(rootReal, full)) stack.push(full)
+        continue
+      }
+      if (!st.isFile() || st.size > 256 * 1024) continue
+      visited += 1
+      const rel = relative(rootReal, full).split(sep).join('/')
+      const base = name.toLowerCase()
+      const ext = extname(name).toLowerCase()
+      const isCompose = /^(?:docker-)?compose(?:[._-][^/]*)?\.ya?ml$/i.test(name)
+      const isDockerfile = /^dockerfile(?:\.[^/]*)?$/i.test(name)
+      const isManifest = base === 'package.json'
+      const looksIngress = /^ingress[^/]*\.ya?ml$/i.test(name)
+      if (!GRAPH_SOURCE_EXTENSIONS.has(ext) && !isCompose && !isDockerfile && !isManifest && !looksIngress) continue
+      const content = readRepoRegularFile(full)
+      if (content === null) continue
+      if (GRAPH_SOURCE_EXTENSIONS.has(ext)) inputs.sourceFiles.push({ path: rel, content })
+      if (isDockerfile && inputs.dockerfiles.length < 40) inputs.dockerfiles.push({ path: rel, content })
+      if (isManifest && inputs.manifests.length < 80) inputs.manifests.push({ path: rel, content })
+      if (isCompose && inputs.compose === undefined) inputs.compose = content
+      if ((looksIngress || (!inputs.ingress && content.slice(0, 4000).includes('kind: Ingress'))) && inputs.ingress === undefined) {
+        inputs.ingress = content
+      }
+    }
+  }
+  return inputs.sourceFiles.length > 0 || inputs.dockerfiles.length > 0 ? inputs : null
+}
+
+function repoBasename(path: string): string {
+  const parts = path.split('/').filter(Boolean)
+  return parts[parts.length - 1] ?? path
+}
+
+/** Candidate monorepo service roots from mounted repos, Dockerfiles and top-level manifests. */
+function discoverGraphServices(inputs: RepoGraphInputs): MonorepoService[] {
+  const services = new Map<string, MonorepoService>()
+  const add = (root: string, name: string) => {
+    const cleanRoot = root.replace(/\/$/, '')
+    if (services.has(cleanRoot)) return
+    services.set(cleanRoot, { name, ...(cleanRoot ? { root: cleanRoot } : {}) })
+  }
+  for (const mounted of inputs.mountedRepos) add(mounted, repoBasename(mounted))
+  for (const dockerfile of inputs.dockerfiles) {
+    const root = dockerfile.path.replace(/\/Dockerfile(?:\..*)?$/i, '')
+    add(root, repoBasename(root) || 'app')
+  }
+  // Manifests only contribute roots at the mounted-repo root or one level below (avoid exposing
+  // every workspace package as a distinct origin candidate).
+  for (const manifest of inputs.manifests) {
+    const root = manifest.path.replace(/\/package\.json$/, '')
+    const ownerRepoDepth = inputs.mountedRepos.find(mounted => root === mounted || root.startsWith(`${mounted}/`))
+      ? (inputs.mountedRepos.find(mounted => root === mounted || root.startsWith(`${mounted}/`))!.split('/').length)
+      : 0
+    const depth = root ? root.split('/').length : 0
+    if (ownerRepoDepth === 0 || depth > ownerRepoDepth + 1) continue
+    add(root, repoBasename(root) || 'app')
+  }
+  return [...services.values()].slice(0, 32)
+}
+
+function authClassFromGuards(guards: readonly string[]): StaticExtractedRoute['authClass'] {
+  if (guards.some(guard => ADMIN_CHAIN_RE.test(guard))) return 'admin'
+  if (guards.some(guard => TENANT_CHAIN_RE.test(guard))) return 'tenant'
+  if (guards.length > 0) return 'auth'
+  return 'unguarded'
+}
+
+function authRequirementFromGuards(guards: readonly string[], authClass: StaticExtractedRoute['authClass']): string | null {
+  if (!guards.length) return null
+  return `${authClass}:${guards.join(',')}`
+}
+
+function routeParamsFromGraph(route: ProgramRoute): StaticExtractedRoute['params'] {
+  const out: StaticExtractedRoute['params'] = []
+  const seen = new Set<string>()
+  const push = (name: string, location: ParamLocation) => {
+    const clean = name.trim()
+    if (!clean || seen.has(`${location}:${clean}`)) return
+    seen.add(`${location}:${clean}`)
+    out.push({ name: clean, location, isObjectId: location === 'path' || OBJECT_ID_PARAM_RE.test(clean) })
+  }
+  for (const name of route.input.params) push(name, 'path')
+  for (const name of extractDynamicPathParams(route.path)) push(name.name, 'path')
+  for (const name of route.input.query) push(name, 'query')
+  for (const name of route.input.body) push(name, 'json')
+  return out
+}
+
+/** Longest mounted-repo prefix that owns a route file. */
+function repoForRouteFile(file: string, mountedRepos: readonly string[]): string {
+  const owner = [...mountedRepos].sort((a, b) => b.length - a.length).find(mounted => file === mounted || file.startsWith(`${mounted}/`))
+  return owner ?? file.split('/')[0] ?? 'repo'
+}
+
+interface RouteOriginResolution {
+  origin: string
+  confidence: ServiceOriginMapping['confidence']
+  service?: string
+  evidence: string[]
+}
+
+/**
+ * Attribute a route file to a target origin. Monorepo service roots are matched longest-first;
+ * `origins[0]` is only used as a documented fallback (recorded in provenance) when no service
+ * root/ingress/port evidence matches.
+ */
+function resolveRouteOrigin(
+  file: string,
+  mappings: readonly ServiceOriginMapping[],
+  origins: readonly string[],
+): RouteOriginResolution {
+  const candidates = mappings
+    .filter(mapping => mapping.root && mapping.origin && (file === mapping.root || file.startsWith(`${mapping.root}/`)))
+    .sort((a, b) => (b.root?.length ?? 0) - (a.root?.length ?? 0))
+  const strong = candidates.find(mapping => mapping.confidence !== 'fallback' && mapping.confidence !== 'unmapped')
+  if (strong && strong.origin) {
+    return {
+      origin: strong.origin,
+      confidence: strong.confidence,
+      ...(strong.root ? { service: strong.service } : {}),
+      evidence: strong.evidence.length ? strong.evidence : [`service root ${strong.root} matched ${file}`],
+    }
+  }
+  if (origins.length === 1) {
+    return { origin: origins[0]!, confidence: 'exact', evidence: ['single approved origin for the run'] }
+  }
+  const fallback = candidates[0]
+  if (fallback && fallback.origin) {
+    return {
+      origin: fallback.origin,
+      confidence: fallback.confidence,
+      ...(fallback.root ? { service: fallback.service } : {}),
+      evidence: fallback.evidence.length ? fallback.evidence : [`service root ${fallback.root} matched ${file}`],
+    }
+  }
+  return {
+    origin: origins[0]!,
+    confidence: 'fallback',
+    evidence: ['no service root/ingress/port evidence; using origins[0] as documented fallback'],
+  }
+}
+
+export interface RepoProgramGraphExtraction {
+  graph: ProgramGraph
+  /** AST-derived routes tagged with guard chain, service and origin provenance. */
+  routes: StaticExtractedRoute[]
+  frameworks: string[]
+  hypotheses: CodeToRuntimeHypothesis[]
+  originMappings: ServiceOriginMapping[]
+  routeOrigins: Record<string, RouteOriginResolution>
+  warnings: string[]
+}
+
+/**
+ * AST-primary route extraction for a mounted/synced repo. Returns `null` when no repository
+ * source is present so callers fall back to the regex scanner unchanged.
+ */
+export function extractRepoProgramGraph(input: {
+  reposDir?: string
+  origins: readonly string[]
+  maxFiles?: number
+  /** Security-relevant commit signals (from the graph producer) folded into hypotheses. */
+  recentDiffSignals?: readonly CommitDiffSignal[]
+}): RepoProgramGraphExtraction | null {
+  if (!input.reposDir) return null
+  const inputs = collectRepoGraphInputs(input.reposDir, input.maxFiles)
+  if (!inputs) return null
+  const graph = extractProgramGraph({ files: inputs.sourceFiles, repo: inputs.mountedRepos.join(',') || undefined })
+  const services = discoverGraphServices(inputs)
+  const originMappings = services.length
+    ? mapServicesToOrigins({
+        services,
+        origins: input.origins,
+        ...(inputs.compose ? { compose: inputs.compose } : {}),
+        ...(inputs.ingress ? { ingress: inputs.ingress } : {}),
+        dockerfiles: inputs.dockerfiles,
+        manifests: inputs.manifests,
+      })
+    : []
+  const filesByPath = new Map(inputs.sourceFiles.map(file => [file.path, file.content]))
+  const globalGuards = graph.globalMiddleware.filter(name => ADMIN_CHAIN_RE.test(name) || TENANT_CHAIN_RE.test(name) || /\b(?:auth|session|jwt|guard|login|authorize)/i.test(name))
+  const routeOrigins: Record<string, RouteOriginResolution> = {}
+  const routes: StaticExtractedRoute[] = []
+  for (const route of graph.routes) {
+    const pathTemplate = normalizeDiscoveryTemplate(route.path)
+    const guards = route.guards.length ? route.guards : globalGuards
+    const authClass = authClassFromGuards(guards)
+    const authRequirement = authRequirementFromGuards(guards, authClass)
+    const tenantGuards = guards.filter(guard => TENANT_CHAIN_RE.test(guard))
+    const ownershipGuard = tenantGuards.length ? tenantGuards.join(',') : null
+    const fileCode = filesByPath.get(route.file) ?? ''
+    const sinkMeta = detectSinksAndGuards(fileCode)
+    const resolved = resolveRouteOrigin(route.file, originMappings, input.origins)
+    const key = `${route.method.toUpperCase()} ${pathTemplate}`
+    if (!routeOrigins[key] || routeOrigins[key]!.confidence === 'fallback') routeOrigins[key] = resolved
+    routes.push({
+      method: route.method.toUpperCase(),
+      pathTemplate,
+      framework: route.framework,
+      authRequirement,
+      ownershipGuard,
+      sinkKinds: sinkMeta.sinkKinds,
+      riskScore: scoreEndpointRisk(route.method, pathTemplate, sinkMeta.sinkKinds, authClass === 'unguarded' ? 'none' : null),
+      params: routeParamsFromGraph(route),
+      codeLocation: {
+        repo: repoForRouteFile(route.file, inputs.mountedRepos),
+        file: route.file,
+        startLine: Math.max(1, route.handlerLine ?? route.line),
+        endLine: Math.max(1, route.handlerLine ?? route.line) + 3,
+      },
+      extraction: 'ast',
+      authClass,
+      guards: [...guards],
+      middleware: [...route.middleware],
+      mountedFrom: [...route.mountedFrom],
+      ...(resolved.service ? { service: resolved.service } : {}),
+      origin: resolved.origin,
+      originConfidence: resolved.confidence,
+      routeId: route.id,
+    })
+  }
+  return {
+    graph,
+    routes,
+    frameworks: [...new Set(graph.routes.map(route => route.framework))],
+    hypotheses: deriveCodeToRuntimeHypotheses(graph, {
+      ...(input.recentDiffSignals?.length ? { recentDiffSignals: input.recentDiffSignals } : {}),
+    }),
+    originMappings,
+    routeOrigins,
+    warnings: [...graph.warnings],
+  }
+}
+
+/**
+ * Merge AST routes with regex fallback routes, deduped by `(origin, METHOD, pathTemplate)`.
+ * AST wins on collision; regex-only routes are retained and marked `extraction: 'regex'`.
+ */
+export function mergeStaticRouteExtractions(input: {
+  astRoutes: readonly StaticExtractedRoute[]
+  regexRoutes: readonly StaticExtractedRoute[]
+  defaultOrigin: string
+}): { routes: StaticExtractedRoute[]; duplicates: number } {
+  const merged: StaticExtractedRoute[] = []
+  const seen = new Set<string>()
+  let duplicates = 0
+  const keyOf = (route: StaticExtractedRoute) =>
+    `${(route.origin ?? input.defaultOrigin).toLowerCase()}|${route.method.toUpperCase()}|${route.pathTemplate}`
+  for (const route of input.astRoutes) {
+    const key = keyOf(route)
+    if (seen.has(key)) { duplicates += 1; continue }
+    seen.add(key)
+    merged.push(route)
+  }
+  for (const route of input.regexRoutes) {
+    const key = keyOf(route)
+    if (seen.has(key)) { duplicates += 1; continue }
+    seen.add(key)
+    merged.push({ ...route, extraction: route.extraction ?? 'regex' })
+  }
+  return { routes: merged, duplicates }
+}
+
+// ----------------------------------------------------------------------------
+// Ranked probe plan: lossless storage, prioritized/sampled probing
+// ----------------------------------------------------------------------------
+
+export interface AstRouteCluster {
+  /** Structural CRUD signature: framework|method|path-shape|guard-chain. */
+  signature: string
+  method: string
+  framework: string
+  routes: number
+  representatives: Array<{ method: string; pathTemplate: string }>
+}
+
+export interface RankedAstProbePlan {
+  totalRoutes: number
+  /** Tier A: linked to an AST sink/recent-diff/admin-guard hypothesis. */
+  priority: StaticExtractedRoute[]
+  /** Tier B: mutating ID-bearing/schema-typed routes and role-exclusive admin routes. */
+  schemaTyped: StaticExtractedRoute[]
+  /** Tier C: structural long tail, probed by cluster representatives. */
+  longTail: StaticExtractedRoute[]
+  clusters: AstRouteCluster[]
+  representatives: StaticExtractedRoute[]
+  /** Tier A + Tier B + Tier C representatives, deduped. */
+  probeSubset: StaticExtractedRoute[]
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+/**
+ * Structural clustering signature. The first path segment (API root) is preserved; deeper
+ * literal segments collapse to `{lit}` and parameters to `:p`, so CRUD boilerplate across
+ * resources (`/rest/projects/:id`, `/rest/billing-docs/:docId`) shares one cluster. Guard
+ * chains are part of the signature: an unguarded sibling must never be sampled away by a
+ * guarded representative.
+ */
+export function astRouteClusterSignature(route: StaticExtractedRoute): string {
+  const segments = route.pathTemplate.split('?')[0]!.split('/').filter(Boolean)
+  const shape = segments.map((segment, index) => {
+    if (/^[:{<]/.test(segment) || segment.startsWith('[')) return ':p'
+    return index === 0 ? segment.toLowerCase() : '{lit}'
+  }).join('/')
+  const guards = [...(route.guards ?? [])].sort().join('>')
+  return `${route.framework}|${route.method.toUpperCase()}|/${shape}|${guards}`
+}
+
+function routeKey(route: StaticExtractedRoute): string {
+  return `${route.method.toUpperCase()} ${route.pathTemplate}`
+}
+
+/**
+ * Rank AST routes for probing and sample CRUD boilerplate by structural cluster.
+ * The caller stores every route losslessly; this plan only decides probe order/breadth.
+ */
+export function rankAndClusterAstRoutes(input: {
+  routes: readonly StaticExtractedRoute[]
+  hypotheses?: readonly CodeToRuntimeHypothesis[]
+  /** Representatives sampled per long-tail cluster (default 1). */
+  maxRepresentativesPerCluster?: number
+  /** Upper bound on sampled long-tail clusters (default 24). */
+  maxLongTailClusters?: number
+}): RankedAstProbePlan {
+  const perCluster = Math.max(1, Math.min(input.maxRepresentativesPerCluster ?? 1, 8))
+  const maxClusters = Math.max(1, Math.min(input.maxLongTailClusters ?? 24, 200))
+  const hypothesisKeys = new Set<string>()
+  for (const hypothesis of input.hypotheses ?? []) {
+    if (hypothesis.routeId) hypothesisKeys.add(`id:${hypothesis.routeId}`)
+    if (hypothesis.method && hypothesis.path) hypothesisKeys.add(`${hypothesis.method.toUpperCase()} ${hypothesis.path}`)
+  }
+  const isPriority = (route: StaticExtractedRoute) =>
+    (route.routeId ? hypothesisKeys.has(`id:${route.routeId}`) : false) || hypothesisKeys.has(routeKey(route))
+
+  const priority: StaticExtractedRoute[] = []
+  const schemaTyped: StaticExtractedRoute[] = []
+  const longTail: StaticExtractedRoute[] = []
+  const clusters = new Map<string, { meta: AstRouteCluster; members: StaticExtractedRoute[] }>()
+  for (const route of input.routes) {
+    const signature = astRouteClusterSignature(route)
+    const entry = clusters.get(signature) ?? {
+      meta: { signature, method: route.method.toUpperCase(), framework: route.framework, routes: 0, representatives: [] },
+      members: [],
+    }
+    entry.members.push(route)
+    entry.meta.routes += 1
+    clusters.set(signature, entry)
+
+    if (isPriority(route)) {
+      priority.push(route)
+      continue
+    }
+    const mutating = MUTATING_METHODS.has(route.method.toUpperCase())
+    const idBearing = route.params.some(param => param.location === 'path')
+    const schemaTypedInput = route.params.some(param => param.location === 'json' || param.location === 'query')
+    if ((mutating && (idBearing || schemaTypedInput)) || route.authClass === 'admin') {
+      schemaTyped.push(route)
+      continue
+    }
+    longTail.push(route)
+  }
+
+  const representatives: StaticExtractedRoute[] = []
+  const longTailKeys = new Set(longTail.map(routeKey))
+  let usedClusters = 0
+  const clusterList = [...clusters.values()].sort((a, b) => b.meta.routes - a.meta.routes)
+  for (const cluster of clusterList) {
+    const candidates = cluster.members
+      .filter(route => longTailKeys.has(routeKey(route)))
+      .sort((a, b) => b.riskScore - a.riskScore)
+    if (candidates.length === 0) continue
+    if (usedClusters >= maxClusters) break
+    usedClusters += 1
+    const sampled = candidates.slice(0, perCluster)
+    representatives.push(...sampled)
+    cluster.meta.representatives = sampled.map(route => ({ method: route.method.toUpperCase(), pathTemplate: route.pathTemplate }))
+  }
+
+  const seen = new Set<string>()
+  const probeSubset: StaticExtractedRoute[] = []
+  for (const route of [...priority, ...schemaTyped, ...representatives]) {
+    const key = routeKey(route)
+    if (seen.has(key)) continue
+    seen.add(key)
+    probeSubset.push(route)
+  }
+  return {
+    totalRoutes: input.routes.length,
+    priority,
+    schemaTyped,
+    longTail,
+    clusters: [...clusters.values()].map(cluster => cluster.meta),
+    representatives,
+    probeSubset,
+  }
 }
 
 const MANIFEST_BASENAMES = new Set([
@@ -2271,16 +2791,35 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     techFingerprint.add(tag)
   }
 
-  // 1. White-box static framework route extraction (runs at ALL tiers including Tier 0)
+  // 1. White-box static route extraction (runs at ALL tiers including Tier 0).
+  //    AST Program Graph is authoritative when a mounted/synced repo is present: it resolves full
+  //    mount prefixes, exact methods, input schemas and middleware/guard chains. Regex extraction
+  //    stays as an explicitly-marked fallback for constructs the structural scanner cannot attribute.
+  let repoStaticExtraction: RepoStaticExtractionSummary | undefined
+  let codeToRuntimeHypotheses: CodeToRuntimeHypothesis[] | undefined
+  let probePlan: Phase0ReconResult['probePlan']
   if (params.reposDir && normalizedOrigins.length > 0) {
-    const primaryOrigin = normalizedOrigins[0]
-    const extracted = extractStaticFrameworkRoutes(params.reposDir)
-    for (const fw of extracted.frameworks) frameworksDetected.add(fw)
-    for (const route of extracted.routes) {
+    const primaryOrigin = normalizedOrigins[0]!
+    const regexExtracted = extractStaticFrameworkRoutes(params.reposDir)
+    let graphExtraction: RepoProgramGraphExtraction | null = null
+    try {
+      graphExtraction = extractRepoProgramGraph({ reposDir: params.reposDir, origins: normalizedOrigins })
+    } catch {
+      graphExtraction = null
+    }
+    const merged = mergeStaticRouteExtractions({
+      astRoutes: graphExtraction?.routes ?? [],
+      regexRoutes: regexExtracted.routes,
+      defaultOrigin: primaryOrigin,
+    })
+    for (const fw of graphExtraction?.frameworks ?? []) frameworksDetected.add(fw)
+    for (const fw of regexExtracted.frameworks) frameworksDetected.add(fw)
+    for (const route of merged.routes) {
+      const origin = route.origin ?? primaryOrigin
       const ep = storage.upsertEndpoint({
         runId,
         scopeRevision,
-        origin: primaryOrigin,
+        origin,
         method: route.method,
         pathTemplate: route.pathTemplate,
         source: 'repo_ast',
@@ -2307,6 +2846,77 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         paramsDiscovered += 1
       }
     }
+    repoStaticExtraction = {
+      astRoutes: graphExtraction?.routes.length ?? 0,
+      regexFallbackRoutes: regexExtracted.routes.length,
+      mergedRoutes: merged.routes.length,
+      duplicateRoutes: merged.duplicates,
+      frameworks: [...new Set([...(graphExtraction?.frameworks ?? []), ...regexExtracted.frameworks])],
+      originMappings: graphExtraction?.originMappings ?? [],
+      routeOrigins: graphExtraction?.routeOrigins ?? {},
+      warnings: graphExtraction?.warnings ?? [],
+    }
+    if (graphExtraction) {
+      codeToRuntimeHypotheses = graphExtraction.hypotheses
+      // Lossless store, ranked probe: every AST route is persisted above; this plan only
+      // prioritizes and clusters the probing/consumption order for downstream consumers.
+      const plan = rankAndClusterAstRoutes({
+        routes: graphExtraction.routes,
+        hypotheses: graphExtraction.hypotheses,
+      })
+      probePlan = {
+        totalRoutes: plan.totalRoutes,
+        priority: plan.priority.length,
+        schemaTyped: plan.schemaTyped.length,
+        longTail: plan.longTail.length,
+        clusters: plan.clusters.length,
+        representatives: plan.representatives.length,
+        probeSubset: plan.probeSubset.length,
+        sample: plan.probeSubset.map(route => `${route.method.toUpperCase()} ${route.pathTemplate}`).slice(0, 40),
+      }
+      storage.event(runId, 'phase0.probe_plan', 'Ranked AST probe plan (lossless store, clustered sampling).', probePlan)
+      // Middleware-aware authz hints: guard chains tag visibility without touching probe eligibility.
+      for (const route of graphExtraction.routes) {
+        const key = `${route.method.toUpperCase()} ${route.pathTemplate}`
+        const label = route.authClass === 'admin' ? 'role:admin'
+          : route.authClass === 'tenant' ? 'role:tenant'
+          : route.authClass === 'auth' ? 'role:authenticated'
+          : 'anonymous'
+        const set = visibleToPersonasUnion.get(key) ?? new Set<string>()
+        set.add(label)
+        visibleToPersonasUnion.set(key, set)
+        if (route.authClass === 'admin') {
+          const entryKey = `${route.method.toUpperCase()} ${route.pathTemplate}`
+          if (!privilegedSurface.some(entry => `${entry.method} ${entry.pathTemplate}` === entryKey)) {
+            privilegedSurface.push({
+              method: route.method.toUpperCase(),
+              pathTemplate: route.pathTemplate,
+              personas: [label],
+              reason: 'code_admin_guard',
+            })
+          }
+        }
+      }
+      for (const hypothesis of graphExtraction.hypotheses) {
+        const method = hypothesis.method?.toUpperCase()
+        if (!method || !hypothesis.path) continue
+        const reason = hypothesis.kind === 'admin_route_missing_admin_guard' ? 'code_admin_route_unguarded'
+          : hypothesis.kind === 'tenant_param_without_scope' ? 'code_tenant_unscoped'
+          : undefined
+        if (!reason) continue
+        if (privilegedSurface.some(entry => `${entry.method} ${entry.pathTemplate}` === `${method} ${hypothesis.path}`)) continue
+        privilegedSurface.push({ method, pathTemplate: hypothesis.path, personas: [], reason })
+      }
+      storage.event(runId, 'phase0.program_graph', 'Program Graph route extraction (AST primary, regex fallback).', {
+        astRoutes: repoStaticExtraction.astRoutes,
+        regexFallbackRoutes: repoStaticExtraction.regexFallbackRoutes,
+        mergedRoutes: repoStaticExtraction.mergedRoutes,
+        duplicateRoutes: repoStaticExtraction.duplicateRoutes,
+        hypotheses: codeToRuntimeHypotheses.length,
+        origins: repoStaticExtraction.originMappings,
+        warnings: repoStaticExtraction.warnings.slice(0, 8),
+      })
+    }
   }
 
   // 1b. Lossless ingestion of the grey-box API reference. Offline: every declared operation is
@@ -2330,9 +2940,18 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
   let siblingEndpoints = 0
   let methodHints = 0
-  // Sibling derivation and its OPTIONS probes are opt-in: a caller that owns its own surface
-  // corpus (the procedural capability harness) keeps the historical endpoint set unless enabled.
-  const siblingDerivationEnabled = /^(?:1|true|on|yes)$/i.test((process.env.GUARDIAN_RECON_SIBLINGS ?? '').trim())
+  // Sibling derivation and its OPTIONS probes are opt-in and stay a blind-target fallback: when
+  // the mounted AST or the declared API reference already describes the surface, speculative
+  // collection->item derivation is disabled (the declared truth is strictly better evidence).
+  const siblingDerivationRequested = /^(?:1|true|on|yes)$/i.test((process.env.GUARDIAN_RECON_SIBLINGS ?? '').trim())
+  const declaredOrAstSurfacePresent = (repoStaticExtraction?.mergedRoutes ?? 0) > 0 || (declaredSurface?.endpoints ?? 0) > 0
+  const siblingDerivationEnabled = siblingDerivationRequested && !declaredOrAstSurfacePresent
+  const siblingDerivationSuppressed = siblingDerivationRequested && declaredOrAstSurfacePresent ? 'declared_surface' as const : undefined
+  if (siblingDerivationSuppressed) {
+    storage.event(runId, 'phase0.siblings_suppressed',
+      'Speculative sibling derivation disabled: AST/declared surface is available for this origin.',
+      { astRoutes: repoStaticExtraction?.mergedRoutes ?? 0, declared: declaredSurface?.endpoints ?? 0 })
+  }
 
   // Tier 0: zero live HTTP requests
   if (tier === 0) {
@@ -2343,6 +2962,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       paramsDiscovered,
     })
     storage.updateRunPhase0Completed(runId, Date.now())
+    const staticVisibility: Record<string, string[]> = {}
+    for (const [key, set] of visibleToPersonasUnion) staticVisibility[key] = [...set].sort()
     return {
       requestsUsed: 0,
       perOriginCap,
@@ -2362,7 +2983,12 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       authRequests,
       soft404Rejected,
       ...(declaredSurface ? { declaredSurface } : {}),
-      visibleToPersonas: {},
+      ...(repoStaticExtraction ? { repoStaticExtraction } : {}),
+      ...(codeToRuntimeHypotheses && codeToRuntimeHypotheses.length ? { codeToRuntimeHypotheses } : {}),
+      ...(probePlan ? { probePlan } : {}),
+      ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
+      visibleToPersonas: staticVisibility,
+      ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
     }
   }
 
@@ -3649,7 +4275,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   for (const [key, set] of visibleToPersonasUnion) visibleToPersonas[key] = [...set].sort()
   if (privilegedSurface.length > 0) {
     storage.event(runId, 'phase0.privileged_surface',
-      `Surfaced ${privilegedSurface.length} privileged/role-restricted route(s) from the persona union.`,
+      `Surfaced ${privilegedSurface.length} privileged/role-restricted route(s) from the persona union and mounted-source guard chains.`,
       { routes: privilegedSurface.slice(0, 20) })
   }
 
@@ -3690,6 +4316,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     siblingEndpoints,
     methodHints,
     visibleToPersonas,
+    ...(repoStaticExtraction ? { repoStaticExtraction } : {}),
+    ...(codeToRuntimeHypotheses && codeToRuntimeHypotheses.length ? { codeToRuntimeHypotheses } : {}),
+    ...(probePlan ? { probePlan } : {}),
+    ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
     ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
   }
 }
