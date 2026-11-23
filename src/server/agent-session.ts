@@ -174,7 +174,7 @@ export function settlementBannerMessage(input: {
 export const AGENTIC_CONTRACT_LINES = [
   'Never re-submit an (endpoint, method, param, cwe) listed in alreadyConfirmed; you MAY chain or escalate it.',
   'Prioritize det_lead upgrades and workflow/numeric/chain routes over single-param fuzzing.',
-  'Use typed proof tools (control-vs-probe differentials and state deltas); status-only claims fail verification.',
+  'Use typed proof tools (control-vs-probe differentials and state deltas) or a guardian_verify script; status-only claims fail verification.',
 ] as const
 
 const NETWORK_TOOLS = new Set([
@@ -187,6 +187,7 @@ const NETWORK_TOOLS = new Set([
   'probe_differential',
   'run_safe_templates',
   'probe_websocket',
+  'guardian_verify',
 ])
 
 export const factKinds = [
@@ -479,6 +480,117 @@ export const proofToolHandlerNames = [
 
 export type ProofToolHandlerName = typeof proofToolHandlerNames[number]
 
+// ---------------------------------------------------------------------------
+// Layer-3 executable verification tool (`guardian_verify`)
+//
+// The tool component never imports verify-rpc: the caller supplies a handler that runs the
+// candidate through `verifyScript` (fresh-session double run + transcript oracle) and returns a
+// verdict-shaped object. This module only validates arguments and normalizes/enforces the
+// evidence contract (stdout is never evidence).
+// ---------------------------------------------------------------------------
+
+export type GuardianVerifyRuntime = 'ts' | 'python'
+
+export interface GuardianVerifyArgs {
+  /** Inline TS/Python verification script. Takes precedence over `scriptPath`. */
+  script?: string
+  /** Workspace path to a previously written script (runtime inferred from a `.py` suffix). */
+  scriptPath?: string
+  runtime?: GuardianVerifyRuntime
+  title?: string
+  /** Execution budget for each fresh run, in milliseconds. */
+  timeoutMs?: number
+}
+
+export interface GuardianVerifyAttemptSummary {
+  attempt: number
+  oraclePassed: boolean
+  exitCode: number
+  exchangeCount: number
+  transcriptDigest: string
+  signaturesValid: boolean
+  failures: string[]
+}
+
+export interface GuardianVerifyToolResult {
+  /** True only when the independent transcript oracle confirmed two fresh, signed runs. */
+  confirmed: boolean
+  reason: string
+  detail: string
+  title: string | null
+  transcriptDigest: string | null
+  transcriptDigests: string[]
+  failures: string[]
+  disagreements: string[]
+  attempts: GuardianVerifyAttemptSummary[]
+}
+
+export type GuardianVerifyHandler = (
+  args: GuardianVerifyArgs,
+  signal: AbortSignal,
+) => Promise<GuardianVerifyToolResult | unknown>
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+/**
+ * Normalize a verifyScript verdict (or an already-compact result) into the tool contract and
+ * downgrade any `confirmed: true` that is not backed by two signature-valid, oracle-passed
+ * transcript attempts. A script's stdout or a hand-written proof document can never confirm.
+ */
+export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyToolResult {
+  const rec = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const attempts: GuardianVerifyAttemptSummary[] = (Array.isArray(rec.attempts) ? rec.attempts : [])
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+    .map((item, index) => ({
+      attempt: typeof item.attempt === 'number' ? item.attempt : index + 1,
+      oraclePassed: item.oraclePassed === true,
+      exitCode: typeof item.exitCode === 'number' ? item.exitCode : 1,
+      exchangeCount: typeof item.exchangeCount === 'number' ? item.exchangeCount : 0,
+      transcriptDigest: typeof item.transcriptDigest === 'string' ? item.transcriptDigest : '',
+      signaturesValid: item.signaturesValid === true,
+      failures: stringList(item.failures),
+    }))
+  const disagreements = stringList(rec.disagreements)
+  const transcriptDigests = attempts.map(attempt => attempt.transcriptDigest).filter(Boolean)
+  const transcriptDigest = transcriptDigests.length > 0
+    ? transcriptDigests[transcriptDigests.length - 1]
+    : (typeof rec.transcriptDigest === 'string' && rec.transcriptDigest ? rec.transcriptDigest : null)
+  const failures = stringList(rec.failures).length > 0
+    ? stringList(rec.failures)
+    : [...new Set([...attempts.flatMap(attempt => attempt.failures), ...disagreements])]
+  let confirmed = rec.confirmed === true
+  let reason = typeof rec.reason === 'string' && rec.reason ? rec.reason : (confirmed ? 'confirmed' : 'unconfirmed')
+  let detail = typeof rec.detail === 'string' ? rec.detail : ''
+  if (confirmed) {
+    const oracleBacked = attempts.length >= 2 && attempts.every(attempt =>
+      attempt.oraclePassed &&
+      attempt.signaturesValid &&
+      attempt.transcriptDigest.length > 0 &&
+      attempt.failures.length === 0)
+    if (!oracleBacked) {
+      confirmed = false
+      reason = 'unverified'
+      detail = 'Handler claimed confirmation without two signature-valid, oracle-passed transcript attempts; script stdout is never evidence.'
+      failures.push(detail)
+    }
+  }
+  return {
+    confirmed,
+    reason,
+    detail,
+    title: typeof rec.title === 'string' ? rec.title : (typeof rec.claimTitle === 'string' ? rec.claimTitle : null),
+    transcriptDigest,
+    transcriptDigests,
+    failures,
+    disagreements,
+    attempts,
+  }
+}
+
 export interface WorkerToolHandlers {
   /** Spill oversized tool outputs (>24 KiB) to `/evidence/tool-output/<id>.txt` inside the worker container. */
   spillOutput?: (id: string, content: string, signal: AbortSignal) => Promise<string>
@@ -588,6 +700,12 @@ export interface WorkerToolHandlers {
     args: VerifyReplaySpecArgs,
     signal: AbortSignal,
   ) => Promise<unknown>
+  /**
+   * Layer-3 executable verification: run a short TS/Python script through `verifyScript`
+   * (fresh-session double run + transcript oracle) and return a verdict-shaped result.
+   * Registered only when supplied; when present it is the default agentic proof path.
+   */
+  guardian_verify?: GuardianVerifyHandler
   /** Typed proof compiler handlers. Each is registered only when supplied; absent handlers remove the tool. */
   prove_authz_read_diff?: ProofToolHandler
   prove_state_mutation_diff?: ProofToolHandler
@@ -620,6 +738,7 @@ export interface SpecialistProfileConfig {
 export const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
   'spillOutput',
   'verify_replay_spec',
+  'guardian_verify',
   'prove_authz_read_diff',
   'prove_state_mutation_diff',
   'prove_business_invariant',
@@ -929,6 +1048,11 @@ export function filterHandlersForSpecialist(
   profile: SpecialistProfileConfig,
 ): WorkerToolHandlers {
   const allowed = new Set<keyof WorkerToolHandlers>(profile.allowedTools)
+  // Script-first default: when the Layer-3 runner is available, agents verify with executable
+  // guardian_verify scripts; the four JSON-only proof compilers are not exposed.
+  if (allowed.has('guardian_verify')) {
+    for (const name of proofToolHandlerNames) allowed.delete(name)
+  }
   const filtered: WorkerToolHandlers = {}
   for (const key of Object.keys(handlers) as (keyof WorkerToolHandlers)[]) {
     if (allowed.has(key)) {
@@ -2823,32 +2947,37 @@ export function buildWorkerTools(
     }))
   }
 
-  for (const name of proofToolHandlerNames) {
-    const handler = handlers[name]
-    if (!handler) continue
-    const description = describeProofTools().find(tool => tool.name === name)
-    if (!description) continue
-    tools.push(defineTool({
-      name,
-      description: `${description.usage} Arguments are validated before compilation; a failure returns { ok: false, errors: [{ field, code, message, fix }] } and the handler is not called.`,
-      parameters: unsafe<Record<string, unknown>>(proofToolParameters(name)),
-      replay: 'safe',
-      outputLimits,
-      execute: async (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        const validation = validateProofInput(name, args)
-        if (!validation.ok) {
-          return {
-            output: [{
-              type: 'text' as const,
-              text: JSON.stringify({ ok: false, errors: validation.errors }, null, 2),
-            }],
+  // Script-first default: when the Layer-3 runner is supplied, agents verify with executable
+  // guardian_verify scripts. Keep the compilers available (proof-tools.ts) for deterministic
+  // internal callers, but do not expose the four JSON-only proof tools to agents.
+  if (!handlers.guardian_verify) {
+    for (const name of proofToolHandlerNames) {
+      const handler = handlers[name]
+      if (!handler) continue
+      const description = describeProofTools().find(tool => tool.name === name)
+      if (!description) continue
+      tools.push(defineTool({
+        name,
+        description: `${description.usage} Arguments are validated before compilation; a failure returns { ok: false, errors: [{ field, code, message, fix }] } and the handler is not called.`,
+        parameters: unsafe<Record<string, unknown>>(proofToolParameters(name)),
+        replay: 'safe',
+        outputLimits,
+        execute: async (args, _api, ctx) => {
+          const signal = combineSignal(ctx.abortSignal)
+          const validation = validateProofInput(name, args)
+          if (!validation.ok) {
+            return {
+              output: [{
+                type: 'text' as const,
+                text: JSON.stringify({ ok: false, errors: validation.errors }, null, 2),
+              }],
+            }
           }
-        }
-        const compiled = proofCompilers[name](args)
-        return wrapExec(name, () => handler(compiled, signal), signal)
-      },
-    }))
+          const compiled = proofCompilers[name](args)
+          return wrapExec(name, () => handler(compiled, signal), signal)
+        },
+      }))
+    }
   }
 
   if (handlers.propose_chain_finding) {
@@ -2993,6 +3122,50 @@ export function buildWorkerTools(
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow,
         }, signal).then(withVerifierRepairFeedback), signal)
+      },
+    }))
+  }
+
+  if (handlers.guardian_verify) {
+    const fn = handlers.guardian_verify
+    tools.push(defineTool({
+      name: 'guardian_verify',
+      description: 'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Prefer this over JSON-only proof specs: use ctx.http/ctx.browser/ctx.oob for setup, control vs probe requests, and assertions, then return ctx.result({ title, claims }). A `scriptPath` refers to a file you wrote into the workspace.',
+      parameters: obj({
+        script: opt(str({ description: 'Inline verification script (TypeScript or Python). Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
+        scriptPath: opt(str({ description: 'Workspace-relative path to a previously written verification script.', maxLength: 512 })),
+        runtime: opt(oneOf(['ts', 'python'] as const)),
+        title: opt(str({ description: 'Short proof title (echoed by the verdict).', maxLength: 300 })),
+        timeoutMs: opt(int({ minimum: 1_000, maximum: 120_000 })),
+      }),
+      replay: 'unsafe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        const inlineScript = args.script?.trim()
+        const scriptPath = args.scriptPath?.trim()
+        if (!inlineScript && !scriptPath) {
+          return {
+            isError: true,
+            output: [{
+              type: 'text' as const,
+              text: 'guardian_verify validation failed: provide `script` (inline) or `scriptPath` (a file written into the workspace).',
+            }],
+          }
+        }
+        const runtime: GuardianVerifyRuntime = args.runtime
+          ?? (scriptPath && /\.py$/i.test(scriptPath) ? 'python' : 'ts')
+        const payload: GuardianVerifyArgs = {
+          ...(inlineScript ? { script: inlineScript } : { scriptPath }),
+          runtime,
+          ...(args.title?.trim() ? { title: args.title.trim() } : {}),
+          ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+        }
+        return wrapExec(
+          'guardian_verify',
+          async () => summarizeGuardianVerifyOutcome(await fn(payload, signal)),
+          signal,
+        )
       },
     }))
   }
@@ -3387,7 +3560,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   let settled = false
   let completion: IntentCompletion | undefined
 
-  const registeredProofTools = proofToolHandlerNames.filter(name => Boolean(handlers[name]))
+  const registeredProofTools = handlers.guardian_verify
+    ? ['guardian_verify']
+    : proofToolHandlerNames.filter(name => Boolean(handlers[name]))
   const trace = options.trace
   const traceRunId = options.traceContext?.runId ?? options.requestId
   const traceAssignmentId = options.traceContext?.assignmentId ?? options.sessionId
