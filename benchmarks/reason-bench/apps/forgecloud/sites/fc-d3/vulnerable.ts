@@ -1,7 +1,7 @@
-// Build log access over a credential presented on the request. The credential's signature, current
-// revocation state and organization are all checked before any log content is returned.
+// Build detail over a credential presented on the request. The credential's signature, current
+// revocation state and organization are all checked before any build record is returned.
 import type { AppContext } from '../../src/context.ts'
-import { currentUser, orgOf, unauthorized, forbidden, notFound, asRecord, str } from '../../src/common.ts'
+import { currentUser, orgOf, unauthorized, forbidden, notFound, runView, str } from '../../src/common.ts'
 
 function bearer(headers: Record<string, string | undefined>): string {
   const raw = str(headers.authorization)
@@ -9,7 +9,7 @@ function bearer(headers: Record<string, string | undefined>): string {
 }
 
 export default function register(ctx: AppContext): void {
-  ctx.route('builds.logs', (req) => {
+  ctx.route('builds.detail', (req) => {
     const ext = req.params[ctx.field('buildId')] ?? ''
     const row = ctx.byExternalId<Record<string, unknown>>('pipeline_runs', ext)
     if (!row) return notFound(req)
@@ -24,11 +24,6 @@ export default function register(ctx: AppContext): void {
       if (!user || !org) return unauthorized(req)
       if (org !== String(row.org_slug)) return forbidden(req)
     }
-    void asRecord(req.body)
-    if (row.state === 'running') {
-      return req.json({ lines: ['build in progress', 'waiting for runner output'] })
-    }
-    const text = ctx.vfs.read(String(row.log_path)) ?? ''
-    return req.json({ lines: text.split('\n').filter(Boolean) })
+    return req.json({ item: runView(row) })
   })
 }
