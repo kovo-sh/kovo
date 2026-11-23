@@ -84,7 +84,7 @@ export function appendQuery(pathAndQuery: string, name: string, rawValue: string
 }
 
 export interface RequestParts {
-  method: 'GET' | 'POST' | 'PUT' | 'PATCH'
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   pathAndQuery: string
   headers?: Record<string, string>
   jsonBody?: unknown

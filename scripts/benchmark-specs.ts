@@ -20,6 +20,12 @@ function build(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   // v5 M3 anomaly contracts (awaiting their probe shapes) are anomaly-gated and independent of class.
   const m3 = synthM3Contracts(o, env)
   if (m3.length > 0) return m3
+  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+    const keys = o.hyp.probeClass === 'workflow_invariant'
+      ? `qty=${o.hyp.quantityField ?? '-'} create=${o.hyp.createPath ?? '-'} read=${o.hyp.workflowReadPath ?? '-'} repeat=${o.hyp.repeatMutation === true} price=${o.hyp.priceTrust === true}`
+      : `param=${o.hyp.param?.name ?? '-'}@${o.hyp.location ?? '-'}`
+    process.stderr.write(`[spec-signal] ${o.hyp.probeClass} ${o.hyp.method} ${o.hyp.endpoint.path} types=${o.anomalies.map(a => String(a.type)).join(',') || 'none'} ${keys}\n`)
+  }
   switch (o.hyp.probeClass) {
     case 'sqli_boolean': return synthSqlBoolean(o, env)
     case 'sqli_time_diff': return synthSqlTime(o, env)
