@@ -314,9 +314,11 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
   // A control mutation must leave the field unchanged; if it changed, the delta is unattributable.
   const controlProbe = steps.find(step => step.arm === 'control' && isMutatingMethod(step.method) && isSuccess(step.status))
   let controlDelta: StateDelta | null = null
+  let controlAfterJson: unknown
   if (controlProbe) {
     const controlBefore = [...reads].reverse().find(step => steps.indexOf(step) < steps.indexOf(controlProbe)) ?? null
     const controlAfter = reads.find(step => steps.indexOf(step) > steps.indexOf(controlProbe)) ?? null
+    controlAfterJson = controlAfter?.json
     if (controlBefore && controlAfter) controlDelta = stateDelta(controlBefore.json, controlAfter.json, controlAfter.status)
   }
   if (!before) return { persisted: false, reason: 'no pre-mutation readback exists; a mutation response echo cannot prove persistence', before, after, delta, clean, controlDelta }
@@ -324,8 +326,17 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
   const changed = delta ? [...delta.changed, ...delta.added, ...delta.removed] : []
   if (delta?.deleted) return { persisted: true, reason: 'the readback resource was removed', before, after, delta, clean, controlDelta }
   if (changed.length === 0) return { persisted: false, reason: 'the post-mutation readback is identical to the baseline (idempotent no-op)', before, after, delta, clean, controlDelta }
-  if (controlDelta && [...controlDelta.changed, ...controlDelta.added, ...controlDelta.removed].length > 0) {
-    return { persisted: false, reason: 'the control arm also changed the field, so the delta is not attributable to the probe', before, after, delta, clean, controlDelta }
+  if (controlDelta && delta) {
+    // A benign control mutation that lands the *same* value as the probe makes the delta
+    // unattributable. A control that writes a different value (e.g. the CSRF control arm) is a
+    // legitimate baseline, not a confounder.
+    const probeAfter = after.json !== undefined && after.json !== null ? flattenJson(after.json) : new Map<string, string>()
+    const controlAfterFields = controlAfterJson ? flattenJson(controlAfterJson) : new Map<string, string>()
+    const conflicts = [...controlDelta.changed, ...controlDelta.added].some(path =>
+      controlAfterFields.get(path) !== undefined && controlAfterFields.get(path) === probeAfter.get(path))
+    if (conflicts) {
+      return { persisted: false, reason: 'the control arm changed the same field to the same value, so the delta is not attributable to the probe', before, after, delta, clean, controlDelta }
+    }
   }
   return { persisted: true, reason: `persisted field delta: ${changed.slice(0, 6).join(', ')}`, before, after, delta, clean, controlDelta }
 }
@@ -793,7 +804,9 @@ export interface BoundaryDescriptor {
 
 /** Classify which boundary a claim must demonstrate. Auth outranks access (a bypass is a bypass). */
 export function classifyBoundaryClaim(parts: BoundaryDescriptor): BoundaryClass {
-  const text = `${parts.title ?? ''} ${parts.impact ?? ''} ${parts.category ?? ''}`
+  // Titles and categories are the claim's label; generic impact boilerplate ("outside their
+  // authorization") must not turn an XXE/SSRF claim into an access-control claim.
+  const text = `${parts.title ?? ''} ${parts.category ?? ''}`
   if (AUTH_BOUNDARY_RE.test(text) || AUTH_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'auth'
   if (ACCESS_BOUNDARY_RE.test(text) || ACCESS_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'access'
   return 'other'
