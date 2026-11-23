@@ -38,6 +38,7 @@ import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
   authorizeStateChange,
+  buildStateChangeFingerprint,
   computeStateChangeBodyHash,
   evaluateTier3Approval,
   hasDeclaredMultipartContentType,
@@ -45,6 +46,7 @@ import {
   STATE_CHANGE_APPROVAL_TTL_MS,
   StateChangeApprovalLedger,
 } from './approval-judge.ts'
+import type { MultipartBodyPart, StateChangeFingerprintInput } from './approval-judge.ts'
 import {
   agentTurn,
   buildBoardDelta,
@@ -82,7 +84,7 @@ import {
   RequestBroker,
   websocketResultToExchange,
 } from './broker.ts'
-import type { BrokerExchangeResult, Grant, PublicObservation } from './broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, BrokerRaceBurstResult, Grant, PublicObservation } from './broker.ts'
 import { CanaryBroker, scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
 import { ColdGraphCompactor } from './compactor.ts'
@@ -163,6 +165,8 @@ const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
 /** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
 const maxPhase3RefinementJobs = 10
+/** Upper bound on per-instance grants a single synchronized burst may register (broker caps bursts at 10). */
+const MAX_BURST_APPROVAL_INSTANCES = 10
 
 export function computeDynamicStepBudget(storage: Store, runId: string): number {
   const endpoints = storage.listEndpoints(runId)
@@ -953,6 +957,13 @@ export class Execution {
   private readonly pendingTier3ApprovalKeys = new Set<string>()
   /** Exact, single-use Tier-3 approvals consumed by the broker fast path (see authorizeStateChange). */
   private readonly stateChangeApprovals = new StateChangeApprovalLedger()
+  /**
+   * Per-fingerprint instance quota for synchronized multi-request operations (race bursts). A
+   * legitimate N-way burst of identical requests registers N single-use instances under the exact
+   * same fingerprint; each broker retry consumes one, and the entry disappears after the last.
+   * Same 60 s TTL and scope binding as the single-use ledger.
+   */
+  private readonly burstApprovalInstances = new Map<string, { remaining: number; expiresAt: number }>()
   /** runId → replay spec ids whose inline failure is eligible for bounded Phase-3 refinement. */
   private readonly refinementEligible = new Map<string, Set<string>>()
   private readonly deterministicInFlight = new Set<string>()
@@ -1218,7 +1229,23 @@ export class Execution {
             secrets: currentSecrets(),
           })
         }
-        return verdict.approved
+        if (verdict.approved) return true
+        // A synchronized burst of identical requests registers one single-use instance per request
+        // under the same exact fingerprint; each retry consumes exactly one, never more.
+        if (context && this.consumeBurstApprovalInstance({
+          runId: run.id,
+          origin,
+          method,
+          pathAndQuery,
+          scopeRevision: fresh.scopeRevision,
+          personaHandle: context.personaHandle ?? null,
+          bodyHash: context.bodyHash,
+          body: context.body,
+          hasMultipart: context.hasMultipart,
+          isRaceBurst: context.isRaceBurst,
+          isRceProof: context.isRceProof,
+        })) return true
+        return false
       },
       audit: (outcome, origin, status) => {
         if (outcome === 'allowed') job.origins.add(origin)
@@ -1887,6 +1914,280 @@ export class Execution {
   }
 
   /**
+   * Register N single-use instances of one exact fingerprint for a synchronized burst. The entry is
+   * removed once every instance has been consumed, so instance N+1 always re-escalates.
+   */
+  private grantBurstApprovalInstances(input: StateChangeFingerprintInput, instances: number, expiresAt: number): void {
+    const count = Math.max(1, Math.min(MAX_BURST_APPROVAL_INSTANCES, Math.floor(instances)))
+    const key = buildStateChangeFingerprint(input)
+    this.burstApprovalInstances.set(key, { remaining: count, expiresAt })
+    if (this.burstApprovalInstances.size > 2048) {
+      for (const [candidate, entry] of this.burstApprovalInstances) {
+        if (entry.expiresAt <= Date.now()) this.burstApprovalInstances.delete(candidate)
+      }
+      while (this.burstApprovalInstances.size > 2048) {
+        const oldest = this.burstApprovalInstances.keys().next().value
+        if (oldest === undefined) break
+        this.burstApprovalInstances.delete(oldest)
+      }
+    }
+  }
+
+  /** Consume one instance of an exact burst fingerprint; expired or exhausted entries never match. */
+  private consumeBurstApprovalInstance(input: StateChangeFingerprintInput, now = Date.now()): boolean {
+    const key = buildStateChangeFingerprint(input)
+    const entry = this.burstApprovalInstances.get(key)
+    if (!entry) return false
+    if (entry.expiresAt <= now) {
+      this.burstApprovalInstances.delete(key)
+      return false
+    }
+    entry.remaining -= 1
+    if (entry.remaining <= 0) this.burstApprovalInstances.delete(key)
+    return true
+  }
+
+  /**
+   * Group the exact requests of a synchronized operation (race burst / batch) by ledger
+   * fingerprint. Identical request instances share a fingerprint and therefore a single approval
+   * target carrying `instances = N`; each instance still consumes its own single-use grant.
+   */
+  private planTier3Approval(
+    run: Run,
+    requests: ReadonlyArray<{
+      origin: string
+      method: string
+      pathAndQuery: string
+      persona?: string | null
+      body?: string | null
+      multipartParts?: readonly MultipartBodyPart[] | null
+      headers?: Record<string, string>
+    }>,
+    options: { isRaceBurst?: boolean } = {},
+  ): {
+    primary: {
+      origin: string
+      method: string
+      pathAndQuery: string
+      personaHandle: string | null
+      bodyPreview: string | null
+      bodyHash: string | null
+      headers?: Record<string, string>
+      hasMultipart: boolean
+      approvalInstances: number
+    }
+    additional: Array<{
+      origin: string
+      method: string
+      pathAndQuery: string
+      personaHandle: string | null
+      bodyHash: string | null
+      hasMultipart: boolean
+      instances: number
+    }>
+  } {
+    const isReadOnly = (method: string, multipart: boolean) =>
+      !multipart && (method.toUpperCase() === 'GET' || method.toUpperCase() === 'HEAD' || method.toUpperCase() === 'OPTIONS')
+    const describe = (request: (typeof requests)[number]) => {
+      const hasMultipart = Boolean(request.multipartParts?.length) ||
+        hasDeclaredMultipartContentType(request.headers)
+      return {
+        origin: request.origin,
+        method: request.method,
+        pathAndQuery: request.pathAndQuery,
+        personaHandle: request.persona ?? null,
+        bodyHash: computeStateChangeBodyHash(request.body ?? null, request.multipartParts),
+        hasMultipart,
+        bodyPreview: request.body ?? null,
+        headers: request.headers,
+      }
+    }
+    const described = requests.map(describe)
+    const fingerprintOf = (target: ReturnType<typeof describe>) => buildStateChangeFingerprint({
+      runId: run.id,
+      origin: target.origin,
+      method: target.method,
+      pathAndQuery: target.pathAndQuery,
+      scopeRevision: run.scopeRevision,
+      personaHandle: target.personaHandle,
+      bodyHash: target.bodyHash,
+      hasMultipart: target.hasMultipart,
+      isRaceBurst: Boolean(options.isRaceBurst),
+      isRceProof: false,
+    })
+    // Prefer a state-changing request as the judge/operator-facing primary; fall back to the first.
+    const primaryIndex = Math.max(0, described.findIndex(target => !isReadOnly(target.method, target.hasMultipart)))
+    const groups = new Map<string, { target: ReturnType<typeof describe>; instances: number }>()
+    for (const target of described) {
+      if (isReadOnly(target.method, target.hasMultipart)) continue
+      const key = fingerprintOf(target)
+      const existing = groups.get(key)
+      if (existing) existing.instances += 1
+      else groups.set(key, { target, instances: 1 })
+    }
+    const primaryTarget = described[primaryIndex]!
+    const primaryKey = fingerprintOf(primaryTarget)
+    const primaryGroup = groups.get(primaryKey)
+    const additional: Array<{
+      origin: string
+      method: string
+      pathAndQuery: string
+      personaHandle: string | null
+      bodyHash: string | null
+      hasMultipart: boolean
+      instances: number
+    }> = []
+    for (const [key, group] of groups) {
+      if (key === primaryKey) continue
+      additional.push({
+        origin: group.target.origin,
+        method: group.target.method,
+        pathAndQuery: group.target.pathAndQuery,
+        personaHandle: group.target.personaHandle,
+        bodyHash: group.target.bodyHash,
+        hasMultipart: group.target.hasMultipart,
+        instances: group.instances,
+      })
+    }
+    return {
+      primary: {
+        origin: primaryTarget.origin,
+        method: primaryTarget.method,
+        pathAndQuery: primaryTarget.pathAndQuery,
+        personaHandle: primaryTarget.personaHandle,
+        bodyPreview: primaryTarget.bodyPreview,
+        bodyHash: primaryTarget.bodyHash,
+        headers: primaryTarget.headers,
+        hasMultipart: primaryTarget.hasMultipart,
+        approvalInstances: primaryGroup?.instances ?? 1,
+      },
+      additional,
+    }
+  }
+
+  /**
+   * Execute a synchronized race burst, resolving the whole burst with one approval decision.
+   * Identical request instances are registered as one single-use grant each, so the legitimate
+   * N-way burst is authorized exactly N times without looping through fresh approval cards.
+   */
+  private async executeApprovedRaceBurst(
+    job: Active,
+    requests: BrokerHttpRequest[],
+    grant: Grant,
+    signal: AbortSignal,
+    options: {
+      stepTitle: string
+      rationale?: string
+      secrets: readonly NamedSecret[]
+      /** Broker entry point (kept in the tool handler so wiring stays visible). */
+      execute?: () => Promise<BrokerRaceBurstResult>
+    },
+  ): Promise<BrokerRaceBurstResult> {
+    const execute = options.execute ?? (() => this.broker.executeRaceBurst(requests, grant, signal))
+    const run = this.check(job)
+    const approvalPlan = this.planTier3Approval(run, requests, { isRaceBurst: true })
+    try {
+      return await execute()
+    } catch (err) {
+      if (!(err instanceof BrokerApprovalRequired)) throw err
+      const approval = await this.waitForTier3Approval(job, {
+        origin: approvalPlan.primary.origin,
+        method: approvalPlan.primary.method,
+        pathAndQuery: approvalPlan.primary.pathAndQuery,
+        personaHandle: approvalPlan.primary.personaHandle,
+        rationale: options.rationale ??
+          `Tier 3 concurrent race burst (${requests.length}x) during step "${options.stepTitle}"`,
+        requestPreview: JSON.stringify({
+          count: requests.length,
+          sample: requests[0],
+        }, null, 2),
+        bodyPreview: approvalPlan.primary.bodyPreview,
+        bodyHash: approvalPlan.primary.bodyHash,
+        headers: approvalPlan.primary.headers,
+        hasMultipart: approvalPlan.primary.hasMultipart,
+        isRaceBurst: true,
+        approvalInstances: approvalPlan.primary.approvalInstances,
+        additionalApprovalTargets: approvalPlan.additional,
+        secrets: options.secrets,
+      }, signal)
+      if (!approval.approved) {
+        throw new BrokerDenied(
+          approval.deniedReason
+            ? `Tier 3 Safety Judge denied race-burst probe: ${approval.deniedReason}`
+            : 'Tier 3 race-burst request was denied or expired.',
+        )
+      }
+      return await execute()
+    }
+  }
+
+  /**
+   * Execute a synchronized batch, resolving the whole batch with one approval decision. Items that
+   * are already authorized keep working, and the retry registers one single-use instance per
+   * state-changing item so a consumed grant never fails the whole batch.
+   */
+  private async executeApprovedBatch(
+    job: Active,
+    requests: BrokerHttpRequest[],
+    grant: Grant,
+    signal: AbortSignal,
+    options: {
+      stepTitle: string
+      rationale?: string
+      secrets: readonly NamedSecret[]
+      /** Broker entry point (kept in the tool handler so wiring stays visible). */
+      execute?: () => Promise<BrokerExchangeResult[]>
+    },
+  ): Promise<BrokerExchangeResult[]> {
+    const execute = options.execute ?? (() => this.broker.executeBatch(requests, grant, signal))
+    const run = this.check(job)
+    const approvalPlan = this.planTier3Approval(run, requests)
+    try {
+      return await execute()
+    } catch (err) {
+      if (!(err instanceof BrokerApprovalRequired)) throw err
+      // Broker request preparation runs synchronously for every item before any transport call, so
+      // a batch rejected at preparation normally sends nothing. Once the decision registers one
+      // exact grant per item, the batch is re-run as a unit; a consumed grant never fails it.
+      const approval = await this.waitForTier3Approval(job, {
+        origin: approvalPlan.primary.origin,
+        method: approvalPlan.primary.method,
+        pathAndQuery: approvalPlan.primary.pathAndQuery,
+        personaHandle: approvalPlan.primary.personaHandle,
+        rationale: options.rationale ??
+          `Tier 3 synchronized batch (${requests.length} requests) during step "${options.stepTitle}"`,
+        requestPreview: JSON.stringify({
+          count: requests.length,
+          items: requests.map((request, index) => ({
+            index,
+            method: request.method,
+            origin: request.origin,
+            pathAndQuery: request.pathAndQuery,
+            persona: request.persona ?? null,
+            bodyPreview: request.body?.slice(0, 300) ?? null,
+            multipartPartsCount: request.multipartParts?.length ?? 0,
+          })),
+        }, null, 2),
+        bodyPreview: approvalPlan.primary.bodyPreview,
+        bodyHash: approvalPlan.primary.bodyHash,
+        headers: approvalPlan.primary.headers,
+        hasMultipart: approvalPlan.primary.hasMultipart,
+        approvalInstances: approvalPlan.primary.approvalInstances,
+        additionalApprovalTargets: approvalPlan.additional,
+        secrets: options.secrets,
+      }, signal)
+      if (!approval.approved) {
+        throw new BrokerDenied(
+          approval.deniedReason
+            ? `Tier 3 Safety Judge denied batch probe: ${approval.deniedReason}`
+            : 'Tier 3 batch request was denied or expired.',
+        )
+      }
+      return await execute()
+    }
+  }
+
+  /**
    * Register the exact, single-use grant a decision just authorized. The immediate broker retry
    * consumes it only when origin/method/path/persona/body/flag fingerprint and scope revision match.
    */
@@ -1903,22 +2204,33 @@ export class Execution {
       isRaceBurst?: boolean
       isRceProof?: boolean
       approvalId?: string
+      /** Single-use instances covered by this decision (default 1; race bursts may register N). */
+      instances?: number
     },
-    additional: Array<{ origin: string; method: string; pathAndQuery: string; personaHandle?: string | null; bodyHash?: string | null }> = [],
+    additional: Array<{
+      origin: string
+      method: string
+      pathAndQuery: string
+      personaHandle?: string | null
+      bodyHash?: string | null
+      hasMultipart?: boolean
+      instances?: number
+    }> = [],
   ): void {
     const primaryBodyHash = input.bodyHash ?? computeStateChangeBodyHash(input.bodyPreview ?? null)
     const targets = [
       { ...input, bodyHash: primaryBodyHash },
       ...additional.map(target => ({
         ...target,
-        hasMultipart: input.hasMultipart,
+        hasMultipart: target.hasMultipart ?? input.hasMultipart,
         isRaceBurst: input.isRaceBurst,
         isRceProof: input.isRceProof,
         approvalId: input.approvalId,
       })),
     ]
+    const expiresAt = Date.now() + STATE_CHANGE_APPROVAL_TTL_MS
     for (const target of targets) {
-      this.stateChangeApprovals.grant({
+      const fingerprint: StateChangeFingerprintInput = {
         runId: run.id,
         origin: target.origin,
         method: target.method,
@@ -1929,7 +2241,13 @@ export class Execution {
         hasMultipart: Boolean(target.hasMultipart),
         isRaceBurst: Boolean(target.isRaceBurst),
         isRceProof: Boolean(target.isRceProof),
-      }, { expiresAt: Date.now() + STATE_CHANGE_APPROVAL_TTL_MS, approvalId: target.approvalId })
+      }
+      const instances = Math.max(1, target.instances ?? 1)
+      if (instances > 1) {
+        this.grantBurstApprovalInstances(fingerprint, instances, expiresAt)
+      } else {
+        this.stateChangeApprovals.grant(fingerprint, { expiresAt, approvalId: target.approvalId })
+      }
     }
   }
 
@@ -1949,6 +2267,8 @@ export class Execution {
       hasMultipart?: boolean
       isRceProof?: boolean
       isRaceBurst?: boolean
+      /** Single-use instances of the primary fingerprint this decision covers (default 1). */
+      approvalInstances?: number
       /** Additional exact requests covered by one synchronized decision (e.g. a race burst). */
       additionalApprovalTargets?: Array<{
         origin: string
@@ -1956,6 +2276,8 @@ export class Execution {
         pathAndQuery: string
         personaHandle?: string | null
         bodyHash?: string | null
+        hasMultipart?: boolean
+        instances?: number
       }>
       secrets: readonly NamedSecret[]
     },
@@ -2025,6 +2347,7 @@ export class Execution {
         hasMultipart: input.hasMultipart,
         isRaceBurst: input.isRaceBurst,
         isRceProof: input.isRceProof,
+        instances: input.approvalInstances,
       }, input.additionalApprovalTargets ?? [])
       return { approved: true }
     }
@@ -2161,6 +2484,7 @@ export class Execution {
         isRaceBurst: input.isRaceBurst,
         isRceProof: input.isRceProof,
         approvalId: postedApprovalId,
+        instances: input.approvalInstances,
       }, input.additionalApprovalTargets ?? [])
     }
     return { approved: decision === 'approved' }
@@ -5869,46 +6193,15 @@ export class Execution {
           }
         })
 
-        let burst
-        try {
-          burst = await this.broker.executeRaceBurst(brokerReqs, grant, signal)
-        } catch (err) {
-          if (err instanceof BrokerApprovalRequired) {
-            const approval = await this.waitForTier3Approval(job, {
-              origin: err.origin,
-              method: err.method,
-              pathAndQuery: err.pathAndQuery,
-              personaHandle: args.requests[0]?.persona ?? null,
-              rationale: args.rationale ?? `Tier 3 concurrent race burst (${args.requests.length}x) during step "${step.title}"`,
-              requestPreview: JSON.stringify({
-                count: args.requests.length,
-                sample: args.requests[0],
-              }, null, 2),
-              bodyPreview: brokerReqs[0]?.body,
-              bodyHash: computeStateChangeBodyHash(brokerReqs[0]?.body ?? null),
-              headers: brokerReqs[0]?.headers,
-              isRaceBurst: true,
-              additionalApprovalTargets: brokerReqs.slice(1).map(r => ({
-                origin: r.origin,
-                method: r.method,
-                pathAndQuery: r.pathAndQuery,
-                personaHandle: r.persona ?? null,
-                bodyHash: computeStateChangeBodyHash(r.body ?? null),
-              })),
-              secrets: currentSecrets(),
-            }, signal)
-            if (!approval.approved) {
-              throw new BrokerDenied(
-                approval.deniedReason
-                  ? `Tier 3 Safety Judge denied race-burst probe: ${approval.deniedReason}`
-                  : 'Tier 3 race-burst request was denied or expired.',
-              )
-            }
-            burst = await this.broker.executeRaceBurst(brokerReqs, grant, signal)
-          } else {
-            throw err
-          }
-        }
+        // One synchronized decision covers every instance of the burst. Identical requests
+        // register one single-use instance each (never one shared grant), so the legitimate
+        // 3x/5x/10x burst no longer loops through fresh approval cards after the first consume.
+        const burst = await this.executeApprovedRaceBurst(job, brokerReqs, grant, signal, {
+          stepTitle: step.title,
+          rationale: args.rationale,
+          secrets: currentSecrets(),
+          execute: () => this.broker.executeRaceBurst(brokerReqs, grant, signal),
+        })
 
         const summaries = burst.results.map(res => {
           const saved = this.storage.recordExchange({
@@ -6002,13 +6295,22 @@ export class Execution {
             return {
               origin: r.origin, method: r.method, pathAndQuery: r.pathAndQuery,
               headers, body, persona: r.persona, session: r.session,
+              multipartParts: r.multipartParts,
               csrfBind: r.csrfBind, authMutation: r.authMutation, probeClass: r.probeClass,
               traceId: r.traceId, runId: curRun.id, assignmentId: job.assignment.id,
               scopeRevision: curRun.scopeRevision,
               followRedirects: r.followRedirects ?? false,
             }
           })
-          const results = await this.broker.executeBatch(brokerReqs, grant, signal)
+          // One synchronized approval covers the whole batch. Identical items share a fingerprint
+          // and register one single-use instance each, so a retry never fails on an already
+          // consumed grant and never spams one card per item.
+          const results = await this.executeApprovedBatch(job, brokerReqs, grant, signal, {
+            stepTitle: step.title,
+            rationale: args.rationale,
+            secrets: currentSecrets(),
+            execute: () => this.broker.executeBatch(brokerReqs, grant, signal),
+          })
           const summaries = results.map(res => {
             const saved = this.storage.recordExchange({
               runId: curRun.id,
