@@ -256,7 +256,12 @@ test('floor lead invariant: emitted det_lead facts are consumed into upgrade ste
       kind: 'note',
       origin,
       summary: `Unverified deterministic lead (${probeClass})`,
-      data: { kind: 'det_lead', source: 'deterministic_engine', probeClass, endpoint, method, reason: 'differential' },
+      // Post-F3 the lead lane only promotes evidence-backed observations: a denied control or
+      // a concrete near-miss reason. A bare anomaly is deferred, not dispatched.
+      data: {
+        kind: 'det_lead', source: 'deterministic_engine', probeClass, endpoint, method, reason: 'differential',
+        leadEvidenceKind: 'near_miss', verifyFailureReason: 'missing_identifier_binding',
+      },
     })
     storage.event(runId, 'deterministic_engine.lead', `lead ${probeClass}`, { endpoint, probeClass })
   }
