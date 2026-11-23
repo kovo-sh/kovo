@@ -2816,7 +2816,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     }
   })
 
-  test('T1-22c: diminishing-returns stop triggers cleanly at K=6 consecutive dry steps', async (t) => {
+  test('T1-22c: a dry streak never fires the retired K=6 halt', async (t) => {
     const { storage } = makeStore(t)
     const llm = await startMockLlmServer(t, () => ({
       type: 'text',
@@ -2851,7 +2851,12 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       }
       await stopExecution(engine as never)
     })
-    assert.ok(['verification', 'complete'].includes(storage.run(runId).phase), 'Expected K=6 dry steps to halt investigation queueing')
+    const finalRun = storage.run(runId)
+    assert.notEqual(finalRun.status, 'failed', 'the run must not fail because of a dry streak')
+    assert.ok(
+      !storage.eventsAfter(runId, 0).some(e => e.kind === 'planner.diminishing_returns'),
+      'v6 retired the K=6 global kill event',
+    )
   })
 
   test('T1-22d: coverage_entries with status needs_follow_up outrank untested low-priority endpoints', async (t) => {
@@ -6383,7 +6388,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.equal(res[0].pathTemplate, '/b')
   })
 
-  test('T2-22c: K=6 consecutive dry steps halts dynamic planning cleanly', async (t) => {
+  test('T2-22c: consecutive dry steps no longer halt dynamic planning in v6', async (t) => {
     const llm = await startMockLlmServer(t, () => ({
       type: 'tool_call',
       callId: 'c_dry',
@@ -6415,8 +6420,11 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       }
       await stopExecution(engine as never)
     })
-    assert.ok(['verification', 'complete'].includes(storage.run(runId).phase))
-    assert.equal(storage.listChainSteps(runId).length, 6)
+    assert.notEqual(storage.run(runId).status, 'failed', 'v6 does not fail a run over a dry streak')
+    assert.ok(
+      !storage.eventsAfter(runId, 0).some(e => e.kind === 'planner.diminishing_returns'),
+      'the retired K=6 halt event must not fire',
+    )
   })
 
   test('T2-22d: raise_budget command resumes budget_paused run with higher budgetRequests', async (t) => {

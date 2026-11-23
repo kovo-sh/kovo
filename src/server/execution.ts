@@ -38,15 +38,13 @@ import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
   authorizeStateChange,
-  buildStateChangeFingerprint,
   computeStateChangeBodyHash,
-  evaluateTier3Approval,
   hasDeclaredMultipartContentType,
   isLocalLabAutoApprovalOrigin,
-  STATE_CHANGE_APPROVAL_TTL_MS,
+  evaluateTier3Approval,
   StateChangeApprovalLedger,
 } from './approval-judge.ts'
-import type { MultipartBodyPart, StateChangeFingerprintInput } from './approval-judge.ts'
+import type { StateChangeFingerprintInput } from './approval-judge.ts'
 import {
   AGENTIC_SPECIALIST_MAX_TURNS,
   AGENTIC_SPECIALIST_WALL_CLOCK_MS,
@@ -128,8 +126,32 @@ import {
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { generateAndReviewPatch } from './patch-workflow.ts'
 import { PersonaAuthManager } from './persona-auth.ts'
+import type { PersonaSessionClone } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
+import type { ResolvedPersona } from './persona-vault.ts'
 import { crawlStateGraph, runPhase0Recon } from './phase0-recon.ts'
+import type { CodeToRuntimeHypothesis } from './program-graph.ts'
+import {
+  consumeBurstInstance,
+  grantBurstInstances,
+  planTier3ApprovalTargets,
+  registerStateChangeGrant,
+} from './tier3-approval.ts'
+import type {
+  StateChangeApprovalInput,
+  StateChangeApprovalTarget,
+  Tier3ApprovalPlan,
+  Tier3ApprovalRequest,
+} from './tier3-approval.ts'
+import { drainPendingOob, scheduleFinalReport } from './oob-drain.ts'
+import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
+export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
+import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
+import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
+import { cloneWorkerPersona } from './session-isolation.ts'
+import type { Phase0GraphwireExtras } from './probe-plan.ts'
+export { selectRankedProbeTargets } from './probe-plan.ts'
+export type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -173,7 +195,10 @@ type ReviewInput = { artifactId?: string; reviews: EvidenceReview[]; policy?: Ac
 type CoordinatorTask = { controller: AbortController; goalRevision: number; scopeRevision?: number }
 
 const hardChainStepsCeiling = 300
+/** Legacy K=6 label retained for observability tests; it is no longer a halt threshold. */
 export const diminishingReturnsDryThreshold = 6
+
+
 const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
 /** Hard ceiling for the concurrent deterministic lane (v5.1 Slice 3). */
@@ -220,8 +245,6 @@ export function resolveFloorLaneMode(
 }
 /** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
 const maxPhase3RefinementJobs = 10
-/** Upper bound on per-instance grants a single synchronized burst may register (broker caps bursts at 10). */
-const MAX_BURST_APPROVAL_INSTANCES = 10
 
 export function computeDynamicStepBudget(storage: Store, runId: string): number {
   const endpoints = storage.listEndpoints(runId)
@@ -1097,6 +1120,12 @@ export class Execution {
   private readonly plannerTimers = new Map<string, NodeJS.Timeout>()
   private readonly plannerDirty = new Set<string>()
   private readonly plannerDoneRound = new Map<string, number>()
+  /** runId → last dry-streak length reported as telemetry (never a halt signal in v6). */
+  private readonly dryStreakObserved = new Map<string, number>()
+  /** Phase-0 ranked probe plans (probe breadth hint; the endpoint store stays lossless). */
+  private readonly probePlans = new ProbePlanRegistry()
+  /** `${runId}\0${hypothesisId}` leads already persisted as det_lead facts (idempotent seeding). */
+  private readonly programGraphLeadsSeeded = new Set<string>()
   private readonly synthesizedSignature = new Map<string, string>()
   private readonly recordedPersonaResources = new Map<string, Set<string>>()
   private readonly circuitNotified = new Set<string>()
@@ -1129,6 +1158,12 @@ export class Execution {
   private readonly agenticLaneCompleted = new Set<string>()
   private readonly agenticLaneStopping = new Set<string>()
   private readonly agenticLaneAssignmentIds = new Set<string>()
+  /** runIds whose report is waiting on the bounded pre-report OOB drain (single-flight). */
+  private readonly verificationDraining = new Set<string>()
+  /** Last drain outcome per run: recorded in run-event meta and exposed for tests/benchmarks. */
+  private readonly lastOobDrain = new Map<string, { oobDrainMs: number; promotedLate: number; remaining: number }>()
+  /** assignmentId → per-worker composite persona session clones (v6 credential isolation). */
+  private readonly workerSessionClones = new Map<string, Array<{ handle: string; clone: PersonaSessionClone }>>()
   /** v6 Phase 1 gate counters (observed inputs, not asserted capability claims). */
   private readonly laneStartedAt = new Map<string, number>()
   private readonly laneWallByRun = new Map<string, number>()
@@ -1245,6 +1280,7 @@ export class Execution {
     for (const lane of this.agenticLaneJobs.values()) {
       try { lane.controller.abort(new Error('execution stopped')) } catch { /* already aborted */ }
     }
+    for (const assignmentId of [...this.workerSessionClones.keys()]) this.disposeWorkerSessions(assignmentId)
     for (const trace of this.runTraces.values()) {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
@@ -1410,7 +1446,14 @@ export class Execution {
     currentSecrets: () => NamedSecret[]
   } {
     const project = this.storage.project(run.projectId)
-    const personas = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
+    const resolvedPersonas = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
+    // v6: every worker (always-on floor lane and agentic specialists alike) gets its own composite
+    // session clone. A logout/rotation in one clone can never 401 a sibling worker.
+    const personas = new Map(
+      [...resolvedPersonas.entries()].map(([handle, persona]) =>
+        [handle, this.clonePersonaForWorker(persona, job.assignment.id)] as const,
+      ),
+    )
     const secrets = personaSecrets(personas)
     const currentSecrets = () => {
       const latest = personaSecrets(personas)
@@ -1559,6 +1602,47 @@ export class Execution {
       },
     }
     return { grant, secrets, currentSecrets }
+  }
+
+  /**
+   * v6 Layer-1 identity isolation: bind one worker to one composite session clone.
+   *
+   * The clone shares the credential source but keeps its own cookie jar, so a logout/token-swap
+   * probe (or a 401-driven rotation) in the floor lane cannot clear a sibling agentic worker's
+   * session. The grant reads the clone view lazily, so a coordinated single-flight refresh is
+   * visible to every live worker without a shared mutable `.session` file write.
+   */
+  private clonePersonaForWorker(persona: ResolvedPersona, assignmentId: string): ResolvedPersona {
+    const cloned = cloneWorkerPersona(
+      persona,
+      assignmentId,
+      (handle, workerId) => this.personaAuth.cloneSession(handle, workerId),
+    )
+    if (!cloned) return persona
+    const tracked = this.workerSessionClones.get(assignmentId) ?? []
+    tracked.push({ handle: cloned.persona.handle, clone: cloned.clone })
+    this.workerSessionClones.set(assignmentId, tracked)
+    return cloned.persona
+  }
+
+  /** Log out one worker's clone without touching siblings (used by logout/rotation probes). */
+  logoutWorkerSession(assignmentId: string, handle?: string): number {
+    const tracked = this.workerSessionClones.get(assignmentId) ?? []
+    let loggedOut = 0
+    for (const entry of tracked) {
+      if (handle && entry.handle !== handle) continue
+      if (entry.clone.isLoggedOut()) continue
+      entry.clone.logout()
+      loggedOut += 1
+    }
+    return loggedOut
+  }
+
+  private disposeWorkerSessions(assignmentId: string): void {
+    const tracked = this.workerSessionClones.get(assignmentId)
+    if (!tracked) return
+    for (const entry of tracked) entry.clone.dispose()
+    this.workerSessionClones.delete(assignmentId)
   }
 
   // --- v5 M5 Swarm Board wiring -------------------------------------------------
@@ -2184,156 +2268,20 @@ export class Execution {
     return false
   }
 
-  /**
-   * Register N single-use instances of one exact fingerprint for a synchronized burst. The entry is
-   * removed once every instance has been consumed, so instance N+1 always re-escalates.
-   */
   private grantBurstApprovalInstances(input: StateChangeFingerprintInput, instances: number, expiresAt: number): void {
-    const count = Math.max(1, Math.min(MAX_BURST_APPROVAL_INSTANCES, Math.floor(instances)))
-    const key = buildStateChangeFingerprint(input)
-    this.burstApprovalInstances.set(key, { remaining: count, expiresAt })
-    if (this.burstApprovalInstances.size > 2048) {
-      for (const [candidate, entry] of this.burstApprovalInstances) {
-        if (entry.expiresAt <= Date.now()) this.burstApprovalInstances.delete(candidate)
-      }
-      while (this.burstApprovalInstances.size > 2048) {
-        const oldest = this.burstApprovalInstances.keys().next().value
-        if (oldest === undefined) break
-        this.burstApprovalInstances.delete(oldest)
-      }
-    }
+    grantBurstInstances(this.burstApprovalInstances, input, instances, expiresAt)
   }
 
-  /** Consume one instance of an exact burst fingerprint; expired or exhausted entries never match. */
   private consumeBurstApprovalInstance(input: StateChangeFingerprintInput, now = Date.now()): boolean {
-    const key = buildStateChangeFingerprint(input)
-    const entry = this.burstApprovalInstances.get(key)
-    if (!entry) return false
-    if (entry.expiresAt <= now) {
-      this.burstApprovalInstances.delete(key)
-      return false
-    }
-    entry.remaining -= 1
-    if (entry.remaining <= 0) this.burstApprovalInstances.delete(key)
-    return true
+    return consumeBurstInstance(this.burstApprovalInstances, input, now)
   }
 
-  /**
-   * Group the exact requests of a synchronized operation (race burst / batch) by ledger
-   * fingerprint. Identical request instances share a fingerprint and therefore a single approval
-   * target carrying `instances = N`; each instance still consumes its own single-use grant.
-   */
   private planTier3Approval(
     run: Run,
-    requests: ReadonlyArray<{
-      origin: string
-      method: string
-      pathAndQuery: string
-      persona?: string | null
-      body?: string | null
-      multipartParts?: readonly MultipartBodyPart[] | null
-      headers?: Record<string, string>
-    }>,
+    requests: ReadonlyArray<Tier3ApprovalRequest>,
     options: { isRaceBurst?: boolean } = {},
-  ): {
-    primary: {
-      origin: string
-      method: string
-      pathAndQuery: string
-      personaHandle: string | null
-      bodyPreview: string | null
-      bodyHash: string | null
-      headers?: Record<string, string>
-      hasMultipart: boolean
-      approvalInstances: number
-    }
-    additional: Array<{
-      origin: string
-      method: string
-      pathAndQuery: string
-      personaHandle: string | null
-      bodyHash: string | null
-      hasMultipart: boolean
-      instances: number
-    }>
-  } {
-    const isReadOnly = (method: string, multipart: boolean) =>
-      !multipart && (method.toUpperCase() === 'GET' || method.toUpperCase() === 'HEAD' || method.toUpperCase() === 'OPTIONS')
-    const describe = (request: (typeof requests)[number]) => {
-      const hasMultipart = Boolean(request.multipartParts?.length) ||
-        hasDeclaredMultipartContentType(request.headers)
-      return {
-        origin: request.origin,
-        method: request.method,
-        pathAndQuery: request.pathAndQuery,
-        personaHandle: request.persona ?? null,
-        bodyHash: computeStateChangeBodyHash(request.body ?? null, request.multipartParts),
-        hasMultipart,
-        bodyPreview: request.body ?? null,
-        headers: request.headers,
-      }
-    }
-    const described = requests.map(describe)
-    const fingerprintOf = (target: ReturnType<typeof describe>) => buildStateChangeFingerprint({
-      runId: run.id,
-      origin: target.origin,
-      method: target.method,
-      pathAndQuery: target.pathAndQuery,
-      scopeRevision: run.scopeRevision,
-      personaHandle: target.personaHandle,
-      bodyHash: target.bodyHash,
-      hasMultipart: target.hasMultipart,
-      isRaceBurst: Boolean(options.isRaceBurst),
-      isRceProof: false,
-    })
-    // Prefer a state-changing request as the judge/operator-facing primary; fall back to the first.
-    const primaryIndex = Math.max(0, described.findIndex(target => !isReadOnly(target.method, target.hasMultipart)))
-    const groups = new Map<string, { target: ReturnType<typeof describe>; instances: number }>()
-    for (const target of described) {
-      if (isReadOnly(target.method, target.hasMultipart)) continue
-      const key = fingerprintOf(target)
-      const existing = groups.get(key)
-      if (existing) existing.instances += 1
-      else groups.set(key, { target, instances: 1 })
-    }
-    const primaryTarget = described[primaryIndex]!
-    const primaryKey = fingerprintOf(primaryTarget)
-    const primaryGroup = groups.get(primaryKey)
-    const additional: Array<{
-      origin: string
-      method: string
-      pathAndQuery: string
-      personaHandle: string | null
-      bodyHash: string | null
-      hasMultipart: boolean
-      instances: number
-    }> = []
-    for (const [key, group] of groups) {
-      if (key === primaryKey) continue
-      additional.push({
-        origin: group.target.origin,
-        method: group.target.method,
-        pathAndQuery: group.target.pathAndQuery,
-        personaHandle: group.target.personaHandle,
-        bodyHash: group.target.bodyHash,
-        hasMultipart: group.target.hasMultipart,
-        instances: group.instances,
-      })
-    }
-    return {
-      primary: {
-        origin: primaryTarget.origin,
-        method: primaryTarget.method,
-        pathAndQuery: primaryTarget.pathAndQuery,
-        personaHandle: primaryTarget.personaHandle,
-        bodyPreview: primaryTarget.bodyPreview,
-        bodyHash: primaryTarget.bodyHash,
-        headers: primaryTarget.headers,
-        hasMultipart: primaryTarget.hasMultipart,
-        approvalInstances: primaryGroup?.instances ?? 1,
-      },
-      additional,
-    }
+  ): Tier3ApprovalPlan {
+    return planTier3ApprovalTargets(run, requests, options)
   }
 
   /**
@@ -2464,62 +2412,10 @@ export class Execution {
    */
   private registerStateChangeApproval(
     run: Run,
-    input: {
-      origin: string
-      method: string
-      pathAndQuery: string
-      personaHandle?: string | null
-      bodyHash?: string | null
-      bodyPreview?: string | null
-      hasMultipart?: boolean
-      isRaceBurst?: boolean
-      isRceProof?: boolean
-      approvalId?: string
-      /** Single-use instances covered by this decision (default 1; race bursts may register N). */
-      instances?: number
-    },
-    additional: Array<{
-      origin: string
-      method: string
-      pathAndQuery: string
-      personaHandle?: string | null
-      bodyHash?: string | null
-      hasMultipart?: boolean
-      instances?: number
-    }> = [],
+    input: StateChangeApprovalInput,
+    additional: StateChangeApprovalTarget[] = [],
   ): void {
-    const primaryBodyHash = input.bodyHash ?? computeStateChangeBodyHash(input.bodyPreview ?? null)
-    const targets = [
-      { ...input, bodyHash: primaryBodyHash },
-      ...additional.map(target => ({
-        ...target,
-        hasMultipart: target.hasMultipart ?? input.hasMultipart,
-        isRaceBurst: input.isRaceBurst,
-        isRceProof: input.isRceProof,
-        approvalId: input.approvalId,
-      })),
-    ]
-    const expiresAt = Date.now() + STATE_CHANGE_APPROVAL_TTL_MS
-    for (const target of targets) {
-      const fingerprint: StateChangeFingerprintInput = {
-        runId: run.id,
-        origin: target.origin,
-        method: target.method,
-        pathAndQuery: target.pathAndQuery,
-        scopeRevision: run.scopeRevision,
-        personaHandle: target.personaHandle ?? null,
-        bodyHash: target.bodyHash ?? null,
-        hasMultipart: Boolean(target.hasMultipart),
-        isRaceBurst: Boolean(target.isRaceBurst),
-        isRceProof: Boolean(target.isRceProof),
-      }
-      const instances = Math.max(1, target.instances ?? 1)
-      if (instances > 1) {
-        this.grantBurstApprovalInstances(fingerprint, instances, expiresAt)
-      } else {
-        this.stateChangeApprovals.grant(fingerprint, { expiresAt, approvalId: target.approvalId })
-      }
-    }
+    registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, input, additional)
   }
 
   private async waitForTier3Approval(
@@ -3163,7 +3059,7 @@ export class Execution {
       const phase0RootExchanges = new Map<string, BrokerExchangeResult>()
       if (!freshRun.phase0CompletedAt && approvedOrigins.size > 0 && this.authorize(job)) {
         try {
-          await runPhase0Recon({
+          const reconResult = await runPhase0Recon({
             storage: this.storage,
             runId: freshRun.id,
             scopeRevision: freshRun.scopeRevision,
@@ -3203,7 +3099,11 @@ export class Execution {
               })
               return saved.id
             },
-          })
+          }) as Awaited<ReturnType<typeof runPhase0Recon>> & Phase0GraphwireExtras
+          // v6 graphwire: the ranked plan bounds probe breadth without trimming the store, and
+          // AST code→runtime hypotheses become prioritized leads for the floor/agentic lane.
+          this.probePlans.record(this.storage, freshRun.id, reconResult.probePlan)
+          this.seedCodeToRuntimeLeads(this.storage.run(freshRun.id), claimed, reconResult.codeToRuntimeHypotheses ?? [])
           this.storage.updateRunDynamicStepBudget(freshRun.id, computeDynamicStepBudget(this.storage, freshRun.id))
         } catch {
           // Phase-0 failure must not block threat model progression
@@ -4633,6 +4533,43 @@ export class Execution {
     return Math.max(20_000, Math.min(intentLeaseMs * 0.85, Math.round(base * turnScale)))
   }
 
+  /**
+   * v6: record the current dry-streak length as telemetry. A productive step resets the streak by
+   * definition, so only increases are emitted. This is deliberately **not** a halt: the planner
+   * keeps scheduling until the budget/round contract ends the investigation phase.
+   */
+  private noteDryStreak(run: Pick<Run, 'id' | 'goalRevision'>): void {
+    const streak = countConsecutiveDrySteps(this.storage, run, this.agenticLaneAssignmentIds)
+    const previous = this.dryStreakObserved.get(run.id) ?? 0
+    if (streak <= previous) return
+    this.dryStreakObserved.set(run.id, streak)
+    this.storage.event(
+      run.id,
+      'planner.dry_streak',
+      `Observed ${streak} consecutive dry step(s); planning continues while budget and work remain.`,
+      {
+        consecutiveDrySteps: streak,
+        threshold: diminishingReturnsDryThreshold,
+        halted: false,
+      },
+    )
+  }
+
+  private seedCodeToRuntimeLeads(
+    run: Run,
+    assignment: Assignment,
+    hypotheses: readonly CodeToRuntimeHypothesis[],
+  ): number {
+    return seedGraphLeads(
+      this.storage,
+      run,
+      assignment,
+      hypotheses,
+      this.programGraphLeadsSeeded,
+      [...this.approvedOriginsSet(run)][0] ?? '',
+    )
+  }
+
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
@@ -4678,21 +4615,13 @@ export class Execution {
       slots -= 1
     }
 
-    // If nothing is running/ready/pending, check K=6 diminishing returns or trigger final planner review
+    // If nothing is running/ready/pending, check diminishing returns or trigger final planner review.
+    // v6: a dry streak is observed, never a global kill switch. Termination is budget/requests/wall
+    // exhaustion, per-assignment caps, drained OOB, or explicit coordinator completion.
     const updatedSteps = this.storage.listChainSteps(run.id, run.goalRevision)
     const anyActive = updatedSteps.some(s => ['pending', 'ready', 'running'].includes(s.status))
     if (!anyActive && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
-      const consecutiveDry = countConsecutiveDrySteps(this.storage, run, this.agenticLaneAssignmentIds)
-      if (consecutiveDry >= diminishingReturnsDryThreshold) {
-        this.storage.event(
-          run.id,
-          'planner.diminishing_returns',
-          `Halted dynamic queueing after ${consecutiveDry} consecutive dry steps (K=${diminishingReturnsDryThreshold}).`,
-          { consecutiveDrySteps: consecutiveDry, threshold: diminishingReturnsDryThreshold },
-        )
-        this.advanceToVerification(run)
-        return
-      }
+      this.noteDryStreak(run)
       const hasCanceledSibling = updatedSteps.some(s => Boolean(s.trialGroupId) && s.status === 'canceled')
       if (hasCanceledSibling) {
         const hasUntestedWork =
@@ -5050,8 +4979,15 @@ export class Execution {
     const approvedOrigins = this.approvedOriginsSet(current)
     if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
 
-    const endpoints = this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 150 })
-      .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE')
+    // Graphwire: full lossless store in, bounded ranked probe subset out. DELETE stays excluded
+    // from this legacy M1 fallback pass (its own tier gate lives in the engine lane).
+    const rankedProbe = selectRankedProbeTargets(
+      this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 5000 })
+        .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE'),
+      this.probePlans.get(this.storage, current.id),
+      { cap: 150 },
+    )
+    const endpoints = rankedProbe.targets
 
     const allParams = this.storage.listEndpointParams(current.id)
     const paramsByEndpoint = new Map<string, typeof allParams>()
@@ -5475,8 +5411,25 @@ export class Execution {
 
     // DELETE routes are part of the write surface: keep them so the engine can build the
     // function-level authorization hypothesis for them (the engine owns the tier gate).
-    const storedEndpoints = this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 220 })
-      .filter(ep => approvedOrigins.has(ep.origin))
+    // Graphwire: read the full store (lossless), probe only the Phase-0 ranked subset when one
+    // exists; otherwise use the risk-ranked cap. The store is never trimmed or rewritten.
+    const rankedProbe = selectRankedProbeTargets(
+      this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 5000 })
+        .filter(ep => approvedOrigins.has(ep.origin)),
+      this.probePlans.get(this.storage, current.id),
+      { cap: 220 },
+    )
+    const storedEndpoints = rankedProbe.targets
+    if (rankedProbe.usedPlan) {
+      try {
+        this.storage.event(
+          current.id,
+          'deterministic_engine.probe_plan_applied',
+          `Engine probing ${rankedProbe.probed} of ${rankedProbe.probed + rankedProbe.skippedStored} stored routes from the ranked plan (full store retained).`,
+          { usedPlan: true, probed: rankedProbe.probed, skippedStored: rankedProbe.skippedStored },
+        )
+      } catch { /* run may be gone */ }
+    }
     const allParams = this.storage.listEndpointParams(current.id)
     const paramsByEndpoint = new Map<string, typeof allParams>()
     for (const param of allParams) {
@@ -5561,6 +5514,8 @@ export class Execution {
           ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
           // Conventional action/noun wordlists are a local-lab convenience: on a real target the
           // engine relies on discovered routes, JS/router harvesting and the API reference.
+          // Graphwire: Program-Graph code→runtime hypotheses are probed first by the floor.
+          ...graphLeadTargets(this.storage.listFacts(current.id, { includeTainted: false, limit: 200 })),
           ...(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
             ? [...approvedOrigins].flatMap(origin =>
                 this.expandConventionalSurfaceTargets(
@@ -6341,18 +6296,10 @@ export class Execution {
     const dynamicStepBudget = Math.min(hardChainStepsCeiling, computeDynamicStepBudget(this.storage, fresh.id))
     this.storage.updateRunDynamicStepBudget(fresh.id, dynamicStepBudget)
 
-    // Diminishing-returns stop: K=6 consecutive dry steps halts dynamic planning cleanly
-    const consecutiveDry = countConsecutiveDrySteps(this.storage, fresh, this.agenticLaneAssignmentIds)
-    if (consecutiveDry >= diminishingReturnsDryThreshold) {
-      this.storage.event(
-        fresh.id,
-        'planner.diminishing_returns',
-        `Planner halted after ${consecutiveDry} consecutive dry steps (K=${diminishingReturnsDryThreshold}).`,
-        { consecutiveDrySteps: consecutiveDry, threshold: diminishingReturnsDryThreshold },
-      )
-      this.advanceToVerification(fresh)
-      return
-    }
+    // v6: a dry streak is telemetry only. Planning stops when the budget/wall clock is exhausted,
+    // the coordinator declares completion, or the queue is empty after the final planner round —
+    // never because a fixed number of consecutive steps produced no fact.
+    this.noteDryStreak(fresh)
 
     // v6 Phase 1: prioritized deterministic leads become upgrade assignments before the planner
     // runs, so the agentic lane never idles on confirmed routes and never loses a floor signal.
@@ -6591,7 +6538,7 @@ export class Execution {
       detLeadsCount: plannerDetLeads.length,
       alreadyConfirmedCount: plannerConfirmed.length,
       spawnedSteps: 0,
-      k6DryStreak: consecutiveDry,
+      k6DryStreak: countConsecutiveDrySteps(this.storage, afterRound, this.agenticLaneAssignmentIds),
       dynamicStepBudget,
       durationMs: Date.now() - plannerStartedAt,
       costUsd: Math.max(0, Number((afterRound.spentUsd - plannerSpendBefore).toFixed(6))),
@@ -8682,6 +8629,48 @@ export class Execution {
 
   // --- Phase 3: Zero-LLM Verification (Replay Specs + Baseline Checks) ---
 
+  /**
+   * v6 Phase 3/4: bounded pre-report drain of durable `pending_oob` subscriptions.
+   *
+   * A background worker can trigger an SSRF/XXE/webhook callback long after the HTTP response.
+   * Finalizing the report as soon as verification workers settle dropped exactly those callbacks.
+   * This waits up to `GUARDIAN_OOB_DRAIN_MS` (default 45 s), promotes late callbacks on every poll,
+   * and records `oobDrainMs` / `promotedLate` in run-event meta. It never waits when nothing is
+   * pending, so local-lab benchmark runs keep their zero-latency behavior.
+   */
+  async drainPendingOob(
+    runOrId: Pick<Run, 'id'> | string,
+    options: OobDrainOptions = {},
+  ): Promise<OobDrainResult> {
+    const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
+    const result = await drainPendingOob(this.canaryBroker, runId, options)
+    this.lastOobDrain.set(runId, result)
+    try {
+      this.storage.event(
+        runId,
+        'oob.drain_complete',
+        `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${result.remaining} still pending).`,
+        { ...result },
+      )
+    } catch { /* store closed */ }
+    return result
+  }
+
+  /** Read-only access to the last drain result (benchmark/test report meta). */
+  getLastOobDrain(runId: string): { oobDrainMs: number; promotedLate: number; remaining: number } | null {
+    return this.lastOobDrain.get(runId) ?? null
+  }
+
+  private scheduleFinalReport(run: Run): void {
+    scheduleFinalReport({
+      storage: this.storage,
+      relay: this.canaryBroker,
+      draining: this.verificationDraining,
+      lastDrain: this.lastOobDrain,
+      drain: runId => this.drainPendingOob(runId),
+    }, run)
+  }
+
   private advanceToVerification(run: Run) {
     // Never let Phase 3 start while the concurrent deterministic lane is still in flight: abort
     // and fast-settle first, then commit the phase transition exactly once.
@@ -8845,13 +8834,9 @@ export class Execution {
     const activeCount = [...this.active.values()].filter(j => j.assignment.runId === run.id).length
 
     if (!queued.length && updatedWorkers.every(w => w.status === 'complete' || w.status === 'canceled')) {
-      this.storage.transaction(() => {
-        const current = this.storage.run(run.id)
-        if (current.status !== 'running' || current.phase !== 'verification') return
-        const complete = this.storage.updateRun(current.id, { phase: 'complete', status: 'complete' })
-        this.storage.writeReport(complete, false)
-        this.storage.message(current.id, current.coordinatorId, 'guardian', 'Verification finished. The complete report is ready.')
-      }, { behavior: 'immediate' })
+      // v6: never finalize while async OOB callbacks can still land. A bounded drain promotes late
+      // callbacks (Fixture #2 delivers 15–30 s after the response) before the report is written.
+      this.scheduleFinalReport(run)
       return
     }
 
@@ -10544,6 +10529,7 @@ export class Execution {
       '# Result', '', outcome, '', 'Evidence: ' + artifactIds.join(', '),
     ].join('\n'), 'result', secrets)
     this.storage.updateWorker(worker.id, { status: 'complete', lease: null, leaseExpiresAt: null, outcome, checks })
+    this.disposeWorkerSessions(worker.id)
     this.storage.message(run.id, worker.id, 'worker', outcome, undefined, [...artifactIds, result.id], secrets)
     this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', {
       assignmentId: worker.id, artifactId: artifactIds[0] ?? result.id,
