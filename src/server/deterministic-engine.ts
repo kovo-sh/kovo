@@ -1538,8 +1538,12 @@ export function enumerateHypotheses(
         // A privileged mutation may act on the *caller's own* identity (impersonation, role grant)
         // instead of the addressed object. The observable state is then the actor's identity read,
         // and the mutation body carries the identity scope field the target itself echoed for the
-        // other persona. Both are bound by name so the replay asserts a named state delta.
-        const identity = mutating && privileged ? options.identityProfiles?.get(endpoint.origin) : undefined
+        // other persona. Only add this variant when no separate object readback exists: otherwise
+        // the primary proof covers the route and a second probe would only spend budget.
+        const sameSurfaceReadback = !readback || (readback.path.split('?')[0] || '/') === bare
+        const identity = mutating && privileged && Boolean(requiredRole) && sameSurfaceReadback
+          ? options.identityProfiles?.get(endpoint.origin)
+          : undefined
         if (identity) {
           const ownBody: Record<string, unknown> = { ...baseBody }
           const targetBody: Record<string, unknown> = { ...baseBody }
@@ -2181,8 +2185,10 @@ export function enumerateHypotheses(
           return undefined
         }
         const selfUpdateTarget = isUpdate && roleField && picks.lower ? selfRowId(picks.lower.handle) : undefined
-        const roleTarget = colleagueTarget ?? selfUpdateTarget ?? viewerTarget
-        const writer = (viewerTarget ?? selfUpdateTarget) ? picks.lower!.handle : picks.owner?.handle
+        // A self-service write must address the writer's own row: a colleague row may not be
+        // addressable at all, and the escalation is the writer's own record changing.
+        const roleTarget = selfUpdateTarget ?? colleagueTarget ?? viewerTarget
+        const writer = (selfUpdateTarget ?? viewerTarget) ? picks.lower!.handle : picks.owner?.handle
         const targetPath = roleTarget && hasIdPath
           ? bare.replace(idSegmentRe, `/${encodeURIComponent(roleTarget)}`)
           : massPath
