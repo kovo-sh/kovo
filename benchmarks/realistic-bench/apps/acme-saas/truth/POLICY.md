@@ -60,7 +60,8 @@ Seed 1 mounts `acme.billing-tamper` as a **hardened decoy**; `acme.seat-invarian
 
 1. *"Vertical BFLA: read-only viewer can PATCH/DELETE another user's private space"* (CWE-285,
    `/api/{projects}/:id`) — **agentic over-claim**. Same-tenant content write is in policy; the
-   engine's own first chain carried a cross-tenant control that was correctly denied (`404`) and then
+   chain's target id is a seeded workspace whose `owner_id` is empty (no owner to violate), and the
+   engine's own first chain carried a cross-tenant control that was correctly denied (`404`) before it
    re-submitted a chain without it. No privilege gain, no ownership violation, no oracle event.
    Verifier gaps: vertical-BFLA impact is satisfied by any 2xx mutation without a role or ownership
    reference, and a denied control (`404`) is treated as a spec error (`requireControlNonError`)
@@ -73,4 +74,16 @@ Seed 1 mounts `acme.billing-tamper` as a **hardened decoy**; `acme.seat-invarian
    Verifier gaps: no protected-field persistence proof, no oracle requirement for plan-price claims,
    and no role hierarchy (it cannot tell that `owner` is the highest role).
 
-Neither claim adds truth: the app does not implement the behaviour, so a target would inflate recall.
+3. *"CSRF: state-changing API accepts cross-origin text/plain requests"* (CWE-352, observed on
+   `POST /api/{projects}` in a later sample) — **agentic over-claim**. The session cookie is issued
+   `SameSite=Lax`, so a cross-site form POST does not carry `acme_sid`; the replay broker attached the
+   cookie regardless of the foreign `Origin`, which is not a browser-reachable request. The modelled
+   CSRF target is `acme.settings-csrf` (`updateSettings`): it is the only route with a
+   `csrf_state_change` oracle, and the only one carrying a form token in its hardened twin. A
+   token-less write on any other route has no impact event and lies outside the planted site.
+   Verifier gap: a CSRF claim is confirmed from "anonymous control denied + cookie-authenticated
+   cross-origin probe accepted" without consulting the cookie's SameSite policy (or bearer auth) and
+   without requiring the endpoint's `csrf_state_change` impact event.
+
+None of these claims adds truth: the app does not implement the behaviour, so a target would inflate
+recall. Each one is a verifier-side gap (see the bullets above), owned by `src/server/replay-verifier.ts`.
