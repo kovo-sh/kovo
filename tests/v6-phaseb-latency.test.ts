@@ -204,6 +204,27 @@ test('warm pool: three assignments reuse one container (one launch, two reuses)'
   await pool.close()
 })
 
+test('warm pool: a two-slot pool serves many assignments with two launches', async () => {
+  const { runner, creates } = stubPoolDocker()
+  const pool = new WarmWorkerPool({
+    cell: 'cell-slots',
+    image: 'guardian-worker:v4',
+    dockerRunner: runner,
+    runLabel: 'run-slots',
+    capacity: 2,
+  })
+  const signal = new AbortController().signal
+  for (let i = 0; i < 5; i += 1) {
+    const name = await pool.take(signal)
+    assert.ok(name)
+    assert.equal(await pool.release(name!), true)
+  }
+  assert.equal(creates(), 2, 'launches must be bounded by slot count, not assignment count')
+  assert.equal(pool.stats.created, 2)
+  assert.equal(pool.stats.reused, 3)
+  await pool.close()
+})
+
 test('warm pool: a container that is still running is removed, never parked', async () => {
   const calls: string[][] = []
   const runner: DockerRunner = async (args) => {

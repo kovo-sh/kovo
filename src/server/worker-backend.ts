@@ -716,6 +716,8 @@ export class WarmWorkerPool {
   private readonly idle: string[] = []
   private readonly inflight = new Set<Promise<void>>()
   private readonly used = new Set<string>()
+  /** Containers currently held by a session (excluding idle and in-flight creates). */
+  private readonly outstanding = new Set<string>()
   private disabled = false
   private closed = false
   private created = 0
@@ -790,9 +792,19 @@ export class WarmWorkerPool {
     return this.idle.includes(name)
   }
 
+  /** A pooled container died or was removed mid-session: stop accounting for it and refill. */
+  forget(name: string): void {
+    this.outstanding.delete(name)
+    this.used.delete(name)
+    this.fill()
+  }
+
   private fill(): void {
     if (!this.enabled) return
-    while (this.idle.length + this.inflight.size < this.capacity) {
+    // Total live pool containers (idle + in a session + being created) never exceeds capacity.
+    // A container returning from a session therefore becomes the next assignment's spare, instead
+    // of racing a speculative prewarm that would be discarded.
+    while (this.idle.length + this.outstanding.size + this.inflight.size < this.capacity) {
       let pending: Promise<void>
       pending = this.create().finally(() => { this.inflight.delete(pending) })
       this.inflight.add(pending)
@@ -856,6 +868,7 @@ export class WarmWorkerPool {
     const name = this.idle.shift()
     if (!name) return null
     liveContainers.delete(name)
+    this.outstanding.add(name)
     if (this.used.has(name)) this.reused += 1
     else this.used.add(name)
     return name
@@ -873,6 +886,7 @@ export class WarmWorkerPool {
    * container that is not stopped, or a pool that is full/disabled, is removed instead.
    */
   async release(name: string): Promise<boolean> {
+    this.outstanding.delete(name)
     if (!this.enabled) {
       this.discarded += 1
       await this.removeIdle(name)
@@ -1012,6 +1026,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // Coalesce concurrent removals: `finally` + the session close/error handlers can race,
     // and a second `docker rm` reports "removal ... already in progress" instead of a clean exit.
     if (this.warmPool?.owns(name)) return Promise.resolve()
+    if (this.pooled.delete(name)) this.warmPool?.forget(name)
     const existing = this.removals.get(name)
     if (existing) return existing
     const removal = this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000))
