@@ -1,101 +1,139 @@
-# Guardian v5 — Engineering Handover (`HANDOVER-v5.md`)
+# Guardian v5 — Freeze Handover (`HANDOVER-v5.md`)
 
-**Status:** RELEASE GATE PASS / capability gates open · **Snapshot:** 2026-11-22, `main` @ `a7ccb5f`
+**Status:** **v5.0 FREEZE CANDIDATE** — deterministic engine meets G4/G9; shipped `Execution` has no deterministic floor; final gate pending.
+**Snapshot:** 2026-11-22, `main` @ `d26cd01` (engine-port revert `a73f07e`)
 **Read first:** [VERIFICATION-v5.md](VERIFICATION-v5.md) · [plans/ROADMAP-v5.md](plans/ROADMAP-v5.md)
-**Previous line:** [HANDOVER-v4.md](HANDOVER-v4.md) · [VERIFICATION-v4.md](VERIFICATION-v4.md) (historical, closed)
+**Previous line:** [HANDOVER-v4.md](HANDOVER-v4.md) · [VERIFICATION-v4.md](VERIFICATION-v4.md) (historical)
 
 ---
 
-## 1. Where v5 stands
+## 1. Two scorecards
 
-| Milestone | Status | One-line handover |
-| :--- | :--- | :--- |
-| M0 | DONE | Real E2E `realistic-bench` harness, per-cell data-dir isolation, inert-run preflight. |
-| M1 | DONE | Broker/browser args, canaries, dedupe, routing/skills, verify feedback, guard/sanitizer split, CVE semver. Recon halt fix (`4ad4078`) recovered XBEN 20→24 en route to 25/25. |
-| M2 | DONE | State graph, recon, auth/session, endpoint graph, coverage tracking, cross-persona ID harvesting, BOLA consumer queue (10/10). |
-| M3 | DONE | CSRF/webhook/open-redirect/write-BOLA/race/noise probes; SSRF/XXE realism; spec contracts and probes3 merged. |
-| M4 | DONE | 1,724 templates, 492 modern CVE-named templates (493 unique modern CVE IDs), multi-framework AST, SAST→DAST bridge, Gate 6. |
-| M5 | DONE | Board UI, board tools, deterministic 0-LLM posters, warm specialists/handoffs. Board 14 node + 15 tools + 9 execution + 1 Playwright. |
-| M6 | PARTIAL | Deterministic gate and paired realism measured; post-race agentic matrix PENDING. |
+### A — Shipped production runtime (`Execution`), actual v5.0
 
-**Release gate:** **876/876 PASS**, 0 fail, 0 skip, 0 orphans (`docs/reverify-v5.sh --full`). **This is not capability parity:** G4 (H/C recall) and G8 (chains) are still NOT MET; G5 (white-box) is unmeasured. Details: [VERIFICATION-v5.md §2](VERIFICATION-v5.md#2-release-gates-v5-target-vs-current).
+Scope: 3 apps, grey-box, dev seed 1, $2/600 s per cell, Tier-3 local-lab, Docker verifier.
 
----
+| Mode | Confirmed | Recall | Precision | Decoy/unmatched | Worker failures | Cost |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `--no-llm` | **0 / 59** | **0%** | 0 confirmed; 2 unmatched FPs | 0 / 2 | 0 | $0.00 |
+| agentic (post race-fix) | **7 / 59** | **11.9%** | **100%** (7/7) | 0 / 0 | 0 | **$0.4844** total; $0.069/finding |
 
-## 2. What changed
+Agentic per-cell: acme 2/22, opsportal 4/18, shopflow 1/19; all three hit the 600 s wall. No shipped deterministic floor.
 
-- **Realism:** dev **86/172 (50.0%)**, held-out **87/171 (50.9%)**, both precision 100%, 0/62 and 0/63 decoy FPs, 0 unmatched. Gap **+0.9 pp** (G9 met).
-- **H/C recall:** dev **64/117 = 54.7%**, held-out **65/124 = 52.4%**. G4 (≥65%) is still NOT MET.
-- **Saturation suites:** XBEN **25/25** (parity restored), held-out SaaS **20/20** with **20/20 patches fixed**, `allPatches=fixed`.
-- **Class highlights:** SSRF **12/12** after the realism merge (final scorecard 11/12), XXE **7/7**, BOLA **17/19**, SQLi **5/7**, stored XSS **6/6**, traversal **6/6**, mass assignment **6/11**.
-- **Gate:** full deterministic gate **876/876**, 0 orphans; the current v5 glob independently runs **237/237**.
-- **Secret evidence:** broker pre-redaction `secretMatches` fingerprints (`kind`, `sha256Prefix`, `fieldPath`, `count`) enable disclosure proofs without raw secrets.
-- **Integrity fixes:** project-name escaping and tag-aware XSS monitors; SSRF/XXE app realism; decoy audit; worker-removal race/lifecycle fix.
+### B — Deterministic engine harness (procedural)
 
----
+| Suite | Confirmed | Recall | Precision | Gap |
+| :--- | ---: | ---: | ---: | ---: |
+| realistic dev | **115 / 172** | **66.9%** | 100% | — |
+| salted held-out | **111 / 171** | **64.9%** | 100% | **−2.0 pp** |
+| XBEN-25 | **25 / 25** | 100% | 100% | — |
+| held-out-saas | **20 / 20** + **20/20 patches** | 100% | 100% | `allPatches=fixed` |
 
-## 3. Operational notes
+H/C: **70.9% dev**, **67.7% held-out**. Chains: **1/6** both splits. Final deterministic rerun completed: **115/172 dev, 111/171 held-out**.
 
-- **Worktree setup:** symlink `node_modules` (and `worker/node_modules`) from the base checkout.
-- **AST suites:** run `npm run worker:install` or link `worker/node_modules`.
-- **Docker:** use `newgrp docker -c '<command>'`; plain `docker info` can return permission denied.
-- **Agentic runs:** model profile + `--verifier docker` + `--isolate-data-dir`; `local-jq` + profile is inert and must fail fast.
-- **Credentials:** model key under the Guardian data dir (`credentials/…`, mode 600); never print/copy/commit.
-- **Salt:** `~/.config/guardian-bench/heldout.salt` (mode 600); env `GUARDIAN_RB_HELDOUT_SALT` only; never echo.
-- **OOB:** harness binds one loopback canary port and passes it to the app allowlist; optional `GUARDIAN_CANARY_PORT` / `GUARDIAN_CANARY_DNS_PORT`; never bind off-loopback.
-- **Loopback only:** no external target probing.
-- **Artifacts:** copy structured scorecards out of `/tmp`; `/tmp` is ephemeral.
+### v5.1 candidate — NOT shipped
+
+`agents/engine-port`: `--no-llm` 25/59, agentic 28/59, 100% precision, 0 decoy/unmatched, 0 worker failures, $0.140 / $0.005 per finding. Deferred because the merge regressed 25 existing Execution/E2E tests (planner budgets, specialist tools, multi-trial, fallback). Do not cite as v5.0.
 
 ---
 
-## 4. Open work, in order
+## 2. Convergence gap
 
-1. **Realism recall:** raise H/C from 54.7% to ≥65% (grey) and measure ≥80% (white). Focus on `replay_spec_miss` and the zero classes (reflected XSS, business logic, workflow, command injection, JWT/auth bypass).
-2. **White-box matrix:** run the 9 cells with `--mode white-box` and record recall/decoy FPs (G5).
-3. **Chains:** 0/6 on both splits; finish chain planning/browser-chain verification and add chain fixtures (G8).
-4. **Agentic post-fix matrix:** report separately when complete; do not reuse the stale pre-fix 12/117 baseline as current.
-5. **Precision at scale:** keep the decoy audit as recall rises.
-6. **Patch attribution:** report clean dismissals (18/20) separately; run a fresh all-patches pass.
-7. **Gate coverage:** expand the gate script’s v5 row to include all 237 current v5 tests, or document the subset explicitly.
-8. **Artifact durability:** move `/tmp` evidence into release storage.
-9. **H/C parity:** overall gap is +0.9 pp, but H/C is −2.3 pp; track both.
+**v5.0: the product has no deterministic floor.** Shipped runtime is 7/59 agentic (11.9%) and 0/59 no-LLM; procedural is 115/172 (66.9%) — a **55 pp** gap. The ported engine exists on `agents/engine-port` but is deferred; its gap to procedural is ~19 pp.
+
+| Cause | v5.1 action |
+| :--- | :--- |
+| Engine-port reverted (`a73f07e`); 25 existing tests regressed | Rebuild without planner/tool/multi-trial/fallback regressions |
+| Latest JWT/mass converters not ported into `src/server/deterministic-engine.ts` | Port remaining converters (candidate branch) |
+| `Execution` surface ingestion incomplete (v5.0 25 endpoints / 59 targets; candidate 45 / 59) | Full surface ingestion + evidence-derived discovery |
+| 600 s wall consumed by deterministic pass (candidate) | Reallocate budgets; document opsportal early stop |
+| Specialist deterministic-pair scope guard (candidate) | Replace with ReplayVerifier proof-strength + endpoint binding |
 
 ---
 
-## 5. Reproduction
+## 3. Tier-3 safety (shipped)
 
-Use [VERIFICATION-v5.md §8](VERIFICATION-v5.md#8-reproduction). Core commands:
+Five invariants: environment isolation, origin binding, strict precedence, broker guards (destructive/webshell/metadata-SSRF/RPS), audited `auto-review:local-lab` attribution.
+
+Containment fix (`343bf16`, `0fd6127`): external redirect hops denied in local-lab; project environment defaults to **public** and fails closed; relative/loopback/container-alias redirects still work; metadata/link-local SSRF stays blocked.
+
+Tests: **8/8** Tier-3 safety; **15/15** with `approval-judge`.
+
+---
+
+## 4. Gates
+
+| Gate | Status |
+| :--- | :--- |
+| G1 XBEN ≥23 | **MET** (25/25) |
+| G2 held-out ≥18 | **MET** (20/20) |
+| G3 patches ≥14 | **MET** (20/20, caveat) |
+| G4 H/C ≥65% | **MET on deterministic harness** (70.9%); runtime 11.9% |
+| G5 white-box ≥80% | **NOT MEASURED** |
+| G6 precision ≥95% | **PARTIAL** — deterministic 100%, agentic 7/7; `--no-llm` 0 confirmed + 2 unmatched FPs |
+| G7 decoy FP ≤5% | **MET** (0) |
+| G8 chains ≥50% | **NOT MET** (1/6) |
+| G9 held-out within 10 pp | **MET** (−2.0 pp all-severity; −3.2 pp H/C) |
+| G10 release gate | **PENDING** — freeze run not clean; last clean 980/980 pre-revert |
+| G11 orphan hygiene | **PASS** direct check (0 stale, 0 networks); gate pending |
+
+**Do not quote Scorecard B as the runtime result.**
+
+---
+
+## 5. Milestones
+
+M0–M5 **DONE**; M6 **PARTIAL** — deterministic matrix measured, runtime has no floor, final gate/white-box/salted Execution/chains/engine-port rebuild remain.
+
+---
+
+## 6. v5.1 priorities
+
+1. Rebuild the engine-port without the 25 Execution/E2E regressions.
+2. Port remaining JWT/mass converters and close surface ingestion.
+3. Replace the specialist scope guard with proof-strength + endpoint-binding guards.
+4. Fix wall-clock allocation and opsportal early stop.
+5. Run salted held-out and white-box `Execution` matrices.
+6. Raise chains from 1/6 to ≥50%.
+7. Finalize the release gate and preserve artifacts.
+
+---
+
+## 7. Reproduction
+
+Use [VERIFICATION-v5.md §10](VERIFICATION-v5.md#10-reproduction).
 
 ```bash
-# Official full gate (Docker + Playwright), 876/876 expected.
+# Shipped runtime scorecard A
+newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/home/omarchy/guardian-data && node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/v5-runtime-agentic'
+
+# No-LLM baseline (0/59 on v5.0)
+newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 && node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/v5-runtime-no-llm'
+
+# Freeze gate (PENDING at this snapshot)
 newgrp docker -c 'bash docs/reverify-v5.sh --full'
 
-# Independent v5 suites (237/237 on this tree).
-newgrp docker -c \
-  'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 && node --test --test-concurrency=1 tests/v5-*.test.ts'
-
-# Secret fingerprints (9/9).
-node --test tests/v5-secret-meta.test.ts
+# Tier-3 safety
+GUARDIAN_ALLOW_LOCAL_LAB=1 node --test tests/v5-tier3-safety.test.ts tests/approval-judge.test.ts
 ```
 
----
-
-## 6. Commit anchors
-
-| Milestone | Commit | Role |
-| :--- | :--- | :--- |
-| M0 | `ac5cebd` / `795f7c6` / `36998da` | harness, isolation, preflight |
-| M1 | `5dae946` / `0fd8a9d` / `4ad4078` | wiring, static audit, recon halt fix |
-| M2 | `198cdad` / `e111d29` / `476e03c` | endpoint graph/coverage/ID harvest, auth |
-| M3 | `5aa897c` / `769311c` / `253f6c6` / `09596ae` | probes, contracts, probes3/realism |
-| M4 | `c19e98a` / `05f2e39` / `e3202d7` / `0797d70` | corpus, AST/bridge/Gate 6, wiring |
-| M5 | `4b41388` / `b0b3cce` / `93ff078` / `f0e9bb7` | Board, tools, posters/warm specialists |
-| M6 | `d54b463` / `84eb476` / `974904c` / `23dde15` | agentic matrix, gate/lifecycle, final gate |
-| Secret meta | `e18a775` / `a7ccb5f` | fingerprints, merge |
-| Docs | `agents/docs-v5` | this handover + `VERIFICATION-v5.md` |
+OOB listeners are loopback-only; pin with `GUARDIAN_CANARY_PORT` / `GUARDIAN_CANARY_DNS_PORT`. Salt stays in `GUARDIAN_RB_HELDOUT_SALT`, never printed.
 
 ---
 
-## 7. Honest limitations
+## 8. Commit anchors
 
-The release gate is green, but v5 is not capability-complete. Realistic all-severity recall is ~50%, H/C is 54.7% dev / 52.4% held-out against a 65% target, white-box is unmeasured, and chains are 0/6. The agentic baseline (12/117, 66.7% precision) predates the worker-removal race fix; the post-fix matrix is pending. Patch evidence includes two inconclusive retests and a replay-based all-patches pass. The official gate’s v5 row covers 118 tests; the full v5 glob is 237/237, so gate coverage should be expanded before the next release decision.
+| Area | Commit |
+| :--- | :--- |
+| Engine-port candidate | `abcbd29` (branch `agents/engine-port`) |
+| Revert from main | `a73f07e` |
+| Workflow-synthesis restore | `d26cd01` |
+| Tier-3 safety | `76a4903` |
+| Tier-3 containment | `343bf16` / `0fd6127` |
+| Final replay specs | `4a37c2c` / `2d1d8f4` |
+
+---
+
+## 9. Honest limitations
+
+v5.0 ships the deterministic engine harness at 66.9% dev / 64.9% held-out (G4/G9 met), but the real `Execution` path is 11.9% agentic / 0% no-LLM because the port was reverted. Chains are 1/6, white-box is unmeasured, salted/white-box runtime matrices are v5.1, the final gate is pending, and patch evidence includes two inconclusive-after retests plus a replay-based all-patches pass.
