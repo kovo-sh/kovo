@@ -252,9 +252,42 @@ test('guards: catch-all HTML response cannot confirm without a real endpoint bas
 })
 
 // ---------------------------------------------------------------------------
-// 5. Declared-vs-actual endpoint binding
+// 4b. Auth bypass with a login-redirect control still confirms
 // ---------------------------------------------------------------------------
 
+test('guards: auth-bypass whose control is a login redirect still confirms via marker differential', async () => {
+  const fx = await fixture((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (url.pathname !== '/admin') return html(res, 404, 'not found')
+    if (req.headers['x-middleware-subrequest']) return html(res, 200, '<html><body>admin dashboard</body></html>')
+    res.statusCode = 302
+    res.setHeader('Location', '/login')
+    res.end()
+  })
+  try {
+    const spec = {
+      ...baseFields(fx.origin),
+      category: 'broken-access-control',
+      cwe: 'CWE-287',
+      kind: 'http_chain',
+      steps: [
+        { id: 'c1', role: 'control', description: 'Admin without bypass header', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/admin' } },
+        { id: 'p1', role: 'probe', description: 'Admin with bypass header', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/admin', headers: { 'x-middleware-subrequest': 'middleware' } } },
+      ],
+      assertionsJq: `{ controlPassed: (.steps.c1.status == 302),
+        confirmed: (.steps.p1.status == 200 and (.steps.p1.body | contains("admin dashboard"))),
+        observed: ("probe=" + (.steps.p1.status | tostring)), expected: "login redirect on both" }`,
+    }
+    const res = await verify(spec, grantFor([fx.origin]))
+    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
+    const proof = res.evidencePayload.proofStrength as { differential?: string }
+    assert.equal(proof.differential, 'denied_then_allowed')
+  } finally { await fx.close() }
+})
+
+// ---------------------------------------------------------------------------
+// 5. Declared-vs-actual endpoint binding
+// ---------------------------------------------------------------------------
 function itemServer() {
   return fixture((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')

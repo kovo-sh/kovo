@@ -335,7 +335,7 @@ function readJsonField(json: unknown, path: readonly string[]): string | null {
 /** Non-secret quoted literals used by the assertion, for identifier-bound marker disclosure checks. */
 function jqStringLiterals(program: string): string[] {
   const out = new Set<string>()
-  for (const match of program.matchAll(/"((?:[^"\\]|\\.){12,120})"/g)) {
+  for (const match of program.matchAll(/"((?:[^"\\]|\\.){8,120})"/g)) {
     const value = match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
     if (!value || /[\r\n\0]/.test(value)) continue
     if (/^(?:application\/json|content-type|content-security-policy)$/i.test(value)) continue
@@ -446,9 +446,12 @@ function detectHttpChainDifferential(
   const sameRoute = (a: HttpChainStepSnapshot, b: HttpChainStepSnapshot) =>
     a.method === b.method && a.route === b.route && a.route !== ''
   const denied = (step: HttpChainStepSnapshot) => step.status === 401 || step.status === 403
+  // A control that is bounced (login/SSO redirect) did not receive the resource either.
+  const bounced = (step: HttpChainStepSnapshot) =>
+    step.status !== null && step.status >= 300 && step.status < 400
 
   // 1. The same endpoint is denied to the control caller and served to the probe caller.
-  if (probes.some(probe => dataBearing(probe) && controls.some(control => sameRoute(control, probe) && denied(control)))) {
+  if (probes.some(probe => dataBearing(probe) && controls.some(control => sameRoute(control, probe) && (denied(control) || bounced(control))))) {
     return 'denied_then_allowed'
   }
 
