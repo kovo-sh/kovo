@@ -1,0 +1,118 @@
+{
+  "fixture": "enterprise-spa",
+  "version": 1,
+  "summary": "Split-origin enterprise SPA with an external OIDC IdP, hybrid cookie/Bearer tenant auth, introspection-disabled GraphQL, interactive admin tabs/modals and a stored XSS rendered only in the authenticated admin view.",
+  "findings": [
+    {
+      "id": "spa-stored-xss-admin",
+      "title": "Stored XSS in note body renders in the authenticated admin moderation view",
+      "vulnClass": "stored_xss",
+      "cwe": "CWE-79",
+      "severity": "high",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/admin",
+      "trigger": { "method": "POST", "endpoint": "/api/notes" },
+      "persona": "u-alpha-1",
+      "impact": "script execution in an authenticated admin browser session (session/token theft, admin action forgery)",
+      "chain": "spa-admin-compromise",
+      "evidence": [
+        "member inbox escapes the same stored body",
+        "admin ?tab=inbox renders the stored body as rich HTML"
+      ]
+    },
+    {
+      "id": "spa-graphql-bola",
+      "title": "GraphQL member resolver ignores the caller tenant",
+      "vulnClass": "bola",
+      "cwe": "CWE-639",
+      "severity": "high",
+      "origin": "api",
+      "method": "POST",
+      "endpoint": "/api/graphql",
+      "persona": "u-alpha-1",
+      "impact": "cross-tenant member profile disclosure (email, role, tenant)",
+      "evidence": ["member(id: \"u-beta-1\") returns bob@beta from a tenant-alpha token"]
+    },
+    {
+      "id": "spa-admin-export-bfla",
+      "title": "Admin member export requires authentication but not the admin role",
+      "vulnClass": "bfla",
+      "cwe": "CWE-862",
+      "severity": "high",
+      "origin": "api",
+      "method": "GET",
+      "endpoint": "/api/admin/export",
+      "persona": "u-alpha-1",
+      "impact": "any member token dumps every tenant's member directory",
+      "chain": "spa-admin-compromise",
+      "evidence": ["tenant-alpha member token receives tenant-beta rows and the beta export canary"]
+    },
+    {
+      "id": "spa-jwt-alg-none",
+      "title": "Session refresh trusts JWT claims without verifying the signature (alg none)",
+      "vulnClass": "auth_bypass",
+      "cwe": "CWE-347",
+      "severity": "critical",
+      "origin": "api",
+      "method": "POST",
+      "endpoint": "/api/session/refresh",
+      "persona": "anonymous",
+      "impact": "self-signed alg:none token with role=admin yields an admin session token",
+      "evidence": ["forged payload sub=u-alpha-1 role=admin is accepted"]
+    },
+    {
+      "id": "spa-oidc-open-redirect",
+      "title": "OIDC authorize endpoint does not allowlist redirect_uri",
+      "vulnClass": "open_redirect",
+      "cwe": "CWE-601",
+      "severity": "medium",
+      "origin": "idp",
+      "method": "GET",
+      "endpoint": "/authorize",
+      "persona": "anonymous",
+      "impact": "authorization codes are delivered to an attacker-controlled origin (account takeover after interception)",
+      "evidence": ["redirect_uri=https://evil.example/steal returns 302 to that origin with a fresh code"]
+    }
+  ],
+  "chains": [
+    {
+      "id": "spa-admin-compromise",
+      "title": "Member-to-admin tenant compromise",
+      "members": ["spa-stored-xss-admin", "spa-admin-export-bfla"],
+      "description": "A member stores markup that executes in the admin moderation view, then the same member token pulls the tenant-wide member export without a role check."
+    }
+  ],
+  "decoys": [
+    {
+      "id": "spa-profile-tenant-scope",
+      "origin": "api",
+      "method": "GET",
+      "endpoint": "/api/profile",
+      "vulnClass": "bola",
+      "reason": "REST profile compares X-Tenant-Id with the token tenant and returns 403 cross-tenant."
+    },
+    {
+      "id": "spa-graphql-introspection",
+      "origin": "api",
+      "method": "POST",
+      "endpoint": "/api/graphql",
+      "vulnClass": "information_disclosure",
+      "reason": "Introspection is disabled server-side; the error is intended hardening, not a finding."
+    },
+    {
+      "id": "spa-cdn-chunk",
+      "origin": "assets",
+      "method": "GET",
+      "endpoint": "/chunks/app.js",
+      "vulnClass": "information_disclosure",
+      "reason": "Public CDN application shell contains no secrets or tenant data."
+    }
+  ],
+  "invariants": {
+    "hosts": ["assets.local", "app.local", "api.local", "idp.local"],
+    "graphqlIntrospection": "disabled",
+    "adminViewRequiresAuth": true,
+    "adminSessionCookie": "HttpOnly"
+  }
+}
