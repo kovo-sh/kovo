@@ -2060,6 +2060,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   // GUARDIAN_DETERMINISTIC_ENGINE). Record the effective value in cell meta as well.
   if (args.conventionalWordlist) delete process.env.GUARDIAN_CONVENTIONAL_WORDLIST
   else process.env.GUARDIAN_CONVENTIONAL_WORDLIST = '0'
+  // The product surface benefits from response-driven object siblings; the procedural capability
+  // harness keeps its historical corpus (the flag is opt-in in phase0-recon).
+  process.env.GUARDIAN_RECON_SIBLINGS = '1'
   const cellCount = cellKeys(args).length
   // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
   const sourceDataDir = args.noLlm ? undefined : args.dataDir

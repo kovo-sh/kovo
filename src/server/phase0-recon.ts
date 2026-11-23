@@ -2302,6 +2302,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
   let siblingEndpoints = 0
   let methodHints = 0
+  // Sibling derivation and its OPTIONS probes are opt-in: a caller that owns its own surface
+  // corpus (the procedural capability harness) keeps the historical endpoint set unless enabled.
+  const siblingDerivationEnabled = /^(?:1|true|on|yes)$/i.test((process.env.GUARDIAN_RECON_SIBLINGS ?? '').trim())
 
   // Tier 0: zero live HTTP requests
   if (tier === 0) {
@@ -3046,6 +3049,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
     let siblingOptionsProbes = 0
     const recordSiblingSurface = async (rawCollection: string, sampleId?: string): Promise<number> => {
+      if (!siblingDerivationEnabled) return 0
       if (siblingSeen.size >= 8) return 0
       const bare = (rawCollection.split('?')[0] || '/').replace(/\/+$/, '')
       if (!bare || bare === '/' || STATIC_ASSET_RE.test(bare)) return 0

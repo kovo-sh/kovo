@@ -277,7 +277,7 @@ describe('response-driven sibling derivation', () => {
     const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
     const grant: Grant = makeLabGrant(fx.origin, { tier: 1 })
 
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
+    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_RECON_SIBLINGS: '1' }, () => runPhase0Recon({
       storage,
       runId: setup.runId,
       scopeRevision: setup.run.scopeRevision,
