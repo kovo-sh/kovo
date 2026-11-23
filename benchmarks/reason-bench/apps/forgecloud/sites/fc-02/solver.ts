@@ -37,7 +37,7 @@ export async function solve(ctx: SolverCtx): Promise<void> {
     method: 'POST',
     path: pathOf(ctx, 'automations.create'),
     headers: json,
-    body: { name: 'nightly-release', roleTemplate: 'admin' },
+    body: { name: 'nightly-release' },
   })
 
   await ctx.request({ method: 'GET', path: pathOf(ctx, 'automations.list'), headers: auth })
