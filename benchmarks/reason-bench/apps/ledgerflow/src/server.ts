@@ -2,7 +2,6 @@
 // policy monitor set; this module applies the schema, seeds deterministic data, starts the internal
 // loopback service mocks, builds the app context, mounts the materialized site modules ahead of the
 // shared area modules, serves the SPA and listens on loopback only.
-import { createHmac, timingSafeEqual } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -27,6 +26,7 @@ import type { VerifyWebhookOpts } from '../../../lib/webhook.ts'
 import { simulateCommand } from '../../../lib/simshell.ts'
 import { parseXml } from '../../../lib/xml.ts'
 import type { ParseXmlOpts } from '../../../lib/xml.ts'
+import { verifyCanonical } from '../../../lib/hmac.ts'
 import { assertLocalLabAllowed } from '../../../lib/safety.ts'
 import { applySchema } from './db.ts'
 import { createDbFacade } from './db-facade.ts'
@@ -64,16 +64,6 @@ export interface RunningServer {
   close(): Promise<void>
 }
 
-function scopedSignature(secret: string, scope: string, body: string, ts: string): string {
-  return createHmac('sha256', secret).update(`${ts}.${scope}.${body}`).digest('hex')
-}
-
-function equalHex(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  const ab = Buffer.from(a, 'hex'); const bb = Buffer.from(b, 'hex')
-  return ab.length === bb.length && ab.length > 0 && timingSafeEqual(ab, bb)
-}
-
 export function createWiring(impact: Recorder, secrets: { jwt: string; webhookSecretFor(tenant: string): string }): Wiring {
   return {
     makeVfs: (files) => createVfs(impact, files),
@@ -87,8 +77,10 @@ export function createWiring(impact: Recorder, secrets: { jwt: string; webhookSe
     signWebhook: (secret, body, ts) => signWebhook(secret, body, ts),
     verifyWebhook: (secret, body, ts, sig) => verifyWebhook(secret, body, ts, sig, { toleranceSec: 300, [REC]: impact } as VerifyWebhookOpts),
     verifyScopedWebhook: (secret, scope, body, ts, sig) => {
-      const expected = scopedSignature(secret, scope, body, ts)
-      return equalHex(expected, sig)
+      const dot = scope.indexOf('.')
+      const tenantId = dot >= 0 ? scope.slice(0, dot) : scope
+      const eventType = dot >= 0 ? scope.slice(dot + 1) : ''
+      return verifyCanonical(secret, ts, { tenantId, eventType }, body, sig, { toleranceSec: 300 })
     },
     simulate: (template, args) => {
       const result = simulateCommand(template, args, impact)

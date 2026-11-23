@@ -51,6 +51,7 @@ async function start(opts: {
   plan: VariantPlan
   groundTruth: StartedApp['groundTruth']
   oobCallbackPorts?: number[]
+  sourceDir?: string
 }): Promise<StartedApp> {
   const { plan, groundTruth } = opts
   const sink = createOracle({ app: plan.app })
@@ -69,20 +70,23 @@ async function start(opts: {
     console.warn(`ledgerflow: skipping site ${site.id}; missing ${mode} implementation`)
     return false
   })
-  const mat = materialize({
-    bp: { ...blueprint, sites: mounted },
-    plan,
-    appDir: HERE,
-    libDir: join(HERE, '..', '..', 'lib'),
-  })
-  const serverMod = (await import(pathToFileURL(join(mat.sourceDir, 'server.ts')).href)) as {
+  const mat = opts.sourceDir
+    ? null
+    : materialize({
+      blueprint: { ...blueprint, sites: mounted },
+      plan,
+      appDir: HERE,
+      libDir: join(HERE, '..', '..', 'lib'),
+    })
+  const sourceDir = opts.sourceDir ?? mat!.sourceDir
+  const serverMod = (await import(pathToFileURL(join(sourceDir, 'server.ts')).href)) as {
     startServer(o: StartServerOpts): Promise<RunningServer>
   }
   const running = await serverMod.startServer({
     plan,
     oracle: sink,
     monitors,
-    uiDir: join(mat.sourceDir, '..', 'ui'),
+    uiDir: mat ? mat.uiDir : join(sourceDir, '..', 'ui'),
     oobCallbackPorts: opts.oobCallbackPorts,
     db, ids, canaries, secrets, wiring, makeApp,
   })
@@ -91,14 +95,14 @@ async function start(opts: {
     origin: running.origin,
     plan,
     groundTruth,
-    sourceDir: mat.sourceDir,
+    sourceDir,
     oracle: sink,
     async stop() {
       await running.close()
-      mat.cleanup()
+      mat?.cleanup()
     },
   }
 }
 
-const mod: AppModule = { name: blueprint.app, blueprint, start }
+const mod: AppModule = { name: blueprint.app, blueprint, reasonBench: true, start }
 export default mod

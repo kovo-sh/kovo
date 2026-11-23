@@ -47,20 +47,24 @@ function orderedSlugPair(a: string, b: string): { a: string; b: string } {
 export function domainOf(plan: VariantPlan): DomainRules {
   const p = plan as unknown as Bag
   const domain = bag(p.domain ?? p.rules ?? p.semantics)
-  const roles = bag(domain.roles ?? domain.roleLabels)
-  const states = bag(domain.states ?? domain.stateLabels)
-  const cur = bag(domain.currencies ?? domain.currency ?? domain.economics)
-  const coupon = bag(domain.coupon ?? domain.coupons ?? domain.economics)
-  const transfer = bag(domain.transfer ?? domain.transfers ?? domain.economics)
-  const slugs = bag(domain.tenantSlugs ?? domain.tenants ?? domain.slugPair ?? domain.slugs)
+  const roles = bag(domain.roleVocab ?? domain.roles ?? domain.roleLabels)
+  const states = bag(domain.stateLabels ?? domain.states ?? domain.stateVocab)
+  const econ = bag(domain.economics)
+  const cur = bag(domain.currencies ?? domain.currency)
+  const curPair = Array.isArray(domain.economics) ? [] : (Array.isArray(econ.currencies) ? econ.currencies : [])
+  const coupon = bag(domain.coupon ?? domain.coupons)
+  const transfer = bag(domain.transfer ?? domain.transfers)
+  const slugs = bag(domain.tenants ?? domain.tenantSlugs ?? domain.slugPair ?? domain.slugs)
   const personaA = personaCredential(plan, 'owner_a', 'persona_a')
   const personaB = personaCredential(plan, 'member_b', 'persona_b')
   const pair = orderedSlugPair(
-    text(slugs.a ?? slugs.orgA ?? slugs.primary, personaA?.tenant ?? 'acme'),
-    text(slugs.b ?? slugs.orgB ?? slugs.secondary, personaB?.tenant ?? 'acme-corp'),
+    text(slugs.orgA ?? slugs.a ?? slugs.primary, personaA?.tenant ?? 'acme'),
+    text(slugs.orgB ?? slugs.b ?? slugs.secondary, personaB?.tenant ?? 'acme-corp'),
   )
-  const base = text(cur.base, 'USD').toUpperCase()
-  const quote = text(cur.quote, base === 'EUR' ? 'USD' : 'EUR').toUpperCase()
+  const base = text(curPair[0], text(cur.base, 'USD')).toUpperCase()
+  const quote = text(curPair[1], text(cur.quote, base === 'EUR' ? 'USD' : 'EUR')).toUpperCase()
+  const feeCents = num(econ.transferFeeCents ?? transfer.feeCents, NaN)
+  const bonusCents = num(econ.promoBonusCents ?? transfer.bonusCents, NaN)
   return {
     roles: {
       owner: text(roles.owner, 'owner'),
@@ -72,9 +76,9 @@ export function domainOf(plan: VariantPlan): DomainRules {
       draft: text(states.draft, 'draft'),
       pending: text(states.pending, 'pending'),
       settled: text(states.settled, 'settled'),
-      open: text(states.open, 'open'),
-      paid: text(states.paid, 'paid'),
-      fulfilled: text(states.fulfilled, 'fulfilled'),
+      open: text(states.open ?? states.pending, 'open'),
+      paid: text(states.paid ?? states.settled, 'paid'),
+      fulfilled: text(states.fulfilled ?? states.settled, 'fulfilled'),
     },
     currencies: {
       base,
@@ -83,12 +87,12 @@ export function domainOf(plan: VariantPlan): DomainRules {
       quoteRateMicros: num(cur.quoteRateMicros ?? cur.quoteRate, 920_000),
     },
     coupon: {
-      percent: Math.min(60, Math.max(5, num(coupon.percent ?? coupon.percentOff ?? domain.couponPercent, 20))),
-      minSpendCents: Math.max(0, num(coupon.minSpendCents ?? coupon.min_spend_cents ?? domain.couponMinSpendCents, 20_000)),
+      percent: Math.min(60, Math.max(5, num(econ.couponPercent ?? coupon.percent ?? coupon.percentOff, 20))),
+      minSpendCents: Math.max(0, num(econ.couponMinSpendCents ?? coupon.minSpendCents ?? coupon.min_spend_cents, 20_000)),
     },
     transfer: {
-      feeMicros: Math.max(0, num(transfer.feeMicros ?? transfer.fee, 250_000)),
-      rebateMicros: Math.max(0, num(transfer.rebateMicros ?? transfer.rebate, 0)),
+      feeMicros: Number.isFinite(feeCents) ? Math.max(0, feeCents * 10_000) : Math.max(0, num(transfer.feeMicros ?? transfer.fee, 250_000)),
+      rebateMicros: Number.isFinite(bonusCents) ? Math.max(0, bonusCents * 10_000) : Math.max(0, num(transfer.rebateMicros ?? transfer.rebate, 0)),
     },
     tenantSlugs: pair,
   }

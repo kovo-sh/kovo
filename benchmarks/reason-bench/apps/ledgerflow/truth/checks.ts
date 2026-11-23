@@ -5,6 +5,11 @@ import type { Actor } from '../../../lib/types.ts'
 import type { Db, AuditRow } from '../../../lib/db.ts'
 import type { RequestCtx } from '../../../lib/oracle.ts'
 import type { HttpResult } from '../../../lib/http.ts'
+import {
+  checkCacheTenantBleed, checkCrossOrgTransfer, checkEconomicConservation, checkHmacScope,
+  checkParserDifferential, checkRevocation, checkSelfApproval, checkSignedUrlPrefix,
+  checkSsoTenantConfusion,
+} from '../../../lib/policy-oracle.ts'
 
 export type Emit = (kind: string, detail: Record<string, string | number | boolean>, sink: string) => void
 
@@ -67,7 +72,10 @@ export function checkAuthorization(db: Db, ctx: RequestCtx, rows: AuditRow[], em
       if (after > before) {
         const hasAdmin = ctx.inputs.some((v) => v.trim().toLowerCase() === 'admin')
         const hasLow = ctx.inputs.some((v) => /^(viewer|member)$/i.test(v.trim()))
-        if (hasAdmin && hasLow) emit('parser_differential_bypass', { field: 'role', to: String(row.neu!.role) }, 'db:users')
+        if (hasAdmin && hasLow) {
+          const result = checkParserDifferential({ edgeValue: 'admin', handlerValue: 'viewer', actionSucceeded: true, field: 'role' })
+          if (result.violated) emit('parser_differential_bypass', { to: String(row.neu!.role), ...result.detail }, 'db:users')
+        }
       }
     }
   }
@@ -139,18 +147,22 @@ export function checkEconomic(db: Db, ctx: RequestCtx, rows: AuditRow[], emit: E
     const order = db.get<Record<string, unknown>>('SELECT * FROM orders WHERE external_id = ?', [orderId])
     if (!order) continue
     const refunded = db.get<{ total: number }>('SELECT COALESCE(SUM(amount_cents),0) AS total FROM refunds WHERE order_id = ? AND status != ?', [orderId, 'voided'])?.total ?? 0
-    if (Number(refunded) > Number(order.paid_cents)) {
-      emit('economic_invariant_violation', { reason: 'refund_exceeds_paid', order: orderId, refunded, paid: Number(order.paid_cents) }, 'db:refunds')
-    }
-    if (FULFILLED.has(String(order.status)) && Number(order.paid_cents) < Number(order.total_cents)) {
-      emit('economic_invariant_violation', { reason: 'underpaid_fulfilment', order: orderId, paid: Number(order.paid_cents), total: Number(order.total_cents) }, 'db:orders')
-    }
-    if (order.coupon_code) {
-      const coupon = db.get<{ min_spend_cents: number }>('SELECT min_spend_cents FROM coupons WHERE code = ? AND tenant_id = ?', [String(order.coupon_code), String(order.tenant_id)])
-      if (coupon && Number(order.subtotal_cents) < Number(coupon.min_spend_cents)) {
-        emit('economic_invariant_violation', { reason: 'coupon_below_minimum', order: orderId }, 'db:coupons')
-      }
-    }
+    const coupon = order.coupon_code
+      ? db.get<{ min_spend_cents: number }>('SELECT min_spend_cents FROM coupons WHERE code = ? AND tenant_id = ?', [String(order.coupon_code), String(order.tenant_id)])
+      : undefined
+    const fulfilled = FULFILLED.has(String(order.status))
+    const result = checkEconomicConservation({
+      paidTotal: Number(order.paid_cents),
+      refundedTotal: Number(refunded),
+      balancesBefore: 0,
+      balancesAfter: 0,
+      fulfilledValue: fulfilled ? Number(order.total_cents) : undefined,
+      paidAmount: fulfilled ? Number(order.paid_cents) : undefined,
+      coupons: order.coupon_code && coupon
+        ? [{ code: String(order.coupon_code), applied: true, cartTotal: Number(order.subtotal_cents), minSpend: Number(coupon.min_spend_cents) }]
+        : [],
+    })
+    if (result.violated) emit('economic_invariant_violation', { order: orderId, ...result.detail }, 'db:economics')
   }
 
   const walletRows = touched(rows, 'wallets')
@@ -216,9 +228,13 @@ export function checkPayoutShadow(db: Db, sinceSeq: number, emit: Emit): number 
     'SELECT seq, payout_id, original_creator_id, creator_id, approved_by, status FROM payout_audit WHERE seq > ? ORDER BY seq', [sinceSeq],
   )
   for (const row of rows) {
-    if (row.status === 'approved' && row.approved_by && row.approved_by === row.original_creator_id) {
-      emit('self_approval_bypass', { payout: row.payout_id, originalCreator: row.original_creator_id }, 'db:payouts')
-    }
+    const result = checkSelfApproval({
+      creatorId: row.creator_id,
+      shadowCreatorId: row.original_creator_id,
+      approverId: row.approved_by,
+      approved: row.status === 'approved',
+    })
+    if (result.violated) emit('self_approval_bypass', { payout: row.payout_id, ...result.detail }, 'db:payouts')
   }
   return rows.length ? rows[rows.length - 1]!.seq : sinceSeq
 }
@@ -231,7 +247,8 @@ export function checkRevoked(ctx: RequestCtx, res: HttpResult, db: Db, emit: Emi
     const hash = createHash('sha256').update(input).digest('hex')
     const revoked = db.get<{ token_hash: string }>('SELECT token_hash FROM revoked_tokens WHERE token_hash = ?', [hash])
     if (revoked) {
-      emit('revoked_token_used', { tokenHash: revoked.token_hash.slice(0, 12) }, 'session:revoked')
+      const result = checkRevocation({ tokenHash: hash, revokedTokens: [hash], accepted: true })
+      if (result.violated) emit('revoked_token_used', result.detail, 'session:revoked')
       return
     }
   }
@@ -271,7 +288,8 @@ export function checkSso(db: Db, ctx: RequestCtx, res: HttpResult, rows: AuditRo
     return Boolean(row)
   })
   if (pendingFromInput) {
-    emit('sso_tenant_confusion', { reason: 'unverified_pending_email_used' }, 'sso:pending')
+    const result = checkSsoTenantConfusion({ signatureValid: true, expectedTid: tenant || 'unknown', matchedOn: 'pending_email' })
+    if (result.violated) emit('sso_tenant_confusion', result.detail, 'sso:pending')
     return
   }
   const pending = db.get<{ id: number }>("SELECT id FROM sso_accounts WHERE pending_email != '' AND verified = 0 LIMIT 1")
@@ -279,7 +297,7 @@ export function checkSso(db: Db, ctx: RequestCtx, res: HttpResult, rows: AuditRo
 }
 
 /** A valid delivery signature was replayed under a different tenant or event scope. */
-export function checkWebhook(db: Db, rows: AuditRow[], emit: Emit): void {
+export function checkWebhook(db: Db, rows: AuditRow[], emit: Emit, canonicalValid?: (row: Record<string, unknown>) => boolean): void {
   for (const row of touched(rows, 'webhook_events')) {
     const data = (row.neu ?? row.old) as Record<string, unknown> | null
     const signature = String(data?.signature ?? '')
@@ -290,7 +308,14 @@ export function checkWebhook(db: Db, rows: AuditRow[], emit: Emit): void {
     const tenants = new Set(scopes.map((s) => s.tenant_id))
     const types = new Set(scopes.map((s) => s.event_type))
     if (tenants.size > 1 || types.size > 1) {
-      emit('hmac_scope_replay', { tenants: tenants.size, eventTypes: types.size }, 'webhook:scope')
+      const canonical = canonicalValid ? canonicalValid(data ?? {}) : false
+      const signed = scopes[0]!
+      const result = checkHmacScope({
+        signatureValid: true,
+        signedScope: { tenantId: signed.tenant_id, eventType: signed.event_type },
+        presentedScope: { tenantId: String(data?.tenant_id ?? ''), eventType: String(data?.event_type ?? '') },
+      })
+      if (result.violated) emit('hmac_scope_replay', { tenants: tenants.size, eventTypes: types.size, canonicalValid: canonical, ...result.detail }, 'webhook:scope')
     }
   }
 }
@@ -306,12 +331,8 @@ export function checkSignedUrl(db: Db, ctx: RequestCtx, emit: Emit): void {
       continue
     }
     if (tenant) {
-      const jail = `/exports/${tenant}/`
-      const slash = input.indexOf('/', '/exports/'.length)
-      const dir = slash > 0 ? input.slice(0, slash + 1) : input
-      if (dir !== jail && !input.startsWith(jail)) {
-        emit('signed_url_prefix_escape', { path: input, jail }, 'vfs:/exports')
-      }
+      const result = checkSignedUrlPrefix({ tenantSlug: tenant, requestedPath: input })
+      if (result.violated) emit('signed_url_prefix_escape', { path: input, ...result.detail }, 'vfs:/exports')
     }
   }
 }
@@ -324,9 +345,14 @@ export function checkCrossOrg(db: Db, ctx: RequestCtx, rows: AuditRow[], emit: E
     const from = db.get<{ tenant_id: string }>('SELECT tenant_id FROM wallets WHERE external_id = ?', [String(data.from_wallet ?? '')])
     const to = db.get<{ tenant_id: string }>('SELECT tenant_id FROM wallets WHERE external_id = ?', [String(data.to_wallet ?? '')])
     if (!from || !to || from.tenant_id === to.tenant_id) continue
-    if (rank(currentRole(db, ctx.actor, from.tenant_id)) < RANK.admin!) {
-      emit('cross_org_transfer', { from: from.tenant_id, to: to.tenant_id }, 'db:wallets')
-    }
+    const result = checkCrossOrgTransfer({
+      resourceTenantBefore: from.tenant_id,
+      resourceTenantAfter: to.tenant_id,
+      actorTenant: ctx.tenant ?? from.tenant_id,
+      actorRoleOnSource: currentRole(db, ctx.actor, from.tenant_id),
+      actionSucceeded: true,
+    })
+    if (result.violated) emit('cross_org_transfer', result.detail, 'db:wallets')
   }
 }
 
@@ -338,7 +364,8 @@ export function checkCacheBleed(ctx: RequestCtx, body: string, prior: Map<string
     const tag = match[1]!
     if (ctx.tenant && tag !== ctx.tenant.replace(/[^a-z0-9]/gi, '').slice(0, 10).toLowerCase()) {
       if (previousTenant && previousTenant !== ctx.tenant) {
-        emit('cache_tenant_bleed', { priorTenant: previousTenant, actorTenant: ctx.tenant ?? 'none' }, 'cache:tenant')
+        const result = checkCacheTenantBleed({ hit: true, cacheTenant: previousTenant, actorTenant: ctx.tenant ?? null, actionSucceeded: true })
+        if (result.violated) emit('cache_tenant_bleed', { token: match[0], ...result.detail }, 'cache:tenant')
       }
     }
   }

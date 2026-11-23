@@ -9,7 +9,7 @@ import type { CanaryRegistry } from '../../../lib/canary.ts'
 import { createPrng } from '../../../lib/prng.ts'
 import { defaultSystemFiles } from '../../../lib/vfs.ts'
 import { sign as jwtSign } from '../../../lib/jwt.ts'
-import { signWebhook } from '../../../lib/webhook.ts'
+import { signCanonical } from '../../../lib/hmac.ts'
 import { domainOf, personaCredential } from './plan.ts'
 
 export interface SeedSecrets { jwt: string; webhookSecretFor(tenant: string): string }
@@ -234,8 +234,7 @@ export function seed(db: Db, deps: {
   const endpointB = db.get<{ external_id: string }>('SELECT external_id FROM webhook_endpoints WHERE tenant_id = ?', [slugB])!.external_id
   const ts = String(Math.floor((T0 - 3600_000) / 1000))
   const payload = JSON.stringify({ tenant: slugB, type: 'payment.settled', data: { amount_cents: 4200 } })
-  const scope = `${slugB}.payment.settled.${payload}`
-  const signature = signWebhook(secrets.webhookSecretFor(slugB), scope, ts)
+  const signature = signCanonical(secrets.webhookSecretFor(slugB), ts, { tenantId: slugB, eventType: 'payment.settled' }, payload)
   db.run('INSERT INTO webhook_events (external_id,tenant_id,event_type,signature,ts,payload,processed,received_at) VALUES (?,?,?,?,?,?,?,?)',
     [ids.encode('hookevent', ++n), slugB, 'payment.settled', signature, ts, payload, 1, T0 - 3600_000])
 
