@@ -265,6 +265,8 @@ type Active = {
   assignment: Assignment
   origins: Set<string>
   controller: AbortController
+  /** Set when the provider-stream watchdog aborted this assignment (retry once). */
+  stallAbort?: boolean
 }
 
 type Capture = { observation: PublicObservation | null; note: string }
@@ -930,6 +932,188 @@ export function computeStepMaxTurns(
   const allLowValueStatic = stepOrigins.every(o => (hostTiers[o] ?? classifyHostTier(o)) === 'low_value_static')
   if (!allLowValueStatic) return baseMaxTurns
   return Math.max(4, Math.min(baseMaxTurns, 15, Math.floor(baseMaxTurns * 0.2)))
+}
+
+// ============================================================================
+// Phase-B throughput: assignment budget + provider-stall accounting
+//
+// The Phase-B measurement showed a median assignment wall of ~150 s at K=6, dominated by
+// single-route steps held open for 25+ turns. A slot is the scarce resource, so a step that names
+// one or two routes gets a short wall cap and a tight turn budget; only a chain step that cites
+// upstream evidence (parent facts / prior steps) is allowed the long cap. The helpers are pure so
+// the contract is testable without a live run.
+// ============================================================================
+
+/** Turn budget for a single-route / single-step assignment (settlement fires at N-2). */
+export const SINGLE_STEP_ASSIGNMENT_MAX_TURNS = 12
+/** Wall cap for a single-step assignment; a slot must turn over inside ~90 s. */
+export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 85_000
+/** Multi-step chains that cite parent evidence keep the long cap (bounded below). */
+export const CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS = 120_000
+export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 180_000
+/** A provider generation longer than this is recorded as a stall turn (flag threshold). */
+export const PROVIDER_STALL_TURN_MS = 10_000
+/** Hard-stall abort threshold floor/ceiling (multiple of the observed median turn latency). */
+export const PROVIDER_STALL_ABORT_FLOOR_MS = 30_000
+export const PROVIDER_STALL_ABORT_CEILING_MS = 60_000
+/** One retry only: a stream that stalls twice is treated as an assignment failure. */
+export const MAX_PROVIDER_STALL_RETRIES = 1
+
+/** Env override for the single-step wall cap (bounded to 30–120 s so a slot still turns over). */
+export function singleStepWallClockMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.GUARDIAN_SINGLE_STEP_WALL_CLOCK_MS)
+  if (!Number.isFinite(raw) || raw <= 0) return SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS
+  return Math.max(30_000, Math.min(120_000, Math.round(raw)))
+}
+
+export interface AssignmentBudgetInput {
+  /** Endpoint templates the step names (see `stepMentionedRoutes`). */
+  routes: readonly string[]
+  /** Upstream evidence the step cites (`dependsOnFactIds`; the chain signal). */
+  parentEvidenceIds: readonly string[]
+  dependsOnStepIds: readonly string[]
+  baseMaxTurns: number
+  baseWallClockMs: number
+  singleStepWallClockMs?: number
+}
+
+export interface AssignmentBudget {
+  kind: 'single_step' | 'chain'
+  maxTurns: number
+  wallClockMs: number
+  /** Turn at which the hard settlement nudge fires (N-2). */
+  settlementTurn: number
+}
+
+/**
+ * Tight budget for a standalone step, long budget only for a chain that cites upstream evidence.
+ * A step that names many routes but cites no evidence is still a standalone assignment: breadth is
+ * not depth, and a wall-capped slot is more valuable than a wide, unanchored probe sweep.
+ */
+export function planAssignmentBudget(input: AssignmentBudgetInput): AssignmentBudget {
+  const chain = input.parentEvidenceIds.length > 0 || input.dependsOnStepIds.length > 0
+  const baseTurns = Math.max(4, Math.floor(input.baseMaxTurns))
+  const baseWall = Math.max(20_000, Math.round(input.baseWallClockMs))
+  if (chain) {
+    const maxTurns = Math.max(18, Math.min(34, baseTurns))
+    return {
+      kind: 'chain',
+      maxTurns,
+      wallClockMs: Math.min(CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS, Math.max(CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS, baseWall)),
+      settlementTurn: Math.max(1, maxTurns - 2),
+    }
+  }
+  const maxTurns = Math.max(8, Math.min(SINGLE_STEP_ASSIGNMENT_MAX_TURNS, baseTurns))
+  return {
+    kind: 'single_step',
+    maxTurns,
+    wallClockMs: Math.max(30_000, Math.min(input.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, baseWall)),
+    settlementTurn: Math.max(1, maxTurns - 2),
+  }
+}
+
+/** Nearest-rank percentile (0 for an empty sample). */
+export function percentile(values: readonly number[], p: number): number {
+  if (!values.length) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  const rank = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1))
+  return sorted[rank]!
+}
+
+export interface TurnLatencySummary {
+  samples: number
+  p50: number
+  p90: number
+  /** Turns whose generation wall exceeded `stallMs`. */
+  stallTurns: number
+  stallMs: number
+}
+
+/** Run-level Phase-B throughput telemetry, mirrored into an event the scorecard can read. */
+export interface AssignmentThroughputMetrics {
+  reason: string
+  assignmentsObserved: number
+  assignmentsCompleted: number
+  assignmentsPausedAtStop: number
+  /** Assignment wall (dispatch → completion/stop) percentiles in ms. */
+  assignmentWallP50: number
+  assignmentWallP90: number
+  assignmentWallSamples: number
+  /** Mean turns per observed investigation assignment. */
+  turnsPerAssignment: number
+  providerStallTurns: number
+  turnLatencyP50: number
+  turnLatencyP90: number
+  containersLaunched: number
+  containersReused: number
+  containerSessions: number
+  coldContainerSessions: number
+  idleWarmContainers: number
+  warmCapacity: number
+}
+
+/** Per-turn generation latencies: p50/p90 + how many turns crossed the stall flag threshold. */
+export function summarizeTurnLatencies(samples: readonly number[], stallMs = PROVIDER_STALL_TURN_MS): TurnLatencySummary {
+  const clean = samples.filter(ms => Number.isFinite(ms) && ms >= 0)
+  return {
+    samples: clean.length,
+    p50: Math.round(percentile(clean, 50)),
+    p90: Math.round(percentile(clean, 90)),
+    stallTurns: clean.filter(ms => ms > stallMs).length,
+    stallMs,
+  }
+}
+
+/**
+ * Hard-stall abort threshold: never below the floor (a slow-but-progressing turn must not be
+ * killed), scaled with the observed median so a provider whose normal turns are already slow is
+ * not aborted on every generation, and never above the ceiling.
+ */
+export function providerStallAbortMs(medianTurnMs: number): number {
+  const scaled = Number.isFinite(medianTurnMs) && medianTurnMs > 0 ? medianTurnMs * 4 : PROVIDER_STALL_ABORT_FLOOR_MS
+  return Math.min(PROVIDER_STALL_ABORT_CEILING_MS, Math.max(PROVIDER_STALL_ABORT_FLOOR_MS, Math.round(scaled)))
+}
+
+export function shouldRetryStalledAssignment(attempt: number): boolean {
+  return Math.max(0, Math.floor(attempt)) < MAX_PROVIDER_STALL_RETRIES
+}
+
+/**
+ * Queue drain: a paused/queued assignment whose chain step is still `running` (pause mid-flight,
+ * process restart, slot reclaimed) never re-enters dispatch on its own. Reset the step to `ready`
+ * and retire the dead assignment so the freed slot is used by the scheduler instead of the step
+ * starving forever. Returns the number of recovered steps.
+ */
+export function requeueInterruptedAssignments(
+  storage: Pick<Store, 'workerList' | 'listChainSteps' | 'updateWorker' | 'updateChainStep' | 'event' | 'transaction'>,
+  run: Pick<Run, 'id' | 'goalRevision'>,
+): number {
+  const steps = storage.listChainSteps(run.id, run.goalRevision)
+  const stepById = new Map(steps.map(step => [step.id, step]))
+  let recovered = 0
+  for (const worker of storage.workerList(run.id)) {
+    if (worker.phase !== 'investigation' || !worker.stepId) continue
+    if (worker.status !== 'paused' && worker.status !== 'queued') continue
+    const step = stepById.get(worker.stepId)
+    if (!step || (step.status !== 'running' && step.status !== 'ready')) continue
+    storage.transaction(() => {
+      storage.updateWorker(worker.id, {
+        status: 'canceled',
+        outcome: 'Requeued after interruption; slot reclaimed by the queue drain.',
+        lease: null,
+        leaseExpiresAt: null,
+      })
+      storage.updateChainStep(step.id, { status: 'ready', assignedWorkerId: null })
+      storage.event(run.id, 'worker.requeued', `${step.title} requeued after pause; slot returned to the scheduler.`, {
+        assignmentId: worker.id,
+        stepId: step.id,
+        previousStatus: worker.status,
+        attempt: worker.attempt,
+      })
+    }, { behavior: 'immediate' })
+    recovered += 1
+  }
+  return recovered
 }
 
 export function applyCrownJewelStepBudget<T extends { title: string; priority: number; origins: string[] }>(
@@ -1628,6 +1812,11 @@ export class Execution {
   /** v6 Phase 1 gate counters (observed inputs, not asserted capability claims). */
   private readonly laneStartedAt = new Map<string, number>()
   private readonly laneWallByRun = new Map<string, number>()
+  /** Phase-B throughput telemetry: per-run assignment wall samples and provider turn latencies. */
+  private readonly assignmentWallByRun = new Map<string, number[]>()
+  private readonly turnLatencyByRun = new Map<string, number[]>()
+  private readonly providerStallTurnsByRun = new Map<string, number>()
+  private readonly lastAssignmentMetrics = new Map<string, AssignmentThroughputMetrics>()
   /** runId → first agent dispatch time after Phase A, for phase-timing telemetry. */
   private readonly agenticFloorDispatchedAt = new Map<string, number>()
   /** runId → Phase A window (start/finish), retained for finalize-time summaries. */
@@ -1746,6 +1935,7 @@ export class Execution {
       ])
       for (const runId of runIds) {
         try { this.recordFloorMetrics(runId, 'finalize') } catch { /* metrics are best-effort */ }
+        try { this.recordAssignmentMetrics(runId, 'finalize') } catch { /* metrics are best-effort */ }
       }
     } catch { /* store may be unavailable during teardown */ }
     // v6 staging: agent-tool mutations captured a grant while tagging; hand the run tag back to the
@@ -4835,6 +5025,57 @@ export class Execution {
     } catch { /* metrics are best-effort */ }
   }
 
+  /**
+   * Phase-B throughput telemetry (observed, never asserted): assignment wall p50/p90, turns per
+   * assignment, provider stall turns, and container launches/reuse. `verified_tp_per_100s_phase_b`
+   * is driven by these, so they must be readable without parsing raw logs.
+   */
+  private recordAssignmentMetrics(runId: string, reason: string): AssignmentThroughputMetrics | null {
+    let workers: Assignment[] = []
+    try {
+      workers = this.storage.workerList(runId).filter(worker => worker.phase === 'investigation')
+    } catch { return null }
+    const walls = this.assignmentWallByRun.get(runId) ?? []
+    const turnSamples = this.turnLatencyByRun.get(runId) ?? []
+    const turnSummary = summarizeTurnLatencies(turnSamples)
+    const containers = this.backend.containerStats?.()
+    const turns = workers.map(worker => worker.turnsUsed)
+    const metrics: AssignmentThroughputMetrics = {
+      reason,
+      assignmentsObserved: workers.length,
+      assignmentsCompleted: workers.filter(worker => worker.status === 'complete').length,
+      assignmentsPausedAtStop: workers.filter(worker => worker.status === 'paused').length,
+      assignmentWallP50: Math.round(percentile(walls, 50)),
+      assignmentWallP90: Math.round(percentile(walls, 90)),
+      assignmentWallSamples: walls.length,
+      turnsPerAssignment: turns.length ? Math.round((turns.reduce((sum, n) => sum + n, 0) / turns.length) * 10) / 10 : 0,
+      providerStallTurns: this.providerStallTurnsByRun.get(runId) ?? 0,
+      turnLatencyP50: turnSummary.p50,
+      turnLatencyP90: turnSummary.p90,
+      containersLaunched: containers?.created ?? 0,
+      containersReused: containers?.reused ?? 0,
+      containerSessions: containers?.sessions ?? 0,
+      coldContainerSessions: containers?.coldSessions ?? 0,
+      idleWarmContainers: containers?.idle ?? 0,
+      warmCapacity: containers?.capacity ?? 0,
+    }
+    this.lastAssignmentMetrics.set(runId, metrics)
+    try {
+      this.storage.event(
+        runId,
+        'agentic.assignment_metrics',
+        `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s).`,
+        { ...metrics },
+      )
+    } catch { /* metrics are best-effort */ }
+    return metrics
+  }
+
+  /** Last recorded Phase-B throughput metrics for a run (test/benchmark seam). */
+  getAssignmentThroughput(runId: string): AssignmentThroughputMetrics | null {
+    return this.lastAssignmentMetrics.get(runId) ?? null
+  }
+
   // --- Slice 3 / agentic value-add: read-only prompt context builders ---
   /** Confirmed + static-verified (endpoint, method, param, cwe) refs. Prompt context only. */
   private alreadyConfirmedRefs(run: Run, limit = 10): AlreadyConfirmedRef[] {
@@ -5162,6 +5403,14 @@ export class Execution {
     // Fan out eligible crown-jewel leads into parallel multi-trial branches before scheduling
     this.expandEligibleMultiTrialSteps(run)
 
+    // Queue drain: a paused/queued assignment whose step is still `running` (pause mid-flight,
+    // restart, reclaimed slot) never re-enters dispatch by itself. Requeue it so a slot that
+    // freed is used instead of the step starving behind a dead assignment.
+    try {
+      const recovered = requeueInterruptedAssignments(this.storage, run)
+      if (recovered > 0) this.storage.event(run.id, 'scheduler.queue_drain', `Requeued ${recovered} interrupted assignment(s).`, { recovered })
+    } catch { /* drain is best-effort */ }
+
     this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
 
     // Phase A: the deterministic floor runs sequentially *before* any agent dispatch, using the
@@ -5198,6 +5447,9 @@ export class Execution {
       })
 
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
+    // One warm session container per worker slot: assignments reuse stopped containers instead of
+    // paying a cold `container create` each dispatch.
+    try { this.backend.setWarmCapacity?.(maxConc) } catch { /* pooling is best-effort */ }
     const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
     const leadStepIds = new Set(steps.filter(step => isDetLeadDispatchStep(step)).map(step => step.id))
     const activeLeadCount = [...this.active.values()].filter(job =>
@@ -7285,11 +7537,21 @@ export class Execution {
       Math.min(specialistConfig.maxTurnsCeiling, run.workerMaxTurns > 0 ? Math.min(run.workerMaxTurns, specialistConfig.defaultMaxTurns) : specialistConfig.defaultMaxTurns),
     )
     const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, baseSpecialistTurns)
+    // Throughput: a standalone step gets a short cap so the slot turns over; only a step that
+    // cites upstream evidence keeps the long chain budget.
+    const budget = planAssignmentBudget({
+      routes: this.stepMentionedRoutes(step),
+      parentEvidenceIds: step.dependsOnFactIds,
+      dependsOnStepIds: step.dependsOnStepIds,
+      baseMaxTurns: stepMaxTurns,
+      baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
+      singleStepWallClockMs: singleStepWallClockMs(),
+    })
 
     const assignment = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {
         stepId: step.id,
-        maxTurns: stepMaxTurns,
+        maxTurns: budget.maxTurns,
         parentFactIds: step.dependsOnFactIds,
         sourceOrigins: targetOrigins,
       })
@@ -7309,6 +7571,7 @@ export class Execution {
       })
       this.storage.event(run.id, 'worker.started', `${step.title} started.`, {
         assignmentId: claimed.id, stepId: step.id, specialistProfile: resolvedSpecialistId,
+        assignmentBudget: budget,
       })
       return claimed
     }, { behavior: 'immediate' })
@@ -7338,9 +7601,44 @@ export class Execution {
 
     this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)
 
-    void this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles).catch(error => {
+    void this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles, budget).catch(error => {
       if (error instanceof BudgetExceededError) {
         this.storage.checkBudgetExceeded(run.id)
+        return
+      }
+      // Provider-stream stall: aborting the assignment's provider call frees the slot without
+      // spending the rest of its wall budget. One retry is allowed per assignment.
+      if (job.stallAbort) {
+        const attempt = job.assignment.attempt
+        if (shouldRetryStalledAssignment(attempt)) {
+          this.storage.transaction(() => {
+            this.storage.updateWorker(assignment.id, {
+              status: 'canceled',
+              outcome: 'Provider stream stalled; requeued once for a fresh attempt.',
+              attempt: attempt + 1,
+              lease: null,
+              leaseExpiresAt: null,
+            })
+            this.storage.updateChainStep(step.id, { status: 'ready', assignedWorkerId: null })
+            this.storage.event(run.id, 'worker.stall_retry', `${step.title} provider stream stalled; requeued once.`, {
+              assignmentId: assignment.id, stepId: step.id, attempt: attempt + 1,
+            })
+          })
+          return
+        }
+        this.storage.transaction(() => {
+          this.storage.updateWorker(assignment.id, {
+            status: 'failed',
+            outcome: 'Provider stream stalled after retry; slot released.',
+            attempt: attempt + 1,
+            lease: null,
+            leaseExpiresAt: null,
+          })
+          this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assignment.id })
+          this.storage.event(run.id, 'worker.stall_failed', `${step.title} provider stream stalled twice; assignment closed without consuming the wall cap.`, {
+            assignmentId: assignment.id, stepId: step.id,
+          })
+        })
         return
       }
       if (!this.authorize(job) || job.controller.signal.aborted) return
@@ -7365,6 +7663,7 @@ export class Execution {
     step: ChainStep,
     targetOrigins: string[],
     profiles: readonly ResolvedModelProfile[],
+    budget: AssignmentBudget,
   ) {
     const run = this.check(job)
     const permittedAtAdmission = this.approvedOriginsSet(run)
@@ -7378,6 +7677,41 @@ export class Execution {
       reposDir ? { reposDir } : undefined,
     )
     const startedAt = Date.now()
+    // Per-turn generation latencies (provider stream), plus a watchdog that aborts a buffered
+    // stream instead of letting it consume the assignment wall.
+    const turnLatencies: number[] = []
+    let generationStartedAt: number | undefined
+    let stallTimer: NodeJS.Timeout | undefined
+    const clearStallTimer = () => {
+      if (stallTimer) { clearTimeout(stallTimer); stallTimer = undefined }
+    }
+    const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50))
+    const armStallTimer = (turn: number) => {
+      clearStallTimer()
+      generationStartedAt = Date.now()
+      if (job.stallAbort) return
+      stallTimer = setTimeout(() => {
+        if (!generationStartedAt) return
+        const elapsed = Date.now() - generationStartedAt
+        job.stallAbort = true
+        try {
+          this.storage.event(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(elapsed / 1000)}s without a response); aborting to free the slot.`, {
+            assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: elapsed, thresholdMs: stallAbortMs(),
+          })
+        } catch { /* telemetry only */ }
+        job.controller.abort(new Error('Provider stream stalled.'))
+      }, stallAbortMs())
+      stallTimer.unref?.()
+    }
+    const recordTurnLatency = () => {
+      if (generationStartedAt === undefined) return
+      const ms = Math.max(0, Date.now() - generationStartedAt)
+      generationStartedAt = undefined
+      clearStallTimer()
+      turnLatencies.push(ms)
+      const stalls = this.providerStallTurnsByRun.get(run.id) ?? 0
+      if (ms > PROVIDER_STALL_TURN_MS) this.providerStallTurnsByRun.set(run.id, stalls + 1)
+    }
 
     try {
       // Stage relevant specs and parent facts inside the air-gapped container
@@ -9235,8 +9569,8 @@ export class Execution {
           ...(assignmentBrief ? { assignmentBrief } : {}),
         }),
         signal: job.controller.signal,
-        maxTurns: job.assignment.maxTurns,
-        wallClockMs: this.specialistWallClockMs(job.assignment.maxTurns),
+        maxTurns: budget.maxTurns,
+        wallClockMs: budget.wallClockMs,
         ...(runTrace ? {
           trace: runTrace,
           traceContext: {
@@ -9272,10 +9606,12 @@ export class Execution {
           )
         },
         onTurn: turn => {
+          recordTurnLatency()
           this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
           this.storage.recordLlmSpend(run.id, { turns: 1 })
         },
         onTurnStart: turn => {
+          armStallTimer(turn)
           const member = this.storage.boardMember(run.id, boardHandle)
           const delta = this.boardTurnDelta(this.storage.run(run.id), boardHandle, member?.lastReadSeq ?? 0)
           if (!delta.text) return undefined
@@ -9296,6 +9632,15 @@ export class Execution {
         this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
     } finally {
+      clearStallTimer()
+      generationStartedAt = undefined
+      const wallMs = Math.max(0, Date.now() - startedAt)
+      const walls = this.assignmentWallByRun.get(run.id) ?? []
+      walls.push(wallMs)
+      this.assignmentWallByRun.set(run.id, walls)
+      const samples = this.turnLatencyByRun.get(run.id) ?? []
+      samples.push(...turnLatencies)
+      this.turnLatencyByRun.set(run.id, samples)
       await session.close().catch(() => undefined)
     }
   }
@@ -9379,6 +9724,7 @@ export class Execution {
         `Investigation complete${openProofGaps.length ? ` (${openProofGaps.length} open proof ${openProofGaps.length === 1 ? 'gap' : 'gaps'} surfaced)` : ''}. Deterministic Zero-LLM verification is replaying every proposed finding and checking baselines.`)
     }, { behavior: 'immediate' })
     try { this.recordFloorMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
+    try { this.recordAssignmentMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
   }
 
   private driveVerification(run: Run) {
