@@ -688,7 +688,7 @@ function sharedWarmPool(input: {
   runLabel: string
   owner?: string
 }): WarmWorkerPool {
-  const key = `${input.cell}\0${input.image}`
+  const key = `${input.cell}\0${input.image}\0${input.runLabel}`
   const existing = warmPools.get(key)
   if (existing) return existing
   const pool = new WarmWorkerPool(input)
@@ -945,9 +945,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (workspace) {
       this.owner = createHash('sha256').update(workspace.id).update('\0').update(realpathSync(workspace.directory)).digest('hex')
     }
-    if (this.cell && warmWorkersEnabled()) {
+    // Pool key: an explicit cell, else the workspace. A bare test backend (no workspace, no cell)
+    // never prewarms, so lifecycle stubs only see the calls they trigger.
+    const poolCell = this.cell ?? (this.owner ? `ws-${this.owner.slice(0, 12)}` : undefined)
+    if (poolCell && warmWorkersEnabled()) {
       this.warmPool = sharedWarmPool({
-        cell: this.cell,
+        cell: poolCell,
         image: this.image,
         dockerRunner: this.docker,
         runLabel: this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`),
@@ -1043,7 +1046,9 @@ export class LinuxWorkerBackend implements WorkerBackend {
       if (!row) continue
       const [id, name, createdLabel, createdAt] = row.split('\t')
       if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) continue
-      if (this.activeContainers.has(name)) continue
+      // Never reap a container this process created: pool-parked idle containers sit in `created`
+      // state between assignments and are removed by the pool, not by the stale sweep.
+      if (this.activeContainers.has(name) || liveContainers.has(name)) continue
       const stamped = Number(createdLabel)
       const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
       if (!Number.isFinite(age) || age < this.staleCreatedMs) continue
