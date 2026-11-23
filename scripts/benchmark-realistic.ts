@@ -28,8 +28,11 @@
 // in the artifact metadata; results are never simulated.
 
 import { execFileSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync,
+  symlinkSync, writeFileSync,
+} from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -43,17 +46,18 @@ import { appNames } from '../benchmarks/realistic-bench/lib/types.ts'
 import { startRealisticApp, briefingFor, gradeRun, renderScorecard } from '../benchmarks/realistic-bench/run.ts'
 import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.ts'
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
-import type { Finding } from '../src/domain.ts'
+import type { EndpointSource, Finding, ParamLocation } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { resolveOobCallbackPorts } from './benchmark-env.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
-import { createProjectPersona } from '../src/server/persona-vault.ts'
+import { createProjectPersona, resolveRunPersonas } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
 import { Store } from '../src/server/store.ts'
+import type { EndpointRow } from '../src/server/store.ts'
 import { selectVerifierBackend } from './benchmark-backend.ts'
 import type { VerifierBackendKind } from './benchmark-backend.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
@@ -82,6 +86,10 @@ export interface RealisticArgs {
   keepDataDirs: boolean
   allowInertWorkers: boolean
   verifier: 'auto' | 'docker' | 'local-jq'
+  /** Reuse a Phase-0 recon snapshot from this directory (v5.1 inner loop). */
+  reuseReconDir?: string
+  /** Ignore any existing snapshot and recapture it after a fresh Phase-0 pass. */
+  refreshRecon: boolean
   help: boolean
 }
 
@@ -115,6 +123,13 @@ Flags:
                           cannot open worker sessions (records an inert run;
                           diagnostics still show zero completed assignments)
   --verifier <kind>       auto | docker | local-jq (default: auto)
+  --reuse-recon <dir>     reuse Phase-0 discovery snapshots (endpoints, params,
+                          dependencies, redacted resource samples and persona
+                          session handles) from <dir>; misses run fresh Phase-0
+                          and write a snapshot back. Probing/verification are
+                          never skipped and scorecards always come from real probes.
+  --refresh-recon         ignore any existing snapshot and recapture it after a
+                          fresh Phase-0 pass (requires --reuse-recon)
   --help                  show this help
 
 Environment:
@@ -131,6 +146,17 @@ Agentic runs need a worker-session-capable verifier:
   model profile + --verifier local-jq  -> exit 2 (inert workers) unless --no-llm
   model profile + --verifier docker    -> requires Docker socket access; run under
                                           newgrp docker -c '<command>'
+
+Recon cache (v5.1 inner loop):
+  --reuse-recon <dir> snapshots Phase-0 discovery keyed by (app, seed, split, mode,
+  briefing variantHash). A hit seeds the run's Store with endpoints, endpoint_params,
+  api_dependencies, engine-redacted resource samples and persona session handles, then
+  lets the engine skip Phase-0 (its own phase0CompletedAt gate). Probing and verification
+  always run for real; nothing about findings/facts/replay specs is cached. Cache hits
+  replay the cached Phase-0 GET paths as benign requests so the discovery funnel stays
+  honest. Snapshot files are owner-only (0600) and contain no cookies, bearer tokens,
+  passwords or session values; a key mismatch/corrupt file falls back to fresh discovery.
+  --refresh-recon ignores an existing snapshot and recaptures it after a fresh Phase-0.
 
 Artifacts per cell:
   <out-dir>/<app>-seed<seed>-<mode>.json      Scorecard (benchmark grader schema)
@@ -192,7 +218,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
     'out-dir', 'concurrency', 'data-dir', 'no-llm', 'isolate-data-dir', 'keep-data-dirs',
-    'allow-inert-workers', 'verifier', 'help',
+    'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
@@ -206,9 +232,14 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
       keepDataDirs: Boolean(a['keep-data-dirs']),
       allowInertWorkers: Boolean(a['allow-inert-workers']),
-      verifier: 'auto', help: true,
+      verifier: 'auto', refreshRecon: a['refresh-recon'] === true, help: true,
     }
   }
+
+  const reuseReconRaw = stringFlag(a, 'reuse-recon')
+  if (a['reuse-recon'] === true) fail('--reuse-recon requires a directory argument')
+  const refreshRecon = a['refresh-recon'] === true
+  if (refreshRecon && !reuseReconRaw) fail('--refresh-recon requires --reuse-recon <dir> (the snapshot directory to rewrite)')
 
   const modeRaw = stringFlag(a, 'mode') ?? 'grey-box'
   if (modeRaw !== 'black-box' && modeRaw !== 'grey-box' && modeRaw !== 'white-box') {
@@ -260,6 +291,10 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     keepDataDirs: a['keep-data-dirs'] === true,
     allowInertWorkers: a['allow-inert-workers'] === true,
     verifier: verifierRaw,
+    ...(reuseReconRaw
+      ? { reuseReconDir: isAbsolute(reuseReconRaw) ? reuseReconRaw : resolve(reuseReconRaw) }
+      : {}),
+    refreshRecon,
     help: false,
   }
 }
@@ -897,6 +932,697 @@ export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Phase-0 recon cache (v5.1 inner loop): reuse discovery snapshots, never probe results
+// ---------------------------------------------------------------------------------------------
+//
+// A hill-climb iteration re-runs the same (app, seed, split, mode) cell many times. Phase-0
+// discovery (surface crawl, auth passes, route-map/JS harvesting) is deterministic for a fixed
+// briefing, so this cache snapshots ONLY the artefacts Phase-0 persists:
+//   * endpoints / endpoint_params / api_dependencies
+//   * resource samples, which the engine itself documents as "redacted non-secret sample
+//     identifiers" (store.recordResourceSample re-validates them on load)
+//   * persona session *handles* (header type/name + adapter + an opaque digest). Session values,
+//     cookies, bearer tokens and passwords are never written.
+//
+// It never caches probing or verification state: findings, facts, replay specs, exchanges and
+// coverage outcomes are absent, so every scorecard still comes from real probes and real
+// Zero-LLM/agentic verification. A hit only flips the engine's own `run.phase0CompletedAt` gate
+// and rehydrates the surface rows exactly as Phase-0 had persisted them.
+
+export const RECON_CACHE_FORMAT = 1
+
+export interface ReconCacheKeyInputs {
+  app: AppName
+  seed: number
+  split: 'dev' | 'held-out'
+  mode: BenchMode
+  variantHash: string
+}
+
+export interface CachedEndpoint {
+  ref: string
+  /** Phase-0 insertion order (rowid). Warm rehydration preserves it so equal-risk ties rank identically. */
+  seq: number
+  origin: string
+  method: string
+  pathTemplate: string
+  source: EndpointSource
+  framework: string | null
+  authRequirement: string | null
+  ownershipGuard: string | null
+  sinkKinds: string[]
+  testedClasses: string[]
+  coveragePct: number | null
+  riskScore: number
+  codeLocation: EndpointRow['codeLocation']
+  createdAt: number
+}
+
+export interface CachedEndpointParam {
+  endpointRef: string
+  name: string
+  location: ParamLocation
+  inferredType: string | null
+  isCsrf: boolean
+  isObjectId: boolean
+  source: string
+  createdAt: number
+}
+
+export interface CachedApiDependency {
+  producerRef: string
+  consumerRef: string
+  resourceKey: string
+  sampleResourceIdHash: string | null
+  personaHandle: string | null
+  observedTransitions: string[]
+  testedBola: boolean
+  createdAt: number
+}
+
+export interface CachedResourceSample {
+  ownerPersona: string
+  resourceKey: string
+  resourceId: string
+  origin: string
+  endpoint: string
+  method: string
+  mediaType: string | null
+  authenticated: boolean
+  createdAt: number
+}
+
+/**
+ * Session metadata only. `sessionHandle` is a non-reversible digest used to confirm the warm run
+ * authenticated the same persona surface; the minted cookie/bearer value stays in the cell's
+ * owner-only credentials directory and is never serialized here.
+ */
+export interface CachedPersonaSessionHandle {
+  handle: string
+  roleLabel: string
+  authKind: string
+  headerType: 'cookie' | 'bearer' | 'header' | 'unknown'
+  headerName: string | null
+  adapter: string | null
+  loginPath: string | null
+  expiresAt: number | null
+  sessionHandle: string
+}
+
+export interface ReconCacheFile {
+  format: number
+  key: string
+  keyInputs: ReconCacheKeyInputs
+  capturedAt: number
+  gitSha: string
+  sourceOrigin: string
+  phase0: { completedAt: number; observedDurationMs: number | null }
+  surface: {
+    endpoints: CachedEndpoint[]
+    endpointParams: CachedEndpointParam[]
+    apiDependencies: CachedApiDependency[]
+    resourceSamples: CachedResourceSample[]
+    /** Plain GET paths Phase-0 requested, replayed unauthenticated on a hit (surface affirmation). */
+    surfacePaths: string[]
+  }
+  auth: CachedPersonaSessionHandle[]
+  security: { secretsIncluded: false; sessionValuesIncluded: false; note: string }
+  checksum: string
+}
+
+export interface ReconCacheMeta {
+  requested: boolean
+  directory: string | null
+  key: string | null
+  keyInputs: ReconCacheKeyInputs | null
+  hit: boolean
+  refresh: boolean
+  path: string | null
+  reason: string | null
+  loadMs: number
+  applyMs: number
+  phase0Skipped: boolean
+  phase0ObservedMs: number | null
+  reconTimeSavedMs: number
+  captured: boolean
+  capturedAt: number | null
+  surface: {
+    endpoints: number
+    endpointParams: number
+    apiDependencies: number
+    resourceSamples: number
+    personaSessionHandles: number
+  }
+  /** Cached surface paths replayed as benign GETs so the benchmark's discovery funnel is not
+   *  penalised for skipping the crawler (real requests; no probe results are reused). */
+  surfaceAffirmation: { attempted: number; completed: number; failed: number }
+}
+
+export function emptyReconCacheMeta(refresh = false): ReconCacheMeta {
+  return {
+    requested: false,
+    directory: null,
+    key: null,
+    keyInputs: null,
+    hit: false,
+    refresh,
+    path: null,
+    reason: null,
+    loadMs: 0,
+    applyMs: 0,
+    phase0Skipped: false,
+    phase0ObservedMs: null,
+    reconTimeSavedMs: 0,
+    captured: false,
+    capturedAt: null,
+    surface: { endpoints: 0, endpointParams: 0, apiDependencies: 0, resourceSamples: 0, personaSessionHandles: 0 },
+    surfaceAffirmation: { attempted: 0, completed: 0, failed: 0 },
+  }
+}
+
+/**
+ * `variantHash` invalidates snapshots when the discovery inputs change: the briefing surface
+ * (routes/params), persona handles, login route and cache format. It deliberately excludes the
+ * app's ephemeral loopback origin/port and the model/verifier configuration, because neither
+ * changes what Phase-0 discovers.
+ */
+export function reconVariantHash(input: {
+  app: AppName
+  mode: BenchMode
+  loginPath: string | null
+  apiReference: Briefing['apiReference']
+  personaHandles: readonly string[]
+}): string {
+  const routes = (input.apiReference ?? [])
+    .map(route => `${route.method.toUpperCase()} ${route.path} ${[...route.params].sort().join(',')}`)
+    .sort()
+  return createHash('sha256').update(JSON.stringify({
+    format: RECON_CACHE_FORMAT,
+    app: input.app,
+    mode: input.mode,
+    loginPath: input.loginPath,
+    routes,
+    personaHandles: [...input.personaHandles].sort(),
+  })).digest('hex').slice(0, 16)
+}
+
+export function reconCacheKey(keyInputs: ReconCacheKeyInputs): string {
+  return createHash('sha256').update(JSON.stringify({
+    format: RECON_CACHE_FORMAT,
+    app: keyInputs.app,
+    seed: keyInputs.seed,
+    split: keyInputs.split,
+    mode: keyInputs.mode,
+    variantHash: keyInputs.variantHash,
+  })).digest('hex').slice(0, 32)
+}
+
+export function reconCachePath(directory: string, keyInputs: ReconCacheKeyInputs): string {
+  const name = `${keyInputs.app}-seed${keyInputs.seed}-${keyInputs.split}-${keyInputs.mode}-${keyInputs.variantHash}.json`
+  return join(resolve(directory), name)
+}
+
+function endpointRef(method: string, pathTemplate: string): string {
+  return `${method.toUpperCase()} ${pathTemplate}`
+}
+
+function reconCacheChecksum(doc: Omit<ReconCacheFile, 'checksum'>): string {
+  const material = JSON.stringify({
+    format: doc.format,
+    key: doc.key,
+    keyInputs: doc.keyInputs,
+    capturedAt: doc.capturedAt,
+    gitSha: doc.gitSha,
+    sourceOrigin: doc.sourceOrigin,
+    phase0: doc.phase0,
+    surface: doc.surface,
+    auth: doc.auth,
+    security: doc.security,
+  })
+  return createHash('sha256').update(material).digest('hex')
+}
+
+function sameKeyInputs(a: ReconCacheKeyInputs, b: ReconCacheKeyInputs): boolean {
+  return a.app === b.app && a.seed === b.seed && a.split === b.split
+    && a.mode === b.mode && a.variantHash === b.variantHash
+}
+
+function isBoundedString(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length <= max
+}
+
+function isBoundedStringArray(value: unknown, maxItems: number, maxLen: number): value is string[] {
+  return Array.isArray(value) && value.length <= maxItems && value.every(item => isBoundedString(item, maxLen))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Structural validation; any failure is a cache miss (never a crash). */
+export function validateReconCacheFile(raw: unknown, expected: ReconCacheKeyInputs): string | null {
+  if (!isRecord(raw)) return 'snapshot is not an object'
+  if (raw.format !== RECON_CACHE_FORMAT) return `format ${String(raw.format)} != ${RECON_CACHE_FORMAT}`
+  if (!isRecord(raw.keyInputs) || !sameKeyInputs(raw.keyInputs as unknown as ReconCacheKeyInputs, expected)) {
+    return 'key inputs changed (app/seed/split/mode/variant)'
+  }
+  const key = reconCacheKey(expected)
+  if (raw.key !== key) return 'cache key mismatch'
+  if (!isBoundedString(raw.sourceOrigin, 2048)) return 'missing source origin'
+  if (!isBoundedString(raw.gitSha, 64)) return 'missing git sha'
+  if (!isRecord(raw.phase0) || typeof raw.phase0.completedAt !== 'number') return 'missing phase-0 marker'
+  if (!isRecord(raw.surface)) return 'missing surface'
+  const surface = raw.surface
+  if (!Array.isArray(surface.endpoints) || surface.endpoints.length > 5_000) return 'invalid endpoints'
+  for (const ep of surface.endpoints as unknown[]) {
+    if (!isRecord(ep)
+      || !isBoundedString(ep.ref, 4096) || typeof ep.seq !== 'number' || !isBoundedString(ep.origin, 2048)
+      || !isBoundedString(ep.method, 16) || !isBoundedString(ep.pathTemplate, 4096)
+      || !isBoundedString(ep.source, 64)
+      || !isBoundedStringArray(ep.sinkKinds, 64, 128)
+      || !isBoundedStringArray(ep.testedClasses, 64, 128)) return 'invalid endpoint row'
+  }
+  const refs = new Set((surface.endpoints as CachedEndpoint[]).map(ep => ep.ref))
+  if (!Array.isArray(surface.endpointParams) || surface.endpointParams.length > 20_000) return 'invalid endpoint params'
+  for (const param of surface.endpointParams as unknown[]) {
+    if (!isRecord(param) || !isBoundedString(param.endpointRef, 4096) || !refs.has(param.endpointRef)
+      || !isBoundedString(param.name, 256) || !isBoundedString(param.location, 32)
+      || !isBoundedString(param.source, 64)) return 'invalid endpoint param row'
+  }
+  if (!Array.isArray(surface.apiDependencies) || surface.apiDependencies.length > 20_000) return 'invalid dependencies'
+  for (const dep of surface.apiDependencies as unknown[]) {
+    if (!isRecord(dep) || !isBoundedString(dep.producerRef, 4096) || !isBoundedString(dep.consumerRef, 4096)
+      || !refs.has(dep.producerRef) || !refs.has(dep.consumerRef)
+      || !isBoundedString(dep.resourceKey, 256)) return 'invalid dependency row'
+  }
+  if (!Array.isArray(surface.resourceSamples) || surface.resourceSamples.length > 20_000) return 'invalid resource samples'
+  for (const sample of surface.resourceSamples as unknown[]) {
+    if (!isRecord(sample) || !isBoundedString(sample.ownerPersona, 256) || !isBoundedString(sample.resourceKey, 256)
+      || !isBoundedString(sample.resourceId, 128) || !isBoundedString(sample.origin, 2048)
+      || !isBoundedString(sample.endpoint, 2048) || !isBoundedString(sample.method, 16)) return 'invalid resource sample row'
+  }
+  if (!Array.isArray(surface.surfacePaths) || surface.surfacePaths.length > 300
+    || !surface.surfacePaths.every(path => isBoundedString(path, 512) && path.startsWith('/'))) {
+    return 'invalid surface paths'
+  }
+  if (!Array.isArray(raw.auth) || raw.auth.length > 64) return 'invalid persona auth handles'
+  for (const auth of raw.auth as unknown[]) {
+    if (!isRecord(auth) || !isBoundedString(auth.handle, 128) || !isBoundedString(auth.sessionHandle, 64)) {
+      return 'invalid persona auth handle'
+    }
+    if ('value' in auth || 'cookie' in auth || 'token' in auth || 'password' in auth) {
+      return 'persona auth handle contains secret material'
+    }
+  }
+  if (!isRecord(raw.security) || raw.security.secretsIncluded !== false || raw.security.sessionValuesIncluded !== false) {
+    return 'snapshot security contract missing'
+  }
+  if (!isBoundedString(raw.checksum, 128)) return 'missing checksum'
+  const { checksum, ...rest } = raw as unknown as ReconCacheFile
+  if (reconCacheChecksum(rest) !== checksum) return 'checksum mismatch (snapshot modified or corrupt)'
+  return null
+}
+
+export interface ReconCacheLoad {
+  hit: boolean
+  reason: string
+  path: string
+  loadMs: number
+  snapshot?: ReconCacheFile
+}
+
+/** Read + validate a snapshot. Any problem is a clean miss so the caller falls back to Phase-0. */
+export function readReconCache(directory: string, keyInputs: ReconCacheKeyInputs): ReconCacheLoad {
+  const startedAt = nowMs()
+  const path = reconCachePath(directory, keyInputs)
+  const done = (hit: boolean, reason: string, snapshot?: ReconCacheFile): ReconCacheLoad => ({
+    hit, reason, path, loadMs: nowMs() - startedAt, ...(snapshot ? { snapshot } : {}),
+  })
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? 'read failed'
+    return done(false, code === 'ENOENT' ? 'no snapshot for this key' : `snapshot unreadable (${code})`)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return done(false, 'snapshot is not valid JSON')
+  }
+  const invalid = validateReconCacheFile(parsed, keyInputs)
+  if (invalid) return done(false, invalid)
+  return done(true, 'snapshot loaded', parsed as ReconCacheFile)
+}
+
+/**
+ * A Phase-0 request path may be replayed on a warm hit only when it is a plain, query-free path
+ * that cannot carry a probe payload, canary marker or redacted secret.
+ */
+export function surfaceReplayPath(pathAndQuery: string): string | null {
+  const path = pathAndQuery.split('?')[0] ?? ''
+  if (!path.startsWith('/') || path.startsWith('//')) return null
+  if (path.length > 512) return null
+  if (path.includes('.guardian-cal-')) return null // soft-404 calibration tokens
+  if (path.includes('[[') || path.includes('{{')) return null // redacted secret placeholders
+  if (!/^[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$/.test(path)) return null
+  return path
+}
+
+/** Unique GET paths the engine's Phase-0 actually requested before completion. */
+export function collectPhase0SurfacePaths(storage: Store, runId: string, boundary: number): string[] {
+  let rows: Array<{ p: string }> = []
+  try {
+    rows = storage.client.prepare(
+      "select path_and_query as p from broker_exchanges where run_id = ? and method = 'GET' and created_at <= ? order by created_at asc",
+    ).all(runId, boundary) as Array<{ p: string }>
+  } catch {
+    return []
+  }
+  const paths = new Set<string>()
+  for (const row of rows) {
+    const path = surfaceReplayPath(row.p)
+    if (path) paths.add(path)
+    if (paths.size >= 300) break
+  }
+  return [...paths]
+}
+
+export interface SurfaceReplayResult {
+  attempted: number
+  completed: number
+  failed: number
+}
+
+/**
+ * Warm-hit surface affirmation: replay the cached Phase-0 GET paths as plain, unauthenticated
+ * requests. These are real in-scope requests (the same routes the crawler already fetched), so
+ * the benchmark's "entry route was touched" funnel stage stays meaningful. No probe payloads,
+ * findings or verification state are replayed.
+ */
+export async function replayReconSurface(input: {
+  origin: string
+  paths: readonly string[]
+  concurrency?: number
+  timeoutMs?: number
+}): Promise<SurfaceReplayResult> {
+  const paths = [...new Set(input.paths)]
+    .map(path => surfaceReplayPath(path))
+    .filter((path): path is string => Boolean(path))
+    .slice(0, 300)
+  let completed = 0
+  let failed = 0
+  let cursor = 0
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = cursor++
+      if (index >= paths.length) return
+      try {
+        const res = await fetch(new URL(paths[index]!, input.origin), {
+          method: 'GET',
+          headers: { accept: '*/*' },
+          signal: AbortSignal.timeout(input.timeoutMs ?? 4_000),
+        })
+        await res.arrayBuffer().catch(() => undefined)
+        completed += 1
+      } catch {
+        failed += 1
+      }
+    }
+  }
+  const concurrency = Math.max(1, Math.min(input.concurrency ?? 4, paths.length || 1))
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return { attempted: paths.length, completed, failed }
+}
+
+export interface ReconCaptureInput {
+  storage: Store
+  runId: string
+  keyInputs: ReconCacheKeyInputs
+  sourceOrigin: string
+  phase0CompletedAt: number
+  observedDurationMs: number | null
+  personaSessions: readonly CachedPersonaSessionHandle[]
+  secrets: readonly NamedSecret[]
+  gitSha: string
+}
+
+export interface ReconCaptureResult {
+  snapshot: ReconCacheFile
+  counts: ReconCacheMeta['surface']
+}
+
+/**
+ * Snapshot the persisted Phase-0 surface. Rows created after Phase-0 completion (investigation,
+ * verification) are excluded via `createdAt <= phase0CompletedAt`, so a warm run starts from the
+ * exact surface a cold run had at the same boundary.
+ */
+export function captureReconSnapshot(input: ReconCaptureInput): ReconCaptureResult {
+  const boundary = input.phase0CompletedAt
+  const included = (createdAt: number) => createdAt <= boundary + 1
+  const endpointRows = input.storage.listEndpoints(input.runId, { limit: 2_000 })
+    .filter(row => included(row.createdAt))
+  // SQLite rowid gives the exact Phase-0 insertion order; ties in risk rank by it.
+  const insertionOrder = new Map<string, number>()
+  try {
+    const rows = input.storage.client.prepare(
+      'select id from endpoints where run_id = ? order by rowid asc',
+    ).all(input.runId) as Array<{ id: string }>
+    rows.forEach((row, index) => insertionOrder.set(row.id, index))
+  } catch { /* ordering is optimisation only; fall back to 0 */ }
+  const endpoints: CachedEndpoint[] = endpointRows
+    .slice()
+    .sort((a, b) => (insertionOrder.get(a.id) ?? 0) - (insertionOrder.get(b.id) ?? 0)
+      || a.createdAt - b.createdAt
+      || endpointRef(a.method, a.pathTemplate).localeCompare(endpointRef(b.method, b.pathTemplate)))
+    .map((row, index) => {
+      const ref = endpointRef(row.method, row.pathTemplate)
+      const cached: CachedEndpoint = {
+        ref,
+        seq: insertionOrder.get(row.id) ?? index,
+        origin: row.origin,
+        method: row.method,
+        pathTemplate: row.pathTemplate,
+        source: row.source,
+        framework: row.framework ?? null,
+        authRequirement: row.authRequirement ?? null,
+        ownershipGuard: row.ownershipGuard ?? null,
+        sinkKinds: [...row.sinkKinds],
+        testedClasses: [...row.testedClasses],
+        coveragePct: row.coveragePct ?? null,
+        riskScore: row.riskScore,
+        codeLocation: row.codeLocation ?? null,
+        createdAt: row.createdAt,
+      }
+      return cached
+    })
+  const endpointById = new Map(endpointRows.map(row => [row.id, row]))
+  const endpointParams: CachedEndpointParam[] = []
+  for (const param of input.storage.listEndpointParams(input.runId)) {
+    if (!included(param.createdAt)) continue
+    const endpoint = endpointById.get(param.endpointId)
+    if (!endpoint) continue
+    endpointParams.push({
+      endpointRef: endpointRef(endpoint.method, endpoint.pathTemplate),
+      name: param.name,
+      location: param.location,
+      inferredType: param.inferredType ?? null,
+      isCsrf: Boolean(param.isCsrf),
+      isObjectId: Boolean(param.isObjectId),
+      source: param.source,
+      createdAt: param.createdAt,
+    })
+  }
+  const idToRef = new Map(endpointRows.map(row => [row.id, endpointRef(row.method, row.pathTemplate)]))
+  const apiDependencies: CachedApiDependency[] = []
+  for (const dep of input.storage.listApiDependencies(input.runId)) {
+    if (!included(dep.createdAt)) continue
+    const producerRef = idToRef.get(dep.producerEndpointId)
+    const consumerRef = idToRef.get(dep.consumerEndpointId)
+    if (!producerRef || !consumerRef) continue
+    apiDependencies.push({
+      producerRef,
+      consumerRef,
+      resourceKey: dep.resourceKey,
+      sampleResourceIdHash: dep.sampleResourceIdHash ?? null,
+      personaHandle: dep.personaHandle ?? null,
+      observedTransitions: [...dep.observedTransitions],
+      testedBola: Boolean(dep.testedBola),
+      createdAt: dep.createdAt,
+    })
+  }
+  const resourceSamples: CachedResourceSample[] = []
+  for (const sample of input.storage.listResourceSamples(input.runId)) {
+    if (!included(sample.createdAt)) continue
+    resourceSamples.push({
+      ownerPersona: sample.ownerPersona,
+      resourceKey: sample.resourceKey,
+      resourceId: sample.resourceId,
+      origin: sample.origin,
+      endpoint: sample.endpoint,
+      method: sample.method,
+      mediaType: sample.mediaType ?? null,
+      authenticated: Boolean(sample.authenticated),
+      createdAt: sample.createdAt,
+    })
+  }
+
+  const surfacePaths = collectPhase0SurfacePaths(input.storage, input.runId, boundary)
+  const base = {
+    format: RECON_CACHE_FORMAT,
+    key: reconCacheKey(input.keyInputs),
+    keyInputs: input.keyInputs,
+    capturedAt: nowMs(),
+    gitSha: input.gitSha,
+    sourceOrigin: input.sourceOrigin,
+    phase0: { completedAt: boundary, observedDurationMs: input.observedDurationMs },
+    surface: { endpoints, endpointParams, apiDependencies, resourceSamples, surfacePaths },
+    auth: input.personaSessions.map(session => ({ ...session })),
+    security: {
+      secretsIncluded: false as const,
+      sessionValuesIncluded: false as const,
+      note: 'Phase-0 surface + redacted resource samples + persona session handles only; '
+        + 'no cookies, bearer tokens, passwords, exchanges, findings or verification state.',
+    },
+  }
+  const redacted = redactJsonValue(base, input.secrets)
+  const snapshot: ReconCacheFile = { ...redacted, checksum: reconCacheChecksum(redacted) }
+  const serialized = JSON.stringify(snapshot)
+  for (const secret of input.secrets) {
+    if (secret.value && secret.value.length >= 4 && serialized.includes(secret.value)) {
+      throw new Error('recon cache would contain a registered secret; refusing to write it')
+    }
+  }
+  return {
+    snapshot,
+    counts: {
+      endpoints: endpoints.length,
+      endpointParams: endpointParams.length,
+      apiDependencies: apiDependencies.length,
+      resourceSamples: resourceSamples.length,
+      personaSessionHandles: snapshot.auth.length,
+    },
+  }
+}
+
+/** Owner-only atomic write; the directory holds only redacted discovery artefacts. */
+export function writeReconCache(directory: string, keyInputs: ReconCacheKeyInputs, snapshot: ReconCacheFile): string {
+  const dir = resolve(directory)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const path = reconCachePath(dir, keyInputs)
+  const tmp = `${path}.tmp-${randomUUID()}`
+  writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
+  chmodSync(tmp, 0o600)
+  renameSync(tmp, path)
+  return path
+}
+
+export interface ApplyReconInput {
+  storage: Store
+  runId: string
+  origin: string
+  snapshot: ReconCacheFile
+  completedAt?: number
+}
+
+export interface ApplyReconResult {
+  endpoints: number
+  endpointParams: number
+  apiDependencies: number
+  resourceSamples: number
+  phase0CompletedAt: number
+}
+
+/**
+ * Rehydrate the snapshot into a fresh run's Store and close the engine's Phase-0 gate. Only
+ * discovery rows are seeded; probing/verification state stays empty, so the run still has to
+ * earn every finding with real requests.
+ */
+export function applyReconSnapshot(input: ApplyReconInput): ApplyReconResult {
+  const mapOrigin = (origin: string): string => origin === input.snapshot.sourceOrigin ? input.origin : origin
+  const ids = new Map<string, string>()
+  const orderedEndpoints = input.snapshot.surface.endpoints
+    .slice()
+    .sort((a, b) => a.seq - b.seq || a.createdAt - b.createdAt || a.ref.localeCompare(b.ref))
+  for (const endpoint of orderedEndpoints) {
+    const row = input.storage.upsertEndpoint({
+      runId: input.runId,
+      origin: mapOrigin(endpoint.origin),
+      method: endpoint.method,
+      pathTemplate: endpoint.pathTemplate,
+      source: endpoint.source,
+      framework: endpoint.framework,
+      authRequirement: endpoint.authRequirement,
+      ownershipGuard: endpoint.ownershipGuard,
+      sinkKinds: endpoint.sinkKinds,
+      testedClasses: endpoint.testedClasses,
+      coveragePct: endpoint.coveragePct,
+      riskScore: endpoint.riskScore,
+      codeLocation: endpoint.codeLocation,
+    })
+    ids.set(endpoint.ref, row.id)
+  }
+  let endpointParams = 0
+  for (const param of input.snapshot.surface.endpointParams) {
+    const endpointId = ids.get(param.endpointRef)
+    if (!endpointId) continue
+    input.storage.upsertEndpointParam({
+      runId: input.runId,
+      endpointId,
+      name: param.name,
+      location: param.location,
+      inferredType: param.inferredType,
+      isCsrf: param.isCsrf,
+      isObjectId: param.isObjectId,
+      source: param.source,
+    })
+    endpointParams += 1
+  }
+  let apiDependencies = 0
+  for (const dep of input.snapshot.surface.apiDependencies) {
+    const producerEndpointId = ids.get(dep.producerRef)
+    const consumerEndpointId = ids.get(dep.consumerRef)
+    if (!producerEndpointId || !consumerEndpointId) continue
+    input.storage.recordApiDependency({
+      runId: input.runId,
+      producerEndpointId,
+      consumerEndpointId,
+      resourceKey: dep.resourceKey,
+      sampleResourceIdHash: dep.sampleResourceIdHash,
+      personaHandle: dep.personaHandle,
+      observedTransitions: dep.observedTransitions,
+      testedBola: dep.testedBola,
+    })
+    apiDependencies += 1
+  }
+  let resourceSamples = 0
+  for (const sample of input.snapshot.surface.resourceSamples) {
+    const saved = input.storage.recordResourceSample({
+      runId: input.runId,
+      ownerPersona: sample.ownerPersona,
+      resourceKey: sample.resourceKey,
+      resourceId: sample.resourceId,
+      origin: mapOrigin(sample.origin),
+      endpoint: sample.endpoint,
+      method: sample.method,
+      mediaType: sample.mediaType,
+      authenticated: sample.authenticated,
+    })
+    if (saved) resourceSamples += 1
+  }
+  const phase0CompletedAt = input.completedAt ?? nowMs()
+  input.storage.updateRunPhase0Completed(input.runId, phase0CompletedAt)
+  return {
+    endpoints: ids.size,
+    endpointParams,
+    apiDependencies,
+    resourceSamples,
+    phase0CompletedAt,
+  }
+}
+
 export interface CellMeta {
   app: AppName
   seed: number
@@ -915,6 +1641,7 @@ export interface CellMeta {
   dataDirKept: boolean
   budgetUsd: number
   maxDurationMs: number
+  reconCache: ReconCacheMeta
   startedAt: number
   endedAt: number
   durationMs: number
@@ -1003,11 +1730,20 @@ async function waitForTerminal(input: {
   runId: string
   deadlineAt: number
   onTick?: (status: string, phase: string) => void
+  /** Fired once, on the first poll that observes the engine's Phase-0 completion marker. */
+  onPhase0Complete?: (completedAt: number) => void
 }): Promise<{ timedOut: boolean; status: string; phase: string }> {
   const terminal = new Set(['complete', 'failed', 'stopped', 'paused', 'budget_paused'])
   let last = 0
+  let phase0Seen = false
   while (true) {
     const run = input.storage.run(input.runId)
+    if (!phase0Seen && run.phase0CompletedAt) {
+      phase0Seen = true
+      try {
+        input.onPhase0Complete?.(run.phase0CompletedAt)
+      } catch { /* cache capture is best-effort; never block the run */ }
+    }
     if (terminal.has(run.status)) return { timedOut: false, status: run.status, phase: run.phase }
     if (nowMs() >= input.deadlineAt) {
       try {
@@ -1161,6 +1897,31 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       else notes.push('black-box login route not discovered; personas are not registered')
     }
     const plan = planCell(briefing, loginPath)
+    const gitSha = resolveGitSha()
+
+    // Recon-cache key: (app, seed, split, mode, variantHash). The variant hash covers only the
+    // discovery inputs (briefing surface + persona handles + login route), never the port.
+    const recon = emptyReconCacheMeta(args.refreshRecon)
+    if (args.reuseReconDir) {
+      const keyInputs: ReconCacheKeyInputs = {
+        app,
+        seed,
+        split: args.heldOut ? 'held-out' : 'dev',
+        mode: args.mode,
+        variantHash: reconVariantHash({
+          app,
+          mode: args.mode,
+          loginPath,
+          apiReference: briefing.apiReference,
+          personaHandles: plan.personas.map(p => p.handle),
+        }),
+      }
+      recon.requested = true
+      recon.directory = args.reuseReconDir
+      recon.keyInputs = keyInputs
+      recon.key = reconCacheKey(keyInputs)
+      recon.path = reconCachePath(args.reuseReconDir, keyInputs)
+    }
 
     const project = storage.createProject({
       requestId: randomUUID(),
@@ -1245,6 +2006,74 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       maxRpsPerOrigin: 10,
     })
 
+    // Recon cache (v5.1): seed the run's Store from a prior Phase-0 snapshot and let the engine's
+    // own `phase0CompletedAt` gate skip discovery. Probing/verification still run in full.
+    if (recon.requested && recon.directory && recon.keyInputs) {
+      if (args.refreshRecon) {
+        recon.reason = 'refresh requested; a fresh Phase-0 pass will recapture the snapshot'
+        notes.push('recon cache refresh requested: existing snapshot ignored')
+      } else {
+        const loaded = readReconCache(recon.directory, recon.keyInputs)
+        recon.loadMs = loaded.loadMs
+        recon.path = loaded.path
+        if (loaded.hit && loaded.snapshot) {
+          try {
+            const applyStartedAt = nowMs()
+            const applied = applyReconSnapshot({
+              storage,
+              runId,
+              origin: briefing.origin,
+              snapshot: loaded.snapshot,
+            })
+            recon.applyMs = nowMs() - applyStartedAt
+            recon.hit = true
+            recon.phase0Skipped = true
+            recon.phase0ObservedMs = loaded.snapshot.phase0.observedDurationMs
+            recon.reconTimeSavedMs = Math.max(0, loaded.snapshot.phase0.observedDurationMs ?? 0)
+            recon.capturedAt = loaded.snapshot.capturedAt
+            recon.surface = {
+              endpoints: applied.endpoints,
+              endpointParams: applied.endpointParams,
+              apiDependencies: applied.apiDependencies,
+              resourceSamples: applied.resourceSamples,
+              personaSessionHandles: loaded.snapshot.auth.length,
+            }
+            notes.push(
+              `recon cache hit (${recon.key?.slice(0, 12)}): seeded ${applied.endpoints} endpoints, `
+              + `${applied.endpointParams} params, ${applied.apiDependencies} dependencies, `
+              + `${applied.resourceSamples} resource samples; Phase-0 discovery skipped in ${recon.applyMs}ms`,
+            )
+            // Real, benign GET replay of the cached discovery routes keeps the benchmark's
+            // "entry route touched" funnel stage honest without re-running the crawler.
+            recon.surfaceAffirmation = await replayReconSurface({
+              origin: briefing.origin,
+              paths: loaded.snapshot.surface.surfacePaths,
+            })
+            notes.push(
+              `recon surface affirmation: ${recon.surfaceAffirmation.completed}/${recon.surfaceAffirmation.attempted} `
+              + 'cached Phase-0 GET paths replayed (real requests; probing/verification untouched)',
+            )
+          } catch (error) {
+            // A snapshot that validates but cannot be applied must not abort the cell: reopen the
+            // Phase-0 gate and fall back to a fresh discovery pass.
+            recon.hit = false
+            recon.phase0Skipped = false
+            recon.reconTimeSavedMs = 0
+            recon.reason = `snapshot apply failed: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 160)}`
+            notes.push(`recon cache apply failed (${recon.reason}); falling back to fresh Phase-0 discovery`)
+            try {
+              if (storage.run(runId).phase0CompletedAt) {
+                storage.updateRun(runId, { phase0CompletedAt: null })
+              }
+            } catch { /* best-effort: engine reruns discovery when the gate is open */ }
+          }
+        } else {
+          recon.reason = loaded.reason
+          notes.push(`recon cache miss: ${loaded.reason}; running fresh Phase-0 discovery`)
+        }
+      }
+    }
+
     engine = new Execution(storage, {
       canaryBroker: canary,
       ...(backend ? { backend } : {}),
@@ -1254,12 +2083,67 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     engine.wake()
     runStartedAt = nowMs()
 
+    const captureRecon = (completedAt: number): void => {
+      if (!recon.requested || recon.captured || recon.hit || !recon.keyInputs || !recon.directory) return
+      try {
+        const resolved = resolveRunPersonas(storage, projectId, personaIds)
+        const personaSessions: CachedPersonaSessionHandle[] = plan.personas.map(p => {
+          const session = resolved.get(p.handle)?.session
+          const headerType = session?.headerType ?? 'unknown'
+          return {
+            handle: p.handle,
+            roleLabel: p.roleLabel,
+            authKind: 'login',
+            headerType,
+            headerName: session?.headerName ?? null,
+            adapter: session?.adapterUsed ?? null,
+            loginPath: loginPath ? new URL(loginPath, briefing.origin).pathname : null,
+            expiresAt: typeof session?.expiresAt === 'number' ? session.expiresAt : null,
+            // Non-reversible handle only; the minted session value stays in the cell credentials dir.
+            sessionHandle: createHash('sha256').update(`${recon.key}:${p.handle}:${headerType}`).digest('hex').slice(0, 24),
+          }
+        })
+        const { snapshot, counts } = captureReconSnapshot({
+          storage,
+          runId,
+          keyInputs: recon.keyInputs,
+          sourceOrigin: briefing.origin,
+          phase0CompletedAt: completedAt,
+          observedDurationMs: Math.max(0, completedAt - runStartedAt),
+          personaSessions,
+          secrets,
+          gitSha,
+        })
+        recon.path = writeReconCache(recon.directory, recon.keyInputs, snapshot)
+        recon.captured = true
+        recon.capturedAt = snapshot.capturedAt
+        recon.phase0ObservedMs = snapshot.phase0.observedDurationMs
+        recon.surface = counts
+        notes.push(
+          `recon cache snapshot written: ${counts.endpoints} endpoints, ${counts.endpointParams} params, `
+          + `${counts.apiDependencies} dependencies, ${counts.resourceSamples} redacted resource samples, `
+          + `${counts.personaSessionHandles} persona session handles (no secret values)`,
+        )
+      } catch (error) {
+        recon.reason = `capture failed: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 160)}`
+        notes.push(`recon cache capture skipped: ${recon.reason}`)
+      }
+    }
+
     const wait = await waitForTerminal({
       storage,
       runId,
       deadlineAt: startedAt + args.maxDurationMs,
       onTick: (status, phase) => log(`[${slug}] ${status}/${phase}`),
+      onPhase0Complete: captureRecon,
     })
+    if (recon.requested && !recon.captured && !recon.hit) {
+      // The poll can miss a very fast phase transition; recapture from the same boundary.
+      // createdAt filters keep investigation/verification rows out either way.
+      const completedAt = storage.run(runId).phase0CompletedAt
+      if (completedAt) captureRecon(completedAt)
+      else notes.push('recon cache not written: Phase-0 never reported completion')
+    }
     if (wait.timedOut) notes.push(`wall-clock cap reached after ${args.maxDurationMs}ms; run stopped`)
     if (wait.status !== 'complete') {
       const recent = storage.eventsAfter(runId, 0, 200)
@@ -1303,7 +2187,6 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     }
     const card = gradeRun(gradeInput)
     const endedAt = nowMs()
-    const gitSha = resolveGitSha()
     const requestsOnDiscoveredRoutes = gradeInput.requestLog.filter(req =>
       detail.endpoints.some(ep => endpointMatches(
         { method: req.method, path: req.path },
@@ -1354,6 +2237,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       dataDirKept: Boolean(isolated) && args.keepDataDirs,
       budgetUsd: args.budgetUsd,
       maxDurationMs: args.maxDurationMs,
+      reconCache: recon,
       startedAt,
       endedAt,
       durationMs: endedAt - startedAt,
@@ -1391,6 +2275,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         verifierBackend: backendKind,
         budgetUsd: args.budgetUsd,
         timedOut: wait.timedOut,
+        reconCache: recon.requested
+          ? { key: recon.key, hit: recon.hit, refreshed: args.refreshRecon, phase0Skipped: recon.phase0Skipped }
+          : null,
       },
       targetsTotal: card.targets,
       confirmedCount: card.confirmed,
@@ -1518,7 +2405,7 @@ async function main(): Promise<void> {
     process.stdout.write(`[realistic-bench] starting ${app} seed=${seed} ${args.mode}\n`)
     const result = finalizeCellResult(await runCell(args, app, seed, line => process.stdout.write(`${line}\n`)))
     const c = result.scorecard
-    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}\n`)
+    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}${result.meta.reconCache.requested ? ` recon=${result.meta.reconCache.hit ? 'hit' : 'miss'} saved=${result.meta.reconCache.reconTimeSavedMs}ms` : ''}\n`)
     return result
   })
 

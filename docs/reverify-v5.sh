@@ -196,6 +196,9 @@ if [[ "$MODE" == fast ]]; then
   run_node "v5 pure unit suites" 1800 \
     tests/v5-board-store.test.ts tests/v5-m2-auth.test.ts tests/v5-m2-recon-probing.test.ts \
     tests/v5-m3-probes.test.ts
+  run_node "security regression suites" 900 \
+    tests/v5-security-approvals.test.ts tests/v5-security-repo.test.ts \
+    tests/v5-security-authbrowser.test.ts
   run_node "worker lifecycle hygiene (stubs)" 300 tests/v5-gate-worker-lifecycle.test.ts
 else
   run_node "v2 core boundaries" 900 \

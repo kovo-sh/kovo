@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import type { Page } from '@playwright/test'
 
 async function availablePort() {
   const server = createServer().listen(0, '127.0.0.1')
@@ -22,12 +23,14 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
   const url = `http://127.0.0.1:${port}`
   let processHandle: ChildProcess | undefined
   let output = ''
+  let bootstrapSecret = ''
 
   return {
     directory,
     url,
     async start() {
       output = ''
+      bootstrapSecret = ''
       const child = spawn(process.execPath, ['scripts/serve.ts'], {
         cwd: process.cwd(),
         env: { ...process.env, GUARDIAN_OFFLINE: '1', GUARDIAN_PUBLIC_ORIGIN: '', ...env, PORT: String(port), GUARDIAN_DATA_DIR: directory },
@@ -40,13 +43,27 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
         if (child.exitCode !== null) break
         try {
           const response = await fetch(url + '/health', { signal: AbortSignal.timeout(300) })
-          if (response.ok) return
+          if (response.ok) {
+            // The server issues a single-use bootstrap secret for the local session; read it
+            // before it is consumed so specs can open the app exactly as an operator would.
+            for (let read = 0; read < 20 && !bootstrapSecret; read += 1) {
+              try { bootstrapSecret = (await readFile(join(directory, 'bootstrap'), 'utf8')).trim() } catch { await delay(50) }
+            }
+            return
+          }
         } catch {
           // The production server has not bound the test port yet.
         }
         await delay(70)
       }
       throw new Error('Guardian startup failed.\n' + output)
+    },
+    /** Open the app through the single-use local bootstrap (sets the session cookie). */
+    async open(page: Page) {
+      const secret = bootstrapSecret.trim()
+      if (!secret) return page.goto(url)
+      bootstrapSecret = ''
+      return page.goto(`${url}/?bootstrap=${encodeURIComponent(secret)}`)
     },
     async stop(signal: NodeJS.Signals = 'SIGTERM') {
       const child = processHandle

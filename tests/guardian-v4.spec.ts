@@ -67,7 +67,7 @@ test('configures, displays across reload, and edits roleAffinity across multiple
 
   try {
     await app.start()
-    await page.goto(app.url)
+    await app.open(page)
     await page.getByRole('link', { name: 'Model settings' }).click()
 
     const roleSelect = page.getByLabel(/Role affinity/i)
@@ -172,7 +172,7 @@ test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset 
 
   try {
     await publicApp.start()
-    await page.goto(publicApp.url)
+    await publicApp.open(page)
     await page.getByLabel('Project name').fill('Public Fail-Closed Project')
     await page.getByLabel('Seed hosts').fill('https://northstar.example')
     await page.getByRole('button', { name: 'Create project', exact: true }).click()
@@ -243,7 +243,7 @@ test('persists local-lab LabRunner config and sandboxWriteAllowlist across reloa
 
   try {
     await labApp.start()
-    await page.goto(labApp.url)
+    await labApp.open(page)
 
     await page.getByLabel('Target environment').selectOption('local-lab')
     await page.getByLabel('Project name').fill('Northstar Local SaaS Lab')
@@ -382,7 +382,7 @@ test('populates endpoints, endpoint_params, and api_dependencies and renders Sur
 
   try {
     await app.start()
-    await page.goto(app.url)
+    await app.open(page)
     await page.getByRole('link', { name: 'Model settings' }).click()
     await createModelProfile(page, {
       name: 'Surface Primary',

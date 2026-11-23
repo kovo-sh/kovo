@@ -74,6 +74,7 @@ test('renders the mandatory Board tab with seeded roster, messages, evidence chi
   const app = await createApp({}, directory)
   try {
     await app.start()
+    await app.open(page)
     await page.goto(`${app.url}/runs/${runId}?view=overview`)
 
     // Mandatory right-pane swap: Board replaces Coordinator, Worker Inspector remains available.
