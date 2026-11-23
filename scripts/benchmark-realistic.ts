@@ -97,6 +97,8 @@ export interface RealisticArgs {
   concurrency: number
   dataDir?: string
   noLlm: boolean
+  /** Conventional noun/action route wordlists (local-lab convenience). Default ON. */
+  conventionalWordlist: boolean
   isolateDataDir: boolean
   keepDataDirs: boolean
   allowInertWorkers: boolean
@@ -139,6 +141,10 @@ Flags:
                           (default: $GUARDIAN_DATA_DIR or <out-dir>/data/<cell>)
   --no-llm                force the deterministic/Zero-LLM path; the run uses an
                           isolated data dir and never loads a model profile
+  --no-conventional-wordlist
+                          run the deterministic engine without the conventional
+                          noun/action route wordlist (local-lab convenience). Only
+                          target-discovered/declared surface is probed.
   --isolate-data-dir      per-cell data dir initialized from --data-dir: copies only
                           enabled model_profiles rows and symlinks credentials/
                           (default: on when --concurrency > 1)
@@ -270,7 +276,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
 
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
-    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'isolate-data-dir', 'keep-data-dirs',
+    'out-dir', 'concurrency', 'data-dir', 'no-llm', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
     'allow-heldout-snapshot',
@@ -285,6 +291,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       budgetUsd: DEFAULT_BUDGET_USD, maxDurationMs: DEFAULT_MAX_DURATION_MS,
       outDir: resolve('.guardian/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
       noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
+      conventionalWordlist: a['no-conventional-wordlist'] !== true,
       keepDataDirs: Boolean(a['keep-data-dirs']),
       allowInertWorkers: Boolean(a['allow-inert-workers']),
       verifier: 'auto', refreshRecon: a['refresh-recon'] === true, help: true,
@@ -364,6 +371,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     concurrency,
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
     noLlm,
+    conventionalWordlist: a['no-conventional-wordlist'] !== true,
     isolateDataDir: a['isolate-data-dir'] === true,
     keepDataDirs: a['keep-data-dirs'] === true,
     allowInertWorkers: a['allow-inert-workers'] === true,
@@ -1886,6 +1894,8 @@ export interface CellMeta {
   seed: number
   seedSet: 'dev' | 'held-out'
   mode: BenchMode
+  /** Effective conventional noun/action route wordlist switch for the deterministic engine. */
+  conventionalWordlist: boolean
   origin: string
   loginPath: string | null
   gitSha: string
@@ -2046,6 +2056,10 @@ export async function stopEngine(engine: Execution): Promise<number> {
 export async function runCell(args: RealisticArgs, app: AppName, seed: number, log: (line: string) => void): Promise<CellResult> {
   const startedAt = nowMs()
   const slug = cellSlug(app, seed, args.mode)
+  // The deterministic engine reads the switch from the environment (same mechanism as
+  // GUARDIAN_DETERMINISTIC_ENGINE). Record the effective value in cell meta as well.
+  if (args.conventionalWordlist) delete process.env.GUARDIAN_CONVENTIONAL_WORDLIST
+  else process.env.GUARDIAN_CONVENTIONAL_WORDLIST = '0'
   const cellCount = cellKeys(args).length
   // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
   const sourceDataDir = args.noLlm ? undefined : args.dataDir
@@ -2658,6 +2672,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       origin: briefing.origin,
       loginPath,
       gitSha,
+      conventionalWordlist: args.conventionalWordlist,
       model,
       verifierBackend: backendKind,
       workerSessions: capability.supported,
