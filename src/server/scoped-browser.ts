@@ -334,7 +334,9 @@ export interface PlaywrightWebSocketRoute {
 
 /**
  * HTTP interception does not cover WebSocket upgrades. Route every socket through an explicit
- * scope check and only call `connectToServer()` for in-scope wss/ws origins.
+ * scope check and only call `connectToServer()` for in-scope wss/ws origins. When the Playwright
+ * version has no `routeWebSocket`, the guard fails closed (page-level deny script) instead of
+ * silently allowing unchecked upgrades.
  */
 export async function installWebSocketGuard(
   context: Pick<PlaywrightContext, 'routeWebSocket'> & Partial<Pick<PlaywrightContext, 'addInitScript'>>,

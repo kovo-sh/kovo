@@ -101,6 +101,11 @@ export interface PlaywrightFormBrowserLike {
 }
 
 export interface PersonaAuthManagerOptions {
+  /**
+   * Transport override for tests/embedders. When supplied without `resolveHost`, Guardian cannot
+   * observe or pin that transport's DNS, so the injector owns the pinning contract. Production
+   * (default fetch) always resolves and connects to the validated address.
+   */
   fetchImpl?: typeof fetch
   launchBrowser?: (pinnedHosts?: ReadonlyMap<string, readonly string[]>) => Promise<PlaywrightFormBrowserLike>
   timeoutMs?: number
