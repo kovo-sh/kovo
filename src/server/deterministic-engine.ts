@@ -87,6 +87,8 @@ export interface EndpointHarvest {
   activeQueryParams: string[]
   /** Identifiers observed on the lower-privileged (viewer) persona's own identity route. */
   viewerIds?: string[]
+  /** Runtime value shape per field (url/path/xml/jwt/uuid/number/email/text). */
+  shapes?: Record<string, ParamValueShape>
   /** Structural response evidence: wire format and value shape, never a route-name assumption. */
   evidence?: HarvestEvidence
 }
@@ -142,6 +144,11 @@ export interface DeterministicEngineInput {
   maxDurationMs?: number
   maxEndpoints?: number
   maxHypotheses?: number
+  /**
+   * v6 Phase 1: the concurrent floor lane is additive and time-boxed, so it optimizes for breadth
+   * (one pass per class) rather than exhaustive depth on one class. Only the caps change.
+   */
+  lane?: boolean
   classes?: ReadonlySet<string>
   /** Injection points for tests; production uses the surface-engine probe and ReplayVerifier. */
   probe?: typeof probeDifferential
@@ -294,6 +301,104 @@ export function searchParamNames(path: string): string[] {
 export function isTextualParam(name: string): boolean {
   if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) return false
   return !/(?:^|_)(?:id|uuid|uid|key|token|secret|password|page|limit|offset|cursor|count|size|amount|price|qty|quantity|num|number|index|sort|order|dir|direction|since|until|from|to|date|time|timestamp|at|version)$/i.test(name)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Explicit parameter / risk ranking (v6 Phase 1)
+// ---------------------------------------------------------------------------------------------
+//
+// Name heuristics are *scores*, never eligibility gates. The structural inputs are the declared
+// schema type, the value shape the target itself returned, the parameter family (identifier,
+// number, URL, path, XML, JWT), the HTTP method semantics and whether the route requires auth.
+
+export type ParamValueShape = 'url' | 'path' | 'xml' | 'jwt' | 'uuid' | 'number' | 'email' | 'text' | 'unknown'
+
+/** Classify a value the target returned. Pure and bounded (no network). */
+export function classifyValueShape(value: string): ParamValueShape {
+  const raw = value.trim()
+  if (!raw) return 'unknown'
+  if (/^https?:\/\/[^\s]{1,300}$/i.test(raw)) return 'url'
+  if (/^(?:\.{0,2}\/|[A-Za-z]:\\|[^\s]{1,200}\.(?:pdf|txt|log|csv|json|xml|zip))$/i.test(raw) && /[/\\.]/.test(raw)) return 'path'
+  if (/^<\??[\s\S]{1,400}>/.test(raw)) return 'xml'
+  if (/^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/.test(raw)) return 'jwt'
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) return 'uuid'
+  if (/^-?\d{1,18}$/.test(raw)) return 'number'
+  if (/^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,}$/.test(raw)) return 'email'
+  return 'text'
+}
+
+/** Name-shape family: id/number/url/path/xml/jwt. Used as one score input, never a gate. */
+export function paramNameShape(name: string): ParamValueShape | 'id' {
+  const lower = name.toLowerCase()
+  const camelEnd = (suffixes: readonly string[]) => suffixes.some(suffix =>
+    name.endsWith(suffix) || name.endsWith(suffix[0].toUpperCase() + suffix.slice(1)))
+  if (/(?:^|[_-])(?:id|uuid|uid|ref|key|slug)$/.test(lower) || /^(?:id|uuid|uid|ref)$/.test(lower) || camelEnd(['id', 'uuid', 'uid', 'ref', 'key'])) return 'id'
+  if (/(?:url|uri|href|callback|webhook|redirect|avatar|image|photo|logo|src|destination|return_to|returnto|next)$/.test(lower)) return 'url'
+  if (/(?:path|file|filename|filepath|document|attachment|log|journal)$/.test(lower)) return 'path'
+  if (/(?:xml|soap)/i.test(name) || /(?:payload|body|markup)$/.test(lower)) return 'xml'
+  if (/(?:jwt|token|assertion|bearer|auth)$/.test(lower)) return 'jwt'
+  if (/(?:page|limit|offset|cursor|count|size|qty|quantity|amount|price|total|num|number|index|since|until)$/.test(lower)) return 'number'
+  return 'text'
+}
+
+export interface ParamRiskInput {
+  /** HTTP method of the route the parameter belongs to. */
+  method?: string
+  /** Route is known to require authentication/privilege (from the surface graph). */
+  authRequired?: boolean
+  /** Route-level semantic hint. A soft +boost only, never an eligibility gate. */
+  routeHint?: boolean
+}
+
+export interface RankedEngineParam {
+  param: EngineParam
+  score: number
+  reasons: string[]
+}
+
+/**
+ * Score one parameter as a probe target. Deterministic and inspectable:
+ *  - declared type (schema) and observed value shape carry the most weight;
+ *  - id/number/url/path/xml/jwt families are recognized structurally;
+ *  - method semantics and auth requirement adjust priority;
+ *  - English route/param hints are a small tie-breaker.
+ */
+export function scoreEngineParam(param: EngineParam, input: ParamRiskInput = {}): RankedEngineParam {
+  const reasons: string[] = []
+  let score = 0
+  const bump = (value: number, reason: string) => { score += value; if (value !== 0) reasons.push(reason) }
+  const declared = (param.declaredType ?? '').toLowerCase()
+  if (declared) {
+    if (['integer', 'number'].includes(declared)) bump(9, `declared:${declared}`)
+    else if (declared === 'string') bump(6, 'declared:string')
+    else if (declared === 'array' || declared === 'object') bump(4, `declared:${declared}`)
+    else bump(3, `declared:${declared}`)
+  }
+  const shape = (param.observedShape ?? 'unknown') as ParamValueShape
+  const shapeWeight: Record<string, number> = { url: 28, path: 24, xml: 26, jwt: 18, uuid: 14, email: 12, number: 10, text: 6, unknown: 0 }
+  bump(shapeWeight[shape] ?? 0, `shape:${shape}`)
+  const family = paramNameShape(param.name)
+  const familyWeight: Record<string, number> = { id: 12, url: 16, path: 14, xml: 16, jwt: 10, number: 8, text: 4 }
+  bump(familyWeight[family] ?? 0, `family:${family}`)
+  bump(param.location === 'json' || param.location === 'form' ? 8 : param.location === 'query' ? 6 : 4, `location:${param.location}`)
+  if (param.isObjectId || family === 'id' || shape === 'uuid') bump(6, 'identifier-shaped')
+  const method = (input.method ?? '').toUpperCase()
+  if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') bump(8, `method:${method}`)
+  else if (method === 'GET') bump(4, 'method:GET')
+  if (input.authRequired) bump(6, 'auth-required')
+  if (input.routeHint) bump(5, 'route-hint')
+  if (param.isCsrf) bump(-40, 'csrf-token')
+  if (/(?:^|_)(?:csrf|xsrf|nonce|authenticity)/i.test(param.name)) bump(-40, 'csrf-token')
+  return { param, score, reasons }
+}
+
+/** Rank parameters for probe priority (highest first, stable on name/location). */
+export function rankEngineParams(params: readonly EngineParam[], input: ParamRiskInput = {}): RankedEngineParam[] {
+  return params
+    .map(param => scoreEngineParam(param, input))
+    .sort((a, b) => b.score - a.score ||
+      a.param.name.localeCompare(b.param.name) ||
+      a.param.location.localeCompare(b.param.location))
 }
 
 export function fileParamNames(path: string): string[] {
@@ -536,6 +641,26 @@ export function enumerateHypotheses(
       ...(siblingEvidence?.evidence ?? {}),
       ...(harvest?.evidence ?? {}),
     }
+    // Explicit, inspectable parameter/risk ranking. Declared schema type, observed value shape,
+    // parameter family, method semantics and auth requirement drive priority; route nouns only
+    // add a small tie-break boost.
+    const shapeOf = (name: string): ParamValueShape =>
+      harvest?.shapes?.[name] ?? (observedValues[name]?.[0] ? classifyValueShape(observedValues[name][0]) : 'unknown')
+    const rankedParams = rankEngineParams(
+      inferred.map(param => ({ ...param, observedShape: param.observedShape ?? shapeOf(param.name) })),
+      {
+        method,
+        authRequired: privileged,
+        routeHint: pathHasSearchHint(bare) || pathHasUrlHint(bare) || pathHasXmlHint(bare) ||
+          pathHasFileHint(bare) || pathHasTemplateHint(bare) || pathHasCommandHint(bare) ||
+          pathHasRedirectHint(bare) || pathHasPrivilegedHint(bare),
+      },
+    )
+    const rankedFor = (predicate: (param: EngineParam) => boolean, bonus = 0): RankedEngineParam[] =>
+      rankedParams
+        .filter(item => predicate(item.param))
+        .map(item => ({ ...item, score: item.score + bonus }))
+        .sort((a, b) => b.score - a.score || a.param.name.localeCompare(b.param.name))
     const pathSegments = bare.split('/').filter(Boolean)
     const lastSegment = pathSegments[pathSegments.length - 1] ?? ''
     const idIsLast = hasIdPath && placeholderSeg.test(lastSegment)
@@ -567,9 +692,10 @@ export function enumerateHypotheses(
       // Function-level authorization: mutating privileged actions (BFLA), or a read of a
       // token/secret/audit surface (the disclosure targets). A generic admin listing read is
       // deliberately left to the agentic pass.
-      const functionRunnable = functionLevel && (
-        mutating ? privileged : sensitiveRead
-      )
+      // Function-level authorization: mutating privileged actions (BFLA). Read-only privileged
+      // collections are handled by the credential-exposure intent, which requires unmasked-value
+      // evidence; a viewer merely reading a feed is not a confirmed impact on its own.
+      const functionRunnable = functionLevel && mutating && privileged
       const runnable = objectRunnable || functionRunnable
       if (runnable && authzOwner && authzOther && authzOwner.handle !== authzOther.handle) {
         let pathAndQuery = endpoint.pathTemplate.split('?')[0]
@@ -640,14 +766,24 @@ export function enumerateHypotheses(
     }
 
     // --- SQL injection ----------------------------------------------------------------------
+    // Eligibility is structural: a declared or observed query/body parameter the target reads.
+    // Textual/identifier/number families rank first; route search hints only boost priority.
     if (method === 'GET' || method === 'POST') {
-      const strongSqlName = /^(?:q|query|search|term|keyword|filter|expr|clause|sort|order|orderby|where|id|uid|ref|sku|slug|name|title|category|type|status|state|email|user|account|member|host|target|page|limit|since|amount|price|total|number|code|text|body|comment|note)$/i
-      const candidates = inferred
-        .filter(p => (p.location === 'query' && method === 'GET') || (p.location === 'json' && method !== 'GET'))
-        .filter(p => strongSqlName.test(p.name))
-      const params = method === 'GET'
-        ? (activeQuery.size > 0 ? candidates.filter(p => activeQuery.has(p.name)) : candidates.filter(p => pathHasSearchHint(bare) || strongSqlName.test(p.name))).slice(0, 2)
-        : candidates.slice(0, 2)
+      const sqlCandidates = rankedFor(param =>
+        ((param.location === 'query' && method === 'GET') || (param.location === 'json' && method !== 'GET')) &&
+        !param.isCsrf &&
+        !['url', 'path', 'xml', 'jwt'].includes(paramNameShape(param.name)) &&
+        param.observedShape !== 'url' && param.observedShape !== 'xml',
+      )
+        .map(item => ({
+          ...item,
+          score: item.score +
+            (['text', 'id', 'number'].includes(paramNameShape(item.param.name)) ? 10 : 0) +
+            (activeQuery.has(item.param.name) ? 8 : 0) +
+            (method === 'GET' && pathHasSearchHint(bare) ? 6 : 0),
+        }))
+        .sort((a, b) => b.score - a.score || a.param.name.localeCompare(b.param.name))
+      const params = sqlCandidates.slice(0, 2).map(item => item.param)
       for (const param of params) {
         const numeric = /^(?:id|page|limit|offset|qty|quantity|amount|price|count|num|index)$/i.test(param.name)
         const observed = harvest?.values[param.name]?.[0] ?? harvest?.seedValues.find(v => v.length >= 3 && v.length <= 40)
@@ -671,18 +807,23 @@ export function enumerateHypotheses(
 
     // --- Path traversal ---------------------------------------------------------------------
     // Structural evidence: a file-shaped declared parameter, an attachment response, or a route
-    // that already published a filename value. Route nouns are only a last-resort hint.
-    const fileishParam = inferred.find(p => p.location === 'query' &&
-      /^(?:file|filepath|filename|path|name|document|doc|attachment|download|src|source|template)$/i.test(p.name))
+    // that already published a filename value. Route nouns are only a priority tie-breaker.
+    const fileishParams = rankedFor(param => param.location === 'query' &&
+      (paramNameShape(param.name) === 'path' || param.observedShape === 'path' ||
+        /^(?:file|filepath|filename|path|name|document|doc|attachment|download|src|source|template)$/i.test(param.name)))
     const fileEvidence = pathHasFileHint(bare) ||
-      Boolean(fileishParam) ||
+      fileishParams.length > 0 ||
       observedEvidence.contentDisposition === true ||
-      (observedValues.filename?.length ?? 0) > 0
+      (observedValues.filename?.length ?? 0) > 0 ||
+      Object.values(observedValues).some(values => values.some(value => classifyValueShape(value) === 'path'))
     if (method === 'GET' && fileEvidence) {
-      const fileNames = new Set([...fileParamNames(bare), ...(fileishParam ? [fileishParam.name] : [])])
+      // Preserve the surface's own parameter order among file-shaped candidates: the declared name
+      // (`logFile`) beats a generic inferred fallback (`file`) when both are plausible.
       const params = inferred
-        .filter(p => p.location === 'query' && (fileNames.has(p.name) || /(?:file|path|name|log|doc|download|export)/i.test(p.name)))
-        .filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
+        .filter(param => param.location === 'query')
+        .filter(param => paramNameShape(param.name) === 'path' || param.observedShape === 'path' ||
+          /^(?:file|filepath|filename|path|name|document|doc|attachment|download|logfile|src|source|template)$/i.test(param.name))
+        .filter(param => activeQuery.size === 0 || activeQuery.has(param.name))
         .slice(0, 1)
       for (const param of params) {
         const observed = harvest?.values[param.name]?.find(v => v.length >= 2 && v.length <= 60 && !/[<>{}\\]/.test(v))
@@ -703,16 +844,21 @@ export function enumerateHypotheses(
     }
 
     // --- SSRF -------------------------------------------------------------------------------
-    // A URL-consuming *write* is the SSRF source. Trigger routes (`/hooks/:id/ping`) are paired as
-    // the second-order fetch step, never probed as if they accepted a URL body themselves.
+    // A URL-consuming *write* is the SSRF source. Eligibility is structural: a declared body
+    // parameter whose family or observed value is URL-shaped, or a collection response that
+    // already publishes URL values (the target itself fetches them). Trigger routes are paired as
+    // the second-order fetch step, never probed as if they accepted a URL body.
     const triggerShaped = hasDynamicIdSegment(bare) && /(?:ping|test|trigger|fetch|replay|send|deliver|run|execute|verify)$/i.test(lastSegment)
-    if ((method === 'POST' || method === 'PUT') && pathHasUrlHint(bare) && !triggerShaped) {
-      const urlNames = new Set(urlParamNames(bare))
-      const declared = inferred.filter(p =>
-        p.location === 'json' &&
-        (urlNames.has(p.name) || /(?:url|uri|src|endpoint|callback|webhook|image|photo|avatar|target|link|host)/i.test(p.name)))
-      const params = declared.slice(0, 3)
-      if (params.length === 0) params.push(inferredParam(urlParamNames(bare)[0] ?? 'url', 'json'))
+    const urlBodyParams = rankedFor(param =>
+      (param.location === 'json' || param.location === 'form') &&
+      (paramNameShape(param.name) === 'url' || param.observedShape === 'url'))
+    const collectionPublishesUrls = (observedEvidence.urlValues?.length ?? 0) > 0
+    if ((method === 'POST' || method === 'PUT') && !triggerShaped &&
+        (urlBodyParams.length > 0 || collectionPublishesUrls)) {
+      const declared = urlBodyParams.slice(0, 3).map(item => item.param)
+      const params = declared.length > 0
+        ? declared
+        : [inferredParam(urlParamNames(bare)[0] ?? 'url', 'json')]
       // Second-order: a sibling trigger route for the same resource collection.
       const trigger = endpoints.find(candidate => {
         const candidateBare = candidate.pathTemplate.split('?')[0] || '/'
@@ -744,7 +890,14 @@ export function enumerateHypotheses(
     }
 
     // --- XXE --------------------------------------------------------------------------------
-    if (method === 'POST' && pathHasXmlHint(bare) && !pathHasUrlHint(bare) && !pathHasSearchHint(bare)) {
+    // Eligibility is wire-format evidence: the route serves XML, or a declared/observed body value
+    // is XML-shaped. The route noun is only a priority tie-breaker.
+    const xmlBodyEvidence = Object.values(observedValues)
+      .some(values => values.some(value => classifyValueShape(value) === 'xml'))
+    const declaredXmlParam = inferred.some(param =>
+      (param.location === 'json' || param.location === 'form') &&
+      (paramNameShape(param.name) === 'xml' || param.observedShape === 'xml'))
+    if (method === 'POST' && (observedEvidence.xml === true || xmlBodyEvidence || declaredXmlParam)) {
       add({
         key: `xxe_canary|${endpoint.id}`,
         endpoint,
@@ -760,8 +913,10 @@ export function enumerateHypotheses(
     // --- Template evaluation and shell-command sinks -----------------------------------------
     // Both families only make sense on a route whose own shape consumes renderable text or an
     // operator-supplied host/command. Candidate field names come from what the target published
-    // (route map/config document) first, then the route's semantic vocabulary.
-    if (mutating && !pathHasUrlHint(bare) && !pathHasFileHint(bare)) {
+    // (route map/config document) first, then the route's semantic vocabulary. URL/file-consuming
+    // routes are excluded structurally (a declared URL/path body field), not by route noun.
+    const hasUrlOrFilePathBody = urlBodyParams.length > 0 || fileishParams.length > 0
+    if (mutating && !hasUrlOrFilePathBody) {
       const declaredBody = inferred.filter(p => p.location === 'json' || p.location === 'form')
       const published = originSchemaPool.get(endpoint.origin) ?? []
       const candidatesFor = (pattern: RegExp, fallbacks: string[]): EngineParam[] => {
@@ -813,8 +968,10 @@ export function enumerateHypotheses(
     }
 
     // --- Workflow step skip ------------------------------------------------------------------
-    // A terminal action verb on an identified resource, seeded from the collection's own list or
-    // detail read. Repeating it must be rejected once the object left its prerequisite state.
+    // A POST transition on an identified resource whose sibling read exposes workflow state, or
+    // whose terminal-verb shape is a soft hint. The repeat-transition probe is the discriminator.
+    const statusLike = observedFields.some(field => /^(?:status|state|stage|phase|workflow_state|step)$/i.test(field)) ||
+      (siblingEvidence?.fields ?? []).some(field => /^(?:status|state|stage|phase|workflow_state|step)$/i.test(field))
     const actionVerb = /(?:confirm|approve|complete|finalize|fulfil|ship|activate|publish|accept|settle)$/i
     if (method === 'POST' && hasIdPath && actionVerb.test(lastSegment)) {
       const collection = collectionPathOf(bare)
@@ -847,7 +1004,7 @@ export function enumerateHypotheses(
           ...(detail ? { workflowReadPath: barePath(detail) } : {}),
           workflowTargetTemplate: bare,
           jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
-          risk: endpointRiskScore(endpoint) + 8,
+          risk: endpointRiskScore(endpoint) + 8 + (statusLike ? 10 : 0),
         })
       }
     }
@@ -879,15 +1036,17 @@ export function enumerateHypotheses(
     }
 
     // --- Reflected XSS ----------------------------------------------------------------------
-    // Any string query parameter the target actually reads is a reflection candidate; the probe
-    // itself is the benign canary, so a parameter that is not reflected simply costs one request.
-    const xssCandidates = inferred.filter(p => p.location === 'query' &&
-      (pathHasSearchHint(bare) || activeQuery.has(p.name) || isTextualParam(p.name)))
-    if (method === 'GET' && xssCandidates.length > 0) {
-      const ordered = [...xssCandidates].sort((a, b) =>
-        Number(activeQuery.has(b.name)) - Number(activeQuery.has(a.name)) ||
-        Number(/^(?:q|query|term|keyword|search|s)$/i.test(b.name)) - Number(/^(?:q|query|term|keyword|search|s)$/i.test(a.name)))
-      for (const param of ordered.slice(0, 1)) {
+    // Any query parameter the target actually reads is a reflection candidate; the probe itself is
+    // the benign canary, so a parameter that is not reflected simply costs one request. Declared
+    // type/observed value shape and the active-filter differential drive the rank.
+    const xssCandidates = method === 'GET'
+      ? rankedFor(param => param.location === 'query' && !param.isCsrf &&
+          ['text', 'id', 'number'].includes(paramNameShape(param.name)) &&
+          (param.declaredType !== undefined || activeQuery.has(param.name) || pathHasSearchHint(bare)))
+        .slice(0, 1)
+      : []
+    if (xssCandidates.length > 0) {
+      for (const { param } of xssCandidates) {
         add({
           key: `xss_context|${endpoint.id}|${param.name}`,
           endpoint,
@@ -907,7 +1066,7 @@ export function enumerateHypotheses(
     // Structural: a cookie-authenticated state mutation is any POST whose sibling GET exposes a
     // mutable state field (or whose creation has a readable detail route). The probe binds the
     // session jar and compares with/without CSRF material, so a non-cookie route stays silent.
-    if (method === 'POST' && !pathHasUrlHint(bare)) {
+    if (method === 'POST' && urlBodyParams.length === 0) {
       const detailReadPath = hasIdPath
         ? bare.replace(`/${lastSegment}`, '')
         : null
@@ -1146,6 +1305,8 @@ interface JsonHarvest {
   ids: string[]
   fields: string[]
   values: Record<string, string[]>
+  /** Runtime value shape per field (url/path/xml/jwt/uuid/number/email/text). */
+  shapes: Record<string, ParamValueShape>
   textValues: string[]
   body: string
   evidence: HarvestEvidence
@@ -1157,10 +1318,11 @@ const jwtValueRe = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/
 function harvestJson(body: string): JsonHarvest {
   const ids: string[] = []
   const values: Record<string, string[]> = {}
+  const shapes: Record<string, ParamValueShape> = {}
   const textValues: string[] = []
   const evidence: HarvestEvidence = {}
   let parsed: unknown
-  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, textValues, body, evidence } }
+  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, shapes, textValues, body, evidence } }
   const walk = (node: unknown, depth: number): void => {
     if (depth > 5 || node === null || node === undefined) return
     if (Array.isArray(node)) {
@@ -1178,6 +1340,10 @@ function harvestJson(body: string): JsonHarvest {
         const bucket = values[key] ?? []
         if (bucket.length < 4) bucket.push(stringValue)
         values[key] = bucket
+        if (!shapes[key] || shapes[key] === 'unknown' || shapes[key] === 'text') {
+          const classified = classifyValueShape(stringValue)
+          if (classified !== 'unknown') shapes[key] = classified
+        }
         if (/^(?:name|title|label|slug|subject|description|text|term|query|filename|file)$/i.test(key) &&
             stringValue.length >= 3 && stringValue.length <= 48 && !/[<>{}\\]/.test(stringValue)) {
           textValues.push(stringValue)
@@ -1209,6 +1375,7 @@ function harvestJson(body: string): JsonHarvest {
     ids: [...new Set(ids)].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id)),
     fields: [...new Set(Object.keys(values))],
     values,
+    shapes,
     textValues: [...new Set(textValues)],
     body,
     evidence,
@@ -1265,9 +1432,9 @@ class SurfaceHarvester {
         if (headerNames.length > 0) evidence.headerNames = headerNames.slice(0, 32)
         return { ...harvested, evidence }
       }
-      return { ids: [], fields: [], values: {}, textValues: [], body: '', evidence: {} }
+      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], body: '', evidence: {} }
     } catch {
-      return { ids: [], fields: [], values: {}, textValues: [], body: '', evidence: {} }
+      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], body: '', evidence: {} }
     } finally {
       this.inflight.delete(pathAndQuery)
     }
@@ -1303,6 +1470,10 @@ function mergeHarvest(target: EndpointHarvest, next: JsonHarvest): void {
     const bucket = target.values[field] ?? []
     for (const value of values) if (!bucket.includes(value)) bucket.push(value)
     target.values[field] = bucket.slice(0, 4)
+  }
+  target.shapes = target.shapes ?? {}
+  for (const [field, shape] of Object.entries(next.shapes)) {
+    if (shape !== 'unknown' && !target.shapes[field]) target.shapes[field] = shape
   }
   for (const value of next.textValues) if (!target.seedValues.includes(value)) target.seedValues.push(value)
   mergeEvidence(target, next.evidence)
@@ -1730,7 +1901,8 @@ async function probeSecondOrderSsrf(
 
 
 const credentialPatterns: ReadonlyArray<RegExp> = [
-  /\brb[cst]_[A-Za-z0-9]+_[0-9a-f]{12}\b/,
+  // Vendor-format credentials only. No benchmark/harness token literals: the engine proves a
+  // disclosure from the response shape and an access-control differential, not from a known prefix.
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b/,
   /\bghp_[A-Za-z0-9]{20,}\b/,
@@ -1812,6 +1984,21 @@ async function probeSecretExposure(
       return exchange
     } catch { requests += 1; return null }
   }
+  const getAnonymous = async (path: string): Promise<BrokerExchangeResult | null> => {
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin: hyp.endpoint.origin,
+        method: 'GET',
+        pathAndQuery: path,
+        followRedirects: false,
+        timeoutMs: 8_000,
+      }, input.grant, input.signal)
+      requests += 1
+      const id = track(exchange)
+      if (typeof id === 'string') exchangeIds.push(id)
+      return exchange
+    } catch { requests += 1; return null }
+  }
   const integrationSurface = /(?:links?|integrations?|connectors?)/i.test(hyp.endpoint.pathTemplate)
   const probePaths: string[] = []
   if (hyp.param) {
@@ -1827,26 +2014,24 @@ async function probeSecretExposure(
     const raw = findSensitiveField(probe.body)
     const literal = credentialPatterns.find(candidate => candidate.test(probe.body))
     if (!raw && !literal) continue
-    let controlPath = '/'
+    const controlPath = path
     if (!integrationSurface) {
-      // Prefer a documented compact/preview toggle; without a masked control there is no proof
-      // that the value is meant to be hidden.
-      const separator = path.includes('?') ? '&' : '?'
-      const control = await get(`${path}${separator}reveal=0`)
-      if (!control || control.status < 200 || control.status >= 300) continue
-      if (!findSensitiveField(control.body) && !credentialPatterns.some(candidate => candidate.test(control.body))) {
-        return {
-          ...base,
-          verdict: 'signal',
-          summary: 'The raw credential is exposed while the compact/preview control masks it.',
-          anomalies: [{ type: 'secret_disclosed', path, controlPath: `${path}${separator}reveal=0`, ...(raw ? { field: raw.field } : { pattern: literal?.source }) }],
-          details: { mode: 'reveal_toggle', field: raw?.field ?? null },
-          requestsSent: requests,
-          exchangeIds,
-          durationMs: Date.now() - started,
-        }
+      // Structural control: the same resource read by an anonymous (no-persona) actor. A 401/403
+      // proves the endpoint is access-controlled, so an unmasked credential returned to the reader
+      // is a disclosure. A public/masked view proves nothing and is silently skipped.
+      const anonymous = await getAnonymous(path)
+      const denied = !anonymous || anonymous.status === 401 || anonymous.status === 403
+      if (!denied) continue
+      return {
+        ...base,
+        verdict: 'signal',
+        summary: 'A credential-bearing response is restricted to an authenticated actor but returns an unmasked secret.',
+        anomalies: [{ type: 'secret_disclosed', path, controlPath, controlActor: 'anonymous', ...(raw ? { field: raw.field } : { pattern: literal?.source }) }],
+        details: { mode: 'anonymous_denial', field: raw?.field ?? null },
+        requestsSent: requests,
+        exchangeIds,
+        durationMs: Date.now() - started,
       }
-      continue
     }
     return {
       ...base,
@@ -1946,10 +2131,13 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   for (const hyp of hypotheses) classStats(report, hyp.intent).hypotheses += 1
 
   const perProbeRequestFloor = 6
+  const laneMode = input.lane === true
+  // The lane is breadth-first: a small authz quota leaves the time-box for the other classes that
+  // the agentic workers cannot cover, while the exhaustive `--no-llm` floor keeps the deep quota.
   const intentCaps: Record<string, number> = {
-    authz: 52,
-    secret_disclosure: 4,
-    sqli: 14,
+    authz: laneMode ? 14 : 52,
+    secret_disclosure: laneMode ? 3 : 4,
+    sqli: laneMode ? 8 : 14,
     traversal: 6,
     ssrf: 8,
     xxe: 4,
@@ -1974,7 +2162,8 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     intentUsed[hyp.intent] = (intentUsed[hyp.intent] ?? 0) + 1
 
     const stats = classStats(report, hyp.intent)
-    const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(defaultEnginePerProbeRequests, remaining))
+    const perProbe = laneMode ? 16 : defaultEnginePerProbeRequests
+    const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(perProbe, remaining))
     let probe: DifferentialResult
     try {
       probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
