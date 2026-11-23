@@ -356,7 +356,8 @@ export function buildAssignmentBriefPacket(
   for (let guard = 0; guard < 500; guard += 1) {
     const text = render()
     if (fits(text)) {
-      return { text, bytes: Buffer.byteLength(text, 'utf8'), truncated }
+      const bytes = assertAssignmentBriefSize(text, cap)
+      return { text, bytes, truncated }
     }
     truncated = true
 
@@ -439,10 +440,12 @@ export function buildAssignmentBriefPacket(
       origin: cleanText(input.origin.split(/[?#]/, 1)[0], 120),
       targetCount: Math.max(1, Math.min(3, Math.floor(input.targetCount ?? 1))),
     })
+    assertAssignmentBriefSize(minimal, cap)
     return { text: minimal, bytes: Buffer.byteLength(minimal, 'utf8'), truncated: true }
   }
 
   const minimal = JSON.stringify({ mission: input.missionKind, origin: cleanText(input.origin.split(/[?#]/, 1)[0], 120) })
+  assertAssignmentBriefSize(minimal, cap)
   return { text: minimal, bytes: Buffer.byteLength(minimal, 'utf8'), truncated: true }
 }
 
@@ -454,4 +457,16 @@ export function buildAssignmentBrief(input: AssignmentBriefInput, maxBytes = ASS
 /** Measure a rendered brief in UTF-8 bytes. */
 export function measureAssignmentBriefBytes(text: string): number {
   return Buffer.byteLength(text, 'utf8')
+}
+
+/**
+ * Assert a rendered brief stays inside its byte cap. The reduction ladder already guarantees this;
+ * the assertion turns a future rendering regression into a loud failure instead of silent bloat.
+ */
+export function assertAssignmentBriefSize(text: string, maxBytes = ASSIGNMENT_BRIEF_MAX_BYTES): number {
+  const bytes = measureAssignmentBriefBytes(text)
+  if (bytes > maxBytes) {
+    throw new RangeError(`assignment brief exceeds ${maxBytes} bytes (rendered ${bytes} bytes)`)
+  }
+  return bytes
 }
