@@ -1890,6 +1890,8 @@ export function linkSnapshotModelCredentials(input: {
 }
 
 export interface CellMeta {
+  runtimeConfirmed?: number
+  advisories?: number
   app: AppName
   seed: number
   seedSet: 'dev' | 'held-out'
@@ -2602,8 +2604,18 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const finalRun = storage.run(runId)
     const detail = storage.runDetail(runId)
 
+    // Product contract: only runtime_confirmed findings are submittable evidence. Static,
+    // pending-OOB, open-proof-gap and dismissed rows are advisories and must never be graded
+    // as confirmed findings (or charged as false positives).
+    const verificationClassOf = (f: unknown): string => {
+      const v = (f as { verificationStatus?: unknown }).verificationStatus
+      return typeof v === 'string' ? v : 'runtime_confirmed'
+    }
+    const runtimeFindings = detail.findings.filter(f => verificationClassOf(f) === 'runtime_confirmed')
+    const advisories = detail.findings.filter(f => verificationClassOf(f) !== 'runtime_confirmed')
+
     const submitted = translateFindings({
-      findings: detail.findings,
+      findings: runtimeFindings,
       replaySpecs: detail.replaySpecs.map(row => ({
         id: row.id, findingId: row.findingId, spec: row.spec, createdAt: row.createdAt,
       })),
@@ -2699,6 +2711,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       runId,
       projectId,
       findingsPersisted: detail.findings.length,
+      runtimeConfirmed: runtimeFindings.length,
+      advisories: advisories.length,
       findingsSubmitted: submitted.length,
       baselineChecksExcluded: detail.findings.filter(f => f.findingKind === 'baseline_check').length,
       endpointsDiscovered: detail.endpoints.length,
