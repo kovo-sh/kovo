@@ -1,6 +1,6 @@
 # Guardian v5 — Freeze Verification (`VERIFICATION-v5.md`)
 
-**Status:** **v5.0 FREEZE CANDIDATE.** The deterministic engine harness meets G4/G9; the shipped production runtime has **no deterministic floor** in v5.0. The ported engine exists on `agents/engine-port` but was reverted from `main` because it regressed 25 existing Execution/E2E tests. Final release gate is **PENDING**.
+**Status:** **v5.0 FREEZE CANDIDATE.** The deterministic engine harness meets G4/G9; the shipped production runtime has **no deterministic floor** in v5.0. The ported engine exists on `agents/engine-port` but was reverted from `main` because it regressed 25 existing Execution/E2E tests. Final release gate: **992/992 PASS** (0 failures, 0 skips, 0 orphans; `/tmp/guardian-reverify-v5.5in05x`).
 
 **Snapshot:** 2026-11-22, `main` @ `d26cd01` (engine-port revert `a73f07e` + workflow-synthesis restore `d26cd01`), docs branch `agents/docs-v5`.
 **Plan:** [plans/ROADMAP-v5.md](plans/ROADMAP-v5.md) · [plans/v5.md](plans/v5.md)
@@ -111,7 +111,7 @@ Five invariants, covered by `tests/v5-tier3-safety.test.ts` (**8/8**) and togeth
 
 ## 6. Release gates
 
-**Release gate status: PENDING.** The freeze `reverify-v5.sh --full` run in `/tmp/guardian-reverify-v5.GtumGa` completed while the tree was still changing and reported failures (2 v4, 6 v5, 17 tiered E2E); it is **not** a clean certification. Last clean full gate was **980/980** before the engine-port revert; the final freeze rerun count is pending.
+**Release gate status: PASS — 992/992, 0 failed, 0 skipped, 0 orphans.** Freeze run: `/tmp/guardian-reverify-v5.5in05x`. This includes 234 v5 tests (full glob), 322 tiered E2E, 198 v4 M1–M7, 46+32 boundaries, 142 realistic-harness, 9 Playwright, and orphan hygiene.
 
 | # | Gate | Target | Current evidence | Status |
 | :--- | :--- | :--- | :--- | :--- |
@@ -124,7 +124,7 @@ Five invariants, covered by `tests/v5-tier3-safety.test.ts` (**8/8**) and togeth
 | G7 | Decoy FP | ≤ 5% | 0/62 dev, 0/63 held-out; runtime 0/19 | **MET** |
 | G8 | Chain completion | ≥ 50% | **1/6 dev, 1/6 held-out** | **NOT MET** |
 | G9 | Held-out within 10 pp | ≤ 10 pp absolute | **−2.0 pp** all-severity; H/C −3.2 pp | **MET** |
-| G10 | Full release gate | 100% pass, 0 skips | freeze gate **PENDING**; last clean **980/980** pre-revert | **PENDING** |
+| G10 | Full release gate | 100% pass, 0 skips | **992/992 PASS**, 0 skips, 0 orphans | **MET** |
 | G11 | Orphan containers/networks | 0 / 0 | direct check **0** stale `Created`, **0** networks | **PASS** (gate pending) |
 
 **Scorecard:** 6 met, 1 met-with-caveat, 1 partial (G6), 1 not met (G8), 1 not measured (G5), 1 pending (G10). **G4 is met on the deterministic surface, not on production `Execution`.**
@@ -175,7 +175,7 @@ The 25/59 and 28/59 numbers are **not** in this table because they are not shipp
 5. **Wall-clock:** candidate behavior (2/3 at 600 s, opsportal 137 s) needs budget allocation.
 6. **White-box and salted Execution matrices** are v5.1.
 7. **Chains remain 1/6 (16.7%)**, below 50%.
-8. **Release gate pending;** do not quote the pre-revert 980/980 as the freeze result.
+8. Release gate is **PASS (992/992)** on the freeze tree.
 9. **Patch evidence** includes 2 inconclusive-after retests and a replay-based all-patches pass.
 10. **No external targets, secrets, or salts.**
 
@@ -240,7 +240,7 @@ git switch agents/engine-port
 ### 10.4 Freeze gate, Tier-3 safety, OOB, secrets
 
 ```bash
-newgrp docker -c 'bash docs/reverify-v5.sh --full'          # PENDING
+newgrp docker -c 'bash docs/reverify-v5.sh --full'          # 992/992 PASS
 
 GUARDIAN_ALLOW_LOCAL_LAB=1 \
   node --test tests/v5-tier3-safety.test.ts tests/approval-judge.test.ts   # 15/15
@@ -260,7 +260,7 @@ OOB callbacks bind one **loopback** canary listener; the harness passes that exa
 | Deterministic dev 115/172, held-out 111/171 | `/tmp/v5-final2/dev`, `/tmp/v5-final2/held` | re-derived, final rerun |
 | XBEN 25/25, held-out 20/20 + patches | `/tmp/guardian-m7-bench/final-dev.json`, `final-held.json` | re-derived |
 | Tier-3 safety 8/8 and 15/15 | test runs | re-derived |
-| Freeze gate | in-flight `GtumGa` log; last clean 980/980 | **PENDING** |
+| Freeze gate | `5in05x` log | **PASS 992/992** |
 
 **Discrepancies:**
 
@@ -270,5 +270,5 @@ OOB callbacks bind one **loopback** canary listener; the harness passes that exa
 4. **G4 is met on the deterministic surface only.**
 5. **G9 is all-severity (−2.0 pp); H/C is −3.2 pp** (70.9% dev vs 67.7% held-out). Both are within 10 pp.
 6. **Chains are 1/6**, below 50%; G8 open.
-7. **Freeze gate PENDING:** latest run was not clean; pre-revert 980/980 is not the freeze result.
+7. Freeze gate is **PASS (992/992)**; the earlier `GtumGa` failures were mid-change and are superseded.
 8. **Final deterministic rerun:** dev holds at 115/172; held-out is 111/171, one below the earlier 112. The document uses the final rerun values.
