@@ -783,6 +783,20 @@ function deterministicIdPath(pathTemplate: string): string | null {
   return replaced.includes('{{id}}') ? replaced : null
 }
 
+const DETERMINISTIC_WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+/**
+ * Route admission for briefing/OpenAPI references. A read route still needs an injectable
+ * parameter or a resource id to be worth a differential probe, but a write route is a real
+ * endpoint even when the reference leaks no body fields (body-only create/action routes such as
+ * `POST /api/refunds/lines`). Keep those with their declared method instead of dropping them.
+ */
+function deterministicRouteIsTestable(method: string, pathTemplate: string, hasInjectable: boolean): boolean {
+  if (hasInjectable) return true
+  if (deterministicIdPath(pathTemplate)) return true
+  return DETERMINISTIC_WRITE_METHODS.has(method.toUpperCase())
+}
+
 /** Tolerant OpenAPI extraction for specs whose stored text is redacted or truncated. */
 function parseTolerantOpenApiTargets(
   content: string,
@@ -824,9 +838,8 @@ function parseTolerantOpenApiTargets(
       if (!params.some(p => p.name === matchPath[1])) params.push({ name: matchPath[1], location: 'path' })
     }
     for (const method of methods) {
-      if (method === 'DELETE') continue
       const hasInjectable = params.some(p => p.location === 'query' || p.location === 'json' || p.location === 'form')
-      if (!hasInjectable && !deterministicIdPath(pathTemplate)) continue
+      if (!deterministicRouteIsTestable(method, pathTemplate, hasInjectable)) continue
       out.push({
         origin: approvedOrigins.has(defaultOrigin) ? defaultOrigin : [...approvedOrigins][0],
         method,
@@ -4227,7 +4240,7 @@ export class Execution {
         const item = rawItem as Record<string, unknown> | null
         if (!item || typeof item !== 'object') continue
         const sharedParams = Array.isArray(item.parameters) ? item.parameters as Array<Record<string, unknown>> : []
-        for (const method of ['get', 'post', 'put', 'patch'] as const) {
+        for (const method of ['get', 'post', 'put', 'patch', 'delete'] as const) {
           const op = item[method] as Record<string, unknown> | undefined
           if (!op || typeof op !== 'object') continue
           const key = `${origin}|${method.toUpperCase()}|${rawPath}`
@@ -4251,7 +4264,7 @@ export class Execution {
           for (const match of rawPath.matchAll(/\{([A-Za-z0-9_]+)\}/g)) pushParam(match[1], 'path')
           seen.add(key)
           const hasInjectable = params.some(p => p.location === 'query' || p.location === 'json' || p.location === 'form')
-          if (!hasInjectable && !deterministicIdPath(rawPath)) continue
+          if (!deterministicRouteIsTestable(method, rawPath, hasInjectable)) continue
           out.push({
             origin,
             method: method.toUpperCase(),
@@ -4694,8 +4707,10 @@ export class Execution {
     const approvedOrigins = this.approvedOriginsSet(current)
     if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
 
+    // DELETE routes are part of the write surface: keep them so the engine can build the
+    // function-level authorization hypothesis for them (the engine owns the tier gate).
     const storedEndpoints = this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 220 })
-      .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE')
+      .filter(ep => approvedOrigins.has(ep.origin))
     const allParams = this.storage.listEndpointParams(current.id)
     const paramsByEndpoint = new Map<string, typeof allParams>()
     for (const param of allParams) {
