@@ -469,6 +469,303 @@ export function computeMultiTrialFanout(
   return 1
 }
 
+// ============================================================================
+// v6 Phase B F2 — dispatch policy
+//
+// The Phase-B diagnosis found that four `det_lead` upgrade steps (created at priority 88) consumed
+// 80% of the agentic wall clock while 8/11 unconfirmed target classes never received a probe. Two
+// independent rules fix the ordering without weakening verification:
+//
+//  1. a deterministic lead is only promoted when it carries contrast evidence (a control that did
+//     not collapse, or a near-miss from a verification attempt), and
+//  2. the scheduler fills slots round-robin across lanes, with at most
+//     {@link DET_LEAD_CONCURRENT_CAP} lead assignments in flight at a time.
+//
+// The pure helpers below are exported so the scheduler contract is testable without a live run.
+// ============================================================================
+
+/** det_lead upgrades sit *below* unproven class/route steps (planner steps start at 60). */
+export const DET_LEAD_STEP_PRIORITY = 55
+/** At most this many det_lead upgrade assignments may be in flight concurrently. */
+export const DET_LEAD_CONCURRENT_CAP = 2
+/** Up to this many interesting BOLA queue items are injected into a single assignment prompt. */
+export const ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS = 10
+/** Hard byte ceiling for the per-assignment BOLA queue slice (was 53 KB for the full queue). */
+export const ASSIGNMENT_BOLA_QUEUE_MAX_BYTES = 4096
+
+/** A lead only reaches the scheduler when a control contrast / near-miss exists. */
+export interface DetLeadEvidenceGate {
+  admitted: boolean
+  reason: string
+}
+
+/**
+ * Reject shapes where the "signal" is explained by the control (idempotent 2xx, nonexistent-id
+ * acceptance, duplicate) rather than a real differential. Until the tightened `detlane-leads`
+ * contract lands, this consumes the existing `verifyFailureReason`/`failureReason` plus explicit
+ * `controlPassed` / `nearMiss` / `contrast` flags so the stricter contract plugs in unchanged.
+ */
+export function detLeadEvidenceGate(data: Record<string, unknown> | null | undefined): DetLeadEvidenceGate {
+  if (!data || data.kind !== 'det_lead') return { admitted: false, reason: 'not_a_det_lead' }
+  if (data.controlPassed === false) return { admitted: false, reason: 'control_collapsed' }
+  if (data.contrast === false || data.differsFromControl === false) return { admitted: false, reason: 'no_contrast' }
+  const failure = typeof data.verifyFailureReason === 'string'
+    ? data.verifyFailureReason
+    : typeof data.failureReason === 'string'
+      ? data.failureReason
+      : ''
+  if (failure) {
+    const collapsed = /control\s*(?:passed\s*[:=]?\s*false)|controlpassed\s*[:=]?\s*false|no\s+contrast|control\s+(?:also|matched|did\s+not\s+differ)|also\s+(?:returned|succeeded)|same\s+(?:result|response|status)|idempoten|non-?existent/i.test(failure)
+    const nearMiss = /near[\s_-]?miss|control\s+(?:diverg|mismatch|differ)|differs?\s+from\s+(?:the\s+)?control|contrast|delta|failed\s+control/i.test(failure)
+    if (collapsed && !nearMiss) return { admitted: false, reason: 'no_control_contrast' }
+    return { admitted: true, reason: 'failed_control_or_near_miss' }
+  }
+  if (data.controlPassed === true || data.nearMiss === true || data.contrast === true || data.differsFromControl === true) {
+    return { admitted: true, reason: 'control_contrast_evidence' }
+  }
+  const anomalies = Array.isArray(data.anomalies) ? data.anomalies : []
+  const contrastAnomaly = anomalies.some(anomaly => {
+    if (!anomaly || typeof anomaly !== 'object') return false
+    const record = anomaly as Record<string, unknown>
+    const tag = typeof record.classification === 'string' ? record.classification : typeof record.type === 'string' ? record.type : ''
+    return /control|contrast|delta|differ|near[\s_-]?miss/i.test(tag)
+  })
+  if (contrastAnomaly) return { admitted: true, reason: 'near_miss_anomaly' }
+  return { admitted: false, reason: 'no_contrast_evidence' }
+}
+
+export type DispatchLane = 'lead' | 'route' | 'workflow' | 'business_logic' | 'race' | 'chain' | 'other'
+
+/** Non-lead lanes in round-robin order. Leads are seeded first, capped, then these cycle. */
+export const DISPATCH_LANE_ORDER: readonly Exclude<DispatchLane, 'lead'>[] = [
+  'route', 'workflow', 'business_logic', 'race', 'chain', 'other',
+]
+
+export interface DispatchLaneStep {
+  id: string
+  seq: number
+  priority: number
+  title: string
+  category?: string | null
+  hypothesis?: string | null
+  skills?: readonly string[]
+  dependsOnFactIds?: readonly string[]
+  dependsOnStepIds?: readonly string[]
+  sourceOrigins?: readonly string[]
+}
+
+export interface RoundRobinDispatchOptions {
+  /** Total concurrent lead assignments allowed (default {@link DET_LEAD_CONCURRENT_CAP}). */
+  leadCap?: number
+  /** Lead assignments already in flight; subtracted from the cap. */
+  activeLeadCount?: number
+  /** Host tiers used to order Tier-A/B routes ahead of low-value static hosts. */
+  hostTiers?: Record<string, HostTier>
+  /** Allow leads past the cap only when no non-lead ready step remains (default true). */
+  allowLeadOverflow?: boolean
+}
+
+export interface RoundRobinDispatchPlan<T extends DispatchLaneStep> {
+  ordered: T[]
+  selectedByLane: Record<DispatchLane, number>
+  leadCapRemaining: number
+  deferredLeads: number
+}
+
+/** A det_lead upgrade is identified by its title/hypothesis contract, not by numeric priority. */
+export function isDetLeadDispatchStep(step: Pick<DispatchLaneStep, 'title' | 'hypothesis'>): boolean {
+  const text = `${step.title} ${step.hypothesis ?? ''}`
+  return /\bdet[_ ]lead\b/i.test(text) || /deterministic floor observed an unproven/i.test(text)
+}
+
+/** Map a step onto the round-robin lane it competes in. */
+export function classifyDispatchLane(
+  step: DispatchLaneStep,
+  hostTiers?: Record<string, HostTier>,
+): DispatchLane {
+  if (isDetLeadDispatchStep(step)) return 'lead'
+  const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''} ${(step.skills ?? []).join(' ')}`.toLowerCase()
+  if ((step.dependsOnStepIds?.length ?? 0) > 0 || /\bchain\b|second[\s_-]?order|cross[\s_-]?host|escalat/.test(text)) return 'chain'
+  if (/\brace\b|concurren|toctou|double[\s_-]?spend|simultaneous|parallel/.test(text)) return 'race'
+  if (/\bworkflow\b|state[\s_-]?machine|transition|invite|onboard|checkout[\s_-]?flow|approval[\s_-]?bypass/.test(text)) return 'workflow'
+  if (/\bbusiness\b|invariant|quantity|price|seat|credit|balance|discount|coupon|refund|quota|entitlement/.test(text)) return 'business_logic'
+  const origins = step.sourceOrigins ?? []
+  if (hostTiers && origins.length > 0 &&
+    origins.every(origin => (hostTiers[origin] ?? classifyHostTier(origin)) === 'low_value_static')) return 'other'
+  return 'route'
+}
+
+function dispatchTierRank(step: DispatchLaneStep, hostTiers?: Record<string, HostTier>): number {
+  if (!hostTiers) return 1
+  const origins = step.sourceOrigins ?? []
+  if (origins.some(origin => (hostTiers[origin] ?? classifyHostTier(origin)) === 'crown_jewel')) return 0
+  if (origins.length > 0 && origins.every(origin => (hostTiers[origin] ?? classifyHostTier(origin)) === 'low_value_static')) return 2
+  return 1
+}
+
+function compareDispatchSteps(a: DispatchLaneStep, b: DispatchLaneStep, hostTiers?: Record<string, HostTier>): number {
+  const tier = dispatchTierRank(a, hostTiers) - dispatchTierRank(b, hostTiers)
+  if (tier !== 0) return tier
+  if (a.priority !== b.priority) return b.priority - a.priority
+  if (a.seq !== b.seq) return a.seq - b.seq
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+
+/**
+ * Fill `slots` deterministically: up to the lead cap first, then one step per lane per round so a
+ * lead backlog or a single large route lane can never starve the semantic classes. Leads past the
+ * cap only run when no non-lead ready step remains.
+ */
+export function planRoundRobinDispatch<T extends DispatchLaneStep>(
+  steps: readonly T[],
+  slots: number,
+  options: RoundRobinDispatchOptions = {},
+): RoundRobinDispatchPlan<T> {
+  const capacity = Math.max(0, Math.floor(slots))
+  const selectedByLane: Record<DispatchLane, number> = {
+    lead: 0, route: 0, workflow: 0, business_logic: 0, race: 0, chain: 0, other: 0,
+  }
+  const lanes = new Map<DispatchLane, T[]>()
+  for (const lane of ['lead', ...DISPATCH_LANE_ORDER] as DispatchLane[]) lanes.set(lane, [])
+  for (const step of steps) lanes.get(classifyDispatchLane(step, options.hostTiers))!.push(step)
+  for (const lane of lanes.values()) lane.sort((a, b) => compareDispatchSteps(a, b, options.hostTiers))
+
+  const leadCap = Math.max(
+    0,
+    Math.floor(options.leadCap ?? DET_LEAD_CONCURRENT_CAP) - Math.max(0, Math.floor(options.activeLeadCount ?? 0)),
+  )
+  const ordered: T[] = []
+  const leadQueue = lanes.get('lead')!
+  while (ordered.length < capacity && leadQueue.length > 0 && selectedByLane.lead < leadCap) {
+    ordered.push(leadQueue.shift()!)
+    selectedByLane.lead += 1
+  }
+
+  let progressed = true
+  while (ordered.length < capacity && progressed) {
+    progressed = false
+    for (const lane of DISPATCH_LANE_ORDER) {
+      if (ordered.length >= capacity) break
+      const queue = lanes.get(lane)!
+      if (!queue.length) continue
+      ordered.push(queue.shift()!)
+      selectedByLane[lane] += 1
+      progressed = true
+    }
+  }
+
+  if (options.allowLeadOverflow ?? true) {
+    while (ordered.length < capacity && leadQueue.length > 0) {
+      ordered.push(leadQueue.shift()!)
+      selectedByLane.lead += 1
+    }
+  }
+
+  return {
+    ordered,
+    selectedByLane,
+    leadCapRemaining: Math.max(0, leadCap - selectedByLane.lead),
+    deferredLeads: leadQueue.length,
+  }
+}
+
+/** Endpoint templates named inside free text (title/hypothesis), normalized. */
+function templatesMentionedInText(text: string): string[] {
+  const routes = new Set<string>()
+  for (const match of text.matchAll(/(?:^|[\s`'"(,])((?:\/[A-Za-z0-9_\-.:{}[\]]+){2,})/g)) {
+    const raw = match[1].replace(/[),.;:'"`]+$/, '')
+    if (!raw.startsWith('/')) continue
+    if (/^\/(?:api|v\d+)$/i.test(raw)) continue
+    routes.add(normalizeEndpointTemplate(raw))
+  }
+  return [...routes]
+}
+
+export interface AssignmentBolaQueueInput {
+  queue: readonly BolaTestQueueItem[]
+  targetOrigins: readonly string[]
+  step: {
+    title: string
+    hypothesis: string
+    category?: string | null
+    skills?: readonly string[]
+    specialistProfile?: string | null
+  }
+  /** Defaults to {@link ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS}. */
+  maxItems?: number
+  /** Defaults to {@link ASSIGNMENT_BOLA_QUEUE_MAX_BYTES}. */
+  maxBytes?: number
+}
+
+export function measureBolaQueueBytes(items: readonly BolaTestQueueItem[]): number {
+  return Buffer.byteLength(JSON.stringify(items), 'utf8')
+}
+
+function readFirstVariants(variants: readonly BolaConsumerVariant[]): BolaConsumerVariant[] {
+  return [...variants].sort((a, b) =>
+    (a.method === 'GET' ? 0 : 1) - (b.method === 'GET' ? 0 : 1) ||
+    Number(a.destructive) - Number(b.destructive))
+}
+
+/**
+ * Slice the cross-persona resource queue down to what one assignment can actually use.
+ *
+ * The full queue (58 items / 53 KB) was injected into every worker, including the cache/CORS
+ * specialist, and biased reads towards destructive DELETE variants. Only BOLA/IDOR-relevant
+ * assignments get a slice now, ordered by route/resource relevance, read variants first, capped at
+ * {@link ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS} items and {@link ASSIGNMENT_BOLA_QUEUE_MAX_BYTES} bytes.
+ * The remainder stays queryable through the worker tools.
+ */
+export function selectAssignmentBolaQueueItems(input: AssignmentBolaQueueInput): BolaTestQueueItem[] {
+  const maxItems = Math.max(0, Math.min(
+    ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS,
+    Math.floor(input.maxItems ?? ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS),
+  ))
+  const maxBytes = Math.max(0, Math.floor(input.maxBytes ?? ASSIGNMENT_BOLA_QUEUE_MAX_BYTES))
+  if (!maxItems || !maxBytes || !input.queue.length) return []
+  const text = `${input.step.title} ${input.step.hypothesis} ${input.step.category ?? ''} ${(input.step.skills ?? []).join(' ')}`.toLowerCase()
+  const eligible = input.step.specialistProfile === 'bola-bfla-specialist' ||
+    (input.step.skills ?? []).includes('bola-idor-race') ||
+    /broken-access-control|\bbola\b|\bidor\b|cross[\s_-]?persona/.test(text)
+  if (!eligible) return []
+
+  const origins = new Set(input.targetOrigins)
+  const mentioned = new Set(templatesMentionedInText(`${input.step.title} ${input.step.hypothesis}`))
+  const leadingSegments = new Set(
+    [...mentioned].map(template => template.split('/').filter(Boolean)[0]).filter((segment): segment is string => Boolean(segment)),
+  )
+  const scored = input.queue
+    .filter(item => origins.has(item.origin))
+    .map(item => {
+      const template = normalizeEndpointTemplate(item.endpoint)
+      let score = 0
+      if (mentioned.has(template)) score += 100
+      else if ([...mentioned].some(named => named.startsWith(template) || template.startsWith(named))) score += 60
+      const leading = template.split('/').filter(Boolean)[0]
+      if (leading && leadingSegments.has(leading)) score += 20
+      if ((item.method ?? '').toUpperCase() === 'GET' && item.variants.some(variant => variant.method === 'GET' && !variant.destructive)) score += 15
+      if (text.includes(item.resourceKey.toLowerCase())) score += 30
+      if (text.includes(item.resourceId.toLowerCase())) score += 15
+      return { item, score }
+    })
+    .sort((a, b) =>
+      b.score - a.score ||
+      a.item.origin.localeCompare(b.item.origin) ||
+      a.item.resourceKey.localeCompare(b.item.resourceKey) ||
+      a.item.endpoint.localeCompare(b.item.endpoint) ||
+      a.item.resourceId.localeCompare(b.item.resourceId))
+
+  const selected: BolaTestQueueItem[] = []
+  for (const { item } of scored) {
+    if (selected.length >= maxItems) break
+    const normalized: BolaTestQueueItem = { ...item, variants: readFirstVariants(item.variants) }
+    const next = [...selected, normalized]
+    if (measureBolaQueueBytes(next) > maxBytes) continue
+    selected.push(normalized)
+  }
+  return selected
+}
+
 export function countConsecutiveDrySteps(
   storage: Store,
   run: Pick<Run, 'id' | 'goalRevision'>,
@@ -1319,6 +1616,8 @@ export class Execution {
   private readonly agenticFloorFinishedAt = new Map<string, number>()
   private readonly detLeadConsumed = new Set<string>()
   private readonly detLeadStepKeys = new Set<string>()
+  /** Facts whose lead contract failed the contrast gate; emit the skip reason once. */
+  private readonly detLeadGateRejected = new Set<string>()
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
@@ -4607,15 +4906,7 @@ export class Execution {
 
   /** Endpoint templates a step explicitly names (normalized). Never used for eligibility. */
   private stepMentionedRoutes(step: Pick<ChainStep, 'title' | 'hypothesis'>): string[] {
-    const text = `${step.title} ${step.hypothesis}`
-    const routes = new Set<string>()
-    for (const match of text.matchAll(/(?:^|[\s`'"(,])((?:\/[A-Za-z0-9_\-.:{}[\]]+){2,})/g)) {
-      const raw = match[1].replace(/[),.;:'"`]+$/, '')
-      if (!raw.startsWith('/')) continue
-      if (/^\/(?:api|v\d+)$/i.test(raw)) continue
-      routes.add(normalizeEndpointTemplate(raw))
-    }
-    return [...routes]
+    return templatesMentionedInText(`${step.title} ${step.hypothesis}`)
   }
 
   /**
@@ -4631,9 +4922,13 @@ export class Execution {
   }
 
   /**
-   * Turn prioritized deterministic leads into upgrade assignments. A det_lead is only useful to the
-   * agentic lane when it is (a) unconfirmed, (b) not a route/class the floor already confirmed, and
+   * Turn *evidence-backed* deterministic leads into upgrade assignments. A det_lead is only useful
+   * to the agentic lane when it is (a) admitted by {@link detLeadEvidenceGate} — a control contrast
+   * or near-miss exists, (b) unconfirmed and not a route/class the floor already confirmed, and
    * (c) bound to its originating fact so it becomes a `det_lead_upgrade` mission with a brief.
+   *
+   * Priority is deliberately below planner-authored class steps; the scheduler also caps lead
+   * concurrency independently, so a lead backlog can never pre-empt unproven target classes.
    */
   private queueDetLeadUpgradeSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
     const confirmed = this.alreadyConfirmedRefs(run, 40)
@@ -4662,6 +4957,21 @@ export class Execution {
       const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(detLeadCategory(probeClass))}`
       if (confirmedKeys.has(routeKey)) continue
       if (this.detLeadStepKeys.has(`${method} ${routeKey}`)) continue
+      const gate = detLeadEvidenceGate(fact.data)
+      if (!gate.admitted) {
+        if (!this.detLeadGateRejected.has(fact.id)) {
+          this.detLeadGateRejected.add(fact.id)
+          try {
+            this.storage.event(
+              run.id,
+              'deterministic_lane.lead_deferred',
+              `det_lead ${probeClass} on ${method} ${endpoint} not promoted: ${gate.reason}.`,
+              { probeClass, endpoint, method, factId: fact.id, reason: gate.reason },
+            )
+          } catch { /* best-effort */ }
+        }
+        continue
+      }
       const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
       if (!asset) continue
       const category = detLeadCategory(probeClass)
@@ -4673,7 +4983,7 @@ export class Execution {
         title,
         hypothesis,
         category,
-        priority: 88,
+        priority: DET_LEAD_STEP_PRIORITY,
         targetAssetIds: [asset.id],
         skills,
         dependsOnFactIds: [fact.id],
@@ -4859,21 +5169,56 @@ export class Execution {
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
     const readySteps = steps
       .filter(s => s.status === 'ready')
-      .sort((a, b) => b.priority - a.priority || a.seq - b.seq)
+      .filter(s => !(s.assignedWorkerId && this.active.has(s.assignedWorkerId)))
 
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
     const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
+    const leadStepIds = new Set(steps.filter(step => isDetLeadDispatchStep(step)).map(step => step.id))
+    const activeLeadCount = [...this.active.values()].filter(job =>
+      job.assignment.runId === run.id &&
+      job.assignment.phase === 'investigation' &&
+      typeof job.assignment.stepId === 'string' &&
+      leadStepIds.has(job.assignment.stepId)).length
 
-    let slots = Math.max(0, maxConc - activeForRun)
-    for (const step of readySteps) {
-      if (slots <= 0) break
-      if (step.assignedWorkerId && this.active.has(step.assignedWorkerId)) continue
+    const slots = Math.max(0, maxConc - activeForRun)
+    const hostTiers = computeHostTiers(
+      [...this.approvedOriginsSet(run)],
+      this.storage.latestThreatModel(run.id, run.goalRevision)?.entries,
+    )
+    const dispatchPlan = planRoundRobinDispatch(readySteps, slots, {
+      leadCap: DET_LEAD_CONCURRENT_CAP,
+      activeLeadCount,
+      hostTiers,
+    })
+    let dispatched = 0
+    for (const step of dispatchPlan.ordered) {
       if (step.sourceOrigins.length > 0 && step.sourceOrigins.every(o => this.broker.isCircuitOpen(o))) {
         this.storage.updateChainStep(step.id, { status: 'blocked' })
         continue
       }
       this.startInvestigationStep(run, step, profiles)
-      slots -= 1
+      dispatched += 1
+    }
+    if (dispatched > 0) {
+      try {
+        this.storage.event(
+          run.id,
+          'scheduler.dispatch',
+          `Dispatched ${dispatched} step(s): ${Object.entries(dispatchPlan.selectedByLane)
+            .filter(([, count]) => count > 0)
+            .map(([lane, count]) => `${lane}=${count}`)
+            .join(', ') || 'none'}.`,
+          {
+            slots,
+            dispatched,
+            selectedByLane: dispatchPlan.selectedByLane,
+            activeLeadCount,
+            leadConcurrentCap: DET_LEAD_CONCURRENT_CAP,
+            deferredLeads: dispatchPlan.deferredLeads,
+            stepIds: dispatchPlan.ordered.slice(0, dispatched).map(step => step.id),
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
     }
 
     // If nothing is running/ready/pending, check diminishing returns or trigger final planner review.
@@ -6589,7 +6934,7 @@ export class Execution {
   }
 
   /** Persist a validated dispatch plan as chain steps, citing parent facts and capability bundles. */
-  private persistDispatchPlan(run: Run, plan: DispatchPlan, factIds: ReadonlySet<string>): number {
+  private persistDispatchPlan(run: Run, plan: DispatchPlan, factIds: ReadonlySet<string>, detLeadFactIds: ReadonlySet<string> = new Set()): number {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const titles = new Set(existing.map(step => step.title.trim().toLowerCase()))
     const confirmed = this.alreadyConfirmedRefs(run, 40)
@@ -6610,11 +6955,14 @@ export class Execution {
       const category = step.probeClass === 'stored_xss' ? 'cors-client-side'
         : step.probeClass === 'authz_replay' || step.probeClass === 'auth_bypass' ? 'broken-access-control'
           : step.probeClass === 'ssrf' ? 'injection-input' : 'broken-access-control'
+      // F2: lead-bound coordinator dispatches obey the same low-priority rule as planner steps.
+      const leadBound = boundFactIds.some(id => detLeadFactIds.has(id)) ||
+        isDetLeadDispatchStep({ title, hypothesis: step.hypothesis })
       this.storage.addChainStep(run, {
         title: title.slice(0, 200),
         hypothesis: step.hypothesis,
         category,
-        priority: step.priority,
+        priority: leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
         targetAssetIds: assetIds,
         skills: step.skills,
         dependsOnFactIds: boundFactIds,
@@ -6689,6 +7037,9 @@ export class Execution {
     const allUntaintedFacts = this.pageAll((offset, limit) =>
       this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset }))
       .filter(fact => approvedOrigins.has(fact.origin))
+    const detLeadFactIds = new Set(allUntaintedFacts
+      .filter(fact => fact.data?.kind === 'det_lead')
+      .map(fact => fact.id))
     const personas = [...resolveRunPersonas(this.storage, updated.projectId, updated.approvedPersonaIds).values()]
       .map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel, originAllowlist: persona.originAllowlist }))
 
@@ -6770,7 +7121,7 @@ export class Execution {
     const handlers = coordinatorPlannerHandlers({
       coordinator,
       onDispatch: plan => {
-        try { toolDispatched += this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds) } catch { /* additive */ }
+        try { toolDispatched += this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds, detLeadFactIds) } catch { /* additive */ }
       },
     })
     const pendingOob = coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total
@@ -6835,11 +7186,15 @@ export class Execution {
           .filter(candidate => validOrigins.includes(candidate.origin) && currentRun.approved.includes(candidate.id))
           .map(candidate => candidate.id)
         if (!assetIds.length) continue
+        // F2: a planner re-emission of a det_lead upgrade must not jump back above class steps.
+        const leadBound = step.dependsOnFactIds.some(id => detLeadFactIds.has(id)) ||
+          isDetLeadDispatchStep({ title: step.title, hypothesis: step.hypothesis })
         const specialistProfile = routeStepToSpecialist({
           title: step.title, hypothesis: step.hypothesis, category: step.category, skills: step.skills,
         })
         this.storage.addChainStep(currentRun, {
-          title: step.title, hypothesis: step.hypothesis, category: step.category, priority: step.priority,
+          title: step.title, hypothesis: step.hypothesis, category: step.category,
+          priority: leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
           targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: step.dependsOnFactIds,
           dependsOnStepIds: step.dependsOnStepIds, sourceOrigins: validOrigins, specialistProfile,
         })
@@ -8763,13 +9118,26 @@ export class Execution {
         handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
       }))
 
+      // F4/F2: never inject the full cross-persona queue (58 items / 53 KB) into every worker.
+      // Only BOLA/IDOR-relevant assignments receive a bounded, relevance-ordered slice; the
+      // remainder stays queryable through the worker tools.
       const bolaTestQueue = run.capabilityTier >= 2 && personasPub.length >= 2
-        ? buildBolaTestQueue(
-            this.storage.listFacts(run.id, { includeTainted: false, limit: 200 }),
-            personasPub,
-            permittedAtAdmission,
-            this.storage.listResourceSamples(run.id),
-          )
+        ? selectAssignmentBolaQueueItems({
+            queue: buildBolaTestQueue(
+              this.storage.listFacts(run.id, { includeTainted: false, limit: 200 }),
+              personasPub,
+              permittedAtAdmission,
+              this.storage.listResourceSamples(run.id),
+            ),
+            targetOrigins,
+            step: {
+              title: step.title,
+              hypothesis: step.hypothesis,
+              category: step.category,
+              skills: step.skills,
+              specialistProfile: step.specialistProfile ?? null,
+            },
+          })
         : []
 
       const specialistProfileId = step.specialistProfile ?? routeStepToSpecialist({
