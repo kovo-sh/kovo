@@ -48,6 +48,8 @@ import {
 } from './approval-judge.ts'
 import type { MultipartBodyPart, StateChangeFingerprintInput } from './approval-judge.ts'
 import {
+  AGENTIC_SPECIALIST_MAX_TURNS,
+  AGENTIC_SPECIALIST_WALL_CLOCK_MS,
   agentTurn,
   buildBoardDelta,
   chainPlannerPrompt,
@@ -57,6 +59,7 @@ import {
   createBoardTools,
   crossHostSynthesizerPrompt,
   defaultCodeAuditMaxTurns,
+  detLeadsFromParentFacts,
   filterHandlersForSpecialist,
   injectBoardTurnInstructions,
   listSkills,
@@ -67,16 +70,25 @@ import {
   runAgentSession,
   threatModelPrompt,
   WarmSpecialistController,
+  withVerifierRepairFeedback,
   workerInvestigationPrompt,
 } from './agent-session.ts'
 import type {
+  AlreadyConfirmedRef,
   CodeAuditSuspectData,
+  DetLeadSummary,
   HostTier,
   PersonaResourceQueueItem,
   RequestHttpArgs,
   RequestHttpRaceArgs,
+  UnconfirmedSurfaceRef,
   WorkerToolHandlers,
 } from './agent-session.ts'
+import { createAgentTraceFromEnv } from './agent-trace.ts'
+import type { AgentTrace } from './agent-trace.ts'
+import { buildAssignmentBrief } from './assignment-brief.ts'
+import type { MissionKind } from './assignment-brief.ts'
+import type { CompiledProof } from './proof-tools.ts'
 import {
   BrokerApprovalRequired,
   BrokerCircuitOpen,
@@ -163,6 +175,25 @@ const hardChainStepsCeiling = 300
 export const diminishingReturnsDryThreshold = 6
 const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
+/** Hard ceiling for the concurrent deterministic lane (v5.1 Slice 3). */
+export const deterministicLaneMaxWallClockMs = 240_000
+/** The lane may consume at most this share of the run's remaining wall clock. */
+export const deterministicLaneWallClockShare = 0.4
+export type DeterministicSweepMode = 'off' | 'on' | 'always'
+
+/** Resolve the Slice-3 flag from the explicit option or `GUARDIAN_DETERMINISTIC_SWEEP`. */
+export function resolveDeterministicSweepMode(
+  option?: boolean | 'always',
+  env: NodeJS.ProcessEnv = process.env,
+): DeterministicSweepMode {
+  if (option === 'always') return 'always'
+  if (option === true) return 'on'
+  if (option === false) return 'off'
+  const raw = env.GUARDIAN_DETERMINISTIC_SWEEP?.trim().toLowerCase()
+  if (raw === 'always') return 'always'
+  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return 'on'
+  return 'off'
+}
 /** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
 const maxPhase3RefinementJobs = 10
 /** Upper bound on per-instance grants a single synchronized burst may register (broker caps bursts at 10). */
@@ -189,7 +220,11 @@ export function computeMultiTrialFanout(
   return 1
 }
 
-export function countConsecutiveDrySteps(storage: Store, run: Pick<Run, 'id' | 'goalRevision'>): number {
+export function countConsecutiveDrySteps(
+  storage: Store,
+  run: Pick<Run, 'id' | 'goalRevision'>,
+  excludedAssignmentIds: ReadonlySet<string> = new Set(),
+): number {
   const completedSteps = storage.listChainSteps(run.id, run.goalRevision)
     .filter(s => s.status === 'complete')
     .sort((a, b) => b.updatedAt - a.updatedAt || b.seq - a.seq)
@@ -198,7 +233,10 @@ export function countConsecutiveDrySteps(storage: Store, run: Pick<Run, 'id' | '
   const productiveWorkerIds = new Set<string>()
   const runFacts = storage.listFacts(run.id, { includeTainted: false, limit: 500 })
   for (const f of runFacts) {
-    if (f.assignmentId) productiveWorkerIds.add(f.assignmentId)
+    // The concurrent deterministic lane (v5.1 Slice 3) is not a specialist step: its facts and
+    // findings must never reset the K=6 dry-streak counter.
+    if (f.data?.source === 'deterministic_engine') continue
+    if (f.assignmentId && !excludedAssignmentIds.has(f.assignmentId)) productiveWorkerIds.add(f.assignmentId)
   }
   const runFindings = storage.db.select().from(findings).where(and(
     eq(findings.runId, run.id),
@@ -206,6 +244,7 @@ export function countConsecutiveDrySteps(storage: Store, run: Pick<Run, 'id' | '
   )).all()
   const runSpecs = storage.listReplaySpecs(run.id)
   for (const sp of runSpecs) {
+    if (sp.assignmentId && excludedAssignmentIds.has(sp.assignmentId)) continue
     if (runFindings.some(f => f.id === sp.findingId && f.finding.status !== 'dismissed')) {
       if (sp.assignmentId) productiveWorkerIds.add(sp.assignmentId)
     }
@@ -935,6 +974,20 @@ export interface ExecutionOptions {
    */
   deterministicOnly?: boolean
   /**
+   * v5.1 Slice 3: run the deterministic engine as a concurrent, isolated sibling lane while the
+   * agentic specialists investigate. Default OFF. `'always'` bypasses the pre-Phase-0 seeded-step
+   * guard (operator override); `true` honours it. The lane never blocks dispatch, never consumes
+   * specialist worker slots, never cancels steps and never hides confirmed routes.
+   * Also settable via `GUARDIAN_DETERMINISTIC_SWEEP=1|always`.
+   */
+  deterministicSweep?: boolean | 'always'
+  /**
+   * Wall-clock ceiling the harness will allow for the whole run. The concurrent lane derives its
+   * own deadline as `min(240 s, 40% × maxDurationMs)`. Falls back to
+   * `GUARDIAN_MAX_DURATION_MS`, then 600 s (which keeps the 240 s lane cap).
+   */
+  maxDurationMs?: number
+  /**
    * Phase/planner-round boundary hook (v5.1 snapshot resume). Called *outside* SQLite
    * transactions with a run id and a boundary label; the harness may capture a checkpoint here.
    * Throwing is swallowed so a best-effort snapshot can never disturb the engine.
@@ -984,6 +1037,16 @@ export class Execution {
   private readonly deterministicInFlight = new Set<string>()
   private readonly deterministicCompleted = new Set<string>()
   private readonly deterministicOnly: boolean
+  /** Slice 3 concurrent lane bookkeeping (never reuses the deterministicInFlight/Completed sets). */
+  private readonly deterministicSweep: DeterministicSweepMode
+  private readonly maxDurationMs: number
+  private readonly prePhase0SeededSteps = new Map<string, boolean>()
+  private readonly agenticLaneJobs = new Map<string, { controller: AbortController; promise: Promise<void>; key: string; assignmentId: string }>()
+  private readonly agenticLaneCompleted = new Set<string>()
+  private readonly agenticLaneStopping = new Set<string>()
+  private readonly agenticLaneAssignmentIds = new Set<string>()
+  /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
+  private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
@@ -1007,6 +1070,14 @@ export class Execution {
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
     this.deterministicOnly = options.deterministicOnly === true
+    this.deterministicSweep = resolveDeterministicSweepMode(options.deterministicSweep)
+    const optionMaxDuration = Number(options.maxDurationMs)
+    const envMaxDuration = Number(process.env.GUARDIAN_MAX_DURATION_MS)
+    this.maxDurationMs = Number.isFinite(optionMaxDuration) && optionMaxDuration > 0
+      ? optionMaxDuration
+      : Number.isFinite(envMaxDuration) && envMaxDuration > 0
+        ? envMaxDuration
+        : 600_000
     this.onCheckpoint = options.onCheckpoint
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
@@ -1082,6 +1153,15 @@ export class Execution {
     for (const ctrl of this.runAuthInFlight.values()) ctrl.abort()
     this.runAuthInFlight.clear()
     this.runAuthStarted.clear()
+    for (const lane of this.agenticLaneJobs.values()) {
+      try { lane.controller.abort(new Error('execution stopped')) } catch { /* already aborted */ }
+    }
+    for (const trace of this.runTraces.values()) {
+      try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
+    }
+    this.runTraces.clear()
+    this.agenticLaneJobs.clear()
+    this.agenticLaneStopping.clear()
     this.personaAuth.stopAll()
     await this.labRunner.stopAll().catch(() => undefined)
     this.startedLabRuns.clear()
@@ -1098,10 +1178,75 @@ export class Execution {
    * an open SQLite transaction (VACUUM INTO), so callers invoke this after their transaction.
    */
   private notifyCheckpoint(runId: string, checkpoint: ExecutionCheckpoint) {
+    this.traceLifecycle(runId, 'checkpoint', { checkpoint })
     if (!this.onCheckpoint) return
     try {
       this.onCheckpoint({ runId, checkpoint })
     } catch { /* snapshot capture is best-effort; never disturb the engine */ }
+  }
+
+  /**
+   * Opt-in trace writer (v5.1 fast loop). Returns `null` unless GUARDIAN_TRACE_DIR /
+   * GUARDIAN_TRACE enabled tracing. Never throws: a trace failure must not disturb a run.
+   */
+  private ensureRunTrace(
+    run: Run,
+    profiles: readonly ResolvedModelProfile[] = [],
+  ): AgentTrace | null {
+    const existing = this.runTraces.get(run.id)
+    if (existing) return existing
+    try {
+      let app = run.id.slice(0, 8)
+      try { app = this.storage.project(run.projectId).name } catch { /* project may be gone */ }
+      const trace = createAgentTraceFromEnv({
+        gitSha: process.env.GUARDIAN_GIT_SHA?.trim() || 'unknown',
+        app,
+        seed: process.env.GUARDIAN_BENCH_SEED ?? null,
+        mode: this.deterministicOnly ? 'deterministic' : 'agentic',
+        model: profiles[0]?.model ?? 'none',
+      })
+      if (!trace) return null
+      this.runTraces.set(run.id, trace)
+      return trace
+    } catch {
+      return null
+    }
+  }
+
+  private traceLifecycle(runId: string, kind: 'lane_start' | 'lane_end' | 'checkpoint' | 'verdict' | 'abort', payload: Record<string, unknown> = {}) {
+    const trace = this.runTraces.get(runId)
+    if (!trace) return
+    try { trace.recordLifecycle(kind, payload) } catch { /* tracing is best-effort */ }
+  }
+
+  private tracePlannerDecision(runId: string, payload: {
+    roundIdx: number
+    factsCount: number
+    detLeadsCount: number
+    alreadyConfirmedCount: number
+    spawnedSteps: number
+    k6DryStreak: number
+    dynamicStepBudget: number
+    durationMs: number
+    costUsd: number
+    inputStateHash?: string
+  }) {
+    const trace = this.runTraces.get(runId)
+    if (!trace) return
+    try {
+      trace.recordPlannerDecision({
+        roundIdx: payload.roundIdx,
+        inputStateHash: payload.inputStateHash ?? '',
+        factsCount: payload.factsCount,
+        detLeadsCount: payload.detLeadsCount,
+        alreadyConfirmedCount: payload.alreadyConfirmedCount,
+        spawnedSteps: payload.spawnedSteps,
+        k6DryStreak: payload.k6DryStreak,
+        dynamicStepBudget: payload.dynamicStepBudget,
+        durationMs: payload.durationMs,
+        costUsd: payload.costUsd,
+      })
+    } catch { /* tracing is best-effort */ }
   }
 
   private scheduleWake() {
@@ -2551,6 +2696,19 @@ export class Execution {
       if (!this.currentCoordinator(runId, task)) task.controller.abort()
     }
 
+    // Slice 3: stop the concurrent deterministic lane as soon as its run leaves investigation or
+    // is no longer authorized. Fire-and-forget here; Phase-3 gates on the settle promise.
+    for (const [runId, lane] of this.agenticLaneJobs) {
+      try {
+        const current = this.storage.run(runId)
+        const active = current.status === 'running' && current.phase === 'investigation'
+        if (!active) void this.abortAgenticLane(current, 'run left investigation').catch(() => undefined)
+      } catch {
+        try { lane.controller.abort(new Error('run unavailable')) } catch { /* already aborted */ }
+        this.agenticLaneJobs.delete(runId)
+      }
+    }
+
     // Stop background login-persona session refreshers for any run that paused, stopped, failed, or completed
     for (const runId of [...this.runAuthStarted.keys()]) {
       try {
@@ -2767,6 +2925,15 @@ export class Execution {
     }
 
     const freshRun = this.storage.run(run.id)
+    // Slice 3 guard input: remember whether any investigation step was already seeded BEFORE the
+    // Phase-0 recon / threat-model seeding ran. A resumed or operator-seeded run skips the
+    // concurrent lane (unless deterministicSweep === 'always').
+    try {
+      this.prePhase0SeededSteps.set(
+        this.deterministicLaneKey(freshRun),
+        this.storage.listChainSteps(freshRun.id, freshRun.goalRevision).length > 0,
+      )
+    } catch { /* guard is advisory only */ }
     const tmWorker = this.storage.makeWorker(freshRun, 'threat_model', approvedAssets[0],
       'Round-0 Threat Model & Surface Ranking',
       `Rank ${approvedAssets.length} approved hosts by attack-surface richness and seed prioritized chain investigation steps.`, {
@@ -3918,6 +4085,282 @@ export class Execution {
     )
   }
 
+  private deterministicLaneKey(run: Pick<Run, 'id' | 'goalRevision' | 'scopeRevision'>): string {
+    return `${run.id}:${run.goalRevision}:${run.scopeRevision}`
+  }
+
+  /** `min(240 s, 40% × maxDurationMs)`; deterministicOnly stays unrestricted (no lane there). */
+  private deterministicLaneDeadlineMs(): number {
+    return Math.max(
+      15_000,
+      Math.min(deterministicLaneMaxWallClockMs, Math.floor(this.maxDurationMs * deterministicLaneWallClockShare)),
+    )
+  }
+
+  private shouldStartDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]): boolean {
+    if (this.deterministicSweep === 'off') return false
+    if (this.deterministicOnly) return false
+    if (!profiles.length) return false
+    if (run.status !== 'running' || run.phase !== 'investigation') return false
+    if (run.capabilityTier < 1) return false
+    if (this.approvedOriginsSet(run).size === 0) return false
+    const key = this.deterministicLaneKey(run)
+    if (this.agenticLaneJobs.has(run.id)) return false
+    if (this.agenticLaneCompleted.has(key)) return false
+    if (this.agenticLaneStopping.has(run.id)) return false
+    // Conservative: a missing pre-Phase-0 record means the run may have been resumed with seeded
+    // steps, so skip unless the operator forced 'always'.
+    const seeded = this.prePhase0SeededSteps.get(key)
+    if (seeded !== false && this.deterministicSweep !== 'always') return false
+    if (this.deterministicInFlight.has(`${key}:engine`) || this.deterministicCompleted.has(`${key}:engine`)) return false
+    return true
+  }
+
+  /**
+   * Slice 3: launch the deterministic engine as an isolated sibling task. Never awaited by
+   * dispatch, never counted in `active` (so it cannot take a specialist worker slot), zero chain
+   * steps, no dynamicStepBudget writes, and its own valid grant through the approval contract.
+   */
+  private startDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]) {
+    if (!this.shouldStartDeterministicLane(run, profiles)) return
+    const key = this.deterministicLaneKey(run)
+    const controller = new AbortController()
+    const holder = {
+      controller,
+      key,
+      assignmentId: '',
+      promise: Promise.resolve(),
+    }
+    this.agenticLaneJobs.set(run.id, holder)
+    const deadlineMs = this.deterministicLaneDeadlineMs()
+    try {
+      this.storage.event(
+        run.id,
+        'deterministic_lane.started',
+        `Concurrent deterministic lane started (deadline ${Math.round(deadlineMs / 1000)}s, ${Math.round(deterministicLaneWallClockShare * 100)}% of run wall clock).`,
+        { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep },
+      )
+    } catch { /* run may be gone */ }
+    this.traceLifecycle(run.id, 'lane_start', { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep })
+    holder.promise = this.runEngineInvestigation(run, {
+      lane: true,
+      signal: controller.signal,
+      maxDurationMs: deadlineMs,
+      onAssignment: id => {
+        holder.assignmentId = id
+        this.agenticLaneAssignmentIds.add(id)
+      },
+    })
+      .catch(error => {
+        if (controller.signal.aborted) return
+        try {
+          const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+          this.storage.event(run.id, 'deterministic_lane.failed', `Concurrent deterministic lane failed: ${msg}`)
+        } catch { /* run may be gone */ }
+      })
+      .finally(() => {
+        this.agenticLaneJobs.delete(run.id)
+        this.agenticLaneStopping.delete(run.id)
+        this.agenticLaneCompleted.add(key)
+        this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
+        try { this.scheduleWake() } catch { /* scheduler stopped */ }
+      })
+  }
+
+  /**
+   * Abort the lane and wait for a fast settle. Callers gate the Phase-3 transition on the
+   * returned promise so no deterministic work is still running when verification/report starts.
+   */
+  private abortAgenticLane(run: Run, reason: string): Promise<void> {
+    const lane = this.agenticLaneJobs.get(run.id)
+    if (!lane) return Promise.resolve()
+    if (this.agenticLaneStopping.has(run.id)) return lane.promise.then(() => undefined, () => undefined)
+    this.agenticLaneStopping.add(run.id)
+    try {
+      this.storage.event(run.id, 'deterministic_lane.aborting', `Stopping concurrent deterministic lane: ${reason}.`)
+    } catch { /* run may be gone */ }
+    this.traceLifecycle(run.id, 'abort', { reason })
+    try { lane.controller.abort(new Error(reason)) } catch { /* already aborted */ }
+    let timer: NodeJS.Timeout | undefined
+    const settleTimeout = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, 2_000)
+      timer.unref?.()
+    })
+    return Promise.race([lane.promise.then(() => undefined, () => undefined), settleTimeout])
+      .finally(() => { if (timer) clearTimeout(timer) })
+  }
+
+  // --- Slice 3 / agentic value-add: read-only prompt context builders ---
+
+  /** Confirmed + static-verified (endpoint, method, param, cwe) refs. Prompt context only. */
+  private alreadyConfirmedRefs(run: Run, limit = 10): AlreadyConfirmedRef[] {
+    try {
+      const rows = this.storage.db.select().from(findings).where(and(
+        eq(findings.runId, run.id),
+        eq(findings.goalRevision, run.goalRevision),
+      )).all()
+      const specById = new Map(this.storage.listReplaySpecs(run.id).map(spec => [spec.id, spec]))
+      const refs: AlreadyConfirmedRef[] = []
+      const seen = new Set<string>()
+      for (const row of rows) {
+        if (row.finding.status !== 'confirmed' && row.finding.status !== 'static_verified') continue
+        const spec = row.replaySpecId ? specById.get(row.replaySpecId) : undefined
+        const fields = spec ? extractSpecDedupeFields(spec.spec) : null
+        const path = fields?.endpoint?.trim()
+        if (!path) continue
+        const method = fields?.method && fields.method !== 'ANY' ? fields.method : null
+        const key = `${method ?? ''} ${path} ${fields?.param ?? ''} ${row.finding.cwe ?? ''}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        refs.push({
+          origin: row.finding.origin,
+          ...(method ? { method } : {}),
+          path,
+          ...(fields?.param ? { param: fields.param } : {}),
+          ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
+          ...(row.finding.category ? { probeClass: row.finding.category } : {}),
+        })
+        if (refs.length >= limit) break
+      }
+      return refs
+    } catch {
+      return []
+    }
+  }
+
+  /** High-risk or under-covered surface that has not been confirmed. Prompt context only. */
+  private unconfirmedHardSurfaceRefs(run: Run, confirmed: readonly AlreadyConfirmedRef[], limit = 8): UnconfirmedSurfaceRef[] {
+    try {
+      const confirmedPaths = new Set(confirmed.map(ref => normalizeEndpointTemplate(ref.path)))
+      const refs: UnconfirmedSurfaceRef[] = []
+      const seen = new Set<string>()
+      for (const gap of this.storage.listOpenProofGaps(run.id, run.goalRevision)) {
+        const key = `${gap.category} ${gap.origin} ${gap.summary.slice(0, 40)}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        refs.push({
+          path: `${gap.origin} ${gap.category}`,
+          category: gap.category,
+          reason: gap.proofGapReason || gap.summary,
+        })
+        if (refs.length >= limit) break
+      }
+      if (refs.length < limit) {
+        const endpoints = this.storage.listEndpoints(run.id, { orderBy: 'risk', limit: 40 })
+        for (const ep of endpoints) {
+          if (refs.length >= limit) break
+          if (confirmedPaths.has(normalizeEndpointTemplate(ep.pathTemplate))) continue
+          if (ep.riskScore < 60) continue
+          const key = `${ep.method} ${ep.pathTemplate}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          refs.push({
+            method: ep.method,
+            path: ep.pathTemplate,
+            category: ep.testedClasses?.[0] ?? null,
+            reason: `risk ${ep.riskScore}, coverage ${ep.coveragePct ?? 0}%`,
+          })
+        }
+      }
+      return refs
+    } catch {
+      return []
+    }
+  }
+
+  /** All deterministic lead facts for the run (not only parent-fact dependencies). */
+  private detLeadSummaries(run: Run): DetLeadSummary[] {
+    try {
+      const facts = this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
+        .filter(f => f.data?.kind === 'det_lead')
+      return detLeadsFromParentFacts(facts)
+    } catch {
+      return []
+    }
+  }
+
+  private missionKindForStep(step: ChainStep, hasDetLead: boolean): MissionKind {
+    if (/second.order|stored|canary/i.test(`${step.title} ${step.hypothesis}`)) return 'second_order'
+    if (step.dependsOnStepIds.length > 0) return 'chain_step_2'
+    if (/workflow|race|double.spend|business|quantity|price/i.test(`${step.title} ${step.hypothesis} ${step.category}`)) return 'business_logic'
+    if (step.dependsOnFactIds.length > 0 && hasDetLead) return 'det_lead_upgrade'
+    return 'class_scan'
+  }
+
+  /** Pre-packaged <=1.5 KB evidence brief for one assignment (routes/params/personas/IDs). */
+  private assignmentBriefForStep(input: {
+    run: Run
+    step: ChainStep
+    targetOrigins: readonly string[]
+    personas: readonly { handle: string; roleLabel: string }[]
+    parentFacts: readonly Fact[]
+    confirmed: readonly AlreadyConfirmedRef[]
+    detLeads: readonly DetLeadSummary[]
+    maxTurns: number
+  }): string | undefined {
+    const origin = input.targetOrigins[0]
+    if (!origin) return undefined
+    try {
+      const routes = this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: 40 })
+        .filter(ep => input.targetOrigins.includes(ep.origin))
+        .slice(0, 6)
+        .map(ep => ({
+          method: ep.method,
+          path: ep.pathTemplate,
+          riskScore: ep.riskScore,
+        }))
+      const samples = this.storage.listResourceSamples(input.run.id)
+        .filter(sample => input.targetOrigins.includes(sample.origin))
+      const personas = input.personas.map(persona => ({
+        handle: persona.handle,
+        role: persona.roleLabel,
+        harvestedIds: [...new Set(samples.filter(s => s.ownerPersona === persona.handle).map(s => s.resourceId))].slice(0, 4),
+      }))
+      const parentDetLead = input.detLeads.find(lead =>
+        input.parentFacts.some(f => f.data?.kind === 'det_lead' && f.id === lead.exchangeId) ||
+        (Boolean(lead.endpoint) && input.targetOrigins.includes(origin)),
+      )
+      return buildAssignmentBrief({
+        missionKind: this.missionKindForStep(input.step, Boolean(parentDetLead)),
+        origin,
+        routes,
+        personas,
+        alreadyConfirmedOnOrigin: input.confirmed
+          .filter(ref => !ref.origin || ref.origin === origin)
+          .map(ref => ({
+            method: ref.method ?? 'ANY',
+            path: ref.path,
+            param: ref.param ?? null,
+            cwe: ref.cwe ?? null,
+            origin: ref.origin ?? origin,
+          })),
+        ...(parentDetLead
+          ? {
+              detLead: {
+                probeClass: parentDetLead.probeClass,
+                exchangeId: parentDetLead.exchangeId ?? null,
+                signalSummary: parentDetLead.signalSummary ?? '',
+                verifyFailureReason: parentDetLead.verifyFailureReason ?? null,
+              },
+            }
+          : {}),
+        targetCount: routes.length > 1 ? 2 : 1,
+        turnBudget: input.maxTurns,
+      })
+    } catch {
+      return undefined
+    }
+  }
+
+  private specialistWallClockMs(maxTurns: number): number {
+    const envMs = Number(process.env.GUARDIAN_AGENTIC_SPECIALIST_WALL_CLOCK_MS)
+    const base = Number.isFinite(envMs) && envMs > 0 ? envMs : AGENTIC_SPECIALIST_WALL_CLOCK_MS
+    // Batched micro-specialists sit at AGENTIC_SPECIALIST_MAX_TURNS; longer legacy assignments
+    // scale linearly up to 2x the base wall clock, always inside the 30-minute intent lease.
+    const turnScale = Math.min(2, Math.max(0.5, maxTurns / Math.max(1, AGENTIC_SPECIALIST_MAX_TURNS)))
+    return Math.max(20_000, Math.min(intentLeaseMs * 0.85, Math.round(base * turnScale)))
+  }
+
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
@@ -3936,6 +4379,12 @@ export class Execution {
     this.expandEligibleMultiTrialSteps(run)
 
     this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
+
+    // Slice 3: the deterministic lane is a sibling task started as Phase-2 dispatch begins. It is
+    // fire-and-forget here; it never blocks dispatch and never shares the specialist semaphore.
+    try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
+    this.startDeterministicLane(run, profiles)
+
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
     const readySteps = steps
       .filter(s => s.status === 'ready')
@@ -3960,7 +4409,7 @@ export class Execution {
     const updatedSteps = this.storage.listChainSteps(run.id, run.goalRevision)
     const anyActive = updatedSteps.some(s => ['pending', 'ready', 'running'].includes(s.status))
     if (!anyActive && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
-      const consecutiveDry = countConsecutiveDrySteps(this.storage, run)
+      const consecutiveDry = countConsecutiveDrySteps(this.storage, run, this.agenticLaneAssignmentIds)
       if (consecutiveDry >= diminishingReturnsDryThreshold) {
         this.storage.event(
           run.id,
@@ -4739,11 +5188,17 @@ export class Execution {
    * decide. Only replay-confirmed runtime findings are persisted; unproven signals become det_lead
    * facts. No specialist steps are cancelled or hidden in this slice.
    */
-  private async runEngineInvestigation(run: Run): Promise<void> {
+  private async runEngineInvestigation(run: Run, laneOptions: {
+    lane?: boolean
+    signal?: AbortSignal
+    maxDurationMs?: number
+    onAssignment?: (assignmentId: string) => void
+  } = {}): Promise<void> {
     const current = this.storage.run(run.id)
     if (current.status !== 'running' || current.phase !== 'investigation') return
     const approvedOrigins = this.approvedOriginsSet(current)
     if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
+    if (laneOptions.signal?.aborted) return
 
     // DELETE routes are part of the write surface: keep them so the engine can build the
     // function-level authorization hypothesis for them (the engine owns the tier gate).
@@ -4773,9 +5228,17 @@ export class Execution {
       lease: randomUUID(),
       leaseExpiresAt: Date.now() + 15 * 60_000,
     }) ?? worker
-    const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
+    if (laneOptions.onAssignment) {
+      try { laneOptions.onAssignment(claimed.id) } catch { /* bookkeeping only */ }
+    }
+    const controller = new AbortController()
+    if (laneOptions.signal) {
+      if (laneOptions.signal.aborted) controller.abort(laneOptions.signal.reason)
+      else laneOptions.signal.addEventListener('abort', () => controller.abort(laneOptions.signal?.reason), { once: true })
+    }
+    const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller }
     const { grant, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
-    const signal = job.controller.signal
+    const signal = controller.signal
 
     const recordExchange = (ex: BrokerExchangeResult) => {
       const latest = this.storage.run(current.id)
@@ -4913,8 +5376,14 @@ export class Execution {
       const remainingRequests = current.budgetRequests > 0
         ? Math.max(0, current.budgetRequests - current.spentRequests)
         : 700
-      const maxRequests = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
-      const maxDurationMs = envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
+      const maxRequests = laneOptions.lane
+        // The lane is additive: it may use at most half the remaining request budget so
+        // specialists always keep headroom (wall clock is its primary cap).
+        ? Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_LANE_MAX_REQUESTS') ?? 900, Math.floor(remainingRequests * 0.5)))
+        : Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
+      const maxDurationMs = laneOptions.lane
+        ? Math.max(1_000, laneOptions.maxDurationMs ?? this.deterministicLaneDeadlineMs())
+        : envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
       const maxHypotheses = envNumber('GUARDIAN_DETERMINISTIC_MAX_HYPOTHESES') ?? 90
 
       this.storage.event(
@@ -5143,6 +5612,7 @@ export class Execution {
       summary: `Replay-verified deterministic finding: ${spec.title}`,
       data: {
         subkind: 'deterministic_engine_confirmed',
+        source: 'deterministic_engine',
         attribution: 'deterministic',
         vulnClass: confirmed.vulnClass,
         endpoint: confirmed.endpoint,
@@ -5251,6 +5721,7 @@ export class Execution {
         summary: `Unverified deterministic lead (${hyp.probeClass}) on ${hyp.method} ${hyp.endpoint.pathTemplate}: ${lead.summary}`,
         data: {
           subkind: 'deterministic_engine_lead',
+          source: 'deterministic_engine',
           kind: 'det_lead',
           attribution: 'deterministic',
           probeClass: hyp.probeClass,
@@ -5579,7 +6050,7 @@ export class Execution {
     this.storage.updateRunDynamicStepBudget(fresh.id, dynamicStepBudget)
 
     // Diminishing-returns stop: K=6 consecutive dry steps halts dynamic planning cleanly
-    const consecutiveDry = countConsecutiveDrySteps(this.storage, fresh)
+    const consecutiveDry = countConsecutiveDrySteps(this.storage, fresh, this.agenticLaneAssignmentIds)
     if (consecutiveDry >= diminishingReturnsDryThreshold) {
       this.storage.event(
         fresh.id,
@@ -5751,6 +6222,12 @@ export class Execution {
       }))
 
     const graphCatalog = this.endpointGraphCatalog(run.id)
+    const plannerStartedAt = Date.now()
+    const plannerSpendBefore = afterRound.spentUsd
+    const plannerConfirmed = this.alreadyConfirmedRefs(afterRound)
+    const plannerHardSurface = this.unconfirmedHardSurfaceRefs(afterRound, plannerConfirmed)
+    const plannerDetLeads = this.detLeadSummaries(afterRound)
+    try { this.ensureRunTrace(afterRound, profiles) } catch { /* tracing is best-effort */ }
     const chainPlannerInput = {
       goal: afterRound.goal,
       roundNo: roundRes.roundNo,
@@ -5803,8 +6280,23 @@ export class Execution {
           ? ('unlimited' as const)
           : Math.max(0, afterRound.budgetRequests - afterRound.spentRequests),
       },
+      alreadyConfirmed: plannerConfirmed,
+      unconfirmedHardSurface: plannerHardSurface,
+      detLeads: plannerDetLeads,
     }
     const prompt = chainPlannerPrompt(chainPlannerInput)
+
+    this.tracePlannerDecision(run.id, {
+      roundIdx: roundRes.roundNo,
+      factsCount: allUntaintedFacts.length,
+      detLeadsCount: plannerDetLeads.length,
+      alreadyConfirmedCount: plannerConfirmed.length,
+      spawnedSteps: 0,
+      k6DryStreak: consecutiveDry,
+      dynamicStepBudget,
+      durationMs: Date.now() - plannerStartedAt,
+      costUsd: Math.max(0, Number((afterRound.spentUsd - plannerSpendBefore).toFixed(6))),
+    })
 
     const answer = await agentTurn({
       directory: this.storage.directory,
@@ -7694,6 +8186,43 @@ export class Execution {
         },
 
         complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
+
+        prove_authz_read_diff: async (proof: CompiledProof, signal: AbortSignal) => {
+          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
+          return this.submitProofSpec({
+            job, grant, currentSecrets,
+            ...(reposDir ? { reposDir } : {}),
+            proof,
+            onExchangeObserved: trackPersonaResources,
+          })
+        },
+        prove_state_mutation_diff: async (proof: CompiledProof, signal: AbortSignal) => {
+          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
+          return this.submitProofSpec({
+            job, grant, currentSecrets,
+            ...(reposDir ? { reposDir } : {}),
+            proof,
+            onExchangeObserved: trackPersonaResources,
+          })
+        },
+        prove_business_invariant: async (proof: CompiledProof, signal: AbortSignal) => {
+          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
+          return this.submitProofSpec({
+            job, grant, currentSecrets,
+            ...(reposDir ? { reposDir } : {}),
+            proof,
+            onExchangeObserved: trackPersonaResources,
+          })
+        },
+        prove_canary_or_redirect: async (proof: CompiledProof, signal: AbortSignal) => {
+          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
+          return this.submitProofSpec({
+            job, grant, currentSecrets,
+            ...(reposDir ? { reposDir } : {}),
+            proof,
+            onExchangeObserved: trackPersonaResources,
+          })
+        },
       }
 
       const personasPub = [...grant.personas?.values() ?? []].map(p => ({
@@ -7736,6 +8265,21 @@ export class Execution {
         limit: 2,
       })
 
+      const confirmedRefs = this.alreadyConfirmedRefs(run)
+      const unconfirmedHardSurface = this.unconfirmedHardSurfaceRefs(run, confirmedRefs)
+      const detLeads = this.detLeadSummaries(run)
+      const assignmentBrief = this.assignmentBriefForStep({
+        run,
+        step,
+        targetOrigins,
+        personas: personasPub,
+        parentFacts,
+        confirmed: confirmedRefs,
+        detLeads,
+        maxTurns: job.assignment.maxTurns,
+      })
+      const runTrace = this.ensureRunTrace(run, profiles)
+
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: job.assignment.sessionId,
@@ -7761,9 +8305,22 @@ export class Execution {
           specsSummary: stagedSpecs,
           mountedRepos,
           preInjectedSkills,
+          alreadyConfirmed: confirmedRefs,
+          unconfirmedHardSurface,
+          detLeads,
+          ...(assignmentBrief ? { assignmentBrief } : {}),
         }),
         signal: job.controller.signal,
         maxTurns: job.assignment.maxTurns,
+        wallClockMs: this.specialistWallClockMs(job.assignment.maxTurns),
+        ...(runTrace ? {
+          trace: runTrace,
+          traceContext: {
+            runId: run.id,
+            assignmentId: job.assignment.id,
+            specialistProfile: specialistProfileId,
+          },
+        } : {}),
         compaction: true,
         enableSettlement: true,
         requireCompleteIntent: true,
@@ -7822,6 +8379,17 @@ export class Execution {
   // --- Phase 3: Zero-LLM Verification (Replay Specs + Baseline Checks) ---
 
   private advanceToVerification(run: Run) {
+    // Never let Phase 3 start while the concurrent deterministic lane is still in flight: abort
+    // and fast-settle first, then commit the phase transition exactly once.
+    if (this.agenticLaneStopping.has(run.id)) return
+    if (this.agenticLaneJobs.has(run.id)) {
+      void this.abortAgenticLane(run, 'phase-2 complete').finally(() => this.commitVerificationPhase(run))
+      return
+    }
+    this.commitVerificationPhase(run)
+  }
+
+  private commitVerificationPhase(run: Run) {
     this.storage.transaction(() => {
       const current = this.storage.run(run.id)
       if (current.status !== 'running' || current.phase !== 'investigation') return
@@ -8651,6 +9219,146 @@ export class Execution {
       feedback: normalizedFeedback,
       artifactId: receipt.id,
     }
+  }
+
+  /**
+   * Typed proof-compiler settlement path (`prove_*` tools). Compiles a proof object into an
+   * identifier-bound replay spec, persists the candidate, then uses the existing inline
+   * ReplayVerifier path. Never bypasses approvals: `executeInlineVerification` performs the same
+   * Tier-3 gates as `propose_chain_finding`.
+   */
+  private async submitProofSpec(params: {
+    job: Active
+    grant: Grant
+    currentSecrets: () => readonly NamedSecret[]
+    reposDir?: string
+    proof: CompiledProof
+    onExchangeObserved?: (curRun: Run, ex: BrokerExchangeResult, exchangeId: string) => void
+  }): Promise<unknown> {
+    const run = this.check(params.job)
+    if (this.storage.checkBudgetExceeded(run.id)) {
+      throw new BudgetExceededError('Run spend or request budget exceeded.')
+    }
+    const parsed = declarativeReplaySpecSchema.parse(params.proof.spec)
+    const origins = [...new Set(replaySpecOrigins(parsed))]
+    const approved = this.approvedOriginsSet(run)
+    if (!origins.length || origins.some(origin => !approved.has(origin))) {
+      throw new BrokerDenied('Proof spec references an origin outside current approved scope.')
+    }
+    const asset = run.candidates.find(c => origins.includes(c.origin) && run.approved.includes(c.id))
+    if (!asset) throw new Error('No approved asset matches the proof origin.')
+
+    const fields = extractSpecDedupeFields(parsed)
+    const existingRows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+    )).all()
+    const existingRefs: ExistingFindingRef[] = existingRows.map(row => {
+      const existingSpec = row.replaySpecId ? this.storage.getReplaySpec(run.id, row.replaySpecId) : null
+      const existingFields = existingSpec ? extractSpecDedupeFields(existingSpec.spec) : undefined
+      return {
+        id: row.id,
+        origin: row.finding.origin,
+        title: row.finding.title,
+        status: row.finding.status,
+        cwe: row.finding.cwe,
+        category: row.finding.category,
+        severity: row.finding.severity,
+        endpoint: existingFields?.endpoint ?? null,
+        authState: existingFields?.authState ?? null,
+        specKind: existingFields?.specKind ?? null,
+        method: existingFields?.method ?? null,
+        param: existingFields?.param ?? null,
+        graphqlField: existingFields?.graphqlField ?? null,
+        fingerprintHash: row.fingerprintHash ?? null,
+      }
+    })
+    const duplicate = checkStructuralDuplicate({
+      origin: parsed.origin,
+      title: parsed.title,
+      cwe: parsed.cwe,
+      category: parsed.category,
+      severity: parsed.severity,
+      endpoint: fields.endpoint,
+      authState: fields.authState,
+      specKind: fields.specKind,
+      method: fields.method,
+      param: fields.param,
+      graphqlField: fields.graphqlField,
+    }, existingRefs)
+    if (duplicate.isDuplicate && duplicate.duplicateOfId) {
+      return {
+        findingId: duplicate.duplicateOfId,
+        status: 'deduplicated',
+        deduplicated: true,
+        proof: { warnings: params.proof.warnings, rationale: params.proof.rationale },
+        note: 'Structural duplicate of an existing finding; call update_proposed_finding to enrich or upgrade it.',
+      }
+    }
+
+    const findingId = randomUUID()
+    const specRow = this.storage.createReplaySpec(run, params.job.assignment, findingId, parsed, origins)
+    const evidence = this.storage.addArtifact(
+      run,
+      params.job.assignment,
+      'replay',
+      `Typed proof spec · ${parsed.title}`,
+      JSON.stringify({
+        replaySpecId: specRow.id,
+        specSha256: specRow.specSha256,
+        rationale: params.proof.rationale,
+        warnings: params.proof.warnings,
+        spec: parsed,
+      }, null, 2),
+      undefined,
+      params.currentSecrets(),
+    )
+    const finding: Finding = {
+      id: findingId,
+      origin: parsed.origin,
+      title: parsed.title,
+      status: 'pending',
+      severity: parsed.severity,
+      reason: parsed.severityRationale,
+      remediation: parsed.remediation,
+      impact: parsed.impact,
+      recheck: parsed.recheckInstructions,
+      category: parsed.category,
+      cwe: parsed.cwe,
+      confidence: 'medium',
+      verification: `Pending Zero-LLM ${parsed.kind} replay verification (typed proof spec ${specRow.id}).`,
+      findingKind: 'multi_step_chain',
+      replaySpecId: specRow.id,
+      fingerprintHash: duplicate.fingerprint.hash,
+      exchangeIds: [],
+      evidenceIds: [evidence.id],
+      scopeRevision: run.scopeRevision,
+    }
+    const saved = this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, origins)
+    this.storage.addGraphEdge(run.id, { fromKind: 'assignment', fromId: params.job.assignment.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
+    this.schedulePlanner(run.id)
+
+    const inline = await this.executeInlineVerification({
+      job: params.job,
+      grant: params.grant,
+      currentSecrets: params.currentSecrets,
+      ...(params.reposDir ? { reposDir: params.reposDir } : {}),
+      spec: parsed,
+      findingId: saved.id,
+      replaySpecId: specRow.id,
+      ...(params.onExchangeObserved ? { onExchangeObserved: params.onExchangeObserved } : {}),
+    })
+    return withVerifierRepairFeedback({
+      findingId: saved.id,
+      replaySpecId: inline.replaySpecId,
+      status: inline.status,
+      ...(inline.verificationTier ? { verificationTier: inline.verificationTier } : {}),
+      inlineVerifyFeedback: inline.feedback,
+      proof: { warnings: params.proof.warnings, rationale: params.proof.rationale },
+      note: inline.status === 'confirmed' || inline.status === 'static_verified'
+        ? `Typed proof verified inline (${inline.status}).`
+        : `Typed proof verification returned ${inline.status}. Repair the request/identifier from inlineVerifyFeedback and re-submit.`,
+    })
   }
 
   private async runPhase3RefinementJob(job: Active, replaySpecId: string) {

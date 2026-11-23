@@ -30,6 +30,63 @@ export interface LoginCredentialFilePayload {
   password: string
 }
 
+/** A single cookie captured for a persona session (including `HttpOnly` cookies). */
+export interface PersonaCookieRecord {
+  name: string
+  value: string
+  /** Cookie domain as issued by the server (`app.example.com` or `.example.com`). */
+  domain: string
+  path: string
+  httpOnly?: boolean
+  secure?: boolean
+  sameSite?: 'Strict' | 'Lax' | 'None'
+  /** Epoch milliseconds; omitted for session cookies. */
+  expires?: number
+}
+
+/**
+ * Per-origin attachment rule. `origin` is an exact origin (`https://app.example.com`) or a
+ * scheme-scoped subdomain glob (`https://*.example.com`). When a bundle declares attachments,
+ * only matching rules receive the bundle's default headers/cookies; unrelated sibling origins
+ * (for example a bare `api.` host when only `app.` is mapped) receive nothing.
+ */
+export interface PersonaOriginAttachment {
+  origin: string
+  /** Restrict cookie attachment to these names (case-sensitive). Defaults to every applicable cookie. */
+  cookies?: string[]
+  /** Extra or overriding headers for this origin (tenant/org/CSRF/…). */
+  headers?: Record<string, string>
+  /** Storage hydration mode for this origin. `false` disables storage for it. */
+  storage?: 'local' | 'session' | 'both' | false
+}
+
+export interface PersonaStorageSnapshot {
+  localStorage?: Record<string, string>
+  sessionStorage?: Record<string, string>
+}
+
+/**
+ * Composite credential bundle: the v6 identity shape that can hold cookies (incl. `HttpOnly`),
+ * headers, browser storage, and per-origin attachment rules at the same time. The legacy
+ * single `headerType`/`value` fields remain authoritative for plain cookie/bearer/header personas.
+ */
+export interface PersonaCredentialBundle {
+  v?: 2
+  cookies?: PersonaCookieRecord[]
+  headers?: Record<string, string>
+  attachments?: PersonaOriginAttachment[]
+  storage?: PersonaStorageSnapshot
+  /** Origins allowed to receive `storage` defaults when no attachment explicitly opts in. */
+  storageOrigins?: string[]
+}
+
+/** Headers, scoped cookies, and storage that may be attached to one origin. */
+export interface PersonaCredentialFrame {
+  headers: Record<string, string>
+  cookies: PersonaCookieRecord[]
+  storage: PersonaStorageSnapshot | null
+}
+
 export interface MintedPersonaSession {
   headerType: 'cookie' | 'bearer' | 'header'
   headerName?: string
@@ -43,6 +100,8 @@ export interface MintedPersonaSession {
    * Stored ONLY in this 0600 host file, never in SQLite or PublicPersona.
    */
   scrubTokens?: string[]
+  /** Composite v6 credential bundle (cookies + headers + storage + per-origin rules). */
+  bundle?: PersonaCredentialBundle
   updatedAt?: number
 }
 
@@ -68,6 +127,359 @@ export interface ResolvedPersona {
 }
 
 const maxScrubHistoryEntries = 64
+const MAX_BUNDLE_COOKIES = 64
+const MAX_BUNDLE_HEADERS = 32
+const MAX_BUNDLE_ATTACHMENTS = 32
+const MAX_BUNDLE_STORAGE_KEYS = 128
+const MAX_COOKIE_VALUE = 8_192
+const MAX_STORAGE_VALUE = 8_192
+
+/** Headers a caller may never smuggle through a credential bundle. */
+const UNSAFE_BUNDLE_HEADERS = new Set([
+  'host',
+  'content-length',
+  'connection',
+  'transfer-encoding',
+  'upgrade',
+  'keep-alive',
+  'te',
+  'trailer',
+  'proxy-authorization',
+  'proxy-connection',
+])
+
+const cookieNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/
+const headerNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}$/
+
+function cleanHostDomain(domain: string): string | null {
+  const raw = domain.trim().toLowerCase().replace(/^\.+/, '')
+  if (!raw || raw.length > 253) return null
+  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(raw)) return null
+  if (raw.includes('..')) return null
+  return raw
+}
+
+function sanitizeCookieRecords(input: unknown): PersonaCookieRecord[] {
+  if (!Array.isArray(input)) return []
+  const out: PersonaCookieRecord[] = []
+  const seen = new Set<string>()
+  for (const entry of input.slice(0, MAX_BUNDLE_COOKIES)) {
+    if (!entry || typeof entry !== 'object') continue
+    const rec = entry as Partial<PersonaCookieRecord>
+    if (typeof rec.name !== 'string' || !cookieNamePattern.test(rec.name)) continue
+    if (typeof rec.value !== 'string' || rec.value.length > MAX_COOKIE_VALUE) continue
+    if (/[\r\n\0]/.test(rec.value)) continue
+    const domain = typeof rec.domain === 'string' ? cleanHostDomain(rec.domain) : null
+    if (!domain) continue
+    const path = typeof rec.path === 'string' && rec.path.startsWith('/') && !/[\r\n;]/.test(rec.path)
+      ? rec.path.slice(0, 256)
+      : '/'
+    const key = `${rec.name}\0${domain}\0${path}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({
+      name: rec.name,
+      value: rec.value,
+      domain,
+      path,
+      ...(rec.httpOnly === true ? { httpOnly: true } : {}),
+      ...(rec.secure === true ? { secure: true } : {}),
+      ...(rec.sameSite === 'Strict' || rec.sameSite === 'Lax' || rec.sameSite === 'None'
+        ? { sameSite: rec.sameSite }
+        : {}),
+      ...(typeof rec.expires === 'number' && Number.isFinite(rec.expires) && rec.expires > 0
+        ? { expires: Math.floor(rec.expires) }
+        : {}),
+    })
+  }
+  return out
+}
+
+function sanitizeHeaders(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const out: Record<string, string> = {}
+  let count = 0
+  for (const [rawName, rawValue] of Object.entries(input as Record<string, unknown>)) {
+    if (count >= MAX_BUNDLE_HEADERS) break
+    const name = rawName.trim()
+    if (!headerNamePattern.test(name) || UNSAFE_BUNDLE_HEADERS.has(name.toLowerCase())) continue
+    if (typeof rawValue !== 'string' || rawValue.length > MAX_COOKIE_VALUE) continue
+    if (/[\r\n\0]/.test(rawValue)) continue
+    out[name] = rawValue
+    count += 1
+  }
+  return out
+}
+
+function sanitizeStorageSnapshot(input: unknown): PersonaStorageSnapshot | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const pick = (raw: unknown): Record<string, string> | undefined => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+    const out: Record<string, string> = {}
+    let count = 0
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (count >= MAX_BUNDLE_STORAGE_KEYS) break
+      if (!key || key.length > 256 || /[\r\n\0]/.test(key)) continue
+      if (typeof value !== 'string' || value.length > MAX_STORAGE_VALUE) continue
+      out[key] = value
+      count += 1
+    }
+    return Object.keys(out).length ? out : undefined
+  }
+  const localStorage = pick((input as PersonaStorageSnapshot).localStorage)
+  const sessionStorage = pick((input as PersonaStorageSnapshot).sessionStorage)
+  if (!localStorage && !sessionStorage) return null
+  return {
+    ...(localStorage ? { localStorage } : {}),
+    ...(sessionStorage ? { sessionStorage } : {}),
+  }
+}
+
+function sanitizeOriginPattern(raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null
+  try {
+    const url = new URL(raw.trim())
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+    if (url.username || url.password) return null
+    if (url.hostname === '*') return null
+    if (url.hostname.includes('*') && !url.hostname.startsWith('*.')) return null
+    return url.origin
+  } catch {
+    return null
+  }
+}
+
+function sanitizeAttachments(input: unknown): PersonaOriginAttachment[] {
+  if (!Array.isArray(input)) return []
+  const out: PersonaOriginAttachment[] = []
+  const seen = new Set<string>()
+  for (const entry of input.slice(0, MAX_BUNDLE_ATTACHMENTS)) {
+    if (!entry || typeof entry !== 'object') continue
+    const rec = entry as Partial<PersonaOriginAttachment>
+    const origin = sanitizeOriginPattern(rec.origin)
+    if (!origin || seen.has(origin)) continue
+    seen.add(origin)
+    const cookies = Array.isArray(rec.cookies)
+      ? [...new Set(rec.cookies.filter((name): name is string =>
+          typeof name === 'string' && cookieNamePattern.test(name)))].slice(0, MAX_BUNDLE_COOKIES)
+      : undefined
+    const headers = sanitizeHeaders(rec.headers)
+    out.push({
+      origin,
+      ...(cookies && cookies.length ? { cookies } : {}),
+      ...(Object.keys(headers).length ? { headers } : {}),
+      ...(rec.storage === 'local' || rec.storage === 'session' || rec.storage === 'both' || rec.storage === false
+        ? { storage: rec.storage }
+        : {}),
+    })
+  }
+  return out
+}
+
+/** Normalize an untrusted bundle (operator import, persisted file, adapter output). */
+export function normalizePersonaBundle(input: unknown): PersonaCredentialBundle | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined
+  const rec = input as PersonaCredentialBundle
+  const cookies = sanitizeCookieRecords(rec.cookies)
+  const headers = sanitizeHeaders(rec.headers)
+  const attachments = sanitizeAttachments(rec.attachments)
+  const storage = sanitizeStorageSnapshot(rec.storage)
+  const storageOrigins = Array.isArray(rec.storageOrigins)
+    ? [...new Set(rec.storageOrigins
+        .map(sanitizeOriginPattern)
+        .filter((origin): origin is string => Boolean(origin)))].slice(0, MAX_BUNDLE_ATTACHMENTS)
+    : []
+  if (!cookies.length && !Object.keys(headers).length && !attachments.length && !storage) return undefined
+  return {
+    v: 2,
+    ...(cookies.length ? { cookies } : {}),
+    ...(Object.keys(headers).length ? { headers } : {}),
+    ...(attachments.length ? { attachments } : {}),
+    ...(storage ? { storage } : {}),
+    ...(storageOrigins.length ? { storageOrigins } : {}),
+  }
+}
+
+/** True when an origin matches an exact or `*.` subdomain-glob attachment rule. */
+export function originMatchesAttachment(origin: string, pattern: string): boolean {
+  let target: URL
+  try {
+    target = new URL(origin)
+  } catch {
+    return false
+  }
+  let rule: URL
+  try {
+    rule = new URL(pattern)
+  } catch {
+    return false
+  }
+  if (target.protocol !== rule.protocol) return false
+  if (target.port !== rule.port) return false
+  const host = target.hostname.toLowerCase()
+  const ruleHost = rule.hostname.toLowerCase()
+  if (!ruleHost.includes('*')) return host === ruleHost
+  const suffix = ruleHost.slice(2) // strip `*.`
+  return host === suffix || host.endsWith(`.${suffix}`)
+}
+
+function cookieAppliesToOrigin(cookie: PersonaCookieRecord, origin: URL, requireSecure: boolean): boolean {
+  const host = origin.hostname.toLowerCase()
+  const domain = cookie.domain.toLowerCase()
+  const hostMatches = host === domain || host.endsWith(`.${domain}`)
+  if (!hostMatches) return false
+  if (cookie.secure === true && origin.protocol !== 'https:') return false
+  if (requireSecure && origin.protocol !== 'https:') return false
+  if (typeof cookie.expires === 'number' && cookie.expires > 0 && cookie.expires < Date.now()) return false
+  return true
+}
+
+function matchingAttachment(bundle: PersonaCredentialBundle, origin: string): PersonaOriginAttachment | null {
+  const attachments = bundle.attachments ?? []
+  if (!attachments.length) return null
+  let best: PersonaOriginAttachment | null = null
+  let bestScore = -1
+  for (const attachment of attachments) {
+    if (!originMatchesAttachment(origin, attachment.origin)) continue
+    // Exact origin beats a glob; more specific globs beat broader ones.
+    const score = attachment.origin.includes('*') ? attachment.origin.length : 10_000
+    if (score > bestScore) {
+      best = attachment
+      bestScore = score
+    }
+  }
+  return best
+}
+
+/**
+ * Build the credentialed frame (headers + scoped cookies + storage) for one origin.
+ *
+ * When a bundle is present, cookie attachment honours cookie domain/secure/expiry rules and
+ * the per-origin attachment allowlist. Legacy single-value sessions (cookie header string or
+ * bearer token) are preserved exactly as before so existing broker call sites keep working.
+ */
+export function frameForSessionOrigin(
+  session: MintedPersonaSession | null | undefined,
+  originAllowlist: readonly string[],
+  origin: string,
+  legacyHeaderName?: string | null,
+): PersonaCredentialFrame | null {
+  if (!session || !originAllowlist.includes(origin)) return null
+  let parsedOrigin: URL
+  try {
+    parsedOrigin = new URL(origin)
+  } catch {
+    return null
+  }
+  const bundle = session.bundle ? normalizePersonaBundle(session.bundle) : undefined
+  if (!bundle) {
+    if (!session.value) return null
+    if (session.headerType === 'bearer') return { headers: { Authorization: 'Bearer ' + session.value }, cookies: [], storage: null }
+    if (session.headerType === 'cookie') return { headers: { Cookie: session.value }, cookies: [], storage: null }
+    return { headers: { [session.headerName || legacyHeaderName || 'X-Api-Key']: session.value }, cookies: [], storage: null }
+  }
+
+  const attachment = matchingAttachment(bundle, origin)
+  const attachmentsDeclared = Boolean(bundle.attachments?.length)
+  const hasCatchAll = (bundle.attachments ?? []).some(rule => rule.origin.includes('*'))
+  if (attachmentsDeclared && !attachment && !hasCatchAll) {
+    // A mapped bundle never covers an unmapped sibling origin — even with legacy fallback value.
+    return null
+  }
+
+  const allowedCookieNames = attachment?.cookies ? new Set(attachment.cookies) : null
+  const cookies = (bundle.cookies ?? []).filter(cookie => {
+    if (allowedCookieNames && !allowedCookieNames.has(cookie.name)) return false
+    return cookieAppliesToOrigin(cookie, parsedOrigin, false)
+  })
+
+  const headers: Record<string, string> = { ...(bundle.headers ?? {}) }
+  if (attachment?.headers) Object.assign(headers, attachment.headers)
+  if (cookies.length) {
+    headers.Cookie = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+  }
+
+  const storageMode = attachment?.storage ?? (
+    bundle.storageOrigins?.length
+      ? (bundle.storageOrigins.some(pattern => originMatchesAttachment(origin, pattern)) ? 'both' : false)
+      : (attachmentsDeclared ? false : 'both')
+  )
+  const storage = bundle.storage && storageMode !== false
+    ? {
+        ...(storageMode !== 'session' && bundle.storage.localStorage
+          ? { localStorage: { ...bundle.storage.localStorage } }
+          : {}),
+        ...(storageMode !== 'local' && bundle.storage.sessionStorage
+          ? { sessionStorage: { ...bundle.storage.sessionStorage } }
+          : {}),
+      }
+    : null
+
+  if (!Object.keys(headers).length && !cookies.length) {
+    // Storage-only bundles still need a frame for browser hydration, but no HTTP attachment.
+    if (!storage || (!storage.localStorage && !storage.sessionStorage)) return null
+  }
+  return {
+    headers,
+    cookies,
+    storage: storage && (storage.localStorage || storage.sessionStorage) ? storage : null,
+  }
+}
+
+/** All secret material inside a bundle (cookie values, sensitive header values, token-like storage). */
+export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): string[] {
+  if (!bundle) return []
+  const out = new Set<string>()
+  const sensitiveHeader = (name: string) =>
+    /^(authorization|cookie|set-cookie|x-xsrf-token)$/i.test(name) ||
+    /csrf|xsrf|token|secret|api[-_]?key|session|auth/i.test(name)
+  const addHeaderValue = (name: string, value: string) => {
+    if (!sensitiveHeader(name)) return
+    const trimmed = value.replace(/^Bearer\s+/i, '').trim()
+    if (trimmed.length >= 4) out.add(trimmed)
+    if (name.toLowerCase() === 'cookie') {
+      for (const pair of value.split(';')) {
+        const eq = pair.indexOf('=')
+        if (eq <= 0) continue
+        const cookieValue = pair.slice(eq + 1).trim()
+        if (cookieValue.length >= 16) out.add(cookieValue)
+      }
+    }
+  }
+  for (const cookie of bundle.cookies ?? []) {
+    if (cookie.value.length >= 4) out.add(cookie.value)
+  }
+  for (const [name, value] of Object.entries(bundle.headers ?? {})) {
+    addHeaderValue(name, value)
+  }
+  for (const scope of [bundle.storage?.localStorage, bundle.storage?.sessionStorage]) {
+    for (const [key, value] of Object.entries(scope ?? {})) {
+      if (value.length >= 4 && /token|jwt|auth|secret|key|session|credential/i.test(key)) out.add(value)
+    }
+  }
+  for (const attachment of bundle.attachments ?? []) {
+    for (const [name, value] of Object.entries(attachment.headers ?? {})) {
+      addHeaderValue(name, value)
+    }
+  }
+  return [...out]
+}
+
+/** Serialize a storage snapshot into a safe Playwright init script. */
+export function storageHydrationScript(storage: PersonaStorageSnapshot | null): string | null {
+  if (!storage || (!storage.localStorage && !storage.sessionStorage)) return null
+  const encode = (value: unknown) => JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029')
+  const local = encode(storage.localStorage ?? {})
+  const session = encode(storage.sessionStorage ?? {})
+  return `(() => { try { const local = ${local}; const session = ${session};
+    for (const [k, v] of Object.entries(local)) window.localStorage.setItem(k, v);
+    for (const [k, v] of Object.entries(session)) window.sessionStorage.setItem(k, v);
+  } catch { /* storage may be unavailable */ } })();`
+}
 
 function readVerifiedSecretFile(path: string): { secret: string; mtimeMs: number; ino: number } {
   const stat = statSync(path)
@@ -100,6 +512,7 @@ function readVerifiedSessionFile(path: string): { session: MintedPersonaSession;
   ) {
     return null
   }
+  const bundle = normalizePersonaBundle(parsed.bundle)
   const session: MintedPersonaSession = {
     headerType: parsed.headerType,
     headerName: typeof parsed.headerName === 'string' && parsed.headerName ? parsed.headerName : undefined,
@@ -109,6 +522,7 @@ function readVerifiedSessionFile(path: string): { session: MintedPersonaSession;
     scrubTokens: Array.isArray(parsed.scrubTokens)
       ? parsed.scrubTokens.filter((v): v is string => typeof v === 'string' && v.length > 0)
       : undefined,
+    ...(bundle ? { bundle } : {}),
     updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : undefined,
   }
   return { session, mtimeMs: stat.mtimeMs, ino: stat.ino }
@@ -163,6 +577,8 @@ export function writePersonaSessionFile(
 
   addToken(session.value)
   for (const tok of session.scrubTokens ?? []) addToken(tok)
+  const bundle = normalizePersonaBundle(session.bundle)
+  for (const tok of bundleSecrets(bundle)) addToken(tok)
 
   const payload: MintedPersonaSession = {
     headerType: session.headerType,
@@ -171,6 +587,7 @@ export function writePersonaSessionFile(
     ...(session.expiresAt !== undefined ? { expiresAt: session.expiresAt } : {}),
     adapterUsed: session.adapterUsed,
     scrubTokens: mergedScrub.slice(-maxScrubHistoryEntries),
+    ...(bundle ? { bundle } : {}),
     updatedAt: Date.now(),
   }
 
@@ -369,6 +786,9 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
         for (const tok of sessionRead.session.scrubTokens ?? []) {
           if (tok && !history.includes(tok)) history.push(tok)
         }
+        for (const tok of bundleSecrets(sessionRead.session.bundle)) {
+          if (tok && !history.includes(tok)) history.push(tok)
+        }
       }
       map.set(row.handle, {
         id: row.id,
@@ -440,6 +860,7 @@ export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): 
       ...(persona.secretHistory ?? []),
       ...(persona.session?.value ? [persona.session.value] : []),
       ...(persona.session?.scrubTokens ?? []),
+      ...bundleSecrets(persona.session?.bundle),
     ])
     for (const raw of values) {
       if (!raw) continue
@@ -460,15 +881,85 @@ export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): 
 
 export function buildPersonaHeader(persona: ResolvedPersona, origin: string): Record<string, string> | null {
   if (!persona.originAllowlist.includes(origin)) return null
+  let frame: PersonaCredentialFrame | null = null
   if (persona.authKind === 'login') {
-    const session = refreshPersonaSession(persona)
-    if (!session || !session.value) return null
-    if (session.headerType === 'bearer') return { Authorization: 'Bearer ' + session.value }
-    if (session.headerType === 'cookie') return { Cookie: session.value }
-    return { [session.headerName || persona.headerName || 'X-Api-Key']: session.value }
+    frame = frameForSessionOrigin(refreshPersonaSession(persona), persona.originAllowlist, origin, persona.headerName)
+  } else {
+    const secret = refreshPersonaSecret(persona)
+    frame = {
+      headers: persona.authKind === 'bearer'
+        ? { Authorization: 'Bearer ' + secret }
+        : persona.authKind === 'cookie'
+          ? { Cookie: secret }
+          : { [persona.headerName ?? 'X-Api-Key']: secret },
+      cookies: [],
+      storage: null,
+    }
   }
-  const secret = refreshPersonaSecret(persona)
-  if (persona.authKind === 'bearer') return { Authorization: 'Bearer ' + secret }
-  if (persona.authKind === 'cookie') return { Cookie: secret }
-  return { [persona.headerName ?? 'X-Api-Key']: secret }
+  if (!frame || !Object.keys(frame.headers).length) return null
+  return frame.headers
 }
+
+/**
+ * Browser-facing attachment for one origin: Playwright-compatible cookie records (with
+ * `httpOnly`/`secure`/`sameSite` preserved), request headers for API calls, and the storage
+ * snapshot to hydrate via `storageHydrationScript()`. Returns null outside the allowlist.
+ */
+export interface PersonaBrowserAttachment {
+  origin: string
+  headers: Record<string, string>
+  cookies: Array<{
+    name: string
+    value: string
+    domain: string
+    path: string
+    httpOnly: boolean
+    secure: boolean
+    sameSite?: 'Strict' | 'Lax' | 'None'
+    expires?: number
+  }>
+  storage: PersonaStorageSnapshot | null
+  initScript: string | null
+}
+
+export function buildPersonaBrowserAttachment(
+  persona: ResolvedPersona,
+  origin: string,
+): PersonaBrowserAttachment | null {
+  if (!persona.originAllowlist.includes(origin)) return null
+  let frame: PersonaCredentialFrame | null
+  if (persona.authKind === 'login') {
+    frame = frameForSessionOrigin(refreshPersonaSession(persona), persona.originAllowlist, origin, persona.headerName)
+  } else {
+    const secret = refreshPersonaSecret(persona)
+    frame = {
+      headers: persona.authKind === 'bearer'
+        ? { Authorization: 'Bearer ' + secret }
+        : persona.authKind === 'cookie'
+          ? { Cookie: secret }
+          : { [persona.headerName ?? 'X-Api-Key']: secret },
+      cookies: [],
+      storage: null,
+    }
+  }
+  if (!frame) return null
+  let secureByOrigin = true
+  try { secureByOrigin = new URL(origin).protocol === 'https:' } catch { secureByOrigin = true }
+  return {
+    origin,
+    headers: frame.headers,
+    cookies: frame.cookies.map(cookie => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+      httpOnly: cookie.httpOnly === true,
+      secure: cookie.secure === true || secureByOrigin,
+      ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
+      ...(cookie.expires ? { expires: cookie.expires } : {}),
+    })),
+    storage: frame.storage,
+    initScript: storageHydrationScript(frame.storage),
+  }
+}
+

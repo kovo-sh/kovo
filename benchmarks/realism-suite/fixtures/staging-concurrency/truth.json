@@ -1,0 +1,103 @@
+{
+  "fixture": "staging-concurrency",
+  "version": 1,
+  "summary": "Stateful staging tenant (staging_isolated) with run-scoped tagging, write-BOLA, a three-step checkout that trusts client pricing, and an h2c transfer endpoint vulnerable to a single-packet double-spend race.",
+  "findings": [
+    {
+      "id": "stg-write-bola",
+      "title": "Invoice update ignores the caller tenant",
+      "vulnClass": "cross_tenant_write",
+      "cwe": "CWE-639",
+      "severity": "critical",
+      "origin": "app",
+      "method": "PATCH",
+      "endpoint": "/v1/invoices/:invoiceId",
+      "persona": "stg-alice",
+      "impact": "tenant-alpha member rewrites tenant-beta invoice totals",
+      "chain": "stg-tenant-takeover",
+      "evidence": ["PATCH inv-beta-1 with an alpha token returns 200 and bob observes total=1"]
+    },
+    {
+      "id": "stg-report-idor",
+      "title": "Report lookup is not tenant-scoped",
+      "vulnClass": "idor",
+      "cwe": "CWE-639",
+      "severity": "high",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v1/reports/:id",
+      "persona": "stg-alice",
+      "impact": "cross-tenant revenue report and its canary are returned to an alpha member",
+      "chain": "stg-tenant-takeover",
+      "evidence": ["rep-beta-1 returns rbs_fake_beta_report_canary to an alpha token"]
+    },
+    {
+      "id": "stg-price-tampering",
+      "title": "Checkout payment trusts client-supplied pricing and skips the quote step",
+      "vulnClass": "price_tampering",
+      "cwe": "CWE-472",
+      "severity": "high",
+      "origin": "app",
+      "method": "POST",
+      "endpoint": "/v1/checkout/pay",
+      "persona": "stg-alice",
+      "impact": "order total becomes 1 instead of the quoted 249; a cart can be paid without a quote",
+      "evidence": ["pay {unitPrice:1} charges 1", "pay without /quote succeeds with quoteSkipped=true"]
+    },
+    {
+      "id": "stg-race-double-spend",
+      "title": "HTTP/2 transfer race acknowledges two debits against one balance update",
+      "vulnClass": "race_double_spend",
+      "cwe": "CWE-362",
+      "severity": "critical",
+      "origin": "h2",
+      "method": "POST",
+      "endpoint": "/v2/transfers",
+      "persona": "stg-alice",
+      "impact": "two same-packet streams with the same idempotency key both return 200 while the account is debited once (200 transferred against a 100 debit)",
+      "evidence": ["both streams observed balance 1000; final balance 900; deduplicated=false twice"]
+    }
+  ],
+  "chains": [
+    {
+      "id": "stg-tenant-takeover",
+      "title": "Cross-tenant staging takeover",
+      "members": ["stg-report-idor", "stg-write-bola"],
+      "description": "Enumerate a foreign report, then mutate the same tenant's invoice total; both actions are run-tagged and must be reverted by cleanup."
+    }
+  ],
+  "decoys": [
+    {
+      "id": "stg-invoice-read-scoped",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v1/invoices/:id",
+      "vulnClass": "idor",
+      "reason": "Reads compare the invoice tenant with the token tenant and return 403 cross-tenant."
+    },
+    {
+      "id": "stg-quote-server-priced",
+      "origin": "app",
+      "method": "POST",
+      "endpoint": "/v1/checkout/quote",
+      "vulnClass": "price_tampering",
+      "reason": "Quote always uses the server-side unit price; only the payment step is tamperable."
+    },
+    {
+      "id": "stg-health",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "vulnClass": "information_disclosure",
+      "reason": "Static staging liveness marker."
+    }
+  ],
+  "invariants": {
+    "environmentMode": "staging_isolated",
+    "runTagPrefix": "guardian-qa-",
+    "orphanRecordsAfterCleanup": 0,
+    "cleanupRestoresMutations": true,
+    "http2": "h2c prior-knowledge",
+    "idempotency": "accepted but not enforced"
+  }
+}
