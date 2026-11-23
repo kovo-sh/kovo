@@ -2407,7 +2407,10 @@ export function renderCellMarkdown(result: RealismCellResult): string {
   lines.push('')
   lines.push('### Wiring metrics')
   lines.push('')
-  const metricValue = (value: number | null, suffix = ''): string => value === null ? 'n/a' : `${value}${suffix}`
+  const metricValue = (value: number | null, suffix = ''): string => {
+    if (value === null) return 'n/a'
+    return `${Number.isInteger(value) ? value : value.toFixed(2)}${suffix}`
+  }
   const wiringMetrics = wiring.metrics
   lines.push(`- OOB: registered=${metricValue(wiringMetrics.pendingOobRegistered)}; drain=${metricValue(wiringMetrics.oobDrainWaitedMs, ' ms')}; late callbacks=${metricValue(wiringMetrics.lateCallbacksMatched)}; late promotions=${metricValue(wiringMetrics.latePromotions)}`)
   lines.push(`- approvals: blocking=${metricValue(wiringMetrics.approvalBlocks)} (created ${metricValue(wiringMetrics.approvalRequestsCreated)}); parked workers=${metricValue(wiringMetrics.parkedWorkers)}; broker-denied mutations=${metricValue(wiringMetrics.brokerDeniedMutations)} (total denied ${metricValue(wiringMetrics.brokerDeniedTotal)}${wiringMetrics.brokerDeniedReasons ? `; reasons ${Object.entries(wiringMetrics.brokerDeniedReasons).map(([reason, count]) => `${reason}=${count}`).join(', ')}` : ''})`)
