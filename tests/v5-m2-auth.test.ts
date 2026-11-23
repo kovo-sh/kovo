@@ -625,17 +625,19 @@ test('V5-M2.6 local-lab Tier-3 approvals auto-approve keyword routes but never r
   const localDelete = await evaluateTier3Approval({
     ...base, method: 'DELETE', pathAndQuery: '/api/invoices/42', environment: 'local-lab', offline: true,
   })
-  assert.equal(localDelete.decision, 'escalate_human')
+  // Loopback local-lab DELETE is auto-approved and audited (Tier-3 lab capability).
+  assert.equal(localDelete.decision, 'approve')
+  assert.equal(localDelete.decidedBy, 'auto-review:local-lab')
 
   const localMultipart = await evaluateTier3Approval({
     ...base, method: 'POST', pathAndQuery: '/api/invoices/42', hasMultipart: true, environment: 'local-lab', offline: true,
   })
-  assert.equal(localMultipart.decision, 'escalate_human')
+  assert.equal(localMultipart.decision, 'approve')
 
   const localRce = await evaluateTier3Approval({
     ...base, method: 'POST', pathAndQuery: '/api/invoices/42', isRceProof: true, environment: 'local-lab', offline: true,
   })
-  assert.equal(localRce.decision, 'escalate_human')
+  assert.equal(localRce.decision, 'approve')
 
   const localStrict = await evaluateTier3Approval({
     ...base, policy: 'strict', method: 'POST', pathAndQuery: '/api/invoices/42/refund', environment: 'local-lab',

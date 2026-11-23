@@ -3250,7 +3250,7 @@ async function diffWorkflowInvariant(ctx: DiffContext): Promise<DiffOutcome> {
     })
     const controlRead = liveReadPath ? await send({ method: 'GET', pathAndQuery: liveReadPath, persona: req.persona }) : null
     const controlState = controlRead ? asRecord(controlRead) : null
-    const testValues = [-1, -5, 0]
+    const testValues = [-1, -5, 0, 1_000_000]
     for (const val of testValues) {
       const ex = await send({
         method,

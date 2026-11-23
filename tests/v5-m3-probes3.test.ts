@@ -249,7 +249,7 @@ test('hypothesis shaping: DELETE keeps its verb, cache includes templated public
   const del = plan.hypotheses.find(h => h.endpoint.method === 'DELETE')
   assert.ok(del, 'DELETE authz hypothesis required')
   assert.equal(del.deleteMethod, true)
-  assert.equal(del.method, 'POST', 'spec-compatible method stays POST; the probe carries the real verb')
+  assert.equal(del.method, 'DELETE', 'DELETE keeps its real verb so findings attribute to the DELETE truth route')
 
   const cache = plan.hypotheses.filter(h => h.probeClass === 'cache_poison_deception')
   assert.ok(cache.some(h => h.endpoint.path === '/api/reports/:reportId/public'), 'templated public view is cache-eligible')

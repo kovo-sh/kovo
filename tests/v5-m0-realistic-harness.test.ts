@@ -158,7 +158,7 @@ test('mapping: black-box exposes only two personas and no specs/source', () => {
   assert.equal(plan.briefing.apiReference, undefined)
   assert.equal(plan.openApi, null)
   assert.equal(plan.loginPath, null)
-  assert.equal(plan.capabilityTier, 2)
+  assert.equal(plan.capabilityTier, 3)
 })
 
 test('mapping: grey-box exposes all personas plus an OpenAPI project spec', () => {
@@ -173,7 +173,7 @@ test('mapping: grey-box exposes all personas plus an OpenAPI project spec', () =
   assert.deepEqual(doc.paths['/api/invoices/:invoiceId']?.get.parameters, [
     { name: 'invoiceId', in: 'path', required: true },
   ])
-  assert.equal(plan.capabilityTier, 2)
+  assert.equal(plan.capabilityTier, 3)
 })
 
 test('mapping: white-box adds the source mount and Tier 3', () => {
