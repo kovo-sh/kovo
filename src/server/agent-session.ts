@@ -494,6 +494,57 @@ export type ProofToolHandlerName = typeof proofToolHandlerNames[number]
 
 export type GuardianVerifyRuntime = 'ts' | 'python'
 
+/**
+ * Typed helpers exported by both guardian_verify SDKs (`ctx.prove_*`). Each records the exact
+ * transcript roles the independent oracle checks, so a proof never fails for want of a role.
+ * Keep the one-liners short: this block is copied verbatim into the tool description and the
+ * (slimmed) agentic prompt context, so every byte is paid on every turn.
+ */
+export const GUARDIAN_VERIFY_HELPERS = [
+  { name: 'prove_access_boundary', use: 'control persona denied + probe persona crosses the same object (control_denied / variant_crossed ids).' },
+  { name: 'prove_persisted_mutation', use: 'before_get -> mutation -> after_get on one object; prove the field delta and an impact claim.' },
+  { name: 'prove_boolean_or_timing_diff', use: 'both arms; stable boolean/structural diff, or timing separation (Mann-Whitney/MAD).' },
+  { name: 'prove_oob_callback', use: 'mint a canary, inject, wait for the durable hit, promote late arrivals.' },
+  { name: 'prove_race_burst', use: 'single-packet burst of one state-changing request; show the over-count.' },
+] as const
+
+/** Class -> typed helper. Kept compact so it fits in the tool description and prompt context. */
+export const GUARDIAN_VERIFY_CLASS_HINTS = [
+  ['authorization/BOLA', 'prove_access_boundary'],
+  ['mutation/BFLA/mass-assignment', 'prove_persisted_mutation'],
+  ['injection/timing', 'prove_boolean_or_timing_diff'],
+  ['SSRF/XXE/webhook', 'prove_oob_callback'],
+  ['race', 'prove_race_burst'],
+] as const
+
+export const GUARDIAN_VERIFY_REPAIR_INSTRUCTION =
+  'On failure read rejectedBy, missingEvidence, and transcriptSummary, then repair the script in the next turn; never abandon the candidate as an open proof gap.'
+
+/** Single compact line reused by the agentic prompt context (survives skill-catalog slimming). */
+export function guardianVerifyPromptHint(): string {
+  const classes = GUARDIAN_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')
+  return `guardian_verify typed helpers: ${classes}. ${GUARDIAN_VERIFY_REPAIR_INSTRUCTION}`
+}
+
+/** Guidance block appended to the guardian_verify tool description. Bounded for prompt budget. */
+export function guardianVerifyHelperGuidance(): string {
+  return [
+    'Typed helpers (prefer the helper for the class; each records the transcript roles the oracle checks):',
+    ...GUARDIAN_VERIFY_HELPERS.map(helper => `- ${helper.name} — ${helper.use}`),
+    `Class hints: ${GUARDIAN_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')}.`,
+    GUARDIAN_VERIFY_REPAIR_INSTRUCTION,
+  ].join('\n')
+}
+
+const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
+  'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Prefer this over JSON-only proof specs: use ctx.http/ctx.browser/ctx.oob for setup, control vs probe requests, and assertions, then return ctx.result({ title, claims }). A `scriptPath` refers to a file you wrote into the workspace.'
+
+export const GUARDIAN_VERIFY_TOOL_DESCRIPTION =
+  `${GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE}\n\n${guardianVerifyHelperGuidance()}`
+
+/** Hard budget for the guidance block added on top of the script-first base description. */
+export const GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES = 2048
+
 export interface GuardianVerifyArgs {
   /** Inline TS/Python verification script. Takes precedence over `scriptPath`. */
   script?: string
@@ -526,6 +577,12 @@ export interface GuardianVerifyToolResult {
   failures: string[]
   disagreements: string[]
   attempts: GuardianVerifyAttemptSummary[]
+  /** First validator/claim that rejected the proof (null when it passed or the handler omitted it). */
+  rejectedBy: string | null
+  /** Exact transcript roles/preconditions a repair must add, carried through verbatim. */
+  missingEvidence: string[]
+  /** Compact role-labelled transcript so a repair can be made in one turn. */
+  transcriptSummary: unknown[]
 }
 
 export type GuardianVerifyHandler = (
@@ -565,6 +622,21 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
   const failures = stringList(rec.failures).length > 0
     ? stringList(rec.failures)
     : [...new Set([...attempts.flatMap(attempt => attempt.failures), ...disagreements])]
+  // Structured repair feedback from the oracle is carried through verbatim so a worker can repair
+  // in one turn. Older handlers only emit the `rejected-by:` / `missing-evidence:` failure lines,
+  // so fall back to parsing those.
+  const reportedRejectedBy = typeof rec.rejectedBy === 'string' && rec.rejectedBy.trim() ? rec.rejectedBy.trim() : null
+  const parsedRejectedBy = failures
+    .map(failure => /^rejected-by:\s*(.+)$/.exec(failure.trim())?.[1]?.trim())
+    .find((value): value is string => Boolean(value))
+  const rejectedBy = reportedRejectedBy ?? parsedRejectedBy ?? null
+  const reportedMissingEvidence = stringList(rec.missingEvidence)
+  const missingEvidence = reportedMissingEvidence.length > 0
+    ? reportedMissingEvidence
+    : failures
+        .map(failure => /^missing-evidence:\s*(.+)$/.exec(failure.trim())?.[1]?.trim())
+        .filter((value): value is string => Boolean(value))
+  const transcriptSummary = Array.isArray(rec.transcriptSummary) ? rec.transcriptSummary : []
   let confirmed = rec.confirmed === true
   let reason = typeof rec.reason === 'string' && rec.reason ? rec.reason : (confirmed ? 'confirmed' : 'unconfirmed')
   let detail = typeof rec.detail === 'string' ? rec.detail : ''
@@ -591,6 +663,9 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
     failures,
     disagreements,
     attempts,
+    rejectedBy,
+    missingEvidence,
+    transcriptSummary,
   }
 }
 
@@ -1499,6 +1574,8 @@ export function buildAgenticPromptContext(input: AgenticPromptContextInput = {})
       assignmentTarget: 'One assignment = one hypothesis cluster (1-3 linked routes) or one det_lead upgrade.',
       turnBudget: '8-10 turns; 6-8 turns for det_lead upgrades and chain step 2.',
       settlement: 'At turn N-2, submit your proof via a typed prove_* tool (or propose_chain_finding/update_proposed_finding) or call complete_intent; do not start new exploration.',
+      // Durable even when the skill catalog is slimmed: the same guidance lives on the tool.
+      proofTools: guardianVerifyPromptHint(),
     },
     ...(brief ? { evidenceBrief: brief } : {}),
   }
@@ -3258,7 +3335,7 @@ export function buildWorkerTools(
     const fn = handlers.guardian_verify
     tools.push(defineTool({
       name: 'guardian_verify',
-      description: 'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Prefer this over JSON-only proof specs: use ctx.http/ctx.browser/ctx.oob for setup, control vs probe requests, and assertions, then return ctx.result({ title, claims }). A `scriptPath` refers to a file you wrote into the workspace.',
+      description: GUARDIAN_VERIFY_TOOL_DESCRIPTION,
       parameters: obj({
         script: opt(str({ description: 'Inline verification script (TypeScript or Python). Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
         scriptPath: opt(str({ description: 'Workspace-relative path to a previously written verification script.', maxLength: 512 })),
