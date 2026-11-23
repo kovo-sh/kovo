@@ -393,17 +393,32 @@ export class ModelGate {
     ))
     if (!response.body) { res.end(); return }
     const reader = response.body.getReader()
+    // A cell that exits mid-stream closes the downstream socket. Cancel the upstream reader so
+    // the permit is released promptly and `gate.close()` never waits on an abandoned stream.
+    const cancelReader = () => { void reader.cancel().catch(() => undefined) }
+    res.once('close', cancelReader)
     try {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        if (res.destroyed) break
         if (!res.write(Buffer.from(value))) {
-          await new Promise<void>(resolvePromise => res.once('drain', resolvePromise))
+          await new Promise<void>(resolvePromise => {
+            const done = () => {
+              res.off('drain', done)
+              res.off('close', done)
+              resolvePromise()
+            }
+            res.once('drain', done)
+            res.once('close', done)
+          })
         }
       }
-      res.end()
+      if (!res.writableEnded && !res.destroyed) res.end()
     } catch {
-      res.destroy()
+      if (!res.destroyed) res.destroy()
+    } finally {
+      res.off('close', cancelReader)
     }
   }
 

@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, request } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -222,6 +222,38 @@ describe('model gate', () => {
     } finally {
       await gate.close()
       await new Promise<void>(resolve => upstream.close(() => resolve()))
+    }
+  })
+
+  test('aborted downstream cancels the upstream stream and releases the permit', async () => {
+    const upstream = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      const timer = setInterval(() => res.write('data: x\n\n'), 20)
+      req.on('close', () => { clearInterval(timer); res.end() })
+    })
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+    const upstreamPort = (upstream.address() as AddressInfo).port
+    const gate = new ModelGate({ maxInFlightStreams: 2 })
+    await gate.start()
+    try {
+      const endpoint = gate.endpointFor(`http://127.0.0.1:${upstreamPort}/v1`)
+      await new Promise<void>((resolve, reject) => {
+        const req = request(`${endpoint}/responses`, { method: 'POST', headers: { 'content-type': 'application/json' } }, response => {
+          response.once('data', () => { req.destroy(); resolve() })
+        })
+        req.once('error', error => { if (!/socket hang up|ECONNRESET/.test(String(error))) reject(error) })
+        req.end('{}')
+      })
+      for (let i = 0; i < 50 && gate.stats().inFlight > 0; i += 1) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      assert.equal(gate.stats().inFlight, 0, 'permit released after downstream abort')
+      await Promise.race([
+        gate.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('gate.close hung')), 2_000)),
+      ])
+    } finally {
+      await upstream.close()
     }
   })
 
