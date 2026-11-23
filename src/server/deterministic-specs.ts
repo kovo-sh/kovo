@@ -82,6 +82,13 @@ export interface EngineHypothesis {
   secretScan?: boolean
   viewerPersona?: string
   csrfBind?: boolean
+  /** auth_protocol_audit: body/header fields that carry a token (body-token routes). */
+  tokenFields?: string[]
+  /** auth_protocol_audit: session-derived scalar claims for a forged token payload. */
+  identityClaims?: Record<string, string>
+  /** webhook_signature_bypass: delivery body and signature header name. */
+  webhookBody?: Record<string, unknown>
+  webhookHeader?: string
   risk: number
   notes?: string[]
 }
@@ -350,9 +357,14 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     const neg = functionLevel ? null : negativeControlJq(mutating)
     const ownerJq = nonTrivial('c1', 3)
     const probeJq = nonTrivial('p1', 3)
-    const jq = `{ controlPassed: ((${ownerJq})${neg ? ` and (${neg})` : ''}), ` +
-      `confirmed: ((${probeJq})${neg ? ` and (${neg})` : ''} and (${matchesOwnerJq()})), ` +
-      `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
+    const anonymousControl = mutating && probePersona !== null && !functionLevel
+    const gate = anonymousControl
+      ? `(((.steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((.steps.c3.status >= 400) and (.steps.c3.status < 500)))`
+      : neg
+    const jq = `{ controlPassed: ((${ownerJq})${anonymousControl ? '' : neg ? ` and (${neg})` : ''}), ` +
+      `confirmed: ((${probeJq})${gate ? ` and (${gate})` : ''} and (${matchesOwnerJq()})), ` +
+      `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}` +
+      `${anonymousControl ? ' + " anon status=" + (.steps.c3.status | tostring)' : ''}), ` +
       'expected: "non-owner denied" }'
     const steps: Array<Record<string, unknown>> = []
     if (!functionLevel) {
@@ -370,6 +382,12 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     steps.push(stepOf(hyp.endpoint.origin, 'c1', 'control', 'Authorized actor performs the request', parts, owner, stepExtra))
     steps.push(stepOf(hyp.endpoint.origin, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the same request`, parts, probePersona, stepExtra))
+    if (anonymousControl) {
+      // Some frameworks answer unknown ids with a generic 2xx no-op, so the bogus-id control cannot
+      // distinguish. The unauthenticated twin then proves the route still enforces *some* access
+      // control while the cross-actor probe was accepted.
+      steps.push(stepOf(hyp.endpoint.origin, 'c3', 'control', 'Unauthenticated caller performs the same request', parts, null, {}, [400, 401, 403]))
+    }
     out.push({
       kind: 'http_chain',
       vulnClass,
@@ -1148,6 +1166,95 @@ function synthWorkflowStepSkip(hyp: EngineHypothesis, result: DifferentialResult
 
 // ---------------------------------------------------------------------------------------------
 
+const authMutationKinds = new Set(['alg_none', 'strip_signature', 'expired_replay', 'kid_inject', 'claim_swap', 'rs256_to_hs256_jwks'])
+
+function synthAuthProtocol(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(anomaly =>
+    anomaly.type === 'jwt_auth_mutation_bypass' || anomaly.type === 'jwt_authorization_forgery' ||
+    anomaly.type === 'jwt_body_token_bypass')
+  if (!hit || !hyp.ownerPersona) return []
+  const mutation = typeof hit.mutation === 'string' && authMutationKinds.has(hit.mutation) ? hit.mutation : 'alg_none'
+  const path = hyp.pathAndQuery.split('?')[0] || hyp.pathAndQuery
+  const jq = `{ controlPassed: ((.steps.c1.status >= 400) or (.steps.c1.status == 0)), ` +
+    `confirmed: ${is2xx('p1')}, ` +
+    'observed: (("probe_status=" + (.steps.p1.status | tostring))), ' +
+    'expected: "random-signature token is rejected; mutated token is accepted" }'
+  return [{
+    kind: 'auth_protocol_proof',
+    vulnClass: 'jwt',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(hyp.endpoint.origin, 'JWT signature verification bypass', 'CWE-347', 'jwt', 'high', jq),
+      kind: 'auth_protocol_proof',
+      protocol: 'jwt',
+      steps: [
+        stepOf(hyp.endpoint.origin, 'c1', 'control', 'Unauthenticated request is rejected', {
+          method: hyp.method,
+          pathAndQuery: path,
+        }, null, {}, [400, 401, 403]),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Mutated token (${mutation}) is accepted`, {
+          method: hyp.method,
+          pathAndQuery: path,
+        }, hyp.ownerPersona, { authMutation: { kind: mutation } }, [200, 201, 204]),
+      ],
+    },
+  }]
+}
+
+function synthWebhook(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(anomaly => anomaly.type === 'webhook_signature_bypass')
+  if (!hit || !hyp.webhookBody || !hyp.ownerPersona) return []
+  const body = hyp.webhookBody
+  const header = typeof hit.headerName === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(hit.headerName)
+    ? hit.headerName
+    : (hyp.webhookHeader ?? 'x-webhook-signature')
+  const proof = typeof hit.proof === 'string' ? hit.proof : 'readback'
+  const stateField = typeof hit.stateField === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.stateField)
+    ? hit.stateField : null
+  const readPath = typeof hit.readPath === 'string' && hit.readPath.startsWith('/') && !hit.readPath.startsWith('//')
+    ? hit.readPath : null
+  const steps: unknown[] = [
+    stepOf(hyp.endpoint.origin, 'c1', 'control', 'Tampered delivery signature', {
+      method: 'POST',
+      pathAndQuery: hyp.pathAndQuery,
+      headers: { 'Content-Type': 'application/json', [header]: 'guardian_invalid_signature' },
+      jsonBody: body,
+    }, hyp.ownerPersona, {}, [200, 201, 202, 204, 400, 401, 403, 422]),
+    stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Unsigned delivery acceptance', {
+      method: 'POST',
+      pathAndQuery: hyp.pathAndQuery,
+      headers: { 'Content-Type': 'application/json' },
+      jsonBody: body,
+    }, hyp.ownerPersona, {}, [200, 201, 202, 204]),
+  ]
+  let confirmedExpr = is2xx('p1')
+  if (proof === 'readback' && readPath && stateField) {
+    steps.push(stepOf(hyp.endpoint.origin, 'v1', 'probe', 'Read back the processed event', {
+      method: 'GET',
+      pathAndQuery: readPath,
+    }, hyp.ownerPersona, {}, [200, 201, 204]))
+    confirmedExpr = `(${is2xx('p1')} and (.steps.v1.json != null) and ((.steps.v1.json | tostring) | length > 2))`
+  } else {
+    confirmedExpr = `(${is2xx('p1')} and ((.steps.p1.body // "") | test("\\"(?:ok|received|processed|accepted|success)\\"\\s*:\\s*true"; "i")))`
+  }
+  const jq = `{ controlPassed: ((.steps.c1.status < 500) and (.steps.c1.status > 0)), ` +
+    `confirmed: ${confirmedExpr}, ` +
+    'observed: (("unsigned_status=" + (.steps.p1.status | tostring))), ' +
+    'expected: "unsigned/tampered-key delivery is rejected and never processed" }'
+  return [{
+    kind: 'http_chain',
+    vulnClass: 'webhook_forgery',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(hyp.endpoint.origin, 'Webhook signature verification bypass', 'CWE-345', 'webhook', 'high', jq),
+      kind: 'http_chain',
+      steps,
+    },
+  }]
+}
+
+// ---------------------------------------------------------------------------------------------
+
 /** All schema-shaped candidate specs for a signal, most specific first. */
 export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   if (result.verdict !== 'signal') return []
@@ -1171,6 +1278,8 @@ export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: Differentia
       case 'mass_assignment': return synthMassAssignment(hyp, result)
       case 'xss_context': return synthReflectedXss(hyp, result)
       case 'csrf_state_change': return synthCsrf(hyp, result)
+      case 'auth_protocol_audit': return synthAuthProtocol(hyp, result)
+      case 'webhook_signature_bypass': return synthWebhook(hyp, result)
       default: return []
     }
   } catch {
@@ -1185,6 +1294,10 @@ export function vulnClassOfSpec(spec: Record<string, unknown>): string {
   if (kind === 'browser_chain') return 'xss_reflected'
   if (kind === 'sql_boolean_diff' || kind === 'sql_time_diff') return 'sqli'
   if (kind === 'cache_differential') return 'cache_poisoning'
+  if (kind === 'auth_protocol_proof') {
+    const protocol = typeof spec.protocol === 'string' ? spec.protocol : 'jwt'
+    return protocol === 'oauth' || protocol === 'oidc' ? 'oauth' : 'jwt'
+  }
   switch (cwe) {
     case 'CWE-639': return 'bola'
     case 'CWE-89': return 'sqli'
@@ -1200,6 +1313,8 @@ export function vulnClassOfSpec(spec: Record<string, unknown>): string {
     case 'CWE-1336': return 'ssti'
     case 'CWE-78': return 'command_injection'
     case 'CWE-840': return 'workflow_bypass'
+    case 'CWE-347': return 'jwt'
+    case 'CWE-345': return 'webhook_forgery'
     default: return 'unknown'
   }
 }

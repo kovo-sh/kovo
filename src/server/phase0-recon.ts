@@ -2052,6 +2052,55 @@ export function parseOpenApiDoc(
 }
 
 /**
+ * Tolerant OpenAPI operation extraction for stored references whose text is truncated or carries a
+ * redaction placeholder (JSON.parse then fails). Reads path keys, methods, declared parameters and
+ * colon/brace path placeholders textually; no network and no semantics beyond the document itself.
+ */
+export interface TolerantOpenApiOperation {
+  method: string
+  pathTemplate: string
+  params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' }>
+}
+
+export function harvestTolerantOpenApiOperations(content: string, maxOps = 300): TolerantOpenApiOperation[] {
+  const pathKeyRe = /"(\/[A-Za-z0-9_\-{}\/.:$\[\]]{0,300})"\s*:\s*\{/g
+  const matches = [...content.matchAll(pathKeyRe)]
+  if (matches.length === 0) return []
+  const out: TolerantOpenApiOperation[] = []
+  for (let idx = 0; idx < matches.length && out.length < maxOps; idx += 1) {
+    const match = matches[idx]!
+    const rawPath = match[1]!
+    if (!rawPath.startsWith('/') || rawPath.length > 300) continue
+    const start = (match.index ?? 0) + match[0].length
+    const end = idx + 1 < matches.length ? (matches[idx + 1]!.index ?? content.length) : content.length
+    const block = content.slice(start, Math.min(end, start + 20_000))
+    const methods = [...new Set([...block.matchAll(/"(get|post|put|patch|delete|head|options)"\s*:\s*\{/g)].map(m => m[1]!.toUpperCase()))]
+    if (methods.length === 0) continue
+    const pathTemplate = normalizeDiscoveryTemplate(rawPath)
+    const params: TolerantOpenApiOperation['params'] = []
+    const pushParam = (name: string, location: TolerantOpenApiOperation['params'][number]['location']) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) return
+      if (params.some(p => p.name === name)) return
+      params.push({ name, location })
+    }
+    for (const rawParam of block.matchAll(/"name"\s*:\s*"([A-Za-z0-9_.\-\[\]]{1,64})"[\s\S]{0,240}?"in"\s*:\s*"(query|path|header|formData|form|body|cookie)"/g)) {
+      const location = rawParam[2] === 'formData' || rawParam[2] === 'form' ? 'form'
+        : rawParam[2] === 'body' ? 'json'
+          : rawParam[2] === 'header' ? 'header'
+            : rawParam[2] === 'path' ? 'path' : 'query'
+      pushParam(rawParam[1]!, location)
+    }
+    for (const placeholder of rawPath.matchAll(/[/{:]([A-Za-z_][A-Za-z0-9_]{0,63})(?:[}/]|$)/g)) {
+      if (rawPath.includes(`:${placeholder[1]}`) || rawPath.includes(`{${placeholder[1]}}`)) {
+        pushParam(placeholder[1]!, 'path')
+      }
+    }
+    for (const method of methods) out.push({ method, pathTemplate, params })
+  }
+  return out.slice(0, maxOps)
+}
+
+/**
  * Offline ingestion of the grey-box API reference (OpenAPI/Swagger) that the harness imported for
  * this project. Every declared operation is kept with its declared method — including DELETE,
  * PATCH and body-only POST routes — without requiring an id segment or a known body field.
@@ -2092,6 +2141,36 @@ export function ingestDeclaredApiSurface(input: {
     result.specs += 1
     const parsed = parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
     result.params += parsed.params
+    if (parsed.endpoints === 0) {
+      // Stored references can be truncated or carry a redaction placeholder, so JSON/YAML parsing
+      // fails. Fall back to the tolerant textual scan used by the route-derivation port; it keeps
+      // every declared operation with its declared method.
+      for (const op of harvestTolerantOpenApiOperations(spec.content)) {
+        const ep = storage.upsertEndpoint({
+          runId,
+          scopeRevision,
+          origin,
+          method: op.method,
+          pathTemplate: op.pathTemplate,
+          source: 'openapi',
+          riskScore: scoreEndpointRisk(op.method, op.pathTemplate),
+        })
+        dynamicPaths.add(op.pathTemplate)
+        for (const p of op.params) {
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: p.name,
+            location: p.location,
+            isCsrf: CSRF_PARAM_RE.test(p.name),
+            isObjectId: p.location === 'path' || OBJECT_ID_PARAM_RE.test(p.name),
+            source: 'openapi',
+          })
+          dynamicParams.add(p.name)
+          result.params += 1
+        }
+      }
+    }
     // Count only operations that were not already present (parseOpenApiDoc upserts, so re-running
     // on an existing run is idempotent and must not inflate the discovery counters).
     let current: Array<{ method: string; pathTemplate: string }> = []
@@ -2959,18 +3038,52 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2d. Bounded probe of discovered route candidates (links, route maps, JS-AST/OpenAPI paths).
     // Strictly within perOriginCap; template routes are probed later with concrete ids.
     const siblingSeen = new Set<string>()
-    const recordSiblingSurface = (rawCollection: string): number => {
-      if (siblingSeen.size >= 12) return 0
+    const detailMethodsSeen = new Set<string>()
+    for (const ep of storage.listEndpoints(runId, { origin })) {
+      const template = ep.pathTemplate.split('?')[0] || '/'
+      const detailBase = /^(.+)\/(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.exec(template)?.[1]
+      if (detailBase) detailMethodsSeen.add(`${detailBase}|${ep.method.toUpperCase()}`)
+    }
+    let siblingOptionsProbes = 0
+    const recordSiblingSurface = async (rawCollection: string, sampleId?: string): Promise<number> => {
+      if (siblingSeen.size >= 8) return 0
       const bare = (rawCollection.split('?')[0] || '/').replace(/\/+$/, '')
       if (!bare || bare === '/' || STATIC_ASSET_RE.test(bare)) return 0
       if (/[:{}[\]]/.test(bare)) return 0
       const segments = bare.split('/').filter(Boolean)
       if (segments.length === 0 || segments.length > 5) return 0
       const template = `${bare}/:id`
+      // Methods the target advertises for the object route (OPTIONS is a safe, read-only request).
+      let allowed = new Set<string>(['GET'])
+      if (sampleId && siblingOptionsProbes < 6 && originUsed < perOriginCap - 2 && !originHalted && !signal.aborted) {
+        siblingOptionsProbes += 1
+        try {
+          const optionsEx = await broker.executeHttp({
+            origin,
+            method: 'OPTIONS',
+            pathAndQuery: `${bare}/${encodeURIComponent(sampleId)}`,
+            ...(discoveryPersona ? { persona: discoveryPersona } : {}),
+            followRedirects: false,
+            timeoutMs: 6_000,
+            runId,
+            assignmentId: params.assignmentId,
+          }, grant, signal)
+          originUsed += 1
+          requestsUsed += 1
+          params.onExchange?.(optionsEx)
+          const advertised = harvestAllowMethods(optionsEx.respHeaders)
+          if (advertised.length > 0) {
+            allowed = new Set(['GET', ...advertised])
+            methodHints += advertised.length
+          }
+        } catch { /* OPTIONS is optional; fall back to the safe GET sibling */ }
+      }
       if (siblingSeen.has(template)) return 0
       siblingSeen.add(template)
       let added = 0
       for (const method of ['GET', 'PATCH', 'DELETE'] as const) {
+        if (!allowed.has(method)) continue
+        if (detailMethodsSeen.has(`${bare}|${method}`)) continue
         const ep = recordEndpoint(method, template, 'surface_probe', { riskScore: scoreEndpointRisk(method, template) })
         storage.upsertEndpointParam({
           runId,
@@ -2982,6 +3095,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           source: 'phase0_sibling',
         })
         dynamicParams.add('id')
+        detailMethodsSeen.add(`${bare}|${method}`)
         siblingEndpoints += 1
         paramsDiscovered += 1
         added += 1
@@ -2989,7 +3103,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return added
     }
     /** A Location header that points below the requested path implies a created resource sibling. */
-    const recordLocationSibling = (requestPath: string, ex: BrokerExchangeResult): void => {
+    const recordLocationSibling = async (requestPath: string, ex: BrokerExchangeResult): Promise<void> => {
       const rawLocation = ex.respHeaders?.location ?? ex.respHeaders?.Location
       if (!rawLocation) return
       const clean = sanitizePathCandidate(rawLocation, origin)
@@ -2997,7 +3111,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const requested = (requestPath.split('?')[0] || '/').replace(/\/+$/, '')
       const located = (clean.split('?')[0] || '/').replace(/\/+$/, '')
       if (!requested || requested === '/' || !located.startsWith(`${requested}/`)) return
-      recordSiblingSurface(requested)
+      const sampleId = located.slice(requested.length + 1).split('/')[0]
+      await recordSiblingSurface(requested, sampleId)
     }
 
     const probeDiscovered = async (candidate: string): Promise<void> => {
@@ -3025,7 +3140,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         rawPathAndQuery: candidate, origin, endpointId: ep.id, source: 'phase0_html',
         storage, runId, dynamicParams,
       })
-      recordLocationSibling(candidate, ex)
+      await recordLocationSibling(candidate, ex)
       // A 400/422 validation body names the schema the route wants; learn it passively.
       if (ex.status === 400 || ex.status === 422) {
         for (const field of harvestValidationFieldHints(ex.body)) {
@@ -3051,7 +3166,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (ids.length > 0) {
           idsByCollection.set(normalizeDiscoveryTemplate(candidate.split('?')[0] || '/'), ids)
           // Observed collection: derive the object siblings without assuming any noun.
-          recordSiblingSurface(candidate.split('?')[0] || '/')
+          await recordSiblingSurface(candidate.split('?')[0] || '/', ids[0])
         }
         for (const link of extractJsonLinkTargets(ex.body, origin).slice(0, 8)) {
           queueDiscoveredRoute('GET', link)
@@ -3175,7 +3290,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const ids = extractJsonRecordIds(ex.body)
       if (ids.length > 0) {
         idsByCollection.set(normalizeDiscoveryTemplate(bare), ids)
-        recordSiblingSurface(bare)
+        await recordSiblingSurface(bare, ids[0])
       }
       if (ids.length > 0 && item.depth === 0 && navQueue.length < 72 &&
           /"(?:items|data|results|rows|records|list|values)"\s*:\s*\[/.test(ex.body)) {
