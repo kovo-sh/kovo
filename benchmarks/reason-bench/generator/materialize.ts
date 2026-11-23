@@ -14,7 +14,8 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 export const DEFAULT_APPS_ROOT = join(HERE, '..', 'apps')
 export const DEFAULT_LIB_DIR = join(HERE, '..', 'lib')
 
-const BANNED = /vulnerab|hardened|decoy|oracle|solver|CWE-|ground.?truth/i
+// Word-bounded so ordinary app vocabulary ("resolver", "orchestration") is not flagged.
+const BANNED = /vulnerab\w*|\bhardened\b|\bdecoy\w*\b|\boracle\w*\b|\bsolver\b|CWE-\d+|ground.?truth/i
 
 export interface MaterializeInput {
   blueprint: AppBlueprint

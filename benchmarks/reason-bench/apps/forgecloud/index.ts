@@ -95,7 +95,7 @@ async function start(opts: { plan: VariantPlan; groundTruth: StartedApp['groundT
   const bp: AppBlueprint = withSites(selected)
 
   const mat = materialize({
-    bp, plan: runPlan, appDir: HERE, libDir: join(HERE, '..', '..', 'lib'),
+    blueprint: bp, plan: runPlan, appDir: HERE, libDir: join(HERE, '..', '..', 'lib'),
   })
   const serverMod = (await import(pathToFileURL(join(mat.sourceDir, 'server.ts')).href)) as {
     startServer(o: StartServerOpts): Promise<RunningServer>
@@ -185,5 +185,5 @@ export const discoveredSites: SiteSpec[] = await discoverSites()
 
 export const blueprint: AppBlueprint = withSites(discoveredSites)
 
-const mod: AppModule = { name: 'forgecloud' as never, blueprint, start }
+const mod: AppModule = { name: 'forgecloud', blueprint, reasonBench: true, start }
 export default mod

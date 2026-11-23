@@ -101,9 +101,15 @@ function assignModes(p: Prng, bp: AppBlueprint): Record<string, SiteMode> {
   const units = groupUnits(bp.sites)
   for (const u of units) if (!u.decoyable) for (const id of u.siteIds) sites[id] = 'vulnerable'
   const decoyable = p.shuffle(units.filter((u) => u.decoyable))
+  // A shell with in-progress (or zero) site directories is a valid intermediate state: it
+  // simply has nothing to harden yet. Full-app blueprints still enforce the declared range.
+  if (decoyable.length === 0) return sites
   const reach = reachableSubsets(decoyable.map((u) => u.size))
   const targets = [...reach.keys()].filter((t) => t >= bp.decoyCount.min && t <= bp.decoyCount.max).sort((a, b) => a - b)
-  if (targets.length === 0) throw new Error(`decoyCount [${bp.decoyCount.min},${bp.decoyCount.max}] is infeasible`)
+  if (targets.length === 0) {
+    if (bp.sites.length === 0) return sites
+    throw new Error(`decoyCount [${bp.decoyCount.min},${bp.decoyCount.max}] is infeasible`)
+  }
   const chosen = new Set(reach.get(p.pick(targets))!)
   decoyable.forEach((u, i) => {
     const mode: SiteMode = chosen.has(i) ? 'hardened' : 'vulnerable'

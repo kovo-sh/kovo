@@ -110,10 +110,11 @@ export function validateBlueprint(bp: AppBlueprint): AppBlueprint {
 
   validateChains(bp, problems)
 
-  // Decoy count must be feasible given decoyable units and chain grouping.
+  // Decoy count must be feasible given decoyable units and chain grouping. Zero-site shells are
+  // a valid intermediate state (site streams land incrementally), so only enforce it when sites exist.
   const { min, max } = bp.decoyCount
   if (min < 0 || max < min) problems.push(`decoyCount range invalid: min=${min} max=${max}`)
-  else if (feasibleDecoyTargets(groupUnits(bp.sites), min, max).length === 0) {
+  else if (bp.sites.length > 0 && feasibleDecoyTargets(groupUnits(bp.sites), min, max).length === 0) {
     problems.push(`decoyCount [${min},${max}] is infeasible given decoyable sites and chain grouping`)
   }
 
