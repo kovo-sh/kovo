@@ -34,7 +34,7 @@ import {
   replayStepSchema,
   sqlBooleanDiffReplaySpecSchema,
 } from '../src/replay-spec.ts'
-import { roleAffinityForScenario } from '../src/server/agent-session.ts'
+import { AGENTIC_MIN_MAX_TURNS, roleAffinityForScenario } from '../src/server/agent-session.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { normalizeEndpointTemplate } from '../src/server/dedupe.ts'
@@ -2917,7 +2917,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     }
   })
 
-  test('T1-23b: specialist profiles enforce turn cap BVA (25..40 default, <= 60 ceiling)', async (t) => {
+  test('T1-23b: specialist profiles enforce the agentic turn budget floor and <= 60 ceiling', async (t) => {
     const { storage } = makeStore(t)
     const llm = await startMockLlmServer(t, () => ({
       type: 'tool_call', callId: 'c_sp', name: 'complete_intent',
@@ -2947,7 +2947,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const worker = storage.workerList(runId).find(w => w.stepId === step.id)
     assert.ok(worker, 'Expected specialist assignment to be created')
-    assert.ok(worker.maxTurns >= 25 && worker.maxTurns <= 60, `Specialist maxTurns=${worker.maxTurns} out of bounds [25..60]`)
+    assert.ok(worker.maxTurns >= AGENTIC_MIN_MAX_TURNS && worker.maxTurns <= 60, `Specialist maxTurns=${worker.maxTurns} out of bounds [${AGENTIC_MIN_MAX_TURNS}..60]`)
   })
 
   test('T1-23c: resolving an unknown specialist profile throws explicit validation error', async (t) => {
@@ -4909,7 +4909,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         }
       }
       return {
-        type: 'tool_call', callId: 'c_http_ord', name: 'http_request',
+        type: 'tool_call', callId: 'c_http_ord', name: 'request_http',
         argumentsJson: JSON.stringify({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/orders', persona: 'persona_a', body: '{}' }),
       }
     })

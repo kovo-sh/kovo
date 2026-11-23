@@ -712,7 +712,7 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
       return {
         type: 'tool_call',
         callId: 'c_sib_req',
-        name: 'http_request',
+        name: 'request_http',
         argumentsJson: JSON.stringify({ origin: fx.origin, method: 'GET', pathAndQuery: '/slow-sibling' }),
       }
     }
