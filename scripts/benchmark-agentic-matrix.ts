@@ -25,6 +25,12 @@ import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  CellReaper, ModelGate, ResourceGuard, cellLabel, defaultMaxInFlightStreams, envFlagDisabled,
+  rewriteProfileEndpoints,
+} from './benchmark-parallel.ts'
+import type { AimdStats } from './benchmark-parallel.ts'
+import { prepareIsolatedDataDir } from './benchmark-realistic.ts'
 
 export const MATRIX_KNOWN_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
 export const MATRIX_KNOWN_MODES = ['black-box', 'grey-box', 'white-box'] as const
@@ -36,6 +42,10 @@ export const DEFAULT_MATRIX_CONCURRENCY = 3
 export const SMOKE_BUDGET_USD = 0.25
 export const SMOKE_MAX_DURATION_MS = 90_000
 export const HELDOUT_SEED_FLOOR = 1_000_000
+/** RAM watermark: do not launch a new cell below this MemAvailable. */
+export const DEFAULT_MIN_FREE_MEM_GB = 6
+/** Do not launch a new cell while this many cell-labeled workers are running. */
+export const DEFAULT_MAX_ACTIVE_WORKERS = 16
 
 export type MatrixApp = (typeof MATRIX_KNOWN_APPS)[number]
 export type MatrixMode = (typeof MATRIX_KNOWN_MODES)[number]
@@ -56,6 +66,18 @@ export interface MatrixArgs {
   smoke: boolean
   /** Hard kill for a child process; defaults to maxDurationMs + 5 minutes. */
   childTimeoutMs: number
+  /** Pause launching cells below this MemAvailable (default 6 GiB). */
+  minFreeMemGb?: number
+  /** Pause launching cells at/above this many running cell workers (default 16). */
+  maxActiveWorkers?: number
+  /** Best-effort warm session container per cell (`GUARDIAN_WARM_WORKERS=0` disables). */
+  warmWorkers?: boolean
+  /** Route model traffic through the loopback gate (global stream cap + 429 AIMD). */
+  modelGate?: boolean
+  /** Global concurrent model-stream ceiling across all cells (default 28). */
+  maxInFlightStreams?: number
+  /** Per-cell prepared data-dir override (gate-routed profiles); keyed by cell label. */
+  dataDirOverrides?: Record<string, string>
   help: boolean
 }
 
@@ -226,7 +248,8 @@ export function parseMatrixArgs(
   const known = new Set([
     'apps', 'seeds', 'modes', 'budget-usd', 'max-duration-ms', 'concurrency',
     'out-dir', 'data-dir', 'no-llm', 'verifier', 'keep-data-dirs', 'smoke',
-    'timeout-ms', 'help',
+    'timeout-ms', 'min-free-gb', 'max-workers', 'no-warm-workers', 'warm-workers',
+    'no-model-gate', 'model-gate', 'max-inflight-streams', 'help',
   ])
   for (const key of Object.keys(flags)) if (!known.has(key)) fail(`unknown flag --${key}`)
 
@@ -274,6 +297,17 @@ export function parseMatrixArgs(
   const childTimeoutMs = stringFlag('timeout-ms') === undefined
     ? maxDurationMs + 5 * 60_000
     : parsePositiveInt(stringFlag('timeout-ms')!, '--timeout-ms')
+  const minFreeMemGb = stringFlag('min-free-gb') === undefined
+    ? (Number(env.GUARDIAN_MATRIX_MIN_FREE_GB) > 0 ? Number(env.GUARDIAN_MATRIX_MIN_FREE_GB) : DEFAULT_MIN_FREE_MEM_GB)
+    : parseNumber(stringFlag('min-free-gb')!, '--min-free-gb', 0, 1024)
+  const maxActiveWorkers = stringFlag('max-workers') === undefined
+    ? (Number(env.GUARDIAN_MATRIX_MAX_WORKERS) >= 1 ? Math.floor(Number(env.GUARDIAN_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS)
+    : parsePositiveInt(stringFlag('max-workers')!, '--max-workers', 256)
+  const warmWorkers = boolFlag('warm-workers') || (!boolFlag('no-warm-workers') && !envFlagDisabled(env, 'GUARDIAN_WARM_WORKERS'))
+  const modelGate = boolFlag('model-gate') || (!boolFlag('no-model-gate') && !envFlagDisabled(env, 'GUARDIAN_MODEL_GATE'))
+  const maxInFlightStreams = stringFlag('max-inflight-streams') === undefined
+    ? defaultMaxInFlightStreams(env)
+    : parsePositiveInt(stringFlag('max-inflight-streams')!, '--max-inflight-streams', 256)
 
   const heldOutSeeds = seeds.filter(seed => seed >= HELDOUT_SEED_FLOOR)
   if (heldOutSeeds.length && (env.GUARDIAN_RB_HELDOUT_SALT ?? '').length < 16) {
@@ -294,6 +328,11 @@ export function parseMatrixArgs(
     keepDataDirs: boolFlag('keep-data-dirs'),
     smoke,
     childTimeoutMs,
+    minFreeMemGb,
+    maxActiveWorkers,
+    warmWorkers,
+    modelGate,
+    maxInFlightStreams,
     help,
   }
 }
@@ -407,9 +446,31 @@ function childEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...base, GUARDIAN_ALLOW_LOCAL_LAB: '1' }
 }
 
+/**
+ * Per-cell environment: a stable docker cell label, a cell-private data dir, a unique run
+ * label and the warm-worker escape hatch. Cells never share a data dir or a run label.
+ */
+export function cellEnv(
+  cell: MatrixCell,
+  args: Pick<MatrixArgs, 'dataDir' | 'outDir' | 'warmWorkers' | 'modelGate' | 'dataDirOverrides'>,
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const id = cellLabel(cell.label)
+  const env = childEnv(base)
+  env.GUARDIAN_CELL_ID = id
+  env.GUARDIAN_RUN_LABEL = id
+  env.GUARDIAN_WARM_WORKERS = args.warmWorkers === false ? '0' : '1'
+  if (!args.modelGate) env.GUARDIAN_MODEL_GATE = '0'
+  if (args.dataDir) {
+    env.GUARDIAN_DATA_DIR = args.dataDirOverrides?.[cell.label] ?? resolve(args.outDir, 'data', cell.label)
+  }
+  return env
+}
+
 /** Build the child CLI for one cell (exported for scheduling/plan tests). */
 export function cellChildArgs(cell: MatrixCell, args: MatrixArgs): string[] {
   const { dir } = cellArtifactPaths(args.outDir, cell)
+  const dataDir = args.dataDirOverrides?.[cell.label] ?? args.dataDir
   const childArgs = [
     'scripts/benchmark-realistic.ts',
     '--app', cell.app,
@@ -423,8 +484,8 @@ export function cellChildArgs(cell: MatrixCell, args: MatrixArgs): string[] {
   if (cell.seedSet === 'held-out') childArgs.push('--held-out')
   if (args.noLlm) {
     childArgs.push('--no-llm')
-  } else if (args.dataDir) {
-    childArgs.push('--data-dir', args.dataDir, '--isolate-data-dir')
+  } else if (dataDir) {
+    childArgs.push('--data-dir', dataDir, '--isolate-data-dir')
   }
   if (args.keepDataDirs) childArgs.push('--keep-data-dirs')
   return childArgs
@@ -439,7 +500,7 @@ export const spawnCell: CellExecutor = (cell, args) => {
     const started = Date.now()
     const child = spawn(process.execPath, childArgs, {
       cwd: resolve(import.meta.dirname, '..'),
-      env: childEnv(process.env),
+      env: cellEnv(cell, args),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let output = ''
@@ -543,10 +604,18 @@ export function collectCellResult(
   }
 }
 
+export interface MatrixRunHooks {
+  /** Called before a cell launches (RAM/worker watermark guard). */
+  beforeCell?: (cell: MatrixCell) => Promise<void> | void
+  /** Called after a cell completes (cell-labeled reaping). */
+  afterCell?: (cell: MatrixCell, result: MatrixCellResult) => Promise<void> | void
+}
+
 /** Run cells with bounded concurrency; injectable executor keeps scheduling testable. */
 export async function runMatrix(
   args: MatrixArgs,
   execute: CellExecutor = spawnCell,
+  hooks: MatrixRunHooks = {},
 ): Promise<MatrixCellResult[]> {
   const cells = buildCells(args)
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
@@ -557,16 +626,20 @@ export async function runMatrix(
     while (next < cells.length) {
       const cell = cells[next]!
       next += 1
+      await hooks.beforeCell?.(cell)
+      let result: MatrixCellResult
       try {
         const outcome = await execute(cell, args)
-        results.push(collectCellResult(cell, args, outcome))
+        result = collectCellResult(cell, args, outcome)
       } catch (error) {
-        results.push(collectCellResult(cell, args, {
+        result = collectCellResult(cell, args, {
           exitCode: null,
           runtimeMs: 0,
           output: `error: ${error instanceof Error ? error.message : String(error)}`,
-        }))
+        })
       }
+      results.push(result)
+      try { await hooks.afterCell?.(cell, result) } catch { /* reaping is best-effort */ }
     }
   }
   await Promise.all(Array.from({ length: width }, worker))
@@ -636,7 +709,7 @@ export function renderMatrixTable(results: readonly MatrixCellResult[]): string 
   const header = [
     'cell'.padEnd(34), 'conf'.padEnd(9), 'prec'.padEnd(7), 'decoyFP'.padEnd(8),
     'unmFP'.padEnd(6), 'cost'.padEnd(8), 'wall'.padEnd(7), 'surf'.padEnd(5),
-    'facts'.padEnd(6), 'assign'.padEnd(9), 'inert'.padEnd(6), 'ws',
+    'facts'.padEnd(6), 'assign'.padEnd(9), 'inert'.padEnd(6), 'ws'.padEnd(3), 'status',
   ].join(' ')
   const lines = ['', header, '-'.repeat(header.length)]
   for (const r of results) {
@@ -653,7 +726,8 @@ export function renderMatrixTable(results: readonly MatrixCellResult[]): string 
       String(r.facts).padEnd(6),
       `${r.assignments.investigationCompleted}/${r.assignments.investigationFailed}`.padEnd(9),
       (r.inert ? 'YES' : 'no').padEnd(6),
-      r.workerSessions ? 'yes' : 'no',
+      (r.workerSessions ? 'yes' : 'no').padEnd(3),
+      r.ok ? 'ok' : 'FAIL',
     ].join(' '))
     if (!r.ok) lines.push(`  ! ${r.label}: ${r.error ?? 'failed'}`)
   }
@@ -696,12 +770,54 @@ Flags:
   --keep-data-dirs        keep per-cell isolated data dirs
   --smoke                 CI preset: ${SMOKE_MAX_DURATION_MS / 1000}s per cell, $${SMOKE_BUDGET_USD} budget
   --timeout-ms <n>        hard child kill (default: max-duration + 5 min)
+  --min-free-gb <n>       pause new cells below this MemAvailable (default: ${DEFAULT_MIN_FREE_MEM_GB})
+  --max-workers <n>       pause new cells at this many running cell workers (default: ${DEFAULT_MAX_ACTIVE_WORKERS})
+  --no-warm-workers       disable the per-cell warm session container pool
+  --no-model-gate         bypass the loopback gate (no global stream cap / 429 AIMD)
+  --max-inflight-streams  global concurrent model streams (default: 28, env GUARDIAN_MODEL_MAX_STREAMS)
   --help                  show this help
 
 Held-out seeds need GUARDIAN_RB_HELDOUT_SALT (env only; never logged).
 Agentic cells need Docker worker access: run under \`newgrp docker -c '<command>'\`.
+Each cell gets its own data dir, ephemeral app/canary ports, cell label and run label.
 Exit codes: 0 clean, 2 fail-closed configuration/inert/lock, 1 cell failure.
 `
+
+/**
+ * Prepare a gate-routed source data dir per cell. The child still isolates again from this dir;
+ * only enabled profile endpoints change (credentials stay symlinked, never copied).
+ */
+export function prepareGatedCellDataDirs(args: MatrixArgs, gate: ModelGate): Record<string, string> {
+  const overrides: Record<string, string> = {}
+  const source = args.dataDir
+  if (!source) return overrides
+  for (const cell of buildCells(args)) {
+    const target = resolve(args.outDir, 'cells', cellLabel(cell.label), 'source')
+    prepareIsolatedDataDir({ sourceDataDir: source, targetDir: target })
+    rewriteProfileEndpoints(target, endpoint => gate.endpointFor(endpoint))
+    overrides[cell.label] = target
+  }
+  return overrides
+}
+
+export interface ParallelStatus {
+  gate: AimdStats | null
+  gatePort: number | null
+  pauses: Array<{ at: number; reason: string; memGiB: number; workers: number; resumedAt?: number }>
+  orphans: number
+}
+
+export function renderParallelStatus(status: ParallelStatus): string {
+  const gate = status.gate
+    ? `gate=max${status.gate.limit} peak=${status.gate.peak} queued=${status.gate.queued} `
+      + `429=${status.gate.rateLimited} retries=${status.gate.retries}`
+    : 'gate=off'
+  const pauses = status.pauses.length
+    ? status.pauses.map(p => `${p.reason}@${Math.round(p.at / 1000)}s(`
+      + `${p.memGiB.toFixed(1)}GiB/${p.workers}w${p.resumedAt ? ` resume@${Math.round(p.resumedAt / 1000)}s` : ',open'})`).join(' ')
+    : 'none'
+  return `parallel ${gate} pauses=${status.pauses.length} [${pauses}] orphans=${status.orphans}`
+}
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   let args: MatrixArgs
@@ -719,32 +835,98 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     process.stderr.write('error: agentic matrix needs --data-dir (or GUARDIAN_DATA_DIR) with an enabled model profile; use --no-llm for deterministic cells\n')
     return 2
   }
+  // Worker sessions need the Docker backend; a model profile + local-jq is inert, so fail fast.
+  if (!args.noLlm && args.verifier === 'local-jq') {
+    process.stderr.write('error: agentic cells need worker sessions: use --verifier docker (local-jq cannot run agents)\n')
+    return 2
+  }
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
   const started = Date.now()
-  const results = await runMatrix(args)
-  const totals = summarizeMatrix(results)
-  const matrix = {
-    generatedAt: new Date().toISOString(),
-    wallMs: Date.now() - started,
-    args: {
-      apps: args.apps, seeds: args.seeds, modes: args.modes, budgetUsd: args.budgetUsd,
-      maxDurationMs: args.maxDurationMs, concurrency: args.concurrency, noLlm: args.noLlm,
-      verifier: args.verifier, smoke: args.smoke, dataDir: args.dataDir ?? null,
-    },
-    totals,
-    cells: results,
+  let gate: ModelGate | undefined
+  const cells = buildCells(args)
+  const reaper = new CellReaper(cells.map(cell => cell.label))
+  const guard = new ResourceGuard({
+    minFreeMemBytes: (args.minFreeMemGb ?? DEFAULT_MIN_FREE_MEM_GB) * 1024 ** 3,
+    maxActiveWorkers: args.maxActiveWorkers ?? DEFAULT_MAX_ACTIVE_WORKERS,
+    onPause: event => process.stderr.write(
+      `[matrix] paused: ${event.reason} (${(event.memAvailableBytes / 1024 ** 3).toFixed(1)}GiB free, `
+      + `${event.activeWorkers} workers)\n`,
+    ),
+    onResume: event => process.stderr.write(`[matrix] resumed: ${event.reason} cleared\n`),
+  })
+  let orphans = 0
+  try {
+    if (!args.noLlm && args.modelGate !== false) {
+      gate = new ModelGate({ maxInFlightStreams: args.maxInFlightStreams ?? 28 })
+      await gate.start()
+      args = { ...args, dataDirOverrides: prepareGatedCellDataDirs(args, gate) }
+      process.stdout.write(`[matrix] model gate 127.0.0.1:${gate.port} maxInFlight=${gate.stats().limit}\n`)
+    }
+    reaper.install()
+    const results = await runMatrix(args, spawnCell, {
+      beforeCell: () => guard.waitForCapacity(),
+      afterCell: async cell => { await reaper.reap(cell.label) },
+    })
+    // Reap once more after the last cell (its exit hook may still be finishing) before counting.
+    await reaper.reapAll()
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 250))
+    orphans = await reaper.orphans()
+    const totals = summarizeMatrix(results)
+    const matrix = {
+      generatedAt: new Date().toISOString(),
+      wallMs: Date.now() - started,
+      args: {
+        apps: args.apps, seeds: args.seeds, modes: args.modes, budgetUsd: args.budgetUsd,
+        maxDurationMs: args.maxDurationMs, concurrency: args.concurrency, noLlm: args.noLlm,
+        verifier: args.verifier, smoke: args.smoke, dataDir: args.dataDir ?? null,
+        warmWorkers: args.warmWorkers !== false,
+        maxInFlightStreams: args.maxInFlightStreams ?? 28,
+        minFreeMemGb: args.minFreeMemGb ?? DEFAULT_MIN_FREE_MEM_GB,
+        maxActiveWorkers: args.maxActiveWorkers ?? DEFAULT_MAX_ACTIVE_WORKERS,
+      },
+      parallel: {
+        gate: gate?.stats() ?? null,
+        pauses: guard.events,
+        orphans,
+      },
+      totals,
+      cells: results,
+    }
+    const outPath = resolve(args.outDir, 'matrix.json')
+    writeFileSync(outPath, `${JSON.stringify(matrix, null, 2)}\n`, { mode: 0o600 })
+    process.stdout.write(`[matrix] ${results.length} cell(s) -> ${outPath}\n`)
+    process.stdout.write(`${renderMatrixTable(results)}\n${renderMatrixSummary(totals)}\n`)
+    process.stdout.write(`${renderParallelStatus({
+      gate: gate?.stats() ?? null,
+      gatePort: gate?.port ?? null,
+      pauses: guard.events.map(event => ({
+        at: event.at, reason: event.reason,
+        memGiB: event.memAvailableBytes / 1024 ** 3, workers: event.activeWorkers,
+        ...(event.resumedAt !== undefined ? { resumedAt: event.resumedAt } : {}),
+      })),
+      orphans,
+    })}\n`)
+    return matrixExitCode(results)
+  } catch (error) {
+    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`)
+    return 2
+  } finally {
+    reaper.dispose()
+    await reaper.reapAll()
+    await gate?.close()
   }
-  const outPath = resolve(args.outDir, 'matrix.json')
-  writeFileSync(outPath, `${JSON.stringify(matrix, null, 2)}\n`, { mode: 0o600 })
-  process.stdout.write(`[matrix] ${results.length} cell(s) -> ${outPath}\n`)
-  process.stdout.write(`${renderMatrixTable(results)}\n${renderMatrixSummary(totals)}\n`)
-  return matrixExitCode(results)
 }
 
 const isMain = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false
 if (isMain) {
-  main().then(code => { process.exitCode = code }).catch(error => {
+  main().then(code => {
+    process.exitCode = code
+    // The matrix is a CLI: never let a stray keep-alive socket hold the process open after the
+    // summary is written (all children have exited and cleanup is complete at this point).
+    setTimeout(() => process.exit(code), 100)
+  }).catch(error => {
     process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
+    setTimeout(() => process.exit(1), 100)
   })
 }
