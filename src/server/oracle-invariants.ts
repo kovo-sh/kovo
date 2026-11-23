@@ -140,6 +140,13 @@ export interface ImpactInput {
   oracleEvents?: readonly string[]
   catalogPrices?: readonly number[]
   targetOrigin?: string | null
+  /**
+   * Credential value shapes the proof itself asserts (the replay spec's `proofPatterns`). The host
+   * re-tests each one against the recorded bodies: it must match the probe response and no control
+   * response. This is evidence, not a declaration — an unmatched or control-echoing pattern does
+   * nothing.
+   */
+  credentialPatterns?: readonly string[] | null
 }
 
 export interface ImpactAssessment {
@@ -255,6 +262,11 @@ export function classifyImpactDescriptor(parts: {
 // ---------------------------------------------------------------------------
 
 const PROTECTED_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:tenant(?:_?id)?|owner(?:_?id)?|role|roles|permissions?|privileges?|is_?admin|admin|is_?owner|price(?:_?cents)?|amount(?:_?cents)?|seat_?limit|seat_?count|seats?|seats_used|credits?|balance|plan(?:_?id)?|tier|visibility|private|shared|secret|api_?key|access_?token|email|password|hash|store|scope|acting(?:_?as)?|account(?:_?id)?|org(?:anization)?(?:_?id)?|identity|impersonat\w*)$/i
+/**
+ * Role-exclusive function surfaces: a mutation here is the privileged action itself, so the
+ * escalation impact is the function-level entitlement, not a protected content column.
+ */
+const FUNCTION_SURFACE_RE = /(?:^|\/)(?:admin(?:istrator)?|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?|impersonate|feature[-_]?flags?)(?:\/|$)/i
 const PRICE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:price(?:_?cents)?|amount(?:_?cents)?|cost(?:_?cents)?)$/i
 const IDENTITY_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|subject|created_?by|author)$/i
 const SECRET_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:secret|api_?key|access_?token|token|password|hash|private_?note|note|internal|ssn)$/i
@@ -402,6 +414,46 @@ function hasOracle(events: readonly string[] | undefined, kinds: readonly string
   return events.some(event => wanted.has(event))
 }
 
+/** Reject patterns that would match anything: the host must re-observe the value, not trust a claim. */
+function isSpecificCredentialPattern(pattern: unknown): pattern is string {
+  if (typeof pattern !== 'string') return false
+  const value = pattern.trim()
+  if (value.length < 8 || value.length > 200) return false
+  if (/\.\*|\.\+|\\s\*|\\s\+|\(\?/.test(value)) return false
+  try {
+    // Must compile; a broken pattern is not evidence.
+    new RegExp(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Credential-shaped values declared by the proof: a pattern that matches the probe response and no
+ * control response. Returned patterns are the evidence; the caller still requires an authorization
+ * boundary (a denied sibling arm or a role differential) before treating it as a disclosure.
+ */
+function credentialPatternEvidence(
+  patterns: readonly string[] | null | undefined,
+  probe: ImpactStep,
+  controls: readonly ImpactStep[],
+): string[] {
+  if (!patterns?.length) return []
+  const probeBody = typeof probe.body === 'string' ? probe.body : ''
+  if (!probeBody) return []
+  const controlBodies = controls.map(control => (typeof control.body === 'string' ? control.body : '')).join('\n')
+  const matched: string[] = []
+  for (const pattern of patterns) {
+    if (!isSpecificCredentialPattern(pattern)) continue
+    const expression = new RegExp(pattern)
+    if (!expression.test(probeBody)) continue
+    if (controlBodies && expression.test(controlBodies)) continue
+    matched.push(pattern)
+  }
+  return matched.slice(0, 4)
+}
+
 // ---------------------------------------------------------------------------
 // Authorization / BFLA
 // ---------------------------------------------------------------------------
@@ -524,17 +576,25 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
     // field. A declared oracle event is a requirement the evidence must satisfy, never a substitute
     // for a missing differential (an LLM can declare anything).
+    //
+    // Function-level vertical escalation is its own impact model: a host-signed lower role performed
+    // a mutating action on a role-exclusive function surface (admin/manage/role/grant/...) and the
+    // change persisted. The privileged *function* is the asset, so demanding a content-column name
+    // from the generic protected list would dismiss every flag/config action. A content write on a
+    // non-function route (a viewer editing a workspace) still needs a protected field — the K=6 FP.
+    const functionLevelEscalation = requiredRank !== null && roleDifferential &&
+      probes.some(step => isMutatingMethod(step.method) && isSuccess(step.status) && FUNCTION_SURFACE_RE.test(step.route ?? ''))
     const oracleDeclared = hasOracle(input.oracleEvents, ['privilege_escalation', 'mass_assignment', 'invariant_violation', 'cross_tenant_write', 'state_delta'])
-    if (!crossTenant && protectedChanged.length === 0) {
+    if (!crossTenant && protectedChanged.length === 0 && !functionLevelEscalation) {
       return { required: true, satisfied: false, reason: `The persisted change (${base.changedFields.slice(0, 6).join(', ') || 'none'}) is not a protected field and no impact-oracle event is declared; a state echo is not impact.`, evidence: base }
     }
-    if (boundaryControlDenied && !crossTenant && protectedChanged.length === 0) {
+    if (boundaryControlDenied && !crossTenant && protectedChanged.length === 0 && !functionLevelEscalation) {
       return { required: true, satisfied: false, reason: 'The control arm was correctly denied and the probe mutated state, but the change is neither cross-tenant nor a protected field; a self-service write is not escalation.', evidence: base }
     }
     return {
       required: true,
       satisfied: true,
-      reason: `${vertical ? 'Vertical' : 'Object-level'} impact: ${escalationReason || (crossTenant ? 'cross-tenant resource access' : 'persisted protected-field change')}; ${persistence.reason}${protectedChanged.length ? `; protected fields: ${protectedChanged.slice(0, 6).join(', ')}` : ''}${oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}.`,
+      reason: `${vertical || functionLevelEscalation ? 'Vertical' : 'Object-level'} impact: ${escalationReason || (crossTenant ? 'cross-tenant resource access' : 'persisted protected-field change')}; ${persistence.reason}${protectedChanged.length ? `; protected fields: ${protectedChanged.slice(0, 6).join(', ')}` : ''}${functionLevelEscalation ? '; role-gated function surface mutated by a lower role' : ''}${oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}.`,
       evidence: base,
     }
   }
@@ -590,6 +650,19 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       required: true,
       satisfied: true,
       reason: `Credential-shaped value(s) disclosed: ${disclosedFingerprints.length} pre-redaction secret fingerprint(s) appear in the probe response and not in any entitled control.`,
+      evidence: base,
+    }
+  }
+  // A credential-bearing response proves disclosure only when the caller was outside the route's
+  // entitlement at the same time: a denied sibling arm on the same route, or a role differential.
+  // The pattern is re-tested against the recorded bodies, so a declared-but-absent value (or one a
+  // control also returns, i.e. a public constant) never confirms.
+  const patternEvidence = credentialPatternEvidence(input.credentialPatterns, probe, controls)
+  if (patternEvidence.length > 0 && probe.actor.handle !== null && (boundaryControlDenied || roleDifferential)) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: `Credential-shaped value disclosed: the probe response matches ${patternEvidence.length} declared credential shape(s) absent from every control, under a ${boundaryControlDenied ? 'denied sibling control' : 'role differential'}.`,
       evidence: base,
     }
   }
@@ -1367,9 +1440,15 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   const controlSteps = steps.filter(step => step.arm === 'control')
   const successes = steps.filter(step => isSuccess(step.status))
   const successFamilies = new Set(successes.map(step => routeFamily(step.route ?? '')).filter(Boolean))
+  // A denied arm only proves the caller was outside an entitlement *before* the crossing action.
+  // A 404/403 readback recorded after the successful probe is persistence evidence (the object is
+  // gone) or a consequence of the mutation, not a boundary the probe crossed — reading it as one
+  // lets a legitimate post-delete readback mask a real actor differential.
+  const firstProbeIndex = steps.findIndex(step => step.arm === 'probe')
   const signals = steps
     .map(step => boundarySignalOf(step, successFamilies))
     .filter((signal): signal is BoundarySignal => signal !== null)
+    .filter(signal => firstProbeIndex < 0 || steps.indexOf(signal.step) < firstProbeIndex)
   const probeActor = steps.find(step => step.arm === 'probe')?.actor ?? null
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   const peerSignal = signals.find(entry => {
