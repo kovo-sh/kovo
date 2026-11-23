@@ -129,3 +129,46 @@ only when it is runtime-confirmed **and** the labels are a documented close-sibl
 `business_logic ↔ race_condition`, `info_disclosure ↔ bfla`). It never earns recall, it still enters
 `strictPrecision = TP / (TP + FP + misclassified)`, and Phase-1 requires `incompatibleClassCount === 0`.
 Non-sibling labels and every `static_verified`/`proposed`/`open_proof_gap` claim stay FPs.
+
+## Third triage round (Phase-B, K=6 in-run workers)
+
+The K=6 cell produced three runtime-confirmed findings that matched no target. All three were
+confirmed by the **guardian_verify** transcript path, and all three shared one root cause: the host
+classified the claimed impact from the **title string only**, and anything outside the four gated
+classes fell to `other`, which skips the impact gate entirely.
+
+| finding | recorded evidence | verdict |
+| --- | --- | --- |
+| *Invoice workflow step-skip: client PATCH sets status draft->paid without payment* (CWE-841) | owner GET `status=draft` → owner PATCH `{status:paid}` 200 → owner GET `paid` | over-claim: an entitled actor's self-service write of a non-protected field; `status` is editable by design in both twins, and the same endpoint's real bug (cross-tenant write) is already `acme.invoice-write-bola` |
+| *Unauthenticated report disclosure via `/api/reports/:id/public`* (CWE-200) | anonymous 404 on a bogus id, anonymous 200 on a real id with `workspace`/`ref` | over-claim: the route is a public share link; every actor (including anonymous) is served the same body, and the planted bug there is cross-tenant cache poisoning (`acme.report-cache-poison`) |
+| *Stored HTML injection via unescaped report name in GET /api/reports/:id/render* (CWE-79) | viewer GET of a benign report, viewer GET of a report named `<b>gnmarker</b>` rendered raw | over-claim: inert presentation markup, no executable content and no in-proof planted marker; the hardened SSTI twin renders the name the same way, so this is not a planted behaviour |
+
+Follow-on samples produced two more fingerprints, both fixed by the same principle:
+
+- *Cross-tenant BOLA on `/api/reports/:id/public`* — "another tenant also read the same link" is not
+  a boundary: a declared-public route (`/public`, `/share`, `/embed`, …) needs owner-scoped private
+  data before a cross-tenant read can confirm.
+- *Cross-actor resource read* / *Unauthorized state mutation* on `/api/spaces/:id` — a viewer
+  reading or editing a peer's space in its **own tenant** is in policy (tenant is the object
+  boundary), and a **cross-tenant** 404 from `persona_b` is tenant isolation working, not a denial
+  of the viewer. Denials only count for a peer of the probe (or the mirrored cross-tenant direction).
+
+Verifier changes (product side, `src/server/oracle-invariants.ts`, `verify-rpc.ts`,
+`replay-verifier.ts`):
+
+- `classifyImpactDescriptor` now maps business-logic/workflow (CWE-840/841/472), markup
+  (CWE-79/80/83) and disclosure (CWE-200/359/522/532) instead of `other`, and `verify-rpc` classifies
+  from title **and** description.
+- `assessBusinessLogicImpact`: boundary differential, repeated terminal transition, persisted
+  protected-field change, or a declared invariant event; the delta must reflect a value *this* probe
+  sent (K=6 cross-talk), and a same-tenant self-service change is in policy.
+- `assessMarkupImpact`: executable markup or a nonce marker planted inside the same proof.
+- Disclosure uses the authorization read path (pre-redaction credential fingerprints count);
+  same-tenant, same-role reads need private/secret data, not just an owner field.
+- `expectControlDenied: false` no longer disables the access boundary gate; the transcript records a
+  host-signed persona role label and impact steps ignore script-supplied role/tenant labels; a
+  declared oracle event is a requirement, never a substitute for a missing differential.
+
+No truth changes: none of the behaviours is a planted target, and the real bugs on those endpoints
+(cross-tenant invoice write, cross-tenant report cache) are already covered.
+

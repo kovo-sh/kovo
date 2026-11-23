@@ -18,7 +18,7 @@
  * Defensive QA framing: everything here is a *falsifier* for over-claims. It never invents impact.
  */
 
-export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'other'
+export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'business_logic' | 'markup' | 'disclosure' | 'other'
 /** Orthogonal boundary class: what kind of gate must be demonstrated for a claim. */
 export type BoundaryClass = 'auth' | 'mfa' | 'access' | 'other'
 export type RoleName = 'viewer' | 'member' | 'admin' | 'owner'
@@ -127,6 +127,8 @@ export interface ImpactStep {
   requestJson?: unknown
   requestHeaders?: Record<string, string> | null
   responseHeaders?: Record<string, string> | null
+  /** Pre-redaction credential fingerprints (sha256 prefixes only) observed in this exchange. */
+  secretMatches?: readonly string[]
 }
 
 export interface ImpactInput {
@@ -207,6 +209,18 @@ const CSRF_RE = /\bcsrf\b|cross[- ]site\s+request\s+forgery|CWE-352/i
 const MASS_ASSIGN_RE = /mass[- ]?assign|over[- ]?post|CWE-915/i
 const AUTHZ_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant)\b/i
 const AUTHZ_CWE_RE = /^CWE-(?:269|284|285|362|566|639|862|863|1021|1220)$/i
+const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- ]transition|invariant|business[- ]rule)\b/i
+const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472)$/i
+const MARKUP_RE = /\b(?:xss|cross[- ]site\s+scripting|html[- ]injection|markup[- ]injection|script[- ]injection|scripting)\b/i
+const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
+const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
+const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
+/**
+ * Active markup only: a real tag carrying an event handler, or an executable scheme inside an
+ * attribute. Escaped entities and inert presentation tags (`<b>`, `<h2>`) are not script execution.
+ * Kept aligned with the benchmark impact oracle so "HTML injection" never equals "XSS".
+ */
+export const ACTIVE_MARKUP_RE = /<script\b|<[a-z][^>]*\son\w+\s*=|(?:href|src)\s*=\s*["']?\s*javascript:/i
 
 /** Classify a claim once, from machine-readable descriptors (never from a request path guess). */
 export function classifyImpactDescriptor(parts: {
@@ -214,13 +228,25 @@ export function classifyImpactDescriptor(parts: {
   category?: string | null
   title?: string | null
   impact?: string | null
+  description?: string | null
 }): ImpactClass {
-  const text = `${parts.title ?? ''} ${parts.impact ?? ''}`
+  const text = `${parts.title ?? ''} ${parts.impact ?? ''} ${parts.description ?? ''}`
   if (CSRF_RE.test(text) || parts.cwe === 'CWE-352') return 'csrf'
   if (MASS_ASSIGN_RE.test(text) || parts.cwe === 'CWE-915') return 'mass_assignment'
+  // A markup claim is executable-content-only; classification is by CWE or explicit scripting words.
+  if (MARKUP_CWE_RE.test(parts.cwe ?? '') || MARKUP_RE.test(text) ||
+      MARKUP_RE.test(parts.category ?? '')) return 'markup'
   if (/\b(?:vertical|bfla|function[- ]level|privilege[- ]escalation)\b/i.test(text) ||
       /^CWE-(?:269|285|862|863)$/i.test(parts.cwe ?? '')) return 'bfla'
+  // Business-logic/workflow claims carry their own impact model (invariant, repeat transition,
+  // protected-field delta); they must never fall through to the ungated 'other' bucket.
+  if (BUSINESS_LOGIC_CWE_RE.test(parts.cwe ?? '') || BUSINESS_LOGIC_RE.test(text) ||
+      BUSINESS_LOGIC_RE.test(parts.category ?? '')) return 'business_logic'
   if (AUTHZ_CWE_RE.test(parts.cwe ?? '') || AUTHZ_RE.test(parts.category ?? '') || AUTHZ_RE.test(text)) return 'authorization'
+  // Disclosure has no role/tenant differential of its own; it needs an entitled control or a
+  // secret-shaped value. Classified last so authz-titled proof vocabulary keeps precedence.
+  if (DISCLOSURE_CWE_RE.test(parts.cwe ?? '') || DISCLOSURE_RE.test(text) ||
+      DISCLOSURE_RE.test(parts.category ?? '')) return 'disclosure'
   return 'other'
 }
 
@@ -406,13 +432,27 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // A boundary control is a *sibling* arm that was denied before the probe ran; a post-mutation
   // 404 readback is persistence evidence and must not be re-read as a boundary denial.
   const firstProbeIndex = probes.length ? steps.indexOf(probes[0]!) : -1
-  const boundaryControlDenied = deniedControls.some(control =>
-    (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
-    probeSuccesses.some(probe => sameRoute(control, probe)))
   const requiredRole = normalizeRole(input.requiredRole)
   const requiredRank = roleRank(requiredRole)
   const mutatingProbe = probeSuccesses.find(step => stepMutatesState(step)) ?? null
   const probe = mutatingProbe ?? probeSuccesses.find(step => isReadMethod(step.method)) ?? probeSuccesses[0] ?? probes[0]
+  // A denial proves *this actor* is unentitled only when the denied control is a peer of the probe
+  // (same tenant, or both unknown). A cross-tenant control that is denied shows tenant isolation,
+  // which is the app working, not a boundary the probe crossed.
+  const probeTenant = probe?.actor.tenant ?? null
+  const declaredResourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const peerDenial = (control: ImpactStep): boolean => {
+    const tenant = control.actor.tenant ?? null
+    if (tenant === null || probeTenant === null) return true
+    // Same-tenant peer (vertical BFLA) or the mirrored cross-tenant direction: the denied control
+    // lives in the resource tenant the probe crossed into (B denied on A while A writes B).
+    return tenant === probeTenant ||
+      (declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
+  }
+  const boundaryControlDenied = deniedControls.some(control =>
+    peerDenial(control) &&
+    (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
+    probeSuccesses.some(success => sameRoute(control, success)))
 
   const base = {
     probeRole: probe?.actor.role ?? null,
@@ -435,7 +475,10 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     isSuccess(control.status) &&
     control.json !== undefined &&
     Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
-  const crossTenant = Boolean((resourceTenant && probe.actor.tenant && resourceTenant !== probe.actor.tenant) || crossTenantControlRead)
+  // A claim-declared `resourceTenant` is model-supplied; it only counts when a signed control arm
+  // corroborates the boundary (a denial on the same route, or a read served to the other tenant).
+  const crossTenant = crossTenantControlRead ||
+    Boolean(resourceTenant && probe.actor.tenant && resourceTenant !== probe.actor.tenant && boundaryControlDenied)
   const vertical = input.impactClass === 'bfla'
 
   let roleDifferential = false
@@ -479,15 +522,14 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     }
     const protectedChanged = base.changedFields.filter(isProtectedField)
     // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
-    // field or carry the endpoint's declared impact event.
+    // field. A declared oracle event is a requirement the evidence must satisfy, never a substitute
+    // for a missing differential (an LLM can declare anything).
     const oracleDeclared = hasOracle(input.oracleEvents, ['privilege_escalation', 'mass_assignment', 'invariant_violation', 'cross_tenant_write', 'state_delta'])
-    // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
-    // field or carry the endpoint's declared impact event.
-    if (!crossTenant && protectedChanged.length === 0 && !oracleDeclared) {
+    if (!crossTenant && protectedChanged.length === 0) {
       return { required: true, satisfied: false, reason: `The persisted change (${base.changedFields.slice(0, 6).join(', ') || 'none'}) is not a protected field and no impact-oracle event is declared; a state echo is not impact.`, evidence: base }
     }
-    if (boundaryControlDenied && !oracleDeclared && !crossTenant) {
-      return { required: true, satisfied: false, reason: 'The control arm was correctly denied and the probe mutated state, but no impact-oracle event is declared and the change is not cross-tenant; require the endpoint\'s impact event before confirming.', evidence: base }
+    if (boundaryControlDenied && !crossTenant && protectedChanged.length === 0) {
+      return { required: true, satisfied: false, reason: 'The control arm was correctly denied and the probe mutated state, but the change is neither cross-tenant nor a protected field; a self-service write is not escalation.', evidence: base }
     }
     return {
       required: true,
@@ -517,6 +559,22 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     }
   }
   if (crossTenant) {
+    // A route that declares itself public (`/public`, `/share`, `/embed`, …) is readable by anyone
+    // who holds the link; serving it to another tenant or anonymously is by design. Such a claim
+    // needs owner-scoped private data, not merely a cross-tenant 200.
+    const publicRoute = steps.some(step => PUBLIC_ROUTE_RE.test(step.route ?? ''))
+    if (publicRoute) {
+      const disclosure = assessReadDisclosure({ steps, probe })
+      base.disclosureFields = disclosure.fields
+      if (!disclosure.satisfied) {
+        return {
+          required: true,
+          satisfied: false,
+          reason: `Cross-tenant claim dismissed: the route declares itself public and ${disclosure.reason}`,
+          evidence: base,
+        }
+      }
+    }
     return {
       required: true,
       satisfied: true,
@@ -524,8 +582,33 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       evidence: base,
     }
   }
+  const probeFingerprints = new Set<string>(probe.secretMatches ?? [])
+  const controlFingerprints = new Set<string>(controls.flatMap(control => [...(control.secretMatches ?? [])]))
+  const disclosedFingerprints = [...probeFingerprints].filter(fingerprint => !controlFingerprints.has(fingerprint))
+  if (disclosedFingerprints.length > 0) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: `Credential-shaped value(s) disclosed: ${disclosedFingerprints.length} pre-redaction secret fingerprint(s) appear in the probe response and not in any entitled control.`,
+      evidence: base,
+    }
+  }
   const disclosure = assessReadDisclosure({ steps, probe })
   base.disclosureFields = disclosure.fields
+  if (disclosure.satisfied && !roleDifferential && !crossTenant && !boundaryControlDenied) {
+    // Same-tenant, same-role read: the tenant is the object boundary, so an owner/identity field
+    // alone is in policy (viewer reading a peer's space). Only private/secret data proves impact.
+    const privateFields = disclosure.fields.filter(path => PRIVATE_DATA_RE.test(path.split('.').pop() ?? ''))
+    if (privateFields.length === 0) {
+      return {
+        required: true,
+        satisfied: false,
+        reason: `Same-tenant read of owner-scoped field(s) (${disclosure.fields.slice(0, 6).join(', ')}) without a role/tenant differential: tenant content is readable by every member, so no private data was disclosed.`,
+        evidence: base,
+      }
+    }
+    base.disclosureFields = privateFields
+  }
   if (!disclosure.satisfied) {
     return { required: true, satisfied: false, reason: `Read-only proof lacks impact evidence: ${disclosure.reason}`, evidence: base }
   }
@@ -716,6 +799,206 @@ export function assessMassAssignmentImpact(input: ImpactInput): MassAssignmentAs
 }
 
 // ---------------------------------------------------------------------------
+// Business logic / workflow integrity
+// ---------------------------------------------------------------------------
+
+export interface BusinessLogicAssessment extends ImpactAssessment {
+  evidence: {
+    persisted: boolean
+    changedFields: string[]
+    protectedFields: string[]
+    repeatedTransition: boolean
+    boundary: boolean
+    oracleDeclared: boolean
+  }
+}
+
+function sameMutatingRequest(a: ImpactStep, b: ImpactStep): boolean {
+  if (!stepMutatesState(a) || !stepMutatesState(b)) return false
+  if ((a.method ?? '').toUpperCase() !== (b.method ?? '').toUpperCase()) return false
+  if ((a.route ?? '') === '' || a.route !== b.route) return false
+  const aBody = a.requestJson === undefined ? null : JSON.stringify(a.requestJson)
+  const bBody = b.requestJson === undefined ? null : JSON.stringify(b.requestJson)
+  return aBody === bBody
+}
+
+/**
+ * Business-logic/workflow claims assert an invariant the server never modelled in HTTP evidence.
+ * A self-service owner mutation of a field the caller is entitled to edit is in policy; impact
+ * requires one of: a boundary differential, the same terminal transition accepted twice, a
+ * persisted *protected* field change, or a declared invariant/workflow oracle event.
+ */
+export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAssessment {
+  const steps = input.steps
+  const probes = steps.filter(step => step.arm === 'probe')
+  const mutatingProbe = probes.find(step => stepMutatesState(step) && isSuccess(step.status)) ?? null
+  const labels = {
+    persisted: false,
+    changedFields: [] as string[],
+    protectedFields: [] as string[],
+    repeatedTransition: false,
+    boundary: false,
+    oracleDeclared: false,
+  }
+  if (!mutatingProbe) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'Business-logic claim has no successful mutating probe step: an asserted invariant needs a state mutation that moved it.',
+      evidence: labels,
+    }
+  }
+  const probeTenant = mutatingProbe.actor.tenant ?? null
+  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const peerDenial = (control: ImpactStep): boolean => {
+    const tenant = control.actor.tenant ?? null
+    if (tenant === null || probeTenant === null) return true
+    return tenant === probeTenant ||
+      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
+  }
+  const boundaryControlDenied = steps.some(control =>
+    control.arm === 'control' &&
+    peerDenial(control) &&
+    isDenied(control.status) &&
+    sameRoute(control, mutatingProbe) &&
+    steps.indexOf(control) < steps.indexOf(mutatingProbe))
+  const crossTenant = Boolean(resourceTenant && mutatingProbe.actor.tenant && resourceTenant !== mutatingProbe.actor.tenant)
+  const requiredRank = roleRank(normalizeRole(input.requiredRole) ?? null)
+  const probeRank = roleRank(mutatingProbe.actor.role)
+  const roleDifferential = requiredRank !== null && probeRank !== null && probeRank < requiredRank
+  labels.boundary = boundaryControlDenied || crossTenant || roleDifferential
+  if (labels.boundary) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: 'Business-logic claim rides on a role/tenant boundary differential (the probe actor is outside the entitlement the control demonstrates).',
+      evidence: labels,
+    }
+  }
+  // The workflow step-skip shape: the identical terminal transition accepted a second time.
+  labels.repeatedTransition = steps.some(other =>
+    other !== mutatingProbe && isSuccess(other.status) && sameMutatingRequest(other, mutatingProbe))
+  if (labels.repeatedTransition) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: 'A terminal transition was accepted a second time for the same resource (the object did not leave its prior state).',
+      evidence: labels,
+    }
+  }
+  const reads = steps.filter(step => isReadMethod(step.method) && step.json !== undefined && step.json !== null)
+  const beforeRead = [...reads].reverse().find(step => steps.indexOf(step) < steps.indexOf(mutatingProbe) && isSuccess(step.status)) ?? null
+  const afterRead = reads.find(step => steps.indexOf(step) > steps.indexOf(mutatingProbe) &&
+    (isSuccess(step.status) || step.status === 404 || step.status === 410)) ?? null
+  const delta = beforeRead && afterRead ? stateDelta(beforeRead.json, afterRead.json, afterRead.status) : null
+  labels.persisted = Boolean(delta && (delta.deleted || delta.changed.length + delta.added.length + delta.removed.length > 0))
+  if (delta) {
+    labels.changedFields = [...delta.changed, ...delta.added, ...delta.removed]
+  }
+  labels.protectedFields = labels.changedFields.filter(isProtectedField)
+  // K=6 cross-talk guard: a delta caused by another worker's write is not this probe's impact.
+  // The after-read must reflect a value this probe sent (or a marker it injected).
+  const sent = new Set<string>()
+  if (mutatingProbe.requestJson !== undefined) {
+    for (const value of flattenJson(mutatingProbe.requestJson).values()) {
+      sent.add(value)
+      for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) sent.add(token)
+    }
+  }
+  const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
+  const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
+    (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token)))
+  if (labels.persisted && !attributable && !labels.oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `The state delta (${labels.changedFields.slice(0, 6).join(', ')}) does not reflect any value this probe sent; a concurrent writer cannot be excluded, so it is not this proof's impact.`,
+      evidence: labels,
+    }
+  }
+  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
+  if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: `Persisted ${labels.protectedFields.length ? `protected field(s) ${labels.protectedFields.slice(0, 6).join(', ')}` : 'state change with a declared invariant event'}${labels.oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}`,
+      evidence: labels,
+    }
+  }
+  return {
+    required: true,
+    satisfied: false,
+    reason: labels.persisted
+      ? `The mutation persisted only non-protected field(s) (${labels.changedFields.slice(0, 6).join(', ') || 'none'}) by an entitled actor in its own tenant: a self-service state change is not a business-invariant violation (no boundary, no repeated terminal transition, no protected field, no declared invariant event).`
+      : 'No before/after readback proves the asserted invariant moved; the mutation response echo is not a state delta.',
+    evidence: labels,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Markup / script execution
+// ---------------------------------------------------------------------------
+
+export interface MarkupAssessment extends ImpactAssessment {
+  evidence: { activeMarkup: boolean; oracleDeclared: boolean; bodies: number; plantedMarker: boolean }
+}
+
+/**
+ * Scripting claims need executable content. Unescaped presentation tags prove output-encoding debt,
+ * not script execution; the payload must contain a script element, an inline event handler or a
+ * javascript: URL in a probe response (or the endpoint's declared XSS impact event).
+ */
+export function assessMarkupImpact(input: ImpactInput): MarkupAssessment {
+  const probes = input.steps.filter(step => step.arm === 'probe' && isSuccess(step.status))
+  let activeMarkup = false
+  for (const probe of probes) {
+    if (typeof probe.body === 'string' && probe.body.length > 0 && ACTIVE_MARKUP_RE.test(probe.body)) {
+      activeMarkup = true
+      break
+    }
+  }
+  // Second-order stored injection: a nonce marker injected by a mutating step inside *this* spec is
+  // rendered back later and is absent from every control body. That is a stored-data flow the proof
+  // itself created (the procedural stored-XSS shape), not a pre-existing tag an unrelated request
+  // left behind (the K=6 over-claim shape).
+  const planted = new Set<string>()
+  for (const step of input.steps) {
+    if (step.arm === 'control' || !stepMutatesState(step) || !isSuccess(step.status) || step.requestJson === undefined) continue
+    for (const value of flattenJson(step.requestJson).values()) {
+      // A marker may be embedded in a payload (`gxssab12<b>`): take its identifier-shaped run.
+      for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) planted.add(token)
+    }
+  }
+  let plantedMarker = false
+  if (planted.size > 0) {
+    const controlBodies = input.steps.filter(step => step.arm === 'control').map(step => String(step.body ?? '')).join('\n')
+    const candidates = [...planted].filter(marker => !controlBodies.includes(marker))
+    plantedMarker = probes.some(probe => typeof probe.body === 'string' &&
+      candidates.some(marker => probe.body!.includes(marker)))
+  }
+  const oracleDeclared = hasOracle(input.oracleEvents, ['stored_xss_rendered', 'reflected_xss_rendered'])
+  const labels = { activeMarkup, oracleDeclared, bodies: probes.length, plantedMarker }
+  if (activeMarkup || oracleDeclared || plantedMarker) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: activeMarkup
+        ? 'The probe response carries executable markup (script element, inline event handler or javascript: URL).'
+        : plantedMarker
+          ? 'A nonce marker injected by a mutating step inside this proof is rendered back on the stored read.'
+          : `The claim declares the endpoint's XSS impact event (${input.oracleEvents!.join(',')}).`,
+      evidence: labels,
+    }
+  }
+  return {
+    required: true,
+    satisfied: false,
+    reason: 'The rendered markup carries no executable content and no marker planted inside this proof: unescaped presentation tags are output-encoding debt, not script execution.',
+    evidence: labels,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CSRF
 // ---------------------------------------------------------------------------
 
@@ -796,7 +1079,12 @@ export function assessImpactEvidence(input: ImpactInput): ImpactAssessment {
       return assessMassAssignmentImpact(input)
     case 'bfla':
     case 'authorization':
+    case 'disclosure':
       return assessAuthorizationImpact(input)
+    case 'business_logic':
+      return assessBusinessLogicImpact(input)
+    case 'markup':
+      return assessMarkupImpact(input)
     default:
       return { required: false, satisfied: true, reason: 'Not an authorization/impact claim.' }
   }
@@ -857,6 +1145,8 @@ export function routeFamily(pathAndQuery: string | null | undefined): string {
 
 const MFA_CHALLENGE_RE = /\b(?:two[- ]?factor|2fa|mfa|otp|totp|one[- ]?time[- ]?(?:pass(?:word|code)?|code)|verification code|authenticator|challenge[- ]?required|mfa_required|step[- ]?up)\b/i
 const LOGIN_REDIRECT_RE = /\/(?:login|signin|sign-in|sso|auth|session|mfa|2fa|verify)\b/i
+/** Share-style routes: readable by anyone holding the link, so cross-tenant reads are by design. */
+const PUBLIC_ROUTE_RE = /\/(?:public|share|shared|embed|preview|open|link)(?:\/|$)/i
 
 export type BoundaryArm = 'control_denied' | 'actor_differential' | null
 
@@ -1080,7 +1370,15 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   const signals = steps
     .map(step => boundarySignalOf(step, successFamilies))
     .filter((signal): signal is BoundarySignal => signal !== null)
-  const signal = signals.find(entry => entry.step.arm === 'control' || entry.step.arm === 'setup') ?? signals[0] ?? null
+  const probeActor = steps.find(step => step.arm === 'probe')?.actor ?? null
+  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const peerSignal = signals.find(entry => {
+    const tenant = entry.step.actor.tenant ?? null
+    if (tenant === null || probeActor?.tenant == null) return true
+    return tenant === probeActor.tenant ||
+      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
+  }) ?? null
+  const signal = peerSignal ?? null
   const controlDenied = signal !== null
   // The variant must cross the same route family and expose data or a state change.
   const signalFamily = signal ? routeFamily(signal.step.route ?? '') : ''
@@ -1143,7 +1441,9 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   }
 
   // access
-  if (controlDenied && (!escape || strict)) {
+  // `expectControlDenied: false` is model-supplied and must never *disable* the gate: an observed
+  // denial always has to be crossed by the variant. The flag only documents intent.
+  if (controlDenied) {
     if (!crossed) {
       return {
         required: true, satisfied: false, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,
