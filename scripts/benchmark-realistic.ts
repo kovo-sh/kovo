@@ -210,7 +210,7 @@ Flags:
                           with --max-duration-ms: 25,000 at 600 s, 100,000 at 45 min).
                           Phase A never borrows it.
   --max-rps <n>           hard per-origin rate cap (default ${DEFAULT_MAX_RPS}; WAF/429
-                          backoff still applies). $GUARDIAN_MAX_RPS is the env equivalent.
+                          backoff still applies). GUARDIAN_MAX_RPS is the env equivalent.
   These are caps, not targets: wall/USD/completion still end the run.
   --out-dir <path>        artifact directory (default: .guardian/realistic-bench)
   --concurrency <n>       parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
@@ -1095,6 +1095,7 @@ export function summarizeRequestBudgets(input: {
   let floorRequests: number | null = null
   let floorExhausted = false
   let agentRequests: number | null = null
+  let spentAtFloorSettle: number | null = null
   let agentExhausted = false
   let terminationReason: string | null = null
   let engineReportedFloor = 0
@@ -1109,6 +1110,7 @@ export function summarizeRequestBudgets(input: {
       }
     } else if (event.kind === 'request_budget.floor_settled') {
       floorRequests = num(detail.floorRequests)
+      spentAtFloorSettle = num(detail.spentRequestsAtSettle)
       if (detail.floorBudgetExhausted === true) floorExhausted = true
     } else if (event.kind === 'request_budget.floor_exhausted') {
       floorExhausted = true
@@ -1125,6 +1127,11 @@ export function summarizeRequestBudgets(input: {
     }
   }
   if (floorRequests === null && sawEngineSummary) floorRequests = engineReportedFloor
+  // A wall stop mid-Phase-B never reaches `request_budget.phase_ended`; the settle event still
+  // gives an honest consumption delta (verification has not run yet).
+  if (agentRequests === null && spentAtFloorSettle !== null) {
+    agentRequests = Math.max(0, input.spentRequests - spentAtFloorSettle)
+  }
   const split = input.floorRequestBudget != null || input.agentRequestBudget != null
   return {
     mode: split ? 'split' : 'single',
