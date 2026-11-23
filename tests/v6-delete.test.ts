@@ -557,15 +557,19 @@ test('v6 delete: a 2,500-route surface probes a bounded ranked subset and keeps 
   }
   const ranked = selectRankedProbeTargets(stored, plan, { cap: 220 })
   assert.equal(ranked.usedPlan, true)
-  assert.equal(ranked.probed, prioritized.length, 'only the ranked sample is probed')
+  assert.equal(ranked.probed, 220, 'probe breadth stays bounded at the engine cap')
   assert.ok(ranked.probed < stored.length, 'probe breadth is bounded well below the surface')
-  assert.ok(ranked.skippedStored >= 2_400, 'unsampled clusters stay in the store for later rounds')
+  assert.ok(ranked.skippedStored >= 2_280, 'unsampled clusters stay in the store for later rounds')
   assert.deepEqual(
-    ranked.targets.map(ep => `${ep.method} ${ep.pathTemplate}`),
+    ranked.targets.slice(0, prioritized.length).map(ep => `${ep.method} ${ep.pathTemplate}`),
     prioritized,
-    'the plan order is honored',
+    'the plan order is honored first',
   )
   assert.equal(storage.listEndpoints(runId, { limit: 5_000 }).length, 2_500, 'nothing is deleted by probing')
+
+  // A plan-only consumer probes exactly the reported ranked sample.
+  const planOnly = selectRankedProbeTargets(stored, plan, { cap: 220, planOnly: true })
+  assert.equal(planOnly.probed, prioritized.length)
 
   // No plan (recon unavailable/resumed/local-lab): risk-ranked cap, still lossless.
   const fallback = selectRankedProbeTargets(stored, null, { cap: 220 })

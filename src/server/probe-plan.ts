@@ -28,10 +28,10 @@ export interface Phase0GraphwireExtras {
 /**
  * Bound the engine's probe targets to the Phase-0 ranked subset.
  *
- * When a ranked plan exists, only routes named by `probePlan.sample` are probed first
- * (ranked/clustered by recon); clusters, tier counts and the long tail remain queryable and are
- * reached by later rounds. With no plan (recon unavailable, resumed runs, local-lab) it falls
- * back to the risk-ranked cap.
+ * Routes named by `probePlan.sample` are probed first, in recon rank order. The remaining breadth
+ * is filled by the risk-ranked store up to `cap`, so a bounded ranked plan (which transports only
+ * a sample of a much larger clustered subset) never starves recall. With `planOnly`, execution
+ * probes only the reported sample. The store itself is never trimmed or rewritten.
  */
 export function selectRankedProbeTargets<T extends {
   origin: string
@@ -41,7 +41,7 @@ export function selectRankedProbeTargets<T extends {
 }>(
   endpoints: readonly T[],
   probePlan: Phase0ProbePlanSummary | null | undefined,
-  options: { cap: number },
+  options: { cap: number; planOnly?: boolean },
 ): { targets: T[]; usedPlan: boolean; probed: number; skippedStored: number } {
   const cap = Math.max(1, Math.round(options.cap))
   const riskFirst = [...endpoints].sort((a, b) =>
@@ -73,6 +73,15 @@ export function selectRankedProbeTargets<T extends {
   // Sample keys may be normalized differently (AST vs regex extraction); fail open to risk order
   // rather than probing nothing.
   if (!targets.length) return fallback()
+  if (!options.planOnly) {
+    const chosen = new Set(targets)
+    for (const endpoint of riskFirst) {
+      if (targets.length >= cap) break
+      if (chosen.has(endpoint)) continue
+      chosen.add(endpoint)
+      targets.push(endpoint)
+    }
+  }
   return {
     targets,
     usedPlan: true,
