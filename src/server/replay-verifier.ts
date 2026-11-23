@@ -1,7 +1,4 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
-import { once } from 'node:events'
-import { createServer } from 'node:http'
-import type { Server } from 'node:http'
 import { diffResponse, dnsTakeoverAnalyze } from '../../worker/analyzers.ts'
 import { maxInlineVerifyRetries } from '../domain.ts'
 import type { InlineVerifyFeedback, VerificationTier } from '../domain.ts'
@@ -23,9 +20,28 @@ import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import type { BrowserDomSinkTrace, BrowserInteractiveAction, BrowserSessionStep } from './scoped-browser.ts'
-import { injectUniversalParam, responseSimilarity } from './surface-engine.ts'
+import { injectUniversalParam } from './surface-engine.ts'
+import {
+  awaitReplayCanary,
+  intersectStructuralDeltas,
+  openCanarySession,
+  structuralDiff,
+  structuralSimilarity,
+} from './verify-support.ts'
+import type { CanaryWaitOutcome, EphemeralCanarySession } from './verify-support.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
+
+// Re-exported for tests and callers that only import the verifier.
+export {
+  awaitReplayCanary,
+  defaultReplayCanaryImmediateMs,
+  intersectStructuralDeltas,
+  normalizeStructuralTokens,
+  structuralDiff,
+  structuralSimilarity,
+} from './verify-support.ts'
+export type { CanaryWaitOutcome, ReplayCanaryWaitOptions, StructuralDiff } from './verify-support.ts'
 
 export type ReplayVerdict = 'confirmed' | 'static_verified' | 'dismissed' | 'inconclusive'
 export type RetestVerdict = 'reproduced' | 'fixed' | 'inconclusive'
@@ -732,83 +748,6 @@ function inconclusiveResult(
   }
 }
 
-interface EphemeralCanarySession {
-  mint(purpose: string): { token: string; url: string; dnsHost: string }
-  check(token: string): { triggered: boolean; detail: Record<string, unknown> | null }
-  close(): Promise<void>
-}
-
-async function openCanarySession(
-  canaryBroker: CanaryBroker | undefined,
-  storage: Store | undefined,
-  runId: string | undefined,
-  assignmentId: string,
-  origin?: string,
-): Promise<EphemeralCanarySession> {
-  if (canaryBroker) {
-    const info = await canaryBroker.startListener()
-    const effectiveRunId = runId ?? 'replay-verifier'
-    const baseUrl = info.effectiveBaseUrl ?? ''
-    return {
-      mint(purpose: string) {
-        const minted = canaryBroker.mintCanary(
-          effectiveRunId,
-          purpose,
-          origin,
-          storage ? { storage, assignmentId } : undefined,
-        )
-        return {
-          token: minted.token,
-          url: minted.httpUrl || `${baseUrl}/c/${minted.token}`,
-          dnsHost: minted.dnsHost,
-        }
-      },
-      check(token: string) {
-        const res = canaryBroker.checkCanary(token, storage ? { storage, runId: effectiveRunId } : undefined)
-        return { triggered: res.hit, detail: res.detail }
-      },
-      async close() { /* Managed by host CanaryBroker lifecycle */ },
-    }
-  }
-
-  // Standalone ephemeral loopback canary listener (used in unit tests without a CanaryBroker).
-  const callbacks = new Map<string, Record<string, unknown>>()
-  const server: Server = createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const match = /^\/c\/(guardian-canary-[a-f0-9]{24})$/.exec(url.pathname)
-    if (match) {
-      callbacks.set(match[1], {
-        method: req.method ?? 'GET',
-        path: url.pathname,
-        receivedAt: new Date().toISOString(),
-      })
-    }
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('guardian-canary-ok')
-  })
-  server.listen(0, '127.0.0.1')
-  await once(server, 'listening')
-  const addr = server.address()
-  if (!addr || typeof addr === 'string') {
-    server.close()
-    throw new Error('Could not bind ephemeral replay canary listener.')
-  }
-  const baseUrl = `http://127.0.0.1:${addr.port}`
-  return {
-    mint() {
-      const token = `guardian-canary-${randomBytes(12).toString('hex')}`
-      return { token, url: `${baseUrl}/c/${token}`, dnsHost: `${token}.canary.guardian.invalid` }
-    },
-    check(token: string) {
-      const detail = callbacks.get(token) ?? null
-      return { triggered: Boolean(detail), detail }
-    },
-    async close() {
-      server.closeAllConnections()
-      await new Promise<void>(resolve => server.close(() => resolve()))
-    },
-  }
-}
-
 /**
  * Mint a throw-away signing key and a fresh timestamp, then compute the HMAC over the documented
  * canonical form. Used only for self-signed webhook proof (no real secret ever enters the spec).
@@ -1189,24 +1128,25 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
 
         let canaryEvidence: Record<string, unknown> | undefined
         if (canarySession && prbCanary && ctrlCanary) {
-          let probeCheck = canarySession.check(prbCanary.token)
-          for (let attempt = 0; attempt < 10 && !probeCheck.triggered; attempt += 1) {
-            await sleepAbortable(150, signal)
-            probeCheck = canarySession.check(prbCanary.token)
-          }
+          // Two-stage async correlation: durable pending_oob subscription, short immediate check,
+          // then promoteLate/awaitAny up to the run deadline so worker callbacks still confirm.
+          const probeWait = await canarySession.waitForCallback(prbCanary.token, signal)
           const controlCheck = canarySession.check(ctrlCanary.token)
           canaryEvidence = {
             proof: {
-              canaryProbeTriggered: probeCheck.triggered,
+              canaryProbeTriggered: probeWait.triggered,
+              canaryProbeStage: probeWait.stage,
+              canaryProbePromoted: probeWait.promoted,
+              ...(probeWait.subscriptionId ? { canarySubscriptionId: probeWait.subscriptionId } : {}),
               canaryControlTriggered: controlCheck.triggered,
-              canaryProbeDetail: probeCheck.detail,
+              canaryProbeDetail: probeWait.detail,
               canaryControlDetail: controlCheck.detail,
             },
             canary: {
-              triggered: probeCheck.triggered && !controlCheck.triggered,
-              probeTriggered: probeCheck.triggered,
+              triggered: probeWait.triggered && !controlCheck.triggered,
+              probeTriggered: probeWait.triggered,
               controlTriggered: controlCheck.triggered,
-              probeDetail: probeCheck.detail,
+              probeDetail: probeWait.detail,
               controlDetail: controlCheck.detail,
             },
           }
@@ -1892,16 +1832,14 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           proofMeta.assembledInProbe = inProbe
           proofMeta.assembledInControl = inControl
         } else if (spec.proofMode === 'oob_canary' && canarySession && controlCanaryToken && probeCanaryToken) {
-          // Wait briefly for asynchronous OOB callback (up to 1500ms, polling every 150ms)
-          let probeCheck = canarySession.check(probeCanaryToken)
-          for (let attempt = 0; attempt < 10 && !probeCheck.triggered; attempt += 1) {
-            await sleepAbortable(150, signal)
-            probeCheck = canarySession.check(probeCanaryToken)
-          }
+          // Durable pending_oob subscription + promotion instead of a fixed 1.5 s poll.
+          const probeWait = await canarySession.waitForCallback(probeCanaryToken, signal)
           const controlCheck = canarySession.check(controlCanaryToken)
-          deterministicProofPassed = probeCheck.triggered && !controlCheck.triggered
-          proofMeta.canaryProbeTriggered = probeCheck.triggered
-          proofMeta.canaryProbeDetail = probeCheck.detail
+          deterministicProofPassed = probeWait.triggered && !controlCheck.triggered
+          proofMeta.canaryProbeTriggered = probeWait.triggered
+          proofMeta.canaryProbeStage = probeWait.stage
+          proofMeta.canaryProbePromoted = probeWait.promoted
+          proofMeta.canaryProbeDetail = probeWait.detail
           proofMeta.canaryControlTriggered = controlCheck.triggered
           proofMeta.canaryControlDetail = controlCheck.detail
         }
@@ -1971,10 +1909,12 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       }
 
       const rounds: Array<Record<string, unknown>> = []
+      const roundDeltas: string[][] = []
       let firstBaseline: BrokerExchangeResult | undefined
       let firstTrue: BrokerExchangeResult | undefined
       let firstFalse: BrokerExchangeResult | undefined
       let allPass = true
+      let baselineHeld = true
       let unstable = false
       let baselineDrift = false
       for (let r = 0; r < roundCount; r += 1) {
@@ -1992,9 +1932,13 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         firstBaseline ??= baseEx
         firstTrue ??= trueEx
         firstFalse ??= falseEx
-        const simBaselineTrue = responseSimilarity(baseEx.body, trueEx.body)
-        const simBaselineFalse = responseSimilarity(baseEx.body, falseEx.body)
-        const simTrueFalse = responseSimilarity(trueEx.body, falseEx.body)
+        // Compare noise-normalized structure: a rotating nonce never separates the arms, and a
+        // single real field delta inside a large HTML shell remains observable.
+        const simBaselineTrue = structuralSimilarity(baseEx.body, trueEx.body)
+        const simBaselineFalse = structuralSimilarity(baseEx.body, falseEx.body)
+        const simTrueFalse = structuralSimilarity(trueEx.body, falseEx.body)
+        const fieldDelta = structuralDiff(trueEx.body, falseEx.body).changedTokens.filter(token => token.length >= 2)
+        roundDeltas.push(fieldDelta)
         const isOrBranch = /\bOR\b/i.test(spec.valueTemplate ?? '')
         const statusDivergence = isOrBranch
           ? (falseEx.status === baseEx.status && trueEx.status !== falseEx.status && trueEx.status < 500) ||
@@ -2005,23 +1949,30 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(trueEx.status, spec.expectedStatus)) {
           controlHealthy = false
         }
-        if (responseSimilarity(firstBaseline.body, baseEx.body) < 0.9) baselineDrift = true
+        if (structuralSimilarity(firstBaseline.body, baseEx.body) < 0.9) baselineDrift = true
         const baselineMatch = isOrBranch ? Math.max(simBaselineTrue, simBaselineFalse) >= 0.9 : simBaselineTrue >= 0.9
+        if (!(!anyServerError && baselineMatch)) baselineHeld = false
         const pass = !anyServerError && baselineMatch && (simTrueFalse <= 0.75 || statusDivergence)
         if (!pass) allPass = false
         rounds.push({
           round: r + 1, k,
           trueExpression: `${k}=${k}`, falseExpression: `${k}=${k + 1}`,
           baseline: lightSummary(baseEx), true: lightSummary(trueEx), false: lightSummary(falseEx),
-          similarityBaselineTrue: simBaselineTrue, similarityBaselineFalse: simBaselineFalse, similarityTrueFalse: simTrueFalse, statusDivergence, isOrBranch, pass,
+          similarityBaselineTrue: simBaselineTrue, similarityBaselineFalse: simBaselineFalse, similarityTrueFalse: simTrueFalse,
+          statusDivergence, isOrBranch, structuralDelta: fieldDelta.length > 0, structuralChangedTokens: fieldDelta.length, pass,
         })
       }
+      // A small set of non-dynamic tokens that differ in *every* round is a stable field delta,
+      // not per-request jitter. This lets a one-field differential in a large shell confirm while
+      // still requiring identical structural context.
+      const stableFieldDelta = intersectStructuralDeltas(roundDeltas).filter(token => token.length >= 2)
+      const structuralFieldDelta = stableFieldDelta.length > 0 && stableFieldDelta.length <= 8
       const controlPassed = controlHealthy && !unstable && !baselineDrift
-      deterministicProofPassed = controlPassed && allPass
+      deterministicProofPassed = controlPassed && baselineHeld && (allPass || structuralFieldDelta)
       if (!deterministicProofPassed) {
         proofFailureReason = !controlPassed
           ? 'sql_boolean_diff control unstable (5xx, unexpected 404 or drifting baseline).'
-          : 'Boolean differential did not hold across all 3 randomized rounds.'
+          : 'Boolean differential did not hold across all 3 randomized rounds (no status divergence, content separation, or stable non-dynamic field delta).'
       }
       evidencePayload = {
         ...evidencePayload,
@@ -2034,7 +1985,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         sqlDiff: {
           passed: deterministicProofPassed,
           controlPassed,
-          thresholds: { trueVsBaselineMin: 0.9, trueVsFalseMax: 0.75 },
+          thresholds: { trueVsBaselineMin: 0.9, trueVsFalseMax: 0.75, stableFieldDeltaMax: 8 },
+          structuralFieldDelta,
+          structuralChangedTokens: stableFieldDelta.length,
           rounds,
         },
         control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
@@ -2323,20 +2276,18 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
 
         let canaryProof: Record<string, unknown> | undefined
         if (canarySession && probeCanaryToken && controlCanaryToken) {
-          let probeCheck = canarySession.check(probeCanaryToken)
-          for (let attempt = 0; attempt < 10 && !probeCheck.triggered; attempt += 1) {
-            await sleepAbortable(150, signal)
-            probeCheck = canarySession.check(probeCanaryToken)
-          }
+          const probeWait = await canarySession.waitForCallback(probeCanaryToken, signal)
           const controlCheck = canarySession.check(controlCanaryToken)
-          deterministicProofPassed = probeCheck.triggered && !controlCheck.triggered
+          deterministicProofPassed = probeWait.triggered && !controlCheck.triggered
           if (!deterministicProofPassed) {
             proofFailureReason = 'auth_protocol_proof OOB canary callback did not trigger exclusively on probe step.'
           }
           canaryProof = {
-            probeTriggered: probeCheck.triggered,
+            probeTriggered: probeWait.triggered,
+            probeStage: probeWait.stage,
+            probePromoted: probeWait.promoted,
             controlTriggered: controlCheck.triggered,
-            probeDetail: probeCheck.detail,
+            probeDetail: probeWait.detail,
             controlDetail: controlCheck.detail,
           }
         }
@@ -2483,8 +2434,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         verifyEx.respHeaders['x-proxy-cache'],
         verifyEx.respHeaders['cache-status'],
       ].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
-      const simControlVsVerify = responseSimilarity(controlEx.body, verifyEx.body)
-      const simProbeVsVerify = responseSimilarity(probeEx.body, verifyEx.body)
+      const simControlVsVerify = structuralSimilarity(controlEx.body, verifyEx.body)
+      const simProbeVsVerify = structuralSimilarity(probeEx.body, verifyEx.body)
 
       let cacheHitObserved: boolean
       let poisonPersistedToVictim: boolean
