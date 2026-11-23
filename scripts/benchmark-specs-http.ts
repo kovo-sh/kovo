@@ -395,7 +395,10 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
       let persona: string | null = null
       let selfRead = false
       if (functionLevel) {
-        if (elevated) {
+        // A trivial function response cannot be its own readback: a same-path read would just
+        // re-observe the echo. Only a non-trivial state read (or a separate observable route)
+        // can prove persistence.
+        if (elevated && !ownerTrivial) {
           read = { path: o.hyp.endpoint.path, detail: true, reserved: false }
           persona = owner
         }

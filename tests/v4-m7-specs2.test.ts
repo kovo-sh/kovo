@@ -222,9 +222,13 @@ describe('M7.2 authz synthesis: identifier binding', () => {
       details: { matrix: rows },
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string; jsonBody?: unknown } }>
-    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1'])
-    assert.equal(steps[0].request.pathAndQuery, '/api/v1/admin/orgs')
-    assert.deepEqual(steps[0].request.jsonBody, ['acme', 'guardian'])
+    // Function-level mutating authz now carries a separate post-mutation readback (p2);
+    // the verifier requires it so the mutation echo alone can never confirm.
+    assert.deepEqual(steps.map(s => s.id), ['c1', 'p1', 'p2'])
+    // The mutation carries the observed function body; c1/p2 are the readback arms.
+    const mutation = steps.find(s => s.id === 'p1')!
+    assert.equal(mutation.request.pathAndQuery, '/api/v1/admin/orgs')
+    assert.deepEqual(mutation.request.jsonBody, ['acme', 'guardian'])
 
     const trivial = rows.map(row => ({ ...row, bodyBytes: 10 }))
     assert.equal(synthesizeSpec(outcome({
