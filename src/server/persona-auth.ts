@@ -1,15 +1,24 @@
 import type { PersonaLoginAdapter, PersonaLoginConfig } from '../domain.ts'
+import { createHmac } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { request as httpRequest } from 'node:http'
 import type { IncomingHttpHeaders } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import ipaddr from 'ipaddr.js'
 import {
+  normalizePersonaBundle,
   readLoginCredentialFile,
   resolveRunPersonas,
   writePersonaSessionFile,
 } from './persona-vault.ts'
-import type { MintedPersonaSession, ResolvedPersona } from './persona-vault.ts'
+import type {
+  MintedPersonaSession,
+  PersonaCookieRecord,
+  PersonaCredentialBundle,
+  PersonaStorageSnapshot,
+  ResolvedPersona,
+} from './persona-vault.ts'
+import { bundleSecrets, frameForSessionOrigin } from './persona-vault.ts'
 import { isCredentialScopeHost, isIpLiteralHost, normalizeHostname, registrableDomain } from './public-suffix.ts'
 import { redact } from './redact.ts'
 import type { Store } from './store.ts'
@@ -36,11 +45,13 @@ export class PersonaAuthError extends Error {
 export interface AuthenticateResult {
   personaId: string
   handle: string
-  adapterUsed: Exclude<PersonaLoginAdapter, 'auto'>
+  adapterUsed: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc' | 'import'
   headerType: 'cookie' | 'bearer' | 'header'
   expiresAt?: number
   refreshIntervalSec?: number
   refresh?: () => Promise<void>
+  /** Composite v6 session (cookies/headers/storage bundle) for per-worker clone seeding. */
+  session?: MintedPersonaSession
 }
 
 interface PlaywrightFormCookie {
@@ -48,6 +59,11 @@ interface PlaywrightFormCookie {
   value: string
   domain: string
   path?: string
+  httpOnly?: boolean
+  secure?: boolean
+  sameSite?: 'Strict' | 'Lax' | 'None'
+  /** Playwright expresses cookie expiry in seconds. */
+  expires?: number
 }
 
 interface PlaywrightFormLocator {
@@ -325,6 +341,257 @@ function checkResponseForCaptchaOrMfa(text: string, target: string, email: strin
 
 const JWT_SHAPE = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/
 
+/** RFC 6238 TOTP over HMAC-SHA1 (6 digits / 30 s by default). */
+export function generateTotp(seed: string, options: { digits?: number; period?: number; atMs?: number } = {}): string {
+  const normalized = normalizeTotpSeed(seed)
+  if (!normalized) throw new PersonaAuthError('AUTH_FAILED', 'TOTP seed is not valid base32.')
+  const digits = options.digits ?? 6
+  const period = options.period ?? 30
+  const counter = Math.floor((options.atMs ?? Date.now()) / 1000 / period)
+  const message = Buffer.alloc(8)
+  message.writeUInt32BE(Math.floor(counter / 2 ** 32), 0)
+  message.writeUInt32BE(counter >>> 0, 4)
+  const digest = createHmac('sha1', normalized).update(message).digest()
+  const offset = digest[digest.length - 1] & 0x0f
+  const binary = ((digest[offset] & 0x7f) << 24) |
+    ((digest[offset + 1] & 0xff) << 16) |
+    ((digest[offset + 2] & 0xff) << 8) |
+    (digest[offset + 3] & 0xff)
+  return String(binary % 10 ** digits).padStart(digits, '0')
+}
+
+/** Accepts raw base32 or an `otpauth://totp/...?secret=...` URI. */
+export function normalizeTotpSeed(seed: string): Buffer | null {
+  const raw = seed.trim()
+  if (!raw) return null
+  let secret = raw
+  if (/^otpauth:\/\//i.test(raw)) {
+    try {
+      const url = new URL(raw)
+      secret = url.searchParams.get('secret') ?? ''
+    } catch {
+      return null
+    }
+  }
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  const cleaned = secret.replace(/[\s-]/g, '').replace(/=+$/, '').toUpperCase()
+  if (!cleaned || /[^A-Z2-7]/.test(cleaned)) return null
+  let bits = 0
+  let value = 0
+  const bytes: number[] = []
+  for (const char of cleaned) {
+    value = (value << 5) | alphabet.indexOf(char)
+    bits += 5
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff)
+      bits -= 8
+    }
+  }
+  return bytes.length ? Buffer.from(bytes) : null
+}
+
+function storageStateCookieToRecord(raw: unknown): PersonaCookieRecord | null {
+  if (!raw || typeof raw !== 'object') return null
+  const rec = raw as Record<string, unknown>
+  if (typeof rec.name !== 'string' || typeof rec.value !== 'string') return null
+  if (typeof rec.domain !== 'string' || !rec.domain) return null
+  const rawExpires = typeof rec.expires === 'number' && Number.isFinite(rec.expires) ? rec.expires : undefined
+  return {
+    name: rec.name,
+    value: rec.value,
+    domain: rec.domain,
+    path: typeof rec.path === 'string' && rec.path.startsWith('/') ? rec.path : '/',
+    ...(rec.httpOnly === true ? { httpOnly: true } : {}),
+    ...(rec.secure === true ? { secure: true } : {}),
+    ...(rec.sameSite === 'Strict' || rec.sameSite === 'Lax' || rec.sameSite === 'None' ? { sameSite: rec.sameSite } : {}),
+    // Playwright storageState uses seconds; be tolerant of millisecond input.
+    ...(rawExpires && rawExpires > 0
+      ? { expires: rawExpires < 1e12 ? Math.floor(rawExpires * 1000) : Math.floor(rawExpires) }
+      : {}),
+  }
+}
+
+function cookieDomainAllowed(domain: string, allowlist: readonly string[]): boolean {
+  const host = domain.replace(/^\.+/, '').toLowerCase()
+  if (!host) return false
+  return allowedHostnames(allowlist).some(allowed => allowed === host || allowed.endsWith(`.${host}`))
+}
+
+function buildImportedBundle(params: {
+  cookies: PersonaCookieRecord[]
+  headersByOrigin: Map<string, Record<string, string>>
+  storageByOrigin: Map<string, PersonaStorageSnapshot>
+  allowlist: readonly string[]
+  /** Browser-captured cookies are already context-scoped; bind unmatched mock/edge domains here. */
+  fallbackOrigin?: string
+}): { session: MintedPersonaSession; origins: string[] } {
+  const knownOrigins = allowlistOrigins(params.allowlist)
+  const isAllowedOrigin = (origin: string) => knownOrigins.includes(origin) || isOriginInScope(origin, params.allowlist)
+  const origins = new Set<string>()
+  const attachments: NonNullable<PersonaCredentialBundle['attachments']> = []
+
+  let cookies = params.cookies.filter(cookie => cookieDomainAllowed(cookie.domain, params.allowlist))
+  if (!cookies.length && params.cookies.length && params.fallbackOrigin && isAllowedOrigin(params.fallbackOrigin)) {
+    const fallbackHost = new URL(params.fallbackOrigin).hostname
+    cookies = params.cookies.map(cookie => ({ ...cookie, domain: fallbackHost }))
+    origins.add(params.fallbackOrigin)
+  }
+
+  for (const origin of params.headersByOrigin.keys()) {
+    if (isAllowedOrigin(origin)) origins.add(origin)
+  }
+  for (const origin of params.storageByOrigin.keys()) {
+    if (isAllowedOrigin(origin)) origins.add(origin)
+  }
+  if (!origins.size) {
+    // Derive origins from cookie domains + allowlist so a cookie-only import still scopes.
+    for (const origin of knownOrigins) {
+      const host = new URL(origin).hostname
+      if (cookies.some(cookie => host === cookie.domain || host.endsWith(`.${cookie.domain}`))) origins.add(origin)
+    }
+  }
+
+  // If an allowlisted origin is covered by imported cookies, register an attachment for it.
+  for (const origin of knownOrigins) {
+    if (origins.has(origin)) continue
+    const host = new URL(origin).hostname
+    if (cookies.some(cookie => host === cookie.domain || host.endsWith(`.${cookie.domain}`))) origins.add(origin)
+  }
+
+  for (const origin of origins) {
+    const storage = params.storageByOrigin.get(origin)
+    const headers = params.headersByOrigin.get(origin)
+    attachments.push({
+      origin,
+      ...(headers && Object.keys(headers).length ? { headers } : {}),
+      ...(storage ? { storage: 'both' } : {}),
+    })
+  }
+
+  const storage: PersonaStorageSnapshot = {}
+  for (const [origin, snapshot] of params.storageByOrigin) {
+    if (!origins.has(origin)) continue
+    if (snapshot.localStorage) Object.assign(storage.localStorage ??= {}, snapshot.localStorage)
+    if (snapshot.sessionStorage) Object.assign(storage.sessionStorage ??= {}, snapshot.sessionStorage)
+  }
+
+  if (!cookies.length && !attachments.some(a => a.headers) && !storage.localStorage && !storage.sessionStorage) {
+    throw new PersonaAuthError('AUTH_FAILED', 'Imported session state contains no usable cookies, headers, or storage for the persona allowlist.')
+  }
+
+  const firstOrigin = [...origins][0]
+  const firstHeaders = firstOrigin ? params.headersByOrigin.get(firstOrigin) : undefined
+  const authorization = firstHeaders?.Authorization ?? firstHeaders?.authorization
+  const bearer = authorization?.replace(/^Bearer\s+/i, '').trim()
+  const applicableCookies = firstOrigin
+    ? cookies.filter(cookie => {
+        const host = new URL(firstOrigin).hostname
+        return host === cookie.domain || host.endsWith(`.${cookie.domain}`)
+      })
+    : cookies
+  const cookieHeader = applicableCookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+  const bundle = normalizePersonaBundle({
+    cookies,
+    ...(Object.keys(storage).length ? { storage } : {}),
+    attachments,
+  })
+  const session: MintedPersonaSession = {
+    headerType: bearer ? 'bearer' : 'cookie',
+    ...(bearer ? { value: bearer } : { value: cookieHeader || 'imported-session-state' }),
+    adapterUsed: 'import',
+    scrubTokens: [...bundleSecrets(bundle)],
+    ...(bundle ? { bundle } : {}),
+  }
+  return { session, origins: [...origins] }
+}
+
+/** Import a Playwright `storageState` object (passkey / hardware-MFA apps). */
+export function importStorageState(input: unknown, allowlist: readonly string[]): { session: MintedPersonaSession; origins: string[] } {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new PersonaAuthError('AUTH_FAILED', 'storageState must be a JSON object.')
+  }
+  const rec = input as { cookies?: unknown; origins?: unknown }
+  const cookies = Array.isArray(rec.cookies)
+    ? rec.cookies.map(storageStateCookieToRecord).filter((cookie): cookie is PersonaCookieRecord => Boolean(cookie))
+    : []
+  const storageByOrigin = new Map<string, PersonaStorageSnapshot>()
+  if (Array.isArray(rec.origins)) {
+    for (const entry of rec.origins.slice(0, 64)) {
+      if (!entry || typeof entry !== 'object') continue
+      const originRec = entry as { origin?: unknown; localStorage?: unknown }
+      if (typeof originRec.origin !== 'string') continue
+      let origin: string
+      try { origin = new URL(originRec.origin).origin } catch { continue }
+      const local: Record<string, string> = {}
+      if (Array.isArray(originRec.localStorage)) {
+        for (const item of originRec.localStorage.slice(0, 256)) {
+          if (!item || typeof item !== 'object') continue
+          const pair = item as { name?: unknown; value?: unknown }
+          if (typeof pair.name === 'string' && typeof pair.value === 'string') local[pair.name] = pair.value
+        }
+      }
+      if (Object.keys(local).length) storageByOrigin.set(origin, { localStorage: local })
+    }
+  }
+  return buildImportedBundle({ cookies, headersByOrigin: new Map(), storageByOrigin, allowlist })
+}
+
+const HAR_HEADER_ALLOW = /^(authorization|cookie|x-[a-z0-9-]*csrf[a-z0-9-]*|x-xsrf-token|x-tenant-id|x-org-id|x-organization-id)$/i
+
+/** Import a HAR capture: cookies, Authorization/Cookie, tenant/org/CSRF headers per origin. */
+export function importHar(input: unknown, allowlist: readonly string[]): { session: MintedPersonaSession; origins: string[] } {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new PersonaAuthError('AUTH_FAILED', 'HAR must be a JSON object.')
+  }
+  const log = (input as { log?: unknown }).log
+  const entries = log && typeof log === 'object' ? (log as { entries?: unknown }).entries : undefined
+  if (!Array.isArray(entries)) {
+    throw new PersonaAuthError('AUTH_FAILED', 'HAR is missing log.entries.')
+  }
+  const headersByOrigin = new Map<string, Record<string, string>>()
+  const cookies: PersonaCookieRecord[] = []
+  for (const entry of entries.slice(0, 5_000)) {
+    if (!entry || typeof entry !== 'object') continue
+    const request = (entry as { request?: unknown }).request
+    if (!request || typeof request !== 'object') continue
+    const req = request as { url?: unknown; headers?: unknown; cookies?: unknown }
+    if (typeof req.url !== 'string') continue
+    let origin: string
+    let parsed: URL
+    try {
+      parsed = new URL(req.url)
+      origin = parsed.origin
+    } catch {
+      continue
+    }
+    if (isOriginInScope(origin, allowlist)) {
+      const headers = headersByOrigin.get(origin) ?? {}
+      if (Array.isArray(req.headers)) {
+        for (const header of req.headers) {
+          if (!header || typeof header !== 'object') continue
+          const pair = header as { name?: unknown; value?: unknown }
+          if (typeof pair.name !== 'string' || typeof pair.value !== 'string') continue
+          if (!HAR_HEADER_ALLOW.test(pair.name)) continue
+          headers[pair.name] = pair.value
+        }
+      }
+      if (Object.keys(headers).length) headersByOrigin.set(origin, headers)
+    }
+    if (Array.isArray(req.cookies)) {
+      for (const rawCookie of req.cookies.slice(0, 64)) {
+        const cookie = storageStateCookieToRecord({
+          ...(rawCookie && typeof rawCookie === 'object' ? rawCookie : {}),
+          domain: (rawCookie && typeof rawCookie === 'object' && typeof (rawCookie as { domain?: unknown }).domain === 'string'
+            ? (rawCookie as { domain: string }).domain
+            : parsed.hostname),
+        })
+        if (cookie) cookies.push(cookie)
+      }
+    }
+  }
+  return buildImportedBundle({ cookies, headersByOrigin, storageByOrigin: new Map(), allowlist })
+}
+
 function isJwtLike(value: string): boolean {
   return value.length > 40 && value.length < 8192 && JWT_SHAPE.test(value) && value.startsWith('eyJ')
 }
@@ -374,6 +641,52 @@ async function harvestBrowserTokens(page: PlaywrightFormPage): Promise<string[]>
   } catch {
     return []
   }
+}
+
+/** Capture localStorage/sessionStorage for the final (allowlisted) page origin. */
+async function captureStorageSnapshot(
+  page: PlaywrightFormPage,
+  allowlist: readonly string[],
+): Promise<Map<string, PersonaStorageSnapshot>> {
+  const out = new Map<string, PersonaStorageSnapshot>()
+  let origin: string | null = null
+  try {
+    origin = new URL(page.url()).origin
+  } catch {
+    return out
+  }
+  if (!origin || !isOriginInScope(origin, allowlist)) return out
+  try {
+    const captured = await page.evaluate(() => {
+      const read = (store: Storage) => {
+        const values: Record<string, string> = {}
+        for (let i = 0; i < store.length && i < 128; i += 1) {
+          const key = store.key(i)
+          if (key) values[key] = store.getItem(key) ?? ''
+        }
+        return values
+      }
+      const local = (() => { try { return read(window.localStorage) } catch { return {} } })()
+      const session = (() => { try { return read(window.sessionStorage) } catch { return {} } })()
+      return { localStorage: local, sessionStorage: session }
+    }) as { localStorage?: unknown; sessionStorage?: unknown } | null
+    if (!captured || typeof captured !== 'object') return out
+    const local = captured.localStorage && typeof captured.localStorage === 'object'
+      ? captured.localStorage as Record<string, string>
+      : {}
+    const session = captured.sessionStorage && typeof captured.sessionStorage === 'object'
+      ? captured.sessionStorage as Record<string, string>
+      : {}
+    if (Object.keys(local).length || Object.keys(session).length) {
+      out.set(origin, {
+        ...(Object.keys(local).length ? { localStorage: local } : {}),
+        ...(Object.keys(session).length ? { sessionStorage: session } : {}),
+      })
+    }
+  } catch {
+    // Storage access can fail on opaque origins; a cookie-only bundle remains valid.
+  }
+  return out
 }
 
 function extractBearerToken(headerValue: string | undefined): string | null {
@@ -664,6 +977,303 @@ export function isClerkCredentialHost(originOrHost: string, allowlist: readonly 
   return exact.some(allowed => registrableDomain(allowed) === apex)
 }
 
+/**
+ * Per-worker session clone pool with coordinated single-flight refresh.
+ *
+ * v6 replaces the v5 60 s per-persona global lockout with generation-based coordination:
+ * - concurrent 401s from sibling clones join one upstream refresh (`inFlight`);
+ * - a clone that saw an older generation is told "already fresh" and retries immediately;
+ * - a clone logout/rotation is local to that clone and never cascades 401s to siblings;
+ * - `rotate()` bumps the shared generation after an out-of-band rotation (logout probe,
+ *   token swap) so sibling workers retry with the fresh credential instead of re-authenticating.
+ */
+export type PersonaSessionRefreshOutcome = 'refreshed' | 'already-fresh' | 'failed' | 'logged-out' | 'unknown'
+
+export interface PersonaSessionRegistration {
+  session: MintedPersonaSession
+  allowlist: readonly string[]
+  /** Upstream renewer (adapter refresh closure or full re-authentication). */
+  refresh?: () => Promise<MintedPersonaSession | null>
+}
+
+export interface PersonaSessionClone {
+  readonly id: string
+  readonly handle: string
+  /** Shared credential generation this clone has observed. */
+  readonly generation: number
+  isLoggedOut(): boolean
+  /** Headers (incl. scoped `Cookie`) for one origin, or null when outside the allowlist. */
+  headersFor(origin: string): Record<string, string> | null
+  storageFor(origin: string): PersonaStorageSnapshot | null
+  cookiesFor(origin: string): PersonaCookieRecord[]
+  /** Rotate this clone's cookie jar only (a logout/token-swap probe never touches siblings). */
+  applySetCookie(origin: string, setCookieLines: readonly string[]): void
+  /** Report a 401 from this clone; deduped across siblings into one upstream refresh. */
+  reportUnauthorized(observedGeneration?: number): Promise<PersonaSessionRefreshOutcome>
+  /** Drop this clone's credentials without invalidating the shared session. */
+  logout(): void
+  dispose(): void
+}
+
+interface PersonaSessionPoolEntry {
+  handle: string
+  session: MintedPersonaSession
+  allowlist: string[]
+  generation: number
+  refresh?: () => Promise<MintedPersonaSession | null>
+  inFlight?: Promise<PersonaSessionRefreshOutcome>
+  refreshCount: number
+  clones: Set<PersonaSessionCloneImpl>
+}
+
+function mergeBundleCookies(
+  bundle: PersonaCredentialBundle | undefined,
+  cookies: readonly PersonaCookieRecord[],
+): PersonaCredentialBundle | undefined {
+  const merged = new Map<string, PersonaCookieRecord>()
+  const add = (cookie: PersonaCookieRecord) => {
+    merged.set(`${cookie.name}\0${cookie.domain}\0${cookie.path}`, cookie)
+  }
+  for (const cookie of bundle?.cookies ?? []) add(cookie)
+  for (const cookie of cookies) add(cookie)
+  const all = [...merged.values()]
+  if (!bundle && !all.length) return undefined
+  return {
+    ...(bundle ?? {}),
+    v: 2,
+    ...(all.length ? { cookies: all } : {}),
+  }
+}
+
+function parseSetCookieLine(line: string, origin: URL): PersonaCookieRecord | null {
+  const parts = line.split(';')
+  const first = parts[0]?.trim() ?? ''
+  const eq = first.indexOf('=')
+  if (eq <= 0) return null
+  const name = first.slice(0, eq).trim()
+  const value = first.slice(eq + 1).trim()
+  if (!name || !value) return null
+  let domain = origin.hostname
+  let path = '/'
+  let httpOnly: boolean | undefined
+  let secure: boolean | undefined
+  let sameSite: PersonaCookieRecord['sameSite']
+  let expires: number | undefined
+  for (const attr of parts.slice(1)) {
+    const [rawKey, ...rest] = attr.split('=')
+    const key = rawKey.trim().toLowerCase()
+    const val = rest.join('=').trim()
+    if (key === 'domain' && val) domain = val.replace(/^\.+/, '')
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'secure') secure = true
+    else if (key === 'samesite') {
+      const normalized = val.toLowerCase()
+      if (normalized === 'strict') sameSite = 'Strict'
+      else if (normalized === 'lax') sameSite = 'Lax'
+      else if (normalized === 'none') sameSite = 'None'
+    } else if (key === 'max-age') {
+      const secs = Number(val)
+      if (Number.isFinite(secs) && secs >= 0) expires = Date.now() + secs * 1000
+    } else if (key === 'expires') {
+      const at = Date.parse(val)
+      if (Number.isFinite(at)) expires = at
+    }
+  }
+  return {
+    name,
+    value,
+    domain,
+    path,
+    ...(httpOnly ? { httpOnly } : {}),
+    ...(secure ? { secure } : {}),
+    ...(sameSite ? { sameSite } : {}),
+    ...(expires ? { expires } : {}),
+  }
+}
+
+export class PersonaSessionCloneImpl implements PersonaSessionClone {
+  readonly id: string
+  readonly handle: string
+  private loggedOut = false
+  private localCookies: PersonaCookieRecord[] = []
+  private seenGeneration: number
+  private readonly entry: PersonaSessionPoolEntry
+
+  constructor(handle: string, entry: PersonaSessionPoolEntry, id?: string) {
+    this.id = id ?? `clone-${handle}-${Math.random().toString(36).slice(2, 10)}`
+    this.handle = handle
+    this.entry = entry
+    this.seenGeneration = entry.generation
+    entry.clones.add(this)
+  }
+
+  get generation(): number { return this.seenGeneration }
+
+  isLoggedOut(): boolean { return this.loggedOut }
+
+  private view(): MintedPersonaSession {
+    if (!this.localCookies.length) return this.entry.session
+    return {
+      ...this.entry.session,
+      bundle: mergeBundleCookies(this.entry.session.bundle, this.localCookies),
+    }
+  }
+
+  headersFor(origin: string): Record<string, string> | null {
+    if (this.loggedOut) return null
+    const frame = frameForSessionOrigin(this.view(), this.entry.allowlist, origin, this.entry.session.headerName)
+    if (!frame || !Object.keys(frame.headers).length) return null
+    return frame.headers
+  }
+
+  storageFor(origin: string): PersonaStorageSnapshot | null {
+    if (this.loggedOut) return null
+    return frameForSessionOrigin(this.view(), this.entry.allowlist, origin, this.entry.session.headerName)?.storage ?? null
+  }
+
+  cookiesFor(origin: string): PersonaCookieRecord[] {
+    if (this.loggedOut) return []
+    return frameForSessionOrigin(this.view(), this.entry.allowlist, origin, this.entry.session.headerName)?.cookies ?? []
+  }
+
+  applySetCookie(origin: string, setCookieLines: readonly string[]): void {
+    if (this.loggedOut) return
+    let parsedOrigin: URL
+    try { parsedOrigin = new URL(origin) } catch { return }
+    const next: PersonaCookieRecord[] = []
+    for (const line of setCookieLines) {
+      const cookie = parseSetCookieLine(line, parsedOrigin)
+      if (cookie) next.push(cookie)
+    }
+    if (!next.length) return
+    this.localCookies = [...this.localCookies.filter(existing =>
+      !next.some(cookie => cookie.name === existing.name && cookie.domain === existing.domain && cookie.path === existing.path),
+    ), ...next]
+  }
+
+  async reportUnauthorized(observedGeneration?: number): Promise<PersonaSessionRefreshOutcome> {
+    if (this.loggedOut) return 'logged-out'
+    const observed = observedGeneration ?? this.seenGeneration
+    const outcome = await this.entryPoolRefresh(observed)
+    if (outcome === 'refreshed' || outcome === 'already-fresh') this.seenGeneration = this.entry.generation
+    return outcome
+  }
+
+  private entryPoolRefresh(observed: number): Promise<PersonaSessionRefreshOutcome> {
+    // The pool owns the single-flight promise; this indirection keeps the clone bound to its entry.
+    return PersonaSessionPool.refreshEntry(this.entry, observed)
+  }
+
+  logout(): void {
+    this.loggedOut = true
+    this.localCookies = []
+    this.entry.clones.delete(this)
+  }
+
+  dispose(): void {
+    this.entry.clones.delete(this)
+  }
+}
+
+export class PersonaSessionPool {
+  private readonly entries = new Map<string, PersonaSessionPoolEntry>()
+
+  register(handle: string, registration: PersonaSessionRegistration): void {
+    const existing = this.entries.get(handle)
+    if (existing) {
+      existing.session = registration.session
+      existing.allowlist = [...registration.allowlist]
+      if (registration.refresh) existing.refresh = registration.refresh
+      existing.generation += 1
+      return
+    }
+    this.entries.set(handle, {
+      handle,
+      session: registration.session,
+      allowlist: [...registration.allowlist],
+      generation: 1,
+      ...(registration.refresh ? { refresh: registration.refresh } : {}),
+      refreshCount: 0,
+      clones: new Set(),
+    })
+  }
+
+  unregister(handle: string): void {
+    const entry = this.entries.get(handle)
+    if (!entry) return
+    for (const clone of entry.clones) clone.dispose()
+    this.entries.delete(handle)
+  }
+
+  has(handle: string): boolean { return this.entries.has(handle) }
+
+  generation(handle: string): number { return this.entries.get(handle)?.generation ?? 0 }
+
+  session(handle: string): MintedPersonaSession | null { return this.entries.get(handle)?.session ?? null }
+
+  refreshCount(handle: string): number { return this.entries.get(handle)?.refreshCount ?? 0 }
+
+  clone(handle: string, id?: string): PersonaSessionClone | null {
+    const entry = this.entries.get(handle)
+    if (!entry) return null
+    return new PersonaSessionCloneImpl(handle, entry, id)
+  }
+
+  /** Log out one tracked clone; siblings and the shared credential are untouched. */
+  logoutClone(handle: string, cloneId: string): boolean {
+    const entry = this.entries.get(handle)
+    if (!entry) return false
+    for (const clone of entry.clones) {
+      if (clone.id === cloneId) {
+        clone.logout()
+        return true
+      }
+    }
+    return false
+  }
+
+  /** Replace the shared credential without an upstream call (logout probe / token swap). */
+  rotate(handle: string, session: MintedPersonaSession): number | null {
+    const entry = this.entries.get(handle)
+    if (!entry) return null
+    entry.session = session
+    entry.generation += 1
+    return entry.generation
+  }
+
+  async refresh(handle: string, observedGeneration?: number): Promise<PersonaSessionRefreshOutcome> {
+    const entry = this.entries.get(handle)
+    if (!entry) return 'unknown'
+    return PersonaSessionPool.refreshEntry(entry, observedGeneration)
+  }
+
+  static async refreshEntry(
+    entry: PersonaSessionPoolEntry,
+    observedGeneration?: number,
+  ): Promise<PersonaSessionRefreshOutcome> {
+    if (observedGeneration !== undefined && entry.generation > observedGeneration) return 'already-fresh'
+    if (!entry.refresh) return entry.inFlight ? await entry.inFlight : 'unknown'
+    if (entry.inFlight) return entry.inFlight
+    const run = (async (): Promise<PersonaSessionRefreshOutcome> => {
+      try {
+        const next = await entry.refresh!()
+        if (!next) return 'failed'
+        entry.session = next
+        entry.generation += 1
+        entry.refreshCount += 1
+        return 'refreshed'
+      } catch {
+        return 'failed'
+      } finally {
+        entry.inFlight = undefined
+      }
+    })()
+    entry.inFlight = run
+    return run
+  }
+}
+
 export class PersonaAuthManager {
   private readonly fetchImpl: typeof fetch
   private readonly fetchImplInjected: boolean
@@ -675,6 +1285,7 @@ export class PersonaAuthManager {
   private readonly hostSafety = new Map<string, { at: number; addresses: string[]; safe: boolean }>()
   private readonly runTimers = new Map<string, NodeJS.Timeout[]>()
   private readonly reauthHandlers = new Map<string, { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean> }>()
+  private readonly sessionPool = new PersonaSessionPool()
 
   constructor(options: PersonaAuthManagerOptions = {}) {
     this.fetchImplInjected = Boolean(options.fetchImpl)
@@ -682,6 +1293,8 @@ export class PersonaAuthManager {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis)
     this.launchBrowser = options.launchBrowser ?? launchDefaultChromium
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    // Legacy pacing for raw registerReauth() handlers only. Session clones (the product path)
+    // never use a time-based lockout; they coordinate through PersonaSessionPool generations.
     this.reauthMinIntervalMs = Math.max(1_000, options.reauthMinIntervalMs ?? 60_000)
     this.resolveHost = options.resolveHost ?? (async hostname => {
       const bare = hostname.replace(/^\[|\]$/g, '')
@@ -881,9 +1494,15 @@ export class PersonaAuthManager {
     return { safe, addresses }
   }
 
+  /** Shared per-run/persona session clones. Seeded by startRunRefreshers()/registerSession(). */
+  get sessions(): PersonaSessionPool { return this.sessionPool }
+
   /**
-   * Register a broker-invoked 401 re-authentication callback for a persona handle.
-   * Calls are rate-limited to at most one per minute per persona (configurable for tests).
+   * Register a raw 401 re-authentication callback for a persona handle.
+   *
+   * Kept for embedders/tests that do not use the session pool. These raw handlers retain the
+   * legacy per-handle pacing; personas registered through `registerSession()` use coordinated
+   * single-flight refresh with no global 60 s lockout.
    */
   registerReauth(handle: string, fn: () => Promise<void>): () => void {
     this.reauthHandlers.set(handle, { fn, lastAt: 0 })
@@ -893,8 +1512,34 @@ export class PersonaAuthManager {
     }
   }
 
-  /** Invoked by RequestBroker on a persona-bound 401. Returns true when a session refresh ran. */
-  async requestReauth(handle: string): Promise<boolean> {
+  /**
+   * Register a persona's composite session for clone/refresh coordination.
+   * `refresh` runs at most once for concurrent 401s across every clone of the handle.
+   */
+  registerSession(handle: string, registration: PersonaSessionRegistration): void {
+    this.sessionPool.register(handle, registration)
+  }
+
+  /** Create an independent per-worker session clone (credentials shared, cookie jar local). */
+  cloneSession(handle: string, workerId?: string): PersonaSessionClone | null {
+    return this.sessionPool.clone(handle, workerId)
+  }
+
+  /** Log out one worker clone without invalidating siblings or the shared credential. */
+  logoutSession(handle: string, cloneId: string): boolean {
+    return this.sessionPool.logoutClone(handle, cloneId)
+  }
+
+  /**
+   * Invoked by RequestBroker on a persona-bound 401. Returns true when a session refresh ran
+   * (or a sibling already refreshed this generation, in which case the caller retries with the
+   * fresh credential). Pool-backed personas never use the 60 s lockout.
+   */
+  async requestReauth(handle: string, observedGeneration?: number): Promise<boolean> {
+    if (this.sessionPool.has(handle)) {
+      const outcome = await this.sessionPool.refresh(handle, observedGeneration)
+      return outcome === 'refreshed' || outcome === 'already-fresh'
+    }
     const entry = this.reauthHandlers.get(handle)
     if (!entry) return false
     if (entry.inFlight) return entry.inFlight
@@ -915,6 +1560,41 @@ export class PersonaAuthManager {
     return run
   }
 
+
+  /** Import operator-captured session state (Playwright storageState or HAR) for MFA-hardened apps. */
+  async importSession(
+    storage: Store,
+    projectId: string,
+    personaId: string,
+    input: unknown,
+    format: 'storage-state' | 'har' | 'auto' = 'auto',
+  ): Promise<AuthenticateResult> {
+    const resolved = resolveRunPersonas(storage, projectId, [personaId])
+    const persona = [...resolved.values()][0]
+    if (!persona) throw new PersonaAuthError('AUTH_FAILED', 'Persona not found.')
+    if (persona.authKind !== 'login' || !persona.sessionPath) {
+      throw new PersonaAuthError('UNSUPPORTED_ADAPTER', `Persona "${persona.handle}" is not a login persona.`)
+    }
+    const looksLikeHar = Boolean(input && typeof input === 'object' && 'log' in (input as Record<string, unknown>))
+    const resolvedFormat = format === 'auto' ? (looksLikeHar ? 'har' : 'storage-state') : format
+    const imported = resolvedFormat === 'har'
+      ? importHar(input, persona.originAllowlist)
+      : importStorageState(input, persona.originAllowlist)
+    const session: MintedPersonaSession = {
+      ...imported.session,
+      adapterUsed: 'import',
+      scrubTokens: [...new Set([...(imported.session.scrubTokens ?? []), ...(persona.secretHistory ?? [])])],
+    }
+    writePersonaSessionFile(persona.sessionPath, session)
+    return {
+      personaId: persona.id,
+      handle: persona.handle,
+      adapterUsed: 'import',
+      headerType: session.headerType,
+      ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
+      session,
+    }
+  }
 
   async authenticatePersona(
     storage: Store,
@@ -939,18 +1619,35 @@ export class PersonaAuthManager {
     }
 
     const config = persona.loginConfig
-    let adapter: Exclude<PersonaLoginAdapter, 'auto'>
+    let adapter: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc'
     let detectedClerkFapiOrigin: string | null = null
 
-    if (config.adapter === 'auto') {
+    const crossOriginAuthUrl = (() => {
+      if (!config.loginUrl) return false
+      try {
+        const loginOrigin = new URL(config.loginUrl).origin
+        return loginOrigin !== targetOrigin && isOriginInScope(loginOrigin, persona.originAllowlist)
+      } catch {
+        return false
+      }
+    })()
+
+    if ((config.adapter as string) === 'oidc') {
+      adapter = 'oidc'
+    } else if (config.adapter === 'auto') {
       const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal)
-      if (inspected.hasClerk) {
+      if (crossOriginAuthUrl) {
+        // An allowlisted external login URL is an SSO/IdP hop, not the app's own form.
+        adapter = 'oidc'
+      } else if (inspected.hasClerk) {
         adapter = 'clerk'
         detectedClerkFapiOrigin = inspected.clerkFapiOrigin
       } else if (config.loginUrl && /\/auth\/v1\/token\b/i.test(config.loginUrl)) {
         adapter = 'supabase'
       } else if (config.loginUrl && /\/api\//i.test(config.loginUrl)) {
         adapter = 'json'
+      } else if (/data-guardian-sso|authorize\?client_id|\/oauth2\/|\/oidc\/|single sign-on/i.test(inspected.html)) {
+        adapter = 'oidc'
       } else {
         adapter = 'form'
       }
@@ -959,6 +1656,8 @@ export class PersonaAuthManager {
     }
 
     switch (adapter) {
+      case 'oidc':
+        return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal)
       case 'clerk':
         return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal)
       case 'supabase':
@@ -1531,6 +2230,306 @@ export class PersonaAuthManager {
     )
   }
 
+  /**
+   * Interactive enterprise SSO login: Playwright-driven OIDC/OAuth2 through the persona's
+   * existing origin allowlist (the `authOrigins` contract), with optional TOTP generation.
+   * Every navigation/subresource is origin-guarded and DNS-pinned exactly like the form adapter.
+   */
+  private async authenticateOidc(
+    persona: ResolvedPersona,
+    config: PersonaLoginConfig,
+    email: string,
+    password: string,
+    targetOrigin: string,
+    signal?: AbortSignal,
+  ): Promise<AuthenticateResult> {
+    const ext = config as PersonaLoginConfig & {
+      authOrigins?: string[]
+      totpSeed?: string
+      headers?: Record<string, string>
+      postLoginUrl?: string
+    }
+    const loginUrl = config.loginUrl || targetOrigin
+    const loginTarget = await this.assertCredentialTarget(
+      loginUrl,
+      persona.originAllowlist,
+      'OIDC login URL',
+      { requireResolution: false },
+    )
+    // `authOrigins` are the existing allowlisted origins (target + IdP); a runtime extra list is
+    // only honoured when every entry is already inside that allowlist.
+    const authOrigins = [...new Set([
+      ...allowlistOrigins(persona.originAllowlist),
+      loginTarget.url.origin,
+      ...(Array.isArray(ext.authOrigins) ? ext.authOrigins : []),
+    ])].filter(origin => origin === loginTarget.url.origin || isOriginInScope(origin, persona.originAllowlist))
+    const allowedOrigins = new Set<string>([...authOrigins, loginTarget.url.origin])
+    const scopeForSubresources = [...persona.originAllowlist, loginTarget.url.origin]
+    const totpSeed = typeof ext.totpSeed === 'string' ? ext.totpSeed : ''
+    if (totpSeed && !normalizeTotpSeed(totpSeed)) {
+      throw new PersonaAuthError('AUTH_FAILED', 'Persona TOTP seed is not valid base32.')
+    }
+    const validatedLoginUrl = loginTarget.url.toString()
+
+    const pinnedHosts = new Map<string, string[]>()
+    const pinCandidates = new Set<string>([
+      normalizeHostname(loginTarget.url.hostname),
+      normalizeHostname(new URL(targetOrigin).hostname),
+      ...allowedHostnames(persona.originAllowlist),
+      ...authOrigins.map(origin => {
+        try { return normalizeHostname(new URL(origin).hostname) } catch { return '' }
+      }),
+    ])
+    await Promise.all([...pinCandidates].filter(Boolean).map(async host => {
+      try {
+        const addresses = await this.resolveHost(host)
+        if (addresses.length > 0) pinnedHosts.set(host, addresses)
+      } catch {
+        // Unresolvable hosts get no MAP rule and therefore cannot connect.
+      }
+    }))
+
+    let browser: PlaywrightFormBrowserLike | undefined
+    let context: PlaywrightFormContext | undefined
+    let page: PlaywrightFormPage | undefined
+    let captchaRouteHit = false
+    const interceptedBearer = new Set<string>()
+
+    const captchaVisible = async (p: PlaywrightFormPage): Promise<boolean> => {
+      if (captchaRouteHit) return true
+      const frameUrls = p.frames?.().map(f => f.url()) ?? []
+      if (frameUrls.some(u => CAPTCHA_PATTERN.test(u))) return true
+      const dom = await p.evaluate(() => {
+        const selectors = [
+          'iframe[src*="challenges.cloudflare.com"]',
+          'iframe[src*="turnstile"]',
+          'iframe[src*="recaptcha"]',
+          'iframe[src*="hcaptcha"]',
+          'iframe[src*="arkoselabs"]',
+          'input[name="cf-turnstile-response"]',
+          '.cf-turnstile',
+          '.g-recaptcha',
+          '.h-captcha',
+          '[data-captcha-provider]',
+        ]
+        if (selectors.some(selector => document.querySelector(selector))) return { captcha: true }
+        const text = (document.body?.innerText || '').slice(0, 4000)
+        return { captcha: /verify you are human|complete the captcha|cloudflare security check/i.test(text) }
+      }) as unknown as { captcha?: boolean } | boolean
+      if (typeof dom === 'boolean') return dom
+      return Boolean(dom && typeof dom === 'object' && dom.captcha)
+    }
+    const otpVisible = async (p: PlaywrightFormPage): Promise<boolean> =>
+      await p.locator('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="totp" i], input[name*="verification" i], input[id*="otp" i]').first().count() > 0
+    const submit = async (p: PlaywrightFormPage, fallbackSelector: string): Promise<void> => {
+      const btn = p.locator('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Continue"), button:has-text("Verify"), button:has-text("Next")').first()
+      if (await btn.count() > 0) await btn.click({ timeout: 5_000 })
+      else await p.locator(fallbackSelector).first().press?.('Enter', { timeout: 5_000 })
+    }
+
+    try {
+      browser = await this.launchBrowser(pinnedHosts)
+      context = await browser.newContext({
+        ignoreHTTPSErrors: false,
+        javaScriptEnabled: true,
+        bypassCSP: false,
+        serviceWorkers: 'block',
+      })
+      await context.addInitScript?.(webrtcGuardScript)
+      if (typeof context.routeWebSocket === 'function') {
+        await context.routeWebSocket('**/*', async ws => {
+          try {
+            const url = new URL(ws.url())
+            const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
+            if ((url.protocol !== 'wss:' && url.protocol !== 'ws:') || !allowedOrigins.has(websocketOrigin) ||
+              typeof ws.connectToServer !== 'function') {
+              await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+              return
+            }
+            await ws.connectToServer()
+          } catch {
+            await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+          }
+        })
+      } else if (context.addInitScript) {
+        await context.addInitScript(formTransportDenyScript)
+      }
+      await context.route('**/*', async route => {
+        const reqUrl = route.request().url()
+        const requestHeaders = route.request().headers?.()
+        const bearer = extractBearerToken(requestHeaders?.authorization ?? requestHeaders?.Authorization)
+        if (bearer) interceptedBearer.add(bearer)
+        if (CAPTCHA_PATTERN.test(reqUrl)) {
+          captchaRouteHit = true
+          await route.abort('blockedbyclient')
+          return
+        }
+        let parsed: URL
+        try { parsed = new URL(reqUrl) } catch {
+          await route.abort('blockedbyclient')
+          return
+        }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+          if (parsed.protocol === 'about:' || parsed.protocol === 'data:' || parsed.protocol === 'blob:') {
+            if (route.fulfill) await route.fulfill({ status: 200, contentType: 'text/plain', body: '' })
+            else await route.abort('blockedbyclient')
+          } else {
+            await route.abort('blockedbyclient')
+          }
+          return
+        }
+        try {
+          const origin = parsed.origin
+          const method = (route.request().method?.() ?? 'GET').toUpperCase()
+          const resourceType = route.request().resourceType?.() ?? 'document'
+          const isReadOnly = method === 'GET' || method === 'HEAD'
+          const exactAllowed = allowedOrigins.has(origin)
+          const inScopeSubresource = isReadOnly && resourceType !== 'document' && isOriginInScope(origin, scopeForSubresources)
+          if (parsed.protocol === 'http:' && !exactAllowed) {
+            await route.abort('blockedbyclient')
+            return
+          }
+          if (!exactAllowed && !inScopeSubresource) {
+            await route.abort('blockedbyclient')
+            return
+          }
+          const safety = await this.browserHostSafety(origin, scopeForSubresources)
+          if (!safety.safe) {
+            await route.abort('blockedbyclient')
+            return
+          }
+          const pinned = pinnedHosts.get(normalizeHostname(parsed.hostname))
+          if (pinned && !safety.addresses.some(address => pinned.includes(address))) {
+            await route.abort('blockedbyclient')
+            return
+          }
+          await route.continue()
+        } catch {
+          await route.abort('blockedbyclient')
+        }
+      })
+
+      page = await context.newPage()
+      await page.goto(validatedLoginUrl, { waitUntil: 'domcontentloaded', timeout: this.timeoutMs })
+      await page.waitForTimeout(400)
+
+      // A script tag alone is never proof of a challenge. Only a rendered widget/challenge
+      // endpoint is; and after submission, only an actual challenge failure blocks the login.
+      if (await captchaVisible(page)) {
+        throw new PersonaAuthError('CAPTCHA_DETECTED', captchaAbortMessage(validatedLoginUrl))
+      }
+
+      const ssoSelector = '[data-guardian-sso], a[href*="authorize?client_id"], a[href*="/oauth2/"], a[href*="/oidc/"], button:has-text("Single sign-on"), button:has-text("SSO"), button:has-text("Sign in with"), button:has-text("Continue with")'
+      const ssoButton = page.locator(ssoSelector).first()
+      if (await ssoButton.count() > 0) {
+        await ssoButton.click({ timeout: 5_000 })
+        await page.waitForLoadState?.('domcontentloaded', { timeout: 5_000 }).catch(() => undefined)
+        await page.waitForTimeout(600)
+      }
+
+      const emailSelector = 'input[type="email"], input[name="identifier"], input[name*="email" i], input[name*="user" i], input[autocomplete="email"], input[autocomplete="username"]'
+      const passwordSelector = 'input[type="password"]'
+      const emailInput = page.locator(emailSelector).first()
+      if (await emailInput.count() > 0) {
+        await emailInput.fill(email, { timeout: 5_000 })
+        await submit(page, emailSelector)
+        await page.waitForTimeout(800)
+      }
+
+      let passwordInput = page.locator(passwordSelector).first()
+      if (await passwordInput.count() > 0) {
+        await passwordInput.fill(password, { timeout: 5_000 })
+        await submit(page, passwordSelector)
+      }
+
+      await page.waitForTimeout(800)
+      // TOTP challenge (only when the IdP actually presents a code field).
+      if (await otpVisible(page)) {
+        if (!totpSeed) {
+          throw new PersonaAuthError('MFA_REQUIRED', mfaAbortMessage(email))
+        }
+        const otpInput = page.locator('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="totp" i], input[name*="verification" i], input[id*="otp" i]').first()
+        await otpInput.fill(generateTotp(totpSeed), { timeout: 5_000 })
+        await submit(page, 'input[autocomplete="one-time-code"], input[name*="otp" i]')
+        await page.waitForTimeout(800)
+      }
+
+      await page.waitForLoadState?.('networkidle', { timeout: 5_000 }).catch(() => undefined)
+      await page.waitForTimeout(500)
+
+      // Post-submit: a challenge that actually blocked the login is terminal; otherwise proceed.
+      if (await captchaVisible(page)) {
+        throw new PersonaAuthError('CAPTCHA_DETECTED', captchaAbortMessage(validatedLoginUrl))
+      }
+      if (await otpVisible(page)) {
+        throw new PersonaAuthError('MFA_REQUIRED', mfaAbortMessage(email))
+      }
+      const finalUrl = page.url()
+      if (new URL(finalUrl).origin === loginTarget.url.origin && await page.locator(passwordSelector).first().count() > 0) {
+        throw new PersonaAuthError('INVALID_CREDENTIALS', `OIDC login on ${validatedLoginUrl} did not complete.`)
+      }
+
+      const rawCookies = await context.cookies([...persona.originAllowlist])
+      const cookieRecords: PersonaCookieRecord[] = []
+      for (const cookie of rawCookies) {
+        if (!cookie.name || !cookie.value || !cookie.domain) continue
+        cookieRecords.push({
+          name: cookie.name,
+          value: cookie.value,
+          domain: cookie.domain,
+          path: cookie.path ?? '/',
+          ...(cookie.httpOnly ? { httpOnly: true } : {}),
+          ...(cookie.secure ? { secure: true } : {}),
+          ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
+          ...(typeof cookie.expires === 'number' && cookie.expires > 0 ? { expires: Math.floor(cookie.expires * 1000) } : {}),
+        })
+      }
+      const storageTokens = await harvestBrowserTokens(page)
+      const bearerToken = [...storageTokens, ...interceptedBearer].find(token => isJwtLike(token))
+      const headersByOrigin = new Map<string, Record<string, string>>()
+      if (ext.headers && typeof ext.headers === 'object') {
+        for (const origin of allowlistOrigins(persona.originAllowlist)) {
+          headersByOrigin.set(origin, { ...ext.headers })
+        }
+      }
+      const storageByOrigin = await captureStorageSnapshot(page, persona.originAllowlist)
+
+      if (!cookieRecords.length && !bearerToken) {
+        throw new PersonaAuthError('INVALID_CREDENTIALS', `OIDC login on ${validatedLoginUrl} produced no session cookies or Bearer JWT for allowlisted origins.`)
+      }
+
+      let session: MintedPersonaSession
+      if (!cookieRecords.length && bearerToken) {
+        const claims = decodeJwtPayload(bearerToken)
+        session = {
+          headerType: 'bearer',
+          value: bearerToken,
+          adapterUsed: 'form',
+          ...(claims?.exp ? { expiresAt: claims.exp * 1000 } : {}),
+          scrubTokens: [bearerToken, ...storageTokens, ...interceptedBearer],
+        }
+      } else {
+        const imported = buildImportedBundle({ cookies: cookieRecords, headersByOrigin, storageByOrigin, allowlist: persona.originAllowlist, fallbackOrigin: loginTarget.url.origin })
+        session = { ...imported.session, adapterUsed: 'form' }
+        if (bearerToken) session.scrubTokens = [...new Set([...(session.scrubTokens ?? []), bearerToken, ...storageTokens, ...interceptedBearer])]
+      }
+      writePersonaSessionFile(persona.sessionPath!, session)
+      const claims = session.headerType === 'bearer' ? decodeJwtPayload(session.value) : null
+      return {
+        personaId: persona.id,
+        handle: persona.handle,
+        adapterUsed: 'form',
+        headerType: session.headerType,
+        ...(claims?.exp ? { expiresAt: claims.exp * 1000 } : {}),
+        session,
+      }
+    } finally {
+      await page?.close().catch(() => undefined)
+      await context?.close().catch(() => undefined)
+      await browser?.close().catch(() => undefined)
+    }
+  }
+
   private async authenticateForm(
     persona: ResolvedPersona,
     config: PersonaLoginConfig,
@@ -1603,11 +2602,8 @@ export class PersonaAuthManager {
         for (const sel of captchaSelectors) {
           if (document.querySelector(sel)) return { captcha: true, mfa: false }
         }
-        const scripts = Array.from(document.querySelectorAll('script[src]'))
-          .map(s => s.getAttribute('src') || '')
-        if (scripts.some(src => /challenges\.cloudflare\.com\/turnstile|google\.com\/recaptcha|hcaptcha\.com\/1\/api/i.test(src))) {
-          return { captcha: true, mfa: false }
-        }
+        // A CAPTCHA *script tag* is not a challenge: many SPAs bundle reCAPTCHA/Turnstile
+        // loaders but never invoke them. Only a rendered widget/iframe or challenge text blocks.
         const text = (document.body?.innerText || '').slice(0, 4000)
         const captchaText = /verify you are human|complete the captcha|cloudflare security check/i.test(text)
         const mfaText = /two-factor|2fa code|authenticator app|enter verification code|second factor/i.test(text)
@@ -1773,8 +2769,20 @@ export class PersonaAuthManager {
 
       const cookies = await context.cookies([...persona.originAllowlist])
       const cookieMap = new Map<string, string>()
+      const cookieRecords: PersonaCookieRecord[] = []
       for (const c of cookies) {
-        if (c.name && c.value) cookieMap.set(c.name, c.value)
+        if (!c.name || !c.value || !c.domain) continue
+        cookieMap.set(c.name, c.value)
+        cookieRecords.push({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path ?? '/',
+          ...(c.httpOnly ? { httpOnly: true } : {}),
+          ...(c.secure ? { secure: true } : {}),
+          ...(c.sameSite ? { sameSite: c.sameSite } : {}),
+          ...(typeof c.expires === 'number' && c.expires > 0 ? { expires: Math.floor(c.expires * 1000) } : {}),
+        })
       }
 
       // Harvest Bearer JWTs from storage + intercepted XHR Authorization headers (SPA logins).
@@ -1803,11 +2811,29 @@ export class PersonaAuthManager {
           adapterUsed: 'form',
           headerType: 'bearer',
           ...(claims?.exp ? { expiresAt: claims.exp * 1000 } : {}),
+          session,
         }
       }
 
       const cookieHeader = cookiesToHeader(cookieMap)
+      // Persist the composite bundle so HttpOnly cookies, storage, and per-origin rules survive
+      // the browser session (the legacy Cookie value is kept for single-header consumers).
+      const imported = buildImportedBundle({
+        cookies: cookieRecords,
+        headersByOrigin: new Map(),
+        storageByOrigin: await captureStorageSnapshot(page, persona.originAllowlist),
+        allowlist: persona.originAllowlist,
+        fallbackOrigin: (() => {
+          try {
+            const origin = new URL(page!.url()).origin
+            return isOriginInScope(origin, persona.originAllowlist) ? origin : loginOrigin
+          } catch {
+            return loginOrigin
+          }
+        })(),
+      })
       const session: MintedPersonaSession = {
+        ...imported.session,
         headerType: 'cookie',
         value: cookieHeader,
         adapterUsed: 'form',
@@ -1820,6 +2846,7 @@ export class PersonaAuthManager {
         handle: persona.handle,
         adapterUsed: 'form',
         headerType: 'cookie',
+        session,
       }
     } finally {
       await page?.close().catch(() => undefined)
@@ -1849,12 +2876,33 @@ export class PersonaAuthManager {
       for (const persona of loginPersonas) {
         const result = await this.authenticatePersona(storage, projectId, persona.id, signal)
         results.push(result)
-        // Broker-invoked 401 re-auth uses the existing refresh closure when available,
-        // otherwise re-runs the full adapter (both are rate-limited to <=1/60s/persona).
         const reauthRefresh = result.refresh
-        this.registerReauth(persona.handle, async () => {
+        const reloadSession = (): MintedPersonaSession | null => {
+          try {
+            return resolveRunPersonas(storage, projectId, [persona.id]).get(persona.handle)?.session ?? null
+          } catch {
+            return null
+          }
+        }
+        const runRefresh = async (): Promise<MintedPersonaSession | null> => {
           if (reauthRefresh) await reauthRefresh()
           else await this.authenticatePersona(storage, projectId, persona.id, signal)
+          return reloadSession()
+        }
+        const seeded = reloadSession() ?? result.session ?? null
+        if (seeded) {
+          // v6: per-worker clones coordinate a single-flight refresh with no 60 s lockout.
+          this.registerSession(persona.handle, {
+            session: seeded,
+            allowlist: persona.originAllowlist,
+            refresh: runRefresh,
+          })
+        }
+        // Raw-handler registration is kept for embedders that call requestReauth() directly
+        // without the pool; pool-backed requests bypass this pacing entirely.
+        this.registerReauth(persona.handle, async () => {
+          const fresh = await runRefresh()
+          if (fresh) this.sessionPool.rotate(persona.handle, fresh)
         })
         storage.event(
           runId,
@@ -1890,6 +2938,8 @@ export class PersonaAuthManager {
               }
             }).finally(() => {
               refreshing = false
+              const latest = reloadSession()
+              if (latest) this.sessionPool.rotate(persona.handle, latest)
             })
           }, intervalMs)
           timer.unref?.()
