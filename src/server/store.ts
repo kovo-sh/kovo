@@ -79,7 +79,7 @@ import {
 } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-judge.ts'
-import { normalizeEndpointTemplate } from './dedupe.ts'
+import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './dedupe.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { listProjectPersonas } from './persona-vault.ts'
 import { isSafeMetadataPath, redact, redactHeaders, redactJsonValue, secretMatchKinds } from './redact.ts'
@@ -2796,16 +2796,49 @@ export class Store {
   findDuplicateChainFinding(
     runId: string,
     goalRevision: number,
-    candidate: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title'>,
+    candidate: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title' | 'fingerprintHash'> & {
+      endpoint?: string | null
+      method?: string | null
+      param?: string | null
+      graphqlField?: string | null
+    },
     excludeId?: string,
   ) {
-    const key = chainFindingDedupKey(candidate)
+    const originWide = isOriginWideCwe(candidate.cwe, candidate.category)
+    const legacyKey = chainFindingDedupKey(candidate)
+    // Prefer the structural fingerprint: (origin, endpoint, method, param/resolver, cwe). Two BOLA
+    // routes, two verbs, two parameters or two GraphQL resolvers on one host stay distinct.
+    const candidateHash = candidate.fingerprintHash ?? (candidate.endpoint
+      ? computeFindingFingerprint({
+          origin: candidate.origin,
+          cwe: candidate.cwe,
+          category: candidate.category,
+          endpoint: candidate.endpoint,
+          method: candidate.method,
+          param: candidate.param,
+          graphqlField: candidate.graphqlField,
+        }).hash
+      : null)
+    const candidateOrigin = candidate.origin.trim().toLowerCase()
+    const candidateCwe = (candidate.cwe ?? '').trim().toUpperCase()
     const rows = this.db.select().from(tables.findings).where(and(
       eq(tables.findings.runId, runId),
       eq(tables.findings.goalRevision, goalRevision),
       eq(tables.findings.findingKind, 'multi_step_chain'),
     )).all()
-    const matches = rows.filter(row => row.id !== excludeId && chainFindingDedupKey(row.finding) === key)
+    const matches = rows.filter(row => {
+      if (row.id === excludeId) return false
+      // Origin-wide classes (CORS/CSP/HSTS/TLS/cookies) collapse per host even across routes.
+      if (originWide) {
+        const rowOrigin = row.finding.origin.trim().toLowerCase()
+        const rowCwe = (row.finding.cwe ?? '').trim().toUpperCase()
+        if (rowOrigin === candidateOrigin && rowCwe === candidateCwe) return true
+      }
+      const rowHash = row.fingerprintHash ?? row.finding.fingerprintHash ?? null
+      if (candidateHash && rowHash) return candidateHash === rowHash
+      // Legacy rows without a fingerprint may only collapse via the fingerprint-free key.
+      return !candidateHash && !rowHash && chainFindingDedupKey(row.finding) === legacyKey
+    })
     if (!matches.length) return undefined
     // Prefer confirmed duplicate first, then static_verified, then pending, then others
     const order: Record<Finding['status'], number> = {

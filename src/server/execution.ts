@@ -4255,6 +4255,7 @@ export class Execution {
         specKind: existingFields?.specKind ?? null,
         method: existingFields?.method ?? null,
         param: existingFields?.param ?? null,
+        graphqlField: existingFields?.graphqlField ?? null,
         fingerprintHash: row.fingerprintHash ?? null,
       }
     })
@@ -4269,6 +4270,7 @@ export class Execution {
       specKind: fields.specKind,
       method: fields.method,
       param: fields.param,
+      graphqlField: fields.graphqlField,
     }, existingRefs)
     if (duplicate.isDuplicate) return null
 
@@ -6251,6 +6253,7 @@ export class Execution {
               specKind: existingFields?.specKind ?? null,
               method: existingFields?.method ?? null,
               param: existingFields?.param ?? null,
+              graphqlField: existingFields?.graphqlField ?? null,
               reason: row.finding.reason,
               impact: row.finding.impact,
               remediation: row.finding.remediation,
@@ -6278,6 +6281,7 @@ export class Execution {
               specKind: specDedupeFields.specKind,
               method: specDedupeFields.method,
               param: specDedupeFields.param,
+              graphqlField: specDedupeFields.graphqlField,
               reason: parsed.severityRationale,
               impact: parsed.impact,
               remediation: parsed.remediation,
