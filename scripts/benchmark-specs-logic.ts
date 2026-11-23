@@ -286,24 +286,42 @@ export function synthSecretDisclosure(o: HypothesisOutcome, env: ProbeEnv): Synt
   if (repeat) steps.push(stepOf(env, 'p2', 'probe', 'Re-read the resource to confirm the secret persists', make('p2', 'probe', 'probe', path, actor), actor))
 
   const controlDeniedOrMasked = `((${matcher.expr('c1')}) | not)`
+  // Pre-redaction fingerprint proof: the broker records a truncated SHA-256 of each secret-shaped
+  // value it scrubbed. When the probe observed the same fingerprint as the entitled view, assert on
+  // that structural evidence instead of relying on the redaction placeholder text.
+  const fingerprints = Array.isArray(hit.secretFingerprints)
+    ? (hit.secretFingerprints as unknown[])
+      .filter((v): v is string => typeof v === 'string' && /^[0-9a-f]{8,64}$/i.test(v))
+      .slice(0, 4)
+    : []
+  const fpMatches = (stepId: string) => fingerprints.length === 0
+    ? '0'
+    : `([(.steps.${stepId}.secretMatches // [])[].sha256Prefix | select(${fingerprints.map(f => `. == ${jqStr(f)}`).join(' or ')})] | length)`
   // Sensitive field names (secret/token) are scrubbed by the broker before the verifier sees the
   // body, so the shape match may be unavailable. In that case a strictly larger probe body than a
   // masked/denied control is the observable differential: a masked preview cannot be longer than the
   // value it masks, and the hardened twin returns the same masked body to every actor.
   const controlSmaller = `((.steps.p1.bodyBytes // 0) > ((.steps.c1.bodyBytes // 0) + 4))`
   const probeLarger = `((.steps.p1.bodyBytes // 0) >= ((.steps.c1.bodyBytes // 0) + 8) and ((.steps.p1.mediaType // "") | test("json")))`
-  const confirmed = `(${is2xx('p1')} and (${matcher.expr('p1')} or ${probeLarger})` +
-    `${repeat ? ` and ${is2xx('p2')} and (${matcher.expr('p2')} or ((${probeLarger}) and (.steps.p2.bodyBytes >= .steps.p1.bodyBytes)))` : ''})`
-  const jq = `{ controlPassed: ((${is2xx('c1')} or (.steps.c1.status == 401 or .steps.c1.status == 403)) and ${controlDeniedOrMasked} and ((${controlSmaller}) or (.steps.c1.status == 401 or .steps.c1.status == 403))), ` +
+  const fingerprintProof = fingerprints.length > 0
+  const confirmed = fingerprintProof
+    ? `(${is2xx('p1')} and (${fpMatches('p1')} >= 1)` +
+      `${repeat ? ` and ${is2xx('p2')} and (${fpMatches('p2')} >= 1)` : ''})`
+    : `(${is2xx('p1')} and (${matcher.expr('p1')} or ${probeLarger})` +
+      `${repeat ? ` and ${is2xx('p2')} and (${matcher.expr('p2')} or ((${probeLarger}) and (.steps.p2.bodyBytes >= .steps.p1.bodyBytes)))` : ''})`
+  const controlPassed = fingerprintProof
+    ? `((${is2xx('c1')} or (.steps.c1.status == 401 or .steps.c1.status == 403)) and (${fpMatches('c1')} == 0))`
+    : `((${is2xx('c1')} or (.steps.c1.status == 401 or .steps.c1.status == 403)) and ${controlDeniedOrMasked} and ((${controlSmaller}) or (.steps.c1.status == 401 or .steps.c1.status == 403)))`
+  const jq = `{ controlPassed: ${controlPassed}, ` +
     `confirmed: ${confirmed}, ` +
-    `observed: ("control bytes=" + (.steps.c1.bodyBytes // 0 | tostring) + " probe bytes=" + (.steps.p1.bodyBytes // 0 | tostring)), ` +
+    `observed: ("control bytes=" + (.steps.c1.bodyBytes // 0 | tostring) + " probe bytes=" + (.steps.p1.bodyBytes // 0 | tostring) + " probe matches=" + (${fpMatches('p1')} | tostring)), ` +
     `expected: "tenant secrets are only served to entitled principals" }`
   return [{
     kind: 'http_chain',
     spec: {
       ...baseFields(env, 'Tenant secret disclosed to a non-entitled principal', 'CWE-200', 'information-disclosure', 'high', jq),
       kind: 'http_chain',
-      proofPatterns: [matcher.pattern],
+      ...(fingerprintProof ? {} : { proofPatterns: [matcher.pattern] }),
       steps,
     },
   }]

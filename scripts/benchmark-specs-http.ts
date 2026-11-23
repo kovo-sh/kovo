@@ -47,6 +47,157 @@ function matrixRows(o: HypothesisOutcome): MatrixRow[] | null {
   return matrix.filter((row): row is MatrixRow => Boolean(row) && typeof row === 'object')
 }
 
+interface ReadTarget {
+  path: string
+  /** A detail route returns one object; a list route is matched by identifier presence. */
+  detail: boolean
+  /** List route chosen by noun/synonym fallback rather than a harvested identifier pool. */
+  reserved: boolean
+}
+
+const memberNoun = /(?:^|[/_-])(?:people|members?|users?|staff|accounts?|persons?|employees?)(?:$|[/_.-])/i
+
+function listPathFor(env: ProbeEnv, id: string, endpointPath: string): { path: string; reserved: boolean } | null {
+  const pools = [...(env.idCache ?? new Map<string, string[]>()).entries()]
+  const matched = pools.filter(([, ids]) => ids.includes(id))
+  const rank = (key: string) => (env.owner && key.startsWith(`${env.owner}|`) ? 0 : 1)
+  matched.sort((a, b) => rank(a[0]) - rank(b[0]))
+  for (const [key] of matched) {
+    const candidate = key.slice(key.indexOf('|') + 1)
+    if (candidate.startsWith('/') && !candidate.startsWith('//') && !hasPathPlaceholder(candidate)) {
+      return { path: candidate, reserved: false }
+    }
+  }
+  // The probe may already have consumed every identifier in the pool (a delete target list is
+  // empty after the matrix). Fall back to a discovered collection of the same record family; the
+  // replay re-reads it to reserve a live identifier before mutating.
+  if (!memberNoun.test(endpointPath)) return null
+  const candidate = (env.endpoints ?? [])
+    .filter(e => e.method.toUpperCase() === 'GET' && !e.path.includes('?') && !hasPathPlaceholder(e.path) && memberNoun.test(e.path))
+    .map(e => e.path)
+    .sort((a, b) => Number(/admin|internal/i.test(a)) - Number(/admin|internal/i.test(b)) || a.length - b.length || a.localeCompare(b))[0]
+  return candidate ? { path: candidate, reserved: true } : null
+}
+
+/**
+ * Find a read route that can prove a mutation changed state: prefer a detail GET under a collection
+ * that was already observed to contain the resource id, else the collection list itself. Derived
+ * only from the run's own harvested identifier pools and discovered surface.
+ */
+function inferReadTarget(env: ProbeEnv, id: string, endpointPath: string): ReadTarget | null {
+  const list = listPathFor(env, id, endpointPath)
+  if (!list) return null
+  if (list.reserved) return { path: list.path, detail: false, reserved: true }
+  const depth = list.path.split('?')[0].split('/').filter(Boolean).length
+  const detail = (env.endpoints ?? [])
+    .filter(e => e.method.toUpperCase() === 'GET' && !e.path.includes('?') && hasPathPlaceholder(e.path))
+    .map(e => e.path)
+    .filter(p => p.startsWith(`${list.path}/`) && p.split('/').filter(Boolean).length === depth + 1)
+    .sort((a, b) => a.length - b.length || a.localeCompare(b))[0]
+  return detail
+    ? { path: fillPlaceholders(detail, encodeURIComponent(id)), detail: true, reserved: false }
+    : { path: list.path, detail: false, reserved: false }
+}
+
+/** Privileged literal asserted on the post-mutation read (never a raw secret; role/plan/boolean only). */
+function privilegedLiteral(bodyTemplate: unknown): string | null {
+  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
+  for (const [key, value] of Object.entries(bodyTemplate as Record<string, unknown>)) {
+    if (!/role|admin|privilege|permission|scope|plan|tier|owner|staff|super/i.test(key)) continue
+    if (typeof value === 'string' && /^[a-z][a-z0-9_-]{2,31}$/i.test(value)) return value
+  }
+  return null
+}
+
+function mutationPath(endpointPath: string, id: string): string {
+  const encoded = id.startsWith('{{') ? id : encodeURIComponent(id)
+  return endpointPath.replace(/\{\{[^}]+\}\}|:[A-Za-z0-9_]+|\[[^\]]+\]/g, () => encoded)
+}
+
+/**
+ * Unauthorized mutation proven by state delta: the authorized actor reads the resource before the
+ * probe write, the lower-privileged actor mutates it, and a post-write read shows the change (or the
+ * object's disappearance for a delete). Identifier-bound, so a trivial `{ok:true}` acknowledgement
+ * cannot pass on its own.
+ */
+function stateDeltaSpec(
+  o: HypothesisOutcome, env: ProbeEnv, read: ReadTarget, id: string, method: string,
+  bodyTemplate: unknown, probePersona: string | null, privileged: string | null,
+): SynthesizedSpec[] {
+  const stepExtra = env.caps.sessionAndCsrf ? { csrfBind: true } : {}
+  // The reserved-victim proof must read and mutate as the same low-privileged actor: a reader in one
+  // tenant and a writer in another cannot prove a same-tenant deletion.
+  const writer = env.viewer ?? (probePersona && probePersona !== env.other ? probePersona : null)
+  const title = method === 'DELETE' ? 'Cross-actor object deletion (state delta)' : 'Cross-actor object mutation (state delta)'
+  const common = (jq: string) => ({
+    ...baseFields(env, title, 'CWE-639', 'broken-access-control', 'high', jq),
+    kind: 'http_chain' as const,
+    steps: [] as Array<Record<string, unknown>>,
+  })
+
+  // A delete consumes the identifier the probe observed. Reserve a live member from the same
+  // collection inside the replay instead of reusing a record that is already gone.
+  if (method === 'DELETE' && !read.detail) {
+    if (!writer) return []
+    const specs: SynthesizedSpec[] = []
+    for (const selector of ['items.1.id', '1.id', 'items[1].id']) {
+      const hasVictim = (stepId: string) => `((.steps.${stepId}.body | index($v)) != null)`
+      const controlPassed = `(${is2xx('c1')} and (($v | length) > 0) and ${hasVictim('c1')})`
+      const goneByAbsence = `((${is2xx('p2')}) and ((${hasVictim('p2')}) | not) and ((.steps.p2.body | length) > 0))`
+      const goneByError = `((.steps.p2.status >= 400) and (.steps.p2.status < 500))`
+      const afterGone = `((($v | length) > 0) and (${goneByAbsence} or ${goneByError}))`
+      const jq = `(.extractedVars.victim_id // "") as $v | ` +
+        `{ controlPassed: ${controlPassed}, ` +
+        `confirmed: (${is2xx('p1')} and ${afterGone}), ` +
+        `observed: ("probe status=" + (.steps.p1.status | tostring) + " after status=" + (.steps.p2.status | tostring)), ` +
+        `reason: ("c1=" + (.steps.c1.status | tostring) + " victim=" + ($v | tostring) + " p1=" + (.steps.p1.status | tostring) + " p2=" + (.steps.p2.status | tostring)), ` +
+        'expected: "non-owner deletion must be denied" }'
+      specs.push({
+        kind: 'http_chain',
+        spec: {
+          ...common(jq),
+          steps: [
+            {
+              ...stepOf(env, 'c1', 'control', 'Lower-privileged actor reads the member collection', { method: 'GET', pathAndQuery: read.path }, writer, {}, [200]),
+              extract: [{ varName: 'victim_id', from: 'json' as const, selector }],
+            },
+            stepOf(env, 'p1', 'probe', 'Lower-privileged actor deletes a live member by identifier', { method: 'DELETE', pathAndQuery: mutationPath(o.hyp.endpoint.path, '{{victim_id}}'), ...(stepExtra) }, writer),
+            stepOf(env, 'p2', 'probe', 'Lower-privileged actor re-reads the member collection', { method: 'GET', pathAndQuery: read.path }, writer),
+          ],
+        },
+      })
+    }
+    return specs
+  }
+
+  const parts: RequestParts = {
+    method: method as RequestParts['method'],
+    pathAndQuery: mutationPath(o.hyp.endpoint.path, id),
+    ...(method !== 'DELETE' ? { jsonBody: bodyTemplate } : {}),
+  }
+  const idLit = jqStr(id)
+  const before = read.detail
+    ? `(${is2xx('c1')} and ((.steps.c1.body | length) > 2))`
+    : `(${is2xx('c1')} and ((.steps.c1.body | index(${idLit})) != null))`
+  const after: string = method === 'DELETE'
+    ? `(((.steps.p2.status >= 400) and (.steps.p2.status < 500)) or (${is2xx('p2')} and ((.steps.p2.body | index(${idLit})) == null) and (.steps.p2.body != .steps.c1.body)))`
+    : `(${is2xx('p2')} and (.steps.p2.body != .steps.c1.body)${privileged ? ` and ((.steps.p2.body | ascii_downcase) | contains(${jqStr(privileged.toLowerCase())}))` : ''})`
+  const jq = `{ controlPassed: ${before}, ` +
+    `confirmed: ((${is2xx('p1')}) and ${after} and ${before}), ` +
+    `observed: ("probe status=" + (.steps.p1.status | tostring) + " after status=" + (.steps.p2.status | tostring)), expected: "non-owner mutation must be denied" }`
+  return [{
+    kind: 'http_chain',
+    spec: {
+      ...common(jq),
+      steps: [
+        stepOf(env, 'c1', 'control', 'Authorized actor reads the resource before the mutation', { method: 'GET', pathAndQuery: read.path }, env.owner),
+        stepOf(env, 'p1', 'probe', 'Lower-privileged actor mutates the resource', parts, probePersona, stepExtra),
+        stepOf(env, 'p2', 'probe', 'Authorized actor reads the resource after the mutation', { method: 'GET', pathAndQuery: read.path }, env.owner),
+      ],
+    },
+  }]
+}
+
 export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const owner = o.pair?.owner ?? env.owner
   const other = o.pair?.other ?? env.other
@@ -82,13 +233,14 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
     const probeActor = hit.actor === 'anonymous' ? 'anonymous' : 'other_persona'
     let ownerOk = true
     let probeOk = true
+    let ownerTrivial = false
     if (rows) {
       const idRows = functionLevel ? rows : rows.filter(r => String(r.resourceId ?? '') === id)
       const ownerRow = idRows.find(r => r.actor === 'owner')
       const probeRow = idRows.find(r => r.actor === probeActor)
       // (2) The owner must demonstrably address the resource, and the replay must carry body evidence.
       if (!ownerRow || ownerRow.accessible !== true || typeof ownerRow.status !== 'number' || ownerRow.status < 200 || ownerRow.status >= 300) { ownerOk = false; rejects.owner += 1 }
-      else if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= (mutating ? 12 : 2)) { ownerOk = false; rejects.trivial += 1 }
+      else if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= (mutating ? 12 : 2)) { ownerOk = false; ownerTrivial = true; rejects.trivial += 1 }
       if (!probeRow || probeRow.accessible !== true) { probeOk = false; rejects.probe += 1 }
       else if (!mutating && Number(probeRow.similarityToOwner ?? hit.similarityToOwner ?? 0) < 0.7) { probeOk = false; rejects.probe += 1 }
       const anonRow = idRows.find(r => r.actor === 'anonymous')
@@ -99,9 +251,19 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
         if (sameBody || similar) { ownerOk = false; rejects.public += 1 }
       }
     }
+    const bodyTemplate: unknown = hit.bodyTemplate !== undefined && hit.bodyTemplate !== null ? hit.bodyTemplate : {}
+    // A mutating route that acknowledges with a trivial `{ok:true}` body still has real impact: prove
+    // it with a before/after read of the same identifier instead of trusting the acknowledgement.
+    if (mutating && !functionLevel && ownerTrivial && probeOk && /(?:admin|internal|manage|staff|superuser|privileged|permission|role|grant|scope)/i.test(o.hyp.endpoint.path)) {
+      const read = inferReadTarget(env, id, o.hyp.endpoint.path)
+      if (read) {
+        out.push(...stateDeltaSpec(o, env, read, id, method, bodyTemplate,
+          hit.actor === 'anonymous' ? null : other, privilegedLiteral(bodyTemplate)))
+        continue
+      }
+    }
     if (!ownerOk || !probeOk) continue
 
-    const bodyTemplate: unknown = hit.bodyTemplate !== undefined && hit.bodyTemplate !== null ? hit.bodyTemplate : {}
     const path = functionLevel
       ? o.hyp.endpoint.path
       : hasPathPlaceholder(o.hyp.endpoint.path)

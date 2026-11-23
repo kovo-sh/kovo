@@ -272,6 +272,18 @@ function summarizeExchange(ex: BrokerExchangeResult) {  let json: unknown = null
     bodyBytes: ex.bodyBytes,
     bodySha256: ex.bodySha256,
     durationMs: ex.durationMs,
+    // Pre-redaction structural proof: fingerprints only (never the raw value), so an assertion can
+    // prove a disclosed secret matched the entitled view even after the body was scrubbed.
+    ...(ex.secretMatches?.length
+      ? {
+          secretMatches: ex.secretMatches.slice(0, 16).map(m => ({
+            kind: m.kind,
+            sha256Prefix: m.sha256Prefix,
+            ...(m.fieldPath ? { fieldPath: m.fieldPath } : {}),
+            count: m.count,
+          })),
+        }
+      : {}),
     ...(json !== null ? { json } : {}),
   }
 }

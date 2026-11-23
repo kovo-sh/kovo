@@ -53,7 +53,7 @@ export interface Hypothesis {
   param?: DiscoveredParam
   location?: SurfaceParamLocation
   /** Method used for the probe/replay (body locations imply a write method). */
-  method: 'GET' | 'POST' | 'PUT' | 'PATCH'
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   /** DELETE endpoints keep `method` POST for spec compatibility but probe the real verb. */
   deleteMethod?: boolean
   /** Plant on a write endpoint, then re-read listing/detail routes for stored reflection. */
@@ -431,7 +431,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     // not resource identifiers, so placeholder action routes are handled by the server-action probe.
     if ((pathHasPlaceholder && !serverActionPath.test(ep.path)) || (idParam && idParam.location === 'query')) {
       add({
-        endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : writeMethod(ep),
+        endpoint: ep, probeClass: 'authz_matrix', method: isGet ? 'GET' : (method === 'DELETE' ? 'DELETE' : writeMethod(ep)),
         ...(!isGet && method === 'DELETE' ? { deleteMethod: true } : {}),
         ...(!isGet && (method === 'PATCH' || method === 'PUT') && pathHasPlaceholder ? { writePathRead: true } : {}),
       })
@@ -1552,7 +1552,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
     const sendFor = async (name: string, value: string): Promise<BrokerExchangeResult | null> => {
       try {
         const inj = injectUniversalParam({
-          pathAndQuery: probePathFor(h), param: name, paramLocation: h.location!, value, method: h.method,
+          pathAndQuery: probePathFor(h), param: name, paramLocation: h.location!, value, method: h.method === 'DELETE' ? 'POST' : h.method,
           ...(h.location === 'json' && body ? { jsonBody: body } : {}),
           ...(h.location === 'form' && body ? { formBody: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v)])) } : {}),
           ...(h.location === 'json' ? { headers: { 'Content-Type': 'application/json' } } : h.location === 'form' ? { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
@@ -1598,7 +1598,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
     for (const value of mined.slice(0, 4)) {
       try {
         const ex = await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...injectUniversalParam({
-          pathAndQuery: probePathFor(h), param: h.param.name, paramLocation: h.location!, value, method: h.method,
+          pathAndQuery: probePathFor(h), param: h.param.name, paramLocation: h.location!, value, method: h.method === 'DELETE' ? 'POST' : h.method,
         }) }, env.grant, env.signal)
         if (ex.status >= 200 && ex.status < 300 && ex.body.trim().length > 0) { ctx.baseline = value; break }
       } catch { /* keep trying */ }
@@ -1618,7 +1618,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
       const send = async (value: string): Promise<BrokerExchangeResult | null> => {
         try {
           const inj = injectUniversalParam({
-            pathAndQuery: probePathFor(h), param: h.param!.name, paramLocation: h.location!, value, method: h.method,
+            pathAndQuery: probePathFor(h), param: h.param!.name, paramLocation: h.location!, value, method: h.method === 'DELETE' ? 'POST' : h.method,
             ...(h.location === 'json' && body ? { jsonBody: body } : {}),
             ...(h.location === 'form' && body ? { formBody: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v)])) } : {}),
             ...(h.location === 'graphql_var' ? { jsonBody: { variables: body ?? {} } } : {}),
@@ -1738,7 +1738,7 @@ async function runSecondOrderCheck(
     param: param.name,
     paramLocation: h.location,
     value: payload,
-    method: h.method,
+    method: h.method === 'DELETE' ? 'POST' : h.method,
     jsonBody: h.location === 'json' ? body : undefined,
     formBody: h.location === 'form' ? Object.fromEntries(Object.entries(body ?? {}).map(([k, v]) => [k, String(v)])) : undefined,
     session: env.caps.sessionAndCsrf ? env.session : undefined,
@@ -2096,7 +2096,7 @@ async function runRaceCheck(h: Hypothesis, env: ProbeEnv, watch: (ex: BrokerExch
     }
     const first = await mint()
     if (!first) { result.details.skipped = 'producer_unavailable'; return result }
-    const singleEx = await send(h.method, consumePath, bodySiblings(first))
+    const singleEx = await send(h.method === 'DELETE' ? 'POST' : h.method, consumePath, bodySiblings(first))
     result.details.singleStatus = singleEx?.status ?? null
     if (!singleEx || singleEx.status < 200 || singleEx.status >= 300) { result.details.skipped = 'consume_baseline_failed'; return result }
     const target = await mint()
@@ -2142,7 +2142,7 @@ async function runRaceCheck(h: Hypothesis, env: ProbeEnv, watch: (ex: BrokerExch
   // with concurrent read-then-write requests (2+ acceptances for a value > half the balance).
   if (baseline === null || baselineField === null) {
     // No read route: one inexpensive consume exposes the post-state balance in its response.
-    const probe = await send(h.method, consumePath, bodySiblings(1))
+    const probe = await send(h.method === 'DELETE' ? 'POST' : h.method, consumePath, bodySiblings(1))
     const picked = pickState(numeric(probe?.body))
     if (picked) { baseline = picked.value + (probe?.status && probe.status >= 200 && probe.status < 300 ? 1 : 0); baselineField = picked.field }
   }
@@ -2359,7 +2359,7 @@ async function runSecondOrderSsrfCheck(h: Hypothesis, env: ProbeEnv, watch: (ex:
     body[p.name] = p.name === param.name ? minted.httpUrl : semanticValue(p.name, env)
   }
   const regEx = await sendRaw(env, {
-    method: h.method, pathAndQuery: probePathFor(h), body: JSON.stringify(body),
+    method: h.method === 'DELETE' ? 'POST' : h.method, pathAndQuery: probePathFor(h), body: JSON.stringify(body),
     headers: { 'Content-Type': 'application/json' }, persona: env.owner,
     session: env.caps.sessionAndCsrf ? env.session : undefined,
   })
@@ -2551,6 +2551,10 @@ export async function runHypothesis(h: Hypothesis, env: ProbeEnv, onExchange: (e
       req = await authzRequest(h, env, owner, other)
       if (h.writePathRead) req.writePathRead = true
       if (h.method !== 'GET') {
+        // A mutating matrix needs the session jar to already hold the anti-CSRF token issued by the
+        // app's own read routes; otherwise every actor write is rejected and the role check is never
+        // observed. Priming is memoized per session, so this is one bounded preflight per run.
+        if (env.caps.sessionAndCsrf) await primeSessionOnce(h, env)
         const csrf = await csrfHeaderFor(env)
         if (csrf) req.headers = { ...(req.headers ?? {}), ...csrf }
       }
