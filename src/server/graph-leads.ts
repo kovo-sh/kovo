@@ -156,5 +156,11 @@ export function graphLeadTargets(
       params: [],
     })
   }
-  return targets
+  // Facts are listed in store row order (ties broken by random row ids); severity-ranked probes
+  // must not inherit that order. Severity first, then a total identity order.
+  return targets.sort((a, b) =>
+    b.riskScore - a.riskScore ||
+    a.origin.localeCompare(b.origin) ||
+    a.method.localeCompare(b.method) ||
+    a.pathTemplate.localeCompare(b.pathTemplate))
 }

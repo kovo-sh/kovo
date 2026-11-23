@@ -44,10 +44,17 @@ export function selectRankedProbeTargets<T extends {
   options: { cap: number; planOnly?: boolean },
 ): { targets: T[]; usedPlan: boolean; probed: number; skippedStored: number } {
   const cap = Math.max(1, Math.round(options.cap))
-  // The store already returns a deterministic risk/coverage order; preserve it exactly so the
-  // bounded probe set is identical to the pre-graphwire floor (no tie-break drift).
+  // Stable total order (risk, then identity). The store's risk ordering breaks ties on row ids,
+  // so without an identity tiebreak the cap boundary moves between identical runs; preserving
+  // store arrival order is therefore not sufficient for a reproducible bounded probe set.
+  const riskFirst = [...endpoints].sort((a, b) =>
+    (b.riskScore ?? 0) - (a.riskScore ?? 0) ||
+    a.origin.localeCompare(b.origin) ||
+    a.method.toUpperCase().localeCompare(b.method.toUpperCase()) ||
+    a.pathTemplate.length - b.pathTemplate.length ||
+    a.pathTemplate.localeCompare(b.pathTemplate))
   const fallback = () => ({
-    targets: endpoints.slice(0, cap),
+    targets: riskFirst.slice(0, cap),
     usedPlan: false,
     probed: Math.min(cap, endpoints.length),
     skippedStored: Math.max(0, endpoints.length - cap),
@@ -55,8 +62,11 @@ export function selectRankedProbeTargets<T extends {
   const sample = probePlan?.sample?.filter(key => typeof key === 'string' && key.trim().length > 0) ?? []
   if (!sample.length) return fallback()
   const byKey = new Map<string, T>()
-  for (const endpoint of endpoints) {
-    byKey.set(`${endpoint.method.toUpperCase()} ${endpoint.pathTemplate}`.toLowerCase(), endpoint)
+  // First canonical endpoint wins when several origins share a method+path key. The plan sample
+  // transports no origin, so picking by arrival order would make the probed origin run-dependent.
+  for (const endpoint of riskFirst) {
+    const key = `${endpoint.method.toUpperCase()} ${endpoint.pathTemplate}`.toLowerCase()
+    if (!byKey.has(key)) byKey.set(key, endpoint)
   }
   const targets: T[] = []
   const seen = new Set<string>()

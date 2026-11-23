@@ -190,7 +190,7 @@ test('missing pre-Phase-0 record is conservative: lane skipped on resumed runs',
   assert.equal(lane.calls.length, 0)
 })
 
-test('flag ON: lane runs concurrently (sibling task) and never blocks specialist dispatch', async (t) => {
+test('flag ON: Phase A runs first (sequential) and gates specialist dispatch', async (t) => {
   const { storage, runId } = await startRun(t, { concurrency: 2 })
   const run = storage.run(runId)
   addStep(storage, run)
@@ -198,27 +198,23 @@ test('flag ON: lane runs concurrently (sibling task) and never blocks specialist
   t.after(() => execution.stop())
   internals(execution).prePhase0SeededSteps.set(laneKey(run), false)
   const dispatched: string[] = []
-  internals(execution).startInvestigationStep = (_r, step) => {
-    dispatched.push(step.id)
-    // Dispatch happens while the lane promise is deliberately still pending.
-    assert.equal(lane.calls.length, 1, 'lane must already be in flight at dispatch time')
-  }
+  internals(execution).startInvestigationStep = (_r, step) => { dispatched.push(step.id) }
   const lane = stubLane(execution)
   const deadline = internals(execution).deterministicLaneDeadlineMs()
 
   internals(execution).driveInvestigation(storage.run(runId), [{ id: 'profile', model: 'mock' }])
 
   assert.equal(lane.calls.length, 1)
-  assert.equal(dispatched.length, 1)
-  assert.equal(lane.calls[0].maxDurationMs, deadline, 'lane deadline = min(240 s, 40% × maxDurationMs)')
-  assert.equal(deadline, 240_000)
+  assert.equal(dispatched.length, 0, 'agents wait for the phase-A floor to settle')
+  assert.equal(lane.calls[0].maxDurationMs, deadline, 'Phase A deadline = min(180 s, 28% × maxDurationMs)')
+  assert.equal(deadline, 168_000)
   // Zero chain-step cancellation and no confirmed-route hiding.
   const steps = storage.listChainSteps(runId, storage.run(runId).goalRevision)
-  assert.ok(steps.every(step => step.status !== 'canceled'), 'lane must not cancel specialist steps')
+  assert.ok(steps.every(step => step.status !== 'canceled'), 'the floor must not cancel specialist steps')
 
   await internals(execution).advanceToVerification(storage.run(runId))
   await delay(20)
-  assert.ok(lane.calls[0].settledAt, 'lane abort settled before finalize')
+  assert.ok(lane.calls[0].settledAt, 'floor abort settled before finalize')
 })
 
 test('lane never writes dynamicStepBudget and aborting it settles before Phase 3', async (t) => {

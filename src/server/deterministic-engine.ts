@@ -35,6 +35,12 @@ export const defaultEngineMaxDurationMs = 240_000
 export const defaultEngineMaxEndpoints = 120
 export const defaultEngineMaxHypotheses = 120
 export const defaultEnginePerProbeRequests = 28
+/**
+ * Fixed wall-clock margin over `maxDurationMs`. The engine terminates on requests first; time is an
+ * emergency brake only, so a loaded or slow host cannot truncate a different queue tail. The margin
+ * is deliberately generous (2 minutes): normal completion is request-count driven.
+ */
+export const deterministicWallMarginMs = 120_000
 
 export const engineDisableEnv = 'GUARDIAN_DETERMINISTIC_ENGINE'
 
@@ -145,10 +151,10 @@ export interface DeterministicEngineInput {
   maxEndpoints?: number
   maxHypotheses?: number
   /**
-   * v6 Phase 1: the concurrent floor lane is additive and time-boxed, so it optimizes for breadth
-   * (one pass per class) rather than exhaustive depth on one class. Only the caps change.
+   * v6 Phase A: the floor always runs with the same deep per-class policy as `--no-llm`.
+   * Breadth-first caps are opt-in only for callers whose remaining budget cannot fund a deep pass.
    */
-  lane?: boolean
+  breadthFirst?: boolean
   /** v6: environment contract. `prod_readonly` generates no mutating hypotheses at all. */
   environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
   /** v6: mandatory run-scoped tag applied to benign entity values the floor creates. */
@@ -282,7 +288,11 @@ export function collapseRouteVariants(endpoints: readonly EngineEndpoint[]): Eng
   const shapeOf = (pathTemplate: string): string => (pathTemplate.split('?')[0] || '/')
     .replace(/\/(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])/g, '/:id')
   const byShape = new Map<string, EngineEndpoint>()
-  for (const endpoint of endpoints) {
+  // Canonical iteration order: the store returns risk-ordered rows whose ties are broken by random
+  // row ids, so variant merging must not depend on arrival order. Every key is a total order over
+  // the fields a route is identified by.
+  const ordered = [...endpoints].sort(compareEngineEndpoints)
+  for (const endpoint of ordered) {
     const key = `${endpoint.origin}|${endpoint.method.toUpperCase()}|${shapeOf(endpoint.pathTemplate)}`
     const prior = byShape.get(key)
     if (!prior) {
@@ -290,7 +300,9 @@ export function collapseRouteVariants(endpoints: readonly EngineEndpoint[]): Eng
       continue
     }
     const preferCurrent = endpoint.params.length > prior.params.length ||
-      (endpoint.params.length === prior.params.length && (endpoint.riskScore ?? 0) > (prior.riskScore ?? 0))
+      (endpoint.params.length === prior.params.length && (endpoint.riskScore ?? 0) > (prior.riskScore ?? 0)) ||
+      (endpoint.params.length === prior.params.length && (endpoint.riskScore ?? 0) === (prior.riskScore ?? 0) &&
+        endpoint.pathTemplate < prior.pathTemplate)
     const keep = preferCurrent ? endpoint : prior
     const other = preferCurrent ? prior : endpoint
     const mergedParams = [...keep.params]
@@ -304,6 +316,14 @@ export function collapseRouteVariants(endpoints: readonly EngineEndpoint[]): Eng
   return [...byShape.values()]
 }
 
+/** Stable total order for engine endpoints: origin, method, path template, then id as last resort. */
+function compareEngineEndpoints(a: EngineEndpoint, b: EngineEndpoint): number {
+  return a.origin.localeCompare(b.origin) ||
+    a.method.toUpperCase().localeCompare(b.method.toUpperCase()) ||
+    a.pathTemplate.localeCompare(b.pathTemplate) ||
+    String(a.id).localeCompare(String(b.id))
+}
+
 /** Rank-risk the surface: static assets/soft baselines sink, injectable/id-bearing routes rise. */
 export function rankEndpoints(endpoints: readonly EngineEndpoint[]): EngineEndpoint[] {
   return endpoints
@@ -311,7 +331,10 @@ export function rankEndpoints(endpoints: readonly EngineEndpoint[]): EngineEndpo
     .filter(item => item.score > -50)
     .sort((a, b) => b.score - a.score ||
       a.endpoint.pathTemplate.length - b.endpoint.pathTemplate.length ||
-      a.endpoint.pathTemplate.localeCompare(b.endpoint.pathTemplate))
+      a.endpoint.pathTemplate.localeCompare(b.endpoint.pathTemplate) ||
+      a.endpoint.origin.localeCompare(b.endpoint.origin) ||
+      a.endpoint.method.toUpperCase().localeCompare(b.endpoint.method.toUpperCase()) ||
+      String(a.endpoint.id).localeCompare(String(b.endpoint.id)))
     .map(item => item.endpoint)
 }
 
@@ -423,13 +446,15 @@ export function scoreEngineParam(param: EngineParam, input: ParamRiskInput = {})
   return { param, score, reasons }
 }
 
-/** Rank parameters for probe priority (highest first, stable on name/location). */
+/** Rank parameters for probe priority (highest first, stable on name/location/declared type). */
 export function rankEngineParams(params: readonly EngineParam[], input: ParamRiskInput = {}): RankedEngineParam[] {
   return params
     .map(param => scoreEngineParam(param, input))
     .sort((a, b) => b.score - a.score ||
       a.param.name.localeCompare(b.param.name) ||
-      a.param.location.localeCompare(b.param.location))
+      a.param.location.localeCompare(b.param.location) ||
+      (a.param.declaredType ?? '').localeCompare(b.param.declaredType ?? '') ||
+      (a.param.observedShape ?? '').localeCompare(b.param.observedShape ?? ''))
 }
 
 export function fileParamNames(path: string): string[] {
@@ -2297,16 +2322,17 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   for (const hyp of gatedHypotheses) classStats(report, hyp.intent).hypotheses += 1
 
   const perProbeRequestFloor = 6
-  const laneMode = input.lane === true
   const probeSlots = Math.min(150, Math.max(defaultEngineMaxHypotheses, Math.floor(maxRequests / 11)))
   const capScale = Math.max(1, probeSlots / defaultEngineMaxHypotheses)
   const capFor = (value: number): number => Math.max(value, Math.ceil(value * capScale))
-  // The lane is breadth-first: it only gets a time-box, so the deep authz/sqli quotas are trimmed
-  // while every other class keeps its full pass. `--no-llm` keeps the exhaustive quotas.
+  // Phase A runs the same deep per-class policy as `--no-llm`, so the agentic floor and the
+  // standalone floor probe the same hypotheses in the same order. Breadth caps are only used when
+  // the caller's remaining request budget cannot fund a deep pass (explicit `breadthFirst`).
+  const breadthFirst = input.breadthFirst === true || maxRequests < 600
   const intentCaps: Record<string, number> = {
-    authz: laneMode ? Math.min(capFor(26), 14) : capFor(26),
-    secret_disclosure: laneMode ? Math.min(capFor(5), 3) : capFor(5),
-    sqli: laneMode ? Math.min(capFor(10), 8) : capFor(10),
+    authz: breadthFirst ? Math.min(capFor(26), 14) : capFor(26),
+    secret_disclosure: breadthFirst ? Math.min(capFor(5), 3) : capFor(5),
+    sqli: breadthFirst ? Math.min(capFor(10), 8) : capFor(10),
     traversal: capFor(6),
     ssrf: capFor(6),
     xxe: capFor(4),
@@ -2322,9 +2348,12 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     auth_protocol: capFor(2),
   }
   const intentUsed: Record<string, number> = {}
+  // Request-count termination is the deterministic contract; the wall clock is only a safety net
+  // with a fixed margin, so a slow host cannot silently truncate a different tail of the queue.
+  const hardDeadlineMs = maxDurationMs + deterministicWallMarginMs
   for (const hyp of gatedHypotheses) {
     if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
-    if (Date.now() - started >= maxDurationMs) { report.stoppedReason = 'time'; break }
+    if (Date.now() - started >= hardDeadlineMs) { report.stoppedReason = 'time'; break }
     if (budget.requestsUsed >= maxRequests) { report.stoppedReason = 'budget'; break }
     const remaining = maxRequests - budget.requestsUsed
     if (remaining < perProbeRequestFloor) { report.stoppedReason = 'budget'; break }
@@ -2333,8 +2362,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     intentUsed[hyp.intent] = (intentUsed[hyp.intent] ?? 0) + 1
 
     const stats = classStats(report, hyp.intent)
-    const perProbe = laneMode ? 16 : defaultEnginePerProbeRequests
-    const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(perProbe, remaining))
+    const maxProbeRequests = Math.max(perProbeRequestFloor, Math.min(defaultEnginePerProbeRequests, remaining))
     let probe: DifferentialResult
     try {
       probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
@@ -2460,7 +2488,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     }
   }
 
-  if (report.stoppedReason === 'complete' && (Date.now() - started >= maxDurationMs)) report.stoppedReason = 'time'
+  if (report.stoppedReason === 'complete' && (Date.now() - started >= hardDeadlineMs)) report.stoppedReason = 'time'
   report.durationMs = Date.now() - started
   return report
 }
