@@ -1296,10 +1296,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
       failAll(new Error(formatWorkerFailure(Buffer.concat(sessionStderr).toString('utf8'), code).replace(/^The isolated worker failed/, 'Isolated worker session exited unexpectedly')))
       // A session that never reached `close()` (crash, image pull, OOM) could leave a container in
       // `created` state; always remove it here so abandoned workers do not accumulate. Pooled
-      // containers taking the graceful shutdown path are released by `close()` instead.
+      // containers taking the graceful stop path are released by `close()` instead and stay live.
       this.activeContainers.delete(name)
-      liveContainers.delete(name)
-      if (!preserveOnExit) void removeContainer()
+      if (!preserveOnExit) {
+        liveContainers.delete(name)
+        void removeContainer()
+      }
     })
     cli.once('error', error => {
       closed = true
@@ -1322,6 +1324,9 @@ export class LinuxWorkerBackend implements WorkerBackend {
         const reusable = pooled && this.warmPool?.enabled === true && pending.size === 0 && !exited
         let recycled = false
         if (reusable) {
+          // 1) Reset the tmpfs scratch while the bridge is still running; 2) stop the container
+          // (the session protocol's shutdown is advisory — the bridge can keep stdin open, so the
+          // container is explicitly stopped and then verified by the pool before reuse).
           const reset = await this.docker(
             ['container', 'exec', name, 'sh', '-c', WARM_SCRATCH_RESET_COMMAND],
             AbortSignal.timeout(4_000),
@@ -1333,13 +1338,16 @@ export class LinuxWorkerBackend implements WorkerBackend {
                 cli.stdin.write(JSON.stringify({ id: 'shutdown', op: 'shutdown' }) + '\n')
               }
             } catch { /* ignore */ }
+            try {
+              await this.docker(['container', 'stop', '--time', '1', name], AbortSignal.timeout(10_000))
+            } catch { /* fall through: release() verifies the state and removes a live container */ }
             let timer: NodeJS.Timeout | undefined
             await Promise.race([
               exitPromise,
-              new Promise<void>(resolve => { timer = setTimeout(resolve, 3_000); timer.unref?.() }),
+              new Promise<void>(resolve => { timer = setTimeout(resolve, 2_000); timer.unref?.() }),
             ])
             if (timer) clearTimeout(timer)
-            recycled = exited
+            recycled = true
           }
         }
         try {
@@ -1355,7 +1363,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
           if (kept) {
             this.pooled.delete(name)
             this.activeContainers.delete(name)
-            liveContainers.delete(name)
+            // release() re-tracks the container as live: the pool (not this session) owns it now.
             return
           }
         }
