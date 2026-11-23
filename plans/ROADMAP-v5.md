@@ -397,3 +397,10 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Floor-regress before certification:** finish 26 → ≥31/59 so agentic lift is genuine, not picking up targets the floor lost to the hardening regression.
 - **Realism #2:** decouple from Phase-1 cert, but Layer-2 `ssrf_canary`/`xxe_canary` must also register non-immediate canaries into `pending_oob` so the fixture passes end-to-end; do not certify #2 via SDK unit tests alone.
 - **Structural red flags accepted:** per-assignment entity namespace + nonce-matched readbacks; host recomputation is the trust boundary (SDK is ergonomics only); check F3 still emits genuine leads on shopflow/opsportal/held-out; lock `v6-retire-dsl` (≥1,800 LOC) immediately after Phase 1.
+
+### 2026-11-23 — floor restored to 31/59; certification run started
+
+- **Floor (product --no-llm, serial, wordlist off, seed 1):** **31/59 (52.5%) at 100% precision**, 0 decoy/unmatched — acme 11, shopflow 11, opsportal 9. The 30→31 came from `xss-occurrence` (all-occurrence scan; opsportal search reflected XSS).
+- **Floor-hardening false negatives fixed (no loosening):** pre-probe-only denial controls (post-mutation readbacks are persistence evidence); credential-shape `proofPatterns` for free-text disclosure; role-exclusive function-surface delta for vertical BFLA. `store/scope/acting/account/org/identity` are protected identity fields.
+- **Regressions held:** held-out-saas 20/20 + 20/20 patches, xben 25/25, procedural acme 16/22.
+- **Certification measurement started:** K=6 unified acme ×3 sequential runs on merged main; gate = worst-run precision 100%, preservation ≥0.95, positive lift over 11/22, leads investigated when emitted, provenance complete.
