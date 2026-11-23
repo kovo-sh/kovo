@@ -308,6 +308,56 @@ export const deterministicLaneWallClockShare = deterministicFloorWallClockShare
 export type DeterministicSweepMode = 'off' | 'on' | 'always'
 
 /**
+ * v6 budget split (Phase-B starvation fix). The run's `budgetRequests` is one shared ledger, but
+ * its consumption is accounted per phase:
+ *
+ *  - Phase A (deterministic floor) may spend at most `floor` requests, measured from the moment
+ *    the floor starts (Phase-0 discovery/scope requests are not charged to it);
+ *  - Phase B (agentic investigation and later agent-driven work) may spend at most `agent`
+ *    requests, measured from the moment the floor settles;
+ *  - neither phase may borrow the other's allowance;
+ *  - the run-total request budget (and the USD/wall caps) still applies as a hard outer bound.
+ *
+ * Split budgets are opt-in. Without an option or env var the engine keeps the legacy single
+ * shared budget (the floor is capped only by what remains of `run.budgetRequests`).
+ */
+export const DEFAULT_FLOOR_REQUEST_BUDGET = 6_000
+export const DEFAULT_AGENT_REQUEST_BUDGET = 25_000
+
+export interface PhaseRequestBudgets {
+  /** Requests the deterministic floor (Phase A) may spend. */
+  floor: number
+  /** Requests agentic investigation (Phase B) may spend. Never borrowed from Phase A. */
+  agent: number
+}
+
+function positiveRequestBudget(value: unknown): number | undefined {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.trunc(parsed)
+}
+
+/**
+ * Resolve the split request budgets. Returns `null` for the legacy single-budget path (no option
+ * and no env var set). A single configured phase keeps the other phase's default so a run can
+ * never accidentally starve a phase by configuring only one half.
+ */
+export function resolvePhaseRequestBudgets(
+  options: { floorRequestBudget?: number; agentRequestBudget?: number } = {},
+  env: NodeJS.ProcessEnv = process.env,
+): PhaseRequestBudgets | null {
+  const floor = positiveRequestBudget(options.floorRequestBudget)
+    ?? positiveRequestBudget(env.GUARDIAN_FLOOR_REQUEST_BUDGET)
+  const agent = positiveRequestBudget(options.agentRequestBudget)
+    ?? positiveRequestBudget(env.GUARDIAN_AGENT_REQUEST_BUDGET)
+  if (floor === undefined && agent === undefined) return null
+  return {
+    floor: floor ?? DEFAULT_FLOOR_REQUEST_BUDGET,
+    agent: agent ?? DEFAULT_AGENT_REQUEST_BUDGET,
+  }
+}
+
+/**
  * Legacy v5.1 parser: an *unset* flag resolves to `off`. Kept exported and unchanged for callers
  * that pin the old opt-in semantics. `Execution` uses `resolveFloorLaneMode` instead.
  */
@@ -1769,9 +1819,34 @@ export interface ExecutionOptions {
    * Throwing is swallowed so a best-effort snapshot can never disturb the engine.
    */
   onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
+  /**
+   * v6 budget split: per-phase request allowances (see `PhaseRequestBudgets`). Omit both to keep
+   * the legacy single shared `run.budgetRequests` behavior. `GUARDIAN_FLOOR_REQUEST_BUDGET` /
+   * `GUARDIAN_AGENT_REQUEST_BUDGET` are the env equivalents.
+   */
+  floorRequestBudget?: number
+  agentRequestBudget?: number
 }
 
 export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
+
+/** Per-run accounting for the split request budgets (never persisted; telemetry only). */
+interface PhaseRequestState {
+  floorBudget: number
+  agentBudget: number
+  /** `run.spentRequests` when the floor started; Phase-A/Phase-B spend are deltas from here. */
+  baselineRequests: number
+  /** Phase-A requests frozen when the floor settles. */
+  floorRequests: number
+  floorSettled: boolean
+  floorBudgetExhausted: boolean
+  agentBudgetExhausted: boolean
+  agentExhaustedReported: boolean
+  floorExhaustedReported: boolean
+  /** Phase-B spend frozen when investigation ends, so verification traffic is not misattributed. */
+  agentSettled: boolean
+  agentRequests: number
+}
 
 export class Execution {
   private readonly storage: Store
@@ -1846,6 +1921,11 @@ export class Execution {
   /** runId → Phase A window (start/finish), retained for finalize-time summaries. */
   private readonly agenticFloorStartedAt = new Map<string, number>()
   private readonly agenticFloorFinishedAt = new Map<string, number>()
+  /** v6 budget split: null = legacy single shared budget. */
+  private readonly phaseRequestBudgets: PhaseRequestBudgets | null
+  private readonly phaseRequestState = new Map<string, PhaseRequestState>()
+  /** runId → honest investigation termination reason when a phase budget ends the phase. */
+  private readonly phaseTerminationReason = new Map<string, string>()
   private readonly detLeadConsumed = new Set<string>()
   private readonly detLeadStepKeys = new Set<string>()
   /** Facts whose lead contract failed the contrast gate; emit the skip reason once. */
@@ -1891,6 +1971,10 @@ export class Execution {
         ? envMaxDuration
         : 600_000
     this.onCheckpoint = options.onCheckpoint
+    this.phaseRequestBudgets = resolvePhaseRequestBudgets({
+      ...(options.floorRequestBudget !== undefined ? { floorRequestBudget: options.floorRequestBudget } : {}),
+      ...(options.agentRequestBudget !== undefined ? { agentRequestBudget: options.agentRequestBudget } : {}),
+    })
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     // `storage` activates second-order canary scanning inside the browser context too.
@@ -3029,6 +3113,10 @@ export class Execution {
   ): Promise<BrokerRaceBurstResult> {
     const execute = options.execute ?? (() => this.broker.executeRaceBurst(requests, grant, signal))
     const run = this.check(job)
+    const phaseRemaining = this.phaseRequestRemaining(run)
+    if (phaseRemaining !== null && requests.length > phaseRemaining) {
+      throw new BudgetExceededError('Race burst would exceed the agent request budget.')
+    }
     const approvalPlan = this.planTier3Approval(run, requests, { isRaceBurst: true })
     try {
       return await execute()
@@ -4885,6 +4973,8 @@ export class Execution {
     this.agenticLaneJobs.set(run.id, holder)
     this.laneStartedAt.set(run.id, Date.now())
     this.agenticFloorStartedAt.set(run.id, Date.now())
+    // Phase-A allowance starts here: Phase-0 discovery/scope requests stay outside both phases.
+    this.beginFloorRequestPhase(this.storage.run(run.id))
     const deadlineMs = this.deterministicLaneDeadlineMs()
     try {
       this.storage.event(
@@ -4916,6 +5006,7 @@ export class Execution {
         this.agenticLaneCompleted.add(key)
         this.agenticFloorFinishedAt.set(run.id, Date.now())
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
+        try { this.settleFloorRequestPhase(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         this.laneStartedAt.delete(run.id)
         try { this.scheduleWake() } catch { /* scheduler stopped */ }
@@ -4954,6 +5045,260 @@ export class Execution {
     const ve = binding?.verifiedEndpoint
     if (!ve || typeof ve.method !== 'string' || typeof ve.origin !== 'string' || typeof ve.pathAndQuery !== 'string') return null
     return `${ve.method.toUpperCase()} ${ve.origin}${ve.pathAndQuery}`.slice(0, 320)
+  }
+
+  // --- v6 split request budgets (Phase A floor / Phase B agents) ------------------------------
+
+  /**
+   * Start Phase-A accounting. No-op in legacy mode. Called once, as close as possible to the
+   * floor's first request, so Phase-0 discovery/scope requests are not charged to Phase A.
+   */
+  private beginFloorRequestPhase(run: Run): PhaseRequestState | null {
+    if (!this.phaseRequestBudgets) return null
+    const existing = this.phaseRequestState.get(run.id)
+    if (existing) return existing
+    const state: PhaseRequestState = {
+      floorBudget: this.phaseRequestBudgets.floor,
+      agentBudget: this.phaseRequestBudgets.agent,
+      baselineRequests: run.spentRequests,
+      floorRequests: 0,
+      floorSettled: false,
+      floorBudgetExhausted: false,
+      agentBudgetExhausted: false,
+      agentExhaustedReported: false,
+      floorExhaustedReported: false,
+      agentSettled: false,
+      agentRequests: 0,
+    }
+    this.phaseRequestState.set(run.id, state)
+    try {
+      this.storage.event(
+        run.id,
+        'request_budget.phase_started',
+        `Phase A request allowance ${state.floorBudget}; Phase B allowance ${state.agentBudget} (split budgets; no borrowing).`,
+        {
+          phase: 'floor',
+          floorRequestBudget: state.floorBudget,
+          agentRequestBudget: state.agentBudget,
+          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
+          spentRequestsAtStart: state.baselineRequests,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
+    return state
+  }
+
+  /**
+   * Start (or adopt) Phase-B accounting when no floor lane ran (e.g. the deterministic sweep is
+   * off). A floor that did run settles itself and is not re-baselined here.
+   */
+  private beginAgentRequestPhase(run: Run): PhaseRequestState | null {
+    if (!this.phaseRequestBudgets) return null
+    const existing = this.phaseRequestState.get(run.id)
+    if (existing) return existing
+    const state: PhaseRequestState = {
+      floorBudget: this.phaseRequestBudgets.floor,
+      agentBudget: this.phaseRequestBudgets.agent,
+      baselineRequests: run.spentRequests,
+      floorRequests: 0,
+      floorSettled: true,
+      floorBudgetExhausted: false,
+      agentBudgetExhausted: false,
+      agentExhaustedReported: false,
+      floorExhaustedReported: false,
+      agentSettled: false,
+      agentRequests: 0,
+    }
+    this.phaseRequestState.set(run.id, state)
+    try {
+      this.storage.event(
+        run.id,
+        'request_budget.phase_started',
+        `Phase B request allowance ${state.agentBudget} (no Phase-A floor in this run).`,
+        {
+          phase: 'agent',
+          floorRequestBudget: state.floorBudget,
+          agentRequestBudget: state.agentBudget,
+          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
+          spentRequestsAtStart: state.baselineRequests,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
+    return state
+  }
+
+  /**
+   * Freeze Phase-A spend and expose the Phase-B allowance. Called when the floor settles (lane
+   * completion or `--no-llm` completion). Idempotent.
+   */
+  private settleFloorRequestPhase(runId: string, reason: string): void {
+    const state = this.phaseRequestState.get(runId)
+    if (!state || state.floorSettled) return
+    let run: Run
+    try { run = this.storage.run(runId) } catch { return }
+    state.floorRequests = Math.max(0, run.spentRequests - state.baselineRequests)
+    state.floorSettled = true
+    state.floorBudgetExhausted = state.floorRequests >= state.floorBudget
+    try {
+      this.storage.event(
+        runId,
+        'request_budget.floor_settled',
+        `Phase A used ${state.floorRequests}/${state.floorBudget} request(s); Phase B allowance is ${state.agentBudget}.`,
+        {
+          phase: 'floor',
+          reason,
+          floorRequests: state.floorRequests,
+          floorRequestBudget: state.floorBudget,
+          agentRequestBudget: state.agentBudget,
+          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
+          spentRequestsAtStart: state.baselineRequests,
+          spentRequestsAtSettle: run.spentRequests,
+          floorBudgetExhausted: state.floorBudgetExhausted,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
+    if (state.floorBudgetExhausted && !state.floorExhaustedReported) {
+      state.floorExhaustedReported = true
+      try {
+        this.storage.event(
+          runId,
+          'request_budget.floor_exhausted',
+          `Phase A floor exhausted its ${state.floorBudget}-request allowance; Phase B keeps its own allowance.`,
+          { phase: 'floor', floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
+  }
+
+  /**
+   * Freeze Phase-B spend when agentic investigation ends. Verification (Phase 3) still sends
+   * requests from the run-total cap, but they must not be reported as Phase-B consumption.
+   * Idempotent; `--no-llm` runs have no Phase B and never reach here.
+   */
+  private settleAgentRequestPhase(runId: string, reason: string): void {
+    const state = this.phaseRequestState.get(runId)
+    if (!state || !state.floorSettled || state.agentSettled) return
+    let run: Run
+    try { run = this.storage.run(runId) } catch { return }
+    state.agentRequests = Math.max(0, run.spentRequests - state.baselineRequests - state.floorRequests)
+    state.agentSettled = true
+    if (state.agentRequests >= state.agentBudget) state.agentBudgetExhausted = true
+    try {
+      this.storage.event(
+        runId,
+        'request_budget.phase_ended',
+        `Phase B used ${state.agentRequests}/${state.agentBudget} request(s) (floor ${state.floorRequests}/${state.floorBudget}).`,
+        {
+          phase: 'agent',
+          reason,
+          agentRequests: state.agentRequests,
+          agentRequestBudget: state.agentBudget,
+          floorRequests: state.floorRequests,
+          floorRequestBudget: state.floorBudget,
+          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
+          agentBudgetExhausted: state.agentBudgetExhausted,
+          terminationReason: this.phaseTerminationReason.get(runId) ?? null,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
+  }
+
+  /**
+   * Requests the current phase may still spend. Legacy mode = remaining run budget. Split mode =
+   * `min(run budget remaining, phase allowance remaining)`; phases never borrow from each other.
+   */
+  private phaseRequestRemaining(run: Run): number | null {
+    const runRemaining = run.budgetRequests > 0 ? Math.max(0, run.budgetRequests - run.spentRequests) : null
+    if (!this.phaseRequestBudgets) return runRemaining
+    const state = this.phaseRequestState.get(run.id)
+    if (!state) return runRemaining
+    const spent = Math.max(0, run.spentRequests - state.baselineRequests)
+    const phaseRemaining = state.floorSettled
+      ? Math.max(0, state.agentBudget - Math.max(0, spent - state.floorRequests))
+      : Math.max(0, state.floorBudget - spent)
+    if (state.floorSettled && phaseRemaining <= 0) state.agentBudgetExhausted = true
+    return runRemaining === null ? phaseRemaining : Math.min(phaseRemaining, runRemaining)
+  }
+
+  /** Honest telemetry snapshot for metrics (`deterministic_floor.summary`) and tests. */
+  private requestBudgetSnapshot(runId: string, floorReportedRequests: number): {
+    requestBudgetMode: 'split' | 'single'
+    floorRequests: number
+    floorRequestBudget: number | null
+    agentRequests: number | null
+    agentRequestBudget: number | null
+    totalRequestBudget: number | null
+    floorBudgetExhausted: boolean
+    agentBudgetExhausted: boolean
+    terminationReason: string | null
+  } {
+    let run: Pick<Run, 'spentRequests' | 'budgetRequests'>
+    try { run = this.storage.run(runId) } catch { run = { spentRequests: 0, budgetRequests: 0 } }
+    const state = this.phaseRequestState.get(runId) ?? null
+    const totalRequestBudget = run.budgetRequests > 0 ? run.budgetRequests : null
+    const terminationReason = this.phaseTerminationReason.get(runId) ?? null
+    if (!this.phaseRequestBudgets) {
+      return {
+        requestBudgetMode: 'single',
+        floorRequests: floorReportedRequests,
+        floorRequestBudget: null,
+        agentRequests: Math.max(0, run.spentRequests - floorReportedRequests),
+        agentRequestBudget: null,
+        totalRequestBudget,
+        floorBudgetExhausted: false,
+        agentBudgetExhausted: false,
+        terminationReason,
+      }
+    }
+    const floorRequests = state?.floorSettled
+      ? state.floorRequests
+      : Math.max(0, run.spentRequests - (state?.baselineRequests ?? run.spentRequests))
+    const agentRequests = state
+      ? state.agentSettled
+        ? state.agentRequests
+        : Math.max(0, run.spentRequests - state.baselineRequests - floorRequests)
+      : 0
+    return {
+      requestBudgetMode: 'split',
+      floorRequests,
+      floorRequestBudget: state?.floorBudget ?? this.phaseRequestBudgets.floor,
+      agentRequests,
+      agentRequestBudget: state?.agentBudget ?? this.phaseRequestBudgets.agent,
+      totalRequestBudget,
+      floorBudgetExhausted: state?.floorBudgetExhausted ?? false,
+      agentBudgetExhausted: state?.agentBudgetExhausted ?? false,
+      terminationReason,
+    }
+  }
+
+  /**
+   * Report an exhausted Phase-B allowance once. Dispatch already stopped; this records why the
+   * investigation phase ended instead of letting a wall-clock stop mislabel it.
+   */
+  private reportAgentBudgetExhausted(run: Run, readySteps: number, activeAssignments: number): void {
+    const state = this.phaseRequestState.get(run.id)
+    if (!state || !state.agentBudgetExhausted || state.agentExhaustedReported) return
+    state.agentExhaustedReported = true
+    this.phaseTerminationReason.set(run.id, 'agent_budget_exhausted')
+    const snapshot = this.requestBudgetSnapshot(run.id, 0)
+    try {
+      this.storage.event(
+        run.id,
+        'request_budget.agent_exhausted',
+        `Phase B agent request allowance exhausted (${snapshot.agentRequests}/${snapshot.agentRequestBudget}); `
+        + `${readySteps} ready step(s) left undispatched, ${activeAssignments} assignment(s) still in flight.`,
+        {
+          phase: 'agent',
+          reason: 'agent_budget_exhausted',
+          agentRequests: snapshot.agentRequests,
+          agentRequestBudget: snapshot.agentRequestBudget,
+          floorRequests: snapshot.floorRequests,
+          floorRequestBudget: snapshot.floorRequestBudget,
+          readySteps,
+          activeAssignments,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
   }
 
   /**
@@ -5019,6 +5364,9 @@ export class Execution {
       agentDispatchAt: dispatchedAt ?? null,
       dispatchAfterFloorMs: dispatchedAt && floorFinishedAt ? Math.max(0, dispatchedAt - floorFinishedAt) : null,
     }
+    // Split-budget accounting: when the floor settled, its measured request delta is authoritative;
+    // legacy mode keeps the engine-reported sum so existing preservation metrics are unchanged.
+    const budget = this.requestBudgetSnapshot(runId, floorRequests)
     const detail = {
       reason,
       floorConfirmed,
@@ -5028,7 +5376,16 @@ export class Execution {
       floorLeadsEmitted,
       floorLeadsConsumed: this.detLeadConsumed.size,
       laneWallMs,
-      floorRequests,
+      floorRequests: budget.floorRequests,
+      floorRequestBudget: budget.floorRequestBudget,
+      agentRequests: budget.agentRequests,
+      agentRequestBudget: budget.agentRequestBudget,
+      totalRequestBudget: budget.totalRequestBudget,
+      requestBudgetMode: budget.requestBudgetMode,
+      floorBudgetExhausted: budget.floorBudgetExhausted,
+      agentBudgetExhausted: budget.agentBudgetExhausted,
+      terminationReason: budget.terminationReason,
+      requestBudgets: budget,
       phaseTimings,
     }
     try {
@@ -5043,7 +5400,7 @@ export class Execution {
       this.storage.event(
         runId,
         'deterministic_floor.summary',
-        `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${this.detLeadConsumed.size} consumed, ${floorRequests} request(s), Phase A ${Math.round(laneWallMs / 1000)}s.`,
+        `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${this.detLeadConsumed.size} consumed, ${budget.floorRequests} floor request(s)${budget.floorRequestBudget !== null ? `/${budget.floorRequestBudget}` : ''}, ${budget.agentRequests ?? 0} agent request(s)${budget.agentRequestBudget !== null ? `/${budget.agentRequestBudget}` : ''}, Phase A ${Math.round(laneWallMs / 1000)}s${budget.terminationReason ? `, stopped: ${budget.terminationReason}` : ''}.`,
         detail,
       )
     } catch { /* metrics are best-effort */ }
@@ -5444,6 +5801,9 @@ export class Execution {
     try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
     if (this.startDeterministicLane(run, profiles)) return
     if (!this.agenticFloorDispatchedAt.has(run.id)) this.agenticFloorDispatchedAt.set(run.id, Date.now())
+    // Phase B starts here (or adopts the run when no floor lane ran). Split mode keeps a separate
+    // allowance, so a floor that ate its whole share can never starve agent dispatch.
+    this.beginAgentRequestPhase(this.storage.run(run.id))
 
     // Round-1 lead seeding: the floor's unproven det_lead signals become prioritized upgrade
     // assignments even before the planner's first LLM turn, so `floorLeadsEmitted > 0` can never
@@ -5475,6 +5835,17 @@ export class Execution {
     // paying a cold `container create` each dispatch.
     try { this.backend.setWarmCapacity?.(maxConc) } catch { /* pooling is best-effort */ }
     const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
+    // Honest Phase-B termination: once the agent allowance is gone, dispatch stops and the phase
+    // ends as `agent_budget_exhausted` even when ready steps remain (they cannot afford a request).
+    // In-flight assignments keep their lease; the handoff waits for them to settle.
+    const freshRun = this.storage.run(run.id)
+    this.phaseRequestRemaining(freshRun)
+    const phaseState = this.phaseRequestState.get(run.id)
+    if (this.phaseRequestBudgets && phaseState?.floorSettled && phaseState.agentBudgetExhausted) {
+      this.reportAgentBudgetExhausted(freshRun, readySteps.length, activeForRun)
+      if (activeForRun === 0) this.advanceToVerification(run)
+      return
+    }
     const leadStepIds = new Set(steps.filter(step => isDetLeadDispatchStep(step)).map(step => step.id))
     const activeLeadCount = [...this.active.values()].filter(job =>
       job.assignment.runId === run.id &&
@@ -5600,6 +5971,8 @@ export class Execution {
       .finally(() => {
         this.deterministicInFlight.delete(key)
         this.deterministicCompleted.add(key)
+        // `--no-llm` has one phase: freeze the floor allowance so the summary reports it as such.
+        try { this.settleFloorRequestPhase(run.id, 'no_llm_complete') } catch { /* metrics only */ }
         try {
           const latest = this.storage.run(run.id)
           if (latest.status === 'running' && latest.phase === 'investigation') {
@@ -6600,12 +6973,11 @@ export class Execution {
         const parsed = Number(process.env[name])
         return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
       }
-      const remainingRequests = current.budgetRequests > 0
-        ? Math.max(0, current.budgetRequests - current.spentRequests)
-        : 700
-      // Phase A and `--no-llm` share one request policy: the deep floor is never halved or
-      // breadth-trimmed just because agents will run afterwards. If the run is short on requests,
-      // the remaining budget is the only cap.
+      // Phase A has its own allowance in split mode (`floorRequestBudget`), so the floor can never
+      // spend the agents' requests. Legacy mode keeps the shared remainder as the only cap. The
+      // deep policy is unchanged: the floor is still never halved just because agents will run.
+      this.beginFloorRequestPhase(current)
+      const remainingRequests = this.phaseRequestRemaining(current) ?? 700
       const requestCap = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
       const durationCap = laneOptions.maxDurationMs ?? envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
       // v6 environment contract: shared staging gets a short, tightly capped floor pass so it can
@@ -8298,9 +8670,11 @@ export class Execution {
           const curRun = this.check(job)
           if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Budget exceeded.')
           const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = curRun.budgetRequests > 0
-            ? Math.max(0, curRun.budgetRequests - curRun.spentRequests)
-            : undefined
+          // Phase-aware cap: Phase B spends only its own allowance, never the floor's leftover.
+          const remainingReqs = this.phaseRequestRemaining(curRun) ?? undefined
+          if (remainingReqs !== undefined && remainingReqs <= 0) {
+            throw new BudgetExceededError('Agent request budget exhausted.')
+          }
           const crawlRes = await crawlStateGraph({
             storage: this.storage,
             runId: curRun.id,
@@ -8397,11 +8771,9 @@ export class Execution {
           const curRun = this.check(job)
           if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
           const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = curRun.budgetRequests > 0
-            ? Math.max(0, curRun.budgetRequests - curRun.spentRequests)
-            : (args.maxRequests ?? 150)
-          if (curRun.budgetRequests > 0 && remainingReqs <= 0) {
-            throw new BudgetExceededError('Run request budget exhausted.')
+          const remainingReqs = this.phaseRequestRemaining(curRun) ?? (args.maxRequests ?? 150)
+          if (remainingReqs <= 0) {
+            throw new BudgetExceededError('Agent request budget exhausted.')
           }
           const cappedMax = args.maxRequests !== undefined
             ? Math.min(args.maxRequests, remainingReqs)
@@ -8473,11 +8845,9 @@ export class Execution {
           const curRun = this.check(job)
           if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
           const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = curRun.budgetRequests > 0
-            ? Math.max(0, curRun.budgetRequests - curRun.spentRequests)
-            : (args.maxRequests ?? 60)
-          if (curRun.budgetRequests > 0 && remainingReqs <= 0) {
-            throw new BudgetExceededError('Run request budget exhausted.')
+          const remainingReqs = this.phaseRequestRemaining(curRun) ?? (args.maxRequests ?? 60)
+          if (remainingReqs <= 0) {
+            throw new BudgetExceededError('Agent request budget exhausted.')
           }
           const cappedMax = args.maxRequests !== undefined
             ? Math.min(args.maxRequests, remainingReqs)
@@ -8600,11 +8970,9 @@ export class Execution {
           const curRun = this.check(job)
           if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
           const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = curRun.budgetRequests > 0
-            ? Math.max(0, curRun.budgetRequests - curRun.spentRequests)
-            : 150
-          if (curRun.budgetRequests > 0 && remainingReqs <= 0) {
-            throw new BudgetExceededError('Run request budget exhausted.')
+          const remainingReqs = this.phaseRequestRemaining(curRun) ?? 150
+          if (remainingReqs <= 0) {
+            throw new BudgetExceededError('Agent request budget exhausted.')
           }
 
           const techFactTags = this.storage.listFacts(curRun.id, { includeTainted: false, origin: cleanOrigin, kind: 'tech_fingerprint', limit: 30 })
@@ -9747,6 +10115,14 @@ export class Execution {
       this.storage.message(current.id, current.coordinatorId, 'guardian',
         `Investigation complete${openProofGaps.length ? ` (${openProofGaps.length} open proof ${openProofGaps.length === 1 ? 'gap' : 'gaps'} surfaced)` : ''}. Deterministic Zero-LLM verification is replaying every proposed finding and checking baselines.`)
     }, { behavior: 'immediate' })
+    try {
+      this.settleAgentRequestPhase(
+        run.id,
+        this.phaseTerminationReason.get(run.id) === 'agent_budget_exhausted'
+          ? 'agent_budget_exhausted'
+          : 'investigation_complete',
+      )
+    } catch { /* metrics are best-effort */ }
     try { this.recordFloorMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
     try { this.recordAssignmentMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
   }
