@@ -178,6 +178,39 @@ test('lead funnel: repeated queue events for one fact are counted once', () => {
   assert.equal(funnel.investigated, 1)
 })
 
+test('lead funnel: a re-queued multi-trial upgrade step still counts its verdict', () => {
+  const funnel = summarizeLeadFunnel({
+    events: [
+      { kind: 'deterministic_lane.lead_consumed', detail: { factId: 'fact-invoice', stepId: 'step-original' } },
+    ],
+    assignments: [
+      { stepId: 'step-original', status: 'canceled' },
+      { stepId: 'step-trial2', status: 'complete' },
+    ],
+    steps: [
+      { id: 'step-original', title: 'det_lead upgrade · authz_matrix DELETE /api/invoices', dependsOnFactIds: ['fact-invoice'] },
+      { id: 'step-trial2', title: 'det_lead upgrade · authz_matrix DELETE /api/invoices [trial 2]', dependsOnFactIds: ['fact-invoice'] },
+    ],
+  })
+  assert.equal(funnel.queued, 1)
+  assert.equal(funnel.dispatched, 1)
+  assert.equal(funnel.investigated, 1, 'the completed trial is the verdict for the same lead fact')
+})
+
+test('lead funnel: broad planner steps bound to a lead fact do not fake a verdict', () => {
+  const funnel = summarizeLeadFunnel({
+    events: [
+      { kind: 'deterministic_lane.lead_consumed', detail: { factId: 'fact-invoice', stepId: 'step-original' } },
+    ],
+    assignments: [{ stepId: 'step-broad', status: 'complete' }],
+    steps: [
+      { id: 'step-original', title: 'det_lead upgrade · authz_matrix DELETE /api/invoices', dependsOnFactIds: ['fact-invoice'] },
+      { id: 'step-broad', title: 'Cross-persona BOLA matrix', dependsOnFactIds: ['fact-invoice'] },
+    ],
+  })
+  assert.equal(funnel.investigated, 0)
+})
+
 // ---------------------------------------------------------------------------------------------
 // Certify ingestion + run-plan plumbing
 // ---------------------------------------------------------------------------------------------

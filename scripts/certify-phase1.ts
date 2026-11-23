@@ -729,6 +729,7 @@ interface RunDatabaseEvidence {
 interface DerivedLeadFunnel {
   emitted: number
   queued: number
+  dispatched: number
   investigated: number
 }
 
@@ -746,35 +747,63 @@ function deriveLeadFunnelFromDatabase(db: DatabaseSync): DerivedLeadFunnel | nul
     const rows = db.prepare(
       "select detail from events where kind = 'deterministic_lane.lead_consumed'",
     ).all() as Array<{ detail?: unknown }>
-    let queued = 0
-    const stepIds = new Set<string>()
+    const queued = new Map<string, { factId: string | null; stepId: string | null }>()
     for (const row of rows) {
       const detail = typeof row.detail === 'string' ? JSON.parse(row.detail) as unknown : row.detail
       if (!isRecord(detail)) continue
       const factId = typeof detail.factId === 'string' ? detail.factId : null
       const stepId = typeof detail.stepId === 'string' ? detail.stepId : null
-      if (!factId && !stepId) continue
-      queued += 1
-      if (stepId) stepIds.add(stepId)
+      const key = factId ?? stepId
+      if (key) queued.set(key, { factId, stepId })
     }
     // No lead events at all: the legacy metrics payload is the only evidence available.
-    if (queued === 0 && emitted?.n === 0) return null
-    const statuses = new Map<string, string[]>()
-    if (stepIds.size) {
-      const assignments = db.prepare('select step_id, status from assignments').all() as Array<{ step_id?: unknown; status?: unknown }>
-      for (const row of assignments) {
-        if (typeof row.step_id !== 'string' || typeof row.status !== 'string') continue
-        if (!stepIds.has(row.step_id)) continue
-        const list = statuses.get(row.step_id) ?? []
-        list.push(row.status)
-        statuses.set(row.step_id, list)
+    if (queued.size === 0 && emitted?.n === 0) return null
+
+    const upgradeStepsByFact = new Map<string, string[]>()
+    try {
+      const steps = db.prepare('select id, title, depends_on_fact_ids from chain_steps').all() as Array<{
+        id?: unknown; title?: unknown; depends_on_fact_ids?: unknown
+      }>
+      for (const step of steps) {
+        if (typeof step.id !== 'string' || typeof step.title !== 'string') continue
+        if (!step.title.startsWith('det_lead upgrade')) continue
+        const raw = typeof step.depends_on_fact_ids === 'string'
+          ? JSON.parse(step.depends_on_fact_ids) as unknown
+          : step.depends_on_fact_ids
+        if (!Array.isArray(raw)) continue
+        for (const factId of raw) {
+          if (typeof factId !== 'string') continue
+          const list = upgradeStepsByFact.get(factId) ?? []
+          list.push(step.id)
+          upgradeStepsByFact.set(factId, list)
+        }
       }
+    } catch { /* chain_steps unavailable in older stores */ }
+
+    const statuses = new Map<string, string[]>()
+    const assignments = db.prepare('select step_id, status from assignments').all() as Array<{ step_id?: unknown; status?: unknown }>
+    for (const row of assignments) {
+      if (typeof row.step_id !== 'string' || typeof row.status !== 'string') continue
+      const list = statuses.get(row.step_id) ?? []
+      list.push(row.status)
+      statuses.set(row.step_id, list)
     }
+    let dispatched = 0
     let investigated = 0
-    for (const stepId of stepIds) if (statuses.get(stepId)?.includes('complete')) investigated += 1
+    for (const entry of queued.values()) {
+      const candidateSteps = new Set<string>()
+      if (entry.stepId) candidateSteps.add(entry.stepId)
+      if (entry.factId) for (const stepId of upgradeStepsByFact.get(entry.factId) ?? []) candidateSteps.add(stepId)
+      if (!candidateSteps.size) continue
+      const values = [...candidateSteps].flatMap(stepId => statuses.get(stepId) ?? [])
+      if (!values.length) continue
+      dispatched += 1
+      if (values.includes('complete')) investigated += 1
+    }
     return {
       emitted: typeof emitted?.n === 'number' ? emitted.n : 0,
-      queued,
+      queued: queued.size,
+      dispatched,
       investigated,
     }
   } catch {

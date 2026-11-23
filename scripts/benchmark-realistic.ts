@@ -879,9 +879,11 @@ export interface LeadFunnelMetrics {
 export function summarizeLeadFunnel(input: {
   events: ReadonlyArray<{ kind: string; detail?: Record<string, unknown> | null }>
   assignments: ReadonlyArray<{ stepId?: string | null; status: string }>
+  /** Chain steps, used to follow a lead fact into a re-queued/multi-trial upgrade step. */
+  steps?: ReadonlyArray<{ id: string; title?: string | null; dependsOnFactIds?: readonly string[] | null }>
 }): LeadFunnelMetrics {
   let emitted = 0
-  const queued = new Map<string, string | null>()
+  const queued = new Map<string, { factId: string | null; stepId: string | null }>()
   for (const event of input.events) {
     if (event.kind === 'deterministic_engine.lead') {
       emitted += 1
@@ -892,7 +894,19 @@ export function summarizeLeadFunnel(input: {
     const factId = typeof detail.factId === 'string' ? detail.factId : null
     const stepId = typeof detail.stepId === 'string' ? detail.stepId : null
     const key = factId ?? stepId
-    if (key) queued.set(key, stepId)
+    if (key) queued.set(key, { factId, stepId })
+  }
+  // A lead may be re-bound to a multi-trial (`[trial 2]`) upgrade step instead of the step that
+  // was queued, so follow the fact into det_lead upgrade steps only (never broad planner steps,
+  // which would count an unrelated verdict as lead investigation).
+  const upgradeStepsByFact = new Map<string, string[]>()
+  for (const step of input.steps ?? []) {
+    if (!step.title?.startsWith('det_lead upgrade')) continue
+    for (const factId of step.dependsOnFactIds ?? []) {
+      const list = upgradeStepsByFact.get(factId) ?? []
+      list.push(step.id)
+      upgradeStepsByFact.set(factId, list)
+    }
   }
   const statusesByStep = new Map<string, string[]>()
   for (const assignment of input.assignments) {
@@ -903,10 +917,13 @@ export function summarizeLeadFunnel(input: {
   }
   let dispatched = 0
   let investigated = 0
-  for (const stepId of queued.values()) {
-    if (!stepId) continue
-    const statuses = statusesByStep.get(stepId)
-    if (!statuses?.length) continue
+  for (const entry of queued.values()) {
+    const candidateSteps = new Set<string>()
+    if (entry.stepId) candidateSteps.add(entry.stepId)
+    if (entry.factId) for (const stepId of upgradeStepsByFact.get(entry.factId) ?? []) candidateSteps.add(stepId)
+    if (!candidateSteps.size) continue
+    const statuses = [...candidateSteps].flatMap(stepId => statusesByStep.get(stepId) ?? [])
+    if (!statuses.length) continue
     dispatched += 1
     // A verdict requires the assignment to close normally; killed/canceled/failed work did not
     // investigate the lead to an outcome (partial closure is reported separately by the engine).
@@ -2734,6 +2751,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const leadFunnel = summarizeLeadFunnel({
       events: collectRunEvents(storage, runId),
       assignments: detail.assignments,
+      steps: detail.chainSteps,
     })
 
     // Product contract: only runtime_confirmed findings are submittable evidence. Static,
