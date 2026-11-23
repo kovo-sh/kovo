@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { newRun, runCommand } from '../src/domain.ts'
+import { newProject, newRun, runCommand } from '../src/domain.ts'
 import {
   evaluateTier3Approval,
   isLocalLabAutoApprovalOrigin,
@@ -421,6 +421,154 @@ test('execution Tier-3 gate: local-lab approval is origin-bound, strict-aware, a
   assert.equal(externalRows.length, 1, 'external mislabeled origin must require human approval')
   assert.equal(externalRows[0]?.decidedBy, null)
   assert.equal(storage.listApprovalRequests(external.runId, 'approved').length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Invariant 6 — redirect containment for auto-approved Tier-3 writes
+// ---------------------------------------------------------------------------
+
+test('redirect containment: an auto-approved loopback Tier-3 write is never followed to an external host', async () => {
+  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    const externalOrigin = 'https://collector.example.net'
+    const resolve = async (hostname: string) => (
+      hostname === '127.0.0.1'
+        ? [{ address: '127.0.0.1', family: 4 as const }]
+        : [{ address: '93.184.216.34', family: 4 as const }]
+    )
+
+    const runRedirectCase = async (canRead: (origin: string) => boolean, expected: RegExp) => {
+      const dialed: string[] = []
+      const audits: Array<{ outcome: string; origin: string }> = []
+      const broker = new RequestBroker({
+        resolve,
+        transport: async url => {
+          dialed.push(url.origin)
+          if (url.origin === LOOPBACK_ORIGIN) {
+            return { status: 302, headers: { location: `${externalOrigin}/exfiltrate` }, body: '' }
+          }
+          return { status: 200, headers: { 'content-type': 'text/plain' }, body: 'must-not-run' }
+        },
+      })
+      const grant = localLabGrant({
+        isStateChangeApproved: origin => origin === LOOPBACK_ORIGIN,
+        canRead,
+        audit: (outcome, origin) => audits.push({ outcome, origin }),
+      })
+      await assert.rejects(
+        broker.executeHttp(
+          { origin: LOOPBACK_ORIGIN, method: 'DELETE', pathAndQuery: '/api/items/42' },
+          grant,
+          AbortSignal.timeout(5_000),
+        ),
+        expected,
+      )
+      assert.deepEqual(dialed, [LOOPBACK_ORIGIN], 'only the auto-approved loopback origin may be dialed')
+      assert.ok(
+        audits.some(entry => entry.outcome === 'denied' && entry.origin === externalOrigin),
+        'the denied redirect target must be recorded in the broker audit trail',
+      )
+      assert.equal(
+        audits.some(entry => entry.origin === externalOrigin && entry.outcome !== 'denied'),
+        false,
+        'no non-denied audit entry may be recorded for the external redirect target',
+      )
+    }
+
+    // (a) Standard case: the external target is outside the assignment scope.
+    await runRedirectCase(origin => origin === LOOPBACK_ORIGIN, /isolated lab network|outside the current assignment scope/i)
+    // (b) Zero-trust case: even a permissively/mis-scoped external host cannot inherit the
+    //     origin-bound local-lab auto-approval via a redirect.
+    await runRedirectCase(() => true, /isolated lab network/i)
+
+    // (c) In-lab redirects keep working: containment must not break legitimate lab flows.
+    const labPaths: string[] = []
+    const labBroker = new RequestBroker({
+      resolve,
+      transport: async url => {
+        labPaths.push(url.pathname)
+        if (url.pathname === '/start') return { status: 302, headers: { location: '/landing' }, body: '' }
+        return { status: 200, headers: { 'content-type': 'text/plain' }, body: 'lab-landing' }
+      },
+    })
+    const labRes = await labBroker.executeHttp(
+      { origin: LOOPBACK_ORIGIN, method: 'POST', pathAndQuery: '/start', body: '{}' },
+      localLabGrant({ canRead: origin => origin === LOOPBACK_ORIGIN, isStateChangeApproved: () => true }),
+      AbortSignal.timeout(5_000),
+    )
+    assert.equal(labRes.status, 200)
+    assert.equal(labRes.body, 'lab-landing')
+    assert.deepEqual(labPaths, ['/start', '/landing'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Invariant 7 — default environment is public (fail-closed)
+// ---------------------------------------------------------------------------
+
+test('default environment fail-closed: a project without explicit environment is public and never local-lab auto-approved', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-tier3-default-env-'))
+  const storage = new Store(dir)
+  try {
+    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+      // The project schema defaults environment to 'public', so a loopback/http seed is rejected
+      // even while GUARDIAN_ALLOW_LOCAL_LAB=1 is set.
+      assert.throws(
+        () => newProject.parse({
+          requestId: randomUUID(),
+          name: 'default-env-loopback-seed',
+          seeds: [LOOPBACK_ORIGIN],
+        }),
+        /hostname or HTTPS origin/i,
+      )
+
+      const parsedProject = newProject.parse({
+        requestId: randomUUID(),
+        name: 'default-env-public',
+        seeds: ['https://app.example.com'],
+      })
+      assert.equal(parsedProject.environment, 'public')
+      const project = storage.createProject(parsedProject)
+      const defaultEnvironment = storage.project(project.id).environment
+      assert.equal(defaultEnvironment, 'public')
+
+      // Even if a caller passes a loopback origin, the defaulted public environment never
+      // receives local-lab auto-approval for DELETE / high-risk keywords.
+      const deleteResult = await evaluateTier3Approval({
+        policy: 'auto_review',
+        environment: defaultEnvironment,
+        origin: LOOPBACK_ORIGIN,
+        method: 'DELETE',
+        pathAndQuery: '/api/items/42',
+      })
+      assert.equal(deleteResult.decision, 'escalate_human')
+      assert.equal(deleteResult.stage, 'hard_escalation')
+      assert.notEqual(deleteResult.decidedBy, 'auto-review:local-lab')
+
+      const keywordResult = await evaluateTier3Approval({
+        policy: 'auto_review',
+        environment: defaultEnvironment,
+        origin: LOOPBACK_ORIGIN,
+        method: 'POST',
+        pathAndQuery: '/api/billing/refund',
+      })
+      assert.equal(keywordResult.decision, 'escalate_human')
+      assert.notEqual(keywordResult.decidedBy, 'auto-review:local-lab')
+
+      const benignResult = await evaluateTier3Approval({
+        policy: 'auto_review',
+        environment: defaultEnvironment,
+        origin: LOOPBACK_ORIGIN,
+        method: 'POST',
+        pathAndQuery: '/api/state-eval',
+        bodyPreview: '{"probe":"benign-tier3-check"}',
+        offline: true,
+      })
+      assert.notEqual(benignResult.decidedBy, 'auto-review:local-lab')
+    })
+  } finally {
+    storage.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
