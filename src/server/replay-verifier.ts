@@ -5,6 +5,7 @@ import type { Server } from 'node:http'
 import { diffResponse, dnsTakeoverAnalyze } from '../../worker/analyzers.ts'
 import { maxInlineVerifyRetries } from '../domain.ts'
 import type { InlineVerifyFeedback, VerificationTier } from '../domain.ts'
+import type { StateChangeApprovalContext } from './approval-judge.ts'
 import {
   cacheBusterValueRegex,
   containsDestructivePayload,
@@ -249,6 +250,409 @@ export function assessBflaImpact(
     required: true,
     satisfied: false,
     reason: 'Read-only BFLA proof lacks impact evidence: a 2xx from one actor on a read-only route is not privilege escalation unless another actor is denied on the same route or the response exposes data the actor cannot otherwise access. Add a same-route role-differential or a privileged mutation step.',
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v5.1 Slice 4 — proof-strength + endpoint-binding guards for LLM-authored
+// http_chain specs. These guards are strictly additive: they can only turn a
+// would-be confirmation into `inconclusive`, never the other way around.
+// ---------------------------------------------------------------------------
+
+type HttpChainSpec = Extract<DeclarativeReplaySpec, { kind: 'http_chain' }>
+
+/** Vertical/horizontal authorization claims, identified by CWE or category only (never free text). */
+const AUTHZ_CWE_RE = /^CWE-(?:269|284|285|566|639|862|863|1220)$/i
+const AUTHZ_CATEGORY_RE = /(?:^|[-_\s])(?:broken[-_\s]?access[-_\s]?control|access[-_\s]?control|idor|bola|bfla|authori[sz]ation|privilege[-_\s]?escalation|tenant[-_\s]?isolation)(?:$|[-_\s])/i
+
+function isAuthorizationClaim(spec: HttpChainSpec): boolean {
+  return AUTHZ_CWE_RE.test(spec.cwe) || AUTHZ_CATEGORY_RE.test(spec.category)
+}
+
+export type HttpChainAssertionEvidence = 'status_only' | 'unbound_content' | 'content_bound'
+
+/**
+ * Classify what the jq assertion actually proves. `status_only` inspects nothing but status codes;
+ * `unbound_content` reads a body/header without binding it to an identifier, extracted variable or
+ * field comparison (a dynamic page differs on every request); `content_bound` compares structured
+ * fields, extracted identifiers, canary/canary-fingerprint evidence or secret fingerprints.
+ */
+export function classifyHttpChainAssertion(program: string): HttpChainAssertionEvidence {
+  const fields = new Set<string>()
+  for (const match of program.matchAll(/\.steps\.[A-Za-z0-9_-]+\.([A-Za-z0-9_]+)/g)) {
+    fields.add(match[1].toLowerCase())
+  }
+  const contentFields = [...fields].filter(field =>
+    field !== 'status' && field !== 'statuses' && field !== 'id' && field !== 'role' && field !== 'batchcount')
+  const topLevelProof = /\.(?:proofMatches|extractedVars|secretMatches|canary|cacheProof|uploadProof|cryptographicProofPassed)\b/.test(program)
+  if (contentFields.length === 0) return topLevelProof ? 'content_bound' : 'status_only'
+  if (fields.has('json') || fields.has('secretmatches')) return 'content_bound'
+  const identifierBound = topLevelProof ||
+    /\$[A-Za-z_][A-Za-z0-9_]*/.test(program) ||
+    /\.(?:body|bodyPreview)\s*\|\s*(?:index|contains|startswith|endswith|test|match|capture|split|ltrimstr|rtrimstr)\s*\(/.test(program) ||
+    /\b(?:index|contains|startswith|endswith)\s*\(\s*(?:"[^"]*"|\$[A-Za-z_])/.test(program)
+  if (identifierBound) return 'content_bound'
+  // A body/header byte-length differential is structural (a masked value cannot be longer than the
+  // value it masks); any other unbound body/header read is only a "different body" observation.
+  if (fields.has('bodybytes')) return 'content_bound'
+  return 'unbound_content'
+}
+
+interface JsonFieldRef {
+  stepId: string
+  path: string[]
+}
+
+/** Extract `.steps.<id>.json.<field>` / `.json["field"]` references (bounded, no array indexes). */
+function referencedJsonPaths(program: string): JsonFieldRef[] {
+  const out: JsonFieldRef[] = []
+  const seen = new Set<string>()
+  const refPattern = /\.steps\.([A-Za-z0-9_-]+)\.json((?:\.[A-Za-z_][A-Za-z0-9_]*|\[(?:"[^"]{1,64}"|\d{1,3})\])+)/g
+  for (const match of program.matchAll(refPattern)) {
+    const segments = [...match[2].matchAll(/\[(?:"([^"]{1,64})"|\d{1,3})\]|\.([A-Za-z_][A-Za-z0-9_]*)/g)]
+    if (segments.some(seg => seg[1] === undefined && seg[2] === undefined)) continue
+    if (/\[\d{1,3}\]/.test(match[2])) continue
+    const path = segments.map(seg => seg[1] ?? seg[2]).filter((seg): seg is string => Boolean(seg))
+    if (path.length === 0) continue
+    const key = `${match[1]}|${path.join('.')}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ stepId: match[1], path })
+    if (out.length >= 24) break
+  }
+  return out
+}
+
+function readJsonField(json: unknown, path: readonly string[]): string | null {
+  let cur: unknown = json
+  for (const segment of path) {
+    if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return null
+    cur = (cur as Record<string, unknown>)[segment]
+  }
+  if (cur === undefined || cur === null) return null
+  return typeof cur === 'string' ? cur : JSON.stringify(cur)
+}
+
+/** Non-secret quoted literals used by the assertion, for identifier-bound marker disclosure checks. */
+function jqStringLiterals(program: string): string[] {
+  const out = new Set<string>()
+  for (const match of program.matchAll(/"((?:[^"\\]|\\.){8,120})"/g)) {
+    const value = match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    if (!value || /[\r\n\0]/.test(value)) continue
+    if (/^(?:application\/json|content-type|content-security-policy)$/i.test(value)) continue
+    out.add(value)
+    if (out.size >= 8) break
+  }
+  return [...out]
+}
+
+function normalizeOriginValue(value: string | undefined): string {
+  if (!value) return ''
+  try {
+    const url = new URL(value)
+    return `${url.protocol}//${url.host.toLowerCase()}`
+  } catch {
+    return value.trim().toLowerCase().replace(/\/+$/, '')
+  }
+}
+
+function originHost(value: string | undefined): string {
+  try {
+    return value ? new URL(value).host.toLowerCase() : ''
+  } catch {
+    return ''
+  }
+}
+
+/** Route family: path only, lower-cased, trailing slash trimmed (query is compared separately). */
+function routeKey(pathAndQuery: string | undefined): string {
+  if (!pathAndQuery) return ''
+  const pathOnly = pathAndQuery.split('?')[0].split('#')[0]
+  const collapsed = pathOnly.replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+  return (collapsed || '/').toLowerCase()
+}
+
+interface HttpChainStepSnapshot {
+  index: number
+  id: string
+  role: string
+  method: string
+  route: string
+  pathAndQuery: string
+  actor: string
+  status: number | null
+  body: string
+  bodyBytes: number
+  mediaType: string
+  json: unknown
+  secretMatches: number
+}
+
+function isSuccessStatus(status: number | null): boolean {
+  return status !== null && status >= 200 && status < 300
+}
+
+function snapshotHttpChainSteps(
+  spec: HttpChainSpec,
+  stepsOut: Record<string, unknown>,
+  stepExchanges: ReadonlyMap<string, BrokerExchangeResult[]>,
+): HttpChainStepSnapshot[] {
+  return spec.steps.map((step, index) => {
+    const entry = (stepsOut[step.id] ?? {}) as Record<string, unknown>
+    const exchange = stepExchanges.get(step.id)?.[0]
+    const body = typeof entry.body === 'string' ? entry.body : ''
+    const persona = step.request.persona ?? null
+    const session = step.request.session ?? null
+    return {
+      index,
+      id: step.id,
+      role: step.role,
+      method: step.request.method.toUpperCase(),
+      route: routeKey(exchange?.pathAndQuery ?? step.request.pathAndQuery),
+      pathAndQuery: exchange?.pathAndQuery ?? step.request.pathAndQuery,
+      actor: persona ? `persona:${persona}` : session ? `session:${session}` : 'anonymous',
+      status: typeof entry.status === 'number' ? entry.status : null,
+      body,
+      bodyBytes: typeof entry.bodyBytes === 'number' ? entry.bodyBytes : Buffer.byteLength(body, 'utf8'),
+      mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : '',
+      json: entry.json ?? null,
+      secretMatches: exchange?.secretMatches?.length ?? 0,
+    }
+  })
+}
+
+export type HttpChainDifferential =
+  | 'denied_then_allowed'
+  | 'cross_actor_access'
+  | 'field_bound'
+  | 'state_delta'
+  | 'identifier_proof'
+  | null
+
+export interface HttpChainProofStrength {
+  claim: 'authorization' | 'other'
+  assertionEvidence: HttpChainAssertionEvidence
+  differential: HttpChainDifferential
+  satisfied: boolean
+  reason: string
+}
+
+function detectHttpChainDifferential(
+  spec: HttpChainSpec,
+  snapshots: readonly HttpChainStepSnapshot[],
+): HttpChainDifferential {
+  const controls = snapshots.filter(step => step.role === 'control')
+  const probes = snapshots.filter(step => step.role === 'probe')
+  const dataBearing = (step: HttpChainStepSnapshot) => isSuccessStatus(step.status) && step.bodyBytes >= 8
+  const sameRoute = (a: HttpChainStepSnapshot, b: HttpChainStepSnapshot) =>
+    a.method === b.method && a.route === b.route && a.route !== ''
+  const denied = (step: HttpChainStepSnapshot) => step.status === 401 || step.status === 403
+  // A control that is bounced (login/SSO redirect) did not receive the resource either.
+  const bounced = (step: HttpChainStepSnapshot) =>
+    step.status !== null && step.status >= 300 && step.status < 400
+
+  // 1. The same endpoint is denied to the control caller and served to the probe caller.
+  if (probes.some(probe => dataBearing(probe) && controls.some(control => sameRoute(control, probe) && (denied(control) || bounced(control))))) {
+    return 'denied_then_allowed'
+  }
+
+  // 2. A different actor reaches the exact endpoint the control actor reached.
+  if (probes.some(probe => dataBearing(probe) && controls.some(control =>
+    sameRoute(control, probe) && control.actor !== probe.actor && (isSuccessStatus(control.status) || denied(control))))) {
+    return 'cross_actor_access'
+  }
+
+  // 3. A declared response field carries a different value for the probe than for the control.
+  for (const ref of referencedJsonPaths(spec.assertionsJq)) {
+    const probe = probes.find(step => step.id === ref.stepId && isSuccessStatus(step.status))
+    if (!probe) continue
+    const probeValue = readJsonField(probe.json, ref.path)
+    if (probeValue === null) continue
+    if (controls.some(control => control.status !== null && readJsonField(control.json, ref.path) !== probeValue)) {
+      return 'field_bound'
+    }
+  }
+
+  // 4. A privileged mutation succeeds and a later read observes the mutated state (or its removal).
+  const mutatingProbe = probes.find(step => MUTATING_REPLAY_METHODS.has(step.method) && isSuccessStatus(step.status))
+  if (mutatingProbe) {
+    const reads = snapshots.filter(step => READ_ONLY_REPLAY_METHODS.has(step.method) && step.index !== mutatingProbe.index)
+    const before = [...reads].reverse().find(step => step.index < mutatingProbe.index && isSuccessStatus(step.status) && step.bodyBytes > 0)
+    const after = reads.find(step => step.index > mutatingProbe.index)
+    if (before && after) {
+      if ((after.status !== null && after.status >= 400) || (after.bodyBytes > 0 && after.body !== before.body)) {
+        return 'state_delta'
+      }
+    }
+  }
+
+  // 5. Identifier-bound proof: pre-redaction secret fingerprints or an asserted marker observed only
+  //    in the probe response.
+  if (probes.some(step => isSuccessStatus(step.status) && step.secretMatches > 0)) return 'identifier_proof'
+  const controlBodies = controls.map(step => step.body)
+  for (const literal of jqStringLiterals(spec.assertionsJq)) {
+    if (probes.some(step => step.body !== '' && step.body.includes(literal)) &&
+        !controlBodies.some(body => body.includes(literal))) {
+      return 'identifier_proof'
+    }
+  }
+
+  return null
+}
+
+/**
+ * Proof-strength gate for authorization `http_chain` specs. A status-only claim (or a bare
+ * "the body differs" claim) is never a control-vs-probe differential, and a content assertion must
+ * be backed by an observable differential in the recorded exchanges (denied-then-allowed,
+ * cross-actor access, field-bound value change, state delta, or identifier-bound proof).
+ */
+export function assessHttpChainProofStrength(
+  spec: HttpChainSpec,
+  snapshots: readonly HttpChainStepSnapshot[],
+): HttpChainProofStrength {
+  const assertionEvidence = classifyHttpChainAssertion(spec.assertionsJq)
+  if (!isAuthorizationClaim(spec)) {
+    return { claim: 'other', assertionEvidence, differential: null, satisfied: true, reason: 'Not an authorization claim.' }
+  }
+  if (assertionEvidence === 'status_only') {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential: null,
+      satisfied: false,
+      reason: 'Authorization claim is status-only: a 2xx status (or status equality) is not an access-control differential. Assert a cross-actor resource read, a field/identifier bound to the victim object, or a state delta.',
+    }
+  }
+  // Canary / cryptographic proof is produced by the verifier itself (distinct control vs probe
+  // tokens, non-destructive math), so it is already an identifier-bound execution differential.
+  if (/\.(?:canary|proof)\b/.test(spec.assertionsJq)) {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential: 'identifier_proof',
+      satisfied: true,
+      reason: 'Authorization claim is bound to verifier-minted canary/cryptographic proof.',
+    }
+  }
+  const differential = detectHttpChainDifferential(spec, snapshots)
+  if (assertionEvidence === 'unbound_content' && differential !== 'state_delta' && differential !== 'field_bound') {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential,
+      satisfied: false,
+      reason: 'Authorization claim rests on a different-body observation without identifier binding; assert a field-bound value, extracted victim identifier, secret fingerprint, or state delta.',
+    }
+  }
+  if (differential === null) {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential,
+      satisfied: false,
+      reason: 'Authorization claim has no genuine control-vs-probe differential in the recorded exchanges (no denied-then-allowed route, cross-actor access, field-bound change, or state delta).',
+    }
+  }
+  return {
+    claim: 'authorization',
+    assertionEvidence,
+    differential,
+    satisfied: true,
+    reason: `Authorization differential proven: ${differential}.`,
+  }
+}
+
+export interface HttpChainEndpointBinding {
+  bound: boolean
+  verifiedEndpoint: { stepId: string; role: string; origin: string; method: string; pathAndQuery: string } | null
+  declaredEndpoint: { stepId: string; origin: string; method: string; pathAndQuery: string } | null
+  mismatches: Array<{ stepId: string; field: 'origin' | 'method' | 'redirectHost' | 'specOrigin'; declared: string; actual: string }>
+  reason: string
+}
+
+/**
+ * Mechanical endpoint/method binding: the verified endpoint is the *actual* probe exchange, not the
+ * spec's claim. Any disagreement between the declared step request and the wire exchange, a redirect
+ * that leaves the declared host, or a primary probe step targeting a different origin than the
+ * finding origin, invalidates the confirmation.
+ */
+export function assessHttpChainEndpointBinding(
+  spec: HttpChainSpec,
+  stepRequests: ReadonlyMap<string, readonly BrokerHttpRequest[]>,
+  stepExchanges: ReadonlyMap<string, readonly BrokerExchangeResult[]>,
+): HttpChainEndpointBinding {
+  const mismatches: HttpChainEndpointBinding['mismatches'] = []
+  for (const step of spec.steps) {
+    const requests = stepRequests.get(step.id) ?? []
+    const exchanges = stepExchanges.get(step.id) ?? []
+    for (const [idx, exchange] of exchanges.entries()) {
+      const request = requests[Math.min(idx, Math.max(0, requests.length - 1))]
+      if (!request) continue
+      if (exchange.method.toUpperCase() !== request.method.toUpperCase()) {
+        mismatches.push({ stepId: step.id, field: 'method', declared: request.method.toUpperCase(), actual: exchange.method.toUpperCase() })
+      }
+      if (normalizeOriginValue(exchange.origin) !== normalizeOriginValue(request.origin)) {
+        mismatches.push({ stepId: step.id, field: 'origin', declared: normalizeOriginValue(request.origin), actual: normalizeOriginValue(exchange.origin) })
+      }
+    }
+  }
+
+  const primaryProbe = spec.steps.find(step => step.role === 'probe' && (stepExchanges.get(step.id)?.length ?? 0) > 0)
+  const primaryExchange = primaryProbe ? stepExchanges.get(primaryProbe.id)?.[0] : undefined
+  if (!primaryProbe || !primaryExchange) {
+    return {
+      bound: false,
+      verifiedEndpoint: null,
+      declaredEndpoint: null,
+      mismatches,
+      reason: 'No executed probe exchange is available to bind the finding endpoint.',
+    }
+  }
+
+  const declaredEndpoint = {
+    stepId: primaryProbe.id,
+    origin: normalizeOriginValue(primaryProbe.request.origin),
+    method: primaryProbe.request.method.toUpperCase(),
+    pathAndQuery: primaryProbe.request.pathAndQuery,
+  }
+  const verifiedEndpoint = {
+    stepId: primaryProbe.id,
+    role: primaryProbe.role,
+    origin: normalizeOriginValue(primaryExchange.origin),
+    method: primaryExchange.method.toUpperCase(),
+    pathAndQuery: primaryExchange.pathAndQuery,
+  }
+
+  if (normalizeOriginValue(spec.origin) !== declaredEndpoint.origin) {
+    mismatches.push({ stepId: primaryProbe.id, field: 'specOrigin', declared: declaredEndpoint.origin, actual: normalizeOriginValue(spec.origin) })
+  }
+  const declaredHost = originHost(primaryProbe.request.origin)
+  const finalHost = originHost(primaryExchange.finalOrigin)
+  if (declaredHost && finalHost && declaredHost !== finalHost) {
+    mismatches.push({ stepId: primaryProbe.id, field: 'redirectHost', declared: declaredHost, actual: finalHost })
+  }
+
+  if (mismatches.length > 0) {
+    const first = mismatches[0]
+    return {
+      bound: false,
+      verifiedEndpoint,
+      declaredEndpoint,
+      mismatches: mismatches.slice(0, 8),
+      reason: first.field === 'specOrigin'
+        ? `Finding origin ${normalizeOriginValue(spec.origin)} does not match the probe endpoint origin ${declaredEndpoint.origin} (step "${first.stepId}"); the verified exchange came from a different asset than the finding claims.`
+        : first.field === 'redirectHost'
+          ? `Probe step "${first.stepId}" redirected from ${first.declared} to ${first.actual}; the verified endpoint is not the declared asset.`
+          : `Probe step "${first.stepId}" ${first.field} mismatch: declared ${first.declared}, exchanged ${first.actual}.`,
+    }
+  }
+
+  return {
+    bound: true,
+    verifiedEndpoint,
+    declaredEndpoint,
+    mismatches: [],
+    reason: `Verified ${verifiedEndpoint.method} ${verifiedEndpoint.origin}${verifiedEndpoint.pathAndQuery} from step "${verifiedEndpoint.stepId}".`,
   }
 }
 
@@ -625,8 +1029,33 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     }
     const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
     const approvalFn = grant.isStateChangeApproved
+    // Reproduce the exact fingerprint a Tier-3 decision registers (origin/method/path/persona/body
+    // hash + multipart/rce flags). Without context the one-shot ledger can never be consumed, and a
+    // matching operator pattern would be the only way through — which must never authorize an
+    // RCE/upload proof of execution, so both kinds are flagged `isRceProof`.
+    //
+    // Local-lab uploads short-circuit through the approval module's `local_lab` decision. A public
+    // upload additionally needs the execution-side registration to carry `isRceProof: true` (the
+    // multipart body is interpolated with a fresh nonce, so the broker must also key the grant to the
+    // prepared parts); until then public uploads fail closed instead of accepting a pattern.
+    const approvalContext: StateChangeApprovalContext = spec.kind === 'rce_proof'
+      ? {
+          personaHandle: spec.probeStep.request.persona ?? null,
+          body: spec.probeStep.request.textBody ??
+            (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : null),
+          hasMultipart: false,
+          isRaceBurst: false,
+          isRceProof: true,
+        }
+      : {
+          personaHandle: spec.uploadStep.persona ?? null,
+          body: spec.uploadStep.contentTemplate,
+          hasMultipart: true,
+          isRaceBurst: false,
+          isRceProof: true,
+        }
     const approved = approvalFn
-      ? approvalFn(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery)
+      ? approvalFn(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery, approvalContext)
       : localLab
     if (!approved) {
       grant.audit('denied', gateRequest.origin)
@@ -642,6 +1071,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     replayedAt: new Date().toISOString(),
   }
   let forcedInconclusiveReason: string | null = null
+  // Proof-strength / endpoint-binding failures are recorded separately: they only veto a spec that
+  // WOULD confirm. A spec that already evaluates to confirmed=false must keep its dismissed/fixed
+  // semantics (e.g. "Verify Fix" after a patch), so the guard never runs ahead of the assertion.
+  let proofGuardFailure: string | null = null
   let deterministicProofPassed = true
   let proofFailureReason = ''
 
@@ -650,6 +1083,14 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       const vars: Record<string, string> = {}
       const stepsOut: Record<string, unknown> = {}
       const probeStepExchanges: Array<{ id: string; exchange: BrokerExchangeResult }> = []
+      // Mechanical endpoint binding: track the exact request that was sent per step (post-interpolation)
+      // and every exchange it produced, then bind the finding to the wire evidence afterwards.
+      const stepRequests = new Map<string, BrokerHttpRequest[]>()
+      const stepExchanges = new Map<string, BrokerExchangeResult[]>()
+      const rememberStep = (stepId: string, requests: BrokerHttpRequest[], produced: BrokerExchangeResult[]) => {
+        stepRequests.set(stepId, requests)
+        stepExchanges.set(stepId, produced)
+      }
       const replayJarPrefix = randomUUID().slice(0, 8)
       let firstControlStep: Record<string, unknown> | undefined
       let firstProbeStep: Record<string, unknown> | undefined
@@ -691,6 +1132,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             const batchReqs = Array.from({ length: step.request.batchCount }, () => ({ ...brokerReq }))
             const batchResults = await broker.executeBatch(batchReqs, grant, signal)
             for (const ex of batchResults) recordExchange(ex)
+            rememberStep(step.id, batchReqs, batchResults)
             const first = batchResults[0]
             if (first) extractVariables(step, first, vars)
             const stepEntry: Record<string, unknown> = {
@@ -710,6 +1152,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           } else {
             const ex = await broker.executeHttp(brokerReq, grant, signal)
             recordExchange(ex)
+            rememberStep(step.id, [brokerReq], [ex])
             extractVariables(step, ex, vars)
             const stepEntry: Record<string, unknown> = {
               id: step.id,
@@ -801,7 +1244,57 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           }
         }
 
+        // Auto catch-all baseline: when the spec does not opt in to spaCatchallControl, a 2xx HTML
+        // probe is still compared against a fresh unmatched-path baseline. If the probe is
+        // indistinguishable from the catch-all, the claim is not tied to a real endpoint and the
+        // verifier requires the explicit control (`spaCatchallControl: true`) to re-verify.
+        let spaCatchallAuto: Record<string, unknown> | undefined
+        if (!spec.spaCatchallControl) {
+          const htmlProbes = probeStepExchanges.filter(probe =>
+            probe.exchange.status >= 200 && probe.exchange.status < 300 && probe.exchange.mediaType.includes('html'))
+          if (htmlProbes.length > 0) {
+            const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+            const catchallEx = await broker.executeHttp({
+              origin: spec.origin,
+              method: 'GET',
+              pathAndQuery: catchallPath,
+              followRedirects: true,
+            }, grant, signal)
+            recordExchange(catchallEx)
+            const comparisons: Record<string, Record<string, unknown>> = {}
+            let matchedProbes = 0
+            for (const probe of htmlProbes) {
+              const diff = diffResponse(
+                { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+                { status: probe.exchange.status, body: probe.exchange.body, mediaType: probe.exchange.mediaType },
+              )
+              comparisons[probe.id] = diff
+              if (diff.likelySpaCatchall) matchedProbes += 1
+            }
+            spaCatchallAuto = {
+              path: catchallPath,
+              requiresControl: true,
+              probeCount: htmlProbes.length,
+              matchedProbes,
+              ...summarizeExchange(catchallEx),
+              comparisons,
+            }
+            if (matchedProbes === htmlProbes.length && !proofGuardFailure) {
+              proofGuardFailure = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route; set spaCatchallControl: true to verify against a real endpoint baseline.'
+            }
+          }
+        }
+
         const bflaImpact = assessBflaImpact(spec, stepsOut)
+        const stepSnapshots = snapshotHttpChainSteps(spec, stepsOut, stepExchanges)
+        const proofStrength = assessHttpChainProofStrength(spec, stepSnapshots)
+        const endpointBinding = assessHttpChainEndpointBinding(spec, stepRequests, stepExchanges)
+        if (proofStrength.claim === 'authorization' && !proofStrength.satisfied && !proofGuardFailure) {
+          proofGuardFailure = proofStrength.reason
+        }
+        if (!endpointBinding.bound && !proofGuardFailure) {
+          proofGuardFailure = endpointBinding.reason
+        }
         let proofMatches: Record<string, boolean[]> | undefined
         if (spec.proofPatterns?.length) {
           proofMatches = {}
@@ -830,7 +1323,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(proofMatches ? { proofMatches } : {}),
           ...(canaryEvidence ?? {}),
           ...(spaCatchall ? { spaCatchall } : {}),
+          ...(spaCatchallAuto ? { spaCatchallAuto } : {}),
           bflaImpact,
+          proofStrength,
+          endpointBinding,
         }
         if (bflaImpact.required && !bflaImpact.satisfied && !forcedInconclusiveReason) {
           forcedInconclusiveReason = bflaImpact.reason
@@ -2104,7 +2600,24 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           return inconclusiveResult('sql_time_diff is blocked on public projects below Tier 3 (requires local-lab or Tier 3 HITL approval).', exchanges, exchangeIds, { kind: spec.kind })
         }
         const approved = grant.isStateChangeApproved
-          ? grant.isStateChangeApproved(spec.targetOrigin, spec.method, spec.pathAndQuery)
+          ? grant.isStateChangeApproved(
+              spec.targetOrigin,
+              spec.method,
+              spec.pathAndQuery,
+              {
+                personaHandle: spec.persona ?? null,
+                // Spec-scoped approval: the pre-gate authorizes the declared request (the mutated
+                // timing payloads are derived from it), so the fingerprint uses the declared body.
+                body: spec.paramLocation === 'json' && spec.jsonBody !== undefined
+                  ? JSON.stringify(spec.jsonBody)
+                  : spec.paramLocation === 'xml'
+                    ? spec.xmlTemplate ?? null
+                    : null,
+                hasMultipart: false,
+                isRaceBurst: false,
+                isRceProof: false,
+              },
+            )
           : false
         if (!approved) {
           grant.audit('denied', spec.targetOrigin)
@@ -2370,6 +2883,21 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     }
   }
 
+  if (proofGuardFailure && outcome.controlPassed && outcome.confirmed) {
+    return {
+      verdict: 'inconclusive',
+      outcome: {
+        ...outcome,
+        confirmed: false,
+        reason: proofGuardFailure,
+      },
+      exchangeIds,
+      exchanges,
+      evidencePayload,
+      evidenceSha256,
+    }
+  }
+
   if (!deterministicProofPassed) {
     return {
       verdict: outcome.controlPassed ? 'dismissed' : 'inconclusive',
@@ -2507,6 +3035,15 @@ export interface EnrichedInlineVerifyFeedback extends InlineVerifyFeedback {
   /** True when a vertical BFLA (function-level) proof lacked impact evidence. */
   bflaImpactRequired?: boolean
   impactEvidenceMissing?: boolean
+  /** False when a status-only / unbound authorization claim was rejected for lacking a differential. */
+  proofStrengthSatisfied?: boolean
+  proofStrengthReason?: string
+  /** True when the executed probe exchange did not match the spec's declared endpoint/method. */
+  endpointBindingFailed?: boolean
+  /** Method + origin + path of the endpoint the verifier actually observed. */
+  verifiedEndpoint?: string
+  /** True when a catch-all baseline matched and the spec must opt in to spaCatchallControl. */
+  spaCatchallRequired?: boolean
 }
 
 const inlinePreviewBytes = 512
@@ -2713,6 +3250,15 @@ export function buildInlineVerifyFeedback(
     }
   }
 
+  let spaCatchallRequired: boolean | undefined
+  if (payload.spaCatchallAuto && typeof payload.spaCatchallAuto === 'object') {
+    const auto = payload.spaCatchallAuto as { requiresControl?: unknown; matchedProbes?: unknown; probeCount?: unknown }
+    if (auto.requiresControl === true && typeof auto.matchedProbes === 'number' &&
+        typeof auto.probeCount === 'number' && auto.matchedProbes === auto.probeCount) {
+      spaCatchallRequired = true
+    }
+  }
+
   let canaryTriggered: boolean | undefined
   const proofObj = payload.proof as { canaryProbeTriggered?: unknown } | undefined
   const probeObj = payload.probe as { canaryCheck?: { triggered?: unknown } } | undefined
@@ -2777,6 +3323,25 @@ export function buildInlineVerifyFeedback(
   const bflaImpact = payload.bflaImpact as { required?: unknown; satisfied?: unknown; reason?: unknown } | undefined
   const bflaImpactRequired = bflaImpact?.required === true ? true : undefined
   const impactEvidenceMissing = bflaImpact?.required === true && bflaImpact?.satisfied === false ? true : undefined
+  const proofStrengthPayload = payload.proofStrength as { claim?: unknown; satisfied?: unknown; reason?: unknown } | undefined
+  const proofStrengthSatisfied = proofStrengthPayload && typeof proofStrengthPayload.satisfied === 'boolean'
+    ? proofStrengthPayload.satisfied
+    : undefined
+  const proofStrengthReason = proofStrengthPayload && proofStrengthPayload.satisfied === false && typeof proofStrengthPayload.reason === 'string'
+    ? redact(proofStrengthPayload.reason, secrets).slice(0, 320)
+    : undefined
+  const endpointBindingPayload = payload.endpointBinding as {
+    bound?: unknown
+    reason?: unknown
+    verifiedEndpoint?: { origin?: unknown; method?: unknown; pathAndQuery?: unknown } | null
+  } | undefined
+  const endpointBindingFailed = endpointBindingPayload && endpointBindingPayload.bound === false ? true : undefined
+  const verifiedEndpoint = endpointBindingPayload?.verifiedEndpoint &&
+    typeof endpointBindingPayload.verifiedEndpoint.method === 'string' &&
+    typeof endpointBindingPayload.verifiedEndpoint.origin === 'string' &&
+    typeof endpointBindingPayload.verifiedEndpoint.pathAndQuery === 'string'
+    ? redact(`${endpointBindingPayload.verifiedEndpoint.method} ${endpointBindingPayload.verifiedEndpoint.origin}${endpointBindingPayload.verifiedEndpoint.pathAndQuery}`, secrets).slice(0, 320)
+    : undefined
 
   const rawFeedback: EnrichedInlineVerifyFeedback = {
     verdict: replay.verdict,
@@ -2785,6 +3350,7 @@ export function buildInlineVerifyFeedback(
     controlPassed: replay.outcome.controlPassed,
     ...(requireControlNonErrorTriggered ? { requireControlNonErrorTriggered } : {}),
     ...(spaCatchallMatched !== undefined ? { spaCatchallMatched } : {}),
+    ...(spaCatchallRequired ? { spaCatchallRequired } : {}),
     ...(spaSimilarityScore !== undefined ? { spaSimilarityScore } : {}),
     ...(canaryTriggered !== undefined ? { canaryTriggered } : {}),
     ...(jqError ? { jqError } : {}),
@@ -2799,6 +3365,10 @@ export function buildInlineVerifyFeedback(
     ...(kind ? { verificationKind: kind } : {}),
     ...(bflaImpactRequired ? { bflaImpactRequired } : {}),
     ...(impactEvidenceMissing ? { impactEvidenceMissing } : {}),
+    ...(proofStrengthSatisfied !== undefined ? { proofStrengthSatisfied } : {}),
+    ...(proofStrengthReason ? { proofStrengthReason } : {}),
+    ...(endpointBindingFailed ? { endpointBindingFailed } : {}),
+    ...(verifiedEndpoint ? { verifiedEndpoint } : {}),
   }
 
   // Enrichment is built from already-redacted exchanges; this final pass catches anything that
