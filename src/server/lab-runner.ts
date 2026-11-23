@@ -144,6 +144,36 @@ export interface IngestLabTelemetryResult {
   hasUnhandledException: boolean
 }
 
+export type LabContainerStatus = 'running' | 'orphaned' | 'reclaimed'
+
+/**
+ * Narrow structural view of the merged v6 Store lab-container registry. LabRunner accepts the full
+ * `Store` (StartLabTargetParams.storage); this interface keeps lifecycle wiring testable with a
+ * fake and decouples the runner from Store internals.
+ */
+export interface LabContainerStore {
+  recordLabContainer(input: {
+    runId: string
+    assignmentId?: string | null
+    containerName: string
+    imageName?: string | null
+    status?: LabContainerStatus
+  }): unknown
+  markLabContainerOrphaned(runId: string, containerName: string): void
+  listLabContainers(runId: string): Array<{ containerName: string; status?: string }>
+}
+
+export interface PersistedLabContainerRef {
+  runId: string
+  containerName: string
+}
+
+export interface LabReclaimResult {
+  removed: number
+  skipped: number
+  mismatched: number
+}
+
 interface InternalTargetState {
   handle: LabTargetHandle
   labConfig: LabConfig
@@ -156,6 +186,7 @@ interface InternalTargetState {
   proxyContainerName: string
   proxyDir: string
   ownsTelemetryDir: boolean
+  storage?: LabContainerStore
 }
 
 const EXCLUDED_DIR_NAMES = new Set([
@@ -2259,6 +2290,144 @@ export class LabRunner {
     }
   }
 
+  // --- Store lab-container registry -------------------------------------------------
+
+  private recordContainerRow(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+    imageName: string,
+    status: LabContainerStatus,
+  ): void {
+    if (!storage) return
+    try {
+      storage.recordLabContainer({ runId, containerName, imageName, status })
+    } catch {
+      // Registry persistence is advisory: label-based reaping still covers a missing row.
+    }
+  }
+
+  private markContainerOrphaned(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+  ): void {
+    if (!storage) return
+    try {
+      storage.markLabContainerOrphaned(runId, containerName)
+    } catch {
+      // Best-effort: the durable label/recovery record remains the source of truth.
+    }
+  }
+
+  /**
+   * Delete the registry row on normal reclamation. The merged Store exposes no delete method, so
+   * use its public SQLite client (or a future `deleteLabContainer` method when present) without
+   * changing store.ts.
+   */
+  private deleteContainerRow(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+  ): void {
+    if (!storage) return
+    try {
+      const extended = storage as unknown as {
+        deleteLabContainer?: (runId: string, containerName: string) => void
+        client?: { prepare: (sql: string) => { run: (...params: unknown[]) => unknown } }
+      }
+      if (typeof extended.deleteLabContainer === 'function') {
+        extended.deleteLabContainer(runId, containerName)
+        return
+      }
+      if (extended.client) {
+        extended.client
+          .prepare('DELETE FROM lab_containers WHERE run_id = ? AND container_name = ?')
+          .run(runId, containerName)
+      }
+    } catch {
+      // Best-effort: a stale row is reclaimed by Store.recover() on the next restart.
+    }
+  }
+
+  /**
+   * Remove one container and its registry row. The row is deleted only when the container was
+   * removed, or when docker confirms it is already gone; a container that still exists keeps its
+   * row so a later recovery retries instead of losing the orphan.
+   */
+  private async removeContainerAndRow(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+  ): Promise<boolean> {
+    const removed = await this.tryDocker(['container', 'rm', '--force', containerName], AbortSignal.timeout(10_000))
+    if (removed) {
+      this.deleteContainerRow(storage, runId, containerName)
+      return true
+    }
+    const stillExists = await this.tryDocker(
+      ['inspect', '-f', '{{.Id}}', containerName],
+      AbortSignal.timeout(5_000),
+    )
+    if (!stillExists) this.deleteContainerRow(storage, runId, containerName)
+    return false
+  }
+
+  /**
+   * Reclaim containers returned by `Store.recover()`. Each candidate is removed only when its
+   * `dev.guardian.run` label matches the requested run, so a stale/corrupt row can never delete a
+   * container belonging to another run. Missing containers are treated as already reclaimed.
+   */
+  async reclaimPersisted(
+    containers: ReadonlyArray<PersistedLabContainerRef>,
+    storage?: LabContainerStore,
+  ): Promise<LabReclaimResult> {
+    const result: LabReclaimResult = { removed: 0, skipped: 0, mismatched: 0 }
+    const seen = new Set<string>()
+    for (const ref of containers.slice(0, 64)) {
+      if (typeof ref?.runId !== 'string' || typeof ref?.containerName !== 'string') {
+        result.skipped += 1
+        continue
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(ref.runId)) {
+        result.skipped += 1
+        continue
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(ref.containerName)) {
+        result.skipped += 1
+        continue
+      }
+      const key = `${ref.runId}\u0000${ref.containerName}`
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      let label: string | null = null
+      try {
+        label = (await this.docker(
+          ['inspect', '-f', `{{index .Config.Labels "${LAB_LABELS.run}"}}`, ref.containerName],
+          AbortSignal.timeout(5_000),
+        )).trim()
+      } catch {
+        // Container is already gone: nothing to remove, but clear any stale row.
+        this.deleteContainerRow(storage, ref.runId, ref.containerName)
+        result.skipped += 1
+        continue
+      }
+      if (label !== ref.runId) {
+        result.mismatched += 1
+        continue
+      }
+      const removed = await this.tryDocker(['container', 'rm', '--force', ref.containerName], AbortSignal.timeout(10_000))
+      if (removed) {
+        result.removed += 1
+        this.deleteContainerRow(storage, ref.runId, ref.containerName)
+      } else {
+        result.skipped += 1
+      }
+    }
+    return result
+  }
+
   private async launchServiceContainer(params: {
     runId: string
     networkName: string
@@ -2267,6 +2436,7 @@ export class LabRunner {
     labConfig: LabConfig
     isPrimary: boolean
     telemetryDir?: string
+    storage?: LabContainerStore
     signal?: AbortSignal
   }): Promise<{
     containerName: string
@@ -2276,7 +2446,7 @@ export class LabRunner {
     builtImage: boolean
     volumes: string[]
   }> {
-    const { runId, networkName, sanitizedRepoDir, service, labConfig, isPrimary, telemetryDir, signal } = params
+    const { runId, networkName, sanitizedRepoDir, service, labConfig, isPrimary, telemetryDir, storage, signal } = params
     const containerUser = resolveLabContainerUser(this.env)
     const shortId = createHash('sha256').update(`${runId}:${service.name}:${randomUUID()}`).digest('hex').slice(0, 10)
     const safeSvc = service.name.replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'svc'
@@ -2433,6 +2603,9 @@ export class LabRunner {
 
     try {
       await this.docker(runArgs, signal)
+      // Persist the labelled container immediately: if the following inspect/health steps fail the
+      // row is flipped to `orphaned` and a later Store.recover()/reclaimPersisted() reaps it.
+      this.recordContainerRow(storage, runId, containerName, imageName, 'running')
       const containerId = (await this.docker(['inspect', '-f', '{{.Id}}', containerName], signal)).trim()
       const rawIp = (await this.docker(
         ['inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', containerName],
@@ -2446,6 +2619,7 @@ export class LabRunner {
       }
       return { containerName, containerId, containerIp: rawIp, imageName, builtImage, volumes }
     } catch (err) {
+      this.markContainerOrphaned(storage, runId, containerName)
       await this.docker(['container', 'rm', '--force', containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
       if (builtImage) {
         await this.docker(['image', 'rm', '--force', imageName], AbortSignal.timeout(5_000)).catch(() => undefined)
@@ -2586,6 +2760,7 @@ export class LabRunner {
           service: sidecar,
           labConfig,
           isPrimary: false,
+          storage: params.storage,
           signal: params.signal,
         })
         containerNames.push(launched.containerName)
@@ -2616,6 +2791,7 @@ export class LabRunner {
         labConfig,
         isPrimary: true,
         telemetryDir,
+        storage: params.storage,
         signal: params.signal,
       })
       containerNames.push(primaryLaunched.containerName)
@@ -2625,18 +2801,20 @@ export class LabRunner {
 
       // Point the in-network proxy at the primary container (container DNS name, unique per launch).
       writeLabProxyTarget(proxyDir, primaryLaunched.containerName, internalPort)
+      const proxyImage = this.env[LAB_PROXY_IMAGE_ENV]?.trim() || LAB_PROXY_IMAGE_DEFAULT
       await this.docker(buildLabProxyRunArgs({
         containerName: proxyContainerName,
         networkName,
         runId: params.runId,
         proxyDir,
-        image: this.env[LAB_PROXY_IMAGE_ENV]?.trim() || LAB_PROXY_IMAGE_DEFAULT,
+        image: proxyImage,
         user: containerUser,
         targetHost: primaryLaunched.containerName,
         targetPort: internalPort,
         socketMode,
       }), params.signal)
       proxyStarted = true
+      this.recordContainerRow(params.storage, params.runId, proxyContainerName, proxyImage, 'running')
       let socketPath: string
       try {
         socketPath = await waitForLabProxySocket(proxyDir, 15_000, params.signal)
@@ -2731,6 +2909,7 @@ export class LabRunner {
         proxyContainerName,
         proxyDir,
         ownsTelemetryDir,
+        ...(params.storage ? { storage: params.storage } : {}),
       })
       this.persistState(params.runId)
 
@@ -2740,9 +2919,11 @@ export class LabRunner {
         await new Promise<void>(res => forwarder!.close(() => res())).catch(() => undefined)
       }
       if (proxyStarted) {
+        this.markContainerOrphaned(params.storage, params.runId, proxyContainerName)
         await this.docker(['container', 'rm', '--force', proxyContainerName], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       for (const cname of containerNames) {
+        this.markContainerOrphaned(params.storage, params.runId, cname)
         await this.docker(['container', 'rm', '--force', cname], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       await this.sweepOrphanContainersForRun(params.runId)
@@ -2787,6 +2968,7 @@ export class LabRunner {
       labConfig: state.labConfig,
       isPrimary: true,
       telemetryDir: state.handle.telemetryDir,
+      storage: state.storage,
       signal,
     })
 
@@ -2802,6 +2984,7 @@ export class LabRunner {
       )
     } catch (err) {
       writeLabProxyTarget(state.proxyDir, prevContainer, state.handle.internalPort)
+      this.markContainerOrphaned(state.storage, runId, launched.containerName)
       await this.docker(['container', 'rm', '--force', launched.containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
       if (launched.builtImage) {
         await this.docker(['image', 'rm', '--force', launched.imageName], AbortSignal.timeout(5_000)).catch(() => undefined)
@@ -2830,7 +3013,7 @@ export class LabRunner {
       startedAt: Date.now(),
     }
 
-    await this.docker(['container', 'rm', '--force', prevContainer], AbortSignal.timeout(5_000)).catch(() => undefined)
+    await this.removeContainerAndRow(state.storage, runId, prevContainer)
     if (prevBuiltImage && prevBuiltImage !== launched.imageName) {
       state.builtImages = state.builtImages.filter(i => i !== prevBuiltImage)
       await this.docker(['image', 'rm', '--force', prevBuiltImage], AbortSignal.timeout(5_000)).catch(() => undefined)
@@ -2852,7 +3035,7 @@ export class LabRunner {
    * Reap every resource for a run: containers/networks/volumes by label, plus every path in the
    * persisted crash record. Idempotent — calling it twice is safe and returns zero removals.
    */
-  async recover(runId: string): Promise<LabRecoveryResult> {
+  async recover(runId: string, storage?: LabContainerStore): Promise<LabRecoveryResult> {
     validateLabRunId(runId)
     if (this.active.has(runId)) {
       await this.stopLabTarget(runId)
@@ -2873,9 +3056,21 @@ export class LabRunner {
       ...(record?.proxyContainerName ? [record.proxyContainerName] : []),
       ...(await this.listByLabel('container', runId)),
     ])
+    const processedContainers = new Set<string>()
     for (const target of containerTargets) {
       if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(target)) continue
-      if (await this.tryDocker(['container', 'rm', '--force', target])) result.containersRemoved += 1
+      if (await this.removeContainerAndRow(storage, runId, target)) result.containersRemoved += 1
+      processedContainers.add(target)
+    }
+    if (storage) {
+      try {
+        for (const row of storage.listLabContainers(runId)) {
+          if (processedContainers.has(row.containerName)) continue
+          if (await this.removeContainerAndRow(storage, runId, row.containerName)) result.containersRemoved += 1
+        }
+      } catch {
+        // Registry cleanup is best-effort; the next Store.recover() retries.
+      }
     }
 
     const networkTargets = new Set<string>([
@@ -2904,8 +3099,12 @@ export class LabRunner {
     return result
   }
 
-  /** Recover every run found in persisted records and by the lab label (crash/restart path). */
-  async recoverAll(): Promise<LabRecoveryResult[]> {
+  /**
+   * Recover every run found in persisted records, the lab label scan and (optionally) the Store
+   * registry rows. Callers that own `Store.recover()` can pass its `reclaimedContainers` refs to
+   * `reclaimPersisted()` instead; this method is the self-contained startup path.
+   */
+  async recoverAll(storage?: LabContainerStore): Promise<LabRecoveryResult[]> {
     const runIds = new Set<string>()
     try {
       for (const entry of readdirSync(this.stateDir)) {
@@ -2946,7 +3145,7 @@ export class LabRunner {
     const results: LabRecoveryResult[] = []
     for (const runId of [...runIds].slice(0, MAX_RECOVERED_RUNS)) {
       if (runId === '<no value>') continue
-      results.push(await this.recover(runId))
+      results.push(await this.recover(runId, storage))
     }
     return results
   }
@@ -2987,9 +3186,9 @@ export class LabRunner {
     this.active.delete(runId)
 
     await new Promise<void>(res => state.forwarder.close(() => res())).catch(() => undefined)
-    await this.docker(['container', 'rm', '--force', state.proxyContainerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+    await this.removeContainerAndRow(state.storage, runId, state.proxyContainerName)
     for (const cname of state.containerNames) {
-      await this.docker(['container', 'rm', '--force', cname], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainerAndRow(state.storage, runId, cname)
     }
     await this.sweepOrphanContainersForRun(runId)
     for (const volume of state.volumes) {

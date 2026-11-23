@@ -17,7 +17,7 @@
  * Unix-socket round trip. Live launch behavior is covered by v3 A2 and v4 B5/B6 (docker tier).
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { mkdirSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -54,7 +54,8 @@ import {
   writeLabProxyTarget,
   writeLabRunRecord,
 } from '../src/server/lab-runner.ts'
-import type { DockerRunner, LabRunRecord } from '../src/server/lab-runner.ts'
+import type { DockerRunner, LabContainerStore, LabRunRecord } from '../src/server/lab-runner.ts'
+import type { Store } from '../src/server/store.ts'
 
 function makeTempDir(t: { after: (fn: () => void) => void }, prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
@@ -723,6 +724,261 @@ test('v6 lifecycle: SIGINT/SIGTERM reaper is exported and stopAll is safe with n
   await runner.stopAll()
   assert.deepEqual(runner.listTargets(), [])
   assert.equal(typeof runner.reapSyncAll, 'function')
+})
+
+// ============================================================================
+// 4b. Store lab-container registry wiring (v6-store merge)
+// ============================================================================
+
+interface FakeLabRow {
+  runId: string
+  containerName: string
+  imageName?: string
+  status: string
+}
+
+function fakeLabStore(): LabContainerStore & {
+  rows: Map<string, FakeLabRow>
+  deleteLabContainer: (runId: string, containerName: string) => void
+} {
+  const rows = new Map<string, FakeLabRow>()
+  const key = (runId: string, containerName: string) => `${runId}/${containerName}`
+  return {
+    rows,
+    recordLabContainer(input) {
+      const existing = rows.get(key(input.runId, input.containerName))
+      const row: FakeLabRow = {
+        runId: input.runId,
+        containerName: input.containerName,
+        imageName: input.imageName ?? existing?.imageName,
+        status: input.status ?? existing?.status ?? 'running',
+      }
+      rows.set(key(input.runId, input.containerName), row)
+      return row
+    },
+    markLabContainerOrphaned(runId, containerName) {
+      const row = rows.get(key(runId, containerName))
+      if (row) row.status = 'orphaned'
+    },
+    listLabContainers(runId) {
+      return [...rows.values()].filter(row => row.runId === runId)
+    },
+    deleteLabContainer(runId, containerName) {
+      rows.delete(key(runId, containerName))
+    },
+  }
+}
+
+/**
+ * Docker CLI emulator for the lifecycle tests: creates a real Unix-socket stand-in for the proxy
+ * container so the host relay + health check path runs end to end without a Docker daemon.
+ */
+function fakeLabDocker(options: { proxyFails?: boolean } = {}): {
+  runner: DockerRunner
+  calls: string[][]
+  live: Map<string, string>
+  labels: Map<string, string>
+  close: () => Promise<void>
+} {
+  const calls: string[][] = []
+  const live = new Map<string, string>()
+  const labels = new Map<string, string>()
+  const servers: Array<{ close: (cb: () => void) => void }> = []
+  let counter = 0
+  const runner: DockerRunner = async args => {
+    calls.push(args)
+    if (args[0] === 'network' || args[0] === 'volume' || args[0] === 'build' || args[0] === 'exec') return ''
+    if (args[0] === 'run') {
+      const name = args[args.indexOf('--name') + 1]
+      const isProxy = name.includes('-proxy-')
+      if (isProxy && options.proxyFails) throw new Error('proxy image unavailable')
+      if (isProxy) {
+        const mountArg = args.find(arg => arg.startsWith('type=bind,source=')) ?? ''
+        const dir = mountArg.slice('type=bind,source='.length, mountArg.indexOf(',target='))
+        const server = createServer(socket => {
+          socket.once('data', () => {
+            socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok')
+          })
+          socket.on('error', () => undefined)
+        })
+        await new Promise<void>(resolve => server.listen(join(dir, 'proxy.sock'), resolve))
+        servers.push(server)
+      }
+      counter += 1
+      live.set(name, `c${String(counter).padStart(11, '0')}`)
+      return ''
+    }
+    if (args[0] === 'inspect') {
+      const name = args[args.length - 1]
+      const format = args[2] ?? ''
+      if (!live.has(name)) throw new Error(`Error: No such container: ${name}`)
+      if (format === '{{.Id}}') return live.get(name) ?? ''
+      if (format.includes('NetworkSettings')) return '172.18.0.2'
+      if (format.includes('State.Status')) return 'running exit=0'
+      if (format.includes('Labels')) return live.has(name) ? (labels.get(name) ?? 'run-lifecycle-1') : ''
+      return ''
+    }
+    if (args[0] === 'container' && args[1] === 'rm') {
+      live.delete(args[args.length - 1])
+      return ''
+    }
+    if (args[0] === 'ps') return ''
+    return ''
+  }
+  return {
+    runner,
+    calls,
+    live,
+    labels,
+    close: () => new Promise<void>(resolve => {
+      let pending = servers.length
+      if (pending === 0) { resolve(); return }
+      for (const server of servers) server.close(() => { pending -= 1; if (pending === 0) resolve() })
+    }),
+  }
+}
+
+test('v6 store wiring: a launched container and the proxy are recorded, then deleted on normal stop', async t => {
+  const workspace = makeTempDir(t, 'guardian-v6-store-stop-')
+  const repoDir = join(workspace, 'repo')
+  mkdirSync(repoDir, { recursive: true })
+  writeFileSync(join(repoDir, 'server.js'), "require('http').createServer((_q, r) => r.end('ok')).listen(8080)\n")
+  const stateDir = join(workspace, 'state')
+  const store = fakeLabStore()
+  const fake = fakeLabDocker()
+  t.after(() => fake.close())
+  const runner = new LabRunner({ docker: fake.runner, stateDir })
+  const runId = 'run-lifecycle-1'
+
+  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  try {
+    const handle = await runner.startLabTarget({
+      runId,
+      environment: 'local-lab',
+      repoDir,
+      storage: store as unknown as Store,
+      labConfig: {
+        enabled: true,
+        image: 'node:24-bookworm-slim',
+        startCommand: 'node /app/server.js',
+        internalPort: 8080,
+        healthPath: '/health',
+        healthTimeoutMs: 5_000,
+      },
+      signal: AbortSignal.timeout(30_000),
+    })
+    assert.match(handle.origin, /^http:\/\/127\.0\.0\.1:\d+$/)
+
+    const rows = store.listLabContainers(runId)
+    assert.equal(rows.length, 2, 'service + proxy containers are both persisted')
+    assert.ok(rows.some(row => row.containerName === handle.containerName))
+    assert.ok(rows.some(row => row.containerName.includes('-proxy-')))
+    assert.ok(rows.every(row => row.status === 'running'))
+
+    await runner.stopLabTarget(runId)
+    assert.equal(store.listLabContainers(runId).length, 0, 'normal stop deletes every registry row')
+    assert.equal(fake.live.size, 0, 'normal stop removes every container')
+    assert.equal(existsSync(handle.sanitizedRepoDir), false)
+  } finally {
+    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+  }
+})
+
+test('v6 store wiring: an unexpected start failure marks the launched container orphaned', async t => {
+  const workspace = makeTempDir(t, 'guardian-v6-store-orphan-')
+  const repoDir = join(workspace, 'repo')
+  mkdirSync(repoDir, { recursive: true })
+  writeFileSync(join(repoDir, 'server.js'), "require('http').createServer((_q, r) => r.end('ok')).listen(8080)\n")
+  const store = fakeLabStore()
+  const fake = fakeLabDocker({ proxyFails: true })
+  t.after(() => fake.close())
+  const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
+  const runId = 'run-lifecycle-orphan'
+
+  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  try {
+    await assert.rejects(
+      runner.startLabTarget({
+        runId,
+        environment: 'local-lab',
+        repoDir,
+        storage: store as unknown as Store,
+        labConfig: {
+          enabled: true,
+          image: 'node:24-bookworm-slim',
+          startCommand: 'node /app/server.js',
+          internalPort: 8080,
+          healthPath: '/health',
+          healthTimeoutMs: 5_000,
+        },
+        signal: AbortSignal.timeout(30_000),
+      }),
+      /proxy image unavailable/,
+    )
+    const rows = store.listLabContainers(runId)
+    assert.equal(rows.length, 1, 'only the service container was launched before the proxy failed')
+    assert.equal(rows[0].status, 'orphaned', 'unexpected-exit containers are marked orphaned, not silently dropped')
+    assert.equal(fake.live.size, 0, 'failure cleanup still removes the container process')
+  } finally {
+    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+  }
+})
+
+test('v6 store wiring: reclaimPersisted removes a recovered orphan and clears its row (label-scoped)', async t => {
+  const workspace = makeTempDir(t, 'guardian-v6-reclaim-')
+  const store = fakeLabStore()
+  store.recordLabContainer({ runId: 'run-crashed-7', containerName: 'guardian-lab-app-crashed', imageName: 'node:24', status: 'orphaned' })
+  const fake = fakeLabDocker()
+  // Simulate the orphan still running on the same run label.
+  fake.live.set('guardian-lab-app-crashed', 'c000000000007')
+  fake.labels.set('guardian-lab-app-crashed', 'run-crashed-7')
+  const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
+
+  const result = await runner.reclaimPersisted(
+    [{ runId: 'run-crashed-7', containerName: 'guardian-lab-app-crashed' }],
+    store,
+  )
+  assert.equal(result.removed, 1)
+  assert.equal(result.mismatched, 0)
+  assert.equal(fake.live.has('guardian-lab-app-crashed'), false)
+  assert.equal(store.listLabContainers('run-crashed-7').length, 0, 'reclaimed row is deleted')
+
+  // Label-scoped: a container whose label names a *different* run is never removed.
+  fake.live.set('guardian-lab-app-other', 'c000000000008')
+  fake.labels.set('guardian-lab-app-other', 'run-other')
+  const mismatched = await runner.reclaimPersisted(
+    [{ runId: 'run-crashed-7', containerName: 'guardian-lab-app-other' }],
+    store,
+  )
+  assert.equal(mismatched.removed, 0)
+  assert.equal(mismatched.mismatched, 1)
+  assert.equal(fake.live.has('guardian-lab-app-other'), true, 'cross-run containers are never removed')
+
+  // Idempotent: an already-gone container is skipped, not an error.
+  const again = await runner.reclaimPersisted([{ runId: 'run-crashed-7', containerName: 'guardian-lab-app-gone' }], store)
+  assert.equal(again.removed, 0)
+  assert.equal(again.skipped, 1)
+  await fake.close()
+})
+
+test('v6 store wiring: recover(runId, storage) deletes rows alongside label-driven removal', async t => {
+  const workspace = makeTempDir(t, 'guardian-v6-recover-rows-')
+  const store = fakeLabStore()
+  store.recordLabContainer({ runId: 'run-recover-rows', containerName: 'guardian-lab-app-rows', imageName: 'node:24' })
+  const fake = fakeLabDocker()
+  fake.live.set('guardian-lab-app-rows', 'c000000000009')
+  const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
+  // The fake's `ps` returns no ids and there is no crash record, so the registry row itself names
+  // the container that must be reclaimed.
+  const result = await runner.recover('run-recover-rows', store)
+  assert.equal(result.containersRemoved, 1, 'registry-named orphan is removed even without a crash record')
+  assert.equal(fake.live.has('guardian-lab-app-rows'), false)
+  assert.equal(store.listLabContainers('run-recover-rows').length, 0, 'recover clears the registry rows for the run')
+  await fake.close()
 })
 
 // ============================================================================
