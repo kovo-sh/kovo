@@ -29,6 +29,7 @@ import {
   chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 
@@ -45,6 +46,8 @@ import { endpointMatches, gradeFindings, loadTruth } from '../benchmarks/realism
 import { assertLocalLabAllowed } from '../benchmarks/realism-suite/lib/safety.ts'
 import { FIXTURES, briefingFor, startFixture } from '../benchmarks/realism-suite/run.ts'
 import type { Finding } from '../src/domain.ts'
+import { BrokerDenied, RequestBroker } from '../src/server/broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, BrokerRaceBurstResult, Grant } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
@@ -56,6 +59,7 @@ import { tenantTagForRun } from '../src/server/scope-policy.ts'
 import type { EnvironmentMode, OriginRole } from '../src/server/scope-policy.ts'
 import { Store } from '../src/server/store.ts'
 import type { EndpointRow } from '../src/server/store.ts'
+import type { HttpTransport } from '../src/server/transport.ts'
 import { selectVerifierBackend } from './benchmark-backend.ts'
 import type { VerifierBackendKind } from './benchmark-backend.ts'
 import {
@@ -549,6 +553,7 @@ export function translateFindings(input: {
 export type FailureStage =
   | 'passed'
   | 'gate_incomplete'
+  | 'wiring_failed'
   | 'fixture_start'
   | 'execution_preflight'
   | 'execution_failed'
@@ -580,7 +585,105 @@ export interface ChainSummary {
   complete: boolean
 }
 
+/**
+ * Wiring health is deliberately separate from capability.
+ *
+ * Wiring answers "was the product mechanism actually exercised, with its safety invariants intact?"
+ * Capability answers "did the product confirm the fixture's ground-truth vulnerabilities?".
+ * A capability miss with healthy wiring is a product gap; a wiring failure means the run cannot
+ * support a capability claim at all, so missing measurements fail closed as `unmeasured`.
+ */
+export type WiringStatus = 'pass' | 'fail' | 'unmeasured'
+
+export interface WiringCriterion {
+  id: string
+  label: string
+  status: WiringStatus
+  observed: string
+}
+
+export interface WiringMetricValues {
+  /** Durable `pending_oob` subscriptions registered for this run. */
+  pendingOobRegistered: number | null
+  /** Bounded pre-report drain wall time recorded by the engine (`oob.drain_complete`). */
+  oobDrainWaitedMs: number | null
+  /** Subscriptions promoted after the immediate correlation window. */
+  lateCallbacksMatched: number | null
+  /** `promotedLate` recorded by the bounded drain event. */
+  latePromotions: number | null
+  /** Blocking approval requests (manual/pending), never auto-review audit rows. */
+  approvalBlocks: number | null
+  /** Raw approval audit rows created during the run (context only, includes auto-review). */
+  approvalRequestsCreated: number | null
+  /** BrokerDenied raised for a mutating request (POST/PUT/PATCH/DELETE). */
+  brokerDeniedMutations: number | null
+  /** All BrokerDenied outcomes (context; reads included). */
+  brokerDeniedTotal: number | null
+  /** Coarse denial categories, never payload text. */
+  brokerDeniedReasons: Record<string, number> | null
+  /** Assignments still parked in awaiting-approval at measurement time. */
+  parkedWorkers: number | null
+  /** Completed race bursts that used the HTTP/2 single-packet barrier. */
+  h2SinglePacketBursts: number | null
+  /** Completed race bursts that fell back to HTTP/1.1 (context). */
+  http1FallbackBursts: number | null
+  /** Total completed race bursts (context). */
+  raceBursts: number | null
+  /** Persisted endpoint rows for the run. */
+  storedEndpoints: number | null
+  /** Routes declared by the fixture briefing. */
+  declaredEndpoints: number | null
+  /** Harness-observed p99 of `Store.upsertEndpoint` during the run. */
+  storeWriteP99Ms: number | null
+  /** Phase-0 disabled speculative sibling derivation because AST/declared routes exist. */
+  siblingDerivationSuppressed: boolean | null
+  /** Truth 4-hop sinks that Phase-0 ranked as Tier A (Program-Graph hypothesis-linked). */
+  tierA4HopSinks: number | null
+  /** `guardian-qa-` records remaining after staging cleanup (staging only). */
+  leakedEntities: number | null
+}
+
+export interface WiringReport {
+  status: WiringStatus
+  criteria: WiringCriterion[]
+  metrics: WiringMetricValues
+}
+
+export interface BrokerObservation {
+  raceBursts: number
+  h2SinglePacketBursts: number
+  http1FallbackBursts: number
+  deniedMutations: number
+  deniedTotal: number
+  deniedReasons: Record<string, number>
+}
+
+export function emptyWiringMetrics(): WiringMetricValues {
+  return {
+    pendingOobRegistered: null,
+    oobDrainWaitedMs: null,
+    lateCallbacksMatched: null,
+    latePromotions: null,
+    approvalBlocks: null,
+    approvalRequestsCreated: null,
+    brokerDeniedMutations: null,
+    brokerDeniedTotal: null,
+    brokerDeniedReasons: null,
+    parkedWorkers: null,
+    h2SinglePacketBursts: null,
+    http1FallbackBursts: null,
+    raceBursts: null,
+    storedEndpoints: null,
+    declaredEndpoints: null,
+    storeWriteP99Ms: null,
+    siblingDerivationSuppressed: null,
+    tierA4HopSinks: null,
+    leakedEntities: null,
+  }
+}
+
 export interface RealismMetrics {
+
   routeDiscovery: RouteDiscovery | null
   crossOriginAuthzConfirmed: boolean
   storedXssConfirmed: boolean
@@ -636,6 +739,8 @@ export interface RealismMetrics {
     recall: number
     chains: ChainSummary[]
   } | null
+  /** Wiring health, reported separately from capability criteria. */
+  wiring: WiringReport
   criteria: GateCriterion[]
 }
 
@@ -714,12 +819,123 @@ function wanCallbacks(fixture: StartedFixture): Record<string, boolean> {
   }
 }
 
-function persistedEndpointCount(storage: Store, runId: string): number {
+function persistedEndpointCount(storage: Store, runId: string): number | null {
+  return countSql(storage, 'select count(*) as c from endpoints where run_id = ?', runId)
+}
+
+interface RunEventRow {
+  kind: string
+  detail: Record<string, unknown> | null
+}
+
+function parseJsonObject(raw: unknown): Record<string, unknown> | null {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+  if (typeof raw !== 'string' || raw.length === 0) return null
   try {
-    const row = storage.client.prepare('select count(*) as c from endpoints where run_id = ?').get(runId) as { c?: number } | undefined
-    return Number(row?.c ?? 0)
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
   } catch {
-    return 0
+    return null
+  }
+}
+
+function readRunEvents(storage: Store, runId: string): RunEventRow[] | null {
+  try {
+    const rows = storage.client.prepare(
+      'select kind, detail from events where run_id = ? order by id asc',
+    ).all(runId) as Array<{ kind?: unknown; detail?: unknown }>
+    return rows.flatMap(row => typeof row.kind === 'string'
+      ? [{ kind: row.kind, detail: parseJsonObject(row.detail) }]
+      : [])
+  } catch {
+    return null
+  }
+}
+
+/** Count query that is explicit about failure: `null` means unmeasured, never a synthetic zero. */
+function countSql(storage: Store, sql: string, ...params: Array<string | number>): number | null {
+  try {
+    const row = storage.client.prepare(sql).get(...params) as { c?: unknown } | undefined
+    if (!row || row.c === undefined || row.c === null) return null
+    const value = Number(row.c)
+    return Number.isFinite(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+/** Nearest-rank percentile over real observations; `null` when there are too few samples. */
+export function percentile(values: readonly number[], p: number, minimumSamples = 20): number | null {
+  const clean = values.filter(value => Number.isFinite(value) && value >= 0).sort((a, b) => a - b)
+  if (clean.length < minimumSamples) return null
+  const index = Math.min(clean.length - 1, Math.max(0, Math.ceil(p * clean.length) - 1))
+  return clean[index] ?? null
+}
+
+interface OobRunMetrics {
+  registered: number
+  promoted: number
+  latePromoted: number
+}
+
+/** Read the per-run OOB relay rows. The relay lives beside the run store in the cell data dir. */
+function readOobRunMetrics(dataDir: string, runId: string): OobRunMetrics | null {
+  const path = join(dataDir, 'oob-relay.sqlite')
+  if (!existsSync(path)) return null
+  let db: DatabaseSync | null = null
+  try {
+    db = new DatabaseSync(path, { readOnly: true })
+    const rows = db.prepare(
+      'select status, created_at, immediate_ms, promoted_at from pending_oob where run_id = ?',
+    ).all(runId) as Array<{ status?: unknown; created_at?: unknown; immediate_ms?: unknown; promoted_at?: unknown }>
+    let registered = 0
+    let promoted = 0
+    let latePromoted = 0
+    for (const row of rows) {
+      registered += 1
+      if (row.status !== 'promoted') continue
+      promoted += 1
+      const createdAt = Number(row.created_at)
+      const promotedAt = Number(row.promoted_at)
+      const immediateMs = Number(row.immediate_ms)
+      if (Number.isFinite(createdAt) && Number.isFinite(promotedAt) && Number.isFinite(immediateMs)
+        && promotedAt - createdAt > immediateMs) {
+        latePromoted += 1
+      }
+    }
+    return { registered, promoted, latePromoted }
+  } catch {
+    return null
+  } finally {
+    try { db?.close() } catch { /* best-effort */ }
+  }
+}
+
+function normalizeRouteTemplate(path: string): string {
+  return path.split('?')[0]!.replace(/\{([^}]+)\}/g, ':$1')
+}
+
+interface CodeLeadRow {
+  method: string
+  endpoint: string
+}
+
+function readProgramGraphLeads(storage: Store, runId: string): CodeLeadRow[] | null {
+  try {
+    const rows = storage.client.prepare(
+      "select data from facts where run_id = ? and kind = 'note'",
+    ).all(runId) as Array<{ data?: unknown }>
+    const leads: CodeLeadRow[] = []
+    for (const row of rows) {
+      const data = parseJsonObject(row.data)
+      if (!data || data.source !== 'program_graph') continue
+      const method = typeof data.method === 'string' ? data.method.toUpperCase() : ''
+      const endpoint = typeof data.endpoint === 'string' ? data.endpoint : ''
+      if (method && endpoint.startsWith('/')) leads.push({ method, endpoint })
+    }
+    return leads
+  } catch {
+    return null
   }
 }
 
@@ -812,6 +1028,263 @@ function probePlanStats(storage: Store, runId: string): ProbePlanStats | null {
   }
 }
 
+/**
+ * Count truth 4-hop sinks that Phase-0 ranked into Tier A.
+ *
+ * Tier A is the hypothesis-linked priority set (`rankAndClusterAstRoutes`). The harness observes it
+ * through the Program-Graph code→runtime lead facts Phase-0 persists for exactly those routes.
+ * `null` means Phase-0 produced no ranking evidence at all; zero means ranking ran but missed.
+ */
+function tierA4HopSinkCount(input: {
+  fixture: string
+  events: RunEventRow[] | null
+  leads: CodeLeadRow[] | null
+}): number | null {
+  if (input.fixture !== 'monorepo-whitebox') return null
+  if (input.events === null && input.leads === null) return null
+  const ranked = (input.events ?? []).some(event =>
+    event.kind === 'phase0.probe_plan' || event.kind === 'phase0.code_leads')
+  if (!ranked) return null
+  const leads = input.leads ?? []
+  if (!leads.length) return 0
+  const truth = loadTruth('monorepo-whitebox')
+  let matched = 0
+  for (const id of MONO_4HOP_IDS) {
+    const finding = truth.findings.find(entry => entry.id === id)
+    if (!finding) continue
+    const want = normalizeRouteTemplate(finding.endpoint)
+    const hit = leads.some(lead =>
+      (!finding.method || lead.method === finding.method.toUpperCase())
+      && endpointMatches(want, normalizeRouteTemplate(lead.endpoint)))
+    if (hit) matched += 1
+  }
+  return matched
+}
+
+function siblingSuppressionObserved(fixture: string, events: RunEventRow[] | null): boolean | null {
+  if (fixture !== 'monorepo-whitebox') return null
+  if (events === null) return null
+  if (events.some(event => event.kind === 'phase0.siblings_suppressed')) return true
+  const phase0Ran = events.some(event =>
+    event.kind === 'phase0.probe_plan'
+    || event.kind === 'phase0.declared_surface'
+    || event.kind === 'phase0.discovery'
+    || event.kind === 'code_audit.started')
+  return phase0Ran ? false : null
+}
+
+/** Collect the wiring observations for one cell. Missing data is reported as `null`. */
+export function collectWiringMetrics(input: {
+  fixture: string
+  storage: Store
+  runId: string
+  dataDir: string
+  routes: RouteRef[]
+  broker?: BrokerObservation
+  storeWriteSamples?: readonly number[]
+}): WiringMetricValues {
+  const events = readRunEvents(input.storage, input.runId)
+  const drainEvent = events?.filter(event => event.kind === 'oob.drain_complete').at(-1)
+  const oobDrainWaitedMs = typeof drainEvent?.detail?.oobDrainMs === 'number'
+    ? Number(drainEvent.detail.oobDrainMs)
+    : null
+  const latePromotions = typeof drainEvent?.detail?.promotedLate === 'number'
+    ? Number(drainEvent.detail.promotedLate)
+    : null
+
+  const oob = readOobRunMetrics(input.dataDir, input.runId)
+  const leads = readProgramGraphLeads(input.storage, input.runId)
+
+  const approvalRequestsCreated = countSql(
+    input.storage, 'select count(*) as c from approval_requests where run_id = ?', input.runId,
+  )
+  const approvalBlocks = countSql(
+    input.storage,
+    `select count(*) as c from approval_requests
+      where run_id = ? and (status = 'pending' or decided_by is null or decided_by not like 'auto-review:%')`,
+    input.runId,
+  )
+  const parkedWorkers = countSql(
+    input.storage,
+    'select count(*) as c from assignments where run_id = ? and approval_parked_at is not null',
+    input.runId,
+  )
+
+  const broker = input.broker
+  const staging = input.fixture === 'staging-concurrency'
+  return {
+    pendingOobRegistered: oob?.registered ?? null,
+    oobDrainWaitedMs,
+    lateCallbacksMatched: oob?.latePromoted ?? null,
+    latePromotions,
+    approvalBlocks,
+    approvalRequestsCreated,
+    brokerDeniedMutations: broker?.deniedMutations ?? null,
+    brokerDeniedTotal: broker?.deniedTotal ?? null,
+    brokerDeniedReasons: broker?.deniedReasons ?? null,
+    parkedWorkers,
+    h2SinglePacketBursts: staging ? (broker?.h2SinglePacketBursts ?? null) : null,
+    http1FallbackBursts: staging ? (broker?.http1FallbackBursts ?? null) : null,
+    raceBursts: staging ? (broker?.raceBursts ?? null) : null,
+    storedEndpoints: persistedEndpointCount(input.storage, input.runId),
+    declaredEndpoints: input.routes.length,
+    storeWriteP99Ms: percentile(input.storeWriteSamples ?? [], 0.99),
+    siblingDerivationSuppressed: siblingSuppressionObserved(input.fixture, events),
+    tierA4HopSinks: tierA4HopSinkCount({ fixture: input.fixture, events, leads }),
+    leakedEntities: null,
+  }
+}
+
+function numericWiringCriterion(input: {
+  id: string
+  label: string
+  value: number | null
+  ok: (value: number) => boolean
+  observed: string
+}): WiringCriterion {
+  if (input.value === null || !Number.isFinite(input.value)) {
+    return { id: input.id, label: input.label, status: 'unmeasured', observed: 'not measured' }
+  }
+  return {
+    id: input.id,
+    label: input.label,
+    status: input.ok(input.value) ? 'pass' : 'fail',
+    observed: input.observed,
+  }
+}
+
+/**
+ * Fixture-scoped wiring criteria. These deliberately never include capability outcomes, so a run
+ * can report `wiring: PASS, capability: FAIL` (a real product gap) or `wiring: FAIL` when the
+ * mechanism was not exercised safely enough to support any claim.
+ */
+export function evaluateWiring(fixture: string, values: WiringMetricValues): WiringCriterion[] {
+  const criteria: WiringCriterion[] = []
+
+  if (fixture === 'wan-oob') {
+    criteria.push(numericWiringCriterion({
+      id: 'oob-pending-registered',
+      label: 'At least one durable pending_oob subscription registered',
+      value: values.pendingOobRegistered,
+      ok: value => value > 0,
+      observed: `${values.pendingOobRegistered ?? '?'} registered`,
+    }))
+
+    const late = values.lateCallbacksMatched
+    const drain = values.oobDrainWaitedMs
+    if (late === null) {
+      criteria.push({
+        id: 'oob-drain-window',
+        label: 'Late OOB callbacks were allowed the >=15 s pre-report drain window',
+        status: 'unmeasured',
+        observed: 'late callback count not measured',
+      })
+    } else if (late === 0) {
+      criteria.push({
+        id: 'oob-drain-window',
+        label: 'Late OOB callbacks were allowed the >=15 s pre-report drain window',
+        status: 'pass',
+        observed: 'no late callbacks to drain',
+      })
+    } else if (drain === null) {
+      criteria.push({
+        id: 'oob-drain-window',
+        label: 'Late OOB callbacks were allowed the >=15 s pre-report drain window',
+        status: 'fail',
+        observed: `${late} late callback(s) matched but no drain measurement was recorded`,
+      })
+    } else {
+      criteria.push(numericWiringCriterion({
+        id: 'oob-drain-window',
+        label: 'Late OOB callbacks were allowed the >=15 s pre-report drain window',
+        value: drain,
+        ok: value => value >= 15_000,
+        observed: `${drain} ms waited for ${late} late callback(s)`,
+      }))
+    }
+  }
+
+  if (fixture === 'staging-concurrency') {
+    criteria.push(numericWiringCriterion({
+      id: 'approval-blocks-zero',
+      label: 'No blocking Tier-3 approval requests during the unattended run',
+      value: values.approvalBlocks,
+      ok: value => value === 0,
+      observed: `${values.approvalBlocks ?? '?'} blocking approval(s)`,
+    }))
+    criteria.push(numericWiringCriterion({
+      id: 'broker-denied-mutations-zero',
+      label: 'No broker-denied mutating requests',
+      value: values.brokerDeniedMutations,
+      ok: value => value === 0,
+      observed: `${values.brokerDeniedMutations ?? '?'} denied mutation(s)`,
+    }))
+    criteria.push(numericWiringCriterion({
+      id: 'leaked-entities-zero',
+      label: 'Zero leaked guardian-qa- entities after cleanup',
+      value: values.leakedEntities,
+      ok: value => value === 0,
+      observed: values.leakedEntities === null ? 'cleanup not measured' : `${values.leakedEntities} leaked`,
+    }))
+  }
+
+  if (fixture === 'monorepo-whitebox') {
+    criteria.push(numericWiringCriterion({
+      id: 'store-scale-2500',
+      label: 'At least 2,500 endpoints persisted in the run store',
+      value: values.storedEndpoints,
+      ok: value => value >= 2_500,
+      observed: `${values.storedEndpoints ?? '?'} persisted / ${values.declaredEndpoints ?? '?'} declared`,
+    }))
+    criteria.push(numericWiringCriterion({
+      id: 'store-write-p99-50',
+      label: 'Endpoint store write p99 < 50 ms',
+      value: values.storeWriteP99Ms,
+      ok: value => value < 50,
+      observed: values.storeWriteP99Ms === null ? 'not measured (too few endpoint writes)' : `${values.storeWriteP99Ms.toFixed(1)} ms p99`,
+    }))
+    if (values.siblingDerivationSuppressed === null) {
+      criteria.push({
+        id: 'sibling-derivation-suppressed',
+        label: 'Speculative sibling derivation suppressed by the declared/AST surface',
+        status: 'unmeasured',
+        observed: 'no Phase-0 ranking evidence',
+      })
+    } else {
+      criteria.push({
+        id: 'sibling-derivation-suppressed',
+        label: 'Speculative sibling derivation suppressed by the declared/AST surface',
+        status: values.siblingDerivationSuppressed ? 'pass' : 'fail',
+        observed: values.siblingDerivationSuppressed ? 'suppressed' : 'not suppressed',
+      })
+    }
+    criteria.push(numericWiringCriterion({
+      id: 'tier-a-4hop-sinks',
+      label: 'At least two 4-hop truth sinks ranked Tier A by Phase-0',
+      value: values.tierA4HopSinks,
+      ok: value => value >= 2,
+      observed: `${values.tierA4HopSinks ?? '?'}/3 Tier A`,
+    }))
+  }
+
+  return criteria
+}
+
+export function wiringStatus(criteria: readonly WiringCriterion[]): WiringStatus {
+  if (criteria.some(criterion => criterion.status === 'fail')) return 'fail'
+  if (criteria.some(criterion => criterion.status === 'unmeasured')) return 'unmeasured'
+  return 'pass'
+}
+
+export function buildWiringReport(fixture: string, values: WiringMetricValues): WiringReport {
+  const criteria = evaluateWiring(fixture, values)
+  return { status: wiringStatus(criteria), criteria, metrics: values }
+}
+
+export function wiringPassed(metrics: RealismMetrics): boolean {
+  return metrics.wiring.status === 'pass'
+}
+
 export function computeMetrics(input: {
   fixture: string
   started: StartedFixture
@@ -823,6 +1296,7 @@ export function computeMetrics(input: {
   grade: GradeResult | null
   storage: Store
   runId: string
+  wiring: WiringMetricValues
   /** Operations carried by the harness-built API reference (grey/white-box). */
   specOps?: number
 }): RealismMetrics {
@@ -850,6 +1324,7 @@ export function computeMetrics(input: {
     staging: null,
     monorepo: null,
     grade,
+    wiring: buildWiringReport(input.fixture, input.wiring),
     criteria: [],
   }
 
@@ -890,7 +1365,7 @@ export function computeMetrics(input: {
   if (input.fixture === 'monorepo-whitebox') {
     const suspects = input.findings.filter(finding => (finding.codeLocations?.length ?? 0) > 0)
     const linked = suspects.filter(finding => (input.endpointCounts.get(finding.id) ?? 0) > 0)
-    const persisted = persistedEndpointCount(input.storage, input.runId)
+    const persisted = persistedEndpointCount(input.storage, input.runId) ?? 0
     const declaredIds = new Set(input.routes.map(route => routeIdentity(route.method, route.path)))
     const persistedIds = new Set(input.endpoints.map(endpoint => routeIdentity(endpoint.method, endpoint.pathTemplate)))
     let declaredMatched = 0
@@ -988,9 +1463,20 @@ export function evaluateGate(fixture: string, metrics: RealismMetrics): GateCrit
 
   if (STAGING_FIXTURES.has(fixture)) {
     const staging = metrics.staging
+    const h2Bursts = metrics.wiring?.metrics?.h2SinglePacketBursts ?? null
+    const fallbackBursts = metrics.wiring?.metrics?.http1FallbackBursts ?? null
+    const h2Observed = h2Bursts === null
+      ? 'not measured'
+      : `${h2Bursts} HTTP/2 single-packet burst(s)${fallbackBursts !== null ? `, ${fallbackBursts} HTTP/1.1 fallback` : ''}`
     criteria.push(
       { id: 'write-bola', label: 'Write-BOLA confirmed', required: true, met: Boolean(staging?.writeBolaConfirmed), observed: String(Boolean(staging?.writeBolaConfirmed)) },
-      { id: 'h2-race', label: 'HTTP/2 double-spend race confirmed', required: true, met: Boolean(staging?.raceConfirmed), observed: String(Boolean(staging?.raceConfirmed)) },
+      {
+        id: 'h2-race',
+        label: 'HTTP/2 double-spend race confirmed (requires an HTTP/2 single-packet burst)',
+        required: true,
+        met: Boolean(staging?.raceConfirmed) && h2Bursts !== null && h2Bursts >= 1,
+        observed: `${staging?.raceConfirmed ? 'race confirmed' : 'not confirmed'}; ${h2Observed}`,
+      },
       { id: 'checkout-tampering', label: 'Checkout price tampering confirmed', required: true, met: Boolean(staging?.checkoutConfirmed), observed: String(Boolean(staging?.checkoutConfirmed)) },
       {
         id: 'zero-leaked-entities',
@@ -1088,6 +1574,7 @@ export function classifyFailureStage(input: {
   vulnerabilityFindings: number
   submitted: number
   truePositives: number
+  wiringPassed: boolean
   metrics: RealismMetrics
 }): { stage: FailureStage; detail: string } {
   if (input.interrupted) return { stage: 'interrupted', detail: 'run interrupted by SIGINT/SIGTERM' }
@@ -1099,6 +1586,10 @@ export function classifyFailureStage(input: {
   }
   if (input.submitted === 0) return { stage: 'verification_or_attribution', detail: 'findings persisted but none carried a concrete endpoint for grading' }
   if (input.truePositives === 0) return { stage: 'verification_or_attribution', detail: 'submitted findings matched no ground-truth endpoint' }
+  if (!input.wiringPassed) {
+    const unmet = input.metrics.wiring.criteria.filter(criterion => criterion.status !== 'pass').map(criterion => criterion.id)
+    return { stage: 'wiring_failed', detail: `wiring criteria unmet: ${unmet.join(', ')}` }
+  }
   if (!gatePassed(input.metrics)) {
     const unmet = input.metrics.criteria.filter(criterion => criterion.required && !criterion.met).map(criterion => criterion.id)
     return { stage: 'gate_incomplete', detail: `gate criteria unmet: ${unmet.join(', ')}` }
@@ -1169,6 +1660,8 @@ export interface RealismMeta {
   failureStage: FailureStage
   failureDetail: string
   gatePassed: boolean
+  capabilityPassed: boolean
+  wiringPassed: boolean
 }
 
 export interface RealismCellResult {
@@ -1176,6 +1669,8 @@ export interface RealismCellResult {
   mode: BenchMode
   noLlm: boolean
   passed: boolean
+  capabilityPassed: boolean
+  wiringPassed: boolean
   failureStage: FailureStage
   failureDetail: string
   grade: GradeResult | null
@@ -1211,7 +1706,7 @@ function execFileSyncText(file: string, args: string[]): string {
   return execFileSync(file, args, { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })
 }
 
-function emptyMetrics(): RealismMetrics {
+export function emptyMetrics(fixture = ''): RealismMetrics {
   return {
     routeDiscovery: null,
     crossOriginAuthzConfirmed: false,
@@ -1221,6 +1716,7 @@ function emptyMetrics(): RealismMetrics {
     staging: null,
     monorepo: null,
     grade: null,
+    wiring: buildWiringReport(fixture, emptyWiringMetrics()),
     criteria: [],
   }
 }
@@ -1233,6 +1729,162 @@ function cellSlug(args: RealismArgs, fixture: string): string {
 // Cell execution
 // ---------------------------------------------------------------------------------------------
 
+type ObservableBarrier = {
+  arrive?: () => Promise<void>
+  skip?: () => void
+}
+
+interface BarrierObservation {
+  arrived: number
+  skipped: number
+}
+
+/** Coarse, payload-free denial class for the wiring report. */
+function denialCategory(message: string): string {
+  if (/staging_isolated|tenant tag|tenantTag/i.test(message)) return 'staging_contract'
+  if (/denylist/i.test(message)) return 'payload_denylist'
+  if (/requires Tier|Tier 3|Tier 2/i.test(message)) return 'tier_requirement'
+  if (/outside|scope|approved origin|approved/i.test(message)) return 'scope'
+  if (/persona|session/i.test(message)) return 'persona'
+  return 'other'
+}
+
+/**
+ * Harness-side broker observation. This never changes broker policy: it only counts what the
+ * real product broker did (race transport, denied mutations) so the gate can separate wiring
+ * health from capability. Race bursts with a fully-arrived barrier are true HTTP/2 single-packet
+ * bursts; bursts where any participant skipped the barrier fell back to HTTP/1.1.
+ */
+export class WiringObservedBroker extends RequestBroker {
+  private readonly barrierRecords: BarrierObservation[] = []
+  private readonly instrumentedBarriers = new WeakSet<object>()
+  private readonly observed = {
+    raceBursts: 0,
+    h2SinglePacketBursts: 0,
+    http1FallbackBursts: 0,
+    deniedMutations: 0,
+    deniedTotal: 0,
+    deniedReasons: {} as Record<string, number>,
+  }
+
+  constructor(options: ConstructorParameters<typeof RequestBroker>[0]) {
+    super(options)
+    this.instrumentTransport()
+  }
+
+  private instrumentTransport(): void {
+    const holder = this as unknown as { httpTransport: HttpTransport }
+    const original = holder.httpTransport
+    const wrapped = ((
+      url: URL,
+      address: Parameters<HttpTransport>[1],
+      signal: AbortSignal,
+      options?: Parameters<HttpTransport>[3],
+    ) => {
+      const barrier = (options as { raceBarrier?: ObservableBarrier } | undefined)?.raceBarrier
+      if (barrier) this.observeBarrier(barrier)
+      return original(url, address, signal, options)
+    }) as HttpTransport
+    wrapped.close = () => original.close()
+    wrapped.mode = original.mode
+    wrapped.isHttp2Enabled = () => original.isHttp2Enabled()
+    holder.httpTransport = wrapped
+  }
+
+  private observeBarrier(barrier: ObservableBarrier): void {
+    if (this.instrumentedBarriers.has(barrier)) return
+    this.instrumentedBarriers.add(barrier)
+    const record: BarrierObservation = { arrived: 0, skipped: 0 }
+    this.barrierRecords.push(record)
+    const originalArrive = barrier.arrive
+    const originalSkip = barrier.skip
+    if (originalArrive) {
+      barrier.arrive = () => {
+        record.arrived += 1
+        return originalArrive.call(barrier)
+      }
+    }
+    if (originalSkip) {
+      barrier.skip = () => {
+        record.skipped += 1
+        originalSkip.call(barrier)
+      }
+    }
+  }
+
+  private noteDenial(error: unknown, methods: readonly string[]): void {
+    if (!(error instanceof BrokerDenied)) return
+    this.observed.deniedTotal += 1
+    const reason = denialCategory(error.message)
+    this.observed.deniedReasons[reason] = (this.observed.deniedReasons[reason] ?? 0) + 1
+    if (methods.some(method => !['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase()))) {
+      this.observed.deniedMutations += 1
+    }
+  }
+
+  override async executeHttp(req: BrokerHttpRequest, grant: Grant, signal: AbortSignal): Promise<BrokerExchangeResult> {
+    try {
+      return await super.executeHttp(req, grant, signal)
+    } catch (error) {
+      this.noteDenial(error, [req.method])
+      throw error
+    }
+  }
+
+  override async executeBatch(reqs: readonly BrokerHttpRequest[], grant: Grant, signal: AbortSignal): Promise<BrokerExchangeResult[]> {
+    try {
+      return await super.executeBatch(reqs, grant, signal)
+    } catch (error) {
+      this.noteDenial(error, reqs.map(req => req.method))
+      throw error
+    }
+  }
+
+  override async executeRaceBurst(
+    requests: readonly BrokerHttpRequest[],
+    grant: Grant,
+    signal: AbortSignal,
+  ): Promise<BrokerRaceBurstResult> {
+    const start = this.barrierRecords.length
+    try {
+      const result = await super.executeRaceBurst(requests, grant, signal)
+      this.observed.raceBursts += 1
+      const barriers = this.barrierRecords.slice(start)
+      if (barriers.some(record => record.arrived > 0 && record.skipped === 0)) {
+        this.observed.h2SinglePacketBursts += 1
+      } else {
+        this.observed.http1FallbackBursts += 1
+      }
+      return result
+    } catch (error) {
+      this.noteDenial(error, requests.map(req => req.method))
+      throw error
+    }
+  }
+
+  observation(): BrokerObservation {
+    return { ...this.observed }
+  }
+}
+
+/**
+ * Time real `Store.upsertEndpoint` calls during the run. This measures the run store under its
+ * actual ingestion load without touching product code paths; too few samples report `null`.
+ */
+function instrumentEndpointWrites(samples: number[]): () => void {
+  const proto = Store.prototype as unknown as { upsertEndpoint: (...args: unknown[]) => unknown }
+  const original = proto.upsertEndpoint
+  proto.upsertEndpoint = function (this: unknown, ...args: unknown[]): unknown {
+    const started = performance.now()
+    try {
+      return original.apply(this, args)
+    } finally {
+      samples.push(performance.now() - started)
+    }
+  }
+  return () => { proto.upsertEndpoint = original }
+}
+
 interface CellContext {
   args: RealismArgs
   fixture: string
@@ -1241,6 +1893,7 @@ interface CellContext {
   storage?: Store
   started?: StartedFixture
   engine?: Execution
+  broker?: WiringObservedBroker
   backend?: WorkerBackend
   backendKind: VerifierBackendKind
   model: ModelInfo
@@ -1398,7 +2051,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
   let detailFindings: Finding[] = []
   let submitted: SubmittedFinding[] = []
   let grade: GradeResult | null = null
-  let metrics: RealismMetrics = emptyMetrics()
+  let metrics: RealismMetrics = emptyMetrics(fixtureName)
   let terminalStatus = 'not_started'
   let terminalPhase = 'unknown'
   let timedOut = false
@@ -1414,6 +2067,9 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
   let capturedOrigins: Record<string, string> = {}
   let capturedHosts: Record<string, string> = {}
   let targetOriginLabel = ''
+  const storeWriteSamples: number[] = []
+  let restoreStoreWrites: (() => void) | null = null
+  let previousSiblingEnv: string | undefined
 
   try {
     // --- Data dir (--no-llm never inherits a model-enabled directory) -----------------------
@@ -1622,8 +2278,31 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     }
 
     // --- Real Execution --------------------------------------------------------------------
+    // White-box scale gate: exercise the opt-in sibling-derivation request so Phase-0's
+    // suppression decision is observed rather than assumed.
+    if (fixtureName === 'monorepo-whitebox') {
+      previousSiblingEnv = process.env.GUARDIAN_RECON_SIBLINGS
+      process.env.GUARDIAN_RECON_SIBLINGS = '1'
+      notes.push('GUARDIAN_RECON_SIBLINGS=1 (opt-in sibling derivation requested for suppression check)')
+    }
+    // Harness-side observation only: the broker is the real product broker, instrumented so the
+    // gate can report denied mutations and HTTP/2 single-packet race bursts. Staging enables the
+    // HTTP/2 transport because the fixture's h2c endpoint is the object under test.
+    const observedBroker = process.env.GUARDIAN_NETWORK_FIXTURE
+      ? undefined
+      : new WiringObservedBroker({
+          storage,
+          canaryBroker: canary,
+          ...(fixtureName === 'staging-concurrency' ? { transportConfig: { http2: true } } : {}),
+        })
+    if (observedBroker) {
+      ctx.broker = observedBroker
+      if (fixtureName === 'staging-concurrency') notes.push('broker transport: HTTP/2 enabled for the h2c race fixture')
+    }
+    restoreStoreWrites = instrumentEndpointWrites(storeWriteSamples)
     const engine = new Execution(storage, {
       canaryBroker: canary,
+      ...(observedBroker ? { broker: observedBroker } : {}),
       ...(ctx.backend ? { backend: ctx.backend } : {}),
       deterministicOnly: args.noLlm,
     })
@@ -1678,6 +2357,17 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     submitted = translated.findings
     endpointCounts = translated.endpointCounts
     grade = gradeFindings(loadTruth(fixtureName), submitted)
+    restoreStoreWrites?.()
+    restoreStoreWrites = null
+    const wiringValues = collectWiringMetrics({
+      fixture: fixtureName,
+      storage,
+      runId: createdRun.id,
+      dataDir,
+      routes,
+      ...(observedBroker ? { broker: observedBroker.observation() } : {}),
+      storeWriteSamples,
+    })
     metrics = computeMetrics({
       fixture: fixtureName,
       started,
@@ -1689,6 +2379,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       grade,
       storage,
       runId: createdRun.id,
+      wiring: wiringValues,
       specOps: ctx.specOps,
     })
     log(`[${slug}] ${terminalStatus}/${terminalPhase}: ${detailEndpoints.length} endpoints, ${detailFindings.length} findings, `
@@ -1698,10 +2389,17 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     failure = error
     ctx.notes.push(`run failed at harness stage: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 240)}`)
   } finally {
+    restoreStoreWrites?.()
+    restoreStoreWrites = null
+    if (fixtureName === 'monorepo-whitebox') {
+      if (previousSiblingEnv === undefined) delete process.env.GUARDIAN_RECON_SIBLINGS
+      else process.env.GUARDIAN_RECON_SIBLINGS = previousSiblingEnv
+    }
     const shutdown = await tearDown(ctx, signal)
     ctx.storage = undefined
     ctx.started = undefined
     ctx.engine = undefined
+    ctx.broker = undefined
     ctx.backend = undefined
     ctx.canary = undefined
     ctx.whiteBoxRoot = undefined
@@ -1715,6 +2413,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       // the post-cleanup orphan scan. Anything left is a real staging-safety regression.
       metrics.staging.cleanup = shutdown.stagingCleanup
       metrics.staging.leakedEntities = shutdown.stagingOrphansAfterCleanup.length
+      metrics.wiring.metrics.leakedEntities = metrics.staging.leakedEntities
       if (shutdown.stagingCleanup) {
         ctx.notes.push(`staging cleanup: ${shutdown.stagingCleanup.removed} removed, ${shutdown.stagingCleanup.restored} restored`)
       }
@@ -1722,6 +2421,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
         ctx.notes.push(`staging orphan check: ${shutdown.stagingOrphansAfterCleanup.length} guardian-qa- record(s) remain`)
       }
     }
+    metrics.wiring = buildWiringReport(ctx.fixture, metrics.wiring.metrics)
     metrics.criteria = evaluateGate(ctx.fixture, metrics)
     if (shutdown.engineBusy > 0) ctx.notes.push(`warning: ${shutdown.engineBusy} execution task(s) still active after stop`)
     if (!shutdown.fixtureStopped) ctx.notes.push('warning: fixture did not report a clean stop')
@@ -1736,6 +2436,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       vulnerabilityFindings,
       submitted: submitted.length,
       truePositives: grade?.truePositives ?? 0,
+      wiringPassed: wiringPassed(metrics),
       metrics,
     })
     const failureStage: FailureStage = failure
@@ -1752,7 +2453,9 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       : (engineSummaryText && classified.stage !== 'passed'
           ? `${classified.detail}; ${engineSummaryText}`
           : classified.detail)
-    const passed = !failure && gatePassed(metrics)
+    const capabilityPassed = !failure && gatePassed(metrics)
+    const wiringOk = wiringPassed(metrics)
+    const passed = capabilityPassed && wiringOk
     const endedAt = Date.now()
     const meta: RealismMeta = {
       fixture: fixtureName,
@@ -1794,6 +2497,8 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       failureStage,
       failureDetail: detailText,
       gatePassed: passed,
+      capabilityPassed,
+      wiringPassed: wiringOk,
     }
 
     // Artifacts are written from a redacted copy; the raw secret list never leaves memory.
@@ -1804,6 +2509,8 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       mode: args.mode,
       noLlm: args.noLlm,
       passed,
+      capabilityPassed,
+      wiringPassed: wiringOk,
       failureStage,
       failureDetail: detailText,
       grade: grade ? redactJsonValue(grade, secrets) : null,
@@ -1840,7 +2547,7 @@ export function renderCellMarkdown(result: RealismCellResult): string {
   lines.push(`# Realism gate — ${result.fixture}`)
   lines.push('')
   lines.push(`- mode: \`${result.mode}\`${result.noLlm ? ' (`--no-llm` deterministic floor)' : ' (agentic)'}`)
-  lines.push(`- result: **${result.passed ? 'PASS' : 'FAIL'}** — failure stage \`${result.failureStage}\``)
+  lines.push(`- result: **${result.passed ? 'PASS' : 'FAIL'}** — capability ${result.capabilityPassed ? 'PASS' : 'FAIL'}, wiring ${result.wiringPassed ? 'PASS' : 'FAIL'}; failure stage \`${result.failureStage}\``)
   lines.push(`- detail: ${result.failureDetail}`)
   lines.push(`- terminal: ${result.meta.terminalStatus}/${result.meta.terminalPhase}; duration ${(result.meta.durationMs / 1000).toFixed(1)}s`)
   lines.push(`- endpoints: ${result.meta.endpointsDiscovered}; facts: ${result.meta.facts}; broker exchanges: ${result.meta.brokerExchanges}`)
@@ -1853,6 +2560,33 @@ export function renderCellMarkdown(result: RealismCellResult): string {
   for (const criterion of result.metrics.criteria) {
     lines.push(`| ${criterion.label} | ${criterion.required ? 'yes' : 'no'} | ${criterion.met ? 'yes' : 'no'} | ${criterion.observed} |`)
   }
+  const wiring = result.metrics.wiring
+  lines.push('')
+  lines.push('## Wiring health (separate from capability)')
+  lines.push('')
+  lines.push(`- wiring: **${wiring.status.toUpperCase()}**`)
+  lines.push(`- capability: **${result.capabilityPassed ? 'PASS' : 'FAIL'}** (gate criteria above)`)
+  if (wiring.criteria.length) {
+    lines.push('')
+    lines.push('| wiring check | status | observed |')
+    lines.push('| --- | --- | --- |')
+    for (const criterion of wiring.criteria) {
+      lines.push(`| ${criterion.label} | ${criterion.status} | ${criterion.observed} |`)
+    }
+  }
+  lines.push('')
+  lines.push('### Wiring metrics')
+  lines.push('')
+  const metricValue = (value: number | null, suffix = ''): string => {
+    if (value === null) return 'n/a'
+    return `${Number.isInteger(value) ? value : value.toFixed(2)}${suffix}`
+  }
+  const wiringMetrics = wiring.metrics
+  lines.push(`- OOB: registered=${metricValue(wiringMetrics.pendingOobRegistered)}; drain=${metricValue(wiringMetrics.oobDrainWaitedMs, ' ms')}; late callbacks=${metricValue(wiringMetrics.lateCallbacksMatched)}; late promotions=${metricValue(wiringMetrics.latePromotions)}`)
+  lines.push(`- approvals: blocking=${metricValue(wiringMetrics.approvalBlocks)} (created ${metricValue(wiringMetrics.approvalRequestsCreated)}); parked workers=${metricValue(wiringMetrics.parkedWorkers)}; broker-denied mutations=${metricValue(wiringMetrics.brokerDeniedMutations)} (total denied ${metricValue(wiringMetrics.brokerDeniedTotal)}${wiringMetrics.brokerDeniedReasons ? `; reasons ${Object.entries(wiringMetrics.brokerDeniedReasons).map(([reason, count]) => `${reason}=${count}`).join(', ')}` : ''})`)
+  lines.push(`- race transport: HTTP/2 single-packet=${metricValue(wiringMetrics.h2SinglePacketBursts)}; HTTP/1.1 fallback=${metricValue(wiringMetrics.http1FallbackBursts)}; bursts=${metricValue(wiringMetrics.raceBursts)}`)
+  lines.push(`- store: persisted=${metricValue(wiringMetrics.storedEndpoints)}/${metricValue(wiringMetrics.declaredEndpoints)}; write p99=${metricValue(wiringMetrics.storeWriteP99Ms, ' ms')}; sibling derivation suppressed=${wiringMetrics.siblingDerivationSuppressed === null ? 'n/a' : String(wiringMetrics.siblingDerivationSuppressed)}; Tier A 4-hop sinks=${metricValue(wiringMetrics.tierA4HopSinks)}`)
+  lines.push(`- leaked guardian-qa- entities after cleanup=${metricValue(wiringMetrics.leakedEntities)}`)
   if (result.metrics.routeDiscovery) {
     const discovery = result.metrics.routeDiscovery
     lines.push('')
@@ -1881,7 +2615,7 @@ export function renderCellMarkdown(result: RealismCellResult): string {
     lines.push('## Staging safety')
     lines.push('')
     lines.push(`- write-BOLA: ${staging.writeBolaConfirmed ? 'confirmed' : 'not confirmed'}`)
-    lines.push(`- HTTP/2 race: ${staging.raceConfirmed ? 'confirmed' : 'not confirmed'}`)
+    lines.push(`- HTTP/2 race: ${staging.raceConfirmed ? 'confirmed' : 'not confirmed'} (${result.metrics.wiring.metrics.h2SinglePacketBursts ?? 'n/a'} HTTP/2 single-packet burst(s), ${result.metrics.wiring.metrics.http1FallbackBursts ?? 'n/a'} HTTP/1.1 fallback)`)
     lines.push(`- checkout tampering: ${staging.checkoutConfirmed ? 'confirmed' : 'not confirmed'}`)
     lines.push(`- leaked \`guardian-qa-\` entities after cleanup: ${staging.leakedEntities}`)
     lines.push(`- cleanup: ${staging.cleanup ? `${staging.cleanup.removed} removed, ${staging.cleanup.restored} restored` : 'not run'}`)
@@ -1948,19 +2682,21 @@ function renderSummaryMarkdown(summary: RealismSummary): string {
   lines.push(`- fixtures: ${summary.passed} gate pass / ${summary.failed} not passing`)
   lines.push(`- artifact secret scan: ${summary.secretScan.clean ? 'clean' : 'FAILED'}`)
   lines.push('')
-  lines.push('| fixture | gate | stage | TP | FP | precision | recall | chains |')
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |')
+  lines.push('| fixture | wiring | capability | overall | stage | TP | FP | precision | recall | chains |')
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
   for (const cell of summary.cells) {
     const grade = cell.metrics.grade
     const chains = grade ? grade.chains.filter(chain => chain.complete).length : 0
     const chainTotal = grade?.chains.length ?? 0
-    lines.push(`| ${cell.fixture} | ${cell.passed ? 'PASS' : 'FAIL'} | \`${cell.failureStage}\` | ${grade?.truePositives ?? 'n/a'} | ${grade?.falsePositives ?? 'n/a'} | ${pct(grade && grade.submitted ? grade.precision : null)} | ${pct(grade?.recall)} | ${chains}/${chainTotal} |`)
+    lines.push(`| ${cell.fixture} | ${cell.wiringPassed ? 'PASS' : 'FAIL'} | ${cell.capabilityPassed ? 'PASS' : 'FAIL'} | ${cell.passed ? 'PASS' : 'FAIL'} | \`${cell.failureStage}\` | ${grade?.truePositives ?? 'n/a'} | ${grade?.falsePositives ?? 'n/a'} | ${pct(grade && grade.submitted ? grade.precision : null)} | ${pct(grade?.recall)} | ${chains}/${chainTotal} |`)
   }
   lines.push('')
   for (const cell of summary.cells) {
     lines.push(`## ${cell.fixture}`)
     lines.push('')
     lines.push(`Failure stage: \`${cell.failureStage}\` — ${cell.failureDetail}`)
+    lines.push('')
+    lines.push(`Wiring: **${cell.metrics.wiring.status.toUpperCase()}**; capability: **${cell.capabilityPassed ? 'PASS' : 'FAIL'}**`)
     lines.push('')
     for (const criterion of cell.metrics.criteria) {
       lines.push(`- [${criterion.met ? 'x' : ' '}] ${criterion.label}: ${criterion.observed}`)
