@@ -6903,6 +6903,11 @@ export class Execution {
             cwe: parsed.cwe,
             category: parsed.category,
             title: parsed.title,
+            fingerprintHash: dedupeDecision.fingerprintHash,
+            endpoint: specDedupeFields.endpoint,
+            method: specDedupeFields.method,
+            param: specDedupeFields.param,
+            graphqlField: specDedupeFields.graphqlField,
           })
           const matchedCandidates = [matchedRow, dbDupRow].filter(
             (row, idx, arr): row is NonNullable<typeof row> =>
