@@ -404,3 +404,11 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Floor-hardening false negatives fixed (no loosening):** pre-probe-only denial controls (post-mutation readbacks are persistence evidence); credential-shape `proofPatterns` for free-text disclosure; role-exclusive function-surface delta for vertical BFLA. `store/scope/acting/account/org/identity` are protected identity fields.
 - **Regressions held:** held-out-saas 20/20 + 20/20 patches, xben 25/25, procedural acme 16/22.
 - **Certification measurement started:** K=6 unified acme ×3 sequential runs on merged main; gate = worst-run precision 100%, preservation ≥0.95, positive lift over 11/22, leads investigated when emitted, provenance complete.
+
+### 2026-11-23 — v7 planning + honest deterministic vs agentic numbers
+
+- **Numbers at planning time:** product floor 3-app **31/59 (52.5%) @100%**; agentic K=6 acme ×3 = **11 / 12 / 11 of 22**, precision **100% / 92.3% / 100%**, median lift **0**, $0.48–0.51, p50 assignment 53 s; realism #2/#3/#4 wiring PASS but **0 capability confirms**; xben 25/25, held-out 20/20 + 20/20; salted held-out product floor last 23/58 (not re-run).
+- **Certification verdict:** not certifiable — worst-run precision 92.3% (one unmatched cross-tenant mass-assign claim under triage) and median lift 0.
+- **Root cause caught by review:** Phase A floor consumes ~1,500–1,800 of the shared ~2,000 request budget, leaving ~20 agent assignments ~10–25 requests each. Decoupling floor/agent budgets is an instant win.
+- **v7 plan:** `plans/v7.md`. No fourth layer. Thesis = real-world conversion + white-box-first verification. M0 ProofReceipt + budget split + DSL retirement (3 cuts); M1 realism conversion #1–#4; M2 white-box dataflow + chains; M4 production ops. **Continuous scanning / persistent org graph deferred** (candidate v8).
+- **Cut for now:** multi-tenant SaaS, plugin SDK, ML priors, heavy UX. M1/M2 blocked behind M0 gates.
