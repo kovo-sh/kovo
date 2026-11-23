@@ -16,8 +16,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { after, describe, test } from 'node:test'
 
 import {
-  AimdLimiter, CellReaper, ModelGate, ResourceGuard, Semaphore, cellLabel, parseRetryAfter,
-  readMemAvailableBytes, rewriteProfileEndpoints,
+  AimdLimiter, CellReaper, ModelGate, ResourceGuard, Semaphore, cellLabel, defaultMaxInFlightStreams,
+  parseRetryAfter, readMemAvailableBytes, rewriteProfileEndpoints,
 } from '../scripts/benchmark-parallel.ts'
 import { WarmWorkerPool, workerContainerCreateArgs } from '../src/server/worker-backend.ts'
 import {
@@ -255,6 +255,38 @@ describe('model gate', () => {
     } finally {
       await upstream.close()
     }
+  })
+
+  test('caps concurrent streams at maxInFlightStreams across callers', async () => {
+    const pending: Array<{ id: number; run: () => void }> = []
+    let fetchId = 0
+    const fetchImpl = (async () => new Promise<Response>(resolve => {
+      const id = ++fetchId
+      pending.push({ id, run: () => resolve(new Response('ok', { status: 200 })) })
+    })) as typeof fetch
+    const gate = new ModelGate({ maxInFlightStreams: 2, fetchImpl })
+    const request = () => gate.forward('https://example.invalid/x', { method: 'POST', headers: {}, body: Buffer.from('{}') })
+    const first = request()
+    const second = request()
+    const third = request()
+    const waitFor = async (predicate: () => boolean) => {
+      for (let i = 0; i < 40 && !predicate(); i += 1) await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    await waitFor(() => pending.length >= 2)
+    assert.equal(pending.length, 2, 'only two requests reach the transport')
+    assert.equal(gate.stats().inFlight, 2)
+    assert.equal(gate.stats().queued, 1, 'third request queues, never drops')
+    pending.shift()!.run()
+    const firstResponse = await first
+    await firstResponse.text()
+    await waitFor(() => pending.length >= 2)
+    assert.equal(pending.length, 2, 'queued request is admitted after a permit frees')
+    pending.shift()!.run()
+    pending.shift()!.run()
+    const [secondResponse, thirdResponse] = await Promise.all([second, third])
+    await Promise.all([secondResponse.text(), thirdResponse.text()])
+    assert.equal(gate.stats().peak, 2)
+    assert.equal(gate.stats().inFlight, 0)
   })
 
   test('two gates bind distinct ephemeral loopback ports', async () => {
@@ -559,5 +591,12 @@ describe('CLI defaults', () => {
     const env = cellEnv(cell(), matrixArgs())
     assert.equal(env.GUARDIAN_CELL_ID, 'acme-saas-seed42-grey-box')
     assert.equal(env.GUARDIAN_ALLOW_LOCAL_LAB, '1')
+  })
+
+  test('global stream cap is env-overridable and clamped', () => {
+    assert.equal(defaultMaxInFlightStreams({} as NodeJS.ProcessEnv), 28)
+    assert.equal(defaultMaxInFlightStreams({ GUARDIAN_MODEL_MAX_STREAMS: '12' } as NodeJS.ProcessEnv), 12)
+    assert.equal(defaultMaxInFlightStreams({ GUARDIAN_MODEL_MAX_STREAMS: '0' } as NodeJS.ProcessEnv), 28)
+    assert.equal(defaultMaxInFlightStreams({ GUARDIAN_MODEL_MAX_STREAMS: '9999' } as NodeJS.ProcessEnv), 256)
   })
 })

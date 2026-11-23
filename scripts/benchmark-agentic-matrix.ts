@@ -303,8 +303,8 @@ export function parseMatrixArgs(
   const maxActiveWorkers = stringFlag('max-workers') === undefined
     ? (Number(env.GUARDIAN_MATRIX_MAX_WORKERS) >= 1 ? Math.floor(Number(env.GUARDIAN_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS)
     : parsePositiveInt(stringFlag('max-workers')!, '--max-workers', 256)
-  const warmWorkers = !boolFlag('no-warm-workers') && !envFlagDisabled(env, 'GUARDIAN_WARM_WORKERS')
-  const modelGate = !boolFlag('no-model-gate') && !envFlagDisabled(env, 'GUARDIAN_MODEL_GATE')
+  const warmWorkers = boolFlag('warm-workers') || (!boolFlag('no-warm-workers') && !envFlagDisabled(env, 'GUARDIAN_WARM_WORKERS'))
+  const modelGate = boolFlag('model-gate') || (!boolFlag('no-model-gate') && !envFlagDisabled(env, 'GUARDIAN_MODEL_GATE'))
   const maxInFlightStreams = stringFlag('max-inflight-streams') === undefined
     ? defaultMaxInFlightStreams(env)
     : parsePositiveInt(stringFlag('max-inflight-streams')!, '--max-inflight-streams', 256)
