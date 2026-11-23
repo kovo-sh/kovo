@@ -47,7 +47,8 @@ type Recorder = Parameters<NonNullable<MonitorSet['afterRequest']>>[1]
 
 export interface StartServerOpts {
   plan: VariantPlan
-  monitors: MonitorSet
+  report?: Recorder
+  monitors?: MonitorSet
   uiDir: string
   oobCallbackPorts?: number[]
   db?: Db
@@ -70,12 +71,14 @@ export function createWiring(impact: Recorder, secrets: { jwt: string; webhookSe
     makeEgress: (services, oob) => createEgress({ internalServices: services, oobCallbackPorts: oob, [REC]: impact } as unknown as Parameters<typeof createEgress>[0]),
     render: (source, data, inputDerived) => render(source, data, { inputDerived, [REC]: impact } as RenderOpts),
     signToken: (payload) => jwtSign(payload, secrets.jwt),
+    signTokenWith: (payload, secret, opts) => jwtSign(payload, secret, opts),
     verifyToken: (token, acceptNone) => {
       const res = jwtVerify(token, { secret: secrets.jwt, algorithms: acceptNone ? ['HS256', 'none'] : ['HS256'], acceptNone, [REC]: impact } as VerifyOpts)
       return { valid: res.valid, payload: res.payload }
     },
+    verifyTokenWith: (token, opts) => jwtVerify(token, { ...opts, [REC]: impact } as VerifyOpts),
     signWebhook: (secret, body, ts) => signWebhook(secret, body, ts),
-    verifyWebhook: (secret, body, ts, sig) => verifyWebhook(secret, body, ts, sig, { toleranceSec: 300, [REC]: impact } as VerifyWebhookOpts),
+    verifyWebhook: (secret, body, ts, sig, opts) => verifyWebhook(secret, body, ts, sig, { toleranceSec: 300, ...(opts ?? {}), [REC]: impact } as VerifyWebhookOpts),
     verifyScopedWebhook: (secret, scope, body, ts, sig) => {
       const dot = scope.indexOf('.')
       const tenantId = dot >= 0 ? scope.slice(0, dot) : scope
@@ -101,7 +104,7 @@ export function createWiring(impact: Recorder, secrets: { jwt: string; webhookSe
 }
 
 export function createAppHttp(deps: {
-  plan: VariantPlan; impact: Recorder; monitors: MonitorSet; canaries: CanaryRegistry; db: Db; resolveActor: ResolveActor
+  plan: VariantPlan; impact: Recorder; monitors?: MonitorSet; canaries: CanaryRegistry; db: Db; resolveActor: ResolveActor
 }): HttpApp {
   return createHttpApp({
     plan: deps.plan, monitors: deps.monitors, canaries: deps.canaries, db: deps.db,
@@ -112,7 +115,7 @@ export function createAppHttp(deps: {
 export async function startServer(opts: StartServerOpts): Promise<RunningServer> {
   assertLocalLabAllowed()
   const { plan, monitors } = opts
-  const impact = (opts as Record<string, unknown>)[REC] as Recorder
+  const impact = (opts.report ?? (opts as Record<string, unknown>)[REC]) as Recorder
   const db = createDbFacade(opts.db ?? createDb(impact))
   const ids = opts.ids ?? createIdCodec(plan.idFormat, plan.canarySalt)
   const canaries = opts.canaries ?? createCanaryRegistry(plan.canarySalt)

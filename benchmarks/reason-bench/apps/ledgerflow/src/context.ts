@@ -6,13 +6,19 @@
 //   export default function register(app: AppContext): void
 // registering exactly its own route(s) via app.route(...). The host mounts site modules before the
 // shared area modules so a mounted site owns its route key.
-import type { VariantPlan, Actor, PersonaId } from '../../../lib/types.ts'
+import type { VariantPlan, Actor, PersonaId, PersonaCredential, PersonaRole } from '../../../lib/types.ts'
 import type { Db } from '../../../lib/db.ts'
 import type { Vfs } from '../../../lib/vfs.ts'
 import type { Egress, InternalServiceRef } from '../../../lib/egress.ts'
 import type { IdCodec } from '../../../lib/ids.ts'
 import type { CanaryRegistry } from '../../../lib/canary.ts'
 import type { Handler, RouteOpts, HttpApp } from '../../../lib/http.ts'
+import type { SessionStore } from '../../../lib/http-session.ts'
+import type { RenderOpts } from '../../../lib/template.ts'
+import type { SignOpts, VerifyOpts, VerifyResult } from '../../../lib/jwt.ts'
+import type { VerifyWebhookOpts } from '../../../lib/webhook.ts'
+import type { SimResult } from '../../../lib/simshell.ts'
+import type { ParseXmlOpts } from '../../../lib/xml.ts'
 import type { XmlNode } from '../../../lib/xml.ts'
 import type { LedgerLabels } from './plan.ts'
 
@@ -30,7 +36,9 @@ export interface Wiring {
   signToken(payload: Record<string, unknown>): string
   verifyToken(token: string, acceptNone: boolean): { valid: boolean; payload?: unknown }
   signWebhook(secret: string, body: string, ts: string): string
-  verifyWebhook(secret: string, body: string, ts: string, sig: string): boolean
+  signTokenWith(payload: Record<string, unknown>, secret: string, opts?: SignOpts): string
+  verifyTokenWith(token: string, opts: VerifyOpts): VerifyResult
+  verifyWebhook(secret: string, body: string, ts: string, sig: string, opts?: VerifyWebhookOpts): boolean
   verifyScopedWebhook(secret: string, scope: string, body: string, ts: string, sig: string): boolean
   simulate(template: string, args: string[]): { output: string; commands: string[] }
   parseXml(source: string, external: boolean, vfs: Vfs, egress: Egress): XmlNode
@@ -96,9 +104,13 @@ export interface AppContext {
     exports: Table<ExportRow>
     files: Table<FileRow>
   }
+  sessions: SessionStore
   /** Register by logical route key, or by runtime method+path (resolved back to its route key). */
-  route(routeKey: string, handler: Handler, opts?: RouteOpts): void
-  route(method: string, path: string, opts: RouteOpts, handler: Handler): void
+  route(routeKey: string, handler: Handler, opts?: RouteOpts): AppContext
+  route(method: string, path: string, opts: RouteOpts, handler: Handler): AppContext
+  serve(dir: string): void
+  listen(): Promise<number>
+  close(): Promise<void>
   /** Unique per-process external id for a newly created row. */
   newId(kind: string): string
   /** Runtime field/param name for a logical param key (e.g. 'orderId' -> 'ord'). */
@@ -110,13 +122,23 @@ export interface AppContext {
   recordActivity(tenant: string, actor: string, action: string, subject?: string, detail?: string): void
   parseXml(source: string, external: boolean): XmlNode
   /** Template renderer (input-derived output is tracked by the host sink). */
-  template(source: string, data: Record<string, unknown>, inputDerived?: boolean): string
-  /** Signed token helpers (HS256). */
+  template: { render(source: string, data: Record<string, unknown>, opts?: RenderOpts): string }
+  /** Signed token helpers (per-call secret, contract shape). */
+  tokens: { sign(payload: Record<string, unknown>, secret: string, opts?: SignOpts): string; verify(token: string, opts: VerifyOpts): VerifyResult }
+  /** Session-bound aliases used by the shared area modules. */
   token: { sign(payload: Record<string, unknown>): string; verify(token: string, acceptNone?: boolean): { valid: boolean; payload?: unknown } }
   /** Delivery signature helpers: unscoped legacy verify plus tenant/event-scoped verify. */
-  webhook: { sign(secret: string, body: string, ts: string): string; verify(secret: string, body: string, ts: string, sig: string): boolean; verifyScoped(secret: string, scope: string, body: string, ts: string, sig: string): boolean }
+  webhook: { sign(secret: string, body: string, ts: string): string; verify(secret: string, body: string, ts: string, sig: string, opts?: VerifyWebhookOpts): boolean; verifyScoped(secret: string, scope: string, body: string, ts: string, sig: string): boolean }
   /** Simulated command runner; never touches the real host. */
-  simshell(template: string, args: string[]): { output: string; commands: string[] }
+  simshell: { run(template: string, args: string[]): SimResult }
+  /** XML parser with explicit external-entity policy. */
+  xml: { parse(source: string, opts?: ParseXmlOpts): XmlNode }
+  /** Contract convenience seams. */
+  paramName(logical: string): string
+  personaFor(id: PersonaId): PersonaCredential | undefined
+  findPersona(email: string, password: string): PersonaCredential | null
+  tenantOf(personaOrId: PersonaId): string
+  memberRole(personaOrId: PersonaId, tenant: string): PersonaRole | null
 }
 
 export interface BuildContextDeps {
@@ -151,11 +173,11 @@ function tableFor<T>(db: Db, name: string): Table<T> {
 export function buildContext(deps: BuildContextDeps): AppContext {
   const { app, plan, db, ids, canaries, config, wiring, vfs, egress } = deps
 
-  const route = (a: string, b: Handler | string, c?: RouteOpts | Handler, d?: Handler): void => {
+  let ctx: AppContext
+  const route = (a: string, b: Handler | string, c?: RouteOpts | Handler, d?: Handler): AppContext => {
     if (typeof b === 'function') {
-      if (!plan.routes[a]) return
-      app.route(a, b, c as RouteOpts | undefined)
-      return
+      if (plan.routes[a]) app.route(a, b, c as RouteOpts | undefined)
+      return ctx
     }
     const method = a.toUpperCase()
     const wanted = shape(b)
@@ -163,8 +185,8 @@ export function buildContext(deps: BuildContextDeps): AppContext {
       const spec = plan.routes[k]!
       return spec.method.toUpperCase() === method && shape(spec.path) === wanted
     })
-    if (!key) return
-    app.route(key, d as Handler, (c as RouteOpts | undefined) ?? {})
+    if (key) app.route(key, d as Handler, (c as RouteOpts | undefined) ?? {})
+    return ctx
   }
 
   const personas: Record<string, UserRow> = {}
@@ -172,8 +194,9 @@ export function buildContext(deps: BuildContextDeps): AppContext {
   let idSeq = 0
   const newId = (kind: string): string => ids.encode(kind, Date.now() * 1000 + (idSeq++ % 1000))
 
-  const ctx: AppContext = {
+  ctx = {
     plan, db, ids, vfs, egress, canary: canaries, canaries, config, wiring, labels: config.labels,
+    sessions: app.sessions,
     personas,
     tables: {
       users: tableFor<UserRow>(db, 'users'),
@@ -187,8 +210,14 @@ export function buildContext(deps: BuildContextDeps): AppContext {
       files: tableFor<FileRow>(db, 'files'),
     },
     route: route as AppContext['route'],
+    serve(dir) { app.static(dir) },
+    listen() { return app.listen() },
+    close() { return app.close() },
     newId,
     field(key) {
+      return plan.params[key] ?? key
+    },
+    paramName(key) {
       return plan.params[key] ?? key
     },
     userForActor(actor) {
@@ -214,8 +243,19 @@ export function buildContext(deps: BuildContextDeps): AppContext {
     parseXml(source, external) {
       return wiring.parseXml(source, external, vfs, egress)
     },
-    template(source, data, inputDerived = false) {
-      return wiring.render(source, data, inputDerived)
+    xml: {
+      parse(source, opts) {
+        return wiring.parseXml(source, opts?.resolveExternalEntities === true, (opts?.vfs as Vfs | undefined) ?? vfs, (opts?.egress as Egress | undefined) ?? egress)
+      },
+    },
+    template: {
+      render(source, data, opts) {
+        return wiring.render(source, data, opts?.inputDerived === true)
+      },
+    },
+    tokens: {
+      sign: (payload, secret, opts) => wiring.signTokenWith(payload, secret, opts),
+      verify: (token, opts) => wiring.verifyTokenWith(token, opts),
     },
     token: {
       sign: (payload) => wiring.signToken(payload),
@@ -223,11 +263,33 @@ export function buildContext(deps: BuildContextDeps): AppContext {
     },
     webhook: {
       sign: (secret, body, ts) => wiring.signWebhook(secret, body, ts),
-      verify: (secret, body, ts, sig) => wiring.verifyWebhook(secret, body, ts, sig),
+      verify: (secret, body, ts, sig, opts) => wiring.verifyWebhook(secret, body, ts, sig, opts),
       verifyScoped: (secret, scope, body, ts, sig) => wiring.verifyScopedWebhook(secret, scope, body, ts, sig),
     },
-    simshell(template, args) {
-      return wiring.simulate(template, args)
+    simshell: {
+      run: (template, args) => {
+        const result = wiring.simulate(template, args)
+        return { output: result.output, commands: result.commands }
+      },
+    },
+    personaFor(id) {
+      return (plan.personas as unknown as Record<string, PersonaCredential | undefined>)[String(id)]
+    },
+    findPersona(email, password) {
+      const all = plan.personas as unknown as Record<string, PersonaCredential | undefined>
+      for (const cred of Object.values(all)) if (cred && cred.email === email && cred.password === password) return cred
+      return null
+    },
+    tenantOf(personaOrId) {
+      const cred = (plan.personas as unknown as Record<string, PersonaCredential | undefined>)[String(personaOrId)]
+      return cred?.tenant ?? String(personaOrId)
+    },
+    memberRole(personaOrId, tenant) {
+      const cred = (plan.personas as unknown as Record<string, PersonaCredential | undefined>)[String(personaOrId)]
+      const user = db.get<{ external_id: string }>('SELECT external_id FROM users WHERE persona = ?', [String(personaOrId)])
+        ?? (cred ? db.get<{ external_id: string }>('SELECT external_id FROM users WHERE email = ?', [cred.email]) : undefined)
+      if (!user) return null
+      return (ctx.roleInTenant(user.external_id, tenant) as PersonaRole | undefined) ?? null
     },
   }
   return ctx

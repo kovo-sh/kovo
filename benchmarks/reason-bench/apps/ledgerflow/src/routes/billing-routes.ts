@@ -90,7 +90,7 @@ export function registerBillingRoutes(ctx: AppContext): void {
     const row = ctx.db.get<Record<string, unknown>>(
       'SELECT * FROM invoices WHERE external_id = ? AND tenant_id = ?', [param(req, ctx, 'invoiceId'), id.tenant])
     if (!row) return notFound(req)
-    return req.html(ctx.template('<article><h1>{{ number }}</h1><p>{{ description }}</p><footer>{{ note }}</footer></article>', {
+    return req.html(ctx.template.render('<article><h1>{{ number }}</h1><p>{{ description }}</p><footer>{{ note }}</footer></article>', {
       number: row.number, description: row.description, note: row.note ?? '',
     }))
   })
@@ -103,9 +103,9 @@ export function registerBillingRoutes(ctx: AppContext): void {
     const row = ctx.db.get<Record<string, unknown>>(
       'SELECT * FROM invoices WHERE external_id = ? AND tenant_id = ?', [param(req, ctx, 'invoiceId'), id.tenant])
     if (!row) return notFound(req)
-    const html = ctx.template('<html><body><h1>{{ number }}</h1><p>{{ description }}</p><footer>{{ note }}</footer></body></html>', {
+    const html = ctx.template.render('<html><body><h1>{{ number }}</h1><p>{{ description }}</p><footer>{{ note }}</footer></body></html>', {
       number: row.number, description: row.description, note: row.note ?? '',
-    }, true)
+    }, { inputDerived: true })
     const path = `/exports/${id.tenant}/invoice-${row.external_id}.html`
     ctx.vfs.write(path, html)
     ctx.recordActivity(id.tenant, id.persona ?? id.email, 'invoice_pdf', String(row.external_id))
