@@ -16,6 +16,64 @@ export interface BrowserSameSiteFetchRequest {
   credentials?: 'include' | 'same-origin' | 'omit'
 }
 
+/** A cookie lifted from a persona session bundle; `httpOnly` is preserved for real hydration. */
+export interface BrowserSeedCookie {
+  name: string
+  value: string
+  domain: string
+  path: string
+  secure?: boolean
+  httpOnly?: boolean
+  sameSite?: 'Strict' | 'Lax' | 'None'
+  expires?: number
+}
+
+/**
+ * Session material for a single persona. The vault is owned by another stream, so this bundle is
+ * resolved through an optional hook / structural fields and never requires a schema change here.
+ */
+export interface BrowserSessionBundle {
+  cookies?: BrowserSeedCookie[]
+  localStorage?: Record<string, string>
+  sessionStorage?: Record<string, string>
+}
+
+/** Passive CDN/static hydration scope. Active probing never uses this allowance. */
+export interface AssetOriginScope {
+  origins?: readonly string[]
+  allowlist?: (origin: string) => boolean
+}
+
+export interface BrowserWebSocketFrame {
+  direction: 'sent' | 'received'
+  opcode: number | null
+  payloadLength: number
+  /** Bounded, redacted preview; frame bodies never enter findings verbatim. */
+  preview: string
+  timestamp: number
+}
+
+export interface BrowserWebSocketRecord {
+  url: string
+  origin: string
+  protocol: string | null
+  handshakeStatus: number | null
+  openedAt: number
+  closedAt?: number
+  closeCode?: number | null
+  frames: BrowserWebSocketFrame[]
+  frameCount: number
+}
+
+export interface BrowserInteractiveTraversalSummary {
+  candidates: number
+  clicked: number
+  skipped: number
+  visitedUrls: string[]
+  /** Non-destructive interactions only; forms/submits are never exercised in read-only mode. */
+  readOnlyMode: boolean
+}
+
 export type BrowserInteractiveAction =
   | { type: 'fill'; selector: string; value: string }
   | { type: 'click'; selector: string }
@@ -60,6 +118,16 @@ export interface BrowserVisitRequest {
   timeoutMs?: number
   waitAfterLoadMs?: number
   secrets?: readonly NamedSecret[]
+  /** Session material (HttpOnly cookies + web storage) for pooled per-persona contexts. */
+  sessionBundle?: BrowserSessionBundle
+  /** Per-visit passive asset hydration origins (merged with ScopedBrowserOptions.assetOrigins). */
+  assetOrigins?: readonly string[]
+  /** Interactive non-destructive traversal after load (tabs, drawers, pagination, filters, modals). */
+  interactiveTraversal?: boolean | { maxClicks?: number }
+  /** Defaults to true: never click form submits or destructive controls. */
+  readOnlyMode?: boolean
+  /** Replace fixed settle sleeps with network-idle + DOM-stability waits. Defaults to true when pooled. */
+  waitForNetworkIdle?: boolean
   onExchange?: (exchange: BrokerExchangeResult) => string | void
 }
 
@@ -179,6 +247,10 @@ export interface BrowserVisitResult {
   selectorResult?: BrowserSelectorResult | null
   fetchResult?: BrowserFetchResult | null
   redirectSummary?: BrowserRedirectSummary
+  /** WebSocket traffic observed through CDP `Network.webSocket*` events (bounded previews). */
+  webSockets?: BrowserWebSocketRecord[]
+  /** Non-destructive interactive traversal summary (only present when traversal ran). */
+  interactiveTraversal?: BrowserInteractiveTraversalSummary
   exchangeIds: string[]
   exchanges: BrokerExchangeResult[]
   durationMs: number
@@ -206,6 +278,7 @@ interface PlaywrightPage {
   on(event: 'pageerror', listener: (err: Error) => void): void
   goto(url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }): Promise<{ status(): number } | null>
   waitForTimeout(ms: number): Promise<void>
+  waitForLoadState?(state?: 'load' | 'domcontentloaded' | 'networkidle', options?: { timeout?: number }): Promise<void>
   fill?(selector: string, value: string, options?: { timeout?: number }): Promise<void>
   click?(selector: string, options?: { timeout?: number }): Promise<void>
   selectOption?(selector: string, values: string, options?: { timeout?: number }): Promise<string[]>
@@ -214,6 +287,13 @@ interface PlaywrightPage {
   title(): Promise<string>
   evaluate<T, A = undefined>(fn: (arg: A) => T | Promise<T>, arg?: A): Promise<T>
   close(): Promise<void>
+}
+
+/** Minimal CDP surface used for WebSocket observation (`Network.webSocket*`). */
+export interface PlaywrightCdpSession {
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>
+  on(event: string, listener: (payload: Record<string, unknown>) => void): void
+  detach?(): Promise<void>
 }
 
 interface PlaywrightContext {
@@ -231,6 +311,7 @@ interface PlaywrightContext {
   route(url: string, handler: (route: PlaywrightRoute) => Promise<void> | void): Promise<void>
   routeWebSocket?(url: string, handler: (ws: PlaywrightWebSocketRoute) => Promise<void> | void): Promise<void>
   newPage(): Promise<PlaywrightPage>
+  newCDPSession?(page: PlaywrightPage): Promise<PlaywrightCdpSession>
   close(): Promise<void>
 }
 
@@ -242,6 +323,18 @@ export interface PlaywrightBrowserLike {
 export interface ScopedBrowserOptions {
   launchBrowser?: () => Promise<PlaywrightBrowserLike>
   storage?: SecondOrderStore
+  /** Passive CDN/static GET hydration allowlist (active probing stays on target origins). */
+  assetOrigins?: readonly string[]
+  assetOriginAllowlist?: (origin: string) => boolean
+  /** Resolve HttpOnly cookie + web-storage material for a persona before pooled context seeding. */
+  resolveSessionBundle?: (
+    persona: string,
+    origin: string,
+  ) => BrowserSessionBundle | null | Promise<BrowserSessionBundle | null>
+  /** Capture WebSocket traffic through CDP. Defaults to true. */
+  captureWebSockets?: boolean
+  /** Upper bound on simultaneously pooled per-persona contexts. Defaults to 8. */
+  maxPooledContexts?: number
 }
 
 const maxBrowserTimeoutMs = 30_000
@@ -597,6 +690,193 @@ function safeFulfillHeaders(respHeaders: Record<string, string>): Record<string,
   return out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Passive asset-origin scope + read-only GraphQL/RPC POST classification
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Match a browser request origin against the passive asset scope. Fail-closed: malformed entries,
+ * wildcard-all patterns, and non-HTTP origins never match. `*.example.com` matches subdomains,
+ * never the apex unless the apex is listed separately.
+ */
+export function isAssetOriginAllowed(origin: string, scope: AssetOriginScope | undefined): boolean {
+  if (!scope) return false
+  let parsed: URL
+  try {
+    parsed = new URL(origin)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false
+  if (scope.allowlist) {
+    try {
+      if (scope.allowlist(parsed.origin)) return true
+    } catch {
+      return false
+    }
+  }
+  const hostAndPort = parsed.host.toLowerCase()
+  const hostOnly = parsed.hostname.toLowerCase()
+  for (const raw of scope.origins ?? []) {
+    const pattern = raw.trim().toLowerCase()
+    if (!pattern || pattern === '*' || pattern === '*/*') continue
+    if (pattern.includes('://')) {
+      try {
+        if (new URL(pattern).origin === parsed.origin) return true
+      } catch { /* ignore malformed */ }
+      continue
+    }
+    if (pattern.startsWith('*.')) {
+      const bare = pattern.slice(2)
+      if (!bare) continue
+      if (hostOnly !== bare && hostOnly.endsWith(`.${bare}`)) return true
+      continue
+    }
+    if (pattern === hostAndPort || pattern === hostOnly) return true
+  }
+  return false
+}
+
+/** Asset-scoped grant: broker transport still enforces DNS/SSRF/rate limits and audit. */
+function assetScopedGrant(grant: Grant, assetOrigin: string): Grant {
+  return {
+    ...grant,
+    // Never widen the primary grant: the browser only consults this derived grant for a request
+    // already classified as passive asset hydration.
+    canRead: origin => origin === assetOrigin || grant.canRead(origin),
+  }
+}
+
+/** Strip GraphQL string/comment literals so operation keywords can be classified safely. */
+function stripGraphqlLiterals(doc: string): string {
+  return doc
+    .replace(/"""[\s\S]*?"""/g, '""')
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/#[^\n\r]*/g, '')
+}
+
+function isReadOnlyGraphqlDocument(doc: string): boolean {
+  if (!doc.trim()) return false
+  const stripped = stripGraphqlLiterals(doc)
+  // A mutation/subscription operation anywhere makes the document state-changing.
+  if (/\b(?:mutation|subscription)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*)?(?:\(|\{)/.test(stripped)) return false
+  return /^\s*(?:query\b|\{)/.test(stripped) || /^\s*fragment\b/.test(stripped)
+}
+
+const readOnlyRpcMethodRe = /^(?:get|list|search|query|read|describe|introspect|fetch|lookup|find|count|view|status|health)(?:$|[._:-])/i
+const mutatingRpcMethodRe = /(?:^|[._:-])(?:create|update|delete|remove|write|set|put|post|patch|mutate|insert|drop|truncate|charge|pay|send|upload|import|reset|revoke|grant)(?:$|[._:-])/i
+
+/**
+ * True when a POST body is a read-only GraphQL operation (`query`/anonymous selection set) —
+ * introspection-disabled targets still expose observed operations this way.
+ */
+export function isReadOnlyGraphqlOperation(body: string | null | undefined): boolean {
+  if (!body || !body.trim()) return false
+  try {
+    const parsed = JSON.parse(body) as unknown
+    const checkOp = (op: unknown): boolean => {
+      if (!op || typeof op !== 'object') return false
+      const record = op as Record<string, unknown>
+      if (record.mutation !== undefined || record.subscription !== undefined) return false
+      if (typeof record.query !== 'string') return false
+      if (record.operationName !== undefined && typeof record.operationName !== 'string') return false
+      if (record.variables !== undefined && (typeof record.variables !== 'object' || Array.isArray(record.variables))) return false
+      return isReadOnlyGraphqlDocument(record.query)
+    }
+    if (Array.isArray(parsed)) return parsed.length > 0 && parsed.length <= 10 && parsed.every(checkOp)
+    return checkOp(parsed)
+  } catch {
+    // Raw GraphQL document body.
+    return isReadOnlyGraphqlDocument(body)
+  }
+}
+
+/** True when a JSON-RPC style POST names a read-only method and carries no mutating verb. */
+export function isReadOnlyRpcOperation(body: string | null | undefined): boolean {
+  if (!body || !body.trim()) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { return false }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+  const record = parsed as Record<string, unknown>
+  const method = typeof record.method === 'string' ? record.method : ''
+  if (!method || !readOnlyRpcMethodRe.test(method) || mutatingRpcMethodRe.test(method)) return false
+  if (record.mutation !== undefined || record.subscription !== undefined) return false
+  return true
+}
+
+export interface BrowserRequestClassification {
+  allowed: boolean
+  assetHydration: boolean
+  readOnlyGraphql: boolean
+  reason: string | null
+}
+
+/**
+ * Single decision point for every intercepted browser request. Read-only GraphQL/RPC POSTs are
+ * classified below Tier 3 (the broker remains the authoritative boundary for the wire request).
+ */
+export function classifyBrowserHttpRequest(input: {
+  method: string
+  url: string
+  body?: string | null
+  tier: number
+  canRead: (origin: string) => boolean
+  allowLocalLab: boolean
+  assetScope?: AssetOriginScope
+}): BrowserRequestClassification {
+  const method = input.method.toUpperCase()
+  let parsed: URL
+  try {
+    parsed = new URL(input.url)
+  } catch {
+    return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'malformed_url' }
+  }
+  const protocolOk = parsed.protocol === 'https:' || (input.allowLocalLab && parsed.protocol === 'http:')
+  const inScope = input.canRead(parsed.origin)
+  const readOnlyGraphql = method === 'POST' &&
+    (isReadOnlyGraphqlOperation(input.body ?? null) || isReadOnlyRpcOperation(input.body ?? null))
+
+  if (!inScope) {
+    // Passive hydration only: GET/HEAD from an explicit asset origin. Everything else fails closed.
+    if (protocolOk && isAssetOriginAllowed(parsed.origin, input.assetScope)) {
+      if (method === 'GET' || method === 'HEAD') {
+        return { allowed: true, assetHydration: true, readOnlyGraphql: false, reason: null }
+      }
+      return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'asset_origin_active_probe' }
+    }
+    return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'out_of_scope' }
+  }
+
+  if (!protocolOk) return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'invalid_protocol' }
+  if (!allowedMethods.has(method)) return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'method_not_allowed' }
+
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    return { allowed: true, assetHydration: false, readOnlyGraphql: false, reason: null }
+  }
+  if (method === 'POST') {
+    if (readOnlyGraphql) return { allowed: true, assetHydration: false, readOnlyGraphql: true, reason: null }
+    if (input.tier >= 2) return { allowed: true, assetHydration: false, readOnlyGraphql: false, reason: null }
+    return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'tier_too_low' }
+  }
+  if (input.tier >= 3) return { allowed: true, assetHydration: false, readOnlyGraphql: false, reason: null }
+  return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'tier_too_low' }
+}
+
+/** Distinct, nested unmatched paths used to calibrate per-origin SPA catch-alls. */
+export function buildSoft404ProbePaths(count = 3): string[] {
+  const n = Math.max(1, Math.min(6, count))
+  const token = randomBytes(6).toString('hex')
+  const bases = [
+    `/.guardian-cal-${token}`,
+    `/api/.guardian-cal-${token}/missing`,
+    `/app/.guardian-cal-${token}/detail/view`,
+    `/v1/.guardian-cal-${token}?probe=1`,
+    `/.well-known/guardian-cal-${token}`,
+    `/static/.guardian-cal-${token}/absent.json`,
+  ]
+  return bases.slice(0, n)
+}
+
 /**
  * Mirror non-HttpOnly session-jar cookies into the Playwright context so SPA JS
  * (`document.cookie`, Axios XSRF double-submit) observes the same values that the
@@ -646,14 +926,892 @@ function validateSafeSelector(selector: string, origin: string, grant: Grant) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Pooled per-persona contexts, session hydration, WS capture, interactive traversal
+// ---------------------------------------------------------------------------------------------
+
+export interface BrowserPoolStats {
+  launches: number
+  contextsCreated: number
+  contextsClosed: number
+  pagesCreated: number
+  activeContexts: number
+}
+
+interface PooledRuntime {
+  key: string
+  context: PlaywrightContext
+  page: PlaywrightPage
+  sockets: Map<string, BrowserWebSocketRecord>
+  cdp: PlaywrightCdpSession | null
+  active: PooledVisitState | null
+  lastUsed: number
+}
+
+interface PooledVisitState {
+  origin: string
+  persona?: string
+  session?: string
+  sessionGroupRole?: string
+  csrfBind?: CsrfBind
+  runId?: string
+  assignmentId?: string
+  traceId?: string
+  tier: number
+  secrets: NamedSecret[]
+  assetScope: AssetOriginScope
+  validatedFetch: { url: string; origin: string; method: 'GET' | 'HEAD' | 'OPTIONS'; credentials: 'include' | 'same-origin' | 'omit' } | null
+  exchanges: BrokerExchangeResult[]
+  exchangeIds: string[]
+  xhrRequests: BrowserXhrRecord[]
+  allRequests: BrowserXhrRecord[]
+  xhrBodyBudget: { chars: number }
+  blockedOrigins: Set<string>
+  consoleMessages: Array<{ type: 'error' | 'warning'; text: string }>
+  onExchange?: (exchange: BrokerExchangeResult) => string | void
+  signal?: AbortSignal
+}
+
+function normalizeSeedBundle(raw: unknown): BrowserSessionBundle | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  const hasShape = 'cookies' in record || 'localStorage' in record || 'sessionStorage' in record
+  if (!hasShape) return null
+  const bundle: BrowserSessionBundle = {}
+  if (Array.isArray(record.cookies)) {
+    const cookies: BrowserSeedCookie[] = []
+    for (const candidate of record.cookies.slice(0, 64)) {
+      if (!candidate || typeof candidate !== 'object') continue
+      const c = candidate as Record<string, unknown>
+      if (typeof c.name !== 'string' || typeof c.value !== 'string' || typeof c.domain !== 'string') continue
+      const expiresRaw = typeof c.expires === 'number' && Number.isFinite(c.expires) ? c.expires : undefined
+      const sameSiteRaw = typeof c.sameSite === 'string' ? c.sameSite : undefined
+      cookies.push({
+        name: c.name.slice(0, 256),
+        value: c.value.slice(0, 8192),
+        domain: c.domain.slice(0, 255),
+        path: typeof c.path === 'string' && c.path ? c.path.slice(0, 512) : '/',
+        secure: c.secure === true,
+        httpOnly: c.httpOnly === true,
+        ...(sameSiteRaw === 'Strict' || sameSiteRaw === 'Lax' || sameSiteRaw === 'None' ? { sameSite: sameSiteRaw } : {}),
+        // Playwright expects epoch seconds; accept millisecond timestamps defensively.
+        ...(expiresRaw !== undefined ? { expires: Math.floor(expiresRaw > 1e12 ? expiresRaw / 1000 : expiresRaw) } : {}),
+      })
+    }
+    if (cookies.length > 0) bundle.cookies = cookies
+  }
+  const normalizeStorage = (value: unknown): Record<string, string> | undefined => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, 64)) {
+      if (!k || typeof v !== 'string') continue
+      out[k.slice(0, 256)] = v.slice(0, 8192)
+    }
+    return Object.keys(out).length > 0 ? out : undefined
+  }
+  const local = normalizeStorage(record.localStorage)
+  const session = normalizeStorage(record.sessionStorage)
+  if (local) bundle.localStorage = local
+  if (session) bundle.sessionStorage = session
+  return Object.keys(bundle).length > 0 ? bundle : null
+}
+
+/** Structural read of optional persona session material (the vault may evolve without a schema bump here). */
+export function personaSessionBundle(grant: Grant, persona: string | undefined): BrowserSessionBundle | null {
+  if (!persona) return null
+  const resolved = grant.personas?.get(persona) as unknown as Record<string, unknown> | undefined
+  if (!resolved) return null
+  for (const key of ['sessionBundle', 'bundle']) {
+    const bundle = normalizeSeedBundle(resolved[key])
+    if (bundle) return bundle
+  }
+  const inline = normalizeSeedBundle({
+    cookies: resolved.cookies,
+    localStorage: resolved.localStorage,
+    sessionStorage: resolved.sessionStorage,
+  })
+  return inline
+}
+
+function seedStorageInitScript(bundle: BrowserSessionBundle | null, origin: string): string | null {
+  if (!bundle) return null
+  const local = bundle.localStorage ?? {}
+  const session = bundle.sessionStorage ?? {}
+  if (Object.keys(local).length === 0 && Object.keys(session).length === 0) return null
+  const payload = JSON.stringify({ origin, local, session })
+  return `(() => {
+  try {
+    const seed = ${payload};
+    if (window.location.origin !== seed.origin) return;
+    const apply = (store, entries) => {
+      for (const key of Object.keys(entries || {})) {
+        try { if (store.getItem(key) === null) store.setItem(key, entries[key]); } catch {}
+      }
+    };
+    apply(window.localStorage, seed.local);
+    apply(window.sessionStorage, seed.session);
+  } catch {}
+})();`
+}
+
+async function hydrateContextSession(
+  context: PlaywrightContext,
+  bundle: BrowserSessionBundle | null,
+  origin: string,
+): Promise<void> {
+  if (!context.addCookies || !bundle?.cookies?.length) return
+  try {
+    await context.addCookies(bundle.cookies.map(cookie => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+      secure: cookie.secure,
+      httpOnly: cookie.httpOnly === true,
+      ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
+      ...(cookie.expires !== undefined ? { expires: cookie.expires } : {}),
+    })))
+  } catch {
+    // Hydration is best-effort: a rejected cookie must never fail a visit.
+  }
+  void origin
+}
+
+/** Wait for network-idle plus DOM stability instead of a fixed settle sleep. */
+export async function waitForBrowserSettle(page: PlaywrightPage, timeoutMs: number): Promise<void> {
+  const limit = Math.max(250, Math.min(timeoutMs, 5_000))
+  if (typeof page.waitForLoadState === 'function') {
+    await page.waitForLoadState('networkidle', { timeout: limit }).catch(() => undefined)
+  } else {
+    await page.waitForTimeout(Math.min(400, limit)).catch(() => undefined)
+  }
+  try {
+    await page.evaluate(async (quietMs: number) => {
+      await new Promise<void>(resolve => {
+        let timer: ReturnType<typeof setTimeout> | null = null
+        let observer: MutationObserver | null = null
+        const finish = () => {
+          try { observer?.disconnect() } catch { /* ignore */ }
+          resolve()
+        }
+        try {
+          observer = new MutationObserver(() => {
+            if (timer) clearTimeout(timer)
+            timer = setTimeout(finish, quietMs)
+          })
+          observer.observe(document.documentElement || document, {
+            childList: true, subtree: true, attributes: true, characterData: true,
+          })
+          timer = setTimeout(finish, quietMs + 100)
+        } catch {
+          finish()
+        }
+      })
+    }, 200)
+  } catch {
+    // DOM stability is best-effort; a page without MutationObserver is still inspected.
+  }
+}
+
+/**
+ * Collect non-destructive SPA navigation affordances (tabs, drawers, pagination, filters, modals).
+ * Form submits and destructive controls are excluded in read-only mode.
+ */
+async function collectInteractiveCandidates(page: PlaywrightPage): Promise<Array<{ selector: string; kind: string; text: string }>> {
+  try {
+    return await page.evaluate((readOnly: boolean) => {
+      const destructive = /(?:^|\b)(?:delete|remove|destroy|drop|revoke|deactivate|logout|sign\s*out|pay|purchase|checkout|refund|charge|transfer|send|publish|deploy|reset|purge|wipe|approve|grant)(?:\b|$)/i
+      const selectors = [
+        '[role="tab"]',
+        '[role="tablist"] [role="tab"]',
+        '[data-testid*="tab" i]',
+        '[data-test*="tab" i]',
+        'a[rel="next"]',
+        '[aria-label*="next" i]',
+        '[data-testid*="pagination" i] a',
+        '.pagination a',
+        '[aria-expanded][aria-controls]',
+        '[data-testid*="drawer" i] button',
+        '[data-testid*="menu" i] button',
+        '[data-testid*="filter" i] button',
+        '[aria-haspopup="dialog"]',
+        '[aria-haspopup="listbox"]',
+        'button[aria-controls]',
+      ]
+      const cssPath = (el: Element): string => {
+        const parts: string[] = []
+        let node: Element | null = el
+        let depth = 0
+        while (node && node.nodeType === 1 && depth < 6) {
+          let part = node.tagName.toLowerCase()
+          const id = node.getAttribute('id')
+          if (id && /^[A-Za-z][\w-]{0,63}$/.test(id)) { parts.unshift(`${part}#${id}`); break }
+          const testId = node.getAttribute('data-testid')
+          if (testId && /^[A-Za-z][\w-]{0,63}$/.test(testId)) { parts.unshift(`${part}[data-testid="${testId}"]`); break }
+          const parent: Element | null = node.parentElement
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(child => child.tagName === node!.tagName)
+            if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`
+          }
+          parts.unshift(part)
+          node = parent
+          depth += 1
+        }
+        return parts.join(' > ')
+      }
+      const seen = new Set<string>()
+      const out: Array<{ selector: string; kind: string; text: string }> = []
+      for (const base of selectors) {
+        let nodes: Element[] = []
+        try { nodes = Array.from(document.querySelectorAll(base)) } catch { continue }
+        for (const el of nodes.slice(0, 12)) {
+          if (!(el instanceof HTMLElement)) continue
+          if (el.closest('form') && readOnly) continue
+          const tag = el.tagName.toLowerCase()
+          if (readOnly && (tag === 'input' || tag === 'select' || tag === 'textarea')) continue
+          if (readOnly && el.getAttribute('type') === 'submit') continue
+          const text = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().slice(0, 80)
+          if (destructive.test(text)) continue
+          const selector = cssPath(el)
+          if (!selector || seen.has(selector)) continue
+          seen.add(selector)
+          out.push({ selector, kind: base, text })
+          if (out.length >= 24) return out
+        }
+      }
+      return out
+    }, true)
+  } catch {
+    return []
+  }
+}
+
+async function traverseInteractive(
+  page: PlaywrightPage,
+  opts: { maxClicks: number; readOnlyMode: boolean; timeoutMs: number; secrets: readonly NamedSecret[] },
+): Promise<BrowserInteractiveTraversalSummary> {
+  const candidates = await collectInteractiveCandidates(page)
+  let clicked = 0
+  let skipped = 0
+  const visitedUrls: string[] = []
+  for (const candidate of candidates) {
+    if (clicked >= opts.maxClicks) break
+    try {
+      const before = page.url()
+      if (typeof page.click === 'function') {
+        await page.click(candidate.selector, { timeout: Math.min(2_500, opts.timeoutMs) })
+      } else {
+        await page.evaluate((selector: string) => {
+          const el = document.querySelector(selector) as HTMLElement | null
+          if (!el) throw new Error('candidate missing')
+          el.click()
+        }, candidate.selector)
+      }
+      await waitForBrowserSettle(page, Math.min(2_000, opts.timeoutMs))
+      const after = page.url()
+      clicked += 1
+      if (after && after !== before && visitedUrls.length < 12) {
+        visitedUrls.push(redact(after, [...opts.secrets]).slice(0, 512))
+      }
+    } catch {
+      skipped += 1
+    }
+  }
+  return {
+    candidates: candidates.length,
+    clicked,
+    skipped: skipped + Math.max(0, candidates.length - clicked - skipped),
+    visitedUrls,
+    readOnlyMode: opts.readOnlyMode,
+  }
+}
+
+/** Attach CDP `Network.webSocket*` observation; degrades silently when CDP is unavailable. */
+async function attachWebSocketCapture(
+  context: PlaywrightContext,
+  page: PlaywrightPage,
+  sockets: Map<string, BrowserWebSocketRecord>,
+  secrets: readonly NamedSecret[],
+): Promise<PlaywrightCdpSession | null> {
+  if (typeof context.newCDPSession !== 'function') return null
+  let session: PlaywrightCdpSession
+  try {
+    session = await context.newCDPSession(page)
+  } catch {
+    return null
+  }
+  const boundedPreview = (raw: unknown): string => {
+    const text = typeof raw === 'string' ? raw : ''
+    return redact(text, [...secrets]).slice(0, 200)
+  }
+  const ensureSocket = (payload: Record<string, unknown>): BrowserWebSocketRecord | null => {
+    const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
+    const url = typeof payload.url === 'string' ? payload.url : ''
+    if (!requestId || !url) return null
+    let record = sockets.get(requestId)
+    if (!record) {
+      if (sockets.size >= 20) return null
+      let socketOrigin = ''
+      try { socketOrigin = new URL(url).origin } catch { /* keep empty */ }
+      record = {
+        url: redact(url, [...secrets]).slice(0, 512),
+        origin: socketOrigin,
+        protocol: null,
+        handshakeStatus: null,
+        openedAt: Date.now(),
+        frames: [],
+        frameCount: 0,
+      }
+      sockets.set(requestId, record)
+    }
+    return record
+  }
+  session.on('Network.webSocketCreated', payload => { ensureSocket(payload) })
+  session.on('Network.webSocketWillSendHandshakeRequest', payload => {
+    const record = ensureSocket(payload)
+    if (!record) return
+    const request = payload.request as Record<string, unknown> | undefined
+    const headers = request?.headers as Record<string, unknown> | undefined
+    if (headers) {
+      const protocol = headers['Sec-WebSocket-Protocol'] ?? headers['sec-websocket-protocol']
+      if (typeof protocol === 'string') record.protocol = protocol.slice(0, 128)
+    }
+  })
+  session.on('Network.webSocketHandshakeResponseReceived', payload => {
+    const record = ensureSocket(payload)
+    if (!record) return
+    const response = payload.response as Record<string, unknown> | undefined
+    const status = response?.status
+    if (typeof status === 'number') record.handshakeStatus = status
+  })
+  const recordFrame = (direction: 'sent' | 'received', payload: Record<string, unknown>) => {
+    const record = ensureSocket(payload)
+    if (!record) return
+    if (record.frames.length >= 40) return
+    const response = payload.response as Record<string, unknown> | undefined
+    const rawData = response?.payloadData
+    const opcode = typeof response?.opcode === 'number' ? response.opcode : null
+    record.frames.push({
+      direction,
+      opcode,
+      payloadLength: typeof rawData === 'string' ? rawData.length : 0,
+      preview: boundedPreview(rawData),
+      timestamp: Date.now(),
+    })
+    record.frameCount += 1
+  }
+  session.on('Network.webSocketFrameSent', payload => recordFrame('sent', payload))
+  session.on('Network.webSocketFrameReceived', payload => recordFrame('received', payload))
+  session.on('Network.webSocketClosed', payload => {
+    const record = ensureSocket(payload)
+    if (!record) return
+    record.closedAt = Date.now()
+  })
+  session.on('Network.webSocketFrameError', payload => {
+    const record = ensureSocket(payload)
+    if (!record || record.frames.length >= 40) return
+    record.frames.push({
+      direction: 'received',
+      opcode: null,
+      payloadLength: 0,
+      preview: `frame_error:${boundedPreview(payload.errorMessage)}`,
+      timestamp: Date.now(),
+    })
+    record.frameCount += 1
+  })
+  try {
+    await session.send('Network.enable')
+  } catch {
+    // Observation still works for events emitted by the browser even if enable is a no-op.
+  }
+  return session
+}
+
 export class ScopedBrowser {
   private readonly broker: RequestBroker
   private readonly options: ScopedBrowserOptions
+  private poolBrowser: PlaywrightBrowserLike | null = null
+  private poolLaunch: Promise<PlaywrightBrowserLike> | null = null
+  private readonly pooled = new Map<string, PooledRuntime>()
+  private readonly poolStats: BrowserPoolStats = {
+    launches: 0, contextsCreated: 0, contextsClosed: 0, pagesCreated: 0, activeContexts: 0,
+  }
 
   constructor(broker: RequestBroker, options: ScopedBrowserOptions = {}) {
     this.broker = broker
     this.options = options
   }
+
+  /** Telemetry for the pooled-context design (one Chromium, one context per persona). */
+  getPoolStats(): BrowserPoolStats {
+    return { ...this.poolStats, activeContexts: this.pooled.size }
+  }
+
+  private async ensurePoolBrowser(): Promise<PlaywrightBrowserLike> {
+    if (this.poolBrowser) return this.poolBrowser
+    if (!this.poolLaunch) {
+      this.poolLaunch = (async () => {
+        const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
+        this.poolStats.launches += 1
+        this.poolBrowser = browser
+        return browser
+      })()
+    }
+    return await this.poolLaunch
+  }
+
+  private assetScopeFor(req: BrowserVisitRequest): AssetOriginScope | undefined {
+    const origins = [...(this.options.assetOrigins ?? []), ...(req.assetOrigins ?? [])]
+    if (origins.length === 0 && !this.options.assetOriginAllowlist) return undefined
+    return {
+      ...(origins.length > 0 ? { origins } : {}),
+      ...(this.options.assetOriginAllowlist ? { allowlist: this.options.assetOriginAllowlist } : {}),
+    }
+  }
+
+  private async resolveBundle(req: BrowserVisitRequest, grant: Grant, origin: string): Promise<BrowserSessionBundle | null> {
+    if (req.sessionBundle) return normalizeSeedBundle(req.sessionBundle)
+    if (this.options.resolveSessionBundle && req.persona) {
+      try {
+        const resolved = await this.options.resolveSessionBundle(req.persona, origin)
+        const bundle = normalizeSeedBundle(resolved)
+        if (bundle) return bundle
+      } catch {
+        // Fall through to structural persona material.
+      }
+    }
+    return personaSessionBundle(grant, req.persona)
+  }
+
+  private async ensurePooledContext(
+    browser: PlaywrightBrowserLike,
+    req: BrowserVisitRequest,
+    grant: Grant,
+    initialOrigin: string,
+    bundle: BrowserSessionBundle | null,
+    allowLocalLab: boolean,
+  ): Promise<PooledRuntime> {
+    const key = req.persona ? `persona:${req.persona}` : 'anonymous'
+    const existing = this.pooled.get(key)
+    if (existing) {
+      existing.lastUsed = Date.now()
+      await hydrateContextSession(existing.context, bundle, initialOrigin)
+      return existing
+    }
+    const maxContexts = Math.max(1, Math.min(this.options.maxPooledContexts ?? 8, 16))
+    if (this.pooled.size >= maxContexts) {
+      // Evict the least-recently-used context instead of growing without bound.
+      let oldest: PooledRuntime | null = null
+      for (const entry of this.pooled.values()) {
+        if (!oldest || entry.lastUsed < oldest.lastUsed) oldest = entry
+      }
+      if (oldest) {
+        this.pooled.delete(oldest.key)
+        await oldest.cdp?.detach?.().catch(() => undefined)
+        await oldest.page.close().catch(() => undefined)
+        await oldest.context.close().catch(() => undefined)
+        this.poolStats.contextsClosed += 1
+      }
+    }
+
+    const context = await browser.newContext({
+      ignoreHTTPSErrors: false,
+      javaScriptEnabled: true,
+      bypassCSP: false,
+      serviceWorkers: 'block',
+      userAgent: 'Guardian/6 pooled scoped inspector',
+    })
+    this.poolStats.contextsCreated += 1
+    await context.addInitScript(postMessageInstrumentationScript)
+    await context.addInitScript(browserWebRtcGuardScript)
+    await installWebSocketGuard(context, {
+      canRead: origin => grant.canRead(origin),
+      allowLocalLab,
+      audit: (decision, origin) => grant.audit(decision, origin),
+    })
+    const storageSeed = seedStorageInitScript(bundle, initialOrigin)
+    if (storageSeed) await context.addInitScript(storageSeed)
+
+    const runtime: PooledRuntime = {
+      key,
+      context,
+      page: undefined as unknown as PlaywrightPage,
+      sockets: new Map(),
+      cdp: null,
+      active: null,
+      lastUsed: Date.now(),
+    }
+
+    await context.route('**/*', async route => {
+      const state = runtime.active
+      if (!state) {
+        await route.abort('blockedbyclient').catch(() => undefined)
+        return
+      }
+      const request = route.request()
+      const rawUrl = request.url()
+      if (rawUrl.startsWith('about:') || rawUrl.startsWith('data:') || rawUrl.startsWith('blob:')) {
+        await route.fulfill({ status: 200, contentType: 'text/plain', body: '' }).catch(() => undefined)
+        return
+      }
+      const method = request.method().toUpperCase()
+      const decision = classifyBrowserHttpRequest({
+        method,
+        url: rawUrl,
+        body: request.postData(),
+        tier: state.tier,
+        canRead: origin => grant.canRead(origin),
+        allowLocalLab,
+        assetScope: state.assetScope,
+      })
+      if (!decision.allowed) {
+        try { state.blockedOrigins.add(new URL(rawUrl).origin) } catch { /* ignore */ }
+        try { grant.audit('denied', new URL(rawUrl).origin) } catch { /* ignore */ }
+        await route.abort('blockedbyclient').catch(() => undefined)
+        return
+      }
+      let parsedUrl: URL
+      try { parsedUrl = new URL(rawUrl) } catch {
+        await route.abort('blockedbyclient').catch(() => undefined)
+        return
+      }
+      const forwardedHeaders: Record<string, string> = {}
+      for (const [k, v] of Object.entries(request.headers())) {
+        if (forbiddenBrowserForwardHeaders.test(k)) continue
+        forwardedHeaders[k] = v
+      }
+      const resourceType = request.resourceType()
+      let personaForRequest: string | undefined
+      if (state.persona && !decision.assetHydration) {
+        if (parsedUrl.origin === state.origin) {
+          personaForRequest = state.persona
+        } else if (
+          state.validatedFetch &&
+          state.validatedFetch.credentials === 'include' &&
+          parsedUrl.origin === state.validatedFetch.origin &&
+          Boolean(grant.personas?.get(state.persona)?.originAllowlist.includes(parsedUrl.origin))
+        ) {
+          personaForRequest = state.persona
+        }
+      }
+      try {
+        const exchange = await this.broker.executeHttp({
+          origin: parsedUrl.origin,
+          method: method as 'GET' | 'HEAD' | 'OPTIONS' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+          pathAndQuery: parsedUrl.pathname + parsedUrl.search,
+          headers: forwardedHeaders,
+          body: request.postData() ?? undefined,
+          ...(personaForRequest ? { persona: personaForRequest } : {}),
+          ...(state.session ? { session: state.session } : {}),
+          ...(state.sessionGroupRole ? { sessionGroupRole: state.sessionGroupRole as 'setup' | 'control' | 'probe' | 'cleanup' } : {}),
+          ...(state.csrfBind ? { csrfBind: state.csrfBind } : {}),
+          ...(state.runId ? { runId: state.runId } : {}),
+          ...(state.assignmentId ? { assignmentId: state.assignmentId } : {}),
+          ...(state.traceId ? { traceId: state.traceId } : {}),
+          followRedirects: true,
+          secrets: state.secrets,
+          timeoutMs: Math.max(2_000, 20_000),
+        }, decision.assetHydration ? assetScopedGrant(grant, parsedUrl.origin) : grant, state.signal ?? AbortSignal.timeout(25_000))
+        if (!decision.assetHydration) {
+          state.exchanges.push(exchange)
+          const recordedId = state.onExchange?.(exchange)
+          if (typeof recordedId === 'string' && recordedId) state.exchangeIds.push(recordedId)
+          await mirrorJarCookies(runtime.context, this.broker, {
+            ...(state.session ? { session: state.session } : {}),
+            ...(state.runId ? { runId: state.runId } : {}),
+            ...(state.assignmentId ? { assignmentId: state.assignmentId } : {}),
+            ...(state.sessionGroupRole ? { sessionGroupRole: state.sessionGroupRole } : {}),
+          }, parsedUrl.origin)
+          const reqRecord: BrowserXhrRecord = {
+            method,
+            url: redact(parsedUrl.href, state.secrets),
+            origin: parsedUrl.origin,
+            resourceType,
+            status: exchange.status,
+            ...((resourceType === 'xhr' || resourceType === 'fetch')
+              ? captureXhrJsonBody({ exchange, sameOrigin: parsedUrl.origin === state.origin, secrets: state.secrets, budget: state.xhrBodyBudget })
+              : {}),
+          }
+          if (state.allRequests.length < 200) state.allRequests.push(reqRecord)
+          if (resourceType === 'xhr' || resourceType === 'fetch') state.xhrRequests.push(reqRecord)
+        } else if (state.allRequests.length < 200) {
+          state.allRequests.push({
+            method,
+            url: `asset:${parsedUrl.origin}${parsedUrl.pathname}`,
+            origin: parsedUrl.origin,
+            resourceType,
+            status: exchange.status,
+          })
+        }
+        await route.fulfill({
+          status: exchange.status,
+          headers: safeFulfillHeaders(exchange.respHeaders),
+          contentType: exchange.mediaType === 'unknown' ? 'application/octet-stream' : exchange.mediaType,
+          body: exchange.body,
+        }).catch(() => undefined)
+      } catch {
+        if (!decision.assetHydration && state.allRequests.length < 200) {
+          state.allRequests.push({
+            method,
+            url: redact(parsedUrl.href, state.secrets),
+            origin: parsedUrl.origin,
+            resourceType,
+            status: null,
+          })
+        }
+        await route.abort('blockedbyclient').catch(() => undefined)
+      }
+    })
+
+    runtime.page = await context.newPage()
+    this.poolStats.pagesCreated += 1
+    runtime.page.on('console', msg => {
+      const state = runtime.active
+      if (!state || state.consoleMessages.length >= 50) return
+      const type = msg.type()
+      if (type !== 'error' && type !== 'warning') return
+      state.consoleMessages.push({ type, text: redact(msg.text(), state.secrets).slice(0, 500) })
+    })
+    runtime.page.on('pageerror', err => {
+      const state = runtime.active
+      if (!state || state.consoleMessages.length >= 50) return
+      state.consoleMessages.push({ type: 'error', text: redact(err.message || String(err), state.secrets).slice(0, 500) })
+    })
+    if (this.options.captureWebSockets !== false) {
+      runtime.cdp = await attachWebSocketCapture(context, runtime.page, runtime.sockets, [])
+    }
+    this.pooled.set(key, runtime)
+    await hydrateContextSession(context, bundle, initialOrigin)
+    return runtime
+  }
+
+  /**
+   * Visit a sequence of pages through one pooled Chromium and one BrowserContext per persona.
+   * Contexts are hydrated with HttpOnly cookies and web storage, and reused across navigations.
+   */
+  async visitPages(
+    requests: readonly BrowserVisitRequest[],
+    grant: Grant,
+    signal: AbortSignal,
+  ): Promise<BrowserVisitResult[]> {
+    const tier = grant.tier ?? 1
+    if (tier === 0) throw new BrokerDenied('Scoped browser inspection is disabled in Tier 0 (offline prepared mode).')
+    if (!Array.isArray(requests) || requests.length === 0) return []
+    const browser = await this.ensurePoolBrowser()
+    const results: BrowserVisitResult[] = []
+    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+
+    for (const req of requests) {
+      signal.throwIfAborted()
+      const initialOrigin = new URL(req.origin).origin
+      if (!req.pathAndQuery.startsWith('/') || req.pathAndQuery.startsWith('//') || /[\r\n\0]/.test(req.pathAndQuery)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Invalid browser visit path.')
+      }
+      if (hasDestructiveInput(req.pathAndQuery)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Browser visit blocked by destructive-payload denylist.')
+      }
+      const targetUrl = new URL(req.pathAndQuery, initialOrigin)
+      if (targetUrl.origin !== initialOrigin || !grant.canRead(initialOrigin)) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied('Browser destination is outside the current assignment scope.')
+      }
+      if (req.selector !== undefined) validateSafeSelector(req.selector, initialOrigin, grant)
+      const actions = (req.actions ?? []).slice(0, maxInteractiveActions)
+      for (const action of actions) {
+        if (action.type === 'fill' || action.type === 'select_option') {
+          validateSafeSelector(action.selector, initialOrigin, grant)
+          if (action.value.length > 2048 || hasDestructiveInput(action.value)) {
+            grant.audit('denied', initialOrigin)
+            throw new BrokerDenied(`Browser ${action.type} value blocked by destructive-payload denylist or length limit.`)
+          }
+        } else if (action.type === 'click' || action.type === 'wait_for_selector') {
+          validateSafeSelector(action.selector, initialOrigin, grant)
+        }
+      }
+
+      const started = Date.now()
+      const timeoutMs = Math.max(2_000, Math.min(req.timeoutMs ?? maxBrowserTimeoutMs, maxBrowserTimeoutMs))
+      const secrets = [...collectSecrets(req, grant), ...this.broker.getRegisteredSecrets()]
+      const bundle = await this.resolveBundle(req, grant, initialOrigin)
+      const runtime = await this.ensurePooledContext(browser, req, grant, initialOrigin, bundle, allowLocalLab)
+      const state: PooledVisitState = {
+        origin: initialOrigin,
+        ...(req.persona ? { persona: req.persona } : {}),
+        ...(req.session ? { session: req.session } : {}),
+        ...(req.sessionGroupRole ? { sessionGroupRole: req.sessionGroupRole } : {}),
+        ...(req.csrfBind ? { csrfBind: req.csrfBind } : {}),
+        ...(req.runId ? { runId: req.runId } : {}),
+        ...(req.assignmentId ? { assignmentId: req.assignmentId } : {}),
+        ...(req.traceId ? { traceId: req.traceId } : {}),
+        tier,
+        secrets,
+        assetScope: this.assetScopeFor(req) ?? {},
+        validatedFetch: null,
+        exchanges: [],
+        exchangeIds: [],
+        xhrRequests: [],
+        allRequests: [],
+        xhrBodyBudget: { chars: 0 },
+        blockedOrigins: new Set(),
+        consoleMessages: [],
+        ...(req.onExchange ? { onExchange: req.onExchange } : {}),
+        signal,
+      }
+      runtime.active = state
+      runtime.lastUsed = Date.now()
+      runtime.sockets.clear()
+
+      const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+      state.signal = deadline
+      try {
+        const navResponse = await runtime.page.goto(targetUrl.href, {
+          waitUntil: 'domcontentloaded',
+          timeout: Math.max(2_000, timeoutMs - (Date.now() - started)),
+        })
+        if (req.waitForNetworkIdle !== false) {
+          await waitForBrowserSettle(runtime.page, Math.max(500, timeoutMs - (Date.now() - started) - 250))
+        } else if ((req.waitAfterLoadMs ?? 0) > 0) {
+          await runtime.page.waitForTimeout(Math.min(req.waitAfterLoadMs ?? 0, 5_000))
+        }
+        let interactiveTraversal: BrowserInteractiveTraversalSummary | undefined
+        const traversal = req.interactiveTraversal
+        if (traversal) {
+          const readOnlyMode = req.readOnlyMode !== false
+          const maxClicks = typeof traversal === 'object' ? Math.max(1, Math.min(traversal.maxClicks ?? 6, 12)) : 6
+          interactiveTraversal = await traverseInteractive(runtime.page, {
+            maxClicks,
+            readOnlyMode,
+            timeoutMs: Math.max(1_000, timeoutMs - (Date.now() - started)),
+            secrets,
+          })
+          await waitForBrowserSettle(runtime.page, Math.max(500, timeoutMs - (Date.now() - started) - 250))
+        }
+
+        const snapshot = await runtime.page.evaluate(() => {
+          const probe = (window as unknown as {
+            __guardianBrowserProbe?: { handlers: Array<{ preview: string; checksOrigin: boolean }>; hasOnMessage: boolean; observedEvents: number }
+          }).__guardianBrowserProbe
+          const domHtml = document.documentElement?.outerHTML ?? ''
+          const links = Array.from(document.querySelectorAll('a[href]'))
+            .map(el => el.getAttribute('href') || '').filter(Boolean).slice(0, 160)
+          const forms = Array.from(document.querySelectorAll('form')).slice(0, 40).map(form => ({
+            action: form.getAttribute('action') || '',
+            method: (form.getAttribute('method') || 'GET').toUpperCase(),
+            inputNames: Array.from(form.querySelectorAll('input, select, textarea'))
+              .map(el => el.getAttribute('name') || el.getAttribute('id') || '').filter(Boolean).slice(0, 30),
+          }))
+          const cookieNames = (document.cookie || '').split(';').map(pair => pair.split('=', 1)[0]?.trim() || '').filter(Boolean).slice(0, 64)
+          let localStorageKeys: string[] = []
+          let sessionStorageKeys: string[] = []
+          try { localStorageKeys = Object.keys(window.localStorage).slice(0, 64) } catch { /* opaque origin */ }
+          try { sessionStorageKeys = Object.keys(window.sessionStorage).slice(0, 64) } catch { /* opaque origin */ }
+          return {
+            domHtml,
+            links,
+            forms,
+            cookieNames,
+            localStorageKeys,
+            sessionStorageKeys,
+            postMessageListeners: {
+              count: probe?.handlers.length ?? 0,
+              hasOnMessage: Boolean(probe?.hasOnMessage),
+              handlers: (probe?.handlers ?? []).slice(0, 30),
+              observedEvents: probe?.observedEvents ?? 0,
+              canaryHandledWithoutOriginCheck: false,
+            },
+          }
+        })
+
+        const finalUrlRaw = runtime.page.url()
+        const runtimeSecrets = [...secrets, ...this.broker.getRegisteredSecrets()]
+        const finalUrl = redact(finalUrlRaw, runtimeSecrets)
+        const title = redact(await runtime.page.title().catch(() => ''), runtimeSecrets).slice(0, 300)
+        let finalOrigin = initialOrigin
+        try { finalOrigin = new URL(finalUrlRaw).origin } catch { /* keep initial */ }
+        const primaryExchange = state.exchanges[0]
+        const redirectOrigins = primaryExchange?.redirectOrigins ?? [initialOrigin]
+        const initialRedactedUrl = redact(targetUrl.href, runtimeSecrets)
+        const webSockets = [...runtime.sockets.values()].map(socket => ({
+          ...socket,
+          frames: socket.frames.map(frame => ({ ...frame, preview: redact(frame.preview, runtimeSecrets) })),
+        }))
+        if (webSockets.length > 0) {
+          for (const socket of webSockets) {
+            if (state.allRequests.length >= 200) break
+            state.allRequests.push({
+              method: 'GET',
+              url: socket.url,
+              origin: socket.origin || finalOrigin,
+              resourceType: 'websocket',
+              status: socket.handshakeStatus,
+            })
+          }
+        }
+        results.push({
+          origin: initialOrigin,
+          finalUrl,
+          title,
+          status: navResponse ? navResponse.status() : (primaryExchange?.status ?? null),
+          domSnippet: redact(snapshot.domHtml, runtimeSecrets).slice(0, maxDomSnippetChars),
+          links: [...new Set(snapshot.links.map(link => redact(link, runtimeSecrets)))].slice(0, 160),
+          forms: snapshot.forms,
+          xhrRequests: state.xhrRequests.slice(0, 100),
+          allRequests: state.allRequests.slice(0, 200),
+          blockedOrigins: [...state.blockedOrigins].slice(0, 100),
+          consoleMessages: state.consoleMessages,
+          postMessageListeners: {
+            ...snapshot.postMessageListeners,
+            handlers: snapshot.postMessageListeners.handlers.map(handler => ({
+              preview: redact(handler.preview, runtimeSecrets),
+              checksOrigin: handler.checksOrigin,
+            })),
+          },
+          cookieNames: snapshot.cookieNames,
+          localStorageKeys: snapshot.localStorageKeys,
+          sessionStorageKeys: snapshot.sessionStorageKeys,
+          canaryCheck: { token: req.canaryToken ?? null, triggered: false, detail: null },
+          domSinkTraces: [],
+          ...(interactiveTraversal ? { interactiveTraversal } : {}),
+          ...(webSockets.length > 0 ? { webSockets } : {}),
+          selectorResult: null,
+          fetchResult: null,
+          redirectSummary: {
+            initialUrl: initialRedactedUrl,
+            finalUrl,
+            redirected: finalUrl !== initialRedactedUrl || redirectOrigins.length > 1,
+            finalOrigin,
+            redirectOrigins,
+            blockedRedirectAttempt: state.blockedOrigins.size > 0,
+          },
+          exchangeIds: state.exchangeIds,
+          exchanges: state.exchanges,
+          durationMs: Date.now() - started,
+        })
+      } finally {
+        runtime.active = null
+      }
+    }
+    return results
+  }
+
+  /** Close every pooled context and the single Chromium process. Idempotent. */
+  async close(): Promise<void> {
+    for (const entry of this.pooled.values()) {
+      await entry.cdp?.detach?.().catch(() => undefined)
+      await entry.page.close().catch(() => undefined)
+      await entry.context.close().catch(() => undefined)
+      this.poolStats.contextsClosed += 1
+    }
+    this.pooled.clear()
+    if (this.poolBrowser) {
+      await this.poolBrowser.close().catch(() => undefined)
+      this.poolBrowser = null
+      this.poolLaunch = null
+    }
+  }
+
 
   async visitPage(req: BrowserVisitRequest, grant: Grant, signal: AbortSignal): Promise<BrowserVisitResult> {
     const tier = grant.tier ?? 1
@@ -799,22 +1957,19 @@ export class ScopedBrowser {
           return
         }
 
-        const validProtocol = parsedUrl.protocol === 'https:' || (allowLocalLab && parsedUrl.protocol === 'http:')
-        if (!validProtocol || !grant.canRead(parsedUrl.origin)) {
+        const method = request.method().toUpperCase()
+        const decision = classifyBrowserHttpRequest({
+          method,
+          url: rawUrl,
+          body: request.postData(),
+          tier,
+          canRead: origin => grant.canRead(origin),
+          allowLocalLab,
+          assetScope: this.assetScopeFor(req),
+        })
+        if (!decision.allowed) {
           blockedOrigins.add(parsedUrl.origin)
           grant.audit('denied', parsedUrl.origin)
-          await route.abort('blockedbyclient').catch(() => undefined)
-          return
-        }
-
-        const method = request.method().toUpperCase()
-        if (!allowedMethods.has(method)) {
-          await route.abort('blockedbyclient').catch(() => undefined)
-          return
-        }
-        const isReadOnly = method === 'GET' || method === 'HEAD' || method === 'OPTIONS'
-        const isTier2Post = method === 'POST' && tier >= 2
-        if (!isReadOnly && !isTier2Post && tier < 3) {
           await route.abort('blockedbyclient').catch(() => undefined)
           return
         }
@@ -827,7 +1982,7 @@ export class ScopedBrowser {
 
         const resourceType = request.resourceType()
         let personaForRequest: string | undefined
-        if (req.persona) {
+        if (req.persona && !decision.assetHydration) {
           if (parsedUrl.origin === initialOrigin) {
             personaForRequest = req.persona
           } else if (
@@ -847,27 +2002,29 @@ export class ScopedBrowser {
             pathAndQuery: parsedUrl.pathname + parsedUrl.search,
             headers: forwardedHeaders,
             body: request.postData() ?? undefined,
-            persona: personaForRequest,
-            session: req.session,
-            sessionGroupRole: req.sessionGroupRole,
-            csrfBind: req.csrfBind,
-            runId: req.runId,
-            assignmentId: req.assignmentId,
-            traceId: req.traceId,
+            ...(personaForRequest ? { persona: personaForRequest } : {}),
+            ...(req.session ? { session: req.session } : {}),
+            ...(req.sessionGroupRole ? { sessionGroupRole: req.sessionGroupRole } : {}),
+            ...(req.csrfBind ? { csrfBind: req.csrfBind } : {}),
+            ...(req.runId ? { runId: req.runId } : {}),
+            ...(req.assignmentId ? { assignmentId: req.assignmentId } : {}),
+            ...(req.traceId ? { traceId: req.traceId } : {}),
             followRedirects: true,
             secrets,
             timeoutMs: Math.max(2_000, timeoutMs - (Date.now() - started)),
-          }, grant, deadline)
+          }, decision.assetHydration ? assetScopedGrant(grant, parsedUrl.origin) : grant, deadline)
 
-          exchanges.push(exchange)
-          const recordedId = req.onExchange?.(exchange)
-          if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
-          await mirrorJarCookies(context, this.broker, {
-            session: req.session,
-            runId: req.runId,
-            assignmentId: req.assignmentId,
-            sessionGroupRole: req.sessionGroupRole,
-          }, parsedUrl.origin)
+          if (!decision.assetHydration) {
+            exchanges.push(exchange)
+            const recordedId = req.onExchange?.(exchange)
+            if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
+            await mirrorJarCookies(context, this.broker, {
+              session: req.session,
+              runId: req.runId,
+              assignmentId: req.assignmentId,
+              sessionGroupRole: req.sessionGroupRole,
+            }, parsedUrl.origin)
+          }
 
           const reqRecord: BrowserXhrRecord = {
             method,
@@ -880,7 +2037,7 @@ export class ScopedBrowser {
               : {}),
           }
           if (allRequests.length < 150) allRequests.push(reqRecord)
-          if (resourceType === 'xhr' || resourceType === 'fetch') {
+          if (!decision.assetHydration && (resourceType === 'xhr' || resourceType === 'fetch')) {
             xhrRequests.push(reqRecord)
             for (const notify of xhrWaiters) notify(reqRecord)
           }
