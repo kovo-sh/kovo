@@ -299,6 +299,9 @@ export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[
     '--host-resolver-rules=MAP * ~NOTFOUND',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
     '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+    // WebTransport is HTTP/3 over UDP: it bypasses HTTP interception and the WebRTC flags.
+    '--disable-quic',
+    '--disable-features=WebTransport',
   ]
   if (options.insecureNoSandbox) args.push('--no-sandbox')
   return args
@@ -307,7 +310,18 @@ export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[
 /** Neutralise WebRTC constructors for target JS even if a platform ignores the launch flags. */
 export const browserWebRtcGuardScript = `(() => {
   const deny = function () { throw new Error('WebRTC is disabled inside Guardian browser sessions.'); };
-  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection']) {
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport']) {
+    try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
+  }
+})();`
+
+/**
+ * Fail-closed fallback when the Playwright version has no `routeWebSocket`: the page loses the
+ * socket constructors entirely instead of being allowed to open an unchecked connection.
+ */
+export const browserSocketDenyScript = `(() => {
+  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Guardian browser sessions.'); };
+  for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
 })();`
@@ -320,17 +334,27 @@ export interface PlaywrightWebSocketRoute {
 
 /**
  * HTTP interception does not cover WebSocket upgrades. Route every socket through an explicit
- * scope check and only call `connectToServer()` for in-scope wss/ws origins.
+ * scope check and only call `connectToServer()` for in-scope wss/ws origins. When the Playwright
+ * version has no `routeWebSocket`, the guard fails closed (page-level deny script) instead of
+ * silently allowing unchecked upgrades.
  */
 export async function installWebSocketGuard(
-  context: Pick<PlaywrightContext, 'routeWebSocket'>,
+  context: Pick<PlaywrightContext, 'routeWebSocket'> & Partial<Pick<PlaywrightContext, 'addInitScript'>>,
   options: {
     canRead: (origin: string) => boolean
     allowLocalLab: boolean
     audit?: (decision: 'denied', origin: string) => void
   },
 ): Promise<void> {
-  if (typeof context.routeWebSocket !== 'function') return
+  if (typeof context.routeWebSocket !== 'function') {
+    // Fail closed: without socket interception an unchecked ws/wss upgrade is possible. Remove
+    // the constructors from the page; if even that is impossible, refuse the session.
+    if (typeof context.addInitScript === 'function') {
+      await context.addInitScript(browserSocketDenyScript)
+      return
+    }
+    throw new Error('WebSocket interception is unavailable; refusing a browser session without it.')
+  }
   await context.routeWebSocket('**/*', async ws => {
     let origin: string
     try {
@@ -351,7 +375,11 @@ export async function installWebSocketGuard(
       await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
       return
     }
-    await ws.connectToServer?.()
+    if (typeof ws.connectToServer !== 'function') {
+      await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+      return
+    }
+    await ws.connectToServer()
   })
 }
 
