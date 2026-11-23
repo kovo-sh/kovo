@@ -127,7 +127,7 @@ import { PersonaAuthManager } from './persona-auth.ts'
 import type { PersonaSessionClone } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
-import { crawlStateGraph, runPhase0Recon } from './phase0-recon.ts'
+import { crawlStateGraph, listEndpointsPaged, runPhase0Recon } from './phase0-recon.ts'
 import type { CodeToRuntimeHypothesis } from './program-graph.ts'
 import {
   consumeBurstInstance,
@@ -160,9 +160,69 @@ import type {
   SchedulerDecision,
 } from './graph-coordinator.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
-import type { Phase0GraphwireExtras } from './probe-plan.ts'
+import type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
 export { selectRankedProbeTargets } from './probe-plan.ts'
 export type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
+
+/** Bounded probe breadth per lane. The cap is a request-budget decision, not a store-read limit. */
+export const DETERMINISTIC_PROBE_CAP = 150
+export const ENGINE_PROBE_CAP = 220
+
+export interface ProbeSelection<T> {
+  targets: T[]
+  usedPlan: boolean
+  /** Every stored row paged out of the store for this lane, before origin/method filters. */
+  storedRows: number
+  /** Rows that passed the scope filter — i.e. the rows actually ranked for probing. */
+  considered: number
+  selected: number
+  cap: number
+  skippedStored: number
+}
+
+/**
+ * Filter the losslessly paged surface to the in-scope routes and apply the ranked probe plan.
+ * `endpoints` must come from a paged read of the full store: the selected cap bounds probes only,
+ * so a route below a fixed page boundary can never be silently ignored during selection.
+ */
+export function selectProbeCandidates<T extends {
+  origin: string
+  method: string
+  pathTemplate: string
+  riskScore?: number
+}>(input: {
+  endpoints: readonly T[]
+  probePlan: Phase0ProbePlanSummary | null | undefined
+  cap: number
+  approvedOrigins: ReadonlySet<string>
+  excludeMethods?: readonly string[]
+  planOnly?: boolean
+}): ProbeSelection<T> {
+  const excluded = new Set((input.excludeMethods ?? []).map(method => method.trim().toUpperCase()))
+  const considered = input.endpoints.filter(endpoint =>
+    input.approvedOrigins.has(endpoint.origin)
+    && !excluded.has(endpoint.method.trim().toUpperCase()))
+  const ranked = selectRankedProbeTargets(considered, input.probePlan, { cap: input.cap, planOnly: input.planOnly })
+  return {
+    targets: ranked.targets,
+    usedPlan: ranked.usedPlan,
+    storedRows: input.endpoints.length,
+    considered: considered.length,
+    selected: ranked.targets.length,
+    cap: Math.max(1, Math.round(input.cap)),
+    skippedStored: ranked.skippedStored,
+  }
+}
+
+/** Stable metric names for probe-selection events and artifacts. */
+export function probeSelectionMetrics(selection: Pick<ProbeSelection<unknown>, 'storedRows' | 'considered' | 'selected' | 'cap'>) {
+  return {
+    probeCandidatesConsidered: selection.considered,
+    probeSelected: selection.selected,
+    probeCap: selection.cap,
+    storedRows: selection.storedRows,
+  }
+}
 import { BudgetExceededError } from './provider.ts'
 import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -5144,13 +5204,22 @@ export class Execution {
 
     // Graphwire: full lossless store in, bounded ranked probe subset out. DELETE stays excluded
     // from this legacy M1 fallback pass (its own tier gate lives in the engine lane).
-    const rankedProbe = selectRankedProbeTargets(
-      this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 5000 })
-        .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE'),
-      this.probePlans.get(this.storage, current.id),
-      { cap: 150 },
-    )
-    const endpoints = rankedProbe.targets
+    const probeSelection = selectProbeCandidates({
+      endpoints: listEndpointsPaged(this.storage, current.id, { orderBy: 'risk' }),
+      probePlan: this.probePlans.get(this.storage, current.id),
+      cap: DETERMINISTIC_PROBE_CAP,
+      approvedOrigins,
+      excludeMethods: ['DELETE'],
+    })
+    const endpoints = probeSelection.targets
+    try {
+      this.storage.event(
+        current.id,
+        'deterministic_probe.selection',
+        `Probe selection ranked ${probeSelection.considered} candidate route(s) from ${probeSelection.storedRows} stored row(s); probing ${probeSelection.selected} (cap ${probeSelection.cap}).`,
+        probeSelectionMetrics(probeSelection),
+      )
+    } catch { /* metrics only */ }
 
     const allParams = this.storage.listEndpointParams(current.id)
     const paramsByEndpoint = new Map<string, typeof allParams>()
@@ -5577,20 +5646,28 @@ export class Execution {
     // function-level authorization hypothesis for them (the engine owns the tier gate).
     // Graphwire: read the full store (lossless), probe only the Phase-0 ranked subset when one
     // exists; otherwise use the risk-ranked cap. The store is never trimmed or rewritten.
-    const rankedProbe = selectRankedProbeTargets(
-      this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 5000 })
-        .filter(ep => approvedOrigins.has(ep.origin)),
-      this.probePlans.get(this.storage, current.id),
-      { cap: 220 },
-    )
-    const storedEndpoints = rankedProbe.targets
-    if (rankedProbe.usedPlan) {
+    const probeSelection = selectProbeCandidates({
+      endpoints: listEndpointsPaged(this.storage, current.id, { orderBy: 'risk' }),
+      probePlan: this.probePlans.get(this.storage, current.id),
+      cap: ENGINE_PROBE_CAP,
+      approvedOrigins,
+    })
+    const storedEndpoints = probeSelection.targets
+    try {
+      this.storage.event(
+        current.id,
+        'deterministic_engine.probe_selection',
+        `Probe selection ranked ${probeSelection.considered} candidate route(s) from ${probeSelection.storedRows} stored row(s); probing ${probeSelection.selected} (cap ${probeSelection.cap}; full store retained).`,
+        probeSelectionMetrics(probeSelection),
+      )
+    } catch { /* metrics only */ }
+    if (probeSelection.usedPlan) {
       try {
         this.storage.event(
           current.id,
           'deterministic_engine.probe_plan_applied',
-          `Engine probing ${rankedProbe.probed} of ${rankedProbe.probed + rankedProbe.skippedStored} stored routes from the ranked plan (full store retained).`,
-          { usedPlan: true, probed: rankedProbe.probed, skippedStored: rankedProbe.skippedStored },
+          `Engine probing ${probeSelection.selected} of ${probeSelection.selected + probeSelection.skippedStored} candidate routes from the ranked plan (full store retained).`,
+          { usedPlan: true, probed: probeSelection.selected, skippedStored: probeSelection.skippedStored },
         )
       } catch { /* run may be gone */ }
     }
