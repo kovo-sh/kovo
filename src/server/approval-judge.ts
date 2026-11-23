@@ -7,6 +7,12 @@ import { providerPool } from './provider.ts'
 import type { UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import {
+  evaluateScopeRequest,
+  isReadOnlyHttpMethod,
+  isVerifiedReadOnlyGraphqlQuery,
+} from './scope-policy.ts'
+import type { EnvironmentMode, ScopeHook } from './scope-policy.ts'
 
 export type { ApprovalPolicy, ApprovedEndpointPattern }
 export type ApprovalPolicyMode = ApprovalPolicy
@@ -15,6 +21,7 @@ export type ApprovalDecidedBy =
   | 'auto-review:rule'
   | 'auto-review:judge'
   | 'auto-review:local-lab'
+  | 'auto-review:environment'
   | 'auto-yolo'
   | 'operator'
 export type ApprovalRiskLevel = 'low' | 'medium' | 'high'
@@ -38,6 +45,18 @@ export interface Tier3ApprovalInput {
   isRaceBurst?: boolean
   hasCompressedBody?: boolean
   environment?: 'public' | 'local-lab'
+  /**
+   * v6 environment contract. When supplied, it replaces per-request keyword HITL as the primary
+   * decision: `prod_readonly` refuses mutations outright (no popup), `staging_isolated` allows
+   * run-tagged tenant mutations / setup-cleanup hooks and denies denylisted routes.
+   * Omitted (or `ephemeral_lab`) keeps the legacy approval flow unchanged.
+   */
+  mode?: EnvironmentMode
+  /** Explicit staging setup/cleanup hook context. */
+  hook?: ScopeHook | null
+  /** Run-scoped synthetic tenant tag (`guardian-qa-<runId>-`). */
+  tenantTag?: string | null
+  routeDenylist?: readonly string[]
   approvedPatterns?: readonly ApprovedEndpointPattern[]
   llmCall?: SafetyJudgeLlmCall
   profiles?: readonly ResolvedModelProfile[]
@@ -56,6 +75,7 @@ export interface Tier3ApprovalEvaluation {
   stage:
     | 'strict'
     | 'yolo'
+    | 'environment_contract'
     | 'approved_pattern'
     | 'local_lab'
     | 'hard_escalation'
@@ -102,8 +122,7 @@ const AUTH_ADMIN_HIGH_RISK_PATTERN =
 const BENIGN_UNAUTH_ENDPOINT_PATTERN =
   /(?:^|\/)(?:v1\/client\/sign_ins|sign_ins|sign-in|signin|login|auth\/login|auth\/sign-in|auth\/session|auth\/token|oauth\/token|v1\/chat\/completions|v1\/completions|v1\/messages|v1\/responses|api\/chat|api\/completions)(?:\/|$|\?)/i
 
-// Read-only GraphQL or search/filter POST endpoints
-const GRAPHQL_PATH_PATTERN = /(?:^|\/)graphql(?:\/|$|\?)/i
+// Read-only search/filter POST endpoints
 const READONLY_SEARCH_PATH_PATTERN =
   /(?:^|\/)(?:search|query|filter|lookup|introspect|validate|check|health|ping)(?:\/|$|\?)/i
 
@@ -608,31 +627,12 @@ function parseJsonObjectBody(body: string | null | undefined): Record<string, un
   }
 }
 
-const GRAPHQL_ENVELOPE_KEYS = new Set(['query', 'operationname', 'variables', 'extensions'])
-
+/**
+ * Compatibility wrapper: read-only GraphQL classification lives in `scope-policy.ts` so the
+ * environment contract, broker and browser all agree on what a verified read-only query is.
+ */
 function isGraphqlReadOnlyQuery(pathAndQuery: string, body: string | null | undefined): boolean {
-  const trimmed = (body ?? '').trim()
-  if (!trimmed) return false
-
-  // JSON GraphQL envelope: require an exact top-level `query` key (no substring/keyword guessing).
-  const envelope = parseJsonObjectBody(trimmed)
-  if (envelope) {
-    const keys = Object.keys(envelope)
-    const hasExactQueryKey = Object.prototype.hasOwnProperty.call(envelope, 'query')
-    if (!hasExactQueryKey) return false
-    if (!keys.every(key => GRAPHQL_ENVELOPE_KEYS.has(key.toLowerCase()))) return false
-    const document = envelope.query
-    if (typeof document !== 'string') return false
-    if (/\b(?:mutation|subscription)\b/i.test(document)) return false
-    return true
-  }
-
-  // Raw GraphQL document (application/graphql) only on a GraphQL endpoint; malformed JSON above
-  // already returned false, so `{"notquery":1}` can never fall through to this branch.
-  if (!trimmed.startsWith('{') && !/^\s*(?:query|fragment)\b/i.test(trimmed)) return false
-  if (!GRAPHQL_PATH_PATTERN.test(pathAndQuery)) return false
-  if (/\b(?:mutation|subscription)\b/i.test(trimmed)) return false
-  return true
+  return isVerifiedReadOnlyGraphqlQuery(pathAndQuery, body)
 }
 
 function isReadOnlySearchPost(pathAndQuery: string, body: string | null | undefined): boolean {
@@ -777,6 +777,48 @@ export async function evaluateTier3Approval(
 ): Promise<Tier3ApprovalEvaluation> {
   const method = input.method.toUpperCase()
   const pathAndQuery = input.pathAndQuery || '/'
+
+  // 0. v6 environment contract — the primary safety decision for non-ephemeral runs.
+  //    No keyword scan, no LLM, and no blocking human popup: the environment either permits the
+  //    request shape or refuses it. Operator opt-in patterns are handled by durable leases at the
+  //    broker boundary, not by re-opening a per-request popup here.
+  if (input.mode && input.mode !== 'ephemeral_lab') {
+    const decision = evaluateScopeRequest(
+      {
+        mode: input.mode,
+        targetOrigins: [input.origin],
+        routeDenylist: input.routeDenylist ?? [],
+        tenantTag: input.tenantTag ?? null,
+      },
+      {
+        origin: input.origin,
+        method,
+        pathAndQuery,
+        body: input.bodyPreview ?? null,
+        headers: input.headers,
+        hook: input.hook ?? null,
+      },
+    )
+    if (decision.allowed) {
+      const readOnly = isReadOnlyHttpMethod(method, input.bodyPreview ?? null)
+      return {
+        decision: 'approve',
+        decidedBy: 'auto-review:environment',
+        riskLevel: 'low',
+        reason: readOnly ? 'Read-only request permitted by the environment contract.' : decision.reason,
+        usedLlm: false,
+        stage: 'environment_contract',
+      }
+    }
+    return {
+      decision: 'deny',
+      decidedBy: 'auto-review:environment',
+      riskLevel: input.mode === 'prod_readonly' ? 'high' : 'medium',
+      reason: decision.reason,
+      usedLlm: false,
+      stage: 'environment_contract',
+    }
+  }
 
   // 1. Strict policy: always escalate to human operator
   if (input.policy === 'strict') {
