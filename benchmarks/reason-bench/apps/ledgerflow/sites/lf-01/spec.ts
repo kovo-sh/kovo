@@ -12,5 +12,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['economic_invariant_violation'], routeKeys: ['refundOrderItem'] },
   rootCause: { file: 'billing/refund-split.ts', symbol: 'register' },
   lure: 'applies each stored line total exactly once and returns a formatted settlement amount',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }

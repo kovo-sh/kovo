@@ -273,6 +273,8 @@ function snapshotChecksum(snapshot: Omit<RunSnapshot, 'checksum'>): string {
  */
 export function captureRunSnapshot(input: CaptureRunSnapshotInput): CaptureRunSnapshotResult {
   const now = input.now ?? Date.now()
+  // v6 batched writes: flush the exchange queue so VACUUM INTO captures every recorded exchange.
+  input.storage.flushNow()
   const run = input.storage.run(input.target.runId)
   const dir = resolve(input.snapshotDir)
   mkdirSync(dir, { recursive: true, mode: 0o700 })

@@ -8,6 +8,8 @@ import type { SecondOrderStore } from './canary-broker.ts'
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import { evaluateBrowserScopeRequest } from './scope-policy.ts'
+import type { ScopePolicy } from './scope-policy.ts'
 
 export interface BrowserSameSiteFetchRequest {
   origin: string
@@ -834,6 +836,8 @@ export function classifyBrowserHttpRequest(input: {
   canRead: (origin: string) => boolean
   allowLocalLab: boolean
   assetScope?: AssetOriginScope
+  /** v6 three-tier scope: when present, the single `scope-policy` classifier is authoritative. */
+  scopePolicy?: ScopePolicy
 }): BrowserRequestClassification {
   const method = input.method.toUpperCase()
   let parsed: URL
@@ -841,6 +845,21 @@ export function classifyBrowserHttpRequest(input: {
     parsed = new URL(input.url)
   } catch {
     return { allowed: false, assetHydration: false, readOnlyGraphql: false, reason: 'malformed_url' }
+  }
+  if (input.scopePolicy) {
+    const decision = evaluateBrowserScopeRequest(input.scopePolicy, {
+      origin: parsed.origin,
+      method,
+      pathAndQuery: `${parsed.pathname}${parsed.search}`,
+      body: input.body ?? null,
+      redirectHop: true,
+    })
+    return {
+      allowed: decision.allowed,
+      assetHydration: decision.allowed && decision.role === 'asset',
+      readOnlyGraphql: false,
+      reason: decision.allowed ? null : decision.code,
+    }
   }
   const protocolOk = parsed.protocol === 'https:' || (input.allowLocalLab && parsed.protocol === 'http:')
   const inScope = input.canRead(parsed.origin)
@@ -1516,6 +1535,7 @@ export class ScopedBrowser {
         canRead: origin => grant.canRead(origin),
         allowLocalLab,
         assetScope: state.assetScope,
+        scopePolicy: grant.scopePolicy,
       })
       if (!decision.allowed) {
         try { state.blockedOrigins.add(new URL(rawUrl).origin) } catch { /* ignore */ }
@@ -2029,6 +2049,7 @@ export class ScopedBrowser {
           canRead: origin => grant.canRead(origin),
           allowLocalLab,
           assetScope: this.assetScopeFor(req),
+          scopePolicy: grant.scopePolicy,
         })
         if (!decision.allowed) {
           blockedOrigins.add(parsedUrl.origin)

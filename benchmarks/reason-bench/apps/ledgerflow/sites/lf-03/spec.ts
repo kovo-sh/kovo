@@ -13,5 +13,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['economic_invariant_violation'], routeKeys: ['downgradePlan'] },
   rootCause: { file: 'billing/plan-cycle.ts', symbol: 'register' },
   lure: 'upgrade grants metered credits and downgrade reports a prorated settlement with a labelled refund',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }

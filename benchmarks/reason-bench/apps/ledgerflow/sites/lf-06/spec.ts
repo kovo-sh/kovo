@@ -12,5 +12,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['economic_invariant_violation'], routeKeys: ['transferFunds'] },
   rootCause: { file: 'wallet/transfer-promo.ts', symbol: 'register' },
   lure: 'debits the documented fee, credits the recipient in full and labels the promotion separately',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }
