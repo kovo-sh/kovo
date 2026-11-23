@@ -37,6 +37,7 @@ Read-only audits, compatibility analysis, docs, and verifier-only changes are us
 2. **Report both product metrics.** Every capability claim states `Execution --no-llm` (deterministic floor) and `Execution` agentic (increment over that floor), on dev **and** salted held-out. Harness numbers are secondary evidence of engine capability, not the product score.
 3. **Mandatory pre-handoff gate.** A branch cannot be handed off until `scripts/worker-gate.sh` passes (typecheck + fast contract invariants + targeted slice). Discover breakage in minutes, not at release freeze.
 4. **Use the slice runner.** Iterate one app/class with `scripts/bench-slice.sh --app <app> --class <class>`; no ad-hoc diagnostic scripts once it exists.
+5. **Know which harness you are running.** `scripts/benchmark-realistic.ts` scores the **product** (`Execution`); `benchmarks/realistic-bench/benchmark-realistic.ts` (or `scripts/bench-slice.sh` / `scripts/benchmark-realistic-matrix.ts`) scores the **deterministic capability** harness. A 0/56 from the first is the known v5.0 product gap, not a regression.
 
 ## Gemini Coding Guidelines
 

@@ -275,19 +275,24 @@ newgrp docker -c '
 
 ### 10.2 Deterministic harness (Scorecard B)
 
+Entrypoint map — the two files are *not* interchangeable:
+
+- `scripts/benchmark-realistic.ts` = **product runtime** harness (drives real `Execution`; Scorecard A).
+- `benchmarks/realistic-bench/benchmark-realistic.ts` = **deterministic capability** harness
+  (procedural probes/spec synthesis; Scorecard B). `scripts/benchmark-realistic-matrix.ts`
+  parallelizes this one across app × seed cells.
+
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- \
-  --app all --seeds 1,2,42 --mode grey-box \
-  --verifier local-jq --concurrency 9 --isolate-data-dir \
-  --out-dir /tmp/v5-dev
+GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-realistic-matrix.ts \
+  --apps acme-saas,shopflow,opsportal --seeds 1,2,42 --split dev \
+  --mode grey-box --concurrency 9 --out-dir /tmp/v5-dev
 
 # Salt lives at ~/.config/guardian-bench/heldout.salt (mode 600); never echo it.
 export GUARDIAN_ALLOW_LOCAL_LAB=1
 export GUARDIAN_RB_HELDOUT_SALT="$(cat "$HOME/.config/guardian-bench/heldout.salt")"
-npm run benchmark:realistic -- \
-  --app all --seeds 1000001,1000002,1000042 --held-out --mode grey-box \
-  --verifier local-jq --concurrency 9 --isolate-data-dir \
-  --out-dir /tmp/v5-held
+node scripts/benchmark-realistic-matrix.ts \
+  --apps acme-saas,shopflow,opsportal --seeds 1000001,1000002,1000042 --split heldout \
+  --mode grey-box --concurrency 9 --out-dir /tmp/v5-held
 unset GUARDIAN_RB_HELDOUT_SALT
 ```
 
