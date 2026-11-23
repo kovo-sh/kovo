@@ -31,7 +31,7 @@
       "endpoint": "/v2/reports/export",
       "persona": "mono-alice",
       "impact": "structural SQL error from report-repo rawQuery; ORDER BY clause injection",
-      "evidence": ["services/reports/src/services/report-service.ts builds '... ORDER BY ' + sort"]
+      "evidence": ["services/reports/src/repos/report-repo.ts concatenates sort into ORDER BY and executes it"]
     },
     {
       "id": "mono-admin-bfla",
@@ -101,6 +101,7 @@
   "invariants": {
     "minRoutes": 2500,
     "generatedRoutes": 2560,
+    "declaredOperations": 2565,
     "hopDepth": 4,
     "gitHistoryCommits": 5,
     "nestedMounts": ["/v2/billing", "/v2/reports", "/v3/admin", "/v4"],

@@ -299,12 +299,18 @@ function safeHandle(id: string): string {
   return cleaned.length ? cleaned.slice(0, 48) : 'persona'
 }
 
-function specPath(raw: string): string | null {
-  const path = raw.split('?')[0]
-  if (!path.startsWith('/')) return null
-  return path
+function specPathParts(raw: string): { path: string; query: string[] } | null {
+  const [rawPath, rawQuery] = raw.split('?')
+  if (!rawPath || !rawPath.startsWith('/')) return null
+  const path = rawPath
     .replace(/<([^>]+)>/g, '{$1}')
     .replace(/:([A-Za-z0-9_]+)/g, '{$1}')
+  const query: string[] = []
+  for (const pair of (rawQuery ?? '').split('&')) {
+    const name = pair.split('=')[0]?.trim()
+    if (name && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name) && !query.includes(name)) query.push(name)
+  }
+  return { path, query }
 }
 
 export interface OpenApiDoc {
@@ -313,7 +319,12 @@ export interface OpenApiDoc {
   paths: Record<string, Record<string, { parameters: Array<{ name: string; in: string; required: boolean }> }>>
 }
 
-/** Build a per-origin OpenAPI document from the fixture's published API reference. */
+/**
+ * Build a per-origin OpenAPI document from the fixture's published API reference. Every declared
+ * operation is emitted (one path entry per concrete path + method); path placeholders become
+ * OpenAPI `{name}` parameters and `?a=&b=` query names become `in: query` parameters. Nothing is
+ * capped, collapsed or sampled here.
+ */
 export function briefingToOpenApi(input: {
   fixture: string
   originLabel: string
@@ -322,13 +333,15 @@ export function briefingToOpenApi(input: {
   const paths: OpenApiDoc['paths'] = {}
   for (const entry of input.api) {
     if (entry.origin !== input.originLabel) continue
-    const path = specPath(entry.path)
-    if (!path) continue
-    const names = [...path.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map(match => match[1]!)
-    paths[path] ??= {}
-    paths[path][entry.method.toLowerCase()] = {
-      parameters: names.map(name => ({ name, in: 'path', required: true })),
-    }
+    const parts = specPathParts(entry.path)
+    if (!parts) continue
+    const names = [...parts.path.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map(match => match[1]!)
+    const parameters = [
+      ...names.map(name => ({ name, in: 'path', required: true })),
+      ...parts.query.map(name => ({ name, in: 'query', required: false })),
+    ]
+    paths[parts.path] ??= {}
+    paths[parts.path][entry.method.toLowerCase()] = { parameters }
   }
   if (Object.keys(paths).length === 0) return null
   return {
@@ -336,6 +349,11 @@ export function briefingToOpenApi(input: {
     info: { title: `realism ${input.fixture} ${input.originLabel} API reference`, version: '1.0.0' },
     paths,
   }
+}
+
+export function countOpenApiOperations(doc: OpenApiDoc | null): number {
+  if (!doc) return 0
+  return Object.values(doc.paths).reduce((total, ops) => total + Object.keys(ops).length, 0)
 }
 
 interface PlannedPersona {
@@ -587,7 +605,27 @@ export interface RealismMetrics {
     sastLinkRate: number | null
     sastLinked: number
     sastSuspects: number
-    routeScale: { declared: number; persisted: number; retrieved: number; truncated: boolean }
+    routeScale: {
+      /** Operations published by the fixture briefing (declared catalog). */
+      declared: number
+      /** Operations carried by the harness-built OpenAPI document. */
+      specOps: number
+      /** Endpoint rows persisted for the run. */
+      persisted: number
+      /** Distinct canonical (method + path) identities persisted. */
+      persistedDistinct: number
+      /** Declared operations that have a persisted endpoint after path-template canonicalization. */
+      declaredMatched: number
+      /** Endpoint rows retrieved back from the store by the harness. */
+      retrieved: number
+      truncated: boolean
+    }
+    /** Program-Graph code leads forwarded into the deterministic lane. */
+    codeLeads: number
+    /** Code leads whose route→sink chain is at least four hops (Tier-A evidence). */
+    fourHopLeads: number
+    /** Ranked probe plan emitted by Phase-0 (lossless store, sampled probing). */
+    probePlan: { totalRoutes: number; priority: number; schemaTyped: number; probeSubset: number; clusters: number } | null
     fourHopConfirmations: number
   } | null
   grade: {
@@ -685,6 +723,95 @@ function persistedEndpointCount(storage: Store, runId: string): number {
   }
 }
 
+/** Page the full endpoint store without the store's default 500-row page limit. */
+export function listAllEndpoints(storage: Store, runId: string): EndpointRow[] {
+  const out: EndpointRow[] = []
+  const pageSize = 500
+  for (let offset = 0; offset < 100_000; offset += pageSize) {
+    const page = storage.listEndpoints(runId, { limit: pageSize, offset })
+    out.push(...page)
+    if (page.length < pageSize) break
+  }
+  return out
+}
+
+/** One identity for `:id`, `<int:id>` and `{id}` spellings of the same path template. */
+export function canonicalRoutePath(path: string): string {
+  return path
+    .split('?')[0]!
+    .replace(/[<{](?:int:|str:|uuid:|slug:|path:)?([A-Za-z_][A-Za-z0-9_]*)[>}]/g, ':$1')
+    .replace(/\/+$/, '') || '/'
+}
+
+function routeIdentity(method: string, path: string): string {
+  return `${method.toUpperCase()} ${canonicalRoutePath(path)}`
+}
+
+interface CodeLeadStats {
+  total: number
+  fourHop: number
+  endpoints: string[]
+}
+
+/** Program-Graph leads persisted as facts (deterministic --no-llm path). */
+function codeLeadStats(storage: Store, runId: string): CodeLeadStats {
+  const seen = new Set<string>()
+  const endpoints: string[] = []
+  let fourHop = 0
+  try {
+    const rows = storage.client
+      .prepare('select data from facts where run_id = ?')
+      .all(runId) as Array<{ data?: string }>
+    for (const row of rows) {
+      if (!row.data) continue
+      let data: Record<string, unknown>
+      try { data = JSON.parse(row.data) as Record<string, unknown> } catch { continue }
+      if (data.source !== 'program_graph' || data.kind !== 'det_lead') continue
+      const reason = typeof data.reason === 'string' ? data.reason : ''
+      const hops = Number(/\((\d+) hops?\)/.exec(reason)?.[1] ?? 0)
+      const method = typeof data.method === 'string' ? data.method : 'GET'
+      const endpoint = typeof data.endpoint === 'string' ? data.endpoint : ''
+      if (!endpoint) continue
+      const key = `${method.toUpperCase()} ${endpoint} ${String(data.file ?? '')}:${String(data.line ?? '')}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      if (hops >= 4) {
+        fourHop += 1
+        endpoints.push(`${method.toUpperCase()} ${endpoint}`)
+      }
+    }
+  } catch { /* facts table unavailable */ }
+  return { total: seen.size, fourHop, endpoints }
+}
+
+interface ProbePlanStats {
+  totalRoutes: number
+  priority: number
+  schemaTyped: number
+  probeSubset: number
+  clusters: number
+}
+
+function probePlanStats(storage: Store, runId: string): ProbePlanStats | null {
+  try {
+    const row = storage.client
+      .prepare("select detail from events where run_id = ? and kind = 'phase0.probe_plan' order by rowid desc limit 1")
+      .get(runId) as { detail?: string } | undefined
+    if (!row?.detail) return null
+    const detail = JSON.parse(row.detail) as Partial<ProbePlanStats>
+    if (typeof detail.totalRoutes !== 'number') return null
+    return {
+      totalRoutes: detail.totalRoutes,
+      priority: Number(detail.priority ?? 0),
+      schemaTyped: Number(detail.schemaTyped ?? 0),
+      probeSubset: Number(detail.probeSubset ?? 0),
+      clusters: Number(detail.clusters ?? 0),
+    }
+  } catch {
+    return null
+  }
+}
+
 export function computeMetrics(input: {
   fixture: string
   started: StartedFixture
@@ -696,6 +823,8 @@ export function computeMetrics(input: {
   grade: GradeResult | null
   storage: Store
   runId: string
+  /** Operations carried by the harness-built API reference (grey/white-box). */
+  specOps?: number
 }): RealismMetrics {
   const tp = truePositiveIds(input.grade)
   const chains: ChainSummary[] = (input.grade?.chains ?? []).map(chain => ({
@@ -762,16 +891,27 @@ export function computeMetrics(input: {
     const suspects = input.findings.filter(finding => (finding.codeLocations?.length ?? 0) > 0)
     const linked = suspects.filter(finding => (input.endpointCounts.get(finding.id) ?? 0) > 0)
     const persisted = persistedEndpointCount(input.storage, input.runId)
+    const declaredIds = new Set(input.routes.map(route => routeIdentity(route.method, route.path)))
+    const persistedIds = new Set(input.endpoints.map(endpoint => routeIdentity(endpoint.method, endpoint.pathTemplate)))
+    let declaredMatched = 0
+    for (const id of declaredIds) if (persistedIds.has(id)) declaredMatched += 1
+    const leads = codeLeadStats(input.storage, input.runId)
     metrics.monorepo = {
       sastLinkRate: suspects.length === 0 ? null : linked.length / suspects.length,
       sastLinked: linked.length,
       sastSuspects: suspects.length,
       routeScale: {
-        declared: input.routes.length,
+        declared: declaredIds.size,
+        specOps: input.specOps ?? 0,
         persisted,
+        persistedDistinct: persistedIds.size,
+        declaredMatched,
         retrieved: input.endpoints.length,
         truncated: persisted > input.endpoints.length,
       },
+      codeLeads: leads.total,
+      fourHopLeads: leads.fourHop,
+      probePlan: probePlanStats(input.storage, input.runId),
       fourHopConfirmations: MONO_4HOP_IDS.filter(id => tp.has(id)).length,
     }
   }
@@ -885,10 +1025,33 @@ export function evaluateGate(fixture: string, metrics: RealismMetrics): GateCrit
       },
       {
         id: 'route-scale-no-truncation',
-        label: '2,500-route scale ingested without endpoint truncation',
+        label: '2,500-route declared catalog ingested without endpoint truncation',
         required: true,
-        met: Boolean(mono && !mono.routeScale.truncated && mono.routeScale.declared >= 2_500 && mono.routeScale.persisted >= 2_500),
-        observed: mono ? `${mono.routeScale.persisted} persisted / ${mono.routeScale.retrieved} retrieved / ${mono.routeScale.declared} declared${mono.routeScale.truncated ? ' (TRUNCATED)' : ''}${mono.routeScale.persisted < 2_500 ? ' (UNDER 2,500)' : ''}` : 'not measured',
+        met: Boolean(mono
+          && !mono.routeScale.truncated
+          && mono.routeScale.declared >= 2_500
+          && mono.routeScale.declaredMatched >= 2_500),
+        observed: mono
+          ? `declared ${mono.routeScale.declared}; spec ops ${mono.routeScale.specOps}; matched ${mono.routeScale.declaredMatched}; `
+            + `persisted ${mono.routeScale.persisted} rows (${mono.routeScale.persistedDistinct} distinct); retrieved ${mono.routeScale.retrieved}`
+            + `${mono.routeScale.truncated ? ' (TRUNCATED)' : ''}${mono.routeScale.declaredMatched < 2_500 ? ' (UNDER 2,500 MATCHED)' : ''}`
+          : 'not measured',
+      },
+      {
+        id: 'four-hop-code-leads',
+        label: 'Informational: >=3 four-hop route->sink code leads (Tier-A evidence)',
+        required: false,
+        met: (mono?.fourHopLeads ?? 0) >= 3,
+        observed: mono ? `${mono.fourHopLeads} four-hop / ${mono.codeLeads} code lead(s)` : 'not measured',
+      },
+      {
+        id: 'probe-plan-tier-a',
+        label: 'Informational: ranked probe plan prioritizes the sink routes (Tier A)',
+        required: false,
+        met: (mono?.probePlan?.priority ?? 0) >= 3,
+        observed: mono?.probePlan
+          ? `Tier A ${mono.probePlan.priority}; schema-typed ${mono.probePlan.schemaTyped}; subset ${mono.probePlan.probeSubset}/${mono.probePlan.totalRoutes}`
+          : 'not measured',
       },
       {
         id: 'four-hop-confirmations',
@@ -1092,6 +1255,7 @@ interface CellContext {
   projectId: string
   runId: string
   personaCount: number
+  specOps: number
   secrets: NamedSecret[]
   notes: string[]
 }
@@ -1228,7 +1392,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     backendKind: 'local-jq', model: { mode: 'deterministic-no-llm', profiles: [] },
     workerSessions: false, workerSessionsDetail: 'not probed', canaryStopped: false,
     dataDir: '', dataDirIsolated: false, dataDirSource: null,
-    projectId: '', runId: '', personaCount: 0, secrets, notes,
+    projectId: '', runId: '', personaCount: 0, specOps: 0, secrets, notes,
   }
   let detailEndpoints: EndpointRow[] = []
   let detailFindings: Finding[] = []
@@ -1358,13 +1522,17 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       for (const label of Object.keys(briefing.origins)) {
         const doc = briefingToOpenApi({ fixture: fixtureName, originLabel: label, api: briefing.api })
         if (!doc) continue
+        const operations = countOpenApiOperations(doc)
+        ctx.specOps += operations
+        const content = JSON.stringify(doc, null, 2)
+        notes.push(`declared API reference ${label}: ${operations} operation(s), ${Math.round(Buffer.byteLength(content, 'utf8') / 1024)} KiB`)
         storage.importProjectSpec({
           requestId: randomUUID(),
           projectId: project.id,
           name: `realism-${fixtureName}-${label}.json`,
           kind: 'openapi',
           origin: briefing.origins[label]!,
-          content: JSON.stringify(doc, null, 2),
+          content,
         })
       }
     }
@@ -1480,7 +1648,8 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     if (interrupted) notes.push('interrupted by signal; run stopped')
 
     const detail = storage.runDetail(createdRun.id)
-    detailEndpoints = detail.endpoints
+    // runDetail pages endpoints at the store's default 500 rows; read the full store for metrics.
+    detailEndpoints = listAllEndpoints(storage, createdRun.id)
     detailFindings = detail.findings
     vulnerabilityFindings = detail.findings.filter(finding => finding.findingKind !== 'baseline_check' && finding.status !== 'dismissed').length
     facts = detail.facts.length
@@ -1520,6 +1689,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       grade,
       storage,
       runId: createdRun.id,
+      specOps: ctx.specOps,
     })
     log(`[${slug}] ${terminalStatus}/${terminalPhase}: ${detailEndpoints.length} endpoints, ${detailFindings.length} findings, `
       + `${grade.truePositives} TP / ${grade.falsePositives} FP`)
@@ -1721,8 +1891,13 @@ export function renderCellMarkdown(result: RealismCellResult): string {
     lines.push('')
     lines.push('## Monorepo white-box')
     lines.push('')
-    lines.push(`- SAST suspects: ${mono.sastSuspects}; linked to live endpoints: ${mono.sastLinked} (${pct(mono.sastLinkRate)})`)
-    lines.push(`- route scale: declared ${mono.routeScale.declared}; persisted ${mono.routeScale.persisted}; retrieved ${mono.routeScale.retrieved}; truncated=${mono.routeScale.truncated}`)
+    lines.push(`- SAST suspects (findings with code locations): ${mono.sastSuspects}; linked to live endpoints: ${mono.sastLinked} (${pct(mono.sastLinkRate)})`)
+    lines.push(`- code leads from Program Graph facts: ${mono.codeLeads} (${mono.fourHopLeads} with a 4-hop route→sink chain)`)
+    lines.push(`- route scale: declared ${mono.routeScale.declared}; spec ops ${mono.routeScale.specOps}; matched ${mono.routeScale.declaredMatched}; `
+      + `persisted ${mono.routeScale.persisted} rows (${mono.routeScale.persistedDistinct} distinct); retrieved ${mono.routeScale.retrieved}; truncated=${mono.routeScale.truncated}`)
+    lines.push(mono.probePlan
+      ? `- ranked probe plan: Tier A ${mono.probePlan.priority}; schema-typed ${mono.probePlan.schemaTyped}; subset ${mono.probePlan.probeSubset}/${mono.probePlan.totalRoutes} across ${mono.probePlan.clusters} clusters`
+      : '- ranked probe plan: not measured')
     lines.push(`- 4-hop confirmations: ${mono.fourHopConfirmations}/3`)
   }
   if (result.grade) {
