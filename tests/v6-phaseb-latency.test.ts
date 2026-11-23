@@ -147,10 +147,13 @@ test('stall: nearest-rank percentile clamps without inventing samples', () => {
 })
 
 test('stall: the abort threshold scales with the median but never below the floor', () => {
-  assert.equal(providerStallAbortMs(0), 30_000)
-  assert.equal(providerStallAbortMs(2_000), 30_000)
-  assert.equal(providerStallAbortMs(10_000), 40_000)
-  assert.equal(providerStallAbortMs(60_000), 60_000, 'ceiling: never wait more than a minute')
+  // No trusted baseline yet: a cold prompt gets the longer cold threshold.
+  assert.equal(providerStallAbortMs(0, 0), 90_000)
+  assert.equal(providerStallAbortMs(2_000, 2), 90_000)
+  assert.equal(providerStallAbortMs(2_000, 3), 45_000)
+  assert.equal(providerStallAbortMs(10_000, 3), 45_000)
+  assert.equal(providerStallAbortMs(13_000, 5), 52_000)
+  assert.equal(providerStallAbortMs(60_000, 8), 75_000, 'ceiling: never wait more than the ceiling')
 })
 
 test('stall: exactly one retry is allowed', () => {

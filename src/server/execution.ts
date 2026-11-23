@@ -954,8 +954,12 @@ export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 180_000
 /** A provider generation longer than this is recorded as a stall turn (flag threshold). */
 export const PROVIDER_STALL_TURN_MS = 10_000
 /** Hard-stall abort threshold floor/ceiling (multiple of the observed median turn latency). */
-export const PROVIDER_STALL_ABORT_FLOOR_MS = 30_000
-export const PROVIDER_STALL_ABORT_CEILING_MS = 60_000
+export const PROVIDER_STALL_ABORT_FLOOR_MS = 45_000
+export const PROVIDER_STALL_ABORT_CEILING_MS = 75_000
+/** Before enough turns have been observed there is no baseline: wait this long before aborting. */
+export const PROVIDER_STALL_ABORT_COLD_MS = 90_000
+/** Turns needed before the median is trusted for the abort threshold. */
+export const PROVIDER_STALL_BASELINE_TURNS = 3
 /** One retry only: a stream that stalls twice is treated as an assignment failure. */
 export const MAX_PROVIDER_STALL_RETRIES = 1
 
@@ -1065,11 +1069,13 @@ export function summarizeTurnLatencies(samples: readonly number[], stallMs = PRO
 }
 
 /**
- * Hard-stall abort threshold: never below the floor (a slow-but-progressing turn must not be
- * killed), scaled with the observed median so a provider whose normal turns are already slow is
- * not aborted on every generation, and never above the ceiling.
+ * Hard-stall abort threshold. With no trusted baseline (fewer than
+ * {@link PROVIDER_STALL_BASELINE_TURNS} observed turns) a cold prompt may legitimately take a
+ * while, so the watchdog waits the cold floor. After that it scales with the observed median, never
+ * below the floor (a slow-but-progressing turn must not be killed) and never above the ceiling.
  */
-export function providerStallAbortMs(medianTurnMs: number): number {
+export function providerStallAbortMs(medianTurnMs: number, samples = PROVIDER_STALL_BASELINE_TURNS): number {
+  if (samples < PROVIDER_STALL_BASELINE_TURNS) return PROVIDER_STALL_ABORT_COLD_MS
   const scaled = Number.isFinite(medianTurnMs) && medianTurnMs > 0 ? medianTurnMs * 4 : PROVIDER_STALL_ABORT_FLOOR_MS
   return Math.min(PROVIDER_STALL_ABORT_CEILING_MS, Math.max(PROVIDER_STALL_ABORT_FLOOR_MS, Math.round(scaled)))
 }
@@ -7685,7 +7691,7 @@ export class Execution {
     const clearStallTimer = () => {
       if (stallTimer) { clearTimeout(stallTimer); stallTimer = undefined }
     }
-    const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50))
+    const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50), turnLatencies.length)
     const armStallTimer = (turn: number) => {
       clearStallTimer()
       generationStartedAt = Date.now()
