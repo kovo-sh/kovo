@@ -92,6 +92,8 @@ test('phase-0 probe-plan selection and route collapse never depend on input orde
   assert.deepEqual(selected[1], selected[0])
   assert.deepEqual(selected[2], selected[0])
   assert.deepEqual(selected[0].slice(0, 2), ['GET /api/items', 'GET /api/users/:id'])
+  // Fill order is the canonical total order, never the caller's array order.
+  assert.deepEqual(selected[0][2], 'GET /api/items/:id')
 
   const collapsed = permutations(endpoints).map(order =>
     collapseRouteVariants(order).map(ep => `${ep.method} ${ep.pathTemplate}`).sort())

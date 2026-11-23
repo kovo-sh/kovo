@@ -83,7 +83,7 @@ export function selectRankedProbeTargets<T extends {
   if (!targets.length) return fallback()
   if (!options.planOnly) {
     const chosen = new Set(targets)
-    for (const endpoint of endpoints) {
+    for (const endpoint of riskFirst) {
       if (targets.length >= cap) break
       if (chosen.has(endpoint)) continue
       chosen.add(endpoint)
