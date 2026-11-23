@@ -95,6 +95,18 @@ export interface EngineHypothesis {
   readbackPath?: string
   /** authz_matrix: actor for `readbackPath` when the read is the mutated user's own identity route. */
   readbackPersona?: string
+  /**
+   * authz_matrix (self-service function state): the identity field(s) the mutation body carried and
+   * the value the post-mutation identity read must show. The readback is the actor's own observable
+   * state, so the proof binds a named field instead of accepting an arbitrary body difference.
+   */
+  functionState?: {
+    bindings: Array<{ field: string; value: string }>
+    /** Identity values that restore the probe actor's own baseline before the mutation. */
+    reset?: Array<{ field: string; value: string }>
+    /** The replay mutation body (the probe matrix carries the non-mutating own-value body). */
+    body?: Record<string, unknown>
+  }
   /** authz_matrix: role the privileged control needed, when the probe outcome established it. */
   authzRequiredRole?: 'viewer' | 'member' | 'admin' | 'owner'
   /**
@@ -350,6 +362,9 @@ const BASELINE_STRONG_NUMERIC_FIELD_RE = /(?:^|[_-])(?:amount|total|price|value|
 const BASELINE_TEXT_FIELD_RE = /^(?:name|title|label|description|note|notes|body|text|summary|message|subject|comment|company|address)$/i
 const BASELINE_WEAK_NUMERIC_FIELD_RE = /^(?:number|num|limit|score|rating|page|size|order)$/i
 const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|status|state|created|updated)(?:$|[_-])/i
+/** Scope/identity selectors: writing these changes which record is addressed, not its content. */
+const BASELINE_SELECTOR_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|created|updated)(?:$|[_-])/i
+const BASELINE_STATE_FIELD_RE = /^(?:status|state|stage|phase|payment_state|fulfil?lment_state|lifecycle)$/i
 
 /**
  * A replay re-sends the body the probe matrix already applied, so the post-read equals the
@@ -360,17 +375,24 @@ const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|r
  */
 function baselineWriteFor(bodyTemplate: unknown): BaselineWrite | null {
   if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
-  const entries = Object.entries(bodyTemplate as Record<string, unknown>)
+  const scalarEntries = Object.entries(bodyTemplate as Record<string, unknown>)
     .filter(([field, value]) =>
       /^[A-Za-z0-9_.-]{1,64}$/.test(field) &&
-      !BASELINE_EXCLUDED_FIELD_RE.test(field) &&
       (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
+  const entries = scalarEntries.filter(([field]) => !BASELINE_EXCLUDED_FIELD_RE.test(field))
   const pick = entries.find(([field]) => BASELINE_STRONG_NUMERIC_FIELD_RE.test(field)) ??
     entries.find(([field]) => BASELINE_TEXT_FIELD_RE.test(field)) ??
     entries.find(([, value]) => typeof value === 'boolean') ??
     entries.find(([field]) => BASELINE_WEAK_NUMERIC_FIELD_RE.test(field))
-  if (!pick) return null
-  const [field, value] = pick
+  // Lifecycle/state columns are excluded above because a *content* edit should prefer a data field,
+  // but they are still a legitimate delta target: re-sending the value the record already holds is
+  // an idempotent no-op, so a state transition needs a fresh baseline too. If the target validates
+  // the token as an enum it rejects the baseline write, the control arm fails, and nothing confirms.
+  const chosen = pick ??
+    scalarEntries.find(([field]) => BASELINE_STATE_FIELD_RE.test(field)) ??
+    scalarEntries.find(([field]) => !BASELINE_SELECTOR_FIELD_RE.test(field))
+  if (!chosen) return null
+  const [field, value] = chosen
   const nonce = randomBytes(4).toString('hex')
   if (typeof value === 'boolean') return { field, baselineValue: false, probeValue: true }
   if (typeof value === 'number' || /^-?\d+(?:\.\d+)?$/.test(String(value))) {
@@ -450,9 +472,10 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     if (!ownerOk || !probeOk) continue
 
-    const bodyTemplate = hit.bodyTemplate !== undefined && hit.bodyTemplate !== null
-      ? hit.bodyTemplate
-      : (hyp.jsonBody ?? {})
+    const bodyTemplate = hyp.functionState?.body
+      ?? (hit.bodyTemplate !== undefined && hit.bodyTemplate !== null
+        ? hit.bodyTemplate
+        : (hyp.jsonBody ?? {}))
     const realPath = functionLevel ? hyp.pathAndQuery : fillId(hyp.pathAndQuery, id)
     const parts: RequestParts = {
       method: method as RequestParts['method'],
@@ -461,13 +484,16 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     const stepExtra = mutating && hyp.csrfBind ? { csrfBind: true } : {}
     const probePersona = hit.actor === 'anonymous' ? null : other
-    const baselineWrite = mutating && !functionLevel && method !== 'DELETE' ? baselineWriteFor(bodyTemplate) : null
+    // A self-service function-state proof reads the *probe actor's own* identity, so a control write
+    // by the privileged actor would mutate the wrong record; the mutation itself is the only write.
+    const selfState = Boolean(hyp.functionState?.bindings?.length)
+    const baselineWrite = mutating && !functionLevel && !selfState && method !== 'DELETE' ? baselineWriteFor(bodyTemplate) : null
     const withValue = (value: string | number | boolean): unknown => (
       bodyTemplate && typeof bodyTemplate === 'object' && !Array.isArray(bodyTemplate)
         ? { ...(bodyTemplate as Record<string, unknown>), [baselineWrite!.field]: value }
         : bodyTemplate
     )
-    const neg = functionLevel || useReservedVictim ? null : negativeControlJq(mutating)
+    const neg = functionLevel || useReservedVictim || selfState ? null : negativeControlJq(mutating)
     // For a privileged delete the bogus-id control may legitimately be a 200 no-op. Selectivity is
     // then proven by re-reading the reserved victim: it must still exist after the bogus delete.
     const deleteReservationJq = useReservedVictim
@@ -504,6 +530,20 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           owner, stepExtra, [200, 201, 204],
         ))
       }
+      // Self-service function state: re-establish the probe actor's own identity baseline before the
+      // pre-read, so a state change caused by the *probe matrix* earlier in the run cannot mask the
+      // replay delta (and cannot make the replay look like a no-op).
+      const resetBody = hyp.functionState?.reset?.length
+        ? { ...(bodyTemplate as Record<string, unknown>), ...Object.fromEntries(hyp.functionState.reset.map(item => [item.field, item.value])) }
+        : null
+      if (resetBody && probePersona) {
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'w0', 'control',
+          'Authorized actor restores its own identity baseline',
+          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: resetBody },
+          probePersona, stepExtra, [200, 201, 204],
+        ))
+      }
       steps.push(stepOf(
         hyp.endpoint.origin, 'c1', 'control',
         'Authorized actor reads the target state before the mutation',
@@ -523,18 +563,33 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         { method: 'GET', pathAndQuery: read.path }, readbackPersona, {},
         method === 'DELETE' ? [200, 204, 404, 410] : [200, 404],
       ))
-      if (functionLevel && probePersona) {
+      if (functionLevel && probePersona && readbackPersona !== probePersona) {
         steps.push(stepOf(
           hyp.endpoint.origin, 'p3', 'probe',
           'Lower-privileged actor observes the mutated function state',
           { method: 'GET', pathAndQuery: read.path }, probePersona, {}, [200, 403, 404],
         ))
       }
+      const jsonEquals = (stepId: string, field: string, value: string): string =>
+        `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) == ${jqStr(value)})`
+      const jsonDiffers = (stepId: string, field: string, value: string): string =>
+        `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) != ${jqStr(value)})`
+      // The actor's own identity read must show the bound field taking the value the mutation body
+      // carried, and must not have shown it before. This is a field-bound state delta, not a
+      // body-difference observation (a rotating nonce can never satisfy it).
+      const stateChanged = selfState
+        ? hyp.functionState!.bindings
+          .map(binding => `((${jsonEquals('p2', binding.field, binding.value)}) and (${jsonDiffers('c1', binding.field, binding.value)}))`)
+          .join(' or ')
+        : null
       const persisted = method === 'DELETE'
         ? `(((.steps.p2.status >= 400) and (.steps.p2.status < 500)) or ((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body)))`
-        : `((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body))`
+        : stateChanged
+          ? `((${is2xx('p2')}) and (${stateChanged}))`
+          : `((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body))`
       const extraControl = [
         baselineWrite ? is2xx('w1') : null,
+        resetBody ? is2xx('w0') : null,
         deleteReservationJq,
       ].filter((expression): expression is string => Boolean(expression))
       return `{ controlPassed: ((${nonTrivial('c1', 2)})${extraControl.length ? ` and (${extraControl.join(') and (')})` : ''}${neg ? ` and (${neg})` : ''}), ` +
@@ -655,11 +710,13 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
       if (!out.some(existing => JSON.stringify(existing.spec) === JSON.stringify(candidate.spec))) out.push(candidate)
     }
     push(make(style))
-    // A LIKE-wrapped search needs a broad baseline so the true branch still resembles the baseline
-    // request. An empty term matches the whole (tenant-scoped) collection; short common letters are
-    // narrower fallbacks. This is a control-vs-variant choice, not a weaker assertion.
+    // A LIKE-wrapped search needs a baseline the true/false arms can actually separate. An empty or
+    // very common term makes the `LIKE '%<term>'` prefix match the whole collection on its own, so
+    // both arms look identical; a fresh non-matching term is tried first, then short discriminators.
+    // This is a control-vs-variant choice, not a weaker assertion.
     const broadStyle = style === 'or_branch' || style === 'like_breakout'
-    for (const baseline of (broadStyle ? ['', 'a', 'e', '1'] : ['a', 'e', '1'])) {
+    const broadBaselines = [`guardian-${randomBytes(4).toString('hex')}`, '1', 'zz', '', 'a', 'e']
+    for (const baseline of (broadStyle ? broadBaselines : ['a', 'e', '1'])) {
       const candidate = make(style)
       candidate.spec.baselineValue = baseline
       push(candidate)
@@ -951,6 +1008,7 @@ function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult):
         spec: {
           ...baseFields(hyp.endpoint.origin, `Mass assignment of "${scopedField}" on create`, 'CWE-915', 'mass-assignment', 'high', jq),
           kind: 'http_chain',
+          expectedImpactEvents: ['mass_assignment'],
           steps: [
             stepOf(hyp.endpoint.origin, 'c1', 'control', 'Create a record in the caller tenant', { method: 'POST', pathAndQuery: hyp.pathAndQuery, jsonBody: body(controlName, massAssignmentValue(scopedField, false)) }, hyp.ownerPersona),
             // A create has no pre-mutation object to read, but the persistence oracle compares a
@@ -981,6 +1039,9 @@ function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult):
       spec: {
         ...baseFields(hyp.endpoint.origin, `Mass assignment of privileged field "${field}"`, 'CWE-915', 'mass-assignment', 'high', jq),
         kind: 'http_chain',
+        // The hypothesis class is the endpoint's declared overpost impact: a persisted privileged
+        // column must not be dismissed because the leaf name is not in the generic protected list.
+        expectedImpactEvents: ['mass_assignment'],
         steps: [
           stepOf(hyp.endpoint.origin, 'w1', 'control', `Baseline write of a low-privilege "${field}" value`, write(lowValue), hyp.ownerPersona),
           stepOf(hyp.endpoint.origin, 'c1', 'control', 'Read the record to confirm the baseline value', read, hyp.ownerPersona),
