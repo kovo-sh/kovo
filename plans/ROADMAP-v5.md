@@ -258,3 +258,15 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Cadence (accepted):** Tier 0 seconds (worker-gate + VCR), Tier 1 60–90 s (post-floor snapshot, 6–9 hard-class slices), Tier 2 5–6 min fresh 6-cell smoke, Tier 3 12–18 min 12-cell dev+held-out+white-box. Every merged prompt/tool/planner batch needs one fresh Tier-2; flag flips need a fresh Tier-3. Never snapshot salted held-out; rotate dev seeds.
 - **Production budget (accepted):** 45-min shape = recon 0–1, concurrent deterministic lane ≤5 min, Wave 1 hard-class breadth 1–18, Wave 2 det_lead/chains/second-order 18–32, Wave 3 variant/deep crown-jewel 32–41, final refinement 41–45; coverage ledger + wave novelty early exit + per-wave spend partitions.
 - **Owner streams:** trace-capture + trace-metrics; snapshot-resume (`execution.ts`/`store.ts`); parallel-matrix + warm workers; agentic-prompts (running); agentic-lane (Slice 3).
+
+### 2026-11-22 — product floor +9pp; held-out gap flagged
+
+- **Threshold:** `Execution --no-llm` dev seed 1 **26/59 → 35/59 (59.3%) at 100% precision**, 0 decoy/unmatched. Salted held-out seed 1000042: **22/58 (37.9%)**, 100% precision. Dev→held-out gap **21.4pp**.
+- **Reviewer verdict (accepted):** the generalizable floor today is ~38%, not 59.3%; the dev surplus tracks the conventional noun wordlist. Do **not** benchmark agentic lift on a wordlist-inflated floor.
+- **Floor gate adopted now:** 100% precision on both splits; **|dev − held-out| ≤ 10pp (target ≤ 8pp)**; **≥ 50% on salted held-out with noun wordlists OFF**.
+- **Diagnostic (accepted, <10 min):** run seed 1 and 1000042 with `conventionalWordlist` OFF vs ON; split the gap into (a) wordlist inflation, (b) surface-ingestion misses, (c) class-selection overfitting.
+- **Generalization work (accepted, ranked):** lossless grey-box OpenAPI/API-ref ingestion (incl. DELETE/PATCH/body-only POST); JS bundle + SPA router extraction; form/link/XHR crawl; response-driven REST sibling derivation; OPTIONS/405/Allow and 400/422 validation-schema hints. Benchmarks turn noun wordlists OFF (universal paths only).
+- **Intent model (accepted):** replace English route/param regexes with structural evidence — method+role matrix, wire format/value shape, one benign canary reflection probe per string param, response/resource signals (secret fingerprints, created-id → downstream action).
+- **Priority (accepted):** parallel tracks — Track A surface/intents (phase0-recon + deterministic engine), Track B agentic lane (already running). Sync, then measure agentic vs `--no-llm` on dev **and** held-out against the honest floor.
+- **Next measurement (accepted):** 12-cell `--no-llm` matrix = 3 apps × seeds 1,2 + 1000042 + a fresh held-out seed, wordlists OFF; pass = 0 decoy/unmatched, gap ≤8pp overall (≤12pp per app), held-out ≥50%, no class drop >20pp.
+- **Owner streams:** heldout-gap (phase0-recon + engine intents), agentic-lane (running), parallel-matrix (running).
