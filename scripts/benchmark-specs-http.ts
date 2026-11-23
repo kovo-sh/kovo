@@ -109,9 +109,48 @@ function privilegedLiteral(bodyTemplate: unknown): string | null {
   return null
 }
 
+/** A route whose name marks an elevated function (admin console, permission/role grant, ...). */
+const privilegedRoute = /(?:^|[/_.-])(?:admin|administration|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?)(?:$|[/_.-])/i
+
+/**
+ * The actor that can read the mutated record back. Identifier pools are harvested per persona and
+ * route (see `idPool`), so a pool that contains this id names the credential that observed it.
+ */
+function readPersonaFor(env: ProbeEnv, id: string): string | null {
+  const matched = [...(env.idCache ?? new Map<string, string[]>()).entries()]
+    .filter(([key, ids]) => key.includes('|') && ids.includes(id))
+    .sort((a, b) => Number(!a[0].startsWith(`${env.owner}|`)) - Number(!b[0].startsWith(`${env.owner}|`)))
+  for (const [key] of matched) {
+    const persona = key.slice(0, key.indexOf('|'))
+    if (persona) return persona
+  }
+  return null
+}
+
+/**
+ * Self-identity fallback: a user-administration route mutates an account whose role is visible on
+ * that same account's own profile route. Only the personas whose user id the run already resolved
+ * can read themselves, so the mutated id must equal one of those ids.
+ */
+function identityRoute(env: ProbeEnv): string | null {
+  return (env.endpoints ?? [])
+    .filter(e => e.method.toUpperCase() === 'GET' && !hasPathPlaceholder(e.path) && !e.path.includes('?'))
+    .map(e => e.path)
+    .filter(p => /(?:^|\/)(?:profile|me|whoami|session|account)(?:\/|$)/i.test(p))
+    .sort((a, b) => a.length - b.length || a.localeCompare(b))[0] ?? null
+}
+
+function identityReadTarget(env: ProbeEnv, id: string): { path: string; persona: string } | null {
+  const persona = id === env.ownerUserId ? env.owner : id === env.otherUserId ? env.other : id === env.viewerUserId ? env.viewer : null
+  const path = identityRoute(env)
+  return persona && path ? { path, persona } : null
+}
+
 function mutationPath(endpointPath: string, id: string): string {
+  // `fillPlaceholders` understands every placeholder spelling discovery emits (`:id`, `{id}`,
+  // `[id]`, `{{id}}`); a hand-rolled regex here silently left `{id}` in the wire path.
   const encoded = id.startsWith('{{') ? id : encodeURIComponent(id)
-  return endpointPath.replace(/\{\{[^}]+\}\}|:[A-Za-z0-9_]+|\[[^\]]+\]/g, () => encoded)
+  return fillPlaceholders(endpointPath, encoded)
 }
 
 /**
@@ -123,14 +162,19 @@ function mutationPath(endpointPath: string, id: string): string {
 function stateDeltaSpec(
   o: HypothesisOutcome, env: ProbeEnv, read: ReadTarget, id: string, method: string,
   bodyTemplate: unknown, probePersona: string | null, privileged: string | null,
+  readback: { persona: string; vertical: boolean; requiredRole?: 'viewer' | 'member' | 'admin' | 'owner' } = { persona: env.owner ?? '', vertical: false },
 ): SynthesizedSpec[] {
   const stepExtra = env.caps.sessionAndCsrf ? { csrfBind: true } : {}
+  const readPersona = readback.persona || env.owner
   // The reserved-victim proof must read and mutate as the same low-privileged actor: a reader in one
   // tenant and a writer in another cannot prove a same-tenant deletion.
   const writer = env.viewer ?? (probePersona && probePersona !== env.other ? probePersona : null)
-  const title = method === 'DELETE' ? 'Cross-actor object deletion (state delta)' : 'Cross-actor object mutation (state delta)'
+  const title = readback.vertical
+    ? 'Vertical BFLA: privileged function invocation (state delta)'
+    : method === 'DELETE' ? 'Cross-actor object deletion (state delta)' : 'Cross-actor object mutation (state delta)'
   const common = (jq: string) => ({
-    ...baseFields(env, title, 'CWE-639', 'broken-access-control', 'high', jq),
+    ...baseFields(env, title, readback.vertical ? 'CWE-285' : 'CWE-639', 'broken-access-control', 'high', jq),
+    ...(readback.vertical && readback.requiredRole ? { requiredRole: readback.requiredRole } : {}),
     kind: 'http_chain' as const,
     steps: [] as Array<Record<string, unknown>>,
   })
@@ -190,9 +234,9 @@ function stateDeltaSpec(
     spec: {
       ...common(jq),
       steps: [
-        stepOf(env, 'c1', 'control', 'Authorized actor reads the resource before the mutation', { method: 'GET', pathAndQuery: read.path }, env.owner),
+        stepOf(env, 'c1', 'control', 'Authorized actor reads the resource before the mutation', { method: 'GET', pathAndQuery: read.path }, readPersona),
         stepOf(env, 'p1', 'probe', 'Lower-privileged actor mutates the resource', parts, probePersona, stepExtra),
-        stepOf(env, 'p2', 'probe', 'Authorized actor reads the resource after the mutation', { method: 'GET', pathAndQuery: read.path }, env.owner),
+        stepOf(env, 'p2', 'probe', 'Authorized actor reads the resource after the mutation', { method: 'GET', pathAndQuery: read.path }, readPersona),
       ],
     },
   }]
@@ -217,6 +261,7 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   const rejects = { owner: 0, probe: 0, public: 0, trivial: 0 }
   const out: SynthesizedSpec[] = []
   const seen = new Set<string>()
+  const selfReadbackEmitted = new Set<string>()
 
   for (const hit of hits) {
     const id = String(hit.resourceId ?? '')
@@ -252,13 +297,55 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
       }
     }
     const bodyTemplate: unknown = hit.bodyTemplate !== undefined && hit.bodyTemplate !== null ? hit.bodyTemplate : {}
-    // A mutating route that acknowledges with a trivial `{ok:true}` body still has real impact: prove
-    // it with a before/after read of the same identifier instead of trusting the acknowledgement.
-    if (mutating && !functionLevel && ownerTrivial && probeOk && /(?:admin|internal|manage|staff|superuser|privileged|permission|role|grant|scope)/i.test(o.hyp.endpoint.path)) {
-      const read = inferReadTarget(env, id, o.hyp.endpoint.path)
-      if (read) {
-        out.push(...stateDeltaSpec(o, env, read, id, method, bodyTemplate,
-          hit.actor === 'anonymous' ? null : other, privilegedLiteral(bodyTemplate)))
+    const elevated = privilegedRoute.test(o.hyp.endpoint.path)
+    const mutatingActor = hit.actor === 'anonymous' ? null : other
+    // A vertical function-level proof: the privileged control persona invokes an elevated route the
+    // probe persona must not reach. The role differential is only declared when the run's own admin
+    // credential is the control actor.
+    const vertical = Boolean(env.admin && owner === env.admin && mutatingActor && mutatingActor !== env.admin)
+    const requiredRole = vertical ? 'admin' as const : undefined
+    // A mutating route that acknowledges with a trivial `{ok:true}` body, or an elevated action whose
+    // response is only an echo, has real impact only when a separate read shows the state change.
+    if (mutating && probeOk && elevated && (ownerTrivial || ownerOk)) {
+      // Self-service is a fresh, unprobed victim for the same elevated function: the viewer invokes
+      // it on its own account and re-reads its own profile. Never for a delete (it would remove the
+      // reader) and never for a collection read.
+      const selfRoute = !functionLevel && elevated && method !== 'DELETE' ? identityRoute(env) : null
+      if (selfRoute && env.viewer && env.viewerUserId && !selfReadbackEmitted.has(method)) {
+        selfReadbackEmitted.add(method)
+        out.push(...stateDeltaSpec(o, env, { path: selfRoute, detail: false, reserved: false }, env.viewerUserId,
+          method, bodyTemplate, mutatingActor, privilegedLiteral(bodyTemplate),
+          { persona: env.viewer, vertical: vertical && method !== 'DELETE', ...(requiredRole ? { requiredRole } : {}) }))
+      }
+      let read: ReadTarget | null = null
+      let persona: string | null = null
+      let selfRead = false
+      if (functionLevel) {
+        if (elevated) {
+          read = { path: o.hyp.endpoint.path, detail: true, reserved: false }
+          persona = owner
+        }
+      } else {
+        read = inferReadTarget(env, id, o.hyp.endpoint.path)
+        if (read) persona = read.detail ? owner : readPersonaFor(env, id)
+        if (!read || !persona) {
+          const identity = identityReadTarget(env, id)
+          if (identity) { read = { path: identity.path, detail: false, reserved: false }; persona = identity.persona; selfRead = true }
+        }
+      }
+      if (read && persona) {
+        // A vertical (BFLA) claim is only declared when the readback is the mutated object itself:
+        // a collection sweep cannot prove the role differential and would over-claim.
+        const directRead = read.detail || selfRead
+        out.push(...stateDeltaSpec(o, env, read, id, method, bodyTemplate, mutatingActor, privilegedLiteral(bodyTemplate),
+          { persona, vertical: vertical && method !== 'DELETE' && directRead, ...(requiredRole ? { requiredRole } : {}) }))
+        continue
+      }
+      // The reserved-victim delete proof reads and mutates as the writer, so it does not need a
+      // separately harvested reader for the identifier.
+      if (read && !persona && method === 'DELETE' && !read.detail && (env.viewer ?? owner)) {
+        out.push(...stateDeltaSpec(o, env, read, id, method, bodyTemplate, mutatingActor, privilegedLiteral(bodyTemplate),
+          { persona: (env.viewer ?? owner)!, vertical: false }))
         continue
       }
     }

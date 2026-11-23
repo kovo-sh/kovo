@@ -885,6 +885,9 @@ export interface ProbeEnv {
   /** Persona user ids used to interpret ownership in authz/GraphQL evidence. */
   ownerUserId?: string
   otherUserId?: string
+  /** The low-privileged (viewer) and elevated (admin) persona user ids, when the lab exposes them. */
+  viewerUserId?: string
+  adminUserId?: string
   /** Cached identifier pools harvested from collection routes. */
   idCache?: Map<string, string[]>
   /** Endpoints discovered in this run (used to resolve body field values from the surface). */
