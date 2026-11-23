@@ -1905,6 +1905,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
   let targetOriginLabel = ''
   const storeWriteSamples: number[] = []
   let restoreStoreWrites: (() => void) | null = null
+  let previousSiblingEnv: string | undefined
 
   try {
     // --- Data dir (--no-llm never inherits a model-enabled directory) -----------------------
@@ -2109,6 +2110,13 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     }
 
     // --- Real Execution --------------------------------------------------------------------
+    // White-box scale gate: exercise the opt-in sibling-derivation request so Phase-0's
+    // suppression decision is observed rather than assumed.
+    if (fixtureName === 'monorepo-whitebox') {
+      previousSiblingEnv = process.env.GUARDIAN_RECON_SIBLINGS
+      process.env.GUARDIAN_RECON_SIBLINGS = '1'
+      notes.push('GUARDIAN_RECON_SIBLINGS=1 (opt-in sibling derivation requested for suppression check)')
+    }
     // Harness-side observation only: the broker is the real product broker, instrumented so the
     // gate can report denied mutations and HTTP/2 single-packet race bursts. Staging enables the
     // HTTP/2 transport because the fixture's h2c endpoint is the object under test.
@@ -2213,6 +2221,10 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
   } finally {
     restoreStoreWrites?.()
     restoreStoreWrites = null
+    if (fixtureName === 'monorepo-whitebox') {
+      if (previousSiblingEnv === undefined) delete process.env.GUARDIAN_RECON_SIBLINGS
+      else process.env.GUARDIAN_RECON_SIBLINGS = previousSiblingEnv
+    }
     const shutdown = await tearDown(ctx, signal)
     ctx.storage = undefined
     ctx.started = undefined

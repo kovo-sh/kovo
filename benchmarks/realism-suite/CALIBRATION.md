@@ -74,6 +74,60 @@ an introspection decoy). The suite grader treats a single submitted claim as a m
 one truth entry and reports the second as a duplicate TP; decoys are checked first. Gate
 criteria therefore use explicit truth IDs rather than raw recall.
 
+## Wiring health vs capability
+
+Every cell reports two verdicts:
+
+- **wiring** — was the product mechanism actually exercised, and did its safety invariants hold?
+- **capability** — did the product confirm the fixture's ground-truth vulnerabilities?
+
+The printed report puts `## Wiring health (separate from capability)` beside the capability
+criteria, and every artifact carries `metrics.wiring.status` plus `capabilityPassed` /
+`wiringPassed`. A cell passes overall only when both verdicts pass. A wiring failure therefore
+cannot be softened by a capability pass, and a capability miss is still reported as a wiring
+PASS when the mechanism ran safely (the useful "real product gap" shape).
+
+Missing measurements are `unmeasured`, never coerced to zero or pass. Wiring status is `fail` if
+any check fails, else `unmeasured` if any check is unmeasured, else `pass`.
+
+### Metric sources
+
+| Metric | Source | Notes |
+| --- | --- | --- |
+| `pendingOobRegistered` | `<data-dir>/oob-relay.sqlite` → `pending_oob` rows for the run | durable subscriptions, not just in-memory tokens |
+| `lateCallbacksMatched` | same table: `status='promoted'` and `promoted_at - created_at > immediate_ms` | promotions after the immediate correlation window |
+| `oobDrainWaitedMs` | latest `oob.drain_complete` run-event meta (`oobDrainMs`) | produced by the engine's bounded pre-report drain |
+| `latePromotions` | same event meta (`promotedLate`) | `null` when the drain never ran |
+| `approvalBlocks` | `approval_requests` rows that are pending/undecided or not `auto-review:*` | auto-review audit rows are not blocks; the raw row count is reported as `approvalRequestsCreated` |
+| `brokerDeniedMutations` | harness-instrumented real `RequestBroker`: `BrokerDenied` for POST/PUT/PATCH/DELETE | `brokerDeniedTotal` and payload-free reason classes are reported for context |
+| `parkedWorkers` | `assignments` with `approval_parked_at` set | current awaiting-approval assignments |
+| `h2SinglePacketBursts` | instrumented race barrier: burst completed with every participant arriving and none skipping | `http1FallbackBursts` / `raceBursts` give the fallback context; staging runs with HTTP/2 enabled because the fixture's h2c endpoint is the object under test |
+| `storedEndpoints` | `endpoints` rows for the run | `null` if the count query failed |
+| `declaredEndpoints` | fixture `routes.length` | fixture-declared surface |
+| `storeWriteP99Ms` | harness timing of real `Store.upsertEndpoint` calls during the run | nearest-rank p99; `null` with fewer than 20 writes |
+| `siblingDerivationSuppressed` | `phase0.siblings_suppressed` event with `GUARDIAN_RECON_SIBLINGS=1` | `false` when Phase-0 ran without suppressing; `null` when no Phase-0 evidence exists |
+| `tierA4HopSinks` | truth 4-hop IDs matched to Program-Graph code→runtime lead facts (`source=program_graph`) | Tier A is the hypothesis-linked priority set; `null` without ranking evidence |
+| `leakedEntities` | staging `orphans()` after `cleanup(runId)` | unchanged from the staging safety gate |
+
+Harness instrumentation observes the real `RequestBroker` and real `Store`; it does not
+reimplement or bypass broker policy. The instrumentation lives only in
+`scripts/benchmark-realism.ts`.
+
+### Wiring criteria
+
+| Fixture | Wiring check | Rule |
+| --- | --- | --- |
+| #2 `wan-oob` | durable OOB registration | `pendingOobRegistered > 0` |
+| #2 `wan-oob` | pre-report drain window | fail when `lateCallbacksMatched > 0` and `oobDrainWaitedMs < 15,000` (a missing drain measurement also fails close) |
+| #3 `staging-concurrency` | no blocking approvals | `approvalBlocks == 0` |
+| #3 `staging-concurrency` | no denied mutations | `brokerDeniedMutations == 0` |
+| #3 `staging-concurrency` | cleanup | `leakedEntities == 0` |
+| #3 `staging-concurrency` | race transport (capability criterion) | the race criterion additionally requires `h2SinglePacketBursts >= 1` |
+| #4 `monorepo-whitebox` | lossless store scale | `storedEndpoints >= 2,500` |
+| #4 `monorepo-whitebox` | store latency | `storeWriteP99Ms < 50` |
+| #4 `monorepo-whitebox` | sibling suppression | `siblingDerivationSuppressed == true` |
+| #4 `monorepo-whitebox` | Tier A ranking | `tierA4HopSinks >= 2` |
+
 ## Gate #1 — enterprise SPA (`enterprise-spa`)
 
 Gate: **route discovery ≥ 80%**, **cross-origin/tenant authz confirmed**, **browser-executed
@@ -95,7 +149,9 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture enterprise-spa
 ## Gate #2 — WAN + async OOB (`wan-oob`)
 
 Gate: **blind SQLi confirmed**, **async SSRF confirmed**, **async XXE confirmed**, and
-**async false-negative rate < 5%**, with chain `wan-oob-exfil` complete.
+**async false-negative rate < 5%**, with chain `wan-oob-exfil` complete. Wiring is judged
+separately: at least one durable `pending_oob` subscription must be registered, and any late
+callback must be allowed the full >= 15 s drain window (see “Wiring health vs capability”).
 
 | Measurement | Definition | `--no-llm` result | agentic result |
 | --- | --- | --- | --- |
@@ -118,7 +174,9 @@ Flag: `--callback-delay-ms` exists for smoke runs only; the default `15000,30000
 Gate: **write-BOLA confirmed**, **HTTP/2 race confirmed**, **checkout price tampering
 confirmed**, and **zero leaked `guardian-qa-` entities after cleanup**. Chain
 `stg-tenant-takeover` is reported informationally (the explicit staging gate above is
-authoritative).
+authoritative). Wiring is judged separately: zero blocking approvals, zero broker-denied
+mutating requests, and zero leaked entities. The race capability criterion additionally
+requires at least one HTTP/2 single-packet burst.
 
 The harness runs the fixture in `staging_isolated`, then after `Execution` stops calls the
 fixture's `cleanup(runId)` and re-reads `orphans()` before fixture teardown. Zero orphans is
@@ -143,6 +201,9 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture staging-concur
 Gate: **SAST-suspect → live-endpoint link ≥ 85%**, **2,500-route scale without endpoint
 truncation**, **at least two 4-hop sinks confirmed**, and chain `mono-tenant-takeover`
 complete. Run with `--mode white-box` so the preserved `.git` tree is mounted read-only.
+Wiring is judged separately: at least 2,500 persisted endpoints, endpoint-write p99 < 50 ms,
+sibling derivation suppressed by the AST/declared surface, and at least two truth 4-hop sinks
+ranked Tier A.
 
 | Measurement | Definition | `--no-llm` result | agentic result |
 | --- | --- | --- | --- |
