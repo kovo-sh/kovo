@@ -1248,6 +1248,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     engine = new Execution(storage, {
       canaryBroker: canary,
       ...(backend ? { backend } : {}),
+      deterministicOnly: args.noLlm,
     })
     engine.start()
     engine.wake()

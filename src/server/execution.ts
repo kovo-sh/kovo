@@ -87,6 +87,10 @@ import {
   normalizeEndpointTemplate,
 } from './dedupe.ts'
 import type { ExistingFindingRef } from './dedupe.ts'
+import {
+  runDeterministicEngine,
+} from './deterministic-engine.ts'
+import type { EngineConfirmed, EngineEndpoint, EngineLead, EnginePersona } from './deterministic-engine.ts'
 import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
 import type { EvidenceReview } from './evidence-checks.ts'
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
@@ -146,7 +150,7 @@ type ReviewInput = { artifactId?: string; reviews: EvidenceReview[]; policy?: Ac
 type CoordinatorTask = { controller: AbortController; goalRevision: number; scopeRevision?: number }
 
 const hardChainStepsCeiling = 300
-const diminishingReturnsDryThreshold = 6
+export const diminishingReturnsDryThreshold = 6
 const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
 /** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
@@ -906,6 +910,11 @@ export interface ExecutionOptions {
   backend?: WorkerBackend
   personaAuth?: PersonaAuthManager
   labRunner?: LabRunner
+  /**
+   * Explicit `--no-llm` deterministic path. When true the deterministic engine replaces the legacy
+   * M1 no-profile fallback. When false (default) the M1 fallback is untouched.
+   */
+  deterministicOnly?: boolean
 }
 
 export class Execution {
@@ -938,6 +947,7 @@ export class Execution {
   private readonly refinementEligible = new Map<string, Set<string>>()
   private readonly deterministicInFlight = new Set<string>()
   private readonly deterministicCompleted = new Set<string>()
+  private readonly deterministicOnly: boolean
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
   private readonly boardHandleByAssignment = new Map<string, string>()
@@ -959,6 +969,7 @@ export class Execution {
 
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
+    this.deterministicOnly = options.deterministicOnly === true
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     // `storage` activates second-order canary scanning inside the browser context too.
@@ -3445,9 +3456,10 @@ export class Execution {
 
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (!profiles.length) {
-      // No model profile configured: run the bounded deterministic baseline so the run can still
-      // produce real findings (see runDeterministicInvestigation). The agentic path is unchanged.
-      this.driveDeterministicInvestigation(run)
+      // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
+      // no-profile fallback below stays byte-for-byte unchanged.
+      if (this.deterministicOnly) this.driveEngineInvestigation(run)
+      else this.driveDeterministicInvestigation(run)
       return
     }
     // Always compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
@@ -3541,6 +3553,40 @@ export class Execution {
               latest.id,
               'deterministic_probes.complete',
               'Deterministic probe pass complete. Advancing to Zero-LLM verification.',
+              { reuse: key },
+            )
+            this.advanceToVerification(latest)
+          }
+        } catch { /* store closed or run removed */ }
+        try {
+          this.scheduleWake()
+        } catch { /* scheduler already stopped */ }
+      })
+  }
+
+  // --- Explicit --no-llm deterministic engine (Slice 2; separate from the M1 fallback above) ---
+
+  private driveEngineInvestigation(run: Run) {
+    const key = `${run.id}:${run.goalRevision}:${run.scopeRevision}:engine`
+    if (this.deterministicCompleted.has(key) || this.deterministicInFlight.has(key)) return
+    this.deterministicInFlight.add(key)
+    void this.runEngineInvestigation(run)
+      .catch(error => {
+        try {
+          const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+          this.storage.event(run.id, 'deterministic_engine.failed', `Deterministic engine failed: ${msg}`)
+        } catch { /* store closed or run removed */ }
+      })
+      .finally(() => {
+        this.deterministicInFlight.delete(key)
+        this.deterministicCompleted.add(key)
+        try {
+          const latest = this.storage.run(run.id)
+          if (latest.status === 'running' && latest.phase === 'investigation') {
+            this.storage.event(
+              latest.id,
+              'deterministic_engine.complete',
+              'Deterministic engine complete. Advancing to Zero-LLM verification.',
               { reuse: key },
             )
             this.advanceToVerification(latest)
@@ -4218,6 +4264,549 @@ export class Execution {
         })
       } catch { /* run may have been deleted */ }
     }
+  }
+
+  /**
+   * Explicit `--no-llm` deterministic closed loop. Risk-ranks the discovered surface, harvests
+   * identifiers/fields from the target's own responses, runs the benign differential probes, turns
+   * strong signals into identifier-bound DeclarativeReplaySpecs and lets the normal ReplayVerifier
+   * decide. Only replay-confirmed runtime findings are persisted; unproven signals become det_lead
+   * facts. No specialist steps are cancelled or hidden in this slice.
+   */
+  private async runEngineInvestigation(run: Run): Promise<void> {
+    const current = this.storage.run(run.id)
+    if (current.status !== 'running' || current.phase !== 'investigation') return
+    const approvedOrigins = this.approvedOriginsSet(current)
+    if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
+
+    const storedEndpoints = this.storage.listEndpoints(current.id, { orderBy: 'risk', limit: 220 })
+      .filter(ep => approvedOrigins.has(ep.origin) && ep.method !== 'DELETE')
+    const allParams = this.storage.listEndpointParams(current.id)
+    const paramsByEndpoint = new Map<string, typeof allParams>()
+    for (const param of allParams) {
+      const list = paramsByEndpoint.get(param.endpointId) ?? []
+      list.push(param)
+      paramsByEndpoint.set(param.endpointId, list)
+    }
+
+    const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
+    if (!asset) return
+
+    const worker = this.storage.makeWorker(
+      current,
+      'investigation',
+      asset,
+      'Deterministic differential engine',
+      'Deterministic closed loop: risk-ranked triage, differential probes and Zero-LLM replay verification.',
+      { sourceOrigins: [...approvedOrigins] },
+    )
+    const claimed = this.storage.updateWorker(worker.id, {
+      status: 'running',
+      lease: randomUUID(),
+      leaseExpiresAt: Date.now() + 15 * 60_000,
+    }) ?? worker
+    const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
+    const { grant, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
+    const signal = job.controller.signal
+
+    const recordExchange = (ex: BrokerExchangeResult) => {
+      const latest = this.storage.run(current.id)
+      const saved = this.storage.recordExchange({
+        runId: current.id,
+        assignmentId: claimed.id,
+        scopeRevision: latest.scopeRevision,
+        origin: ex.origin,
+        finalOrigin: ex.finalOrigin,
+        redirectOrigins: ex.redirectOrigins,
+        method: ex.method,
+        pathAndQuery: ex.pathAndQuery,
+        personaHandle: ex.personaHandle,
+        status: ex.status,
+        mediaType: ex.mediaType,
+        reqHeaders: ex.reqHeaders,
+        respHeaders: ex.respHeaders,
+        body: ex.body,
+        durationMs: ex.durationMs,
+        secretMatches: ex.secretMatches,
+        secrets: currentSecrets(),
+      })
+      this.storage.trackExchangeResources({
+        runId: current.id,
+        scopeRevision: latest.scopeRevision,
+        exchange: ex,
+        source: 'surface_probe',
+      })
+      this.markEndpointCoverage(latest, ex.origin, ex.method, ex.pathAndQuery, 'http_exchange')
+      this.scanSecondOrderExchange(latest, claimed.id, ex, saved.id)
+      return saved.id
+    }
+
+    let leadCount = 0
+    try {
+      let derivedTargets: Array<{
+        origin: string
+        method: string
+        pathTemplate: string
+        riskScore: number
+        source?: string
+        params: Array<{ name: string; location: string }>
+      }> = []
+      try {
+        derivedTargets = [
+          ...this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints),
+          ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
+          // Conventional action/noun wordlists are a local-lab convenience: on a real target the
+          // engine relies on discovered routes, JS/router harvesting and the API reference.
+          ...(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
+            ? [...approvedOrigins].flatMap(origin =>
+                this.expandConventionalSurfaceTargets(
+                  origin,
+                  [...storedEndpoints, ...this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints)],
+                ))
+            : []),
+        ].filter((target, idx, all) =>
+          all.findIndex(other => other.origin === target.origin && other.method === target.method && other.pathTemplate === target.pathTemplate) === idx,
+        )
+      } catch (error) {
+        this.storage.event(
+          current.id,
+          'deterministic_engine.derived_failed',
+          `Derived route expansion failed: ${error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)}`,
+        )
+      }
+
+      const paramLocation = (value: string): EngineEndpoint['params'][number]['location'] | null => {
+        return ['query', 'json', 'form', 'path', 'header', 'xml', 'graphql_var'].includes(value)
+          ? value as EngineEndpoint['params'][number]['location']
+          : null
+      }
+
+      const endpoints: EngineEndpoint[] = []
+      const seenEndpoints = new Set<string>()
+      const pushEndpoint = (endpoint: EngineEndpoint) => {
+        const key = `${endpoint.origin}|${endpoint.method.toUpperCase()}|${endpoint.pathTemplate}`
+        if (seenEndpoints.has(key)) return
+        seenEndpoints.add(key)
+        endpoints.push(endpoint)
+      }
+      for (const endpoint of storedEndpoints) {
+        pushEndpoint({
+          id: endpoint.id,
+          origin: endpoint.origin,
+          method: endpoint.method,
+          pathTemplate: endpoint.pathTemplate,
+          params: (paramsByEndpoint.get(endpoint.id) ?? []).flatMap(param => {
+            const location = paramLocation(param.location)
+            return location ? [{ name: param.name, location, isObjectId: param.isObjectId, isCsrf: param.isCsrf }] : []
+          }),
+          riskScore: endpoint.riskScore,
+          sinkKinds: endpoint.sinkKinds,
+          source: endpoint.source,
+        })
+      }
+      for (const [idx, target] of derivedTargets.entries()) {
+        pushEndpoint({
+          id: `derived:${idx}:${target.method}:${target.pathTemplate}`,
+          origin: target.origin,
+          method: target.method,
+          pathTemplate: target.pathTemplate,
+          params: target.params.flatMap(param => {
+            const location = paramLocation(param.location)
+            return location ? [{ name: param.name, location }] : []
+          }),
+          riskScore: target.riskScore,
+          source: target.source ?? 'openapi',
+        })
+      }
+      if (!endpoints.length) return
+
+      const tenantOf = (roleLabel: string): string | undefined => {
+        const match = /\(([^()]+)\)\s*$/.exec(roleLabel)
+        return match?.[1]?.trim() || undefined
+      }
+      const privilegeOf = (roleLabel: string): EnginePersona['privilege'] => {
+        if (/admin|superuser|owner[-_ ]?admin/i.test(roleLabel)) return 'admin'
+        if (/viewer|read[-_ ]?only|readonly|guest|auditor|audit/i.test(roleLabel)) return 'viewer'
+        return 'member'
+      }
+      const personas: EnginePersona[] = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
+        .filter(persona => persona.originAllowlist.some(origin => approvedOrigins.has(origin)))
+        .map(persona => ({
+          handle: persona.handle,
+          roleLabel: persona.roleLabel,
+          privilege: privilegeOf(persona.roleLabel),
+          tenant: tenantOf(persona.roleLabel),
+        }))
+
+      const envNumber = (name: string): number | undefined => {
+        const parsed = Number(process.env[name])
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+      }
+      const remainingRequests = current.budgetRequests > 0
+        ? Math.max(0, current.budgetRequests - current.spentRequests)
+        : 700
+      const maxRequests = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
+      const maxDurationMs = envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
+      const maxHypotheses = envNumber('GUARDIAN_DETERMINISTIC_MAX_HYPOTHESES') ?? 90
+
+      this.storage.event(
+        current.id,
+        'deterministic_engine.started',
+        `Deterministic engine triaging ${endpoints.length} endpoint(s) (request cap ${maxRequests}, ${Math.round(maxDurationMs / 1000)}s).`,
+        {
+          endpoints: endpoints.length,
+          stored: storedEndpoints.length,
+          derived: derivedTargets.length,
+          personas: personas.length,
+          maxRequests,
+          maxDurationMs,
+        },
+      )
+
+      const report = await runDeterministicEngine({
+        runId: current.id,
+        assignmentId: claimed.id,
+        signal,
+        endpoints,
+        personas,
+        broker: this.broker,
+        grant,
+        backend: this.backend,
+        canaryBroker: this.canaryBroker,
+        browser: this.browser,
+        storage: this.storage,
+        tier: current.capabilityTier,
+        maxRequests,
+        maxDurationMs,
+        maxHypotheses,
+        recordExchange,
+        log: (kind, message, data) => {
+          try { this.storage.event(current.id, kind, message, data ?? {}) } catch { /* run may be gone */ }
+        },
+        onConfirmed: input => this.persistDeterministicConfirmed({
+          run: this.storage.run(current.id),
+          assignment: claimed,
+          asset,
+          confirmed: input,
+          secrets: currentSecrets(),
+        }),
+        onLead: lead => {
+          if (leadCount >= 16) return
+          leadCount += 1
+          this.persistDeterministicLead({
+            run: this.storage.run(current.id),
+            assignment: claimed,
+            lead,
+            secrets: currentSecrets(),
+          })
+        },
+      })
+
+      const byClass = Object.entries(report.byClass)
+        .map(([intent, stats]) => `${intent}:${stats.confirmed}/${stats.hypotheses}`)
+        .join(' ')
+      this.storage.event(
+        current.id,
+        'deterministic_engine.summary',
+        `Deterministic engine used ${report.requestsUsed} request(s), confirmed ${report.confirmed}, rejected ${report.rejectedSpecs}, leads ${report.leads}.`,
+        {
+          requestsUsed: report.requestsUsed,
+          endpointsConsidered: report.endpointsConsidered,
+          endpointsHarvested: report.endpointsHarvested,
+          hypothesesFormed: report.hypothesesFormed,
+          hypothesesRun: report.hypothesesRun,
+          signals: report.signals,
+          specsSubmitted: report.specsSubmitted,
+          confirmed: report.confirmed,
+          rejectedSpecs: report.rejectedSpecs,
+          leads: report.leads,
+          stoppedReason: report.stoppedReason,
+          durationMs: report.durationMs,
+          byClass,
+        },
+      )
+      this.storage.message(
+        current.id,
+        current.coordinatorId,
+        'guardian',
+        `Deterministic engine finished: ${report.confirmed} confirmed finding(s) from ${report.hypothesesFormed} hypothesis(es), ${report.specsSubmitted} replay spec(s), ${report.requestsUsed} request(s) (${report.stoppedReason}).${byClass ? ` Classes ${byClass}.` : ''}`,
+      )
+    } finally {
+      try {
+        this.storage.updateWorker(claimed.id, {
+          status: 'complete',
+          outcome: 'Deterministic engine complete.',
+          lease: null,
+          leaseExpiresAt: null,
+        })
+      } catch { /* run may have been deleted */ }
+    }
+  }
+
+  /**
+   * Local-lab-only conventional action/noun expansion. Every candidate is still differentially
+   * verified, so an extra route can only add a verified finding, never a raw claim.
+   */
+  private expandConventionalSurfaceTargets(
+    origin: string,
+    existing: ReadonlyArray<{ method: string; pathTemplate: string }>,
+  ): Array<{
+    origin: string
+    method: string
+    pathTemplate: string
+    riskScore: number
+    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+  }> {
+    const seen = new Set(existing.map(ep => `${origin}|${ep.method.toUpperCase()}|${ep.pathTemplate}`))
+    const out: Array<{
+      origin: string
+      method: string
+      pathTemplate: string
+      riskScore: number
+      source?: string
+      params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
+    }> = []
+    const add = (method: string, pathTemplate: string, riskScore = 12) => {
+      const key = `${origin}|${method}|${pathTemplate}`
+      if (seen.has(key)) return
+      if (!pathTemplate.startsWith('/') || pathTemplate.length > 200) return
+      if (/\.(?:js|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|mp4|pdf|zip|gz)$/i.test(pathTemplate)) return
+      seen.add(key)
+      const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
+      for (const match of pathTemplate.matchAll(/:([A-Za-z0-9_]+)/g)) params.push({ name: match[1], location: 'path' })
+      out.push({ origin, method, pathTemplate, riskScore, source: 'conventional', params })
+    }
+    const conventional: ReadonlyArray<[string, string, number]> = [
+      ['GET', '/api/tokens', 18], ['POST', '/api/tokens', 15],
+      ['GET', '/api/v1/whoami', 18], ['POST', '/api/v1/login', 12],
+      ['GET', '/api/admin/activity', 18], ['GET', '/api/admin/users', 10],
+      ['POST', '/api/admin/impersonate', 20],
+      ['GET', '/api/staff', 12], ['POST', '/api/staff/:userId/role', 20],
+      ['GET', '/api/downloads/reports', 18], ['POST', '/api/apps/import', 25],
+      ['GET', '/api/v1/downloads/download', 20],
+      ['POST', '/api/seats', 15], ['POST', '/api/credits', 12],
+      ['POST', '/api/enrollments/accept', 18],
+      ['GET', '/api/v1/search', 22],
+      ['GET', '/api/accounts/search', 20],
+      ['POST', '/api/queries/run', 22], ['POST', '/api/logs/filter', 22],
+      ['GET', '/api/logs/view', 20], ['GET', '/api/logs', 8],
+      ['GET', '/api/hooks', 14], ['POST', '/api/hooks', 22],
+      ['POST', '/api/hooks/:webhookId/ping', 18],
+      ['GET', '/api/links', 16], ['GET', '/api/links/:iid', 14],
+      ['POST', '/api/links/:iid/fetch', 18],
+      ['GET', '/api/v1/checkout/return', 18], ['GET', '/api/checkout/return', 16],
+      ['POST', '/api/v1/orders/:orderId/confirm', 18],
+      ['POST', '/api/orders/:orderId/confirm', 16],
+      ['GET', '/api/v1/reports/sales', 16], ['GET', '/api/reports/sales', 16],
+      ['POST', '/api/issues/:ticketId/notes', 18], ['GET', '/api/issues/:ticketId/view', 14],
+      ['POST', '/api/jobs/:jobId/trigger', 16], ['POST', '/api/jobs/:jobId/complete', 14],
+      ['POST', '/api/sso/import', 18], ['GET', '/api/sso/start', 10],
+      ['GET', '/api/v1/customers/:customerId', 14], ['GET', '/api/v1/orders/:orderId', 14],
+      ['GET', '/api/v1/wares/:productId/photos', 16], ['POST', '/api/v1/wares/:productId/photos', 22],
+      ['POST', '/api/v1/manifests', 22], ['POST', '/api/v1/product-import', 18],
+    ]
+    for (const [method, path, risk] of conventional) add(method, path, risk)
+    for (const ep of existing) {
+      const bare = ep.pathTemplate.split('?')[0] || '/'
+      if (bare.split('/').filter(Boolean).length > 4) continue
+      if (/:/.test(bare)) continue
+      if (ep.method.toUpperCase() === 'GET') add('POST', bare, 8)
+      else if (ep.method.toUpperCase() === 'POST') add('GET', bare, 8)
+    }
+    return out.slice(0, 60)
+  }
+
+  /** Persist a replay-confirmed runtime finding. Never called for an unverified signal. */
+  private persistDeterministicConfirmed(input: {
+    run: Run
+    assignment: Assignment
+    asset: Candidate
+    confirmed: EngineConfirmed
+    secrets: readonly NamedSecret[]
+  }): string | null {
+    const { run, assignment, asset, confirmed, secrets } = input
+    const spec = confirmed.spec
+    if (spec.kind === 'static_ast_proof') return null
+    if (confirmed.result.verdict !== 'confirmed') return null
+    const fields = extractSpecDedupeFields(spec)
+    const rows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+    )).all()
+    const existingRefs: ExistingFindingRef[] = rows.map(row => {
+      const existingSpec = row.replaySpecId ? this.storage.getReplaySpec(run.id, row.replaySpecId) : null
+      const existingFields = existingSpec ? extractSpecDedupeFields(existingSpec.spec) : undefined
+      return {
+        id: row.id,
+        origin: row.finding.origin,
+        title: row.finding.title,
+        status: row.finding.status,
+        cwe: row.finding.cwe,
+        category: row.finding.category,
+        severity: row.finding.severity,
+        endpoint: existingFields?.endpoint ?? null,
+        authState: existingFields?.authState ?? null,
+        specKind: existingFields?.specKind ?? null,
+        method: existingFields?.method ?? null,
+        param: existingFields?.param ?? null,
+        graphqlField: existingFields?.graphqlField ?? null,
+        fingerprintHash: row.fingerprintHash ?? null,
+      }
+    })
+    const duplicate = checkStructuralDuplicate({
+      origin: spec.origin,
+      title: spec.title,
+      cwe: spec.cwe,
+      category: spec.category,
+      severity: spec.severity,
+      endpoint: fields.endpoint,
+      authState: fields.authState,
+      specKind: fields.specKind,
+      method: fields.method,
+      param: fields.param,
+      graphqlField: fields.graphqlField,
+    }, existingRefs)
+    if (duplicate.isDuplicate) return null
+
+    const origins = [...new Set(replaySpecOrigins(spec))].filter(origin => this.permitted(run, origin))
+    const fact = this.storage.addFact(run, assignment, {
+      kind: 'note',
+      origin: spec.origin,
+      summary: `Replay-verified deterministic finding: ${spec.title}`,
+      data: {
+        subkind: 'deterministic_engine_confirmed',
+        attribution: 'deterministic',
+        vulnClass: confirmed.vulnClass,
+        endpoint: confirmed.endpoint,
+        probeClass: confirmed.hypothesis.probeClass,
+        specKind: spec.kind,
+        verdict: confirmed.result.verdict,
+        verificationTier: confirmed.result.verificationTier ?? 'runtime_confirmed',
+        controlPassed: confirmed.result.outcome.controlPassed,
+        observed: confirmed.result.outcome.observed.slice(0, 400),
+      },
+      exchangeIds: confirmed.exchangeIds.slice(0, 5),
+      sourceOrigins: origins,
+      secrets,
+    })
+
+    const findingId = randomUUID()
+    const specRow = this.storage.createReplaySpec(run, assignment, findingId, spec, origins)
+    const artifact = this.storage.addArtifact(
+      run,
+      assignment,
+      'replay',
+      `Deterministic verified · ${spec.title}`,
+      JSON.stringify({
+        replaySpecId: specRow.id,
+        specSha256: specRow.specSha256,
+        kind: spec.kind,
+        verdict: confirmed.result.verdict,
+        verificationTier: confirmed.result.verificationTier ?? 'runtime_confirmed',
+        outcome: confirmed.result.outcome,
+        exchangeIds: confirmed.result.exchangeIds,
+        evidenceSha256: confirmed.result.evidenceSha256,
+        evidencePayload: confirmed.result.evidencePayload,
+      }, null, 2),
+      `replay:${specRow.id}`,
+      secrets,
+    )
+    const uniqueTitle = `${spec.title.slice(0, 150)} · ${confirmed.hypothesis.method} ${confirmed.endpoint}`.slice(0, 200)
+    const finding: Finding = {
+      id: findingId,
+      origin: spec.origin,
+      title: uniqueTitle,
+      status: 'confirmed',
+      verificationTier: 'runtime_confirmed',
+      severity: spec.severity,
+      reason: redact(confirmed.result.outcome.reason || spec.severityRationale, secrets),
+      remediation: spec.remediation,
+      impact: spec.impact,
+      recheck: spec.recheckInstructions,
+      category: spec.category,
+      cwe: spec.cwe,
+      confidence: 'high',
+      verification: `Deterministic Zero-LLM ${spec.kind} replay confirmed (controlPassed=${confirmed.result.outcome.controlPassed}), verified by the engine's own differential pass.`,
+      findingKind: 'multi_step_chain',
+      replaySpecId: specRow.id,
+      fingerprintHash: duplicate.fingerprint.hash,
+      chainFactIds: [fact.id],
+      exchangeIds: [...new Set(confirmed.exchangeIds)].slice(0, 6),
+      evidenceIds: [artifact.id],
+      scopeRevision: run.scopeRevision,
+    }
+    const saved = this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, origins)
+    this.storage.addGraphEdge(run.id, { fromKind: 'fact', fromId: fact.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
+    if (owaspCategories.includes(spec.category as OwaspCategory) && this.permitted(run, spec.origin)) {
+      this.storage.upsertCoverageEntry(run, assignment.id, {
+        origin: spec.origin,
+        category: spec.category as OwaspCategory,
+        status: 'reported',
+        summary: `Deterministic verified: ${spec.title}`,
+        linkedFindingId: saved.id,
+      })
+    }
+    this.storage.event(
+      run.id,
+      'deterministic_engine.confirmed',
+      `Deterministic engine confirmed ${confirmed.vulnClass} on ${confirmed.endpoint} (${spec.kind}, attribution=deterministic).`,
+      {
+        attribution: 'deterministic',
+        endpoint: confirmed.endpoint,
+        vulnClass: confirmed.vulnClass,
+        probeClass: confirmed.hypothesis.probeClass,
+        specKind: spec.kind,
+        findingId: saved.id,
+        exchangeCount: confirmed.exchangeIds.length,
+      },
+    )
+    return saved.id
+  }
+
+  /** Persist an unproven deterministic observation as a det_lead fact (never as a finding). */
+  private persistDeterministicLead(input: {
+    run: Run
+    assignment: Assignment
+    lead: EngineLead
+    secrets: readonly NamedSecret[]
+  }): void {
+    const { run, assignment, lead, secrets } = input
+    const hyp = lead.hypothesis
+    if (!this.permitted(run, hyp.endpoint.origin)) return
+    const canaryId = lead.probe.anomalies
+      .map(anomaly => anomaly.canaryId ?? anomaly.token ?? anomaly.canaryToken)
+      .find((value): value is string => typeof value === 'string' && value.length > 0)
+    try {
+      this.storage.addFact(run, assignment, {
+        kind: 'note',
+        origin: hyp.endpoint.origin,
+        summary: `Unverified deterministic lead (${hyp.probeClass}) on ${hyp.method} ${hyp.endpoint.pathTemplate}: ${lead.summary}`,
+        data: {
+          subkind: 'deterministic_engine_lead',
+          kind: 'det_lead',
+          attribution: 'deterministic',
+          probeClass: hyp.probeClass,
+          intent: hyp.intent,
+          endpoint: hyp.endpoint.pathTemplate,
+          method: hyp.method,
+          param: hyp.param?.name ?? null,
+          exchangeId: lead.probe.exchangeIds[0] ?? null,
+          ...(canaryId ? { canaryId } : {}),
+          reason: lead.summary,
+          verdict: lead.probe.verdict,
+          anomalies: lead.probe.anomalies.slice(0, 4),
+        },
+        exchangeIds: lead.probe.exchangeIds.slice(0, 5),
+        sourceOrigins: [hyp.endpoint.origin],
+        secrets,
+      })
+      this.storage.event(
+        run.id,
+        'deterministic_engine.lead',
+        `Unverified deterministic lead: ${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}.`,
+        { attribution: 'deterministic', endpoint: hyp.endpoint.pathTemplate, probeClass: hyp.probeClass },
+      )
+    } catch { /* lead persistence is best-effort */ }
   }
 
   private recordDeterministicFinding(input: {
