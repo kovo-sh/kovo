@@ -1670,7 +1670,7 @@ async function observeFunctionStateReadback(
     let afterJson: unknown
     try { afterJson = JSON.parse(after.body) } catch { continue }
     const delta = scalarDeltas(beforeJson, afterJson)[0]
-    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} ${readPath} control=${before.status} probe=${write.status} after=${after.status} delta=${delta ? delta.path.join('.') : 'none'} before=${before.body.slice(0, 200)} after=${after.body.slice(0, 200)}\n`)
+    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} ${readPath} before=${before.status} probe=${write.status} after=${after.status} delta=${delta ? delta.path.join('.') : 'none'}\n`)
     if (!delta) continue
     return {
       path: readPath, controlBody: variants.controlBody, probeBody: variants.probeBody,
