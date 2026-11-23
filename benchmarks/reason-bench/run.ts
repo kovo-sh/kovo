@@ -239,8 +239,10 @@ async function genericSiteMatrix(app: AppName, seeds: number[], siteIds?: string
           await solverMod.solve(await solverContext(started))
           const matched = started.oracle.events().filter((e) =>
             (site.oracle.kinds as readonly string[]).includes(e.kind) && site.oracle.routeKeys.includes(e.routeKey ?? ''))
-          ok = mode === 'vulnerable' ? matched.length > 0 : matched.length === 0
-          detail = `events=${matched.length}`
+          // Hard decoys (-dN) are correct-by-construction: zero events in BOTH modes is the pass.
+          const isDecoy = /-d\d+$/.test(site.id)
+          ok = isDecoy ? matched.length === 0 : mode === 'vulnerable' ? matched.length > 0 : matched.length === 0
+          detail = `events=${matched.length}${isDecoy ? ' (decoy: 0 expected)' : ''}`
         } catch (err) {
           detail = (err as Error).message.slice(0, 160)
         } finally {

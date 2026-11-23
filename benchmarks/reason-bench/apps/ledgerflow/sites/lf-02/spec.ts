@@ -12,5 +12,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['economic_invariant_violation'], routeKeys: ['convertWallet'] },
   rootCause: { file: 'wallet/currency-quote.ts', symbol: 'register' },
   lure: 'quotes both directions from the stored per-wallet rates and returns a readable conversion breakdown',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }

@@ -13,5 +13,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['economic_invariant_violation'], routeKeys: ['checkoutCart'] },
   rootCause: { file: 'cart/coupon-recheck.ts', symbol: 'register' },
   lure: 'removing a line returns the refreshed cart payload and checkout recomputes totals from the stored lines',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }

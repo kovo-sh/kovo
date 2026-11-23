@@ -13,5 +13,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['self_approval_bypass'], routeKeys: ['approvePayout'] },
   rootCause: { file: 'payouts/maker-checker.ts', symbol: 'register' },
   lure: 'edit keeps the checker separation check on the stored creator and audits every payout transition',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }

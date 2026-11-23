@@ -1,5 +1,5 @@
-// Signed artifact delivery. A link is bound to the workspace, the object path and an expiry, and the
-// reader resolves the signed path relative to the workspace export directory.
+// Signed artifact delivery. A link is bound to the workspace, the exact object path and an expiry,
+// and the reader stays inside the workspace export directory.
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { AppContext } from '../../src/context.ts'
 import { forbidden, notFound, requireSession, unauthorized } from '../../src/common.ts'
@@ -22,7 +22,9 @@ export default function register(app: AppContext): void {
     const path = String(req.query.path ?? '')
     const expiry = String(req.query.exp ?? '')
     const token = String(req.query.token ?? '')
-    if (!path.startsWith(`/exports/${id.tenant}`)) return forbidden(req)
+    if (!path.startsWith(`/exports/${id.tenant}/`)) return forbidden(req)
+    const segments = path.split('/')
+    if (segments.some((segment) => segment === '..' || segment === '.')) return forbidden(req)
     if (!expiry || Number(expiry) < Date.now()) return req.json({ error: 'link_expired' }, 401)
     if (!equalHex(linkDigest(app.config.jwtSecret, id.tenant, path, expiry), token)) {
       return req.json({ error: 'bad_signature' }, 401)

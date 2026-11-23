@@ -12,5 +12,5 @@ export const spec: SiteSpec = {
   oracle: { kinds: ['stale_privilege_use'], routeKeys: ['acceptInvite'] },
   rootCause: { file: 'team/invite-token.ts', symbol: 'register' },
   lure: 'checks the invite signature and matches the invite and tenant claims before creating the membership',
-  canBeDecoy: true,
+  canBeDecoy: false,
 }
