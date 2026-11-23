@@ -6070,7 +6070,10 @@ export class Execution {
       evidenceIds: [artifact.id],
       scopeRevision: run.scopeRevision,
     }
-    const saved = this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, origins)
+    const saved = this.storage.upsertChainFinding(
+      run, asset.id, finding, specRow.id, origins,
+      { provenance: 'floor', verificationClass: 'runtime_confirmed' },
+    )
     this.storage.addGraphEdge(run.id, { fromKind: 'fact', fromId: fact.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
     if (owaspCategories.includes(spec.category as OwaspCategory) && this.permitted(run, spec.origin)) {
       this.storage.upsertCoverageEntry(run, assignment.id, {
@@ -10508,10 +10511,23 @@ export class Execution {
       evidenceIds,
       scopeRevision: run.scopeRevision,
     }
+    const verificationClass = confirmed
+      ? 'runtime_confirmed'
+      : status === 'dismissed'
+        ? 'dismissed'
+        : status === 'inconclusive' || status === 'pending'
+          ? 'open_proof_gap'
+          : 'static_advisory'
+    const persistedRecord = {
+      ...record,
+      provenance: 'agent_only',
+      verificationStatus: verificationClass,
+    } as typeof record
     if (existingId) {
       this.storage.db.update(findings).set({
         verificationTier: confirmed ? 'baseline_confirmed' : null,
-        finding: record,
+        verificationClass,
+        finding: persistedRecord,
       }).where(eq(findings.id, record.id)).run()
     } else {
       this.storage.db.insert(findings).values({
@@ -10525,7 +10541,9 @@ export class Execution {
         replaySpecId: null,
         sourceOrigins: [asset.origin],
         verificationTier: confirmed ? 'baseline_confirmed' : null,
-        finding: record,
+        provenance: 'agent_only',
+        verificationClass,
+        finding: persistedRecord,
       }).run()
     }
   }

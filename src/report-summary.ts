@@ -305,6 +305,84 @@ export function collapseBaselineHeaderFindings(findings: readonly Finding[]): {
   return { findings: combined, collapsedCount, hygieneSummaries }
 }
 
+// ---------------------------------------------------------------------------
+// v6 provenance / confirmed-vs-advisory report contract
+// ---------------------------------------------------------------------------
+
+export const findingProvenances = ['floor', 'agent_only', 'chain_from_floor'] as const
+export type FindingProvenance = typeof findingProvenances[number]
+
+export const findingVerificationClasses = [
+  'runtime_confirmed', 'pending_oob', 'static_advisory', 'open_proof_gap', 'dismissed',
+] as const
+export type FindingVerificationClass = typeof findingVerificationClasses[number]
+
+/** Provenance/verification fields persisted beside a finding row (and embedded in its JSON). */
+export interface FindingProvenanceFields {
+  provenance?: FindingProvenance
+  parentFindingIds?: string[] | null
+  verificationStatus?: FindingVerificationClass
+}
+
+export type ProvenanceFinding = Finding & FindingProvenanceFields
+
+export interface ProvenanceCounts {
+  floor: number
+  agent_only: number
+  chain_from_floor: number
+  /** `agent_only + chain_from_floor`: the additive agentic increment over the floor. */
+  incremental: number
+  /** camelCase aliases consumed by scripts/certify-phase1.ts. */
+  agentOnly: number
+  chainFromFloor: number
+}
+
+export interface ReportProvenanceSurface {
+  provenanceCounts: ProvenanceCounts
+  /** Static-only, pending-OOB, open-proof-gap and dismissed items; never recall/precision TP. */
+  advisories: Finding[]
+  /** Only runtime-confirmed findings (the grader's TP pool). */
+  confirmedFindings: Finding[]
+}
+
+/** A finding is runtime-confirmed only when its status *and* verification class agree. */
+export function isRuntimeConfirmedFinding(
+  finding: Pick<Finding, 'status' | 'verificationTier'> & FindingProvenanceFields,
+): boolean {
+  if (finding.status !== 'confirmed') return false
+  const verification = finding.verificationStatus
+  if (verification !== undefined && verification !== 'runtime_confirmed') return false
+  return finding.verificationTier !== 'static_verified'
+}
+
+export function findingProvenanceOf(finding: FindingProvenanceFields): FindingProvenance {
+  return finding.provenance ?? 'agent_only'
+}
+
+export function emptyProvenanceCounts(): ProvenanceCounts {
+  return { floor: 0, agent_only: 0, chain_from_floor: 0, incremental: 0, agentOnly: 0, chainFromFloor: 0 }
+}
+
+/** Count provenance over the confirmed set and split the rest into a separate advisory bucket. */
+export function buildProvenanceReport(findings: readonly (Finding & FindingProvenanceFields)[]): ReportProvenanceSurface {
+  const counts = emptyProvenanceCounts()
+  const advisories: Finding[] = []
+  const confirmedFindings: Finding[] = []
+  for (const finding of findings) {
+    if (!isRuntimeConfirmedFinding(finding)) {
+      advisories.push(finding)
+      continue
+    }
+    confirmedFindings.push(finding)
+    const provenance = findingProvenanceOf(finding)
+    counts[provenance] += 1
+  }
+  counts.incremental = counts.agent_only + counts.chain_from_floor
+  counts.agentOnly = counts.agent_only
+  counts.chainFromFloor = counts.chain_from_floor
+  return { provenanceCounts: counts, advisories, confirmedFindings }
+}
+
 export const suppliedResponseLabel = 'Supplied response metadata'
 
 export function capabilityTierLabel(tier: CapabilityTier): string {

@@ -72,12 +72,19 @@ import type {
 import { parseDnsInventory } from '../passive-dns.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import {
+  buildProvenanceReport,
   chainFindingDedupKey,
   collapseBaselineHeaderFindings,
   deduplicateChainFindings,
   findingSeverityOrder,
   mergeChainFindings,
   suppliedResponseLabel,
+} from '../report-summary.ts'
+import type {
+  FindingProvenance,
+  FindingProvenanceFields,
+  FindingVerificationClass,
+  ReportProvenanceSurface,
 } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-judge.ts'
@@ -103,7 +110,57 @@ import type { EnvironmentMode, OriginRole, ScopePolicy } from './scope-policy.ts
 import * as tables from './schema.ts'
 
 /** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
-export const STORE_SCHEMA_VERSION = 7
+export const STORE_SCHEMA_VERSION = 8
+
+const PENDING_OOB_RE = /pending[_\s-]?oob|awaiting[_\s-]?(?:oob|callback)/i
+
+/**
+ * Hard verification invariant: a persisted finding may only be `confirmed` when its
+ * verification class is `runtime_confirmed`. Static-only proof belongs in the advisory bucket.
+ */
+export function assertConfirmedVerificationClass(
+  status: Finding['status'],
+  verificationClass: FindingVerificationClass,
+): void {
+  if (status === 'confirmed' && verificationClass !== 'runtime_confirmed') {
+    throw new Error(
+      `Invariant: confirmed findings require verification_class='runtime_confirmed' (got '${verificationClass}').`,
+    )
+  }
+}
+
+/** Derive the persisted verification class from a finding status + optional pending-OOB signal. */
+export function verificationClassForFinding(
+  finding: Pick<Finding, 'status'> & Pick<Partial<Finding>, 'runtimeProofGap' | 'verification' | 'reason' | 'verificationTier'>,
+  requested?: FindingVerificationClass,
+): FindingVerificationClass {
+  if (finding.status === 'confirmed') {
+    if (requested !== undefined && requested !== 'runtime_confirmed') {
+      assertConfirmedVerificationClass(finding.status, requested)
+    }
+    if (finding.verificationTier === 'static_verified') {
+      throw new Error(
+        "Invariant: a static_verified finding must persist with status='static_verified' and verification_class='static_advisory', never as confirmed.",
+      )
+    }
+    return 'runtime_confirmed'
+  }
+  if (finding.status === 'static_verified') return 'static_advisory'
+  if (finding.status === 'dismissed') return 'dismissed'
+  if (requested === 'pending_oob') return 'pending_oob'
+  const signal = `${finding.runtimeProofGap ?? ''} ${finding.verification ?? ''} ${finding.reason ?? ''}`
+  if (PENDING_OOB_RE.test(signal)) return 'pending_oob'
+  return requested === 'open_proof_gap' || requested === undefined ? 'open_proof_gap' : requested
+}
+
+export interface FindingProvenanceOptions {
+  /** Explicit attribution. `floor` is reserved for the deterministic floor's own confirmations. */
+  provenance?: FindingProvenance
+  /** Findings/primitives this chain was derived from; enables `chain_from_floor` attribution. */
+  parentFindingIds?: readonly string[]
+  /** Explicit verification class; confirmed + non-runtime is rejected by the store. */
+  verificationClass?: FindingVerificationClass
+}
 
 /**
  * Full-body FTS5 indexing modes (v6.2):
@@ -1152,7 +1209,9 @@ export class Store {
     const ensureColumn = (table: string, column: string, definition: string) => {
       if (!existingColumns(table).has(column)) {
         this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+        return true
       }
+      return false
     }
 
     ensureColumn('resource_samples', 'collection_path', "TEXT NOT NULL DEFAULT ''")
@@ -1166,6 +1225,29 @@ export class Store {
     ensureColumn('runs', 'environment_mode', "TEXT NOT NULL DEFAULT 'prod_readonly'")
     ensureColumn('runs', 'route_denylist', "TEXT NOT NULL DEFAULT '[]'")
     ensureColumn('assignments', 'approval_parked_at', 'INTEGER')
+
+    // v6 provenance / advisory contract (additive; safe on legacy databases).
+    const previousVersion = Number(
+      (this.client.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)?.user_version ?? 0,
+    )
+    const addedProvenance = ensureColumn(
+      'findings', 'provenance',
+      "TEXT NOT NULL DEFAULT 'agent_only' CHECK (provenance IN ('floor', 'agent_only', 'chain_from_floor'))",
+    )
+    const addedParents = ensureColumn('findings', 'parent_finding_ids', 'TEXT')
+    const addedVerificationClass = ensureColumn(
+      'findings', 'verification_class',
+      "TEXT NOT NULL DEFAULT 'runtime_confirmed' CHECK (verification_class IN ('runtime_confirmed', 'pending_oob', 'static_advisory', 'open_proof_gap', 'dismissed')) "
+      + "CHECK (json_extract(finding, '$.status') <> 'confirmed' OR verification_class = 'runtime_confirmed') "
+      + "CHECK (json_extract(finding, '$.status') <> 'confirmed' OR verification_tier IS NULL OR verification_tier <> 'static_verified')",
+    )
+    if (addedProvenance || addedParents || addedVerificationClass || previousVersion < STORE_SCHEMA_VERSION) {
+      this.backfillFindingsProvenance()
+    }
+    this.client.exec(`
+      CREATE INDEX IF NOT EXISTS findings_provenance ON findings (run_id, provenance);
+    `)
+
     if (!hadEnvironmentMode) {
       // Existing local-lab runs keep autonomous testing; every other existing run starts read-only.
       this.client.exec(`
@@ -1232,6 +1314,68 @@ export class Store {
       );
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
+  }
+
+  /**
+   * Additive backfill for pre-provenance databases:
+   *  - static/open-proof-gap findings become advisories (never confirmed),
+   *  - findings emitted by `deterministic_engine.confirmed` become `floor`.
+   * Idempotent; the CHECK constraints guard every later write.
+   */
+  private backfillFindingsProvenance() {
+    if (!this.tableExists('findings')) return
+    this.client.exec(`
+      -- A legacy "confirmed" row that was only static-verified is a static item, not a runtime
+      -- confirmation. Correct the embedded status before class backfill so it can never leak
+      -- into queryFindings()/report confirmed counts.
+      UPDATE findings
+      SET finding = json_set(finding, '$.status', 'static_verified')
+      WHERE verification_tier = 'static_verified'
+        AND json_extract(finding, '$.status') = 'confirmed';
+
+      UPDATE findings
+      SET verification_class = 'static_advisory'
+      WHERE verification_class <> 'static_advisory'
+        AND (json_extract(finding, '$.status') = 'static_verified' OR verification_tier = 'static_verified');
+
+      UPDATE findings
+      SET verification_class = 'dismissed'
+      WHERE verification_class <> 'dismissed'
+        AND json_extract(finding, '$.status') = 'dismissed';
+
+      UPDATE findings
+      SET verification_class = 'pending_oob'
+      WHERE verification_class NOT IN ('pending_oob', 'dismissed')
+        AND json_extract(finding, '$.status') IN ('pending', 'inconclusive')
+        AND lower(coalesce(json_extract(finding, '$.runtimeProofGap'), '') || ' '
+          || coalesce(json_extract(finding, '$.verification'), '') || ' '
+          || coalesce(json_extract(finding, '$.reason'), '')) GLOB '*pending*oob*';
+
+      UPDATE findings
+      SET verification_class = 'open_proof_gap'
+      WHERE verification_class = 'runtime_confirmed'
+        AND json_extract(finding, '$.status') IN ('pending', 'inconclusive');
+    `)
+    if (this.tableExists('events')) {
+      this.client.exec(`
+        UPDATE findings
+        SET provenance = 'floor'
+        WHERE provenance = 'agent_only'
+          AND EXISTS (
+            SELECT 1 FROM events e
+            WHERE e.run_id = findings.run_id
+              AND e.kind = 'deterministic_engine.confirmed'
+              AND json_extract(e.detail, '$.findingId') = findings.id
+          );
+      `)
+    }
+  }
+
+  private tableExists(table: string): boolean {
+    const row = this.client.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get(table) as { name?: string } | undefined
+    return Boolean(row?.name)
   }
 
   /** Durably record the storage/FTS configuration this DB was opened with. */
@@ -2255,7 +2399,12 @@ export class Store {
       confidenceRationale: row.confidenceRationale ?? row.finding.confidenceRationale,
       severityChangeConditions: row.severityChangeConditions ?? row.finding.severityChangeConditions,
       ...(row.codeLocations?.length ? { codeLocations: row.codeLocations } : row.finding.codeLocations?.length ? { codeLocations: row.finding.codeLocations } : {}),
-    }))
+      // The DB row is authoritative for the v6 provenance/verification contract.
+      provenance: row.provenance,
+      ...(row.parentFindingIds?.length ? { parentFindingIds: row.parentFindingIds } : {}),
+      verificationStatus: row.verificationClass,
+    } as Finding & FindingProvenanceFields))
+    const provenanceCounts = buildProvenanceReport(findings as (Finding & FindingProvenanceFields)[]).provenanceCounts
 
     const messageBase = this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
       .orderBy(asc(tables.messages.createdAt), sql`${tables.messages}.rowid`)
@@ -2311,6 +2460,7 @@ export class Store {
       replaySpecs: replaySpecs as unknown as SerializableReplaySpecRow[],
       retestRuns,
       findings,
+      provenanceCounts,
       messages,
       boardMembers: this.listBoardMembers(runId),
       boardMessages,
@@ -4011,12 +4161,26 @@ export class Store {
       confidenceRationale?: string | null
       severityChangeConditions?: string | null
       codeLocations?: CodeLocation[] | null
+      parentFindingIds?: string[] | null
+      verificationClass?: FindingVerificationClass
     },
   ): Finding {
     const existing = this.db.select().from(tables.findings).where(and(
       eq(tables.findings.runId, run.id), eq(tables.findings.id, findingId),
     )).get()
     if (!existing) throw new Error('Finding not found.')
+
+    // Floor-confirmed rows are immutable: later agent passes may add evidence elsewhere but can
+    // never overwrite, downgrade or reclassify the floor's own confirmation.
+    if (existing.provenance === 'floor') {
+      this.event(
+        run.id,
+        'finding.floor_preserved',
+        `Rejected update of floor-confirmed finding "${existing.finding.title}" (${existing.id}); floor rows are immutable.`,
+        { findingId: existing.id, provenance: 'floor' },
+      )
+      return existing.finding
+    }
 
     const mergedFinding: Finding = {
       ...existing.finding,
@@ -4042,6 +4206,21 @@ export class Store {
       ...(mergedFinding.origin ? [mergedFinding.origin] : []),
     ])]
 
+    const parentFindingIds = patch.parentFindingIds !== undefined
+      ? (patch.parentFindingIds ? [...new Set(patch.parentFindingIds)] : null)
+      : existing.parentFindingIds
+    if (mergedFinding.status === 'confirmed' && mergedFinding.verificationTier === 'static_verified') {
+      mergedFinding.verificationTier = 'runtime_confirmed'
+    }
+    const verificationClass = verificationClassForFinding(mergedFinding, patch.verificationClass)
+    assertConfirmedVerificationClass(mergedFinding.status, verificationClass)
+    const persistedFinding = {
+      ...mergedFinding,
+      provenance: existing.provenance,
+      ...(parentFindingIds?.length ? { parentFindingIds } : {}),
+      verificationStatus: verificationClass,
+    } as Finding
+
     this.db.update(tables.findings).set({
       replaySpecId: patch.replaySpecId ?? existing.replaySpecId,
       sourceOrigins: cleanOrigins,
@@ -4052,7 +4231,9 @@ export class Store {
       confidenceRationale: patch.confidenceRationale !== undefined ? patch.confidenceRationale : (mergedFinding.confidenceRationale ?? existing.confidenceRationale),
       severityChangeConditions: patch.severityChangeConditions !== undefined ? patch.severityChangeConditions : (mergedFinding.severityChangeConditions ?? existing.severityChangeConditions),
       codeLocations: patch.codeLocations !== undefined ? patch.codeLocations : (mergedFinding.codeLocations ?? existing.codeLocations),
-      finding: mergedFinding,
+      parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
+      verificationClass,
+      finding: persistedFinding,
     }).where(eq(tables.findings.id, existing.id)).run()
 
     this.event(run.id, 'finding.updated', `Updated finding "${mergedFinding.title}" (${mergedFinding.status}).`, {
@@ -4060,8 +4241,9 @@ export class Store {
       status: mergedFinding.status,
       severity: mergedFinding.severity,
       verificationTier: mergedFinding.verificationTier ?? null,
+      verificationClass,
     })
-    return mergedFinding
+    return persistedFinding
   }
 
   upsertCoverageEntry(run: Run, assignmentId: string, input: {
@@ -4175,12 +4357,59 @@ export class Store {
     return matches[0]
   }
 
+  /**
+   * Resolve monotonic provenance for a persisted finding:
+   *  - `floor` rows stay `floor`,
+   *  - `chain_from_floor` requires >=1 confirmed floor parent AND a distinct dedupe key,
+   *  - everything else is `agent_only`.
+   */
+  private resolveFindingProvenance(
+    runId: string,
+    finding: Finding,
+    targetRow: typeof tables.findings.$inferSelect | undefined,
+    requested: FindingProvenance | undefined,
+    parentFindingIds: readonly string[] | null | undefined,
+  ): FindingProvenance {
+    if (targetRow?.provenance === 'floor') return 'floor'
+    if (requested === 'floor') return 'floor'
+    if (requested === 'chain_from_floor' || (parentFindingIds?.length ?? 0) > 0) {
+      return this.chainFromFloorIsValid(runId, finding, parentFindingIds) ? 'chain_from_floor' : 'agent_only'
+    }
+    return 'agent_only'
+  }
+
+  private chainFromFloorIsValid(
+    runId: string,
+    finding: Finding,
+    parentFindingIds: readonly string[] | null | undefined,
+  ): boolean {
+    const ids = [...new Set((parentFindingIds ?? []).filter(id => typeof id === 'string' && id.length > 0))]
+    if (!ids.length) return false
+    const rows = this.db.select().from(tables.findings).where(and(
+      eq(tables.findings.runId, runId),
+      inArray(tables.findings.id, ids),
+    )).all()
+    const floorParents = rows.filter(row =>
+      row.provenance === 'floor'
+      && row.verificationClass === 'runtime_confirmed'
+      && row.finding.status === 'confirmed')
+    if (!floorParents.length) return false
+    // A chain must prove a distinct downstream target/privilege boundary: the dedupe key must
+    // differ from every floor parent, otherwise it is the same finding re-discovered.
+    const incomingKey = finding.fingerprintHash ?? chainFindingDedupKey(finding)
+    return floorParents.some(parent => {
+      const parentKey = parent.fingerprintHash ?? parent.finding.fingerprintHash ?? chainFindingDedupKey(parent.finding)
+      return parentKey !== incomingKey
+    })
+  }
+
   upsertChainFinding(
     run: Run,
     assetId: string,
     finding: Finding,
     replaySpecId: string,
     sourceOrigins: string[],
+    options: FindingProvenanceOptions = {},
   ) {
     const byId = this.db.select().from(tables.findings).where(eq(tables.findings.id, finding.id)).get()
     const dupRow = this.findDuplicateChainFinding(run.id, run.goalRevision, finding, byId?.id)
@@ -4205,9 +4434,37 @@ export class Store {
       ? (targetRow?.id === byId.id ? dupRow : byId)
       : undefined
 
+    // Monotonicity: a floor-confirmed row is immutable. An agent re-discovery of the same
+    // canonical dedupe key is suppressed as a no-op — never overwritten, never duplicated.
+    const targetIsFloor = targetRow?.provenance === 'floor'
+    if (targetIsFloor && options.provenance !== 'floor') {
+      this.event(
+        run.id,
+        'finding.floor_preserved',
+        `Ignored agent re-discovery of floor-confirmed finding "${targetRow.finding.title}" (${targetRow.id}); floor rows are immutable.`,
+        { findingId: targetRow.id, suppressedFindingId: finding.id, provenance: 'floor' },
+      )
+      return targetRow.finding
+    }
+
     const storedFinding: Finding = targetRow
       ? mergeChainFindings(targetRow.finding, incoming)
       : incoming
+
+    const parentFindingIds = options.parentFindingIds
+      ? [...new Set(options.parentFindingIds.filter(id => typeof id === 'string' && id.length > 0))]
+      : (targetRow?.parentFindingIds ?? null)
+    const provenance = this.resolveFindingProvenance(
+      run.id, storedFinding, targetRow, options.provenance, parentFindingIds,
+    )
+    const verificationClass = verificationClassForFinding(storedFinding, options.verificationClass)
+    assertConfirmedVerificationClass(storedFinding.status, verificationClass)
+    const persistedFinding = {
+      ...storedFinding,
+      provenance,
+      ...(parentFindingIds?.length ? { parentFindingIds } : {}),
+      verificationStatus: verificationClass,
+    } as Finding
 
     const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
     const cleanOrigins = [...new Set([
@@ -4225,6 +4482,10 @@ export class Store {
           : targetRow?.verificationTier ?? null)
 
     if (verificationTier) storedFinding.verificationTier = verificationTier
+    // A finding promoted to runtime-confirmed must not retain the static tier marker.
+    if (storedFinding.status === 'confirmed' && storedFinding.verificationTier === 'static_verified') {
+      storedFinding.verificationTier = 'runtime_confirmed'
+    }
 
     this.transaction(() => {
       if (targetRow) {
@@ -4238,7 +4499,10 @@ export class Store {
           confidenceRationale: storedFinding.confidenceRationale ?? targetRow.confidenceRationale ?? null,
           severityChangeConditions: storedFinding.severityChangeConditions ?? targetRow.severityChangeConditions ?? null,
           codeLocations: storedFinding.codeLocations ?? targetRow.codeLocations ?? null,
-          finding: storedFinding,
+          provenance,
+          parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
+          verificationClass,
+          finding: persistedFinding,
         }).where(eq(tables.findings.id, targetRow.id)).run()
       } else {
         this.db.insert(tables.findings).values({
@@ -4258,7 +4522,10 @@ export class Store {
           confidenceRationale: storedFinding.confidenceRationale ?? null,
           severityChangeConditions: storedFinding.severityChangeConditions ?? null,
           codeLocations: storedFinding.codeLocations ?? null,
-          finding: storedFinding,
+          provenance,
+          parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
+          verificationClass,
+          finding: persistedFinding,
         }).run()
       }
       if (targetRow) {
@@ -4284,8 +4551,10 @@ export class Store {
         origin: storedFinding.origin,
         replaySpecId: canonicalSpecId,
         deduplicated: Boolean(dupRow),
+        provenance,
+        verificationClass,
       })
-    return storedFinding
+    return persistedFinding
   }
 
   // --- Budget & Spend Tracking ---
@@ -5130,7 +5399,7 @@ export class Store {
       eq(tables.findings.runId, run.id), eq(tables.findings.goalRevision, run.goalRevision),
     )).all().flatMap(row => {
       const { assetId, checkId, caseId, findingKind, sourceOrigins, replaySpecId } = row
-      const finding: Finding = {
+      const finding: Finding & FindingProvenanceFields = {
         ...row.finding,
         verificationTier: row.verificationTier ?? row.finding.verificationTier,
         fingerprintHash: row.fingerprintHash ?? row.finding.fingerprintHash,
@@ -5139,6 +5408,9 @@ export class Store {
         confidenceRationale: row.confidenceRationale ?? row.finding.confidenceRationale,
         severityChangeConditions: row.severityChangeConditions ?? row.finding.severityChangeConditions,
         ...(row.codeLocations?.length ? { codeLocations: row.codeLocations } : row.finding.codeLocations?.length ? { codeLocations: row.finding.codeLocations } : {}),
+        provenance: row.provenance,
+        ...(row.parentFindingIds?.length ? { parentFindingIds: row.parentFindingIds } : {}),
+        verificationStatus: row.verificationClass,
       }
       const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
       if (!isStaticVerified) {
@@ -5167,6 +5439,9 @@ export class Store {
 
     const deduplicated = deduplicateChainFindings(results)
     const { findings: finalFindings } = collapseBaselineHeaderFindings(deduplicated)
+    // v6 report contract: only runtime-confirmed items count; static/open-proof-gap items are
+    // surfaced separately as advisories and can never become recall/precision TPs.
+    const reportProvenance = buildProvenanceReport(finalFindings as (Finding & FindingProvenanceFields)[])
 
     const currentSteps = snapshot.chainSteps.filter(s => s.goalRevision === run.goalRevision)
     const chainStepsCompleted = currentSteps.filter(s => s.status === 'complete').length
@@ -5217,7 +5492,7 @@ export class Store {
         updatedAt: p.updatedAt,
       }))
 
-    const body: ReportBody = {
+    const body: ReportBody & ReportProvenanceSurface = {
       goal: run.goal,
       capabilityTier: run.capabilityTier,
       scope: scope.map(({ accessPolicy: _ap, ...asset }) => asset),
@@ -5239,6 +5514,9 @@ export class Store {
       },
       coverage,
       findings: finalFindings,
+      provenanceCounts: reportProvenance.provenanceCounts,
+      confirmedFindings: reportProvenance.confirmedFindings,
+      advisories: reportProvenance.advisories,
       gaps,
     }
 

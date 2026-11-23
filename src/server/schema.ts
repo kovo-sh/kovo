@@ -383,6 +383,19 @@ export const evidence = sqliteTable('evidence', {
   createdAt: integer('created_at').notNull(),
 }, table => [index('evidence_run').on(table.runId), uniqueIndex('evidence_operation').on(table.assignmentId, table.operationId)])
 
+/** v6 provenance contract: where a persisted finding came from. */
+export const findingProvenances = ['floor', 'agent_only', 'chain_from_floor'] as const
+export type FindingProvenance = typeof findingProvenances[number]
+
+/**
+ * v6 verification contract. `confirmed` findings must be `runtime_confirmed`; static-only and
+ * open-proof-gap items are persisted as advisories and never counted as confirmed.
+ */
+export const findingVerificationClasses = [
+  'runtime_confirmed', 'pending_oob', 'static_advisory', 'open_proof_gap', 'dismissed',
+] as const
+export type FindingVerificationClass = typeof findingVerificationClasses[number]
+
 export const findings = sqliteTable('findings', {
   id: text('id').primaryKey().notNull(),
   runId: text('run_id').notNull().references(() => runs.id),
@@ -392,6 +405,9 @@ export const findings = sqliteTable('findings', {
   caseId: text('case_id').notNull().default(''),
   findingKind: text('finding_kind').$type<'baseline_check' | 'multi_step_chain'>().default('baseline_check').notNull(),
   replaySpecId: text('replay_spec_id'),
+  provenance: text('provenance').$type<FindingProvenance>().default('agent_only').notNull(),
+  parentFindingIds: text('parent_finding_ids', { mode: 'json' }).$type<string[] | null>(),
+  verificationClass: text('verification_class').$type<FindingVerificationClass>().default('runtime_confirmed').notNull(),
   sourceOrigins: text('source_origins', { mode: 'json' }).$type<string[]>().notNull(),
   verificationTier: text('verification_tier').$type<VerificationTier | null>(),
   fingerprintHash: text('fingerprint_hash'),
@@ -404,6 +420,7 @@ export const findings = sqliteTable('findings', {
 }, table => [
   index('findings_run').on(table.runId),
   index('findings_fingerprint').on(table.runId, table.fingerprintHash),
+  index('findings_provenance').on(table.runId, table.provenance),
   uniqueIndex('findings_check_case').on(table.runId, table.assetId, table.goalRevision, table.checkId, table.caseId),
 ])
 
