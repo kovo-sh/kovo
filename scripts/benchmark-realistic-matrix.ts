@@ -16,6 +16,9 @@ import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { availableParallelism } from 'node:os'
 import { resolve } from 'node:path'
+import {
+  CellReaper, ResourceGuard, cellLabel, envFlagDisabled,
+} from './benchmark-parallel.ts'
 
 interface Cell { app: string; seed: number }
 interface CellResult {
@@ -31,6 +34,7 @@ interface CellResult {
   decoyFp: number
   decoys: number
   unmatchedFp: number
+  costUsd: number
   funnel?: Record<string, number>
   error?: string
 }
@@ -39,11 +43,14 @@ type MatrixSuite = 'realistic' | 'xben-25' | 'held-out-saas'
 
 const KNOWN_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
 const KNOWN_SUITES: MatrixSuite[] = ['realistic', 'xben-25', 'held-out-saas']
+const DEFAULT_MIN_FREE_MEM_GB = 6
+const DEFAULT_MAX_ACTIVE_WORKERS = 16
 
 function parseArgs(argv: readonly string[]): {
   suite: MatrixSuite; apps: string[]; seeds: number[]; split: 'dev' | 'heldout'; concurrency: number
   outDir: string; timeoutMs: number; mode: string; profileMode: string
   maxRequests?: number; probeConcurrency?: number; verifyConcurrency?: number; slowProbes?: number
+  minFreeMemGb: number; maxActiveWorkers: number; warmWorkers: boolean
 } {
   const out = {
     suite: 'realistic' as MatrixSuite,
@@ -54,6 +61,11 @@ function parseArgs(argv: readonly string[]): {
     probeConcurrency: undefined as number | undefined,
     verifyConcurrency: undefined as number | undefined,
     slowProbes: undefined as number | undefined,
+    minFreeMemGb: Number(process.env.GUARDIAN_MATRIX_MIN_FREE_GB) > 0
+      ? Number(process.env.GUARDIAN_MATRIX_MIN_FREE_GB) : DEFAULT_MIN_FREE_MEM_GB,
+    maxActiveWorkers: Number(process.env.GUARDIAN_MATRIX_MAX_WORKERS) >= 1
+      ? Math.floor(Number(process.env.GUARDIAN_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS,
+    warmWorkers: !envFlagDisabled(process.env, 'GUARDIAN_WARM_WORKERS'),
   }
   const int = (arg: string, value: string, min: number, max: number): number => {
     const n = Number(value)
@@ -88,8 +100,11 @@ function parseArgs(argv: readonly string[]): {
       case '--probe-concurrency': out.probeConcurrency = int(arg, take(), 1, 8); break
       case '--verify-concurrency': out.verifyConcurrency = int(arg, take(), 1, 4); break
       case '--slow-probes': out.slowProbes = int(arg, take(), 0, 64); break
+      case '--min-free-gb': out.minFreeMemGb = int(arg, take(), 0, 1024); break
+      case '--max-workers': out.maxActiveWorkers = int(arg, take(), 1, 256); break
+      case '--no-warm-workers': out.warmWorkers = false; break
       case '--help': case '-h':
-        console.log('Usage: node scripts/benchmark-realistic-matrix.ts [--suite realistic|xben-25|held-out-saas] [--apps a,b] [--seeds 1,2] [--split dev|heldout] [--concurrency N] [--out-dir DIR] [--timeout-ms N] [--mode grey-box] [--profile-mode v4-full] [--max-requests N] [--probe-concurrency 1-8] [--verify-concurrency 1-4] [--slow-probes N]')
+        console.log('Usage: node scripts/benchmark-realistic-matrix.ts [--suite realistic|xben-25|held-out-saas] [--apps a,b] [--seeds 1,2] [--split dev|heldout] [--concurrency N] [--out-dir DIR] [--timeout-ms N] [--mode grey-box] [--profile-mode v4-full] [--max-requests N] [--probe-concurrency 1-8] [--verify-concurrency 1-4] [--slow-probes N] [--min-free-gb N] [--max-workers N] [--no-warm-workers]')
         process.exit(0)
         break
       default: throw new Error(`Unknown option: ${arg}`)
@@ -115,14 +130,22 @@ function readScorecard(file: string): Partial<CellResult> | null {
     return {
       confirmed: num(c.confirmed ?? c.confirmedCount), targets: num(c.targets ?? c.targetsTotal), recall: num(c.recall),
       precision: num(c.precision), decoyFp: num(c.decoyFalsePositives ?? c.falsePositiveCount), decoys: num(c.decoys ?? c.decoysTotal),
-      unmatchedFp: num(c.unmatchedFalsePositives),
+      unmatchedFp: num(c.unmatchedFalsePositives), costUsd: num(c.totalCostUsd),
       funnel: funnel && typeof funnel === 'object' ? funnel : undefined,
     }
   } catch { return null }
 }
 
-function orchestrationEnv(opts: ReturnType<typeof parseArgs>): Record<string, string> {
-  const env: Record<string, string> = { GUARDIAN_ALLOW_LOCAL_LAB: '1' }
+export function orchestrationEnv(opts: ReturnType<typeof parseArgs>, cell: Cell): Record<string, string> {
+  const id = cellLabel(opts.suite === 'realistic' ? `realistic-${cell.app}-seed${cell.seed}` : `${opts.suite}-seed${cell.seed}`)
+  const env: Record<string, string> = {
+    GUARDIAN_ALLOW_LOCAL_LAB: '1',
+    // Cell isolation: stable label + unique data dir + unique run label per cell.
+    GUARDIAN_CELL_ID: id,
+    GUARDIAN_RUN_LABEL: id,
+    GUARDIAN_DATA_DIR: resolve(opts.outDir, 'cells', id, 'data'),
+    GUARDIAN_WARM_WORKERS: opts.warmWorkers ? '1' : '0',
+  }
   if (opts.maxRequests !== undefined) env.GUARDIAN_BENCH_MAX_REQUESTS = String(opts.maxRequests)
   if (opts.probeConcurrency !== undefined) env.GUARDIAN_BENCH_PROBE_CONCURRENCY = String(opts.probeConcurrency)
   if (opts.verifyConcurrency !== undefined) env.GUARDIAN_BENCH_VERIFY_CONCURRENCY = String(opts.verifyConcurrency)
@@ -152,7 +175,7 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
   return new Promise(resolvePromise => {
     const child = spawn(process.execPath, args, {
       cwd: resolve(import.meta.dirname, '..'),
-      env: { ...process.env, ...orchestrationEnv(opts) },
+      env: { ...process.env, ...orchestrationEnv(opts, cell) },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let logText = ''
@@ -162,7 +185,7 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
     const timer = setTimeout(() => { child.kill('SIGKILL') }, opts.timeoutMs)
     child.on('error', err => {
       clearTimeout(timer)
-      resolvePromise({ app: cell.app, seed: cell.seed, ok: false, exitCode: null, runtimeMs: Date.now() - started, confirmed: 0, targets: 0, recall: 0, precision: 0, decoyFp: 0, decoys: 0, unmatchedFp: 0, error: err.message })
+      resolvePromise({ app: cell.app, seed: cell.seed, ok: false, exitCode: null, runtimeMs: Date.now() - started, confirmed: 0, targets: 0, recall: 0, precision: 0, decoyFp: 0, decoys: 0, unmatchedFp: 0, costUsd: 0, error: err.message })
     })
     child.on('close', code => {
       clearTimeout(timer)
@@ -173,7 +196,7 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
         runtimeMs: Date.now() - started,
         confirmed: score?.confirmed ?? 0, targets: score?.targets ?? 0, recall: score?.recall ?? 0,
         precision: score?.precision ?? 0, decoyFp: score?.decoyFp ?? 0, decoys: score?.decoys ?? 0,
-        unmatchedFp: score?.unmatchedFp ?? 0, funnel: score?.funnel,
+        unmatchedFp: score?.unmatchedFp ?? 0, costUsd: score?.costUsd ?? 0, funnel: score?.funnel,
         ...(code === 0 ? {} : { error: firstError ?? `exit ${code}` }),
       })
     })
@@ -195,29 +218,68 @@ async function main(): Promise<number> {
     cells.push({ app: opts.suite, seed: opts.seeds[0] ?? 42 })
   }
 
+  const cellIds = cells.map(cell => cellLabel(opts.suite === 'realistic' ? `realistic-${cell.app}-seed${cell.seed}` : `${opts.suite}-seed${cell.seed}`))
+  const reaper = new CellReaper(cellIds)
+  const guard = new ResourceGuard({
+    minFreeMemBytes: opts.minFreeMemGb * 1024 ** 3,
+    maxActiveWorkers: opts.maxActiveWorkers,
+    onPause: event => console.error(`[matrix] paused: ${event.reason} (${(event.memAvailableBytes / 1024 ** 3).toFixed(1)}GiB free, ${event.activeWorkers} workers)`),
+    onResume: event => console.error(`[matrix] resumed: ${event.reason} cleared`),
+  })
+  const startedAt = Date.now()
   const results: CellResult[] = []
   let next = 0
-  const workers = Array.from({ length: Math.min(opts.concurrency, cells.length) }, async () => {
-    while (next < cells.length) {
-      const cell = cells[next]
-      next += 1
-      const result = await runCell(cell, opts)
-      results.push(result)
-      const verdict = result.ok
-        ? `recall=${result.confirmed}/${result.targets} (${(result.recall * 100).toFixed(1)}%) precision=${(result.precision * 100).toFixed(1)}% decoyFP=${result.decoyFp}/${result.decoys} unmatchedFP=${result.unmatchedFp} funnel=${JSON.stringify(result.funnel)}`
-        : `ERROR ${result.error ?? 'failed'} exit=${result.exitCode}`
-      console.log(`[cell] ${result.app} seed=${result.seed} ${(result.runtimeMs / 1000).toFixed(1)}s ${verdict}`)
-    }
-  })
-  await Promise.all(workers)
+  let orphans = 0
+  try {
+    reaper.install()
+    const workers = Array.from({ length: Math.min(opts.concurrency, cells.length) }, async () => {
+      while (next < cells.length) {
+        const index = next
+        const cell = cells[next]
+        next += 1
+        await guard.waitForCapacity()
+        const result = await runCell(cell, opts)
+        results.push(result)
+        await reaper.reap(cellIds[index]!)
+        const verdict = result.ok
+          ? `recall=${result.confirmed}/${result.targets} (${(result.recall * 100).toFixed(1)}%) precision=${(result.precision * 100).toFixed(1)}% decoyFP=${result.decoyFp}/${result.decoys} unmatchedFP=${result.unmatchedFp}`
+          : `ERROR ${result.error ?? 'failed'} exit=${result.exitCode}`
+        console.log(`[cell] ${cellIds[index]} ${(result.runtimeMs / 1000).toFixed(1)}s ${verdict}`)
+      }
+    })
+    await Promise.all(workers)
+    orphans = await reaper.orphans()
+  } finally {
+    reaper.dispose()
+    await reaper.reapAll()
+  }
 
   results.sort((a, b) => a.app.localeCompare(b.app) || a.seed - b.seed)
   const totalConfirmed = results.reduce((n, r) => n + r.confirmed, 0)
   const totalTargets = results.reduce((n, r) => n + r.targets, 0)
   const totalDecoyFp = results.reduce((n, r) => n + r.decoyFp, 0)
   const totalUnmatched = results.reduce((n, r) => n + r.unmatchedFp, 0)
+  const totalCost = results.reduce((n, r) => n + r.costUsd, 0)
   const failures = results.filter(r => !r.ok).length
-  console.log(`[matrix] suite=${opts.suite} cells=${results.length} failed=${failures} confirmed=${totalConfirmed}/${totalTargets} recall=${totalTargets ? ((totalConfirmed / totalTargets) * 100).toFixed(1) : '0.0'}% decoyFP=${totalDecoyFp} unmatchedFP=${totalUnmatched} out=${opts.outDir}`)
+  const table = [
+    '',
+    ['cell'.padEnd(40), 'recall'.padEnd(11), 'prec'.padEnd(7), 'decoy/unmFP'.padEnd(12), 'wall'.padEnd(7), 'cost'.padEnd(8), 'status'].join(' '),
+    '-'.repeat(90),
+    ...results.map(result => [
+      (opts.suite === 'realistic' ? `realistic-${result.app}-seed${result.seed}` : `${opts.suite}-seed${result.seed}`).padEnd(40),
+      `${result.confirmed}/${result.targets}`.padEnd(11),
+      `${(result.precision * 100).toFixed(1)}%`.padEnd(7),
+      `${result.decoyFp}/${result.unmatchedFp}`.padEnd(12),
+      `${(result.runtimeMs / 1000).toFixed(1)}s`.padEnd(7),
+      `$${result.costUsd.toFixed(3)}`.padEnd(8),
+      result.ok ? 'ok' : 'FAIL',
+    ].join(' ')),
+  ].join('\n')
+  const pauses = guard.events.length
+    ? guard.events.map(e => `${e.reason}@${Math.round(e.at / 1000)}s${e.resumedAt ? `->${Math.round(e.resumedAt / 1000)}s` : '(open)'}`).join(' ')
+    : 'none'
+  console.log(table)
+  console.log(`[matrix] suite=${opts.suite} cells=${results.length} failed=${failures} concurrency=${Math.min(opts.concurrency, cells.length)} wall=${((Date.now() - startedAt) / 1000).toFixed(1)}s confirmed=${totalConfirmed}/${totalTargets} recall=${totalTargets ? ((totalConfirmed / totalTargets) * 100).toFixed(1) : '0.0'}% decoyFP=${totalDecoyFp} unmatchedFP=${totalUnmatched} cost=$${totalCost.toFixed(3)} pauses=${guard.events.length} [${pauses}] orphans=${orphans} out=${opts.outDir}`)
   return failures === 0 ? 0 : 1
 }
 

@@ -21,6 +21,9 @@ const runNamespace = 'dev.guardian.run'
 const assignmentNamespace = 'dev.guardian.assignment'
 const sessionNamespace = 'dev.guardian.session'
 const createdAtNamespace = 'dev.guardian.created-at'
+/** Matrix cells label every container so the cell reaper can remove exactly its own. */
+const cellNamespace = 'dev.guardian.cell'
+const warmNamespace = 'dev.guardian.warm'
 /** A container may legitimately sit in `created` only for the create→start instant. */
 const DEFAULT_STALE_CREATED_MS = 120_000
 const processSessionId = randomUUID()
@@ -425,17 +428,238 @@ type DockerRunner = (args: string[], signal: AbortSignal, input?: string) => Pro
 /** The real CLI executor, exported so Docker-gated tests can wrap it (e.g. force a start failure). */
 export const dockerCliRunner: DockerRunner = docker
 
+/** Session options that change the container shape; warm containers only serve exact matches. */
+export function workerOptionsSignature(options?: WorkerSessionOptions): string {
+  return JSON.stringify({
+    memoryMb: options?.memoryMb ?? null,
+    cpus: options?.cpus ?? null,
+    pidsLimit: options?.pidsLimit ?? null,
+    tmpfsMb: options?.tmpfsMb ?? null,
+    reposDir: options?.reposDir ?? null,
+  })
+}
+
+interface ContainerArgsInput {
+  image: string
+  name: string
+  assignmentId: string
+  extraArgs?: string[]
+  runLabel: string
+  owner?: string
+  cell?: string
+  warm?: boolean
+  options?: WorkerSessionOptions
+}
+
+function resolveReposMountArgs(reposDir?: string): string[] {
+  if (!reposDir) return []
+  if (/[\0,\r\n]/.test(reposDir)) {
+    throw new Error('Invalid repository mount path.')
+  }
+  if (!existsSync(reposDir)) return []
+  const st = statSync(reposDir)
+  if (!st.isDirectory()) {
+    throw new Error('Repository mount path must be an existing directory.')
+  }
+  const resolved = realpathSync(reposDir)
+  if (/[\0,\r\n]/.test(resolved)) {
+    throw new Error('Invalid resolved repository mount path.')
+  }
+  return ['--mount', `type=bind,source=${resolved},target=/repos,readonly`]
+}
+
+/**
+ * The single container-create argument builder (cold and warm-pool containers share it, so
+ * security flags can never drift between the two paths).
+ */
+export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
+  // Default 1536m RAM, 2.0 CPU, 256 PIDs (ceiling: 4096m / 4.0 / 384)
+  const options = input.options
+  const memoryMb = Math.round(clamp(options?.memoryMb, 1536, 512, 4096))
+  const cpus = Number(clamp(options?.cpus, 2.0, 0.5, 4.0).toFixed(2))
+  const pidsLimit = Math.round(clamp(options?.pidsLimit, 256, 64, 384))
+  const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 512))
+  return [
+    // No `--rm`: Docker's automatic removal races the explicit `rm --force` below and the
+    // daemon answers "removal of container ... is already in progress", which previously
+    // surfaced as a failed worker session. Explicit removal is the single mechanism.
+    'container', 'create', '--name', input.name, '--interactive', '--pull', 'never',
+    '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges',
+    '--pids-limit', String(pidsLimit),
+    '--cpus', String(cpus),
+    '--memory', `${memoryMb}m`, '--memory-swap', `${memoryMb}m`,
+    '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
+    ...resolveReposMountArgs(options?.reposDir),
+    '--label', `${assignmentNamespace}=` + input.assignmentId,
+    '--label', `${runNamespace}=${input.runLabel}`,
+    ...(input.owner ? ['--label', `${workerNamespace}=${input.owner}`] : []),
+    ...(input.cell ? ['--label', `${cellNamespace}=${input.cell}`] : []),
+    ...(input.warm ? ['--label', `${warmNamespace}=1`] : []),
+    '--label', `${sessionNamespace}=${processSessionId}`,
+    '--label', `${createdAtNamespace}=` + Date.now(),
+    input.image,
+    ...(input.extraArgs ?? []),
+  ]
+}
+
+/** Warm-pool escape hatch: `GUARDIAN_WARM_WORKERS=0` (or false/off) disables pooling. */
+export function warmWorkersEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.GUARDIAN_WARM_WORKERS
+  return value !== '0' && value !== 'false' && value !== 'off'
+}
+
+/**
+ * One pool per (cell, image) per process: Execution may construct more than one backend, and a
+ * cell must not accumulate one idle container per backend.
+ */
+const warmPools = new Map<string, WarmWorkerPool>()
+function sharedWarmPool(input: {
+  cell: string
+  image: string
+  dockerRunner: DockerRunner
+  runLabel: string
+  owner?: string
+}): WarmWorkerPool {
+  const key = `${input.cell}\0${input.image}`
+  const existing = warmPools.get(key)
+  if (existing) return existing
+  const pool = new WarmWorkerPool(input)
+  warmPools.set(key, pool)
+  return pool
+}
+
+/**
+ * Best-effort warm session pool: one pre-created `--session` container per cell. The container is
+ * never started until a session takes it; after the session ends it is removed and a fresh one is
+ * pre-created for the next assignment (tmpfs scratch is therefore fresh every time). Any create
+ * failure disables the pool and callers fall back to the cold create path unchanged.
+ */
+export class WarmWorkerPool {
+  readonly cell: string
+  private readonly image: string
+  private readonly docker: DockerRunner
+  private readonly runLabel: string
+  private readonly owner?: string
+  private readonly options: WorkerSessionOptions
+  private readonly signature: string
+  private ready?: string
+  private pending?: Promise<string | null>
+  private disabled = false
+  private closed = false
+  private prewarmed = 0
+  private failures = 0
+
+  constructor(input: {
+    cell: string
+    image: string
+    dockerRunner: DockerRunner
+    runLabel: string
+    owner?: string
+    options?: WorkerSessionOptions
+  }) {
+    this.cell = input.cell
+    this.image = input.image
+    this.docker = input.dockerRunner
+    this.runLabel = input.runLabel
+    this.owner = input.owner
+    this.options = { ...(input.options ?? {}) }
+    delete this.options.reposDir
+    this.signature = workerOptionsSignature(this.options)
+  }
+
+  get enabled(): boolean { return !this.disabled && !this.closed }
+  get state(): 'warming' | 'ready' | 'disabled' | 'closed' {
+    if (this.closed) return 'closed'
+    if (this.disabled) return 'disabled'
+    return this.ready ? 'ready' : 'warming'
+  }
+  get stats(): { state: string; prewarmed: number; failures: number } {
+    return { state: this.state, prewarmed: this.prewarmed, failures: this.failures }
+  }
+
+  /** Ensure one idle session container exists; resolves to its name or null. */
+  warm(): Promise<string | null> {
+    if (!this.enabled) return Promise.resolve(null)
+    if (this.ready) return Promise.resolve(this.ready)
+    if (this.pending) return this.pending
+    const name = 'guardian-' + randomUUID()
+    this.pending = (async () => {
+      try {
+        await this.docker(workerContainerCreateArgs({
+          image: this.image,
+          name,
+          assignmentId: `warm-${randomUUID()}`,
+          extraArgs: ['--session'],
+          runLabel: this.runLabel,
+          ...(this.owner ? { owner: this.owner } : {}),
+          cell: this.cell,
+          warm: true,
+          options: this.options,
+        }), AbortSignal.timeout(15_000))
+        if (this.closed) {
+          await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+          return null
+        }
+        trackLiveContainer(name)
+        this.ready = name
+        this.prewarmed += 1
+        return name
+      } catch (error) {
+        this.failures += 1
+        this.disabled = true
+        if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+          console.error('[worker-pool] prewarm failed; falling back to cold create:', error instanceof Error ? error.message.slice(0, 160) : String(error))
+        }
+        return null
+      } finally {
+        this.pending = undefined
+      }
+    })()
+    return this.pending
+  }
+
+  /** Take the idle container when it matches the caller's session shape; null means cold create. */
+  async take(signal: AbortSignal, options?: WorkerSessionOptions): Promise<string | null> {
+    if (!this.enabled) return null
+    if (workerOptionsSignature(options) !== this.signature) return null
+    const name = this.ready ?? await this.warm()
+    signal.throwIfAborted()
+    if (!name || this.ready !== name) return null
+    this.ready = undefined
+    liveContainers.delete(name)
+    void this.warm()
+    return name
+  }
+
+  /** Container left the pool (session ended): it is already removed; prewarm a replacement. */
+  recycled(): void { void this.warm() }
+
+  async close(): Promise<void> {
+    this.closed = true
+    const name = this.ready
+    this.ready = undefined
+    if (name) {
+      liveContainers.delete(name)
+      await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+    }
+  }
+}
+
 export class LinuxWorkerBackend implements WorkerBackend {
   private readonly image: string
   private readonly owner?: string
   private readonly runId?: string
+  private readonly cell?: string
   private readonly docker: DockerRunner
   private readonly staleCreatedMs: number
+  private readonly warmPool?: WarmWorkerPool
+  private readonly pooled = new Set<string>()
   private readonly activeContainers = new Set<string>()
   private readonly removals = new Map<string, Promise<void>>()
   private reclaiming?: Promise<void>
 
-  constructor({ image = 'guardian-worker:v4', workspace, runId, dockerRunner, staleCreatedMs }: {
+  constructor({ image = 'guardian-worker:v4', workspace, runId, dockerRunner, staleCreatedMs, cell }: {
     image?: string
     workspace?: { id: string; directory: string }
     runId?: string
@@ -443,14 +667,37 @@ export class LinuxWorkerBackend implements WorkerBackend {
     dockerRunner?: DockerRunner
     /** Grace before an abandoned `created` container is reclaimed (default 2 min). */
     staleCreatedMs?: number
+    /**
+     * Matrix cell id (default: `GUARDIAN_CELL_ID`). Labels every container `dev.guardian.cell`
+     * and enables the best-effort warm session pool unless `GUARDIAN_WARM_WORKERS=0`.
+     */
+    cell?: string
   } = {}) {
     this.image = image
     this.runId = runId
     this.docker = dockerRunner ?? docker
     this.staleCreatedMs = Math.max(0, staleCreatedMs ?? DEFAULT_STALE_CREATED_MS)
+    const cellId = cell ?? process.env.GUARDIAN_CELL_ID
+    this.cell = cellId && cellId.trim() ? cellId.trim() : undefined
     if (workspace) {
       this.owner = createHash('sha256').update(workspace.id).update('\0').update(realpathSync(workspace.directory)).digest('hex')
     }
+    if (this.cell && warmWorkersEnabled()) {
+      this.warmPool = sharedWarmPool({
+        cell: this.cell,
+        image: this.image,
+        dockerRunner: this.docker,
+        runLabel: this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`),
+        ...(this.owner ? { owner: this.owner } : {}),
+      })
+      // Kick the first create early; failure only disables the pool (cold path remains).
+      void this.warmPool.warm()
+    }
+  }
+
+  /** Warm-pool state (test/diagnostic seam; never contains secrets). */
+  get warmPoolStats(): { state: string; prewarmed: number; failures: number } | undefined {
+    return this.warmPool?.stats
   }
 
   /**
@@ -484,6 +731,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (existing) return existing
     const removal = this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000))
       .then(() => undefined, () => undefined)
+      .then(() => {
+        // A pool-issued container was consumed by a session: replace it so the next assignment
+        // starts without a create round-trip. Recycling is best-effort and never blocks removal.
+        if (this.pooled.delete(name)) this.warmPool?.recycled()
+      })
       .finally(() => { this.removals.delete(name) })
     this.removals.set(name, removal)
     return removal
@@ -554,52 +806,20 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await this.docker(['container', 'rm', '--force', ...inactive], signal).catch(() => undefined)
   }
 
-  private resolveReposMountArgs(reposDir?: string): string[] {
-    if (!reposDir) return []
-    if (/[\0,\r\n]/.test(reposDir)) {
-      throw new Error('Invalid repository mount path.')
-    }
-    if (!existsSync(reposDir)) return []
-    const st = statSync(reposDir)
-    if (!st.isDirectory()) {
-      throw new Error('Repository mount path must be an existing directory.')
-    }
-    const resolved = realpathSync(reposDir)
-    if (/[\0,\r\n]/.test(resolved)) {
-      throw new Error('Invalid resolved repository mount path.')
-    }
-    return ['--mount', `type=bind,source=${resolved},target=/repos,readonly`]
-  }
-
   private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions) {
     // Every container is attributable even when the caller did not supply a run id:
     // `run` falls back to the workspace hash or this process's ad-hoc session.
     const runLabelValue = this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`)
-    // Default 1536m RAM, 2.0 CPU, 256 PIDs (ceiling: 4096m / 4.0 / 384)
-    const memoryMb = Math.round(clamp(options?.memoryMb, 1536, 512, 4096))
-    const cpus = Number(clamp(options?.cpus, 2.0, 0.5, 4.0).toFixed(2))
-    const pidsLimit = Math.round(clamp(options?.pidsLimit, 256, 64, 384))
-    const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 512))
-    return [
-      // No `--rm`: Docker's automatic removal races the explicit `rm --force` below and the
-      // daemon answers "removal of container ... is already in progress", which previously
-      // surfaced as a failed worker session. Explicit removal is the single mechanism.
-      'container', 'create', '--name', name, '--interactive', '--pull', 'never',
-      '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
-      '--security-opt', 'no-new-privileges',
-      '--pids-limit', String(pidsLimit),
-      '--cpus', String(cpus),
-      '--memory', `${memoryMb}m`, '--memory-swap', `${memoryMb}m`,
-      '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
-      ...this.resolveReposMountArgs(options?.reposDir),
-      '--label', `${assignmentNamespace}=` + assignmentId,
-      '--label', `${runNamespace}=${runLabelValue}`,
-      ...(this.owner ? ['--label', `${workerNamespace}=${this.owner}`] : []),
-      '--label', `${sessionNamespace}=${processSessionId}`,
-      '--label', `${createdAtNamespace}=` + Date.now(),
-      this.image,
-      ...extraArgs,
-    ]
+    return workerContainerCreateArgs({
+      image: this.image,
+      name,
+      assignmentId,
+      extraArgs,
+      runLabel: runLabelValue,
+      ...(this.owner ? { owner: this.owner } : {}),
+      ...(this.cell ? { cell: this.cell } : {}),
+      ...(options ? { options } : {}),
+    })
   }
 
   async run(rawJob: WorkerJob, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerResult> {
@@ -656,16 +876,23 @@ export class LinuxWorkerBackend implements WorkerBackend {
     signal.throwIfAborted()
     await this.reclaimInactive()
     signal.throwIfAborted()
-    const name = 'guardian-' + randomUUID()
+    // Warm pool first (best-effort): a pre-created session container skips the create
+    // round-trip. Mismatched options or an unavailable pool fall back to the cold path.
+    const warm = this.warmPool ? await this.warmPool.take(signal, options) : null
+    const pooled = warm !== null
+    const name = warm ?? 'guardian-' + randomUUID()
+    if (pooled) this.pooled.add(name)
     this.activeContainers.add(name)
     trackLiveContainer(name)
-    try {
-      await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
-    } catch (error) {
-      await this.removeContainer(name)
-      this.activeContainers.delete(name)
-      liveContainers.delete(name)
-      throw error
+    if (!pooled) {
+      try {
+        await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+      } catch (error) {
+        await this.removeContainer(name)
+        this.activeContainers.delete(name)
+        liveContainers.delete(name)
+        throw error
+      }
     }
 
     let cli: ChildProcess
