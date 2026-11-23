@@ -1248,6 +1248,9 @@ export class Execution {
   private readonly laneWallByRun = new Map<string, number>()
   /** runId → first agent dispatch time after Phase A, for phase-timing telemetry. */
   private readonly agenticFloorDispatchedAt = new Map<string, number>()
+  /** runId → Phase A window (start/finish), retained for finalize-time summaries. */
+  private readonly agenticFloorStartedAt = new Map<string, number>()
+  private readonly agenticFloorFinishedAt = new Map<string, number>()
   private readonly detLeadConsumed = new Set<string>()
   private readonly detLeadStepKeys = new Set<string>()
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
@@ -4246,6 +4249,7 @@ export class Execution {
     }
     this.agenticLaneJobs.set(run.id, holder)
     this.laneStartedAt.set(run.id, Date.now())
+    this.agenticFloorStartedAt.set(run.id, Date.now())
     const deadlineMs = this.deterministicLaneDeadlineMs()
     try {
       this.storage.event(
@@ -4275,6 +4279,7 @@ export class Execution {
         this.agenticLaneJobs.delete(run.id)
         this.agenticLaneStopping.delete(run.id)
         this.agenticLaneCompleted.add(key)
+        this.agenticFloorFinishedAt.set(run.id, Date.now())
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
         try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         this.laneStartedAt.delete(run.id)
@@ -4365,16 +4370,19 @@ export class Execution {
     const startedAt = this.laneStartedAt.get(runId)
     const laneWallMs = startedAt ? Math.max(0, Date.now() - startedAt) : (this.laneWallByRun.get(runId) ?? 0)
     if (startedAt) this.laneWallByRun.set(runId, laneWallMs)
+    const floorStartedAt = this.agenticFloorStartedAt.get(runId) ?? startedAt ?? null
+    const floorFinishedAt = this.agenticFloorFinishedAt.get(runId)
+      ?? (floorStartedAt !== null ? floorStartedAt + laneWallMs : null)
     const preservationRatio = floorStandaloneExpected > 0
       ? Number((floorConfirmed / floorStandaloneExpected).toFixed(4))
       : (floorConfirmed > 0 ? 1 : 0)
     const dispatchedAt = this.agenticFloorDispatchedAt.get(runId)
     const phaseTimings = {
-      floorStartedAt: startedAt ?? null,
-      floorFinishedAt: startedAt ? startedAt + laneWallMs : null,
-      floorMs: laneWallMs,
+      floorStartedAt,
+      floorFinishedAt,
+      floorMs: floorStartedAt !== null && floorFinishedAt !== null ? Math.max(0, floorFinishedAt - floorStartedAt) : laneWallMs,
       agentDispatchAt: dispatchedAt ?? null,
-      dispatchAfterFloorMs: dispatchedAt && startedAt ? Math.max(0, dispatchedAt - (startedAt + laneWallMs)) : null,
+      dispatchAfterFloorMs: dispatchedAt && floorFinishedAt ? Math.max(0, dispatchedAt - floorFinishedAt) : null,
     }
     const detail = {
       reason,
@@ -4730,7 +4738,7 @@ export class Execution {
     // starved by specialist request/rate/budget pressure.
     try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
     if (this.startDeterministicLane(run, profiles)) return
-    this.agenticFloorDispatchedAt.set(run.id, Date.now())
+    if (!this.agenticFloorDispatchedAt.has(run.id)) this.agenticFloorDispatchedAt.set(run.id, Date.now())
 
     // Round-1 lead seeding: the floor's unproven det_lead signals become prioritized upgrade
     // assignments even before the planner's first LLM turn, so `floorLeadsEmitted > 0` can never
