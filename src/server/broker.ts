@@ -21,6 +21,8 @@ import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
+import { evaluateScopeRequest, isVerifiedReadOnlyGraphqlQuery, originRoleFor } from './scope-policy.ts'
+import type { ScopeHook, ScopePolicy } from './scope-policy.ts'
 import {
   createHttpTransport,
   extractTlsMetadata,
@@ -89,6 +91,8 @@ export interface BrokerHttpRequest {
   assignmentId?: string
   scopeRevision?: number
   followRedirects?: boolean
+  /** v6: explicit staging setup/cleanup hook context (scope-policy). */
+  scopeHook?: ScopeHook
   secrets?: readonly NamedSecret[]
   maxBodyBytes?: number
   timeoutMs?: number
@@ -283,6 +287,17 @@ export type Grant = {
   canaryBroker?: CanaryBroker
   mintCanary?: (purpose: string, origin?: string) => { httpUrl?: string; url?: string } | null
   canRead: (origin: string) => boolean
+  /**
+   * v6 Layer-1 three-tier scope + environment contract. When supplied, auth/asset origins are
+   * reachable only through their narrow verbs and `prod_readonly`/`staging_isolated` decide
+   * mutations without per-request approval. Omitted grants keep legacy v5 behavior exactly.
+   */
+  scopePolicy?: ScopePolicy
+  /**
+   * Durable, route-scoped operator lease (Run approval_leases). A match authorizes the normalized
+   * route across probe iterations and replays; it never widens origin scope.
+   */
+  approvalLeases?: (origin: string, method: string, pathAndQuery: string) => boolean
   /**
    * @deprecated Never consulted for authorization. Tier-3 state changes are always authorized by
    * `isStateChangeApproved`; a path-substring "idempotent POST" predicate must not skip approvals.
@@ -2241,6 +2256,21 @@ export class RequestBroker {
     }
   }
 
+  /**
+   * Origin reachability for grants that carry a v6 scope policy. Target origins still require the
+   * run's `canRead` allowlist; auth/asset origins are transit-only and their allowed verbs are
+   * enforced by `evaluateScopeRequest` at the request boundary. Without a policy this is the
+   * unchanged v5 `canRead` check.
+   */
+  private originInGrantScope(grant: Grant, origin: string): boolean {
+    if (grant.scopePolicy) {
+      const role = originRoleFor(grant.scopePolicy, origin)
+      if (!role) return false
+      if (role === 'auth' || role === 'asset') return true
+    }
+    return grant.canRead(origin)
+  }
+
   private async resolveAndCheckAddresses(hostname: string, grant: Grant, deadline: AbortSignal, originForAudit: string): Promise<PublicAddress[]> {
     const resolve = this.options.resolve ?? ((host: string) => lookup(host, { all: true, order: 'verbatim' }))
     const addresses = await withAbort(resolve(hostname), deadline)
@@ -2282,7 +2312,10 @@ export class RequestBroker {
     }
     const check = () => {
       deadline.throwIfAborted()
-      if (!safeUrl(url, false, localLab, grant.allowedPorts) || !grant.canRead(url.origin)) {
+      if (grant.scopePolicy && originRoleFor(grant.scopePolicy, url.origin) !== 'target') {
+        deny('Passive root discovery is only permitted for target origins.')
+      }
+      if (!safeUrl(url, false, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, url.origin)) {
         deny('Destination is outside the current assignment scope.')
       }
     }
@@ -2371,7 +2404,7 @@ export class RequestBroker {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Request path escaped the requested origin.')
     }
-    if (!safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(initialOrigin)) {
+    if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
       this.purgeSessionJars(undefined, initialOrigin)
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Destination is outside the current assignment scope.')
@@ -2477,7 +2510,48 @@ export class RequestBroker {
       .find(([k]) => k.toLowerCase() === 'content-encoding')?.[1] ?? ''
     const hasMultipartContentType = /^\s*multipart\//i.test(callerContentType)
     const hasCompressedBody = callerContentEncoding.trim() !== '' && !/^identity$/i.test(callerContentEncoding.trim())
-    if (!isReadOnlyMethod || hasMultipart) {
+
+    // v6 Layer-1: one policy decision for every request shape (including reads, so active probing
+    // of auth/asset origins is refused here rather than only in the mutation gate).
+    let contractApproved = false
+    if (grant.scopePolicy) {
+      const decision = evaluateScopeRequest(grant.scopePolicy, {
+        origin: initialOrigin,
+        method: req.method,
+        pathAndQuery: req.pathAndQuery,
+        body: req.body ?? null,
+        headers: req.headers,
+        hook: req.scopeHook ?? null,
+      })
+      const contractApplies = grant.scopePolicy.mode !== 'ephemeral_lab'
+      if (decision.allowed) {
+        // Ephemeral labs keep the legacy approval flow unless an operator granted a durable lease.
+        contractApproved = contractApplies ||
+          (!isReadOnlyMethod && grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true)
+      } else {
+        // A durable operator lease may authorize a route the environment contract would otherwise
+        // refuse. It can never widen origin scope or permit active auth/asset probing.
+        const leaseEligible = contractApplies &&
+          decision.code !== 'out_of_scope' &&
+          decision.code !== 'auth_origin_active_probe' &&
+          decision.code !== 'asset_origin_active_probe'
+        const leased = leaseEligible &&
+          grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+        if (!leased) {
+          grant.audit('denied', initialOrigin)
+          throw new BrokerDenied(decision.reason)
+        }
+        contractApproved = true
+      }
+      const verifiedGraphqlRead = req.method === 'POST' &&
+        isVerifiedReadOnlyGraphqlQuery(req.pathAndQuery, req.body ?? null, req.headers)
+      if (contractApproved && !isReadOnlyMethod && !verifiedGraphqlRead && tier < 3) {
+        grant.audit('denied', initialOrigin)
+        throw new BrokerDenied(`Method ${req.method} requires Tier 3 (approval-gated state validation).`)
+      }
+    }
+
+    if (!contractApproved && (!isReadOnlyMethod || hasMultipart)) {
       // The only pre-approval fast path is the explicit Tier-2 sandbox write allowlist (an operator
       // configuration), never a caller-supplied path heuristic. Every other non-GET/HEAD request
       // goes through the exact-fingerprint approval hook.
@@ -2855,7 +2929,7 @@ export class RequestBroker {
     }
     const check = () => {
       deadline.throwIfAborted()
-      if (!safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(url.origin)) {
+      if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, url.origin)) {
         this.purgeSessionJars(undefined, url.origin)
         deny('Destination is outside the current assignment scope.')
       }
@@ -2870,6 +2944,32 @@ export class RequestBroker {
       if (activeMethod === 'GET' || activeMethod === 'HEAD' ||
           (activeMethod === 'OPTIONS' && (activeBody === undefined || activeBody === ''))) return
       const targetPathAndQuery = `${target.pathname}${target.search}`
+      if (grant.scopePolicy) {
+        const decision = evaluateScopeRequest(grant.scopePolicy, {
+          origin: target.origin,
+          method: activeMethod,
+          pathAndQuery: targetPathAndQuery,
+          body: bodyForHop ?? null,
+          headers: cleanHeaders,
+          redirectHop: true,
+          hook: req.scopeHook ?? null,
+        })
+        if (!decision.allowed) {
+          const leaseEligible = grant.scopePolicy.mode !== 'ephemeral_lab' &&
+            decision.code !== 'out_of_scope' &&
+            decision.code !== 'auth_origin_active_probe' &&
+            decision.code !== 'asset_origin_active_probe'
+          const leased = leaseEligible &&
+            grant.approvalLeases?.(target.origin, activeMethod, targetPathAndQuery) === true
+          if (!leased) {
+            grant.audit('denied', target.origin)
+            throw new BrokerDenied(decision.reason)
+          }
+        } else if (grant.scopePolicy.mode !== 'ephemeral_lab') {
+          // Environment contract authorized the redirect target; no per-request approval popup.
+          return
+        }
+      }
       const multipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
       const context: StateChangeApprovalContext = {
         personaHandle: includePersona ? (personaHandle ?? null) : null,
@@ -3224,7 +3324,7 @@ export class RequestBroker {
     const uniqueOrigins = new Set<string>()
     for (const req of reqs) {
       const origin = new URL(req.origin).origin
-      if (!grant.canRead(origin)) {
+      if (!this.originInGrantScope(grant, origin)) {
         grant.audit('denied', origin)
         throw new BrokerDenied(`Origin ${origin} is outside the current assignment scope.`)
       }
@@ -3362,7 +3462,11 @@ export class RequestBroker {
     const tier = grant.tier ?? 1
     if (tier === 0) throw new BrokerDenied('Live DNS inspection is disabled in Tier 0 (offline prepared mode).')
     const parsed = new URL(origin)
-    if (!grant.canRead(parsed.origin)) {
+    if (grant.scopePolicy && originRoleFor(grant.scopePolicy, parsed.origin) !== 'target') {
+      grant.audit('denied', parsed.origin)
+      throw new BrokerDenied('Passive DNS/TLS inspection is only permitted for target origins.')
+    }
+    if (!this.originInGrantScope(grant, parsed.origin)) {
       grant.audit('denied', parsed.origin)
       throw new BrokerDenied('Destination is outside the current assignment scope.')
     }
@@ -3405,7 +3509,8 @@ export class RequestBroker {
     const tier = grant.tier ?? 1
     if (tier === 0) throw new BrokerDenied('Live TLS inspection is disabled in Tier 0 (offline prepared mode).')
     const parsed = new URL(origin)
-    if (parsed.protocol !== 'https:' || !grant.canRead(parsed.origin)) {
+    if (parsed.protocol !== 'https:' || !this.originInGrantScope(grant, parsed.origin) ||
+        (grant.scopePolicy && originRoleFor(grant.scopePolicy, parsed.origin) !== 'target')) {
       grant.audit('denied', parsed.origin)
       throw new BrokerDenied('TLS inspection requires an approved HTTPS origin.')
     }
@@ -3458,9 +3563,13 @@ export class RequestBroker {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('WebSocket path is invalid or exceeds Guardian 8 KiB limit.')
     }
-    if (url.origin !== initialOrigin || !safeUrl(url, true, localLab, grant.allowedPorts) || !grant.canRead(initialOrigin)) {
+    if (url.origin !== initialOrigin || !safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('WebSocket destination is outside the current assignment scope.')
+    }
+    if (grant.scopePolicy && originRoleFor(grant.scopePolicy, initialOrigin) !== 'target') {
+      grant.audit('denied', initialOrigin)
+      throw new BrokerDenied('WebSocket sessions are only permitted for target origins.')
     }
 
     const sendMessages = (req.sendMessages ?? []).slice(0, hardWsMaxFrames)

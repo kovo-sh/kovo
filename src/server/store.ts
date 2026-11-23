@@ -87,6 +87,17 @@ import type { NamedSecret, SecretMatch } from './redact.ts'
 import { responseCapture, restrictAccessVerification } from './report-evidence.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks } from './review-plan.ts'
+import {
+  defaultEnvironmentMode,
+  environmentModes,
+  isProvenanceOriginAllowed,
+  normalizeScopeOrigin,
+  originRoles,
+  provenanceOriginsFor,
+  routePatternForPath,
+  tenantTagForRun,
+} from './scope-policy.ts'
+import type { EnvironmentMode, OriginRole, ScopePolicy } from './scope-policy.ts'
 import * as tables from './schema.ts'
 
 /** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
@@ -104,6 +115,7 @@ export type GraphEdge = typeof tables.graphEdges.$inferSelect
 export type GraphDigest = typeof tables.graphDigests.$inferSelect
 export type BrokerExchange = typeof tables.brokerExchanges.$inferSelect
 export type ApprovalRequest = typeof tables.approvalRequests.$inferSelect
+export type ApprovalLeaseRow = typeof tables.approvalLeases.$inferSelect
 export type ReplaySpecRow = typeof tables.replaySpecs.$inferSelect
 export type RetestRun = typeof tables.retestRuns.$inferSelect
 export type CoverageEntry = typeof tables.coverageEntries.$inferSelect
@@ -989,6 +1001,22 @@ export class Store {
     ensureColumn('resource_samples', 'collection_path', "TEXT NOT NULL DEFAULT ''")
     this.client.exec("UPDATE resource_samples SET collection_path = '' WHERE collection_path IS NULL")
 
+    // v6 Phase 2 Layer-1 scope + environment contract (additive).
+    // The legacy approved-candidate allowlist stays the target tier; auth/asset tiers are additive.
+    const hadEnvironmentMode = existingColumns('runs').has('environment_mode')
+    ensureColumn('runs', 'auth_origins', "TEXT NOT NULL DEFAULT '[]'")
+    ensureColumn('runs', 'asset_origins', "TEXT NOT NULL DEFAULT '[]'")
+    ensureColumn('runs', 'environment_mode', "TEXT NOT NULL DEFAULT 'prod_readonly'")
+    ensureColumn('runs', 'route_denylist', "TEXT NOT NULL DEFAULT '[]'")
+    ensureColumn('assignments', 'approval_parked_at', 'INTEGER')
+    if (!hadEnvironmentMode) {
+      // Existing local-lab runs keep autonomous testing; every other existing run starts read-only.
+      this.client.exec(`
+        UPDATE runs SET environment_mode = 'ephemeral_lab'
+        WHERE project_id IN (SELECT id FROM projects WHERE environment = 'local-lab')
+      `)
+    }
+
     const desiredColumns = ['run_id', 'owner_persona', 'origin', 'collection_path', 'resource_key']
     const currentColumns = (this.client.prepare('PRAGMA index_info(resource_samples_key)').all() as Array<{ name: string }>)
       .map(row => row.name)
@@ -1012,6 +1040,27 @@ export class Store {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS lab_containers_name ON lab_containers (run_id, container_name);
       CREATE INDEX IF NOT EXISTS lab_containers_run ON lab_containers (run_id, status);
+
+      CREATE TABLE IF NOT EXISTS approval_leases (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        scope_revision INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        method TEXT NOT NULL,
+        route_pattern TEXT NOT NULL,
+        persona_handle TEXT,
+        status TEXT NOT NULL,
+        source_approval_id TEXT,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        uses INTEGER NOT NULL DEFAULT 0,
+        last_used_at INTEGER
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS approval_leases_route
+        ON approval_leases (run_id, origin, method, route_pattern, scope_revision);
+      CREATE INDEX IF NOT EXISTS approval_leases_run ON approval_leases (run_id, status);
 
       CREATE INDEX IF NOT EXISTS broker_exchanges_run_created ON broker_exchanges (run_id, created_at);
       CREATE INDEX IF NOT EXISTS facts_run_created ON facts (run_id, created_at);
@@ -1263,7 +1312,10 @@ export class Store {
         const placeholders = runIds.map(() => '?').join(', ')
         const requeued = this.client.prepare(
           `UPDATE assignments SET status = 'queued', lease = NULL, lease_expires_at = NULL
-           WHERE run_id IN (${placeholders}) AND status IN ('running', 'waiting_approval', 'paused')`,
+           WHERE run_id IN (${placeholders}) AND (
+             status IN ('running', 'paused')
+             OR (status = 'waiting_approval' AND approval_parked_at IS NULL)
+           )`,
         ).run(...runIds) as { changes?: number }
         report.requeuedAssignments = Number(requeued.changes ?? 0)
 
@@ -1402,6 +1454,89 @@ export class Store {
   private approvedOriginsFor(run: Run): Set<string> {
     const approved = new Set(run.approved)
     return new Set(run.candidates.filter(candidate => approved.has(candidate.id)).map(candidate => candidate.origin))
+  }
+
+  /**
+   * v6 three-tier scope for a run. `targetOrigins` remains the legacy approved-candidate allowlist
+   * (so every pre-v6 database upgrades without data loss); `authOrigins`/`assetOrigins` are
+   * additive benign-infrastructure tiers.
+   */
+  scopePolicy(runOrId: Run | string): ScopePolicy {
+    const run = typeof runOrId === 'string' ? this.run(runOrId) : runOrId
+    return {
+      mode: run.environmentMode ?? defaultEnvironmentMode(this.project(run.projectId).environment),
+      targetOrigins: [...this.approvedOriginsFor(run)],
+      authOrigins: [...(run.authOrigins ?? [])],
+      assetOrigins: [...(run.assetOrigins ?? [])],
+      routeDenylist: [...(run.routeDenylist ?? [])],
+      tenantTag: tenantTagForRun(run.id),
+      runId: run.id,
+    }
+  }
+
+  /** Target + benign auth/asset origins, used for provenance and revocation decisions. */
+  private provenanceOriginsFor(run: Run): Set<string> {
+    return provenanceOriginsFor(this.scopePolicy(run))
+  }
+
+  setEnvironmentMode(run: Run, mode: EnvironmentMode): Run {
+    if (!environmentModes.includes(mode)) throw new Error('Unknown environment mode.')
+    if (['complete', 'stopped', 'failed'].includes(run.status)) {
+      throw new Error('Cannot change the environment mode after a run has ended.')
+    }
+    const updated = this.updateRun(run.id, { environmentMode: mode })
+    this.event(run.id, 'scope.environment_mode', `Environment contract set to ${mode}.`, {
+      environmentMode: mode,
+    })
+    return updated
+  }
+
+  setRouteDenylist(run: Run, routes: readonly string[]): Run {
+    const normalized: string[] = []
+    for (const entry of routes) {
+      const path = (entry ?? '').trim()
+      if (!path) continue
+      if (!path.startsWith('/')) throw new Error('Route denylist entries must start with "/".')
+      if (/[\r\n\0]/.test(path)) throw new Error('Invalid route denylist entry.')
+      normalized.push(path)
+    }
+    const updated = this.updateRun(run.id, { routeDenylist: [...new Set(normalized)] })
+    this.event(run.id, 'scope.route_denylist', `Staging route denylist updated (${normalized.length} entries).`, {
+      routeDenylist: updated.routeDenylist,
+    })
+    return updated
+  }
+
+  /**
+   * Assign an origin to one of the three tiers. The legacy approved-candidate allowlist is the
+   * target tier, so promoting/demoting is expressed as an edit to `approved` plus the role lists.
+   */
+  setOriginRole(run: Run, origin: string, role: OriginRole): Run {
+    if (!originRoles.includes(role)) throw new Error('Unknown origin role.')
+    const project = this.project(run.projectId)
+    const validated = assetOriginForEnvironment(project.environment).parse(origin)
+    const normalized = normalizeScopeOrigin(validated) ?? validated
+    const candidate = run.candidates.find(item => normalizeScopeOrigin(item.origin) === normalized)
+    const approved = new Set(run.approved)
+    if (role === 'target') {
+      if (!candidate) {
+        throw new Error('Add the host to the run inventory before approving it as a target origin.')
+      }
+      approved.add(candidate.id)
+    } else if (candidate) {
+      approved.delete(candidate.id)
+    }
+    const without = (list: readonly string[] | undefined) =>
+      [...(list ?? [])].filter(item => normalizeScopeOrigin(item) !== normalized)
+    const updated = this.updateRun(run.id, {
+      approved: [...approved],
+      authOrigins: role === 'auth' ? [...new Set([...without(run.authOrigins), normalized])] : without(run.authOrigins),
+      assetOrigins: role === 'asset' ? [...new Set([...without(run.assetOrigins), normalized])] : without(run.assetOrigins),
+    })
+    this.event(run.id, 'scope.origin_role', `Origin ${normalized} assigned the ${role} role.`, {
+      origin: normalized, role,
+    })
+    return updated
   }
 
   boardMember(runId: string, handle: string): BoardMemberRow | undefined {
@@ -1582,9 +1717,11 @@ export class Store {
       }
       if (!allowed.has(mention)) throw new Error(`Cannot mention unknown or retired board handle @${mention}.`)
     }
+    const scopePolicy = this.scopePolicy(run)
     const approvedOrigins = this.approvedOriginsFor(run)
+    // A board post may cite a benign IdP/CDN hop without being out of scope.
     const sourceOrigins = [...new Set(input.sourceOrigins ?? approvedOrigins)]
-    if (sourceOrigins.some(origin => !approvedOrigins.has(origin))) {
+    if (sourceOrigins.some(origin => !isProvenanceOriginAllowed(scopePolicy, origin))) {
       throw new Error('Board message references an origin outside approved scope.')
     }
     const body = this.cleanBoardBody(input.body, secrets)
@@ -1665,11 +1802,15 @@ export class Store {
     taintedMessageIds: string[]
     retiredHandles: string[]
   } {
+    // IdP/CDN hops are benign infrastructure: they must never taint a valid target finding.
+    const policy = this.scopePolicy(runId)
+    const allowed = (origin: string) =>
+      approvedOrigins.has(origin) || isProvenanceOriginAllowed(policy, origin)
     const taintedMessageIds: string[] = []
     for (const message of this.db.select().from(tables.boardMessages).where(and(
       eq(tables.boardMessages.runId, runId), eq(tables.boardMessages.tainted, false),
     )).all()) {
-      if (message.sourceOrigins.some(origin => !approvedOrigins.has(origin))) {
+      if (message.sourceOrigins.some(origin => !allowed(origin))) {
         taintedMessageIds.push(message.id)
       }
     }
@@ -1681,7 +1822,7 @@ export class Store {
     const retiredHandles: string[] = []
     for (const member of this.listBoardMembers(runId)) {
       if (member.state === 'retired') continue
-      if (member.sourceOrigins.some(origin => !approvedOrigins.has(origin))) {
+      if (member.sourceOrigins.some(origin => !allowed(origin))) {
         this.updateBoardMemberState(runId, member.handle, { state: 'retired', activeAssignmentId: null })
         retiredHandles.push(member.handle)
       }
@@ -2776,6 +2917,186 @@ export class Store {
       .orderBy(desc(tables.approvalRequests.createdAt)).all()
   }
 
+  // --- v6 durable route-scoped approval leases ---
+
+  /**
+   * Grant (or refresh) a durable, route-scoped lease. Unlike the single-use 60 s body-hash
+   * fingerprint, a lease authorizes every probe iteration and independent replay on the normalized
+   * route, until the run's scope revision changes or the origin leaves scope.
+   */
+  grantApprovalLease(run: Run, input: {
+    origin: string
+    method: string
+    pathAndQuery: string
+    personaHandle?: string | null
+    sourceApprovalId?: string | null
+    createdBy?: string
+    expiresInMs?: number | null
+  }): ApprovalLeaseRow {
+    const origin = normalizeScopeOrigin(input.origin)
+    if (!origin) throw new Error('Approval lease origin is malformed.')
+    const method = input.method.trim().toUpperCase()
+    if (!method) throw new Error('Approval lease method is required.')
+    const routePattern = routePatternForPath(input.pathAndQuery)
+    const now = Date.now()
+    const row = this.db.insert(tables.approvalLeases).values({
+      id: randomUUID(),
+      runId: run.id,
+      scopeRevision: run.scopeRevision,
+      origin,
+      method,
+      routePattern,
+      personaHandle: input.personaHandle ?? null,
+      status: 'active',
+      sourceApprovalId: input.sourceApprovalId ?? null,
+      createdBy: input.createdBy ?? 'operator',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: input.expiresInMs === null || input.expiresInMs === undefined ? null : now + input.expiresInMs,
+      uses: 0,
+      lastUsedAt: null,
+    }).onConflictDoUpdate({
+      target: [
+        tables.approvalLeases.runId, tables.approvalLeases.origin, tables.approvalLeases.method,
+        tables.approvalLeases.routePattern, tables.approvalLeases.scopeRevision,
+      ],
+      set: {
+        status: 'active',
+        updatedAt: now,
+        personaHandle: input.personaHandle ?? null,
+        sourceApprovalId: input.sourceApprovalId ?? null,
+        expiresAt: input.expiresInMs == null ? null : now + input.expiresInMs,
+      },
+    }).returning().get()
+    this.event(run.id, 'approval.lease_granted', `Durable route lease for ${method} ${origin}${routePattern}.`, {
+      leaseId: row.id, origin, method, routePattern, sourceApprovalId: row.sourceApprovalId,
+    })
+    return row
+  }
+
+  listApprovalLeases(runId: string, status?: ApprovalLeaseRow['status']): ApprovalLeaseRow[] {
+    const where = status
+      ? and(eq(tables.approvalLeases.runId, runId), eq(tables.approvalLeases.status, status))
+      : eq(tables.approvalLeases.runId, runId)
+    return this.db.select().from(tables.approvalLeases).where(where)
+      .orderBy(desc(tables.approvalLeases.createdAt)).all()
+  }
+
+  revokeApprovalLease(run: Run, leaseId: string, reason = 'Revoked by operator.'): ApprovalLeaseRow {
+    const updated = this.db.update(tables.approvalLeases).set({ status: 'revoked', updatedAt: Date.now() })
+      .where(and(eq(tables.approvalLeases.runId, run.id), eq(tables.approvalLeases.id, leaseId)))
+      .returning().get()
+    if (!updated) throw new Error('Approval lease not found.')
+    this.event(run.id, 'approval.lease_revoked', `Durable route lease revoked: ${updated.method} ${updated.origin}${updated.routePattern}.`, {
+      leaseId: updated.id, origin: updated.origin, method: updated.method, reason,
+    })
+    return updated
+  }
+
+  revokeApprovalLeasesForOrigin(run: Run, origin: string): number {
+    const normalized = normalizeScopeOrigin(origin)
+    if (!normalized) return 0
+    const revoked = this.db.update(tables.approvalLeases).set({ status: 'revoked', updatedAt: Date.now() })
+      .where(and(
+        eq(tables.approvalLeases.runId, run.id),
+        eq(tables.approvalLeases.status, 'active'),
+        eq(tables.approvalLeases.origin, normalized),
+      )).returning({ id: tables.approvalLeases.id }).all()
+    if (revoked.length) {
+      this.event(run.id, 'approval.lease_revoked', `${revoked.length} durable lease(s) revoked for ${normalized}.`, {
+        origin: normalized, leases: revoked.map(row => row.id),
+      })
+    }
+    return revoked.length
+  }
+
+  /**
+   * Broker-side lease check. A match authorizes the normalized route without a per-request
+   * approval; the lease must belong to the run's current scope revision and be unexpired.
+   */
+  leaseAuthorizes(runId: string, origin: string, method: string, pathAndQuery: string): boolean {
+    const normalized = normalizeScopeOrigin(origin)
+    if (!normalized) return false
+    let run: Run
+    try {
+      run = this.run(runId)
+    } catch {
+      return false
+    }
+    const routePattern = routePatternForPath(pathAndQuery)
+    const row = this.db.select().from(tables.approvalLeases).where(and(
+      eq(tables.approvalLeases.runId, runId),
+      eq(tables.approvalLeases.origin, normalized),
+      eq(tables.approvalLeases.method, method.trim().toUpperCase()),
+      eq(tables.approvalLeases.routePattern, routePattern),
+      eq(tables.approvalLeases.status, 'active'),
+      eq(tables.approvalLeases.scopeRevision, run.scopeRevision),
+    )).get()
+    if (!row) return false
+    if (row.expiresAt !== null && row.expiresAt <= Date.now()) {
+      this.db.update(tables.approvalLeases).set({ status: 'expired', updatedAt: Date.now() })
+        .where(eq(tables.approvalLeases.id, row.id)).run()
+      return false
+    }
+    this.db.update(tables.approvalLeases).set({
+      uses: row.uses + 1, lastUsedAt: Date.now(), updatedAt: Date.now(),
+    }).where(eq(tables.approvalLeases.id, row.id)).run()
+    return true
+  }
+
+  /** Ready-to-wire broker grant hook: `approvalLeases: storage.approvalLeaseAuthorizer(runId)`. */
+  approvalLeaseAuthorizer(runId: string): (origin: string, method: string, pathAndQuery: string) => boolean {
+    return (origin, method, pathAndQuery) => this.leaseAuthorizes(runId, origin, method, pathAndQuery)
+  }
+
+  /**
+   * Park an assignment in `awaiting_approval` with its worker slot released. The caller persists
+   * the approval request separately; this is the non-blocking half of the operator opt-in flow.
+   */
+  parkWorkerForApproval(run: Run, assignmentId: string): Assignment {
+    const existing = this.worker(assignmentId)
+    if (existing.runId !== run.id) throw new Error('Assignment does not belong to this run.')
+    if (!['queued', 'running', 'waiting_approval'].includes(existing.status)) {
+      throw new Error(`Cannot park an assignment in state ${existing.status}.`)
+    }
+    const updated = this.updateWorker(assignmentId, {
+      status: 'waiting_approval',
+      approvalParkedAt: Date.now(),
+      lease: null,
+      leaseExpiresAt: null,
+    })!
+    this.event(run.id, 'approval.worker_parked', `Worker parked awaiting approval; slot released.`, {
+      assignmentId,
+    })
+    return updated
+  }
+
+  /** Resume a parked assignment with a fresh worker lease (caller re-enters the scheduler). */
+  resumeParkedWorker(run: Run, assignmentId: string): Assignment {
+    const existing = this.worker(assignmentId)
+    if (existing.runId !== run.id) throw new Error('Assignment does not belong to this run.')
+    if (existing.status !== 'waiting_approval') {
+      throw new Error(`Assignment is not awaiting approval (state ${existing.status}).`)
+    }
+    const updated = this.updateWorker(assignmentId, {
+      status: 'running',
+      approvalParkedAt: null,
+      lease: randomUUID(),
+      leaseExpiresAt: Date.now() + 10 * 60_000,
+    })!
+    this.event(run.id, 'approval.worker_resumed', `Worker resumed with a fresh slot lease.`, {
+      assignmentId, leaseExpiresAt: updated.leaseExpiresAt,
+    })
+    return updated
+  }
+
+  parkedWorkerCount(runId: string): number {
+    const row = this.client.prepare(
+      `SELECT count(*) AS c FROM assignments WHERE run_id = ? AND status = 'waiting_approval' AND approval_parked_at IS NOT NULL AND lease IS NULL`,
+    ).get(runId) as { c?: number } | undefined
+    return Number(row?.c ?? 0)
+  }
+
   decideApproval(run: Run, approvalId: string, decision: 'approved' | 'denied'): ApprovalRequest {
     const existing = this.getApprovalRequest(run.id, approvalId)
     if (existing.status !== 'pending') throw new Error(`Approval request is already ${existing.status}.`)
@@ -2792,6 +3113,17 @@ export class Store {
     this.event(run.id, 'approval.decided', `Tier 3 request ${decision} for ${updated.method} ${updated.origin}.`, {
       approvalId: updated.id, assignmentId: updated.assignmentId, decision, decidedBy: 'operator',
     })
+    if (decision === 'approved') {
+      // Operator opt-in grants a durable route-scoped lease, not a 60 s single-use body-hash token.
+      this.grantApprovalLease(run, {
+        origin: updated.origin,
+        method: updated.method,
+        pathAndQuery: updated.pathAndQuery,
+        personaHandle: updated.personaHandle,
+        sourceApprovalId: updated.id,
+        createdBy: 'operator',
+      })
+    }
     this.message(run.id, run.coordinatorId, 'guardian',
       `Tier 3 request ${decision}: ${updated.method} ${updated.origin}${updated.pathAndQuery}`)
     return updated
@@ -2895,6 +3227,14 @@ export class Store {
       pathPattern: newPattern.pathPattern,
       matchedPendingCount,
     })
+    this.grantApprovalLease(run, {
+      origin: newPattern.origin,
+      method: newPattern.method,
+      pathAndQuery: newPattern.pathPattern,
+      personaHandle: existing.personaHandle,
+      sourceApprovalId: existing.id,
+      createdBy: 'operator',
+    })
     this.message(run.id, run.coordinatorId, 'guardian',
       `Approved ${existing.method} ${existing.origin}${existing.pathAndQuery} and future probes matching ${newPattern.method} ${newPattern.pathPattern}.`)
   }
@@ -2915,6 +3255,14 @@ export class Store {
         decidedAt: now,
         policyNote: 'Batch-approved by operator (Approve all pending).',
       }).where(eq(tables.approvalRequests.id, req.id)).run()
+      this.grantApprovalLease(run, {
+        origin: req.origin,
+        method: req.method,
+        pathAndQuery: req.pathAndQuery,
+        personaHandle: req.personaHandle,
+        sourceApprovalId: req.id,
+        createdBy: 'operator',
+      })
       approvedCount += 1
     }
     this.event(run.id, 'approval.batch_approved', `Operator batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'request' : 'requests'}.`, {
@@ -3693,6 +4041,10 @@ export class Store {
         phase0CompletedAt: null,
         candidates: [],
         approved: [],
+        authOrigins: [],
+        assetOrigins: [],
+        environmentMode: defaultEnvironmentMode(project.environment),
+        routeDenylist: [],
         createdAt: Date.now(),
       }).returning().get()
       for (const [handle, role] of [
@@ -3887,7 +4239,10 @@ export class Store {
     this.updateRun(run.id, { status })
     if (status === 'paused' || status === 'budget_paused' || status === 'stopped' || status === 'failed') {
       this.db.update(tables.assignments).set({ status: 'paused', lease: null, leaseExpiresAt: null }).where(and(
-        eq(tables.assignments.runId, run.id), inArray(tables.assignments.status, ['queued', 'running', 'waiting_approval']),
+        eq(tables.assignments.runId, run.id),
+        inArray(tables.assignments.status, ['queued', 'running', 'waiting_approval']),
+        // Operator opt-in approvals that released their slot survive pause/recovery.
+        sql`NOT (${tables.assignments.status} = 'waiting_approval' AND ${tables.assignments.approvalParkedAt} IS NOT NULL)`,
       )).run()
     }
     if (status === 'running') {
@@ -3928,6 +4283,10 @@ export class Store {
 
   private applyTransitiveRevocation(run: Run, approvedIds: readonly string[], approvedOrigins: ReadonlySet<string>, scopeRevision: number) {
     const approvedIdSet = new Set(approvedIds)
+    // Benign auth/asset hops remain valid provenance after a target origin is revoked.
+    const provenanceOrigins = this.provenanceOriginsFor(run)
+    const provenanceAllowed = (origin: string) =>
+      approvedOrigins.has(origin) || provenanceOrigins.has(normalizeScopeOrigin(origin) ?? origin)
     const allFacts = this.db.select().from(tables.facts).where(eq(tables.facts.runId, run.id)).all()
     const allSteps = this.db.select().from(tables.chainSteps).where(eq(tables.chainSteps.runId, run.id)).all()
     const allAssignments = this.workerList(run.id)
@@ -3982,12 +4341,12 @@ export class Store {
 
     // Seed with directly affected facts, steps, assignments
     for (const fact of allFacts) {
-      if (!approvedOrigins.has(fact.origin) || fact.sourceOrigins.some(o => !approvedOrigins.has(o))) {
+      if (!approvedOrigins.has(fact.origin) || fact.sourceOrigins.some(o => !provenanceAllowed(o))) {
         enqueue(`fact:${fact.id}`)
       }
     }
     for (const step of allSteps) {
-      if (step.sourceOrigins.some(o => !approvedOrigins.has(o)) ||
+      if (step.sourceOrigins.some(o => !provenanceAllowed(o)) ||
           step.targetAssetIds.some(aid => !approvedIdSet.has(aid))) {
         enqueue(`step:${step.id}`)
       }
@@ -3996,8 +4355,8 @@ export class Store {
       if (worker.phase === 'discovery') continue
       const touchesUnapproved =
         (worker.assetId !== null && !approvedIdSet.has(worker.assetId)) ||
-        worker.sourceOrigins.some(o => !approvedOrigins.has(o)) ||
-        this.brokerOrigins(worker).some(o => !approvedOrigins.has(o))
+        worker.sourceOrigins.some(o => !provenanceAllowed(o)) ||
+        this.brokerOrigins(worker).some(o => !provenanceAllowed(o))
       if (touchesUnapproved) enqueue(`assignment:${worker.id}`)
     }
 
@@ -4055,6 +4414,19 @@ export class Store {
       if (!approvedOrigins.has(req.origin) || canceledAssignmentIds.includes(req.assignmentId)) {
         this.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: Date.now() })
           .where(eq(tables.approvalRequests.id, req.id)).run()
+      }
+    }
+
+    // Durable leases are scoped to the current scope revision; revoke any lease on a revoked origin.
+    this.db.update(tables.approvalLeases).set({ status: 'revoked', updatedAt: Date.now() }).where(and(
+      eq(tables.approvalLeases.runId, run.id),
+      eq(tables.approvalLeases.status, 'active'),
+      sql`${tables.approvalLeases.scopeRevision} != ${scopeRevision}`,
+    )).run()
+    for (const lease of this.listApprovalLeases(run.id, 'active')) {
+      if (!approvedOrigins.has(lease.origin)) {
+        this.db.update(tables.approvalLeases).set({ status: 'revoked', updatedAt: Date.now() })
+          .where(eq(tables.approvalLeases.id, lease.id)).run()
       }
     }
 
@@ -4229,6 +4601,12 @@ export class Store {
     const snapshot = this.runDetail(run.id)
     const scope = run.candidates.filter(candidate => run.approved.includes(candidate.id))
     const approvedOrigins = new Set(scope.map(asset => asset.origin))
+    // Provenance rule: IdP/auth and CDN/asset hops are benign infrastructure. They may appear in a
+    // recorded redirect chain or source set without invalidating a valid targetOrigins finding.
+    const provenancePolicy = this.scopePolicy(run)
+    const provenanceOrigins = provenanceOriginsFor(provenancePolicy)
+    const provenanceAllowed = (origin: string) =>
+      approvedOrigins.has(origin) || provenanceOrigins.has(normalizeScopeOrigin(origin) ?? origin)
     const currentEvidence = new Set<string>()
     const retainedAccess = new Map<string, NonNullable<ReturnType<Store['retainAccessVerification']>>>()
     const gaps: string[] = []
@@ -4259,7 +4637,7 @@ export class Store {
         (verified ? item.kind === 'verification' : ['observation', 'access-policy'].includes(item.kind)))
       const access = evList.findLast(item => item.assignmentId === analyzed?.id && item.kind === 'access-policy')
 
-      if (analyzed && this.brokerOrigins(analyzed).some(origin => !approvedOrigins.has(origin))) {
+      if (analyzed && this.brokerOrigins(analyzed).some(origin => !provenanceAllowed(origin))) {
         const reason = 'A source in the recorded redirect chain is no longer approved.'
         const retained = verified?.inputAssignmentId === analyzed.id && access && artifact
           ? this.retainAccessVerification(run, asset.origin, verified, access, artifact) : undefined
@@ -4327,11 +4705,11 @@ export class Store {
       const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
       if (!isStaticVerified) {
         if (!run.approved.includes(assetId) || !approvedOrigins.has(finding.origin)) return []
-        if (sourceOrigins.some(o => !approvedOrigins.has(o))) return []
+        if (sourceOrigins.some(o => !provenanceAllowed(o))) return []
       } else {
         // Static-verified findings may reference approved origins or synthetic 'https://static-analysis.invalid'
         const nonSynthetic = sourceOrigins.filter(o => o !== 'https://static-analysis.invalid')
-        if (nonSynthetic.some(o => !approvedOrigins.has(o))) return []
+        if (nonSynthetic.some(o => !provenanceAllowed(o))) return []
       }
       if (finding.chainFactIds?.some(fid => taintedFactIds.has(fid))) return []
       if (!finding.evidenceIds.length && !(finding.exchangeIds?.length)) return []
@@ -4609,7 +4987,9 @@ export class Store {
           if (!row.replaySpecId) throw new Error('Only findings with a Declarative Replay Spec support one-click Verify Fix retest.')
           const specRow = this.getReplaySpec(run.id, row.replaySpecId)
           const approvedOrigins = new Set(run.candidates.filter(c => run.approved.includes(c.id)).map(c => c.origin))
-          if (specRow.sourceOrigins.some(o => !approvedOrigins.has(o))) {
+          const retestPolicy = this.scopePolicy(run)
+          if (specRow.sourceOrigins.some(o =>
+            !approvedOrigins.has(o) && !isProvenanceOriginAllowed(retestPolicy, o))) {
             throw new Error('Cannot retest because one or more origins in this replay spec are no longer in approved scope.')
           }
           const asset = run.candidates.find(c => c.id === row.assetId)

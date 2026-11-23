@@ -10,6 +10,7 @@ import type {
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import type { SecretMatch } from './redact.ts'
+import type { EnvironmentMode } from './scope-policy.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -121,6 +122,12 @@ export const runs = sqliteTable('runs', {
   reviewPlan: text('review_plan', { mode: 'json' }).$type<ReviewPlan>(),
   candidates: text('candidates', { mode: 'json' }).$type<Candidate[]>().notNull(),
   approved: text('approved', { mode: 'json' }).$type<string[]>().notNull(),
+  // v6 Layer-1: the legacy approved-candidate allowlist remains `targetOrigins` for compatibility;
+  // these additive role lists carry the two benign-infrastructure tiers.
+  authOrigins: text('auth_origins', { mode: 'json' }).$type<string[]>().default([]).notNull(),
+  assetOrigins: text('asset_origins', { mode: 'json' }).$type<string[]>().default([]).notNull(),
+  environmentMode: text('environment_mode').$type<EnvironmentMode>().default('prod_readonly').notNull(),
+  routeDenylist: text('route_denylist', { mode: 'json' }).$type<string[]>().default([]).notNull(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('runs_project').on(table.projectId)])
 
@@ -171,6 +178,8 @@ export const assignments = sqliteTable('assignments', {
   sessionId: text('session_id').notNull(),
   lease: text('lease'),
   leaseExpiresAt: integer('lease_expires_at'),
+  /** v6: set while the assignment is parked in awaiting_approval with its slot released. */
+  approvalParkedAt: integer('approval_parked_at'),
   attempt: integer('attempt').default(0).notNull(),
   maxTurns: integer('max_turns').default(150).notNull(),
   turnsUsed: integer('turns_used').default(0).notNull(),
@@ -270,6 +279,33 @@ export const approvalRequests = sqliteTable('approval_requests', {
   expiresAt: integer('expires_at').notNull(),
   createdAt: integer('created_at').notNull(),
 }, table => [index('approval_requests_run').on(table.runId, table.status)])
+
+/**
+ * v6 durable, route-scoped approval leases. An operator approval authorizes the whole normalized
+ * route (`POST /api/items/*`) across probe iterations and independent replays, instead of a
+ * single-use 60 s exact-body-hash fingerprint. Leases are scoped to the run's current revision and
+ * are revoked when that origin leaves scope.
+ */
+export const approvalLeases = sqliteTable('approval_leases', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  scopeRevision: integer('scope_revision').notNull(),
+  origin: text('origin').notNull(),
+  method: text('method').notNull(),
+  routePattern: text('route_pattern').notNull(),
+  personaHandle: text('persona_handle'),
+  status: text('status').$type<'active' | 'revoked' | 'expired'>().notNull(),
+  sourceApprovalId: text('source_approval_id'),
+  createdBy: text('created_by').notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+  expiresAt: integer('expires_at'),
+  uses: integer('uses').default(0).notNull(),
+  lastUsedAt: integer('last_used_at'),
+}, table => [
+  index('approval_leases_run').on(table.runId, table.status),
+  uniqueIndex('approval_leases_route').on(table.runId, table.origin, table.method, table.routePattern, table.scopeRevision),
+])
 
 export const replaySpecs = sqliteTable('replay_specs', {
   id: text('id').primaryKey().notNull(),
