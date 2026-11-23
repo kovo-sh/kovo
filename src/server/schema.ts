@@ -585,6 +585,47 @@ export const boardMessages = sqliteTable('board_messages', {
   index('board_messages_run_tainted').on(table.runId, table.tainted, table.seq),
 ])
 
+/**
+ * v6 M2.1: redacted non-secret sample identifiers harvested per collection. The unique key
+ * includes `collection_path` so `/invoices`, `/orders` and `/tickets` keep distinct ids instead
+ * of clobbering each other on the same `id` field name.
+ */
+export const resourceSamples = sqliteTable('resource_samples', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  ownerPersona: text('owner_persona').notNull(),
+  resourceKey: text('resource_key').notNull(),
+  collectionPath: text('collection_path').default('').notNull(),
+  resourceId: text('resource_id').notNull(),
+  origin: text('origin').notNull(),
+  endpoint: text('endpoint').notNull(),
+  method: text('method').notNull(),
+  mediaType: text('media_type'),
+  authenticated: integer('authenticated', { mode: 'boolean' }).default(false).notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, table => [
+  uniqueIndex('resource_samples_key').on(
+    table.runId, table.ownerPersona, table.origin, table.collectionPath, table.resourceKey,
+  ),
+  index('resource_samples_run').on(table.runId, table.resourceKey),
+])
+
+/** v6 crash recovery: persisted LabRunner container IDs so a restart can reclaim orphans. */
+export const labContainers = sqliteTable('lab_containers', {
+  id: text('id').primaryKey().notNull(),
+  runId: text('run_id').notNull().references(() => runs.id),
+  assignmentId: text('assignment_id'),
+  containerName: text('container_name').notNull(),
+  imageName: text('image_name'),
+  status: text('status').$type<'running' | 'orphaned' | 'reclaimed'>().default('running').notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, table => [
+  uniqueIndex('lab_containers_name').on(table.runId, table.containerName),
+  index('lab_containers_run').on(table.runId, table.status),
+])
+
 export const benchmarkRuns = sqliteTable('benchmark_runs', {
   id: text('id').primaryKey().notNull(),
   suite: text('suite').notNull(),
