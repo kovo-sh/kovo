@@ -224,3 +224,12 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
   4. Ordering: **wave-2 security + deferred `execution.ts` items first** (per-instance grants for identical race bursts, batch approval path, remove `isSafeIdempotentPost` with a fast exact-envelope read-only judge path), then Slice 3 behind a default-off flag, then Slice 4, then flip.
 - **Rejected/deferred:** per-assignment or planner-shared caps (240 s per-run chosen); auto-queued deterministic chain steps (planner-decided only, for now).
 - **Owner streams:** sec2-approvals, sec2-auth, sec2-lab (wave 2), exec-approvals (race/batch grants), parity-diff (bucket classification), verifier-guards (Slice 4 + Tier-3 context).
+
+### 2026-11-22 — parity diff triage (seed 1)
+
+- **Measured:** procedural 38/59 (64.4%) vs product `--no-llm` 26/59 (44.1%); intersection 21, procedural-only 17, product-only 5.
+- **Root cause (accepted):** class coverage, not deadline — 24/33 product misses had no probe port for their class; the engine enumerates ~10 intents while `src/server/probes/` ships 8 unused classes. Remaining: surface drops (4, all DELETE/body-only routes), signal→spec converters (3), genuine caps (2).
+- **Fixes accepted, in order:** (1) stop dropping briefing routes/DELETE in `execution.ts` + engine DELETE gate; (2) close authz/boolean signal→spec gaps; (3) mass-assignment on PATCH/PUT; (4) wire existing probe classes (`ssti_math`, `command_injection`, `workflow_invariant`, cache, webhook); (5) stored-XSS lifecycle + collection secret scan.
+- **Notable:** the product floor is **not** a subset of the harness — 5 targets confirmed by the product had no procedural signal. Treat both scorecards as independent evidence.
+- **Caveat carried:** part of procedural parity comes from the conventional route wordlist, so every fix must be re-checked on a salted held-out seed.
+- **Owner streams:** surface-filter (`execution.ts`), engine-coverage (`deterministic-engine.ts`/`-specs.ts`), exec-approvals (race/batch grants, merged `7a6dd98`).
