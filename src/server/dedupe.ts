@@ -8,6 +8,16 @@ import type { UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
+/** The explicitly mutated input reported by a proof script (never inferred from body key order). */
+export type MutatedInputKind = 'param' | 'header' | 'graphql' | 'rpc'
+
+export interface MutatedInput {
+  kind: MutatedInputKind
+  name: string
+  /** Where a `param` lives (query/json/form/path/xml). Informational: not part of the key. */
+  location?: string
+}
+
 export interface FindingFingerprintInput {
   origin: string
   cwe?: string | null
@@ -21,6 +31,12 @@ export interface FindingFingerprintInput {
   param?: string | null
   /** GraphQL root field/resolver when the route itself is a single `/graphql` endpoint. */
   graphqlField?: string | null
+  /** Explicit mutated input from the proof spec; when present it (not `param`) keys the finding. */
+  mutated?: MutatedInput | null
+  /** Verified handler (reverse-proxy service path / resolved route). Distinct handlers never merge. */
+  handler?: string | null
+  /** Alias for `handler` as reported by the replay verifier's endpoint binding. */
+  verifiedEndpoint?: string | null
 }
 
 export interface SpecDedupeFields {
@@ -30,12 +46,20 @@ export interface SpecDedupeFields {
   method: string
   param: string
   graphqlField: string
+  /** Explicitly mutated input declared by the spec schema (sql/upload/cache/graphql). */
+  mutated?: MutatedInput
 }
 
 export interface ComputedFindingFingerprint {
   key: string
   hash: string
   normalizedEndpoint: string
+  /** Normalized verified handler, or '' when the finding carries none. */
+  handler: string
+  /** Explicit mutated input used for the key, or null. */
+  mutated: MutatedInput | null
+  /** `explicit` when keyed by mutated input; `legacy` when the deprecated first-key heuristic ran. */
+  mutatedSource: 'explicit' | 'legacy'
 }
 
 export interface DedupeCandidate {
@@ -51,6 +75,9 @@ export interface DedupeCandidate {
   method?: string | null
   param?: string | null
   graphqlField?: string | null
+  mutated?: MutatedInput | null
+  handler?: string | null
+  verifiedEndpoint?: string | null
   reason?: string
   impact?: string
   remediation?: string
@@ -72,6 +99,9 @@ export interface ExistingFindingRef {
   method?: string | null
   param?: string | null
   graphqlField?: string | null
+  mutated?: MutatedInput | null
+  handler?: string | null
+  verifiedEndpoint?: string | null
   reason?: string
   impact?: string
   remediation?: string
@@ -254,21 +284,112 @@ export function normalizeEndpointTemplate(endpoint?: string | null, options?: { 
   return normalized || '/'
 }
 
+const MUTATED_KINDS: ReadonlySet<MutatedInputKind> = new Set(['param', 'header', 'graphql', 'rpc'])
+
+/**
+ * Normalize an explicitly mutated input for fingerprinting. Names are lowercased for
+ * parameter/header/GraphQL (`param`/`header`/`graphql` are case-insensitive in practice and the
+ * GraphQL root field is already lowercased by `extractGraphqlRootField`); RPC procedure names keep
+ * their case because `getUser` and `getuser` are genuinely different procedures.
+ */
+export function normalizeMutatedInput(input?: MutatedInput | null): MutatedInput | null {
+  if (!input || typeof input !== 'object') return null
+  if (!MUTATED_KINDS.has(input.kind)) return null
+  const name = typeof input.name === 'string' ? input.name.trim() : ''
+  if (!name) return null
+  const normalizedName = input.kind === 'rpc' ? name : name.toLowerCase()
+  const location = typeof input.location === 'string' ? input.location.trim().toLowerCase() : ''
+  return location ? { kind: input.kind, name: normalizedName, location } : { kind: input.kind, name: normalizedName }
+}
+
+/**
+ * Normalize the verified handler/service path so reverse-proxy front paths that map to different
+ * microservice handlers never collapse. Accepts a bare path, a URL, or a `"METHOD /path"` string.
+ */
+export function normalizeHandlerRef(handler?: string | null): string {
+  const raw = (handler ?? '').trim()
+  if (!raw) return ''
+  let value = raw.replace(/^(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|TRACE)\s+/i, '')
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    try {
+      value = new URL(value).pathname || '/'
+    } catch {
+      // Keep the raw value; it is still a stable handler identity.
+    }
+  }
+  return normalizeEndpointTemplate(value)
+}
+
+/** Deprecated first-key heuristic token (legacy keys must stay byte-identical). */
+function legacyMutationToken(input: Pick<FindingFingerprintInput, 'param' | 'graphqlField'>): string {
+  const graphqlField = (input.graphqlField?.trim().toLowerCase() || '')
+  return graphqlField ? `gql:${graphqlField}` : (input.param?.trim().toLowerCase() || '')
+}
+
 export function computeFindingFingerprint(input: FindingFingerprintInput): ComputedFindingFingerprint {
   const origin = normalizeOrigin(input.origin)
   const cwe = normalizeCwe(input.cwe, input.category)
   const normalizedEndpoint = normalizeEndpointTemplate(input.endpoint)
   const method = (input.method?.trim().toUpperCase() || 'ANY')
-  const graphqlField = (input.graphqlField?.trim().toLowerCase() || '')
-  // The `/graphql` route is shared by every resolver, so the root field is the dedupe unit there.
-  // Otherwise the primary injectable/read parameter disambiguates two parameters on one route.
-  const paramOrGraphqlField = graphqlField ? `gql:${graphqlField}` : (input.param?.trim().toLowerCase() || '')
+  const mutated = normalizeMutatedInput(input.mutated)
+  const handler = normalizeHandlerRef(input.handler?.trim() ? input.handler : input.verifiedEndpoint)
+  // A distinct verified handler means a distinct unit of work even when the public path matches
+  // (`/api/orders/:id` fronted by two microservices). Handler-less findings keep the v5 key shape.
+  const endpointComponent = handler ? `${normalizedEndpoint}#${handler}` : normalizedEndpoint
+  // The key unit is the *explicitly* mutated input: parameter, header, GraphQL operation or RPC
+  // procedure. `Object.keys(jsonBody)[0]` is only consulted when no explicit mutation was reported.
+  const mutationToken = mutated ? `mutated:${mutated.kind}:${mutated.name}` : legacyMutationToken(input)
   // Deliberately exclude authState/specKind: one root cause observed through two personas or two
-  // replay shapes is still the same finding. `(method, paramOrGraphqlField)` keep distinct attack
-  // surfaces (GET vs DELETE BOLA, two parameters, two resolvers) on one route separate.
-  const key = `${origin}|${normalizedEndpoint}|${method}|${paramOrGraphqlField}|${cwe}`
+  // replay shapes is still the same finding. `(endpoint, method, mutation)` keeps distinct attack
+  // surfaces (GET vs DELETE BOLA, two parameters, two resolvers, two handlers) separate.
+  const key = `${origin}|${endpointComponent}|${method}|${mutationToken}|${cwe}`
   const hash = createHash('sha256').update(key).digest('hex')
-  return { key, hash, normalizedEndpoint }
+  return {
+    key,
+    hash,
+    normalizedEndpoint,
+    handler,
+    mutated,
+    mutatedSource: mutated ? 'explicit' : 'legacy',
+  }
+}
+
+/** Fingerprint ignoring any explicit mutation (the deprecated first-key heuristic key). */
+function computeLegacyFindingFingerprint(input: FindingFingerprintInput): ComputedFindingFingerprint {
+  return computeFindingFingerprint({ ...input, mutated: null })
+}
+
+/**
+ * Deprecated-heuristic view of a finding for backward compatibility: a param/graphql mutation is
+ * projected onto `param`/`graphqlField`, so a v6 finding still matches a v5 row that only carried
+ * the first-key heuristic. Header/RPC mutations have no legacy equivalent and return null.
+ */
+function computeLegacyEquivalentFingerprint(input: FindingFingerprintInput): ComputedFindingFingerprint | null {
+  const mutated = normalizeMutatedInput(input.mutated)
+  if (!mutated) return computeLegacyFindingFingerprint(input)
+  if (mutated.kind !== 'param' && mutated.kind !== 'graphql') return null
+  return computeLegacyFindingFingerprint({
+    ...input,
+    param: mutated.kind === 'param' ? input.param?.trim() || mutated.name : input.param,
+    graphqlField: mutated.kind === 'graphql' ? input.graphqlField?.trim() || mutated.name : input.graphqlField,
+  })
+}
+
+function fingerprintInputFromRef(ref: DedupeCandidate | ExistingFindingRef): FindingFingerprintInput {
+  return {
+    origin: ref.origin,
+    cwe: ref.cwe,
+    category: ref.category,
+    endpoint: ref.endpoint,
+    authState: ref.authState,
+    specKind: ref.specKind,
+    method: ref.method,
+    param: ref.param,
+    graphqlField: ref.graphqlField,
+    mutated: ref.mutated,
+    handler: ref.handler,
+    verifiedEndpoint: ref.verifiedEndpoint,
+  }
 }
 
 /** Extract the first parameter name from a pathAndQuery string (`?a=1&b=2` → `a`). */
@@ -296,6 +417,17 @@ function firstJsonKey(value: unknown): string {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
   const key = Object.keys(value as Record<string, unknown>)[0]
   return typeof key === 'string' ? key : ''
+}
+
+/**
+ * Map a spec-declared `(paramName, paramLocation)` pair to the dedupe mutation unit. The location
+ * decides whether the mutated input is a header, a GraphQL variable, or a body/query parameter.
+ */
+function declaredParamMutation(paramName: unknown, paramLocation: unknown): MutatedInput | undefined {
+  if (typeof paramName !== 'string' || !paramName.trim()) return undefined
+  const location = typeof paramLocation === 'string' ? paramLocation.trim().toLowerCase() : ''
+  const kind: MutatedInputKind = location === 'header' ? 'header' : location === 'graphql_var' ? 'graphql' : 'param'
+  return location ? { kind, name: paramName.trim(), location } : { kind, name: paramName.trim() }
 }
 
 /** Resolve the primary parameter for a ReplaySpec step (request body → query string). */
@@ -346,6 +478,7 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
       method,
       param: graphqlField ? '' : primaryParamForRequest(probeStep?.request),
       graphqlField,
+      ...(graphqlField ? { mutated: { kind: 'graphql' as const, name: graphqlField } } : {}),
     }
   }
 
@@ -397,7 +530,8 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const persona = (typeof s.persona === 'string' ? s.persona : probe?.persona)
     const method = (typeof s.method === 'string' ? s.method : probe?.method) ?? 'ANY'
     const param = typeof s.paramName === 'string' ? s.paramName : firstQueryParam(endpoint)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param, graphqlField: '' }
+    const mutated = declaredParamMutation(s.paramName, s.paramLocation)
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param, graphqlField: '', ...(mutated ? { mutated } : {}) }
   }
 
   if (specKind === 'sql_time_diff') {
@@ -409,7 +543,8 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const param = typeof s.paramName === 'string'
       ? s.paramName
       : firstJsonKey(s.jsonBody) || firstQueryParam(endpoint)
-    return { endpoint, authState: persona, specKind, method, param, graphqlField: '' }
+    const mutated = declaredParamMutation(s.paramName, s.paramLocation)
+    return { endpoint, authState: persona, specKind, method, param, graphqlField: '', ...(mutated ? { mutated } : {}) }
   }
 
   if (specKind === 'auth_protocol_proof' && Array.isArray(s.steps)) {
@@ -436,7 +571,8 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
       ? Object.keys(s.poisonHeaders as Record<string, unknown>).map(k => k.toLowerCase()).sort()
       : []
     const param = headers[0] ?? firstQueryParam(endpoint)
-    return { endpoint, authState: persona, specKind, method, param, graphqlField: '' }
+    const mutated: MutatedInput | undefined = headers[0] ? { kind: 'header', name: headers[0], location: 'header' } : undefined
+    return { endpoint, authState: persona, specKind, method, param, graphqlField: '', ...(mutated ? { mutated } : {}) }
   }
 
   if (specKind === 'ws_chain' && Array.isArray(s.steps)) {
@@ -453,7 +589,10 @@ export function extractSpecDedupeFields(spec: unknown): SpecDedupeFields {
     const persona = uploadReq?.persona ?? uploadReq?.request?.persona ?? (typeof s.persona === 'string' ? s.persona : undefined)
     const method = uploadReq?.method ?? uploadReq?.request?.method ?? 'ANY'
     const param = typeof uploadReq?.fieldName === 'string' ? uploadReq.fieldName : firstQueryParam(endpoint)
-    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param, graphqlField: '' }
+    const mutated: MutatedInput | undefined = typeof uploadReq?.fieldName === 'string' && uploadReq.fieldName.trim()
+      ? { kind: 'param', name: uploadReq.fieldName.trim(), location: 'form' }
+      : undefined
+    return { endpoint, authState: persona ? `persona:${persona}` : 'anonymous', specKind, method, param, graphqlField: '', ...(mutated ? { mutated } : {}) }
   }
 
   if (specKind === 'static_ast_proof') {
@@ -497,33 +636,41 @@ export function checkStructuralDuplicate(
   existingFindings: readonly ExistingFindingRef[],
   excludeFindingId?: string,
 ): StructuralDuplicateResult {
-  const fingerprint = computeFindingFingerprint({
-    origin: candidate.origin,
-    cwe: candidate.cwe,
-    category: candidate.category,
-    endpoint: candidate.endpoint,
-    authState: candidate.authState,
-    specKind: candidate.specKind,
-    method: candidate.method,
-    param: candidate.param,
-    graphqlField: candidate.graphqlField,
-  })
+  const fingerprint = computeFindingFingerprint(fingerprintInputFromRef(candidate))
   const candidateHash = candidate.fingerprintHash || fingerprint.hash
+  const candidateMutated = fingerprint.mutated
+  const candidateHandler = fingerprint.handler
   const active = activeExistingFindings(existingFindings, excludeFindingId ?? candidate.id)
 
   const matches = active.filter(existing => {
-    const existingFp = existing.fingerprintHash || computeFindingFingerprint({
-      origin: existing.origin,
-      cwe: existing.cwe,
-      category: existing.category,
-      endpoint: existing.endpoint,
-      authState: existing.authState,
-      specKind: existing.specKind,
-      method: existing.method,
-      param: existing.param,
-      graphqlField: existing.graphqlField,
-    }).hash
-    return existingFp === candidateHash || existingFp === fingerprint.hash
+    const existingFp = computeFindingFingerprint(fingerprintInputFromRef(existing))
+    const existingHash = existing.fingerprintHash || existingFp.hash
+    const hashMatch = existingHash === candidateHash || existingHash === fingerprint.hash
+    const existingHandler = existingFp.handler
+    const handlerConflict = Boolean(candidateHandler && existingHandler && candidateHandler !== existingHandler)
+
+    // Two explicit mutations are distinct attack surfaces even when a deprecated stored hash
+    // collides: never merge two parameters, a header vs a body field, two GraphQL operations or
+    // two RPC procedures on one endpoint.
+    if (candidateMutated && existingFp.mutated) {
+      const sameMutation = candidateMutated.kind === existingFp.mutated.kind
+        && candidateMutated.name === existingFp.mutated.name
+      return hashMatch && sameMutation && !handlerConflict
+    }
+
+    if (hashMatch) return !handlerConflict
+
+    // Backward compatibility with findings fingerprinted before explicit mutations existed: only
+    // param/graphql mutations can be projected onto the deprecated first-key heuristic.
+    const mutatedSide = candidateMutated ?? existingFp.mutated
+    if (mutatedSide && mutatedSide.kind !== 'param' && mutatedSide.kind !== 'graphql') return false
+
+    const candidateLegacy = computeLegacyEquivalentFingerprint(fingerprintInputFromRef(candidate))
+    const existingLegacy = computeLegacyEquivalentFingerprint(fingerprintInputFromRef(existing))
+    if (!candidateLegacy || !existingLegacy) return false
+    return candidateLegacy.hash === existingLegacy.hash
+      || candidateLegacy.hash === existingHash
+      || existingLegacy.hash === candidateHash
   })
 
   if (!matches.length) {
@@ -597,9 +744,9 @@ function deterministicSemanticFallback(
     const sameOrigin = candOrigin === exOrigin
     const sameCwe = candCwe !== 'unknown' && candCwe === exCwe
     const sameEndpoint = candEndpoint === exEndpoint
-    // Two probes that explicitly name different verbs, different injectable parameters or different
-    // GraphQL root fields on the same route are distinct attack surfaces (GET vs DELETE BOLA, two
-    // parameters, two resolvers).
+    // Two probes that explicitly name different verbs, different injectable parameters,
+    // GraphQL/RPC operations or verified handlers are distinct attack surfaces (GET vs DELETE
+    // BOLA, two parameters, two resolvers, reverse-proxy handlers).
     const methodConflict = Boolean(
       candidate.method && existing.method &&
       candidate.method.trim().toUpperCase() !== existing.method.trim().toUpperCase(),
@@ -612,7 +759,16 @@ function deterministicSemanticFallback(
       candidate.graphqlField && existing.graphqlField &&
       candidate.graphqlField.trim().toLowerCase() !== existing.graphqlField.trim().toLowerCase(),
     )
-    const probeConflict = methodConflict || paramConflict || fieldConflict
+    const candMutated = normalizeMutatedInput(candidate.mutated)
+    const exMutated = normalizeMutatedInput(existing.mutated)
+    const mutationConflict = Boolean(
+      candMutated && exMutated &&
+      (candMutated.kind !== exMutated.kind || candMutated.name !== exMutated.name),
+    )
+    const candHandler = normalizeHandlerRef(candidate.handler?.trim() ? candidate.handler : candidate.verifiedEndpoint)
+    const exHandler = normalizeHandlerRef(existing.handler?.trim() ? existing.handler : existing.verifiedEndpoint)
+    const handlerConflict = Boolean(candHandler && exHandler && candHandler !== exHandler)
+    const probeConflict = methodConflict || paramConflict || fieldConflict || mutationConflict || handlerConflict
     const shouldUpgrade = severityRank(candidate.severity) > severityRank(existing.severity)
 
     // Same origin + origin-wide CWE (e.g., CORS / CSP / HSTS / TLS / cookies):
@@ -695,6 +851,8 @@ export async function judgeSemanticDuplicate(
     '- Return STRICT JSON only with keys: {"isDuplicate": boolean, "duplicateOfId": string | null, "shouldUpgrade": boolean, "rationale": string}.',
     '- Mark isDuplicate=true ONLY if fixing one existing finding fixes the candidate (same root cause, same component/middleware/handler).',
     '- Different endpoints with distinct authorization/injection bugs are NOT duplicates, even if they share a CWE.',
+    '- Findings that mutate a different parameter, header, GraphQL operation or RPC procedure on the same endpoint are NOT duplicates.',
+    '- Findings that resolve to a different verified handler/service path behind a reverse proxy are NOT duplicates.',
     '- Near-identical origin-level misconfigurations (e.g., two CORS reflections on the same host, one Low and one Medium with credentials) ARE duplicates, and shouldUpgrade=true if the candidate proves higher severity/impact.',
     '- If isDuplicate=false, duplicateOfId MUST be null and shouldUpgrade MUST be false.',
   ].join('\n')
@@ -711,6 +869,9 @@ export async function judgeSemanticDuplicate(
       specKind: candidate.specKind ?? 'http_chain',
       method: candidate.method ?? 'ANY',
       param: candidate.param ?? null,
+      graphqlField: candidate.graphqlField ?? null,
+      mutated: normalizeMutatedInput(candidate.mutated),
+      handler: normalizeHandlerRef(candidate.handler?.trim() ? candidate.handler : candidate.verifiedEndpoint) || null,
       reason: (candidate.reason ?? '').slice(0, 600),
       impact: (candidate.impact ?? '').slice(0, 400),
       remediation: (candidate.remediation ?? '').slice(0, 400),
@@ -728,6 +889,9 @@ export async function judgeSemanticDuplicate(
       specKind: f.specKind ?? 'http_chain',
       method: f.method ?? 'ANY',
       param: f.param ?? null,
+      graphqlField: f.graphqlField ?? null,
+      mutated: normalizeMutatedInput(f.mutated),
+      handler: normalizeHandlerRef(f.handler?.trim() ? f.handler : f.verifiedEndpoint) || null,
       reason: (f.reason ?? '').slice(0, 400),
       remediation: (f.remediation ?? '').slice(0, 300),
     })),
