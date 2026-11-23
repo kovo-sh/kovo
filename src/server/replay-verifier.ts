@@ -33,7 +33,9 @@ import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import {
   actorFromPersona,
+  assessBoundary,
   assessImpactEvidence,
+  classifyBoundaryClaim,
   classifyImpactDescriptor,
   normalizeRole,
 } from './oracle-invariants.ts'
@@ -219,6 +221,7 @@ export function impactStepsFromStepsOut(
       arm: step.role,
       method: step.request.method.toUpperCase(),
       route: normalizedReplayPath(step.request.pathAndQuery),
+      pathAndQuery: step.request.pathAndQuery,
       status: typeof entry?.status === 'number' ? entry.status : null,
       actor: {
         handle,
@@ -1294,16 +1297,38 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           : declaredImpactEvents
         const gateApplies = impactClass === 'mass_assignment' || impactClass === 'csrf' ||
           (impactClass === 'authorization' && (distinctActors.size > 1 || Boolean(spec.requiredRole) || Boolean(spec.resourceTenant)))
+        const impactSteps = impactStepsFromStepsOut(spec, stepsOut)
         const impactGate = !gateApplies
           ? null
           : assessImpactEvidence({
               impactClass,
-              steps: impactStepsFromStepsOut(spec, stepsOut),
+              steps: impactSteps,
               requiredRole: spec.requiredRole ?? null,
               resourceTenant: spec.resourceTenant ?? null,
               expectControlDenied: spec.expectControlDenied,
               oracleEvents,
               targetOrigin: spec.origin,
+            })
+        // Universal default-deny boundary gate: auth/bypass claims always need a challenged control
+        // (401/403, login redirect, MFA challenge, negative id) plus a crossing variant; access
+        // claims may fall back to an explicit actor/precondition differential.
+        const boundaryClass = classifyBoundaryClaim({
+          cwe: spec.cwe,
+          category: spec.category,
+          title: spec.title,
+          impact: spec.impact,
+        })
+        const boundaryGate = boundaryClass === 'other'
+          ? null
+          : assessBoundary({
+              impactClass,
+              steps: impactSteps,
+              requiredRole: spec.requiredRole ?? null,
+              resourceTenant: spec.resourceTenant ?? null,
+              expectControlDenied: spec.expectControlDenied,
+              oracleEvents,
+              targetOrigin: spec.origin,
+              boundaryClass,
             })
         if (impactGate?.required && !impactGate.satisfied && !proofGuardFailure) {
           proofGuardFailure = impactGate.reason
@@ -1339,6 +1364,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(spaCatchallAuto ? { spaCatchallAuto } : {}),
           bflaImpact,
           ...(impactGate ? { impactGate } : {}),
+          ...(boundaryGate ? { boundaryGate } : {}),
           proofStrength,
           endpointBinding,
         }
@@ -1349,6 +1375,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           // Vetoes only a would-be confirmation; a spec whose assertion already fails keeps its
           // dismissed/fixed semantics (Verify Fix must still report `fixed`).
           proofGuardFailure = impactGate.reason
+        }
+        if (boundaryGate?.required && !boundaryGate.satisfied && !proofGuardFailure) {
+          proofGuardFailure = boundaryGate.reason
         }
       } finally {
         await canarySession?.close()

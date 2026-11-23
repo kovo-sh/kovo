@@ -34,13 +34,15 @@ import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildPersonaHeader } from './persona-vault.ts'
 import {
+  assessBoundary,
   assessImpactEvidence,
+  classifyBoundaryClaim,
   classifyImpactDescriptor,
   normalizeRole,
   parseRoleLabel,
   assessReadDisclosure,
 } from './oracle-invariants.ts'
-import type { AmbientAuth, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
+import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
 
 // ---------------------------------------------------------------------------
 // Constants shared with the container mount (worker-backend) and both SDKs.
@@ -278,6 +280,21 @@ export type VerifyClaim =
       ambient?: { kind: AmbientAuth; sameSite?: string }
       message?: string
     }
+  /**
+   * Universal default-deny boundary evidence: a denied/challenged control plus a variant that crosses
+   * the same route family. Auth claims confirm only through this claim; access claims may instead
+   * rely on a passing `impact`/disclosure differential.
+   */
+  | {
+      kind: 'boundary'
+      boundaryClass: BoundaryClass
+      controlExchangeId: string
+      probeExchangeId: string
+      expectControlDenied?: boolean
+      actorRoles?: Record<string, string>
+      actorTenants?: Record<string, string>
+      message?: string
+    }
 
 export interface VerifyScriptResult {
   sdk?: string
@@ -313,6 +330,8 @@ export interface VerifyClaimContext {
    * needs an owner-scoped disclosure in the probe exchange.
    */
   claimedImpact?: ImpactClass
+  /** Boundary class declared by the proof title/description; auth claims need a `boundary` claim. */
+  claimedBoundary?: BoundaryClass
 }
 
 export interface VerifyCanaryCheck {
@@ -383,6 +402,12 @@ function isClaim(value: unknown): value is VerifyClaim {
         typeof rec.impactClass === 'string' && knownClasses.has(rec.impactClass) &&
         (rec.controlExchangeIds === undefined || (Array.isArray(rec.controlExchangeIds) && rec.controlExchangeIds.every(v => typeof v === 'string'))) &&
         (rec.oracleEvents === undefined || (Array.isArray(rec.oracleEvents) && rec.oracleEvents.every(v => typeof v === 'string')))
+    }
+    case 'boundary': {
+      const knownClasses = new Set(['auth', 'access'])
+      return typeof rec.controlExchangeId === 'string' &&
+        typeof rec.probeExchangeId === 'string' &&
+        typeof rec.boundaryClass === 'string' && knownClasses.has(rec.boundaryClass)
     }
     default:
       return false
@@ -677,6 +702,7 @@ function transcriptImpactStep(
     arm,
     method: (record.request?.method ?? 'GET').toUpperCase(),
     route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
+    pathAndQuery: record.request?.pathAndQuery ?? '/',
     status: record.response?.status ?? null,
     actor,
     json,
@@ -686,6 +712,77 @@ function transcriptImpactStep(
     responseHeaders: record.response?.headers ?? null,
     ...(record.seq !== undefined ? { seq: record.seq } : {}),
   } as ImpactStep & { seq: number }
+}
+
+function transcriptBoundaryStep(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'boundary' | 'impact' }>,
+  id: string,
+  arm: ImpactStep['arm'],
+): ImpactStep | null {
+  const record = store.get(id)
+  if (!record) return null
+  const body = store.body(id)
+  let json: unknown
+  if (body !== undefined) {
+    try { json = JSON.parse(body) } catch { json = undefined }
+  }
+  const handle = record.request?.personaHandle ?? null
+  const roles = 'actorRoles' in claim ? claim.actorRoles : undefined
+  const tenants = 'actorTenants' in claim ? claim.actorTenants : undefined
+  return {
+    id,
+    arm,
+    method: (record.request?.method ?? 'GET').toUpperCase(),
+    route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
+    pathAndQuery: record.request?.pathAndQuery ?? '/',
+    status: record.response?.status ?? null,
+    actor: {
+      handle,
+      role: normalizeRole(roles?.[handle ?? '']) ?? normalizeRole(handle),
+      tenant: tenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant,
+      auth: 'unknown',
+      sameSite: null,
+    },
+    json,
+    body: body ?? '',
+    requestHeaders: record.request?.headers ?? null,
+    responseHeaders: record.response?.headers ?? null,
+  }
+}
+
+function evaluateBoundaryClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'boundary' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const requireRecord = (id: string): VerifyTranscriptRecord | null => {
+    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
+    return store.get(id) ?? null
+  }
+  if (!requireRecord(claim.controlExchangeId)) {
+    return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
+  }
+  if (!requireRecord(claim.probeExchangeId)) {
+    return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for a boundary claim.` }
+  }
+  const control = transcriptBoundaryStep(store, claim, claim.controlExchangeId, 'control')
+  const probe = transcriptBoundaryStep(store, claim, claim.probeExchangeId, 'probe')
+  if (!control || !probe) {
+    return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
+  }
+  const assessment = assessBoundary({
+    boundaryClass: claim.boundaryClass,
+    impactClass: claim.boundaryClass === 'access' ? 'authorization' : 'other',
+    steps: [control, probe],
+    expectControlDenied: claim.expectControlDenied,
+  })
+  return {
+    claim,
+    passed: assessment.required && assessment.satisfied,
+    detail: assessment.reason,
+    observed: assessment.evidence,
+  }
 }
 
 function evaluateImpactClaim(
@@ -744,6 +841,11 @@ function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
   const ids = new Set<string>()
   for (const claim of claims) {
     if (claim.kind === 'timing' || claim.kind === 'impact') continue
+    if (claim.kind === 'boundary') {
+      ids.add(claim.controlExchangeId)
+      ids.add(claim.probeExchangeId)
+      continue
+    }
     ids.add(claim.exchangeId)
   }
   return [...ids]
@@ -805,6 +907,8 @@ function evaluateClaim(
   switch (claim.kind) {
     case 'impact':
       return evaluateImpactClaim(store, claim, context)
+    case 'boundary':
+      return evaluateBoundaryClaim(store, claim, context)
     case 'status': {
       const record = requireRecord(claim.exchangeId)
       if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}; claims must reference recorded RPC exchanges.` }
@@ -997,19 +1101,30 @@ export function evaluateClaims(
   const checks = claims.map(claim => evaluateClaim(store, claim, context))
   const failures = checks.filter(c => !c.passed).map(c => `${c.claim.kind}: ${c.detail}`)
   const claimed = context.claimedImpact
-  if (claimed && claimed !== 'other') {
-    const impactBacked = checks.some(check =>
-      check.passed && check.claim.kind === 'impact' &&
-      (check.claim.impactClass === claimed || (claimed === 'bfla' && check.claim.impactClass === 'authorization')))
-    if (!impactBacked) {
-      if (claimed === 'authorization') {
-        const disclosure = implicitReadDisclosure(store, claims, context)
-        if (!disclosure.satisfied) {
-          failures.push(`impact: authorization claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
-        }
-      } else {
-        failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim (role/tenant differential plus a clean persisted readback); status and echo claims are insufficient.`)
+  const boundaryClaimPassed = checks.some(check => check.passed && check.claim.kind === 'boundary')
+  const impactBacked = checks.some(check =>
+    check.passed && check.claim.kind === 'impact' &&
+    (check.claim.impactClass === claimed || (claimed === 'bfla' && check.claim.impactClass === 'authorization')))
+  if (claimed && claimed !== 'other' && !impactBacked) {
+    if (claimed === 'authorization') {
+      const disclosure = implicitReadDisclosure(store, claims, context)
+      if (!disclosure.satisfied && !boundaryClaimPassed) {
+        failures.push(`impact: authorization claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
       }
+    } else {
+      failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim (role/tenant differential plus a clean persisted readback); status and echo claims are insufficient.`)
+    }
+  }
+  // Universal default-deny: authentication/bypass claims confirm only with a signed, challenged
+  // control that the variant crosses. No label can pass on a 2xx from an ungated request.
+  const claimedBoundary = context.claimedBoundary
+  if (claimedBoundary === 'auth' && !boundaryClaimPassed) {
+    failures.push('boundary: authentication/bypass claim requires a `boundary` claim over a denied/challenged control (401/403, login redirect or MFA challenge) and a variant that crosses it; a 2xx from an ungated request is not a bypass.')
+  }
+  if (claimedBoundary === 'access' && !boundaryClaimPassed && !impactBacked) {
+    const disclosure = implicitReadDisclosure(store, claims, context)
+    if (!disclosure.satisfied) {
+      failures.push('boundary: access-control claim requires a denied/challenged control plus a crossing variant, or an actor/precondition differential backed by data/state evidence.')
     }
   }
   return {
@@ -1084,6 +1199,17 @@ export function causalFingerprints(
         path: pathFingerprint(probe?.request?.pathAndQuery),
         status: probe?.response?.status ?? null,
         expectation: { impactClass: claim.impactClass, oracleEvents: [...(claim.oracleEvents ?? [])].sort() },
+        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+      }
+    }
+    if (claim.kind === 'boundary') {
+      const probe = store.get(claim.probeExchangeId)
+      return {
+        kind: claim.kind,
+        method: probe?.request?.method ?? '',
+        path: pathFingerprint(probe?.request?.pathAndQuery),
+        status: probe?.response?.status ?? null,
+        expectation: { boundaryClass: claim.boundaryClass },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
     }
@@ -1855,6 +1981,7 @@ async function runAttempt(
       ...(options.canary ? { canary: options.canary } : {}),
       allowedExchangeIds: new Set(session.transcript.list().map(record => record.exchangeId)),
       claimedImpact: classifyImpactDescriptor({ title: parsed.title }),
+      claimedBoundary: classifyBoundaryClaim({ title: parsed.title }),
     })
     const causal = causalFingerprints(session.transcript, oracle.checks, nonce)
     return {
