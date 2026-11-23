@@ -342,3 +342,13 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Realism #3 (wiring signal, not capability):** `staging-concurrency --no-llm` fails at investigation, but **0 leaked entities, 0 tagged orphans, 0 approval requests/leases/parked workers** — env mode + cleanup wiring is healthy; the zero confirms are a capability gap.
 - **Floor variance caveat:** 29 vs 33/59 measured on the same base while ~31 concurrent benchmarks ran; treated as possibly **load-induced**, not automatically a code bug. Determinism stream now measures idle vs loaded spreads and replaces wall-clock early exit with request-count termination where load truncates the queue.
 - **Follow-up merge:** `9a865b6` (preserve store ordering for the bounded probe set) is committed but not yet in main; merge after the worktree is clean.
+
+### 2026-11-23 — hourly architecture check-in #5
+
+- **Determinism breakthrough (checkpoint `0f9a974`):** idle floor counts `[10,10,10]/[10,10,10]/[9,9,9]` with identical site sets; with 8 CPU hogs loaded the counts are identical (`driftApps=0`). Sequential Phase A (168 s / 1,800 req) restored acme agentic floor to **10/10 preserved**, leads **5 emitted / 4 consumed**, total **11/22 @100%** (was floor 5, leads 0, total 8).
+- **Checkpoint protocol (accepted, now in AGENTS.md):** 15-minute commit ceiling; commit code/typecheck/worker-gate before long evals; heartbeat every 15–20 min; reclaim any stream silent >25–30 min with a dirty tree.
+- **Provenance (accepted):** keep monotonicity **and** surface `provenance: floor | agent_only | chain_from_floor` in product report and certificate; `agentic_incremental_lift` computed from agent-only/chain findings, not total−floor alone.
+- **Phase-1 scope (accepted):** reason-bench **agentic ≥25% moves to Phase 3**; reason `--no-llm == 0/28` stays a Phase-1 gate, with one non-blocking agentic baseline recorded at Phase-1 close.
+- **Grader contract (accepted):** `confirmed_findings` may contain only `verificationStatus === 'confirmed'`; `static_only`/`open_proof_gap` go to a separate advisories bucket (≤10/app, never recall/precision); a static item leaking into confirmed counts as an FP. Fix the product boundary, never the grader.
+- **Universal default-deny (accepted):** every auth/access/bypass claim needs a transcript-verified denied/challenged control plus a boundary-crossing variant with state/data proof, regardless of label — closes label whack-a-mole (e.g. “2FA bypass” on an account without 2FA).
+- **Order confirmed:** determinism → realism #2 → #3 → #4 → #1 → `v6-retire-dsl` (≥1,800 LOC). Do not run the full n=3 matrix until static/advisory separation and the default-deny control land.

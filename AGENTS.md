@@ -25,7 +25,7 @@
 
 1. **Split before starting.** Enumerate the files a task touches and carve them into disjoint leases. If there are **two or more independent sets, launch two or more agents in separate worktrees immediately**. Serial execution is allowed only when edits share a file or a hard dependency exists — and the coordinator must state the reason.
 2. **One writer per file.** Use unique branches (`agents/<stream>`). Two streams must never edit the same file; if they must, split the file by section or serialize with an explicit handoff.
-3. **Checkpoint, don't run silent.** Every stream commits a WIP checkpoint within ~15 minutes or at each milestone and reports concise status. A long-running stream with no commit is a process bug, not progress.
+3. **Checkpoint, don't run silent (enforced).** Every stream commits a WIP checkpoint within ~15 minutes or at each milestone. Commit code + typecheck + worker-gate first, then run long evals from committed code, posting a 3-line heartbeat every 15–20 minutes (SHA, step, partial metric). Any stream silent >25–30 minutes with a dirty tree is interrupted to checkpoint or split. A long-running stream with no commit is a process bug, not progress.
 4. **Merge as streams finish.** Do not batch merges behind the slowest stream; integrate each completed stream and re-run the smoke floor.
 5. **Parallelize validation too.** Independent suites and benchmark legs (dev, held-out, agentic) run concurrently with isolated dirs. Use the smoke tier between tweaks; full matrices/gates only at batch boundaries.
 6. **Report the plan.** Before dispatching, state the parallel streams, their file leases, the merge order, and any serialization exception.
