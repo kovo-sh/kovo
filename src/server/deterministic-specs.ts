@@ -18,6 +18,10 @@ export interface EngineParam {
   location: SurfaceParamLocation
   isObjectId?: boolean
   isCsrf?: boolean
+  /** Schema-declared type from an OpenAPI/route map (string, integer, number, boolean, array, object). */
+  declaredType?: string
+  /** Runtime value shape observed in the target's own responses (url, path, xml, jwt, uuid, ...). */
+  observedShape?: string
 }
 
 export interface EngineEndpoint {

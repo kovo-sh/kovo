@@ -110,6 +110,7 @@ import {
 } from './dedupe.ts'
 import type { ExistingFindingRef } from './dedupe.ts'
 import {
+  intentFamily,
   runDeterministicEngine,
 } from './deterministic-engine.ts'
 import type { EngineConfirmed, EngineEndpoint, EngineLead, EnginePersona } from './deterministic-engine.ts'
@@ -181,7 +182,10 @@ export const deterministicLaneMaxWallClockMs = 240_000
 export const deterministicLaneWallClockShare = 0.4
 export type DeterministicSweepMode = 'off' | 'on' | 'always'
 
-/** Resolve the Slice-3 flag from the explicit option or `GUARDIAN_DETERMINISTIC_SWEEP`. */
+/**
+ * Legacy v5.1 parser: an *unset* flag resolves to `off`. Kept exported and unchanged for callers
+ * that pin the old opt-in semantics. `Execution` uses `resolveFloorLaneMode` instead.
+ */
 export function resolveDeterministicSweepMode(
   option?: boolean | 'always',
   env: NodeJS.ProcessEnv = process.env,
@@ -193,6 +197,26 @@ export function resolveDeterministicSweepMode(
   if (raw === 'always') return 'always'
   if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return 'on'
   return 'off'
+}
+
+/**
+ * v6 Phase 1: the Layer-2 deterministic floor is always-on. An agentic run starts the concurrent
+ * lane unless the operator explicitly disables it (`deterministicSweep: false` or
+ * `GUARDIAN_DETERMINISTIC_SWEEP=0`). `'always'` additionally bypasses the resumed-run guard.
+ * `--no-llm` runs the same engine unrestricted in `driveEngineInvestigation` and never starts the
+ * lane, so the floor is present on every run either way.
+ */
+export function resolveFloorLaneMode(
+  option?: boolean | 'always',
+  env: NodeJS.ProcessEnv = process.env,
+): DeterministicSweepMode {
+  if (option === 'always') return 'always'
+  if (option === false) return 'off'
+  if (option === true) return 'on'
+  const raw = env.GUARDIAN_DETERMINISTIC_SWEEP?.trim().toLowerCase()
+  if (raw === 'always') return 'always'
+  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
+  return 'on'
 }
 /** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
 const maxPhase3RefinementJobs = 10
@@ -961,6 +985,66 @@ function createBroker(options: { storage: SecondOrderStore; canaryBroker: Canary
   })
 }
 
+/** v6 Phase 1: map a deterministic probe class to the specialist category it best belongs to. */
+function detLeadCategory(probeClass: string): string {
+  switch (probeClass) {
+    case 'authz_matrix': return 'broken-access-control'
+    case 'sqli_boolean':
+    case 'sqli_time_diff':
+    case 'sql_boolean_diff':
+    case 'sql_time_diff':
+    case 'ssti_math': return 'injection'
+    case 'xss_context':
+    case 'stored_xss': return 'xss'
+    case 'ssrf_canary': return 'ssrf'
+    case 'xxe_canary': return 'xxe'
+    case 'command_injection': return 'command-injection'
+    case 'path_traversal_benign': return 'path-traversal'
+    case 'workflow_invariant': return 'business-logic'
+    case 'open_redirect_differential': return 'open-redirect'
+    case 'csrf_state_change': return 'csrf'
+    case 'mass_assignment': return 'mass-assignment'
+    case 'graphql_audit': return 'broken-access-control'
+    case 'cache_poison_deception': return 'misconfig-exposure'
+    default: return 'misconfig-exposure'
+  }
+}
+
+/** v6 Phase 1: map a persisted finding category onto the engine family namespace. */
+function confirmedCategoryFamily(category: string): string {
+  const raw = category.toLowerCase()
+  if (/access-control|authz|bola|bfla|idor/.test(raw)) return 'authz'
+  if (/injection/.test(raw)) return 'sqli'
+  if (/xss/.test(raw)) return 'xss'
+  if (/ssrf/.test(raw)) return 'ssrf'
+  if (/xxe/.test(raw)) return 'xxe'
+  if (/traversal/.test(raw)) return 'traversal'
+  if (/redirect/.test(raw)) return 'redirect'
+  if (/mass|overpost/.test(raw)) return 'mass_assign'
+  if (/csrf/.test(raw)) return 'csrf'
+  if (/logic|business/.test(raw)) return 'logic'
+  if (/disclos|exposure/.test(raw)) return 'disclosure'
+  if (/cmdi|command/.test(raw)) return 'cmdi'
+  return intentFamily(category)
+}
+
+/** v6 Phase 1: the skills a det_lead upgrade assignment should pre-inject. */
+function detLeadSkills(probeClass: string): string[] {
+  switch (probeClass) {
+    case 'authz_matrix':
+    case 'graphql_audit': return ['bola-idor-race', 'false-positive-elimination']
+    case 'sqli_boolean':
+    case 'sqli_time_diff':
+    case 'sql_boolean_diff':
+    case 'sql_time_diff': return ['injection-sqli-nosqli', 'false-positive-elimination']
+    case 'ssrf_canary': return ['oob-ssrf-browser-chain', 'false-positive-elimination']
+    case 'xss_context':
+    case 'stored_xss': return ['client-side-xss-postmessage', 'false-positive-elimination']
+    case 'workflow_invariant': return ['business-logic-chains', 'false-positive-elimination']
+    default: return ['false-positive-elimination']
+  }
+}
+
 export interface ExecutionOptions {
   broker?: RequestBroker
   browser?: ScopedBrowser
@@ -974,11 +1058,11 @@ export interface ExecutionOptions {
    */
   deterministicOnly?: boolean
   /**
-   * v5.1 Slice 3: run the deterministic engine as a concurrent, isolated sibling lane while the
-   * agentic specialists investigate. Default OFF. `'always'` bypasses the pre-Phase-0 seeded-step
-   * guard (operator override); `true` honours it. The lane never blocks dispatch, never consumes
-   * specialist worker slots, never cancels steps and never hides confirmed routes.
-   * Also settable via `GUARDIAN_DETERMINISTIC_SWEEP=1|always`.
+   * v6 Phase 1: run the deterministic floor as a concurrent, isolated sibling lane on **every**
+   * agentic run. Default ON; `deterministicSweep: false` (or `GUARDIAN_DETERMINISTIC_SWEEP=0`) is
+   * an operator kill switch, and `'always'` bypasses the resumed-run guard. The lane never blocks
+   * dispatch, never consumes specialist worker slots, never cancels steps and never hides
+   * confirmed routes.
    */
   deterministicSweep?: boolean | 'always'
   /**
@@ -1045,6 +1129,11 @@ export class Execution {
   private readonly agenticLaneCompleted = new Set<string>()
   private readonly agenticLaneStopping = new Set<string>()
   private readonly agenticLaneAssignmentIds = new Set<string>()
+  /** v6 Phase 1 gate counters (observed inputs, not asserted capability claims). */
+  private readonly laneStartedAt = new Map<string, number>()
+  private readonly laneWallByRun = new Map<string, number>()
+  private readonly detLeadConsumed = new Set<string>()
+  private readonly detLeadStepKeys = new Set<string>()
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
@@ -1070,7 +1159,7 @@ export class Execution {
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
     this.deterministicOnly = options.deterministicOnly === true
-    this.deterministicSweep = resolveDeterministicSweepMode(options.deterministicSweep)
+    this.deterministicSweep = resolveFloorLaneMode(options.deterministicSweep)
     const optionMaxDuration = Number(options.maxDurationMs)
     const envMaxDuration = Number(process.env.GUARDIAN_MAX_DURATION_MS)
     this.maxDurationMs = Number.isFinite(optionMaxDuration) && optionMaxDuration > 0
@@ -1348,6 +1437,16 @@ export class Execution {
       storage: this.storage,
       canaryBroker: this.canaryBroker,
       scopeRevision: run.scopeRevision,
+      // v6 Layer-1: every request is evaluated against the run's 3-tier origin policy, and an
+      // explicit operator lease (never a body-hash token) authorizes an otherwise-refused route.
+      scopePolicy: this.storage.scopePolicy(run),
+      // Explicit operator leases authorize otherwise-refused routes for long-lived engagements.
+      // Ephemeral local labs keep the exact single-use fingerprint ledger authoritative, so a
+      // consumed instance can never be replayed.
+      approvalLeases: (origin, method, pathAndQuery) => {
+        if (project.environment === 'local-lab') return false
+        return this.storage.approvalLeaseAuthorizer(run.id)(origin, method, pathAndQuery)
+      },
       mintCanary: (purpose, origin) => {
         const minted = this.canaryBroker.mintCanary(run.id, purpose, origin, {
           storage: this.storage,
@@ -2583,6 +2682,14 @@ export class Execution {
         rationale: input.rationale,
       }, input.secrets)
 
+      // v6 Layer-1: non-blocking operator opt-in. Persist `awaiting_approval` and release the worker
+      // slot immediately; the coroutine waits on the durable decision, not on a busy worker.
+      try {
+        this.storage.parkWorkerForApproval(run, job.assignment.id)
+        this.active.delete(job.assignment.id)
+        this.scheduleWake()
+      } catch { /* an already-parked or terminal worker keeps its state */ }
+
       decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
         const checkCurrent = () => {
           try {
@@ -2643,6 +2750,14 @@ export class Execution {
       this.storage.updateWorker(job.assignment.id, { status: 'running' })
     }
     if (decision === 'approved') {
+      // Resume the parked worker with a fresh lease and re-enter the scheduler. The exact
+      // single-use ledger remains: the durable operator lease is route-scoped and auditable.
+      try {
+        const resumed = this.storage.resumeParkedWorker(this.storage.run(run.id), job.assignment.id)
+        job.assignment = resumed
+        this.active.set(resumed.id, job)
+        this.scheduleWake()
+      } catch { /* resume is best-effort; the request still retries under the approval ledger */ }
       // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
       // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
       this.registerStateChangeApproval(run, {
@@ -2658,6 +2773,17 @@ export class Execution {
         approvalId: postedApprovalId,
         instances: input.approvalInstances,
       }, input.additionalApprovalTargets ?? [])
+    } else {
+      // A denied/expired/canceled decision ends this assignment; its slot was already released.
+      try {
+        this.storage.updateWorker(job.assignment.id, {
+          status: 'failed',
+          approvalParkedAt: null,
+          lease: null,
+          leaseExpiresAt: null,
+          outcome: `Tier 3 approval ${decision}.`,
+        })
+      } catch { /* worker may already be terminal */ }
     }
     return { approved: decision === 'approved' }
   }
@@ -4132,6 +4258,7 @@ export class Execution {
       promise: Promise.resolve(),
     }
     this.agenticLaneJobs.set(run.id, holder)
+    this.laneStartedAt.set(run.id, Date.now())
     const deadlineMs = this.deterministicLaneDeadlineMs()
     try {
       this.storage.event(
@@ -4163,6 +4290,8 @@ export class Execution {
         this.agenticLaneStopping.delete(run.id)
         this.agenticLaneCompleted.add(key)
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
+        try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'lane_aborted' : 'lane_complete') } catch { /* metrics only */ }
+        this.laneStartedAt.delete(run.id)
         try { this.scheduleWake() } catch { /* scheduler stopped */ }
       })
   }
@@ -4190,8 +4319,66 @@ export class Execution {
       .finally(() => { if (timer) clearTimeout(timer) })
   }
 
-  // --- Slice 3 / agentic value-add: read-only prompt context builders ---
+  /** Verified handler/endpoint reported by the replay verifier's endpoint binding, if any. */
+  private verifiedEndpointOf(result: { evidencePayload?: Record<string, unknown> }): string | null {
+    const binding = result.evidencePayload?.endpointBinding as
+      | { verifiedEndpoint?: { origin?: unknown; method?: unknown; pathAndQuery?: unknown } | null }
+      | undefined
+    const ve = binding?.verifiedEndpoint
+    if (!ve || typeof ve.method !== 'string' || typeof ve.origin !== 'string' || typeof ve.pathAndQuery !== 'string') return null
+    return `${ve.method.toUpperCase()} ${ve.origin}${ve.pathAndQuery}`.slice(0, 320)
+  }
 
+  /**
+   * Record the v6 Phase-1 gate counters (observed attribution, never asserted capability):
+   *  - `floorConfirmed`  findings whose id was emitted by a `deterministic_engine.confirmed` event,
+   *  - `agenticConfirmed` every other confirmed finding,
+   *  - `floorLeadsConsumed` det_lead facts turned into (or deduped against) a specialist assignment,
+   *  - `laneWallMs` how long the concurrent floor actually ran.
+   */
+  private recordFloorMetrics(runId: string, reason: string): void {
+    const deterministicIds = new Set<string>()
+    let floorRequests = 0
+    for (const event of this.storage.eventsAfter(runId, 0, 3_000)) {
+      if (event.kind === 'deterministic_engine.confirmed') {
+        const id = event.detail?.findingId
+        if (typeof id === 'string') deterministicIds.add(id)
+      } else if (event.kind === 'deterministic_engine.summary') {
+        const used = Number(event.detail?.requestsUsed)
+        if (Number.isFinite(used) && used > 0) floorRequests += used
+      }
+    }
+    let floorConfirmed = 0
+    let agenticConfirmed = 0
+    try {
+      const rows = this.storage.db.select().from(findings).where(eq(findings.runId, runId)).all()
+      for (const row of rows) {
+        if (row.finding.status !== 'confirmed') continue
+        if (deterministicIds.has(row.id)) floorConfirmed += 1
+        else agenticConfirmed += 1
+      }
+    } catch { /* run may be gone */ }
+    const startedAt = this.laneStartedAt.get(runId)
+    const laneWallMs = startedAt ? Math.max(0, Date.now() - startedAt) : (this.laneWallByRun.get(runId) ?? 0)
+    if (startedAt) this.laneWallByRun.set(runId, laneWallMs)
+    try {
+      this.storage.event(
+        runId,
+        'deterministic_lane.metrics',
+        `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${this.detLeadConsumed.size} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
+        {
+          reason,
+          floorConfirmed,
+          agenticConfirmed,
+          floorLeadsConsumed: this.detLeadConsumed.size,
+          laneWallMs,
+          floorRequests,
+        },
+      )
+    } catch { /* metrics are best-effort */ }
+  }
+
+  // --- Slice 3 / agentic value-add: read-only prompt context builders ---
   /** Confirmed + static-verified (endpoint, method, param, cwe) refs. Prompt context only. */
   private alreadyConfirmedRefs(run: Run, limit = 10): AlreadyConfirmedRef[] {
     try {
@@ -4279,8 +4466,93 @@ export class Execution {
     }
   }
 
-  private missionKindForStep(step: ChainStep, hasDetLead: boolean): MissionKind {
-    if (/second.order|stored|canary/i.test(`${step.title} ${step.hypothesis}`)) return 'second_order'
+  /** Endpoint templates a step explicitly names (normalized). Never used for eligibility. */
+  private stepMentionedRoutes(step: Pick<ChainStep, 'title' | 'hypothesis'>): string[] {
+    const text = `${step.title} ${step.hypothesis}`
+    const routes = new Set<string>()
+    for (const match of text.matchAll(/(?:^|[\s`'"(,])((?:\/[A-Za-z0-9_\-.:{}[\]]+){2,})/g)) {
+      const raw = match[1].replace(/[),.;:'"`]+$/, '')
+      if (!raw.startsWith('/')) continue
+      if (/^\/(?:api|v\d+)$/i.test(raw)) continue
+      routes.add(normalizeEndpointTemplate(raw))
+    }
+    return [...routes]
+  }
+
+  /**
+   * A planner step that only names routes the deterministic floor already confirmed is a duplicate
+   * dispatch, unless it declares a parent fact/step (that is an explicit chain/escalation).
+   */
+  private stepRepeatsConfirmedWork(step: Pick<ChainStep, 'title' | 'hypothesis' | 'dependsOnFactIds' | 'dependsOnStepIds'>, confirmed: readonly AlreadyConfirmedRef[]): boolean {
+    if ((step.dependsOnFactIds?.length ?? 0) > 0 || (step.dependsOnStepIds?.length ?? 0) > 0) return false
+    const routes = this.stepMentionedRoutes(step)
+    if (!routes.length) return false
+    const confirmedPaths = new Set(confirmed.map(ref => normalizeEndpointTemplate(ref.path)))
+    return routes.every(route => confirmedPaths.has(route))
+  }
+
+  /**
+   * Turn prioritized deterministic leads into upgrade assignments. A det_lead is only useful to the
+   * agentic lane when it is (a) unconfirmed, (b) not a route/class the floor already confirmed, and
+   * (c) bound to its originating fact so it becomes a `det_lead_upgrade` mission with a brief.
+   */
+  private queueDetLeadUpgradeSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
+    const confirmed = this.alreadyConfirmedRefs(run, 40)
+    const confirmedKeys = new Set(confirmed.map(ref =>
+      `${normalizeEndpointTemplate(ref.path)}|${confirmedCategoryFamily(ref.probeClass ?? '')}`))
+    const facts = this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
+    const existing = this.storage.listChainSteps(run.id, run.goalRevision)
+    const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
+    let slots = Math.max(0, budget - existing.length)
+    let created = 0
+    for (const fact of facts) {
+      if (slots <= 0 || created >= 4) break
+      if (fact.data?.kind !== 'det_lead') continue
+      if (!approvedOrigins.has(fact.origin)) continue
+      const endpoint = typeof fact.data.endpoint === 'string' ? fact.data.endpoint : ''
+      const probeClass = typeof fact.data.probeClass === 'string' ? fact.data.probeClass : ''
+      const method = typeof fact.data.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
+      if (!endpoint.startsWith('/') || !probeClass) continue
+      if (boundFactIds.has(fact.id)) continue
+      const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(detLeadCategory(probeClass))}`
+      if (confirmedKeys.has(routeKey)) continue
+      if (this.detLeadStepKeys.has(`${method} ${routeKey}`)) continue
+      const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
+      if (!asset) continue
+      const category = detLeadCategory(probeClass)
+      const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'differential observation'
+      const skills = detLeadSkills(probeClass)
+      const title = `det_lead upgrade · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
+      const hypothesis = `The deterministic floor observed an unproven ${probeClass} signal at ${method} ${endpoint} (${reason}). Reproduce it, identify the concretely mutated input, and submit a verified proof or chain it into a higher-impact finding.`
+      const createdStep = this.storage.addChainStep(run, {
+        title,
+        hypothesis,
+        category,
+        priority: 88,
+        targetAssetIds: [asset.id],
+        skills,
+        dependsOnFactIds: [fact.id],
+        sourceOrigins: [fact.origin],
+        specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills }),
+      })
+      this.storage.updateChainStep(createdStep.id, { status: 'ready' })
+      this.detLeadStepKeys.add(`${method} ${routeKey}`)
+      this.detLeadConsumed.add(fact.id)
+      slots -= 1
+      created += 1
+      try {
+        this.storage.event(
+          run.id,
+          'deterministic_lane.lead_consumed',
+          `det_lead ${probeClass} on ${method} ${endpoint} queued as a prioritized upgrade assignment.`,
+          { probeClass, endpoint, method, factId: fact.id, stepId: createdStep.id },
+        )
+      } catch { /* best-effort */ }
+    }
+    return created
+  }
+
+  private missionKindForStep(step: ChainStep, hasDetLead: boolean): MissionKind {    if (/second.order|stored|canary/i.test(`${step.title} ${step.hypothesis}`)) return 'second_order'
     if (step.dependsOnStepIds.length > 0) return 'chain_step_2'
     if (/workflow|race|double.spend|business|quantity|price/i.test(`${step.title} ${step.hypothesis} ${step.category}`)) return 'business_logic'
     if (step.dependsOnFactIds.length > 0 && hasDetLead) return 'det_lead_upgrade'
@@ -4364,9 +4636,10 @@ export class Execution {
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
-      // no-profile fallback below stays byte-for-byte unchanged.
+      // no-profile fallback stays byte-for-byte unchanged; it is suppressed while a worker is
+      // parked awaiting an operator decision, because the run is not idle, it is blocked on a human.
       if (this.deterministicOnly) this.driveEngineInvestigation(run)
-      else this.driveDeterministicInvestigation(run)
+      else if (this.storage.parkedWorkerCount(run.id) === 0) this.driveDeterministicInvestigation(run)
       return
     }
     // Always compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
@@ -5376,14 +5649,25 @@ export class Execution {
       const remainingRequests = current.budgetRequests > 0
         ? Math.max(0, current.budgetRequests - current.spentRequests)
         : 700
-      const maxRequests = laneOptions.lane
+      const requestCap = laneOptions.lane
         // The lane is additive: it may use at most half the remaining request budget so
         // specialists always keep headroom (wall clock is its primary cap).
         ? Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_LANE_MAX_REQUESTS') ?? 900, Math.floor(remainingRequests * 0.5)))
         : Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
-      const maxDurationMs = laneOptions.lane
+      const durationCap = laneOptions.lane
         ? Math.max(1_000, laneOptions.maxDurationMs ?? this.deterministicLaneDeadlineMs())
         : envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
+      // v6 environment contract: shared staging gets a short, tightly capped floor pass so it can
+      // never dominate the engagement budget, and every created entity carries the run tag.
+      const environmentMode = this.storage.scopePolicy(current).mode
+      const entityTag = environmentMode === 'staging_isolated' ? `guardian-qa-${current.id}-` : undefined
+      const stagingCap = environmentMode === 'staging_isolated'
+        ? Math.max(50, Math.floor((current.budgetRequests > 0 ? current.budgetRequests : requestCap) * 0.2))
+        : requestCap
+      const maxRequests = Math.min(requestCap, stagingCap)
+      const maxDurationMs = environmentMode === 'staging_isolated'
+        ? Math.min(durationCap, 90_000)
+        : durationCap
       const maxHypotheses = envNumber('GUARDIAN_DETERMINISTIC_MAX_HYPOTHESES') ?? 90
 
       this.storage.event(
@@ -5416,6 +5700,9 @@ export class Execution {
         maxRequests,
         maxDurationMs,
         maxHypotheses,
+        lane: Boolean(laneOptions.lane),
+        environmentMode,
+        ...(entityTag ? { entityTag } : {}),
         recordExchange,
         log: (kind, message, data) => {
           try { this.storage.event(current.id, kind, message, data ?? {}) } catch { /* run may be gone */ }
@@ -5587,6 +5874,7 @@ export class Execution {
         method: existingFields?.method ?? null,
         param: existingFields?.param ?? null,
         graphqlField: existingFields?.graphqlField ?? null,
+        mutated: existingFields?.mutated ?? null,
         fingerprintHash: row.fingerprintHash ?? null,
       }
     })
@@ -5602,6 +5890,8 @@ export class Execution {
       method: fields.method,
       param: fields.param,
       graphqlField: fields.graphqlField,
+      mutated: fields.mutated ?? null,
+      ...(this.verifiedEndpointOf(confirmed.result) ? { verifiedEndpoint: this.verifiedEndpointOf(confirmed.result)! } : {}),
     }, existingRefs)
     if (duplicate.isDuplicate) return null
 
@@ -5784,6 +6074,7 @@ export class Execution {
         method: existingFields?.method ?? null,
         param: existingFields?.param ?? null,
         graphqlField: existingFields?.graphqlField ?? null,
+        mutated: existingFields?.mutated ?? null,
         fingerprintHash: row.fingerprintHash ?? null,
       }
     })
@@ -5799,6 +6090,7 @@ export class Execution {
       method: fields.method,
       param: fields.param,
       graphqlField: fields.graphqlField,
+      mutated: fields.mutated ?? null,
     }, existingRefs)
     if (duplicate.isDuplicate) return null
 
@@ -6061,6 +6353,13 @@ export class Execution {
       this.advanceToVerification(fresh)
       return
     }
+
+    // v6 Phase 1: prioritized deterministic leads become upgrade assignments before the planner
+    // runs, so the agentic lane never idles on confirmed routes and never loses a floor signal.
+    let detLeadSteps = 0
+    try {
+      detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, this.approvedOriginsSet(fresh), dynamicStepBudget)
+    } catch { /* lead queueing is additive */ }
 
     // 1. Advance roundNo & trigger background LSM cold-graph compaction
     const roundRes = this.compactor.onPlannerRound(this.storage, run.id, profiles, task.controller.signal)
@@ -6333,7 +6632,7 @@ export class Execution {
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
-    let addedCount = synthesizedStepsCount + bolaAutoSteps
+    let addedCount = synthesizedStepsCount + bolaAutoSteps + detLeadSteps
 
     for (const cancelId of parsedPlanner.data.cancelStepIds) {
       const target = existingSteps.find(s => s.id === cancelId)
@@ -6342,13 +6641,16 @@ export class Execution {
       }
     }
 
+    // Confirmed floor work is read-only context: a new step that only re-names an already
+    // confirmed route (and declares no parent fact/step) is a duplicate dispatch, not new work.
+    const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 40)
     const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
     const budgetedNewSteps = applyCrownJewelStepBudget(
       parsedPlanner.data.newSteps.map(step => ({ ...step, origins: step.origins.filter(o => currentApproved.has(o)) })),
       hostTiers,
       existingSteps,
       remainingSlots,
-    )
+    ).filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
 
     for (const step of budgetedNewSteps) {
       const validOrigins = step.origins.filter(o => currentApproved.has(o))
@@ -6381,7 +6683,7 @@ export class Execution {
       this.plannerDoneRound.set(run.id, roundRes.roundNo)
     }
     this.storage.event(run.id, 'planner.round', `Planner round ${roundRes.roundNo}: added ${addedCount} steps.`, {
-      roundNo: roundRes.roundNo, addedCount, synthesizedStepsCount, bolaAutoSteps, done: parsedPlanner.data.done, summary: parsedPlanner.data.summary.slice(0, 300),
+      roundNo: roundRes.roundNo, addedCount, synthesizedStepsCount, bolaAutoSteps, detLeadSteps, done: parsedPlanner.data.done, summary: parsedPlanner.data.summary.slice(0, 300),
     })
   }
 
@@ -7796,6 +8098,7 @@ export class Execution {
               method: existingFields?.method ?? null,
               param: existingFields?.param ?? null,
               graphqlField: existingFields?.graphqlField ?? null,
+              mutated: existingFields?.mutated ?? null,
               reason: row.finding.reason,
               impact: row.finding.impact,
               remediation: row.finding.remediation,
@@ -7824,6 +8127,7 @@ export class Execution {
               method: specDedupeFields.method,
               param: specDedupeFields.param,
               graphqlField: specDedupeFields.graphqlField,
+              mutated: specDedupeFields.mutated ?? null,
               reason: parsed.severityRationale,
               impact: parsed.impact,
               remediation: parsed.remediation,
@@ -8412,6 +8716,7 @@ export class Execution {
       this.storage.message(current.id, current.coordinatorId, 'guardian',
         `Investigation complete${openProofGaps.length ? ` (${openProofGaps.length} open proof ${openProofGaps.length === 1 ? 'gap' : 'gaps'} surfaced)` : ''}. Deterministic Zero-LLM verification is replaying every proposed finding and checking baselines.`)
     }, { behavior: 'immediate' })
+    try { this.recordFloorMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
   }
 
   private driveVerification(run: Run) {
@@ -9270,6 +9575,7 @@ export class Execution {
         method: existingFields?.method ?? null,
         param: existingFields?.param ?? null,
         graphqlField: existingFields?.graphqlField ?? null,
+        mutated: existingFields?.mutated ?? null,
         fingerprintHash: row.fingerprintHash ?? null,
       }
     })
@@ -9285,6 +9591,7 @@ export class Execution {
       method: fields.method,
       param: fields.param,
       graphqlField: fields.graphqlField,
+      mutated: fields.mutated ?? null,
     }, existingRefs)
     if (duplicate.isDuplicate && duplicate.duplicateOfId) {
       return {
