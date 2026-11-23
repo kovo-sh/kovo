@@ -120,6 +120,59 @@ export function seedCodeToRuntimeLeads(
 
 const SEVERITY_RISK: Record<string, number> = { critical: 98, high: 92, medium: 84, low: 70 }
 
+/**
+ * Evidence fields a promoted deterministic lead must carry into its `det_lead` fact so the dispatcher
+ * can prioritize (and brief) the upgrade without re-probing blindly. Structurally typed to avoid a
+ * runtime import cycle with `deterministic-engine.ts`. Adoption at the fact-persistence site is:
+ *   data: { ...existing, ...detLeadEvidenceFactFields(lead.evidence) }
+ */
+export interface DetLeadEvidenceFacts {
+  kind?: string
+  verifyFailureReason?: string | null
+  verifyFailureCode?: string | null
+  controlOutcome?: string
+  evidenceExchangeIds?: readonly string[]
+  candidateProbeClass?: string
+  detail?: string
+}
+
+export const detLeadEvidenceFieldKeys = [
+  'leadEvidenceKind',
+  'verifyFailureReason',
+  'verifyFailureCode',
+  'controlOutcome',
+  'evidenceExchangeIds',
+  'candidateProbeClass',
+  'leadEvidenceDetail',
+] as const
+
+/** Build the additive fact-data fields for a promoted lead (empty object when no evidence). */
+export function detLeadEvidenceFactFields(
+  evidence?: DetLeadEvidenceFacts | null,
+): Record<string, unknown> {
+  if (!evidence) return {}
+  const fields: Record<string, unknown> = {}
+  if (evidence.kind) fields.leadEvidenceKind = evidence.kind
+  if (evidence.verifyFailureReason) fields.verifyFailureReason = evidence.verifyFailureReason
+  if (evidence.verifyFailureCode) fields.verifyFailureCode = evidence.verifyFailureCode
+  if (evidence.controlOutcome) fields.controlOutcome = evidence.controlOutcome
+  if (evidence.candidateProbeClass) fields.candidateProbeClass = evidence.candidateProbeClass
+  if (evidence.detail) fields.leadEvidenceDetail = evidence.detail
+  const exchangeIds = [...new Set((evidence.evidenceExchangeIds ?? []).filter(id => typeof id === 'string' && id))]
+  if (exchangeIds.length > 0) fields.evidenceExchangeIds = exchangeIds.slice(0, 6)
+  return fields
+}
+
+/** Severity bonus for a fact that already carries promotion evidence (dispatcher ranking input). */
+export function leadEvidenceRiskBonus(data?: Record<string, unknown>): number {
+  switch (data?.leadEvidenceKind) {
+    case 'near_miss': return 12
+    case 'denied_control': return 8
+    case 'data_delta': return 4
+    default: return 0
+  }
+}
+
 export interface GraphLeadTarget {
   origin: string
   method: string
@@ -151,7 +204,7 @@ export function graphLeadTargets(
       origin: fact.origin,
       method,
       pathTemplate: path,
-      riskScore: SEVERITY_RISK[severity] ?? 84,
+      riskScore: (SEVERITY_RISK[severity] ?? 84) + leadEvidenceRiskBonus(fact.data),
       source: 'program_graph',
       params: [],
     })
