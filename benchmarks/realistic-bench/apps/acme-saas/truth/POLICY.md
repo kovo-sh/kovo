@@ -28,11 +28,11 @@ Roles rank `viewer < member < admin < owner`. The app gates **function-level** a
 
 | action | required role |
 | --- | --- |
-| invite a member, delete a member, update a member's role | owner / admin (owner for role + delete) |
-| revoke/create API keys, manage webhooks | owner |
-| change the tenant plan (`updatePlan`), add seats, impersonate | owner |
+| invite a member | owner / admin |
+| remove a member, create/revoke API keys, create a webhook, change the tenant plan, add seats, impersonate | owner |
 | admin surface (`/api/admin/**`) | admin / owner |
-| read/list/write tenant content, read own profile, list keys | any authenticated member |
+| update a member profile (`updateMember`, `updateAvatar`), delete a webhook | any authenticated member; `role` is silently ignored for non-owners |
+| read/list/write tenant content, apply credit to the own tenant, read own profile, list keys | any authenticated member |
 
 Content writes by a `viewer` are therefore in policy (the UI advertises `updateProject`,
 `createInvoice`, … to every signed-in user). The planted vertical-BFLA target is
