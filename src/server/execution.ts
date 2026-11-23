@@ -754,12 +754,6 @@ export function shouldRunCrossHostSynthesizer(
   return { trigger, reason, distinctOrigins, leverageSignals }
 }
 
-function isSafeIdempotentPost(pathAndQuery: string, body?: string): boolean {
-  if (!/(?:graphql|search|query|introspect)/i.test(pathAndQuery)) return false
-  if (!body) return true
-  return !/\bmutation\b/i.test(body)
-}
-
 // --- Deterministic (zero-LLM) investigation fallback helpers ---
 
 /** Parameter names worth a differential SQL probe (generic, engine-level — not app-specific). */
@@ -1187,7 +1181,6 @@ export class Execution {
         const fresh = this.storage.run(run.id)
         return permittedAtAdmission.has(origin) && this.permitted(fresh, origin)
       },
-      isIdempotentPostAllowed: (_origin, pathAndQuery, body) => isSafeIdempotentPost(pathAndQuery, body),
       isStateChangeApproved: (origin, method, pathAndQuery, context) => {
         const fresh = this.storage.run(run.id)
         const localLabAutoApproval =
