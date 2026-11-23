@@ -212,10 +212,13 @@ export const diminishingReturnsDryThreshold = 6
 
 const plannerDebounceMs = 1_200
 const intentLeaseMs = 30 * 60_000
-/** Hard ceiling for the concurrent deterministic lane (v5.1 Slice 3). */
-export const deterministicLaneMaxWallClockMs = 240_000
-/** The lane may consume at most this share of the run's remaining wall clock. */
-export const deterministicLaneWallClockShare = 0.4
+/** Hard ceiling for Phase A (the sequential deterministic floor that runs before agents). */
+export const deterministicFloorMaxWallClockMs = 180_000
+/** Phase A may consume at most this share of the run's wall clock (25–30% target). */
+export const deterministicFloorWallClockShare = 0.28
+/** Keep the legacy lane names as aliases so external diagnostics keep compiling. */
+export const deterministicLaneMaxWallClockMs = deterministicFloorMaxWallClockMs
+export const deterministicLaneWallClockShare = deterministicFloorWallClockShare
 export type DeterministicSweepMode = 'off' | 'on' | 'always'
 
 /**
@@ -1243,6 +1246,8 @@ export class Execution {
   /** v6 Phase 1 gate counters (observed inputs, not asserted capability claims). */
   private readonly laneStartedAt = new Map<string, number>()
   private readonly laneWallByRun = new Map<string, number>()
+  /** runId → first agent dispatch time after Phase A, for phase-timing telemetry. */
+  private readonly agenticFloorDispatchedAt = new Map<string, number>()
   private readonly detLeadConsumed = new Set<string>()
   private readonly detLeadStepKeys = new Set<string>()
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
@@ -1335,6 +1340,20 @@ export class Execution {
 
   async stop() {
     this.stopped = true
+    // Finalize the floor summary for every run this engine touched, including runs stopped by the
+    // wall-clock/driver before Phase 3 (partial reports). This is the "run finalize" emission the
+    // preservation gate reads; per-phase snapshots keep their own reason.
+    try {
+      const runIds = new Set<string>([
+        ...[...this.active.values()].map(job => job.assignment.runId),
+        ...this.laneStartedAt.keys(),
+        ...this.laneWallByRun.keys(),
+        ...this.agenticFloorDispatchedAt.keys(),
+      ])
+      for (const runId of runIds) {
+        try { this.recordFloorMetrics(runId, 'finalize') } catch { /* metrics are best-effort */ }
+      }
+    } catch { /* store may be unavailable during teardown */ }
     this.wakeScheduled = false
     this.unsubWake?.()
     this.unsubWake = undefined
@@ -4211,12 +4230,12 @@ export class Execution {
   }
 
   /**
-   * Slice 3: launch the deterministic engine as an isolated sibling task. Never awaited by
-   * dispatch, never counted in `active` (so it cannot take a specialist worker slot), zero chain
-   * steps, no dynamicStepBudget writes, and its own valid grant through the approval contract.
+   * Phase A: start the deterministic floor as the first, blocking investigation phase. It uses the
+   * exact `--no-llm` implementation and deep policy; agents are not dispatched until it settles.
+   * Returns true when the floor is (or remains) in flight, so `driveInvestigation` yields to it.
    */
-  private startDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]) {
-    if (!this.shouldStartDeterministicLane(run, profiles)) return
+  private startDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]): boolean {
+    if (!this.shouldStartDeterministicLane(run, profiles)) return this.agenticLaneJobs.has(run.id)
     const key = this.deterministicLaneKey(run)
     const controller = new AbortController()
     const holder = {
@@ -4232,13 +4251,12 @@ export class Execution {
       this.storage.event(
         run.id,
         'deterministic_lane.started',
-        `Concurrent deterministic lane started (deadline ${Math.round(deadlineMs / 1000)}s, ${Math.round(deterministicLaneWallClockShare * 100)}% of run wall clock).`,
-        { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep },
+        `Deterministic floor (Phase A) started before agents (deadline ${Math.round(deadlineMs / 1000)}s, ${Math.round(deterministicFloorWallClockShare * 100)}% of run wall clock).`,
+        { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep, sequential: true },
       )
     } catch { /* run may be gone */ }
     this.traceLifecycle(run.id, 'lane_start', { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep })
     holder.promise = this.runEngineInvestigation(run, {
-      lane: true,
       signal: controller.signal,
       maxDurationMs: deadlineMs,
       onAssignment: id => {
@@ -4250,7 +4268,7 @@ export class Execution {
         if (controller.signal.aborted) return
         try {
           const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
-          this.storage.event(run.id, 'deterministic_lane.failed', `Concurrent deterministic lane failed: ${msg}`)
+          this.storage.event(run.id, 'deterministic_lane.failed', `Deterministic floor failed: ${msg}`)
         } catch { /* run may be gone */ }
       })
       .finally(() => {
@@ -4258,10 +4276,11 @@ export class Execution {
         this.agenticLaneStopping.delete(run.id)
         this.agenticLaneCompleted.add(key)
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
-        try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'lane_aborted' : 'lane_complete') } catch { /* metrics only */ }
+        try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         this.laneStartedAt.delete(run.id)
         try { this.scheduleWake() } catch { /* scheduler stopped */ }
       })
+    return true
   }
 
   /**
@@ -4300,21 +4319,38 @@ export class Execution {
   /**
    * Record the v6 Phase-1 gate counters (observed attribution, never asserted capability):
    *  - `floorConfirmed`  findings whose id was emitted by a `deterministic_engine.confirmed` event,
+   *  - `floorStandaloneExpected` confirmations the floor itself reported (same deep policy as
+   *    `--no-llm`), so preservation is measurable without re-running the benchmark,
    *  - `agenticConfirmed` every other confirmed finding,
-   *  - `floorLeadsConsumed` det_lead facts turned into (or deduped against) a specialist assignment,
-   *  - `laneWallMs` how long the concurrent floor actually ran.
+   *  - `floorLeadsEmitted`/`floorLeadsConsumed` det_lead signals and upgraded assignments,
+   *  - `laneWallMs` and phase timings for the sequential Phase A floor.
    */
   private recordFloorMetrics(runId: string, reason: string): void {
     const deterministicIds = new Set<string>()
     let floorRequests = 0
-    for (const event of this.storage.eventsAfter(runId, 0, 3_000)) {
-      if (event.kind === 'deterministic_engine.confirmed') {
-        const id = event.detail?.findingId
-        if (typeof id === 'string') deterministicIds.add(id)
-      } else if (event.kind === 'deterministic_engine.summary') {
-        const used = Number(event.detail?.requestsUsed)
-        if (Number.isFinite(used) && used > 0) floorRequests += used
+    let floorStandaloneExpected = 0
+    let floorLeadsEmitted = 0
+    // Paginate: a deep floor emits >3k broker/probe events, so a single capped page silently
+    // misses the summary/confirmation events at the tail.
+    let after = 0
+    for (;;) {
+      const page = this.storage.eventsAfter(runId, after, 1_000)
+      if (!page.length) break
+      for (const event of page) {
+        if (event.kind === 'deterministic_engine.confirmed') {
+          const id = event.detail?.findingId
+          if (typeof id === 'string') deterministicIds.add(id)
+        } else if (event.kind === 'deterministic_engine.summary') {
+          const used = Number(event.detail?.requestsUsed)
+          if (Number.isFinite(used) && used > 0) floorRequests += used
+          const confirmed = Number(event.detail?.confirmed)
+          if (Number.isFinite(confirmed) && confirmed > 0) floorStandaloneExpected += confirmed
+        } else if (event.kind === 'deterministic_engine.lead') {
+          floorLeadsEmitted += 1
+        }
       }
+      after = page[page.length - 1]!.id
+      if (page.length < 1_000) break
     }
     let floorConfirmed = 0
     let agenticConfirmed = 0
@@ -4329,19 +4365,43 @@ export class Execution {
     const startedAt = this.laneStartedAt.get(runId)
     const laneWallMs = startedAt ? Math.max(0, Date.now() - startedAt) : (this.laneWallByRun.get(runId) ?? 0)
     if (startedAt) this.laneWallByRun.set(runId, laneWallMs)
+    const preservationRatio = floorStandaloneExpected > 0
+      ? Number((floorConfirmed / floorStandaloneExpected).toFixed(4))
+      : (floorConfirmed > 0 ? 1 : 0)
+    const dispatchedAt = this.agenticFloorDispatchedAt.get(runId)
+    const phaseTimings = {
+      floorStartedAt: startedAt ?? null,
+      floorFinishedAt: startedAt ? startedAt + laneWallMs : null,
+      floorMs: laneWallMs,
+      agentDispatchAt: dispatchedAt ?? null,
+      dispatchAfterFloorMs: dispatchedAt && startedAt ? Math.max(0, dispatchedAt - (startedAt + laneWallMs)) : null,
+    }
+    const detail = {
+      reason,
+      floorConfirmed,
+      floorStandaloneExpected,
+      preservationRatio,
+      agenticConfirmed,
+      floorLeadsEmitted,
+      floorLeadsConsumed: this.detLeadConsumed.size,
+      laneWallMs,
+      floorRequests,
+      phaseTimings,
+    }
     try {
       this.storage.event(
         runId,
         'deterministic_lane.metrics',
         `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${this.detLeadConsumed.size} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
-        {
-          reason,
-          floorConfirmed,
-          agenticConfirmed,
-          floorLeadsConsumed: this.detLeadConsumed.size,
-          laneWallMs,
-          floorRequests,
-        },
+        detail,
+      )
+    } catch { /* metrics are best-effort */ }
+    try {
+      this.storage.event(
+        runId,
+        'deterministic_floor.summary',
+        `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${this.detLeadConsumed.size} consumed, ${floorRequests} request(s), Phase A ${Math.round(laneWallMs / 1000)}s.`,
+        detail,
       )
     } catch { /* metrics are best-effort */ }
   }
@@ -4468,7 +4528,13 @@ export class Execution {
     const confirmed = this.alreadyConfirmedRefs(run, 40)
     const confirmedKeys = new Set(confirmed.map(ref =>
       `${normalizeEndpointTemplate(ref.path)}|${confirmedCategoryFamily(ref.probeClass ?? '')}`))
-    const facts = this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
+    const facts = [...this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })]
+      // det_lead facts are listed in store row order (random row-id tiebreak). The upgrade queue
+      // takes the first N, so sort by stable leading fields before choosing.
+      .sort((a, b) => {
+        const keyOf = (fact: typeof a) => `${String(fact.data?.endpoint ?? '')}\u0000${String(fact.data?.method ?? '')}\u0000${String(fact.data?.probeClass ?? '')}\u0000${fact.id}`
+        return keyOf(a).localeCompare(keyOf(b))
+      })
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
     let slots = Math.max(0, budget - existing.length)
@@ -4634,7 +4700,7 @@ export class Execution {
       assignment,
       hypotheses,
       this.programGraphLeadsSeeded,
-      [...this.approvedOriginsSet(run)][0] ?? '',
+      [...this.approvedOriginsSet(run)].sort()[0] ?? '',
     )
   }
 
@@ -4658,10 +4724,26 @@ export class Execution {
 
     this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
 
-    // Slice 3: the deterministic lane is a sibling task started as Phase-2 dispatch begins. It is
-    // fire-and-forget here; it never blocks dispatch and never shares the specialist semaphore.
+    // Phase A: the deterministic floor runs sequentially *before* any agent dispatch, using the
+    // same deep implementation/policy as `--no-llm`. It is not a sibling lane: dispatch yields
+    // until it settles, so workers never race or clobber floor probe state and the floor cannot be
+    // starved by specialist request/rate/budget pressure.
     try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
-    this.startDeterministicLane(run, profiles)
+    if (this.startDeterministicLane(run, profiles)) return
+    this.agenticFloorDispatchedAt.set(run.id, Date.now())
+
+    // Round-1 lead seeding: the floor's unproven det_lead signals become prioritized upgrade
+    // assignments even before the planner's first LLM turn, so `floorLeadsEmitted > 0` can never
+    // silently coexist with `floorLeadsConsumed === 0`.
+    try {
+      if (!this.detLeadConsumed.size && this.agenticLaneCompleted.has(this.deterministicLaneKey(run))) {
+        this.queueDetLeadUpgradeSteps(
+          this.storage.run(run.id),
+          this.approvedOriginsSet(run),
+          computeDynamicStepBudget(this.storage, run.id),
+        )
+      }
+    } catch { /* lead queueing is additive */ }
 
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
     const readySteps = steps
@@ -4811,7 +4893,11 @@ export class Execution {
     }> = []
     let summaries: Array<{ id: string; origin: string; method: string; pathAndQuery: string; status: number; mediaType: string }> = []
     try {
-      summaries = this.storage.runDetail(run.id).exchangesSummary
+      summaries = [...this.storage.runDetail(run.id).exchangesSummary].sort((a, b) =>
+        a.origin.localeCompare(b.origin) ||
+        a.pathAndQuery.localeCompare(b.pathAndQuery) ||
+        a.method.localeCompare(b.method) ||
+        a.id.localeCompare(b.id))
     } catch {
       return []
     }
@@ -4824,7 +4910,7 @@ export class Execution {
     // Phase-0 may not have fetched the runtime route map yet; fetch at most two generic config
     // candidates so recon-derived routes are still reachable in deterministic mode.
     if (configExchanges.length === 0) {
-      const origin = [...approvedOrigins][0]
+      const origin = [...approvedOrigins].sort()[0]
       const alreadyFetched = new Set(summaries.map(ex => ex.pathAndQuery))
       for (const candidate of ['/app-config.json', '/api/routes', '/routes.json']) {
         if (configExchanges.length >= 2) break
@@ -4940,7 +5026,8 @@ export class Execution {
   }> {
     let specs: Array<{ name: string; kind: string; content: string }> = []
     try {
-      specs = this.storage.listProjectSpecsFull(run.projectId)
+      specs = [...this.storage.listProjectSpecsFull(run.projectId)].sort((a, b) =>
+        a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name))
     } catch {
       return []
     }
@@ -4952,7 +5039,7 @@ export class Execution {
       riskScore: number
       params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
     }> = []
-    const defaultOrigin = [...approvedOrigins][0]
+    const defaultOrigin = [...approvedOrigins].sort()[0]
     const mapLocation = (value: unknown): 'query' | 'json' | 'form' | 'path' | 'header' | null => {
       const raw = typeof value === 'string' ? value.toLowerCase() : ''
       if (raw === 'query' || raw === 'path' || raw === 'header') return raw
@@ -5466,6 +5553,7 @@ export class Execution {
    * facts. No specialist steps are cancelled or hidden in this slice.
    */
   private async runEngineInvestigation(run: Run, laneOptions: {
+    /** @deprecated Phase A runs the same depth as `--no-llm`; kept for typed callers. */
     lane?: boolean
     signal?: AbortSignal
     maxDurationMs?: number
@@ -5515,7 +5603,7 @@ export class Execution {
       asset,
       'Deterministic differential engine',
       'Deterministic closed loop: risk-ranked triage, differential probes and Zero-LLM replay verification.',
-      { sourceOrigins: [...approvedOrigins] },
+      { sourceOrigins: [...approvedOrigins].sort() },
     )
     const claimed = this.storage.updateWorker(worker.id, {
       status: 'running',
@@ -5585,7 +5673,7 @@ export class Execution {
           // Graphwire: Program-Graph code→runtime hypotheses are probed first by the floor.
           ...graphLeadTargets(this.storage.listFacts(current.id, { includeTainted: false, limit: 200 })),
           ...(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
-            ? [...approvedOrigins].flatMap(origin =>
+            ? [...approvedOrigins].sort().flatMap(origin =>
                 this.expandConventionalSurfaceTargets(
                   origin,
                   [...storedEndpoints, ...this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints)],
@@ -5672,14 +5760,11 @@ export class Execution {
       const remainingRequests = current.budgetRequests > 0
         ? Math.max(0, current.budgetRequests - current.spentRequests)
         : 700
-      const requestCap = laneOptions.lane
-        // The lane is additive: it may use at most half the remaining request budget so
-        // specialists always keep headroom (wall clock is its primary cap).
-        ? Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_LANE_MAX_REQUESTS') ?? 900, Math.floor(remainingRequests * 0.5)))
-        : Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
-      const durationCap = laneOptions.lane
-        ? Math.max(1_000, laneOptions.maxDurationMs ?? this.deterministicLaneDeadlineMs())
-        : envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
+      // Phase A and `--no-llm` share one request policy: the deep floor is never halved or
+      // breadth-trimmed just because agents will run afterwards. If the run is short on requests,
+      // the remaining budget is the only cap.
+      const requestCap = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
+      const durationCap = laneOptions.maxDurationMs ?? envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
       // v6 environment contract: shared staging gets a short, tightly capped floor pass so it can
       // never dominate the engagement budget, and every created entity carries the run tag.
       const environmentMode = this.storage.scopePolicy(current).mode
@@ -5723,7 +5808,6 @@ export class Execution {
         maxRequests,
         maxDurationMs,
         maxHypotheses,
-        lane: Boolean(laneOptions.lane),
         environmentMode,
         ...(entityTag ? { entityTag } : {}),
         recordExchange,

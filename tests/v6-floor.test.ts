@@ -125,7 +125,7 @@ test('floor lane resolver defaults ON; explicit false/env 0 is the operator kill
   assert.equal(resolveDeterministicSweepMode(undefined, {}), 'off')
 })
 
-test('agentic run starts the floor lane with no flag and never blocks dispatch', async (t) => {
+test('agentic run starts the deep floor first and dispatches agents only after it settles', async (t) => {
   const { storage, runId } = await startRun(t)
   const run = storage.run(runId)
   addStep(storage, run)
@@ -138,15 +138,16 @@ test('agentic run starts the floor lane with no flag and never blocks dispatch',
 
   internals(execution).driveInvestigation(storage.run(runId), [{ id: 'profile', model: 'mock' }])
 
-  assert.equal(lane.calls.length, 1, 'floor lane must run on an agentic run without an opt-in flag')
-  assert.equal(dispatched.length, 1, 'specialist dispatch is not blocked by the lane')
-  assert.equal(lane.calls[0].maxDurationMs, 240_000, 'lane budget = min(240 s, 40% x maxDuration)')
+  assert.equal(lane.calls.length, 1, 'the floor runs on an agentic run without an opt-in flag')
+  assert.equal(dispatched.length, 0, 'specialist dispatch waits for Phase A to settle')
+  assert.equal(lane.calls[0].maxDurationMs, 168_000, 'Phase A budget = min(180 s, 28% x maxDuration)')
   const steps = storage.listChainSteps(runId, storage.run(runId).goalRevision)
-  assert.ok(steps.every(step => step.status !== 'canceled'), 'the lane never cancels steps')
+  assert.ok(steps.every(step => step.status !== 'canceled'), 'the floor never cancels steps')
 
+  // The lane stub resolves when its run signal aborts; the phase transition aborts it.
   await internals(execution).advanceToVerification(storage.run(runId))
   await delay(20)
-  assert.ok(lane.calls[0].settledAt, 'lane settles before verification')
+  assert.ok(lane.calls[0].settledAt, 'Phase A settles before verification')
 })
 
 test('--no-llm stays floor-only: engine path runs, concurrent lane never starts', async (t) => {
