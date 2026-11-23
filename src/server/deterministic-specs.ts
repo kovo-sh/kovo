@@ -357,14 +357,9 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     const neg = functionLevel ? null : negativeControlJq(mutating)
     const ownerJq = nonTrivial('c1', 3)
     const probeJq = nonTrivial('p1', 3)
-    const anonymousControl = mutating && probePersona !== null && !functionLevel
-    const gate = anonymousControl
-      ? `(((.steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((.steps.c3.status >= 400) and (.steps.c3.status < 500)))`
-      : neg
-    const jq = `{ controlPassed: ((${ownerJq})${anonymousControl ? '' : neg ? ` and (${neg})` : ''}), ` +
-      `confirmed: ((${probeJq})${gate ? ` and (${gate})` : ''} and (${matchesOwnerJq()})), ` +
-      `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}` +
-      `${anonymousControl ? ' + " anon status=" + (.steps.c3.status | tostring)' : ''}), ` +
+    const jq = `{ controlPassed: ((${ownerJq})${neg ? ` and (${neg})` : ''}), ` +
+      `confirmed: ((${probeJq})${neg ? ` and (${neg})` : ''} and (${matchesOwnerJq()})), ` +
+      `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
       'expected: "non-owner denied" }'
     const steps: Array<Record<string, unknown>> = []
     if (!functionLevel) {
@@ -382,12 +377,6 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     steps.push(stepOf(hyp.endpoint.origin, 'c1', 'control', 'Authorized actor performs the request', parts, owner, stepExtra))
     steps.push(stepOf(hyp.endpoint.origin, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the same request`, parts, probePersona, stepExtra))
-    if (anonymousControl) {
-      // Some frameworks answer unknown ids with a generic 2xx no-op, so the bogus-id control cannot
-      // distinguish. The unauthenticated twin then proves the route still enforces *some* access
-      // control while the cross-actor probe was accepted.
-      steps.push(stepOf(hyp.endpoint.origin, 'c3', 'control', 'Unauthenticated caller performs the same request', parts, null, {}, [400, 401, 403]))
-    }
     out.push({
       kind: 'http_chain',
       vulnClass,
