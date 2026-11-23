@@ -535,6 +535,194 @@ function collectionPathOf(pathTemplate: string): string | null {
   return null
 }
 
+// ---------------------------------------------------------------------------------------------
+// Authz readback inference
+//
+// A mutating authorization proof only proves impact when a *separate* GET shows the state change;
+// the mutation's own acknowledgement is an echo (see deterministic-specs synthAuthz). The engine
+// owns the harvest and the discovered route map, so it names that reading route here. Everything is
+// derived from routes and identifiers the target itself exposed: no app or route literals.
+// ---------------------------------------------------------------------------------------------
+
+/** A discovered GET route that can read state back, normalized to a single `{{id}}` placeholder. */
+interface ReadRoute {
+  /** Path with every dynamic segment collapsed to `{{id}}` (at most one placeholder per route). */
+  path: string
+  segments: string[]
+  /** Index of the `{{id}}` segment; -1 for a collection (no identifier) read. */
+  placeholderIndex: number
+  paramName?: string
+}
+
+/** Routes whose name marks the caller's own identity, read back with the mutating actor's persona. */
+const identityReadRe = /(?:^|\/)(?:profile|me|whoami|session|account|self)(?:\/|$)/i
+
+function readRouteParamName(segment: string): string | undefined {
+  return segment.match(/^:([A-Za-z0-9_]+)$/)?.[1] ?? segment.match(/^\{([A-Za-z0-9_]+)\}$/)?.[1]
+}
+
+/**
+ * Index every discovered GET route by origin. Built from the full surface (including baseline-ish
+ * routes, which can still be the only readable detail for an object) and independent of iteration
+ * order, so hypothesis output stays deterministic.
+ */
+function buildReadRouteIndex(endpoints: readonly EngineEndpoint[]): Map<string, ReadRoute[]> {
+  const index = new Map<string, ReadRoute[]>()
+  for (const endpoint of endpoints) {
+    if (endpoint.method.toUpperCase() !== 'GET') continue
+    const bare = endpoint.pathTemplate.split('?')[0] || '/'
+    if (bare === '' || bare === '/') continue
+    const raw = bare.split('/').filter(Boolean)
+    const placeholders = raw.filter(segment => placeholderSeg.test(segment))
+    // A readback the synthesizer cannot fill (`fillId` resolves `{{id}}` only) is not a readback.
+    if (placeholders.length > 1) continue
+    if (raw.length === 0) continue
+    const placeholderIndex = raw.findIndex(segment => placeholderSeg.test(segment))
+    const segments = raw.map(segment => (placeholderSeg.test(segment) ? '{{id}}' : segment))
+    const path = `/${segments.join('/')}`
+    const list = index.get(endpoint.origin) ?? []
+    if (list.some(route => route.path === path)) continue
+    const paramName = placeholderIndex >= 0 ? readRouteParamName(raw[placeholderIndex]!) : undefined
+    list.push({ path, segments, placeholderIndex, ...(paramName ? { paramName } : {}) })
+    index.set(endpoint.origin, list)
+  }
+  for (const list of index.values()) list.sort((a, b) => a.path.localeCompare(b.path))
+  return index
+}
+
+/** Specificity of a GET route as the readback of one mutated object (0 = not a reader). */
+function scoreObjectReadback(
+  mutation: { segments: string[]; placeholderIndex: number },
+  route: ReadRoute,
+  idParamName: string | undefined,
+): number {
+  const mutationPathLength = mutation.placeholderIndex + 1
+  // Same REST shape: `PATCH /api/invoices/{{id}}` -> `GET /api/invoices/{{id}}`.
+  if (route.placeholderIndex === mutation.placeholderIndex && route.segments.length === mutation.segments.length) {
+    const same = route.segments.every((segment, i) => i === mutation.placeholderIndex || segment === mutation.segments[i])
+    if (same) return 100
+  }
+  // Detail of the same object with a trailing action verb dropped: `/members/{{id}}/avatar`.
+  if (route.placeholderIndex === mutation.placeholderIndex && route.segments.length === mutationPathLength) {
+    const same = route.segments.every((segment, i) => segment === mutation.segments[i])
+    if (same) return 90
+  }
+  if (route.placeholderIndex >= 0 && route.placeholderIndex === route.segments.length - 1 && route.segments.length > 1) {
+    const routeNoun = route.segments[route.placeholderIndex - 1]!.toLowerCase()
+    const mutationNoun = mutation.segments[mutation.placeholderIndex - 1]?.toLowerCase()
+    // A sibling listing of the same record family: `DELETE /api/admin/people/{{id}}` -> `GET /api/people/{{id}}`.
+    if (routeNoun && routeNoun === mutationNoun) return 70
+    // Same identifier contract on a different prefix (`/api/v1/...` legacy aliases).
+    if (idParamName && route.paramName && route.paramName.toLowerCase() === idParamName.toLowerCase()) return 60
+  }
+  // A collection that contains the object: proves a delete by disappearance.
+  if (route.placeholderIndex < 0 && route.segments.length === mutation.placeholderIndex) {
+    const same = route.segments.every((segment, i) => segment === mutation.segments[i])
+    if (same) return 50
+  }
+  return 0
+}
+
+interface AuthzReadbackHint {
+  path: string
+  persona?: string
+}
+
+/**
+ * Pick the GET route that can observe a mutating authz hypothesis:
+ *  - object routes prefer the object's own detail readback (dropping action verbs), then a sibling
+ *    detail of the same record family, then the containing collection;
+ *  - function routes prefer a discovered observable GET (status route or sibling collection sharing
+ *    the action's noun) and never reuse a path whose only response is the mutation echo;
+ *  - the mutating actor's own identity route is the last resort for self-service account mutations.
+ */
+function inferAuthzReadback(input: {
+  bare: string
+  method: string
+  functionLevel: boolean
+  idParamName?: string
+  queryIdParam?: string
+  readRoutes: readonly ReadRoute[]
+  selfIds: readonly string[]
+  probePersona?: string
+}): AuthzReadbackHint | null {
+  if (input.functionLevel) {
+    const segments = input.bare.split('/').filter(Boolean)
+    if (segments.length === 0) return null
+    const samePath = input.readRoutes.find(route => route.placeholderIndex < 0 && route.segments.length === segments.length &&
+      route.segments.every((segment, i) => segment === segments[i]))
+    if (samePath) return { path: samePath.path }
+    // Action noun -> the collection/detail the function's state shows up in
+    // (`/api/admin/feature-flags` -> `GET /api/feature-flags`).
+    const tokens = new Set(segments[segments.length - 1]!
+      .split(/[-_.]+/)
+      .flatMap(token => token.split(/(?=[A-Z])/))
+      .map(token => token.toLowerCase())
+      .filter(token => token.length >= 3))
+    if (tokens.size === 0) return null
+    const scored = input.readRoutes
+      .filter(route => route.placeholderIndex < 0 && route.path !== input.bare)
+      .map(route => {
+        const routeTokens = new Set(route.segments.flatMap(segment => segment
+          .split(/[-_.]+/)
+          .flatMap(token => token.split(/(?=[A-Z])/))
+          .map(token => token.toLowerCase())))
+        let score = 0
+        for (const routeToken of routeTokens) {
+          const singular = routeToken.replace(/s$/, '')
+          for (const token of tokens) if (token === routeToken || token.replace(/s$/, '') === singular) score += 1
+        }
+        return { route, score }
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.route.segments.length - b.route.segments.length ||
+        a.route.path.length - b.route.path.length || a.route.path.localeCompare(b.route.path))
+    return scored[0] ? { path: scored[0].route.path } : null
+  }
+  if (input.method === 'GET') return null
+
+  const rawSegments = input.bare.split('/').filter(Boolean)
+  // Query-string object references keep their identifier in the read too.
+  if (input.queryIdParam) {
+    const collection = input.readRoutes.find(route => route.placeholderIndex < 0 &&
+      route.segments.length === rawSegments.length && route.segments.every((segment, i) => segment === rawSegments[i]))
+    if (collection) return { path: `${collection.path}?${encodeURIComponent(input.queryIdParam)}={{id}}` }
+  }
+  const placeholderIndex = rawSegments.findIndex(segment => placeholderSeg.test(segment))
+  if (placeholderIndex <= 0) return null
+  // Normalize the mutation's own placeholder so it compares against the read index (`{{id}}`).
+  const segments = rawSegments.map(segment => (placeholderSeg.test(segment) ? '{{id}}' : segment))
+  const mutation = { segments, placeholderIndex }
+  const ranked = input.readRoutes
+    .map(route => ({ route, score: scoreObjectReadback(mutation, route, input.idParamName) }))
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.route.segments.length - b.route.segments.length ||
+      a.route.path.length - b.route.path.length || a.route.path.localeCompare(b.route.path))
+  if (ranked[0]) return { path: ranked[0].route.path }
+  // Self-service: the mutating actor's own identity route is the only observable state.
+  if (input.selfIds.length > 0 && input.probePersona) {
+    const identity = input.readRoutes.find(route => route.placeholderIndex < 0 && identityReadRe.test(route.path))
+    if (identity) return { path: identity.path, persona: input.probePersona }
+  }
+  return null
+}
+
+/**
+ * Role a privileged function needs, when the route shape is role-exclusive and the control persona
+ * outranks the probe persona. This is what makes a function-level mutation a vertical (BFLA) claim:
+ * the replay has no bogus-id negative control, so the role differential has to be declared.
+ */
+function authzRequiredRoleFor(
+  privileged: boolean,
+  control?: EnginePersona,
+  probe?: EnginePersona,
+): 'viewer' | 'member' | 'admin' | 'owner' | undefined {
+  if (!privileged || !control || !probe || control.handle === probe.handle) return undefined
+  const rank: Record<EnginePersona['privilege'], number> = { viewer: 0, member: 1, admin: 2 }
+  if (rank[control.privilege] <= rank[probe.privilege]) return undefined
+  return control.privilege
+}
+
 export interface EnumerateOptions {
   tier: number
   personas: readonly EnginePersona[]
@@ -607,6 +795,7 @@ export function enumerateHypotheses(
   // A route's own collection is authoritative, but object parameters often point at a sibling
   // resource (assets?projectId -> /api/spaces). Keep a bounded per-origin pool as a fallback.
   const originIdPool = new Map<string, string[]>()
+  const readRoutesByOrigin = buildReadRouteIndex(endpoints)
   for (const endpoint of endpoints) {
     const harvest = harvests.get(endpoint.id)
     const pool = originIdPool.get(endpoint.origin) ?? []
@@ -761,6 +950,20 @@ export function enumerateHypotheses(
         else if (objectIdParam) {
           pathAndQuery = `${bare}?${encodeURIComponent(objectIdParam.name)}={{id}}`
         }
+        const idParamName = objectIdParam?.name ?? (hasIdPath ? bare.match(/:([A-Za-z0-9_]+)/)?.[1] : undefined)
+        // Mutating authz proofs need a separate read of the mutated state; name it from the route
+        // map the harvest already produced, and declare the role a privileged function requires.
+        const readback = method === 'GET' ? null : inferAuthzReadback({
+          bare,
+          method,
+          functionLevel,
+          ...(idParamName ? { idParamName } : {}),
+          ...(objectIdParam ? { queryIdParam: objectIdParam.name } : {}),
+          readRoutes: readRoutesByOrigin.get(endpoint.origin) ?? [],
+          selfIds: harvest?.otherIds ?? [],
+          ...(authzOther ? { probePersona: authzOther.handle } : {}),
+        })
+        const requiredRole = method === 'GET' ? undefined : authzRequiredRoleFor(privileged, authzOwner, authzOther)
         const score = endpointRiskScore(endpoint) + (hasIdPath || objectIdParam ? 20 : 0) + (privileged ? 15 : 0)
         add({
           key: `authz|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
@@ -773,7 +976,10 @@ export function enumerateHypotheses(
           otherPersona: authzOther.handle,
           resourceIds: ids,
           functionLevel,
-          idParamName: objectIdParam?.name ?? (hasIdPath ? bare.match(/:([A-Za-z0-9_]+)/)?.[1] : undefined),
+          idParamName,
+          ...(readback ? { readbackPath: readback.path } : {}),
+          ...(readback?.persona ? { readbackPersona: readback.persona } : {}),
+          ...(requiredRole ? { authzRequiredRole: requiredRole } : {}),
           jsonBody: mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
             ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
             : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
