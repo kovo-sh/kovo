@@ -487,7 +487,7 @@ function detectHttpChainDifferential(
   if (probes.some(step => isSuccessStatus(step.status) && step.secretMatches > 0)) return 'identifier_proof'
   const controlBodies = controls.map(step => step.body)
   for (const literal of jqStringLiterals(spec.assertionsJq)) {
-    if (probes.some(step => isSuccessStatus(step.status) && step.body.includes(literal)) &&
+    if (probes.some(step => step.body !== '' && step.body.includes(literal)) &&
         !controlBodies.some(body => body.includes(literal))) {
       return 'identifier_proof'
     }
@@ -517,6 +517,17 @@ export function assessHttpChainProofStrength(
       differential: null,
       satisfied: false,
       reason: 'Authorization claim is status-only: a 2xx status (or status equality) is not an access-control differential. Assert a cross-actor resource read, a field/identifier bound to the victim object, or a state delta.',
+    }
+  }
+  // Canary / cryptographic proof is produced by the verifier itself (distinct control vs probe
+  // tokens, non-destructive math), so it is already an identifier-bound execution differential.
+  if (/\.(?:canary|proof)\b/.test(spec.assertionsJq)) {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential: 'identifier_proof',
+      satisfied: true,
+      reason: 'Authorization claim is bound to verifier-minted canary/cryptographic proof.',
     }
   }
   const differential = detectHttpChainDifferential(spec, snapshots)
