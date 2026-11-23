@@ -1,29 +1,23 @@
-// Webhook scope-replay attempt: present a signature bundle for the sibling tenant and an unrelated
-// event type. A correct receiver rejects the mismatched scope.
+// Cache priming attempt: read settings in the organization where the caller is an admin, then read
+// settings in the organization where the caller is only a viewer.
 import type { SolverCtx } from '../../../../lib/types.ts'
 
 export async function solve(ctx: SolverCtx): Promise<void> {
-  const list = ctx.plan.routes['webhooks.list']
-  const update = ctx.plan.routes['webhooks.update']
-  if (!list || !update) return
-  const headers = await ctx.login('owner_a')
-  const hooks = await ctx.request({ method: list.method, path: list.path, headers })
-  const hookId = hooks.json<{ items?: Array<{ id?: string }> }>().items?.[0]?.id
-  if (!hookId) return
-  const path = update.path.replace(/:[^/]+$/, encodeURIComponent(hookId))
-  const timestamp = String(Math.floor(Date.now() / 1000))
+  const route = ctx.plan.routes['org.settings']
+  if (!route) return
+  const headers = await ctx.login('dual_member')
+  const adminOrg = ctx.plan.domain.tenants.orgA
+  const viewerOrg = ctx.plan.domain.tenants.orgB
+  const adminPath = route.path.replace(/:[^/]+/, encodeURIComponent(adminOrg))
   await ctx.request({
-    method: update.method,
-    path,
-    headers: { ...headers, 'content-type': 'application/json' },
-    body: {
-      signatureCheck: {
-        tenantId: ctx.plan.domain.tenants.orgB,
-        eventType: 'deploy.approved',
-        timestamp,
-        rawBody: '{}',
-        signature: '0'.repeat(64),
-      },
-    },
+    method: route.method,
+    path: adminPath,
+    headers: { ...headers, 'x-org-id': adminOrg },
+  })
+  const viewerPath = route.path.replace(/:[^/]+/, encodeURIComponent(viewerOrg))
+  await ctx.request({
+    method: route.method,
+    path: viewerPath,
+    headers: { ...headers, 'x-org-id': viewerOrg },
   })
 }
