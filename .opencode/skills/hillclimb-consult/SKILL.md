@@ -20,6 +20,20 @@ reviewer with raw benchmark data.
 
 Do not consult for tiny edits or while a benchmark matrix is still running.
 
+## Product-first and the inner loop (v5.1)
+
+- **Freeze harness-only capability work.** `scripts/benchmark-probes.ts` and
+  `scripts/benchmark-specs*.ts` are maintenance-only; new detection/verification
+  belongs in `src/server/`. Score every claim as `Execution --no-llm` +
+  agentic increment, on dev and salted held-out; harness numbers are secondary.
+- **Run the pre-handoff gate** before returning a branch:
+  `scripts/worker-gate.sh` (typecheck + contract invariants + optional slice).
+  Use `--full` only at freeze.
+- **Iterate one app/class:** `scripts/bench-slice.sh --app <app> --class <class>`
+  prints a compact funnel and per-target statuses. No ad-hoc diagnostic scripts.
+- **Cache recon when available:** `--reuse-recon <dir>` skips repeated Phase-0
+  discovery during tuning; final runs stay cold.
+
 ## Parallelization playbook (default, not optional)
 
 Before starting any hill-climb or integration batch:

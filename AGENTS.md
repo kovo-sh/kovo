@@ -31,6 +31,13 @@
 
 Read-only audits, compatibility analysis, docs, and verifier-only changes are usually parallelizable even when the main engine is busy — use them.
 
+## Meta-process: product-first and the inner loop
+
+1. **Freeze harness-only recall work.** `scripts/benchmark-probes.ts` and `scripts/benchmark-specs*.ts` are **maintenance-only** from v5.1 on (bugfixes, scoring, harness parity). New detection/verification capability must land in `src/server/` and be scored through real `Execution`. A PR that only lifts the standalone harness is not acceptance.
+2. **Report both product metrics.** Every capability claim states `Execution --no-llm` (deterministic floor) and `Execution` agentic (increment over that floor), on dev **and** salted held-out. Harness numbers are secondary evidence of engine capability, not the product score.
+3. **Mandatory pre-handoff gate.** A branch cannot be handed off until `scripts/worker-gate.sh` passes (typecheck + fast contract invariants + targeted slice). Discover breakage in minutes, not at release freeze.
+4. **Use the slice runner.** Iterate one app/class with `scripts/bench-slice.sh --app <app> --class <class>`; no ad-hoc diagnostic scripts once it exists.
+
 ## Gemini Coding Guidelines
 
 1. **Never `read_file` or `cat` raw debug dumps or benchmark logs (main session OR sub-agents):**
