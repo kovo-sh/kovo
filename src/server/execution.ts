@@ -934,7 +934,15 @@ export interface ExecutionOptions {
    * M1 no-profile fallback. When false (default) the M1 fallback is untouched.
    */
   deterministicOnly?: boolean
+  /**
+   * Phase/planner-round boundary hook (v5.1 snapshot resume). Called *outside* SQLite
+   * transactions with a run id and a boundary label; the harness may capture a checkpoint here.
+   * Throwing is swallowed so a best-effort snapshot can never disturb the engine.
+   */
+  onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
 }
+
+export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
 
 export class Execution {
   private readonly storage: Store
@@ -976,6 +984,7 @@ export class Execution {
   private readonly deterministicInFlight = new Set<string>()
   private readonly deterministicCompleted = new Set<string>()
   private readonly deterministicOnly: boolean
+  private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
   private readonly boardHandleByAssignment = new Map<string, string>()
@@ -998,6 +1007,7 @@ export class Execution {
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
     this.deterministicOnly = options.deterministicOnly === true
+    this.onCheckpoint = options.onCheckpoint
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     // `storage` activates second-order canary scanning inside the browser context too.
@@ -1081,6 +1091,17 @@ export class Execution {
 
   getLabTargetHandle(runId: string): LabTargetHandle | undefined {
     return this.startedLabHandles.get(runId)
+  }
+
+  /**
+   * Best-effort checkpoint notification. Checkpoints are boundary-only and must never run inside
+   * an open SQLite transaction (VACUUM INTO), so callers invoke this after their transaction.
+   */
+  private notifyCheckpoint(runId: string, checkpoint: ExecutionCheckpoint) {
+    if (!this.onCheckpoint) return
+    try {
+      this.onCheckpoint({ runId, checkpoint })
+    } catch { /* snapshot capture is best-effort; never disturb the engine */ }
   }
 
   private scheduleWake() {
@@ -2896,6 +2917,12 @@ export class Execution {
         }
       }
 
+      // Phase-0 boundary: capture the deterministic surface before the LLM threat model. Resuming
+      // here is valid (the threat model simply re-runs from the saved discovery state).
+      if (this.storage.run(freshRun.id).phase0CompletedAt) {
+        this.notifyCheckpoint(freshRun.id, 'phase0')
+      }
+
       // 1. Correlate dependencies from uploaded/synced specs via CVE broker
       const seenDeps = new Set<string>()
       let advisoryLookups = 0
@@ -3319,6 +3346,15 @@ export class Execution {
               : `Threat model ranked ${finalEntries.length} hosts and queued ${totalQueued} initial investigation steps${codeAuditStepsCreated ? ` (including ${codeAuditStepsCreated} from Source-First Code Audit)` : ''}.`
             : 'Baseline capture complete. Deterministic verification is checking the recorded evidence.')
       }, { behavior: 'immediate' })
+
+      // Post-floor boundary: Phase-0 + threat model + deterministic lane are complete and the
+      // first agentic assignment has not started yet. This is the primary resume checkpoint.
+      const afterFloor = this.storage.run(freshRun.id)
+      if (afterFloor.status === 'running' && afterFloor.phase === 'investigation') {
+        this.notifyCheckpoint(afterFloor.id, 'post-floor')
+      } else if (afterFloor.status === 'running' && afterFloor.phase === 'verification') {
+        this.notifyCheckpoint(afterFloor.id, 'deterministic-lane')
+      }
     } finally {
       this.active.delete(claimed.id)
     }
@@ -3986,6 +4022,7 @@ export class Execution {
             this.advanceToVerification(latest)
           }
         } catch { /* store closed or run removed */ }
+        try { this.notifyCheckpoint(run.id, 'deterministic-lane') } catch { /* best-effort */ }
         try {
           this.scheduleWake()
         } catch { /* scheduler already stopped */ }
@@ -4020,6 +4057,7 @@ export class Execution {
             this.advanceToVerification(latest)
           }
         } catch { /* store closed or run removed */ }
+        try { this.notifyCheckpoint(run.id, 'deterministic-lane') } catch { /* best-effort */ }
         try {
           this.scheduleWake()
         } catch { /* scheduler already stopped */ }
@@ -5376,6 +5414,12 @@ export class Execution {
       // Planner errors should not crash active workers; retry on next wake or advance cleanly
     }).finally(() => {
       this.plannerTasks.delete(run.id)
+      try {
+        const latest = this.storage.run(run.id)
+        if (latest.status === 'running' && latest.phase === 'investigation') {
+          this.notifyCheckpoint(latest.id, 'planner-round')
+        }
+      } catch { /* run/store may already be gone */ }
       this.scheduleWake()
     })
   }
