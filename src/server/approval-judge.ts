@@ -422,7 +422,7 @@ export async function evaluateTier3Approval(
   //     mislabeled as local-lab falls through to the public hard-escalation rules below.
   //     Hard broker invariants (destructive denylist, webshell filter, private-IP/metadata SSRF
   //     guards, RPS/budget caps) stay fully enforced; this gate only replaces the human approval.
-  if (input.environment === 'local-lab' && isLocalLabAutoApprovalOrigin(input.origin)) {
+  if (input.environment === 'local-lab' && isLocalLabAutoApprovalOrigin(input.origin) && input.method !== 'DELETE' && !input.hasMultipart && !input.isRceProof) {
     return {
       decision: 'approve',
       decidedBy: 'auto-review:local-lab',

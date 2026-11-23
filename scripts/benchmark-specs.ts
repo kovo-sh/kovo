@@ -11,7 +11,7 @@ import { synthM3Contracts } from './benchmark-specs-m3.ts'
 import { synthAuthProtocol, synthCache } from './benchmark-specs-proto.ts'
 import { synthNosql } from './benchmark-specs-nosql.ts'
 import { synthSqlBoolean, synthSqlTime } from './benchmark-specs-sql.ts'
-import { synthDomXss, synthGraphql, synthRace, synthReflectedXss, synthSecondOrderXss, synthUrlDomXss, synthWorkflowRepeatAccepted, synthWorkflowStepSkip } from './benchmark-specs-web.ts'
+import { synthDomXss, synthGraphql, synthRace, synthReflectedXss, synthSecondOrderXss, synthUrlDomXss, synthWorkflow, synthWorkflowRepeatAccepted, synthWorkflowStepSkip } from './benchmark-specs-web.ts'
 import type { SynthesizedSpec } from './benchmark-specs-common.ts'
 
 export type { SynthesizedSpec } from './benchmark-specs-common.ts'
@@ -38,7 +38,7 @@ function build(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
     case 'auth_protocol_audit': return synthAuthProtocol(o, env)
     case 'cache_poison_deception': return synthCache(o, env)
     case 'graphql_audit': return synthGraphql(o, env)
-    case 'workflow_invariant': return [...synthWorkflowStepSkip(o, env), ...synthWorkflowRepeatAccepted(o, env)]
+    case 'workflow_invariant': return [...synthWorkflow(o, env), ...synthWorkflowStepSkip(o, env), ...synthWorkflowRepeatAccepted(o, env)]
     case 'xss_context': return [...synthSecondOrderXss(o, env), ...synthUrlDomXss(o, env), ...synthDomXss(o, env), ...synthReflectedXss(o, env)]
     case 'path_traversal_benign': return synthTraversal(o, env)
     case 'command_injection': return synthCommandInjection(o, env)
