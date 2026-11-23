@@ -1,0 +1,21 @@
+services:
+  ledgerflow:
+    build:
+      context: ../../..
+      dockerfile: benchmarks/reason-bench/apps/ledgerflow/Dockerfile
+    environment:
+      GUARDIAN_ALLOW_LOCAL_LAB: "1"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - lab
+    # No published ports, no host binds, no privileged mode: loopback only inside the lab network.
+
+networks:
+  lab:
+    internal: true
