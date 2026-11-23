@@ -201,3 +201,26 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Security audit triage (all accepted):** HIGH (1) auto-approval path-prefix reuse → exact single-use context-bound approval ledger; HIGH (2) `--repo` symlink escape → link-free copy, `lstat`/`O_NOFOLLOW` walkers, realpath-contained patch writes; MED (3–8) bootstrap-only session issuance, PSL/Clerk host allowlist, no-follow credential POSTs, WS/WebRTC blocking, DNS-rebinding checks, sandbox-by-default; MED (9) 0700 telemetry + non-root lab container; MED (10) parsed-JSON/multipart fast paths, 64 KiB keyword scan, untrusted rationale; MED (11) bounded worker output.
 - **Evidence:** security suites 11/11, 10/10, 12/12; boundaries 46/46; Playwright v2/v4/v5-board 9/9 after bootstrap harness fix; realistic seed-42 smoke 39/56 at 100% precision.
 - **Kept intentional:** public-target RCE/upload/time-diff replay gates now fail closed without operator pattern or local-lab authorization (binding rule).
+
+### 2026-11-22 — adversarial security re-audit (second pass)
+
+- **Threshold:** independent refutation pass over the 11 merged fixes; 33/33 security tests still pass, but 3 findings remain **HIGH**.
+- **Accepted (all):**
+  1. **Idempotent-POST pre-approval bypass** — broker skips the Tier-3 gate on a path-substring predicate. Fix: broker authorizes every non-GET through the judge/ledger; read-only POSTs are approved by exact envelope checks only.
+  2. **307/308 redirect re-send** — an approved state change is re-sent to a different path without a new grant, and the exchange records the original path. Fix: re-authorize non-GET redirects (or fail closed) and record the final path.
+  3. **Registrable-domain widening** — hardcoded suffix list collapses shared-tenant suffixes (`github.io`, `vercel.app`, `s3.amazonaws.com`, `com.co`), so sibling tenants are in scope; form login never validated `loginUrl`. Fix: real PSL data, reject shared-suffix targets, exact-host IdP pins, validate form login.
+- **Also accepted:** pin credential connections (deny zero/unknown resolution, no 60 s unknown-safe cache), apply scoped-browser guards to the persona form browser, reject dangling symlinks in `safeResolveUnderRoot`, parse `GUARDIAN_LAB_USER` numerically, per-run telemetry mount, duplicate-JSON-key/gzip/oversize fast-path parity, pattern depth/ID-only wildcards + no pattern coverage of RCE.
+- **Deferred to post-Slice-2 (`execution.ts` owner):** per-request-instance grants for identical race bursts, `request_http_batch` approval path, tightening/removing `isSafeIdempotentPost`.
+- **Streams:** sec2-approvals (broker/approval-judge), sec2-auth (persona-auth/scoped-browser), sec2-lab (lab-runner/patch-workflow), verifier-guards (approval context for Tier-3 replay).
+- **Control:** procedural seed-42 stays 39/56 at 100% precision, 0 decoy/unmatched; product baseline `Execution --no-llm` 0/59, 2 unmatched FP.
+
+### 2026-11-22 — product deterministic floor crossed (0 → 26/59)
+
+- **Threshold:** real `Execution --no-llm` 0/59 → **26/59 (44.1%) at 100% precision**, 0 decoy/unmatched (acme 13/22, shopflow 7/19, opsportal 6/18); control on the same tree 0/59 with 2 unmatched FP. Gate 1086/1086, 0 skips, 0 orphans. Floors xben 25/25, held-out-saas 20/20 + 20/20 patches.
+- **Reviewer points (accepted):**
+  1. Agentic consumption = **read-only** context: "Already Confirmed (may chain/escalate)" table + top-8/10 `det_lead` summary in the planner prompt; no auto-queued chain steps (preserves `dynamicStepBudget`/K=6). Pair with Slice 4 so novel business-logic/workflow targets are not censored.
+  2. Lane deadline **per run**: `min(240 s, 40% of maxDurationMs)`, linked to the run AbortSignal; do not gate the planner; `deterministicOnly` stays unrestricted; fast high-yield probes first.
+  3. Diagnose the 44% vs 67% gap with a **4-bucket diff** on seed 1 (`not_in_surface`, `not_probed_before_deadline`, `probed_no_signal`, `signal_no_confirm`) before building parity converters; prior is surface ingestion + converter parity + Tier-3 wiring.
+  4. Ordering: **wave-2 security + deferred `execution.ts` items first** (per-instance grants for identical race bursts, batch approval path, remove `isSafeIdempotentPost` with a fast exact-envelope read-only judge path), then Slice 3 behind a default-off flag, then Slice 4, then flip.
+- **Rejected/deferred:** per-assignment or planner-shared caps (240 s per-run chosen); auto-queued deterministic chain steps (planner-decided only, for now).
+- **Owner streams:** sec2-approvals, sec2-auth, sec2-lab (wave 2), exec-approvals (race/batch grants), parity-diff (bucket classification), verifier-guards (Slice 4 + Tier-3 context).

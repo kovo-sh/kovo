@@ -129,12 +129,23 @@ export interface HeaderPostureSummary {
   finding: Finding
 }
 
-export function chainFindingDedupKey(finding: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title'>): string {
+// Origin-wide classes where one root cause covers every route on the host. Keep in sync with
+// ORIGIN_WIDE_CWES in src/server/dedupe.ts. Duplicated here so the report layer stays free of
+// server/node imports (it also runs in the browser bundle).
+const ORIGIN_WIDE_CWE_KEYS = new Set([
+  'CWE-942', 'CWE-346', 'CWE-693', 'CWE-1021', 'CWE-319', 'CWE-295', 'CWE-327', 'CWE-614', 'CWE-1004', 'CWE-1275',
+])
+
+export function chainFindingDedupKey(finding: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title' | 'fingerprintHash'>): string {
   const origin = finding.origin.trim().toLowerCase()
   const cwe = (finding.cwe ?? '').trim().toUpperCase()
-  if (cwe) return `${origin}::cwe::${cwe}`
-  const category = (finding.category ?? 'uncategorized').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')
   const title = finding.title.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  // A fingerprint already encodes (origin, endpoint, method, param/resolver, cwe), but origin-wide
+  // classes (CORS/CSP/HSTS/TLS/cookies) share one host-level root cause and still collapse.
+  if (cwe && ORIGIN_WIDE_CWE_KEYS.has(cwe)) return `${origin}::cwe::${cwe}`
+  if (finding.fingerprintHash) return `${origin}::fp::${finding.fingerprintHash}`
+  if (cwe) return `${origin}::cwe::${cwe}::title::${title}`
+  const category = (finding.category ?? 'uncategorized').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')
   return `${origin}::class::${category}::${title}`
 }
 

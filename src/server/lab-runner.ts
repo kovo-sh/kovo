@@ -3,19 +3,26 @@ import { createHash, randomUUID } from 'node:crypto'
 import {
   chmodSync,
   chownSync,
+  closeSync,
+  constants as fsConstants,
   copyFileSync,
   existsSync,
+  fchmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
+import type { Stats } from 'node:fs'
 import { createServer as createTcpServer } from 'node:net'
 import type { AddressInfo, Server as TcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -674,6 +681,17 @@ function copySanitizedRepo(srcDir: string, destDir: string, rootReal: string): v
   }
 }
 
+/** lstat that treats a missing entry as absent but surfaces every other failure as unsafe. */
+function lstatOrNull(fullPath: string, relPath: string): Stats | null {
+  try {
+    return lstatSync(fullPath)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return null
+    throw new Error(`Unsafe file path rejected: "${relPath}" (${code ?? 'lstat failed'})`)
+  }
+}
+
 export function safeResolveUnderRoot(rootDir: string, relPath: string): string {
   const clean = relPath.replace(/^[ab]\//, '').replace(/\\/g, '/')
   if (!clean || clean.includes('\0') || clean.startsWith('/') || clean.split('/').some(seg => seg === '..')) {
@@ -682,22 +700,30 @@ export function safeResolveUnderRoot(rootDir: string, relPath: string): string {
   const rootReal = realpathSync(rootDir)
   const full = resolve(rootReal, clean)
   const rel = relative(rootReal, full)
-  if (rel.startsWith('..') || rel === '') {
+  if (rel.startsWith('..') || rel === '' || isAbsolute(rel)) {
     throw new Error(`Path escapes repository root: "${relPath}"`)
   }
 
   // Textual containment is not enough: a component below the root can be a symlink to /etc or to
-  // an outside directory. Reject links on the path and require the deepest existing parent's
-  // canonical path to stay under the canonical root.
-  let existing = full
-  while (!existsSync(existing)) {
-    const parent = dirname(existing)
-    if (parent === existing) break
-    existing = parent
+  // an outside directory. Walk every component with lstat (NOT existsSync, which follows links and
+  // therefore treats a dangling link as absent) and reject any link unconditionally.
+  let deepestExisting = rootReal
+  let cursor = rootReal
+  for (const segment of rel.split(sep)) {
+    cursor = join(cursor, segment)
+    const st = lstatOrNull(cursor, relPath)
+    if (!st) break
+    if (st.isSymbolicLink()) {
+      throw new Error(`Symlinked path rejected inside repository: "${relPath}"`)
+    }
+    deepestExisting = cursor
   }
+
+  // The deepest existing parent's canonical path must stay under the canonical root. A dangling
+  // link that survived the walk cannot (realpath throws), so this fails closed as well.
   let existingReal: string
   try {
-    existingReal = realpathSync(existing)
+    existingReal = realpathSync(deepestExisting)
   } catch {
     throw new Error(`Path escapes repository root: "${relPath}"`)
   }
@@ -705,17 +731,109 @@ export function safeResolveUnderRoot(rootDir: string, relPath: string): string {
   if (existingRel.startsWith('..') || isAbsolute(existingRel)) {
     throw new Error(`Path escapes repository root: "${relPath}"`)
   }
-
-  let cursor = rootReal
-  for (const segment of relative(rootReal, full).split(sep)) {
-    cursor = join(cursor, segment)
-    if (!existsSync(cursor)) break
-    if (lstatSync(cursor).isSymbolicLink()) {
-      throw new Error(`Symlinked path rejected inside repository: "${relPath}"`)
-    }
-  }
   return full
 }
+
+/**
+ * Create (or verify) every parent directory of `fullPath` one component at a time with lstat, so a
+ * concurrently or previously planted symlink is never traversed by `mkdir -p`. Re-checks the
+ * canonical parent immediately before returning, right before the caller writes.
+ */
+function ensureSafeParentChain(rootDir: string, fullPath: string, relPath: string): void {
+  const rootReal = realpathSync(rootDir)
+  const rel = relative(rootReal, fullPath)
+  const segments = rel.split(sep).slice(0, -1)
+  let cursor = rootReal
+  for (const segment of segments) {
+    cursor = join(cursor, segment)
+    let st = lstatOrNull(cursor, relPath)
+    if (!st) {
+      try {
+        mkdirSync(cursor, { mode: 0o755 })
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      }
+      st = lstatOrNull(cursor, relPath)
+      if (!st) throw new Error(`Failed to create patch directory for: "${relPath}"`)
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Symlinked path rejected inside repository: "${relPath}"`)
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`Patch parent path is not a directory: "${relPath}"`)
+    }
+  }
+
+  const parentReal = realpathSync(dirname(fullPath))
+  const parentRel = relative(rootReal, parentReal)
+  if (parentRel.startsWith('..') || isAbsolute(parentRel)) {
+    throw new Error(`Path escapes repository root: "${relPath}"`)
+  }
+}
+
+function readFileNoFollow(fullPath: string): string {
+  const fd = openSync(fullPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+  try {
+    return readFileSync(fd, 'utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
+ * Atomically place `content` at `fullPath` without ever following an existing path: either create
+ * the file directly with O_CREAT|O_EXCL|O_NOFOLLOW (`createOnly`), or stage a temp file in the same
+ * verified directory and rename it over the target (rename replaces the directory entry, it never
+ * writes through a link). A final lstat refuses a target that became a link.
+ */
+function writeFileNoFollow(fullPath: string, content: string, createOnly: boolean): void {
+  if (createOnly) {
+    let fd: number | undefined
+    try {
+      fd = openSync(
+        fullPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o644,
+      )
+      writeSync(fd, content, null, 'utf8')
+      fchmodSync(fd, 0o644)
+    } finally {
+      if (fd !== undefined) closeSync(fd)
+    }
+    return
+  }
+
+  const parent = dirname(fullPath)
+  const tmpPath = join(parent, `.guardian-patch-${randomUUID()}.tmp`)
+  let fd: number | undefined
+  try {
+    fd = openSync(
+      tmpPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o644,
+    )
+    writeSync(fd, content, null, 'utf8')
+    fchmodSync(fd, 0o644)
+    closeSync(fd)
+    fd = undefined
+
+    const leaf = lstatOrNull(fullPath, fullPath)
+    if (leaf?.isSymbolicLink()) {
+      throw new Error(`Symlinked path rejected inside repository: "${fullPath}"`)
+    }
+    if (leaf && !leaf.isFile()) {
+      throw new Error(`Patch target is not a regular file: "${fullPath}"`)
+    }
+    renameSync(tmpPath, fullPath)
+  } catch (err) {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+    try { unlinkSync(tmpPath) } catch { /* ignore */ }
+    throw err
+  }
+}
+
 
 /** Operator override for the lab container uid:gid. Must be a non-root numeric user. */
 export const LAB_CONTAINER_USER_ENV = 'GUARDIAN_LAB_USER'
@@ -735,13 +853,21 @@ export function resolveLabContainerUser(env: NodeJS.ProcessEnv = process.env): s
       const gid = typeof process.getgid === 'function' ? process.getgid() : uid
       return `${uid}:${gid}`
     })()
-  if (!/^\d{1,10}:\d{1,10}$/.test(candidate)) {
+  // Parse numerically: Docker accepts leading zeros (`00:00` is uid 0), so a textual check on the
+  // first character is not enough. Reject any non-numeric form and any uid/gid that resolves to 0.
+  const match = /^(\d{1,10}):(\d{1,10})$/.exec(candidate)
+  if (!match) {
     throw new Error(`${LAB_CONTAINER_USER_ENV} must be numeric uid:gid.`)
   }
-  if (candidate.split(':')[0] === '0') {
-    throw new Error(`Lab containers must run as a non-root user; ${LAB_CONTAINER_USER_ENV}=0:* is rejected.`)
+  const uid = Number(match[1])
+  const gid = Number(match[2])
+  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid < 0 || gid < 0) {
+    throw new Error(`${LAB_CONTAINER_USER_ENV} must be numeric uid:gid.`)
   }
-  return candidate
+  if (uid === 0 || gid === 0) {
+    throw new Error(`Lab containers must run as a non-root user; ${LAB_CONTAINER_USER_ENV}=0:* or *:0 is rejected.`)
+  }
+  return `${uid}:${gid}`
 }
 
 /**
@@ -757,6 +883,155 @@ export function prepareIastTelemetryDir(dir: string, containerUser = resolveLabC
   }
   return dir
 }
+
+/**
+ * Fail fast when the 0700 telemetry dir is not writable by the user the lab container runs as.
+ * Non-root Guardian cannot chown, so a `GUARDIAN_LAB_USER` uid different from Guardian's own uid
+ * would silently produce no IAST data; that combination is rejected explicitly instead.
+ */
+export function assertIastTelemetryDirWritable(
+  dir: string,
+  containerUser = resolveLabContainerUser(),
+): void {
+  const [uidRaw, gidRaw] = containerUser.split(':')
+  const containerUid = Number(uidRaw)
+  const containerGid = Number(gidRaw)
+  const st = statSync(dir)
+  const guardianUid = typeof process.getuid === 'function' ? process.getuid() : undefined
+
+  if (guardianUid === 0) {
+    if (st.uid !== containerUid || st.gid !== containerGid) {
+      throw new Error(
+        `IAST telemetry dir ${dir} could not be handed to lab container user ${containerUser} ` +
+        `(still uid ${st.uid}:gid ${st.gid}); refusing to run without writable telemetry.`,
+      )
+    }
+    return
+  }
+  if (guardianUid !== undefined && guardianUid !== containerUid) {
+    throw new Error(
+      `IAST telemetry dir ${dir} is owned by uid ${guardianUid}, but the lab container runs as ` +
+      `${containerUser}. A 0700 telemetry dir cannot be written by a different uid, so IAST data ` +
+      `would be silently lost. Set ${LAB_CONTAINER_USER_ENV}=${guardianUid}:${st.gid} or run Guardian as root.`,
+    )
+  }
+}
+
+/** Mount args for the IAST telemetry bind; read-only unless IAST telemetry is enabled. */
+export function buildIastTelemetryMountArgs(dir: string, iastEnabled: boolean): string[] {
+  return ['--mount', `type=bind,source=${dir},target=/var/run/guardian-iast${iastEnabled ? '' : ',readonly'}`]
+}
+
+/** Bounded retention for per-run telemetry dirs under a shared data-dir base. */
+export const MAX_IAST_TELEMETRY_RUN_DIRS = 4
+export const MAX_IAST_TELEMETRY_TOTAL_BYTES = 128 * 1024 * 1024
+const MAX_IAST_TELEMETRY_WALK_ENTRIES = 20_000
+
+function boundedDirectorySize(root: string): number {
+  let total = 0
+  let seen = 0
+  const stack = [root]
+  while (stack.length > 0 && seen < MAX_IAST_TELEMETRY_WALK_ENTRIES) {
+    const current = stack.pop()!
+    let entries
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      seen += 1
+      if (seen >= MAX_IAST_TELEMETRY_WALK_ENTRIES) break
+      const full = join(current, entry.name)
+      try {
+        const st = lstatSync(full)
+        if (st.isSymbolicLink()) continue
+        if (st.isDirectory()) stack.push(full)
+        else if (st.isFile()) total += st.size
+      } catch {
+        // Best-effort accounting.
+      }
+    }
+  }
+  return total
+}
+
+/**
+ * Best-effort bounded cleanup of previous per-run telemetry dirs. Keeps the newest `retain` dirs and
+ * removes older ones (and any beyond the total size cap) so a long-lived data dir cannot grow
+ * without bound. Only entries named `run-*` are touched; the base dir itself is never removed.
+ */
+export function pruneLabTelemetryDirs(
+  baseDir: string,
+  retain = MAX_IAST_TELEMETRY_RUN_DIRS,
+  maxTotalBytes = MAX_IAST_TELEMETRY_TOTAL_BYTES,
+): string[] {
+  let names: string[]
+  try {
+    names = readdirSync(baseDir)
+  } catch {
+    return []
+  }
+  const runs: Array<{ path: string; mtimeMs: number }> = []
+  for (const name of names) {
+    if (!/^run-[a-z0-9-]{1,80}$/i.test(name)) continue
+    const full = join(baseDir, name)
+    try {
+      const st = lstatSync(full)
+      if (st.isSymbolicLink() || !st.isDirectory()) continue
+      runs.push({ path: full, mtimeMs: st.mtimeMs })
+    } catch {
+      continue
+    }
+  }
+  runs.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const removed: string[] = []
+  for (const stale of runs.slice(Math.max(0, retain))) {
+    try {
+      rmSync(stale.path, { recursive: true, force: true })
+      removed.push(stale.path)
+    } catch {
+      // Best-effort cleanup.
+    }
+  }
+  let kept = runs.slice(0, Math.max(0, retain))
+  let total = kept.reduce((sum, r) => sum + boundedDirectorySize(r.path), 0)
+  while (total > maxTotalBytes && kept.length > 0) {
+    const oldest = kept.pop()!
+    const size = boundedDirectorySize(oldest.path)
+    try {
+      rmSync(oldest.path, { recursive: true, force: true })
+      total -= size
+      removed.push(oldest.path)
+    } catch {
+      break
+    }
+  }
+  return removed
+}
+
+/**
+ * Create a unique, owner-only per-run telemetry dir under the shared base so two lab runs can never
+ * read or overwrite each other's IAST artifacts. Returns the per-run directory to mount.
+ */
+export function createPerRunIastTelemetryDir(
+  baseDir: string,
+  runId: string,
+  containerUser = resolveLabContainerUser(),
+): string {
+  mkdirSync(baseDir, { recursive: true, mode: 0o700 })
+  chmodSync(baseDir, 0o700)
+  pruneLabTelemetryDirs(baseDir)
+
+  const slug = runId.replace(/[^a-z0-9]/gi, '').slice(0, 16).toLowerCase() || 'run'
+  const rand = randomUUID().replace(/-/g, '').slice(0, 12)
+  const dir = join(baseDir, `run-${slug}-${rand}`)
+  mkdirSync(dir, { mode: 0o700 })
+  prepareIastTelemetryDir(dir, containerUser)
+  assertIastTelemetryDirWritable(dir, containerUser)
+  return dir
+}
+
 
 export interface LabContainerRunArgsInput {
   containerName: string
@@ -915,16 +1190,25 @@ export function applyUnifiedDiffToDirectory(rootDir: string, diffText: string): 
       const fullPath = safeResolveUnderRoot(rootDir, relTarget)
       const normalizedRel = relTarget.replace(/^[ab]\//, '')
 
-      const existed = existsSync(fullPath)
+      // lstat, not existsSync: a dangling link reports as absent to existsSync and would be written
+      // through. safeResolveUnderRoot already rejects any link component, including the leaf.
+      const leaf = lstatOrNull(fullPath, relTarget)
+      const existed = leaf !== null
+      if (existed && !leaf.isFile()) {
+        throw new Error(`Patch target is not a regular file: ${normalizedRel}`)
+      }
       if (!backups.has(fullPath)) {
-        backups.set(fullPath, existed ? readFileSync(fullPath, 'utf8') : null)
+        backups.set(fullPath, existed ? readFileNoFollow(fullPath) : null)
       }
 
       if (!existed && !isCreate) {
         throw new Error(`Target file does not exist for patch: ${normalizedRel}`)
       }
+      if (isCreate && existed) {
+        throw new Error(`Create-file patch target already exists: ${normalizedRel}`)
+      }
 
-      const originalContent = existed ? readFileSync(fullPath, 'utf8') : ''
+      const originalContent = existed ? readFileNoFollow(fullPath) : ''
       const hadTrailingNewline = originalContent.endsWith('\n')
       const lines = originalContent === ''
         ? []
@@ -975,12 +1259,29 @@ export function applyUnifiedDiffToDirectory(rootDir: string, diffText: string): 
       }
 
       if (isDelete) {
-        if (existsSync(fullPath)) unlinkSync(fullPath)
+        // Re-check with lstat and only unlink a regular file; never unlink through a link.
+        const current = lstatOrNull(fullPath, relTarget)
+        if (current) {
+          if (current.isSymbolicLink()) {
+            throw new Error(`Symlinked path rejected inside repository: "${relTarget}"`)
+          }
+          unlinkSync(fullPath)
+        }
       } else {
-        mkdirSync(dirname(fullPath), { recursive: true, mode: 0o755 })
+        ensureSafeParentChain(rootDir, fullPath, relTarget)
+        // Re-verify the leaf immediately before writing: safeResolve + lstat above is not atomic.
+        const latestLeaf = lstatOrNull(fullPath, relTarget)
+        if (latestLeaf?.isSymbolicLink()) {
+          throw new Error(`Symlinked path rejected inside repository: "${relTarget}"`)
+        }
+        if (isCreate && latestLeaf) {
+          throw new Error(`Create-file patch target already exists: ${normalizedRel}`)
+        }
+        if (!isCreate && !latestLeaf) {
+          throw new Error(`Target file does not exist for patch: ${normalizedRel}`)
+        }
         const out = lines.length > 0 ? lines.join('\n') + '\n' : ''
-        writeFileSync(fullPath, out, { encoding: 'utf8', mode: 0o644 })
-        chmodSync(fullPath, 0o644)
+        writeFileNoFollow(fullPath, out, isCreate)
       }
       filesModified.push(normalizedRel)
     }
@@ -989,10 +1290,13 @@ export function applyUnifiedDiffToDirectory(rootDir: string, diffText: string): 
   } catch (err) {
     for (const [filePath, prev] of backups.entries()) {
       try {
+        const relRestore = relative(realpathSync(rootDir), filePath)
         if (prev === null) {
-          if (existsSync(filePath)) unlinkSync(filePath)
+          const current = lstatOrNull(filePath, relRestore)
+          if (current && !current.isSymbolicLink()) unlinkSync(filePath)
         } else {
-          writeFileSync(filePath, prev, 'utf8')
+          ensureSafeParentChain(rootDir, filePath, relRestore)
+          writeFileNoFollow(filePath, prev, false)
         }
       } catch {
         // Best-effort rollback
@@ -1001,6 +1305,7 @@ export function applyUnifiedDiffToDirectory(rootDir: string, diffText: string): 
     throw err
   }
 }
+
 
 function createLoopbackForwarder(
   targetRef: { containerName: string; port: number },
@@ -1299,16 +1604,19 @@ export class LabRunner {
     }
 
     const extraInternalEnv: Record<string, string> = {}
-    if (isPrimary && labConfig.iastEnabled && telemetryDir) {
-      mountArgs.push('--mount', `type=bind,source=${telemetryDir},target=/var/run/guardian-iast`)
-      extraInternalEnv.GUARDIAN_IAST_OUT_DIR = '/var/run/guardian-iast'
-      if (existsSync(IAST_HOOKS_DIR)) {
-        mountArgs.push('--mount', `type=bind,source=${IAST_HOOKS_DIR},target=/opt/guardian-iast,readonly`)
-        const runtime = labConfig.iastRuntime ?? 'node'
-        if (runtime === 'node' && existsSync(join(IAST_HOOKS_DIR, 'node-hook.mjs'))) {
-          extraInternalEnv.NODE_OPTIONS = '--import=/opt/guardian-iast/node-hook.mjs'
-        } else if (runtime === 'python' && existsSync(join(IAST_HOOKS_DIR, 'python', 'sitecustomize.py'))) {
-          extraInternalEnv.PYTHONPATH = '/opt/guardian-iast/python'
+    if (isPrimary && telemetryDir) {
+      const iastActive = Boolean(labConfig.iastEnabled)
+      mountArgs.push(...buildIastTelemetryMountArgs(telemetryDir, iastActive))
+      if (iastActive) {
+        extraInternalEnv.GUARDIAN_IAST_OUT_DIR = '/var/run/guardian-iast'
+        if (existsSync(IAST_HOOKS_DIR)) {
+          mountArgs.push('--mount', `type=bind,source=${IAST_HOOKS_DIR},target=/opt/guardian-iast,readonly`)
+          const runtime = labConfig.iastRuntime ?? 'node'
+          if (runtime === 'node' && existsSync(join(IAST_HOOKS_DIR, 'node-hook.mjs'))) {
+            extraInternalEnv.NODE_OPTIONS = '--import=/opt/guardian-iast/node-hook.mjs'
+          } else if (runtime === 'python' && existsSync(join(IAST_HOOKS_DIR, 'python', 'sitecustomize.py'))) {
+            extraInternalEnv.PYTHONPATH = '/opt/guardian-iast/python'
+          }
         }
       }
     }
@@ -1423,14 +1731,22 @@ export class LabRunner {
 
     let telemetryDir: string | undefined
     let ownsTelemetryDir = false
+    let ephemeralTelemetryDir = false
     if (labConfig.iastEnabled) {
-      // IAST telemetry is mounted read-write into the lab container. Keep it owner-only (0700) and
-      // run the container as a non-root user, instead of a world-writable 0777 host dir.
+      // IAST telemetry is mounted into the lab container. Keep each run's dir owner-only (0700),
+      // unique per run (never shared across runs), and run the container as a non-root user.
+      const containerUser = resolveLabContainerUser()
       if (params.telemetryDir) {
-        telemetryDir = prepareIastTelemetryDir(params.telemetryDir)
+        telemetryDir = createPerRunIastTelemetryDir(params.telemetryDir, params.runId, containerUser)
+        ephemeralTelemetryDir = true
       } else {
-        telemetryDir = prepareIastTelemetryDir(mkdtempSync(join(tmpdir(), 'guardian-lab-telemetry-')))
+        telemetryDir = prepareIastTelemetryDir(
+          mkdtempSync(join(tmpdir(), 'guardian-lab-telemetry-')),
+          containerUser,
+        )
+        assertIastTelemetryDirWritable(telemetryDir, containerUser)
         ownsTelemetryDir = true
+        ephemeralTelemetryDir = true
       }
     }
 
@@ -1590,7 +1906,7 @@ export class LabRunner {
         await runDocker(['network', 'rm', networkName], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       rmSync(sanitizedRepoDir, { recursive: true, force: true })
-      if (ownsTelemetryDir && telemetryDir) {
+      if (ephemeralTelemetryDir && telemetryDir) {
         rmSync(telemetryDir, { recursive: true, force: true })
       }
       throw err
