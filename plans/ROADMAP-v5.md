@@ -270,3 +270,10 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Priority (accepted):** parallel tracks — Track A surface/intents (phase0-recon + deterministic engine), Track B agentic lane (already running). Sync, then measure agentic vs `--no-llm` on dev **and** held-out against the honest floor.
 - **Next measurement (accepted):** 12-cell `--no-llm` matrix = 3 apps × seeds 1,2 + 1000042 + a fresh held-out seed, wordlists OFF; pass = 0 decoy/unmatched, gap ≤8pp overall (≤12pp per app), held-out ≥50%, no class drop >20pp.
 - **Owner streams:** heldout-gap (phase0-recon + engine intents), agentic-lane (running), parallel-matrix (running).
+
+### 2026-11-22 — v6 pivot + honest floor baseline
+
+- **P0 pivot:** `plans/better-architecture.md` adopted. Phase 1 (store/WAL/pagination/recover, dedupe, always-on floor, regex de-overfit) and Phase 2–4 streams launched in disjoint worktrees.
+- **Wordlist-off floor (new honest number):** dev seed 1 **26/59 (44.1%)**, 100% precision, 0 decoy/unmatched (acme 8/22, shopflow 10/19, opsportal 8/18). Wordlist ON remains 35/59 (59.3%). Salted held-out (wordlists off) 22/58 (37.9%) → **gap 6.2pp**, inside the ≤8pp gate but below the ≥50% held-out bar.
+- **Interpretation:** the previous +9pp dev move was largely conventional-noun inflation; the structural intents + declared-surface ingestion hold the held-out floor and narrow the gap. No English route/param heuristics may be reintroduced to recover dev points.
+- **Merged:** agentic Slice 3 lane (`3df2821`) — acme seed 1 flag OFF 1/22 → ON 7/22 at 100% precision, $0.39; held-out generalization `ae3308d`.
