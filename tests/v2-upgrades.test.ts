@@ -24,7 +24,6 @@ import {
 import {
   classifyHostTier,
   codeAuditPrompt,
-  crossHostSynthesizerPrompt,
   loadSkill,
   skillsByTag,
 } from '../src/server/agent-session.ts'
@@ -38,7 +37,6 @@ import {
   computeHostTiers,
   computeStepMaxTurns,
   extractPersonaResourcesFromExchange,
-  shouldRunCrossHostSynthesizer,
 } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles, saveModelProfile } from '../src/server/model-settings.ts'
@@ -858,164 +856,6 @@ test('Source-First Code Audit reads mounted /repos via derive_evidence, records 
 // 5. Priority #4: Cross-Host Chain Synthesizer
 // ============================================================================
 
-test('Cross-Host Chain Synthesizer triggers on multi-origin facts, queues cross-host chain steps, deduplicates unchanged facts, and skips single-host routine facts cleanly', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-cross-host-'))
-  t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const storage = new Store(dir)
-  t.after(() => storage.close())
-
-  let synthCallCount = 0
-  let returnEmpty = false
-
-  const llmServer = await httpFixture(async (req, res) => {
-    const chunks: Buffer[] = []
-    for await (const c of req) chunks.push(Buffer.from(c))
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
-      input?: Array<Record<string, unknown>>
-    }
-    const serialized = JSON.stringify(body.input ?? [])
-    synthCallCount += 1
-
-    if (returnEmpty) {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream' }).end(
-        sseResponsesPayload(JSON.stringify({ summary: 'No cross-host chains found.', hypotheses: [], chainSteps: [] })),
-      )
-      return
-    }
-
-    // Extract recorded fact IDs from the JSON-serialized prompt (quotes are escaped inside message content)
-    const factIds = [...serialized.matchAll(/\\?"id\\?":\\?"([0-9a-f-]{36})\\?"/g)].map(m => m[1]).slice(0, 2)
-    const responseObj = {
-      summary: 'Chained clerk wildcard credentialed CORS with sandpack user JS execution.',
-      hypotheses: [{
-        title: 'Sandpack User JS -> Clerk Credentialed CORS Account Takeover',
-        sourceOrigins: [clerkOrigin, sandpackOrigin],
-        factIds,
-        primitiveA: 'clerk.northstar.example reflects *.northstar.example with ACAC: true',
-        primitiveB: 'sandpack.northstar.example executes arbitrary user-authored JS',
-        combinedImpact: 'Untrusted preview script on sandpack can read authenticated clerk session tokens.',
-        severity: 'high',
-        recommendedReplayKind: 'browser_chain',
-      }],
-      chainSteps: [{
-        title: 'Verify Clerk CORS + Sandpack JS browser_chain',
-        hypothesis: 'Execute read-only credentialed fetch from sandpack to clerk via ScopedBrowser and verify response.',
-        category: 'cors-client-side',
-        priority: 95,
-        origins: [sandpackOrigin, clerkOrigin],
-        skills: ['cross-host-chaining', 'oob-ssrf-browser-chain'],
-        dependsOnFactIds: factIds,
-      }],
-    }
-    res.writeHead(200, { 'Content-Type': 'text/event-stream' }).end(
-      sseResponsesPayload(JSON.stringify(responseObj)),
-    )
-  })
-  t.after(() => llmServer.close())
-
-  await saveModelProfile({
-    name: 'Synth Fixture',
-    endpoint: llmServer.url,
-    model: 'synth-fixture',
-    protocol: 'responses',
-    key: 'synth-key-12345',
-    priority: 100,
-  }, storage, { skipConnectionCheck: true })
-  const profiles = privateModelProfiles(storage)
-
-  const { id: projectId } = storage.createProject({
-    requestId: randomUUID(), name: 'Multi-Host Project', seeds: [clerkOrigin, sandpackOrigin, wwwOrigin], environment: 'public',
-  })
-  const { id: runId } = storage.createRun({
-    requestId: randomUUID(), projectId, goal: 'Cross-host chain synthesis', sourceMode: 'public',
-    capabilityTier: 2, budgetUsd: 1, budgetRequests: 30, maxRpsPerOrigin: 10, workerConcurrency: 2, workerMaxTurns: 15,
-  })
-  storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-  const run0 = storage.run(runId)
-  storage.command({
-    requestId: randomUUID(), runId, action: 'scope', expectedScopeRevision: 0,
-    assetIds: run0.candidates.map(c => c.id), consent: true,
-  })
-
-  const run = storage.run(runId)
-  const wwwAsset = run.candidates.find(c => c.origin === wwwOrigin)!
-  const clerkAsset = run.candidates.find(c => c.origin === clerkOrigin)!
-  const sandpackAsset = run.candidates.find(c => c.origin === sandpackOrigin)!
-  const w1 = storage.makeWorker(run, 'investigation', wwwAsset, 'Recon www', 'Check www')
-  const w2 = storage.makeWorker(run, 'investigation', clerkAsset, 'Recon clerk', 'Check clerk')
-  const w3 = storage.makeWorker(run, 'investigation', sandpackAsset, 'Recon sandpack', 'Check sandpack')
-
-  // Single-host routine header fact MUST NOT trigger cross-host synthesizer
-  storage.addFact(run, w1, {
-    kind: 'header',
-    origin: wwwOrigin,
-    summary: 'Marketing page missing Referrer-Policy header.',
-  })
-  const approvedSet = new Set([clerkOrigin, sandpackOrigin, wwwOrigin])
-  const singleCheck = shouldRunCrossHostSynthesizer(storage.listFacts(runId), approvedSet)
-  assert.equal(singleCheck.trigger, false)
-
-  const execution = new Execution(storage)
-  t.after(() => execution.stop())
-  const skippedSingle = await execution.runCrossHostSynthesizer(run, 1, profiles, AbortSignal.timeout(10_000))
-  assert.equal(skippedSingle.triggered, false)
-  assert.equal(synthCallCount, 0)
-
-  // Add multi-origin primitives: clerk wildcard CORS + sandpack user JS execution
-  const clerkFact = storage.addFact(run, w2, {
-    kind: 'cors',
-    origin: clerkOrigin,
-    summary: 'Clerk reflects wildcard *.northstar.example in Access-Control-Allow-Origin with Access-Control-Allow-Credentials: true.',
-  })
-  const sandpackFact = storage.addFact(run, w3, {
-    kind: 'dom',
-    origin: sandpackOrigin,
-    summary: 'Sandpack bundler executes user-controlled JavaScript on sandpack.northstar.example.',
-  })
-
-  const multiCheck = shouldRunCrossHostSynthesizer(storage.listFacts(runId), approvedSet)
-  assert.equal(multiCheck.trigger, true)
-  assert.ok(multiCheck.distinctOrigins.length >= 2)
-  assert.ok(multiCheck.leverageSignals.includes('credentialed-cors-or-wildcard'))
-  assert.ok(multiCheck.leverageSignals.includes('sandboxed-user-js-or-postmessage'))
-
-  // Verify crossHostSynthesizerPrompt auto-groups facts by origin
-  const synthPromptParsed = JSON.parse(crossHostSynthesizerPrompt({
-    goal: run.goal,
-    roundNo: 2,
-    capabilityTier: 2,
-    approvedOrigins: [clerkOrigin, sandpackOrigin],
-    facts: [
-      { id: clerkFact.id, kind: clerkFact.kind, origin: clerkFact.origin, summary: clerkFact.summary },
-      { id: sandpackFact.id, kind: sandpackFact.kind, origin: sandpackFact.origin, summary: sandpackFact.summary },
-    ],
-  })) as { factsByOrigin: Record<string, unknown[]> }
-  assert.equal(synthPromptParsed.factsByOrigin[clerkOrigin]?.length, 1)
-  assert.equal(synthPromptParsed.factsByOrigin[sandpackOrigin]?.length, 1)
-
-  const synthRes = await execution.runCrossHostSynthesizer(storage.run(runId), 2, profiles, AbortSignal.timeout(10_000))
-  assert.equal(synthRes.triggered, true)
-  assert.equal(synthRes.hypothesesCount, 1)
-  assert.equal(synthRes.stepsCreated.length, 1)
-  assert.ok(synthRes.stepsCreated[0].sourceOrigins.includes(clerkOrigin))
-  assert.ok(synthRes.stepsCreated[0].sourceOrigins.includes(sandpackOrigin))
-  assert.ok(synthRes.stepsCreated[0].skills.includes('cross-host-chaining'))
-  assert.ok(synthRes.stepsCreated[0].dependsOnFactIds.length >= 1)
-
-  // Calling again with unchanged facts MUST short-circuit without another LLM call
-  const callsAfterFirst = synthCallCount
-  const dupRes = await execution.runCrossHostSynthesizer(storage.run(runId), 3, profiles, AbortSignal.timeout(10_000))
-  assert.equal(dupRes.triggered, false)
-  assert.equal(synthCallCount, callsAfterFirst)
-
-  // New fact + empty synthesizer JSON MUST handle gracefully with zero crashes
-  returnEmpty = true
-  storage.addFact(run, w2, { kind: 'endpoint', origin: clerkOrigin, summary: 'Observed /v1/client endpoint.' })
-  const emptyRes = await execution.runCrossHostSynthesizer(storage.run(runId), 4, profiles, AbortSignal.timeout(10_000))
-  assert.equal(emptyRes.triggered, true)
-  assert.equal(emptyRes.stepsCreated.length, 0)
-  assert.equal(emptyRes.hypothesesCount, 0)
-})
 
 // ============================================================================
 // 6. Priority #6 & #3: Header Hygiene Collapse, (origin, cwe) Dedup, 80/20 Budgeting, BOLA Queue & Skills

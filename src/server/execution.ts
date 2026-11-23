@@ -50,12 +50,11 @@ import {
   AGENTIC_SPECIALIST_WALL_CLOCK_MS,
   agentTurn,
   buildBoardDelta,
-  chainPlannerPrompt,
   classifyHostTier,
   codeAuditPrompt,
+  coordinatorPlannerPrompt,
   coordinatorPrompt,
   createBoardTools,
-  crossHostSynthesizerPrompt,
   defaultCodeAuditMaxTurns,
   detLeadsFromParentFacts,
   filterHandlersForSpecialist,
@@ -97,7 +96,6 @@ import {
 import type { BrokerExchangeResult, BrokerHttpRequest, BrokerRaceBurstResult, Grant, PublicObservation } from './broker.ts'
 import { CanaryBroker, scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
-import { ColdGraphCompactor } from './compactor.ts'
 import { hasCuratedAdvisory, queryCves, templateIdsForCves } from './cve-broker.ts'
 import {
   checkStructuralDuplicate,
@@ -133,7 +131,6 @@ import { crawlStateGraph, runPhase0Recon } from './phase0-recon.ts'
 import type { CodeToRuntimeHypothesis } from './program-graph.ts'
 import {
   consumeBurstInstance,
-  grantBurstInstances,
   planTier3ApprovalTargets,
   registerStateChangeGrant,
 } from './tier3-approval.ts'
@@ -148,6 +145,20 @@ import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
 import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
 import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
+import {
+  createGraphCoordinator,
+  decideNext,
+} from './graph-coordinator.ts'
+import type {
+  ChainHypothesis,
+  CoordinatorDeps,
+  CoordinatorEndpoint,
+  CoordinatorProgramGraph,
+  DispatchPlan,
+  DispatchStepInput,
+  GraphCoordinator,
+  SchedulerDecision,
+} from './graph-coordinator.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
 import type { Phase0GraphwireExtras } from './probe-plan.ts'
 export { selectRankedProbeTargets } from './probe-plan.ts'
@@ -246,6 +257,128 @@ export function resolveFloorLaneMode(
 /** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
 const maxPhase3RefinementJobs = 10
 
+/** Page a Store listing to exhaustion; the coordinator never plans from a fixed-size snapshot. */
+export function collectAllPages<T>(
+  fetchPage: (offset: number, limit: number) => readonly T[],
+  pageSize = 500,
+): T[] {
+  const size = Math.max(1, Math.floor(pageSize))
+  const out: T[] = []
+  for (let offset = 0; ;) {
+    const page = fetchPage(offset, size)
+    out.push(...page)
+    if (page.length < size) return out
+    offset += page.length
+  }
+}
+
+export interface CoordinatorSchedulerState {
+  budgetExhausted: boolean
+  budgetRequests: number
+  spentRequests: number
+  startedAt: number
+  maxDurationMs: number
+  emptyRounds?: number
+  coordinatorDone?: boolean
+  pendingOob?: number
+}
+
+/** Deterministic v6 scheduler guard: budget, requests, wall clock, K=2 empty rounds, done+OOB drain. */
+export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): SchedulerDecision {
+  return decideNext({
+    budgetExhausted: state.budgetExhausted,
+    requestsLeft: state.budgetRequests > 0 ? state.budgetRequests - state.spentRequests : null,
+    wallClockLeft: state.maxDurationMs > 0 ? state.startedAt + state.maxDurationMs - Date.now() : null,
+    consecutiveEmptyPlannerRounds: state.emptyRounds ?? 0,
+    coordinatorDone: state.coordinatorDone === true,
+    pendingOob: state.pendingOob ?? 0,
+  })
+}
+
+/** Map chained hypotheses onto validated dispatch inputs (ordered by the planner's ranking). */
+export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesis[]): DispatchStepInput[] {
+  return hypotheses.map(hypothesis => ({
+    hypothesis: `${hypothesis.title} — ${hypothesis.rationale}`.slice(0, 1200),
+    origins: hypothesis.chainOrigins,
+    capabilities: hypothesis.capabilities,
+    parentEvidenceIds: hypothesis.parentEvidenceIds,
+    ...(hypothesis.probeClasses.length ? { probeClass: hypothesis.probeClasses[0] } : {}),
+    skills: [...new Set([...hypothesis.primitiveKinds.map(kind => `chain:${kind}`), 'chain-primitives', ...hypothesis.probeClasses])],
+    priority: Math.round(hypothesis.confidence * 100),
+  }))
+}
+
+export interface CoordinatorPlannerSessionDeps {
+  coordinator: GraphCoordinator
+  /** Persist validated hypotheses as chain steps. The tool never performs HTTP. */
+  onDispatch?: (plan: DispatchPlan) => void
+}
+
+/** Compact coordinator pages (≤25 rows) so a compaction-free planner never bloats context. */
+const COORDINATOR_PAGE_MAX = 25
+const compactLimit = (limit?: number): number =>
+  Math.min(COORDINATOR_PAGE_MAX, Math.max(1, Math.floor(limit ?? COORDINATOR_PAGE_MAX)))
+const compactText = (value: string, max = 160): string =>
+  value.length <= max ? value : `${value.slice(0, max - 1)}…`
+const compactChainTitle = (hypothesis: string): string => {
+  const head = hypothesis.split(' — ')[0] ?? hypothesis
+  return compactText(head.trim() || 'Chain hypothesis', 160)
+}
+const compactPrimitiveTag = (data: Record<string, unknown> | undefined): string | null => {
+  for (const candidate of [data?.subkind, data?.probeClass, data?.kind]) {
+    if (typeof candidate === 'string' && candidate.trim()) return compactText(candidate.trim(), 48)
+  }
+  return null
+}
+
+/** Map the coordinator's five tools onto agent-session handlers (registered only when supplied). */
+export function coordinatorPlannerHandlers(
+  deps: CoordinatorPlannerSessionDeps,
+): Pick<WorkerToolHandlers, 'query_endpoints' | 'query_program_graph' | 'query_facts' | 'query_findings' | 'dispatch_investigations'> {
+  return {
+    query_endpoints: async args => {
+      const page = deps.coordinator.queryEndpoints({ ...args, limit: compactLimit(args.limit) })
+      return {
+        ...page,
+        items: page.items.map(endpoint => ({
+          id: endpoint.id, method: endpoint.method, route: compactText(endpoint.pathTemplate, 160),
+          origin: endpoint.origin, risk: endpoint.riskScore ?? 0, coverage: endpoint.coveragePct ?? null,
+          tested: endpoint.testedClasses ?? [], sinks: endpoint.sinkKinds ?? [],
+          auth: endpoint.authRequirement ?? null, guard: endpoint.ownershipGuard ?? null,
+          roleExclusive: endpoint.roleExclusive === true,
+        })),
+      }
+    },
+    query_program_graph: async args => {
+      const page = deps.coordinator.queryProgramGraph({ ...args, limit: compactLimit(args.limit) })
+      return { ...page, items: page.items.slice(0, COORDINATOR_PAGE_MAX) }
+    },
+    query_facts: async args => {
+      // `origin:'*'` spans every approved origin (cross-host chaining never loses its evidence).
+      const origin = args.origin?.trim() === '*' ? undefined : args.origin
+      const page = deps.coordinator.queryFacts({ ...args, origin, limit: compactLimit(args.limit) })
+      return {
+        ...page,
+        items: page.items.map(fact => ({
+          id: fact.id, kind: fact.kind, origin: fact.origin,
+          primitiveTag: compactPrimitiveTag(fact.data),
+          summary: compactText(fact.summary),
+          evidenceIds: fact.evidenceIds ?? [],
+        })),
+      }
+    },
+    query_findings: async args => {
+      const page = deps.coordinator.queryFindings({ ...args, limit: compactLimit(args.limit) })
+      return { ...page, items: page.items.map(item => ({ ...item, title: compactText(item.title, 160), reason: item.reason ? compactText(item.reason, 160) : undefined })) }
+    },
+    dispatch_investigations: async args => {
+      const plan = deps.coordinator.dispatchInvestigations(args.steps, { maxSteps: args.maxSteps })
+      if (plan.plan.length) deps.onDispatch?.(plan)
+      return plan
+    },
+  }
+}
+
 export function computeDynamicStepBudget(storage: Store, runId: string): number {
   const endpoints = storage.listEndpoints(runId)
   const crownJewels = endpoints.filter(e => e.riskScore >= 80).length
@@ -341,29 +474,6 @@ const plannerResponseSchema = z.object({
   })).default([]),
   cancelStepIds: z.array(z.string()).default([]),
   done: z.boolean().default(false),
-})
-
-const crossHostSynthesizerResponseSchema = z.object({
-  summary: z.string().default(''),
-  hypotheses: z.array(z.object({
-    title: z.string().min(1).max(200),
-    sourceOrigins: z.array(z.string()).default([]),
-    factIds: z.array(z.string()).default([]),
-    primitiveA: z.string().default(''),
-    primitiveB: z.string().default(''),
-    combinedImpact: z.string().default(''),
-    severity: z.enum(['critical', 'high', 'medium', 'low', 'informational']).default('high'),
-    recommendedReplayKind: z.string().optional(),
-  })).default([]),
-  chainSteps: z.array(z.object({
-    title: z.string().min(1).max(200),
-    hypothesis: z.string().min(1).max(1200),
-    category: z.string().default('cors-client-side'),
-    priority: z.number().min(0).max(100).default(85),
-    origins: z.array(z.string()).min(1),
-    skills: z.array(z.string()).default(['cross-host-chaining']),
-    dependsOnFactIds: z.array(z.string()).default([]),
-  })).default([]),
 })
 
 export function derivedResult(result: { exitStatus: number; result: string; stdout: string }) {
@@ -805,40 +915,6 @@ export function buildBolaTestQueue(
   ).slice(0, overallBudget)
 }
 
-const CROSS_HOST_LEVERAGE_PATTERNS: ReadonlyArray<{ label: string; kindMatch?: string[]; pattern: RegExp }> = [
-  { label: 'credentialed-cors-or-wildcard', kindMatch: ['cors'], pattern: /access-control-allow-credentials|wildcard|allow-origin|reflected origin|cors|subdomain trust/i },
-  { label: 'dangling-cname-or-takeover', kindMatch: ['dns'], pattern: /dangling|cname|takeover|nxdomain|unclaimed/i },
-  { label: 'oauth-redirect-or-sso', kindMatch: ['redirect', 'auth'], pattern: /oauth|oidc|redirect_uri|callback|sso|clerk|token|session|cross-origin/i },
-  { label: 'sandboxed-user-js-or-postmessage', kindMatch: ['dom'], pattern: /sandpack|sandbox|postmessage|iframe|user js|script execution|xss|bundler/i },
-]
-
-export function shouldRunCrossHostSynthesizer(
-  facts: readonly Fact[],
-  approvedOrigins: ReadonlySet<string>,
-): { trigger: boolean; reason: string; distinctOrigins: string[]; leverageSignals: string[] } {
-  const validFacts = facts.filter(f => !f.tainted && approvedOrigins.has(f.origin))
-  if (!validFacts.length) {
-    return { trigger: false, reason: 'No untainted facts in approved scope.', distinctOrigins: [], leverageSignals: [] }
-  }
-  const distinctOrigins = [...new Set(validFacts.map(f => f.origin))].sort()
-  const signalSet = new Set<string>()
-  for (const fact of validFacts) {
-    const text = `${fact.summary} ${JSON.stringify(fact.data ?? {})}`
-    for (const rule of CROSS_HOST_LEVERAGE_PATTERNS) {
-      if ((rule.kindMatch?.includes(fact.kind) && rule.pattern.test(text)) || rule.pattern.test(text)) {
-        signalSet.add(rule.label)
-      }
-    }
-  }
-  const leverageSignals = [...signalSet]
-  const trigger = distinctOrigins.length >= 2 || leverageSignals.length > 0
-  const reason = distinctOrigins.length >= 2
-    ? `Facts span ${distinctOrigins.length} distinct approved origins${leverageSignals.length ? ` with signals: ${leverageSignals.join(', ')}` : ''}.`
-    : leverageSignals.length > 0
-      ? `High-leverage cross-origin signals detected: ${leverageSignals.join(', ')}.`
-      : 'Single-origin facts without cross-origin leverage signals.'
-  return { trigger, reason, distinctOrigins, leverageSignals }
-}
 
 // --- Deterministic (zero-LLM) investigation fallback helpers ---
 
@@ -1111,7 +1187,6 @@ export class Execution {
   readonly canaryBroker: CanaryBroker
   readonly backend: WorkerBackend
   readonly personaAuth: PersonaAuthManager
-  readonly compactor: ColdGraphCompactor
   readonly labRunner: LabRunner
   private readonly active = new Map<string, Active>()
   private readonly coordinator = new Map<string, CoordinatorTask>()
@@ -1126,7 +1201,8 @@ export class Execution {
   private readonly probePlans = new ProbePlanRegistry()
   /** `${runId}\0${hypothesisId}` leads already persisted as det_lead facts (idempotent seeding). */
   private readonly programGraphLeadsSeeded = new Set<string>()
-  private readonly synthesizedSignature = new Map<string, string>()
+  /** runId → consecutive planner rounds with zero dispatched work (K=2 diminishing-returns guard). */
+  private readonly plannerEmptyRounds = new Map<string, number>()
   private readonly recordedPersonaResources = new Map<string, Set<string>>()
   private readonly circuitNotified = new Set<string>()
   private readonly runAuthStarted = new Map<string, string>()
@@ -1212,10 +1288,6 @@ export class Execution {
     })
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.labRunner = options.labRunner ?? new LabRunner()
-    this.compactor = new ColdGraphCompactor({
-      onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-      onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
-    })
   }
 
   private isCanaryDnsConfigured(): boolean {
@@ -2202,6 +2274,10 @@ export class Execution {
     }
   }
 
+  private isRefinementEligible(runId: string, replaySpecId: string): boolean {
+    return this.refinementEligible.get(runId)?.has(replaySpecId) === true
+  }
+
   private markRefinementEligible(runId: string, replaySpecId: string) {
     let set = this.refinementEligible.get(runId)
     if (!set) {
@@ -2209,10 +2285,6 @@ export class Execution {
       this.refinementEligible.set(runId, set)
     }
     set.add(replaySpecId)
-  }
-
-  private isRefinementEligible(runId: string, replaySpecId: string): boolean {
-    return this.refinementEligible.get(runId)?.has(replaySpecId) === true
   }
 
   /** Number of Phase-3 refinement jobs already dispatched for this run (complete or active). */
@@ -2266,10 +2338,6 @@ export class Execution {
       if (multiPersona && subkind === 'persona_resource') return true
     }
     return false
-  }
-
-  private grantBurstApprovalInstances(input: StateChangeFingerprintInput, instances: number, expiresAt: number): void {
-    grantBurstInstances(this.burstApprovalInstances, input, instances, expiresAt)
   }
 
   private consumeBurstApprovalInstance(input: StateChangeFingerprintInput, now = Date.now()): boolean {
@@ -6142,149 +6210,126 @@ export class Execution {
     })
   }
 
-  // --- Priority #4: Cross-Host Chain Synthesizer Pass ---
+  // --- v6 Phase 4: tool-equipped Graph Coordinator planner ---
 
-  async runCrossHostSynthesizer(
-    run: Run,
-    roundNo: number,
-    profiles: readonly ResolvedModelProfile[],
-    signal: AbortSignal,
-  ): Promise<{ triggered: boolean; stepsCreated: ChainStep[]; hypothesesCount: number; reason: string }> {
-    if (!profiles.length) {
-      return { triggered: false, stepsCreated: [], hypothesesCount: 0, reason: 'No model profiles configured.' }
-    }
-    const approvedOrigins = this.approvedOriginsSet(run)
-    const allValidFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 120 })
-      .filter(f => approvedOrigins.has(f.origin) && f.sourceOrigins.every(o => approvedOrigins.has(o)))
-    const check = shouldRunCrossHostSynthesizer(allValidFacts, approvedOrigins)
-    if (!check.trigger) {
-      return { triggered: false, stepsCreated: [], hypothesesCount: 0, reason: check.reason }
-    }
-
-    const signature = createHash('sha256')
-      .update(`${run.goalRevision}:${run.scopeRevision}:${allValidFacts.map(f => f.id).sort().join(',')}`)
-      .digest('hex')
-    if (this.synthesizedSignature.get(run.id) === signature) {
-      return { triggered: false, stepsCreated: [], hypothesesCount: 0, reason: 'Facts unchanged since last cross-host synthesis.' }
-    }
-
-    const tm = this.storage.latestThreatModel(run.id, run.goalRevision)
-    const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
-    const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
-      .map(p => ({ handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist }))
-
-    const factsByOrigin: Record<string, Array<{
-      id: string
-      kind: string
-      summary: string
-      data?: Record<string, unknown>
-      exchangeIds?: readonly string[]
-    }>> = {}
-    for (const fact of allValidFacts) {
-      const list = factsByOrigin[fact.origin] ?? (factsByOrigin[fact.origin] = [])
-      list.push({
-        id: fact.id,
-        kind: typeof fact.data?.subkind === 'string' ? fact.data.subkind : fact.kind,
-        summary: fact.summary,
-        data: fact.data,
-        exchangeIds: fact.exchangeIds,
+  /**
+   * Lossless Program Graph view assembled from persisted endpoint code locations and sink tags.
+   * The full AST graph is not persisted, but every AST-derived route keeps its `codeLocation`, so
+   * sink paths and middleware diffs remain queryable without the old snapshot.
+   */
+  private coordinatorProgramGraph(endpoints: readonly CoordinatorEndpoint[]): CoordinatorProgramGraph | null {
+    const routes: CoordinatorProgramGraph['routes'][number][] = []
+    const nodes: Array<{ id: string; kind: string; symbol: string; file: string; line: number; sinkKind?: string }> = []
+    const edges: Array<{ fromId: string; toId: string }> = []
+    for (const endpoint of endpoints) {
+      const location = endpoint.codeLocation as { file?: unknown; startLine?: unknown } | null | undefined
+      const file = typeof location?.file === 'string' ? location.file : null
+      if (!file) continue
+      const line = typeof location?.startLine === 'number' ? location.startLine : 1
+      routes.push({
+        id: endpoint.id, method: endpoint.method, path: endpoint.pathTemplate, file, line, handler: '',
+        guards: [endpoint.authRequirement, endpoint.ownershipGuard]
+          .filter((guard): guard is string => Boolean(guard && guard.trim())),
       })
+      for (const sinkKind of endpoint.sinkKinds ?? []) {
+        const sinkId = `${endpoint.id}:${sinkKind}`
+        nodes.push({ id: sinkId, kind: 'sink', symbol: sinkKind, file, line, sinkKind })
+        edges.push({ fromId: endpoint.id, toId: sinkId })
+      }
     }
+    return routes.length ? { routes, nodes, edges } : null
+  }
 
-    const prompt = crossHostSynthesizerPrompt({
-      goal: run.goal,
-      roundNo,
-      capabilityTier: run.capabilityTier,
-      approvedOrigins: [...approvedOrigins],
-      personas,
-      threatModel: tm?.entries.filter(e => approvedOrigins.has(e.origin)),
-      factsByOrigin,
-      existingSteps: existingSteps.map(s => ({ id: s.id, title: s.title, status: s.status, origins: s.sourceOrigins })),
-    })
-
-    const answer = await agentTurn({
-      directory: this.storage.directory,
-      sessionId: `synth-${run.id}-r${roundNo}`,
-      requestId: `synth:${run.goalRevision}:${roundNo}`,
-      profiles: resolveProfilePoolForRole('reasoning', profiles),
-      scenario: 'cross-host-synthesizer',
-      roleAffinity: 'reasoning',
-      prompt,
-      signal,
-      onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
-      onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-      onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
-    })
-
-    this.synthesizedSignature.set(run.id, signature)
-    let parsedJson: unknown
-    try {
-      parsedJson = JSON.parse(stripJsonFences(answer))
-    } catch {
-      return { triggered: true, stepsCreated: [], hypothesesCount: 0, reason: 'Synthesizer returned non-JSON output.' }
-    }
-    const parsed = crossHostSynthesizerResponseSchema.safeParse(parsedJson)
-    if (!parsed.success) {
-      return { triggered: true, stepsCreated: [], hypothesesCount: 0, reason: 'Synthesizer output did not match schema.' }
-    }
-
-    const currentRun = this.storage.run(run.id)
-    const currentApproved = this.approvedOriginsSet(currentRun)
-    const latestSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
-    const existingTitles = new Set(latestSteps.map(s => s.title.trim().toLowerCase()))
-    const validFactIdSet = new Set(allValidFacts.map(f => f.id))
-    const stepsCreated: ChainStep[] = []
-    let totalSteps = latestSteps.length
-
-    const dynamicBudget = Math.min(hardChainStepsCeiling, currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id))
-    for (const step of parsed.data.chainSteps) {
-      if (totalSteps >= dynamicBudget || stepsCreated.length >= 6) break
-      const validOrigins = step.origins.filter(o => currentApproved.has(o))
-      const assetIds = currentRun.candidates
-        .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
-        .map(c => c.id)
-      if (!assetIds.length) continue
-      const titleKey = step.title.trim().toLowerCase()
-      if (existingTitles.has(titleKey)) continue
-      const depFacts = step.dependsOnFactIds.filter(fid => validFactIdSet.has(fid))
-      const specialistProfile = routeStepToSpecialist({
-        title: step.title,
-        hypothesis: step.hypothesis,
-        category: step.category,
-        skills: step.skills,
-      })
-      const created = this.storage.addChainStep(currentRun, {
-        title: step.title,
-        hypothesis: step.hypothesis,
-        category: step.category,
-        priority: Math.max(82, Math.min(100, step.priority)),
-        targetAssetIds: assetIds,
-        skills: [...new Set([...step.skills, 'cross-host-chaining'])],
-        dependsOnFactIds: depFacts,
-        sourceOrigins: validOrigins,
-        specialistProfile,
-      })
-      existingTitles.add(titleKey)
-      stepsCreated.push(created)
-      totalSteps += 1
-    }
-
-    this.storage.event(run.id, 'synthesizer.round',
-      `Cross-host synthesizer round ${roundNo}: ${parsed.data.hypotheses.length} hypotheses, ${stepsCreated.length} cross-host steps queued.`, {
-        roundNo,
-        hypothesesCount: parsed.data.hypotheses.length,
-        addedCount: stepsCreated.length,
-        distinctOrigins: check.distinctOrigins,
-        leverageSignals: check.leverageSignals,
-        summary: parsed.data.summary.slice(0, 300),
-      })
-
+  /** Untruncated, paginated data access for the coordinator (never a fixed snapshot). */
+  private coordinatorDeps(run: Run): CoordinatorDeps {
+    const endpoints = (): CoordinatorEndpoint[] => this.pageAll((offset, limit) =>
+      this.storage.listEndpoints(run.id, { limit, offset }))
     return {
-      triggered: true,
-      stepsCreated,
-      hypothesesCount: parsed.data.hypotheses.length,
-      reason: check.reason,
+      listEndpoints: endpoints,
+      listFacts: () => this.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset })),
+      listFindings: () => this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all()
+        .map(row => ({
+          id: row.id, origin: row.finding.origin, title: row.finding.title, status: row.finding.status,
+          severity: row.finding.severity, ...(row.finding.reason ? { reason: row.finding.reason } : {}),
+          ...(row.finding.category ? { category: row.finding.category } : {}),
+          ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
+          ...(row.finding.confidence ? { confidence: row.finding.confidence } : {}),
+          ...(row.finding.verification ? { verification: row.finding.verification } : {}),
+          ...(row.finding.runtimeProofGap ? { runtimeProofGap: row.finding.runtimeProofGap } : {}),
+          ...(row.finding.findingKind ? { findingKind: row.finding.findingKind } : {}),
+          evidenceIds: row.finding.evidenceIds ?? [], chainFactIds: row.finding.chainFactIds ?? [],
+          exchangeIds: row.finding.exchangeIds ?? [],
+        }))
+      ,
+      programGraph: () => this.coordinatorProgramGraph(endpoints()),
+      // No persisted commit-signal table in v6; git hotspots remain empty rather than fabricated.
+      commitSignals: () => [],
+      approvedOrigins: () => [...this.approvedOriginsSet(run)],
     }
+  }
+
+  private pageAll<T>(fetchPage: (offset: number, limit: number) => readonly T[], pageSize = 500): T[] {
+    return collectAllPages(fetchPage, pageSize)
+  }
+
+  /** Persist a validated dispatch plan as chain steps, citing parent facts and capability bundles. */
+  private persistDispatchPlan(run: Run, plan: DispatchPlan, factIds: ReadonlySet<string>): number {
+    const existing = this.storage.listChainSteps(run.id, run.goalRevision)
+    const titles = new Set(existing.map(step => step.title.trim().toLowerCase()))
+    const confirmed = this.alreadyConfirmedRefs(run, 40)
+    let added = 0
+    for (const step of plan.plan) {
+      const title = compactChainTitle(step.hypothesis)
+      const key = title.toLowerCase()
+      if (titles.has(key)) continue
+      const boundFactIds = step.parentEvidenceIds.filter(id => factIds.has(id))
+      // Tool-dispatched hypotheses obey the same no-re-dispatch rule as planner JSON steps.
+      if (this.stepRepeatsConfirmedWork({
+        title, hypothesis: step.hypothesis, dependsOnFactIds: boundFactIds, dependsOnStepIds: [],
+      }, confirmed)) continue
+      const assetIds = run.candidates
+        .filter(candidate => step.origins.includes(candidate.origin) && run.approved.includes(candidate.id))
+        .map(candidate => candidate.id)
+      if (!assetIds.length) continue
+      const category = step.probeClass === 'stored_xss' ? 'cors-client-side'
+        : step.probeClass === 'authz_replay' || step.probeClass === 'auth_bypass' ? 'broken-access-control'
+          : step.probeClass === 'ssrf' ? 'injection-input' : 'broken-access-control'
+      this.storage.addChainStep(run, {
+        title: title.slice(0, 200),
+        hypothesis: step.hypothesis,
+        category,
+        priority: step.priority,
+        targetAssetIds: assetIds,
+        skills: step.skills,
+        dependsOnFactIds: boundFactIds,
+        sourceOrigins: step.origins,
+        specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
+      })
+      titles.add(key)
+      added += 1
+    }
+    return added
+  }
+
+  /**
+   * Explicit chaining round: derive typed primitives from the untruncated store (same-origin and
+   * cross-origin), plan 2–3 hop hypotheses and dispatch each with parent evidence + capabilities.
+   */
+  private dispatchChainRound(run: Run, coordinator: GraphCoordinator, budget: number, factIds: ReadonlySet<string>): number {
+    const existing = this.storage.listChainSteps(run.id, run.goalRevision)
+    const remaining = Math.max(0, budget - existing.length)
+    if (remaining <= 0) return 0
+    const hypotheses = coordinator.planChainRound({ maxHops: 3, limit: Math.min(12, remaining) })
+    if (!hypotheses.length) return 0
+    const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(hypotheses), { maxSteps: remaining })
+    const added = this.persistDispatchPlan(run, plan, factIds)
+    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${added} hypothesis(es) with parent evidence.`, {
+      hypotheses: hypotheses.length, dispatched: added, rejected: plan.rejected.length,
+      crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
+      primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
+    })
+    return added
   }
 
   private async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
@@ -6292,13 +6337,12 @@ export class Execution {
     if (fresh.status !== 'running' || fresh.phase !== 'investigation') return
     if (this.storage.checkBudgetExceeded(run.id)) return
 
-    // Compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
+    // Advance the planner round without a compactor: facts stay raw and paginated.
+    const roundNo = fresh.roundNo + 1
+    const plannerStartedAt = Date.now()
+    const updated = this.storage.updateRun(fresh.id, { roundNo })
     const dynamicStepBudget = Math.min(hardChainStepsCeiling, computeDynamicStepBudget(this.storage, fresh.id))
     this.storage.updateRunDynamicStepBudget(fresh.id, dynamicStepBudget)
-
-    // v6: a dry streak is telemetry only. Planning stops when the budget/wall clock is exhausted,
-    // the coordinator declares completion, or the queue is empty after the final planner round —
-    // never because a fixed number of consecutive steps produced no fact.
     this.noteDryStreak(fresh)
 
     // v6 Phase 1: prioritized deterministic leads become upgrade assignments before the planner
@@ -6308,94 +6352,64 @@ export class Execution {
       detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, this.approvedOriginsSet(fresh), dynamicStepBudget)
     } catch { /* lead queueing is additive */ }
 
-    // 1. Advance roundNo & trigger background LSM cold-graph compaction
-    const roundRes = this.compactor.onPlannerRound(this.storage, run.id, profiles, task.controller.signal)
-    const afterRound = this.storage.run(run.id)
-    const approvedOrigins = this.approvedOriginsSet(afterRound)
+    const approvedOrigins = this.approvedOriginsSet(updated)
+    const factIds = new Set(this.pageAll((offset, limit) =>
+      this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset })).map(fact => fact.id))
+    const remainingBudget = Math.max(0, dynamicStepBudget - this.storage.listChainSteps(fresh.id, updated.goalRevision).length)
+    const coordinator = createGraphCoordinator({
+      deps: this.coordinatorDeps(updated),
+      approvedOrigins: [...approvedOrigins],
+      budgetUsd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
+      maxDispatchSteps: Math.min(6, remainingBudget),
+    })
 
-    // 2. Priority #4: Cross-Host Chain Synthesizer Pass when facts span >=2 origins or cross-origin primitives exist
-    let synthesizedStepsCount = 0
-    try {
-      const synth = await this.runCrossHostSynthesizer(afterRound, roundRes.roundNo, profiles, task.controller.signal)
-      synthesizedStepsCount = synth.stepsCreated.length
-    } catch {
-      // Cross-host synthesis is best-effort; continue planning cleanly
+    // Chain round after the floor + first planner round. Deterministic hypotheses over the full
+    // store dispatch *before* the LLM turn, so a planner failure can never leave an empty window.
+    let chainSteps = 0
+    if (roundNo >= 2) {
+      try { chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds) } catch { /* additive */ }
     }
-    if (!this.currentCoordinator(run.id, task)) return
 
-    const allSteps = this.storage.listChainSteps(run.id, afterRound.goalRevision)
-    const allUntaintedFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 150 })
-      .filter(f => approvedOrigins.has(f.origin))
-    const activeFacts = allUntaintedFacts.filter(f => !f.digestId).slice(0, 80)
-    const codeAuditSuspects = allUntaintedFacts
-      .filter(f => f.data?.subkind === 'code_audit_suspect')
-      .slice(0, 30)
-      .map(f => ({ factId: f.id, origin: f.origin, summary: f.summary, data: f.data }))
-    const coldDigests = this.storage.listDigests(run.id, true)
-    const coverageEntries = this.storage.listCoverageEntries(run.id, afterRound.goalRevision)
-      .filter(c => approvedOrigins.has(c.origin))
-    const tm = this.storage.latestThreatModel(run.id, afterRound.goalRevision)
-    const tmEntries = tm?.entries.filter(e => approvedOrigins.has(e.origin))
-    const hostTiers = computeHostTiers([...approvedOrigins], tmEntries)
-    const pendingFindings = this.storage.runDetail(run.id).findings
-      .filter(f => approvedOrigins.has(f.origin))
-      .slice(0, 30)
+    const allSteps = this.storage.listChainSteps(fresh.id, updated.goalRevision)
+    const allUntaintedFacts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset }))
+      .filter(fact => approvedOrigins.has(fact.origin))
+    const personas = [...resolveRunPersonas(this.storage, updated.projectId, updated.approvedPersonaIds).values()]
+      .map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel, originAllowlist: persona.originAllowlist }))
 
-    const personas = [...resolveRunPersonas(this.storage, afterRound.projectId, afterRound.approvedPersonaIds).values()]
-      .map(p => ({ handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist }))
-    const { mountedRepos } = this.projectReposMount(afterRound.projectId)
-
-    // Priority #3: Auto-enqueue cross-persona BOLA/IDOR step if >= 2 personas discovered owned resources not yet tested
+    // Priority #3: bounded cross-persona BOLA/IDOR matrix per discovered resource type.
     let bolaAutoSteps = 0
-    if (afterRound.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
-      const bolaQueue = buildBolaTestQueue(
-        allUntaintedFacts,
-        personas,
-        approvedOrigins,
-        this.storage.listResourceSamples(run.id),
-      )
-      // A bounded per-resource-type budget (not one step per origin): on realistic multi-tenant
-      // apps several ID-bearing resource types share an origin and each deserves its own matrix.
+    if (updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
-      for (const item of bolaQueue) {
+      for (const item of buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins, this.storage.listResourceSamples(run.id))) {
         const key = `${item.origin}\u0000${item.resourceKey}`
-        const list = typeGroups.get(key) ?? []
-        list.push(item)
-        typeGroups.set(key, list)
+        typeGroups.set(key, [...(typeGroups.get(key) ?? []), item])
       }
-      const candidateGroups = [...typeGroups.values()]
-        .sort((a, b) =>
-          Number(b[0].ownerPersona !== 'anonymous') - Number(a[0].ownerPersona !== 'anonymous') ||
-          b.length - a.length,
-        )
       const perOriginSteps = new Map<string, number>()
+      const candidateGroups = [...typeGroups.values()].sort((a, b) =>
+        Number(b[0].ownerPersona !== 'anonymous') - Number(a[0].ownerPersona !== 'anonymous') || b.length - a.length)
       for (const itemsForType of candidateGroups) {
         if (allSteps.length + bolaAutoSteps >= dynamicStepBudget) break
         const origin = itemsForType[0].origin
         if ((perOriginSteps.get(origin) ?? 0) >= 3) continue
         const resourceKey = itemsForType[0].resourceKey
-        const alreadyPlanned = allSteps.some(s =>
-          s.sourceOrigins.includes(origin) &&
-          (s.title.includes(`resource:${resourceKey}`) || (
-            s.skills.includes('bola-idor-race') && /\b(?:bola|idor|cross-persona)\b/i.test(s.title)
-          )),
-        )
+        const alreadyPlanned = allSteps.some(step => step.sourceOrigins.includes(origin) &&
+          (step.title.includes(`resource:${resourceKey}`) ||
+            (step.skills.includes('bola-idor-race') && /\b(?:bola|idor|cross-persona)\b/i.test(step.title))))
         if (alreadyPlanned) continue
-        const asset = afterRound.candidates.find(c => c.origin === origin && afterRound.approved.includes(c.id))
+        const asset = updated.candidates.find(candidate => candidate.origin === origin && updated.approved.includes(candidate.id))
         if (!asset) continue
         const itemsForOrigin = itemsForType.slice(0, 6)
-        const factIds = itemsForOrigin.map(i => i.factId).filter((fid): fid is string => Boolean(fid))
-        const variants = [...new Set(itemsForOrigin.flatMap(i => i.variants.map(v =>
-          `${v.method} ${v.endpoint}${v.destructive ? ' (Tier 3 only)' : ''}`,
-        )))].slice(0, 8)
-        this.storage.addChainStep(afterRound, {
+        const variants = [...new Set(itemsForOrigin.flatMap(item => item.variants.map(variant =>
+          `${variant.method} ${variant.endpoint}${variant.destructive ? ' (Tier 3 only)' : ''}`)))].slice(0, 8)
+        this.storage.addChainStep(updated, {
           title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname} · resource:${resourceKey}`,
-          hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(i => `${i.endpoint} [${i.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. Verify tenant isolation with GET first; use benign PUT/PATCH field deltas only where reversible; DELETE stays Tier 3/local-lab. Submit a DeclarativeReplaySpec if unauthorized access succeeds.`,
+          hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(item => `${item.endpoint} [${item.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. Verify tenant isolation with GET first; use benign PUT/PATCH field deltas only where reversible; DELETE stays Tier 3/local-lab. Submit a DeclarativeReplaySpec if unauthorized access succeeds.`,
           category: 'broken-access-control',
           priority: 92,
           targetAssetIds: [asset.id],
           skills: ['bola-idor-race', 'false-positive-elimination'],
-          dependsOnFactIds: factIds,
+          dependsOnFactIds: itemsForOrigin.map(item => item.factId).filter((id): id is string => Boolean(id)),
           sourceOrigins: [origin],
           specialistProfile: 'bola-bfla-specialist',
         })
@@ -6404,26 +6418,10 @@ export class Execution {
       }
     }
 
-    const secondOrderCanaries = this.storage.listSecondOrderCanaries(run.id).slice(0, 30)
-      .map(c => ({
-        marker: c.marker,
-        status: c.status,
-        injectedOrigin: c.injectedOrigin,
-        injectedEndpoint: c.injectedEndpoint,
-        injectedParam: c.injectedParam,
-        injectedPersona: c.injectedPersona,
-        surfacedOrigin: c.surfacedOrigin,
-        surfacedEndpoint: c.surfacedEndpoint,
-        surfacedPersona: c.surfacedPersona,
-      }))
-    const secondOrderSurfaceFacts = allUntaintedFacts
-      .filter(f => f.data?.subkind === 'second_order_surface' && afterRound.capabilityTier >= 1)
-      .slice(0, 20)
-
-    // Auto-enqueue a high-priority verification step for each new cross-persona or active-HTML
-    // second-order surface, so a surfaced canary is never left as an unexamined fact.
+    // Auto-enqueue verification for each new cross-persona or active-HTML second-order surface.
     let secondOrderAutoSteps = 0
-    for (const fact of secondOrderSurfaceFacts) {
+    for (const fact of allUntaintedFacts.filter(candidate =>
+      candidate.data?.subkind === 'second_order_surface' && updated.capabilityTier >= 1).slice(0, 20)) {
       if (allSteps.length + bolaAutoSteps + secondOrderAutoSteps >= dynamicStepBudget) break
       const marker = typeof fact.data?.marker === 'string' ? fact.data.marker : ''
       const surfacedOrigin = typeof fact.data?.surfacedOrigin === 'string' ? fact.data.surfacedOrigin : fact.origin
@@ -6432,14 +6430,11 @@ export class Execution {
       const crossPersona = fact.data?.crossPersona === true
       const activeHtml = /html/i.test(surfacedMediaType)
       if (!marker || !approvedOrigins.has(surfacedOrigin) || (!crossPersona && !activeHtml)) continue
-      const alreadyPlanned = allSteps.some(s =>
-        (s.dependsOnFactIds ?? []).includes(fact.id) ||
-        (s.title.includes(marker) && s.sourceOrigins.includes(surfacedOrigin)),
-      )
-      if (alreadyPlanned) continue
-      const asset = afterRound.candidates.find(c => c.origin === surfacedOrigin && afterRound.approved.includes(c.id))
+      if (allSteps.some(step => (step.dependsOnFactIds ?? []).includes(fact.id) ||
+        (step.title.includes(marker) && step.sourceOrigins.includes(surfacedOrigin)))) continue
+      const asset = updated.candidates.find(candidate => candidate.origin === surfacedOrigin && updated.approved.includes(candidate.id))
       if (!asset) continue
-      this.storage.addChainStep(afterRound, {
+      this.storage.addChainStep(updated, {
         title: `Second-order canary verification · ${marker} → ${new URL(surfacedOrigin).hostname}${surfacedEndpoint.slice(0, 40)}`,
         hypothesis: `Second-order canary ${marker} planted via ${String(fact.data?.injectedEndpoint ?? '/')} (param ${String(fact.data?.injectedParam ?? 'input')}, persona ${String(fact.data?.injectedPersona ?? 'anonymous')}) resurfaced on ${surfacedOrigin}${surfacedEndpoint} as persona ${String(fact.data?.surfacedPersona ?? 'anonymous')} with media type ${surfacedMediaType || 'unknown'}${crossPersona ? ' (cross-persona)' : ''}${activeHtml ? ' (active HTML render)' : ''}. Re-read the surfaced endpoint with a control persona, prove the injected marker is persisted and rendered to a different principal, then submit a ${activeHtml ? 'browser_chain' : 'http_chain'} DeclarativeReplaySpec whose probe step renders the marker verbatim and whose control step does not.`,
         category: crossPersona ? 'broken-access-control' : 'cors-client-side',
@@ -6449,188 +6444,120 @@ export class Execution {
           ? ['oob-ssrf-browser-chain', 'bola-idor-race', 'false-positive-elimination']
           : ['client-side-xss-postmessage', 'oob-ssrf-browser-chain'],
         dependsOnFactIds: [fact.id],
-        sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(o => approvedOrigins.has(o)),
+        sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(origin => approvedOrigins.has(origin)),
         specialistProfile: crossPersona ? 'bola-bfla-specialist' : 'client-browser-dom-specialist',
       })
       secondOrderAutoSteps += 1
     }
 
-    const uncoveredEndpoints = this.storage.listEndpoints(run.id, { orderBy: 'coverage', limit: 25 })
-      .filter(ep => approvedOrigins.has(ep.origin))
-      .map(ep => ({
-        id: ep.id,
-        origin: ep.origin,
-        method: ep.method,
-        pathTemplate: ep.pathTemplate,
-        riskScore: ep.riskScore,
-        coveragePct: ep.coveragePct ?? 0,
-        testedClasses: ep.testedClasses,
-      }))
-
-    const graphCatalog = this.endpointGraphCatalog(run.id)
-    const plannerStartedAt = Date.now()
-    const plannerSpendBefore = afterRound.spentUsd
-    const plannerConfirmed = this.alreadyConfirmedRefs(afterRound)
-    const plannerHardSurface = this.unconfirmedHardSurfaceRefs(afterRound, plannerConfirmed)
-    const plannerDetLeads = this.detLeadSummaries(afterRound)
-    try { this.ensureRunTrace(afterRound, profiles) } catch { /* tracing is best-effort */ }
-    const chainPlannerInput = {
-      goal: afterRound.goal,
-      roundNo: roundRes.roundNo,
-      capabilityTier: afterRound.capabilityTier,
-      approvedOrigins: [...approvedOrigins],
-      personas,
-      mountedRepos,
-      threatModel: tmEntries,
-      hostTiers,
-      codeAuditSuspects,
-      activeFacts: activeFacts.map(f => ({
-        id: f.id,
-        kind: typeof f.data?.subkind === 'string' ? f.data.subkind : f.kind,
-        origin: f.origin,
-        summary: f.summary,
-        exchangeIds: f.exchangeIds,
-      })),
-      coldDigests: coldDigests.map(d => ({
-        id: d.id, level: d.level, roundNo: d.roundNo, summary: d.summary, coveredCount: d.coveredFactIds.length,
-      })),
-      chainSteps: this.storage.listChainSteps(run.id, afterRound.goalRevision).map(s => ({
-        id: s.id, seq: s.seq, title: s.title, category: s.category, status: s.status, priority: s.priority, origins: s.sourceOrigins,
-      })),
-      coverageEntries: coverageEntries.map(c => ({
-        origin: c.origin,
-        category: c.category,
-        status: c.status,
-        summary: c.summary,
-        enforcingControl: c.enforcingControl ?? null,
-        proofGapReason: c.proofGapReason ?? null,
-        linkedFindingId: c.linkedFindingId ?? null,
-      })),
-      openProofGaps: this.storage.listOpenProofGaps(run.id, afterRound.goalRevision)
-        .filter(g => approvedOrigins.has(g.origin))
-        .map(g => ({
-          origin: g.origin,
-          category: g.category,
-          summary: g.summary,
-          proofGapReason: g.proofGapReason ?? g.summary,
-        })),
-      pendingFindings: pendingFindings.map(f => ({ id: f.id, origin: f.origin, title: f.title, status: f.status, severity: f.severity })),
-      secondOrderCanaries,
-      uncoveredEndpoints,
-      dynamicStepBudget,
-      endpointParams: graphCatalog.endpointParams,
-      apiDependencies: graphCatalog.apiDependencies,
-      budgetRemaining: {
-        usd: Math.max(0, Number((afterRound.budgetUsd - afterRound.spentUsd).toFixed(4))),
-        requests: afterRound.budgetRequests === 0
-          ? ('unlimited' as const)
-          : Math.max(0, afterRound.budgetRequests - afterRound.spentRequests),
+    // Tool-equipped coordinator session: paginated read tools, explicit dispatch, no snapshot.
+    let toolDispatched = 0
+    const handlers = coordinatorPlannerHandlers({
+      coordinator,
+      onDispatch: plan => {
+        try { toolDispatched += this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds) } catch { /* additive */ }
       },
-      alreadyConfirmed: plannerConfirmed,
-      unconfirmedHardSurface: plannerHardSurface,
-      detLeads: plannerDetLeads,
-    }
-    const prompt = chainPlannerPrompt(chainPlannerInput)
-
-    this.tracePlannerDecision(run.id, {
-      roundIdx: roundRes.roundNo,
-      factsCount: allUntaintedFacts.length,
-      detLeadsCount: plannerDetLeads.length,
-      alreadyConfirmedCount: plannerConfirmed.length,
-      spawnedSteps: 0,
-      k6DryStreak: countConsecutiveDrySteps(this.storage, afterRound, this.agenticLaneAssignmentIds),
-      dynamicStepBudget,
-      durationMs: Date.now() - plannerStartedAt,
-      costUsd: Math.max(0, Number((afterRound.spentUsd - plannerSpendBefore).toFixed(6))),
     })
-
+    const pendingOob = coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total
+    const prompt = coordinatorPlannerPrompt({
+      goal: updated.goal,
+      roundNo,
+      capabilityTier: updated.capabilityTier,
+      approvedOrigins: [...approvedOrigins],
+      budgetRemaining: {
+        usd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
+        requests: updated.budgetRequests === 0 ? 'unlimited' : Math.max(0, updated.budgetRequests - updated.spentRequests),
+      },
+      dynamicStepBudget,
+      pendingOob,
+      chainSteps: this.storage.listChainSteps(fresh.id, updated.goalRevision)
+        .map(step => ({ id: step.id, title: step.title, status: step.status })),
+      personas: personas.map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel })),
+      mountedRepos: this.projectReposMount(updated.projectId).mountedRepos,
+      openProofGaps: this.storage.listOpenProofGaps(fresh.id, updated.goalRevision)
+        .filter(gap => approvedOrigins.has(gap.origin)).length,
+    })
     const answer = await agentTurn({
       directory: this.storage.directory,
-      sessionId: `planner-${run.id}-r${roundRes.roundNo}`,
-      requestId: `planner:${afterRound.goalRevision}:${roundRes.roundNo}`,
+      sessionId: `planner-${run.id}-r${roundNo}`,
+      requestId: `planner:${updated.goalRevision}:${roundNo}`,
       profiles: resolveProfilePoolForRole('tactical', profiles),
       scenario: 'chain-planner',
       roleAffinity: 'tactical',
       prompt,
       signal: task.controller.signal,
-      onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
+      maxTurns: 10,
+      handlers,
+      onUsage: usage => this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens: usage.inputTokens + usage.outputTokens }),
       onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-      onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+      onProfileFailure: (id, error, hard) => recordProfileFailure(id, error, hard, this.storage),
     })
-
     if (!this.currentCoordinator(run.id, task)) return
 
-    let parsedPlanner: ReturnType<typeof plannerResponseSchema.safeParse>
-    try {
-      parsedPlanner = plannerResponseSchema.safeParse(JSON.parse(stripJsonFences(answer)))
-    } catch {
-      if (synthesizedStepsCount === 0 && bolaAutoSteps === 0) {
-        this.plannerDoneRound.set(run.id, roundRes.roundNo)
-      }
-      return
-    }
-    if (!parsedPlanner.success) {
-      if (synthesizedStepsCount === 0 && bolaAutoSteps === 0) {
-        this.plannerDoneRound.set(run.id, roundRes.roundNo)
-      }
-      return
-    }
-
+    let parsedPlanner: ReturnType<typeof plannerResponseSchema.safeParse> | null = null
+    try { parsedPlanner = plannerResponseSchema.safeParse(JSON.parse(stripJsonFences(answer))) } catch { parsedPlanner = null }
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
-    let addedCount = synthesizedStepsCount + bolaAutoSteps + detLeadSteps
+    let addedCount = detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps + toolDispatched
 
-    for (const cancelId of parsedPlanner.data.cancelStepIds) {
-      const target = existingSteps.find(s => s.id === cancelId)
-      if (target && ['pending', 'ready'].includes(target.status)) {
-        this.storage.updateChainStep(target.id, { status: 'canceled' })
+    if (parsedPlanner?.success) {
+      for (const cancelId of parsedPlanner.data.cancelStepIds) {
+        const target = existingSteps.find(step => step.id === cancelId)
+        if (target && ['pending', 'ready'].includes(target.status)) this.storage.updateChainStep(target.id, { status: 'canceled' })
+      }
+      const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 40)
+      const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
+      const budgetedNewSteps = applyCrownJewelStepBudget(
+        parsedPlanner.data.newSteps.map(step => ({ ...step, origins: step.origins.filter(origin => currentApproved.has(origin)) })),
+        computeHostTiers([...currentApproved], this.storage.latestThreatModel(run.id, currentRun.goalRevision)?.entries),
+        existingSteps,
+        remainingSlots,
+      ).filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
+      for (const step of budgetedNewSteps) {
+        const validOrigins = step.origins.filter(origin => currentApproved.has(origin))
+        const assetIds = currentRun.candidates
+          .filter(candidate => validOrigins.includes(candidate.origin) && currentRun.approved.includes(candidate.id))
+          .map(candidate => candidate.id)
+        if (!assetIds.length) continue
+        const specialistProfile = routeStepToSpecialist({
+          title: step.title, hypothesis: step.hypothesis, category: step.category, skills: step.skills,
+        })
+        this.storage.addChainStep(currentRun, {
+          title: step.title, hypothesis: step.hypothesis, category: step.category, priority: step.priority,
+          targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: step.dependsOnFactIds,
+          dependsOnStepIds: step.dependsOnStepIds, sourceOrigins: validOrigins, specialistProfile,
+        })
+        addedCount += 1
       }
     }
 
-    // Confirmed floor work is read-only context: a new step that only re-names an already
-    // confirmed route (and declares no parent fact/step) is a duplicate dispatch, not new work.
-    const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 40)
-    const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
-    const budgetedNewSteps = applyCrownJewelStepBudget(
-      parsedPlanner.data.newSteps.map(step => ({ ...step, origins: step.origins.filter(o => currentApproved.has(o)) })),
-      hostTiers,
-      existingSteps,
-      remainingSlots,
-    ).filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
-
-    for (const step of budgetedNewSteps) {
-      const validOrigins = step.origins.filter(o => currentApproved.has(o))
-      const assetIds = currentRun.candidates
-        .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
-        .map(c => c.id)
-      if (!assetIds.length) continue
-      const specialistProfile = routeStepToSpecialist({
-        title: step.title,
-        hypothesis: step.hypothesis,
-        category: step.category,
-        skills: step.skills,
-      })
-      this.storage.addChainStep(currentRun, {
-        title: step.title,
-        hypothesis: step.hypothesis,
-        category: step.category,
-        priority: step.priority,
-        targetAssetIds: assetIds,
-        skills: step.skills,
-        dependsOnFactIds: step.dependsOnFactIds,
-        dependsOnStepIds: step.dependsOnStepIds,
-        sourceOrigins: validOrigins,
-        specialistProfile,
-      })
-      addedCount += 1
-    }
-
-    if ((parsedPlanner.data.done && synthesizedStepsCount === 0 && bolaAutoSteps === 0) || addedCount === 0) {
-      this.plannerDoneRound.set(run.id, roundRes.roundNo)
-    }
-    this.storage.event(run.id, 'planner.round', `Planner round ${roundRes.roundNo}: added ${addedCount} steps.`, {
-      roundNo: roundRes.roundNo, addedCount, synthesizedStepsCount, bolaAutoSteps, detLeadSteps, done: parsedPlanner.data.done, summary: parsedPlanner.data.summary.slice(0, 300),
+    // Deterministic scheduler guard outside the LLM: budget/requests/wall/K=2/done+pending OOB.
+    const emptyRounds = addedCount === 0 ? (this.plannerEmptyRounds.get(run.id) ?? 0) + 1 : 0
+    this.plannerEmptyRounds.set(run.id, emptyRounds)
+    const latest = this.storage.run(run.id)
+    const decision = coordinatorSchedulerDecision({
+      budgetExhausted: this.storage.checkBudgetExceeded(run.id),
+      budgetRequests: latest.budgetRequests,
+      spentRequests: latest.spentRequests,
+      startedAt: latest.createdAt,
+      maxDurationMs: this.maxDurationMs,
+      emptyRounds,
+      coordinatorDone: parsedPlanner?.success ? parsedPlanner.data.done : false,
+      pendingOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
+    })
+    if (decision.decision === 'stop') this.plannerDoneRound.set(run.id, roundNo)
+    this.tracePlannerDecision(run.id, {
+      roundIdx: roundNo, factsCount: allUntaintedFacts.length, detLeadsCount: detLeadSteps,
+      alreadyConfirmedCount: 0, spawnedSteps: addedCount, k6DryStreak: emptyRounds,
+      dynamicStepBudget, durationMs: Date.now() - plannerStartedAt,
+      costUsd: Math.max(0, Number((this.storage.run(run.id).spentUsd - updated.spentUsd).toFixed(6))),
+    })
+    this.storage.event(run.id, 'planner.round', `Planner round ${roundNo}: added ${addedCount} steps.`, {
+      roundNo, addedCount, chainSteps, bolaAutoSteps, secondOrderAutoSteps, detLeadSteps, toolDispatched,
+      done: parsedPlanner?.success === true ? parsedPlanner.data.done : false,
+      decision: decision.decision, reason: decision.reason,
+      summary: parsedPlanner?.success ? parsedPlanner.data.summary.slice(0, 300) : compactText(answer, 300),
     })
   }
 
@@ -7940,16 +7867,18 @@ export class Execution {
           }))
         },
 
+        // Store-direct digest expansion: no compactor dependency; missing digests are non-fatal.
         expand_digest: async ({ digestId }) => {
           const curRun = this.check(job)
           const currentApproved = this.approvedOriginsSet(curRun)
-          const expanded = this.compactor.expandDigest(this.storage, curRun.id, digestId)
-          if (!expanded) return { error: 'Digest not found.' }
-          return {
-            digest: expanded.digest,
-            facts: expanded.facts.filter(f => currentApproved.has(f.origin)),
+          try {
+            const expanded = this.storage.getDigest(curRun.id, digestId)
+            return { digest: expanded.digest, facts: expanded.facts.filter(f => currentApproved.has(f.origin)) }
+          } catch {
+            return { error: 'Digest not found.' }
           }
         },
+
 
         record_fact: async (args) => {
           const curRun = this.check(job)
@@ -8218,6 +8147,7 @@ export class Execution {
             `Proposed replay spec · ${parsed.title}`,
             JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
             undefined, currentSecrets())
+          const chainTags = step.skills.filter(skill => skill.startsWith('chain:')).map(skill => skill.slice('chain:'.length))
           const finding: Finding = {
             id: findingId,
             origin: parsed.origin,
@@ -8231,7 +8161,7 @@ export class Execution {
             category: parsed.category,
             cwe: parsed.cwe,
             confidence: 'medium',
-            verification: `Pending Zero-LLM ${parsed.kind} replay verification (spec ${specRow.id}).`,
+            verification: `Pending Zero-LLM ${parsed.kind} replay verification (spec ${specRow.id}).${chainTags.length ? ` Chain primitives: ${chainTags.join(', ')}.` : ''}`,
             findingKind: 'multi_step_chain',
             replaySpecId: specRow.id,
             fingerprintHash: dedupeDecision.fingerprintHash,
