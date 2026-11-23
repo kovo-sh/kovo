@@ -580,15 +580,18 @@ test('engine: a self-service update addresses the writer row the collection corr
   const collection: EngineEndpoint = { id: 'GET:/api/users', origin, method: 'GET', pathTemplate: '/api/users', params: [] }
   const harvests = new Map<string, EndpointHarvest>([
     [users.id, harvestOf({
-      ownerIds: ['u-1', 'u-2'],
+      ownerIds: ['u-1', 'u-2', 'u-3'],
+      // The identity route exposes the writer's own id; the collection correlates it to a row.
+      viewerIds: ['u-2'],
       fields: ['id', 'name', 'role'],
-      values: { id: ['u-1', 'u-2'], name: ['Pat', 'Sam'], role: ['owner', 'viewer'] },
-      rowIds: { viewer: 'u-2', Pat: 'u-1', Sam: 'u-2' },
+      values: { id: ['u-1', 'u-2', 'u-3'], name: ['Pat', 'Sam', 'Kim'], role: ['owner', 'viewer', 'admin'] },
+      rowIds: { viewer: 'u-2', Pat: 'u-1', Sam: 'u-2', Kim: 'u-3' },
     })],
   ])
   const hypotheses = enumerateHypotheses([users, collection], harvests, { tier: 3, personas: PERSONAS })
   const mass = hypotheses.find(hyp => hyp.probeClass === 'mass_assignment')
   assert.ok(mass, 'a mass-assignment hypothesis exists')
   assert.equal(mass!.ownerPersona, 'viewer')
+  // The writer's own correlated row wins over a colleague row: the escalation is its own record.
   assert.equal(mass!.pathAndQuery, '/api/users/u-2')
 })
