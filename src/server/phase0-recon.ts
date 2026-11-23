@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { extname, join, relative, sep } from 'node:path'
+import { closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
+import { extname, isAbsolute, join, relative, sep } from 'node:path'
 import { jsHarvest } from '../../worker/analyzers.ts'
 import type { CapabilityTier, CodeLocation, EndpointSource, ParamLocation } from '../domain.ts'
 import { mergeTechTags, techTagsFromManifests, techTagsFromResponse } from '../templates/tech-tags.ts'
@@ -250,9 +250,51 @@ function lineNumberAt(text: string, index: number): number {
   return line
 }
 
+const NO_FOLLOW = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0
+
+/**
+ * True when `candidate` resolves inside `rootReal`. Repo trees may contain directories replaced
+ * by links between the lstat and the read; canonicalising each directory keeps the walker contained.
+ */
+function isRealPathUnder(rootReal: string, candidate: string): boolean {
+  try {
+    const real = realpathSync(candidate)
+    const rel = relative(rootReal, real)
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Read a repo file only when it is a regular file that is not a symlink. `O_NOFOLLOW` closes the
+ * lstat/read race, so a manifest-shaped link to /etc/passwd is never dereferenced.
+ */
+function readRepoRegularFile(path: string, maxBytes = 256 * 1024): string | null {
+  let fd: number | undefined
+  try {
+    const st = lstatSync(path)
+    if (!st.isFile() || st.size > maxBytes) return null
+    fd = openSync(path, fsConstants.O_RDONLY | NO_FOLLOW)
+    return readFileSync(fd, 'utf8')
+  } catch {
+    return null
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* already closed */ }
+    }
+  }
+}
+
 function walkRepoFiles(rootDir: string, maxFiles = 1500): string[] {
   const out: string[] = []
-  const stack: string[] = [rootDir]
+  let rootReal: string
+  try {
+    rootReal = realpathSync(rootDir)
+  } catch {
+    return out
+  }
+  const stack: string[] = [rootReal]
   while (stack.length > 0 && out.length < maxFiles) {
     const dir = stack.pop()!
     let entries: string[]
@@ -267,12 +309,14 @@ function walkRepoFiles(rootDir: string, maxFiles = 1500): string[] {
       const full = join(dir, name)
       let st
       try {
-        st = statSync(full)
+        st = lstatSync(full)
       } catch {
         continue
       }
+      // Never traverse or read through a symlink: it can point at host files outside /repos.
+      if (st.isSymbolicLink()) continue
       if (st.isDirectory()) {
-        stack.push(full)
+        if (isRealPathUnder(rootReal, full)) stack.push(full)
       } else if (st.isFile() && st.size <= 256 * 1024) {
         const ext = extname(name).toLowerCase()
         if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.go', '.rb', '.graphql', '.gql'].includes(ext)) {
@@ -295,6 +339,12 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
 } {
   if (!reposDir || !existsSync(reposDir)) return { routes: [], frameworks: [] }
   const files = walkRepoFiles(reposDir)
+  let rootReal: string
+  try {
+    rootReal = realpathSync(reposDir)
+  } catch {
+    return { routes: [], frameworks: [] }
+  }
   const routes: StaticExtractedRoute[] = []
   const frameworks = new Set<string>()
   const seen = new Set<string>()
@@ -308,13 +358,9 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
   }
 
   for (const fullPath of files) {
-    let code: string
-    try {
-      code = readFileSync(fullPath, 'utf8')
-    } catch {
-      continue
-    }
-    const rel = relative(reposDir, fullPath).split(sep).join('/')
+    const code = readRepoRegularFile(fullPath)
+    if (code === null) continue
+    const rel = relative(rootReal, fullPath).split(sep).join('/')
     const repoName = rel.split('/')[0] || 'repo'
     const ext = extname(fullPath).toLowerCase()
     const meta = detectSinksAndGuards(code)
@@ -585,10 +631,16 @@ function isManifestBasename(name: string): boolean {
 }
 
 /** Read dependency manifests from the mounted repo tree (bounded; never executes a package manager). */
-function readRepoManifests(reposDir: string, maxFiles = 60): ManifestFile[] {
+export function readRepoManifests(reposDir: string, maxFiles = 60): ManifestFile[] {
   if (!reposDir || !existsSync(reposDir)) return []
+  let rootReal: string
+  try {
+    rootReal = realpathSync(reposDir)
+  } catch {
+    return []
+  }
   const out: ManifestFile[] = []
-  const stack: string[] = [reposDir]
+  const stack: string[] = [rootReal]
   while (stack.length > 0 && out.length < maxFiles) {
     const dir = stack.pop()!
     let entries: string[]
@@ -603,21 +655,24 @@ function readRepoManifests(reposDir: string, maxFiles = 60): ManifestFile[] {
       const full = join(dir, name)
       let st
       try {
-        st = statSync(full)
+        st = lstatSync(full)
       } catch {
         continue
       }
+      // Symlinked directories/files are never traversed or read: a link named like a manifest
+      // must not make the host parse files outside the mounted repo.
+      if (st.isSymbolicLink()) continue
       if (st.isDirectory()) {
-        stack.push(full)
+        if (isRealPathUnder(rootReal, full)) stack.push(full)
         continue
       }
       if (!st.isFile() || st.size > 256 * 1024 || !isManifestBasename(name)) continue
-      try {
-        out.push({
-          name: relative(reposDir, full).split(sep).join('/'),
-          content: readFileSync(full, 'utf8'),
-        })
-      } catch { /* unreadable manifest */ }
+      const content = readRepoRegularFile(full)
+      if (content === null) continue
+      out.push({
+        name: relative(rootReal, full).split(sep).join('/'),
+        content,
+      })
     }
   }
   return out

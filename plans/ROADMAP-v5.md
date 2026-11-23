@@ -186,3 +186,30 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Accepted traps:** never auto-cancel specialist steps or hide confirmed routes (chains!); inject read-only “Already Confirmed” context; preserve white-box `static_verified`; persist unconfirmed leads; per-endpoint structural dedupe.
 - **Gate before flag flip:** full suite green with flag forced ON, dynamicStepBudget/K=6/fallback invariants, `Execution --no-llm` ≥25/59 at 100%, agentic strictly additive at ≥95% precision with ≤10 pp held-out gap, 0 orphans, legacy floors.
 - **Proceeding:** Slices 1–2 launched in `m5-integrate-port`; Slices 3–5 gated on their results.
+
+### 2026-11-22 — engine-port integration architecture (v5.1)
+
+- **Question:** safest way to re-land the deferred deterministic engine after 25 regressions.
+- **Reviewer plan (accepted):** 5 slices — (1) standalone engine modules + structural dedupe key; (2) explicit `deterministicOnly` path outside M1 fallback with verified-only persistence + `det_lead`; (3) non-blocking concurrent lane behind default-off flag with seeded-step guard, 30%/180 s cap, budget/K=6 isolation; (4) replace specialist scope guard with ReplayVerifier proof-strength + endpoint binding; (5) flip flag and retire duplicate script logic.
+- **Accepted traps:** never cancel specialist steps or hide confirmed routes (chains); inject read-only "Already Confirmed" context; preserve white-box `static_verified`; per-endpoint dedupe; keep late OOB leads.
+- **Deferred:** Slices 3–5 until 1–2 clear the full gate.
+- **Owner streams:** integrate-port (1–2), verifier-guards (4 foundation), compat-audit (failure classification for 3).
+
+### 2026-11-22 — meta-process P0 + security sprint
+
+- **Meta-process (accepted):** freeze harness-only recall work; report `Execution --no-llm` + agentic increment on dev and held-out; split monolith probes into per-class modules for structural parallelism; build inner loop (`worker-gate.sh`, `bench-slice.sh`, `--reuse-recon`).
+- **Security audit triage (all accepted):** HIGH (1) auto-approval path-prefix reuse → exact single-use context-bound approval ledger; HIGH (2) `--repo` symlink escape → link-free copy, `lstat`/`O_NOFOLLOW` walkers, realpath-contained patch writes; MED (3–8) bootstrap-only session issuance, PSL/Clerk host allowlist, no-follow credential POSTs, WS/WebRTC blocking, DNS-rebinding checks, sandbox-by-default; MED (9) 0700 telemetry + non-root lab container; MED (10) parsed-JSON/multipart fast paths, 64 KiB keyword scan, untrusted rationale; MED (11) bounded worker output.
+- **Evidence:** security suites 11/11, 10/10, 12/12; boundaries 46/46; Playwright v2/v4/v5-board 9/9 after bootstrap harness fix; realistic seed-42 smoke 39/56 at 100% precision.
+- **Kept intentional:** public-target RCE/upload/time-diff replay gates now fail closed without operator pattern or local-lab authorization (binding rule).
+
+### 2026-11-22 — adversarial security re-audit (second pass)
+
+- **Threshold:** independent refutation pass over the 11 merged fixes; 33/33 security tests still pass, but 3 findings remain **HIGH**.
+- **Accepted (all):**
+  1. **Idempotent-POST pre-approval bypass** — broker skips the Tier-3 gate on a path-substring predicate. Fix: broker authorizes every non-GET through the judge/ledger; read-only POSTs are approved by exact envelope checks only.
+  2. **307/308 redirect re-send** — an approved state change is re-sent to a different path without a new grant, and the exchange records the original path. Fix: re-authorize non-GET redirects (or fail closed) and record the final path.
+  3. **Registrable-domain widening** — hardcoded suffix list collapses shared-tenant suffixes (`github.io`, `vercel.app`, `s3.amazonaws.com`, `com.co`), so sibling tenants are in scope; form login never validated `loginUrl`. Fix: real PSL data, reject shared-suffix targets, exact-host IdP pins, validate form login.
+- **Also accepted:** pin credential connections (deny zero/unknown resolution, no 60 s unknown-safe cache), apply scoped-browser guards to the persona form browser, reject dangling symlinks in `safeResolveUnderRoot`, parse `GUARDIAN_LAB_USER` numerically, per-run telemetry mount, duplicate-JSON-key/gzip/oversize fast-path parity, pattern depth/ID-only wildcards + no pattern coverage of RCE.
+- **Deferred to post-Slice-2 (`execution.ts` owner):** per-request-instance grants for identical race bursts, `request_http_batch` approval path, tightening/removing `isSafeIdempotentPost`.
+- **Streams:** sec2-approvals (broker/approval-judge), sec2-auth (persona-auth/scoped-browser), sec2-lab (lab-runner/patch-workflow), verifier-guards (approval context for Tier-3 replay).
+- **Control:** procedural seed-42 stays 39/56 at 100% precision, 0 decoy/unmatched; product baseline `Execution --no-llm` 0/59, 2 unmatched FP.

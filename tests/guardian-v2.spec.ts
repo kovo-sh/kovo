@@ -20,7 +20,7 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
 
   try {
     await app.start()
-    await page.goto(app.url)
+    await app.open(page)
 
     // 1. Multi-profile LLM Settings UI
     await configureModel(page, fixture.origin + '/api/v1', E2E_CREDENTIAL)
@@ -108,7 +108,7 @@ test('surfaces Tier 3 HITL approval card and blocks state-changing probe until o
 
   try {
     await app.start()
-    await page.goto(app.url)
+    await app.open(page)
     await configureModel(page, fixture.origin + '/api/v1', E2E_CREDENTIAL)
 
     await page.getByLabel('Project name').fill('Northstar Tier 3 HITL')
@@ -165,7 +165,7 @@ test('recovers cleanly from SIGKILL crash into paused and resumes without duplic
 
   try {
     await app.start()
-    await page.goto(app.url)
+    await app.open(page)
     await configureModel(page, fixture.origin + '/api/v1', E2E_CREDENTIAL)
 
     await page.getByLabel('Project name').fill('Northstar Crash Recovery')
@@ -211,7 +211,7 @@ test('enforces mid-chain scope revocation and omits revoked host from subsequent
 
   try {
     await app.start()
-    await page.goto(app.url)
+    await app.open(page)
     await configureModel(page, fixture.origin + '/api/v1', E2E_CREDENTIAL)
 
     await page.getByLabel('Project name').fill('Northstar Scope Revocation')

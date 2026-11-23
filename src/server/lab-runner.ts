@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   chmodSync,
+  chownSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -18,7 +19,7 @@ import {
 import { createServer as createTcpServer } from 'node:net'
 import type { AddressInfo, Server as TcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { createProjectPersona, listProjectPersonas } from './persona-vault.ts'
@@ -673,7 +674,7 @@ function copySanitizedRepo(srcDir: string, destDir: string, rootReal: string): v
   }
 }
 
-function safeResolveUnderRoot(rootDir: string, relPath: string): string {
+export function safeResolveUnderRoot(rootDir: string, relPath: string): string {
   const clean = relPath.replace(/^[ab]\//, '').replace(/\\/g, '/')
   if (!clean || clean.includes('\0') || clean.startsWith('/') || clean.split('/').some(seg => seg === '..')) {
     throw new Error(`Unsafe file path rejected: "${relPath}"`)
@@ -684,7 +685,120 @@ function safeResolveUnderRoot(rootDir: string, relPath: string): string {
   if (rel.startsWith('..') || rel === '') {
     throw new Error(`Path escapes repository root: "${relPath}"`)
   }
+
+  // Textual containment is not enough: a component below the root can be a symlink to /etc or to
+  // an outside directory. Reject links on the path and require the deepest existing parent's
+  // canonical path to stay under the canonical root.
+  let existing = full
+  while (!existsSync(existing)) {
+    const parent = dirname(existing)
+    if (parent === existing) break
+    existing = parent
+  }
+  let existingReal: string
+  try {
+    existingReal = realpathSync(existing)
+  } catch {
+    throw new Error(`Path escapes repository root: "${relPath}"`)
+  }
+  const existingRel = relative(rootReal, existingReal)
+  if (existingRel.startsWith('..') || isAbsolute(existingRel)) {
+    throw new Error(`Path escapes repository root: "${relPath}"`)
+  }
+
+  let cursor = rootReal
+  for (const segment of relative(rootReal, full).split(sep)) {
+    cursor = join(cursor, segment)
+    if (!existsSync(cursor)) break
+    if (lstatSync(cursor).isSymbolicLink()) {
+      throw new Error(`Symlinked path rejected inside repository: "${relPath}"`)
+    }
+  }
   return full
+}
+
+/** Operator override for the lab container uid:gid. Must be a non-root numeric user. */
+export const LAB_CONTAINER_USER_ENV = 'GUARDIAN_LAB_USER'
+
+/**
+ * Choose the non-root user lab containers run as. Defaults to the invoking uid:gid so a bind
+ * mounted, owner-only IAST telemetry dir stays writable without world permissions; when Guardian
+ * itself runs as root the container falls back to nobody:nogroup.
+ */
+export function resolveLabContainerUser(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env[LAB_CONTAINER_USER_ENV]?.trim()
+  const candidate = override && override.length > 0
+    ? override
+    : (() => {
+      const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
+      if (uid === undefined || uid === 0) return '65534:65534'
+      const gid = typeof process.getgid === 'function' ? process.getgid() : uid
+      return `${uid}:${gid}`
+    })()
+  if (!/^\d{1,10}:\d{1,10}$/.test(candidate)) {
+    throw new Error(`${LAB_CONTAINER_USER_ENV} must be numeric uid:gid.`)
+  }
+  if (candidate.split(':')[0] === '0') {
+    throw new Error(`Lab containers must run as a non-root user; ${LAB_CONTAINER_USER_ENV}=0:* is rejected.`)
+  }
+  return candidate
+}
+
+/**
+ * Prepare the IAST telemetry dir: owner-only (0700) rather than world-writable, optionally handed
+ * to the non-root container user when Guardian itself runs as root.
+ */
+export function prepareIastTelemetryDir(dir: string, containerUser = resolveLabContainerUser()): string {
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    const [uidRaw, gidRaw] = containerUser.split(':')
+    try { chownSync(dir, Number(uidRaw), Number(gidRaw)) } catch { /* best effort; perms stay 0700 */ }
+  }
+  return dir
+}
+
+export interface LabContainerRunArgsInput {
+  containerName: string
+  networkName: string
+  runId: string
+  serviceName: string
+  imageName: string
+  cmd: string[]
+  internalPort: number
+  mountArgs: string[]
+  env: Record<string, string>
+  extraEnv: Record<string, string>
+  memoryLimit: string
+  cpus: string
+  pidsLimit: number
+  user: string
+}
+
+/** Pure builder for the `docker run` argv; exported so security invariants are unit-testable. */
+export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): string[] {
+  return [
+    'run', '-d',
+    '--name', input.containerName,
+    '--network', input.networkName,
+    '--network-alias', input.serviceName,
+    '--user', input.user,
+    '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges',
+    '--read-only',
+    '--tmpfs', '/tmp:rw,nosuid,nodev,size=64m',
+    '--memory', input.memoryLimit,
+    '--memory-swap', input.memoryLimit,
+    '--cpus', input.cpus,
+    '--pids-limit', String(input.pidsLimit),
+    '--label', 'dev.guardian.lab=1',
+    '--label', `dev.guardian.run=${input.runId}`,
+    '--label', `dev.guardian.service=${input.serviceName}`,
+    ...buildSyntheticEnvArgs(input.internalPort, input.env, input.extraEnv),
+    ...input.mountArgs,
+    input.imageName,
+    ...input.cmd,
+  ]
 }
 
 interface ParsedHunk {
@@ -1201,27 +1315,22 @@ export class LabRunner {
 
     const mergedEnv = { ...(isPrimary ? labConfig.env : undefined), ...(service.env ?? {}) }
 
-    const runArgs = [
-      'run', '-d',
-      '--name', containerName,
-      '--network', networkName,
-      '--network-alias', service.name,
-      '--cap-drop', 'ALL',
-      '--security-opt', 'no-new-privileges',
-      '--read-only',
-      '--tmpfs', '/tmp:rw,nosuid,nodev,size=64m',
-      '--memory', memoryLimit,
-      '--memory-swap', memoryLimit,
-      '--cpus', cpus,
-      '--pids-limit', String(pidsLimit),
-      '--label', 'dev.guardian.lab=1',
-      '--label', `dev.guardian.run=${runId}`,
-      '--label', `dev.guardian.service=${service.name}`,
-      ...buildSyntheticEnvArgs(internalPort, mergedEnv, extraInternalEnv),
-      ...mountArgs,
+    const runArgs = buildLabContainerRunArgs({
+      containerName,
+      networkName,
+      runId,
+      serviceName: service.name,
       imageName,
-      ...cmd,
-    ]
+      cmd,
+      internalPort,
+      mountArgs,
+      env: mergedEnv,
+      extraEnv: extraInternalEnv,
+      memoryLimit,
+      cpus,
+      pidsLimit,
+      user: resolveLabContainerUser(),
+    })
 
     try {
       await runDocker(runArgs, signal)
@@ -1315,13 +1424,12 @@ export class LabRunner {
     let telemetryDir: string | undefined
     let ownsTelemetryDir = false
     if (labConfig.iastEnabled) {
+      // IAST telemetry is mounted read-write into the lab container. Keep it owner-only (0700) and
+      // run the container as a non-root user, instead of a world-writable 0777 host dir.
       if (params.telemetryDir) {
-        telemetryDir = params.telemetryDir
-        mkdirSync(telemetryDir, { recursive: true, mode: 0o777 })
-        chmodSync(telemetryDir, 0o777)
+        telemetryDir = prepareIastTelemetryDir(params.telemetryDir)
       } else {
-        telemetryDir = mkdtempSync(join(tmpdir(), 'guardian-lab-telemetry-'))
-        chmodSync(telemetryDir, 0o777)
+        telemetryDir = prepareIastTelemetryDir(mkdtempSync(join(tmpdir(), 'guardian-lab-telemetry-')))
         ownsTelemetryDir = true
       }
     }

@@ -13,7 +13,8 @@ import { referrerPolicies } from '../domain.ts'
 import type { ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
-import { isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
+import { computeStateChangeBodyHash, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
+import type { StateChangeApprovalContext } from './approval-judge.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
@@ -256,7 +257,17 @@ export type Grant = {
   mintCanary?: (purpose: string, origin?: string) => { httpUrl?: string; url?: string } | null
   canRead: (origin: string) => boolean
   isIdempotentPostAllowed?: (origin: string, pathAndQuery: string, body?: string) => boolean
-  isStateChangeApproved?: (origin: string, method: string, pathAndQuery: string) => boolean
+  /**
+   * Exact-fingerprint Tier-3 authorization. The optional context carries the bytes/flags of the
+   * precise request so auto-approvals cannot be replayed against a different path, persona, body,
+   * or multipart/race/rce shape. Callers must not return true without matching that fingerprint.
+   */
+  isStateChangeApproved?: (
+    origin: string,
+    method: string,
+    pathAndQuery: string,
+    context?: StateChangeApprovalContext,
+  ) => boolean
   audit: (outcome: 'allowed' | 'denied' | 'observed' | 'circuit_open', origin: string, status?: number) => void
 }
 
@@ -2199,7 +2210,7 @@ export class RequestBroker {
     return deny('The public response exceeded the redirect limit.')
   }
 
-  private prepareHttpRequest(req: BrokerHttpRequest, grant: Grant): {
+  private prepareHttpRequest(req: BrokerHttpRequest, grant: Grant, options: { raceBurst?: boolean } = {}): {
     initialOrigin: string
     url: URL
     localLab: boolean
@@ -2367,8 +2378,15 @@ export class RequestBroker {
               : `Method ${req.method} requires Tier 3 (approval-gated state validation).`,
           )
         }
+        const approvalContext: StateChangeApprovalContext = {
+          personaHandle: personaHandle ?? null,
+          body: req.body ?? null,
+          bodyHash: computeStateChangeBodyHash(req.body, req.multipartParts),
+          hasMultipart: hasMultipart || hasMultipartContentType,
+          isRaceBurst: options.raceBurst === true,
+        }
         const approved = grant.isStateChangeApproved
-          ? grant.isStateChangeApproved(initialOrigin, req.method, req.pathAndQuery)
+          ? grant.isStateChangeApproved(initialOrigin, req.method, req.pathAndQuery, approvalContext)
           : localLab
         if (!approved) {
           throw new BrokerApprovalRequired(initialOrigin, req.method, req.pathAndQuery)
@@ -3088,7 +3106,7 @@ export class RequestBroker {
 
     // 1. Validate every request up-front (scope, destructive payload denylist, Tier 2/3 method rules,
     //    Tier 3 HITL approvals, persona originAllowlist, forbidden headers) before sending any bytes.
-    const preparedList = requests.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant) }))
+    const preparedList = requests.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant, { raceBurst: true }) }))
 
     const countsByOrigin = new Map<string, number>()
     const hostsToResolve = new Map<string, string>() // hostname -> originForAudit
