@@ -1,0 +1,122 @@
+{
+  "fixture": "wan-oob",
+  "version": 1,
+  "summary": "Edge proxy with seeded 50\u2013300 ms WAN jitter and rotating CSP nonces in front of an app whose background worker emits SSRF, XXE and blind-SQLi callbacks 15\u201330 s after the HTTP response, plus a signature-optional billing webhook.",
+  "findings": [
+    {
+      "id": "wan-blind-sqli",
+      "title": "Blind SQL injection in catalog search resolved asynchronously",
+      "vulnClass": "blind_sqli",
+      "cwe": "CWE-89",
+      "severity": "high",
+      "origin": "proxy",
+      "method": "GET",
+      "endpoint": "/v1/catalog/search",
+      "persona": "anonymous",
+      "impact": "boolean structure reaches the database and drives an out-of-band job; response bodies are identical",
+      "chain": "wan-oob-exfil",
+      "evidence": [
+        "injected and benign responses are byte-identical; only the async callback differs"
+      ]
+    },
+    {
+      "id": "wan-ssrf-async",
+      "title": "Integration tester fetches attacker URLs after the response (async SSRF)",
+      "vulnClass": "ssrf",
+      "cwe": "CWE-918",
+      "severity": "high",
+      "origin": "proxy",
+      "method": "POST",
+      "endpoint": "/v1/integrations/webhook-test",
+      "persona": "anonymous",
+      "impact": "loopback/internal URL is fetched 15\u201330 s later, escaping synchronous SSRF filters",
+      "chain": "wan-oob-exfil",
+      "evidence": [
+        "202 returned with no callback evidence; collector records the fetch afterwards"
+      ]
+    },
+    {
+      "id": "wan-xxe-async",
+      "title": "XML preview resolves external entities in a background worker",
+      "vulnClass": "xxe",
+      "cwe": "CWE-611",
+      "severity": "high",
+      "origin": "proxy",
+      "method": "POST",
+      "endpoint": "/v1/import/preview",
+      "persona": "anonymous",
+      "impact": "external entity URL is contacted after the 202, enabling internal file/HTTP exfiltration",
+      "chain": "wan-oob-exfil",
+      "evidence": [
+        "DOCTYPE SYSTEM entity produces a delayed collector hit"
+      ]
+    },
+    {
+      "id": "wan-webhook-forgery",
+      "title": "Billing webhook accepts unsigned events",
+      "vulnClass": "webhook_forgery",
+      "cwe": "CWE-345",
+      "severity": "critical",
+      "origin": "proxy",
+      "method": "POST",
+      "endpoint": "/v1/billing/webhook",
+      "persona": "anonymous",
+      "impact": "unauthenticated caller credits invoices while a wrong signature is rejected",
+      "evidence": [
+        "no X-Webhook-Signature header -> credited=true with synthetic credit canary",
+        "a supplied token schedules an out-of-band delivery after the response"
+      ]
+    }
+  ],
+  "chains": [
+    {
+      "id": "wan-oob-exfil",
+      "title": "Async out-of-band exfiltration chain",
+      "members": [
+        "wan-ssrf-async",
+        "wan-xxe-async",
+        "wan-blind-sqli"
+      ],
+      "description": "Three independent async jobs reach the same external collector after their HTTP responses, defeating synchronous-only verification."
+    }
+  ],
+  "decoys": [
+    {
+      "id": "wan-safe-preview",
+      "origin": "proxy",
+      "method": "POST",
+      "endpoint": "/v1/import/safe-preview",
+      "vulnClass": "xxe",
+      "reason": "Hardened importer rejects DOCTYPE/ENTITY with 400 before parsing."
+    },
+    {
+      "id": "wan-item-parameterized",
+      "origin": "proxy",
+      "method": "GET",
+      "endpoint": "/v1/catalog/item/:id",
+      "vulnClass": "sqli",
+      "reason": "Item lookup uses a fixed parameterized template, not the search query builder."
+    },
+    {
+      "id": "wan-health",
+      "origin": "proxy",
+      "method": "GET",
+      "endpoint": "/v1/health",
+      "vulnClass": "ssrf",
+      "reason": "Static liveness endpoint; no URL or query input."
+    }
+  ],
+  "invariants": {
+    "jitterMs": [
+      50,
+      300
+    ],
+    "callbackDelayMs": [
+      15000,
+      30000
+    ],
+    "callbackDelivery": "after HTTP response",
+    "nonceRotation": "per response",
+    "egress": "loopback collector only"
+  }
+}

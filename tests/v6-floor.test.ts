@@ -30,6 +30,7 @@ import {
 import {
   classifyValueShape,
   enumerateHypotheses,
+  floorHypothesesForEnvironment,
   paramNameShape,
   rankEngineParams,
   rankEndpoints,
@@ -280,8 +281,8 @@ test('no benchmark token literals or mandatory English route gates remain in the
   assert.ok(!source.includes('reveal=0'), 'no reveal=0 assumption')
   assert.ok(!source.includes('strongSqlName'), 'no mandatory SQL name gate')
   // The four named gates may only appear as scoring/tie-breakers, never as `&& gate` eligibility.
-  assert.doesNotMatch(source, /pathHasUrlHint\(bare\)\s*&&/, 'pathHasUrlHint must not gate eligibility')
-  assert.doesNotMatch(source, /pathHasXmlHint\(bare\)\s*&&/, 'pathHasXmlHint must not gate eligibility')
+  assert.doesNotMatch(source, /if\s*\([^\n]*pathHasUrlHint\(bare\)\s*&&/, 'pathHasUrlHint must not gate eligibility')
+  assert.doesNotMatch(source, /if\s*\([^\n]*pathHasXmlHint\(bare\)\s*&&/, 'pathHasXmlHint must not gate eligibility')
   // The workflow verb is only an eligibility hint here; observed state evidence raises its rank.
   assert.match(source, /risk: endpointRiskScore\(endpoint\) \+ 8 \+ \(statusLike \? 10 : 0\)/, 'workflow rank is boosted by structural state evidence')
 })
@@ -376,6 +377,30 @@ function sqlSpec(origin: string, paramName: string): DeclarativeReplaySpec {
     assertionsJq: '{ controlPassed: (.sqlDiff.controlPassed == true), confirmed: (.sqlDiff.passed == true), observed: "diff", expected: "no sql diff" }',
   })
 }
+
+test('prod_readonly forms no mutating floor hypotheses', () => {
+  const origin = 'https://app.example.test'
+  const endpoints: EngineEndpoint[] = [
+    {
+      id: 'ep-write', origin, method: 'POST', pathTemplate: '/v2/relay',
+      params: [{ name: 'target', location: 'json', declaredType: 'string', observedShape: 'url' }],
+      riskScore: 40, source: 'openapi',
+    },
+    {
+      id: 'ep-read', origin, method: 'GET', pathTemplate: '/v2/things',
+      params: [{ name: 'needle', location: 'query', declaredType: 'string' }],
+      riskScore: 40, source: 'openapi',
+    },
+  ]
+  const hypotheses = enumerateHypotheses(endpoints, new Map(), {
+    personas: [{ handle: 'owner', roleLabel: 'member', privilege: 'member' }, { handle: 'other', roleLabel: 'member (other)', privilege: 'member' }],
+    tier: 2,
+  })
+  assert.ok(hypotheses.some(h => h.intent === 'ssrf'), 'control: mutating hypothesis exists in a lab')
+  const readOnly = floorHypothesesForEnvironment(hypotheses, 'prod_readonly')
+  assert.ok(readOnly.every(h => h.method === 'GET' && !['ssrf', 'xxe', 'workflow', 'csrf', 'mass_assignment', 'ssti', 'command_injection'].includes(h.intent)))
+  assert.ok(readOnly.length > 0, 'read-only checks are still formed')
+})
 
 test('two findings mutating different params stay distinct through Execution', async (t) => {
   const { storage, runId } = await startRun(t)

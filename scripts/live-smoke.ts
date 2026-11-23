@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -111,7 +111,15 @@ try {
         .map(row => JSON.parse(String(row.detail)) as { origin: string; status: number })
       assert.ok(observed.some(({ status }) => status >= 200 && status < 300))
       const captures = db.prepare("SELECT id FROM evidence WHERE run_id = ? AND kind = 'observation'").all(runId)
-        .map(({ id }) => JSON.parse(readFileSync(join(app.directory, 'artifacts', `${id}.txt`), 'utf8')))
+        .map(({ id }) => {
+          const flat = join(app.directory, 'artifacts', `${id}.txt`)
+          if (existsSync(flat)) return JSON.parse(readFileSync(flat, 'utf8'))
+          // v6 sharded layout: artifacts/<runId>/<bucket>/<id>.txt
+          const runArtifacts = join(app.directory, 'artifacts', runId)
+          const bucket = readdirSync(runArtifacts).find(name => existsSync(join(runArtifacts, name, `${id}.txt`)))
+          assert.ok(bucket, `missing artifact ${id}`)
+          return JSON.parse(readFileSync(join(runArtifacts, bucket, `${id}.txt`), 'utf8'))
+        })
       assert.ok(captures.some(({ observation }) => observation?.source === 'public response'))
       const sessions = readdirSync(join(app.directory, 'agent-sessions')).filter(file => file.endsWith('.sqlite'))
       assert.ok(sessions.length >= 2)

@@ -1448,6 +1448,7 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
     patPath,
     cloneDir: reposDir,
     gitBaseUrl: `file://${gitOriginParent}`,
+    stripGitMetadata: true,
   })
 
   assert.equal(synced.length, 1)

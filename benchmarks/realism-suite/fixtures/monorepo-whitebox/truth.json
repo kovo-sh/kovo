@@ -1,0 +1,109 @@
+{
+  "fixture": "monorepo-whitebox",
+  "version": 1,
+  "summary": "Multi-service monorepo with preserved .git history, nested /v2 and /v3 router mounts, 2,560 generated /v4 routes, and 4-hop route→controller→service→repo authz/SQLi sinks.",
+  "findings": [
+    {
+      "id": "mono-billing-bola",
+      "title": "Invoice lookup lost its tenant predicate in the repo layer",
+      "vulnClass": "cross_tenant_read",
+      "cwe": "CWE-639",
+      "severity": "critical",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v2/billing/invoices/:invoiceId",
+      "persona": "mono-alice",
+      "impact": "any authenticated member reads another tenant's invoice and canary through the /v2 + /billing mount",
+      "chain": "mono-tenant-takeover",
+      "evidence": [
+        "services/billing/src/repos/invoice-repo.ts::findById selects WHERE id = ? only",
+        "git history: 'refactor(billing): drop tenant predicate from invoice lookup'"
+      ]
+    },
+    {
+      "id": "mono-report-sqli",
+      "title": "CSV export concatenates the sort parameter into SQL",
+      "vulnClass": "sqli",
+      "cwe": "CWE-89",
+      "severity": "critical",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v2/reports/export",
+      "persona": "mono-alice",
+      "impact": "structural SQL error from report-repo rawQuery; ORDER BY clause injection",
+      "evidence": ["services/reports/src/services/report-service.ts builds '... ORDER BY ' + sort"]
+    },
+    {
+      "id": "mono-admin-bfla",
+      "title": "Admin routes are mounted before the authz middleware",
+      "vulnClass": "bfla",
+      "cwe": "CWE-862",
+      "severity": "critical",
+      "origin": "app",
+      "method": "PATCH",
+      "endpoint": "/v3/admin/users/:id",
+      "persona": "mono-alice",
+      "impact": "a member promotes any user (including another tenant's) to admin",
+      "chain": "mono-tenant-takeover",
+      "evidence": [
+        "services/gateway/src/router.ts mounts app.use('/v3', adminRouter) before requireAdmin",
+        "PATCH /v3/admin/users/mono-bob with a member token returns role=admin"
+      ]
+    },
+    {
+      "id": "mono-git-history-regression",
+      "title": "Authz weakening introduced in git history",
+      "vulnClass": "git_history_regression",
+      "cwe": "CWE-1391",
+      "severity": "high",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v2/billing/invoices/:invoiceId",
+      "persona": "mono-alice",
+      "impact": "the regression commit removed the tenant predicate from the invoice repository",
+      "evidence": ["regression commit message and before/after blob diff for services/billing/src/repos/invoice-repo.ts"]
+    }
+  ],
+  "chains": [
+    {
+      "id": "mono-tenant-takeover",
+      "title": "Read a foreign invoice, then promote to admin",
+      "members": ["mono-billing-bola", "mono-admin-bfla"],
+      "description": "The dropped repo predicate leaks a foreign invoice; the mount-order bug then grants admin to any authenticated member."
+    }
+  ],
+  "decoys": [
+    {
+      "id": "mono-profile-scoped",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v1/profile",
+      "vulnClass": "idor",
+      "reason": "Profile derives identity from the bearer token and never accepts a target id."
+    },
+    {
+      "id": "mono-health",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v2/health",
+      "vulnClass": "information_disclosure",
+      "reason": "Static gateway liveness response."
+    },
+    {
+      "id": "mono-generated-routes",
+      "origin": "app",
+      "method": "GET",
+      "endpoint": "/v4/*",
+      "vulnClass": "bfla",
+      "reason": "Generated /v4 routes are public read handlers by design and carry no privileged action."
+    }
+  ],
+  "invariants": {
+    "minRoutes": 2500,
+    "generatedRoutes": 2560,
+    "hopDepth": 4,
+    "gitHistoryCommits": 5,
+    "nestedMounts": ["/v2/billing", "/v2/reports", "/v3/admin", "/v4"],
+    "regressionCommitMessage": "refactor(billing): drop tenant predicate from invoice lookup"
+  }
+}

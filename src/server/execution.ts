@@ -1437,6 +1437,16 @@ export class Execution {
       storage: this.storage,
       canaryBroker: this.canaryBroker,
       scopeRevision: run.scopeRevision,
+      // v6 Layer-1: every request is evaluated against the run's 3-tier origin policy, and an
+      // explicit operator lease (never a body-hash token) authorizes an otherwise-refused route.
+      scopePolicy: this.storage.scopePolicy(run),
+      // Explicit operator leases authorize otherwise-refused routes for long-lived engagements.
+      // Ephemeral local labs keep the exact single-use fingerprint ledger authoritative, so a
+      // consumed instance can never be replayed.
+      approvalLeases: (origin, method, pathAndQuery) => {
+        if (project.environment === 'local-lab') return false
+        return this.storage.approvalLeaseAuthorizer(run.id)(origin, method, pathAndQuery)
+      },
       mintCanary: (purpose, origin) => {
         const minted = this.canaryBroker.mintCanary(run.id, purpose, origin, {
           storage: this.storage,
@@ -2672,6 +2682,14 @@ export class Execution {
         rationale: input.rationale,
       }, input.secrets)
 
+      // v6 Layer-1: non-blocking operator opt-in. Persist `awaiting_approval` and release the worker
+      // slot immediately; the coroutine waits on the durable decision, not on a busy worker.
+      try {
+        this.storage.parkWorkerForApproval(run, job.assignment.id)
+        this.active.delete(job.assignment.id)
+        this.scheduleWake()
+      } catch { /* an already-parked or terminal worker keeps its state */ }
+
       decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
         const checkCurrent = () => {
           try {
@@ -2732,6 +2750,14 @@ export class Execution {
       this.storage.updateWorker(job.assignment.id, { status: 'running' })
     }
     if (decision === 'approved') {
+      // Resume the parked worker with a fresh lease and re-enter the scheduler. The exact
+      // single-use ledger remains: the durable operator lease is route-scoped and auditable.
+      try {
+        const resumed = this.storage.resumeParkedWorker(this.storage.run(run.id), job.assignment.id)
+        job.assignment = resumed
+        this.active.set(resumed.id, job)
+        this.scheduleWake()
+      } catch { /* resume is best-effort; the request still retries under the approval ledger */ }
       // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
       // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
       this.registerStateChangeApproval(run, {
@@ -2747,6 +2773,17 @@ export class Execution {
         approvalId: postedApprovalId,
         instances: input.approvalInstances,
       }, input.additionalApprovalTargets ?? [])
+    } else {
+      // A denied/expired/canceled decision ends this assignment; its slot was already released.
+      try {
+        this.storage.updateWorker(job.assignment.id, {
+          status: 'failed',
+          approvalParkedAt: null,
+          lease: null,
+          leaseExpiresAt: null,
+          outcome: `Tier 3 approval ${decision}.`,
+        })
+      } catch { /* worker may already be terminal */ }
     }
     return { approved: decision === 'approved' }
   }
@@ -4599,9 +4636,10 @@ export class Execution {
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
-      // no-profile fallback below stays byte-for-byte unchanged.
+      // no-profile fallback stays byte-for-byte unchanged; it is suppressed while a worker is
+      // parked awaiting an operator decision, because the run is not idle, it is blocked on a human.
       if (this.deterministicOnly) this.driveEngineInvestigation(run)
-      else this.driveDeterministicInvestigation(run)
+      else if (this.storage.parkedWorkerCount(run.id) === 0) this.driveDeterministicInvestigation(run)
       return
     }
     // Always compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
@@ -5611,14 +5649,25 @@ export class Execution {
       const remainingRequests = current.budgetRequests > 0
         ? Math.max(0, current.budgetRequests - current.spentRequests)
         : 700
-      const maxRequests = laneOptions.lane
+      const requestCap = laneOptions.lane
         // The lane is additive: it may use at most half the remaining request budget so
         // specialists always keep headroom (wall clock is its primary cap).
         ? Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_LANE_MAX_REQUESTS') ?? 900, Math.floor(remainingRequests * 0.5)))
         : Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
-      const maxDurationMs = laneOptions.lane
+      const durationCap = laneOptions.lane
         ? Math.max(1_000, laneOptions.maxDurationMs ?? this.deterministicLaneDeadlineMs())
         : envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
+      // v6 environment contract: shared staging gets a short, tightly capped floor pass so it can
+      // never dominate the engagement budget, and every created entity carries the run tag.
+      const environmentMode = this.storage.scopePolicy(current).mode
+      const entityTag = environmentMode === 'staging_isolated' ? `guardian-qa-${current.id}-` : undefined
+      const stagingCap = environmentMode === 'staging_isolated'
+        ? Math.max(50, Math.floor((current.budgetRequests > 0 ? current.budgetRequests : requestCap) * 0.2))
+        : requestCap
+      const maxRequests = Math.min(requestCap, stagingCap)
+      const maxDurationMs = environmentMode === 'staging_isolated'
+        ? Math.min(durationCap, 90_000)
+        : durationCap
       const maxHypotheses = envNumber('GUARDIAN_DETERMINISTIC_MAX_HYPOTHESES') ?? 90
 
       this.storage.event(
@@ -5652,6 +5701,8 @@ export class Execution {
         maxDurationMs,
         maxHypotheses,
         lane: Boolean(laneOptions.lane),
+        environmentMode,
+        ...(entityTag ? { entityTag } : {}),
         recordExchange,
         log: (kind, message, data) => {
           try { this.storage.event(current.id, kind, message, data ?? {}) } catch { /* run may be gone */ }

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   chmodSync,
@@ -23,16 +23,27 @@ import {
   writeSync,
 } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { createServer as createTcpServer } from 'node:net'
+import { connect as connectTcp, createServer as createTcpServer } from 'node:net'
 import type { AddressInfo, Server as TcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { parseComposeDocument } from './compose-parse.ts'
+import type { ComposeHealthcheckSpec, ComposeServiceSource } from './compose-parse.ts'
 import { createProjectPersona, listProjectPersonas } from './persona-vault.ts'
 import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import type { Store } from './store.ts'
+
+export interface LabServiceHealthcheck {
+  test?: string | string[]
+  intervalMs?: number
+  timeoutMs?: number
+  retries?: number
+  startPeriodMs?: number
+  disabled?: boolean
+}
 
 export interface LabServiceSpec {
   name: string
@@ -40,13 +51,16 @@ export interface LabServiceSpec {
   dockerfile?: string
   startCommand?: string
   command?: string | string[]
+  entrypoint?: string | string[]
   internalPort?: number
   healthPath?: string
+  healthcheck?: LabServiceHealthcheck
   env?: Record<string, string>
   memoryLimit?: string
   cpus?: string
   pidsLimit?: number
   dependsOn?: string[]
+  networkAliases?: string[]
 }
 
 export interface LabConfig {
@@ -130,15 +144,49 @@ export interface IngestLabTelemetryResult {
   hasUnhandledException: boolean
 }
 
+export type LabContainerStatus = 'running' | 'orphaned' | 'reclaimed'
+
+/**
+ * Narrow structural view of the merged v6 Store lab-container registry. LabRunner accepts the full
+ * `Store` (StartLabTargetParams.storage); this interface keeps lifecycle wiring testable with a
+ * fake and decouples the runner from Store internals.
+ */
+export interface LabContainerStore {
+  recordLabContainer(input: {
+    runId: string
+    assignmentId?: string | null
+    containerName: string
+    imageName?: string | null
+    status?: LabContainerStatus
+  }): unknown
+  markLabContainerOrphaned(runId: string, containerName: string): void
+  listLabContainers(runId: string): Array<{ containerName: string; status?: string }>
+}
+
+export interface PersistedLabContainerRef {
+  runId: string
+  containerName: string
+}
+
+export interface LabReclaimResult {
+  removed: number
+  skipped: number
+  mismatched: number
+}
+
 interface InternalTargetState {
   handle: LabTargetHandle
   labConfig: LabConfig
   primaryService: LabServiceSpec
   builtImages: string[]
   containerNames: string[]
+  containerIds: string[]
+  volumes: string[]
   forwarder: TcpServer
-  forwardTarget: { containerName: string; port: number }
+  proxyContainerName: string
+  proxyDir: string
   ownsTelemetryDir: boolean
+  storage?: LabContainerStore
 }
 
 const EXCLUDED_DIR_NAMES = new Set([
@@ -159,8 +207,36 @@ const EXCLUDED_FILE_PATTERNS = [
 
 const SAFE_ENV_KEY = /^[A-Z_][A-Z0-9_]{0,63}$/
 const SAFE_SERVICE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const SAFE_LABEL_VALUE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/
 const MAX_LAB_CONTAINERS = 6
 const MAX_TELEMETRY_BYTES = 65_536
+
+/** Docker labels used to persist and reap every lab resource. */
+export const LAB_LABELS = {
+  lab: 'dev.guardian.lab',
+  run: 'dev.guardian.run',
+  service: 'dev.guardian.service',
+  role: 'dev.guardian.role',
+} as const
+
+/** Proxy container image: a known-good Node runtime that runs only the trusted relay script. */
+export const LAB_PROXY_IMAGE_DEFAULT = 'node:24-bookworm-slim'
+export const LAB_PROXY_IMAGE_ENV = 'GUARDIAN_LAB_PROXY_IMAGE'
+export const LAB_DB_VOLUMES_ENV = 'GUARDIAN_LAB_DB_VOLUMES'
+export const LAB_STATE_DIR_ENV = 'GUARDIAN_LAB_STATE_DIR'
+const LAB_PROXY_TARGET_FILE = 'target'
+const LAB_PROXY_SOCKET_FILE = 'proxy.sock'
+const LAB_PROXY_DIR_PREFIX = 'guardian-lab-proxy-'
+const LAB_REPO_DIR_PREFIX = 'guardian-lab-repo-'
+const LAB_TELEMETRY_DIR_PREFIX = 'guardian-lab-telemetry-'
+const MAX_RECOVERED_RUNS = 32
+
+/** Scratch-directory prefixes; exported so recovery/cleanup policies are unit-testable. */
+export const LAB_PATHS = {
+  repoPrefix: LAB_REPO_DIR_PREFIX,
+  proxyPrefix: LAB_PROXY_DIR_PREFIX,
+  telemetryPrefix: LAB_TELEMETRY_DIR_PREFIX,
+} as const
 
 const FORBIDDEN_ENV_KEYS = new Set([
   'LD_PRELOAD',
@@ -299,9 +375,27 @@ function validateRawServiceObject(raw: Record<string, unknown>, fallbackName?: s
     command = rawCommand.trim()
   }
 
+  const rawEntrypoint = raw.entrypoint
+  let entrypoint: string | string[] | undefined
+  if (Array.isArray(rawEntrypoint)) {
+    entrypoint = rawEntrypoint.map(v => String(v))
+  } else if (typeof rawEntrypoint === 'string' && rawEntrypoint.trim()) {
+    entrypoint = rawEntrypoint.trim()
+  }
+
   const rawDeps = raw.dependsOn ?? raw.depends_on
   const dependsOn = Array.isArray(rawDeps)
     ? rawDeps.map(d => String(d).trim()).filter(Boolean)
+    : undefined
+
+  const rawAliases = raw.networkAliases
+  const networkAliases = Array.isArray(rawAliases)
+    ? rawAliases.map(alias => String(alias).trim()).filter(alias => SAFE_SERVICE_NAME.test(alias)).slice(0, 8)
+    : undefined
+
+  const rawHealthcheck = raw.healthcheck
+  const healthcheck = rawHealthcheck && typeof rawHealthcheck === 'object' && !Array.isArray(rawHealthcheck)
+    ? composeHealthcheckToSpec(rawHealthcheck as ComposeHealthcheckSpec)
     : undefined
 
   return {
@@ -310,157 +404,175 @@ function validateRawServiceObject(raw: Record<string, unknown>, fallbackName?: s
     dockerfile,
     startCommand: typeof raw.startCommand === 'string' && raw.startCommand.trim() ? raw.startCommand.trim() : undefined,
     command,
+    entrypoint,
     internalPort,
     healthPath: typeof raw.healthPath === 'string' && raw.healthPath.trim() ? raw.healthPath.trim() : undefined,
+    healthcheck,
     env: envObj && typeof envObj === 'object' && !Array.isArray(envObj) ? { ...envObj } : undefined,
     memoryLimit: typeof raw.memoryLimit === 'string' && raw.memoryLimit.trim() ? raw.memoryLimit.trim() : undefined,
     cpus: typeof raw.cpus === 'string' && raw.cpus.trim() ? raw.cpus.trim() : undefined,
     pidsLimit: typeof raw.pidsLimit === 'number' && Number.isInteger(raw.pidsLimit) ? raw.pidsLimit : undefined,
     dependsOn,
+    networkAliases,
   }
 }
 
-function unquoteYamlScalar(raw: string): string {
-  const s = raw.trim()
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    return s.slice(1, -1)
-  }
-  return s
+function composeHealthcheckToSpec(healthcheck: ComposeHealthcheckSpec | undefined): LabServiceHealthcheck | undefined {
+  if (!healthcheck) return undefined
+  if (healthcheck.test === undefined) return undefined
+  const spec: LabServiceHealthcheck = { test: healthcheck.test }
+  if (healthcheck.intervalMs !== undefined) spec.intervalMs = healthcheck.intervalMs
+  if (healthcheck.timeoutMs !== undefined) spec.timeoutMs = healthcheck.timeoutMs
+  if (healthcheck.retries !== undefined) spec.retries = healthcheck.retries
+  if (healthcheck.startPeriodMs !== undefined) spec.startPeriodMs = healthcheck.startPeriodMs
+  if (healthcheck.disabled !== undefined) spec.disabled = healthcheck.disabled
+  return spec
 }
 
-export function parseAndSanitizeComposeYaml(yamlText: string): LabServiceSpec[] {
-  const lines = yamlText.replace(/\r\n/g, '\n').split('\n')
-  const rawServices = new Map<string, Record<string, unknown>>()
+/**
+ * Derive a readiness path from a Compose healthcheck command. Only a bounded http(s) URL is
+ * considered; everything else returns undefined and the caller falls back to the configured
+ * healthPath + TCP readiness probe.
+ */
+export function deriveHealthPathFromHealthcheck(healthcheck: LabServiceHealthcheck | undefined): string | undefined {
+  if (!healthcheck || healthcheck.disabled) return undefined
+  const test = healthcheck.test
+  const parts = Array.isArray(test) ? test : (typeof test === 'string' ? [test] : [])
+  for (const part of parts) {
+    const match = /https?:\/\/[^\s/'"`]+(\/[^\s'"`]*)?/.exec(part)
+    if (match) {
+      const path = (match[1] ?? '/').split('?')[0]
+      if (path.startsWith('/') && path.length <= 256) return path
+    }
+  }
+  return undefined
+}
 
-  let inServices = false
-  let servicesIndent = -1
-  let currentService: string | null = null
-  let serviceIndent = -1
-  let currentProp: string | null = null
-  let propIndent = -1
+const COMPOSE_UNSUPPORTED_SERVICE_DIRECTIVES: ReadonlyMap<string, string> = new Map([
+  ['env_file', 'env_file is not supported; pass environment values explicitly'],
+  ['volumes_from', 'volumes_from is not supported'],
+  ['extends', 'extends is not supported'],
+  ['links', 'links is not supported'],
+  ['tmpfs', 'tmpfs overlays are not supported; DB data dirs are provisioned automatically'],
+  ['deploy', 'deploy is not supported; use memoryLimit/cpus/pidsLimit'],
+  ['profiles', 'profiles are not supported'],
+  ['secrets', 'secrets are not supported'],
+  ['configs', 'configs are not supported'],
+])
 
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const indent = rawLine.length - rawLine.trimStart().length
+function validateComposeServiceSource(source: ComposeServiceSource): LabServiceSpec {
+  const { name, config, normalized } = source
+  if (!SAFE_SERVICE_NAME.test(name)) {
+    throw new Error(`Invalid lab service name "${name}": must match ${SAFE_SERVICE_NAME.source}.`)
+  }
 
-    if (!inServices) {
-      if (/^services\s*:\s*$/.test(trimmed)) {
-        inServices = true
-        servicesIndent = indent
+  // Reject every forbidden/unsupported directive explicitly: never let an unrecognised Compose
+  // key silently become no-op semantics.
+  for (const key of Object.keys(config)) {
+    if (key.startsWith('x-')) continue
+    const lower = key.toLowerCase()
+    if (COMPOSE_UNSUPPORTED_SERVICE_DIRECTIVES.has(lower)) {
+      throw new Error(
+        `Unsupported compose service directive "${key}" rejected on lab service "${name}": ` +
+        `${COMPOSE_UNSUPPORTED_SERVICE_DIRECTIVES.get(lower)}.`,
+      )
+    }
+    if (FORBIDDEN_COMPOSE_KEYS.has(lower)) {
+      const value = config[key]
+      const isEmptyList = Array.isArray(value) && value.length === 0
+      const isFalseFlag = lower === 'privileged' && (value === false || value === 'false')
+      if (!isEmptyList && !isFalseFlag) {
+        throw new Error(`Forbidden unsafe compose directive "${key}" rejected on lab service "${name}".`)
       }
-      continue
-    }
-
-    // Left top-level services block
-    if (indent <= servicesIndent && !trimmed.startsWith('-')) {
-      inServices = false
-      currentService = null
-      currentProp = null
-      continue
-    }
-
-    // Service name declaration
-    if (currentService === null || indent <= serviceIndent) {
-      const svcMatch = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:\s*$/)
-      if (!svcMatch) continue
-      currentService = svcMatch[1]
-      serviceIndent = indent
-      currentProp = null
-      propIndent = -1
-      rawServices.set(currentService, { name: currentService })
-      continue
-    }
-
-    const svcObj = rawServices.get(currentService)!
-
-    // Property under current service (or nested under currentProp)
-    if (currentProp !== null && indent > propIndent) {
-      if (trimmed.startsWith('- ')) {
-        const item = unquoteYamlScalar(trimmed.slice(2))
-        if (currentProp === 'environment') {
-          const envMap = (svcObj.env ?? {}) as Record<string, string>
-          const eqIdx = item.indexOf('=')
-          if (eqIdx > 0) {
-            envMap[item.slice(0, eqIdx).trim()] = unquoteYamlScalar(item.slice(eqIdx + 1))
-          }
-          svcObj.env = envMap
-        } else {
-          const arr = Array.isArray(svcObj[currentProp]) ? (svcObj[currentProp] as unknown[]) : []
-          arr.push(item)
-          svcObj[currentProp] = arr
-        }
-        continue
-      }
-      const nestedKv = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:\s*(.*)$/)
-      if (nestedKv) {
-        const [, nk, nvRaw] = nestedKv
-        const nv = unquoteYamlScalar(nvRaw)
-        if (currentProp === 'environment') {
-          const envMap = (svcObj.env ?? {}) as Record<string, string>
-          envMap[nk] = nv
-          svcObj.env = envMap
-        } else if (currentProp === 'build') {
-          if (nk === 'dockerfile' && nv) svcObj.dockerfile = nv
-          if (nk === 'context' && nv && nv !== '.' && nv !== './') {
-            throw new Error(`Forbidden unsafe compose build context "${nv}" on service "${currentService}".`)
-          }
-        }
-        continue
-      }
-    }
-
-    const kvMatch = trimmed.match(/^([a-zA-Z0-9_.-]+)\s*:\s*(.*)$/)
-    if (!kvMatch) continue
-    const [, key, valRaw] = kvMatch
-    const val = valRaw.trim()
-    currentProp = key
-    propIndent = indent
-
-    if (val === '') {
-      if (key === 'environment') svcObj.env = {}
-      else if (key === 'build') svcObj.dockerfile = 'Dockerfile'
-      else svcObj[key] = []
-      continue
-    }
-
-    if (key === 'build') {
-      const ctx = unquoteYamlScalar(val)
-      if (ctx !== '.' && ctx !== './') {
-        throw new Error(`Forbidden unsafe compose build context "${ctx}" on service "${currentService}".`)
-      }
-      svcObj.dockerfile = 'Dockerfile'
-      continue
-    }
-
-    if (val.startsWith('[') && val.endsWith(']')) {
-      try {
-        svcObj[key] = JSON.parse(val)
-      } catch {
-        svcObj[key] = val.slice(1, -1).split(',').map(s => unquoteYamlScalar(s)).filter(Boolean)
-      }
-      continue
-    }
-
-    if (val === 'true' || val === 'false') {
-      svcObj[key] = val === 'true'
-    } else {
-      svcObj[key] = unquoteYamlScalar(val)
     }
   }
 
-  if (rawServices.size === 0) {
-    throw new Error('Docker Compose file contains no valid services.')
-  }
-  if (rawServices.size > MAX_LAB_CONTAINERS) {
-    throw new Error(`Lab stack exceeds maximum limit of ${MAX_LAB_CONTAINERS} containers per run (got ${rawServices.size}).`)
+  if (normalized.ports.length > 0) {
+    throw new Error(
+      `Forbidden unsafe compose directive "ports" rejected on lab service "${name}": ` +
+      'lab targets are reached through a loopback-only proxy and never publish host ports.',
+    )
   }
 
-  const sanitized: LabServiceSpec[] = []
-  for (const [svcName, rawObj] of rawServices.entries()) {
-    sanitized.push(validateRawServiceObject(rawObj, svcName))
+  if (normalized.volumes.length > 0) {
+    throw new Error(
+      `Forbidden unsafe compose volume directive rejected on lab service "${name}": ` +
+      'host bind mounts and pre-existing volumes are not supported; databases get a per-run writable overlay.',
+    )
   }
-  return sanitized
+
+  if (normalized.build) {
+    const context = normalized.build.context
+    if (context !== '.' && context !== './') {
+      throw new Error(`Forbidden unsafe compose build context "${context}" on service "${name}".`)
+    }
+    if (normalized.build.args && Object.keys(normalized.build.args).length > 0) {
+      throw new Error(`Unsupported compose build.args on service "${name}".`)
+    }
+    if (normalized.build.target !== undefined) {
+      throw new Error(`Unsupported compose build.target on service "${name}".`)
+    }
+  }
+
+  const dockerfile = normalized.build?.dockerfile
+  if (dockerfile && (dockerfile.startsWith('/') || dockerfile.includes('..') || dockerfile.includes('\0'))) {
+    throw new Error(`Unsafe dockerfile path "${dockerfile}" rejected on lab service "${name}".`)
+  }
+
+  if (normalized.user !== undefined) {
+    const userValue = normalized.user.trim()
+    const uidPart = userValue.includes(':') ? userValue.split(':')[0] : userValue
+    if (uidPart === '0' || uidPart === 'root') {
+      throw new Error(`Forbidden root user "${userValue}" rejected on lab service "${name}"; lab containers must run as non-root.`)
+    }
+  }
+
+  const env = normalized.environment
+  if (env) validateEnvMap(env, `service "${name}"`)
+
+  const healthcheck = composeHealthcheckToSpec(normalized.healthcheck)
+  const healthPath = deriveHealthPathFromHealthcheck(healthcheck)
+
+  const internalPort = normalized.expose.length > 0 ? normalized.expose[0] : undefined
+  if (internalPort !== undefined && (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65_535)) {
+    throw new Error(`Invalid expose port "${internalPort}" on lab service "${name}".`)
+  }
+
+  const command = normalized.command
+  const dependsOn = normalized.dependsOn.length > 0 ? normalized.dependsOn : undefined
+  const networkAliases = normalized.networkAliases.length > 0 ? normalized.networkAliases : undefined
+
+  return {
+    name,
+    image: normalized.image,
+    dockerfile,
+    command,
+    entrypoint: normalized.entrypoint,
+    internalPort,
+    healthPath,
+    healthcheck,
+    env,
+    dependsOn,
+    networkAliases,
+  }
+}
+
+/**
+ * Parse and sanitize a Docker Compose document. Replaces the v5 indentation-regex parser with the
+ * bounded YAML parser in `compose-parse.ts`; every security decision stays in this module.
+ */
+export function parseAndSanitizeComposeYaml(
+  yamlText: string,
+  options: { env?: Record<string, string | undefined>; maxServices?: number } = {},
+): LabServiceSpec[] {
+  const document = parseComposeDocument(yamlText, {
+    env: options.env ?? (process.env as Record<string, string | undefined>),
+    maxServices: options.maxServices ?? MAX_LAB_CONTAINERS,
+  })
+  if (document.services.length > MAX_LAB_CONTAINERS) {
+    throw new Error(`Lab stack exceeds maximum limit of ${MAX_LAB_CONTAINERS} containers per run (got ${document.services.length}).`)
+  }
+  return document.services.map(validateComposeServiceSource)
 }
 
 function scrubIastString(text: string, secrets: readonly NamedSecret[]): string {
@@ -605,6 +717,8 @@ export function ingestLabTelemetry(input: IngestLabTelemetryInput): IngestLabTel
     hasUnhandledException,
   }
 }
+
+export type DockerRunner = (args: string[], signal?: AbortSignal) => Promise<string>
 
 function dockerHost(): string {
   const host = process.env.DOCKER_HOST || 'unix:///var/run/docker.sock'
@@ -1033,6 +1147,309 @@ export function createPerRunIastTelemetryDir(
 }
 
 
+// ===========================================================================
+// Durable run state (crash recovery / orphan reaping)
+// ===========================================================================
+
+export interface LabRunRecord {
+  version: 1
+  runId: string
+  networkName: string
+  containerNames: string[]
+  containerIds: string[]
+  proxyContainerName?: string
+  volumes: string[]
+  sanitizedRepoDir?: string
+  telemetryDir?: string
+  ownsTelemetryDir?: boolean
+  proxyDir?: string
+  startedAt: number
+  updatedAt: number
+  pid: number
+}
+
+export interface LabRecoveryResult {
+  runId: string
+  containersRemoved: number
+  networksRemoved: number
+  volumesRemoved: number
+  tempDirsRemoved: number
+  recoveredFromRecord: boolean
+}
+
+export function validateLabRunId(runId: string): string {
+  if (typeof runId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(runId)) {
+    throw new Error(`Invalid lab run id "${String(runId).slice(0, 64)}": must match [A-Za-z0-9][A-Za-z0-9._:-]{0,127}.`)
+  }
+  return runId
+}
+
+function labRunRecordFileName(runId: string): string {
+  const slug = runId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 96)
+  const digest = createHash('sha256').update(runId).digest('hex').slice(0, 8)
+  return `${slug}-${digest}.json`
+}
+
+/** Directory holding crash-recovery records; owner-only, never inside the repo. */
+export function labStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env[LAB_STATE_DIR_ENV]?.trim()
+  const dir = configured && isAbsolute(configured) ? configured : join(tmpdir(), 'guardian-lab-state')
+  return dir
+}
+
+export function labRunRecordPath(stateDir: string, runId: string): string {
+  validateLabRunId(runId)
+  return join(stateDir, labRunRecordFileName(runId))
+}
+
+export function readLabRunRecord(stateDir: string, runId: string): LabRunRecord | null {
+  const recordPath = labRunRecordPath(stateDir, runId)
+  try {
+    const raw = readFileSync(recordPath, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<LabRunRecord>
+    if (!parsed || parsed.version !== 1 || parsed.runId !== runId) return null
+    if (!Array.isArray(parsed.containerNames) || !Array.isArray(parsed.containerIds)) return null
+    return {
+      version: 1,
+      runId,
+      networkName: typeof parsed.networkName === 'string' ? parsed.networkName : '',
+      containerNames: parsed.containerNames.filter((name): name is string => typeof name === 'string').slice(0, 32),
+      containerIds: parsed.containerIds.filter((id): id is string => typeof id === 'string').slice(0, 32),
+      ...(typeof parsed.proxyContainerName === 'string' ? { proxyContainerName: parsed.proxyContainerName } : {}),
+      volumes: Array.isArray(parsed.volumes)
+        ? parsed.volumes.filter((name): name is string => typeof name === 'string').slice(0, 32)
+        : [],
+      ...(typeof parsed.sanitizedRepoDir === 'string' ? { sanitizedRepoDir: parsed.sanitizedRepoDir } : {}),
+      ...(typeof parsed.telemetryDir === 'string' ? { telemetryDir: parsed.telemetryDir } : {}),
+      ...(parsed.ownsTelemetryDir === true ? { ownsTelemetryDir: true } : {}),
+      ...(typeof parsed.proxyDir === 'string' ? { proxyDir: parsed.proxyDir } : {}),
+      startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : Date.now(),
+      updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
+      pid: typeof parsed.pid === 'number' ? parsed.pid : 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+export function writeLabRunRecord(stateDir: string, record: LabRunRecord): void {
+  validateLabRunId(record.runId)
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+  chmodSync(stateDir, 0o700)
+  const target = labRunRecordPath(stateDir, record.runId)
+  const tmpPath = join(stateDir, `.${basename(target)}.${randomUUID()}.tmp`)
+  writeFileSync(tmpPath, `${JSON.stringify({ ...record, version: 1, updatedAt: Date.now() }, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
+  try {
+    renameSync(tmpPath, target)
+  } catch (err) {
+    try { unlinkSync(tmpPath) } catch { /* ignore */ }
+    throw err
+  }
+}
+
+export function removeLabRunRecord(stateDir: string, runId: string): void {
+  try {
+    unlinkSync(labRunRecordPath(stateDir, runId))
+  } catch {
+    // Idempotent: no record is a success.
+  }
+}
+
+/**
+ * Remove a lab scratch directory only if it is a real directory named with one of our known
+ * prefixes. Refuses symlinks and unexpected names so a corrupted/stale record can never delete an
+ * arbitrary path.
+ */
+export function safeRemoveLabTempDir(
+  dirPath: string | undefined,
+  expectedPrefixes: readonly string[] = [LAB_REPO_DIR_PREFIX, LAB_TELEMETRY_DIR_PREFIX, LAB_PROXY_DIR_PREFIX, 'run-'],
+): boolean {
+  if (!dirPath || !isAbsolute(dirPath)) return false
+  const name = basename(dirPath)
+  if (!expectedPrefixes.some(prefix => name.startsWith(prefix))) return false
+  try {
+    const st = lstatSync(dirPath)
+    if (st.isSymbolicLink() || !st.isDirectory()) return false
+    rmSync(dirPath, { recursive: true, force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ===========================================================================
+// Writable database overlays
+// ===========================================================================
+
+export type LabDatabaseKind = 'postgres' | 'mysql' | 'mariadb' | 'redis' | 'mongo' | 'sqlite'
+
+const DB_DEFAULT_PORTS: Record<Exclude<LabDatabaseKind, 'sqlite'>, number> = {
+  postgres: 5432,
+  mysql: 3306,
+  mariadb: 3306,
+  redis: 6379,
+  mongo: 27017,
+}
+
+/** Strip registry, tag and digest from an image reference so `docker.io/library/postgres:16` -> `postgres`. */
+export function normalizeImageRepository(image: string | undefined): string | undefined {
+  if (!image) return undefined
+  const withoutDigest = image.split('@')[0]
+  const lastSegment = withoutDigest.slice(withoutDigest.lastIndexOf('/') + 1)
+  const repo = lastSegment.split(':')[0].trim().toLowerCase()
+  return repo || undefined
+}
+
+/**
+ * Detect a database service from its image/command/env. Detection only decides where a writable
+ * data dir is mounted; it never relaxes isolation (cap-drop ALL / no-new-privileges stay on).
+ */
+export function detectLabDatabaseKind(input: {
+  image?: string
+  command?: string | string[]
+  env?: Record<string, string | undefined>
+}): LabDatabaseKind | null {
+  const repo = normalizeImageRepository(input.image)
+  if (repo) {
+    if (repo === 'postgres' || repo === 'postgresql') return 'postgres'
+    if (repo === 'mysql') return 'mysql'
+    if (repo === 'mariadb') return 'mariadb'
+    if (repo === 'redis') return 'redis'
+    if (repo === 'mongo' || repo === 'mongodb') return 'mongo'
+    if (repo.includes('sqlite')) return 'sqlite'
+  }
+  const commandText = Array.isArray(input.command) ? input.command.join(' ') : (input.command ?? '')
+  const envText = Object.entries(input.env ?? {})
+    .map(([key, value]) => `${key}=${value ?? ''}`)
+    .join(' ')
+  const haystack = `${commandText} ${envText}`.toLowerCase()
+  if (/\bpostgres(?:ql)?\b|\bpostmaster\b/.test(haystack)) return 'postgres'
+  if (/\bmariadbd?\b/.test(haystack)) return 'mariadb'
+  if (/\bmysqld\b/.test(haystack)) return 'mysql'
+  if (/\bredis-server\b/.test(haystack)) return 'redis'
+  if (/\bmongod\b/.test(haystack)) return 'mongo'
+  if (/\bsqlite3?\b|sqlite:|\.(?:db|sqlite|sqlite3)\b/.test(haystack)) return 'sqlite'
+  return null
+}
+
+/** Default container port for a detected database (used for readiness probes and base URLs). */
+export function defaultLabDatabasePort(kind: LabDatabaseKind): number | undefined {
+  return kind === 'sqlite' ? undefined : DB_DEFAULT_PORTS[kind]
+}
+
+export function labDataVolumeName(runId: string, serviceName: string, nonce?: string): string {
+  const runSlug = runId.replace(/[^a-z0-9]/gi, '').slice(0, 12).toLowerCase() || 'run'
+  const svcSlug = serviceName.replace(/[^a-z0-9]/gi, '').slice(0, 20).toLowerCase() || 'svc'
+  const suffix = (nonce ?? createHash('sha256').update(`${runId}:${serviceName}:${randomUUID()}`).digest('hex')).slice(0, 8)
+  return `guardian-lab-vol-${runSlug}-${svcSlug}-${suffix}`
+}
+
+export interface LabWritableOverlayInput {
+  kind: LabDatabaseKind
+  serviceName: string
+  runId: string
+  containerUser: string
+  /** `tmpfs` (default) keeps DB state ephemeral; `volume` uses a labelled per-run named volume. */
+  backing?: 'tmpfs' | 'volume'
+  nonce?: string
+  sizeMb?: number
+}
+
+export interface LabWritableOverlay {
+  kind: LabDatabaseKind
+  dataDir: string
+  readOnlyRootfs: boolean
+  tmpfsArgs: string[]
+  mountArgs: string[]
+  env: Record<string, string>
+  volumeName?: string
+}
+
+function tmpfsSpec(
+  target: string,
+  options: { uid: number; gid: number; mode: number; sizeMb: number },
+): string {
+  return `${target}:rw,nosuid,nodev,size=${options.sizeMb}m,uid=${options.uid},gid=${options.gid},mode=0${options.mode.toString(8)}`
+}
+
+/**
+ * Plan the writable data-dir overlay for a database service.
+ *
+ * v5 mounted the sanitized repo read-only and never gave Postgres/MySQL/Redis a writable data dir,
+ * so `initdb`/`mysqld --initialize`/AOF writes aborted and the lab "health check timed out" with no
+ * actionable signal. Every DB now gets:
+ *   - a writable data dir owned by the non-root lab uid (tmpfs by default, labelled per-run volume
+ *     on request),
+ *   - the runtime socket dir as a writable tmpfs,
+ *   - NO `--read-only` rootfs for DB images that write outside the data dir during init,
+ *   - explicit PGDATA for Postgres and a rewritten `sqlite:` URL for SQLite app services.
+ */
+export function buildWritableDataOverlay(input: LabWritableOverlayInput): LabWritableOverlay {
+  const [uidRaw, gidRaw] = input.containerUser.split(':')
+  const uid = Number(uidRaw)
+  const gid = Number(gidRaw)
+  if (!Number.isInteger(uid) || !Number.isInteger(gid) || uid <= 0 || gid <= 0) {
+    throw new Error(`${LAB_CONTAINER_USER_ENV} must resolve to a non-root numeric uid:gid for writable overlays.`)
+  }
+  const backing = input.backing ?? 'tmpfs'
+  const sizeMb = input.sizeMb ?? 256
+  const dataTmpfs = tmpfsSpec('<data>', { uid, gid, mode: 0o700, sizeMb })
+  const socketTmpfs = (target: string, mode: number): string =>
+    tmpfsSpec(target, { uid, gid, mode, sizeMb: 16 })
+
+  const plan = (dataDir: string, extraTmpfs: string[], env: Record<string, string> = {}): LabWritableOverlay => {
+    const overlay: LabWritableOverlay = {
+      kind: input.kind,
+      dataDir,
+      // DB init writes outside the data dir on some images; the data dir is still uid-scoped.
+      readOnlyRootfs: false,
+      tmpfsArgs: [],
+      mountArgs: [],
+      env,
+    }
+    if (backing === 'volume') {
+      overlay.volumeName = labDataVolumeName(input.runId, input.serviceName, input.nonce)
+      overlay.mountArgs.push('--mount', `type=volume,source=${overlay.volumeName},target=${dataDir}`)
+    } else {
+      overlay.tmpfsArgs.push(dataTmpfs.replace('<data>', dataDir))
+    }
+    overlay.tmpfsArgs.push(...extraTmpfs)
+    return overlay
+  }
+
+  switch (input.kind) {
+    case 'postgres': {
+      const dataDir = '/var/lib/postgresql/data'
+      return plan(dataDir, [socketTmpfs('/var/run/postgresql', 0o775)], { PGDATA: dataDir })
+    }
+    case 'mysql':
+      return plan('/var/lib/mysql', [socketTmpfs('/var/run/mysqld', 0o775)])
+    case 'mariadb':
+      return plan('/var/lib/mysql', [socketTmpfs('/run/mysqld', 0o775)])
+    case 'redis':
+      return plan('/data', [])
+    case 'mongo':
+      return plan('/data/db', [socketTmpfs('/data/configdb', 0o700)])
+    case 'sqlite':
+      // SQLite runs inside the app container: keep the app rootfs read-only but give the DB file a
+      // writable per-run data dir, and point DATABASE_URL at it when the URL names a repo file.
+      return {
+        ...plan('/app/data', [socketTmpfs('/data', 0o700)], { GUARDIAN_LAB_DATA_DIR: '/app/data' }),
+        readOnlyRootfs: true,
+      }
+  }
+}
+
+/** Rewrite a repo-relative sqlite URL to the writable per-run data dir. Bounded, no host paths. */
+export function rewriteSqliteDatabaseUrl(value: string): string {
+  const match = /^sqlite:(?:\/\/)?(?:file:)?(?:\.\/)?\/?(?:[A-Za-z0-9._-]+\/)?([A-Za-z0-9._-]{1,128}\.(?:db|sqlite|sqlite3))$/i.exec(value.trim())
+  if (!match) return value
+  return `sqlite:/app/data/${match[1]}`
+}
+
 export interface LabContainerRunArgsInput {
   containerName: string
   networkName: string
@@ -1048,33 +1465,292 @@ export interface LabContainerRunArgsInput {
   cpus: string
   pidsLimit: number
   user: string
+  /** Defaults to true. Only database images that initialise outside their data dir opt out. */
+  readOnly?: boolean
+  /** Extra `--tmpfs <spec>` mounts (writable DB overlays). */
+  writableTmpfs?: string[]
+  /** Extra network aliases (Compose `networks.<name>.aliases`). */
+  networkAliases?: string[]
+  /** Docker `--entrypoint` override (Compose `entrypoint`). */
+  entrypoint?: string
+  /** Additional non-security labels (role markers). */
+  extraLabels?: Record<string, string>
 }
 
 /** Pure builder for the `docker run` argv; exported so security invariants are unit-testable. */
 export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): string[] {
-  return [
+  const aliases = [...new Set([input.serviceName, ...(input.networkAliases ?? [])])]
+    .filter(alias => SAFE_SERVICE_NAME.test(alias))
+  const labels: string[] = [
+    `${LAB_LABELS.lab}=1`,
+    `${LAB_LABELS.run}=${input.runId}`,
+    `${LAB_LABELS.service}=${input.serviceName}`,
+  ]
+  for (const [key, value] of Object.entries(input.extraLabels ?? {})) {
+    if (!/^dev\.guardian\.[a-z-]{1,32}$/.test(key) || !SAFE_LABEL_VALUE.test(value)) continue
+    labels.push(`${key}=${value}`)
+  }
+  const args: string[] = [
     'run', '-d',
     '--name', input.containerName,
     '--network', input.networkName,
-    '--network-alias', input.serviceName,
+  ]
+  for (const alias of aliases) args.push('--network-alias', alias)
+  args.push(
     '--user', input.user,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
-    '--read-only',
-    '--tmpfs', '/tmp:rw,nosuid,nodev,size=64m',
+  )
+  if (input.readOnly !== false) args.push('--read-only')
+  args.push('--tmpfs', '/tmp:rw,nosuid,nodev,size=64m')
+  for (const spec of input.writableTmpfs ?? []) args.push('--tmpfs', spec)
+  args.push(
     '--memory', input.memoryLimit,
     '--memory-swap', input.memoryLimit,
     '--cpus', input.cpus,
     '--pids-limit', String(input.pidsLimit),
-    '--label', 'dev.guardian.lab=1',
-    '--label', `dev.guardian.run=${input.runId}`,
-    '--label', `dev.guardian.service=${input.serviceName}`,
+  )
+  for (const label of labels) args.push('--label', label)
+  if (input.entrypoint) args.push('--entrypoint', input.entrypoint)
+  args.push(
     ...buildSyntheticEnvArgs(input.internalPort, input.env, input.extraEnv),
     ...input.mountArgs,
     input.imageName,
     ...input.cmd,
+  )
+  return args
+}
+
+// ===========================================================================
+// Loopback -> proxy-container relay
+// ===========================================================================
+
+/**
+ * Trusted relay script executed by the proxy container. It has no user input: it binds a Unix
+ * socket inside the bind-mounted proxy dir, re-reads the target file for every connection (so a
+ * patch rebuild can retarget it without restarting the proxy), and pipes bytes to the service by
+ * container DNS name on the internal network. No host TCP port is ever published.
+ */
+export const LAB_PROXY_SCRIPT = [
+  "const net=require('net'),fs=require('fs')",
+  "const dir='/guardian-proxy'",
+  "const sock=dir+'/proxy.sock'",
+  "const targetFile=dir+'/target'",
+  "function target(){",
+  "  try{",
+  "    const raw=fs.readFileSync(targetFile,'utf8').trim()",
+  "    const idx=raw.lastIndexOf(':')",
+  "    if(idx>0){",
+  "      const host=raw.slice(0,idx)",
+  "      const port=Number(raw.slice(idx+1))",
+  "      if(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(host)&&Number.isInteger(port)&&port>0&&port<65536)return{host,port}",
+  "    }",
+  "  }catch{}",
+  "  return{host:process.env.GUARDIAN_PROXY_TARGET_HOST||'127.0.0.1',port:Number(process.env.GUARDIAN_PROXY_TARGET_PORT||'8080')}",
+  "}",
+  "try{fs.unlinkSync(sock)}catch{}",
+  "net.createServer(client=>{",
+  "  const {host,port}=target()",
+  "  const upstream=net.connect({host,port})",
+  "  const teardown=()=>{try{client.destroy()}catch{};try{upstream.destroy()}catch{}}",
+  "  client.pipe(upstream)",
+  "  upstream.pipe(client)",
+  "  client.on('error',teardown)",
+  "  upstream.on('error',teardown)",
+  "  client.on('close',()=>{try{upstream.destroy()}catch{}})",
+  "  upstream.on('close',()=>{try{client.destroy()}catch{}})",
+  "  upstream.setTimeout(120000,teardown)",
+  "  client.setTimeout(120000,teardown)",
+  "}).listen(sock,()=>{",
+  "  try{fs.chmodSync(sock,process.env.GUARDIAN_PROXY_SOCKET_MODE==='666'?0o666:0o600)}catch{}",
+  "  console.log('guardian-lab-proxy-ready')",
+  "})",
+].join('\n')
+
+/** Pure builder for the per-run `--internal` bridge network argv. */
+export function buildLabNetworkCreateArgs(runId: string, networkName: string): string[] {
+  if (!SAFE_SERVICE_NAME.test(networkName)) {
+    throw new Error(`Unsafe lab network name "${networkName}" rejected.`)
+  }
+  return [
+    'network', 'create',
+    '--driver', 'bridge',
+    '--internal',
+    '-o', 'com.docker.network.bridge.inhibit_ipv4=true',
+    '--label', `${LAB_LABELS.lab}=1`,
+    '--label', `${LAB_LABELS.run}=${runId}`,
+    networkName,
   ]
 }
+
+export interface LabProxyRunArgsInput {
+  containerName: string
+  networkName: string
+  runId: string
+  proxyDir: string
+  image?: string
+  user: string
+  targetHost: string
+  targetPort: number
+  socketMode: '600' | '666'
+  memoryLimit?: string
+  cpus?: string
+  pidsLimit?: number
+}
+
+/**
+ * Pure builder for the proxy container argv. The proxy is on the same `--internal` user-defined
+ * network as the lab services (so it resolves them by container DNS), carries the run label for
+ * reaping, runs non-root with all capabilities dropped, and publishes zero ports.
+ */
+export function buildLabProxyRunArgs(input: LabProxyRunArgsInput): string[] {
+  const image = (input.image ?? LAB_PROXY_IMAGE_DEFAULT).trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9_./:@-]{0,191}$/.test(image) || image.includes('..')) {
+    throw new Error(`Unsafe lab proxy image reference "${image}" rejected.`)
+  }
+  if (!SAFE_SERVICE_NAME.test(input.targetHost) && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(input.targetHost)) {
+    throw new Error(`Unsafe lab proxy target host "${input.targetHost}" rejected.`)
+  }
+  if (!Number.isInteger(input.targetPort) || input.targetPort < 1 || input.targetPort > 65_535) {
+    throw new Error(`Unsafe lab proxy target port "${input.targetPort}" rejected.`)
+  }
+  if (!isAbsolute(input.proxyDir) || input.proxyDir.includes(',') || input.proxyDir.includes('\0')) {
+    throw new Error('Lab proxy dir must be a clean absolute path.')
+  }
+  return [
+    'run', '-d',
+    '--name', input.containerName,
+    '--network', input.networkName,
+    '--user', input.user,
+    '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges',
+    '--read-only',
+    '--tmpfs', '/tmp:rw,nosuid,nodev,size=16m',
+    '--memory', input.memoryLimit ?? '128m',
+    '--memory-swap', input.memoryLimit ?? '128m',
+    '--cpus', input.cpus ?? '0.5',
+    '--pids-limit', String(input.pidsLimit ?? 64),
+    '--label', `${LAB_LABELS.lab}=1`,
+    '--label', `${LAB_LABELS.run}=${input.runId}`,
+    '--label', `${LAB_LABELS.role}=proxy`,
+    '--mount', `type=bind,source=${input.proxyDir},target=/guardian-proxy`,
+    '-e', 'GUARDIAN_PROXY_SOCKET_MODE=' + input.socketMode,
+    '-e', 'GUARDIAN_PROXY_TARGET_HOST=' + input.targetHost,
+    '-e', 'GUARDIAN_PROXY_TARGET_PORT=' + String(input.targetPort),
+    image,
+    'node', '-e', LAB_PROXY_SCRIPT,
+  ]
+}
+
+/** Create the owner-only proxy handshake dir (socket + target file live here). */
+export function createLabProxyDir(
+  runId: string,
+  containerUser = resolveLabContainerUser(),
+  baseDir = tmpdir(),
+): string {
+  mkdirSync(baseDir, { recursive: true, mode: 0o755 })
+  const hostUid = typeof process.getuid === 'function' ? process.getuid() : undefined
+  const containerUid = Number(containerUser.split(':')[0])
+  if (hostUid !== undefined && hostUid !== 0 && containerUid !== hostUid) {
+    throw new Error(
+      `Lab proxy handshake dir must be writable by the lab container user (uid ${containerUid}); ` +
+      `Guardian runs as uid ${hostUid}. Set ${LAB_CONTAINER_USER_ENV}=${hostUid}:${containerUser.split(':')[1]} ` +
+      'or run Guardian as root.',
+    )
+  }
+  const slug = runId.replace(/[^a-z0-9]/gi, '').slice(0, 12).toLowerCase() || 'run'
+  const dir = mkdtempSync(join(baseDir, `${LAB_PROXY_DIR_PREFIX}${slug}-`))
+  chmodSync(dir, 0o700)
+  if (hostUid === 0) {
+    const [uidRaw, gidRaw] = containerUser.split(':')
+    try { chownSync(dir, Number(uidRaw), Number(gidRaw)) } catch { /* perms stay 0700 */ }
+  }
+  return dir
+}
+
+/**
+ * Decide the handshake socket mode. When the container uid differs from Guardian's uid (only
+ * possible via GUARDIAN_LAB_USER) the proxy dir becomes traversable (0711) and the socket 0666 so
+ * the host relay can connect; this matches the trust level of the existing loopback TCP listener
+ * (any local user may reach the lab target) without exposing the target to the network at all.
+ */
+export function labProxySocketMode(_containerUser?: string): '600' | '666' {
+  // The handshake dir is 0700 and owned by the lab container uid (createLabProxyDir rejects a
+  // non-root uid mismatch), so a 0600 socket is always connectable by the host relay. The '666'
+  // branch is retained for operator-supplied dirs that intentionally widen access.
+  return '600'
+}
+
+/** Atomically retarget the proxy (used on start and after a patch rebuild). */
+export function writeLabProxyTarget(dir: string, host: string, port: number): void {
+  if (!SAFE_SERVICE_NAME.test(host) && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+    throw new Error(`Unsafe lab proxy target host "${host}" rejected.`)
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Unsafe lab proxy target port "${port}" rejected.`)
+  }
+  const targetPath = join(dir, LAB_PROXY_TARGET_FILE)
+  const tmpPath = join(dir, `.target-${randomUUID()}.tmp`)
+  writeFileSync(tmpPath, `${host}:${port}\n`, { encoding: 'utf8', mode: 0o644, flag: 'wx' })
+  try {
+    renameSync(tmpPath, targetPath)
+  } catch (err) {
+    try { unlinkSync(tmpPath) } catch { /* ignore */ }
+    throw err
+  }
+}
+
+export async function waitForLabProxySocket(
+  dir: string,
+  timeoutMs = 15_000,
+  signal?: AbortSignal,
+): Promise<string> {
+  const socketPath = join(dir, LAB_PROXY_SOCKET_FILE)
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    signal?.throwIfAborted()
+    if (existsSync(socketPath)) return socketPath
+    await delay(50, undefined, { signal }).catch(() => undefined)
+  }
+  throw new Error(`Lab proxy did not create its handshake socket within ${timeoutMs}ms.`)
+}
+
+/**
+ * Host-side loopback listener. Each accepted TCP connection opens a Unix-socket connection to the
+ * proxy container, so no `docker exec` process is spawned per connection and long-lived/streaming
+ * protocols survive. Bound strictly to 127.0.0.1 (no 0.0.0.0, no published docker port).
+ */
+export function createLoopbackSocketForwarder(
+  socketPath: string,
+): Promise<{ server: TcpServer; port: number }> {
+  return new Promise((resolvePromise, reject) => {
+    const server = createTcpServer(clientSocket => {
+      const upstream = connectTcp({ path: socketPath })
+      clientSocket.pipe(upstream)
+      upstream.pipe(clientSocket)
+      const teardown = () => {
+        try { clientSocket.destroy() } catch { /* ignore */ }
+        try { upstream.destroy() } catch { /* ignore */ }
+      }
+      clientSocket.on('error', teardown)
+      upstream.on('error', teardown)
+      clientSocket.on('close', () => { try { upstream.destroy() } catch { /* ignore */ } })
+      upstream.on('close', () => { try { clientSocket.destroy() } catch { /* ignore */ } })
+    })
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address() as AddressInfo | null
+      if (!addr || typeof addr.port !== 'number') {
+        server.close()
+        reject(new Error('Failed to allocate loopback ephemeral port for lab target.'))
+        return
+      }
+      resolvePromise({ server, port: addr.port })
+    })
+  })
+}
+
+
 
 interface ParsedHunk {
   oldStart: number
@@ -1307,57 +1983,19 @@ export function applyUnifiedDiffToDirectory(rootDir: string, diffText: string): 
 }
 
 
-function createLoopbackForwarder(
-  targetRef: { containerName: string; port: number },
-): Promise<{ server: TcpServer; port: number }> {
-  const bridgeScript = [
-    `if command -v node >/dev/null 2>&1; then`,
-    `  exec node -e "const net=require('net');const s=net.connect(Number(process.argv[1]),'127.0.0.1');process.stdin.pipe(s);s.pipe(process.stdout);s.on('error',()=>process.exit(1));s.on('close',()=>process.exit(0));process.stdin.on('end',()=>s.end());" "$1"`,
-    `elif command -v python3 >/dev/null 2>&1; then`,
-    `  exec python3 -u -c "import os,select,socket,sys; s=socket.create_connection(('127.0.0.1',int(sys.argv[1]))); fds=[0,s.fileno()]` +
-      `; \nwhile True:\n r,_,_=select.select(fds,[],[])\n if 0 in r:\n  d=os.read(0,65536)\n  if not d: s.shutdown(socket.SHUT_WR); fds.remove(0)\n  else: s.sendall(d)\n if s.fileno() in r:\n  d=s.recv(65536)\n  if not d: break\n  os.write(1,d)" "$1"`,
-    `else`,
-    `  exit 127`,
-    `fi`,
-  ].join('\n')
-
-  return new Promise((resolvePromise, reject) => {
-    const server = createTcpServer(clientSocket => {
-      const proc = spawn(
-        'docker',
-        ['exec', '-i', targetRef.containerName, 'sh', '-c', bridgeScript, '_', String(targetRef.port)],
-        { env: dockerEnv(), stdio: ['pipe', 'pipe', 'ignore'] },
-      )
-      clientSocket.pipe(proc.stdin)
-      proc.stdout.pipe(clientSocket)
-
-      const teardown = () => {
-        try { clientSocket.destroy() } catch { /* ignore */ }
-        try { proc.kill() } catch { /* ignore */ }
-      }
-      clientSocket.on('error', teardown)
-      clientSocket.on('close', () => {
-        try { proc.kill() } catch { /* ignore */ }
-      })
-      proc.stdin.on('error', () => { /* ignore EPIPE */ })
-      proc.stdout.on('error', teardown)
-      proc.once('error', teardown)
-      proc.once('close', () => {
-        try { clientSocket.end() } catch { /* ignore */ }
-      })
-    })
-    server.once('error', reject)
-    // Strictly bind ONLY to 127.0.0.1 ephemeral port (never 0.0.0.0).
-    server.listen(0, '127.0.0.1', () => {
-      const addr = server.address() as AddressInfo | null
-      if (!addr || typeof addr.port !== 'number') {
-        server.close()
-        reject(new Error('Failed to allocate loopback ephemeral port for lab target.'))
-        return
-      }
-      resolvePromise({ server, port: addr.port })
-    })
-  })
+/** Readiness probe argv for known database images (falls back to a Node TCP probe). */
+function readinessProbeCommand(kind: LabDatabaseKind | null, port: number): string[] | null {
+  switch (kind) {
+    case 'postgres':
+      return ['pg_isready', '-h', '127.0.0.1', '-p', String(port)]
+    case 'mysql':
+    case 'mariadb':
+      return ['mysqladmin', 'ping', '-h', '127.0.0.1', '--silent']
+    case 'redis':
+      return ['redis-cli', '-h', '127.0.0.1', '-p', String(port), 'ping']
+    default:
+      return null
+  }
 }
 
 async function waitForHealthCheck(origin: string, healthPath: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
@@ -1392,18 +2030,30 @@ async function waitForHealthCheck(origin: string, healthPath: string, timeoutMs:
   throw new Error(`Lab target health check timed out after ${timeoutMs}ms at ${url} (${lastError}).`)
 }
 
-async function waitForContainerPort(containerName: string, port: number, timeoutMs = 10_000, signal?: AbortSignal): Promise<void> {
+async function waitForContainerPort(
+  docker: DockerRunner,
+  containerName: string,
+  port: number,
+  options: { kind?: LabDatabaseKind | null; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 10_000
   const deadline = Date.now() + timeoutMs
   const probeJs = `const net=require('net');const s=net.connect(${port},'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),1000);`
+  const nativeProbe = readinessProbeCommand(options.kind ?? null, port)
   while (Date.now() < deadline) {
-    signal?.throwIfAborted()
+    options.signal?.throwIfAborted()
     try {
-      await runDocker(['exec', containerName, 'node', '-e', probeJs], AbortSignal.timeout(2_000))
+      if (nativeProbe) {
+        await docker(['exec', containerName, ...nativeProbe], AbortSignal.timeout(2_000))
+        return
+      }
+      await docker(['exec', containerName, 'node', '-e', probeJs], AbortSignal.timeout(2_000))
       return
     } catch {
-      await delay(200, undefined, { signal }).catch(() => undefined)
+      await delay(200, undefined, { signal: options.signal }).catch(() => undefined)
     }
   }
+  // Readiness of optional sidecars is advisory: the app health check is the authoritative gate.
 }
 
 function buildSyntheticEnvArgs(
@@ -1519,8 +2169,66 @@ function choosePrimaryService(services: readonly LabServiceSpec[], labConfig: La
   )
 }
 
+// ===========================================================================
+// Signal / crash reaping
+// ===========================================================================
+
+const ACTIVE_LAB_RUNNERS = new Set<LabRunner>()
+let labSignalHooksInstalled = false
+
+function spawnDockerSync(args: string[], timeoutMs = 5_000): string {
+  try {
+    const result = spawnSync('docker', args, {
+      env: dockerEnv(),
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return typeof result.stdout === 'string' ? result.stdout : ''
+  } catch {
+    return ''
+  }
+}
+
+function installLabSignalHooks(): void {
+  if (labSignalHooksInstalled) return
+  labSignalHooksInstalled = true
+  const reapThenReraise = (signal: NodeJS.Signals) => {
+    for (const runner of ACTIVE_LAB_RUNNERS) runner.reapSyncAll()
+    // Re-deliver the signal with our listener removed so the default action/other handlers run.
+    try {
+      process.kill(process.pid, signal)
+    } catch {
+      // Ignore: the process is already exiting.
+    }
+  }
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.once(signal, () => reapThenReraise(signal))
+  }
+  process.once('exit', () => {
+    for (const runner of ACTIVE_LAB_RUNNERS) runner.reapSyncAll()
+  })
+}
+
+export interface LabRunnerOptions {
+  /** Where crash-recovery records live. Defaults to GUARDIAN_LAB_STATE_DIR or <tmp>/guardian-lab-state. */
+  stateDir?: string
+  /** Injectable Docker CLI runner (tests use a deterministic fake). */
+  docker?: DockerRunner
+  env?: NodeJS.ProcessEnv
+}
+
 export class LabRunner {
   private readonly active = new Map<string, InternalTargetState>()
+  private readonly docker: DockerRunner
+  private readonly stateDir: string
+  private readonly env: NodeJS.ProcessEnv
+
+  constructor(options: LabRunnerOptions = {}) {
+    this.docker = options.docker ?? runDocker
+    this.env = options.env ?? process.env
+    this.stateDir = options.stateDir ?? labStateDir(this.env)
+  }
 
   getTarget(runId: string): LabTargetHandle | undefined {
     return this.active.get(runId)?.handle
@@ -1528,6 +2236,196 @@ export class LabRunner {
 
   listTargets(): LabTargetHandle[] {
     return [...this.active.values()].map(s => s.handle)
+  }
+
+  private async tryDocker(args: string[], signal?: AbortSignal): Promise<boolean> {
+    try {
+      await this.docker(args, signal ?? AbortSignal.timeout(10_000))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private async listByLabel(kind: 'container' | 'network' | 'volume', runId: string): Promise<string[]> {
+    const args = kind === 'container'
+      ? ['ps', '-aq', '--filter', `label=${LAB_LABELS.run}=${runId}`]
+      : kind === 'network'
+        ? ['network', 'ls', '-q', '--filter', `label=${LAB_LABELS.run}=${runId}`]
+        : ['volume', 'ls', '-q', '--filter', `label=${LAB_LABELS.run}=${runId}`]
+    try {
+      const out = await this.docker(args, AbortSignal.timeout(10_000))
+      return out.trim().split(/\s+/).filter(Boolean).slice(0, 64)
+    } catch {
+      return []
+    }
+  }
+
+  private recordFor(runId: string, state: InternalTargetState): LabRunRecord {
+    return {
+      version: 1,
+      runId,
+      networkName: state.handle.networkName,
+      containerNames: [...state.containerNames],
+      containerIds: [...state.containerIds],
+      proxyContainerName: state.proxyContainerName,
+      volumes: [...state.volumes],
+      sanitizedRepoDir: state.handle.sanitizedRepoDir,
+      ...(state.handle.telemetryDir ? { telemetryDir: state.handle.telemetryDir } : {}),
+      ownsTelemetryDir: state.ownsTelemetryDir,
+      proxyDir: state.proxyDir,
+      startedAt: state.handle.startedAt,
+      updatedAt: Date.now(),
+      pid: process.pid,
+    }
+  }
+
+  private persistState(runId: string): void {
+    const state = this.active.get(runId)
+    if (!state) return
+    try {
+      writeLabRunRecord(this.stateDir, this.recordFor(runId, state))
+    } catch {
+      // Persistence is best-effort: label-based reaping still covers a crash.
+    }
+  }
+
+  // --- Store lab-container registry -------------------------------------------------
+
+  private recordContainerRow(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+    imageName: string,
+    status: LabContainerStatus,
+  ): void {
+    if (!storage) return
+    try {
+      storage.recordLabContainer({ runId, containerName, imageName, status })
+    } catch {
+      // Registry persistence is advisory: label-based reaping still covers a missing row.
+    }
+  }
+
+  private markContainerOrphaned(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+  ): void {
+    if (!storage) return
+    try {
+      storage.markLabContainerOrphaned(runId, containerName)
+    } catch {
+      // Best-effort: the durable label/recovery record remains the source of truth.
+    }
+  }
+
+  /**
+   * Delete the registry row on normal reclamation. The merged Store exposes no delete method, so
+   * use its public SQLite client (or a future `deleteLabContainer` method when present) without
+   * changing store.ts.
+   */
+  private deleteContainerRow(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+  ): void {
+    if (!storage) return
+    try {
+      const extended = storage as unknown as {
+        deleteLabContainer?: (runId: string, containerName: string) => void
+        client?: { prepare: (sql: string) => { run: (...params: unknown[]) => unknown } }
+      }
+      if (typeof extended.deleteLabContainer === 'function') {
+        extended.deleteLabContainer(runId, containerName)
+        return
+      }
+      if (extended.client) {
+        extended.client
+          .prepare('DELETE FROM lab_containers WHERE run_id = ? AND container_name = ?')
+          .run(runId, containerName)
+      }
+    } catch {
+      // Best-effort: a stale row is reclaimed by Store.recover() on the next restart.
+    }
+  }
+
+  /**
+   * Remove one container and its registry row. The row is deleted only when the container was
+   * removed, or when docker confirms it is already gone; a container that still exists keeps its
+   * row so a later recovery retries instead of losing the orphan.
+   */
+  private async removeContainerAndRow(
+    storage: LabContainerStore | undefined,
+    runId: string,
+    containerName: string,
+  ): Promise<boolean> {
+    const removed = await this.tryDocker(['container', 'rm', '--force', containerName], AbortSignal.timeout(10_000))
+    if (removed) {
+      this.deleteContainerRow(storage, runId, containerName)
+      return true
+    }
+    const stillExists = await this.tryDocker(
+      ['inspect', '-f', '{{.Id}}', containerName],
+      AbortSignal.timeout(5_000),
+    )
+    if (!stillExists) this.deleteContainerRow(storage, runId, containerName)
+    return false
+  }
+
+  /**
+   * Reclaim containers returned by `Store.recover()`. Each candidate is removed only when its
+   * `dev.guardian.run` label matches the requested run, so a stale/corrupt row can never delete a
+   * container belonging to another run. Missing containers are treated as already reclaimed.
+   */
+  async reclaimPersisted(
+    containers: ReadonlyArray<PersistedLabContainerRef>,
+    storage?: LabContainerStore,
+  ): Promise<LabReclaimResult> {
+    const result: LabReclaimResult = { removed: 0, skipped: 0, mismatched: 0 }
+    const seen = new Set<string>()
+    for (const ref of containers.slice(0, 64)) {
+      if (typeof ref?.runId !== 'string' || typeof ref?.containerName !== 'string') {
+        result.skipped += 1
+        continue
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(ref.runId)) {
+        result.skipped += 1
+        continue
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(ref.containerName)) {
+        result.skipped += 1
+        continue
+      }
+      const key = `${ref.runId}\u0000${ref.containerName}`
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      let label: string | null = null
+      try {
+        label = (await this.docker(
+          ['inspect', '-f', `{{index .Config.Labels "${LAB_LABELS.run}"}}`, ref.containerName],
+          AbortSignal.timeout(5_000),
+        )).trim()
+      } catch {
+        // Container is already gone: nothing to remove, but clear any stale row.
+        this.deleteContainerRow(storage, ref.runId, ref.containerName)
+        result.skipped += 1
+        continue
+      }
+      if (label !== ref.runId) {
+        result.mismatched += 1
+        continue
+      }
+      const removed = await this.tryDocker(['container', 'rm', '--force', ref.containerName], AbortSignal.timeout(10_000))
+      if (removed) {
+        result.removed += 1
+        this.deleteContainerRow(storage, ref.runId, ref.containerName)
+      } else {
+        result.skipped += 1
+      }
+    }
+    return result
   }
 
   private async launchServiceContainer(params: {
@@ -1538,13 +2436,21 @@ export class LabRunner {
     labConfig: LabConfig
     isPrimary: boolean
     telemetryDir?: string
+    storage?: LabContainerStore
     signal?: AbortSignal
-  }): Promise<{ containerName: string; containerIp: string; imageName: string; builtImage: boolean }> {
-    const { runId, networkName, sanitizedRepoDir, service, labConfig, isPrimary, telemetryDir, signal } = params
+  }): Promise<{
+    containerName: string
+    containerId: string
+    containerIp: string
+    imageName: string
+    builtImage: boolean
+    volumes: string[]
+  }> {
+    const { runId, networkName, sanitizedRepoDir, service, labConfig, isPrimary, telemetryDir, storage, signal } = params
+    const containerUser = resolveLabContainerUser(this.env)
     const shortId = createHash('sha256').update(`${runId}:${service.name}:${randomUUID()}`).digest('hex').slice(0, 10)
     const safeSvc = service.name.replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'svc'
     const containerName = `guardian-lab-${safeSvc}-${shortId}`
-    const internalPort = service.internalPort ?? (isPrimary ? (labConfig.internalPort ?? 8080) : 8080)
     const memoryLimit = service.memoryLimit ?? labConfig.memoryLimit ?? '512m'
     const cpus = service.cpus ?? labConfig.cpus ?? '1.0'
     const pidsLimit = service.pidsLimit ?? labConfig.pidsLimit ?? 128
@@ -1562,6 +2468,15 @@ export class LabRunner {
             : undefined))
         : undefined)
 
+    const rawCommand = service.command ?? service.startCommand ?? (isPrimary ? labConfig.startCommand : undefined)
+    const rawEntrypoint = service.entrypoint
+    let entrypointArg: string | undefined
+    if (Array.isArray(rawEntrypoint) && rawEntrypoint.length > 0) {
+      entrypointArg = rawEntrypoint[0]
+    } else if (typeof rawEntrypoint === 'string' && rawEntrypoint.trim()) {
+      entrypointArg = rawEntrypoint.trim()
+    }
+
     if (dockerfileRel) {
       const dockerfileFull = safeResolveUnderRoot(sanitizedRepoDir, dockerfileRel)
       if (!existsSync(dockerfileFull)) {
@@ -1572,24 +2487,22 @@ export class LabRunner {
         AbortSignal.timeout(labConfig.buildTimeoutMs ?? 120_000),
         ...(signal ? [signal] : []),
       ])
-      await runDocker(
+      await this.docker(
         ['build', '--pull=false', '--network', 'none', '-f', dockerfileFull, '-t', imageName, sanitizedRepoDir],
         buildSignal,
       )
       builtImage = true
-      const overrideCmd = service.command ?? service.startCommand ?? (isPrimary ? labConfig.startCommand : undefined)
-      if (Array.isArray(overrideCmd)) {
-        cmd = overrideCmd
-      } else if (typeof overrideCmd === 'string' && overrideCmd.trim()) {
-        cmd = ['sh', '-c', overrideCmd.trim()]
+      if (Array.isArray(rawCommand)) {
+        cmd = rawCommand
+      } else if (typeof rawCommand === 'string' && rawCommand.trim()) {
+        cmd = ['sh', '-c', rawCommand.trim()]
       }
     } else if (service.image || service.command || service.startCommand) {
       imageName = service.image || labConfig.image || 'node:24-bookworm-slim'
-      const rawCmd = service.command ?? service.startCommand ?? (isPrimary ? labConfig.startCommand : undefined)
-      if (Array.isArray(rawCmd)) {
-        cmd = rawCmd
-      } else if (typeof rawCmd === 'string' && rawCmd.trim()) {
-        cmd = ['sh', '-c', rawCmd.trim()]
+      if (Array.isArray(rawCommand)) {
+        cmd = rawCommand
+      } else if (typeof rawCommand === 'string' && rawCommand.trim()) {
+        cmd = ['sh', '-c', rawCommand.trim()]
       } else if (isPrimary) {
         const resolved = resolveStartCommand(sanitizedRepoDir, { ...labConfig, image: imageName })
         imageName = resolved.image
@@ -1603,7 +2516,48 @@ export class LabRunner {
       mountArgs.push('--mount', `type=bind,source=${sanitizedRepoDir},target=/app,readonly`, '--workdir', '/app')
     }
 
+    // Compose entrypoint arrays keep the image binary but prepend their arguments to the command.
+    if (Array.isArray(rawEntrypoint) && rawEntrypoint.length > 1) {
+      cmd = [...rawEntrypoint.slice(1), ...cmd]
+    }
+
+    const mergedEnv: Record<string, string> = { ...(isPrimary ? labConfig.env : undefined), ...(service.env ?? {}) }
+    const dbKind = detectLabDatabaseKind({
+      image: imageName,
+      command: cmd,
+      env: mergedEnv,
+    })
+
+    // SQLite files normally live under the read-only /app bind mount; point them at the overlay.
+    if (dbKind === 'sqlite' && mergedEnv.DATABASE_URL) {
+      mergedEnv.DATABASE_URL = rewriteSqliteDatabaseUrl(mergedEnv.DATABASE_URL)
+    }
+
     const extraInternalEnv: Record<string, string> = {}
+    const volumes: string[] = []
+    let overlay: LabWritableOverlay | null = null
+    if (dbKind) {
+      overlay = buildWritableDataOverlay({
+        kind: dbKind,
+        serviceName: service.name,
+        runId,
+        containerUser,
+        backing: this.env[LAB_DB_VOLUMES_ENV] === '1' ? 'volume' : 'tmpfs',
+      })
+      mountArgs.push(...overlay.mountArgs)
+      Object.assign(extraInternalEnv, overlay.env)
+      if (overlay.volumeName) {
+        const sized = ['volume', 'create',
+          '--label', `${LAB_LABELS.lab}=1`,
+          '--label', `${LAB_LABELS.run}=${runId}`,
+          '--label', `${LAB_LABELS.service}=${service.name}`,
+          overlay.volumeName,
+        ]
+        await this.docker(sized, signal)
+        volumes.push(overlay.volumeName)
+      }
+    }
+
     if (isPrimary && telemetryDir) {
       const iastActive = Boolean(labConfig.iastEnabled)
       mountArgs.push(...buildIastTelemetryMountArgs(telemetryDir, iastActive))
@@ -1621,7 +2575,10 @@ export class LabRunner {
       }
     }
 
-    const mergedEnv = { ...(isPrimary ? labConfig.env : undefined), ...(service.env ?? {}) }
+    const dbDefaultPort = dbKind ? defaultLabDatabasePort(dbKind) : undefined
+    const internalPort = service.internalPort
+      ?? dbDefaultPort
+      ?? (isPrimary ? (labConfig.internalPort ?? 8080) : 8080)
 
     const runArgs = buildLabContainerRunArgs({
       containerName,
@@ -1637,23 +2594,38 @@ export class LabRunner {
       memoryLimit,
       cpus,
       pidsLimit,
-      user: resolveLabContainerUser(),
+      user: containerUser,
+      readOnly: overlay ? overlay.readOnlyRootfs : true,
+      writableTmpfs: overlay?.tmpfsArgs ?? [],
+      networkAliases: service.networkAliases,
+      ...(entrypointArg ? { entrypoint: entrypointArg } : {}),
     })
 
     try {
-      await runDocker(runArgs, signal)
-      const rawIp = (await runDocker(
+      await this.docker(runArgs, signal)
+      // Persist the labelled container immediately: if the following inspect/health steps fail the
+      // row is flipped to `orphaned` and a later Store.recover()/reclaimPersisted() reaps it.
+      this.recordContainerRow(storage, runId, containerName, imageName, 'running')
+      const containerId = (await this.docker(['inspect', '-f', '{{.Id}}', containerName], signal)).trim()
+      const rawIp = (await this.docker(
         ['inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', containerName],
         signal,
       )).trim()
       if (!rawIp || !/^\d+\.\d+\.\d+\.\d+$/.test(rawIp)) {
         throw new Error(`Failed to resolve internal bridge IP for lab container ${containerName}.`)
       }
-      return { containerName, containerIp: rawIp, imageName, builtImage }
+      if (!/^[a-f0-9]{12,64}$/.test(containerId)) {
+        throw new Error(`Failed to resolve container id for lab container ${containerName}.`)
+      }
+      return { containerName, containerId, containerIp: rawIp, imageName, builtImage, volumes }
     } catch (err) {
-      await runDocker(['container', 'rm', '--force', containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      this.markContainerOrphaned(storage, runId, containerName)
+      await this.docker(['container', 'rm', '--force', containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
       if (builtImage) {
-        await runDocker(['image', 'rm', '--force', imageName], AbortSignal.timeout(5_000)).catch(() => undefined)
+        await this.docker(['image', 'rm', '--force', imageName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      }
+      for (const volume of volumes) {
+        await this.docker(['volume', 'rm', '--force', volume], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       throw err
     }
@@ -1661,13 +2633,17 @@ export class LabRunner {
 
   async startLabTarget(params: StartLabTargetParams): Promise<LabTargetHandle> {
     assertLocalLabAllowed(params.environment)
+    validateLabRunId(params.runId)
     params.signal?.throwIfAborted()
+    installLabSignalHooks()
+    ACTIVE_LAB_RUNNERS.add(this)
 
     if (!existsSync(params.repoDir) || !statSync(params.repoDir).isDirectory()) {
       throw new Error(`Lab repository directory does not exist: ${params.repoDir}`)
     }
 
     const labConfig: LabConfig = params.labConfig ?? {}
+    const containerUser = resolveLabContainerUser(this.env)
 
     // Strict pre-launch validation BEFORE touching Docker or creating any networks/containers!
     validateEnvMap(labConfig.env, 'labConfig.env')
@@ -1679,7 +2655,7 @@ export class LabRunner {
         throw new Error(`Docker Compose file not found: ${labConfig.dockerComposeFile}`)
       }
       const composeYaml = readFileSync(composePath, 'utf8')
-      composeServices = parseAndSanitizeComposeYaml(composeYaml)
+      composeServices = parseAndSanitizeComposeYaml(composeYaml, { env: this.env })
     }
 
     let explicitServices: LabServiceSpec[] | undefined
@@ -1720,12 +2696,15 @@ export class LabRunner {
     }
 
     const internalPort = primaryService.internalPort ?? labConfig.internalPort ?? 8080
-    const healthPath = primaryService.healthPath ?? labConfig.healthPath ?? '/health'
+    const healthPath = primaryService.healthPath
+      ?? deriveHealthPathFromHealthcheck(primaryService.healthcheck)
+      ?? labConfig.healthPath
+      ?? '/health'
     const runSlug = params.runId.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase() || 'run'
     const shortRand = createHash('sha256').update(`${params.runId}:${randomUUID()}`).digest('hex').slice(0, 8)
     const networkName = `guardian-lab-${runSlug}-${shortRand}`
 
-    const sanitizedRepoDir = mkdtempSync(join(tmpdir(), 'guardian-lab-repo-'))
+    const sanitizedRepoDir = mkdtempSync(join(tmpdir(), LAB_REPO_DIR_PREFIX))
     const repoReal = realpathSync(params.repoDir)
     copySanitizedRepo(repoReal, sanitizedRepoDir, repoReal)
 
@@ -1735,13 +2714,12 @@ export class LabRunner {
     if (labConfig.iastEnabled) {
       // IAST telemetry is mounted into the lab container. Keep each run's dir owner-only (0700),
       // unique per run (never shared across runs), and run the container as a non-root user.
-      const containerUser = resolveLabContainerUser()
       if (params.telemetryDir) {
         telemetryDir = createPerRunIastTelemetryDir(params.telemetryDir, params.runId, containerUser)
         ephemeralTelemetryDir = true
       } else {
         telemetryDir = prepareIastTelemetryDir(
-          mkdtempSync(join(tmpdir(), 'guardian-lab-telemetry-')),
+          mkdtempSync(join(tmpdir(), LAB_TELEMETRY_DIR_PREFIX)),
           containerUser,
         )
         assertIastTelemetryDirWritable(telemetryDir, containerUser)
@@ -1750,24 +2728,23 @@ export class LabRunner {
       }
     }
 
+    const proxyDir = createLabProxyDir(params.runId, containerUser)
+    const proxyContainerName = `guardian-lab-proxy-${shortRand}`
+    const socketMode = labProxySocketMode(containerUser)
+
     let networkCreated = false
+    let proxyStarted = false
     const containerNames: string[] = []
+    const containerIds: string[] = []
     const builtImages: string[] = []
+    const volumes: string[] = []
     let forwarder: TcpServer | undefined
 
     try {
       // Dedicated per-run Docker --internal bridge network with inhibit_ipv4=true:
       // zero internet egress AND zero host bridge gateway IP (blocks access to host 0.0.0.0 services!).
-      await runDocker(
-        [
-          'network', 'create',
-          '--driver', 'bridge',
-          '--internal',
-          '-o', 'com.docker.network.bridge.inhibit_ipv4=true',
-          '--label', 'dev.guardian.lab=1',
-          '--label', `dev.guardian.run=${params.runId}`,
-          networkName,
-        ],
+      await this.docker(
+        buildLabNetworkCreateArgs(params.runId, networkName),
         params.signal,
       )
       networkCreated = true
@@ -1783,13 +2760,26 @@ export class LabRunner {
           service: sidecar,
           labConfig,
           isPrimary: false,
+          storage: params.storage,
           signal: params.signal,
         })
         containerNames.push(launched.containerName)
+        containerIds.push(launched.containerId)
+        volumes.push(...launched.volumes)
         if (launched.builtImage) builtImages.push(launched.imageName)
-        if (sidecar.internalPort) {
-          baseUrls[sidecar.name] = `http://${sidecar.name}:${sidecar.internalPort}`
-          await waitForContainerPort(launched.containerName, sidecar.internalPort, 8_000, params.signal)
+        const sidecarKind = detectLabDatabaseKind({
+          image: sidecar.image,
+          command: sidecar.command,
+          env: sidecar.env,
+        })
+        const sidecarPort = sidecar.internalPort ?? defaultLabDatabasePort(sidecarKind ?? 'sqlite')
+        if (sidecarPort) {
+          if (!sidecarKind) baseUrls[sidecar.name] = `http://${sidecar.name}:${sidecarPort}`
+          await waitForContainerPort(this.docker, launched.containerName, sidecarPort, {
+            kind: sidecarKind,
+            timeoutMs: 8_000,
+            signal: params.signal,
+          })
         }
       }
 
@@ -1801,13 +2791,41 @@ export class LabRunner {
         labConfig,
         isPrimary: true,
         telemetryDir,
+        storage: params.storage,
         signal: params.signal,
       })
       containerNames.push(primaryLaunched.containerName)
+      containerIds.push(primaryLaunched.containerId)
+      volumes.push(...primaryLaunched.volumes)
       if (primaryLaunched.builtImage) builtImages.push(primaryLaunched.imageName)
 
-      const forwardTarget = { containerName: primaryLaunched.containerName, port: internalPort }
-      const proxy = await createLoopbackForwarder(forwardTarget)
+      // Point the in-network proxy at the primary container (container DNS name, unique per launch).
+      writeLabProxyTarget(proxyDir, primaryLaunched.containerName, internalPort)
+      const proxyImage = this.env[LAB_PROXY_IMAGE_ENV]?.trim() || LAB_PROXY_IMAGE_DEFAULT
+      await this.docker(buildLabProxyRunArgs({
+        containerName: proxyContainerName,
+        networkName,
+        runId: params.runId,
+        proxyDir,
+        image: proxyImage,
+        user: containerUser,
+        targetHost: primaryLaunched.containerName,
+        targetPort: internalPort,
+        socketMode,
+      }), params.signal)
+      proxyStarted = true
+      this.recordContainerRow(params.storage, params.runId, proxyContainerName, proxyImage, 'running')
+      let socketPath: string
+      try {
+        socketPath = await waitForLabProxySocket(proxyDir, 15_000, params.signal)
+      } catch (err) {
+        const status = await this.docker(
+          ['inspect', '-f', '{{.State.Status}} exit={{.State.ExitCode}}', proxyContainerName],
+          AbortSignal.timeout(5_000),
+        ).catch(() => 'unavailable')
+        throw new Error(`${err instanceof Error ? err.message : String(err)} (proxy container: ${status.trim()}).`)
+      }
+      const proxy = await createLoopbackSocketForwarder(socketPath)
       forwarder = proxy.server
 
       const origin = `http://127.0.0.1:${proxy.port}`
@@ -1823,7 +2841,7 @@ export class LabRunner {
           AbortSignal.timeout(30_000),
           ...(params.signal ? [params.signal] : []),
         ])
-        const seedStdout = await runDocker(
+        const seedStdout = await this.docker(
           ['exec', primaryLaunched.containerName, 'sh', '-c', labConfig.seedCommand.trim()],
           seedSignal,
         )
@@ -1885,36 +2903,52 @@ export class LabRunner {
         primaryService,
         builtImages,
         containerNames,
+        containerIds,
+        volumes,
         forwarder: proxy.server,
-        forwardTarget,
+        proxyContainerName,
+        proxyDir,
         ownsTelemetryDir,
+        ...(params.storage ? { storage: params.storage } : {}),
       })
+      this.persistState(params.runId)
 
       return handle
     } catch (err) {
       if (forwarder) {
         await new Promise<void>(res => forwarder!.close(() => res())).catch(() => undefined)
       }
+      if (proxyStarted) {
+        this.markContainerOrphaned(params.storage, params.runId, proxyContainerName)
+        await this.docker(['container', 'rm', '--force', proxyContainerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      }
       for (const cname of containerNames) {
-        await runDocker(['container', 'rm', '--force', cname], AbortSignal.timeout(5_000)).catch(() => undefined)
+        this.markContainerOrphaned(params.storage, params.runId, cname)
+        await this.docker(['container', 'rm', '--force', cname], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       await this.sweepOrphanContainersForRun(params.runId)
+      for (const vol of volumes) {
+        await this.docker(['volume', 'rm', '--force', vol], AbortSignal.timeout(5_000)).catch(() => undefined)
+      }
       for (const img of builtImages) {
-        await runDocker(['image', 'rm', '--force', img], AbortSignal.timeout(5_000)).catch(() => undefined)
+        await this.docker(['image', 'rm', '--force', img], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       if (networkCreated) {
-        await runDocker(['network', 'rm', networkName], AbortSignal.timeout(5_000)).catch(() => undefined)
+        await this.docker(['network', 'rm', networkName], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
-      rmSync(sanitizedRepoDir, { recursive: true, force: true })
+      safeRemoveLabTempDir(sanitizedRepoDir, [LAB_REPO_DIR_PREFIX])
+      safeRemoveLabTempDir(proxyDir, [LAB_PROXY_DIR_PREFIX])
       if (ephemeralTelemetryDir && telemetryDir) {
-        rmSync(telemetryDir, { recursive: true, force: true })
+        safeRemoveLabTempDir(telemetryDir)
       }
+      removeLabRunRecord(this.stateDir, params.runId)
       throw err
     }
   }
 
   async rebuildWithPatch(runId: string, patchDiff: string, signal?: AbortSignal): Promise<LabTargetHandle> {
     assertLocalLabAllowed('local-lab')
+    validateLabRunId(runId)
     const state = this.active.get(runId)
     if (!state) {
       throw new Error(`No active local-lab target found for run ${runId}.`)
@@ -1923,6 +2957,7 @@ export class LabRunner {
     applyUnifiedDiffToDirectory(state.handle.sanitizedRepoDir, patchDiff)
 
     const prevContainer = state.handle.containerName
+    const prevContainerId = state.containerIds[state.containerNames.indexOf(prevContainer)]
     const prevBuiltImage = state.builtImages.includes(state.handle.imageName) ? state.handle.imageName : undefined
 
     const launched = await this.launchServiceContainer({
@@ -1933,11 +2968,12 @@ export class LabRunner {
       labConfig: state.labConfig,
       isPrimary: true,
       telemetryDir: state.handle.telemetryDir,
+      storage: state.storage,
       signal,
     })
 
-    state.forwardTarget.containerName = launched.containerName
-    state.forwardTarget.port = state.handle.internalPort
+    // Retarget the in-network proxy before the health check so the rebuilt container is the target.
+    writeLabProxyTarget(state.proxyDir, launched.containerName, state.handle.internalPort)
 
     try {
       await waitForHealthCheck(
@@ -1947,16 +2983,24 @@ export class LabRunner {
         signal,
       )
     } catch (err) {
-      state.forwardTarget.containerName = prevContainer
-      await runDocker(['container', 'rm', '--force', launched.containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      writeLabProxyTarget(state.proxyDir, prevContainer, state.handle.internalPort)
+      this.markContainerOrphaned(state.storage, runId, launched.containerName)
+      await this.docker(['container', 'rm', '--force', launched.containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
       if (launched.builtImage) {
-        await runDocker(['image', 'rm', '--force', launched.imageName], AbortSignal.timeout(5_000)).catch(() => undefined)
+        await this.docker(['image', 'rm', '--force', launched.imageName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      }
+      for (const volume of launched.volumes) {
+        await this.docker(['volume', 'rm', '--force', volume], AbortSignal.timeout(5_000)).catch(() => undefined)
       }
       throw err
     }
 
+    const prevIndex = state.containerNames.indexOf(prevContainer)
     state.containerNames = state.containerNames.filter(c => c !== prevContainer)
     state.containerNames.push(launched.containerName)
+    if (prevIndex >= 0) state.containerIds.splice(prevIndex, 1)
+    state.containerIds.push(launched.containerId)
+    state.volumes.push(...launched.volumes)
     if (launched.builtImage) state.builtImages.push(launched.imageName)
 
     state.handle = {
@@ -1969,56 +3013,197 @@ export class LabRunner {
       startedAt: Date.now(),
     }
 
-    await runDocker(['container', 'rm', '--force', prevContainer], AbortSignal.timeout(5_000)).catch(() => undefined)
+    await this.removeContainerAndRow(state.storage, runId, prevContainer)
     if (prevBuiltImage && prevBuiltImage !== launched.imageName) {
       state.builtImages = state.builtImages.filter(i => i !== prevBuiltImage)
-      await runDocker(['image', 'rm', '--force', prevBuiltImage], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.docker(['image', 'rm', '--force', prevBuiltImage], AbortSignal.timeout(5_000)).catch(() => undefined)
     }
+    state.containerIds = state.containerIds.filter(id => id !== prevContainerId)
+    this.persistState(runId)
 
     return state.handle
   }
 
   private async sweepOrphanContainersForRun(runId: string): Promise<void> {
+    const ids = await this.listByLabel('container', runId)
+    if (ids.length > 0) {
+      await this.docker(['container', 'rm', '--force', ...ids], AbortSignal.timeout(10_000)).catch(() => undefined)
+    }
+  }
+
+  /**
+   * Reap every resource for a run: containers/networks/volumes by label, plus every path in the
+   * persisted crash record. Idempotent — calling it twice is safe and returns zero removals.
+   */
+  async recover(runId: string, storage?: LabContainerStore): Promise<LabRecoveryResult> {
+    validateLabRunId(runId)
+    if (this.active.has(runId)) {
+      await this.stopLabTarget(runId)
+    }
+    const record = readLabRunRecord(this.stateDir, runId)
+    const result: LabRecoveryResult = {
+      runId,
+      containersRemoved: 0,
+      networksRemoved: 0,
+      volumesRemoved: 0,
+      tempDirsRemoved: 0,
+      recoveredFromRecord: record !== null,
+    }
+
+    const containerTargets = new Set<string>([
+      ...(record?.containerNames ?? []),
+      ...(record?.containerIds ?? []),
+      ...(record?.proxyContainerName ? [record.proxyContainerName] : []),
+      ...(await this.listByLabel('container', runId)),
+    ])
+    const processedContainers = new Set<string>()
+    for (const target of containerTargets) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(target)) continue
+      if (await this.removeContainerAndRow(storage, runId, target)) result.containersRemoved += 1
+      processedContainers.add(target)
+    }
+    if (storage) {
+      try {
+        for (const row of storage.listLabContainers(runId)) {
+          if (processedContainers.has(row.containerName)) continue
+          if (await this.removeContainerAndRow(storage, runId, row.containerName)) result.containersRemoved += 1
+        }
+      } catch {
+        // Registry cleanup is best-effort; the next Store.recover() retries.
+      }
+    }
+
+    const networkTargets = new Set<string>([
+      ...(record?.networkName ? [record.networkName] : []),
+      ...(await this.listByLabel('network', runId)),
+    ])
+    for (const network of networkTargets) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(network)) continue
+      if (await this.tryDocker(['network', 'rm', network])) result.networksRemoved += 1
+    }
+
+    const volumeTargets = new Set<string>([
+      ...(record?.volumes ?? []),
+      ...(await this.listByLabel('volume', runId)),
+    ])
+    for (const volume of volumeTargets) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(volume)) continue
+      if (await this.tryDocker(['volume', 'rm', '--force', volume])) result.volumesRemoved += 1
+    }
+
+    if (safeRemoveLabTempDir(record?.sanitizedRepoDir, [LAB_REPO_DIR_PREFIX])) result.tempDirsRemoved += 1
+    if (record?.ownsTelemetryDir && safeRemoveLabTempDir(record.telemetryDir)) result.tempDirsRemoved += 1
+    if (safeRemoveLabTempDir(record?.proxyDir, [LAB_PROXY_DIR_PREFIX])) result.tempDirsRemoved += 1
+
+    removeLabRunRecord(this.stateDir, runId)
+    return result
+  }
+
+  /**
+   * Recover every run found in persisted records, the lab label scan and (optionally) the Store
+   * registry rows. Callers that own `Store.recover()` can pass its `reclaimedContainers` refs to
+   * `reclaimPersisted()` instead; this method is the self-contained startup path.
+   */
+  async recoverAll(storage?: LabContainerStore): Promise<LabRecoveryResult[]> {
+    const runIds = new Set<string>()
     try {
-      const out = await runDocker(
-        ['ps', '-aq', '--filter', `label=dev.guardian.run=${runId}`],
-        AbortSignal.timeout(5_000),
-      )
-      const ids = out.trim().split(/\s+/).filter(Boolean)
-      if (ids.length > 0) {
-        await runDocker(['container', 'rm', '--force', ...ids], AbortSignal.timeout(10_000)).catch(() => undefined)
+      for (const entry of readdirSync(this.stateDir)) {
+        if (!entry.endsWith('.json')) continue
+        try {
+          const parsed = JSON.parse(readFileSync(join(this.stateDir, entry), 'utf8')) as { runId?: unknown }
+          if (typeof parsed.runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(parsed.runId)) {
+            runIds.add(parsed.runId)
+          }
+        } catch {
+          // Ignore unreadable/corrupt records; the label scan below still finds live orphans.
+        }
       }
     } catch {
-      // Best-effort sweep
+      // No state dir yet.
     }
+
+    try {
+      const ids = (await this.docker(['ps', '-aq', '--filter', `label=${LAB_LABELS.lab}=1`], AbortSignal.timeout(10_000)))
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 64)
+      if (ids.length > 0) {
+        const labels = await this.docker(
+          ['inspect', '-f', `{{index .Config.Labels "${LAB_LABELS.run}"}}`, ...ids],
+          AbortSignal.timeout(10_000),
+        )
+        for (const line of labels.split('\n')) {
+          const runId = line.trim()
+          if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(runId)) runIds.add(runId)
+        }
+      }
+    } catch {
+      // Docker unavailable: records still get cleaned up.
+    }
+
+    const results: LabRecoveryResult[] = []
+    for (const runId of [...runIds].slice(0, MAX_RECOVERED_RUNS)) {
+      if (runId === '<no value>') continue
+      results.push(await this.recover(runId, storage))
+    }
+    return results
+  }
+
+  /**
+   * Synchronous best-effort reaping used from SIGINT/SIGTERM/exit handlers where async cleanup
+   * cannot run. Removes persisted ids/names, sweeps by label, then removes scratch dirs.
+   */
+  reapSyncAll(): void {
+    for (const [runId, state] of this.active.entries()) {
+      const names = [state.proxyContainerName, ...state.containerNames]
+      for (const name of names) {
+        if (/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(name)) spawnDockerSync(['container', 'rm', '--force', name])
+      }
+      for (const id of state.containerIds) {
+        if (/^[a-f0-9]{12,64}$/.test(id)) spawnDockerSync(['container', 'rm', '--force', id])
+      }
+      for (const listed of spawnDockerSync(['ps', '-aq', '--filter', `label=${LAB_LABELS.run}=${runId}`])
+        .trim().split(/\s+/).filter(Boolean)) {
+        spawnDockerSync(['container', 'rm', '--force', listed])
+      }
+      spawnDockerSync(['network', 'rm', state.handle.networkName])
+      for (const volume of state.volumes) spawnDockerSync(['volume', 'rm', '--force', volume])
+      safeRemoveLabTempDir(state.handle.sanitizedRepoDir, [LAB_REPO_DIR_PREFIX])
+      safeRemoveLabTempDir(state.proxyDir, [LAB_PROXY_DIR_PREFIX])
+      if (state.ownsTelemetryDir) safeRemoveLabTempDir(state.handle.telemetryDir)
+      removeLabRunRecord(this.stateDir, runId)
+    }
+    this.active.clear()
   }
 
   async stopLabTarget(runId: string): Promise<void> {
     const state = this.active.get(runId)
-    if (!state) return
+    if (!state) {
+      removeLabRunRecord(this.stateDir, runId)
+      return
+    }
     this.active.delete(runId)
 
     await new Promise<void>(res => state.forwarder.close(() => res())).catch(() => undefined)
+    await this.removeContainerAndRow(state.storage, runId, state.proxyContainerName)
     for (const cname of state.containerNames) {
-      await runDocker(['container', 'rm', '--force', cname], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainerAndRow(state.storage, runId, cname)
     }
     await this.sweepOrphanContainersForRun(runId)
+    for (const volume of state.volumes) {
+      await this.docker(['volume', 'rm', '--force', volume], AbortSignal.timeout(5_000)).catch(() => undefined)
+    }
     for (const img of state.builtImages) {
-      await runDocker(['image', 'rm', '--force', img], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.docker(['image', 'rm', '--force', img], AbortSignal.timeout(5_000)).catch(() => undefined)
     }
-    await runDocker(['network', 'rm', state.handle.networkName], AbortSignal.timeout(5_000)).catch(() => undefined)
-    try {
-      rmSync(state.handle.sanitizedRepoDir, { recursive: true, force: true })
-    } catch {
-      // Best-effort cleanup
-    }
+    await this.docker(['network', 'rm', state.handle.networkName], AbortSignal.timeout(5_000)).catch(() => undefined)
+    safeRemoveLabTempDir(state.handle.sanitizedRepoDir, [LAB_REPO_DIR_PREFIX])
+    safeRemoveLabTempDir(state.proxyDir, [LAB_PROXY_DIR_PREFIX])
     if (state.ownsTelemetryDir && state.handle.telemetryDir) {
-      try {
-        rmSync(state.handle.telemetryDir, { recursive: true, force: true })
-      } catch {
-        // Best-effort cleanup
-      }
+      safeRemoveLabTempDir(state.handle.telemetryDir)
     }
+    removeLabRunRecord(this.stateDir, runId)
   }
 
   async stopAll(): Promise<void> {

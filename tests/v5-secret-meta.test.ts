@@ -56,6 +56,15 @@ function assertNoRawSecrets(serialized: string, secrets: readonly string[]): voi
   }
 }
 
+function artifactContents(dir: string): string {
+  return readdirSync(dir, { withFileTypes: true })
+    .map(entry => {
+      const path = join(dir, entry.name)
+      return entry.isDirectory() ? artifactContents(path) : readFileSync(path, 'utf8')
+    })
+    .join('\n')
+}
+
 // ============================================================================
 // 1. Pre-redaction structural scan keeps disclosure evidence without the value
 // ============================================================================
@@ -241,10 +250,8 @@ test('secretMatches persist with the exchange and raw values never reach the dat
   const dbBytes = readFileSync(join(dir, 'guardian.sqlite')).toString('utf8')
   assertNoRawSecrets(dbBytes, [jwt, rbsSecret])
   const artifactsDir = join(dir, 'artifacts')
-  const artifactContents = readdirSync(artifactsDir)
-    .map(name => readFileSync(join(artifactsDir, name)).toString('utf8'))
-    .join('\n')
-  assertNoRawSecrets(artifactContents, [jwt, rbsSecret])
+  const artifactText = artifactContents(artifactsDir)
+  assertNoRawSecrets(artifactText, [jwt, rbsSecret])
   assertNoRawSecrets(JSON.stringify(read), [jwt, rbsSecret])
 })
 

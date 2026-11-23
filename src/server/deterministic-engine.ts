@@ -149,6 +149,10 @@ export interface DeterministicEngineInput {
    * (one pass per class) rather than exhaustive depth on one class. Only the caps change.
    */
   lane?: boolean
+  /** v6: environment contract. `prod_readonly` generates no mutating hypotheses at all. */
+  environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
+  /** v6: mandatory run-scoped tag applied to benign entity values the floor creates. */
+  entityTag?: string
   classes?: ReadonlySet<string>
   /** Injection points for tests; production uses the surface-engine probe and ReplayVerifier. */
   probe?: typeof probeDifferential
@@ -273,7 +277,34 @@ export function endpointRiskScore(endpoint: EngineEndpoint): number {
   return score
 }
 
-/** Risk-rank the surface: static assets/soft baselines sink, injectable/id-bearing routes rise. */
+/** Collapse `<collection>/:id`, `<collection>/{id}` and renamed-placeholder variants of one route. */
+export function collapseRouteVariants(endpoints: readonly EngineEndpoint[]): EngineEndpoint[] {
+  const shapeOf = (pathTemplate: string): string => (pathTemplate.split('?')[0] || '/')
+    .replace(/\/(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])/g, '/:id')
+  const byShape = new Map<string, EngineEndpoint>()
+  for (const endpoint of endpoints) {
+    const key = `${endpoint.origin}|${endpoint.method.toUpperCase()}|${shapeOf(endpoint.pathTemplate)}`
+    const prior = byShape.get(key)
+    if (!prior) {
+      byShape.set(key, endpoint)
+      continue
+    }
+    const preferCurrent = endpoint.params.length > prior.params.length ||
+      (endpoint.params.length === prior.params.length && (endpoint.riskScore ?? 0) > (prior.riskScore ?? 0))
+    const keep = preferCurrent ? endpoint : prior
+    const other = preferCurrent ? prior : endpoint
+    const mergedParams = [...keep.params]
+    for (const param of other.params) {
+      if (!mergedParams.some(existing => existing.name === param.name && existing.location === param.location)) {
+        mergedParams.push(param)
+      }
+    }
+    byShape.set(key, { ...keep, params: mergedParams })
+  }
+  return [...byShape.values()]
+}
+
+/** Rank-risk the surface: static assets/soft baselines sink, injectable/id-bearing routes rise. */
 export function rankEndpoints(endpoints: readonly EngineEndpoint[]): EngineEndpoint[] {
   return endpoints
     .map(endpoint => ({ endpoint, score: endpointRiskScore(endpoint) }))
@@ -415,7 +446,7 @@ export function urlParamNames(path: string): string[] {
 }
 
 export function redirectParamNames(path: string): string[] {
-  if (/(?:sso|oauth|authorize|openid|login)/i.test(path)) return ['next', 'returnTo', 'returnUrl', 'redirect']
+  if (/(?:sso|oauth|authorize|openid|login)/i.test(path)) return ['next', 'returnTo', 'returnUrl', 'redirect', 'redirect_uri']
   if (/(?:checkout|return)/i.test(path)) return ['next', 'returnUrl', 'returnTo', 'redirect']
   if (/(?:download|export)/i.test(path)) return ['url', 'next', 'returnTo', 'redirect']
   return ['url', 'next', 'redirect', 'returnTo']
@@ -483,6 +514,8 @@ export interface EnumerateOptions {
   tier: number
   personas: readonly EnginePersona[]
   maxHypotheses?: number
+  /** Request budget the probe loop may spend; used to size class quotas fairly. */
+  maxRequests?: number
   classes?: ReadonlySet<string>
 }
 
@@ -838,7 +871,7 @@ export function enumerateHypotheses(
           location: 'query',
           ownerPersona: picks.owner?.handle,
           baselineValue: observed,
-          risk: endpointRiskScore(endpoint) + 10,
+          risk: endpointRiskScore(endpoint) + (/(?:^|\/)(?:download|downloads|file|files|export|exports)(?:\/|$)/i.test(bare) ? 44 : pathHasFileHint(bare) ? 26 : 12) + (/^(?:filepath|path|document|file|name)$/i.test(param.name) ? 8 : 0),
         })
       }
     }
@@ -1012,7 +1045,7 @@ export function enumerateHypotheses(
     // --- Open redirect ----------------------------------------------------------------------
     // URL/redirect-shaped declared or observed parameter, independent of the route noun.
     const redirectShapedParams = inferred.filter(p => p.location === 'query' &&
-      /^(?:next|url|uri|redirect|redirect_uri|redirecturl|return|returnurl|returnto|return_to|callback|callbackurl|dest|destination|target|continue|continueurl)$/i.test(p.name))
+      /^(?:next|redirect|redirect_uri|redirecturl|return|returnurl|returnto|return_to|dest|destination|continue|continueurl)$/i.test(p.name))
     if (method === 'GET' && (pathHasRedirectHint(bare) || redirectShapedParams.length > 0)) {
       const candidates = new Set(redirectParamNames(bare))
       const declared = inferred.filter(p => p.location === 'query' && (candidates.has(p.name) || /^(?:next|url|uri|redirect|return\w*|callback\w*|dest|target|continue)$/i.test(p.name)))
@@ -1030,23 +1063,27 @@ export function enumerateHypotheses(
           param,
           location: 'query',
           ownerPersona: picks.owner?.handle,
-          risk: endpointRiskScore(endpoint) + 8,
+          risk: endpointRiskScore(endpoint) + (pathHasRedirectHint(bare) ? 26 : 10),
         })
       }
     }
 
     // --- Reflected XSS ----------------------------------------------------------------------
-    // Any query parameter the target actually reads is a reflection candidate; the probe itself is
-    // the benign canary, so a parameter that is not reflected simply costs one request. Declared
-    // type/observed value shape and the active-filter differential drive the rank.
-    const xssCandidates = method === 'GET'
-      ? rankedFor(param => param.location === 'query' && !param.isCsrf &&
-          ['text', 'id', 'number'].includes(paramNameShape(param.name)) &&
-          (param.declaredType !== undefined || activeQuery.has(param.name) || pathHasSearchHint(bare)))
-        .slice(0, 1)
-      : []
-    if (xssCandidates.length > 0) {
-      for (const { param } of xssCandidates) {
+    // Any string query parameter the target actually reads is a reflection candidate; the probe
+    // itself is the benign canary, so a parameter that is not reflected simply costs one request.
+    const xssCandidates = inferred.filter(p => p.location === 'query' &&
+      (pathHasSearchHint(bare) || activeQuery.has(p.name) ||
+        (isTextualParam(p.name) &&
+          ((observedValues[p.name]?.length ?? 0) > 0 || (p.declaredType ?? '').toLowerCase() === 'string'))))
+    if (method === 'GET' && xssCandidates.length > 0) {
+      const rank = (name: string): number => {
+        if (activeQuery.has(name)) return 0
+        if (/^(?:q|query|search)$/i.test(name)) return 1
+        if (/^(?:term|keyword|s)$/i.test(name)) return 2
+        return 3
+      }
+      const ordered = [...xssCandidates].sort((a, b) => rank(a.name) - rank(b.name))
+      for (const param of ordered.slice(0, pathHasSearchHint(bare) ? 3 : 1)) {
         add({
           key: `xss_context|${endpoint.id}|${param.name}`,
           endpoint,
@@ -1057,7 +1094,7 @@ export function enumerateHypotheses(
           param,
           location: 'query',
           ownerPersona: picks.owner?.handle,
-          risk: endpointRiskScore(endpoint) + 6,
+          risk: endpointRiskScore(endpoint) + (pathHasSearchHint(bare) || activeQuery.has(param.name) ? 30 : 8) + (pathHasSearchHint(bare) && !hasIdPath ? 12 : 0),
         })
       }
     }
@@ -1115,7 +1152,7 @@ export function enumerateHypotheses(
     // A read that the target itself publishes credential-shaped values from is scanned with a
     // non-entitled viewer actor; the anonymous denial in the same matrix is the control. The
     // selection is response-evidence driven (secret fingerprints) or a credential-surface route.
-    const credentialSurface = /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?|audit|auditlog|config|settings|credentials?|secrets?|exports?)(?:\/|$)/i.test(bare)
+    const credentialSurface = /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?|audit|auditlog|activity|logs?|config|settings|credentials?|secrets?|exports?)(?:\/|$)/i.test(bare)
     const secretEvidence = (observedEvidence.sensitiveFields?.length ?? 0) > 0 ||
       (observedEvidence.headerNames ?? []).some(name => /^(?:set-cookie|authorization|x-api-key)$/i.test(name))
     if (method === 'GET' && (credentialSurface || secretEvidence)) {
@@ -1132,7 +1169,7 @@ export function enumerateHypotheses(
         ...((picks.lower?.handle ?? picks.crossTenant?.handle)
           ? { viewerPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
           : {}),
-        risk: endpointRiskScore(endpoint) + 30,
+        risk: endpointRiskScore(endpoint) + (credentialSurface ? 34 : 18),
       })
     }
 
@@ -1186,6 +1223,70 @@ export function enumerateHypotheses(
         graphqlSeedsByRoot,
         jsonBody: {},
         risk: endpointRiskScore(endpoint) + 25,
+      })
+    }
+
+    // --- Auth-protocol / JWT ----------------------------------------------------------------
+    // Evidence: the target returned 3-segment base64url values (or a session/token surface whose
+    // response carries them). The probe mutates the persona's own token; when the persona session
+    // is not a JWT, the broker refuses the mutation, so this cannot manufacture a finding.
+    const identityClaims: Record<string, string> = {}
+    for (const field of ['email', 'mail', 'sub', 'userId', 'id', 'tenant', 'org', 'store', 'workspace', 'team', 'role']) {
+      const value = observedValues[field]?.[0]
+      if (value && value.length <= 120) identityClaims[field] = value
+    }
+    const jwtEvidence = options.tier >= 2 && method === 'GET' && picks.owner &&
+      ((observedEvidence.jwtValues?.length ?? 0) > 0 || credentialSurface)
+    if (jwtEvidence) {
+      add({
+        key: `auth_protocol|${endpoint.id}`,
+        endpoint,
+        probeClass: 'auth_protocol_audit',
+        intent: 'auth_protocol',
+        method: 'GET',
+        pathAndQuery: resolvedPath,
+        ownerPersona: picks.owner?.handle,
+        tokenFields: Object.keys(observedValues).filter(field => /(?:token|jwt|auth|credential)/i.test(field)).slice(0, 3),
+        ...(Object.keys(identityClaims).length > 0 ? { identityClaims } : {}),
+        risk: endpointRiskScore(endpoint) + 18 +
+          ((observedEvidence.jwtValues?.length ?? 0) > 0 ? 40 : 0) +
+          (/(?:^|\/)(?:session|tokens?|auth|whoami|me)(?:\/|$)/i.test(bare) ? 16 : 0),
+      })
+    }
+
+    // --- Webhook signature bypass -----------------------------------------------------------
+    // Evidence: a mutating route that declares a signature/HMAC header, or a receiver-shaped write
+    // route with a readable detail/collection sibling. Delivery bodies are built from observed
+    // fields; the probe itself requires an accepted unsigned delivery plus a read-back/ack.
+    const signatureHeader = inferred.find(p => p.location === 'header' && /signature|hmac|^x-.*sig/i.test(p.name))?.name
+    const receiverShaped = method === 'POST' && !hasIdPath && !graphqlShaped && !pathHasUrlHint(bare) &&
+      (Boolean(signatureHeader) || /(?:webhook|hooks?|receive|deliver|callback|events?)/i.test(bare))
+    if (receiverShaped && picks.owner) {
+      const delivery: Record<string, unknown> = {}
+      for (const field of observedFields.slice(0, 8)) delivery[field] = semanticValue(field, observedValues[field]?.[0])
+      if (Object.keys(delivery).length === 0) {
+        delivery.event = 'guardian.verification'
+        delivery.type = 'guardian.verification'
+      }
+      const detail = endpoints.find(candidate => {
+        const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+        return candidate.origin === endpoint.origin && candidate.method.toUpperCase() === 'GET' &&
+          candidatePath.startsWith(`${bare}/`) && hasDynamicIdSegment(candidatePath)
+      })
+      const stateField = observedFields.find(field => /^(?:status|state|processed|received|ok|count|total|events?)$/i.test(field))
+      add({
+        key: `webhook_signature_bypass|${endpoint.id}`,
+        endpoint,
+        probeClass: 'webhook_signature_bypass',
+        intent: 'webhook',
+        method: 'POST',
+        pathAndQuery: resolvedPath,
+        ownerPersona: picks.owner?.handle,
+        webhookBody: delivery,
+        ...(signatureHeader ? { webhookHeader: signatureHeader } : {}),
+        ...(detail ? { readPath: (detail.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`) } : {}),
+        ...(stateField ? { stateField } : {}),
+        risk: endpointRiskScore(endpoint) + 16 + (/(?:webhook|hooks?|receive|deliver|callback)(?:\/|$)/i.test(bare) ? 34 : 0),
       })
     }
 
@@ -1277,12 +1378,22 @@ export function enumerateHypotheses(
   }
   // Quota selection, not a pure global slice: late classes (SQLi in particular) must not be
   // starved when a richer surface forms more authz/xxe/ssrf hypotheses than the cap.
-  const quotas: Record<string, number> = {
-    authz: 52, secret_disclosure: 4, graphql: 2, xxe: 6, ssrf: 8, traversal: 6, redirect: 6,
-    xss: 5, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
-    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 14,
+  const baseQuotas: Record<string, number> = {
+    // Quotas reserve breadth: an authz-heavy surface must not starve the other classes when the
+    // global hypothesis cap is reached.
+    authz: 26, secret_disclosure: 5, graphql: 2, xxe: 5, ssrf: 7, traversal: 6, redirect: 6,
+    xss: 6, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
+    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 10,
   }
-  const max = options.maxHypotheses ?? defaultEngineMaxHypotheses
+  const baseMax = options.maxHypotheses ?? defaultEngineMaxHypotheses
+  // A probe costs ~11 requests (control/probe variants + read-back). Spend the request budget
+  // instead of starving late classes behind a fixed hypothesis count.
+  const slots = Math.min(150, Math.max(baseMax, Math.floor((options.maxRequests ?? defaultEngineMaxRequests) / 11)))
+  const scale = Math.max(1, slots / baseMax)
+  const quotas: Record<string, number> = Object.fromEntries(
+    Object.entries(baseQuotas).map(([intent, quota]) => [intent, Math.max(quota, Math.ceil(quota * scale))]),
+  )
+  const max = slots
   const used: Record<string, number> = {}
   const selected: EngineHypothesis[] = []
   for (const hyp of [...all.values()].sort((a, b) =>
@@ -1608,10 +1719,26 @@ async function harvestSurface(
 // Execution
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Apply the mandatory run-scoped entity tag to benign, human-visible fields the floor creates in a
+ * staging/isolated environment, so every test entity is attributable and cleanable.
+ */
+function tagEntityBody(body: Record<string, unknown>, tag?: string): Record<string, unknown> {
+  if (!tag) return body
+  const out: Record<string, unknown> = { ...body }
+  for (const key of Object.keys(out)) {
+    if (!/^(?:name|title|label|slug|subject|description|note|notes|body|text|company)$/i.test(key)) continue
+    const value = out[key]
+    if (typeof value !== 'string' || value.startsWith(tag)) continue
+    out[key] = `${tag}-${value}`.slice(0, 160)
+  }
+  return out
+}
+
 function buildProbeRequest(
   hyp: EngineHypothesis,
   maxRequests: number,
-  context: Pick<DeterministicEngineInput, 'runId' | 'assignmentId' | 'storage'>,
+  context: Pick<DeterministicEngineInput, 'runId' | 'assignmentId' | 'storage' | 'entityTag'>,
 ): ProbeDifferentialRequest {
   const base: ProbeDifferentialRequest = {
     probeClass: hyp.probeClass,
@@ -1624,7 +1751,7 @@ function buildProbeRequest(
     ...(context.storage ? { storage: context.storage } : {}),
     ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
     ...(hyp.session ? { session: hyp.session } : {}),
-    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+    ...(hyp.jsonBody ? { jsonBody: tagEntityBody(hyp.jsonBody, context.entityTag) } : {}),
     ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
     ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate } : {}),
     ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
@@ -1747,6 +1874,21 @@ function buildProbeRequest(
         paramLocation: 'json',
         candidateFields: hyp.candidateFields ?? [],
         jsonBody: hyp.jsonBody ?? {},
+      }
+    case 'auth_protocol_audit':
+      return {
+        ...base,
+        ...(hyp.tokenFields?.length ? { tokenFields: hyp.tokenFields } : {}),
+        ...(hyp.identityClaims ? { identityClaims: hyp.identityClaims } : {}),
+      }
+    case 'webhook_signature_bypass':
+      return {
+        ...base,
+        method: 'POST',
+        webhookBody: hyp.webhookBody ?? {},
+        ...(hyp.webhookHeader ? { webhookHeader: hyp.webhookHeader } : {}),
+        ...(hyp.readPath ? { readPath: hyp.readPath } : {}),
+        ...(hyp.stateField ? { readStateField: hyp.stateField } : {}),
       }
     default:
       return base
@@ -2055,6 +2197,24 @@ function classStats(report: DeterministicEngineReport, intent: string): EngineCl
   return created
 }
 
+/**
+ * v6 environment contract: which floor hypotheses may be formed under an engagement mode.
+ * `prod_readonly` keeps read-only checks (read BOLA, reflected redirect/XSS, GraphQL query reads,
+ * credential exposure) and drops every mutating class, so no write ever reaches the broker.
+ */
+export function floorHypothesesForEnvironment(
+  hypotheses: readonly EngineHypothesis[],
+  mode: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab',
+): EngineHypothesis[] {
+  if (mode !== 'prod_readonly') return [...hypotheses]
+  const mutatingIntents = new Set(['csrf', 'mass_assignment', 'workflow', 'webhook', 'ssrf', 'xxe', 'ssti', 'command_injection'])
+  return hypotheses.filter(hyp => {
+    if (mutatingIntents.has(hyp.intent)) return false
+    if (hyp.intent === 'graphql') return true // query-only audit
+    return hyp.method === 'GET'
+  })
+}
+
 export async function runDeterministicEngine(input: DeterministicEngineInput): Promise<DeterministicEngineReport> {
   const started = Date.now()
   const maxRequests = Math.max(0, input.maxRequests ?? defaultEngineMaxRequests)
@@ -2091,7 +2251,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   if (!conventionalWordlist && candidateEndpoints.length !== input.endpoints.length) {
     report.notes.push(`conventional wordlist OFF: ${input.endpoints.length - candidateEndpoints.length} wordlist-only endpoint(s) excluded`)
   }
-  const ranked = rankEndpoints(candidateEndpoints).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
+  const ranked = rankEndpoints(collapseRouteVariants(candidateEndpoints)).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
   report.endpointsConsidered = ranked.length
   if (ranked.length === 0) {
     report.durationMs = Date.now() - started
@@ -2123,35 +2283,46 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     tier: input.tier,
     personas: input.personas,
     maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
+    maxRequests,
     ...(input.classes ? { classes: input.classes } : {}),
   })
-  report.hypothesesFormed = hypotheses.length
-  report.touchedPairs = [...new Set(hypotheses.map(hyp =>
+
+  // v6 environment contract: a production read-only engagement never forms a mutating hypothesis,
+  // so a write probe cannot burn budget or a dry-step counter only to be refused by the broker.
+  const environmentMode = input.environmentMode ?? 'ephemeral_lab'
+  const gatedHypotheses = floorHypothesesForEnvironment(hypotheses, environmentMode)
+  report.hypothesesFormed = gatedHypotheses.length
+  report.touchedPairs = [...new Set(gatedHypotheses.map(hyp =>
     `${normalizeEndpointTemplate(hyp.endpoint.pathTemplate)}|${intentFamily(hyp.intent)}`))]
-  for (const hyp of hypotheses) classStats(report, hyp.intent).hypotheses += 1
+  for (const hyp of gatedHypotheses) classStats(report, hyp.intent).hypotheses += 1
 
   const perProbeRequestFloor = 6
   const laneMode = input.lane === true
-  // The lane is breadth-first: a small authz quota leaves the time-box for the other classes that
-  // the agentic workers cannot cover, while the exhaustive `--no-llm` floor keeps the deep quota.
+  const probeSlots = Math.min(150, Math.max(defaultEngineMaxHypotheses, Math.floor(maxRequests / 11)))
+  const capScale = Math.max(1, probeSlots / defaultEngineMaxHypotheses)
+  const capFor = (value: number): number => Math.max(value, Math.ceil(value * capScale))
+  // The lane is breadth-first: it only gets a time-box, so the deep authz/sqli quotas are trimmed
+  // while every other class keeps its full pass. `--no-llm` keeps the exhaustive quotas.
   const intentCaps: Record<string, number> = {
-    authz: laneMode ? 14 : 52,
-    secret_disclosure: laneMode ? 3 : 4,
-    sqli: laneMode ? 8 : 14,
-    traversal: 6,
-    ssrf: 8,
-    xxe: 4,
-    redirect: 6,
-    xss: 5,
-    graphql: 2,
-    mass_assignment: 6,
-    csrf: 4,
-    workflow: 3,
-    ssti: 3,
-    command_injection: 3,
+    authz: laneMode ? Math.min(capFor(26), 14) : capFor(26),
+    secret_disclosure: laneMode ? Math.min(capFor(5), 3) : capFor(5),
+    sqli: laneMode ? Math.min(capFor(10), 8) : capFor(10),
+    traversal: capFor(6),
+    ssrf: capFor(6),
+    xxe: capFor(4),
+    redirect: capFor(6),
+    xss: capFor(6),
+    graphql: capFor(2),
+    mass_assignment: capFor(6),
+    csrf: capFor(4),
+    workflow: capFor(3),
+    ssti: capFor(3),
+    command_injection: capFor(3),
+    webhook: capFor(2),
+    auth_protocol: capFor(2),
   }
   const intentUsed: Record<string, number> = {}
-  for (const hyp of hypotheses) {
+  for (const hyp of gatedHypotheses) {
     if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
     if (Date.now() - started >= maxDurationMs) { report.stoppedReason = 'time'; break }
     if (budget.requestsUsed >= maxRequests) { report.stoppedReason = 'budget'; break }

@@ -9,6 +9,7 @@ import { BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
+import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { Store } from './store.ts'
 import { parseGraphqlIntrospection, runSafeTemplates } from './surface-engine.ts'
@@ -29,6 +30,12 @@ export interface Phase0ReconParams {
   signal: AbortSignal
   assignmentId?: string
   onExchange?: (ex: BrokerExchangeResult) => string | void
+  /** Passive CDN/static origins for browser asset hydration (never actively probed). */
+  assetOrigins?: readonly string[]
+  /** Exercise non-destructive SPA navigation during the crawl. Defaults to true. */
+  interactiveTraversal?: boolean
+  /** Read-only traversal mode (no form submits). Defaults to true. */
+  readOnlyMode?: boolean
 }
 
 export interface Phase0ReconResult {
@@ -60,6 +67,10 @@ export interface Phase0ReconResult {
   siblingEndpoints?: number
   /** Allowed methods learned from OPTIONS/405 `Allow` headers and validation 400/422 bodies. */
   methodHints?: number
+  /** Endpoint union visibility: `METHOD pathTemplate` -> persona handles (or `anonymous`). */
+  visibleToPersonas?: Record<string, string[]>
+  /** Admin/privileged or role-restricted routes surfaced immediately from the persona union. */
+  privilegedEndpoints?: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }>
 }
 
 export interface CrawlStateGraphParams {
@@ -76,6 +87,9 @@ export interface CrawlStateGraphParams {
   signal: AbortSignal
   assignmentId?: string
   onExchange?: (ex: BrokerExchangeResult) => string | void
+  assetOrigins?: readonly string[]
+  interactiveTraversal?: boolean
+  readOnlyMode?: boolean
 }
 
 export interface CrawlStateGraphResult {
@@ -89,6 +103,10 @@ export interface CrawlStateGraphResult {
   stoppedReason?: string
   /** Endpoints expanded from route-map/config documents captured in XHR/fetch response bodies. */
   routeMapEndpoints?: number
+  /** Endpoint union visibility across every crawled persona (`METHOD pathTemplate` -> handles). */
+  visibleToPersonas?: Record<string, string[]>
+  /** Privileged/admin routes discovered through the persona union, surfaced immediately. */
+  privilegedEndpoints?: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }>
 }
 
 export interface StaticExtractedRoute {
@@ -201,6 +219,14 @@ export function normalizeDiscoveryTemplate(rawPath: string): string {
   const joined = segments.join('/').replace(/\/{2,}/g, '/')
   const trimmed = joined.length > 1 && joined.endsWith('/') ? joined.slice(0, -1) : joined
   return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+}
+
+/**
+ * Paths that conventionally expose administrative or privileged surface. Used only to surface
+ * persona-union discoveries immediately (risk prioritization), never to skip coverage.
+ */
+export function isPrivilegedPathTemplate(pathTemplate: string): boolean {
+  return /(?:^|\/)(?:admin|administrator|internal|debug|audit|staff|manage|management|console|superuser|settings|billing|roles?|permissions?|security|orgs?|tenants?)(?:\/|$)/i.test(pathTemplate)
 }
 
 function scoreEndpointRisk(method: string, pathTemplate: string, sinkKinds: readonly string[] = [], authReq?: string | null): number {
@@ -2052,6 +2078,55 @@ export function parseOpenApiDoc(
 }
 
 /**
+ * Tolerant OpenAPI operation extraction for stored references whose text is truncated or carries a
+ * redaction placeholder (JSON.parse then fails). Reads path keys, methods, declared parameters and
+ * colon/brace path placeholders textually; no network and no semantics beyond the document itself.
+ */
+export interface TolerantOpenApiOperation {
+  method: string
+  pathTemplate: string
+  params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' }>
+}
+
+export function harvestTolerantOpenApiOperations(content: string, maxOps = 300): TolerantOpenApiOperation[] {
+  const pathKeyRe = /"(\/[A-Za-z0-9_\-{}\/.:$\[\]]{0,300})"\s*:\s*\{/g
+  const matches = [...content.matchAll(pathKeyRe)]
+  if (matches.length === 0) return []
+  const out: TolerantOpenApiOperation[] = []
+  for (let idx = 0; idx < matches.length && out.length < maxOps; idx += 1) {
+    const match = matches[idx]!
+    const rawPath = match[1]!
+    if (!rawPath.startsWith('/') || rawPath.length > 300) continue
+    const start = (match.index ?? 0) + match[0].length
+    const end = idx + 1 < matches.length ? (matches[idx + 1]!.index ?? content.length) : content.length
+    const block = content.slice(start, Math.min(end, start + 20_000))
+    const methods = [...new Set([...block.matchAll(/"(get|post|put|patch|delete|head|options)"\s*:\s*\{/g)].map(m => m[1]!.toUpperCase()))]
+    if (methods.length === 0) continue
+    const pathTemplate = normalizeDiscoveryTemplate(rawPath)
+    const params: TolerantOpenApiOperation['params'] = []
+    const pushParam = (name: string, location: TolerantOpenApiOperation['params'][number]['location']) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) return
+      if (params.some(p => p.name === name)) return
+      params.push({ name, location })
+    }
+    for (const rawParam of block.matchAll(/"name"\s*:\s*"([A-Za-z0-9_.\-\[\]]{1,64})"[\s\S]{0,240}?"in"\s*:\s*"(query|path|header|formData|form|body|cookie)"/g)) {
+      const location = rawParam[2] === 'formData' || rawParam[2] === 'form' ? 'form'
+        : rawParam[2] === 'body' ? 'json'
+          : rawParam[2] === 'header' ? 'header'
+            : rawParam[2] === 'path' ? 'path' : 'query'
+      pushParam(rawParam[1]!, location)
+    }
+    for (const placeholder of rawPath.matchAll(/[/{:]([A-Za-z_][A-Za-z0-9_]{0,63})(?:[}/]|$)/g)) {
+      if (rawPath.includes(`:${placeholder[1]}`) || rawPath.includes(`{${placeholder[1]}}`)) {
+        pushParam(placeholder[1]!, 'path')
+      }
+    }
+    for (const method of methods) out.push({ method, pathTemplate, params })
+  }
+  return out.slice(0, maxOps)
+}
+
+/**
  * Offline ingestion of the grey-box API reference (OpenAPI/Swagger) that the harness imported for
  * this project. Every declared operation is kept with its declared method — including DELETE,
  * PATCH and body-only POST routes — without requiring an id segment or a known body field.
@@ -2092,6 +2167,36 @@ export function ingestDeclaredApiSurface(input: {
     result.specs += 1
     const parsed = parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
     result.params += parsed.params
+    if (parsed.endpoints === 0) {
+      // Stored references can be truncated or carry a redaction placeholder, so JSON/YAML parsing
+      // fails. Fall back to the tolerant textual scan used by the route-derivation port; it keeps
+      // every declared operation with its declared method.
+      for (const op of harvestTolerantOpenApiOperations(spec.content)) {
+        const ep = storage.upsertEndpoint({
+          runId,
+          scopeRevision,
+          origin,
+          method: op.method,
+          pathTemplate: op.pathTemplate,
+          source: 'openapi',
+          riskScore: scoreEndpointRisk(op.method, op.pathTemplate),
+        })
+        dynamicPaths.add(op.pathTemplate)
+        for (const p of op.params) {
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: p.name,
+            location: p.location,
+            isCsrf: CSRF_PARAM_RE.test(p.name),
+            isObjectId: p.location === 'path' || OBJECT_ID_PARAM_RE.test(p.name),
+            source: 'openapi',
+          })
+          dynamicParams.add(p.name)
+          result.params += 1
+        }
+      }
+    }
     // Count only operations that were not already present (parseOpenApiDoc upserts, so re-running
     // on an existing run is idempotent and must not inflate the discovery counters).
     let current: Array<{ method: string; pathTemplate: string }> = []
@@ -2145,6 +2250,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let navigationEndpoints = 0
   let authRequests = 0
   let soft404Rejected = 0
+  const visibleToPersonasUnion = new Map<string, Set<string>>()
+  const privilegedSurface: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }> = []
   const frameworksDetected = new Set<string>()
   const techFingerprint = new Set<string>()
   const dynamicPaths = new Set<string>()
@@ -2223,6 +2330,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
   let siblingEndpoints = 0
   let methodHints = 0
+  // Sibling derivation and its OPTIONS probes are opt-in: a caller that owns its own surface
+  // corpus (the procedural capability harness) keeps the historical endpoint set unless enabled.
+  const siblingDerivationEnabled = /^(?:1|true|on|yes)$/i.test((process.env.GUARDIAN_RECON_SIBLINGS ?? '').trim())
 
   // Tier 0: zero live HTTP requests
   if (tier === 0) {
@@ -2252,6 +2362,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       authRequests,
       soft404Rejected,
       ...(declaredSurface ? { declaredSurface } : {}),
+      visibleToPersonas: {},
     }
   }
 
@@ -2298,7 +2409,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const method = ex.method.toUpperCase()
       if (method !== 'GET' && method !== 'HEAD') return
       const bare = ex.pathAndQuery.split('?')[0] || '/'
-      if (!bare.startsWith('/') || bare.startsWith('//') || bare === '/') return
+      if (!bare.startsWith('/') || bare.startsWith('//')) return
       if (/[:{}[\]]/.test(bare) || /[\r\n\0]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
       if ([301, 302, 303, 307, 308, 401, 403].includes(ex.status) && protectedPaths.size < 12) {
         protectedPaths.add(bare)
@@ -2408,6 +2519,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return ep
     }
 
+    /** Track which role personas can reach an endpoint (merged after all passes). */
+    const phase0Visibility = new Map<string, Set<string>>()
+    const tagVisibility = (method: string, rawPath: string, who: string): void => {
+      const bare = rawPath.split('?')[0] || '/'
+      const tmpl = normalizeDiscoveryTemplate(bare)
+      const key = `${method.toUpperCase()} ${tmpl}`
+      const set = phase0Visibility.get(key) ?? new Set<string>()
+      set.add(who)
+      phase0Visibility.set(key, set)
+    }
+
     const recordParams = (endpointId: string, paramList: readonly { name: string; location: ParamLocation }[], source: string): number => {
       let added = 0
       for (const p of paramList.slice(0, 24)) {
@@ -2443,7 +2565,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const clean = bare.startsWith('/') && !bare.startsWith('//') && !/[\r\n\0\\]/.test(bare)
         ? (bare.split('?')[0] || '/')
         : sanitizePathCandidate(rawPath, origin)
-      if (!clean || clean === '/' || STATIC_ASSET_RE.test(clean)) return
+      if (!clean || STATIC_ASSET_RE.test(clean)) return
       if (/[:{}[\]]/.test(clean.split('?')[0] ?? '')) {
         const template = normalizeDiscoveryTemplate(clean)
         if (discoveredTemplates.length < 24 && !discoveredTemplates.includes(template)) {
@@ -2475,11 +2597,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const seedBudget = Math.max(1, perOriginCap - jsReserve)
     let seedFetches = 0
 
-    // 2a-cal. Soft-404 / SPA catch-all calibration before recording discovered routes.
-    if (!originHalted && !signal.aborted && originUsed + 2 <= perOriginCap) {
+    // 2a-cal. Per-origin soft-404 / SPA catch-all calibration with several unmatched paths at
+    // different depths (root-only calibration misses nested API catch-alls).
+    if (!originHalted && !signal.aborted && originUsed + 1 < perOriginCap) {
       const cal: SoftNotFoundCalibration = { statuses: [], mediaTypes: [], lengths: [], signatures: [] }
-      for (let i = 0; i < 2; i += 1) {
-        const probePath = `/.guardian-cal-${randomUUID().replace(/-/g, '').slice(0, 12)}`
+      const probeCount = Math.min(3, Math.max(1, perOriginCap - originUsed - 1))
+      for (const probePath of buildSoft404ProbePaths(probeCount)) {
+        if (originHalted || signal.aborted || originUsed >= perOriginCap) break
         const ex = await safeGet(probePath)
         if (!ex) continue
         cal.statuses.push(ex.status)
@@ -2519,7 +2643,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             let headersObj: Record<string, string> = {}
             try { headersObj = JSON.parse(prior.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
             for (const t of mergeTechTags(techTagsFromResponse(headersObj, prior.bodyPreview ?? ''))) techFingerprint.add(t)
-            if (prior.status < 400) recordEndpoint('GET', '/', 'surface_probe')
+            if (prior.status < 400) {
+              recordEndpoint('GET', '/', 'surface_probe')
+              tagVisibility('GET', '/', 'anonymous')
+              if (discoveryPersona) tagVisibility('GET', '/', discoveryPersona)
+            }
             const html = extractHtmlLinksAndScripts(prior.bodyPreview ?? '', origin)
             for (const s of html.scripts) {
               queueJsChunk(s, '/')
@@ -2556,16 +2684,24 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         } catch { /* fall through to live GET / */ }
       }
       let ex = await safeGet(seedPath)
-      // Config/route-map artifacts are often behind auth; retry once with the first approved persona
-      // so authenticated tables are not invisible to recon.
-      if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.[0]) {
-        ex = await safeGet(seedPath, { persona: params.personas[0] })
+      // Config/route-map artifacts are often behind auth; retry with every approved persona (not
+      // just the first) so role-scoped tables are visible to the persona union.
+      if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.length) {
+        for (const handle of params.personas) {
+          if (!personaForOrigin(handle)) continue
+          if (originHalted || originUsed >= perOriginCap) break
+          ex = await safeGet(seedPath, { persona: handle })
+          if (ex && ex.status < 400) break
+        }
       }
       if (!ex) continue
 
       if (seedPath === '/') {
         for (const t of mergeTechTags(techTagsFromResponse(ex.respHeaders, ex.body))) techFingerprint.add(t)
-        if (ex.status < 400) recordEndpoint('GET', '/', 'surface_probe')
+        if (ex.status < 400) {
+          recordEndpoint('GET', '/', 'surface_probe')
+          tagVisibility('GET', '/', discoveryPersona ?? 'anonymous')
+        }
         const html = extractHtmlLinksAndScripts(ex.body, origin)
         for (const s of html.scripts) {
           queueJsChunk(s, '/')
@@ -2945,8 +3081,15 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
       const apiPrefix = [...prefixCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
       if (apiPrefix) {
-        for (let i = 0; i < 2; i += 1) {
-          const ex = await safeGet(`${apiPrefix}/.guardian-cal-${randomUUID().replace(/-/g, '').slice(0, 12)}`)
+        const token = randomUUID().replace(/-/g, '').slice(0, 12)
+        const prefixProbes = [
+          `${apiPrefix}/.guardian-cal-${token}`,
+          `${apiPrefix}/.guardian-cal-${token}/missing`,
+          `${apiPrefix}/.guardian-cal-${token}/detail/view`,
+        ]
+        for (const probePath of prefixProbes) {
+          if (originHalted || signal.aborted || originUsed >= perOriginCap) break
+          const ex = await safeGet(probePath)
           if (!ex) continue
           softCalibration.statuses.push(ex.status)
           softCalibration.mediaTypes.push(ex.mediaType)
@@ -2959,18 +3102,53 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2d. Bounded probe of discovered route candidates (links, route maps, JS-AST/OpenAPI paths).
     // Strictly within perOriginCap; template routes are probed later with concrete ids.
     const siblingSeen = new Set<string>()
-    const recordSiblingSurface = (rawCollection: string): number => {
-      if (siblingSeen.size >= 12) return 0
+    const detailMethodsSeen = new Set<string>()
+    for (const ep of storage.listEndpoints(runId, { origin })) {
+      const template = ep.pathTemplate.split('?')[0] || '/'
+      const detailBase = /^(.+)\/(?::[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/.exec(template)?.[1]
+      if (detailBase) detailMethodsSeen.add(`${detailBase}|${ep.method.toUpperCase()}`)
+    }
+    let siblingOptionsProbes = 0
+    const recordSiblingSurface = async (rawCollection: string, sampleId?: string): Promise<number> => {
+      if (!siblingDerivationEnabled) return 0
+      if (siblingSeen.size >= 8) return 0
       const bare = (rawCollection.split('?')[0] || '/').replace(/\/+$/, '')
       if (!bare || bare === '/' || STATIC_ASSET_RE.test(bare)) return 0
       if (/[:{}[\]]/.test(bare)) return 0
       const segments = bare.split('/').filter(Boolean)
       if (segments.length === 0 || segments.length > 5) return 0
       const template = `${bare}/:id`
+      // Methods the target advertises for the object route (OPTIONS is a safe, read-only request).
+      let allowed = new Set<string>(['GET'])
+      if (sampleId && siblingOptionsProbes < 6 && originUsed < perOriginCap - 2 && !originHalted && !signal.aborted) {
+        siblingOptionsProbes += 1
+        try {
+          const optionsEx = await broker.executeHttp({
+            origin,
+            method: 'OPTIONS',
+            pathAndQuery: `${bare}/${encodeURIComponent(sampleId)}`,
+            ...(discoveryPersona ? { persona: discoveryPersona } : {}),
+            followRedirects: false,
+            timeoutMs: 6_000,
+            runId,
+            assignmentId: params.assignmentId,
+          }, grant, signal)
+          originUsed += 1
+          requestsUsed += 1
+          params.onExchange?.(optionsEx)
+          const advertised = harvestAllowMethods(optionsEx.respHeaders)
+          if (advertised.length > 0) {
+            allowed = new Set(['GET', ...advertised])
+            methodHints += advertised.length
+          }
+        } catch { /* OPTIONS is optional; fall back to the safe GET sibling */ }
+      }
       if (siblingSeen.has(template)) return 0
       siblingSeen.add(template)
       let added = 0
       for (const method of ['GET', 'PATCH', 'DELETE'] as const) {
+        if (!allowed.has(method)) continue
+        if (detailMethodsSeen.has(`${bare}|${method}`)) continue
         const ep = recordEndpoint(method, template, 'surface_probe', { riskScore: scoreEndpointRisk(method, template) })
         storage.upsertEndpointParam({
           runId,
@@ -2982,6 +3160,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           source: 'phase0_sibling',
         })
         dynamicParams.add('id')
+        detailMethodsSeen.add(`${bare}|${method}`)
         siblingEndpoints += 1
         paramsDiscovered += 1
         added += 1
@@ -2989,7 +3168,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return added
     }
     /** A Location header that points below the requested path implies a created resource sibling. */
-    const recordLocationSibling = (requestPath: string, ex: BrokerExchangeResult): void => {
+    const recordLocationSibling = async (requestPath: string, ex: BrokerExchangeResult): Promise<void> => {
       const rawLocation = ex.respHeaders?.location ?? ex.respHeaders?.Location
       if (!rawLocation) return
       const clean = sanitizePathCandidate(rawLocation, origin)
@@ -2997,7 +3176,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const requested = (requestPath.split('?')[0] || '/').replace(/\/+$/, '')
       const located = (clean.split('?')[0] || '/').replace(/\/+$/, '')
       if (!requested || requested === '/' || !located.startsWith(`${requested}/`)) return
-      recordSiblingSurface(requested)
+      const sampleId = located.slice(requested.length + 1).split('/')[0]
+      await recordSiblingSurface(requested, sampleId)
     }
 
     const probeDiscovered = async (candidate: string): Promise<void> => {
@@ -3025,7 +3205,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         rawPathAndQuery: candidate, origin, endpointId: ep.id, source: 'phase0_html',
         storage, runId, dynamicParams,
       })
-      recordLocationSibling(candidate, ex)
+      await recordLocationSibling(candidate, ex)
       // A 400/422 validation body names the schema the route wants; learn it passively.
       if (ex.status === 400 || ex.status === 422) {
         for (const field of harvestValidationFieldHints(ex.body)) {
@@ -3051,7 +3231,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (ids.length > 0) {
           idsByCollection.set(normalizeDiscoveryTemplate(candidate.split('?')[0] || '/'), ids)
           // Observed collection: derive the object siblings without assuming any noun.
-          recordSiblingSurface(candidate.split('?')[0] || '/')
+          await recordSiblingSurface(candidate.split('?')[0] || '/', ids[0])
         }
         for (const link of extractJsonLinkTargets(ex.body, origin).slice(0, 8)) {
           queueDiscoveredRoute('GET', link)
@@ -3156,6 +3336,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         authRequirement: discoveryPersona ? `persona:${discoveryPersona}` : null,
         riskScore: 60,
       })
+      tagVisibility('GET', bare, discoveryPersona ?? 'anonymous')
       navigationEndpoints += 1
       paramsDiscovered += recordQueryParamsForEndpoint({
         rawPathAndQuery: clean, origin, endpointId: ep.id, source: 'spa_crawl',
@@ -3175,7 +3356,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const ids = extractJsonRecordIds(ex.body)
       if (ids.length > 0) {
         idsByCollection.set(normalizeDiscoveryTemplate(bare), ids)
-        recordSiblingSurface(bare)
+        await recordSiblingSurface(bare, ids[0])
       }
       if (ids.length > 0 && item.depth === 0 && navQueue.length < 72 &&
           /"(?:items|data|results|rows|records|list|values)"\s*:\s*\[/.test(ex.body)) {
@@ -3306,6 +3487,41 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
+    // 2d-ter. Multi-persona shell pass: every approved role persona gets its own root shell so
+    // role-gated navigation (admin console) enters discovery instead of only persona[0]'s view.
+    if (!originHalted && !signal.aborted && (params.personas?.length ?? 0) > 0 && originUsed < perOriginCap) {
+      const handles = params.personas ?? []
+      const personaCap = Math.min(handles.length, Math.max(1, Math.floor(perOriginCap * 0.12)))
+      let personaFetches = 0
+      for (const handle of handles) {
+        if (personaFetches >= personaCap || originHalted || signal.aborted || originUsed >= perOriginCap) break
+        if (!personaForOrigin(handle)) continue
+        const ex = await safeGet('/', { persona: handle })
+        if (!ex) continue
+        personaFetches += 1
+        tagVisibility('GET', '/', handle)
+        if (ex.status >= 400) continue
+        for (const t of mergeTechTags(techTagsFromResponse(ex.respHeaders, ex.body))) techFingerprint.add(t)
+        const html = extractHtmlLinksAndScripts(ex.body, origin)
+        for (const s of html.scripts) {
+          queueJsChunk(s, '/')
+          jsPageByScript.set(s, '/')
+        }
+        for (const asset of extractAssetReferences(ex.body)) {
+          if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+          else queueJsChunk(asset, '/')
+        }
+        // Role-gated links are queued (soft-404 calibrated) rather than trusted blindly.
+        for (const link of html.links.slice(0, 60)) {
+          dynamicPaths.add(normalizeRouteTemplate(link))
+          if (discoveredCandidatePaths.length < 40 && !discoveredCandidatePaths.includes(link)) {
+            discoveredCandidatePaths.push(link)
+          }
+          if (!/\.json(?:\?|$)/i.test(link)) navSeeds.push({ path: link, depth: 0 })
+        }
+      }
+    }
+
     // 2e. Optional browser SPA crawl when caller supplies ScopedBrowser and budget remains
     const remainingForCrawl = perOriginCap - originUsed
     if (params.browser && !originHalted && !signal.aborted && remainingForCrawl >= 2 && grant.canRead(origin)) {
@@ -3323,6 +3539,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         grant,
         signal,
         assignmentId: params.assignmentId,
+        ...(params.assetOrigins ? { assetOrigins: params.assetOrigins } : {}),
+        ...(params.interactiveTraversal !== undefined ? { interactiveTraversal: params.interactiveTraversal } : {}),
+        ...(params.readOnlyMode !== undefined ? { readOnlyMode: params.readOnlyMode } : {}),
         onExchange: ex => {
           browserExchanges += 1
           originUsed += 1
@@ -3334,6 +3553,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       endpointsDiscovered += crawlRes.endpointsDiscovered
       paramsDiscovered += crawlRes.paramsDiscovered
       routeMapEndpoints += crawlRes.routeMapEndpoints ?? 0
+      for (const [key, personas] of Object.entries(crawlRes.visibleToPersonas ?? {})) {
+        const set = phase0Visibility.get(key) ?? new Set<string>()
+        for (const handle of personas) set.add(handle)
+        phase0Visibility.set(key, set)
+      }
       // Browser traffic is accounted per accepted exchange above; page visits that produced no
       // recorded exchange still consumed a broker call.
       const unaccountedPages = Math.max(0, crawlRes.pagesVisited - browserExchanges)
@@ -3383,6 +3607,50 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       }
     } catch { /* best-effort static edge inference */ }
+
+    // 2g. Persona-union visibility: persist `visibleToPersonas` on discovered endpoints and surface
+    // admin/privileged routes immediately instead of waiting for a later probe pass.
+    for (const [key, set] of phase0Visibility) {
+      const spaceAt = key.indexOf(' ')
+      const method = key.slice(0, spaceAt)
+      const pathTemplate = key.slice(spaceAt + 1)
+      const personas = [...set].sort()
+      const merged = visibleToPersonasUnion.get(key) ?? new Set<string>()
+      for (const handle of personas) merged.add(handle)
+      visibleToPersonasUnion.set(key, merged)
+      const rolePersonas = personas.filter(handle => handle !== 'anonymous')
+      const reasons: string[] = []
+      if (isPrivilegedPathTemplate(pathTemplate)) reasons.push('privileged_path')
+      if (rolePersonas.length > 0 && !personas.includes('anonymous') && personas.length > 1) reasons.push('role_restricted')
+      if (reasons.length === 0) continue
+      const entryKey = `${method} ${pathTemplate}`
+      if (!privilegedSurface.some(entry => `${entry.method} ${entry.pathTemplate}` === entryKey)) {
+        privilegedSurface.push({ method, pathTemplate, personas, reason: reasons.join('+') })
+      }
+      try {
+        const existing = storage.listEndpoints(runId, { origin })
+          .find(ep => ep.method === method && ep.pathTemplate === pathTemplate)
+        if (existing) {
+          storage.upsertEndpoint({
+            runId,
+            scopeRevision,
+            origin,
+            method,
+            pathTemplate,
+            source: existing.source,
+            authRequirement: rolePersonas.map(handle => `persona:${handle}`).join(',') || null,
+          })
+        }
+      } catch { /* visibility tagging is best-effort */ }
+    }
+  }
+
+  const visibleToPersonas: Record<string, string[]> = {}
+  for (const [key, set] of visibleToPersonasUnion) visibleToPersonas[key] = [...set].sort()
+  if (privilegedSurface.length > 0) {
+    storage.event(runId, 'phase0.privileged_surface',
+      `Surfaced ${privilegedSurface.length} privileged/role-restricted route(s) from the persona union.`,
+      { routes: privilegedSurface.slice(0, 20) })
   }
 
   storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts.', {
@@ -3421,6 +3689,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     ...(declaredSurface ? { declaredSurface } : {}),
     siblingEndpoints,
     methodHints,
+    visibleToPersonas,
+    ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
   }
 }
 
@@ -3464,11 +3734,23 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
   let hasPostMessageListener = false
   const personasCrawled: string[] = []
   let stoppedReason: string | undefined
+  const visibility = new Map<string, Set<string>>()
+  const privilegedByKey = new Map<string, { method: string; pathTemplate: string; personas: string[]; reason: string }>()
+
+  const tagVisibility = (method: string, rawPath: string, who: string): void => {
+    const bare = rawPath.split('?')[0] || '/'
+    const tmpl = normalizeDiscoveryTemplate(bare)
+    const key = `${method.toUpperCase()} ${tmpl}`
+    const set = visibility.get(key) ?? new Set<string>()
+    set.add(who)
+    visibility.set(key, set)
+  }
 
   const recordFormAndParams = (
     actionRaw: string,
     methodRaw: string,
     inputNames: readonly string[],
+    who: string,
   ) => {
     const cleanAction = sanitizePathCandidate(actionRaw || '/', normalizedOrigin)
     if (!cleanAction) return
@@ -3483,6 +3765,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       source: 'spa_crawl',
       riskScore: scoreEndpointRisk(method, pathTemplate),
     })
+    tagVisibility(method, pathTemplate, who)
     endpointsDiscovered += 1
     for (const name of inputNames) {
       if (!name) continue
@@ -3499,7 +3782,8 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     }
   }
 
-  for (const persona of personaList) {
+  for (let personaIndex = 0; personaIndex < personaList.length; personaIndex += 1) {
+    const persona = personaList[personaIndex]
     if (signal.aborted) {
       stoppedReason = 'aborted'
       break
@@ -3514,10 +3798,16 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     const visitedForPersona = new Set<string>()
     const templateVisits = new Map<string, number>()
     let personaPages = 0
-    // Per-persona budget share when crawling multiple personas while respecting total budgetRemaining if specified
+    // Fair per-persona share: no single persona may consume the whole page budget, otherwise the
+    // admin/privileged pass never runs and the persona union collapses to persona[0].
+    const remainingPages = params.budgetRemaining !== undefined
+      ? Math.max(1, effectiveMaxPages - pagesVisited)
+      : requestedMaxPages
+    const remainingSlots = Math.max(1, personaList.length - personaIndex)
+    const fairShare = Math.max(1, Math.floor(remainingPages / remainingSlots))
     const personaPageCap = persona
-      ? (params.budgetRemaining !== undefined ? Math.max(1, effectiveMaxPages - pagesVisited) : requestedMaxPages)
-      : Math.max(1, Math.min(anonymousPageCap, params.budgetRemaining !== undefined ? effectiveMaxPages - pagesVisited : anonymousPageCap))
+      ? Math.max(1, Math.min(fairShare, Math.max(1, effectiveMaxPages - pagesVisited)))
+      : Math.max(1, Math.min(anonymousPageCap, fairShare, Math.max(1, effectiveMaxPages - pagesVisited)))
 
     if (params.budgetRemaining !== undefined && pagesVisited >= effectiveMaxPages) break
 
@@ -3542,17 +3832,32 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       if (templateCount >= 2) continue
       templateVisits.set(routeTemplateKey, templateCount + 1)
 
+      const who = persona ?? 'anonymous'
       let visit
       try {
-        visit = await browser.visitPage({
+        const visitRequest = {
           origin: normalizedOrigin,
           pathAndQuery: next.pathAndQuery,
           persona,
           runId,
           assignmentId: params.assignmentId,
           waitAfterLoadMs: 120,
+          interactiveTraversal: params.interactiveTraversal !== false,
+          readOnlyMode: params.readOnlyMode !== false,
+          ...(params.assetOrigins ? { assetOrigins: params.assetOrigins } : {}),
           ...(params.onExchange ? { onExchange: params.onExchange } : {}),
-        }, grant, signal)
+        }
+        const pooledBrowser = browser as unknown as { visitPages?: ScopedBrowser['visitPages'] }
+        if (typeof pooledBrowser.visitPages === 'function') {
+          const visits = await pooledBrowser.visitPages([visitRequest], grant, signal)
+          visit = visits[0]
+        } else {
+          visit = await browser.visitPage(visitRequest, grant, signal)
+        }
+        if (!visit) {
+          stoppedReason = 'browser_unavailable'
+          break
+        }
       } catch (err) {
         if (err instanceof BrokerCircuitOpen) {
           stoppedReason = 'circuit_open'
@@ -3609,6 +3914,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         authRequirement: persona ? `persona:${persona}` : null,
         riskScore: scoreEndpointRisk('GET', routeTemplate),
       })
+      tagVisibility('GET', routeTemplate, who)
       endpointsDiscovered += 1
 
       // Record query params from URL
@@ -3638,13 +3944,13 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
 
       // Record HTML forms & inputs (including CSRF fields)
       for (const form of visit.forms) {
-        recordFormAndParams(form.action, form.method, form.inputNames)
+        recordFormAndParams(form.action, form.method, form.inputNames, who)
       }
       // Also parse raw domSnippet forms in case hidden inputs weren't captured
       if (visit.domSnippet && /<form\b/i.test(visit.domSnippet)) {
         const parsedHtml = extractHtmlLinksAndScripts(visit.domSnippet, normalizedOrigin)
         for (const f of parsedHtml.forms) {
-          recordFormAndParams(f.action, f.method, f.inputs)
+          recordFormAndParams(f.action, f.method, f.inputs, who)
         }
       }
 
@@ -3713,6 +4019,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
           authRequirement: persona ? `persona:${persona}` : null,
           riskScore: scoreEndpointRisk(shape.method, tmpl),
         })
+        tagVisibility(shape.method, tmpl, who)
         endpointsDiscovered += 1
         for (const p of shape.params) {
           storage.upsertEndpointParam({
@@ -3817,6 +4124,43 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     }
   }
 
+  const visibleToPersonas: Record<string, string[]> = {}
+  for (const [key, set] of visibility) {
+    const spaceAt = key.indexOf(' ')
+    const method = key.slice(0, spaceAt)
+    const pathTemplate = key.slice(spaceAt + 1)
+    const personas = [...set].sort()
+    visibleToPersonas[key] = personas
+    const rolePersonas = personas.filter(handle => handle !== 'anonymous')
+    const reasons: string[] = []
+    if (isPrivilegedPathTemplate(pathTemplate)) reasons.push('privileged_path')
+    if (rolePersonas.length > 0 && !personas.includes('anonymous')) reasons.push('role_restricted')
+    if (reasons.length === 0) continue
+    privilegedByKey.set(key, { method, pathTemplate, personas, reason: reasons.join('+') })
+    try {
+      const existing = storage.listEndpoints(runId, { origin: normalizedOrigin })
+        .find(ep => ep.method === method && ep.pathTemplate === pathTemplate)
+      if (existing) {
+        storage.upsertEndpoint({
+          runId,
+          scopeRevision,
+          origin: normalizedOrigin,
+          method,
+          pathTemplate,
+          source: existing.source,
+          authRequirement: rolePersonas.map(handle => `persona:${handle}`).join(',') || null,
+          riskScore: isPrivilegedPathTemplate(pathTemplate) ? Math.max(existing.riskScore, 85) : existing.riskScore,
+        })
+      }
+    } catch { /* visibility tagging is best-effort */ }
+  }
+  const privilegedEndpoints = [...privilegedByKey.values()]
+  if (privilegedEndpoints.length > 0) {
+    storage.event(runId, 'phase0.privileged_surface',
+      `Persona union surfaced ${privilegedEndpoints.length} privileged/role-restricted route(s).`,
+      { origin: normalizedOrigin, routes: privilegedEndpoints.slice(0, 20) })
+  }
+
   return {
     origin: normalizedOrigin,
     pagesVisited,
@@ -3826,6 +4170,8 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     hasPostMessageListener,
     personasCrawled,
     routeMapEndpoints,
+    visibleToPersonas,
+    ...(privilegedEndpoints.length > 0 ? { privilegedEndpoints } : {}),
     ...(stoppedReason ? { stoppedReason } : {}),
   }
 }
