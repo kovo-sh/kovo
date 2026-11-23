@@ -376,3 +376,15 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **#3 staging-concurrency:** FAIL at investigation (0 TP), but `leakedEntities=0`, no tagged orphans, cleanup 0/0 → staging safety wiring healthy. Capability (write-BOLA/race/checkout) absent. Harness did not emit `approvalBlocks`/`brokerDeniedMutations`/`h2SinglePacketBursts`, so a metrics stream was launched to separate wiring from capability and fail closed on missing metrics.
 - **#4 monorepo-whitebox:** FAIL at investigation; **62 persisted / 62 retrieved / 2565 declared**, SAST suspects 0, 4-hop 0/3. This is a fixture↔product wiring gap: the declared catalog is not reaching the store and the 4-hop sinks are not AST-recognizable. Stream launched to fix briefing completeness and fixture AST patterns (no `src/` edits; report if a product bug is proven).
 - **Held gates remain:** held-out-saas 20/20 + 20/20 patches, xben 25/25, procedural acme 16/22.
+
+### 2026-11-23 — hourly check-in #7: honest zero lift + proof-conversion cliff
+
+- **Corrected measurement (quiet host, serialized):** floor acme 11/22, unified 11/22 at 100% precision, **0 net agentic targets**, $0.129 of $2, preservation 1.00, leads 4/3, Phase A 145 s. The earlier 12/22 was an `open_proof_gap` advisory leaked by the harness; fixed to submit runtime-confirmed only.
+- **Reviewer verdict:** not a model ceiling — a **proof-conversion cliff** (5 candidates → 5 `open_proof_gap`, 0 confirmed) plus **6% budget utilization**. Same model previously confirmed 7–11/22.
+- **Structural fixes (accepted):**
+  1. Five typed SDK helpers aligned to `oracle-invariants` (`prove_access_boundary`, `prove_persisted_mutation`, `prove_boolean_or_timing_diff`, `prove_oob_callback` auto-registering `pending_oob`, `prove_race_burst` using the HTTP/2 barrier) with machine-readable `rejectedBy`/`missingEvidence` feedback for one-turn repair.
+  2. Phase-B utilization: keep K=4–6 saturated, warm workers across assignments, target 12–20 completed assignments and $0.50–1.20 at 600 s, <15% idle.
+  3. Restore the post-harden floor regression spec-side: shopflow 11→7 and opsportal 9–10→8 (total 30–33→26) using the xben/hos readback + control_denied pattern.
+- **Certification protocol:** do not run the full matrix. Tune acme to ≥14–15/22 (≥+3–4 net-new, ≥50% proof conversion, 100% precision), smoke shopflow/opsportal at ≥+2–3 net-new each (aggregate ≥+6 targets / +10pp), then certify.
+- **Realism #2/#3:** real wiring bugs; `prove_oob_callback` and `prove_race_burst` should register `pending_oob` and execute the h2 barrier. Keep Phase-1 grey-box certification decoupled from Phase-3 realism gates, but fix both in this wiring sprint.
+- **Streams launched:** sdk-helpers, floor-regress, phaseb-diag (read-only diagnosis).
