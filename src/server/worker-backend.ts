@@ -984,7 +984,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   containerStats(): WorkerContainerStats {
     const pool = this.warmPool?.stats
     return {
-      created: (pool?.created ?? 0),
+      created: (pool?.created ?? 0) + this.coldSessionCreates,
       reused: (pool?.reused ?? 0),
       sessions: this.sessionsServed,
       coldSessions: this.coldSessionCreates,
