@@ -24,6 +24,7 @@ import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
 import { LocalJqBackend } from '../scripts/benchmark-backend.ts'
 import {
   ROLE_RANK,
+  alignClaimClass,
   assessAuthorizationImpact,
   assessBoundary,
   assessBusinessLogicImpact,
@@ -32,6 +33,7 @@ import {
   assessMassAssignmentImpact,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
+  evidenceClassLabel,
   parseRoleLabel,
   roleRank,
 } from '../src/server/oracle-invariants.ts'
@@ -1513,4 +1515,53 @@ test('audit: cross-tenant read on a declared public route needs private owner-sc
     ],
   })
   assert.equal(privateRead.satisfied, true, privateRead.reason)
+})
+
+// ---------------------------------------------------------------------------
+// 12. Evidence-class alignment: a tenant_id overpost reported as BOLA is mass assignment
+// ---------------------------------------------------------------------------
+
+test('units: verified evidence class relabels a mislabelled claim (and only then)', () => {
+  // The K=6 finding: BOLA/CWE-639 label, mass-assignment evidence (protected tenant_id persisted).
+  assert.deepEqual(alignClaimClass({ cwe: 'CWE-639', category: 'broken-access-control' }, 'mass_assignment'), {
+    vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment',
+  })
+  // Already-correct labels are untouched.
+  assert.equal(alignClaimClass({ cwe: 'CWE-915' }, 'mass_assignment'), null)
+  // Authorization evidence never relabels a claim.
+  assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'authorization'), null)
+  assert.equal(alignClaimClass({ cwe: 'CWE-285' }, 'bfla'), null)
+  // Other specific classes.
+  assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'markup')?.cwe, 'CWE-79')
+  assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'disclosure')?.cwe, 'CWE-200')
+  assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'csrf')?.cwe, 'CWE-352')
+  assert.equal(alignClaimClass({ cwe: 'CWE-472' }, 'business_logic'), null, 'same family keeps the more precise CWE')
+  assert.deepEqual(evidenceClassLabel('mass_assignment'), {
+    vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment',
+  })
+})
+
+test('verifier: a satisfied mass-assignment gate records evidenceClass on the payload', async () => {
+  const fx = await startFixture()
+  try {
+    const spec = baseFields(fx.origin, {
+      title: 'Mass assignment of tenant_id on create',
+      cwe: 'CWE-915',
+      category: 'mass-assignment',
+      steps: [
+        { id: 'before', role: 'control', description: 'Owner reads the project', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/projects/p1', persona: 'persona_a' } },
+        { id: 'probe', role: 'probe', description: 'Owner overposts tenant_id', request: { origin: fx.origin, method: 'PATCH', pathAndQuery: '/api/projects/p1', persona: 'persona_a', jsonBody: { tenant_id: 'globex' } } },
+        { id: 'after', role: 'control', description: 'Foreign tenant reads the moved project', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/projects/p1', persona: 'persona_b' } },
+      ],
+      assertionsJq: `{
+        controlPassed: (.steps.before.status == 200 and .steps.before.json.tenant_id == "acme"),
+        confirmed: (.steps.probe.status == 200 and .steps.after.status == 200 and .steps.after.json.tenant_id == "globex"),
+        observed: ("after tenant=" + (.steps.after.json.tenant_id // "")),
+        expected: "tenant_id is not mass-assignable"
+      }`,
+    })
+    const res = await verify(spec, fx.origin)
+    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
+    assert.equal(res.evidencePayload.evidenceClass, 'mass_assignment')
+  } finally { await fx.close() }
 })

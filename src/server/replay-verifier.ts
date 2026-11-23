@@ -35,6 +35,7 @@ import {
   actorFromPersona,
   assessBoundary,
   assessImpactEvidence,
+  assessMassAssignmentImpact,
   assessMfaBypass,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
@@ -1285,12 +1286,27 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         // `assessBflaImpact` above (same validators). Unmodelled classes ('other') stay ungated; every
         // class the gate understands is gated regardless of actor count, so a single anonymous actor
         // cannot bypass the authorization read-disclosure check.
-        const impactClass = classifyImpactDescriptor({
+        const declaredImpactClass = classifyImpactDescriptor({
           cwe: spec.cwe,
           category: spec.category,
           title: spec.title,
           impact: spec.impact,
         })
+        const impactSteps = impactStepsFromStepsOut(spec, stepsOut)
+        // Evidence-first class: if the probe persisted a protected field from the request body, the
+        // proof *is* mass assignment no matter how the model labelled it (the common K=6 case is a
+        // `tenant_id` overpost reported as BOLA). This both gates and labels on what happened.
+        const massAssignmentEvidence = declaredImpactClass === 'mass_assignment'
+          ? null
+          : assessMassAssignmentImpact({
+              impactClass: 'mass_assignment',
+              steps: impactSteps,
+              oracleEvents: spec.expectedImpactEvents,
+              targetOrigin: spec.origin,
+            })
+        const impactClass = massAssignmentEvidence?.required && massAssignmentEvidence.satisfied
+          ? 'mass_assignment' as const
+          : declaredImpactClass
         // A control arm that binds a CSRF token is the engine's declared anti-CSRF defence for the
         // route, equivalent to the route's `csrf_state_change` oracle. It is a requirement, not
         // evidence: the persisted readback is still demanded below.
@@ -1303,7 +1319,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const gateApplies = impactClass === 'mass_assignment' || impactClass === 'csrf' ||
           impactClass === 'business_logic' || impactClass === 'markup' || impactClass === 'disclosure' ||
           (impactClass === 'authorization' && (distinctActors.size > 1 || Boolean(spec.requiredRole) || Boolean(spec.resourceTenant)))
-        const impactSteps = impactStepsFromStepsOut(spec, stepsOut)
         const impactGate = !gateApplies
           ? null
           : assessImpactEvidence({
@@ -1379,6 +1394,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(spaCatchallAuto ? { spaCatchallAuto } : {}),
           bflaImpact,
           ...(impactGate ? { impactGate } : {}),
+          // Verified evidence class: lets the host align a mislabelled finding (e.g. a tenant_id
+          // overpost reported as BOLA is mass assignment) with what the proof actually showed.
+          ...(impactGate?.required && impactGate.satisfied ? { evidenceClass: impactClass } : {}),
           ...(boundaryGate ? { boundaryGate } : {}),
           proofStrength,
           endpointBinding,

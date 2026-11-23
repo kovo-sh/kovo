@@ -236,7 +236,25 @@ import {
   verifyReplaySpec,
   verifyReplaySpecInline,
 } from './replay-verifier.ts'
+import { alignClaimClass } from './oracle-invariants.ts'
 import { responseReview } from './response-checks.ts'
+
+/**
+ * A finding's declared class can disagree with what the proof actually showed (the common case:
+ * a protected-field overpost reported as BOLA). The verifier records the verified `evidenceClass`;
+ * align the persisted finding with it so the report and the benchmark see the class the evidence
+ * supports. Authorization evidence never relabels a claim.
+ */
+function alignFindingForEvidence(
+  finding: Finding,
+  replay: { evidencePayload?: Record<string, unknown> | null },
+): Finding {
+  const payload = replay.evidencePayload
+  const evidenceClass = payload && typeof payload.evidenceClass === 'string' ? payload.evidenceClass : null
+  const label = alignClaimClass({ cwe: finding.cwe, category: finding.category }, evidenceClass)
+  if (!label) return finding
+  return { ...finding, cwe: label.cwe, category: label.category }
+}
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
@@ -9738,7 +9756,7 @@ export class Execution {
         scopeRevision: current.scopeRevision,
       }
       if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
-        this.storage.upsertChainFinding(current, findingRow.assetId, updatedFinding, specRow.id, specRow.sourceOrigins)
+        this.storage.upsertChainFinding(current, findingRow.assetId, alignFindingForEvidence(updatedFinding, result), specRow.id, specRow.sourceOrigins)
         if (owaspCategories.includes(specRow.spec.category as OwaspCategory) &&
             this.permitted(current, specRow.spec.origin)) {
           this.storage.upsertCoverageEntry(current, job.assignment.id, {
@@ -10126,7 +10144,10 @@ export class Execution {
         this.storage.upsertChainFinding(
           latestRun,
           findingRow.assetId,
-          { ...findingRow.finding, ...nextFindingPatch, replaySpecId: updatedSpec.id, scopeRevision: latestRun.scopeRevision },
+          alignFindingForEvidence(
+            { ...findingRow.finding, ...nextFindingPatch, replaySpecId: updatedSpec.id, scopeRevision: latestRun.scopeRevision },
+            replay,
+          ),
           updatedSpec.id,
           mergedOrigins,
         )
