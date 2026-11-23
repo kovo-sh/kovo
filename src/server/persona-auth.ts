@@ -1,4 +1,6 @@
 import type { PersonaLoginAdapter, PersonaLoginConfig } from '../domain.ts'
+import { lookup } from 'node:dns/promises'
+import ipaddr from 'ipaddr.js'
 import {
   readLoginCredentialFile,
   resolveRunPersonas,
@@ -75,6 +77,12 @@ interface PlaywrightFormRoute {
 
 interface PlaywrightFormContext {
   route(url: string, handler: (route: PlaywrightFormRoute) => Promise<void> | void): Promise<void>
+  addInitScript?(script: string | (() => void)): Promise<void>
+  routeWebSocket?(url: string, handler: (ws: {
+    url(): string
+    close(options?: { code?: number; reason?: string }): Promise<void> | void
+    connectToServer?(): Promise<void> | void
+  }) => Promise<void> | void): Promise<void>
   newPage(): Promise<PlaywrightFormPage>
   cookies(urls?: string | string[]): Promise<PlaywrightFormCookie[]>
   close(): Promise<void>
@@ -91,6 +99,8 @@ export interface PersonaAuthManagerOptions {
   timeoutMs?: number
   /** Minimum interval between broker-invoked 401 re-auths per persona (default 60s). */
   reauthMinIntervalMs?: number
+  /** Injectable DNS resolver for deterministic SSRF/rebinding checks in tests. */
+  resolveHost?: (hostname: string) => Promise<string[]>
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -140,10 +150,121 @@ export function decodeClerkPublishableKey(key: string): string | null {
   }
 }
 
-function deriveApexDomain(hostname: string): string {
-  const parts = hostname.toLowerCase().split('.').filter(Boolean)
-  if (parts.length <= 2) return hostname.toLowerCase()
-  return parts.slice(-2).join('.')
+/**
+ * Conservative public-suffix handling for the multi-label suffixes Guardian encounters in the wild.
+ * The previous implementation blindly took the last two labels, so `app.example.co.uk` mapped to
+ * `co.uk` and Clerk discovery could be steered to `clerk.co.uk`.
+ */
+const multiLabelPublicSuffixes = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'net.uk', 'ltd.uk', 'plc.uk', 'sch.uk',
+  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'id.au', 'asn.au',
+  'co.nz', 'net.nz', 'org.nz', 'govt.nz', 'ac.nz', 'school.nz',
+  'co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'go.jp', 'ad.jp', 'ed.jp', 'gr.jp', 'lg.jp',
+  'co.kr', 'or.kr', 'ne.kr', 'go.kr', 'ac.kr',
+  'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br',
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+  'com.tw', 'net.tw', 'org.tw', 'gov.tw', 'edu.tw',
+  'com.hk', 'net.hk', 'org.hk', 'gov.hk', 'edu.hk',
+  'com.sg', 'net.sg', 'org.sg', 'gov.sg', 'edu.sg',
+  'com.my', 'net.my', 'org.my', 'gov.my', 'edu.my',
+  'co.in', 'net.in', 'org.in', 'gov.in', 'ac.in', 'edu.in', 'firm.in', 'gen.in', 'ind.in',
+  'co.za', 'net.za', 'org.za', 'gov.za', 'ac.za', 'web.za',
+  'com.mx', 'net.mx', 'org.mx', 'gov.mx', 'edu.mx',
+  'com.ar', 'net.ar', 'org.ar', 'gov.ar', 'edu.ar',
+  'com.tr', 'net.tr', 'org.tr', 'gov.tr', 'edu.tr',
+  'co.il', 'org.il', 'net.il', 'gov.il', 'ac.il',
+  'com.ua', 'net.ua', 'org.ua', 'gov.ua', 'edu.ua',
+  'com.pl', 'net.pl', 'org.pl', 'gov.pl', 'edu.pl',
+  'com.ru', 'net.ru', 'org.ru', 'gov.ru', 'edu.ru',
+  'com.es', 'net.es', 'org.es', 'gov.es', 'edu.es',
+  'co.id', 'or.id', 'ac.id', 'go.id', 'web.id',
+  'co.th', 'in.th', 'ac.th', 'go.th',
+  'com.vn', 'net.vn', 'org.vn', 'gov.vn', 'edu.vn',
+  'com.ph', 'net.ph', 'org.ph', 'gov.ph', 'edu.ph',
+  'com.pk', 'net.pk', 'org.pk', 'gov.pk', 'edu.pk',
+  'com.ng', 'net.ng', 'org.ng', 'gov.ng', 'edu.ng',
+  'co.ke', 'or.ke', 'ne.ke', 'go.ke', 'ac.ke',
+  'com.eg', 'net.eg', 'org.eg', 'gov.eg', 'edu.eg',
+  'com.sa', 'net.sa', 'org.sa', 'gov.sa', 'edu.sa',
+  'co.ae', 'net.ae', 'org.ae', 'gov.ae', 'ac.ae',
+])
+
+/** Exact hostname/IP literal, never a scheme. Returns null for single labels and IPs. */
+export function registrableDomain(hostname: string): string | null {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, '')
+  if (!host || host.includes(':')) return null
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return null
+  const labels = host.split('.').filter(Boolean)
+  if (labels.length < 2) return null
+  const lastTwo = labels.slice(-2).join('.')
+  const suffixLabels = multiLabelPublicSuffixes.has(lastTwo) ? 2 : 1
+  if (labels.length <= suffixLabels) return null
+  return labels.slice(-(suffixLabels + 1)).join('.')
+}
+
+function allowedHostnames(allowlist: readonly string[]): string[] {
+  const hosts: string[] = []
+  for (const origin of allowlist) {
+    try {
+      hosts.push(new URL(origin).hostname.toLowerCase().replace(/\.$/, ''))
+    } catch {
+      // Ignore malformed allowlist entries; the broker rejects them independently.
+    }
+  }
+  return hosts
+}
+
+/**
+ * True when `host` is an explicitly allowlisted host or shares the registrable domain of one.
+ * This is the only permitted source for Clerk/IdP hosts — never a raw two-label fallback.
+ */
+export function isHostInScope(host: string, allowlist: readonly string[]): boolean {
+  const normalized = host.trim().toLowerCase().replace(/\.$/, '')
+  if (!normalized) return false
+  for (const allowed of allowedHostnames(allowlist)) {
+    if (normalized === allowed) return true
+    const registrable = registrableDomain(allowed)
+    if (registrable && normalized === registrable) return true
+    if (registrable && normalized.endsWith(`.${registrable}`)) return true
+  }
+  return false
+}
+
+export function isOriginInScope(origin: string, allowlist: readonly string[]): boolean {
+  try {
+    const parsed = new URL(origin)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false
+    return isHostInScope(parsed.hostname, allowlist)
+  } catch {
+    return false
+  }
+}
+
+function isIpLiteral(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/g, '')
+  return ipaddr.isValid(bare)
+}
+
+/** Loopback is allowed only for an explicitly allowlisted local-lab origin; link-local is never allowed. */
+export type AddressClass = 'public' | 'loopback' | 'blocked'
+
+export function classifyAddress(address: string): AddressClass {
+  try {
+    const ip = ipaddr.process(address)
+    const range = ip.range()
+    if (range === 'unicast') return 'public'
+    if (range === 'loopback') return 'loopback'
+    return 'blocked'
+  } catch {
+    return 'blocked'
+  }
+}
+
+function isLoopbackLiteral(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/g, '')
+  if (bare === 'localhost') return true
+  if (!ipaddr.isValid(bare)) return false
+  return ipaddr.process(bare).range() === 'loopback'
 }
 
 function extractSetCookies(headers: Headers): Map<string, string> {
@@ -266,26 +387,44 @@ function extractBearerToken(headerValue: string | undefined): string | null {
   return isJwtLike(match[1]) ? match[1] : null
 }
 
+/** Chromium sandboxing defaults. `--no-sandbox` is an explicit, warned-about insecure opt-in. */
+export function formChromiumLaunchArgs(options: { insecureNoSandbox?: boolean } = {}): string[] {
+  const args = [
+    '--disable-dev-shm-usage',
+    '--disable-background-networking',
+    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+  ]
+  if (options.insecureNoSandbox) args.push('--no-sandbox')
+  return args
+}
+
+const webrtcGuardScript = `(() => {
+  const deny = function () { throw new Error('WebRTC is disabled inside Guardian browser sessions.'); };
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
+    try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
+  }
+})();`
+
 async function launchDefaultChromium(): Promise<PlaywrightFormBrowserLike> {
+  const insecureNoSandbox = process.env.GUARDIAN_INSECURE_NO_SANDBOX === '1'
+  if (insecureNoSandbox) {
+    console.warn('WARNING: Chromium sandbox disabled (GUARDIAN_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
+  }
+  const args = formChromiumLaunchArgs({ insecureNoSandbox })
   try {
     const coreName = 'playwright-core'
     const coreMod = await import(/* @vite-ignore */ coreName) as {
       chromium?: { launch: (opts: Record<string, unknown>) => Promise<PlaywrightFormBrowserLike> }
     }
     if (coreMod.chromium) {
-      return await coreMod.chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking'],
-      })
+      return await coreMod.chromium.launch({ headless: true, args })
     }
   } catch {
     // Fallback to @playwright/test
   }
   const pw = await import('@playwright/test')
-  return await pw.chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking'],
-  }) as unknown as PlaywrightFormBrowserLike
+  return await pw.chromium.launch({ headless: true, args }) as unknown as PlaywrightFormBrowserLike
 }
 
 async function fetchWithTimeout(
@@ -300,36 +439,59 @@ async function fetchWithTimeout(
   const onOuterAbort = () => controller.abort(outerSignal?.reason)
   outerSignal?.addEventListener('abort', onOuterAbort, { once: true })
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal })
+    // Credential-bearing requests must never replay across a redirect. Every caller (including
+    // provider discovery) opts out of automatic redirect following and fails closed on 3xx.
+    return await fetchImpl(url, { ...init, redirect: 'manual', signal: controller.signal })
   } finally {
     clearTimeout(timer)
     outerSignal?.removeEventListener('abort', onOuterAbort)
   }
 }
 
+function rejectUnexpectedRedirect(res: Response, label: string): void {
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get('location') ?? ''
+    throw new PersonaAuthError(
+      'AUTH_FAILED',
+      `${label} returned an unexpected ${res.status} redirect${location ? ` to ${location.slice(0, 200)}` : ''}; Guardian never replays credentials across redirects.`,
+    )
+  }
+}
+
 async function inspectTargetOrigin(
   fetchImpl: typeof fetch,
   targetOrigin: string,
+  allowlist: readonly string[],
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<{ html: string; headers: Headers; clerkFapiOrigin: string | null; hasClerk: boolean }> {
   try {
+    // No redirects while discovering provider configuration: a redirect target must never decide
+    // which Clerk/IdP host receives credentials.
     const res = await fetchWithTimeout(
       fetchImpl,
       targetOrigin,
-      { method: 'GET', headers: { Accept: 'text/html,application/xhtml+xml,*/*' }, redirect: 'follow' },
+      { method: 'GET', headers: { Accept: 'text/html,application/xhtml+xml,*/*' }, redirect: 'manual' },
       Math.min(timeoutMs, 8_000),
       signal,
     )
+    if (res.status >= 300 && res.status < 400) {
+      return { html: '', headers: res.headers, clerkFapiOrigin: null, hasClerk: false }
+    }
     const html = (await res.text()).slice(0, 250_000)
     let clerkFapiOrigin: string | null = null
     const pkMatch = /\b(pk_(?:live|test)_[A-Za-z0-9+/=_-]{12,})\b/.exec(html)
     if (pkMatch) {
-      clerkFapiOrigin = decodeClerkPublishableKey(pkMatch[1])
+      const decoded = decodeClerkPublishableKey(pkMatch[1])
+      // A target document can contain an attacker-controlled publishable key; only hosts inside
+      // the persona allowlist's registrable domain may become the credential destination.
+      if (decoded && isOriginInScope(decoded, allowlist)) clerkFapiOrigin = decoded
     }
     if (!clerkFapiOrigin) {
       const fapiMatch = /https:\/\/(clerk\.[a-z0-9.-]+\.[a-z]{2,})/i.exec(html)
-      if (fapiMatch) clerkFapiOrigin = `https://${fapiMatch[1].toLowerCase()}`
+      if (fapiMatch && isOriginInScope(`https://${fapiMatch[1]}`, allowlist)) {
+        clerkFapiOrigin = `https://${fapiMatch[1].toLowerCase()}`
+      }
     }
     const hasClerkHeader = Boolean(
       res.headers.get('x-clerk-auth-status') ||
@@ -352,6 +514,8 @@ export class PersonaAuthManager {
   private readonly launchBrowser: () => Promise<PlaywrightFormBrowserLike>
   private readonly timeoutMs: number
   private readonly reauthMinIntervalMs: number
+  private readonly resolveHost: (hostname: string) => Promise<string[]>
+  private readonly hostSafety = new Map<string, { at: number; safe: boolean }>()
   private readonly runTimers = new Map<string, NodeJS.Timeout[]>()
   private readonly reauthHandlers = new Map<string, { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean> }>()
 
@@ -360,6 +524,85 @@ export class PersonaAuthManager {
     this.launchBrowser = options.launchBrowser ?? launchDefaultChromium
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.reauthMinIntervalMs = Math.max(1_000, options.reauthMinIntervalMs ?? 60_000)
+    this.resolveHost = options.resolveHost ?? (async hostname => {
+      if (isIpLiteral(hostname) || hostname.toLowerCase() === 'localhost') {
+        return [hostname.replace(/^\[|\]$/g, '')]
+      }
+      try {
+        const addresses = await lookup(hostname, { all: true, order: 'verbatim' })
+        return addresses.map(entry => entry.address)
+      } catch {
+        // Unresolvable names cannot reach an address; the ensuing fetch fails closed.
+        return []
+      }
+    })
+  }
+
+  /**
+   * Validate a credential destination: hostname must be inside the persona allowlist scope, the
+   * scheme must be HTTPS (HTTP only for an explicitly allowlisted loopback lab), and every resolved
+   * address must be public. Loopback is only accepted when the exact origin was allowlisted;
+   * link-local/metadata and private ranges are always refused.
+   */
+  private async assertCredentialTarget(rawUrl: string, allowlist: readonly string[], label: string): Promise<URL> {
+    let parsed: URL
+    try {
+      parsed = new URL(rawUrl)
+    } catch {
+      throw new PersonaAuthError('AUTH_FAILED', `${label} is not a valid URL.`)
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new PersonaAuthError('AUTH_FAILED', `${label} must use HTTPS.`)
+    }
+    const originAllowed = isOriginInScope(parsed.origin, allowlist)
+      || allowlist.some(entry => {
+        try { return new URL(entry).origin === parsed.origin } catch { return false }
+      })
+    if (!originAllowed) {
+      throw new PersonaAuthError('AUTH_FAILED', `${label} host ${parsed.hostname} is outside the persona origin allowlist.`)
+    }
+    const loopback = isLoopbackLiteral(parsed.hostname)
+    if (parsed.protocol === 'http:' && !loopback) {
+      throw new PersonaAuthError('AUTH_FAILED', `${label} must use HTTPS; credentials are never sent over plaintext HTTP.`)
+    }
+    const exactAllowlisted = allowlist.some(entry => {
+      try { return new URL(entry).origin === parsed.origin } catch { return false }
+    })
+    if (loopback && !exactAllowlisted) {
+      throw new PersonaAuthError('AUTH_FAILED', `${label} points at loopback without an explicit allowlist entry.`)
+    }
+    const addresses = await this.resolveHost(parsed.hostname)
+    for (const address of addresses) {
+      const kind = classifyAddress(address)
+      if (kind === 'blocked' || (kind === 'loopback' && !exactAllowlisted)) {
+        throw new PersonaAuthError('AUTH_FAILED', `${label} host ${parsed.hostname} resolves to a private, loopback, or metadata address.`)
+      }
+    }
+    return parsed
+  }
+
+  /** Re-check a browser navigation origin before Chromium is allowed to connect to it directly. */
+  private async hostIsSafeForBrowser(origin: string, allowlist: readonly string[]): Promise<boolean> {
+    let host: string
+    try {
+      host = new URL(origin).hostname
+    } catch {
+      return false
+    }
+    const cached = this.hostSafety.get(host)
+    if (cached && Date.now() - cached.at < 60_000) return cached.safe
+    const addresses = await this.resolveHost(host)
+    const kind = addresses.length === 0
+      ? 'unknown'
+      : addresses.every(address => classifyAddress(address) === 'public') ? 'public'
+        : addresses.every(address => classifyAddress(address) === 'loopback') ? 'loopback'
+          : 'blocked'
+    const exactAllowlisted = allowlist.some(entry => {
+      try { return new URL(entry).hostname.toLowerCase() === host.toLowerCase() } catch { return false }
+    })
+    const safe = kind === 'public' || (kind === 'loopback' && exactAllowlisted) || kind === 'unknown'
+    this.hostSafety.set(host, { at: Date.now(), safe })
+    return safe
   }
 
   /**
@@ -424,7 +667,7 @@ export class PersonaAuthManager {
     let detectedClerkFapiOrigin: string | null = null
 
     if (config.adapter === 'auto') {
-      const inspected = await inspectTargetOrigin(this.fetchImpl, targetOrigin, this.timeoutMs, signal)
+      const inspected = await inspectTargetOrigin(this.fetchImpl, targetOrigin, persona.originAllowlist, this.timeoutMs, signal)
       if (inspected.hasClerk) {
         adapter = 'clerk'
         detectedClerkFapiOrigin = inspected.clerkFapiOrigin
@@ -452,24 +695,42 @@ export class PersonaAuthManager {
   }
 
   private async resolveClerkFapiOrigin(
+    persona: ResolvedPersona,
     config: PersonaLoginConfig,
     targetOrigin: string,
     detectedFapiOrigin: string | null,
     signal?: AbortSignal,
   ): Promise<string> {
+    const allowlist = persona.originAllowlist
     if (config.loginUrl) {
       const parsed = new URL(config.loginUrl)
-      // If operator supplied a Clerk FAPI URL (e.g. https://clerk.dyad.sh or http://127.0.0.1:4000 in tests),
-      // use its origin directly. If it matches targetOrigin with a page path, still inspect HTML first.
+      // If operator supplied a Clerk FAPI URL (e.g. https://clerk.dyad.sh), use its origin directly.
+      // If it matches targetOrigin with a page path, still inspect HTML first. Either way the host
+      // must be inside the persona allowlist scope.
+      if (!isOriginInScope(parsed.origin, allowlist)) {
+        throw new PersonaAuthError('AUTH_FAILED', `Clerk login URL host ${parsed.hostname} is outside the persona origin allowlist.`)
+      }
       if (parsed.origin !== targetOrigin || /^clerk\./i.test(parsed.hostname) || parsed.pathname.includes('/v1/client')) {
         return parsed.origin
       }
     }
-    if (detectedFapiOrigin) return detectedFapiOrigin
-    const inspected = await inspectTargetOrigin(this.fetchImpl, targetOrigin, this.timeoutMs, signal)
+    if (detectedFapiOrigin && isOriginInScope(detectedFapiOrigin, allowlist)) return detectedFapiOrigin
+    const inspected = await inspectTargetOrigin(this.fetchImpl, targetOrigin, allowlist, this.timeoutMs, signal)
     if (inspected.clerkFapiOrigin) return inspected.clerkFapiOrigin
-    const host = new URL(targetOrigin).hostname
-    return `https://clerk.${deriveApexDomain(host)}`
+    // Only the target origin's registrable domain may host its Clerk instance. Never fall back to
+    // a bare last-two-label host (the old `co.uk` bug) or an arbitrary host from target HTML.
+    const registrable = registrableDomain(new URL(targetOrigin).hostname)
+    if (!registrable) {
+      throw new PersonaAuthError(
+        'AUTH_FAILED',
+        `Cannot derive a Clerk Frontend API host for ${targetOrigin}; configure an explicit Clerk login URL inside the persona allowlist.`,
+      )
+    }
+    const derived = `https://clerk.${registrable}`
+    if (!isOriginInScope(derived, allowlist)) {
+      throw new PersonaAuthError('AUTH_FAILED', `Derived Clerk host ${derived} is outside the persona origin allowlist.`)
+    }
+    return derived
   }
 
   private async authenticateClerk(
@@ -481,8 +742,9 @@ export class PersonaAuthManager {
     detectedClerkFapiOrigin: string | null,
     signal?: AbortSignal,
   ): Promise<AuthenticateResult> {
-    const fapiOrigin = await this.resolveClerkFapiOrigin(config, targetOrigin, detectedClerkFapiOrigin, signal)
+    const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, detectedClerkFapiOrigin, signal)
     const signInUrl = `${fapiOrigin}/v1/client/sign_ins`
+    await this.assertCredentialTarget(signInUrl, persona.originAllowlist, 'Clerk sign-in URL')
     const form = new URLSearchParams({
       identifier: email,
       password,
@@ -506,6 +768,7 @@ export class PersonaAuthManager {
     )
 
     const rawText = await res.text()
+    rejectUnexpectedRedirect(res, 'Clerk sign-in')
     let body: Record<string, unknown> = {}
     try {
       body = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {}
@@ -588,6 +851,7 @@ export class PersonaAuthManager {
         this.timeoutMs,
       )
       const tokText = await tokRes.text()
+      rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
       checkResponseForCaptchaOrMfa(tokText, fapiOrigin, email)
       if (!tokRes.ok) {
         throw new PersonaAuthError('AUTH_FAILED', `Clerk token refresh failed (${tokRes.status}): ${sanitizeErrorText(tokText, [password, clientCookie, jwt])}`)
@@ -670,6 +934,7 @@ export class PersonaAuthManager {
     signal?: AbortSignal,
   ): Promise<AuthenticateResult> {
     const loginUrl = config.loginUrl || `${targetOrigin}/auth/v1/token?grant_type=password`
+    await this.assertCredentialTarget(loginUrl, persona.originAllowlist, 'Supabase login URL')
     const res = await fetchWithTimeout(
       this.fetchImpl,
       loginUrl,
@@ -686,6 +951,7 @@ export class PersonaAuthManager {
     )
 
     const rawText = await res.text()
+    rejectUnexpectedRedirect(res, 'Supabase login')
     checkResponseForCaptchaOrMfa(rawText, loginUrl, email)
 
     let body: Record<string, unknown> = {}
@@ -728,6 +994,7 @@ export class PersonaAuthManager {
     const refreshIntervalSec = config.refreshIntervalSec ?? Math.max(15, Math.min(1800, Math.floor(expiresInSec * 0.75)))
     const doRefresh = async () => {
       if (!refreshToken) return
+      await this.assertCredentialTarget(refreshUrl, persona.originAllowlist, 'Supabase refresh URL')
       const rRes = await fetchWithTimeout(
         this.fetchImpl,
         refreshUrl,
@@ -742,6 +1009,7 @@ export class PersonaAuthManager {
         this.timeoutMs,
       )
       const rText = await rRes.text()
+      rejectUnexpectedRedirect(rRes, 'Supabase token refresh')
       checkResponseForCaptchaOrMfa(rText, refreshUrl, email)
       if (!rRes.ok) {
         throw new PersonaAuthError('AUTH_FAILED', `Supabase token refresh failed (${rRes.status}): ${sanitizeErrorText(rText, [password, refreshToken])}`)
@@ -800,6 +1068,7 @@ export class PersonaAuthManager {
     // Optional CSRF pre-fetch: cookie + token seeding for JSON logins behind CSRF middleware.
     if (ext.csrfPrefetchUrl) {
       try {
+        await this.assertCredentialTarget(ext.csrfPrefetchUrl, persona.originAllowlist, 'CSRF pre-fetch URL')
         const csrfRes = await fetchWithTimeout(
           this.fetchImpl,
           ext.csrfPrefetchUrl,
@@ -831,6 +1100,7 @@ export class PersonaAuthManager {
       }
     }
 
+    await this.assertCredentialTarget(loginUrl, persona.originAllowlist, 'JSON login URL')
     const res = await fetchWithTimeout(
       this.fetchImpl,
       loginUrl,
@@ -844,6 +1114,7 @@ export class PersonaAuthManager {
     )
 
     const rawText = await res.text()
+    rejectUnexpectedRedirect(res, 'JSON login')
     checkResponseForCaptchaOrMfa(rawText, loginUrl, email)
 
     let body: unknown = null
@@ -875,6 +1146,7 @@ export class PersonaAuthManager {
       let currentRefreshToken = refreshToken
       const doRefresh = refreshUrl && refreshToken
         ? async () => {
+            await this.assertCredentialTarget(refreshUrl, persona.originAllowlist, 'JSON refresh URL')
             const rr = await fetchWithTimeout(
               this.fetchImpl,
               refreshUrl,
@@ -886,6 +1158,7 @@ export class PersonaAuthManager {
               this.timeoutMs,
             )
             const rt = await rr.text()
+            rejectUnexpectedRedirect(rr, 'JSON refresh')
             if (!rr.ok) {
               throw new PersonaAuthError('AUTH_FAILED', `JSON refresh failed (${rr.status}): ${sanitizeErrorText(rt.slice(0, 160), [currentRefreshToken ?? '', password])}`)
             }
@@ -1041,6 +1314,25 @@ export class PersonaAuthManager {
     try {
       browser = await this.launchBrowser()
       context = await browser.newContext({ ignoreHTTPSErrors: false })
+      await context.addInitScript?.(webrtcGuardScript)
+      // WebSocket upgrades are never brokered HTTP. Only the target/login origins may open a
+      // socket; everything else is closed before Chromium connects.
+      if (typeof context.routeWebSocket === 'function') {
+        await context.routeWebSocket('**/*', async ws => {
+          try {
+            const url = new URL(ws.url())
+            const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
+            if (!allowedOrigins.has(websocketOrigin)) {
+              await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+              return
+            }
+            await ws.connectToServer?.()
+          } catch {
+            await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+          }
+        })
+      }
+      const scopeForSubresources = [...persona.originAllowlist, loginOrigin]
       await context.route('**/*', async route => {
         const reqUrl = route.request().url()
         const requestHeaders = route.request().headers?.()
@@ -1056,17 +1348,19 @@ export class PersonaAuthManager {
           const method = (route.request().method?.() ?? 'GET').toUpperCase()
           const resourceType = route.request().resourceType?.() ?? 'document'
           const isReadOnly = method === 'GET' || method === 'HEAD'
-          if (allowedOrigins.has(origin)) {
-            await route.continue()
+          const exactAllowed = allowedOrigins.has(origin)
+          const inScopeSubresource = isReadOnly && resourceType !== 'document' && isOriginInScope(origin, scopeForSubresources)
+          if (!exactAllowed && !inScopeSubresource) {
+            await route.abort('blockedbyclient')
             return
           }
-          // Read-only static assets / configured IdP subresources may render during login,
-          // but never documents and never mutating requests.
-          if (isReadOnly && resourceType !== 'document' && /^https?:$/i.test(new URL(reqUrl).protocol)) {
-            await route.continue()
+          // Re-check DNS at request time: a hostname that rebinds to loopback/LAN/metadata after
+          // discovery must never receive browser traffic.
+          if (!(await this.hostIsSafeForBrowser(origin, scopeForSubresources))) {
+            await route.abort('blockedbyclient')
             return
           }
-          await route.abort('blockedbyclient')
+          await route.continue()
           return
         } catch {
           await route.abort('blockedbyclient')
