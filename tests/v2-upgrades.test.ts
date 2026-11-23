@@ -370,7 +370,9 @@ test('RequestBroker.executeRaceBurst hits local TOCTOU fixture concurrently and 
     tier: 2,
     canRead: origin => origin === appOrigin || origin === clerkOrigin,
     personas,
-    isIdempotentPostAllowed: (_o, p) => p === '/api/redeem-once',
+    // The legacy path-substring idempotent predicate no longer bypasses authorization. Tier-2
+    // writes require the operator's explicit sandbox allowlist entry instead.
+    sandboxWriteAllowlist: [{ origin: appOrigin, method: 'POST', pathPattern: '/api/redeem-once' }],
   })
   const burst = await broker.executeRaceBurst(
     Array.from({ length: 5 }, () => ({
@@ -553,7 +555,7 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
     tier: 2,
     canRead: origin => origin === appOrigin || origin === clerkOrigin || origin === sandpackOrigin,
     personas,
-    isIdempotentPostAllowed: (_o, p) => p === '/api/coupon/redeem',
+    sandboxWriteAllowlist: [{ origin: appOrigin, method: 'POST', pathPattern: '/api/coupon/redeem' }],
   })
 
   // --- 3A. race_burst Replay Spec ---

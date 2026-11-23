@@ -123,10 +123,14 @@ test('HIGH #1: automatic approvals are never matched by path prefix or reused ac
 })
 
 test('HIGH #1: operator-approved patterns stay segment-aware and reusable, but never cover RCE proofs', () => {
+  // A wildcard covers one identifier-shaped segment only. It must not cover a sibling verb or an
+  // arbitrary literal (the pre-fix behaviour let `POST /api/*` approve `POST /api/delete`).
   const patterns = [
     { origin: PUBLIC_ORIGIN, method: 'POST', pathPattern: '/api/*', scopeRevision: 1 },
   ]
-  assert.ok(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/x' }, patterns))
+  assert.ok(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/42' }, patterns))
+  assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/x' }, patterns), undefined)
+  assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/delete' }, patterns), undefined)
   assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/apix' }, patterns), undefined)
   assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/other/api/x' }, patterns), undefined)
 
@@ -140,10 +144,11 @@ test('HIGH #1: operator-approved patterns stay segment-aware and reusable, but n
     approvedPatterns: patterns,
   })
 
-  assert.equal(authorize('/api/x').via, 'operator_pattern')
-  assert.equal(authorize('/api/x').approved, true, 'operator patterns remain reusable')
+  assert.equal(authorize('/api/42').via, 'operator_pattern')
+  assert.equal(authorize('/api/42').approved, true, 'operator patterns remain reusable')
   assert.equal(authorize('/apix').approved, false, 'segment boundary must be respected')
-  assert.equal(authorize('/api/x', true).approved, false, 'operator patterns never cover RCE proof probes')
+  assert.equal(authorize('/api/delete').approved, false, 'a wildcard never covers a sibling verb')
+  assert.equal(authorize('/api/42', true).approved, false, 'operator patterns never cover RCE proof probes')
 })
 
 test('HIGH #1: multipart body hashing is boundary-independent and parts-sensitive', () => {
@@ -440,11 +445,12 @@ test('HIGH #1: execution auto-approval is exact and single-use; persisted rows n
   assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/prefix/child', { ...context, body: '{}' }), false,
     'a persisted approved row must never prefix-match child paths')
 
-  // Operator-approved patterns still work, segment-aware only.
+  // Operator-approved patterns still work, segment-aware only, and only for ID-shaped segments.
   storage.updateRun(auto.runId, {
     approvedEndpointPatterns: [{ origin: PUBLIC_ORIGIN, method: 'POST', pathPattern: '/api/*', scopeRevision: storage.run(auto.runId).scopeRevision }],
   })
-  assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/api/x', context), true)
+  assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/api/42', context), true)
+  assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/api/x', context), false)
   assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/apix', context), false)
 })
 
