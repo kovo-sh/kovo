@@ -1,0 +1,1811 @@
+#!/usr/bin/env node
+/**
+ * Guardian v6 Phase-1 certification runner.
+ *
+ * Turns the reviewer's Phase-1 matrix (ROADMAP check-in #4) into one reproducible
+ * certificate. It does not grade anything itself: every number comes from the real
+ * `scripts/benchmark-realistic.ts` / `scripts/benchmark-reason.ts` artifacts. The runner
+ * either
+ *
+ *   --run       spawns the matrix (floor n=3/app dev + n=1/app held-out, unified agentic
+ *               n=3/app dev + n=2-3/app held-out, reason-bench floor + agentic) with one
+ *               isolated out-dir per cell, or
+ *   --from-dir  ingests existing report JSONs (cheap reruns, no model spend).
+ *
+ * Metric definitions (ROADMAP check-in #3/#4):
+ *   floor_recall            median [min-max] of `--no-llm` recall per app (seed 1 dev).
+ *   floor spread            max-min confirmed targets across the floor dev runs (<= 1).
+ *   total_product_recall    median [min-max] per-run total recall after deduping floor∩agent
+ *                           targets by (origin, normalizedRoute, vulnClass, mutatedInput) when
+ *                           the report exposes route/mutation; otherwise by site id. The union
+ *                           across independent runs is reported separately as coverage.
+ *   agentic_incremental_lift= total_product_recall - floor_recall, per app and aggregate.
+ *   floor_preservation_ratio= floorConfirmedInUnified / floorStandalone (median). The unified
+ *                           floor count comes from the run's `deterministic_lane.metrics`
+ *                           event / meta summary; the standalone baseline is the floor median.
+ *   precision               worst-run precision across every realism cell (must be 100%).
+ *   leads invariant         floorLeadsEmitted > 0 => floorLeadsConsumed > 0.
+ *   reason-bench            floor 0/28; agentic >= 25% at worst-run 100% precision.
+ *
+ * Verdicts: PASS only when every criterion passes its stated threshold. Artifacts:
+ * `certificate.json` (machine readable) + `certificate.md` (summary). Exit 1 on FAIL.
+ *
+ * Safety: the salted held-out salt is read only from GUARDIAN_RB_HELDOUT_SALT, is never
+ * written to any artifact, and every rendered artifact is scanned/redacted before disk.
+ * Each cell gets its own out-dir/data-dir; SIGINT/SIGTERM kills the whole child process
+ * group and removes per-cell data dirs (0 orphans).
+ *
+ * Usage:
+ *   GUARDIAN_ALLOW_LOCAL_LAB=1 npm run certify:phase1 -- --run \
+ *     --data-dir /home/omarchy/guardian-data --verifier docker --use-newgrp
+ *   npm run certify:phase1 -- --from-dir /tmp/v6-floor-post --from-dir /tmp/preserve
+ */
+import { execFileSync, spawn } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
+import {
+  chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+} from 'node:fs'
+import { basename, dirname, join, relative, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { pathToFileURL } from 'node:url'
+
+// ---------------------------------------------------------------------------------------------
+// Constants and contract types
+// ---------------------------------------------------------------------------------------------
+
+export const CERTIFY_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
+export const REASON_APPS = ['ledgerflow', 'forgecloud'] as const
+export const DEV_SEED = 1
+export const HELDOUT_SEED = 1_000_042
+export const REASON_TARGETS = 28
+
+export const DEFAULT_THRESHOLDS = {
+  /** Floor runs are deterministic: max-min confirmed targets per app must be <= this. */
+  floorSpreadMax: 1,
+  /** Median floorConfirmedInUnified / floorStandalone across unified runs. */
+  preservationMin: 0.95,
+  /** Every realism cell must be perfectly precise (no decoy or unmatched FP). */
+  worstPrecision: 1,
+  /** Aggregate incremental lift over the standalone floor. */
+  liftDevMin: 0.10,
+  liftHeldoutMin: 0.08,
+  /** Unified total must not sit below the floor on any app (both splits). */
+  requireMonotonic: true,
+  /** Reason-bench anti-heuristic floor must stay at 0 confirmed out of 28. */
+  reasonFloorConfirmed: 0,
+  reasonTargets: REASON_TARGETS,
+  /** Reason-bench agentic recall at worst-run 100% precision. */
+  reasonAgenticMin: 0.25,
+} as const
+
+export type Thresholds = typeof DEFAULT_THRESHOLDS
+
+export type SeedSet = 'dev' | 'held-out'
+export type LlmMode = 'agentic' | 'deterministic-no-llm'
+
+export interface VulnLike {
+  siteId: string
+  vulnClass?: string
+  outcome?: string
+  origin?: string
+  route?: string
+  normalizedRoute?: string
+  endpoint?: string
+  mutatedInput?: unknown
+  mutated?: unknown
+  matchedFindingIds?: string[]
+}
+
+export interface ScorecardLike {
+  app: string
+  seed: number
+  seedSet?: string
+  mode?: string
+  targets: number
+  confirmed: number
+  recall?: number
+  precision?: number
+  decoys?: number
+  decoyFalsePositives?: number
+  unmatchedFalsePositives?: number
+  vulns?: VulnLike[]
+  llm?: string
+}
+
+export interface FloorMetrics {
+  floorConfirmed: number | null
+  floorLeadsConsumed: number | null
+  floorLeadsEmitted: number | null
+  source: string
+}
+
+export interface RealismRun {
+  id: string
+  dir: string
+  file: string | null
+  app: string
+  seed: number
+  seedSet: SeedSet
+  mode: string
+  llm: LlmMode
+  targets: number
+  confirmed: number
+  recall: number
+  precision: number
+  decoyFalsePositives: number
+  unmatchedFalsePositives: number
+  confirmedKeys: string[]
+  floor: FloorMetrics
+  notes: string[]
+}
+
+export interface ReasonSiteLike {
+  siteId: string
+  confirmed: boolean
+}
+
+export interface ReasonCellLike {
+  app: string
+  seed: number
+  mode: string
+  llm: LlmMode
+  targets: number
+  confirmed: number
+  recall: number
+  precision: number
+  decoyFalsePositives: number
+  unmatchedFalsePositives: number
+  sites: ReasonSiteLike[]
+}
+
+export interface ReasonRun {
+  source: string
+  cells: ReasonCellLike[]
+}
+
+export interface IngestResult {
+  runs: RealismRun[]
+  reason: ReasonRun[]
+  notes: string[]
+  filesScanned: number
+}
+
+// ---------------------------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------------------------
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+function ratio(numerator: number, denominator: number): number {
+  return denominator > 0 ? numerator / denominator : 0
+}
+
+export function median(values: number[]): number | null {
+  if (!values.length) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2
+}
+
+function sum(values: number[]): number {
+  return values.reduce((n, v) => n + v, 0)
+}
+
+function pct(value: number | null | undefined): string {
+  return value === null || value === undefined || !Number.isFinite(value) ? 'n/a' : `${(value * 100).toFixed(1)}%`
+}
+
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)]
+}
+
+function seedSetOf(raw: unknown, seed: number): SeedSet {
+  if (raw === 'held-out' || raw === 'heldout' || raw === 'heldOut') return 'held-out'
+  if (raw === 'dev') return 'dev'
+  return seed >= 1_000_000 ? 'held-out' : 'dev'
+}
+
+function llmOf(raw: unknown): LlmMode | null {
+  if (raw === 'agentic') return 'agentic'
+  if (raw === 'deterministic-no-llm' || raw === 'deterministic' || raw === 'no-llm') return 'deterministic-no-llm'
+  return null
+}
+
+export function cellSlug(app: string, seed: number, mode: string): string {
+  return `${app}-seed${seed}-${mode}`
+}
+
+// ---------------------------------------------------------------------------------------------
+// Target identity (dedupe)
+// ---------------------------------------------------------------------------------------------
+
+export function normalizeOrigin(raw: string): string {
+  const text = raw.trim()
+  try {
+    const url = new URL(text)
+    return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}`
+  } catch {
+    return text.toLowerCase().replace(/\/+$/, '')
+  }
+}
+
+/** Path-only normalizer: strips query/fragment, collapses separators, anonymous ids -> :id. */
+export function normalizeRoute(raw: string): string {
+  let pathname = raw.trim()
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(pathname)) {
+    try {
+      pathname = new URL(pathname).pathname || '/'
+    } catch {
+      // Keep the raw value; it is still a stable identity.
+    }
+  }
+  const q = pathname.indexOf('?')
+  if (q >= 0) pathname = pathname.slice(0, q)
+  const h = pathname.indexOf('#')
+  if (h >= 0) pathname = pathname.slice(0, h)
+  if (!pathname.startsWith('/')) pathname = `/${pathname}`
+  pathname = pathname.replace(/\/{2,}/g, '/')
+  if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1)
+  pathname = pathname
+    .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=\/|$)/gi, '/:id')
+    .replace(/\/\d+(?=\/|$)/g, '/:id')
+  return pathname.toLowerCase()
+}
+
+export function normalizeMutatedInput(raw: unknown): string {
+  if (raw === null || raw === undefined) return ''
+  if (typeof raw === 'string') return raw.trim().toLowerCase()
+  if (!isRecord(raw)) return ''
+  const kind = typeof raw.kind === 'string' ? raw.kind.toLowerCase() : ''
+  const name = typeof raw.name === 'string' ? raw.name : (typeof raw.param === 'string' ? raw.param : '')
+  if (!kind && !name) return ''
+  return `${kind}:${name.toLowerCase()}`.replace(/^:+/, '')
+}
+
+/**
+ * Dedupe key for one confirmed site. Uses the four-part product identity when the report
+ * exposes it; otherwise falls back to the benchmark site id (all current scorecards).
+ */
+export function targetKey(vuln: VulnLike, app: string): string {
+  const origin = asString(vuln.origin)
+  const route = asString(vuln.normalizedRoute) ?? asString(vuln.route) ?? asString(vuln.endpoint)
+  const mutated = normalizeMutatedInput(vuln.mutatedInput ?? vuln.mutated)
+  if (origin && route) {
+    return `${normalizeOrigin(origin)}|${normalizeRoute(route)}|${(vuln.vulnClass ?? '').toLowerCase()}|${mutated || '-'}`
+  }
+  return `site:${app}|${vuln.siteId}`
+}
+
+export function confirmedTargetKeys(vulns: VulnLike[], app: string): string[] {
+  const keys = new Set<string>()
+  for (const vuln of vulns) {
+    if (vuln.outcome !== 'confirmed') continue
+    keys.add(targetKey(vuln, app))
+  }
+  return [...keys]
+}
+
+/** Union of confirmed targets across independent runs, deduped by the identity above. */
+export function unionConfirmedTargets(runs: RealismRun[]): string[] {
+  const keys = new Set<string>()
+  for (const run of runs) for (const key of run.confirmedKeys) keys.add(key)
+  return [...keys]
+}
+
+function maxTargets(runs: RealismRun[]): number {
+  return runs.reduce((n, run) => Math.max(n, run.targets), 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Floor metrics (meta summary or per-run events DB)
+// ---------------------------------------------------------------------------------------------
+
+interface RawFloorMetrics {
+  floorConfirmed?: number
+  floorLeadsConsumed?: number
+  floorLeadsEmitted?: number
+}
+
+function pickFloorMetrics(source: unknown): RawFloorMetrics | null {
+  if (!isRecord(source)) return null
+  const out: RawFloorMetrics = {}
+  let found = false
+  for (const key of ['floorConfirmed', 'floorLeadsConsumed', 'floorLeadsEmitted'] as const) {
+    if (typeof source[key] === 'number' && Number.isFinite(source[key])) {
+      out[key] = source[key] as number
+      found = true
+    }
+  }
+  return found ? out : null
+}
+
+function metaFloorMetrics(meta: Record<string, unknown> | null, card: ScorecardLike): FloorMetrics {
+  if (meta) {
+    for (const candidate of [meta.floorMetrics, meta.deterministicLane, meta.deterministic_lane, meta.floor]) {
+      const picked = pickFloorMetrics(candidate)
+      if (picked) {
+        return {
+          floorConfirmed: picked.floorConfirmed ?? null,
+          floorLeadsConsumed: picked.floorLeadsConsumed ?? null,
+          floorLeadsEmitted: picked.floorLeadsEmitted ?? null,
+          source: 'meta',
+        }
+      }
+    }
+    const direct = pickFloorMetrics(meta)
+    if (direct) {
+      return {
+        floorConfirmed: direct.floorConfirmed ?? null,
+        floorLeadsConsumed: direct.floorLeadsConsumed ?? null,
+        floorLeadsEmitted: direct.floorLeadsEmitted ?? null,
+        source: 'meta',
+      }
+    }
+  }
+  const cardLevel = pickFloorMetrics(card)
+  if (cardLevel) {
+    return {
+      floorConfirmed: cardLevel.floorConfirmed ?? null,
+      floorLeadsConsumed: cardLevel.floorLeadsConsumed ?? null,
+      floorLeadsEmitted: cardLevel.floorLeadsEmitted ?? null,
+      source: 'summary',
+    }
+  }
+  return { floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: null, source: 'none' }
+}
+
+function findRunDatabase(dir: string, slug: string): string | null {
+  const direct = join(dir, 'data', slug, 'guardian.sqlite')
+  if (existsSync(direct)) return direct
+  const dataRoot = join(dir, 'data')
+  const matches: string[] = []
+  if (existsSync(dataRoot)) {
+    try {
+      for (const entry of readdirSync(dataRoot)) {
+        if (entry === slug || entry.startsWith(`${slug}-`)) {
+          const candidate = join(dataRoot, entry, 'guardian.sqlite')
+          if (existsSync(candidate)) matches.push(candidate)
+        }
+      }
+    } catch { /* unreadable data dir */ }
+  }
+  if (matches.length === 1) return matches[0]!
+  // Last resort: exactly one guardian.sqlite under the cell's own directory tree.
+  const found = collectFiles(dir, (path) => basename(path) === 'guardian.sqlite', 3)
+  return found.length === 1 ? found[0]! : (matches.sort()[0] ?? null)
+}
+
+function collectFiles(root: string, accept: (path: string) => boolean, maxDepth: number): string[] {
+  const out: string[] = []
+  const walk = (dir: string, depth: number): void => {
+    if (depth > maxDepth) return
+    let entries: string[]
+    try { entries = readdirSync(dir) } catch { return }
+    for (const entry of entries) {
+      if (entry === 'node_modules' || entry === '.git' || entry === 'credentials') continue
+      const path = join(dir, entry)
+      let stat
+      try { stat = statSync(path) } catch { continue }
+      if (stat.isDirectory()) walk(path, depth + 1)
+      else if (stat.isFile() && accept(path)) out.push(path)
+    }
+  }
+  walk(root, 0)
+  return out
+}
+
+function readMetricsFromDatabase(dbPath: string): FloorMetrics | null {
+  let db: DatabaseSync | null = null
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+    const latest = db.prepare(
+      "select detail from events where kind = 'deterministic_lane.metrics' order by rowid desc limit 1",
+    ).get() as { detail?: unknown } | undefined
+    let emitted: number | null = null
+    try {
+      const row = db.prepare(
+        "select count(*) as n from facts where json_extract(data, '$.kind') = 'det_lead'",
+      ).get() as { n?: unknown } | undefined
+      if (typeof row?.n === 'number') emitted = row.n
+    } catch { /* facts/data shape unavailable */ }
+    if (!latest) return emitted === null ? null : {
+      floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: emitted, source: 'events-db',
+    }
+    const detail = typeof latest.detail === 'string' ? JSON.parse(latest.detail) as unknown : latest.detail
+    if (!isRecord(detail)) return null
+    return {
+      floorConfirmed: typeof detail.floorConfirmed === 'number' ? detail.floorConfirmed : null,
+      floorLeadsConsumed: typeof detail.floorLeadsConsumed === 'number' ? detail.floorLeadsConsumed : null,
+      floorLeadsEmitted: typeof detail.floorLeadsEmitted === 'number'
+        ? detail.floorLeadsEmitted
+        : emitted,
+      source: 'events-db',
+    }
+  } catch {
+    return null
+  } finally {
+    try { db?.close() } catch { /* already closed */ }
+  }
+}
+
+function resolveFloorMetrics(dir: string, card: ScorecardLike, meta: Record<string, unknown> | null): FloorMetrics {
+  const fromMeta = metaFloorMetrics(meta, card)
+  const dbPath = findRunDatabase(dir, cellSlug(card.app, card.seed, card.mode ?? 'grey-box'))
+  const fromDb = dbPath ? readMetricsFromDatabase(dbPath) : null
+  return {
+    floorConfirmed: fromMeta.floorConfirmed ?? fromDb?.floorConfirmed ?? null,
+    floorLeadsConsumed: fromMeta.floorLeadsConsumed ?? fromDb?.floorLeadsConsumed ?? null,
+    floorLeadsEmitted: fromMeta.floorLeadsEmitted ?? fromDb?.floorLeadsEmitted ?? null,
+    source: fromMeta.source !== 'none' ? fromMeta.source : (fromDb?.source ?? 'none'),
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Report ingestion
+// ---------------------------------------------------------------------------------------------
+
+function parseJsonFile(path: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as unknown
+  } catch {
+    return null
+  }
+}
+
+function isScorecard(value: unknown): value is ScorecardLike {
+  return isRecord(value)
+    && typeof value.app === 'string'
+    && typeof value.seed === 'number'
+    && typeof value.targets === 'number'
+    && typeof value.confirmed === 'number'
+    && (Array.isArray(value.vulns) || typeof value.precision === 'number')
+}
+
+function isReasonReport(value: unknown): value is { cells: unknown[] } {
+  return isRecord(value)
+    && value.schemaVersion === 1
+    && Array.isArray(value.cells)
+    && ('agentic' in value || 'floorRun' in value || 'gate' in value)
+}
+
+function metaPathFor(dir: string, card: ScorecardLike): string {
+  return join(dir, `${cellSlug(card.app, card.seed, card.mode ?? 'grey-box')}.meta.json`)
+}
+
+function readMeta(dir: string, card: ScorecardLike): Record<string, unknown> | null {
+  const path = metaPathFor(dir, card)
+  if (!existsSync(path)) return null
+  const parsed = parseJsonFile(path)
+  return isRecord(parsed) ? parsed : null
+}
+
+function inferLlm(card: ScorecardLike, meta: Record<string, unknown> | null, file: string): { llm: LlmMode; inferred: boolean } {
+  const explicit = llmOf(card.llm)
+    ?? llmOf(meta?.llm)
+    ?? llmOf(isRecord(meta?.model) ? meta.model.mode : undefined)
+  if (explicit) return { llm: explicit, inferred: false }
+  const hint = file.toLowerCase()
+  if (/floor|no-llm|deterministic/.test(hint)) return { llm: 'deterministic-no-llm', inferred: true }
+  return { llm: 'agentic', inferred: true }
+}
+
+function realismRunFromCard(
+  card: ScorecardLike,
+  dir: string,
+  file: string | null,
+  meta: Record<string, unknown> | null,
+  llm: LlmMode,
+  notes: string[],
+): RealismRun {
+  const vulns = Array.isArray(card.vulns) ? card.vulns.filter(isRecord) as unknown as VulnLike[] : []
+  const confirmedKeys = confirmedTargetKeys(vulns, card.app)
+  const recall = asNumber(card.recall, ratio(card.confirmed, card.targets))
+  return {
+    id: `${dir}#${file ?? 'summary'}#${cellSlug(card.app, card.seed, card.mode ?? 'grey-box')}`,
+    dir,
+    file,
+    app: card.app,
+    seed: card.seed,
+    seedSet: seedSetOf(card.seedSet ?? meta?.seedSet, card.seed),
+    mode: card.mode ?? 'grey-box',
+    llm,
+    targets: card.targets,
+    confirmed: card.confirmed,
+    recall,
+    precision: asNumber(card.precision, 1),
+    decoyFalsePositives: asNumber(card.decoyFalsePositives),
+    unmatchedFalsePositives: asNumber(card.unmatchedFalsePositives),
+    confirmedKeys,
+    floor: resolveFloorMetrics(dir, card, meta),
+    notes,
+  }
+}
+
+function reasonCellFromScorecard(
+  card: ScorecardLike,
+  meta: Record<string, unknown> | null,
+  llm: LlmMode,
+): ReasonCellLike {
+  const vulns = Array.isArray(card.vulns) ? card.vulns : []
+  return {
+    app: card.app,
+    seed: card.seed,
+    mode: card.mode ?? 'grey-box',
+    llm,
+    targets: card.targets,
+    confirmed: card.confirmed,
+    recall: asNumber(card.recall, ratio(card.confirmed, card.targets)),
+    precision: asNumber(card.precision, 1),
+    decoyFalsePositives: asNumber(card.decoyFalsePositives),
+    unmatchedFalsePositives: asNumber(card.unmatchedFalsePositives),
+    sites: vulns.map(v => ({ siteId: String(v.siteId), confirmed: v.outcome === 'confirmed' })),
+  }
+}
+
+function reasonCellsFromReport(report: { cells: unknown[] }): ReasonCellLike[] {
+  const cells: ReasonCellLike[] = []
+  for (const raw of report.cells) {
+    if (!isRecord(raw)) continue
+    const llm = llmOf(raw.llm)
+    if (!llm) continue
+    const sitesRaw = Array.isArray(raw.sites) ? raw.sites : []
+    cells.push({
+      app: typeof raw.app === 'string' ? raw.app : 'unknown',
+      seed: asNumber(raw.seed, 0),
+      mode: typeof raw.mode === 'string' ? raw.mode : 'grey-box',
+      llm,
+      targets: asNumber(raw.targets),
+      confirmed: asNumber(raw.confirmed),
+      recall: asNumber(raw.recall, ratio(asNumber(raw.confirmed), asNumber(raw.targets))),
+      precision: asNumber(raw.precision, 1),
+      decoyFalsePositives: asNumber(raw.decoyFalsePositives),
+      unmatchedFalsePositives: asNumber(raw.unmatchedFalsePositives),
+      sites: sitesRaw.filter(isRecord).map(site => ({
+        siteId: String(site.siteId),
+        confirmed: site.confirmed === true || site.outcome === 'confirmed',
+      })),
+    })
+  }
+  return cells
+}
+
+/**
+ * Ingest one or more artifact directories. Recursively finds realistic scorecards
+ * (`summary.json` / per-cell `<slug>.json`), reason reports (`reason-report.json`), and the
+ * matching `.meta.json` / per-cell data DB. Report JSON is deduplicated per directory:
+ * a `summary.json` wins over its sibling per-cell scorecards.
+ */
+export function ingestFromDirs(dirs: string[], env: NodeJS.ProcessEnv = process.env): IngestResult {
+  const runs: RealismRun[] = []
+  const reason: ReasonRun[] = []
+  const notes: string[] = []
+  const scanned = new Set<string>()
+  const seenDirs = new Set<string>()
+
+  for (const input of dirs) {
+    const root = resolve(input)
+    if (!existsSync(root)) throw new Error(`--from-dir path does not exist: ${input}`)
+    const jsonFiles = collectFiles(root, path => path.endsWith('.json') && !basename(path).endsWith('.meta.json'), 6)
+    for (const file of jsonFiles) scanned.add(file)
+
+    const byDir = new Map<string, string[]>()
+    for (const file of jsonFiles) {
+      const list = byDir.get(dirname(file)) ?? []
+      list.push(file)
+      byDir.set(dirname(file), list)
+    }
+
+    for (const [dir, files] of byDir) {
+      if (seenDirs.has(dir)) continue
+      seenDirs.add(dir)
+      const parsed = files.map(file => ({ file, value: parseJsonFile(file) }))
+      const reasonReports = parsed.filter(entry => isReasonReport(entry.value))
+      for (const entry of reasonReports) {
+        const cells = reasonCellsFromReport(entry.value as { cells: unknown[] })
+        if (cells.length) reason.push({ source: entry.file, cells })
+      }
+      const summary = parsed.find(entry => basename(entry.file) === 'summary.json' && Array.isArray(entry.value))
+      const cards: Array<{ card: ScorecardLike; file: string }> = []
+      if (summary && Array.isArray(summary.value)) {
+        for (const value of summary.value) if (isScorecard(value)) cards.push({ card: value, file: summary.file })
+      }
+      if (!cards.length) {
+        for (const entry of parsed) {
+          if (isScorecard(entry.value)) cards.push({ card: entry.value, file: entry.file })
+        }
+      }
+      for (const { card, file } of cards) {
+        const meta = readMeta(dir, card)
+        const { llm, inferred } = inferLlm(card, meta, `${relative(dir, file)} ${dir}`)
+        const cardNotes: string[] = []
+        if (inferred) cardNotes.push(`llm mode inferred from path (${llm}); report had no model metadata`)
+        if (REASON_APPS.includes(card.app as typeof REASON_APPS[number])) {
+          if (!reasonReports.length) {
+            reason.push({ source: file, cells: [reasonCellFromScorecard(card, meta, llm)] })
+          }
+          continue
+        }
+        if (llm === 'deterministic-no-llm' && cardNotes.length === 0) {
+          // no-op; keeps the branch explicit for future notes
+        }
+        runs.push(realismRunFromCard(card, dir, file, meta, llm, cardNotes))
+      }
+      if (reasonReports.length && cards.length) {
+        notes.push(`${dir}: used reason-report.json cells (${reasonReports.length}); skipped ${cards.length} per-cell scorecard duplicate(s)`)
+      }
+    }
+  }
+
+  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  if (runs.some(run => run.seedSet === 'held-out') && !salt) {
+    notes.push('held-out cells ingested without GUARDIAN_RB_HELDOUT_SALT (salt not needed to read finished reports)')
+  }
+  return { runs, reason, notes, filesScanned: scanned.size }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Certificate evaluation
+// ---------------------------------------------------------------------------------------------
+
+export interface Criterion {
+  id: string
+  description: string
+  threshold: string
+  observed: string
+  status: 'PASS' | 'FAIL'
+}
+
+export interface RunStats {
+  runs: number
+  targets: number
+  confirmed: number
+  recall: number
+  minRecall: number
+  maxRecall: number
+  spreadTargets: number
+}
+
+export interface UnifiedAppStats {
+  runs: number
+  targets: number
+  /** Median per-run deduped confirmed targets (gate metric). */
+  confirmed: number
+  recall: number
+  minRecall: number
+  maxRecall: number
+  /** Union across independent runs: capability coverage, informational. */
+  coverageConfirmed: number
+  coverageRecall: number
+}
+
+export interface SplitStats {
+  floor: { perApp: Record<string, RunStats | null>; confirmed: number; targets: number; recall: number }
+  unified: {
+    perApp: Record<string, UnifiedAppStats | null>
+    confirmed: number
+    targets: number
+    recall: number
+    coverageConfirmed: number
+    coverageRecall: number
+  }
+  lift: { perApp: Record<string, number | null>; aggregate: number | null }
+}
+
+export interface Certificate {
+  schemaVersion: 1
+  generatedAt: string
+  gitSha: string
+  mode: 'from-dir' | 'run'
+  verdict: 'PASS' | 'FAIL'
+  thresholds: Thresholds
+  matrix: {
+    expected: {
+      apps: string[]
+      floorDevRuns: number
+      floorHeldoutRuns: number
+      unifiedDevRuns: number
+      unifiedHeldoutRuns: number
+    }
+    observed: Record<string, { floorDev: number; floorHeldout: number; unifiedDev: number; unifiedHeldout: number }>
+    complete: boolean
+  }
+  floor: { dev: SplitStats['floor']; heldout: SplitStats['floor']; spread: Record<string, number | null> }
+  unified: { dev: SplitStats['unified']; heldout: SplitStats['unified'] }
+  lift: { dev: SplitStats['lift']; heldout: SplitStats['lift'] }
+  preservation: {
+    median: number | null
+    ratios: Array<{ app: string; seedSet: SeedSet; ratio: number; floorConfirmed: number; floorStandalone: number }>
+    unmeasuredRuns: number
+    keyBased: { dev: number | null; heldout: number | null }
+  }
+  precision: {
+    worst: number
+    worstRun: string | null
+    decoyFalsePositives: number
+    unmatchedFalsePositives: number
+    runs: number
+  }
+  leads: {
+    checkedRuns: number
+    unmeasuredRuns: number
+    violations: Array<{ app: string; seedSet: SeedSet; emitted: number; consumed: number }>
+  }
+  reason: {
+    floor: { confirmed: number; targets: number; recall: number | null }
+    agentic: { confirmed: number; targets: number; recall: number | null; worstPrecision: number | null; cells: number }
+  }
+  criteria: Criterion[]
+  notes: string[]
+}
+
+export interface CertifyOptions {
+  mode: 'from-dir' | 'run'
+  apps?: string[]
+  devRuns?: number
+  floorHeldoutRuns?: number
+  heldoutRuns?: number
+  checkMatrix?: boolean
+  thresholds?: Thresholds
+  generatedAt?: string
+  gitSha?: string
+  notes?: string[]
+}
+
+function runStats(runs: RealismRun[]): RunStats | null {
+  if (!runs.length) return null
+  const recalls = runs.map(run => run.recall)
+  const counts = runs.map(run => run.confirmed)
+  return {
+    runs: runs.length,
+    targets: maxTargets(runs),
+    confirmed: median(counts) ?? 0,
+    recall: median(recalls) ?? 0,
+    minRecall: Math.min(...recalls),
+    maxRecall: Math.max(...recalls),
+    spreadTargets: Math.max(...counts) - Math.min(...counts),
+  }
+}
+
+function splitStats(floorRuns: RealismRun[], unifiedRuns: RealismRun[], apps: string[]): SplitStats {
+  const floorPerApp: Record<string, RunStats | null> = {}
+  const unifiedPerApp: SplitStats['unified']['perApp'] = {}
+  const liftPerApp: Record<string, number | null> = {}
+  let floorConfirmed = 0
+  let floorTargets = 0
+  let comparableFloorConfirmed = 0
+  let comparableFloorTargets = 0
+  let unifiedConfirmed = 0
+  let unifiedTargets = 0
+  let coverageConfirmed = 0
+
+  for (const app of apps) {
+    const appFloor = floorRuns.filter(run => run.app === app)
+    const appUnified = unifiedRuns.filter(run => run.app === app)
+    const stats = runStats(appFloor)
+    floorPerApp[app] = stats
+    floorConfirmed += stats?.confirmed ?? 0
+    floorTargets += stats?.targets ?? 0
+
+    if (!appUnified.length) {
+      unifiedPerApp[app] = null
+      liftPerApp[app] = null
+      continue
+    }
+    const keys = unionConfirmedTargets(appUnified)
+    const targets = maxTargets(appUnified)
+    const perRunCounts = appUnified.map(run => new Set(run.confirmedKeys).size)
+    const perRunRecalls = perRunCounts.map(count => ratio(count, targets))
+    const medianConfirmed = median(perRunCounts) ?? 0
+    const medianRecall = median(perRunRecalls) ?? 0
+    unifiedPerApp[app] = {
+      runs: appUnified.length,
+      targets,
+      confirmed: medianConfirmed,
+      recall: medianRecall,
+      minRecall: Math.min(...perRunRecalls),
+      maxRecall: Math.max(...perRunRecalls),
+      coverageConfirmed: keys.length,
+      coverageRecall: ratio(keys.length, targets),
+    }
+    unifiedConfirmed += medianConfirmed
+    unifiedTargets += targets
+    coverageConfirmed += keys.length
+    if (stats) {
+      comparableFloorConfirmed += stats.confirmed
+      comparableFloorTargets += stats.targets
+    }
+    liftPerApp[app] = stats ? medianRecall - stats.recall : null
+  }
+
+  const floorRecall = ratio(floorConfirmed, floorTargets)
+  const unifiedRecall = ratio(unifiedConfirmed, unifiedTargets)
+  const comparableFloorRecall = ratio(comparableFloorConfirmed, comparableFloorTargets)
+  return {
+    floor: { perApp: floorPerApp, confirmed: floorConfirmed, targets: floorTargets, recall: floorRecall },
+    unified: {
+      perApp: unifiedPerApp,
+      confirmed: unifiedConfirmed,
+      targets: unifiedTargets,
+      recall: unifiedRecall,
+      coverageConfirmed,
+      coverageRecall: ratio(coverageConfirmed, unifiedTargets),
+    },
+    lift: {
+      perApp: liftPerApp,
+      aggregate: unifiedTargets > 0 && comparableFloorTargets > 0 ? unifiedRecall - comparableFloorRecall : null,
+    },
+  }
+}
+
+function aggregateReason(cells: ReasonCellLike[]): { confirmed: number; targets: number; recall: number | null; precision: number | null; decoyFP: number; unmatchedFP: number } {
+  if (!cells.length) return { confirmed: 0, targets: 0, recall: null, precision: null, decoyFP: 0, unmatchedFP: 0 }
+  const siteKeys = new Set<string>()
+  const confirmedKeys = new Set<string>()
+  const maxTargetsByApp = new Map<string, number>()
+  const maxConfirmedByApp = new Map<string, number>()
+  let decoyFP = 0
+  let unmatchedFP = 0
+  for (const cell of cells) {
+    decoyFP += cell.decoyFalsePositives
+    unmatchedFP += cell.unmatchedFalsePositives
+    maxTargetsByApp.set(cell.app, Math.max(maxTargetsByApp.get(cell.app) ?? 0, cell.targets))
+    maxConfirmedByApp.set(cell.app, Math.max(maxConfirmedByApp.get(cell.app) ?? 0, cell.confirmed))
+    for (const site of cell.sites) {
+      const key = `${cell.app}|${site.siteId}`
+      siteKeys.add(key)
+      if (site.confirmed) confirmedKeys.add(key)
+    }
+  }
+  let targets = siteKeys.size
+  let confirmed = confirmedKeys.size
+  if (!siteKeys.size) {
+    targets = sum([...maxTargetsByApp.values()])
+    confirmed = sum([...maxConfirmedByApp.values()])
+  }
+  const worst = Math.min(...cells.map(cell => cell.precision))
+  return {
+    confirmed,
+    targets,
+    recall: ratio(confirmed, targets),
+    precision: Number.isFinite(worst) ? worst : null,
+    decoyFP,
+    unmatchedFP,
+  }
+}
+
+function criterion(
+  id: string,
+  description: string,
+  threshold: string,
+  observed: string,
+  pass: boolean,
+): Criterion {
+  return { id, description, threshold, observed, status: pass ? 'PASS' : 'FAIL' }
+}
+
+export function evaluateCertification(
+  runs: RealismRun[],
+  reasonRuns: ReasonRun[],
+  options: CertifyOptions,
+): Certificate {
+  const thresholds = options.thresholds ?? DEFAULT_THRESHOLDS
+  const apps = options.apps ?? [...CERTIFY_APPS]
+  const devRuns = options.devRuns ?? 3
+  const floorHeldoutRuns = options.floorHeldoutRuns ?? 1
+  const heldoutRuns = options.heldoutRuns ?? 2
+  const notes = [...(options.notes ?? [])]
+
+  const floorDev = runs.filter(run => run.llm === 'deterministic-no-llm' && run.seedSet === 'dev')
+  const floorHeldout = runs.filter(run => run.llm === 'deterministic-no-llm' && run.seedSet === 'held-out')
+  const unifiedDev = runs.filter(run => run.llm === 'agentic' && run.seedSet === 'dev')
+  const unifiedHeldout = runs.filter(run => run.llm === 'agentic' && run.seedSet === 'held-out')
+
+  const dev = splitStats(floorDev, unifiedDev, apps)
+  const heldout = splitStats(floorHeldout, unifiedHeldout, apps)
+
+  // Floor spread is the determinism gate; only app/split pairs with >= 2 runs are measurable.
+  const spread: Record<string, number | null> = {}
+  let spreadOk = true
+  let spreadMeasured = 0
+  for (const app of apps) {
+    const appFloor = floorDev.filter(run => run.app === app)
+    if (appFloor.length >= 2) {
+      const counts = appFloor.map(run => run.confirmed)
+      const value = Math.max(...counts) - Math.min(...counts)
+      spread[app] = value
+      spreadMeasured += 1
+      if (value > thresholds.floorSpreadMax) spreadOk = false
+    } else {
+      spread[app] = null
+      spreadOk = false
+    }
+  }
+  const spreadObserved = apps.map(app => `${app} ${spread[app] === null ? 'unmeasured' : spread[app]}`).join(', ')
+
+  // Preservation: unified floor count vs standalone floor median, per app/split.
+  const preservationRatios: Certificate['preservation']['ratios'] = []
+  let unmeasuredPreservation = 0
+  for (const run of [...unifiedDev, ...unifiedHeldout]) {
+    const baseline = (run.seedSet === 'dev' ? dev : heldout).floor.perApp[run.app]?.confirmed ?? null
+    if (baseline === null || run.floor.floorConfirmed === null) {
+      unmeasuredPreservation += 1
+      continue
+    }
+    preservationRatios.push({
+      app: run.app,
+      seedSet: run.seedSet,
+      ratio: ratio(run.floor.floorConfirmed, baseline),
+      floorConfirmed: run.floor.floorConfirmed,
+      floorStandalone: baseline,
+    })
+  }
+  const preservationMedian = median(preservationRatios.map(row => row.ratio))
+  const keyPreservation = (split: 'dev' | 'held-out'): number | null => {
+    const floorKeys = new Set(unionConfirmedTargets(split === 'dev' ? floorDev : floorHeldout))
+    if (!floorKeys.size) return null
+    const unifiedKeys = new Set(unionConfirmedTargets(split === 'dev' ? unifiedDev : unifiedHeldout))
+    let present = 0
+    for (const key of floorKeys) if (unifiedKeys.has(key)) present += 1
+    return present / floorKeys.size
+  }
+
+  // Worst-run precision and false-positive totals across every realism cell.
+  const precisionRuns = runs
+  const worstRun = precisionRuns.reduce<RealismRun | null>(
+    (worst, run) => (worst === null || run.precision < worst.precision ? run : worst),
+    null,
+  )
+  const worstPrecision = precisionRuns.length ? (worstRun?.precision ?? 0) : 0
+  const decoyFP = sum(runs.map(run => run.decoyFalsePositives))
+  const unmatchedFP = sum(runs.map(run => run.unmatchedFalsePositives))
+
+  // Leads invariant on unified runs only.
+  const leadViolations: Certificate['leads']['violations'] = []
+  let leadsChecked = 0
+  let leadsUnmeasured = 0
+  for (const run of [...unifiedDev, ...unifiedHeldout]) {
+    const emitted = run.floor.floorLeadsEmitted
+    const consumed = run.floor.floorLeadsConsumed
+    if (emitted === null || consumed === null) {
+      leadsUnmeasured += 1
+      continue
+    }
+    leadsChecked += 1
+    if (emitted > 0 && consumed === 0) {
+      leadViolations.push({ app: run.app, seedSet: run.seedSet, emitted, consumed })
+    }
+  }
+
+  // Reason-bench.
+  const reasonFloorCells = reasonRuns.flatMap(run => run.cells.filter(cell => cell.llm === 'deterministic-no-llm'))
+  const reasonAgenticCells = reasonRuns.flatMap(run => run.cells.filter(cell => cell.llm === 'agentic'))
+  const reasonFloor = aggregateReason(reasonFloorCells)
+  const reasonAgentic = aggregateReason(reasonAgenticCells)
+
+  // Matrix coverage.
+  const observed: Certificate['matrix']['observed'] = {}
+  let matrixComplete = true
+  for (const app of apps) {
+    const row = {
+      floorDev: floorDev.filter(run => run.app === app).length,
+      floorHeldout: floorHeldout.filter(run => run.app === app).length,
+      unifiedDev: unifiedDev.filter(run => run.app === app).length,
+      unifiedHeldout: unifiedHeldout.filter(run => run.app === app).length,
+    }
+    observed[app] = row
+    if (row.floorDev < devRuns || row.floorHeldout < floorHeldoutRuns
+      || row.unifiedDev < devRuns || row.unifiedHeldout < heldoutRuns) matrixComplete = false
+  }
+
+  const liftDev = dev.lift.aggregate
+  const liftHeldout = heldout.lift.aggregate
+  const liftDevOk = liftDev !== null && liftDev >= thresholds.liftDevMin
+  const liftHeldoutOk = liftHeldout !== null && liftHeldout >= thresholds.liftHeldoutMin
+  const monotonicPairs: Array<{ split: string; app: string; total: number; floor: number }> = []
+  for (const [splitName, split] of [['dev', dev], ['heldout', heldout]] as const) {
+    for (const app of apps) {
+      const unified = split.unified.perApp[app]
+      const floor = split.floor.perApp[app]
+      if (unified && floor) monotonicPairs.push({ split: splitName, app, total: unified.recall, floor: floor.recall })
+    }
+  }
+  const monotonicFailures = monotonicPairs.filter(pair => pair.total + 1e-9 < pair.floor)
+  const monotonicOk = !thresholds.requireMonotonic
+    || (monotonicPairs.length >= apps.length * 2 && monotonicFailures.length === 0)
+
+  const reasonFloorOk = reasonFloor.confirmed === thresholds.reasonFloorConfirmed
+    && reasonFloor.targets === thresholds.reasonTargets
+  const reasonAgenticOk = reasonAgentic.recall !== null
+    && reasonAgentic.recall >= thresholds.reasonAgenticMin
+    && reasonAgentic.precision !== null
+    && reasonAgentic.precision >= thresholds.worstPrecision
+
+  const criteria: Criterion[] = [
+    criterion(
+      'floor_spread',
+      'Floor determinism: max-min confirmed targets per app across n=3 dev runs',
+      `<= ${thresholds.floorSpreadMax} target`,
+      spreadObserved,
+      spreadOk,
+    ),
+    criterion(
+      'floor_preservation',
+      'Floor preservation: median floorConfirmedInUnified / floorStandalone',
+      `>= ${thresholds.preservationMin}`,
+      `${preservationMedian === null ? 'unmeasured' : preservationMedian.toFixed(3)} (${preservationRatios.length} run(s), ${unmeasuredPreservation} unmeasured)`,
+      preservationMedian !== null && preservationMedian >= thresholds.preservationMin,
+    ),
+    criterion(
+      'worst_run_precision',
+      'Worst-run precision across every realism cell (decoy + unmatched FP = 0)',
+      `== ${thresholds.worstPrecision}`,
+      `${worstPrecision.toFixed(3)} (${worstRun ? `${worstRun.app}@${worstRun.seed}` : 'no runs'})`,
+      precisionRuns.length > 0 && worstPrecision >= thresholds.worstPrecision,
+    ),
+    criterion(
+      'agentic_lift_dev',
+      'Aggregate agentic incremental lift on dev (total product recall - floor recall)',
+      `>= +${(thresholds.liftDevMin * 100).toFixed(0)}pp`,
+      liftDev === null ? 'unmeasured' : `${liftDev >= 0 ? '+' : ''}${(liftDev * 100).toFixed(1)}pp`,
+      liftDevOk,
+    ),
+    criterion(
+      'agentic_lift_heldout',
+      'Aggregate agentic incremental lift on salted held-out',
+      `>= +${(thresholds.liftHeldoutMin * 100).toFixed(0)}pp`,
+      liftHeldout === null ? 'unmeasured' : `${liftHeldout >= 0 ? '+' : ''}${(liftHeldout * 100).toFixed(1)}pp`,
+      liftHeldoutOk,
+    ),
+    criterion(
+      'monotonicity',
+      'Unified total >= standalone floor on every app, dev and held-out',
+      '0 app/split regressions',
+      monotonicFailures.length
+        ? monotonicFailures.map(pair => `${pair.split}/${pair.app} ${pct(pair.total)} < ${pct(pair.floor)}`).join(', ')
+        : `${monotonicPairs.length}/${apps.length * 2} pair(s) monotonic`,
+      monotonicOk,
+    ),
+    criterion(
+      'leads_invariant',
+      'floorLeadsEmitted > 0 implies floorLeadsConsumed > 0 on every unified run',
+      '0 violations, 0 unmeasured',
+      `${leadViolations.length} violation(s), ${leadsUnmeasured} unmeasured, ${leadsChecked} checked`,
+      leadViolations.length === 0 && leadsUnmeasured === 0 && leadsChecked > 0,
+    ),
+    criterion(
+      'reason_bench_floor',
+      'Reason-bench deterministic floor',
+      `${thresholds.reasonFloorConfirmed}/${thresholds.reasonTargets} confirmed`,
+      `${reasonFloor.confirmed}/${reasonFloor.targets}${reasonFloor.recall === null ? ' (unmeasured)' : ''}`,
+      reasonFloorOk,
+    ),
+    criterion(
+      'reason_bench_agentic',
+      'Reason-bench agentic recall at worst-run 100% precision',
+      `>= ${(thresholds.reasonAgenticMin * 100).toFixed(0)}% and worst precision == ${thresholds.worstPrecision}`,
+      `${reasonAgentic.recall === null ? 'unmeasured' : pct(reasonAgentic.recall)} (${reasonAgentic.confirmed}/${reasonAgentic.targets}), worst precision ${reasonAgentic.precision === null ? 'n/a' : reasonAgentic.precision.toFixed(3)}`,
+      reasonAgenticOk,
+    ),
+  ]
+  if (options.checkMatrix !== false) {
+    criteria.push(criterion(
+      'matrix_coverage',
+      'Certification matrix completeness (per app)',
+      `floor dev >= ${devRuns}, floor held-out >= ${floorHeldoutRuns}, unified dev >= ${devRuns}, unified held-out >= ${heldoutRuns}`,
+      apps.map(app => {
+        const row = observed[app]!
+        return `${app} ${row.floorDev}/${row.floorHeldout}/${row.unifiedDev}/${row.unifiedHeldout}`
+      }).join(', '),
+      matrixComplete,
+    ))
+  }
+
+  if (runs.some(run => run.notes.length)) {
+    for (const run of runs) {
+      for (const note of run.notes) {
+        const text = `${run.app}@${run.seed}: ${note}`
+        if (!notes.includes(text)) notes.push(text)
+      }
+    }
+  }
+
+  const verdict = criteria.every(item => item.status === 'PASS') ? 'PASS' : 'FAIL'
+  return {
+    schemaVersion: 1,
+    generatedAt: options.generatedAt ?? new Date().toISOString(),
+    gitSha: options.gitSha ?? resolveGitSha(),
+    mode: options.mode,
+    verdict,
+    thresholds,
+    matrix: {
+      expected: { apps, floorDevRuns: devRuns, floorHeldoutRuns, unifiedDevRuns: devRuns, unifiedHeldoutRuns: heldoutRuns },
+      observed,
+      complete: matrixComplete,
+    },
+    floor: { dev: dev.floor, heldout: heldout.floor, spread },
+    unified: { dev: dev.unified, heldout: heldout.unified },
+    lift: { dev: dev.lift, heldout: heldout.lift },
+    preservation: {
+      median: preservationMedian,
+      ratios: preservationRatios,
+      unmeasuredRuns: unmeasuredPreservation,
+      keyBased: { dev: keyPreservation('dev'), heldout: keyPreservation('held-out') },
+    },
+    precision: { worst: worstPrecision, worstRun: worstRun?.id ?? null, decoyFalsePositives: decoyFP, unmatchedFalsePositives: unmatchedFP, runs: runs.length },
+    leads: { checkedRuns: leadsChecked, unmeasuredRuns: leadsUnmeasured, violations: leadViolations },
+    reason: {
+      floor: { confirmed: reasonFloor.confirmed, targets: reasonFloor.targets, recall: reasonFloor.recall },
+      agentic: {
+        confirmed: reasonAgentic.confirmed,
+        targets: reasonAgentic.targets,
+        recall: reasonAgentic.recall,
+        worstPrecision: reasonAgentic.precision,
+        cells: reasonAgenticCells.length,
+      },
+    },
+    criteria,
+    notes,
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering and secret hygiene
+// ---------------------------------------------------------------------------------------------
+
+export function redactText(text: string, secrets: string[]): string {
+  let out = text
+  for (const secret of secrets) {
+    if (secret && secret.length >= 8) out = out.split(secret).join('[redacted]')
+  }
+  return out
+}
+
+export function assertSecretFree(text: string, secrets: string[]): void {
+  for (const secret of secrets) {
+    if (secret && secret.length >= 8 && text.includes(secret)) {
+      throw new Error('refusing to write an artifact containing a secret value')
+    }
+  }
+}
+
+function artifactSecrets(env: NodeJS.ProcessEnv): string[] {
+  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  return salt.length >= 8 ? [salt] : []
+}
+
+export function renderCertificateMarkdown(cert: Certificate): string {
+  const lines: string[] = []
+  lines.push('# Guardian v6 Phase-1 certification')
+  lines.push('')
+  lines.push(`**Verdict: ${cert.verdict}**`)
+  lines.push('')
+  lines.push(`- mode: \`${cert.mode}\``)
+  lines.push(`- generated: ${cert.generatedAt}`)
+  lines.push(`- git: \`${cert.gitSha}\``)
+  lines.push(`- realism cells: ${cert.precision.runs}, reason cells: ${cert.reason.agentic.cells}`)
+  lines.push('')
+  lines.push('## Criteria')
+  lines.push('')
+  lines.push('| criterion | threshold | observed | status |')
+  lines.push('| --- | --- | --- | --- |')
+  for (const item of cert.criteria) {
+    lines.push(`| ${item.id} | ${item.threshold} | ${item.observed} | **${item.status}** |`)
+  }
+  lines.push('')
+  lines.push('## Floor recall (median [min-max])')
+  lines.push('')
+  lines.push('| app | dev | salted held-out | spread (targets) |')
+  lines.push('| --- | --- | --- | --- |')
+  for (const app of cert.matrix.expected.apps) {
+    const dev = cert.floor.dev.perApp[app]
+    const held = cert.floor.heldout.perApp[app]
+    const fmt = (stats: RunStats | null) => stats
+      ? `${stats.confirmed}/${stats.targets} ${pct(stats.recall)} [${pct(stats.minRecall)}-${pct(stats.maxRecall)}] (n=${stats.runs})`
+      : 'unmeasured'
+    lines.push(`| ${app} | ${fmt(dev)} | ${fmt(held)} | ${cert.floor.spread[app] ?? 'n/a'} |`)
+  }
+  lines.push(`| **aggregate** | ${cert.floor.dev.confirmed}/${cert.floor.dev.targets} ${pct(cert.floor.dev.recall)} | ${cert.floor.heldout.confirmed}/${cert.floor.heldout.targets} ${pct(cert.floor.heldout.recall)} | - |`)
+  lines.push('')
+  lines.push('## Unified product recall and lift')
+  lines.push('')
+  lines.push('| app | dev total | dev lift | held-out total | held-out lift |')
+  lines.push('| --- | --- | --- | --- | --- |')
+  for (const app of cert.matrix.expected.apps) {
+    const dev = cert.unified.dev.perApp[app]
+    const held = cert.unified.heldout.perApp[app]
+    const fmt = (stats: UnifiedAppStats | null) => stats
+      ? `${stats.confirmed}/${stats.targets} ${pct(stats.recall)} [${pct(stats.minRecall)}-${pct(stats.maxRecall)}] (cov ${stats.coverageConfirmed})`
+      : 'unmeasured'
+    const fmtLift = (value: number | null | undefined) => value === null || value === undefined ? 'n/a' : `${value >= 0 ? '+' : ''}${(value * 100).toFixed(1)}pp`
+    lines.push(`| ${app} | ${fmt(dev)} | ${fmtLift(cert.lift.dev.perApp[app])} | ${fmt(held)} | ${fmtLift(cert.lift.heldout.perApp[app])} |`)
+  }
+  lines.push(`| **aggregate** | ${cert.unified.dev.confirmed}/${cert.unified.dev.targets} ${pct(cert.unified.dev.recall)} | ${cert.lift.dev.aggregate === null ? 'n/a' : `${cert.lift.dev.aggregate >= 0 ? '+' : ''}${(cert.lift.dev.aggregate * 100).toFixed(1)}pp`} | ${cert.unified.heldout.confirmed}/${cert.unified.heldout.targets} ${pct(cert.unified.heldout.recall)} | ${cert.lift.heldout.aggregate === null ? 'n/a' : `${cert.lift.heldout.aggregate >= 0 ? '+' : ''}${(cert.lift.heldout.aggregate * 100).toFixed(1)}pp`} |`)
+  lines.push('')
+  lines.push('## Preservation, precision and leads')
+  lines.push('')
+  lines.push(`- floor preservation (median): ${cert.preservation.median === null ? 'unmeasured' : cert.preservation.median.toFixed(3)}`
+    + ` (${cert.preservation.ratios.length} measured, ${cert.preservation.unmeasuredRuns} unmeasured)`)
+  lines.push(`- key-based floor retention: dev ${cert.preservation.keyBased.dev === null ? 'n/a' : pct(cert.preservation.keyBased.dev)}, held-out ${cert.preservation.keyBased.heldout === null ? 'n/a' : pct(cert.preservation.keyBased.heldout)}`)
+  lines.push(`- worst-run precision: ${cert.precision.worst.toFixed(3)}; decoy FP ${cert.precision.decoyFalsePositives}; unmatched FP ${cert.precision.unmatchedFalsePositives}`)
+  lines.push(`- leads invariant: ${cert.leads.violations.length} violation(s), ${cert.leads.unmeasuredRuns} unmeasured, ${cert.leads.checkedRuns} checked`)
+  lines.push('')
+  lines.push('## Reason-bench')
+  lines.push('')
+  lines.push(`- floor: ${cert.reason.floor.confirmed}/${cert.reason.floor.targets}`)
+  lines.push(`- agentic: ${cert.reason.agentic.confirmed}/${cert.reason.agentic.targets} ${pct(cert.reason.agentic.recall)}`
+    + ` at worst-run precision ${cert.reason.agentic.worstPrecision === null ? 'n/a' : cert.reason.agentic.worstPrecision.toFixed(3)}`)
+  lines.push('')
+  if (cert.notes.length) {
+    lines.push('## Notes')
+    lines.push('')
+    for (const note of cert.notes) lines.push(`- ${note}`)
+    lines.push('')
+  }
+  return `${lines.join('\n')}\n`
+}
+
+function resolveGitSha(): string {
+  try {
+    return execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+      cwd: resolve(import.meta.dirname, '..'),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Run mode
+// ---------------------------------------------------------------------------------------------
+
+export interface RunPlanCell {
+  id: string
+  kind: 'floor-dev' | 'floor-heldout' | 'unified-dev' | 'unified-heldout' | 'reason-floor' | 'reason-agentic'
+  app: string
+  seed: number
+  heldOut: boolean
+  outDir: string
+  dataDir: string | null
+  args: string[]
+}
+
+export interface RunPlanOptions {
+  outDir: string
+  apps: string[]
+  devSeed: number
+  heldoutSeed: number
+  devRuns: number
+  floorHeldoutRuns: number
+  heldoutRuns: number
+  dataDir: string | null
+  verifier: 'auto' | 'docker' | 'local-jq'
+  budgetUsd: number
+  maxDurationMs: number
+  reasonRuns: number
+  mode: string
+}
+
+export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
+  const cells: RunPlanCell[] = []
+  const base = ['--mode', options.mode, '--verifier', options.verifier, '--keep-data-dirs']
+  const realistic = (args: string[]) => [resolve(import.meta.dirname, 'benchmark-realistic.ts'), ...args]
+
+  for (const app of options.apps) {
+    for (let i = 1; i <= options.devRuns; i += 1) {
+      const outDir = join(options.outDir, 'floor', 'dev', `${app}-r${i}`)
+      cells.push({
+        id: `floor-dev-${app}-r${i}`,
+        kind: 'floor-dev', app, seed: options.devSeed, heldOut: false, outDir, dataDir: null,
+        args: realistic(['--app', app, '--seed', String(options.devSeed), '--out-dir', outDir, ...base, '--no-llm']),
+      })
+    }
+    for (let i = 1; i <= options.floorHeldoutRuns; i += 1) {
+      const outDir = join(options.outDir, 'floor', 'heldout', `${app}-r${i}`)
+      cells.push({
+        id: `floor-heldout-${app}-r${i}`,
+        kind: 'floor-heldout', app, seed: options.heldoutSeed, heldOut: true, outDir, dataDir: null,
+        args: realistic(['--app', app, '--seed', String(options.heldoutSeed), '--out-dir', outDir, ...base, '--no-llm', '--held-out']),
+      })
+    }
+    for (let i = 1; i <= options.devRuns; i += 1) {
+      const outDir = join(options.outDir, 'unified', 'dev', `${app}-r${i}`)
+      cells.push({
+        id: `unified-dev-${app}-r${i}`,
+        kind: 'unified-dev', app, seed: options.devSeed, heldOut: false, outDir, dataDir: options.dataDir,
+        args: realistic([
+          '--app', app, '--seed', String(options.devSeed), '--out-dir', outDir, ...base,
+          '--isolate-data-dir', '--budget-usd', String(options.budgetUsd),
+          '--max-duration-ms', String(options.maxDurationMs),
+          ...(options.dataDir ? ['--data-dir', options.dataDir] : []),
+        ]),
+      })
+    }
+    for (let i = 1; i <= options.heldoutRuns; i += 1) {
+      const outDir = join(options.outDir, 'unified', 'heldout', `${app}-r${i}`)
+      cells.push({
+        id: `unified-heldout-${app}-r${i}`,
+        kind: 'unified-heldout', app, seed: options.heldoutSeed, heldOut: true, outDir, dataDir: options.dataDir,
+        args: realistic([
+          '--app', app, '--seed', String(options.heldoutSeed), '--out-dir', outDir, ...base,
+          '--isolate-data-dir', '--budget-usd', String(options.budgetUsd),
+          '--max-duration-ms', String(options.maxDurationMs), '--held-out',
+          ...(options.dataDir ? ['--data-dir', options.dataDir] : []),
+        ]),
+      })
+    }
+  }
+
+  const reason = (args: string[]) => [resolve(import.meta.dirname, 'benchmark-reason.ts'), ...args]
+  for (let i = 1; i <= options.reasonRuns; i += 1) {
+    const floorDir = join(options.outDir, 'reason', `floor-r${i}`)
+    cells.push({
+      id: `reason-floor-r${i}`,
+      kind: 'reason-floor', app: 'all', seed: options.devSeed, heldOut: false, outDir: floorDir, dataDir: null,
+      args: reason([
+        '--app', 'all', '--seed', String(options.devSeed), '--out-dir', floorDir,
+        '--json', join(floorDir, 'reason-report.json'), '--mode', options.mode,
+        '--verifier', options.verifier, '--keep-data-dirs', '--no-llm',
+      ]),
+    })
+  }
+  for (let i = 1; i <= options.reasonRuns; i += 1) {
+    const outDir = join(options.outDir, 'reason', `agentic-r${i}`)
+    const floorDir = i === 1 ? join(options.outDir, 'reason', `floor-r${i}`) : join(options.outDir, 'reason', `floor-r1`)
+    cells.push({
+      id: `reason-agentic-r${i}`,
+      kind: 'reason-agentic', app: 'all', seed: options.devSeed, heldOut: false, outDir, dataDir: options.dataDir,
+      args: reason([
+        '--app', 'all', '--seed', String(options.devSeed), '--out-dir', outDir,
+        '--json', join(outDir, 'reason-report.json'), '--mode', options.mode,
+        '--verifier', options.verifier, '--keep-data-dirs',
+        '--budget-usd', String(options.budgetUsd), '--max-duration-ms', String(options.maxDurationMs),
+        '--floor-from', floorDir,
+        ...(options.dataDir ? ['--data-dir', options.dataDir, '--isolate-data-dir'] : []),
+      ]),
+    })
+  }
+  return cells
+}
+
+function shellQuote(args: string[]): string {
+  return args.map(arg => (
+    /^[A-Za-z0-9_./:=+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`
+  )).join(' ')
+}
+
+interface ExecuteOptions {
+  useNewgrp: boolean
+  concurrency: number
+  abort: AbortSignal
+  log: (line: string) => void
+}
+
+async function runCell(cell: RunPlanCell, options: ExecuteOptions): Promise<{ cell: RunPlanCell; code: number | null; signal: string | null; error?: string }> {
+  mkdirSync(cell.outDir, { recursive: true, mode: 0o700 })
+  cleanupCellIds.add(cell.id)
+  const logPath = join(cell.outDir, 'run.log')
+  let logFd: number | null = null
+  try { logFd = openSync(logPath, 'w', 0o600) } catch { logFd = null }
+  const node = process.execPath
+  const command = [node, ...cell.args]
+  const spawnArgs = options.useNewgrp
+    ? { cmd: 'newgrp', args: ['docker', '-c', shellQuote(command)] }
+    : { cmd: command[0]!, args: command.slice(1) }
+  return await new Promise((resolvePromise) => {
+    let child: ChildProcess
+    try {
+      child = spawn(spawnArgs.cmd, spawnArgs.args, {
+        cwd: resolve(import.meta.dirname, '..'),
+        detached: true,
+        stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
+        env: { ...process.env, GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_CELL_ID: cell.id },
+      })
+    } catch (error) {
+      if (logFd !== null) { try { closeSync(logFd) } catch { /* already closed */ } }
+      resolvePromise({ cell, code: null, signal: null, error: (error as Error).message })
+      return
+    }
+    liveChildren.add(child)
+    const done = (code: number | null, signal: string | null, error?: string): void => {
+      liveChildren.delete(child)
+      if (logFd !== null) { try { closeSync(logFd) } catch { /* already closed */ } }
+      resolvePromise({ cell, code, signal, ...(error ? { error } : {}) })
+    }
+    child.once('error', error => done(null, null, error.message))
+    child.once('exit', (code, signal) => done(code, signal))
+    options.abort.addEventListener('abort', () => {
+      try { if (child.pid) process.kill(-child.pid, 'SIGTERM') } catch { /* already gone */ }
+    }, { once: true })
+    options.log(`[certify] started ${cell.id} -> ${relative(process.cwd(), cell.outDir)}`)
+  })
+}
+
+const liveChildren = new Set<ChildProcess>()
+const cleanupCellIds = new Set<string>()
+let cleanupUseNewgrp = false
+
+function runDocker(args: string[]): string {
+  if (cleanupUseNewgrp) {
+    return execFileSync('newgrp', ['docker', '-c', shellQuote(args)], {
+      encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'],
+    })
+  }
+  return execFileSync(args[0]!, args.slice(1), {
+    encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'],
+  })
+}
+
+/** Best-effort removal of worker containers labelled with this runner's own cell ids. */
+function cleanupContainers(): void {
+  if (!cleanupCellIds.size) return
+  const ids: string[] = []
+  for (const cell of cleanupCellIds) {
+    try {
+      const listed = runDocker(['docker', 'ps', '-aq', '--filter', `label=dev.guardian.cell=${cell}`])
+      ids.push(...listed.split('\n').map(line => line.trim()).filter(Boolean))
+    } catch { /* docker not reachable in this process (newgrp off / no group) */ }
+  }
+  const uniqueIds = [...new Set(ids)]
+  if (!uniqueIds.length) return
+  try { runDocker(['docker', 'rm', '-f', ...uniqueIds]) } catch { /* best effort */ }
+}
+
+function killLiveChildren(): void {
+  for (const child of liveChildren) {
+    try { if (child.pid) process.kill(-child.pid, 'SIGTERM') } catch { /* already gone */ }
+  }
+}
+
+function cleanupDataDirs(root: string): void {
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }]
+  while (stack.length) {
+    const item = stack.pop()!
+    if (item.depth > 4) continue
+    let entries: string[]
+    try { entries = readdirSync(item.dir) } catch { continue }
+    for (const entry of entries) {
+      const path = join(item.dir, entry)
+      let stat
+      try { stat = statSync(path) } catch { continue }
+      if (!stat.isDirectory()) continue
+      if (entry === 'data') {
+        try { rmSync(path, { recursive: true, force: true }) } catch { /* best effort */ }
+        continue
+      }
+      stack.push({ dir: path, depth: item.depth + 1 })
+    }
+  }
+}
+
+async function executeRunPlan(plan: RunPlanCell[], options: ExecuteOptions): Promise<Array<{ id: string; code: number | null; signal: string | null; error?: string }>> {
+  const results: Array<{ id: string; code: number | null; signal: string | null; error?: string }> = []
+  let next = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(options.concurrency, plan.length)) }, async () => {
+    while (true) {
+      if (options.abort.aborted) return
+      const index = next++
+      if (index >= plan.length) return
+      const result = await runCell(plan[index]!, options)
+      results.push({ id: result.cell.id, code: result.code, signal: result.signal, ...(result.error ? { error: result.error } : {}) })
+      options.log(`[certify] finished ${result.cell.id}: ${result.error ?? (result.signal ? `signal ${result.signal}` : `exit ${result.code}`)}`)
+      if (result.code !== 0 && result.code !== 3) {
+        // Keep going: the certificate reports the missing cell rather than hiding it.
+        options.log(`[certify] warning: ${result.cell.id} exited ${result.code ?? result.signal}; certificate will fail unmeasured criteria`)
+      }
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
+// ---------------------------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------------------------
+
+interface CliOptions {
+  fromDirs: string[]
+  run: boolean
+  dryRun: boolean
+  outDir: string
+  jsonPath: string | null
+  mdPath: string | null
+  apps: string[]
+  devSeed: number
+  heldoutSeed: number
+  devRuns: number
+  floorHeldoutRuns: number
+  heldoutRuns: number
+  concurrency: number
+  dataDir: string | null
+  verifier: 'auto' | 'docker' | 'local-jq'
+  useNewgrp: boolean
+  budgetUsd: number
+  maxDurationMs: number
+  reasonRuns: number
+  skipReason: boolean
+  keepDataDirs: boolean
+  checkMatrix: boolean
+  help: boolean
+}
+
+const usage = `Guardian v6 Phase-1 certification
+
+Usage:
+  npm run certify:phase1 -- --run [flags]        execute the matrix
+  npm run certify:phase1 -- --from-dir <dir>     ingest existing reports (no spend)
+
+Flags:
+  --run                     spawn floor + unified + reason harnesses with per-cell dirs
+  --dry-run                 print the --run plan as JSON and exit (implies --run)
+  --from-dir <dir>          artifact directory to ingest (repeatable)
+  --out-dir <dir>           certificate directory (default .guardian/certify-phase1)
+  --json <path>             certificate JSON path (default <out-dir>/certificate.json)
+  --md <path>               certificate Markdown path (default <out-dir>/certificate.md)
+  --apps <all|a,b>          apps for the realism matrix (default all three)
+  --dev-seed <n>            dev seed (default ${DEV_SEED})
+  --heldout-seed <n>        salted held-out seed (default ${HELDOUT_SEED})
+  --dev-runs <n>            floor and unified runs per app on dev (default 3)
+  --floor-heldout-runs <n>  floor runs per app on held-out (default 1)
+  --heldout-runs <n>        unified runs per app on held-out (default 2)
+  --concurrency <n>         concurrent harness processes (default 3)
+  --data-dir <path>         Guardian data dir with an enabled model profile
+                            (default $GUARDIAN_DATA_DIR); required for --run agentic
+  --verifier <kind>         auto | docker | local-jq (default docker for --run)
+  --use-newgrp              wrap harnesses in 'newgrp docker -c' (Docker socket group)
+  --budget-usd <n>          per-cell agentic budget (default 5)
+  --max-duration-ms <n>     per-cell wall clock (default 600000)
+  --reason-runs <n>         reason-bench runs per mode (default 1)
+  --skip-reason             do not schedule reason-bench in --run mode
+  --keep-data-dirs          keep per-cell data dirs (default: removed after the certificate)
+  --no-matrix-check         do not fail on incomplete n (still reports counts)
+  --help                    show this help
+
+Environment:
+  GUARDIAN_ALLOW_LOCAL_LAB=1   required by the harnesses (set automatically for children)
+  GUARDIAN_RB_HELDOUT_SALT     required for --run held-out cells; never written to artifacts
+  GUARDIAN_DATA_DIR            default Guardian data dir
+
+Verdict thresholds:
+  floor spread <= ${DEFAULT_THRESHOLDS.floorSpreadMax} target; preservation >= ${DEFAULT_THRESHOLDS.preservationMin};
+  worst precision == ${DEFAULT_THRESHOLDS.worstPrecision}; lift >= +${(DEFAULT_THRESHOLDS.liftDevMin * 100).toFixed(0)}pp dev /
+  +${(DEFAULT_THRESHOLDS.liftHeldoutMin * 100).toFixed(0)}pp held-out; reason floor 0/${DEFAULT_THRESHOLDS.reasonTargets};
+  reason agentic >= ${(DEFAULT_THRESHOLDS.reasonAgenticMin * 100).toFixed(0)}% at worst-run 100% precision.
+
+Artifacts (owner-only):
+  <out-dir>/certificate.json   machine-readable certificate
+  <out-dir>/certificate.md     Markdown summary
+  <out-dir>/<cell>/run.log      child stdout/stderr (raw output stays out of the summary)
+`
+
+function fail(message: string): never {
+  throw new Error(message)
+}
+
+function parsePositiveInt(raw: string, flag: string): number {
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value <= 0) fail(`${flag} must be a positive integer (got '${raw}')`)
+  return value
+}
+
+function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOptions {
+  const a: Record<string, string | boolean | string[]> = {}
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!
+    if (!arg.startsWith('--')) fail(`unexpected argument '${arg}'`)
+    const equal = arg.indexOf('=')
+    const key = equal >= 0 ? arg.slice(2, equal) : arg.slice(2)
+    if (!key) fail('empty flag')
+    let value: string | boolean
+    if (equal >= 0) value = arg.slice(equal + 1)
+    else {
+      const next = argv[i + 1]
+      if (next === undefined || next.startsWith('--')) value = true
+      else { value = next; i += 1 }
+    }
+    if (key === 'from-dir') {
+      const list = Array.isArray(a[key]) ? a[key] as string[] : []
+      list.push(String(value))
+      a[key] = list
+    } else a[key] = value
+  }
+
+  const known = new Set([
+    'run', 'dry-run', 'from-dir', 'out-dir', 'json', 'md', 'apps', 'dev-seed', 'heldout-seed',
+    'dev-runs', 'floor-heldout-runs', 'heldout-runs', 'concurrency', 'data-dir', 'verifier',
+    'use-newgrp', 'budget-usd', 'max-duration-ms', 'reason-runs', 'skip-reason', 'keep-data-dirs',
+    'no-matrix-check', 'help',
+  ])
+  for (const key of Object.keys(a)) if (!known.has(key)) fail(`unknown flag --${key}`)
+  if (a.help === true) {
+    return {
+      fromDirs: [], run: false, dryRun: false, outDir: resolve('.guardian/certify-phase1'),
+      jsonPath: null, mdPath: null, apps: [...CERTIFY_APPS], devSeed: DEV_SEED, heldoutSeed: HELDOUT_SEED,
+      devRuns: 3, floorHeldoutRuns: 1, heldoutRuns: 2, concurrency: 3, dataDir: null,
+      verifier: 'docker', useNewgrp: false, budgetUsd: 5, maxDurationMs: 600_000, reasonRuns: 1,
+      skipReason: false, keepDataDirs: false, checkMatrix: true, help: true,
+    }
+  }
+
+  const run = a.run === true
+  const fromDirs = (a['from-dir'] as string[] | undefined) ?? []
+  if (!run && !fromDirs.length) fail('use --run or --from-dir <dir>')
+  if (run && fromDirs.length) fail('use either --run or --from-dir, not both')
+  const dryRun = a['dry-run'] === true
+  const appsRaw = typeof a.apps === 'string' ? a.apps : 'all'
+  const apps = appsRaw === 'all' ? [...CERTIFY_APPS] : appsRaw.split(',').map(s => s.trim()).filter(Boolean)
+  for (const app of apps) if (!CERTIFY_APPS.includes(app as typeof CERTIFY_APPS[number])) fail(`--apps must be ${CERTIFY_APPS.join(', ')} or all (got '${app}')`)
+  const verifier = typeof a.verifier === 'string' ? a.verifier : 'docker'
+  if (verifier !== 'auto' && verifier !== 'docker' && verifier !== 'local-jq') fail(`--verifier must be auto, docker or local-jq (got '${verifier}')`)
+  const dataDir = typeof a['data-dir'] === 'string' ? resolve(a['data-dir']) : (env.GUARDIAN_DATA_DIR ? resolve(env.GUARDIAN_DATA_DIR) : null)
+  return {
+    fromDirs: fromDirs.map(dir => resolve(dir)),
+    run,
+    dryRun,
+    outDir: resolve(typeof a['out-dir'] === 'string' ? a['out-dir'] : '.guardian/certify-phase1'),
+    jsonPath: typeof a.json === 'string' ? resolve(a.json) : null,
+    mdPath: typeof a.md === 'string' ? resolve(a.md) : null,
+    apps,
+    devSeed: parsePositiveInt(typeof a['dev-seed'] === 'string' ? a['dev-seed'] : String(DEV_SEED), '--dev-seed'),
+    heldoutSeed: parsePositiveInt(typeof a['heldout-seed'] === 'string' ? a['heldout-seed'] : String(HELDOUT_SEED), '--heldout-seed'),
+    devRuns: parsePositiveInt(typeof a['dev-runs'] === 'string' ? a['dev-runs'] : '3', '--dev-runs'),
+    floorHeldoutRuns: parsePositiveInt(typeof a['floor-heldout-runs'] === 'string' ? a['floor-heldout-runs'] : '1', '--floor-heldout-runs'),
+    heldoutRuns: parsePositiveInt(typeof a['heldout-runs'] === 'string' ? a['heldout-runs'] : '2', '--heldout-runs'),
+    concurrency: parsePositiveInt(typeof a.concurrency === 'string' ? a.concurrency : '3', '--concurrency'),
+    dataDir,
+    verifier,
+    useNewgrp: a['use-newgrp'] === true,
+    budgetUsd: asNumber(Number(typeof a['budget-usd'] === 'string' ? a['budget-usd'] : 5), 5),
+    maxDurationMs: parsePositiveInt(typeof a['max-duration-ms'] === 'string' ? a['max-duration-ms'] : '600000', '--max-duration-ms'),
+    reasonRuns: parsePositiveInt(typeof a['reason-runs'] === 'string' ? a['reason-runs'] : '1', '--reason-runs'),
+    skipReason: a['skip-reason'] === true,
+    keepDataDirs: a['keep-data-dirs'] === true,
+    checkMatrix: a['no-matrix-check'] !== true,
+    help: false,
+  }
+}
+
+function writeOwnerOnly(path: string, text: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  writeFileSync(path, text, { mode: 0o600 })
+  try { chmodSync(path, 0o600) } catch { /* best effort */ }
+}
+
+async function main(): Promise<void> {
+  const cli = parseCli(process.argv.slice(2))
+  if (cli.help) {
+    process.stdout.write(usage)
+    return
+  }
+  if (cli.dryRun && !cli.run) fail('--dry-run requires --run')
+  const secrets = artifactSecrets(process.env)
+  const abort = new AbortController()
+  let interrupted = false
+
+  const onSignal = (signal: NodeJS.Signals): void => {
+    interrupted = true
+    process.stderr.write(`\n[certify] ${signal}: stopping child process groups and cleaning per-cell data dirs\n`)
+    abort.abort()
+    killLiveChildren()
+    cleanupContainers()
+    cleanupDataDirs(cli.outDir)
+    process.exit(signal === 'SIGINT' ? 130 : 143)
+  }
+  process.once('SIGINT', onSignal)
+  process.once('SIGTERM', onSignal)
+
+  try {
+    let certificate: Certificate
+    const ingestNotes: string[] = []
+    if (cli.run) {
+      if (cli.heldoutSeed < 1_000_000) fail('--heldout-seed must be >= 1000000 (salted held-out split)')
+      const plan = buildRunPlan({
+        outDir: cli.outDir,
+        apps: cli.apps,
+        devSeed: cli.devSeed,
+        heldoutSeed: cli.heldoutSeed,
+        devRuns: cli.devRuns,
+        floorHeldoutRuns: cli.floorHeldoutRuns,
+        heldoutRuns: cli.heldoutRuns,
+        dataDir: cli.dataDir,
+        verifier: cli.verifier,
+        budgetUsd: cli.budgetUsd,
+        maxDurationMs: cli.maxDurationMs,
+        reasonRuns: cli.skipReason ? 0 : cli.reasonRuns,
+        mode: 'grey-box',
+      })
+      if (cli.dryRun) {
+        process.stdout.write(`${JSON.stringify({ cells: plan, concurrency: cli.concurrency }, null, 2)}\n`)
+        return
+      }
+      const salt = process.env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+      if (salt.length < 16) fail('--run requires GUARDIAN_RB_HELDOUT_SALT (>= 16 chars); the value is never written')
+      if (!cli.dataDir) fail('--run agentic cells need --data-dir (or GUARDIAN_DATA_DIR) with an enabled model profile')
+      for (const sub of ['floor', 'unified', 'reason']) {
+        if (existsSync(join(cli.outDir, sub))) {
+          fail(`--run refuses to mix with existing matrix artifacts at ${join(cli.outDir, sub)}; use a fresh --out-dir`)
+        }
+      }
+      mkdirSync(cli.outDir, { recursive: true, mode: 0o700 })
+      cleanupUseNewgrp = cli.useNewgrp
+      process.stdout.write(`[certify] executing ${plan.length} cell(s) with concurrency ${cli.concurrency}\n`)
+      const results = await executeRunPlan(plan, {
+        useNewgrp: cli.useNewgrp,
+        concurrency: cli.concurrency,
+        abort: abort.signal,
+        log: line => process.stdout.write(`${line}\n`),
+      })
+      cleanupContainers()
+      const failed = results.filter(result => result.code !== 0 && result.code !== 3)
+      for (const result of failed) ingestNotes.push(`cell ${result.id} did not complete cleanly (${result.error ?? result.code ?? result.signal})`)
+      const expectedGateFailure = results.filter(result => result.code === 3)
+      if (expectedGateFailure.length) {
+        ingestNotes.push(`${expectedGateFailure.length} reason floor cell(s) exited 3 (anti-heuristic gate violation recorded in the certificate)`)
+      }
+      const ingested = ingestFromDirs([cli.outDir], process.env)
+      ingestNotes.push(...ingested.notes)
+      certificate = evaluateCertification(ingested.runs, ingested.reason, {
+        mode: 'run',
+        apps: cli.apps,
+        devRuns: cli.devRuns,
+        floorHeldoutRuns: cli.floorHeldoutRuns,
+        heldoutRuns: cli.heldoutRuns,
+        checkMatrix: cli.checkMatrix,
+        notes: ingestNotes,
+      })
+      if (!cli.keepDataDirs) cleanupDataDirs(cli.outDir)
+    } else {
+      const ingested = ingestFromDirs(cli.fromDirs, process.env)
+      ingestNotes.push(...ingested.notes)
+      ingestNotes.push(`ingested ${ingested.runs.length} realism cell(s) and ${ingested.reason.length} reason report(s) from ${ingested.filesScanned} file(s)`)
+      certificate = evaluateCertification(ingested.runs, ingested.reason, {
+        mode: 'from-dir',
+        apps: cli.apps,
+        devRuns: cli.devRuns,
+        floorHeldoutRuns: cli.floorHeldoutRuns,
+        heldoutRuns: cli.heldoutRuns,
+        checkMatrix: cli.checkMatrix,
+        notes: ingestNotes,
+      })
+    }
+
+    const jsonText = redactText(`${JSON.stringify(certificate, null, 2)}\n`, secrets)
+    const mdText = redactText(renderCertificateMarkdown(certificate), secrets)
+    assertSecretFree(jsonText, secrets)
+    assertSecretFree(mdText, secrets)
+    const jsonPath = cli.jsonPath ?? join(cli.outDir, 'certificate.json')
+    const mdPath = cli.mdPath ?? join(cli.outDir, 'certificate.md')
+    writeOwnerOnly(jsonPath, jsonText)
+    writeOwnerOnly(mdPath, mdText)
+
+    process.stdout.write(`\n${mdText}`)
+    process.stdout.write(`\nwrote ${jsonPath}\nwrote ${mdPath}\n`)
+    process.stdout.write(`certify:phase1 ${certificate.verdict}\n`)
+    if (certificate.verdict === 'FAIL') process.exitCode = 1
+  } finally {
+    process.removeListener('SIGINT', onSignal)
+    process.removeListener('SIGTERM', onSignal)
+    if (interrupted) killLiveChildren()
+    // Failure paths must not leave per-cell data dirs behind either.
+    if (cli.run && !cli.dryRun && !cli.keepDataDirs) cleanupDataDirs(cli.outDir)
+  }
+}
+
+const isMain = process.argv[1] ? import.meta.url === pathToFileURL(resolve(process.argv[1])).href : false
+if (isMain) {
+  main().catch((error) => {
+    process.stderr.write(`error: ${(error as Error).message}\n`)
+    process.exit(1)
+  })
+}
