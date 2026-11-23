@@ -126,10 +126,60 @@ export interface EngineConfirmed {
   exchangeIds: string[]
 }
 
+export type LeadEvidenceKind = 'denied_control' | 'data_delta' | 'near_miss'
+
+/**
+ * Evidence that justifies promoting an unconfirmed observation into a `det_lead`.
+ *
+ * A bare anomaly ("a non-owner received a 2xx") is not enough: on idempotent routes every caller and
+ * every nonexistent id receives the same acknowledgement, so the "signal" carries no contrast and a
+ * dispatched upgrade assignment can only burn budget re-proving it false. Promotion therefore needs
+ * at least one of:
+ *  - `denied_control`: an actor/identifier differential observed on the same route (401/403 for one
+ *    actor while the owner/another actor is served) — the app does enforce a boundary;
+ *  - `data_delta`: an observed body/state delta that only spec synthesis/verification failed to bind
+ *    (owner-equivalent cross-actor read, boolean/time differential, state mutation read-back, ...);
+ *  - `near_miss`: a verifier rejection with a concrete, actionable missing-evidence code (not a
+ *    failed/absent control, which is evidence *against* the lead).
+ */
+export interface LeadEvidence {
+  kind: LeadEvidenceKind
+  /**
+   * Concrete verifier-side reason the replay was rejected, or null when no spec reached the
+   * verifier. Bounded probe/verifier wording only — never a raw HTTP body.
+   */
+  verifyFailureReason: string | null
+  /** Concrete missing-evidence code derived from the verifier reason (null when none applies). */
+  verifyFailureCode: string | null
+  /**
+   * What the control leg observed on the same route: `actor_denied_401`, `bogus_id_denied_404`,
+   * `owner_equivalent_2xx`, `state_delta`, `anomaly_boolean_differential`, ...
+   */
+  controlOutcome: string
+  /** Bounded exchange ids holding the differential and control evidence. */
+  evidenceExchangeIds: string[]
+  /** Probe class the dispatcher should prioritize for the upgrade (the lead's own class). */
+  candidateProbeClass: string
+  /** Short machine-readable justification. Never contains payloads or response bodies. */
+  detail: string
+}
+
 export interface EngineLead {
   hypothesis: EngineHypothesis
   probe: DifferentialResult
   summary: string
+  /** Promotion evidence. Always present on engine-emitted leads; optional for direct callers. */
+  evidence?: LeadEvidence
+}
+
+/** One rejected replay attempt, retained so a failed hypothesis can still carry actionable evidence. */
+export interface RejectedSpecEvidence {
+  kind: string
+  verdict: string
+  controlPassed: boolean
+  observed: string
+  reason: string | null
+  exchangeIds: string[]
 }
 
 export interface DeterministicEngineInput {
@@ -150,6 +200,8 @@ export interface DeterministicEngineInput {
   maxDurationMs?: number
   maxEndpoints?: number
   maxHypotheses?: number
+  /** Evidence-gated `det_lead` emission cap for this pass (default 6, severity-ranked). */
+  maxLeads?: number
   /**
    * v6 Phase A: the floor always runs with the same deep per-class policy as `--no-llm`.
    * Breadth-first caps are opt-in only for callers whose remaining budget cannot fund a deep pass.
@@ -196,6 +248,8 @@ export interface DeterministicEngineReport {
   confirmed: number
   rejectedSpecs: number
   leads: number
+  /** Signals rejected by the evidence gate (bare anomaly / 2xx-only / non-selective control). */
+  leadsSuppressed: number
   stoppedReason: 'budget' | 'time' | 'aborted' | 'complete' | 'disabled'
   byClass: Record<string, EngineClassStats>
   confirmedPairs: Array<{ endpoint: string; vulnClass: string }>
@@ -212,6 +266,373 @@ export interface DeterministicEngineReport {
   /** v6 staging: entity ids observed in tagged 2xx create responses (cleanup audit trail). */
   stagingCreatedEntityIds: string[]
   notes: string[]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deterministic lead promotion
+// ---------------------------------------------------------------------------------------------
+
+/** Per-run lead emission cap. Six severity-ranked leads are enough for one dispatch window. */
+export const defaultEngineLeadCap = 6
+const maxLeadEvidenceExchanges = 6
+const maxLeadEvidenceText = 200
+
+/**
+ * Anomaly types that already carry an observed delta (body/state/timing/callback), so a rejected
+ * synthesis is the only thing standing between the observation and a proof. Bare status anomalies
+ * (`unauthorized_access`) are handled by the stricter authz rules below.
+ */
+const leadDataDeltaAnomalyTypes = new Set([
+  'boolean_differential',
+  'sql_time_differential',
+  'db_error_fingerprint',
+  'canary_callback',
+  'xxe_entity_resolved_inband',
+  'xxe_canary_callback',
+  'command_executed',
+  'expression_evaluated',
+  'path_traversal_escape',
+  'path_normalization_differential',
+  'ssrf_inband_differential',
+  'open_redirect_differential',
+  'oauth_redirect_differential',
+  'web_cache_deception',
+  'cache_poisoning',
+  'webhook_signature_bypass',
+  'csrf_state_change',
+  'mass_assignment',
+  'workflow_step_skip',
+  'workflow_repeat_accepted',
+  'workflow_quantity_invariant',
+  'invariant_violation',
+  'xss_context',
+  'graphql_nested_bola',
+  'graphql_cross_persona_access',
+  'graphql_mutation_accessible',
+  'secret_disclosed',
+  'jwt_auth_mutation_bypass',
+  'pkce_downgrade',
+  'introspection_enabled',
+  'field_suggestion_leak',
+  'operator_type_divergence',
+  'alias_batching_allowed',
+  'write_path_bola',
+])
+
+/** Verifier reasons that name a concrete next evidence step (and therefore justify a lead). */
+const promotableNearMissCodes = new Set([
+  'missing_identifier_binding',
+  'missing_state_delta',
+  'missing_probe_binding',
+])
+
+/**
+ * Classify a verifier rejection reason into a concrete missing-evidence code.
+ * `status_only`, `missing_control_differential` and `control_failed` are negatives: they say the
+ * observation never had a contrast to begin with, so they must not promote a lead.
+ */
+export function missingEvidenceCode(reason: string | null | undefined): string | null {
+  const text = (reason ?? '').trim()
+  if (!text) return null
+  if (/status-only|status only|status equality|2xx status/i.test(text)) return 'status_only'
+  if (/no genuine control-vs-probe differential|no genuine control versus probe differential/i.test(text)) {
+    return 'missing_control_differential'
+  }
+  if (/different-body observation without identifier binding|without identifier binding/i.test(text)) {
+    return 'missing_identifier_binding'
+  }
+  if (/state delta|persisted state|persisted mutation/i.test(text)) return 'missing_state_delta'
+  if (/no executed probe|bind the finding endpoint|no bound exchange/i.test(text)) return 'missing_probe_binding'
+  return null
+}
+
+/** Read the bogus/nonexistent-identifier control status out of a replay `observed` string. */
+export function bogusIdControlOutcome(observed: string | null | undefined): { status: number; accepted: boolean } | null {
+  const match = /bogus status=(\d{3})/.exec(observed ?? '')
+  if (!match) return null
+  const status = Number(match[1])
+  if (!Number.isFinite(status) || status <= 0) return null
+  return { status, accepted: status >= 200 && status < 300 }
+}
+
+interface LeadMatrixRow {
+  resourceId: string
+  actor: string
+  status: number | null
+  accessible: boolean | null
+  similarityToOwner: number | null
+  bodyBytes: number | null
+  bodySha256: string | null
+}
+
+function leadMatrix(probe: DifferentialResult): LeadMatrixRow[] {
+  const raw = probe.details?.matrix
+  if (!Array.isArray(raw)) return []
+  const rows: LeadMatrixRow[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const row = entry as Record<string, unknown>
+    rows.push({
+      resourceId: typeof row.resourceId === 'string' ? row.resourceId : '',
+      actor: typeof row.actor === 'string' ? row.actor : '',
+      status: typeof row.status === 'number' ? row.status : null,
+      accessible: typeof row.accessible === 'boolean' ? row.accessible : null,
+      similarityToOwner: typeof row.similarityToOwner === 'number' ? row.similarityToOwner : null,
+      bodyBytes: typeof row.bodyBytes === 'number' ? row.bodyBytes : null,
+      bodySha256: typeof row.bodySha256 === 'string' ? row.bodySha256 : null,
+    })
+  }
+  return rows
+}
+
+function isSuccessStatus(status: unknown): boolean {
+  return typeof status === 'number' && status >= 200 && status < 300
+}
+
+function isDeniedStatus(status: number | null): boolean {
+  return status === 401 || status === 403
+}
+
+function isCrossActorHit(anomaly: Record<string, unknown>): boolean {
+  const type = String(anomaly.type ?? '')
+  if (type !== 'unauthorized_access' && type !== 'graphql_nested_bola' && type !== 'graphql_cross_persona_access') {
+    return false
+  }
+  if (anomaly.actor === 'owner') return false
+  return isSuccessStatus(anomaly.status)
+}
+
+function uniqueExchangeIds(values: Iterable<string>): string[] {
+  const out: string[] = []
+  for (const value of values) {
+    if (typeof value !== 'string' || !value) continue
+    if (!out.includes(value)) out.push(value)
+  }
+  return out.slice(0, maxLeadEvidenceExchanges)
+}
+
+function leadFailureReason(rejections: readonly RejectedSpecEvidence[]): string | null {
+  // Prefer a rejection that names a concrete next step; fall back to the first verifier wording.
+  const scored = rejections
+    .map((rejection, index) => {
+      const text = (rejection.reason ?? rejection.observed ?? '').trim()
+      const code = missingEvidenceCode(rejection.reason)
+      const weight = code && promotableNearMissCodes.has(code) ? 2 : code ? 1 : 0
+      return { text, weight, index }
+    })
+    .filter(entry => entry.text.length > 0)
+    .sort((a, b) => b.weight - a.weight || a.index - b.index)
+  const chosen = scored[0]
+  return chosen ? chosen.text.slice(0, maxLeadEvidenceText) : null
+}
+
+export interface LeadEvidenceInput {
+  hypothesis: EngineHypothesis
+  probe: DifferentialResult
+  rejections?: readonly RejectedSpecEvidence[]
+}
+
+/**
+ * Decide whether an unconfirmed observation has enough evidence to become a lead.
+ * Returns null when the observation is a bare anomaly/2xx-only signal that must not be promoted.
+ */
+export function deriveLeadEvidence(input: LeadEvidenceInput): LeadEvidence | null {
+  const { hypothesis: hyp, probe } = input
+  const rejections = input.rejections ?? []
+  if (probe.verdict !== 'signal') return null
+  const anomalies = probe.anomalies.filter(
+    (anomaly): anomaly is Record<string, unknown> => Boolean(anomaly) && typeof anomaly === 'object',
+  )
+  if (anomalies.length === 0) return null
+
+  const verifyFailureReason = leadFailureReason(rejections)
+  const verifyFailureCode = missingEvidenceCode(verifyFailureReason)
+  const evidenceExchangeIds = uniqueExchangeIds([
+    ...probe.exchangeIds,
+    ...rejections.flatMap(rejection => rejection.exchangeIds),
+  ])
+  const base = {
+    verifyFailureReason,
+    verifyFailureCode,
+    evidenceExchangeIds,
+    candidateProbeClass: hyp.probeClass,
+  }
+  const scope = `${hyp.endpoint.origin} ${hyp.method} ${hyp.endpoint.pathTemplate}`
+  const method = (hyp.method ?? 'GET').toUpperCase()
+  const mutating = method !== 'GET' && method !== 'HEAD'
+  const authz = hyp.intent === 'authz' || hyp.intent === 'graphql' ||
+    probe.probeClass === 'authz_matrix' || probe.probeClass === 'graphql_audit'
+
+  if (authz) {
+    const hits = anomalies.filter(isCrossActorHit)
+    if (hits.length === 0) return null
+    const matrix = leadMatrix(probe)
+    const ownerAccessible = matrix.some(row => row.actor === 'owner' && (row.accessible === true || isSuccessStatus(row.status)))
+    const deniedRows = matrix.filter(row => isDeniedStatus(row.status))
+    const hitIds = new Set(hits.map(hit => String(hit.resourceId ?? '')).filter(Boolean))
+    const deniedForHit = deniedRows.filter(row => hitIds.size === 0 || hitIds.has(row.resourceId))
+
+    if (mutating) {
+      // A mutating 2xx is only meaningful when the route discriminates. The replay's bogus-id
+      // control is the decisive observation: if a nonexistent identifier is also accepted, every
+      // caller sees the same acknowledgement and the "signal" is a false lead.
+      for (const rejection of rejections) {
+        const bogus = bogusIdControlOutcome(rejection.observed)
+        if (bogus?.accepted) {
+          return null
+        }
+      }
+      for (const rejection of rejections) {
+        const bogus = bogusIdControlOutcome(rejection.observed)
+        if (bogus && !bogus.accepted && /probe status=2\d\d/.test(rejection.observed)) {
+          return {
+            ...base,
+            kind: 'near_miss',
+            controlOutcome: `bogus_id_denied_${bogus.status}`,
+            detail: `mutating 2xx with a denied bogus-id control on ${scope}`,
+          }
+        }
+      }
+      const hitActors = new Set(hits.map(hit => String(hit.actor ?? '')).filter(Boolean))
+      const sameActorDenied = deniedForHit.some(row => ownerAccessible && hitActors.has(row.actor))
+      if (sameActorDenied) {
+        const status = deniedForHit.find(row => hitActors.has(row.actor))?.status ?? 0
+        return {
+          ...base,
+          kind: 'denied_control',
+          controlOutcome: `actor_denied_${status}`,
+          detail: `mutating 2xx with a same-actor denial on ${scope}`,
+        }
+      }
+      const stateDelta = anomalies.find(anomaly =>
+        anomaly.type === 'write_path_bola' || anomaly.stateDelta === true || anomaly.persisted === true)
+      if (stateDelta) {
+        return {
+          ...base,
+          kind: 'data_delta',
+          controlOutcome: 'state_delta',
+          detail: `mutating 2xx with an owner-read-back state delta on ${scope}`,
+        }
+      }
+      return null
+    }
+
+    const deniedForRoute = deniedForHit.length > 0 || (hitIds.size === 0 && deniedRows.length > 0)
+    if (deniedForRoute && ownerAccessible) {
+      const status = (deniedForHit[0] ?? deniedRows[0])?.status ?? 0
+      return {
+        ...base,
+        kind: 'denied_control',
+        controlOutcome: `actor_denied_${status}`,
+        detail: `cross-actor 2xx with a denied actor control on ${scope}`,
+      }
+    }
+    const ownerEquivalent = hits.some(hit => Number(hit.similarityToOwner ?? 0) >= 0.7) ||
+      matrix.some((row, index) => row.bodySha256 !== null &&
+        matrix.some((other, otherIndex) => otherIndex !== index && other.actor === 'owner' &&
+          other.bodySha256 === row.bodySha256))
+    if (ownerEquivalent) {
+      return {
+        ...base,
+        kind: 'data_delta',
+        controlOutcome: 'owner_equivalent_2xx',
+        detail: `cross-actor read returned owner-equivalent content on ${scope}`,
+      }
+    }
+    const code = missingEvidenceCode(verifyFailureReason)
+    if (code && promotableNearMissCodes.has(code)) {
+      return {
+        ...base,
+        kind: 'near_miss',
+        controlOutcome: `verifier_${code}`,
+        detail: `cross-actor read rejected for ${code} on ${scope}`,
+      }
+    }
+    return null
+  }
+
+  const delta = anomalies.find(anomaly => leadDataDeltaAnomalyTypes.has(String(anomaly.type ?? '')))
+  if (delta) {
+    return {
+      ...base,
+      kind: 'data_delta',
+      controlOutcome: `anomaly_${String(delta.type)}`,
+      detail: `observed ${String(delta.type)} delta on ${scope}`,
+    }
+  }
+  const code = missingEvidenceCode(verifyFailureReason)
+  if (code && promotableNearMissCodes.has(code)) {
+    return {
+      ...base,
+      kind: 'near_miss',
+      controlOutcome: `verifier_${code}`,
+      detail: `verifier rejected the spec for ${code} on ${scope}`,
+    }
+  }
+  return null
+}
+
+export interface EngineLeadCandidate {
+  lead: EngineLead
+  key: string
+  score: number
+}
+
+const leadEvidenceSeverity: Record<LeadEvidenceKind, number> = {
+  near_miss: 3,
+  denied_control: 2,
+  data_delta: 1,
+}
+
+/** Dedupe key required by the lead lane: origin, endpoint, method, mutated input, class. */
+export function leadCandidateKey(hyp: EngineHypothesis): string {
+  const param = hyp.param?.name ?? hyp.idParamName ?? ''
+  const location = hyp.param?.location ?? hyp.location ?? ''
+  const mutatedInput = param ? `${param}@${location}` : '-'
+  return [
+    hyp.endpoint.origin,
+    normalizeEndpointTemplate(hyp.endpoint.pathTemplate),
+    (hyp.method ?? 'GET').toUpperCase(),
+    mutatedInput,
+    hyp.probeClass,
+  ].join('|')
+}
+
+/** Severity rank: evidence kind first, then the hypothesis risk score, then a total identity order. */
+export function leadCandidateScore(hyp: EngineHypothesis, evidence: LeadEvidence): number {
+  const risk = Number.isFinite(hyp.risk) ? Math.max(0, Math.min(100, hyp.risk)) : 0
+  return leadEvidenceSeverity[evidence.kind] * 1_000 + risk
+}
+
+/**
+ * Deduplicate by the lane key and keep the `cap` highest-severity leads.
+ * Total order: score desc, then key, then first exchange id (stable on permuted input).
+ */
+export function selectEngineLeads(
+  candidates: readonly EngineLeadCandidate[],
+  cap: number = defaultEngineLeadCap,
+): EngineLeadCandidate[] {
+  const byKey = new Map<string, EngineLeadCandidate>()
+  for (const candidate of candidates) {
+    const current = byKey.get(candidate.key)
+    if (!current) {
+      byKey.set(candidate.key, candidate)
+      continue
+    }
+    const candidateExchange = candidate.lead.evidence?.evidenceExchangeIds[0] ?? ''
+    const currentExchange = current.lead.evidence?.evidenceExchangeIds[0] ?? ''
+    if (candidate.score > current.score ||
+        (candidate.score === current.score && candidateExchange < currentExchange)) {
+      byKey.set(candidate.key, candidate)
+    }
+  }
+  const limit = Math.max(0, Math.floor(cap))
+  return [...byKey.values()]
+    .sort((a, b) =>
+      b.score - a.score ||
+      a.key.localeCompare(b.key) ||
+      (a.lead.evidence?.evidenceExchangeIds[0] ?? '').localeCompare(b.lead.evidence?.evidenceExchangeIds[0] ?? ''))
+    .slice(0, limit)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2777,6 +3198,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     confirmed: 0,
     rejectedSpecs: 0,
     leads: 0,
+    leadsSuppressed: 0,
     stoppedReason: 'complete',
     byClass: {},
     confirmedPairs: [],
@@ -2810,6 +3232,8 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   const origins = [...new Set(ranked.map(endpoint => endpoint.origin))]
   const budget = { requestsUsed: 0, maxRequests }
   const createdEntityIds = new Set<string>()
+  /** Evidence-gated leads collected during the pass; deduped/ranked/capped before emission. */
+  const leadCandidates: EngineLeadCandidate[] = []
   const stagingTag = (input.entityTag ?? '').trim()
   /**
    * Every brokered request (harvest, probe, replay) counts against the engine's request cap. Tagged
@@ -2973,6 +3397,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       })
     }
     let confirmedThisHypothesis = false
+    const rejections: RejectedSpecEvidence[] = []
     for (const candidate of candidates) {
       if (input.signal.aborted || budget.requestsUsed >= maxRequests) break
       const parsed = declarativeReplaySpecSchema.safeParse(candidate.spec)
@@ -3011,6 +3436,14 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         })
         report.rejectedSpecs += 1
         stats.rejected += 1
+        rejections.push({
+          kind: candidate.kind,
+          verdict: replay.verdict,
+          controlPassed: replay.outcome.controlPassed === true,
+          observed: replay.outcome.observed,
+          reason: replay.outcome.reason ?? null,
+          exchangeIds: replay.exchangeIds,
+        })
         continue
       }
       const vulnClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
@@ -3038,16 +3471,42 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       report.confirmedPairs.push({ endpoint: hyp.endpoint.pathTemplate, vulnClass })
       break
     }
-    if (!confirmedThisHypothesis && candidates.length > 0) {
-      report.leads += 1
-      try {
-        input.onLead?.({
-          hypothesis: hyp,
-          probe,
-          summary: probe.summary.slice(0, 240),
+    if (!confirmedThisHypothesis) {
+      const evidence = deriveLeadEvidence({ hypothesis: hyp, probe, rejections })
+      if (!evidence) {
+        report.leadsSuppressed += 1
+        log('deterministic_engine.lead_suppressed', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}: observation lacks failed-control/near-miss evidence`, {
+          intent: hyp.intent,
+          probeClass: hyp.probeClass,
+          endpoint: hyp.endpoint.pathTemplate,
+          method: hyp.method,
+          anomalies: probe.anomalies.map(anomaly => String(anomaly.type)).slice(0, 6),
+          rejected: rejections.length,
+          controlPassed: rejections.map(rejection => rejection.controlPassed),
         })
-      } catch { /* lead emission is best-effort */ }
+      } else {
+        leadCandidates.push({
+          lead: {
+            hypothesis: hyp,
+            probe,
+            summary: probe.summary.slice(0, 240),
+            evidence,
+          },
+          key: leadCandidateKey(hyp),
+          score: leadCandidateScore(hyp, evidence),
+        })
+      }
     }
+  }
+
+  // Emit the deduplicated, severity-ranked, capped lead set only after the whole pass: a later
+  // hypothesis on the same (origin, route, method, input, class) may carry stronger evidence.
+  const emittedLeads = selectEngineLeads(leadCandidates, input.maxLeads ?? defaultEngineLeadCap)
+  for (const candidate of emittedLeads) {
+    report.leads += 1
+    try {
+      input.onLead?.(candidate.lead)
+    } catch { /* lead emission is best-effort */ }
   }
 
   if (report.stoppedReason === 'complete' && (Date.now() - started >= hardDeadlineMs)) report.stoppedReason = 'time'
