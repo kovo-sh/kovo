@@ -100,10 +100,13 @@ recall. Each one is a verifier-side gap (see the bullets above), owned by `src/s
    but that is **not modelled as a target**: enforcing it at `login` would put every `persona_a`
    solver and every engine cell into a pending state (login is shared by the whole lab and the harness
    has no second-factor step), and an oracle event keyed to `login` would be triggered by any
-   ordinary login, i.e. truth inflation. Verifier gap: `auth_protocol_proof` has no
-   second-factor-state gate (enrolled account, verifier session pending before the probe, access
-   denied before verification and granted after it); it confirms on `anon 401 / authed 200 {ok:true}`
-   alone.
+   ordinary login, i.e. truth inflation. Deterministic probe: password login → `GET /api/me` 200 and
+   an owner-only read 200 *before* any challenge; `POST /api/auth/2fa` with a wrong code or an empty
+   body → `{ok:true}` with the same 200 afterwards; anonymous → 401; zero oracle events.
+   Verifier gap: `auth_protocol_proof` (`src/server/replay-verifier.ts`) and its schema
+   (`src/replay-spec.ts:594`) have no second-factor state gate (enrolled account, verifier session
+   pending before the probe, access denied before verification and granted after it) and no `mfa`
+   protocol; it confirms on `anon 401 / authed 200 {ok:true}` alone.
 
 5. *"Missing vertical role check on `/api/admin/activity` exposes rotated org secret to read-only
    viewer"* (CWE-863, `open_proof_gap`) — **real endpoint, wrong label; not a false alarm**. The
