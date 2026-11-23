@@ -11,15 +11,15 @@
 
 1. **Consult after every major threshold AND at least hourly.** Thresholds: a recall move of ≥5 percentage points on any suite, a class milestone flip, a capability/release gate status change, or a merged stream that changes the funnel, precision, or worker reliability. While a batch is in flight, also check in at least once an hour even without a threshold. Load the `hillclimb-consult` skill and use its helper (`scripts/consult.sh`); the operator's review pane is `0:2.1` when it is running `agy`, otherwise discover the `agy` pane.
 2. **Ask for an architecture review, not just metrics.** Each hourly check-in must ask whether the design is still sound: unwired primitives accumulating beside live v5 code, dual paths, default-flip/deletion debt, LOC direction, safety invariants, and the realism-gate plan. Give the reviewer current metrics, what merged, what is unwired, and specific questions.
-2. **The reviewer gets summaries, not raw data.** Send current metrics, what changed, per-class gaps, blockers, and specific questions. Explicitly state: do not re-read raw benchmark JSON/logs and do not re-run benchmarks unless the operator asks for a fresh independent measurement. Never include secrets.
-3. **Triage every recommendation.** Record accept/reject/defer with a reason and an owner stream, then log a short entry in the “Consult log” section of `plans/ROADMAP-v5.md`.
-4. **Commit and push after every meaningful progress.** This includes a benchmark metric change, a merged stream, a gate result, or a substantive fix. Use the keyring credential helper and never print or store the token:
+3. **The reviewer gets summaries, not raw data.** Send current metrics, what changed, per-class gaps, blockers, and specific questions. Explicitly state: do not re-read raw benchmark JSON/logs and do not re-run benchmarks unless the operator asks for a fresh independent measurement. Never include secrets.
+4. **Triage every recommendation.** Record accept/reject/defer with a reason and an owner stream, then log a short entry in the “Consult log” section of `plans/ROADMAP-v5.md`.
+5. **Commit and push after every meaningful progress.** This includes a benchmark metric change, a merged stream, a gate result, or a substantive fix. Use the keyring credential helper and never print or store the token:
 
    ```bash
    git -c credential.helper='!gh auth git-credential' push origin main
    ```
 
-5. **Iterate with the smoke tier, not full matrices.** Use `scripts/hillclimb-loop.sh` (realistic seed 42 + agentic `--smoke` + typecheck, in parallel) between tweaks; run `--full`/`reverify-v5.sh --full` only once per batch or at milestones. Batch 3–5 related fixes before validating.
+6. **Iterate with the smoke tier, not full matrices.** Use `scripts/hillclimb-loop.sh` (realistic seed 42 + agentic `--smoke` + typecheck, in parallel) between tweaks; run `--full`/`reverify-v5.sh --full` only once per batch or at milestones. Batch 3–5 related fixes before validating.
 
 ## Parallelization by default
 
