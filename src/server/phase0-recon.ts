@@ -54,6 +54,12 @@ export interface Phase0ReconResult {
   authRequests?: number
   /** Candidate routes rejected by soft-404 / SPA catch-all calibration. */
   soft404Rejected?: number
+  /** Declared operations ingested offline from the imported OpenAPI/API reference. */
+  declaredSurface?: { specs: number; endpoints: number; params: number; methods: Record<string, number> }
+  /** Sibling detail routes derived from observed collections / Location headers (passive, no probe). */
+  siblingEndpoints?: number
+  /** Allowed methods learned from OPTIONS/405 `Allow` headers and validation 400/422 bodies. */
+  methodHints?: number
 }
 
 export interface CrawlStateGraphParams {
@@ -1441,6 +1447,51 @@ export function bodyStructuralSignature(body: string): string {
   return createHash('sha256').update(normalized).digest('hex').slice(0, 16)
 }
 
+/**
+ * Allowed methods advertised by an OPTIONS response or a 405 rejection (`Allow: GET, POST`).
+ * Passive: the header is read from a response recon already received.
+ */
+export function harvestAllowMethods(respHeaders: Record<string, string> | undefined | null): string[] {
+  if (!respHeaders) return []
+  const raw = respHeaders.allow ?? respHeaders.Allow ?? ''
+  if (!raw) return []
+  return [...new Set(raw.split(',').map(part => part.trim().toUpperCase())
+    .filter(method => HTTP_METHOD_SET.has(method) && method !== 'OPTIONS' && method !== 'HEAD'))].slice(0, 6)
+}
+
+/**
+ * Field names named by a JSON RFC7807 / express-validator / class-validator style 400/422 body.
+ * Used to learn a declared write/query schema from a validation error instead of guessing nouns.
+ */
+export function harvestValidationFieldHints(body: string): string[] {
+  const out = new Set<string>()
+  const push = (raw: unknown) => {
+    if (typeof raw !== 'string') return
+    const name = raw.split('.').pop()?.trim() ?? ''
+    if (/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(name)) out.add(name)
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { parsed = undefined }
+  if (parsed && typeof parsed === 'object') {
+    const walk = (node: unknown, depth: number): void => {
+      if (depth > 3 || !node || typeof node !== 'object') return
+      if (Array.isArray(node)) { for (const item of node.slice(0, 12)) walk(item, depth + 1); return }
+      const record = node as Record<string, unknown>
+      for (const key of ['field', 'property', 'param', 'name', 'path']) {
+        if (typeof record[key] === 'string') push(record[key])
+      }
+      for (const key of ['errors', 'issues', 'details', 'violations', 'required', 'missing']) {
+        if (Array.isArray(record[key])) walk(record[key], depth + 1)
+      }
+    }
+    walk(parsed, 0)
+  }
+  for (const match of body.matchAll(/([A-Za-z_][A-Za-z0-9_-]{0,63})\s+(?:is required|required|must be provided|is missing|missing)/gi)) {
+    push(match[1])
+  }
+  return [...out].slice(0, 8)
+}
+
 /** True when a response structurally matches a calibrated soft-404 / SPA catch-all probe. */
 export function isSoftNotFound(calibration: SoftNotFoundCalibration, ex: Pick<BrokerExchangeResult, 'status' | 'mediaType' | 'body'>): boolean {
   if (calibration.statuses.length === 0) return false
@@ -2001,6 +2052,66 @@ export function parseOpenApiDoc(
 }
 
 /**
+ * Offline ingestion of the grey-box API reference (OpenAPI/Swagger) that the harness imported for
+ * this project. Every declared operation is kept with its declared method — including DELETE,
+ * PATCH and body-only POST routes — without requiring an id segment or a known body field.
+ * Deduped by (origin, METHOD, pathTemplate). No network request is made here.
+ */
+export function ingestDeclaredApiSurface(input: {
+  storage: Store
+  runId: string
+  scopeRevision: number
+  origin: string
+  dynamicPaths?: Set<string>
+  dynamicParams?: Set<string>
+}): { specs: number; endpoints: number; params: number; methods: Record<string, number> } {
+  const result = { specs: 0, endpoints: 0, params: 0, methods: {} as Record<string, number> }
+  const { storage, runId, scopeRevision, origin } = input
+  let specs: Array<{ kind: string; content: string }> = []
+  try {
+    const run = storage.run(runId)
+    specs = storage.listProjectSpecsFull(run.projectId)
+  } catch {
+    return result
+  }
+  const known = new Set<string>()
+  try {
+    for (const endpoint of storage.listEndpoints(runId, { origin })) {
+      known.add(`${origin}|${endpoint.method.toUpperCase()}|${endpoint.pathTemplate}`)
+    }
+  } catch { /* empty run: no known endpoints */ }
+  const dynamicPaths = input.dynamicPaths ?? new Set<string>()
+  const dynamicParams = input.dynamicParams ?? new Set<string>()
+
+  for (const spec of specs.slice(0, 6)) {
+    const head = spec.content.slice(0, 400)
+    const looksOpenApi = /openapi|swagger/i.test(spec.kind)
+      || /"(?:openapi|swagger)"\s*:/.test(head)
+      || /^\s*openapi\s*:/m.test(head)
+    if (!looksOpenApi) continue
+    result.specs += 1
+    const parsed = parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+    result.params += parsed.params
+    // Count only operations that were not already present (parseOpenApiDoc upserts, so re-running
+    // on an existing run is idempotent and must not inflate the discovery counters).
+    let current: Array<{ method: string; pathTemplate: string }> = []
+    try {
+      current = storage.listEndpoints(runId, { origin }).map(endpoint => ({
+        method: endpoint.method.toUpperCase(), pathTemplate: endpoint.pathTemplate,
+      }))
+    } catch { /* ignore */ }
+    for (const endpoint of current) {
+      const key = `${origin}|${endpoint.method}|${endpoint.pathTemplate}`
+      if (known.has(key)) continue
+      known.add(key)
+      result.endpoints += 1
+      result.methods[endpoint.method] = (result.methods[endpoint.method] ?? 0) + 1
+    }
+  }
+  return result
+}
+
+/**
  * Zero-LLM Phase-0 deterministic surface mapper (SPEC-v4 §4.3A).
  * Strictly enforces per-origin request budget `min(floor(15% * budgetRequests), 250)`,
  * skips live HTTP at Tier 0, runs 11-framework static route extraction, harvests JS/OpenAPI/GraphQL,
@@ -2091,6 +2202,28 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
   }
 
+  // 1b. Lossless ingestion of the grey-box API reference. Offline: every declared operation is
+  // recorded with its declared method (DELETE/PATCH/body-only POST included), so a variant that
+  // renames resources still gets the full declared surface without any noun wordlist.
+  let declaredSurface: Phase0ReconResult['declaredSurface']
+  if (normalizedOrigins.length > 0) {
+    declaredSurface = ingestDeclaredApiSurface({
+      storage,
+      runId,
+      scopeRevision,
+      origin: normalizedOrigins[0],
+      dynamicPaths,
+      dynamicParams,
+    })
+    endpointsDiscovered += declaredSurface.endpoints
+    paramsDiscovered += declaredSurface.params
+    if (declaredSurface.endpoints > 0) {
+      storage.event(runId, 'phase0.declared_surface', `Ingested ${declaredSurface.endpoints} declared operation(s) from the API reference.`, declaredSurface)
+    }
+  }
+  let siblingEndpoints = 0
+  let methodHints = 0
+
   // Tier 0: zero live HTTP requests
   if (tier === 0) {
     storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts (static only).', {
@@ -2118,6 +2251,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       navigationEndpoints,
       authRequests,
       soft404Rejected,
+      ...(declaredSurface ? { declaredSurface } : {}),
     }
   }
 
@@ -2824,6 +2958,48 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     // 2d. Bounded probe of discovered route candidates (links, route maps, JS-AST/OpenAPI paths).
     // Strictly within perOriginCap; template routes are probed later with concrete ids.
+    const siblingSeen = new Set<string>()
+    const recordSiblingSurface = (rawCollection: string): number => {
+      if (siblingSeen.size >= 12) return 0
+      const bare = (rawCollection.split('?')[0] || '/').replace(/\/+$/, '')
+      if (!bare || bare === '/' || STATIC_ASSET_RE.test(bare)) return 0
+      if (/[:{}[\]]/.test(bare)) return 0
+      const segments = bare.split('/').filter(Boolean)
+      if (segments.length === 0 || segments.length > 5) return 0
+      const template = `${bare}/:id`
+      if (siblingSeen.has(template)) return 0
+      siblingSeen.add(template)
+      let added = 0
+      for (const method of ['GET', 'PATCH', 'DELETE'] as const) {
+        const ep = recordEndpoint(method, template, 'surface_probe', { riskScore: scoreEndpointRisk(method, template) })
+        storage.upsertEndpointParam({
+          runId,
+          endpointId: ep.id,
+          name: 'id',
+          location: 'path',
+          isObjectId: true,
+          isCsrf: false,
+          source: 'phase0_sibling',
+        })
+        dynamicParams.add('id')
+        siblingEndpoints += 1
+        paramsDiscovered += 1
+        added += 1
+      }
+      return added
+    }
+    /** A Location header that points below the requested path implies a created resource sibling. */
+    const recordLocationSibling = (requestPath: string, ex: BrokerExchangeResult): void => {
+      const rawLocation = ex.respHeaders?.location ?? ex.respHeaders?.Location
+      if (!rawLocation) return
+      const clean = sanitizePathCandidate(rawLocation, origin)
+      if (!clean) return
+      const requested = (requestPath.split('?')[0] || '/').replace(/\/+$/, '')
+      const located = (clean.split('?')[0] || '/').replace(/\/+$/, '')
+      if (!requested || requested === '/' || !located.startsWith(`${requested}/`)) return
+      recordSiblingSurface(requested)
+    }
+
     const probeDiscovered = async (candidate: string): Promise<void> => {
       if (originHalted || originUsed >= perOriginCap || signal.aborted) return
       if (candidate === '/' || STATIC_ASSET_RE.test(candidate)) return
@@ -2834,17 +3010,48 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         return
       }
       if (!ex || !(ex.status < 400 || ex.status === 401 || ex.status === 403 || ex.status === 405)) return
+      // A 405 response advertises the methods the route really accepts. Record those with their
+      // declared method instead of inventing a GET, and never probe them from recon.
+      const allow = harvestAllowMethods(ex.respHeaders)
+      if (ex.status === 405 && allow.length > 0) {
+        for (const method of allow) {
+          recordEndpoint(method, candidate, 'surface_probe', { riskScore: scoreEndpointRisk(method, candidate) })
+          methodHints += 1
+        }
+        return
+      }
       const ep = recordEndpoint('GET', candidate, 'surface_probe')
       paramsDiscovered += recordQueryParamsForEndpoint({
         rawPathAndQuery: candidate, origin, endpointId: ep.id, source: 'phase0_html',
         storage, runId, dynamicParams,
       })
+      recordLocationSibling(candidate, ex)
+      // A 400/422 validation body names the schema the route wants; learn it passively.
+      if (ex.status === 400 || ex.status === 422) {
+        for (const field of harvestValidationFieldHints(ex.body)) {
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: field,
+            location: 'query',
+            isCsrf: CSRF_PARAM_RE.test(field),
+            isObjectId: OBJECT_ID_PARAM_RE.test(field),
+            source: 'phase0_validation',
+          })
+          dynamicParams.add(field)
+          paramsDiscovered += 1
+          methodHints += 1
+        }
+        return
+      }
       if (ex.status >= 400) return
       if (/json/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body.slice(0, 64))) {
         // Collection listings seed concrete ids for templated detail routes.
         const ids = extractJsonRecordIds(ex.body)
         if (ids.length > 0) {
           idsByCollection.set(normalizeDiscoveryTemplate(candidate.split('?')[0] || '/'), ids)
+          // Observed collection: derive the object siblings without assuming any noun.
+          recordSiblingSurface(candidate.split('?')[0] || '/')
         }
         for (const link of extractJsonLinkTargets(ex.body, origin).slice(0, 8)) {
           queueDiscoveredRoute('GET', link)
@@ -2966,7 +3173,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       }
       const ids = extractJsonRecordIds(ex.body)
-      if (ids.length > 0) idsByCollection.set(normalizeDiscoveryTemplate(bare), ids)
+      if (ids.length > 0) {
+        idsByCollection.set(normalizeDiscoveryTemplate(bare), ids)
+        recordSiblingSurface(bare)
+      }
       if (ids.length > 0 && item.depth === 0 && navQueue.length < 72 &&
           /"(?:items|data|results|rows|records|list|values)"\s*:\s*\[/.test(ex.body)) {
         // Collections without a documented detail template still imply `collection/:id` reads; probe
@@ -3208,6 +3418,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     navigationEndpoints,
     authRequests,
     soft404Rejected,
+    ...(declaredSurface ? { declaredSurface } : {}),
+    siblingEndpoints,
+    methodHints,
   }
 }
 

@@ -38,6 +38,31 @@ export const defaultEnginePerProbeRequests = 28
 
 export const engineDisableEnv = 'GUARDIAN_DETERMINISTIC_ENGINE'
 
+/**
+ * Conventional noun/action route wordlists (e.g. `/api/tokens`, `/api/admin/users`) are a local-lab
+ * convenience: they only match when the target happens to use the same English nouns as the list.
+ * They stay ON by default for local-lab compatibility, but a run can turn them OFF so capability is
+ * measured from discovered/declared surface only. The switch never changes what is probed on a route
+ * the target itself exposed; it only drops endpoints whose sole source is that wordlist.
+ */
+export const conventionalWordlistEnv = 'GUARDIAN_CONVENTIONAL_WORDLIST'
+
+export function conventionalWordlistEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[conventionalWordlistEnv]
+  if (raw === undefined) return true
+  const value = raw.trim().toLowerCase()
+  if (value === '') return true
+  return !(value === '0' || value === 'off' || value === 'false' || value === 'no')
+}
+
+/** Endpoints the deterministic engine may triage, honouring the conventional-wordlist switch. */
+export function engineWordlistSurface(
+  endpoints: readonly EngineEndpoint[],
+  enabled: boolean,
+): EngineEndpoint[] {
+  return enabled ? [...endpoints] : endpoints.filter(endpoint => endpoint.source !== 'conventional')
+}
+
 /** The engine is on by default; `GUARDIAN_DETERMINISTIC_ENGINE=0|false|off` disables it. */
 export function deterministicEngineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[engineDisableEnv]
@@ -62,6 +87,25 @@ export interface EndpointHarvest {
   activeQueryParams: string[]
   /** Identifiers observed on the lower-privileged (viewer) persona's own identity route. */
   viewerIds?: string[]
+  /** Structural response evidence: wire format and value shape, never a route-name assumption. */
+  evidence?: HarvestEvidence
+}
+
+export interface HarvestEvidence {
+  /** `Content-Disposition: attachment[; filename=...]` on a response. */
+  contentDisposition?: boolean
+  /** Response `Location` header (redirect or created resource). */
+  location?: string
+  /** Response `Content-Type` carries XML. */
+  xml?: boolean
+  /** Observed string values that are absolute URLs. */
+  urlValues?: string[]
+  /** Observed values that are three-segment base64url JWT-shaped tokens. */
+  jwtValues?: string[]
+  /** Field names whose values look like credentials (pre-redaction secret fingerprints). */
+  sensitiveFields?: string[]
+  /** Response header names (signature/HMAC/cache/set-cookie evidence). */
+  headerNames?: string[]
 }
 
 export interface EngineConfirmed {
@@ -135,6 +179,8 @@ export interface DeterministicEngineReport {
   confirmedPairs: Array<{ endpoint: string; vulnClass: string }>
   /** Normalized `<endpoint>|<family>` keys for every hypothesis the engine formed. */
   touchedPairs: string[]
+  /** Reporting for the conventional-noun wordlist switch (expansion is ON unless disabled). */
+  conventionalWordlist: boolean
   notes: string[]
 }
 
@@ -242,6 +288,12 @@ export function searchParamNames(path: string): string[] {
   if (/(?:logs?|journals?|audit)/i.test(path)) return ['filter', 'q', 'query']
   if (/(?:graphql)/i.test(path)) return []
   return ['q', 'query', 'term', 'keyword']
+}
+
+/** A declared parameter that plausibly carries free text (not an identifier, paging or sort key). */
+export function isTextualParam(name: string): boolean {
+  if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(name)) return false
+  return !/(?:^|_)(?:id|uuid|uid|key|token|secret|password|page|limit|offset|cursor|count|size|amount|price|qty|quantity|num|number|index|sort|order|dir|direction|since|until|from|to|date|time|timestamp|at|version)$/i.test(name)
 }
 
 export function fileParamNames(path: string): string[] {
@@ -430,6 +482,39 @@ export function enumerateHypotheses(
     originSchemaPool.set(endpoint.origin, pool.slice(0, 120))
   }
 
+  // Collection-level evidence: a detail PATCH often exposes its writable schema only on the
+  // collection/detail GET. Key by (origin, collection) — never by a route noun.
+  const collectionEvidence = new Map<string, { fields: string[]; values: Record<string, string[]>; evidence: HarvestEvidence }>()
+  for (const endpoint of endpoints) {
+    const harvest = harvests.get(endpoint.id)
+    if (!harvest) continue
+    const bare = endpoint.pathTemplate.split('?')[0] || '/'
+    const collection = collectionPathOf(bare) ?? (hasDynamicIdSegment(bare) ? null : bare)
+    if (!collection || collection === '/') continue
+    const key = `${endpoint.origin}|${collection}`
+    const entry = collectionEvidence.get(key) ?? { fields: [], values: {}, evidence: {} }
+    for (const field of [...harvest.fields, ...Object.keys(harvest.values)]) {
+      if (!entry.fields.includes(field)) entry.fields.push(field)
+    }
+    for (const [field, values] of Object.entries(harvest.values)) {
+      const bucket = entry.values[field] ?? []
+      for (const value of values) if (!bucket.includes(value)) bucket.push(value)
+      entry.values[field] = bucket.slice(0, 4)
+    }
+    const evidence = entry.evidence
+    evidence.contentDisposition = evidence.contentDisposition || harvest.evidence?.contentDisposition
+    evidence.xml = evidence.xml || harvest.evidence?.xml
+    if (harvest.evidence?.location && !evidence.location) evidence.location = harvest.evidence.location
+    for (const evidenceKey of ['urlValues', 'jwtValues', 'sensitiveFields', 'headerNames'] as const) {
+      const incoming = harvest.evidence?.[evidenceKey]
+      if (!incoming?.length) continue
+      const bucket = evidence[evidenceKey] ?? []
+      for (const value of incoming) if (bucket.length < 8 && !bucket.includes(value)) bucket.push(value)
+      evidence[evidenceKey] = bucket
+    }
+    collectionEvidence.set(key, entry)
+  }
+
   for (const endpoint of endpoints) {
     const bare = endpoint.pathTemplate.split('?')[0] || '/'
     if (isStaticOrBaselinePath(bare)) continue
@@ -439,6 +524,18 @@ export function enumerateHypotheses(
     const hasIdPath = hasDynamicIdSegment(bare)
     const objectIdParam = inferred.find(p => p.location === 'query' && isObjectIdParam(p))
     const privileged = pathHasPrivilegedHint(bare)
+    const siblingEvidence = collectionEvidence.get(
+      `${endpoint.origin}|${collectionPathOf(bare) ?? (hasIdPath ? '' : bare)}`,
+    )
+    const observedFields = [...new Set([...(harvest?.fields ?? []), ...(siblingEvidence?.fields ?? [])])]
+    const observedValues: Record<string, string[]> = {
+      ...(siblingEvidence?.values ?? {}),
+      ...(harvest?.values ?? {}),
+    }
+    const observedEvidence: HarvestEvidence = {
+      ...(siblingEvidence?.evidence ?? {}),
+      ...(harvest?.evidence ?? {}),
+    }
     const pathSegments = bare.split('/').filter(Boolean)
     const lastSegment = pathSegments[pathSegments.length - 1] ?? ''
     const idIsLast = hasIdPath && placeholderSeg.test(lastSegment)
@@ -573,8 +670,16 @@ export function enumerateHypotheses(
     }
 
     // --- Path traversal ---------------------------------------------------------------------
-    if (method === 'GET' && pathHasFileHint(bare) && /(?:download|file|view|serve|log|journal|billing[-_]?docs?|document|attachment|backup|archive)/i.test(bare)) {
-      const fileNames = new Set(fileParamNames(bare))
+    // Structural evidence: a file-shaped declared parameter, an attachment response, or a route
+    // that already published a filename value. Route nouns are only a last-resort hint.
+    const fileishParam = inferred.find(p => p.location === 'query' &&
+      /^(?:file|filepath|filename|path|name|document|doc|attachment|download|src|source|template)$/i.test(p.name))
+    const fileEvidence = pathHasFileHint(bare) ||
+      Boolean(fileishParam) ||
+      observedEvidence.contentDisposition === true ||
+      (observedValues.filename?.length ?? 0) > 0
+    if (method === 'GET' && fileEvidence) {
+      const fileNames = new Set([...fileParamNames(bare), ...(fileishParam ? [fileishParam.name] : [])])
       const params = inferred
         .filter(p => p.location === 'query' && (fileNames.has(p.name) || /(?:file|path|name|log|doc|download|export)/i.test(p.name)))
         .filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
@@ -667,7 +772,9 @@ export function enumerateHypotheses(
         ])].slice(0, 3)
         return names.map(name => declaredBody.find(p => p.name === name) ?? inferredParam(name, 'json'))
       }
-      if (pathHasTemplateHint(bare)) {
+      const templateShaped = Object.values(observedValues).some(values =>
+        values.some(value => /\{\{|\$\{|<%|\{%/.test(value)))
+      if (pathHasTemplateHint(bare) || templateShaped) {
         for (const param of candidatesFor(/template|layout|markup|content|snippet|source|body|text|render/i, templateParamNames(bare)).slice(0, 2)) {
           add({
             key: `ssti_math|${endpoint.id}|${param.name}`,
@@ -746,7 +853,10 @@ export function enumerateHypotheses(
     }
 
     // --- Open redirect ----------------------------------------------------------------------
-    if (method === 'GET' && pathHasRedirectHint(bare)) {
+    // URL/redirect-shaped declared or observed parameter, independent of the route noun.
+    const redirectShapedParams = inferred.filter(p => p.location === 'query' &&
+      /^(?:next|url|uri|redirect|redirect_uri|redirecturl|return|returnurl|returnto|return_to|callback|callbackurl|dest|destination|target|continue|continueurl)$/i.test(p.name))
+    if (method === 'GET' && (pathHasRedirectHint(bare) || redirectShapedParams.length > 0)) {
       const candidates = new Set(redirectParamNames(bare))
       const declared = inferred.filter(p => p.location === 'query' && (candidates.has(p.name) || /^(?:next|url|uri|redirect|return\w*|callback\w*|dest|target|continue)$/i.test(p.name)))
       const active = declared.filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
@@ -769,12 +879,15 @@ export function enumerateHypotheses(
     }
 
     // --- Reflected XSS ----------------------------------------------------------------------
-    if (method === 'GET' && pathHasSearchHint(bare)) {
-      const names = new Set(searchParamNames(bare))
-      const declared = inferred
-        .filter(p => p.location === 'query' && (names.has(p.name) || /^(?:q|query|term|keyword|search|s)$/i.test(p.name)))
-        .filter(p => activeQuery.size === 0 || activeQuery.has(p.name))
-      for (const param of declared.slice(0, 1)) {
+    // Any string query parameter the target actually reads is a reflection candidate; the probe
+    // itself is the benign canary, so a parameter that is not reflected simply costs one request.
+    const xssCandidates = inferred.filter(p => p.location === 'query' &&
+      (pathHasSearchHint(bare) || activeQuery.has(p.name) || isTextualParam(p.name)))
+    if (method === 'GET' && xssCandidates.length > 0) {
+      const ordered = [...xssCandidates].sort((a, b) =>
+        Number(activeQuery.has(b.name)) - Number(activeQuery.has(a.name)) ||
+        Number(/^(?:q|query|term|keyword|search|s)$/i.test(b.name)) - Number(/^(?:q|query|term|keyword|search|s)$/i.test(a.name)))
+      for (const param of ordered.slice(0, 1)) {
         add({
           key: `xss_context|${endpoint.id}|${param.name}`,
           endpoint,
@@ -791,7 +904,10 @@ export function enumerateHypotheses(
     }
 
     // --- CSRF -------------------------------------------------------------------------------
-    if (method === 'POST' && (pathHasPrivilegedHint(bare) || /(?:settings|profile|account|tenant|billing|refund|job|trigger|subscribe|invite|transfer|grant)/i.test(bare))) {
+    // Structural: a cookie-authenticated state mutation is any POST whose sibling GET exposes a
+    // mutable state field (or whose creation has a readable detail route). The probe binds the
+    // session jar and compares with/without CSRF material, so a non-cookie route stays silent.
+    if (method === 'POST' && !pathHasUrlHint(bare)) {
       const detailReadPath = hasIdPath
         ? bare.replace(`/${lastSegment}`, '')
         : null
@@ -808,9 +924,10 @@ export function enumerateHypotheses(
             return candidatePath.startsWith(`${bare}/`) && hasDynamicIdSegment(candidatePath)
           })
         : undefined
-      const observedFields = [...new Set([...(harvest?.fields ?? []), ...(siblingHarvest?.fields ?? [])])]
-      const stateField = observedFields.find(field => /^(?:name|title|label|company|timezone|email|status|state|plan|tier|enabled|active|value|notifications|digest|locale|language|amount|total|price)$/i.test(field))
-        ?? observedFields.find(field => typeof harvest?.values[field]?.[0] === 'string' && !/(?:^|_)id$/i.test(field))
+      const csrfFields = [...new Set([...observedFields, ...(siblingHarvest?.fields ?? [])])]
+      const csrfValues: Record<string, string[]> = { ...(siblingHarvest?.values ?? {}), ...observedValues }
+      const stateField = csrfFields.find(field => /^(?:name|title|label|company|timezone|email|status|state|plan|tier|enabled|active|value|notifications|digest|locale|language|amount|total|price)$/i.test(field))
+        ?? csrfFields.find(field => typeof csrfValues[field]?.[0] === 'string' && !/(?:^|_)id$/i.test(field))
       const createReadTemplate = createDetail ? (createDetail.pathTemplate.split('?')[0] || '') : undefined
       if ((getSibling && stateField) || createReadTemplate) {
         const bodyField = stateField ?? (/refund|payment|credit|transfer|amount|price/i.test(bare) ? 'amount' : 'value')
@@ -829,16 +946,20 @@ export function enumerateHypotheses(
           ...(createReadTemplate ? { createReadTemplate } : {}),
           session: 'csrf',
           ownerPersona: picks.owner?.handle,
-          jsonBody: siblingBody(observedFields, harvest?.values ?? {}, bodyField),
+          jsonBody: siblingBody(csrfFields, csrfValues, bodyField),
           risk: endpointRiskScore(endpoint) + 8,
         })
       }
     }
 
     // --- Credential exposure on a read surface ----------------------------------------------
-    // A collection/config read that the target itself publishes credentials from is scanned with a
-    // non-entitled viewer actor; the anonymous denial in the same matrix is the control.
-    if (method === 'GET' && !hasIdPath && /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?)(?:\/|$)/i.test(bare)) {
+    // A read that the target itself publishes credential-shaped values from is scanned with a
+    // non-entitled viewer actor; the anonymous denial in the same matrix is the control. The
+    // selection is response-evidence driven (secret fingerprints) or a credential-surface route.
+    const credentialSurface = /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?|audit|auditlog|config|settings|credentials?|secrets?|exports?)(?:\/|$)/i.test(bare)
+    const secretEvidence = (observedEvidence.sensitiveFields?.length ?? 0) > 0 ||
+      (observedEvidence.headerNames ?? []).some(name => /^(?:set-cookie|authorization|x-api-key)$/i.test(name))
+    if (method === 'GET' && (credentialSurface || secretEvidence)) {
       add({
         key: `secret_disclosure|${endpoint.id}`,
         endpoint,
@@ -847,7 +968,7 @@ export function enumerateHypotheses(
         method: 'GET',
         pathAndQuery: resolvedPath,
         ownerPersona: picks.owner?.handle,
-        functionLevel: true,
+        functionLevel: !hasIdPath && !objectIdParam,
         secretScan: true,
         ...((picks.lower?.handle ?? picks.crossTenant?.handle)
           ? { viewerPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
@@ -857,7 +978,13 @@ export function enumerateHypotheses(
     }
 
     // --- GraphQL ----------------------------------------------------------------------------
-    if (method === 'POST' && /graphql/i.test(bare) && picks.owner && picks.crossTenant) {
+    // Body shape `{query, variables}` identifies a GraphQL endpoint even without a `/graphql` noun.
+    const graphqlShaped = method === 'POST' && (
+      /graphql/i.test(bare) ||
+      (inferred.some(p => p.location === 'json' && /^query$/i.test(p.name)) &&
+        inferred.some(p => p.location === 'json' && /^(?:variables|operationName)$/i.test(p.name)))
+    )
+    if (graphqlShaped && picks.owner && picks.crossTenant) {
       // Introspection is often disabled. Derive candidate root fields from the discovered
       // collection nouns and pair each root with ids read from that collection for both actors.
       const graphqlRoots = new Set<string>()
@@ -914,12 +1041,12 @@ export function enumerateHypotheses(
             : null)
         : null
     if (massPath) {
-      const observedFields = harvest?.fields ?? []
+      const massFields = observedFields
       const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|is_admin|visibility|amount|total|price|payment_state|status|state)/i
       const fieldRank = (field: string): number =>
         /role|roles|permission|privilege|grant|admin|tenant|owner|org|team/i.test(field) ? 0
           : /amount|total|price|payment_state|status|state/i.test(field) ? 1 : 2
-      const observedPrivilege = observedFields.filter(f => privilegeField.test(f))
+      const observedPrivilege = massFields.filter(f => privilegeField.test(f))
         .sort((a, b) => fieldRank(a) - fieldRank(b))
       // On an update route, ordinary editable columns (name, amount, status) are not evidence of
       // overposting by themselves. Restrict the PATCH/PUT candidate set to ownership/privilege and
@@ -927,12 +1054,12 @@ export function enumerateHypotheses(
       const updateSensitive = /role|roles|permission|permissions|privilege|grant|level|admin|is_admin|isAdmin|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|visibility|payment_state|return_url/i
       const isUpdate = method === 'PATCH' || method === 'PUT'
       const candidateSource = isUpdate
-        ? [...observedFields.filter(f => updateSensitive.test(f)), 'role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']
+        ? [...massFields.filter(f => updateSensitive.test(f)), 'role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']
         : [...observedPrivilege, ...['role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']]
       const candidates = [...new Set(candidateSource)]
         .filter(f => /^[A-Za-z0-9_.-]{1,64}$/.test(f)).slice(0, 10)
       const eligible = isUpdate
-        ? observedFields.some(f => updateSensitive.test(f)) || pathHasPrivilegedHint(bare)
+        ? massFields.some(f => updateSensitive.test(f)) || pathHasPrivilegedHint(bare)
         : observedPrivilege.length > 0 || pathHasPrivilegedHint(bare)
       if (candidates.length > 0 && eligible) {
         const values: Record<string, string | boolean | number> = {}
@@ -975,7 +1102,7 @@ export function enumerateHypotheses(
           otherPersona: picks.crossTenant?.handle,
           candidateFields: candidates,
           candidateValues: values,
-          jsonBody: siblingBody(observedFields, harvest?.values ?? {}),
+          jsonBody: siblingBody(massFields, observedValues),
           risk: endpointRiskScore(endpoint) + 10,
         })
       }
@@ -1021,14 +1148,19 @@ interface JsonHarvest {
   values: Record<string, string[]>
   textValues: string[]
   body: string
+  evidence: HarvestEvidence
 }
+
+const credentialFieldRe = /(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|secret|secret[_-]?key|client[_-]?secret|password|passwd|private[_-]?key|signing[_-]?key|webhook[_-]?secret|credential|authorization)$/i
+const jwtValueRe = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/
 
 function harvestJson(body: string): JsonHarvest {
   const ids: string[] = []
   const values: Record<string, string[]> = {}
   const textValues: string[] = []
+  const evidence: HarvestEvidence = {}
   let parsed: unknown
-  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, textValues, body } }
+  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, textValues, body, evidence } }
   const walk = (node: unknown, depth: number): void => {
     if (depth > 5 || node === null || node === undefined) return
     if (Array.isArray(node)) {
@@ -1050,6 +1182,23 @@ function harvestJson(body: string): JsonHarvest {
             stringValue.length >= 3 && stringValue.length <= 48 && !/[<>{}\\]/.test(stringValue)) {
           textValues.push(stringValue)
         }
+        // Wire-format and value-shape evidence: a URL value, a JWT-shaped token, a credential field.
+        if (/^https?:\/\/[^\s]{1,300}$/i.test(stringValue)) {
+          const urls = evidence.urlValues ?? []
+          if (urls.length < 4 && !urls.includes(stringValue)) urls.push(stringValue.slice(0, 300))
+          evidence.urlValues = urls
+        }
+        if (jwtValueRe.test(stringValue)) {
+          const tokens = evidence.jwtValues ?? []
+          if (tokens.length < 2) tokens.push(stringValue)
+          evidence.jwtValues = tokens
+        }
+        if (credentialFieldRe.test(key) && stringValue.length >= 8 && stringValue.length <= 2048 &&
+            !/^(?:redacted|\*+|null|undefined|none|false|true)$/i.test(stringValue)) {
+          const fields = evidence.sensitiveFields ?? []
+          if (fields.length < 6 && !fields.includes(key)) fields.push(key)
+          evidence.sensitiveFields = fields
+        }
       } else if (value && typeof value === 'object') {
         walk(value, depth + 1)
       }
@@ -1062,6 +1211,7 @@ function harvestJson(body: string): JsonHarvest {
     values,
     textValues: [...new Set(textValues)],
     body,
+    evidence,
   }
 }
 
@@ -1105,11 +1255,19 @@ class SurfaceHarvester {
       }, this.deps.grant, this.deps.signal)
       if (exchange.status >= 200 && exchange.status < 300) {
         try { this.deps.recordExchange?.(exchange) } catch { /* persistence is best-effort */ }
-        return harvestJson(exchange.body)
+        const harvested = harvestJson(exchange.body)
+        const headers = exchange.respHeaders ?? {}
+        const evidence: HarvestEvidence = { ...harvested.evidence }
+        if (/attachment|filename=/i.test(headers['content-disposition'] ?? '')) evidence.contentDisposition = true
+        if (headers.location) evidence.location = headers.location.slice(0, 300)
+        if (/xml/i.test(exchange.mediaType ?? '')) evidence.xml = true
+        const headerNames = Object.keys(headers).map(name => name.toLowerCase())
+        if (headerNames.length > 0) evidence.headerNames = headerNames.slice(0, 32)
+        return { ...harvested, evidence }
       }
-      return { ids: [], fields: [], values: {}, textValues: [], body: '' }
+      return { ids: [], fields: [], values: {}, textValues: [], body: '', evidence: {} }
     } catch {
-      return { ids: [], fields: [], values: {}, textValues: [], body: '' }
+      return { ids: [], fields: [], values: {}, textValues: [], body: '', evidence: {} }
     } finally {
       this.inflight.delete(pathAndQuery)
     }
@@ -1118,6 +1276,22 @@ class SurfaceHarvester {
 
 function emptyHarvest(): EndpointHarvest {
   return { ownerIds: [], otherIds: [], fields: [], values: {}, otherValues: {}, seedValues: [], activeQueryParams: [], viewerIds: [] }
+}
+
+function mergeEvidence(target: EndpointHarvest, next: HarvestEvidence): void {
+  if (!next || Object.keys(next).length === 0) return
+  const evidence = target.evidence ?? {}
+  evidence.contentDisposition = evidence.contentDisposition || next.contentDisposition
+  evidence.xml = evidence.xml || next.xml
+  if (next.location && !evidence.location) evidence.location = next.location
+  for (const key of ['urlValues', 'jwtValues', 'sensitiveFields', 'headerNames'] as const) {
+    const incoming = next[key]
+    if (!incoming?.length) continue
+    const bucket = evidence[key] ?? []
+    for (const value of incoming) if (bucket.length < 8 && !bucket.includes(value)) bucket.push(value)
+    evidence[key] = bucket
+  }
+  target.evidence = evidence
 }
 
 function mergeHarvest(target: EndpointHarvest, next: JsonHarvest): void {
@@ -1131,6 +1305,7 @@ function mergeHarvest(target: EndpointHarvest, next: JsonHarvest): void {
     target.values[field] = bucket.slice(0, 4)
   }
   for (const value of next.textValues) if (!target.seedValues.includes(value)) target.seedValues.push(value)
+  mergeEvidence(target, next.evidence)
 }
 
 function mergeOtherHarvest(target: EndpointHarvest, next: JsonHarvest): void {
@@ -1142,6 +1317,7 @@ function mergeOtherHarvest(target: EndpointHarvest, next: JsonHarvest): void {
     for (const value of values) if (!bucket.includes(value)) bucket.push(value)
     target.otherValues[field] = bucket.slice(0, 4)
   }
+  mergeEvidence(target, next.evidence)
 }
 
 function mergeViewerHarvest(target: EndpointHarvest, next: JsonHarvest): void {
@@ -1699,6 +1875,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   const maxRequests = Math.max(0, input.maxRequests ?? defaultEngineMaxRequests)
   const maxDurationMs = Math.max(1_000, input.maxDurationMs ?? defaultEngineMaxDurationMs)
   const log = input.log ?? (() => {})
+  const conventionalWordlist = conventionalWordlistEnabled()
   const report: DeterministicEngineReport = {
     requestsUsed: 0,
     durationMs: 0,
@@ -1715,6 +1892,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     byClass: {},
     confirmedPairs: [],
     touchedPairs: [],
+    conventionalWordlist,
     notes: [],
   }
 
@@ -1724,7 +1902,11 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     return report
   }
 
-  const ranked = rankEndpoints(input.endpoints).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
+  const candidateEndpoints = engineWordlistSurface(input.endpoints, conventionalWordlist)
+  if (!conventionalWordlist && candidateEndpoints.length !== input.endpoints.length) {
+    report.notes.push(`conventional wordlist OFF: ${input.endpoints.length - candidateEndpoints.length} wordlist-only endpoint(s) excluded`)
+  }
+  const ranked = rankEndpoints(candidateEndpoints).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
   report.endpointsConsidered = ranked.length
   if (ranked.length === 0) {
     report.durationMs = Date.now() - started
