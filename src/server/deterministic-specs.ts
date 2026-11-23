@@ -381,9 +381,6 @@ function baselineWriteFor(bodyTemplate: unknown): BaselineWrite | null {
 }
 
 function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
-  const owner = hyp.ownerPersona
-  const other = hyp.otherPersona
-  if (!owner || !other) return []
   const sensitiveRead = hyp.method === 'GET' && /(?:^|[/_.-])(?:tokens?|keys?|secrets?|audit|auditlog|activity|logs?|config|export|apikeys?|links?|integrations?)(?:$|[/_.-])/i.test(hyp.endpoint.pathTemplate)
   // A read of a credential/audit surface is a disclosure claim, not a body-equality claim. Delegate
   // it to the credential-proof shape (masked control or anonymous denial plus a pre-redaction
@@ -393,6 +390,9 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     if (sensitive.length > 0) return sensitive
     if (hyp.method === 'GET') return []
   }
+  const owner = hyp.ownerPersona
+  const other = hyp.otherPersona
+  if (!owner || !other) return []
   const cwe = 'CWE-639'
   const category = 'broken-access-control'
   const title = 'Cross-actor object or function access'

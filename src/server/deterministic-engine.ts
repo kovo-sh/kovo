@@ -1446,9 +1446,6 @@ export function enumerateHypotheses(
         ...((picks.lower?.handle ?? picks.crossTenant?.handle)
           ? { viewerPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
           : {}),
-        ...((picks.lower?.handle ?? picks.crossTenant?.handle)
-          ? { otherPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
-          : {}),
         risk: endpointRiskScore(endpoint) + (credentialSurface ? 34 : 18),
       })
     }
