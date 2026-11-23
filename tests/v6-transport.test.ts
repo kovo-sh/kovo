@@ -278,6 +278,7 @@ test('v6 transport: HTTP/2 GET/POST round trip reuses one pooled session; HTTP/1
     assert.equal(fallbackBroker.getTransportSummary().http2, true, 'fallback must not disable the configured mode')
     const again = await fallbackBroker.executeHttp({ origin: h1.origin, method: 'GET', pathAndQuery: '/again' }, h1Grant, signal)
     assert.equal(again.status, 200, 'the downgraded origin keeps working on later requests')
+    assert.equal(fallbackBroker.getTransportSummary().http2, true)
   })
 })
 
@@ -303,6 +304,66 @@ test('v6 transport: configured authorized User-Agent replaces the hardcoded defa
     t.after(() => defaultBroker.closeTransport())
     await defaultBroker.executeHttp({ origin: h2.origin, method: 'GET', pathAndQuery: '/default' }, grant, AbortSignal.timeout(10_000))
     assert.match(h2.userAgents[1] ?? '', /^Guardian\//, 'unconfigured runs keep the defensive default UA')
+  })
+})
+
+test('v6 transport: opt-in egress proxy carries requests and never silently bypasses', async t => {
+  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    const seen: Array<{ path?: string; host?: string; proxyAuth?: string }> = []
+    const proxy = createServer((req, res) => {
+      seen.push({
+        path: req.url,
+        host: String(req.headers.host ?? ''),
+        proxyAuth: typeof req.headers['proxy-authorization'] === 'string' ? req.headers['proxy-authorization'] : undefined,
+      })
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('via-proxy')
+    })
+    const proxyPort = await listen(proxy)
+    t.after(() => new Promise<void>(resolve => {
+      proxy.closeAllConnections()
+      proxy.close(() => resolve())
+    }))
+
+    const h1 = await h1Fixture()
+    t.after(() => h1.close())
+
+    const config = resolveTransportConfig({
+      GUARDIAN_EGRESS_PROXY: `http://user:pass@127.0.0.1:${proxyPort}`,
+    })
+    const broker = new RequestBroker({
+      resolve: async () => [localAddr],
+      transportConfig: { http2: true, proxy: config.proxy },
+    })
+    t.after(() => broker.closeTransport())
+    const result = await broker.executeHttp(
+      { origin: h1.origin, method: 'GET', pathAndQuery: '/proxied?a=1' },
+      labGrant(h1.origin),
+      AbortSignal.timeout(10_000),
+    )
+    assert.equal(result.status, 200)
+    assert.equal(result.body, 'via-proxy')
+    assert.equal(h1.requests.length, 0, 'egress must not bypass the configured proxy')
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].path, `${h1.origin}/proxied?a=1`, 'plain HTTP through a proxy uses absolute-form')
+    assert.equal(seen[0].host, new URL(h1.origin).host)
+    assert.match(seen[0].proxyAuth ?? '', /^Basic /)
+
+    // An HTTPS proxy cannot carry a plaintext target; fail closed instead of bypassing it.
+    const httpsProxyBroker = new RequestBroker({
+      resolve: async () => [localAddr],
+      transportConfig: { http2: false, proxy: resolveTransportConfig({ GUARDIAN_EGRESS_PROXY: 'https://127.0.0.1:9' }).proxy },
+    })
+    t.after(() => httpsProxyBroker.closeTransport())
+    await assert.rejects(
+      httpsProxyBroker.executeHttp(
+        { origin: h1.origin, method: 'GET', pathAndQuery: '/leak' },
+        labGrant(h1.origin),
+        AbortSignal.timeout(10_000),
+      ),
+      TransportConfigError,
+    )
+    assert.equal(h1.requests.length, 0)
   })
 })
 

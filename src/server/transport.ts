@@ -642,6 +642,9 @@ async function openStream(
     const proxyTls = tlsConnect({ ...tlsOptions(new URL(`https://${proxy.host}`), opts.rejectUnauthorized, undefined, raw) })
     await waitForTls(proxyTls, signal)
     base = await httpProxyTunnel(proxyTls, { host: url.hostname, port }, proxy, signal)
+  } else if (proxy) {
+    // Every configured proxy must carry the traffic; never silently bypass it.
+    throw new TransportConfigError(`egress proxy ${proxy.protocol} cannot transport ${url.protocol}:// targets`)
   } else {
     base = await connectTcp(address.address, port, signal)
   }
@@ -1036,20 +1039,26 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
     let extraHeaders: Record<string, string> = {}
 
     if (isHttps) {
-      // CONNECT tunnel, then TLS inside it.
+      // CONNECT tunnel (HTTP proxy) or SOCKS5 tunnel, then TLS inside it.
       const raw = await connectTcp(proxy.host, proxy.port, signal)
-      socket = await httpProxyTunnel(raw, { host: url.hostname, port }, proxy, signal)
+      socket = proxy.protocol === 'socks5:' || proxy.protocol === 'socks5h:'
+        ? await socks5Tunnel(raw, { host: url.hostname, port, address: address.address }, proxy, signal)
+        : await httpProxyTunnel(raw, { host: url.hostname, port }, proxy, signal)
       const tlsSocket = tlsConnect(tlsOptions(url, options.rejectUnauthorized ?? true, config.mtls, socket))
       await waitForTls(tlsSocket, signal)
       socket = tlsSocket
       requestHost = url.hostname
       requestPort = port
       headers.Host = url.host
-    } else if (proxy.protocol === 'http:' || proxy.protocol === 'https:') {
+    } else if (proxy.protocol === 'http:') {
       // Plain HTTP through an HTTP proxy: absolute-form request line.
       requestPath = url.href
       headers.Host = url.host
       if (proxy.authorization) extraHeaders['Proxy-Authorization'] = proxy.authorization
+    } else if (proxy.protocol === 'https:') {
+      // Fail closed: an HTTPS proxy needs a CONNECT tunnel, which we only implement for TLS
+      // targets. Silently sending plaintext to the proxy would leak the request outside it.
+      throw new TransportConfigError('HTTPS egress proxy requires an https:// target')
     } else {
       const raw = await connectTcp(proxy.host, proxy.port, signal)
       socket = await socks5Tunnel(raw, { host: url.hostname, port, address: address.address }, proxy, signal)
