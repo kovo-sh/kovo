@@ -179,3 +179,10 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - The in-`Execution` deterministic engine delivered 25/59 no-LLM and 28/59 agentic at 100%, but broke **25 existing tests** (planner budgets, specialist tool scopes, multi-trial, M1 fallback). It is preserved on `agents/engine-port` for v5.1; **not shipped**.
 - Fixes kept: workflow-quantity synthesis restored to dispatch; DELETE/multipart/RCE escalation ordered before local-lab auto-approval; Tier-3 safety/containment merged.
 - Final v5.0: procedural dev **115/172 (66.9%)**, held-out **111/171 (64.9%)**, 100% precision, 0 decoys/unmatched; xben 25/25; held-out-saas 20/20 + 20/20 patches. Product `Execution`: 7/59 agentic (11.9%), `--no-llm` 0/59 — honest gap documented for v5.1.
+
+### 2026-11-22 — engine-port integration plan (v5.1)
+
+- **Slices:** (1) standalone engine modules + structural dedupe key `(origin, endpoint, method, param/resolver, cwe)`; (2) explicit `deterministicOnly` path outside the M1 fallback, verified-only persistence + `det_lead` facts; (3) non-blocking concurrent agentic lane behind a default-off flag with seeded-step guard, 30%/180 s cap, K=6/budget isolation, no step cancellation; (4) replace specialist scope guard with ReplayVerifier proof-strength + endpoint binding; (5) flip flag on after parity port.
+- **Accepted traps:** never auto-cancel specialist steps or hide confirmed routes (chains!); inject read-only “Already Confirmed” context; preserve white-box `static_verified`; persist unconfirmed leads; per-endpoint structural dedupe.
+- **Gate before flag flip:** full suite green with flag forced ON, dynamicStepBudget/K=6/fallback invariants, `Execution --no-llm` ≥25/59 at 100%, agentic strictly additive at ≥95% precision with ≤10 pp held-out gap, 0 orphans, legacy floors.
+- **Proceeding:** Slices 1–2 launched in `m5-integrate-port`; Slices 3–5 gated on their results.
