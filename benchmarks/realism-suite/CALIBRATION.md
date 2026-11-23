@@ -230,6 +230,12 @@ do not transcribe expected or simulated numbers.
 | 2026-11-23 | `91a4be1` | `wan-oob` | grey-box / `--no-llm`, **smoke** (`--callback-delay-ms 1000,2000`) | FAIL | `timeout` | blind SQLi / async SSRF / async XXE: no product confirmations; async FN 100%; fixture-side `sqli` callback observed, `ssrf`/`xxe` not; TP 0 / FP 0; 36 endpoints; 120 s cap | `realism-gate-2-smoke` (local out-dir) |
 | 2026-11-23 | `91a4be1` | `monorepo-whitebox` | white-box / `--no-llm`, **smoke** (120 s cap) | FAIL | `investigation` | SAST suspects 0 (link n/a); persisted 62 / retrieved 62 / declared 2,565 (under 2,500); 4-hop 0/3; chain 0/2; TP 0 / FP 0; 611 engine requests, 2 rejected / 1 lead; 88.3 s | `realism-gate-4-smoke` (local out-dir) |
 
-Smoke rows are harness-validation runs, not gate evidence: the WAN row uses a shortened
-callback delay and the monorepo row uses a shortened wall-clock cap. The #1 and #3 rows use
-the gate configuration (`--no-llm`, grey-box, 180 s cap, default WAN settings where applicable).
+| 2026-11-23 | `b62401c` | `wan-oob` | grey-box / `--no-llm`, 300 s cap, default callback delays (15/30 s) | FAIL | `investigation` | **wiring FAIL**: pending_oob registered 0; drain n/a (no late callbacks); approvals 0 blocking / 176 auto-review rows; denied mutations 0; 33 endpoints; p99 1.24 ms; **capability FAIL**: blind SQLi / async SSRF / async XXE not confirmed, async FN 100%; fixture callbacks `sqli` only; TP 0 / FP 0; 467 engine requests | `realism-gate-2-final` (local out-dir) |
+| 2026-11-23 | `b62401c` | `staging-concurrency` | grey-box / `--no-llm`, 180 s cap, `staging_isolated`, HTTP/2 transport enabled | FAIL | `investigation` | **wiring FAIL**: approvals 0 blocking; **denied mutations 15 (all `staging_contract`)**; parked workers 0; leaked 0; **h2 single-packet bursts 0**, HTTP/1.1 fallback 0; 18 endpoints; p99 1.23 ms; **capability FAIL**: write-BOLA / race / checkout not confirmed; TP 0 / FP 0; 396 engine requests | `realism-gate-3-final` (local out-dir) |
+| 2026-11-23 | `b62401c` | `monorepo-whitebox` | white-box / `--no-llm`, 300 s cap, `GUARDIAN_RECON_SIBLINGS=1` | FAIL | `investigation` | **wiring FAIL**: stored 62 / declared 2,565 (< 2,500); p99 1.06 ms (pass); sibling derivation suppressed true (pass); Tier A 4-hop sinks 3/3 (pass); **capability FAIL**: SAST suspects 0, 4-hop 0/3, chain 0/2; TP 0 / FP 0; 62 endpoints; 571 engine requests, 2 rejected / 1 lead | `realism-gate-4-final` (local out-dir) |
+
+Smoke rows (`91a4be1`) are harness-validation runs, not gate evidence: the WAN smoke row uses a
+shortened callback delay and the monorepo smoke row uses a shortened wall-clock cap. The new
+`b62401c` rows use the stated configuration. The `b62401c` #2/#4 rows use a 300 s cap so the
+bounded OOB drain and white-box scale pass have room to finish; the #3 row keeps the 180 s gate
+cap used by the earlier baseline.
