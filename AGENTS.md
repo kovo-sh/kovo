@@ -31,6 +31,20 @@
 
 Read-only audits, compatibility analysis, docs, and verifier-only changes are usually parallelizable even when the main engine is busy — use them.
 
+## Parallel pulse (every ~30 minutes)
+
+While a multi-stream batch is in flight:
+
+1. Run `scripts/parallel-pulse.sh`. It lists actionable streams (unmerged commits or dirty trees), mergeable (clean + ahead), in-progress, and the files each holds.
+2. Answer its five questions explicitly:
+   - clean + ahead → merge it, run `scripts/worker-gate.sh`, push;
+   - P0 item unstarted on a free lease → launch that stream now;
+   - P0 blocked only by a lease → park the holder and reclaim the file;
+   - acceptance gate unmeasured → start the measurement;
+   - otherwise say “nothing actionable” and stop.
+3. Do not invent work to fill the pulse. Silence is a valid result.
+4. The in-session reminder is a background `sleep 1800` timer that prints the pulse; relaunch it after each pulse. The same script is safe to run from cron if the session is not alive (read-only).
+
 ## Meta-process: product-first and the inner loop
 
 1. **Freeze harness-only recall work.** `scripts/benchmark-probes.ts` and `scripts/benchmark-specs*.ts` are **maintenance-only** from v5.1 on (bugfixes, scoring, harness parity). New detection/verification capability must land in `src/server/` and be scored through real `Execution`. A PR that only lifts the standalone harness is not acceptance.
