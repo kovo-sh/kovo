@@ -370,3 +370,9 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Diagnostic:** fixture callbacks `sqli=true, ssrf=false, xxe=false, webhook=false` — the product never triggered the async sinks, so `pending_oob` promotion was **not exercised**. This is not the "run closes early with a relay hit" wiring signature; it is route-shape/probe selection on this fixture (Layer-3 capability).
 - **Not claimed:** OOB wiring is neither passed nor failed by this run; it remains covered by unit tests (`v6-verify-loop` fake-clock promotion) and needs an agentic #2 run once the floor/agent can reach the sinks.
 - **Next:** realism #3 (staging safety) for the certifiable wiring properties (`approval_blocks=0`, `broker_denied_mutations=0`, `leaked_entities=0`, H2 burst), then #4 (scale/ranking).
+
+### 2026-11-23 — realism #3/#4 measured: safety wiring passes, scale ingestion gap
+
+- **#3 staging-concurrency:** FAIL at investigation (0 TP), but `leakedEntities=0`, no tagged orphans, cleanup 0/0 → staging safety wiring healthy. Capability (write-BOLA/race/checkout) absent. Harness did not emit `approvalBlocks`/`brokerDeniedMutations`/`h2SinglePacketBursts`, so a metrics stream was launched to separate wiring from capability and fail closed on missing metrics.
+- **#4 monorepo-whitebox:** FAIL at investigation; **62 persisted / 62 retrieved / 2565 declared**, SAST suspects 0, 4-hop 0/3. This is a fixture↔product wiring gap: the declared catalog is not reaching the store and the 4-hop sinks are not AST-recognizable. Stream launched to fix briefing completeness and fixture AST patterns (no `src/` edits; report if a product bug is proven).
+- **Held gates remain:** held-out-saas 20/20 + 20/20 patches, xben 25/25, procedural acme 16/22.
