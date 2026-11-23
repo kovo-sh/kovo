@@ -19,6 +19,8 @@
  */
 
 export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'other'
+/** Orthogonal boundary class: what kind of gate must be demonstrated for a claim. */
+export type BoundaryClass = 'auth' | 'mfa' | 'access' | 'other'
 export type RoleName = 'viewer' | 'member' | 'admin' | 'owner'
 export type AmbientAuth = 'cookie' | 'bearer' | 'header' | 'unknown'
 
@@ -115,6 +117,8 @@ export interface ImpactStep {
   arm: 'control' | 'probe' | 'setup' | 'cleanup'
   method: string
   route?: string
+  /** Exact request target, used for a parameter/body precondition differential. */
+  pathAndQuery?: string
   status: number | null
   actor: ActorIdentity
   json?: unknown
@@ -310,9 +314,11 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
   // A control mutation must leave the field unchanged; if it changed, the delta is unattributable.
   const controlProbe = steps.find(step => step.arm === 'control' && isMutatingMethod(step.method) && isSuccess(step.status))
   let controlDelta: StateDelta | null = null
+  let controlAfterJson: unknown
   if (controlProbe) {
     const controlBefore = [...reads].reverse().find(step => steps.indexOf(step) < steps.indexOf(controlProbe)) ?? null
     const controlAfter = reads.find(step => steps.indexOf(step) > steps.indexOf(controlProbe)) ?? null
+    controlAfterJson = controlAfter?.json
     if (controlBefore && controlAfter) controlDelta = stateDelta(controlBefore.json, controlAfter.json, controlAfter.status)
   }
   if (!before) return { persisted: false, reason: 'no pre-mutation readback exists; a mutation response echo cannot prove persistence', before, after, delta, clean, controlDelta }
@@ -320,8 +326,17 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
   const changed = delta ? [...delta.changed, ...delta.added, ...delta.removed] : []
   if (delta?.deleted) return { persisted: true, reason: 'the readback resource was removed', before, after, delta, clean, controlDelta }
   if (changed.length === 0) return { persisted: false, reason: 'the post-mutation readback is identical to the baseline (idempotent no-op)', before, after, delta, clean, controlDelta }
-  if (controlDelta && [...controlDelta.changed, ...controlDelta.added, ...controlDelta.removed].length > 0) {
-    return { persisted: false, reason: 'the control arm also changed the field, so the delta is not attributable to the probe', before, after, delta, clean, controlDelta }
+  if (controlDelta && delta) {
+    // A benign control mutation that lands the *same* value as the probe makes the delta
+    // unattributable. A control that writes a different value (e.g. the CSRF control arm) is a
+    // legitimate baseline, not a confounder.
+    const probeAfter = after.json !== undefined && after.json !== null ? flattenJson(after.json) : new Map<string, string>()
+    const controlAfterFields = controlAfterJson ? flattenJson(controlAfterJson) : new Map<string, string>()
+    const conflicts = [...controlDelta.changed, ...controlDelta.added].some(path =>
+      controlAfterFields.get(path) !== undefined && controlAfterFields.get(path) === probeAfter.get(path))
+    if (conflicts) {
+      return { persisted: false, reason: 'the control arm changed the same field to the same value, so the delta is not attributable to the probe', before, after, delta, clean, controlDelta }
+    }
   }
   return { persisted: true, reason: `persisted field delta: ${changed.slice(0, 6).join(', ')}`, before, after, delta, clean, controlDelta }
 }
@@ -765,3 +780,377 @@ export function knownOracleEvent(event: string): boolean {
     'invariant_violation', 'csrf_state_change', 'state_delta', 'workflow_skip', 'secret_disclosed',
   ].includes(event)
 }
+
+// ---------------------------------------------------------------------------
+// Universal boundary control (default-deny)
+// ---------------------------------------------------------------------------
+
+/**
+ * Authentication/identity claims describe a gate being circumvented. A 2xx from a request that was
+ * never gated is not a bypass (e.g. "2FA bypass" on an account that never enabled 2FA), so these
+ * claims require a *challenged/denied control* and a variant that crosses that exact boundary.
+ */
+const MFA_CLAIM_RE = /\b(?:2fa|mfa|two[- ]?factor|multi[- ]?factor|one[- ]?time[- ]?pass(?:word|code)?|otp|totp|authenticator|step[- ]?up)\b/i
+const AUTH_BOUNDARY_RE = /\b(?:authenticat(?:ion|or)[- ]?(?:bypass|confusion)|auth[- ]?bypass|login[- ]?bypass|session[- ]?fixation|token[- ]?forgery|jwt|sso|single[- ]?sign[- ]?on|oauth[- ]?confusion|confused[- ]?deputy|legacy[- ]?auth)\b/i
+const AUTH_BOUNDARY_CWE_RE = /^CWE-(?:287|288|290|294|302|303|305|306|346|384|522|620|798)$/i
+const ACCESS_BOUNDARY_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|insecure[- ]direct[- ]object)\b/i
+const ACCESS_BOUNDARY_CWE_RE = /^CWE-(?:269|284|285|566|639|862|863|1021|1220)$/i
+
+export interface BoundaryDescriptor {
+  cwe?: string | null
+  category?: string | null
+  title?: string | null
+  impact?: string | null
+}
+
+/** Classify which boundary a claim must demonstrate. Auth outranks access (a bypass is a bypass). */
+export function classifyBoundaryClaim(parts: BoundaryDescriptor): BoundaryClass {
+  // Titles and categories are the claim's label; generic impact boilerplate ("outside their
+  // authorization") must not turn an XXE/SSRF claim into an access-control claim.
+  const text = `${parts.title ?? ''} ${parts.category ?? ''}`
+  if (MFA_CLAIM_RE.test(text)) return 'mfa'
+  if (AUTH_BOUNDARY_RE.test(text) || AUTH_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'auth'
+  if (ACCESS_BOUNDARY_RE.test(text) || ACCESS_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'access'
+  return 'other'
+}
+
+/** Collapse path identifiers so a negative/foreign-id control matches the real resource route. */
+export function routeFamily(pathAndQuery: string | null | undefined): string {
+  if (!pathAndQuery) return ''
+  const path = pathAndQuery.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/'
+  return path.split('/').map(segment => {
+    if (!segment || /^(?:api|rest|v\d+|read|public|admin|me|settings|login|logout|auth|token|refresh|verify|mfa|2fa|otp|session)$/i.test(segment)) return segment
+    const idShaped = /(?:^|[-_.])\d|^[0-9a-f]{8,}$|^[a-z]{2,10}_[A-Za-z0-9_-]{4,}$|^[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*$/.test(segment)
+    if (idShaped && (segment.length >= 4 || /^[a-z]\d{1,3}$/i.test(segment))) return ':id'
+    return segment
+  }).join('/') || '/'
+}
+
+const MFA_CHALLENGE_RE = /\b(?:two[- ]?factor|2fa|mfa|otp|totp|one[- ]?time[- ]?(?:pass(?:word|code)?|code)|verification code|authenticator|challenge[- ]?required|mfa_required|step[- ]?up)\b/i
+const LOGIN_REDIRECT_RE = /\/(?:login|signin|sign-in|sso|auth|session|mfa|2fa|verify)\b/i
+
+export type BoundaryArm = 'control_denied' | 'actor_differential' | null
+
+export interface BoundaryAssessment {
+  required: boolean
+  satisfied: boolean
+  boundaryClass: BoundaryClass
+  /** A control exchange that was denied or challenged (401/403, login redirect, MFA challenge, negative id). */
+  controlDenied: boolean
+  controlKind: 'denied' | 'challenge' | 'negative_id' | null
+  /** A variant exchange that crossed the same route family with data/state proof. */
+  crossed: boolean
+  arm: BoundaryArm
+  reason: string
+  evidence: Record<string, unknown>
+}
+
+export interface BoundaryInput extends ImpactInput {
+  /**
+   * `true`  — the control arm is expected to be denied/challenged; a 2xx control is a spec error.
+   * `false` — documented escape for `access` claims whose control is legitimately allowed
+   *           (object differentials where both arms are served): the actor/precondition
+   *           differential is the boundary. Ignored for `auth` claims, which always need a denial.
+   * unset   — prefer control-denial evidence; fall back to the actor differential for `access`.
+   */
+  expectControlDenied?: boolean
+}
+
+function headerField(headers: Record<string, string> | null | undefined, pattern: RegExp): string | null {
+  if (!headers) return null
+  for (const [key, value] of Object.entries(headers)) {
+    if (pattern.test(key) && typeof value === 'string' && value.length > 0) return value
+  }
+  return null
+}
+
+interface BoundarySignal {
+  step: ImpactStep
+  kind: 'denied' | 'challenge' | 'negative_id'
+}
+
+function boundarySignalOf(step: ImpactStep, successFamilies: ReadonlySet<string>): BoundarySignal | null {
+  const status = step.status
+  if (status === 401 || status === 403) return { step, kind: 'denied' }
+  if (status !== null && status >= 300 && status < 400) {
+    const location = headerField(step.responseHeaders, /^location$/i)
+    if (location === null || LOGIN_REDIRECT_RE.test(location)) return { step, kind: 'challenge' }
+  }
+  if (status === 404 && successFamilies.has(routeFamily(step.route ?? ''))) return { step, kind: 'negative_id' }
+  // A 200/4xx challenge page (MFA step-up) is a challenge, not a served resource.
+  if (status !== null && (status < 300 || status === 428)) {
+    const challengeHeader = headerField(step.responseHeaders, /^(?:www-authenticate|x-mfa|mfa|otp|challenge|location)$/i)
+    const body = `${challengeHeader ?? ''} ${(step.body ?? '').slice(0, 2048)}`
+    if (MFA_CHALLENGE_RE.test(body) && (step.json === undefined || step.json === null)) return { step, kind: 'challenge' }
+  }
+  return null
+}
+
+/**
+ * MFA/2FA bypass gate. A 2xx from an OTP endpoint is not a bypass unless:
+ *   1. a control read shows the account is enrolled (`twofa_enabled`/`mfa`/`totp` claim);
+ *   2. a protected read is denied/challenged before the code check; and
+ *   3. the same session/actor is granted the same protected resource after it.
+ * A decorative endpoint that returns `{ok:true}` for any code but gates nothing is reported as an
+ * advisory (not confirmed): there is no challenged control to cross.
+ */
+const MFA_ENROLL_FIELD_RE = /^(?:twofa|two_?fa|mfa|totp|otp|two_?factor|two_?factor_?enabled|twofa_?enabled|mfa_?enabled|totp_?enabled|authenticator(?:_?enabled)?|enrolled|mfa_?enrolled|two_?step)$/i
+const MFA_ROUTE_RE = /\/(?:2fa|mfa|otp|totp|verify|challenge|step-?up)(?:\/|$|\?)/i
+
+function truthyJsonLeaf(value: string): boolean {
+  const lower = value.trim().toLowerCase()
+  return lower === 'true' || lower === '1' || lower === 'yes' || lower === 'enabled' || lower === 'on' || lower === '"true"'
+}
+
+export interface MfaAssessment extends ImpactAssessment {
+  evidence: {
+    enrolled: boolean
+    enrolledStep: string | null
+    enrolledField: string | null
+    preDenied: boolean
+    preStep: string | null
+    postGranted: boolean
+    postStep: string | null
+    challengeStep: string | null
+    sameActor: boolean
+    sameRoute: boolean
+    decorative: boolean
+  }
+}
+
+export function assessMfaBypass(input: ImpactInput): MfaAssessment {
+  const steps = input.steps
+  const evidence = {
+    enrolled: false,
+    enrolledStep: null as string | null,
+    enrolledField: null as string | null,
+    preDenied: false,
+    preStep: null as string | null,
+    postGranted: false,
+    postStep: null as string | null,
+    challengeStep: null as string | null,
+    sameActor: false,
+    sameRoute: false,
+    decorative: false,
+  }
+  // 1. Enrollment must come from a control/setup read of the account state, not the probe echo.
+  for (const step of steps) {
+    if (step.arm === 'probe' || step.json === undefined || step.json === null) continue
+    for (const [path, value] of flattenJson(step.json)) {
+      const leaf = path.split('.').pop() ?? ''
+      if (MFA_ENROLL_FIELD_RE.test(leaf) && truthyJsonLeaf(value)) {
+        evidence.enrolled = true
+        evidence.enrolledStep = step.id
+        evidence.enrolledField = path
+        break
+      }
+    }
+    if (evidence.enrolled) break
+  }
+  // 2. Protected reads exclude the OTP/challenge endpoint itself.
+  const protectedReads = steps.filter(step =>
+    isReadMethod(step.method) &&
+    !MFA_ROUTE_RE.test(step.pathAndQuery ?? '') &&
+    !MFA_ROUTE_RE.test(step.route ?? ''))
+  const challenge = steps.find(step =>
+    isMutatingMethod(step.method) &&
+    (MFA_ROUTE_RE.test(step.pathAndQuery ?? '') || MFA_ROUTE_RE.test(step.route ?? '') || MFA_CHALLENGE_RE.test(step.body ?? ''))) ??
+    steps.find(step => step.arm === 'probe' && isMutatingMethod(step.method)) ??
+    null
+  evidence.challengeStep = challenge?.id ?? null
+  const challengeIndex = challenge ? steps.indexOf(challenge) : steps.length
+  const deniedRead = (step: ImpactStep): boolean =>
+    step.status === 401 || step.status === 403 ||
+    (step.status !== null && step.status >= 300 && step.status < 400) ||
+    MFA_CHALLENGE_RE.test(`${headerField(step.responseHeaders, /^(?:www-authenticate|x-mfa|mfa|challenge)$/i) ?? ''} ${(step.body ?? '').slice(0, 1024)}`)
+  const pre = [...protectedReads].reverse().find(step => steps.indexOf(step) < challengeIndex && deniedRead(step)) ?? null
+  const post = protectedReads.find(step =>
+    steps.indexOf(step) > (pre ? steps.indexOf(pre) : -1) &&
+    isSuccess(step.status) &&
+    ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ?? null
+  evidence.preDenied = pre !== null
+  evidence.preStep = pre?.id ?? null
+  evidence.postGranted = post !== null
+  evidence.postStep = post?.id ?? null
+  evidence.sameActor = Boolean(pre && post && pre.actor.handle === post.actor.handle)
+  evidence.sameRoute = Boolean(pre && post && routeFamily(pre.route ?? '') === routeFamily(post.route ?? ''))
+  evidence.decorative = !pre
+
+  if (!pre) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: no protected read was denied/challenged before the code check, so the OTP endpoint gates nothing (decorative 2FA). Report this as an advisory, not a confirmed bypass.',
+      evidence,
+    }
+  }
+  if (!evidence.enrolled) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: no control read shows the account is enrolled (twofa_enabled/mfa/totp claim). A 2xx from an OTP endpoint on an unenrolled account is not a bypass.',
+      evidence,
+    }
+  }
+  if (!post) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: no post-challenge read of the same protected resource shows the boundary was crossed with data/state proof.',
+      evidence,
+    }
+  }
+  if (!evidence.sameActor) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: the pre-challenge denial and post-challenge grant are not tied to the same session/actor.',
+      evidence,
+    }
+  }
+  if (!evidence.sameRoute) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: the denied pre-challenge read and the granted post-challenge read are different resources, so no access differential is proven.',
+      evidence,
+    }
+  }
+  return {
+    required: true,
+    satisfied: true,
+    reason: `MFA gate crossed: enrolled (${evidence.enrolledField}) control shows the boundary, "${pre.id}" was denied/challenged, and the same actor read ${post.route ?? 'the protected resource'} with data after the code check.`,
+    evidence,
+  }
+}
+
+/**
+ * Universal default-deny boundary gate.
+ *
+ * `auth` claims confirm only with a denied/challenged control and a successful variant on the same
+ * route family that exposes data or a state change. `access` claims confirm with either that denial
+ * or an explicit actor/precondition differential (the documented control-legitimately-allowed
+ * escape). A claim that merely gets a 2xx from an ungated request never confirms.
+ */
+export function assessBoundary(input: BoundaryInput & { boundaryClass: BoundaryClass }): BoundaryAssessment {
+  return assessBoundaryForClass(input, input.boundaryClass)
+}
+
+function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryClass): BoundaryAssessment {
+  if (boundaryClass === 'other') {
+    return {
+      required: false, satisfied: true, boundaryClass, controlDenied: false, controlKind: null,
+      crossed: false, arm: null, reason: 'Not an authentication/access-control claim.', evidence: {},
+    }
+  }
+  const steps = input.steps
+  const probeSteps = steps.filter(step => step.arm === 'probe')
+  const controlSteps = steps.filter(step => step.arm === 'control')
+  const successes = steps.filter(step => isSuccess(step.status))
+  const successFamilies = new Set(successes.map(step => routeFamily(step.route ?? '')).filter(Boolean))
+  const signals = steps
+    .map(step => boundarySignalOf(step, successFamilies))
+    .filter((signal): signal is BoundarySignal => signal !== null)
+  const signal = signals.find(entry => entry.step.arm === 'control' || entry.step.arm === 'setup') ?? signals[0] ?? null
+  const controlDenied = signal !== null
+  // The variant must cross the same route family and expose data or a state change.
+  const signalFamily = signal ? routeFamily(signal.step.route ?? '') : ''
+  const crossed = Boolean(signal && successes.some(step =>
+    step.id !== signal.step.id &&
+    routeFamily(step.route ?? '') === signalFamily &&
+    step.arm === 'probe' &&
+    ((isReadMethod(step.method) && ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ||
+      (isMutatingMethod(step.method) && isSuccess(step.status)))))
+  const distinctActors = new Set(steps.map(step => step.actor.handle).filter((handle): handle is string => Boolean(handle)))
+  const roleOrTenantDifferential = steps.some(a => steps.some(b =>
+    a !== b &&
+    ((a.actor.role !== null && b.actor.role !== null && a.actor.role !== b.actor.role) ||
+      (a.actor.tenant !== null && b.actor.tenant !== null && a.actor.tenant !== b.actor.tenant))))
+  // A parameter/body precondition differential (e.g. ?id=pub vs ?id=priv) is the same kind of
+  // "the variant changed the precondition" evidence as an actor differential.
+  const requestDifferential = controlSteps.some(control => probeSteps.some(probe =>
+    (control.pathAndQuery ?? control.route ?? '') !== (probe.pathAndQuery ?? probe.route ?? '') ||
+    JSON.stringify(control.requestJson ?? null) !== JSON.stringify(probe.requestJson ?? null)))
+  const actorDifferential = distinctActors.size >= 2 || roleOrTenantDifferential || requestDifferential
+  const strict = input.expectControlDenied === true
+  const escape = input.expectControlDenied === false
+  const evidence = {
+    boundaryClass,
+    controlDenied,
+    controlKind: signal?.kind ?? null,
+    controlStep: signal?.step.id ?? null,
+    crossed,
+    arm: null as BoundaryArm,
+    distinctActors: distinctActors.size,
+    actorDifferential,
+    expectControlDenied: input.expectControlDenied ?? null,
+    probeSteps: probeSteps.length,
+    controlSteps: controlSteps.length,
+  }
+
+  if (boundaryClass === 'auth') {
+    if (!controlDenied) {
+      return {
+        required: true, satisfied: false, boundaryClass, controlDenied, controlKind: null, crossed,
+        arm: null,
+        reason: 'Authentication/bypass claim dismissed: the signed transcript has no denied/challenged control (401/403, login redirect or MFA challenge). A 2xx from a request that was never gated is not a bypass (e.g. 2FA bypass on an account without 2FA enabled). Add a challenged control and a variant that crosses it.',
+        evidence,
+      }
+    }
+    if (!crossed) {
+      return {
+        required: true, satisfied: false, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,
+        arm: null,
+        reason: 'Authentication/bypass claim has a challenged control but no variant exchange on the same route family that crosses the boundary with data/state proof.',
+        evidence,
+      }
+    }
+    return {
+      required: true, satisfied: true, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,
+      arm: 'control_denied',
+      reason: `Boundary crossed: the ${signal?.kind === 'challenge' ? 'challenge' : 'denied control'} on "${signal?.step.id}" was bypassed by a successful variant with data/state evidence.`,
+      evidence: { ...evidence, arm: 'control_denied' },
+    }
+  }
+
+  // access
+  if (controlDenied && (!escape || strict)) {
+    if (!crossed) {
+      return {
+        required: true, satisfied: false, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,
+        arm: null,
+        reason: 'Access-control claim has a denied/challenged control but no variant exchange on the same route family that crosses it with data/state proof.',
+        evidence,
+      }
+    }
+    return {
+      required: true, satisfied: true, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,
+      arm: 'control_denied',
+      reason: `Boundary crossed: the ${signal?.kind ?? 'denied'} control on "${signal?.step.id}" was crossed by a successful variant with data/state evidence.`,
+      evidence: { ...evidence, arm: 'control_denied' },
+    }
+  }
+  if (strict) {
+    return {
+      required: true, satisfied: false, boundaryClass, controlDenied, controlKind: null, crossed,
+      arm: null,
+      reason: 'expectControlDenied is true but no control exchange was denied/challenged on the same precondition; a spec that expects a gate must observe it.',
+      evidence,
+    }
+  }
+  if (!actorDifferential) {
+    return {
+      required: true, satisfied: false, boundaryClass, controlDenied, controlKind: null, crossed,
+      arm: null,
+      reason: 'Access-control claim has no denied/challenged control and no actor/precondition differential to stand in for the boundary; a 2xx from one actor is not a bypass.',
+      evidence,
+    }
+  }
+  return {
+    required: true, satisfied: true, boundaryClass, controlDenied: false, controlKind: null, crossed,
+    arm: 'actor_differential',
+    reason: 'No denial is observable on this route (the control is legitimately served); the object boundary is demonstrated by the actor/precondition differential, which the impact gate must still back with data/state proof.',
+    evidence: { ...evidence, arm: 'actor_differential' },
+  }
+}
+
