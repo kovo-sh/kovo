@@ -87,3 +87,34 @@ Seed 1 mounts `acme.billing-tamper` as a **hardened decoy**; `acme.seat-invarian
 
 None of these claims adds truth: the app does not implement the behaviour, so a target would inflate
 recall. Each one is a verifier-side gap (see the bullets above), owned by `src/server/replay-verifier.ts`.
+
+## Second triage round (post v6-verifier-harden)
+
+4. *"Two-factor (OTP) verification accepts any/absent code — 2FA bypass"* (CWE-287,
+   `POST /api/auth/2fa`) — **agentic over-claim (non-impactful evidence)**, with a genuine latent
+   weakness behind it. `twofaVerify` does not check the code, but **no session is ever in a
+   2FA-pending state**: `doLogin` always calls `identityForUser(u, false)`, so a password login is
+   already fully authorised and the verify call changes nothing (`twofaPending` is `false` before and
+   after; no session, role or data delta; no oracle event). The real deficiency is that
+   `users.twofa_enabled` (set for `persona_a`) is never enforced — a password-only login is enough —
+   but that is **not modelled as a target**: enforcing it at `login` would put every `persona_a`
+   solver and every engine cell into a pending state (login is shared by the whole lab and the harness
+   has no second-factor step), and an oracle event keyed to `login` would be triggered by any
+   ordinary login, i.e. truth inflation. Deterministic probe: password login → `GET /api/me` 200 and
+   an owner-only read 200 *before* any challenge; `POST /api/auth/2fa` with a wrong code or an empty
+   body → `{ok:true}` with the same 200 afterwards; anonymous → 401; zero oracle events.
+   Verifier gap: `auth_protocol_proof` (`src/server/replay-verifier.ts`) and its schema
+   (`src/replay-spec.ts:594`) have no second-factor state gate (enrolled account, verifier session
+   pending before the probe, access denied before verification and granted after it) and no `mfa`
+   protocol; it confirms on `anon 401 / authed 200 {ok:true}` alone.
+
+5. *"Missing vertical role check on `/api/admin/activity` exposes rotated org secret to read-only
+   viewer"* (CWE-863, `open_proof_gap`) — **real endpoint, wrong label; not a false alarm**. The
+   endpoint is the `adminAuditLog` route owned by the vulnerable `acme.auditlog-secret` target (seed 1
+   mounts it vulnerable): a viewer reads the admin activity log and the response carries the tenant
+   secret canary. The finding is labelled `bfla`/CWE-863 (authz family), which is class-incompatible
+   with the entry's `info_disclosure`/CWE-532 (disclosure family), and the verifier honestly declined
+   to confirm the BFLA framing (no role differential beyond the route itself, no state delta). The
+   grader now records this as a **misclassified location hit** (`misclassifiedFindingIds`): the site
+   is not clean, so it is not a false positive, and wrong-class claims never earn recall. The endpoint
+   itself is already truth; no new target is added.

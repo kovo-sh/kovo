@@ -49,6 +49,27 @@ test('viewer may write tenant content; the tenant, not the owner, is the object 
   }
 })
 
+test('2FA verify endpoint is inert: no pending state, no access delta, no impact event', async () => {
+  const app = await startRealisticApp({ app: 'acme-saas', seed: 1 })
+  try {
+    const ctx = makeSolverCtx(app)
+    const owner = await ctx.login('persona_a')
+    // persona_a is seeded with twofa_enabled=1, yet the password login is already fully authorised.
+    assert.equal((await ctx.fetch(ctx.path('me'), { session: owner })).status, 200)
+    assert.equal((await ctx.fetch(ctx.path('getBilling'), { session: owner })).status, 200)
+
+    const wrong = await ctx.fetch(ctx.path('twofaVerify'), { method: 'POST', session: owner, body: { code: '000000' } })
+    const empty = await ctx.fetch(ctx.path('twofaVerify'), { method: 'POST', session: owner, body: {} })
+    assert.deepEqual(wrong.json, { ok: true }, 'the verify endpoint accepts any code')
+    assert.deepEqual(empty.json, { ok: true }, 'and an empty body')
+    assert.equal((await ctx.fetch(ctx.path('getBilling'), { session: owner })).status, 200, 'access was already granted before verification')
+    assert.equal((await ctx.fetch(ctx.path('twofaVerify'), { method: 'POST', body: { code: '000000' } })).status, 401)
+    assert.deepEqual(app.oracle.events().map((e) => e.kind), [], 'no impact event: the call changes no state')
+  } finally {
+    await app.stop()
+  }
+})
+
 test('hardened plan route ignores caller price/limit/credit fields and stays oracle-silent', async () => {
   const app = await startRealisticApp({ app: 'acme-saas', seed: 1 })
   try {
