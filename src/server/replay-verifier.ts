@@ -1033,6 +1033,11 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     // hash + multipart/rce flags). Without context the one-shot ledger can never be consumed, and a
     // matching operator pattern would be the only way through — which must never authorize an
     // RCE/upload proof of execution, so both kinds are flagged `isRceProof`.
+    //
+    // Local-lab uploads short-circuit through the approval module's `local_lab` decision. A public
+    // upload additionally needs the execution-side registration to carry `isRceProof: true` (the
+    // multipart body is interpolated with a fresh nonce, so the broker must also key the grant to the
+    // prepared parts); until then public uploads fail closed instead of accepting a pattern.
     const approvalContext: StateChangeApprovalContext = spec.kind === 'rce_proof'
       ? {
           personaHandle: spec.probeStep.request.persona ?? null,
