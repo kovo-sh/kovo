@@ -388,3 +388,12 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Certification protocol:** do not run the full matrix. Tune acme to ≥14–15/22 (≥+3–4 net-new, ≥50% proof conversion, 100% precision), smoke shopflow/opsportal at ≥+2–3 net-new each (aggregate ≥+6 targets / +10pp), then certify.
 - **Realism #2/#3:** real wiring bugs; `prove_oob_callback` and `prove_race_burst` should register `pending_oob` and execute the h2 barrier. Keep Phase-1 grey-box certification decoupled from Phase-3 realism gates, but fix both in this wiring sprint.
 - **Streams launched:** sdk-helpers, floor-regress, phaseb-diag (read-only diagnosis).
+
+### 2026-11-23 — hourly check-in #8: +9.1pp on acme, precision is the only gate
+
+- **Correction adopted:** K=6 acme 13/22 is **+9.1pp** over floor 11/22 (not +2pp), with 18 assignments queued/paused and 75% of budget unspent. Keep the +10pp dev / +8pp held-out bar; do not lower it.
+- **Precision first:** 3 unmatched FPs at K=6 (100% → 81.3%). Audit order: (1) repair-loop reward hacking (`control_denied` pairing / `expectControlDenied:false`), (2) concurrent cross-talk (`before!=after` caused by another worker — require this script's nonce in `after_get`), (3) SDK helper bypass of host transcript validation.
+- **Throughput second:** drive `verified_tp_per_100s_phase_b`; cut median assignment wall ~150 s → 70–90 s (warm workers across assignments, cap single-step assignments, check provider-stream stalls) to drain 12 ready/6 paused in the same window.
+- **Floor-regress before certification:** finish 26 → ≥31/59 so agentic lift is genuine, not picking up targets the floor lost to the hardening regression.
+- **Realism #2:** decouple from Phase-1 cert, but Layer-2 `ssrf_canary`/`xxe_canary` must also register non-immediate canaries into `pending_oob` so the fixture passes end-to-end; do not certify #2 via SDK unit tests alone.
+- **Structural red flags accepted:** per-assignment entity namespace + nonce-matched readbacks; host recomputation is the trust boundary (SDK is ergonomics only); check F3 still emits genuine leads on shopflow/opsportal/held-out; lock `v6-retire-dsl` (≥1,800 LOC) immediately after Phase 1.
