@@ -383,14 +383,19 @@ describe('cell-labeled reaper', () => {
   test('removes only containers from its own cell labels', async () => {
     const queries: string[] = []
     const removals: string[][] = []
+    const live = new Set(['id-a', 'id-b'])
     const docker = async (args: string[]) => {
       if (args[0] === 'ps') {
         const filter = args.find(arg => arg.startsWith('label=dev.guardian.cell='))!
         queries.push(filter)
         const id = filter.endsWith('cell-a') ? 'id-a' : filter.endsWith('cell-b') ? 'id-b' : ''
-        return id
+        return live.has(id) ? id : ''
       }
-      if (args[0] === 'rm') { removals.push(args.slice(2)); return '' }
+      if (args[0] === 'rm') {
+        removals.push(args.slice(2))
+        for (const id of args.slice(2)) live.delete(id)
+        return ''
+      }
       return ''
     }
     const reaper = new CellReaper(['cell-a', 'cell-b'], { dockerRunner: docker })
@@ -398,8 +403,8 @@ describe('cell-labeled reaper', () => {
     assert.equal(queries.length, 0)
     assert.equal(await reaper.reap('cell-a'), 1)
     assert.deepEqual(removals, [['id-a']])
-    assert.equal(await reaper.reapAll(), 2)
-    assert.deepEqual(removals.slice(1).sort(), [['id-a'], ['id-b']])
+    assert.equal(await reaper.reapAll(), 1)
+    assert.deepEqual(removals.slice(1).sort(), [['id-b']])
     assert.ok(queries.every(query => query.startsWith('label=dev.guardian.cell=')))
   })
 

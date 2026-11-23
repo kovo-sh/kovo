@@ -290,6 +290,8 @@ export class ModelGate {
   private readonly maxRequestBytes: number
   private server?: Server
   private portValue = 0
+  private readonly openReleases = new Set<() => void>()
+  private readonly openCancels = new Set<() => void>()
 
   constructor(opts: ModelGateOptions = {}) {
     this.limiter = new AimdLimiter({
@@ -342,8 +344,15 @@ export class ModelGate {
     const server = this.server
     if (!server) return
     this.server = undefined
+    // Force-close any stream still in flight: a cell can exit between the request and its first
+    // byte, and an abandoned upstream socket must never keep the matrix process alive.
+    for (const cancel of [...this.openCancels]) { try { cancel() } catch { /* best-effort */ } }
+    this.openCancels.clear()
+    for (const release of [...this.openReleases]) { try { release() } catch { /* best-effort */ } }
+    this.openReleases.clear()
     await new Promise<void>(resolvePromise => {
-      server.close(() => resolvePromise())
+      const timer = setTimeout(resolvePromise, 2_000)
+      server.close(() => { clearTimeout(timer); resolvePromise() })
       server.closeAllConnections?.()
     })
   }
@@ -387,11 +396,35 @@ export class ModelGate {
     }
     headers['content-length'] = String(body.length)
 
-    const response = await this.forward(`${upstream}${suffix}${url.search}`, { method: 'POST', headers, body })
+    // If the cell goes away before the upstream answers (or while queued for a permit), abort the
+    // upstream request instead of leaving an orphaned stream behind.
+    const downstream = new AbortController()
+    const onDownstreamClose = () => downstream.abort()
+    res.once('close', onDownstreamClose)
+    let response: Response
+    try {
+      response = await this.forward(`${upstream}${suffix}${url.search}`, { method: 'POST', headers, body }, downstream.signal)
+    } catch {
+      res.off('close', onDownstreamClose)
+      if (!res.destroyed) {
+        res.writeHead(502, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: 'The model gate request was interrupted.' } }))
+      }
+      return
+    }
+    if (res.destroyed) {
+      res.off('close', onDownstreamClose)
+      await response.body?.cancel().catch(() => undefined)
+      return
+    }
     res.writeHead(response.status, Object.fromEntries(
       [...response.headers.entries()].filter(([name]) => !HOP_BY_HOP.has(name.toLowerCase())),
     ))
-    if (!response.body) { res.end(); return }
+    if (!response.body) {
+      res.off('close', onDownstreamClose)
+      res.end()
+      return
+    }
     const reader = response.body.getReader()
     // A cell that exits mid-stream closes the downstream socket. Cancel the upstream reader so
     // the permit is released promptly and `gate.close()` never waits on an abandoned stream.
@@ -419,6 +452,7 @@ export class ModelGate {
       if (!res.destroyed) res.destroy()
     } finally {
       res.off('close', cancelReader)
+      res.off('close', onDownstreamClose)
     }
   }
 
@@ -427,17 +461,19 @@ export class ModelGate {
    * `Retry-After` (bounded attempts) and shrinks the ceiling; the permit is held for the whole
    * response stream, so the cap counts live streams rather than just request dispatch.
    */
-  async forward(target: string, init: { method: string; headers: Record<string, string>; body: Buffer }): Promise<Response> {
+  async forward(target: string, init: { method: string; headers: Record<string, string>; body: Buffer }, signal?: AbortSignal): Promise<Response> {
     let last: Response | undefined
     for (let attempt = 0; attempt < this.maxAttempts; attempt += 1) {
-      const release = await this.limiter.acquire()
+      const release = await this.limiter.acquire(signal)
       let response: Response
       try {
+        signal?.throwIfAborted()
         response = await this.fetchImpl(target, {
           method: init.method,
           headers: init.headers,
           body: new Uint8Array(init.body),
           redirect: 'error',
+          ...(signal ? { signal } : {}),
         })
       } catch (error) {
         release()
@@ -465,7 +501,16 @@ export class ModelGate {
     if (!response.body) { release(); return response }
     const reader = response.body.getReader()
     let released = false
-    const releaseOnce = () => { if (!released) { released = true; release() } }
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      this.openReleases.delete(releaseOnce)
+      this.openCancels.delete(cancelOnce)
+      release()
+    }
+    const cancelOnce = () => { void reader.cancel().catch(() => undefined) }
+    this.openReleases.add(releaseOnce)
+    this.openCancels.add(cancelOnce)
     const body = new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
@@ -677,12 +722,21 @@ export class CellReaper {
   }
 
   async reap(cell: string): Promise<number> {
-    const ids = await this.list(cell)
-    if (!ids.length) return 0
-    try {
-      await this.docker(['rm', '--force', ...ids])
-      return ids.length
-    } catch { return 0 }
+    const id = cellLabel(cell)
+    if (!this.cells.has(id)) return 0
+    let removed = 0
+    // A child's exit hook and this reaper can race the same `rm`; retry briefly so a
+    // "removal already in progress" never leaves a stale container counted as an orphan.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const ids = await this.list(id)
+      if (!ids.length) break
+      try {
+        await this.docker(['rm', '--force', ...ids])
+        removed += ids.length
+      } catch { /* retry */ }
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 120))
+    }
+    return removed
   }
 
   async reapAll(): Promise<number> {

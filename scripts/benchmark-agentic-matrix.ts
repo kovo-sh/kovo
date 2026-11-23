@@ -867,6 +867,9 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       beforeCell: () => guard.waitForCapacity(),
       afterCell: async cell => { await reaper.reap(cell.label) },
     })
+    // Reap once more after the last cell (its exit hook may still be finishing) before counting.
+    await reaper.reapAll()
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 250))
     orphans = await reaper.orphans()
     const totals = summarizeMatrix(results)
     const matrix = {
@@ -916,8 +919,14 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
 
 const isMain = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false
 if (isMain) {
-  main().then(code => { process.exitCode = code }).catch(error => {
+  main().then(code => {
+    process.exitCode = code
+    // The matrix is a CLI: never let a stray keep-alive socket hold the process open after the
+    // summary is written (all children have exited and cleanup is complete at this point).
+    setTimeout(() => process.exit(code), 100)
+  }).catch(error => {
     process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
+    setTimeout(() => process.exit(1), 100)
   })
 }
