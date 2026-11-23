@@ -93,7 +93,14 @@ export function createMonitors(deps: MonitorDeps): MonitorSet {
       const credits = Number(row.neu.credits)
       const planCode = String(row.neu.plan_id)
       const limit = db.get<{ seat_limit: number }>('SELECT seat_limit FROM plans WHERE code = ?', [planCode])?.seat_limit
-      if (limit !== undefined && seats > limit) oracle.emit('invariant_violation', { kind: 'seats', seats, limit }, 'db:tenants')
+      // Only a seat-allocation mutation can violate the seat limit. A self-service plan change can
+      // leave seats_used above the new plan's limit, but that is the owner's own downgrade, not the
+      // seat invariant: emitting it here would attribute an `invariant_violation` to `updatePlan`
+      // and let a plan-price claim borrow another site's impact signal.
+      const seatsMutated = row.op !== 'UPDATE' || Number(row.old?.seats_used) !== seats
+      if (seatsMutated && limit !== undefined && seats > limit) {
+        oracle.emit('invariant_violation', { kind: 'seats', seats, limit, plan: planCode }, 'db:tenants')
+      }
       if (Number.isFinite(credits) && credits < 0) oracle.emit('race_double_spend', { credits }, 'db:tenants')
     }
     if (row.table === 'plans' && row.op === 'UPDATE' && row.old && row.neu
