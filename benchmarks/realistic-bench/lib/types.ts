@@ -268,6 +268,9 @@ export interface Scorecard {
   decoys: number
   decoyFalsePositives: number
   unmatchedFalsePositives: number
+  /** Findings that hit a vulnerable target's endpoint under an incompatible class: real location,
+   *  wrong label — not a TP and not a false alarm. Excluded from the precision denominator. */
+  misclassifiedFindingIds?: string[]
   duplicateFindings: number
   chainsTotal: number
   chainsCompleted: number

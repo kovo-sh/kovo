@@ -57,7 +57,7 @@ const XSS = (siteId: string): GroundTruthEntry => entry({
   oracle: { kinds: ['stored_xss_rendered'], routeKeys: ['card.view'] },
 })
 
-test('class mismatch (authz claim on an XSS site) never matches a vuln or a decoy', () => {
+test('class mismatch (authz claim on an XSS site) never confirms and never double-charges', () => {
   const authzClaim = { vulnClass: 'idor', cwe: 'CWE-639' }
   const vuln = gradeRun(mk({
     groundTruth: gt([XSS('xss-vuln')]),
@@ -65,7 +65,8 @@ test('class mismatch (authz claim on an XSS site) never matches a vuln or a deco
     oracleEvents: [event({ seq: 1, kind: 'stored_xss_rendered', routeKey: 'card.view' })],
   }))
   assert.equal(vuln.confirmed, 0)
-  assert.equal(vuln.unmatchedFalsePositives, 1)
+  assert.equal(vuln.unmatchedFalsePositives, 0, 'a hit on a planted vuln surface is a misclassified location hit')
+  assert.deepEqual(vuln.misclassifiedFindingIds, ['f'])
   assert.equal(vuln.decoyFalsePositives, 0)
 
   const decoy = gradeRun(mk({
@@ -74,6 +75,7 @@ test('class mismatch (authz claim on an XSS site) never matches a vuln or a deco
   }))
   assert.equal(decoy.decoyFalsePositives, 0, 'class-mismatched claim must not silently become a decoy FP')
   assert.equal(decoy.unmatchedFalsePositives, 1)
+  assert.deepEqual(decoy.misclassifiedFindingIds ?? [], [])
 })
 
 test('sibling action/inbox routes do not match their parent resource route', () => {
@@ -167,18 +169,21 @@ test('finding partition: every active finding lands in exactly one bucket', () =
       finding({ id: 'decoy', vulnClass: 'xss_stored', cwe: 'CWE-79', endpoints: [{ path: '/api/v1/cards/9/view' }] }),
       finding({ id: 'decoy-wrong-class', vulnClass: 'idor', cwe: 'CWE-639', endpoints: [{ path: '/api/v1/cards/9/view' }] }),
       finding({ id: 'unplanted', vulnClass: 'info_disclosure', endpoints: [{ path: '/api/health' }] }),
+      finding({ id: 'misfiled', vulnClass: 'xss_stored', cwe: 'CWE-79', endpoints: [{ path: '/api/v1/invoices/42' }] }),
       finding({ id: 'ruled-out', status: 'ruled_out', vulnClass: 'xss_stored', cwe: 'CWE-79', endpoints: [{ path: '/api/v1/cards/9/view' }] }),
     ],
     oracleEvents: [event({ seq: 1, ts: 50 })],
   }))
-  const active = ['tp', 'tp-dup', 'decoy', 'decoy-wrong-class', 'unplanted']
+  const active = ['tp', 'tp-dup', 'decoy', 'decoy-wrong-class', 'unplanted', 'misfiled']
   const vulnMatched = s.vulns.flatMap((x) => x.matchedFindingIds)
   const decoyMatched = s.decoyResults.flatMap((x) => x.findingIds)
   const unmatched = s.unmatchedFindingIds
+  const misclassified = s.misclassifiedFindingIds ?? []
   assert.deepEqual([...vulnMatched].sort(), ['tp', 'tp-dup'])
   assert.deepEqual(decoyMatched, ['decoy'])
   assert.deepEqual([...unmatched].sort(), ['decoy-wrong-class', 'unplanted'])
-  const union = [...vulnMatched, ...decoyMatched, ...unmatched]
+  assert.deepEqual(misclassified, ['misfiled'])
+  const union = [...vulnMatched, ...decoyMatched, ...unmatched, ...misclassified]
   assert.equal(new Set(union).size, union.length, 'a finding was counted in two buckets')
   assert.deepEqual([...union].sort(), [...active].sort(), 'a finding vanished from accounting')
   assert.equal(s.duplicateFindings, 1)

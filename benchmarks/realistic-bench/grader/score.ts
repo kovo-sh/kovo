@@ -62,6 +62,11 @@ export function gradeRun(input: GradeInput): Scorecard {
   const vulnMatched = new Map<string, SubmittedFinding[]>()
   const decoyMatched = new Map<string, SubmittedFinding[]>()
   const unmatched: SubmittedFinding[] = []
+  // A subclass/class-family mismatch on a planted vulnerable endpoint is a *misclassified location
+  // hit*: the site is not clean, so it is neither a false positive nor a confirmation. It never
+  // earns recall (a TP still needs class compatibility) but it must not be charged as an alarm on a
+  // clean endpoint. Decoys and non-target endpoints are unaffected: a claim there is still an FP.
+  const misclassified: SubmittedFinding[] = []
   for (const f of active) {
     const vulnMatch = matchFindingToEntries(f, vulnEntries)
     if (vulnMatch) {
@@ -78,7 +83,10 @@ export function gradeRun(input: GradeInput): Scorecard {
       list.push(f)
       decoyMatched.set(ge.entry.siteId, list)
     }
-    if (!vulnMatch && decoySites.size === 0) unmatched.push(f)
+    if (!vulnMatch && decoySites.size === 0) {
+      if (vulnEntries.some((ge) => findingHitsEntry(f, ge.entry))) misclassified.push(f)
+      else unmatched.push(f)
+    }
   }
 
   // Evaluate each vuln.
@@ -234,6 +242,7 @@ export function gradeRun(input: GradeInput): Scorecard {
     decoys: gt.decoys.length,
     decoyFalsePositives,
     unmatchedFalsePositives,
+    misclassifiedFindingIds: misclassified.map((f) => f.id),
     duplicateFindings,
     chainsTotal: completableChains.length,
     chainsCompleted,

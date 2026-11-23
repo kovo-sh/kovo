@@ -20,6 +20,10 @@ function headlineTable(s: Scorecard): string {
     row(['recall', `${pct(s.recall)} (${s.confirmed}/${s.targets})`]),
     row(['precision', pct(s.precision)]),
     row(['decoyFP', `${s.decoyFalsePositives}/${s.decoys}`]),
+    row(['unmatchedFP', `${s.unmatchedFalsePositives}`]),
+    ...((s.misclassifiedFindingIds?.length ?? 0) > 0
+      ? [row(['misclassified (uncharged)', `${s.misclassifiedFindingIds!.length}`])]
+      : []),
     row(['chains', `${s.chainsCompleted}/${s.chainsTotal}`]),
     row(['cost', usd(s.totalCostUsd)]),
   ]
