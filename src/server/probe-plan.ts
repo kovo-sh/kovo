@@ -44,12 +44,10 @@ export function selectRankedProbeTargets<T extends {
   options: { cap: number; planOnly?: boolean },
 ): { targets: T[]; usedPlan: boolean; probed: number; skippedStored: number } {
   const cap = Math.max(1, Math.round(options.cap))
-  const riskFirst = [...endpoints].sort((a, b) =>
-    (b.riskScore ?? 0) - (a.riskScore ?? 0) ||
-    a.pathTemplate.localeCompare(b.pathTemplate) ||
-    a.method.localeCompare(b.method))
+  // The store already returns a deterministic risk/coverage order; preserve it exactly so the
+  // bounded probe set is identical to the pre-graphwire floor (no tie-break drift).
   const fallback = () => ({
-    targets: riskFirst.slice(0, cap),
+    targets: endpoints.slice(0, cap),
     usedPlan: false,
     probed: Math.min(cap, endpoints.length),
     skippedStored: Math.max(0, endpoints.length - cap),
@@ -75,7 +73,7 @@ export function selectRankedProbeTargets<T extends {
   if (!targets.length) return fallback()
   if (!options.planOnly) {
     const chosen = new Set(targets)
-    for (const endpoint of riskFirst) {
+    for (const endpoint of endpoints) {
       if (targets.length >= cap) break
       if (chosen.has(endpoint)) continue
       chosen.add(endpoint)
