@@ -30,6 +30,7 @@ import {
 } from '../scripts/certify-phase1.ts'
 import type {
   Certificate,
+  ProvenanceCounts,
   RealismRun,
   ReasonCellLike,
   ReasonRun,
@@ -62,9 +63,16 @@ interface RunOverrides {
   floorConfirmed?: number | null
   floorLeadsEmitted?: number | null
   floorLeadsConsumed?: number | null
+  provenance?: ProvenanceCounts | null
+  provenanceComplete?: boolean
+  provenanceSource?: string
+  advisories?: number
+  contractLeaks?: number
   vulns?: VulnLike[]
   id?: string
 }
+
+let runSequence = 0
 
 function realismRun(overrides: RunOverrides = {}): RealismRun {
   const app = overrides.app ?? 'acme-saas'
@@ -75,8 +83,14 @@ function realismRun(overrides: RunOverrides = {}): RealismRun {
   const confirmed = overrides.confirmed ?? 0
   const vulns = overrides.vulns ?? vulnsFor(app, confirmed, targets)
   const floorConfirmed = overrides.floorConfirmed === undefined ? confirmed : overrides.floorConfirmed
+  const provenance = overrides.provenance !== undefined
+    ? overrides.provenance
+    : (llm === 'agentic' && floorConfirmed !== null
+        ? { floor: floorConfirmed, agentOnly: Math.max(0, confirmed - floorConfirmed), chainFromFloor: 0 }
+        : null)
+  runSequence += 1
   return {
-    id: overrides.id ?? `${llm}-${seedSet}-${app}-${seed}-${confirmed}-${Math.random()}`,
+    id: overrides.id ?? `${llm}-${seedSet}-${app}-${seed}-${confirmed}-${runSequence}`,
     dir: '/synthetic',
     file: null,
     app,
@@ -97,6 +111,11 @@ function realismRun(overrides: RunOverrides = {}): RealismRun {
       floorLeadsEmitted: overrides.floorLeadsEmitted === undefined ? (floorConfirmed === null ? null : 5) : overrides.floorLeadsEmitted,
       source: 'synthetic',
     },
+    provenance,
+    provenanceComplete: overrides.provenanceComplete ?? provenance !== null,
+    provenanceSource: overrides.provenanceSource ?? (provenance ? 'synthetic' : 'none'),
+    advisories: overrides.advisories ?? 0,
+    contractLeaks: overrides.contractLeaks ?? 0,
     notes: [],
   }
 }
@@ -146,8 +165,11 @@ function passRuns(): RealismRun[] {
       runs.push(realismRun({ app, seed: 1, seedSet: 'dev', llm: 'deterministic-no-llm', confirmed }))
     }
     runs.push(realismRun({ app, seed: 1_000_042, seedSet: 'held-out', llm: 'deterministic-no-llm', confirmed: 8 }))
-    for (const confirmed of [12, 14, 16]) {
-      runs.push(realismRun({ app, seed: 1, seedSet: 'dev', llm: 'agentic', confirmed, floorConfirmed: 10 }))
+    for (const [index, confirmed] of [12, 14, 16].entries()) {
+      runs.push(realismRun({
+        app, seed: 1, seedSet: 'dev', llm: 'agentic', confirmed, floorConfirmed: 10,
+        provenance: { floor: 10, agentOnly: [2, 3, 4][index]!, chainFromFloor: [0, 1, 2][index]! },
+      }))
     }
     for (const confirmed of [12, 14]) {
       runs.push(realismRun({ app, seed: 1_000_042, seedSet: 'held-out', llm: 'agentic', confirmed, floorConfirmed: 8 }))
@@ -186,14 +208,23 @@ describe('verdict: PASS matrix', () => {
     assert.equal(cert.unified.dev.perApp['acme-saas']?.coverageConfirmed, 16)
     assert.equal(cert.unified.dev.perApp['acme-saas']?.minRecall, 12 / TARGETS)
     assert.equal(cert.unified.dev.perApp['acme-saas']?.maxRecall, 16 / TARGETS)
-    assert.ok((cert.lift.dev.aggregate ?? 0) > 0.15)
+    // Provenance-derived lift: median(agent_only + chain_from_floor) = median(2,4,6) = 4 targets.
+    assert.equal(cert.lift.dev.aggregate, 4 / TARGETS)
+    assert.equal(cert.lift.heldout.aggregate, 5 / TARGETS)
+    assert.equal(cert.provenance.complete, true)
+    assert.equal(cert.provenance.aggregate.dev?.floor, 10)
+    assert.equal(cert.provenance.aggregate.dev?.agentOnly, 3)
+    assert.equal(cert.provenance.aggregate.dev?.chainFromFloor, 1)
+    assert.equal(cert.provenance.aggregate.dev?.incremental, 4)
     assert.equal(cert.preservation.median, 1)
     assert.equal(cert.precision.worst, 1)
     assert.equal(cert.reason.floor.confirmed, 0)
     assert.equal(cert.reason.floor.targets, 28)
     assert.equal(cert.reason.agentic.confirmed, 11)
     assert.equal(cert.reason.agentic.recall, 11 / 28)
+    assert.equal(cert.informational[0]?.status, 'MEETS')
     assert.equal(cert.matrix.complete, true)
+    assert.equal(cert.advisories.contractLeaks, 0)
   })
 
   test('floor spread 2 targets fails the determinism gate', () => {
@@ -237,7 +268,13 @@ describe('verdict: PASS matrix', () => {
       run.llm === 'agentic' && run.seedSet === 'dev'
         ? (() => {
           const vulns = vulnsFor(run.app, 11)
-          return { ...run, confirmed: 11, recall: 11 / TARGETS, confirmedKeys: vulns.filter(v => v.outcome === 'confirmed').map(v => targetKey(v, run.app)) }
+          return {
+            ...run,
+            confirmed: 11,
+            recall: 11 / TARGETS,
+            confirmedKeys: vulns.filter(v => v.outcome === 'confirmed').map(v => targetKey(v, run.app)),
+            provenance: { floor: 10, agentOnly: 1, chainFromFloor: 0 },
+          }
         })()
         : run
     ))
@@ -265,6 +302,23 @@ describe('verdict: PASS matrix', () => {
     assert.equal(cert.verdict, 'FAIL')
   })
 
+  test('reason agentic below 25% is informational (Phase 3), not a Phase-1 failure', () => {
+    const reason: ReasonRun[] = [{
+      source: 'synthetic',
+      cells: [
+        reasonCell('ledgerflow', 'deterministic-no-llm', 0),
+        reasonCell('forgecloud', 'deterministic-no-llm', 0),
+        reasonCell('ledgerflow', 'agentic', 2),
+        reasonCell('forgecloud', 'agentic', 3),
+      ],
+    }]
+    const cert = evaluate(passRuns(), reason)
+    assert.equal(cert.verdict, 'PASS')
+    assert.equal(cert.informational[0]?.status, 'BELOW')
+    assert.equal(cert.criteria.some(item => item.id === 'reason_bench_agentic'), false)
+    assert.equal(criterion(cert, 'reason_bench_floor').status, 'PASS')
+  })
+
   test('leads invariant fails when leads are emitted but never consumed', () => {
     const runs = passRuns().map(run => (
       run.llm === 'agentic' ? { ...run, floor: { ...run.floor, floorLeadsEmitted: 5, floorLeadsConsumed: 0 } } : run
@@ -272,6 +326,57 @@ describe('verdict: PASS matrix', () => {
     const cert = evaluate(runs)
     assert.equal(cert.leads.violations.length, 15)
     assert.equal(criterion(cert, 'leads_invariant').status, 'FAIL')
+  })
+})
+
+describe('provenance and advisory contract', () => {
+  test('missing provenance marks lift unmeasured and fails completeness (no inference)', () => {
+    const runs = passRuns().map(run => (
+      run.llm === 'agentic' ? { ...run, provenance: null, provenanceComplete: false } : run
+    ))
+    const cert = evaluate(runs)
+    assert.equal(cert.provenance.complete, false)
+    assert.equal(cert.lift.dev.aggregate, null)
+    assert.equal(cert.lift.heldout.aggregate, null)
+    assert.equal(criterion(cert, 'provenance_completeness').status, 'FAIL')
+    assert.equal(criterion(cert, 'agentic_lift_dev').status, 'FAIL')
+    assert.equal(cert.verdict, 'FAIL')
+  })
+
+  test('advisory noise above 10 per app fails the advisory cap', () => {
+    const runs = passRuns()
+    const target = runs.find(run => run.llm === 'agentic')!
+    target.advisories = 11
+    const cert = evaluate(runs)
+    assert.equal(cert.advisories.overCap.length, 1)
+    assert.equal(cert.advisories.perApp[target.app]?.devWorst, 11)
+    assert.equal(criterion(cert, 'advisory_noise').status, 'FAIL')
+    assert.equal(cert.verdict, 'FAIL')
+  })
+
+  test('a static-only item inside confirmed findings is a contract leak and an FP', () => {
+    const runs = passRuns()
+    const target = runs.find(run => run.llm === 'agentic')!
+    target.contractLeaks = 1
+    target.precision = 9 / 10
+    const cert = evaluate(runs)
+    assert.equal(cert.advisories.contractLeaks, 1)
+    assert.equal(criterion(cert, 'confirmed_contract').status, 'FAIL')
+    assert.equal(criterion(cert, 'worst_run_precision').status, 'FAIL')
+    assert.equal(cert.verdict, 'FAIL')
+  })
+
+  test('static_only outcomes never count toward confirmed recall', () => {
+    const run = realismRun({
+      confirmed: 0,
+      vulns: [
+        { siteId: 'adv-1', vulnClass: 'xss_reflected', outcome: 'static_only' },
+        { siteId: 'adv-2', vulnClass: 'sqli', outcome: 'static_only' },
+      ],
+      provenance: { floor: 0, agentOnly: 0, chainFromFloor: 0 },
+    })
+    assert.equal(run.confirmedKeys.length, 0)
+    assert.equal(run.recall, 0)
   })
 })
 
@@ -415,11 +520,94 @@ describe('--from-dir ingestion', () => {
       assert.equal(agentic.floor.floorConfirmed, 2)
       assert.equal(agentic.floor.floorLeadsConsumed, 3)
       assert.equal(agentic.floor.floorLeadsEmitted, 5)
+      // No finding-level provenance anywhere: must stay unmeasured, never inferred.
+      assert.equal(agentic.provenance, null)
+      assert.equal(agentic.provenanceComplete, false)
       const floor = ingested.runs.find(run => run.app === 'shopflow')
       assert.ok(floor)
       assert.equal(floor.llm, 'deterministic-no-llm')
       assert.equal(ingested.reason.length, 1)
       assert.equal(ingested.reason[0]!.cells.length, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('parses findings provenance, advisories and contract leaks from a report', () => {
+    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    try {
+      const card: ScorecardLike = {
+        app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
+        targets: TARGETS, confirmed: 2, recall: 2 / TARGETS, precision: 1,
+        decoys: 6, decoyFalsePositives: 0, unmatchedFalsePositives: 0,
+        vulns: vulnsFor('acme-saas', 2),
+        findings: [
+          { id: 'f1', status: 'confirmed', verificationStatus: 'confirmed', provenance: 'floor', targetSiteId: 'site-a' },
+          { id: 'f2', status: 'confirmed', verificationStatus: 'confirmed', provenance: 'agent_only', targetSiteId: 'site-b' },
+          { id: 'f3', status: 'open_proof_gap', verificationStatus: 'open_proof_gap', provenance: 'agent_only', targetSiteId: 'site-c' },
+          { id: 'f4', status: 'confirmed', verificationStatus: 'static_only', provenance: 'agent_only', targetSiteId: 'site-d' },
+        ],
+      }
+      writeFileSync(join(root, 'summary.json'), JSON.stringify([card]))
+      writeFileSync(join(root, 'acme-saas-seed1-grey-box.meta.json'), JSON.stringify({
+        app: 'acme-saas', seed: 1, mode: 'grey-box', seedSet: 'dev',
+        model: { mode: 'agentic' },
+      }))
+
+      const ingested = ingestFromDirs([root], {})
+      const run = ingested.runs[0]
+      assert.ok(run)
+      assert.equal(run.provenanceComplete, true)
+      assert.deepEqual(run.provenance, { floor: 1, agentOnly: 1, chainFromFloor: 0 })
+      assert.equal(run.advisories, 2)
+      assert.equal(run.contractLeaks, 1)
+      // TP = 2 verified; the leaked static-only confirmed item is an FP.
+      assert.equal(run.precision, 2 / 3)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('static_only scorecard outcomes land in advisories, never recall', () => {
+    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    try {
+      const card: ScorecardLike = {
+        app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
+        targets: TARGETS, confirmed: 0, recall: 0, precision: 1,
+        vulns: [
+          { siteId: 'adv-1', vulnClass: 'xss_reflected', outcome: 'static_only' },
+          { siteId: 'adv-2', vulnClass: 'sqli', outcome: 'static_only' },
+          { siteId: 'miss-1', vulnClass: 'bola', outcome: 'missed' },
+        ],
+        provenance: { floor: 0, agent_only: 0, chain_from_floor: 0 },
+      }
+      writeFileSync(join(root, 'summary.json'), JSON.stringify([card]))
+      const run = ingestFromDirs([root], {}).runs[0]
+      assert.ok(run)
+      assert.equal(run.confirmedKeys.length, 0)
+      assert.equal(run.advisories, 2)
+      assert.equal(run.contractLeaks, 0)
+      assert.equal(run.precision, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('report-level provenance counts are accepted without finding-level rows', () => {
+    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    try {
+      const card: ScorecardLike = {
+        app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
+        targets: TARGETS, confirmed: 2, recall: 2 / TARGETS, precision: 1,
+        vulns: vulnsFor('acme-saas', 2),
+        provenance: { floor: 1, agent_only: 1, chain_from_floor: 0 },
+      }
+      writeFileSync(join(root, 'summary.json'), JSON.stringify([card]))
+      const run = ingestFromDirs([root], {}).runs[0]
+      assert.ok(run)
+      assert.equal(run.provenanceComplete, true)
+      assert.deepEqual(run.provenance, { floor: 1, agentOnly: 1, chainFromFloor: 0 })
+      assert.equal(run.provenanceSource, 'report-counts')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

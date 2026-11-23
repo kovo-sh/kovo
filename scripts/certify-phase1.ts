@@ -19,13 +19,19 @@
  *                           targets by (origin, normalizedRoute, vulnClass, mutatedInput) when
  *                           the report exposes route/mutation; otherwise by site id. The union
  *                           across independent runs is reported separately as coverage.
- *   agentic_incremental_lift= total_product_recall - floor_recall, per app and aggregate.
+ *   agentic_incremental_lift= provenance-derived: median per-run (agent_only + chain_from_floor) /
+ *                           targets. If any unified report omits provenance the metric is
+ *                           "unmeasured" and the completeness criterion fails (never inferred).
  *   floor_preservation_ratio= floorConfirmedInUnified / floorStandalone (median). The unified
  *                           floor count comes from the run's `deterministic_lane.metrics`
  *                           event / meta summary; the standalone baseline is the floor median.
- *   precision               worst-run precision across every realism cell (must be 100%).
+ *   precision               worst-run confirmed precision across every realism cell (must be
+ *                           100%). Only `verificationStatus === 'confirmed'` findings are TP;
+ *                           static_only/open_proof_gap items are advisories, and a static-only
+ *                           item inside confirmed findings is a contract leak counted as FP.
  *   leads invariant         floorLeadsEmitted > 0 => floorLeadsConsumed > 0.
- *   reason-bench            floor 0/28; agentic >= 25% at worst-run 100% precision.
+ *   reason-bench            floor 0/28 is mandatory Phase 1. The agentic >=25% baseline is
+ *                           Phase 3 and is reported informationally (non-blocking).
  *
  * Verdicts: PASS only when every criterion passes its stated threshold. Artifacts:
  * `certificate.json` (machine readable) + `certificate.md` (summary). Exit 1 on FAIL.
@@ -93,6 +99,10 @@ export interface VulnLike {
   endpoint?: string
   mutatedInput?: unknown
   mutated?: unknown
+  verificationStatus?: string
+  verificationTier?: string
+  provenance?: unknown
+  findingStatus?: string
   matchedFindingIds?: string[]
 }
 
@@ -109,7 +119,34 @@ export interface ScorecardLike {
   decoyFalsePositives?: number
   unmatchedFalsePositives?: number
   vulns?: VulnLike[]
+  findings?: unknown[]
+  advisories?: unknown[]
+  advisoryFindings?: unknown[]
+  provenance?: unknown
+  provenanceCounts?: unknown
   llm?: string
+}
+
+export type FindingProvenance = 'floor' | 'agent_only' | 'chain_from_floor'
+
+export interface ProvenanceCounts {
+  floor: number
+  agentOnly: number
+  chainFromFloor: number
+}
+
+/** One submitted finding parsed from a report/DB; advisory items never enter recall. */
+export interface FindingRecord {
+  id: string
+  submittedStatus: string | null
+  verificationStatus: string | null
+  verificationTier: string | null
+  provenance: FindingProvenance | null
+  identity: string
+  submittedConfirmed: boolean
+  verifiedConfirmed: boolean
+  advisory: boolean
+  contractLeak: boolean
 }
 
 export interface FloorMetrics {
@@ -136,6 +173,11 @@ export interface RealismRun {
   unmatchedFalsePositives: number
   confirmedKeys: string[]
   floor: FloorMetrics
+  provenance: ProvenanceCounts | null
+  provenanceComplete: boolean
+  provenanceSource: string
+  advisories: number
+  contractLeaks: number
   notes: string[]
 }
 
@@ -295,6 +337,222 @@ export function confirmedTargetKeys(vulns: VulnLike[], app: string): string[] {
   return [...keys]
 }
 
+// ---------------------------------------------------------------------------------------------
+// Finding provenance / confirmed-vs-advisory contract
+// ---------------------------------------------------------------------------------------------
+
+const CONFIRMED_STATUSES = new Set(['confirmed', 'runtime_confirmed'])
+/** Anything the engine has not runtime-confirmed lives in advisories, never recall/precision TP. */
+const ADVISORY_STATUSES = new Set(['static_verified', 'static_only', 'open_proof_gap', 'proposed', 'ruled_out'])
+export const ADVISORY_NOISE_CAP_PER_APP = 10
+
+export function normalizeProvenance(raw: unknown): FindingProvenance | null {
+  if (typeof raw !== 'string') return null
+  const value = raw.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (value === 'floor') return 'floor'
+  if (value === 'agent_only' || value === 'agentonly') return 'agent_only'
+  if (value === 'chain_from_floor' || value === 'chainfromfloor') return 'chain_from_floor'
+  return null
+}
+
+function statusOf(raw: unknown): string | null {
+  return typeof raw === 'string' && raw.trim() ? raw.trim().toLowerCase() : null
+}
+
+function numberField(source: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return null
+}
+
+/** Report/DB provenance summary: `{ floor, agent_only, chain_from_floor }` (counts). */
+export function readProvenanceCounts(source: unknown): ProvenanceCounts | null {
+  if (!isRecord(source)) return null
+  const floor = numberField(source, ['floor', 'floorConfirmed', 'floor_confirmed'])
+  const agentOnly = numberField(source, ['agentOnly', 'agent_only', 'agenticOnly', 'agentic_only'])
+  const chainFromFloor = numberField(source, ['chainFromFloor', 'chain_from_floor', 'chain'])
+  if (floor === null && agentOnly === null && chainFromFloor === null) return null
+  return { floor: floor ?? 0, agentOnly: agentOnly ?? 0, chainFromFloor: chainFromFloor ?? 0 }
+}
+
+function findingIdentity(raw: Record<string, unknown>, fallback: string): string {
+  const site = asString(raw.targetSiteId) ?? asString(raw.target_site_id) ?? asString(raw.siteId)
+  if (site) return `site:${site}`
+  const origin = asString(raw.origin)
+  const route = asString(raw.normalizedRoute) ?? asString(raw.route) ?? asString(raw.endpoint)
+  if (origin && route) {
+    return targetKey({
+      siteId: fallback,
+      origin,
+      route,
+      ...(asString(raw.normalizedRoute) ? { normalizedRoute: asString(raw.normalizedRoute)! } : {}),
+      vulnClass: asString(raw.vulnClass) ?? asString(raw.cwe) ?? undefined,
+      ...(raw.mutatedInput !== undefined ? { mutatedInput: raw.mutatedInput } : {}),
+    }, '')
+  }
+  return `finding:${fallback}`
+}
+
+/**
+ * Parse one submitted finding. `verificationStatus` (or the legacy status/tier pair) decides
+ * whether it is runtime-confirmed; static-only/open-proof-gap items never become TP.
+ */
+export function parseFindingRecord(raw: Record<string, unknown>, options: { forceAdvisory?: boolean; fallbackId?: string } = {}): FindingRecord {
+  const id = asString(raw.id) ?? asString(raw.findingId) ?? options.fallbackId ?? 'unknown'
+  const submittedStatus = statusOf(raw.status ?? raw.findingStatus ?? raw.submittedStatus)
+  const verificationStatus = statusOf(raw.verificationStatus ?? raw.verification_status)
+  const verificationTier = statusOf(raw.verificationTier ?? raw.verification_tier)
+  const provenance = normalizeProvenance(raw.provenance ?? raw.findingProvenance ?? raw.finding_provenance)
+  const advisory = options.forceAdvisory === true
+    || (verificationStatus !== null && ADVISORY_STATUSES.has(verificationStatus))
+    || (verificationTier !== null && ADVISORY_STATUSES.has(verificationTier))
+    || (submittedStatus !== null && ADVISORY_STATUSES.has(submittedStatus))
+  const submittedConfirmed = submittedStatus !== null && CONFIRMED_STATUSES.has(submittedStatus)
+  const verifiedConfirmed = !advisory
+    && (CONFIRMED_STATUSES.has(verificationStatus ?? '')
+      || (verificationStatus === null && CONFIRMED_STATUSES.has(verificationTier ?? ''))
+      || (verificationStatus === null && verificationTier === null && submittedConfirmed))
+  return {
+    id,
+    submittedStatus,
+    verificationStatus,
+    verificationTier,
+    provenance,
+    identity: findingIdentity(raw, id),
+    submittedConfirmed,
+    verifiedConfirmed,
+    advisory,
+    contractLeak: submittedConfirmed && advisory,
+  }
+}
+
+function recordArray(source: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(source)) return []
+  return source.filter(isRecord)
+}
+
+export interface RunEvidence {
+  provenance: ProvenanceCounts | null
+  provenanceComplete: boolean
+  provenanceSource: string
+  advisories: number
+  contractLeaks: number
+  precision: number
+  registeredFindings: number
+}
+
+/**
+ * Merge the run's finding-level contract into provenance counts, advisory noise and
+ * confirmed precision. No inference: a missing provenance field leaves the metric unmeasured.
+ */
+export function buildRunEvidence(
+  card: ScorecardLike,
+  meta: Record<string, unknown> | null,
+  dbFindings: FindingRecord[],
+): RunEvidence {
+  const records = new Map<string, FindingRecord>()
+  const add = (record: FindingRecord): void => {
+    if (!records.has(record.identity)) records.set(record.identity, record)
+  }
+
+  let source = 'none'
+  const reportFindings = recordArray(card.findings)
+  const metaFindings = recordArray(meta?.findings)
+  if (reportFindings.length) {
+    source = 'report-findings'
+    reportFindings.forEach((raw, index) => add(parseFindingRecord(raw, { fallbackId: `${card.app}-f${index}` })))
+  } else if (metaFindings.length) {
+    source = 'meta-findings'
+    metaFindings.forEach((raw, index) => add(parseFindingRecord(raw, { fallbackId: `${card.app}-f${index}` })))
+  } else if (dbFindings.length) {
+    source = 'events-db'
+    dbFindings.forEach(record => add(record))
+  }
+
+  // Advisory arrays are explicit; never let their entries masquerade as TP.
+  for (const [index, raw] of [...recordArray(card.advisories), ...recordArray(card.advisoryFindings), ...recordArray(meta?.advisories)].entries()) {
+    add(parseFindingRecord(raw, { forceAdvisory: true, fallbackId: `${card.app}-advisory-${index}` }))
+  }
+
+  // Enriched scorecard site rows can carry the same contract fields.
+  const vulns = Array.isArray(card.vulns) ? card.vulns.filter(isRecord) as unknown as VulnLike[] : []
+  vulns.forEach((vuln, index) => {
+    const enriched = vuln.verificationStatus !== undefined || vuln.verificationTier !== undefined
+      || vuln.provenance !== undefined || vuln.findingStatus !== undefined || vuln.outcome === 'static_only'
+    if (!enriched) return
+    const submitted = vuln.findingStatus ?? (vuln.outcome === 'confirmed' ? 'confirmed' : vuln.outcome)
+    add(parseFindingRecord({
+      ...vuln,
+      status: submitted,
+      ...(vuln.verificationStatus !== undefined ? { verificationStatus: vuln.verificationStatus } : {}),
+      ...(vuln.verificationTier !== undefined ? { verificationTier: vuln.verificationTier } : {}),
+      ...(vuln.provenance !== undefined ? { provenance: vuln.provenance } : {}),
+    }, { forceAdvisory: vuln.outcome === 'static_only', fallbackId: `${card.app}-vuln-${index}` }))
+  })
+
+  const allRecords = [...records.values()]
+  const verified = allRecords.filter(record => record.verifiedConfirmed && !record.contractLeak)
+  const verifiedIdentities = new Map<string, FindingProvenance | null>()
+  for (const record of verified) if (!verifiedIdentities.has(record.identity)) verifiedIdentities.set(record.identity, record.provenance)
+  const derived: ProvenanceCounts = { floor: 0, agentOnly: 0, chainFromFloor: 0 }
+  let missingProvenance = 0
+  for (const provenance of verifiedIdentities.values()) {
+    if (provenance === 'floor') derived.floor += 1
+    else if (provenance === 'agent_only') derived.agentOnly += 1
+    else if (provenance === 'chain_from_floor') derived.chainFromFloor += 1
+    else missingProvenance += 1
+  }
+
+  const explicit = readProvenanceCounts(card.provenance)
+    ?? readProvenanceCounts(card.provenanceCounts)
+    ?? readProvenanceCounts(meta?.provenance)
+    ?? readProvenanceCounts(meta?.provenanceCounts)
+  let provenance: ProvenanceCounts | null = null
+  let provenanceComplete = false
+  const explicitComplete = explicit !== null
+    && explicit.floor + explicit.agentOnly + explicit.chainFromFloor >= card.confirmed
+  if (explicit && explicitComplete) {
+    provenance = explicit
+    provenanceComplete = true
+    source = 'report-counts'
+  } else if (allRecords.length) {
+    provenance = derived
+    const classified = derived.floor + derived.agentOnly + derived.chainFromFloor
+    provenanceComplete = missingProvenance === 0 && classified >= card.confirmed
+  } else if (explicit) {
+    provenance = explicit
+    source = 'report-counts'
+    provenanceComplete = false
+  }
+
+  const advisoryRecords = allRecords.filter(record => record.advisory)
+  const leakRecords = allRecords.filter(record => record.contractLeak)
+  const explicitAdvisories = typeof card.advisories === 'number'
+    ? card.advisories
+    : (Array.isArray(card.advisories) ? card.advisories.length + recordArray(card.advisoryFindings).length : null)
+  const advisories = advisoryRecords.length > 0 ? advisoryRecords.length : (explicitAdvisories ?? 0)
+
+  let precision = asNumber(card.precision, 1)
+  if (allRecords.length) {
+    // The grader's confirmed target count is the authoritative TP set; contract leaks add FP.
+    const tp = card.confirmed
+    const fp = leakRecords.length + asNumber(card.decoyFalsePositives) + asNumber(card.unmatchedFalsePositives)
+    precision = tp + fp > 0 ? tp / (tp + fp) : 1
+  }
+
+  return {
+    provenance,
+    provenanceComplete,
+    provenanceSource: source,
+    advisories,
+    contractLeaks: leakRecords.length,
+    precision,
+    registeredFindings: allRecords.length,
+  }
+}
+
 /** Union of confirmed targets across independent runs, deduped by the identity above. */
 export function unionConfirmedTargets(runs: RealismRun[]): string[] {
   const keys = new Set<string>()
@@ -404,7 +662,12 @@ function collectFiles(root: string, accept: (path: string) => boolean, maxDepth:
   return out
 }
 
-function readMetricsFromDatabase(dbPath: string): FloorMetrics | null {
+interface RunDatabaseEvidence {
+  floor: FloorMetrics
+  findings: FindingRecord[]
+}
+
+function readMetricsFromDatabase(dbPath: string): RunDatabaseEvidence | null {
   let db: DatabaseSync | null = null
   try {
     db = new DatabaseSync(dbPath, { readOnly: true })
@@ -418,18 +681,50 @@ function readMetricsFromDatabase(dbPath: string): FloorMetrics | null {
       ).get() as { n?: unknown } | undefined
       if (typeof row?.n === 'number') emitted = row.n
     } catch { /* facts/data shape unavailable */ }
-    if (!latest) return emitted === null ? null : {
-      floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: emitted, source: 'events-db',
+
+    let floor: FloorMetrics | null = null
+    if (!latest) {
+      if (emitted !== null) {
+        floor = {
+          floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: emitted, source: 'events-db',
+        }
+      }
+    } else {
+      const detail = typeof latest.detail === 'string' ? JSON.parse(latest.detail) as unknown : latest.detail
+      if (isRecord(detail)) {
+        floor = {
+          floorConfirmed: typeof detail.floorConfirmed === 'number' ? detail.floorConfirmed : null,
+          floorLeadsConsumed: typeof detail.floorLeadsConsumed === 'number' ? detail.floorLeadsConsumed : null,
+          floorLeadsEmitted: typeof detail.floorLeadsEmitted === 'number'
+            ? detail.floorLeadsEmitted
+            : emitted,
+          source: 'events-db',
+        }
+      }
     }
-    const detail = typeof latest.detail === 'string' ? JSON.parse(latest.detail) as unknown : latest.detail
-    if (!isRecord(detail)) return null
+
+    const findings: FindingRecord[] = []
+    try {
+      const columns = db.prepare("select name from pragma_table_info('findings')").all() as Array<{ name?: unknown }>
+      const names = new Set(columns.map(row => String(row.name)))
+      const extras = ['provenance', 'verification_status', 'verification_tier'].filter(name => names.has(name))
+      const select = ['finding', ...extras].join(', ')
+      const rows = db.prepare(`select ${select} from findings`).all() as Array<Record<string, unknown>>
+      rows.forEach((row, index) => {
+        const raw = typeof row.finding === 'string' ? JSON.parse(row.finding) as unknown : row.finding
+        if (!isRecord(raw)) return
+        const merged: Record<string, unknown> = { ...raw }
+        if (merged.provenance == null && row.provenance != null) merged.provenance = row.provenance
+        if (merged.verificationStatus == null && row.verification_status != null) merged.verificationStatus = row.verification_status
+        if (merged.verificationTier == null && row.verification_tier != null) merged.verificationTier = row.verification_tier
+        findings.push(parseFindingRecord(merged, { fallbackId: `${dbPath}#${index}` }))
+      })
+    } catch { /* findings table/columns unavailable */ }
+
+    if (!floor && !findings.length) return null
     return {
-      floorConfirmed: typeof detail.floorConfirmed === 'number' ? detail.floorConfirmed : null,
-      floorLeadsConsumed: typeof detail.floorLeadsConsumed === 'number' ? detail.floorLeadsConsumed : null,
-      floorLeadsEmitted: typeof detail.floorLeadsEmitted === 'number'
-        ? detail.floorLeadsEmitted
-        : emitted,
-      source: 'events-db',
+      floor: floor ?? { floorConfirmed: null, floorLeadsConsumed: null, floorLeadsEmitted: null, source: 'events-db' },
+      findings,
     }
   } catch {
     return null
@@ -438,15 +733,18 @@ function readMetricsFromDatabase(dbPath: string): FloorMetrics | null {
   }
 }
 
-function resolveFloorMetrics(dir: string, card: ScorecardLike, meta: Record<string, unknown> | null): FloorMetrics {
-  const fromMeta = metaFloorMetrics(meta, card)
+function resolveRunDatabase(dir: string, card: ScorecardLike): RunDatabaseEvidence | null {
   const dbPath = findRunDatabase(dir, cellSlug(card.app, card.seed, card.mode ?? 'grey-box'))
-  const fromDb = dbPath ? readMetricsFromDatabase(dbPath) : null
+  return dbPath ? readMetricsFromDatabase(dbPath) : null
+}
+
+function mergeFloorMetrics(meta: Record<string, unknown> | null, card: ScorecardLike, db: RunDatabaseEvidence | null): FloorMetrics {
+  const fromMeta = metaFloorMetrics(meta, card)
   return {
-    floorConfirmed: fromMeta.floorConfirmed ?? fromDb?.floorConfirmed ?? null,
-    floorLeadsConsumed: fromMeta.floorLeadsConsumed ?? fromDb?.floorLeadsConsumed ?? null,
-    floorLeadsEmitted: fromMeta.floorLeadsEmitted ?? fromDb?.floorLeadsEmitted ?? null,
-    source: fromMeta.source !== 'none' ? fromMeta.source : (fromDb?.source ?? 'none'),
+    floorConfirmed: fromMeta.floorConfirmed ?? db?.floor.floorConfirmed ?? null,
+    floorLeadsConsumed: fromMeta.floorLeadsConsumed ?? db?.floor.floorLeadsConsumed ?? null,
+    floorLeadsEmitted: fromMeta.floorLeadsEmitted ?? db?.floor.floorLeadsEmitted ?? null,
+    source: fromMeta.source !== 'none' ? fromMeta.source : (db?.floor.source ?? 'none'),
   }
 }
 
@@ -510,6 +808,8 @@ function realismRunFromCard(
   const vulns = Array.isArray(card.vulns) ? card.vulns.filter(isRecord) as unknown as VulnLike[] : []
   const confirmedKeys = confirmedTargetKeys(vulns, card.app)
   const recall = asNumber(card.recall, ratio(card.confirmed, card.targets))
+  const db = resolveRunDatabase(dir, card)
+  const evidence = buildRunEvidence(card, meta, db?.findings ?? [])
   return {
     id: `${dir}#${file ?? 'summary'}#${cellSlug(card.app, card.seed, card.mode ?? 'grey-box')}`,
     dir,
@@ -522,11 +822,16 @@ function realismRunFromCard(
     targets: card.targets,
     confirmed: card.confirmed,
     recall,
-    precision: asNumber(card.precision, 1),
+    precision: evidence.precision,
     decoyFalsePositives: asNumber(card.decoyFalsePositives),
     unmatchedFalsePositives: asNumber(card.unmatchedFalsePositives),
     confirmedKeys,
-    floor: resolveFloorMetrics(dir, card, meta),
+    floor: mergeFloorMetrics(meta, card, db),
+    provenance: evidence.provenance,
+    provenanceComplete: evidence.provenanceComplete,
+    provenanceSource: evidence.provenanceSource,
+    advisories: evidence.advisories,
+    contractLeaks: evidence.contractLeaks,
     notes,
   }
 }
@@ -688,6 +993,25 @@ export interface UnifiedAppStats {
   coverageRecall: number
 }
 
+export interface ProvenanceSummary {
+  runs: number
+  completeRuns: number
+  /** Median per-run counts over runs that expose provenance. */
+  floor: number
+  agentOnly: number
+  chainFromFloor: number
+  /** Median per-run `agent_only + chain_from_floor`; null when any run is unclassified. */
+  incremental: number | null
+}
+
+export interface InformationalMetric {
+  id: string
+  description: string
+  target: string
+  observed: string
+  status: 'MEETS' | 'BELOW' | 'UNMEASURED'
+}
+
 export interface SplitStats {
   floor: { perApp: Record<string, RunStats | null>; confirmed: number; targets: number; recall: number }
   unified: {
@@ -721,7 +1045,22 @@ export interface Certificate {
   }
   floor: { dev: SplitStats['floor']; heldout: SplitStats['floor']; spread: Record<string, number | null> }
   unified: { dev: SplitStats['unified']; heldout: SplitStats['unified'] }
-  lift: { dev: SplitStats['lift']; heldout: SplitStats['lift'] }
+  lift: { dev: SplitStats['lift']; heldout: SplitStats['lift']; source: 'provenance' }
+  provenance: {
+    complete: boolean
+    totalRuns: number
+    completeRuns: number
+    perApp: Record<string, { dev: ProvenanceSummary | null; heldout: ProvenanceSummary | null }>
+    aggregate: { dev: ProvenanceSummary | null; heldout: ProvenanceSummary | null }
+  }
+  advisories: {
+    noiseCapPerApp: number
+    perApp: Record<string, { dev: number; heldout: number; devWorst: number; heldoutWorst: number; total: number }>
+    total: number
+    overCap: string[]
+    contractLeaks: number
+  }
+  informational: InformationalMetric[]
   preservation: {
     median: number | null
     ratios: Array<{ app: string; seedSet: SeedSet; ratio: number; floorConfirmed: number; floorStandalone: number }>
@@ -776,17 +1115,24 @@ function runStats(runs: RealismRun[]): RunStats | null {
   }
 }
 
+function incrementalCount(run: RealismRun): number | null {
+  if (!run.provenance || !run.provenanceComplete) return null
+  return run.provenance.agentOnly + run.provenance.chainFromFloor
+}
+
 function splitStats(floorRuns: RealismRun[], unifiedRuns: RealismRun[], apps: string[]): SplitStats {
   const floorPerApp: Record<string, RunStats | null> = {}
   const unifiedPerApp: SplitStats['unified']['perApp'] = {}
   const liftPerApp: Record<string, number | null> = {}
   let floorConfirmed = 0
   let floorTargets = 0
-  let comparableFloorConfirmed = 0
-  let comparableFloorTargets = 0
   let unifiedConfirmed = 0
   let unifiedTargets = 0
   let coverageConfirmed = 0
+  let aggregateIncremental = 0
+  let aggregateIncrementalTargets = 0
+  let unifiedApps = 0
+  let incrementalComplete = true
 
   for (const app of apps) {
     const appFloor = floorRuns.filter(run => run.app === app)
@@ -801,6 +1147,7 @@ function splitStats(floorRuns: RealismRun[], unifiedRuns: RealismRun[], apps: st
       liftPerApp[app] = null
       continue
     }
+    unifiedApps += 1
     const keys = unionConfirmedTargets(appUnified)
     const targets = maxTargets(appUnified)
     const perRunCounts = appUnified.map(run => new Set(run.confirmedKeys).size)
@@ -820,16 +1167,23 @@ function splitStats(floorRuns: RealismRun[], unifiedRuns: RealismRun[], apps: st
     unifiedConfirmed += medianConfirmed
     unifiedTargets += targets
     coverageConfirmed += keys.length
-    if (stats) {
-      comparableFloorConfirmed += stats.confirmed
-      comparableFloorTargets += stats.targets
+
+    const increments = appUnified.map(incrementalCount)
+    const medianIncrement = increments.every(value => value !== null)
+      ? median(increments as number[])
+      : null
+    if (medianIncrement === null) {
+      liftPerApp[app] = null
+      incrementalComplete = false
+    } else {
+      liftPerApp[app] = medianIncrement / targets
+      aggregateIncremental += medianIncrement
+      aggregateIncrementalTargets += targets
     }
-    liftPerApp[app] = stats ? medianRecall - stats.recall : null
   }
 
   const floorRecall = ratio(floorConfirmed, floorTargets)
   const unifiedRecall = ratio(unifiedConfirmed, unifiedTargets)
-  const comparableFloorRecall = ratio(comparableFloorConfirmed, comparableFloorTargets)
   return {
     floor: { perApp: floorPerApp, confirmed: floorConfirmed, targets: floorTargets, recall: floorRecall },
     unified: {
@@ -842,10 +1196,32 @@ function splitStats(floorRuns: RealismRun[], unifiedRuns: RealismRun[], apps: st
     },
     lift: {
       perApp: liftPerApp,
-      aggregate: unifiedTargets > 0 && comparableFloorTargets > 0 ? unifiedRecall - comparableFloorRecall : null,
+      aggregate: incrementalComplete && unifiedApps > 0 && aggregateIncrementalTargets > 0
+        ? aggregateIncremental / aggregateIncrementalTargets
+        : null,
     },
   }
 }
+
+function provenanceSummary(runs: RealismRun[]): ProvenanceSummary | null {
+  const withProvenance = runs.filter(run => run.provenance !== null)
+  if (!withProvenance.length) return null
+  const floor = median(withProvenance.map(run => run.provenance!.floor)) ?? 0
+  const agentOnly = median(withProvenance.map(run => run.provenance!.agentOnly)) ?? 0
+  const chainFromFloor = median(withProvenance.map(run => run.provenance!.chainFromFloor)) ?? 0
+  const complete = withProvenance.filter(run => run.provenanceComplete)
+  const increments = complete.map(run => run.provenance!.agentOnly + run.provenance!.chainFromFloor)
+  const allComplete = complete.length === runs.length
+  return {
+    runs: runs.length,
+    completeRuns: complete.length,
+    floor,
+    agentOnly,
+    chainFromFloor,
+    incremental: allComplete ? (median(increments) ?? 0) : null,
+  }
+}
+
 
 function aggregateReason(cells: ReasonCellLike[]): { confirmed: number; targets: number; recall: number | null; precision: number | null; decoyFP: number; unmatchedFP: number } {
   if (!cells.length) return { confirmed: 0, targets: 0, recall: null, precision: null, decoyFP: 0, unmatchedFP: 0 }
@@ -1025,10 +1401,55 @@ export function evaluateCertification(
 
   const reasonFloorOk = reasonFloor.confirmed === thresholds.reasonFloorConfirmed
     && reasonFloor.targets === thresholds.reasonTargets
-  const reasonAgenticOk = reasonAgentic.recall !== null
+  const reasonAgenticMeets = reasonAgentic.recall !== null
     && reasonAgentic.recall >= thresholds.reasonAgenticMin
     && reasonAgentic.precision !== null
     && reasonAgentic.precision >= thresholds.worstPrecision
+
+  // Provenance is mandatory for the lift metric: never infer floor/agent attribution.
+  const unifiedAll = [...unifiedDev, ...unifiedHeldout]
+  const fullyClassified = unifiedAll.filter(run => run.provenance !== null && run.provenanceComplete)
+  const provenanceComplete = unifiedAll.length > 0 && fullyClassified.length === unifiedAll.length
+  const provenancePerApp: Certificate['provenance']['perApp'] = {}
+  for (const app of apps) {
+    provenancePerApp[app] = {
+      dev: provenanceSummary(unifiedDev.filter(run => run.app === app)),
+      heldout: provenanceSummary(unifiedHeldout.filter(run => run.app === app)),
+    }
+  }
+
+  // Advisories (static_only / open_proof_gap) are a separate noise budget, never recall.
+  const advisoryPerApp: Certificate['advisories']['perApp'] = {}
+  const overCap: string[] = []
+  let advisoryTotal = 0
+  for (const app of apps) {
+    const devAdvisory = unifiedDev.filter(run => run.app === app).map(run => run.advisories)
+    const heldAdvisory = unifiedHeldout.filter(run => run.app === app).map(run => run.advisories)
+    const devWorst = devAdvisory.length ? Math.max(...devAdvisory) : 0
+    const heldWorst = heldAdvisory.length ? Math.max(...heldAdvisory) : 0
+    const total = sum(devAdvisory) + sum(heldAdvisory)
+    advisoryPerApp[app] = {
+      dev: sum(devAdvisory),
+      heldout: sum(heldAdvisory),
+      devWorst,
+      heldoutWorst: heldWorst,
+      total,
+    }
+    advisoryTotal += total
+    if (devWorst > ADVISORY_NOISE_CAP_PER_APP || heldWorst > ADVISORY_NOISE_CAP_PER_APP) overCap.push(app)
+  }
+  const contractLeaks = sum(unifiedAll.map(run => run.contractLeaks))
+  const worstAdvisory = Math.max(0, ...Object.values(advisoryPerApp).map(row => Math.max(row.devWorst, row.heldoutWorst)))
+
+  const informational: InformationalMetric[] = [{
+    id: 'reason_bench_agentic_baseline',
+    description: 'Reason-bench agentic baseline (Phase 3; non-blocking in Phase 1)',
+    target: `>= ${(thresholds.reasonAgenticMin * 100).toFixed(0)}% at worst-run ${(thresholds.worstPrecision * 100).toFixed(0)}% precision`,
+    observed: reasonAgenticCells.length
+      ? `${reasonAgentic.recall === null ? 'unmeasured' : pct(reasonAgentic.recall)} (${reasonAgentic.confirmed}/${reasonAgentic.targets}), worst precision ${reasonAgentic.precision === null ? 'n/a' : reasonAgentic.precision.toFixed(3)}`
+      : 'unmeasured (no agentic reason cells ingested)',
+    status: !reasonAgenticCells.length ? 'UNMEASURED' : (reasonAgenticMeets ? 'MEETS' : 'BELOW'),
+  }]
 
   const criteria: Criterion[] = [
     criterion(
@@ -1054,16 +1475,16 @@ export function evaluateCertification(
     ),
     criterion(
       'agentic_lift_dev',
-      'Aggregate agentic incremental lift on dev (total product recall - floor recall)',
+      'Aggregate provenance-derived lift on dev (agent_only + chain_from_floor)',
       `>= +${(thresholds.liftDevMin * 100).toFixed(0)}pp`,
-      liftDev === null ? 'unmeasured' : `${liftDev >= 0 ? '+' : ''}${(liftDev * 100).toFixed(1)}pp`,
+      liftDev === null ? 'unmeasured (provenance missing/incomplete)' : `${liftDev >= 0 ? '+' : ''}${(liftDev * 100).toFixed(1)}pp`,
       liftDevOk,
     ),
     criterion(
       'agentic_lift_heldout',
-      'Aggregate agentic incremental lift on salted held-out',
+      'Aggregate provenance-derived lift on salted held-out (agent_only + chain_from_floor)',
       `>= +${(thresholds.liftHeldoutMin * 100).toFixed(0)}pp`,
-      liftHeldout === null ? 'unmeasured' : `${liftHeldout >= 0 ? '+' : ''}${(liftHeldout * 100).toFixed(1)}pp`,
+      liftHeldout === null ? 'unmeasured (provenance missing/incomplete)' : `${liftHeldout >= 0 ? '+' : ''}${(liftHeldout * 100).toFixed(1)}pp`,
       liftHeldoutOk,
     ),
     criterion(
@@ -1090,11 +1511,25 @@ export function evaluateCertification(
       reasonFloorOk,
     ),
     criterion(
-      'reason_bench_agentic',
-      'Reason-bench agentic recall at worst-run 100% precision',
-      `>= ${(thresholds.reasonAgenticMin * 100).toFixed(0)}% and worst precision == ${thresholds.worstPrecision}`,
-      `${reasonAgentic.recall === null ? 'unmeasured' : pct(reasonAgentic.recall)} (${reasonAgentic.confirmed}/${reasonAgentic.targets}), worst precision ${reasonAgentic.precision === null ? 'n/a' : reasonAgentic.precision.toFixed(3)}`,
-      reasonAgenticOk,
+      'provenance_completeness',
+      'Every unified confirmed finding exposes provenance (floor | agent_only | chain_from_floor)',
+      '100% of unified runs fully classified',
+      `${fullyClassified.length}/${unifiedAll.length} run(s) fully classified`,
+      provenanceComplete,
+    ),
+    criterion(
+      'advisory_noise',
+      'Advisories (static_only / open_proof_gap) stay outside confirmed recall/precision',
+      `<= ${ADVISORY_NOISE_CAP_PER_APP} per app, worst run`,
+      `${advisoryTotal} total, worst ${worstAdvisory}${overCap.length ? `; over cap: ${overCap.join(', ')}` : ''}`,
+      overCap.length === 0,
+    ),
+    criterion(
+      'confirmed_contract',
+      'A static-only/open-proof-gap finding never appears inside confirmed findings',
+      '0 contract leaks',
+      `${contractLeaks} leak(s)`,
+      contractLeaks === 0,
     ),
   ]
   if (options.checkMatrix !== false) {
@@ -1134,7 +1569,25 @@ export function evaluateCertification(
     },
     floor: { dev: dev.floor, heldout: heldout.floor, spread },
     unified: { dev: dev.unified, heldout: heldout.unified },
-    lift: { dev: dev.lift, heldout: heldout.lift },
+    lift: { dev: dev.lift, heldout: heldout.lift, source: 'provenance' },
+    provenance: {
+      complete: provenanceComplete,
+      totalRuns: unifiedAll.length,
+      completeRuns: fullyClassified.length,
+      perApp: provenancePerApp,
+      aggregate: {
+        dev: provenanceSummary(unifiedDev),
+        heldout: provenanceSummary(unifiedHeldout),
+      },
+    },
+    advisories: {
+      noiseCapPerApp: ADVISORY_NOISE_CAP_PER_APP,
+      perApp: advisoryPerApp,
+      total: advisoryTotal,
+      overCap,
+      contractLeaks,
+    },
+    informational,
     preservation: {
       median: preservationMedian,
       ratios: preservationRatios,
@@ -1192,7 +1645,7 @@ export function renderCertificateMarkdown(cert: Certificate): string {
   lines.push(`- mode: \`${cert.mode}\``)
   lines.push(`- generated: ${cert.generatedAt}`)
   lines.push(`- git: \`${cert.gitSha}\``)
-  lines.push(`- realism cells: ${cert.precision.runs}, reason cells: ${cert.reason.agentic.cells}`)
+  lines.push(`- realism cells: ${cert.precision.runs}, reason agentic baseline cells: ${cert.reason.agentic.cells}`)
   lines.push('')
   lines.push('## Criteria')
   lines.push('')
@@ -1216,8 +1669,41 @@ export function renderCertificateMarkdown(cert: Certificate): string {
   }
   lines.push(`| **aggregate** | ${cert.floor.dev.confirmed}/${cert.floor.dev.targets} ${pct(cert.floor.dev.recall)} | ${cert.floor.heldout.confirmed}/${cert.floor.heldout.targets} ${pct(cert.floor.heldout.recall)} | - |`)
   lines.push('')
+  lines.push('## Provenance of confirmed findings')
+  lines.push('')
+  lines.push(`Provenance completeness: **${cert.provenance.complete ? 'complete' : 'incomplete'}** (${cert.provenance.completeRuns}/${cert.provenance.totalRuns} unified runs fully classified).`)
+  lines.push('')
+  lines.push('| app | split | classified runs | floor | agent_only | chain_from_floor | incremental | provenanced lift |')
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |')
+  const fmtProvenance = (summary: ProvenanceSummary | null, lift: number | null | undefined) => {
+    if (!summary) return ['unmeasured', 'n/a', 'n/a', 'n/a', 'n/a', 'n/a']
+    return [
+      `${summary.completeRuns}/${summary.runs}`,
+      String(summary.floor),
+      String(summary.agentOnly),
+      String(summary.chainFromFloor),
+      summary.incremental === null ? 'unmeasured' : String(summary.incremental),
+      lift === null || lift === undefined ? 'n/a' : `${lift >= 0 ? '+' : ''}${(lift * 100).toFixed(1)}pp`,
+    ]
+  }
+  for (const app of cert.matrix.expected.apps) {
+    for (const [split, summary, lift] of [
+      ['dev', cert.provenance.perApp[app]?.dev ?? null, cert.lift.dev.perApp[app]],
+      ['held-out', cert.provenance.perApp[app]?.heldout ?? null, cert.lift.heldout.perApp[app]],
+    ] as const) {
+      lines.push(`| ${app} | ${split} | ${fmtProvenance(summary, lift).join(' | ')} |`)
+    }
+  }
+  for (const [split, summary, lift] of [
+    ['dev', cert.provenance.aggregate.dev, cert.lift.dev.aggregate],
+    ['held-out', cert.provenance.aggregate.heldout, cert.lift.heldout.aggregate],
+  ] as const) {
+    lines.push(`| **aggregate** | ${split} | ${fmtProvenance(summary, lift).join(' | ')} |`)
+  }
+  lines.push('')
   lines.push('## Unified product recall and lift')
   lines.push('')
+  lines.push('Lift is provenance-derived (`agent_only + chain_from_floor`), not `total - floor`.')
   lines.push('| app | dev total | dev lift | held-out total | held-out lift |')
   lines.push('| --- | --- | --- | --- | --- |')
   for (const app of cert.matrix.expected.apps) {
@@ -1239,11 +1725,27 @@ export function renderCertificateMarkdown(cert: Certificate): string {
   lines.push(`- worst-run precision: ${cert.precision.worst.toFixed(3)}; decoy FP ${cert.precision.decoyFalsePositives}; unmatched FP ${cert.precision.unmatchedFalsePositives}`)
   lines.push(`- leads invariant: ${cert.leads.violations.length} violation(s), ${cert.leads.unmeasuredRuns} unmeasured, ${cert.leads.checkedRuns} checked`)
   lines.push('')
-  lines.push('## Reason-bench')
+  lines.push('## Advisories (outside confirmed recall/precision)')
   lines.push('')
-  lines.push(`- floor: ${cert.reason.floor.confirmed}/${cert.reason.floor.targets}`)
-  lines.push(`- agentic: ${cert.reason.agentic.confirmed}/${cert.reason.agentic.targets} ${pct(cert.reason.agentic.recall)}`
-    + ` at worst-run precision ${cert.reason.agentic.worstPrecision === null ? 'n/a' : cert.reason.agentic.worstPrecision.toFixed(3)}`)
+  lines.push(`Noise cap: <= ${cert.advisories.noiseCapPerApp}/app on the worst run; total advisories ${cert.advisories.total}; contract leaks ${cert.advisories.contractLeaks}.`)
+  lines.push('')
+  lines.push('| app | dev | held-out | dev worst run | held-out worst run | over cap |')
+  lines.push('| --- | --- | --- | --- | --- | --- |')
+  for (const app of cert.matrix.expected.apps) {
+    const row = cert.advisories.perApp[app]
+    if (!row) continue
+    lines.push(`| ${app} | ${row.dev} | ${row.heldout} | ${row.devWorst} | ${row.heldoutWorst} | ${cert.advisories.overCap.includes(app) ? 'YES' : 'no'} |`)
+  }
+  lines.push('')
+  lines.push('## Reason-bench (mandatory floor)')
+  lines.push('')
+  lines.push(`- floor: ${cert.reason.floor.confirmed}/${cert.reason.floor.targets} (must be 0/${cert.thresholds.reasonTargets})`)
+  lines.push('')
+  lines.push('## Non-blocking reason baseline (Phase 3)')
+  lines.push('')
+  for (const item of cert.informational) {
+    lines.push(`- **${item.id}**: ${item.status} — ${item.observed} (target ${item.target}). ${item.description}`)
+  }
   lines.push('')
   if (cert.notes.length) {
     lines.push('## Notes')
@@ -1579,9 +2081,11 @@ Environment:
 
 Verdict thresholds:
   floor spread <= ${DEFAULT_THRESHOLDS.floorSpreadMax} target; preservation >= ${DEFAULT_THRESHOLDS.preservationMin};
-  worst precision == ${DEFAULT_THRESHOLDS.worstPrecision}; lift >= +${(DEFAULT_THRESHOLDS.liftDevMin * 100).toFixed(0)}pp dev /
-  +${(DEFAULT_THRESHOLDS.liftHeldoutMin * 100).toFixed(0)}pp held-out; reason floor 0/${DEFAULT_THRESHOLDS.reasonTargets};
-  reason agentic >= ${(DEFAULT_THRESHOLDS.reasonAgenticMin * 100).toFixed(0)}% at worst-run 100% precision.
+  worst confirmed precision == ${DEFAULT_THRESHOLDS.worstPrecision}; provenance complete;
+  provenance-derived lift >= +${(DEFAULT_THRESHOLDS.liftDevMin * 100).toFixed(0)}pp dev /
+  +${(DEFAULT_THRESHOLDS.liftHeldoutMin * 100).toFixed(0)}pp held-out; advisories <= ${ADVISORY_NOISE_CAP_PER_APP}/app;
+  reason floor 0/${DEFAULT_THRESHOLDS.reasonTargets}. The reason agentic ${(DEFAULT_THRESHOLDS.reasonAgenticMin * 100).toFixed(0)}%
+  baseline is Phase 3 and non-blocking.
 
 Artifacts (owner-only):
   <out-dir>/certificate.json   machine-readable certificate
