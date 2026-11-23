@@ -233,3 +233,16 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Notable:** the product floor is **not** a subset of the harness — 5 targets confirmed by the product had no procedural signal. Treat both scorecards as independent evidence.
 - **Caveat carried:** part of procedural parity comes from the conventional route wordlist, so every fix must be re-checked on a salted held-out seed.
 - **Owner streams:** surface-filter (`execution.ts`), engine-coverage (`deterministic-engine.ts`/`-specs.ts`), exec-approvals (race/batch grants, merged `7a6dd98`).
+
+### 2026-11-22 — agentic value-add consult (same model: deepseek-v4.1-flash)
+
+- **Diagnosis (reviewer):** the agentic layer is not failing on intelligence first; it is throughput-starved (2–4 assignments per 600 s, $0.14 of $2 spent) and blocked by raw-JSON spec friction (13 signals → 7 specs). Flash-class models do well on short, batched, typed micro-tasks and poorly on 30-turn open exploration plus hand-written jq.
+- **Top 5 changes (accepted, in rank order):**
+  1. Slice 3 concurrent deterministic lane + **specialists only on hard classes** (det_lead upgrades, business logic/workflow/second-order/race, chains, white-box suspects).
+  2. Batched micro-specialists: 8–10 turns, 75–90 s wall, 4–5 concurrent, `request_http_batch` 4–8 probes/turn, parallel read-only tool calls → target 18–28 assignments/cell.
+  3. Pre-packaged ≤1.5 KB evidence brief per assignment (routes/params/encodings/CSRF, harvested persona IDs, baseline status/keys, producer + read-back routes) so turn 1 probes instead of exploring.
+  4. **Typed proof-compiler tools** (`prove_authz_read_diff`, `prove_state_mutation_diff`, `prove_business_invariant`, `prove_canary_or_redirect`) that compile identifier-bound, proof-strength-compliant specs in TS instead of asking the model for raw JSON+jq; structured 1-turn repair feedback; hard settlement at N-2 turns.
+  5. Typed coordinator artifact registry (leaked IDs, token handles, second-order canaries, draft resources) + 4 explicit chain archetypes (leak→authz, token→BFLA, plant→trigger, create→skip/mutate).
+- **Measurement plan (accepted):** 6-cell A/B (`--no-llm` control vs agentic) across 3 apps × dev seed 1 + one salted held-out seed, plus one white-box cell; report net additive confirmed by class, precision/decoy FP, chains, assignments/cell, signal→spec rate, marginal $ per additive vuln. Default-ON bar: **≥ +8–10 pp additive** on both dev and held-out, ≥95% precision, chains ≥3/6, ≤$0.35/additive vuln.
+- **Kill switch (accepted):** if after all five changes additive lift stays <+5 pp on dev+held-out, or precision <95%/decoy FP >0, or variance exceeds the mean lift, agentic becomes opt-in (`--deep`) with `--no-llm` as default. White-box evaluated separately (Flash gains more from exact source handlers).
+- **Owner streams:** agentic-prompts (`agent-session.ts`), agentic-lane (`execution.ts`, Slice 3 + tool handlers), proof-tools (typed compilers), artifact-registry/chains (after lane).
