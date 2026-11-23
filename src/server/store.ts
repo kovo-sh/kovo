@@ -566,13 +566,29 @@ export class Store {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       }
     }
-    this.client = new DatabaseSync(path, { timeout: 5000 })
+    const rawClient = new DatabaseSync(path, { timeout: 5000 })
     // v6 scale pragmas: WAL keeps readers non-blocking under the batched writer; NORMAL skips the
     // per-commit fsync (WAL still guarantees a consistent DB across process crashes), and the
     // busy timeout lets concurrent readers/snapshot copies wait instead of failing fast.
-    this.client.exec(
+    rawClient.exec(
       'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;',
     )
+    // Transparent read-after-write safety: any direct `client.prepare/exec` (including engine code
+    // and tests that bypass Store helpers) flushes queued exchanges first. Flush/transaction
+    // internals are guarded, so this never recurses.
+    this.client = new Proxy(rawClient, {
+      get: (target, property) => {
+        const value = Reflect.get(target, property, target)
+        if (typeof value !== 'function') return value
+        if (property === 'prepare' || property === 'exec') {
+          return (...args: unknown[]) => {
+            if (!this.flushing && this.txDepth === 0) this.flushNow()
+            return (value as (...params: unknown[]) => unknown).apply(target, args)
+          }
+        }
+        return value.bind(target)
+      },
+    }) as DatabaseSync
     this.db = drizzle({ client: this.client })
     const result = migrate(this.db, { migrationsFolder: resolve('drizzle') })
     if (result && 'exitCode' in result) throw new Error('Guardian database migration failed.')
