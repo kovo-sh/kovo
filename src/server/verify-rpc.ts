@@ -18,7 +18,8 @@
  * pass and both transcripts to agree on the causal artifact.
  *
  * This module intentionally does not import replay-verifier, execution, store or broker internals
- * beyond the public `RequestBroker` / `Grant` seam.
+ * beyond the public `RequestBroker` / `Grant` seam. Impact semantics are shared with the replay
+ * path through the pure `oracle-invariants` module, so both paths dismiss the same over-claims.
  */
 import { spawn } from 'node:child_process'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
@@ -32,6 +33,14 @@ import { lookup } from 'node:dns/promises'
 import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildPersonaHeader } from './persona-vault.ts'
+import {
+  assessImpactEvidence,
+  classifyImpactDescriptor,
+  normalizeRole,
+  parseRoleLabel,
+  assessReadDisclosure,
+} from './oracle-invariants.ts'
+import type { AmbientAuth, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
 
 // ---------------------------------------------------------------------------
 // Constants shared with the container mount (worker-backend) and both SDKs.
@@ -247,6 +256,28 @@ export type VerifyClaim =
   | { kind: 'dom_sentinel'; exchangeId: string; sentinel: string; mode?: 'source' | 'executed'; message?: string }
   | { kind: 'oob'; exchangeId: string; expectHit?: boolean; message?: string }
   | { kind: 'timing'; controlIds: string[]; variantIds: string[]; minPairs?: number; maxPValue?: number; message?: string }
+  /**
+   * Impact-evidence claim: binds an impact class to the exchanges that prove it. Evaluated by the
+   * same pure validators as the declarative replay path (`oracle-invariants.ts`), so a status-only
+   * script cannot confirm an assertion the replay verifier would dismiss.
+   */
+  | {
+      kind: 'impact'
+      impactClass: ImpactClass
+      probeExchangeId: string
+      controlExchangeIds?: string[]
+      beforeExchangeId?: string
+      afterExchangeId?: string
+      requiredRole?: string
+      resourceTenant?: string
+      expectControlDenied?: boolean
+      oracleEvents?: string[]
+      actorRoles?: Record<string, string>
+      actorTenants?: Record<string, string>
+      requestBody?: unknown
+      ambient?: { kind: AmbientAuth; sameSite?: string }
+      message?: string
+    }
 
 export interface VerifyScriptResult {
   sdk?: string
@@ -276,6 +307,12 @@ export interface VerifyClaimContext {
   canary?: VerifyCanaryBroker
   /** Exchange ids recorded by a different attempt must never satisfy this attempt's claims. */
   allowedExchangeIds?: ReadonlySet<string>
+  /**
+   * Impact class declared by the proof title/description. Mutation-based classes (BFLA, mass
+   * assignment, CSRF) confirm only with a passing `impact` claim; a read-based authorization claim
+   * needs an owner-scoped disclosure in the probe exchange.
+   */
+  claimedImpact?: ImpactClass
 }
 
 export interface VerifyCanaryCheck {
@@ -340,6 +377,13 @@ function isClaim(value: unknown): value is VerifyClaim {
     case 'timing':
       return Array.isArray(rec.controlIds) && Array.isArray(rec.variantIds) &&
         rec.controlIds.every(v => typeof v === 'string') && rec.variantIds.every(v => typeof v === 'string')
+    case 'impact': {
+      const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf'])
+      return typeof rec.probeExchangeId === 'string' &&
+        typeof rec.impactClass === 'string' && knownClasses.has(rec.impactClass) &&
+        (rec.controlExchangeIds === undefined || (Array.isArray(rec.controlExchangeIds) && rec.controlExchangeIds.every(v => typeof v === 'string'))) &&
+        (rec.oracleEvents === undefined || (Array.isArray(rec.oracleEvents) && rec.oracleEvents.every(v => typeof v === 'string')))
+    }
     default:
       return false
   }
@@ -595,6 +639,159 @@ function observedHeader(record: VerifyTranscriptRecord, name: string): string | 
   return undefined
 }
 
+function sameSiteFromRecord(record: VerifyTranscriptRecord | undefined): string | null {
+  if (!record) return null
+  const raw = observedHeader(record, 'set-cookie')
+  if (!raw) return null
+  const match = /samesite\s*=\s*([a-z]+)/i.exec(raw)
+  return match ? match[1] ?? null : null
+}
+
+/** Normalize a recorded exchange into the shared impact-evidence shape. */
+function transcriptImpactStep(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'impact' }>,
+  id: string,
+  arm: ImpactStep['arm'],
+  defaultSameSite: string | null,
+): ImpactStep | null {
+  const record = store.get(id)
+  if (!record) return null
+  const body = store.body(id)
+  let json: unknown
+  if (body !== undefined) {
+    try { json = JSON.parse(body) } catch { json = undefined }
+  }
+  const handle = record.request?.personaHandle ?? null
+  const role = normalizeRole(claim.actorRoles?.[handle ?? '']) ?? normalizeRole(handle)
+  const tenant = claim.actorTenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant
+  const actor: ActorIdentity = {
+    handle,
+    role,
+    tenant,
+    auth: (claim.ambient?.kind ?? 'unknown') as AmbientAuth,
+    sameSite: claim.ambient?.sameSite ?? defaultSameSite,
+  }
+  return {
+    id,
+    arm,
+    method: (record.request?.method ?? 'GET').toUpperCase(),
+    route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
+    status: record.response?.status ?? null,
+    actor,
+    json,
+    body: body ?? '',
+    requestJson: claim.requestBody,
+    requestHeaders: record.request?.headers ?? null,
+    responseHeaders: record.response?.headers ?? null,
+    ...(record.seq !== undefined ? { seq: record.seq } : {}),
+  } as ImpactStep & { seq: number }
+}
+
+function evaluateImpactClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'impact' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const requireRecord = (id: string): VerifyTranscriptRecord | null => {
+    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
+    return store.get(id) ?? null
+  }
+  if (!requireRecord(claim.probeExchangeId)) {
+    return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for an impact claim.` }
+  }
+  const ids = [
+    ...(claim.beforeExchangeId ? [claim.beforeExchangeId] : []),
+    claim.probeExchangeId,
+    ...(claim.controlExchangeIds ?? []),
+    ...(claim.afterExchangeId ? [claim.afterExchangeId] : []),
+  ]
+  for (const id of ids) {
+    if (!requireRecord(id)) return { claim, passed: false, detail: `Unknown exchange ${id} for an impact claim.` }
+  }
+  const defaultSameSite = ids.map(id => sameSiteFromRecord(store.get(id))).find(Boolean) ?? null
+  const steps: ImpactStep[] = []
+  const add = (id: string | undefined, arm: ImpactStep['arm']) => {
+    if (!id) return
+    const step = transcriptImpactStep(store, claim, id, arm, defaultSameSite)
+    if (step) steps.push(step)
+  }
+  add(claim.beforeExchangeId, 'control')
+  add(claim.probeExchangeId, 'probe')
+  for (const id of claim.controlExchangeIds ?? []) add(id, 'control')
+  add(claim.afterExchangeId, 'control')
+  steps.sort((a, b) => ((a as unknown as { seq?: number }).seq ?? 0) - ((b as unknown as { seq?: number }).seq ?? 0))
+  const probeRecord = store.get(claim.probeExchangeId)
+  const assessment = assessImpactEvidence({
+    impactClass: claim.impactClass,
+    steps,
+    requiredRole: claim.requiredRole ?? null,
+    resourceTenant: claim.resourceTenant ?? null,
+    expectControlDenied: claim.expectControlDenied,
+    oracleEvents: claim.oracleEvents,
+    targetOrigin: probeRecord?.request?.origin ?? null,
+  })
+  return {
+    claim,
+    passed: assessment.required && assessment.satisfied,
+    detail: assessment.reason,
+    ...(assessment.evidence ? { observed: assessment.evidence } : {}),
+  }
+}
+
+/** Claims that reference a recorded exchange id (used for implicit read-disclosure checks). */
+function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
+  const ids = new Set<string>()
+  for (const claim of claims) {
+    if (claim.kind === 'timing' || claim.kind === 'impact') continue
+    ids.add(claim.exchangeId)
+  }
+  return [...ids]
+}
+
+/**
+ * An authorization-titled proof without an `impact` claim still has to expose an owner-scoped
+ * non-public attribute in its probe exchange. Status and self-echoed fields are not disclosure.
+ */
+function implicitReadDisclosure(
+  store: TranscriptStore,
+  claims: readonly VerifyClaim[],
+  context: VerifyClaimContext,
+): { satisfied: boolean; reason: string } {
+  const steps: ImpactStep[] = []
+  for (const id of claimedExchangeIds(claims)) {
+    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
+    const record = store.get(id)
+    if (!record) continue
+    const body = store.body(id)
+    let json: unknown
+    if (body !== undefined) {
+      try { json = JSON.parse(body) } catch { json = undefined }
+    }
+    const handle = record.request?.personaHandle ?? null
+    steps.push({
+      id,
+      arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
+      method: (record.request?.method ?? 'GET').toUpperCase(),
+      status: record.response?.status ?? null,
+      actor: {
+        handle,
+        role: normalizeRole(handle),
+        tenant: parseRoleLabel(handle).tenant,
+        auth: 'unknown',
+        sameSite: null,
+      },
+      json,
+      body: body ?? '',
+      ...(record.seq !== undefined ? { seq: record.seq } : {}),
+    } as ImpactStep & { seq: number })
+  }
+  const probe = steps.find(step => step.arm === 'probe') ?? steps.find(step => step.json !== undefined)
+  if (!probe) return { satisfied: false, reason: 'no probe exchange carries a JSON body to inspect for an owner-scoped disclosure' }
+  const disclosure = assessReadDisclosure({ steps, probe })
+  return { satisfied: disclosure.satisfied, reason: disclosure.reason }
+}
+
 function evaluateClaim(
   store: TranscriptStore,
   claim: VerifyClaim,
@@ -605,6 +802,8 @@ function evaluateClaim(
     return store.get(id) ?? null
   }
   switch (claim.kind) {
+    case 'impact':
+      return evaluateImpactClaim(store, claim, context)
     case 'status': {
       const record = requireRecord(claim.exchangeId)
       if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}; claims must reference recorded RPC exchanges.` }
@@ -796,6 +995,22 @@ export function evaluateClaims(
 ): VerifyOracleResult {
   const checks = claims.map(claim => evaluateClaim(store, claim, context))
   const failures = checks.filter(c => !c.passed).map(c => `${c.claim.kind}: ${c.detail}`)
+  const claimed = context.claimedImpact
+  if (claimed && claimed !== 'other') {
+    const impactBacked = checks.some(check =>
+      check.passed && check.claim.kind === 'impact' &&
+      (check.claim.impactClass === claimed || (claimed === 'bfla' && check.claim.impactClass === 'authorization')))
+    if (!impactBacked) {
+      if (claimed === 'authorization') {
+        const disclosure = implicitReadDisclosure(store, claims, context)
+        if (!disclosure.satisfied) {
+          failures.push(`impact: authorization claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
+        }
+      } else {
+        failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim (role/tenant differential plus a clean persisted readback); status and echo claims are insufficient.`)
+      }
+    }
+  }
   return {
     passed: checks.length > 0 && failures.length === 0,
     checks,
@@ -858,6 +1073,17 @@ export function causalFingerprints(
         status: first?.response?.status ?? null,
         expectation: { maxPValue: claim.maxPValue ?? 0.05, minPairs: claim.minPairs ?? 5 },
         observed: normalizedValue({ separated: check.passed, separationBucket: Number((Number(check.observed?.separation ?? 0) >= 3)) }, nonce),
+      }
+    }
+    if (claim.kind === 'impact') {
+      const probe = store.get(claim.probeExchangeId)
+      return {
+        kind: claim.kind,
+        method: probe?.request?.method ?? '',
+        path: pathFingerprint(probe?.request?.pathAndQuery),
+        status: probe?.response?.status ?? null,
+        expectation: { impactClass: claim.impactClass, oracleEvents: [...(claim.oracleEvents ?? [])].sort() },
+        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
     }
     const record = store.get(claim.exchangeId)
@@ -1627,6 +1853,7 @@ async function runAttempt(
     const oracle = evaluateClaims(session.transcript, parsed.claims, {
       ...(options.canary ? { canary: options.canary } : {}),
       allowedExchangeIds: new Set(session.transcript.list().map(record => record.exchangeId)),
+      claimedImpact: classifyImpactDescriptor({ title: parsed.title }),
     })
     const causal = causalFingerprints(session.transcript, oracle.checks, nonce)
     return {
