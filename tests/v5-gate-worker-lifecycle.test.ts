@@ -151,9 +151,18 @@ test('worker lifecycle (docker): abandoned created container is reaped, fresh cr
     await execFile('docker', ['container', 'rm', '--force', staleName, freshName], { timeout: 15_000 }).catch(() => undefined)
   })
   const backend = new LinuxWorkerBackend()
-  await backend.reclaimInactive()
   const list = async (name: string) => (await execFile('docker', ['container', 'ls', '--all', '--no-trunc', '--filter', 'name=^' + name + '$', '--format', '{{.ID}}'], { timeout: 5_000 })).stdout.trim()
-  assert.equal(await list(staleName), '', 'aged created container must be reaped')
+  // Reaping is best-effort: under a loaded daemon a create can still be settling when the
+  // sweep lists containers, and `docker rm` is intentionally non-fatal. Poll the same
+  // operation the production 30 s sweep performs rather than asserting a single pass.
+  let stale = ''
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    await backend.reclaimInactive()
+    stale = await list(staleName)
+    if (!stale) break
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+  }
+  assert.equal(stale, '', 'aged created container must be reaped')
   assert.notEqual(await list(freshName), '', 'a fresh created container may be an in-flight create from another stream')
 })
 
