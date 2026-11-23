@@ -155,12 +155,9 @@ test('traversal: a jail escape signals and final-segment hardening stays silent'
   {
     const make = (hardened: boolean) => fixture((req, res) => {
       const requested = new URL(req.url ?? '/', 'http://fixture').searchParams.get('file') ?? ''
+      // A final-segment handler resolves inside /srv/files; /etc/passwd never exists there.
+      if (hardened) return json(res, 404, { error: 'not_found' })
       const last = requested.split('/').filter(Boolean).pop() ?? ''
-      if (hardened) {
-        // A final-segment handler resolves inside /srv/files; /etc/passwd never exists there.
-        void last
-        return json(res, 404, { error: 'not_found' })
-      }
       const stack: string[] = []
       for (const part of `/${requested}`.split('/')) {
         if (!part || part === '.') continue
