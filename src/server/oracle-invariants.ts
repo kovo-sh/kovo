@@ -432,13 +432,27 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // A boundary control is a *sibling* arm that was denied before the probe ran; a post-mutation
   // 404 readback is persistence evidence and must not be re-read as a boundary denial.
   const firstProbeIndex = probes.length ? steps.indexOf(probes[0]!) : -1
-  const boundaryControlDenied = deniedControls.some(control =>
-    (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
-    probeSuccesses.some(probe => sameRoute(control, probe)))
   const requiredRole = normalizeRole(input.requiredRole)
   const requiredRank = roleRank(requiredRole)
   const mutatingProbe = probeSuccesses.find(step => stepMutatesState(step)) ?? null
   const probe = mutatingProbe ?? probeSuccesses.find(step => isReadMethod(step.method)) ?? probeSuccesses[0] ?? probes[0]
+  // A denial proves *this actor* is unentitled only when the denied control is a peer of the probe
+  // (same tenant, or both unknown). A cross-tenant control that is denied shows tenant isolation,
+  // which is the app working, not a boundary the probe crossed.
+  const probeTenant = probe?.actor.tenant ?? null
+  const declaredResourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const peerDenial = (control: ImpactStep): boolean => {
+    const tenant = control.actor.tenant ?? null
+    if (tenant === null || probeTenant === null) return true
+    // Same-tenant peer (vertical BFLA) or the mirrored cross-tenant direction: the denied control
+    // lives in the resource tenant the probe crossed into (B denied on A while A writes B).
+    return tenant === probeTenant ||
+      (declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
+  }
+  const boundaryControlDenied = deniedControls.some(control =>
+    peerDenial(control) &&
+    (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
+    probeSuccesses.some(success => sameRoute(control, success)))
 
   const base = {
     probeRole: probe?.actor.role ?? null,
@@ -508,15 +522,14 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     }
     const protectedChanged = base.changedFields.filter(isProtectedField)
     // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
-    // field or carry the endpoint's declared impact event.
+    // field. A declared oracle event is a requirement the evidence must satisfy, never a substitute
+    // for a missing differential (an LLM can declare anything).
     const oracleDeclared = hasOracle(input.oracleEvents, ['privilege_escalation', 'mass_assignment', 'invariant_violation', 'cross_tenant_write', 'state_delta'])
-    // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
-    // field or carry the endpoint's declared impact event.
-    if (!crossTenant && protectedChanged.length === 0 && !oracleDeclared) {
+    if (!crossTenant && protectedChanged.length === 0) {
       return { required: true, satisfied: false, reason: `The persisted change (${base.changedFields.slice(0, 6).join(', ') || 'none'}) is not a protected field and no impact-oracle event is declared; a state echo is not impact.`, evidence: base }
     }
-    if (boundaryControlDenied && !oracleDeclared && !crossTenant) {
-      return { required: true, satisfied: false, reason: 'The control arm was correctly denied and the probe mutated state, but no impact-oracle event is declared and the change is not cross-tenant; require the endpoint\'s impact event before confirming.', evidence: base }
+    if (boundaryControlDenied && !crossTenant && protectedChanged.length === 0) {
+      return { required: true, satisfied: false, reason: 'The control arm was correctly denied and the probe mutated state, but the change is neither cross-tenant nor a protected field; a self-service write is not escalation.', evidence: base }
     }
     return {
       required: true,
@@ -582,6 +595,20 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   }
   const disclosure = assessReadDisclosure({ steps, probe })
   base.disclosureFields = disclosure.fields
+  if (disclosure.satisfied && !roleDifferential && !crossTenant && !boundaryControlDenied) {
+    // Same-tenant, same-role read: the tenant is the object boundary, so an owner/identity field
+    // alone is in policy (viewer reading a peer's space). Only private/secret data proves impact.
+    const privateFields = disclosure.fields.filter(path => PRIVATE_DATA_RE.test(path.split('.').pop() ?? ''))
+    if (privateFields.length === 0) {
+      return {
+        required: true,
+        satisfied: false,
+        reason: `Same-tenant read of owner-scoped field(s) (${disclosure.fields.slice(0, 6).join(', ')}) without a role/tenant differential: tenant content is readable by every member, so no private data was disclosed.`,
+        evidence: base,
+      }
+    }
+    base.disclosureFields = privateFields
+  }
   if (!disclosure.satisfied) {
     return { required: true, satisfied: false, reason: `Read-only proof lacks impact evidence: ${disclosure.reason}`, evidence: base }
   }
@@ -821,12 +848,20 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
+  const probeTenant = mutatingProbe.actor.tenant ?? null
+  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const peerDenial = (control: ImpactStep): boolean => {
+    const tenant = control.actor.tenant ?? null
+    if (tenant === null || probeTenant === null) return true
+    return tenant === probeTenant ||
+      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
+  }
   const boundaryControlDenied = steps.some(control =>
     control.arm === 'control' &&
+    peerDenial(control) &&
     isDenied(control.status) &&
     sameRoute(control, mutatingProbe) &&
     steps.indexOf(control) < steps.indexOf(mutatingProbe))
-  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   const crossTenant = Boolean(resourceTenant && mutatingProbe.actor.tenant && resourceTenant !== mutatingProbe.actor.tenant)
   const requiredRank = roleRank(normalizeRole(input.requiredRole) ?? null)
   const probeRank = roleRank(mutatingProbe.actor.role)
@@ -1335,7 +1370,15 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   const signals = steps
     .map(step => boundarySignalOf(step, successFamilies))
     .filter((signal): signal is BoundarySignal => signal !== null)
-  const signal = signals.find(entry => entry.step.arm === 'control' || entry.step.arm === 'setup') ?? signals[0] ?? null
+  const probeActor = steps.find(step => step.arm === 'probe')?.actor ?? null
+  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const peerSignal = signals.find(entry => {
+    const tenant = entry.step.actor.tenant ?? null
+    if (tenant === null || probeActor?.tenant == null) return true
+    return tenant === probeActor.tenant ||
+      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
+  }) ?? null
+  const signal = peerSignal ?? null
   const controlDenied = signal !== null
   // The variant must cross the same route family and expose data or a state change.
   const signalFamily = signal ? routeFamily(signal.step.route ?? '') : ''
