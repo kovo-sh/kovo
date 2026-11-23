@@ -258,7 +258,10 @@ export const brokerExchanges = sqliteTable('broker_exchanges', {
   secretMatches: text('secret_matches', { mode: 'json' }).$type<SecretMatch[]>().notNull(),
   durationMs: integer('duration_ms').notNull(),
   createdAt: integer('created_at').notNull(),
-}, table => [index('broker_exchanges_run').on(table.runId, table.origin)])
+}, table => [
+  index('broker_exchanges_run').on(table.runId, table.origin),
+  index('broker_exchanges_body_artifact').on(table.bodyArtifactId),
+])
 
 export const approvalRequests = sqliteTable('approval_requests', {
   id: text('id').primaryKey().notNull(),
@@ -646,6 +649,17 @@ export const resourceSamples = sqliteTable('resource_samples', {
   ),
   index('resource_samples_run').on(table.runId, table.resourceKey),
 ])
+
+/**
+ * v6.2 persistence settings: durable record of the storage configuration the DB was opened with
+ * (e.g. `fts_mode`, `fts_max_body_bytes`) so a diagnostic can tell how the FTS index was built
+ * without re-reading process arguments.
+ */
+export const storeSettings = sqliteTable('store_settings', {
+  key: text('key').primaryKey().notNull(),
+  value: text('value').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+})
 
 /** v6 crash recovery: persisted LabRunner container IDs so a restart can reclaim orphans. */
 export const labContainers = sqliteTable('lab_containers', {
