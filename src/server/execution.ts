@@ -36,7 +36,15 @@ import { declarativeReplaySpecSchema, replaySpecOrigins } from '../replay-spec.t
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
-import { evaluateTier3Approval, isLocalLabAutoApprovalOrigin, matchesApprovedEndpointPattern } from './approval-judge.ts'
+import {
+  authorizeStateChange,
+  computeStateChangeBodyHash,
+  evaluateTier3Approval,
+  hasDeclaredMultipartContentType,
+  isLocalLabAutoApprovalOrigin,
+  STATE_CHANGE_APPROVAL_TTL_MS,
+  StateChangeApprovalLedger,
+} from './approval-judge.ts'
 import {
   agentTurn,
   buildBoardDelta,
@@ -934,6 +942,8 @@ export class Execution {
   private readonly variantSweptFindings = new Set<string>()
   private readonly variantSweepInFlight = new Set<string>()
   private readonly pendingTier3ApprovalKeys = new Set<string>()
+  /** Exact, single-use Tier-3 approvals consumed by the broker fast path (see authorizeStateChange). */
+  private readonly stateChangeApprovals = new StateChangeApprovalLedger()
   /** runId → replay spec ids whose inline failure is eligible for bounded Phase-3 refinement. */
   private readonly refinementEligible = new Map<string, Set<string>>()
   private readonly deterministicInFlight = new Set<string>()
@@ -1156,15 +1166,32 @@ export class Execution {
         return permittedAtAdmission.has(origin) && this.permitted(fresh, origin)
       },
       isIdempotentPostAllowed: (_origin, pathAndQuery, body) => isSafeIdempotentPost(pathAndQuery, body),
-      isStateChangeApproved: (origin, method, pathAndQuery) => {
+      isStateChangeApproved: (origin, method, pathAndQuery, context) => {
         const fresh = this.storage.run(run.id)
-        if (
+        const localLabAutoApproval =
           project.environment === 'local-lab' &&
           allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' &&
           fresh.capabilityTier >= 3 &&
           (fresh.approvalPolicy ?? 'auto_review') !== 'strict' &&
           isLocalLabAutoApprovalOrigin(origin)
-        ) {
+        const activePatterns = (fresh.approvedEndpointPatterns ?? []).filter(
+          p => p.scopeRevision === undefined || p.scopeRevision === fresh.scopeRevision,
+        )
+        // Skip the safety judge only for the exact request fingerprint (or an explicit operator
+        // pattern). Automatic decisions are single-use: a consumed grant can never authorize a
+        // later state change on the same origin.
+        const verdict = authorizeStateChange({
+          runId: run.id,
+          origin,
+          method,
+          pathAndQuery,
+          scopeRevision: fresh.scopeRevision,
+          context,
+          approvedPatterns: activePatterns,
+          ledger: this.stateChangeApprovals,
+          localLabAutoApproval,
+        })
+        if (verdict.via === 'local_lab') {
           // Persist the zero-trust audit trail BEFORE the state change leaves the broker:
           // origin-bound local-lab auto-approval is attributed distinctly from rule/judge/yolo.
           this.storage.recordAutoApprovalDecision(fresh, job.assignment, {
@@ -1179,23 +1206,8 @@ export class Execution {
             policyNote: 'Authorized local-lab loopback/lab-internal origin; broker destructive-payload, webshell, SSRF metadata and RPS invariants enforced.',
             secrets: currentSecrets(),
           })
-          return true
         }
-        const activePatterns = (fresh.approvedEndpointPatterns ?? []).filter(
-          p => p.scopeRevision === undefined || p.scopeRevision === fresh.scopeRevision,
-        )
-        if (matchesApprovedEndpointPattern({ origin, method, pathAndQuery }, activePatterns)) {
-          return true
-        }
-        const now = Date.now()
-        const rows = this.storage.db.select().from(approvalRequests).where(and(
-          eq(approvalRequests.runId, run.id),
-          eq(approvalRequests.scopeRevision, fresh.scopeRevision),
-          eq(approvalRequests.origin, origin),
-          eq(approvalRequests.method, method.toUpperCase()),
-          eq(approvalRequests.status, 'approved'),
-        )).all()
-        return rows.some(r => r.expiresAt > now && (r.pathAndQuery === pathAndQuery || pathAndQuery.startsWith(r.pathAndQuery.split('?')[0])))
+        return verdict.approved
       },
       audit: (outcome, origin, status) => {
         if (outcome === 'allowed') job.origins.add(origin)
@@ -1863,6 +1875,53 @@ export class Execution {
     return false
   }
 
+  /**
+   * Register the exact, single-use grant a decision just authorized. The immediate broker retry
+   * consumes it only when origin/method/path/persona/body/flag fingerprint and scope revision match.
+   */
+  private registerStateChangeApproval(
+    run: Run,
+    input: {
+      origin: string
+      method: string
+      pathAndQuery: string
+      personaHandle?: string | null
+      bodyHash?: string | null
+      bodyPreview?: string | null
+      hasMultipart?: boolean
+      isRaceBurst?: boolean
+      isRceProof?: boolean
+      approvalId?: string
+    },
+    additional: Array<{ origin: string; method: string; pathAndQuery: string; personaHandle?: string | null; bodyHash?: string | null }> = [],
+  ): void {
+    const primaryBodyHash = input.bodyHash ?? computeStateChangeBodyHash(input.bodyPreview ?? null)
+    const targets = [
+      { ...input, bodyHash: primaryBodyHash },
+      ...additional.map(target => ({
+        ...target,
+        hasMultipart: input.hasMultipart,
+        isRaceBurst: input.isRaceBurst,
+        isRceProof: input.isRceProof,
+        approvalId: input.approvalId,
+      })),
+    ]
+    for (const target of targets) {
+      this.stateChangeApprovals.grant({
+        runId: run.id,
+        origin: target.origin,
+        method: target.method,
+        pathAndQuery: target.pathAndQuery,
+        scopeRevision: run.scopeRevision,
+        personaHandle: target.personaHandle ?? null,
+        bodyHash: target.bodyHash ?? null,
+        hasMultipart: Boolean(target.hasMultipart),
+        isRaceBurst: Boolean(target.isRaceBurst),
+        isRceProof: Boolean(target.isRceProof),
+      }, { expiresAt: Date.now() + STATE_CHANGE_APPROVAL_TTL_MS, approvalId: target.approvalId })
+    }
+  }
+
   private async waitForTier3Approval(
     job: Active,
     input: {
@@ -1873,10 +1932,20 @@ export class Execution {
       rationale: string
       requestPreview: string
       bodyPreview?: string | null
+      /** Precomputed body/parts digest (must match the broker's computeStateChangeBodyHash). */
+      bodyHash?: string | null
       headers?: Record<string, string>
       hasMultipart?: boolean
       isRceProof?: boolean
       isRaceBurst?: boolean
+      /** Additional exact requests covered by one synchronized decision (e.g. a race burst). */
+      additionalApprovalTargets?: Array<{
+        origin: string
+        method: string
+        pathAndQuery: string
+        personaHandle?: string | null
+        bodyHash?: string | null
+      }>
       secrets: readonly NamedSecret[]
     },
     signal: AbortSignal,
@@ -1933,6 +2002,19 @@ export class Execution {
         policyNote: evaluation.reason,
         secrets: input.secrets,
       })
+      // The audit row above is never authoritative. Authorize only the exact request the judge
+      // evaluated, via a single-use fingerprint the broker retry consumes once.
+      this.registerStateChangeApproval(run, {
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        personaHandle: input.personaHandle ?? null,
+        bodyHash: input.bodyHash,
+        bodyPreview: input.bodyPreview ?? null,
+        hasMultipart: input.hasMultipart,
+        isRaceBurst: input.isRaceBurst,
+        isRceProof: input.isRceProof,
+      }, input.additionalApprovalTargets ?? [])
       return { approved: true }
     }
 
@@ -2053,6 +2135,22 @@ export class Execution {
     }
     if (this.authorize(job)) {
       this.storage.updateWorker(job.assignment.id, { status: 'running' })
+    }
+    if (decision === 'approved') {
+      // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
+      // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
+      this.registerStateChangeApproval(run, {
+        origin: input.origin,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        personaHandle: input.personaHandle ?? null,
+        bodyHash: input.bodyHash,
+        bodyPreview: input.bodyPreview ?? null,
+        hasMultipart: input.hasMultipart,
+        isRaceBurst: input.isRaceBurst,
+        isRceProof: input.isRceProof,
+        approvalId: postedApprovalId,
+      }, input.additionalApprovalTargets ?? [])
     }
     return { approved: decision === 'approved' }
   }
@@ -5077,8 +5175,9 @@ export class Execution {
                 ...(args.multipartParts?.length ? { multipartPartsCount: args.multipartParts.length } : {}),
               }, null, 2),
               bodyPreview: body,
+              bodyHash: computeStateChangeBodyHash(body, args.multipartParts),
               headers,
-              hasMultipart: Boolean(args.multipartParts?.length),
+              hasMultipart: Boolean(args.multipartParts?.length) || hasDeclaredMultipartContentType(headers),
               secrets: currentSecrets(),
             }, signal)
             if (!approval.approved) {
@@ -5195,8 +5294,16 @@ export class Execution {
                 sample: args.requests[0],
               }, null, 2),
               bodyPreview: brokerReqs[0]?.body,
+              bodyHash: computeStateChangeBodyHash(brokerReqs[0]?.body ?? null),
               headers: brokerReqs[0]?.headers,
               isRaceBurst: true,
+              additionalApprovalTargets: brokerReqs.slice(1).map(r => ({
+                origin: r.origin,
+                method: r.method,
+                pathAndQuery: r.pathAndQuery,
+                personaHandle: r.persona ?? null,
+                bodyHash: computeStateChangeBodyHash(r.body ?? null),
+              })),
               secrets: currentSecrets(),
             }, signal)
             if (!approval.approved) {
