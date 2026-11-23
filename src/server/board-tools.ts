@@ -413,29 +413,8 @@ function classifyStoreError(error: unknown): { reason: BoardPostRejectReason; me
 
 /**
  * Build the `board_post` / `board_read` handlers for one specialist assignment.
- *
- * EXECUTION_WIRING (documented for `execution.ts`; not wired by this module):
- *   1. At worker-handler construction:
- *        const board = createBoardTools({ store, run, handle, redact: secrets, onWakeup })
- *        handlers.board_post = board.board_post
- *        handlers.board_read = board.board_read
- *      (`board_post`/`board_read` are already in `SPECIALIST_COMMON_TOOLS`, so
- *       `filterHandlersForSpecialist` keeps them for all 7 profiles/tiers.)
- *   2. At the start of every worker turn / wakeup:
- *        board.beginTurn()
- *        const delta = board.delta({ lastReadSeq: member.lastReadSeq })
- *        instructions = injectBoardTurnInstructions(baseInstructions, delta.text)
- *        store.updateBoardMemberState(run.id, handle, { lastReadSeq: delta.cursor })
- *   3. After `record_fact` / `record_exchange` / a new replay spec:
- *        board.noteEvidence()
- *      After operator/coordinator intervention:
- *        board.noteOperatorIntervention()
- *   4. Drain `board.takeWakeups()` and enqueue wakeup jobs through the existing
- *      `workerConcurrency`/budget gates (one peer per turn is already enforced here).
- */
-/**
- * Machine-readable execution wiring contract (documented, intentionally not wired here).
- * `execution.ts` owns the scheduler/budget/concurrency side of these hooks.
+ * Wiring contract: see `boardExecutionWiring` below. The tools ride the always-on base capability
+ * bundle, so `filterHandlersForSpecialist` keeps them for every investigator.
  */
 export const boardExecutionWiring = {
   handlers: ['board_post', 'board_read'],

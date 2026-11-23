@@ -20,7 +20,9 @@ import {
   SPECIALIST_PROFILES,
   boardGuardrailInstructions,
   boardSpecialistTools,
+  capabilityBundlesFor,
   injectBoardTurnInstructions,
+  investigatorTools,
 } from '../src/server/agent-session.ts'
 import {
   WarmSpecialistController,
@@ -77,9 +79,12 @@ function makeTools(store: Store, runId: string, handle: string, secrets = [{ val
 }
 
 test('M5 board tools are registered for all 7 specialist profiles in every tier', () => {
+  // v6 fluid bundles removed the per-profile allowlist; board tools now ride the always-on base
+  // bundle, so assert the resolved bundle instead of a profile-level allowlist.
   for (const [profileId, profile] of Object.entries(SPECIALIST_PROFILES)) {
-    assert.ok(profile.allowedTools.includes('board_post'), `${profileId} must allow board_post`)
-    assert.ok(profile.allowedTools.includes('board_read'), `${profileId} must allow board_read`)
+    const tools = investigatorTools(capabilityBundlesFor('', profile.capabilities))
+    assert.ok(tools.includes('board_post'), `${profileId} must allow board_post`)
+    assert.ok(tools.includes('board_read'), `${profileId} must allow board_read`)
   }
   for (const tool of boardSpecialistTools) {
     assert.ok(SPECIALIST_COMMON_TOOLS.includes(tool), `${tool} must be in SPECIALIST_COMMON_TOOLS`)
