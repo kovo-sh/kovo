@@ -13,6 +13,7 @@ import { referrerPolicies } from '../domain.ts'
 import type { ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
+import { isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
@@ -2944,6 +2945,11 @@ export class RequestBroker {
           url = new URL(location, url)
         } catch {
           return deny('The redirect destination is invalid.')
+        }
+        // Local-lab containment: Tier-3 auto-approval is bound to the isolated lab origin, so a
+        // redirect must never carry it to an external host — even if that host was (mis)scoped.
+        if (localLab && !isLocalLabAutoApprovalOrigin(url.origin)) {
+          return deny('Local-lab requests may not follow redirects outside the isolated lab network.')
         }
         if (response.status === 301 || response.status === 302 || response.status === 303) {
           activeMethod = 'GET'
