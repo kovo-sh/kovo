@@ -262,6 +262,11 @@ export function classifyImpactDescriptor(parts: {
 // ---------------------------------------------------------------------------
 
 const PROTECTED_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:tenant(?:_?id)?|owner(?:_?id)?|role|roles|permissions?|privileges?|is_?admin|admin|is_?owner|price(?:_?cents)?|amount(?:_?cents)?|seat_?limit|seat_?count|seats?|seats_used|credits?|balance|plan(?:_?id)?|tier|visibility|private|shared|secret|api_?key|access_?token|email|password|hash)$/i
+/**
+ * Role-exclusive function surfaces: a mutation here is the privileged action itself, so the
+ * escalation impact is the function-level entitlement, not a protected content column.
+ */
+const FUNCTION_SURFACE_RE = /(?:^|\/)(?:admin(?:istrator)?|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?|impersonate|feature[-_]?flags?)(?:\/|$)/i
 const PRICE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:price(?:_?cents)?|amount(?:_?cents)?|cost(?:_?cents)?)$/i
 const IDENTITY_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|subject|created_?by|author)$/i
 const SECRET_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:secret|api_?key|access_?token|token|password|hash|private_?note|note|internal|ssn)$/i
@@ -571,17 +576,25 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
     // field. A declared oracle event is a requirement the evidence must satisfy, never a substitute
     // for a missing differential (an LLM can declare anything).
+    //
+    // Function-level vertical escalation is its own impact model: a host-signed lower role performed
+    // a mutating action on a role-exclusive function surface (admin/manage/role/grant/...) and the
+    // change persisted. The privileged *function* is the asset, so demanding a content-column name
+    // from the generic protected list would dismiss every flag/config action. A content write on a
+    // non-function route (a viewer editing a workspace) still needs a protected field — the K=6 FP.
+    const functionLevelEscalation = requiredRank !== null && roleDifferential &&
+      probes.some(step => isMutatingMethod(step.method) && isSuccess(step.status) && FUNCTION_SURFACE_RE.test(step.route ?? ''))
     const oracleDeclared = hasOracle(input.oracleEvents, ['privilege_escalation', 'mass_assignment', 'invariant_violation', 'cross_tenant_write', 'state_delta'])
-    if (!crossTenant && protectedChanged.length === 0) {
+    if (!crossTenant && protectedChanged.length === 0 && !functionLevelEscalation) {
       return { required: true, satisfied: false, reason: `The persisted change (${base.changedFields.slice(0, 6).join(', ') || 'none'}) is not a protected field and no impact-oracle event is declared; a state echo is not impact.`, evidence: base }
     }
-    if (boundaryControlDenied && !crossTenant && protectedChanged.length === 0) {
+    if (boundaryControlDenied && !crossTenant && protectedChanged.length === 0 && !functionLevelEscalation) {
       return { required: true, satisfied: false, reason: 'The control arm was correctly denied and the probe mutated state, but the change is neither cross-tenant nor a protected field; a self-service write is not escalation.', evidence: base }
     }
     return {
       required: true,
       satisfied: true,
-      reason: `${vertical ? 'Vertical' : 'Object-level'} impact: ${escalationReason || (crossTenant ? 'cross-tenant resource access' : 'persisted protected-field change')}; ${persistence.reason}${protectedChanged.length ? `; protected fields: ${protectedChanged.slice(0, 6).join(', ')}` : ''}${oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}.`,
+      reason: `${vertical || functionLevelEscalation ? 'Vertical' : 'Object-level'} impact: ${escalationReason || (crossTenant ? 'cross-tenant resource access' : 'persisted protected-field change')}; ${persistence.reason}${protectedChanged.length ? `; protected fields: ${protectedChanged.slice(0, 6).join(', ')}` : ''}${functionLevelEscalation ? '; role-gated function surface mutated by a lower role' : ''}${oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}.`,
       evidence: base,
     }
   }

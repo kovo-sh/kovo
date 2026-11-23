@@ -101,6 +101,43 @@ test('floor regress: a denial recorded before the probe still has to be crossed'
   assert.match(unrelated.reason, /no variant exchange on the same route family/i)
 })
 
+function privilegeFunctionSteps(hardened: boolean): ImpactStep[] {
+  return [
+    { id: 'c1', arm: 'control', method: 'GET', route: '/api/v1/admin/feature-flags', status: 200, actor: admin, json: { flags: { audit: false } } },
+    {
+      id: 'p1', arm: 'probe', method: 'POST', route: '/api/v1/admin/feature-flags', status: hardened ? 403 : 200,
+      actor: viewer, requestJson: { flag: 'escalate', enabled: true }, json: { ok: true },
+    },
+    {
+      id: 'p2', arm: 'control', method: 'GET', route: '/api/v1/admin/feature-flags', status: 200, actor: admin,
+      json: hardened ? { flags: { audit: false } } : { flags: { audit: false, escalate: true } },
+    },
+  ]
+}
+
+test('floor regress: a lower role mutating a role-gated function surface is vertical impact', () => {
+  const vulnerable = assessImpactEvidence({ impactClass: 'authorization', requiredRole: 'admin', steps: privilegeFunctionSteps(false) })
+  assert.equal(vulnerable.satisfied, true, vulnerable.reason)
+  assert.match(vulnerable.reason, /Vertical|role-gated function surface/i)
+
+  const hardened = assessImpactEvidence({ impactClass: 'authorization', requiredRole: 'admin', steps: privilegeFunctionSteps(true) })
+  assert.equal(hardened.satisfied, false, hardened.reason)
+
+  // The same role differential on a content route is in policy: a viewer editing a workspace field
+  // is not vertical escalation, even if a claim declares a required admin role (the K=6 FP).
+  const contentRoute = assessImpactEvidence({
+    impactClass: 'bfla',
+    requiredRole: 'admin',
+    steps: [
+      { id: 'c1', arm: 'control', method: 'GET', route: '/api/projects/p1', status: 200, actor: admin, json: { id: 'p1', description: 'old' } },
+      { id: 'p1', arm: 'probe', method: 'PATCH', route: '/api/projects/p1', status: 200, actor: viewer, requestJson: { description: 'policy-probe' }, json: { ok: true } },
+      { id: 'p2', arm: 'control', method: 'GET', route: '/api/projects/p1', status: 200, actor: admin, json: { id: 'p1', description: 'policy-probe' } },
+    ],
+  })
+  assert.equal(contentRoute.satisfied, false, contentRoute.reason)
+  assert.match(contentRoute.reason, /not a protected field|self-service|in policy/i)
+})
+
 function auditDisclosureSteps(hardened: boolean): ImpactStep[] {
   const detail = hardened ? 'rotated secret gl_[redacted]' : `rotated secret ${credentialValue}`
   const body = JSON.stringify({ items: [{ actor: 'system', action: 'rotate_key', detail }] })
