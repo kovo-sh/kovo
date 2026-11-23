@@ -437,10 +437,9 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
     // field or carry the endpoint's declared impact event.
     const oracleDeclared = hasOracle(input.oracleEvents, ['privilege_escalation', 'mass_assignment', 'invariant_violation', 'cross_tenant_write', 'state_delta'])
-    if (!vertical && !crossTenant && protectedChanged.length === 0 && !oracleDeclared) {
-      return { required: true, satisfied: false, reason: `The persisted change (${base.changedFields.slice(0, 6).join(', ') || 'none'}) is not a protected field and no impact-oracle event is declared; a state echo is not impact.`, evidence: base }
-    }
-    if (vertical && !crossTenant && protectedChanged.length === 0 && !oracleDeclared) {
+    // A cross-tenant write may persist any field; a same-tenant escalation must move a protected
+    // field or carry the endpoint's declared impact event.
+    if (!crossTenant && protectedChanged.length === 0 && !oracleDeclared) {
       return { required: true, satisfied: false, reason: `The persisted change (${base.changedFields.slice(0, 6).join(', ') || 'none'}) is not a protected field and no impact-oracle event is declared; a state echo is not impact.`, evidence: base }
     }
     if (boundaryControlDenied && !oracleDeclared && !crossTenant) {
@@ -501,7 +500,7 @@ export interface ReadDisclosureResult {
 }
 
 const OWNER_SCOPED_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|created_?by|author)$/i
-const PRIVATE_DATA_RE = /^(?:[a-z0-9]+[_-])*(?:private(?:_?note)?|internal|secret|api_?key|access_?token|token|ssn|phone|address|note|text|body|content|message|title|email|subject)$/i
+const PRIVATE_DATA_RE = /^(?:[a-z0-9]+[_-])*(?:private(?:_?note)?|internal|secret|api_?key|access_?token|token|ssn|phone|address|note|text|body|content|message|title|email|subject|amount(?:_?cents)?|total|balance|credits?|number)$/i
 
 /**
  * Response values are scrubbed before they leave the broker, so an identity that happened to equal
