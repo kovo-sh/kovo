@@ -86,6 +86,17 @@ export interface EngineHypothesis {
   secretScan?: boolean
   viewerPersona?: string
   csrfBind?: boolean
+  /**
+   * authz_matrix: a GET route that reads the mutated object (or the target actor's own identity)
+   * so a mutating proof can carry a pre/post readback. The engine sets this when its harvest has
+   * already observed the reading route; without it the synthesizer falls back to the endpoint's own
+   * REST detail/function surface.
+   */
+  readbackPath?: string
+  /** authz_matrix: actor for `readbackPath` when the read is the mutated user's own identity route. */
+  readbackPersona?: string
+  /** authz_matrix: role the privileged control needed, when the probe outcome established it. */
+  authzRequiredRole?: 'viewer' | 'member' | 'admin' | 'owner'
   /** auth_protocol_audit: body/header fields that carry a token (body-token routes). */
   tokenFields?: string[]
   /** auth_protocol_audit: session-derived scalar claims for a forged token payload. */
@@ -286,6 +297,43 @@ function negativeControlJq(mutating: boolean): string {
   return `(((.steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((${is2xx('c2')}) and (.steps.c2.body != .steps.c1.body) and ((.steps.c2.body | length) > 2)))`
 }
 
+/** A route whose name marks an elevated function (admin console, permission/role grant, ...). */
+const PRIVILEGED_ACTION_RE = /(?:^|[/_.-])(?:admin|administration|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?)(?:$|[/_.-])/i
+
+interface AuthzReadback {
+  /** GET path (with the resource id already filled in) used before and after the mutation. */
+  path: string
+}
+
+/**
+ * A mutating authorization proof only becomes observable when a *separate read* shows the change;
+ * the mutation's own response is an echo. Pick the read from what the hypothesis already knows:
+ * an explicit harvested readback route, the object's REST detail route (dropping a trailing action
+ * verb such as `/promote`), or the function's own surface for an elevated action.
+ */
+function authzReadback(hyp: EngineHypothesis, functionLevel: boolean, id: string): AuthzReadback | null {
+  if (hyp.readbackPath) return { path: fillId(hyp.readbackPath, id) }
+  const pathAndQuery = hyp.pathAndQuery
+  const bare = pathAndQuery.split('?')[0]
+  if (functionLevel) {
+    if (!PRIVILEGED_ACTION_RE.test(bare)) return null
+    return { path: pathAndQuery }
+  }
+  // Identifier in the query string: re-read the filtered collection with the same identifier.
+  const queryAt = pathAndQuery.indexOf('?')
+  if (queryAt >= 0 && pathAndQuery.slice(queryAt).includes('{{id}}')) return { path: pathAndQuery }
+  const segs = bare.split('/')
+  const placeholderIdx = segs.findIndex(seg => seg === '{{id}}' || /^\{[^}]+\}$/.test(seg) || /^:[A-Za-z_][A-Za-z0-9_]*$/.test(seg))
+  if (placeholderIdx <= 0) return null
+  // `/api/invoices/{{id}}` — the identifier is the object itself.
+  if (placeholderIdx === segs.length - 1) return { path: fillId(pathAndQuery, id) }
+  // `/api/admin/users/{{id}}/promote` — read the object under the elevated action verb.
+  if (placeholderIdx === segs.length - 2 && PRIVILEGED_ACTION_RE.test(bare)) {
+    return { path: fillId(segs.slice(0, -1).join('/'), id) }
+  }
+  return null
+}
+
 function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const owner = hyp.ownerPersona
   const other = hyp.otherPersona
@@ -359,13 +407,75 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     const stepExtra = mutating && hyp.csrfBind ? { csrfBind: true } : {}
     const probePersona = hit.actor === 'anonymous' ? null : other
     const neg = functionLevel ? null : negativeControlJq(mutating)
+    // A mutating proof must show the protected state changed in a *separate readback*, never the
+    // mutation's own acknowledgement. Roles: the privileged actor reads before and after, the lower
+    // role mutates in between; a function-level proof also lets the lower role re-read the function
+    // state so the change is visible to the actor that caused it.
+    const readback = mutating ? authzReadback(hyp, functionLevel, id) : null
+    const readbackPersona = hyp.readbackPersona ?? owner
+    const steps: Array<Record<string, unknown>> = []
+    const buildMutatingChain = (read: AuthzReadback) => {
+      if (!functionLevel) {
+        const negativeId = matrix === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'c2', 'control',
+          `Authorized actor addresses a nonexistent identifier (${negativeId})`,
+          {
+            method: method as RequestParts['method'],
+            pathAndQuery: fillId(hyp.pathAndQuery, negativeId),
+            ...(mutating ? { jsonBody: bodyTemplate } : {}),
+          },
+          owner, stepExtra, NEGATIVE_CONTROL_STATUS,
+        ))
+      }
+      steps.push(stepOf(
+        hyp.endpoint.origin, 'c1', 'control',
+        'Authorized actor reads the target state before the mutation',
+        { method: 'GET', pathAndQuery: read.path }, readbackPersona,
+      ))
+      steps.push(stepOf(hyp.endpoint.origin, 'p1', 'probe', `${probePersona ? 'Lower-privileged actor' : 'Unauthenticated caller'} performs the mutation`, parts, probePersona, stepExtra))
+      steps.push(stepOf(
+        hyp.endpoint.origin, 'p2', 'control',
+        'Authorized actor re-reads the target state after the mutation',
+        { method: 'GET', pathAndQuery: read.path }, readbackPersona, {},
+        method === 'DELETE' ? [200, 204, 404, 410] : [200, 404],
+      ))
+      if (functionLevel && probePersona) {
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'p3', 'probe',
+          'Lower-privileged actor observes the mutated function state',
+          { method: 'GET', pathAndQuery: read.path }, probePersona, {}, [200, 403, 404],
+        ))
+      }
+      const persisted = method === 'DELETE'
+        ? `(((.steps.p2.status >= 400) and (.steps.p2.status < 500)) or ((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body)))`
+        : `((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body))`
+      return `{ controlPassed: ((${nonTrivial('c1', 2)})${neg ? ` and (${neg})` : ''}), ` +
+        `confirmed: ((${is2xx('p1')}) and (${persisted})${neg ? ` and (${neg})` : ''}), ` +
+        `observed: ("probe status=" + (.steps.p1.status | tostring) + " after status=" + (.steps.p2.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
+        'expected: "the mutation is denied and the protected state is unchanged" }'
+    }
+    if (readback) {
+      const jq = buildMutatingChain(readback)
+      out.push({
+        kind: 'http_chain',
+        vulnClass,
+        endpoint: hyp.endpoint.pathTemplate,
+        spec: {
+          ...baseFields(hyp.endpoint.origin, title, cwe, category, sensitiveRead ? 'medium' : 'high', jq),
+          kind: 'http_chain',
+          ...(mutating && hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
+          steps,
+        },
+      })
+      continue
+    }
     const ownerJq = nonTrivial('c1', 3)
     const probeJq = nonTrivial('p1', 3)
     const jq = `{ controlPassed: ((${ownerJq})${neg ? ` and (${neg})` : ''}), ` +
       `confirmed: ((${probeJq})${neg ? ` and (${neg})` : ''} and (${matchesOwnerJq()})), ` +
       `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
       'expected: "non-owner denied" }'
-    const steps: Array<Record<string, unknown>> = []
     if (!functionLevel) {
       const negativeId = matrix === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
       steps.push(stepOf(

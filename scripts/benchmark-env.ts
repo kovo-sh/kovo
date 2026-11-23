@@ -165,15 +165,19 @@ export async function createEngineEnv(handle: BenchmarkServerHandle, caps: Profi
   const pick = (...names: string[]) => names.find(n => personaMap.has(n))
   const owner = pick('persona_a', 'user', 'alice') ?? handles[0]
   const other = pick('persona_b', 'bob') ?? handles.find(n => n !== owner)
+  const viewer = pick('viewer')
+  const admin = pick('admin')
   const probeEnv: ProbeEnv = {
     origin, broker, grant, canaryBroker, storage, runId: run.id, signal: controller.signal, caps,
-    owner, other, admin: pick('admin'), viewer: pick('viewer'), jwtPersona, personaUserIds: userIds, session: 'bench',
+    owner, other, admin, viewer, jwtPersona, personaUserIds: userIds, session: 'bench',
     // Adaptive budget: enough slow probes to cover every plausible blind-SQLi parameter class while
     // still bounding wall-clock (each hit costs ~3 interleaved delay rounds). The live pipeline
     // recomputes this from the formed plan and the M7 orchestration config.
     slowProbesLeft: opts.slowProbes ?? 20,
     ...(owner && userIdByHandle.get(owner) ? { ownerUserId: userIdByHandle.get(owner)! } : {}),
     ...(other && userIdByHandle.get(other) ? { otherUserId: userIdByHandle.get(other)! } : {}),
+    ...(viewer && userIdByHandle.get(viewer) ? { viewerUserId: userIdByHandle.get(viewer)! } : {}),
+    ...(admin && userIdByHandle.get(admin) ? { adminUserId: userIdByHandle.get(admin)! } : {}),
   }
   return {
     storage, broker, canaryBroker, grant, runId: run.id, scopeRevision, oobCallbackPorts, probeEnv, controller, requestsUsed: () => used,
