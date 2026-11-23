@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gt, inArray, or, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
@@ -89,6 +89,9 @@ import { responseReview } from './response-checks.ts'
 import { availableReviewChecks } from './review-plan.ts'
 import * as tables from './schema.ts'
 
+/** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
+export const STORE_SCHEMA_VERSION = 6
+
 export type Run = typeof tables.runs.$inferSelect
 export type Assignment = typeof tables.assignments.$inferSelect
 export type Project = typeof tables.projects.$inferSelect
@@ -117,6 +120,8 @@ export type EndpointParamRow = typeof tables.endpointParams.$inferSelect
 export type ApiDependencyRow = typeof tables.apiDependencies.$inferSelect
 export type SecondOrderCanaryRow = typeof tables.secondOrderCanaries.$inferSelect
 export type LabTelemetryRow = typeof tables.labTelemetry.$inferSelect
+export type LabContainerRow = typeof tables.labContainers.$inferSelect
+export type ResourceSampleTableRow = typeof tables.resourceSamples.$inferSelect
 export type BenchmarkRunRow = typeof tables.benchmarkRuns.$inferSelect
 
 export type FactKind =
@@ -176,6 +181,35 @@ export interface ProjectSpecSummary {
   createdAt: number
 }
 
+/** v6 pagination contract: `limit` is explicit (never silently capped); offset is stable. */
+export interface PaginationOptions {
+  limit?: number
+  offset?: number
+}
+
+export interface RunDetailOptions extends PaginationOptions {
+  /** Per-collection overrides; omitted collections inherit `limit`/`offset`. */
+  facts?: PaginationOptions
+  endpoints?: PaginationOptions
+  endpointParams?: PaginationOptions
+  exchanges?: PaginationOptions
+  evidence?: PaginationOptions
+  messages?: PaginationOptions
+  boardMessages?: PaginationOptions
+  /** Include exact SQL COUNT(*) totals for paginated collections (default: true when paging). */
+  includeTotals?: boolean
+}
+
+/** Summary returned by `Store.recover()`; persisted so startup recovery is idempotent. */
+export interface RecoveryReport {
+  pausedRuns: number
+  requeuedAssignments: number
+  resetBoardMembers: number
+  expiredApprovals: number
+  reclaimedContainers: Array<{ runId: string; containerName: string }>
+  changed: boolean
+}
+
 export interface RunEventPayload {
   id: number
   kind: string
@@ -194,6 +228,17 @@ function evidenceTitle(run: Run, kind: EvidenceSummary['kind'], title: string) {
 }
 
 export const dataDirectory = () => resolve(process.env.GUARDIAN_DATA_DIR ?? '.guardian')
+
+/** Explicit limits are honored (never silently capped); non-finite input falls back. */
+export function resolvePageLimit(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.max(1, Math.round(value))
+}
+
+export function resolvePageOffset(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
+  return Math.round(value)
+}
 
 export function assessmentAssignments(assignments: readonly Assignment[], assetId: string, goalRevision: number) {
   const ordered = assignments.filter(worker => worker.assetId === assetId && worker.goalRevision === goalRevision)
@@ -257,6 +302,8 @@ export interface ResourceSampleRow {
   runId: string
   ownerPersona: string
   resourceKey: string
+  /** Collection the id belongs to (e.g. `/invoices`); absent on legacy rows (treated as `''`). */
+  collectionPath?: string
   resourceId: string
   origin: string
   endpoint: string
@@ -325,6 +372,23 @@ export function isOpaqueResourceId(raw: string, opts?: { keyed?: boolean }): boo
   }
   if (RESOURCE_HASHID_RE.test(value)) return true
   return false
+}
+
+/**
+ * Normalize the collection a harvested identifier belongs to. Trailing opaque id segments are
+ * dropped so `/invoices/42` and `/invoices` share the `/invoices` collection, while `/orders`
+ * and `/tickets` never collide on a shared `id` field name.
+ */
+export function collectionPathFor(endpoint: string): string {
+  const bare = (endpoint.split('?')[0]?.split('#')[0] ?? '').trim()
+  const segments = bare.split('/').filter(Boolean)
+  while (segments.length) {
+    const last = decodePathSegment(segments[segments.length - 1]!)
+    if (!isOpaqueResourceId(last)) break
+    segments.pop()
+  }
+  const normalized = ('/' + segments.join('/')).slice(0, 512)
+  return normalized === '/' ? '' : normalized
 }
 
 function sameOriginPath(raw: string, origin: string): string | null {
@@ -458,6 +522,13 @@ function sanitizeSecretMatches(matches: readonly SecretMatch[] | undefined, secr
   return out
 }
 
+/** One queued exchange write; `row` is fully redacted and safe to persist at flush time. */
+interface PendingExchangeWrite {
+  row: typeof tables.brokerExchanges.$inferInsert
+  eventMessage: string
+  eventDetail: Record<string, unknown>
+}
+
 export class Store {
   readonly db
   readonly client: DatabaseSync
@@ -467,6 +538,12 @@ export class Store {
   private readonly emitter = new EventEmitter()
   private ftsAvailable = false
   private txDepth = 0
+  /** Bounded async write queue for broker exchanges (flushed by microtask/size boundary). */
+  private pendingExchanges: PendingExchangeWrite[] = []
+  private flushScheduled = false
+  private flushing = false
+  private flushError: unknown = null
+  private static readonly maxPendingExchanges = 128
 
   constructor(directory: string) {
     this.directory = directory
@@ -490,13 +567,19 @@ export class Store {
       }
     }
     this.client = new DatabaseSync(path, { timeout: 5000 })
-    this.client.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;')
+    // v6 scale pragmas: WAL keeps readers non-blocking under the batched writer; NORMAL skips the
+    // per-commit fsync (WAL still guarantees a consistent DB across process crashes), and the
+    // busy timeout lets concurrent readers/snapshot copies wait instead of failing fast.
+    this.client.exec(
+      'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;',
+    )
     this.db = drizzle({ client: this.client })
     const result = migrate(this.db, { migrationsFolder: resolve('drizzle') })
     if (result && 'exitCode' in result) throw new Error('Guardian database migration failed.')
     this.initV3Schema()
     this.initV4Schema()
     this.initV5Schema()
+    this.initV6Schema()
     this.initFts()
     const current = this.db.select().from(tables.workspaces).limit(1).get()
     this.workspace = current ?? this.db.insert(tables.workspaces).values({
@@ -798,12 +881,13 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS board_messages_run_seq ON board_messages (run_id, seq);
       CREATE INDEX IF NOT EXISTS board_messages_run_tainted ON board_messages (run_id, tainted, seq);
 
-      -- v5 M2.1: redacted non-secret sample identifiers harvested per (run, owner persona, resource key).
+      -- v5 M2.1: redacted non-secret sample identifiers harvested per (run, owner persona, collection, resource key).
       CREATE TABLE IF NOT EXISTS resource_samples (
         id TEXT PRIMARY KEY NOT NULL,
         run_id TEXT NOT NULL REFERENCES runs(id),
         owner_persona TEXT NOT NULL,
         resource_key TEXT NOT NULL,
+        collection_path TEXT NOT NULL DEFAULT '',
         resource_id TEXT NOT NULL,
         origin TEXT NOT NULL,
         endpoint TEXT NOT NULL,
@@ -813,7 +897,7 @@ export class Store {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS resource_samples_key ON resource_samples (run_id, owner_persona, resource_key, origin);
+      CREATE UNIQUE INDEX IF NOT EXISTS resource_samples_key ON resource_samples (run_id, owner_persona, origin, collection_path, resource_key);
       CREATE INDEX IF NOT EXISTS resource_samples_run ON resource_samples (run_id, resource_key);
     `)
 
@@ -868,6 +952,59 @@ export class Store {
     `)
   }
 
+  /**
+   * v6 scale/data-integrity migration. Additive only:
+   * - `resource_samples.collection_path` + a wider unique key (backfilled with `''`).
+   * - `lab_containers` registry for crash recovery.
+   * - pagination indexes so `runDetail`/`listEndpoints`/`listFacts` do not scan whole tables.
+   * `PRAGMA user_version = STORE_SCHEMA_VERSION` stamps the upgrade.
+   */
+  private initV6Schema() {
+    const existingColumns = (table: string): Set<string> => {
+      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    }
+    const ensureColumn = (table: string, column: string, definition: string) => {
+      if (!existingColumns(table).has(column)) {
+        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+      }
+    }
+
+    ensureColumn('resource_samples', 'collection_path', "TEXT NOT NULL DEFAULT ''")
+    this.client.exec("UPDATE resource_samples SET collection_path = '' WHERE collection_path IS NULL")
+
+    const desiredColumns = ['run_id', 'owner_persona', 'origin', 'collection_path', 'resource_key']
+    const currentColumns = (this.client.prepare('PRAGMA index_info(resource_samples_key)').all() as Array<{ name: string }>)
+      .map(row => row.name)
+    if (currentColumns.join(',') !== desiredColumns.join(',')) {
+      this.client.exec(`
+        DROP INDEX IF EXISTS resource_samples_key;
+        CREATE UNIQUE INDEX resource_samples_key ON resource_samples (run_id, owner_persona, origin, collection_path, resource_key);
+      `)
+    }
+
+    this.client.exec(`
+      CREATE TABLE IF NOT EXISTS lab_containers (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        assignment_id TEXT,
+        container_name TEXT NOT NULL,
+        image_name TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS lab_containers_name ON lab_containers (run_id, container_name);
+      CREATE INDEX IF NOT EXISTS lab_containers_run ON lab_containers (run_id, status);
+
+      CREATE INDEX IF NOT EXISTS broker_exchanges_run_created ON broker_exchanges (run_id, created_at);
+      CREATE INDEX IF NOT EXISTS facts_run_created ON facts (run_id, created_at);
+      CREATE INDEX IF NOT EXISTS endpoints_run_updated ON endpoints (run_id, updated_at);
+      CREATE INDEX IF NOT EXISTS evidence_run_created ON evidence (run_id, created_at);
+    `)
+    this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
+  }
+
   private initFts() {
     try {
       this.client.exec(`
@@ -906,13 +1043,128 @@ export class Store {
   }
 
   close() {
+    try { this.flushNow() } catch { /* teardown is best-effort */ }
     try { this.client.close() } catch { /* ignore */ }
     try { this.processLock.exec('ROLLBACK') } catch { /* ignore */ }
     try { this.processLock.close() } catch { /* ignore */ }
   }
 
+  /**
+   * Durably flush every queued exchange write. Called by tests, teardown, snapshot capture and
+   * every read-after-write path (`getExchange`, `runDetail`, `searchExchanges`, report authoring).
+   * Safe to call repeatedly; a no-op when the queue is empty.
+   */
+  flushNow(): void {
+    if (this.txDepth > 0) return
+    if (this.flushing) return
+    const priorError = this.flushError
+    this.flushError = null
+    if (!this.pendingExchanges.length) {
+      if (priorError) throw priorError
+      return
+    }
+    const batch = this.pendingExchanges.splice(0, this.pendingExchanges.length)
+    this.flushing = true
+    try {
+      this.client.exec('BEGIN IMMEDIATE')
+      try {
+        this.applyExchangeBatch(batch)
+        this.client.exec('COMMIT')
+      } catch (error) {
+        try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
+        this.pendingExchanges.unshift(...batch)
+        throw error
+      }
+    } finally {
+      this.flushing = false
+    }
+    if (priorError) throw priorError
+  }
+
+  /** Queue one fully-redacted exchange row, flushing synchronously at the bounded size boundary. */
+  private enqueueExchange(item: PendingExchangeWrite) {
+    if (this.txDepth > 0) {
+      this.applyExchangeBatch([item])
+      return
+    }
+    this.pendingExchanges.push(item)
+    if (this.pendingExchanges.length >= Store.maxPendingExchanges) {
+      this.flushNow()
+      return
+    }
+    this.scheduleFlush()
+  }
+
+  private scheduleFlush() {
+    if (this.flushScheduled || this.flushing || this.txDepth > 0) return
+    this.flushScheduled = true
+    queueMicrotask(() => {
+      this.flushScheduled = false
+      if (!this.pendingExchanges.length || this.flushing || this.txDepth > 0) return
+      try {
+        this.flushNow()
+      } catch (error) {
+        this.flushError ??= error
+      }
+    })
+  }
+
+  /**
+   * Insert a batch of exchanges, their FTS rows, run/assignment request counters and audit events
+   * inside one IMMEDIATE transaction. Bulk values keep a 128-exchange flush well under 50 ms.
+   */
+  private applyExchangeBatch(batch: readonly PendingExchangeWrite[]) {
+    if (!batch.length) return
+    const rows = batch.map(item => item.row)
+    this.db.insert(tables.brokerExchanges).values(rows as typeof tables.brokerExchanges.$inferInsert[]).run()
+    if (this.ftsAvailable) {
+      const fts = this.client.prepare(
+        `INSERT INTO broker_exchanges_fts (exchange_id, run_id, origin, method, path_and_query, req_headers, resp_headers, body_preview)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      for (const row of rows) {
+        fts.run(row.id, row.runId, row.origin, row.method, row.pathAndQuery,
+          JSON.stringify(row.reqHeaders ?? {}), JSON.stringify(row.respHeaders ?? {}), row.bodyPreview)
+      }
+    }
+    const byRun = new Map<string, number>()
+    const byAssignment = new Map<string, number>()
+    for (const row of rows) {
+      byRun.set(row.runId, (byRun.get(row.runId) ?? 0) + 1)
+      byAssignment.set(row.assignmentId, (byAssignment.get(row.assignmentId) ?? 0) + 1)
+    }
+    const bumpRun = this.client.prepare('UPDATE runs SET spent_requests = spent_requests + ? WHERE id = ?')
+    for (const [runId, count] of byRun) bumpRun.run(count, runId)
+    const bumpAssignment = this.client.prepare('UPDATE assignments SET requests_used = requests_used + ? WHERE id = ?')
+    for (const [assignmentId, count] of byAssignment) bumpAssignment.run(count, assignmentId)
+
+    const eventRows = batch.map(item => ({
+      workspaceId: this.workspace.id,
+      runId: item.row.runId,
+      kind: 'broker.exchange',
+      message: redact(item.eventMessage),
+      detail: item.eventDetail,
+      createdAt: item.row.createdAt ?? Date.now(),
+    }))
+    const inserted = this.db.insert(tables.events).values(eventRows).returning().all()
+    queueMicrotask(() => {
+      for (const event of inserted) {
+        this.emitter.emit('run:' + event.runId, {
+          id: event.id,
+          kind: event.kind,
+          message: event.message,
+          detail: event.detail,
+          createdAt: event.createdAt,
+        } satisfies RunEventPayload)
+      }
+      this.emitter.emit('wake')
+    })
+  }
+
   transaction<T>(fn: () => T, _options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {
     if (this.txDepth === 0) {
+      // Preserve write ordering: never open a transaction while exchange writes are pending.
+      this.flushNow()
       this.txDepth += 1
       this.client.exec('BEGIN IMMEDIATE')
       try {
@@ -958,19 +1210,146 @@ export class Store {
     queueMicrotask(() => { this.emitter.emit('wake') })
   }
 
-  private recover() {
+  /**
+   * Crash recovery (idempotent). Resets interrupted runs, stuck board members and stale
+   * assignments, expires pending approval leases, and reclaims persisted LabRunner container rows.
+   * Permanently `failed` assignments are never re-queued.
+   */
+  recover(now = Date.now()): RecoveryReport {
+    if (this.txDepth > 0) throw new Error('recover() cannot run inside an open transaction.')
+    this.flushNow()
+    const report: RecoveryReport = {
+      pausedRuns: 0,
+      requeuedAssignments: 0,
+      resetBoardMembers: 0,
+      expiredApprovals: 0,
+      reclaimedContainers: [],
+      changed: false,
+    }
     this.transaction(() => {
-      const interrupted = this.db.select().from(tables.runs).where(and(
-        eq(tables.runs.workspaceId, this.workspace.id), eq(tables.runs.status, 'running'),
-      )).all()
-      for (const run of interrupted) {
+      const runRows = this.db.select({ id: tables.runs.id, status: tables.runs.status }).from(tables.runs)
+        .where(and(
+          eq(tables.runs.workspaceId, this.workspace.id),
+          inArray(tables.runs.status, ['running', 'paused']),
+        )).all()
+      const runIds = runRows.map(row => row.id)
+      const interrupted = runRows.filter(row => row.status === 'running')
+
+      for (const row of interrupted) {
+        const run = this.run(row.id)
         this.setStatus(run, 'paused')
-        this.db.update(tables.chainSteps).set({ status: 'ready', assignedWorkerId: null, updatedAt: Date.now() })
+        this.db.update(tables.chainSteps).set({ status: 'ready', assignedWorkerId: null, updatedAt: now })
           .where(and(eq(tables.chainSteps.runId, run.id), eq(tables.chainSteps.status, 'running'))).run()
-        this.event(run.id, 'interrupted', 'The application restarted. Resume to continue from saved evidence.')
+        report.pausedRuns += 1
+      }
+
+      if (runIds.length) {
+        const placeholders = runIds.map(() => '?').join(', ')
+        const requeued = this.client.prepare(
+          `UPDATE assignments SET status = 'queued', lease = NULL, lease_expires_at = NULL
+           WHERE run_id IN (${placeholders}) AND status IN ('running', 'waiting_approval', 'paused')`,
+        ).run(...runIds) as { changes?: number }
+        report.requeuedAssignments = Number(requeued.changes ?? 0)
+
+        const resetMembers = this.client.prepare(
+          `UPDATE board_members SET state = 'waiting', active_assignment_id = NULL, updated_at = ?
+           WHERE run_id IN (${placeholders}) AND state = 'working'`,
+        ).run(now, ...runIds) as { changes?: number }
+        report.resetBoardMembers = Number(resetMembers.changes ?? 0)
+      }
+
+      const expired = this.client.prepare(
+        `UPDATE approval_requests SET status = 'expired', decided_at = ?,
+           policy_note = coalesce(policy_note, 'Expired approval lease cleared during crash recovery.')
+         WHERE status = 'pending' AND expires_at < ?
+           AND run_id IN (SELECT id FROM runs WHERE workspace_id = ?)`,
+      ).run(now, now, this.workspace.id) as { changes?: number }
+      report.expiredApprovals = Number(expired.changes ?? 0)
+
+      const orphanedRows = this.db.select().from(tables.labContainers)
+        .where(eq(tables.labContainers.status, 'orphaned')).all()
+      const liveRows = runIds.length
+        ? this.db.select().from(tables.labContainers).where(and(
+            eq(tables.labContainers.status, 'running'),
+            inArray(tables.labContainers.runId, runIds),
+          )).all()
+        : []
+      const containerRows = [...orphanedRows, ...liveRows]
+      const uniqueContainers = new Map(containerRows.map(row => [row.id, row]))
+      if (uniqueContainers.size) {
+        const ids = [...uniqueContainers.keys()]
+        const deleteStmt = this.client.prepare(`DELETE FROM lab_containers WHERE id IN (${ids.map(() => '?').join(', ')})`)
+        deleteStmt.run(...ids)
+        report.reclaimedContainers = [...uniqueContainers.values()]
+          .map(row => ({ runId: row.runId, containerName: row.containerName }))
+      }
+
+      for (const row of interrupted) {
+        this.event(row.id, 'interrupted', 'The application restarted. Resume to continue from saved evidence.')
+      }
+
+      report.changed = report.pausedRuns > 0 || report.requeuedAssignments > 0
+        || report.resetBoardMembers > 0 || report.expiredApprovals > 0 || report.reclaimedContainers.length > 0
+
+      if (report.reclaimedContainers.length || report.expiredApprovals) {
+        this.event(null, 'recovery.completed', 'Crash recovery reclaimed runtime state.', {
+          pausedRuns: report.pausedRuns,
+          requeuedAssignments: report.requeuedAssignments,
+          resetBoardMembers: report.resetBoardMembers,
+          expiredApprovals: report.expiredApprovals,
+          reclaimedContainers: report.reclaimedContainers.map(row => row.containerName).slice(0, 50),
+        })
       }
     }, { behavior: 'immediate' })
+    return report
   }
+
+  // --- LabRunner container registry (v6 crash recovery) ------------------------------
+
+  recordLabContainer(input: {
+    runId: string
+    assignmentId?: string | null
+    containerName: string
+    imageName?: string | null
+    status?: LabContainerRow['status']
+  }): LabContainerRow {
+    const now = Date.now()
+    const existing = this.db.select().from(tables.labContainers).where(and(
+      eq(tables.labContainers.runId, input.runId),
+      eq(tables.labContainers.containerName, input.containerName),
+    )).get()
+    if (existing) {
+      return this.db.update(tables.labContainers).set({
+        assignmentId: input.assignmentId !== undefined ? input.assignmentId : existing.assignmentId,
+        imageName: input.imageName !== undefined ? input.imageName : existing.imageName,
+        status: input.status ?? existing.status,
+        updatedAt: now,
+      }).where(eq(tables.labContainers.id, existing.id)).returning().get()!
+    }
+    return this.db.insert(tables.labContainers).values({
+      id: randomUUID(),
+      runId: input.runId,
+      assignmentId: input.assignmentId ?? null,
+      containerName: input.containerName,
+      imageName: input.imageName ?? null,
+      status: input.status ?? 'running',
+      createdAt: now,
+      updatedAt: now,
+    }).returning().get()
+  }
+
+  markLabContainerOrphaned(runId: string, containerName: string) {
+    this.db.update(tables.labContainers).set({ status: 'orphaned', updatedAt: Date.now() }).where(and(
+      eq(tables.labContainers.runId, runId),
+      eq(tables.labContainers.containerName, containerName),
+    )).run()
+  }
+
+  listLabContainers(runId: string): LabContainerRow[] {
+    return this.db.select().from(tables.labContainers).where(eq(tables.labContainers.runId, runId))
+      .orderBy(asc(tables.labContainers.createdAt), asc(tables.labContainers.containerName)).all()
+  }
+
 
   event(runId: string | null, kind: string, message: string, detail: Record<string, unknown> = {}) {
     const inserted = this.db.insert(tables.events).values({
@@ -1432,21 +1811,46 @@ export class Store {
     }
   }
 
-  runDetail(runId: string) {
+  runDetail(runId: string, options?: RunDetailOptions) {
+    // A caller that just recorded an exchange must see it in the detail view.
+    this.flushNow()
     const run = this.run(runId)
+    const pageFor = (specific?: PaginationOptions): PaginationOptions => ({
+      limit: specific?.limit ?? options?.limit,
+      offset: specific?.offset ?? options?.offset,
+    })
+    const isPaged = (page: PaginationOptions) => page.limit !== undefined || page.offset !== undefined
+    const evidencePage = pageFor(options?.evidence)
+    const factsPage = pageFor(options?.facts)
+    const exchangePage = pageFor(options?.exchanges)
+    const endpointPage = pageFor(options?.endpoints)
+    const messagePage = pageFor(options?.messages)
+    const boardPage = pageFor(options?.boardMessages)
+
     const streamHead = this.db.select({ id: tables.events.id }).from(tables.events)
       .where(eq(tables.events.runId, run.id)).orderBy(desc(tables.events.id)).limit(1).get()
-    const evidence = this.db.select().from(tables.evidence).where(eq(tables.evidence.runId, runId))
-      .orderBy(asc(tables.evidence.createdAt)).all()
+
+    const evidenceBase = this.db.select().from(tables.evidence).where(eq(tables.evidence.runId, runId))
+      .orderBy(asc(tables.evidence.createdAt), asc(tables.evidence.id))
+    const evidenceRows = isPaged(evidencePage)
+      ? evidenceBase.limit(resolvePageLimit(evidencePage.limit, 1000)).offset(resolvePageOffset(evidencePage.offset)).all()
+      : evidenceBase.all()
+
     const threatModel = this.latestThreatModel(runId, run.goalRevision)
     const chainSteps = this.listChainSteps(runId)
-    const facts = this.db.select().from(tables.facts).where(eq(tables.facts.runId, runId))
-      .orderBy(asc(tables.facts.createdAt)).all()
+
+    const factsBase = this.db.select().from(tables.facts).where(eq(tables.facts.runId, runId))
+      .orderBy(asc(tables.facts.createdAt), asc(tables.facts.id))
+    const facts = isPaged(factsPage)
+      ? factsBase.limit(resolvePageLimit(factsPage.limit, 100)).offset(resolvePageOffset(factsPage.offset)).all()
+      : factsBase.all()
+
     const graphEdges = this.listGraphEdges(runId)
     const digests = this.listDigests(runId, false)
     const assignments = this.workerList(runId)
     const approvals = this.listApprovalRequests(runId)
-    const exchangesSummary: ExchangeSummary[] = this.db.select({
+
+    const exchangeColumns = {
       id: tables.brokerExchanges.id,
       assignmentId: tables.brokerExchanges.assignmentId,
       scopeRevision: tables.brokerExchanges.scopeRevision,
@@ -1463,12 +1867,27 @@ export class Store {
       bodySha256: tables.brokerExchanges.bodySha256,
       durationMs: tables.brokerExchanges.durationMs,
       createdAt: tables.brokerExchanges.createdAt,
-    }).from(tables.brokerExchanges).where(eq(tables.brokerExchanges.runId, runId))
-      .orderBy(desc(tables.brokerExchanges.createdAt)).limit(500).all()
+    }
+    const exchangeBase = this.db.select(exchangeColumns).from(tables.brokerExchanges)
+      .where(eq(tables.brokerExchanges.runId, runId))
+      .orderBy(desc(tables.brokerExchanges.createdAt), asc(tables.brokerExchanges.id))
+    const exchangesSummary: ExchangeSummary[] = (isPaged(exchangePage)
+      ? exchangeBase.limit(resolvePageLimit(exchangePage.limit, 500)).offset(resolvePageOffset(exchangePage.offset)).all()
+      : exchangeBase.limit(500).all())
       .map(ex => ({ ...ex, bodyPreview: ex.bodyPreview.slice(0, 320) }))
+
     const coverageEntries = this.listCoverageEntries(runId)
-    const endpoints = this.listEndpoints(runId)
-    const endpointParams = this.listEndpointParams(runId)
+    const endpoints = this.listEndpoints(runId, isPaged(endpointPage)
+      ? { limit: resolvePageLimit(endpointPage.limit, 500), offset: resolvePageOffset(endpointPage.offset) }
+      : undefined)
+    const endpointParams = isPaged(endpointPage)
+      ? (endpoints.length
+          ? this.db.select().from(tables.endpointParams).where(and(
+              eq(tables.endpointParams.runId, runId),
+              inArray(tables.endpointParams.endpointId, endpoints.map(endpoint => endpoint.id)),
+            )).orderBy(asc(tables.endpointParams.createdAt), asc(tables.endpointParams.id)).all()
+          : [])
+      : this.listEndpointParams(runId)
     const apiDependencies = this.listApiDependencies(runId)
     const labTelemetry = this.listLabTelemetry(runId)
     const openProofGaps = this.listOpenProofGaps(runId, run.goalRevision)
@@ -1491,6 +1910,36 @@ export class Store {
       severityChangeConditions: row.severityChangeConditions ?? row.finding.severityChangeConditions,
       ...(row.codeLocations?.length ? { codeLocations: row.codeLocations } : row.finding.codeLocations?.length ? { codeLocations: row.finding.codeLocations } : {}),
     }))
+
+    const messageBase = this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
+      .orderBy(asc(tables.messages.createdAt), sql`${tables.messages}.rowid`)
+    const messages = isPaged(messagePage)
+      ? messageBase.limit(resolvePageLimit(messagePage.limit, 1000)).offset(resolvePageOffset(messagePage.offset)).all()
+      : messageBase.all()
+    const boardMessages = isPaged(boardPage)
+      ? this.db.select().from(tables.boardMessages).where(eq(tables.boardMessages.runId, runId))
+          .orderBy(asc(tables.boardMessages.seq))
+          .limit(resolvePageLimit(boardPage.limit, 500)).offset(resolvePageOffset(boardPage.offset)).all()
+      : this.listBoardMessages(runId, { includeTainted: true, limit: 500 })
+
+    const paging = options
+      ? {
+          ...(options.includeTotals === false ? {} : {
+            totals: {
+              evidence: this.countRunRows('evidence', runId),
+              facts: this.countRunRows('facts', runId),
+              exchanges: this.countRunRows('broker_exchanges', runId),
+              endpoints: this.countRunRows('endpoints', runId),
+              endpointParams: this.countRunRows('endpoint_params', runId),
+              messages: this.countRunRows('messages', runId),
+              boardMessages: this.countRunRows('board_messages', runId),
+            },
+          }),
+          limit: options.limit,
+          offset: resolvePageOffset(options.offset),
+        }
+      : undefined
+
     return {
       run,
       project: this.project(run.projectId),
@@ -1516,15 +1965,21 @@ export class Store {
       replaySpecs: replaySpecs as unknown as SerializableReplaySpecRow[],
       retestRuns,
       findings,
-      messages: this.db.select().from(tables.messages).where(eq(tables.messages.runId, runId))
-        .orderBy(asc(tables.messages.createdAt), sql`${tables.messages}.rowid`).all(),
+      messages,
       boardMembers: this.listBoardMembers(runId),
-      boardMessages: this.listBoardMessages(runId, { includeTainted: true, limit: 500 }),
-      evidence: evidence.map(item => ({ ...item, title: evidenceTitle(run, item.kind, item.title) })),
+      boardMessages,
+      evidence: evidenceRows.map(item => ({ ...item, title: evidenceTitle(run, item.kind, item.title) })),
       reports: this.db.select().from(tables.reports).where(eq(tables.reports.runId, runId))
         .orderBy(desc(tables.reports.version)).all(),
       cursor: streamHead?.id ?? 0,
+      ...(paging ? { paging } : {}),
     }
+  }
+
+  /** Exact pagination totals (indexed run_id COUNT); used by `runDetail` instead of hydration. */
+  private countRunRows(table: string, runId: string): number {
+    const row = this.client.prepare(`SELECT count(*) AS c FROM ${table} WHERE run_id = ?`).get(runId) as { c?: number } | undefined
+    return Number(row?.c ?? 0)
   }
 
   workerList(runId: string) {
@@ -1569,6 +2024,7 @@ export class Store {
   }
 
   brokerOrigins(assignment: Assignment) {
+    this.flushNow()
     const exchangeRows = this.db.select({
       origin: tables.brokerExchanges.origin,
       finalOrigin: tables.brokerExchanges.finalOrigin,
@@ -1596,24 +2052,90 @@ export class Store {
     return [...origins]
   }
 
-  writeBlob(content: string, secrets: readonly NamedSecret[] = []): { id: string; sha256: string } {
+  /** Deterministic 2-hex shard for artifact paths: `artifacts/<runId>/<bucket>/<id>.txt`. */
+  private artifactBucket(id: string): string {
+    return createHash('sha256').update(id).digest('hex').slice(0, 2)
+  }
+
+  private artifactShardFile(runId: string, id: string, group?: string): string {
+    const parts = [this.directory, 'artifacts', runId]
+    if (group) parts.push(group)
+    parts.push(this.artifactBucket(id), id + '.txt')
+    return join(...parts)
+  }
+
+  private writeArtifactFile(runId: string, id: string, content: string, group?: string, durable = true) {
+    const file = this.artifactShardFile(runId, id, group)
+    mkdirSync(join(file, '..'), { recursive: true, mode: 0o700 })
+    try {
+      writeFileSync(file, content, { flag: 'wx', mode: 0o600, flush: durable })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+  }
+
+  /** Read a sharded artifact, falling back to the legacy flat `artifacts/<id>.txt` layout. */
+  private readArtifactFile(runId: string, id: string, group?: string): string | null {
+    const flat = join(this.directory, 'artifacts', id + '.txt')
+    if (existsSync(flat)) return readFileSync(flat, 'utf8')
+    const direct = this.artifactShardFile(runId, id, group)
+    if (existsSync(direct)) return readFileSync(direct, 'utf8')
+    const runDir = join(this.directory, 'artifacts', runId)
+    const buckets = [this.artifactBucket(id)]
+    try {
+      for (const entry of readdirSync(runDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && entry.name !== buckets[0]) buckets.push(entry.name)
+      }
+    } catch { /* no sharded artifacts yet */ }
+    for (const bucket of buckets) {
+      for (const prefix of group ? [group] : []) {
+        const candidate = join(runDir, prefix, bucket, id + '.txt')
+        if (existsSync(candidate)) return readFileSync(candidate, 'utf8')
+      }
+      const candidate = join(runDir, bucket, id + '.txt')
+      if (existsSync(candidate)) return readFileSync(candidate, 'utf8')
+    }
+    return null
+  }
+
+  writeBlob(content: string, secrets: readonly NamedSecret[] = [], runId?: string, durable = true): { id: string; sha256: string } {
     const clean = redact(content, secrets)
     const sha256 = createHash('sha256').update(clean, 'utf8').digest('hex')
     const id = 'blob-' + sha256
-    const file = join(this.directory, 'artifacts', id + '.txt')
-    if (!existsSync(file)) {
-      try {
-        writeFileSync(file, clean, { flag: 'wx', mode: 0o600, flush: true })
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    if (runId) {
+      this.writeArtifactFile(runId, id, clean, 'blobs', durable)
+    } else {
+      const file = join(this.directory, 'artifacts', id + '.txt')
+      if (!existsSync(file)) {
+        try {
+          writeFileSync(file, clean, { flag: 'wx', mode: 0o600, flush: durable })
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        }
       }
     }
     return { id, sha256 }
   }
 
-  readBlob(blobId: string): string {
+  readBlob(blobId: string, runId?: string): string {
     if (!/^blob-[a-f0-9]{64}$/.test(blobId)) throw new Error('Invalid blob ID.')
-    return readFileSync(join(this.directory, 'artifacts', blobId + '.txt'), 'utf8')
+    if (runId) {
+      const scoped = this.readArtifactFile(runId, blobId, 'blobs')
+      if (scoped !== null) return scoped
+    }
+    const flat = join(this.directory, 'artifacts', blobId + '.txt')
+    if (existsSync(flat)) return readFileSync(flat, 'utf8')
+    // Content-addressed blobs may have been first written under another run.
+    let dirs: string[] = []
+    try {
+      dirs = readdirSync(join(this.directory, 'artifacts'), { withFileTypes: true })
+        .filter(entry => entry.isDirectory()).map(entry => entry.name)
+    } catch { /* empty artifacts dir */ }
+    for (const dir of dirs) {
+      const found = this.readArtifactFile(dir, blobId, 'blobs')
+      if (found !== null) return found
+    }
+    throw new Error('Artifact not found.')
   }
 
   artifact(runId: string, artifactId: string) {
@@ -1622,10 +2144,12 @@ export class Store {
       eq(tables.evidence.id, artifactId), eq(tables.evidence.runId, runId),
     )).get()
     if (!item) throw new Error('Evidence not found.')
+    const content = this.readArtifactFile(runId, item.id)
+    if (content === null) throw new Error('Artifact not found.')
     return {
       ...item,
       title: evidenceTitle(run, item.kind, item.title),
-      content: readFileSync(join(this.directory, 'artifacts', item.id + '.txt'), 'utf8'),
+      content,
     }
   }
 
@@ -1643,7 +2167,7 @@ export class Store {
       if (existing) return existing
     }
     const id = randomUUID()
-    writeFileSync(join(this.directory, 'artifacts', id + '.txt'), redact(content, secrets), { flag: 'wx', mode: 0o600, flush: true })
+    this.writeArtifactFile(run.id, id, redact(content, secrets))
     return this.db.insert(tables.evidence).values({
       id, runId: run.id, assignmentId: assignment.id, scopeRevision: run.scopeRevision,
       goalRevision: assignment.goalRevision, title: redact(title, secrets), kind, operationId, createdAt: Date.now(),
@@ -1681,14 +2205,16 @@ export class Store {
     let bodyArtifactId: string | null = null
     let bodySha256: string
     if (cleanBody.length > 0) {
-      const blob = this.writeBlob(cleanBody, secrets)
+      // Hot path: write the content-addressed body without an fsync. WAL + the explicit flush
+      // boundaries (snapshot/close/report) provide the same crash guarantee as `synchronous=NORMAL`.
+      const blob = this.writeBlob(cleanBody, secrets, input.runId, false)
       bodyArtifactId = blob.id
       bodySha256 = blob.sha256
     } else {
       bodySha256 = createHash('sha256').update('').digest('hex')
     }
 
-    const row: typeof tables.brokerExchanges.$inferInsert = {
+    const row: BrokerExchange = {
       id: randomUUID(),
       runId: input.runId,
       assignmentId: input.assignmentId,
@@ -1711,36 +2237,23 @@ export class Store {
       createdAt: Date.now(),
     }
 
-    const inserted = this.transaction(() => {
-      const ex = this.db.insert(tables.brokerExchanges).values(row).returning().get()
-      if (this.ftsAvailable) {
-        this.client.prepare(
-          `INSERT INTO broker_exchanges_fts (exchange_id, run_id, origin, method, path_and_query, req_headers, resp_headers, body_preview)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          ex.id, ex.runId, ex.origin, ex.method, ex.pathAndQuery,
-          JSON.stringify(ex.reqHeaders), JSON.stringify(ex.respHeaders), ex.bodyPreview,
-        )
-      }
-      this.db.update(tables.runs).set({ spentRequests: sql`${tables.runs.spentRequests} + 1` })
-        .where(eq(tables.runs.id, input.runId)).run()
-      this.db.update(tables.assignments).set({ requestsUsed: sql`${tables.assignments.requestsUsed} + 1` })
-        .where(eq(tables.assignments.id, input.assignmentId)).run()
-      return ex
-    }, { behavior: 'immediate' })
-
-    this.event(input.runId, 'broker.exchange', `${inserted.method} ${inserted.origin}${inserted.pathAndQuery.slice(0, 80)} → ${inserted.status}`, {
-      exchangeId: inserted.id,
-      assignmentId: inserted.assignmentId,
-      origin: inserted.origin,
-      finalOrigin: inserted.finalOrigin,
-      status: inserted.status,
-      personaHandle: inserted.personaHandle,
+    this.enqueueExchange({
+      row,
+      eventMessage: `${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)} → ${row.status}`,
+      eventDetail: {
+        exchangeId: row.id,
+        assignmentId: row.assignmentId,
+        origin: row.origin,
+        finalOrigin: row.finalOrigin,
+        status: row.status,
+        personaHandle: row.personaHandle,
+      },
     })
-    return inserted
+    return row
   }
 
   getExchange(runId: string, exchangeId: string): (BrokerExchange & { body: string }) {
+    this.flushNow()
     this.run(runId)
     const row = this.db.select().from(tables.brokerExchanges).where(and(
       eq(tables.brokerExchanges.runId, runId), eq(tables.brokerExchanges.id, exchangeId),
@@ -1748,7 +2261,7 @@ export class Store {
     if (!row) throw new Error('Broker exchange not found.')
     let body = row.bodyPreview
     if (row.bodyArtifactId) {
-      try { body = this.readBlob(row.bodyArtifactId) } catch { body = row.bodyPreview }
+      try { body = this.readBlob(row.bodyArtifactId, runId) } catch { body = row.bodyPreview }
     }
     return { ...row, body }
   }
@@ -1758,6 +2271,7 @@ export class Store {
     origin?: string
     limit?: number
   } = {}): BrokerExchange[] {
+    this.flushNow()
     this.run(runId)
     const limit = Math.min(Math.max(1, opts.limit ?? 30), 100)
     const q = query.trim()
@@ -2021,24 +2535,29 @@ export class Store {
     kind?: string
     query?: string
     limit?: number
+    offset?: number
   } = {}): Fact[] {
-    const all = this.db.select().from(tables.facts).where(eq(tables.facts.runId, runId))
-      .orderBy(desc(tables.facts.createdAt)).all()
+    const conditions = [eq(tables.facts.runId, runId)]
+    if (!opts.includeTainted) conditions.push(eq(tables.facts.tainted, false))
+    if (opts.origin) conditions.push(eq(tables.facts.origin, opts.origin))
+    if (opts.kind) {
+      conditions.push(or(
+        eq(tables.facts.kind, opts.kind as Fact['kind']),
+        sql`json_extract(${tables.facts.data}, '$.subkind') = ${opts.kind}`,
+      )!)
+    }
     const q = opts.query?.trim().toLowerCase()
-    const filtered = all.filter(f => {
-      if (!opts.includeTainted && f.tainted) return false
-      if (opts.origin && f.origin !== opts.origin) return false
-      if (opts.kind) {
-        const subkind = typeof f.data?.subkind === 'string' ? f.data.subkind : ''
-        if (f.kind !== opts.kind && subkind !== opts.kind) return false
-      }
-      if (q) {
-        const hay = `${f.origin} ${f.kind} ${f.summary} ${JSON.stringify(f.data)}`.toLowerCase()
-        if (!hay.includes(q)) return false
-      }
-      return true
-    })
-    return filtered.slice(0, Math.min(Math.max(1, opts.limit ?? 100), 500))
+    if (q) {
+      const pattern = `%${q}%`
+      conditions.push(sql`lower(
+        ${tables.facts.origin} || ' ' || ${tables.facts.kind} || ' ' || ${tables.facts.summary} || ' ' || ${tables.facts.data}
+      ) LIKE ${pattern}`)
+    }
+    const limit = resolvePageLimit(opts.limit, 100)
+    const offset = resolvePageOffset(opts.offset)
+    return this.db.select().from(tables.facts).where(and(...conditions))
+      .orderBy(desc(tables.facts.createdAt), asc(tables.facts.id))
+      .limit(limit).offset(offset).all()
   }
 
   addGraphEdge(runId: string, edge: {
@@ -4200,37 +4719,35 @@ export class Store {
     maxCoveragePct?: number
     orderBy?: 'risk' | 'coverage' | 'updated'
     limit?: number
+    offset?: number
   }): EndpointRow[] {
     const conditions = [eq(tables.endpoints.runId, runId)]
     if (filter?.origin) conditions.push(eq(tables.endpoints.origin, filter.origin))
     if (filter?.method) conditions.push(eq(tables.endpoints.method, filter.method.trim().toUpperCase()))
     if (filter?.source) conditions.push(eq(tables.endpoints.source, filter.source))
-
-    const rows = this.db.select().from(tables.endpoints).where(and(...conditions)).all()
-    const filtered = rows.filter(row => {
-      if (filter?.untestedClass && row.testedClasses.includes(filter.untestedClass)) return false
-      if (filter?.minRiskScore !== undefined && row.riskScore < filter.minRiskScore) return false
-      if (filter?.maxCoveragePct !== undefined && (row.coveragePct ?? 0) > filter.maxCoveragePct) return false
-      return true
-    })
+    if (filter?.untestedClass) {
+      conditions.push(sql`NOT EXISTS (
+        SELECT 1 FROM json_each(${tables.endpoints.testedClasses}) WHERE json_each.value = ${filter.untestedClass}
+      )`)
+    }
+    if (filter?.minRiskScore !== undefined) {
+      conditions.push(sql`${tables.endpoints.riskScore} >= ${filter.minRiskScore}`)
+    }
+    if (filter?.maxCoveragePct !== undefined) {
+      conditions.push(sql`coalesce(${tables.endpoints.coveragePct}, 0) <= ${filter.maxCoveragePct}`)
+    }
 
     const orderBy = filter?.orderBy ?? 'risk'
-    filtered.sort((a, b) => {
-      if (orderBy === 'coverage') {
-        const ca = a.coveragePct ?? -1
-        const cb = b.coveragePct ?? -1
-        return ca - cb || b.riskScore - a.riskScore
-      }
-      if (orderBy === 'updated') {
-        return b.updatedAt - a.updatedAt
-      }
-      return b.riskScore - a.riskScore || (a.coveragePct ?? 0) - (b.coveragePct ?? 0)
-    })
+    const order = orderBy === 'coverage'
+      ? [sql`coalesce(${tables.endpoints.coveragePct}, -1) asc`, desc(tables.endpoints.riskScore), asc(tables.endpoints.id)]
+      : orderBy === 'updated'
+        ? [desc(tables.endpoints.updatedAt), asc(tables.endpoints.id)]
+        : [desc(tables.endpoints.riskScore), sql`coalesce(${tables.endpoints.coveragePct}, 0) asc`, asc(tables.endpoints.id)]
 
-    const limit = typeof filter?.limit === 'number' && Number.isFinite(filter.limit)
-      ? Math.min(Math.max(1, Math.round(filter.limit)), 2000)
-      : 500
-    return filtered.slice(0, limit)
+    const limit = resolvePageLimit(filter?.limit, 500)
+    const offset = resolvePageOffset(filter?.offset)
+    return this.db.select().from(tables.endpoints).where(and(...conditions))
+      .orderBy(...order).limit(limit).offset(offset).all()
   }
 
   updateEndpointCoverage(
@@ -4366,6 +4883,11 @@ export class Store {
     method: string
     mediaType?: string | null
     authenticated?: boolean
+    /**
+     * Collection the identifier belongs to. Defaults to the endpoint's collection so
+     * `/invoices` and `/orders` keep separate ids for the same `id` field name.
+     */
+    collectionPath?: string
   }): ResourceSampleRow | null {
     const rawId = input.resourceId.trim()
     if (!rawId || rawId.length > 128) return null
@@ -4376,15 +4898,20 @@ export class Store {
     const origin = input.origin.trim()
     const endpoint = redact(input.endpoint).slice(0, 2048)
     const method = input.method.trim().toUpperCase() || 'GET'
+    const collectionRaw = (input.collectionPath ?? collectionPathFor(endpoint)).split('?')[0]!.split('#')[0]!.trim()
+    const collectionPath = collectionRaw
+      ? (collectionRaw.startsWith('/') ? collectionRaw : `/${collectionRaw}`).slice(0, 512)
+      : ''
     const now = Date.now()
     return this.transaction(() => {
       const existing = this.client.prepare(
-        `SELECT id, resource_id AS resourceId, endpoint, method, media_type AS mediaType,
-           authenticated, created_at AS createdAt FROM resource_samples
-         WHERE run_id = ? AND owner_persona = ? AND resource_key = ? AND origin = ? LIMIT 1`,
-      ).get(input.runId, input.ownerPersona, resourceKey, origin) as {
+        `SELECT id, resource_id AS resourceId, collection_path AS collectionPath, endpoint, method,
+           media_type AS mediaType, authenticated, created_at AS createdAt FROM resource_samples
+         WHERE run_id = ? AND owner_persona = ? AND origin = ? AND collection_path = ? AND resource_key = ? LIMIT 1`,
+      ).get(input.runId, input.ownerPersona, origin, collectionPath, resourceKey) as {
         id: string
         resourceId: string
+        collectionPath: string
         endpoint: string
         method: string
         mediaType: string | null
@@ -4398,6 +4925,7 @@ export class Store {
             runId: input.runId,
             ownerPersona: input.ownerPersona,
             resourceKey,
+            collectionPath,
             resourceId: existing.resourceId,
             origin,
             endpoint: existing.endpoint,
@@ -4417,6 +4945,7 @@ export class Store {
           runId: input.runId,
           ownerPersona: input.ownerPersona,
           resourceKey,
+          collectionPath,
           resourceId: sample,
           origin,
           endpoint,
@@ -4430,16 +4959,17 @@ export class Store {
       const id = randomUUID()
       this.client.prepare(
         `INSERT INTO resource_samples (
-           id, run_id, owner_persona, resource_key, resource_id, origin, endpoint, method,
+           id, run_id, owner_persona, resource_key, collection_path, resource_id, origin, endpoint, method,
            media_type, authenticated, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(id, input.runId, input.ownerPersona, resourceKey, sample, origin, endpoint, method,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, input.runId, input.ownerPersona, resourceKey, collectionPath, sample, origin, endpoint, method,
         input.mediaType ?? null, input.authenticated ? 1 : 0, now, now)
       return {
         id,
         runId: input.runId,
         ownerPersona: input.ownerPersona,
         resourceKey,
+        collectionPath,
         resourceId: sample,
         origin,
         endpoint,
@@ -4455,9 +4985,10 @@ export class Store {
   listResourceSamples(runId: string): ResourceSampleRow[] {
     const rows = this.client.prepare(
       `SELECT id, run_id AS runId, owner_persona AS ownerPersona, resource_key AS resourceKey,
-         resource_id AS resourceId, origin, endpoint, method, media_type AS mediaType,
-         authenticated, created_at AS createdAt, updated_at AS updatedAt
-       FROM resource_samples WHERE run_id = ? ORDER BY resource_key ASC, created_at ASC`,
+         collection_path AS collectionPath, resource_id AS resourceId, origin, endpoint, method,
+         media_type AS mediaType, authenticated, created_at AS createdAt, updated_at AS updatedAt
+       FROM resource_samples WHERE run_id = ?
+       ORDER BY collection_path ASC, resource_key ASC, created_at ASC`,
     ).all(runId) as Array<Omit<ResourceSampleRow, 'authenticated'> & { authenticated: number }>
     return rows.map(row => ({ ...row, authenticated: Boolean(row.authenticated) }))
   }
@@ -4498,6 +5029,7 @@ export class Store {
           runId: input.runId,
           ownerPersona,
           resourceKey,
+          collectionPath: collectionPathFor(ref.endpoint),
           resourceId: ref.resourceId,
           origin,
           endpoint: ref.endpoint,
