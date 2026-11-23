@@ -279,12 +279,15 @@ test('K=6 dry-streak still halts and engine facts never reset it', async (t) => 
   t.after(() => execution.stop())
   internals(execution).prePhase0SeededSteps.set(laneKey(current), true)
   internals(execution).startInvestigationStep = () => undefined
+  ;(internals(execution) as unknown as Record<string, unknown>).schedulePlanner = () => undefined
   const lane = stubLane(execution)
   internals(execution).driveInvestigation(current, [{ id: 'profile', model: 'mock' }])
-  assert.equal(lane.calls.length, 0, 'seeded guard also applies to the K=6 case')
+  assert.equal(lane.calls.length, 0, 'seeded guard also applies to the dry-streak case')
   await delay(10)
-  assert.ok(['verification', 'complete'].includes(storage.run(runId).phase))
-  assert.ok(storage.eventsAfter(runId, 0).some(e => e.kind === 'planner.diminishing_returns'))
+  assert.equal(storage.run(runId).phase, 'investigation', 'a dry streak never kills the sweep in v6')
+  const kinds = storage.eventsAfter(runId, 0).map(e => e.kind)
+  assert.ok(kinds.includes('planner.dry_streak'))
+  assert.ok(!kinds.includes('planner.diminishing_returns'))
 })
 
 test('multi-trial fanout/early-stop machinery is untouched by the lane', async (t) => {

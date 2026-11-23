@@ -290,9 +290,12 @@ test('C: hard-escalated requests still escalate even with a matching pattern', a
     ...overrides,
   })
 
+  // v6: English keyword payloads are no longer an escalation trigger. The explicit operator
+  // pattern owns this route, so the same request is now authorized by the pattern — safety comes
+  // from the environment contract + durable route lease, not from guessing at the body words.
   const destructiveBody = await decide({ bodyPreview: '{"operation":"refund","amount":1}' })
-  assert.equal(destructiveBody.decision, 'escalate_human')
-  assert.equal(destructiveBody.stage, 'hard_escalation')
+  assert.equal(destructiveBody.decision, 'approve')
+  assert.equal(destructiveBody.stage, 'approved_pattern')
 
   const multipart = await decide({ hasMultipart: true })
   assert.equal(multipart.decision, 'escalate_human')

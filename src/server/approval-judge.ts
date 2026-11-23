@@ -110,13 +110,9 @@ function isIdLikeSegment(segment: string): boolean {
   )
 }
 
-// Financial / destructive / irreversible state mutations — always escalate regardless of auth
-const ALWAYS_HIGH_RISK_PATTERN =
-  /(?:^|[^a-z])(billing|stripe|cancel|refund|charge|invoice|void|payout|subscription|trial|delete|destroy|remove|drop|transfer|webhook)(?:$|[^a-z])/i
-
-// Privilege / credential / access-control mutations — escalate conservatively
-const AUTH_ADMIN_HIGH_RISK_PATTERN =
-  /(?:^|[^a-z])(admin|role|permission|password|reset|revoke)(?:$|[^a-z])/i
+// v6: keyword escalation ("billing", "delete", "admin", "password", …) is retired. The
+// environment contract plus durable operator leases own the safety decision; English words in a
+// path or body are not a security boundary and caused approval storms on benign staging routes.
 
 // Benign unauthenticated sign-in / auth-check / inference / read-only endpoints
 const BENIGN_UNAUTH_ENDPOINT_PATTERN =
@@ -129,8 +125,10 @@ const READONLY_SEARCH_PATH_PATTERN =
 const MUTATION_BODY_HINT =
   /(?:^|[^a-z])(mutation|delete|destroy|remove|drop|update|insert|create|write|transfer|refund|charge|cancel)(?:$|[^a-z])/i
 
-// Bounded keyword scan: the full request body is inspected up to this cap instead of only the
-// first few KiB, so a destructive/privileged keyword placed past a short prefix is still caught.
+/**
+ * Body inspection cap. Kept exported for callers/tests that pin the classification limit: a body
+ * larger than this cannot be classified deterministically and is escalated structurally.
+ */
 export const MAX_KEYWORD_SCAN_CHARS = 64 * 1024
 
 const safetyJudgeResponseSchema = z.object({
@@ -462,15 +460,13 @@ export function authorizeStateChange(input: {
   }
 
   const context = input.context
-  // Hard escalations are evaluated before patterns: multipart/upload, DELETE, RCE, race bursts,
-  // compressed or over-cap bodies, and destructive/privileged keyword payloads can never be
-  // pre-authorized by a broad operator pattern. Patterns additionally require the caller to supply
-  // the exact request context — a context-less call (e.g. a replay retry that cannot describe the
-  // request) fails closed instead of inheriting a pattern grant.
-  const hardEscalation = !context || Boolean(detectHardEscalationReason({
+  // Structural escalations are evaluated before patterns: multipart/upload, DELETE, RCE, race
+  // bursts and compressed or over-cap bodies can never be pre-authorized by a broad operator
+  // pattern. Patterns additionally require the caller to supply the exact request context — a
+  // context-less call (e.g. a replay retry that cannot describe the request) fails closed instead
+  // of inheriting a pattern grant. Keyword payloads are deliberately not a gate in v6.
+  const hardEscalation = !context || Boolean(detectStructuralEscalationReason({
     method: input.method.toUpperCase(),
-    pathAndQuery: input.pathAndQuery,
-    personaHandle: context?.personaHandle,
     bodyPreview: context?.body ?? null,
     hasMultipart: context?.hasMultipart,
     isRceProof: context?.isRceProof,
@@ -646,10 +642,14 @@ function isReadOnlySearchPost(pathAndQuery: string, body: string | null | undefi
   return !MUTATION_BODY_HINT.test(trimmed)
 }
 
-function detectHardEscalationReason(input: {
+/**
+ * Structural escalations only. These describe the *shape* of a request that cannot be classified
+ * deterministically (RCE proof, compressed or oversized body, malformed/multipart upload, DELETE);
+ * they are not keyword scans. A real human gate is an operator opt-in (`strict` policy or an
+ * explicit sensitive-route pattern), never a guess about English words in a path or payload.
+ */
+function detectStructuralEscalationReason(input: {
   method: string
-  pathAndQuery: string
-  personaHandle?: string | null
   bodyPreview?: string | null
   headers?: Record<string, string>
   hasMultipart?: boolean
@@ -676,41 +676,6 @@ function detectHardEscalationReason(input: {
   if (input.method === 'DELETE') {
     return 'HTTP DELETE requests always require explicit human approval.'
   }
-
-  const actionHeader =
-    headerLookup(input.headers, 'next-action') ??
-    headerLookup(input.headers, 'x-action') ??
-    headerLookup(input.headers, 'soapaction') ??
-    ''
-  const pathText = input.pathAndQuery
-  // Scan the full body (bounded) so keywords placed past a short prefix are still detected.
-  const bodyText = (input.bodyPreview ?? '').slice(0, MAX_KEYWORD_SCAN_CHARS)
-
-  const alwaysMatch =
-    ALWAYS_HIGH_RISK_PATTERN.exec(pathText) ??
-    ALWAYS_HIGH_RISK_PATTERN.exec(actionHeader) ??
-    ALWAYS_HIGH_RISK_PATTERN.exec(bodyText)
-  if (alwaysMatch) {
-    return `High-risk state-mutation keyword "${alwaysMatch[1].toLowerCase()}" detected; escalating to human approval.`
-  }
-
-  const isAuthSignInPath = !input.personaHandle && BENIGN_UNAUTH_ENDPOINT_PATTERN.test(pathText)
-  const authAdminPathMatch =
-    AUTH_ADMIN_HIGH_RISK_PATTERN.exec(pathText) ??
-    AUTH_ADMIN_HIGH_RISK_PATTERN.exec(actionHeader)
-  if (authAdminPathMatch) {
-    return `Sensitive auth/privilege path keyword "${authAdminPathMatch[1].toLowerCase()}" detected; escalating to human approval.`
-  }
-
-  const authAdminBodyMatch = AUTH_ADMIN_HIGH_RISK_PATTERN.exec(bodyText)
-  if (authAdminBodyMatch) {
-    const matchedWord = authAdminBodyMatch[1].toLowerCase()
-    // Allow unauthenticated login/sign-in credential enforcement probes without flagging "password" field
-    if (!(isAuthSignInPath && matchedWord === 'password')) {
-      return `Sensitive auth/privilege payload keyword "${matchedWord}" detected; escalating to human approval.`
-    }
-  }
-
   return null
 }
 
@@ -863,13 +828,11 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Stage 1A — Hard Escalation Patterns (ALWAYS escalate to human). These run BEFORE operator
-  // pattern matching: a broad pattern can never pre-approve multipart/DELETE/RCE/upload/race
-  // probes, compressed or over-cap bodies, or destructive/privileged payload keywords.
-  const hardEscalationReason = detectHardEscalationReason({
+  // Stage 1A — Structural escalations (RCE proof, compressed/over-cap bodies, multipart upload,
+  // DELETE). These run BEFORE operator pattern matching so a broad pattern can never pre-approve a
+  // request shape that cannot be classified. Keyword payloads are not escalated in v6.
+  const hardEscalationReason = detectStructuralEscalationReason({
     method,
-    pathAndQuery,
-    personaHandle: input.personaHandle,
     bodyPreview: input.bodyPreview,
     headers: input.headers,
     hasMultipart: input.hasMultipart,

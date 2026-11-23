@@ -108,7 +108,7 @@ test('dynamicStepBudget stays correct and is never cleared by the engine path', 
   assert.equal(run.dynamicStepBudget, null, 'the seeded run started with no budget')
 })
 
-test('K=6 consecutive dry steps still halt the investigation queue', async (t) => {
+test('v6: K=6 consecutive dry steps no longer halt while budget and work remain', async (t) => {
   const { storage } = makeStore(t)
   const { runId, run, assetIds } = await setupApprovedRun(storage, { budgetRequests: 2000 })
   for (let i = 0; i < diminishingReturnsDryThreshold; i += 1) {
@@ -122,17 +122,19 @@ test('K=6 consecutive dry steps still halt the investigation queue', async (t) =
   assert.equal(countConsecutiveDrySteps(storage, current), diminishingReturnsDryThreshold)
 
   const execution = new Execution(storage)
-  internals(execution).plannerDoneRound.set(runId, current.roundNo)
+  // The planner keeps the investigation phase open; a dry streak is telemetry, never a kill.
+  ;(internals(execution) as unknown as Record<string, unknown>).schedulePlanner = () => undefined
   await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => {
-    // A non-empty profile list takes the specialist scheduler; with no ready steps and K dry steps
-    // already recorded it must advance to verification instead of queueing more work.
     internals(execution).driveInvestigation(current, [{ id: 'profile', model: 'test' }])
   })
-  assert.ok(
-    ['verification', 'complete'].includes(storage.run(runId).phase),
-    `expected K=${diminishingReturnsDryThreshold} dry steps to halt investigation (phase ${storage.run(runId).phase})`,
+  assert.equal(
+    storage.run(runId).phase,
+    'investigation',
+    `expected K=${diminishingReturnsDryThreshold} dry steps to keep the sweep alive`,
   )
-  assert.ok(storage.eventsAfter(runId, 0).some(e => e.kind === 'planner.diminishing_returns'))
+  const kinds = storage.eventsAfter(runId, 0).map(e => e.kind)
+  assert.ok(kinds.includes('planner.dry_streak'), 'the dry streak is observed as telemetry')
+  assert.ok(!kinds.includes('planner.diminishing_returns'), 'the retired K=6 kill must not fire')
 })
 
 test('runtime findings persist only when replay-confirmed', async (t) => {

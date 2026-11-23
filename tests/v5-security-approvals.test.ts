@@ -12,6 +12,7 @@ import {
   computeStateChangeBodyHash,
   evaluateTier3Approval,
   matchesApprovedEndpointPattern,
+  MAX_KEYWORD_SCAN_CHARS,
   StateChangeApprovalLedger,
 } from '../src/server/approval-judge.ts'
 import { BrokerApprovalRequired, RequestBroker } from '../src/server/broker.ts'
@@ -259,22 +260,39 @@ test('MEDIUM #10: multipart is detected from Content-Type/boundary; malformed up
   assert.equal(flagOnly.stage, 'hard_escalation')
 })
 
-test('MEDIUM #10: destructive keywords past the first 4 KiB are still caught', async () => {
-  const body = JSON.stringify({ pad: 'a'.repeat(5_000), op: 'refund' })
-  assert.ok(body.length > 4_096)
+test('MEDIUM #10: the 64 KiB classification cap still fails closed; keyword text alone is not the gate', async () => {
+  const keyworded = JSON.stringify({ pad: 'a'.repeat(5_000), op: 'refund' })
+  assert.ok(keyworded.length > 4_096)
 
+  // v6 retires the English keyword scan. The same small body is decided by policy/structural
+  // rules (offline auto-review fails safe to a human), not by the word "refund".
   const result = await evaluateTier3Approval({
     policy: 'auto_review',
     origin: PUBLIC_ORIGIN,
     method: 'POST',
     pathAndQuery: '/api/profile/update',
     personaHandle: 'user_a',
-    bodyPreview: body,
+    bodyPreview: keyworded,
     offline: true,
   })
   assert.equal(result.decision, 'escalate_human')
-  assert.equal(result.stage, 'hard_escalation')
-  assert.match(result.reason, /refund/i)
+  assert.equal(result.stage, 'fail_safe')
+  assert.doesNotMatch(result.reason, /refund/i, 'keyword text is never echoed as the escalation reason')
+
+  // A body past the deterministic classification cap still escalates structurally.
+  const oversized = JSON.stringify({ pad: 'a'.repeat(MAX_KEYWORD_SCAN_CHARS + 1) })
+  const capped = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: PUBLIC_ORIGIN,
+    method: 'POST',
+    pathAndQuery: '/api/profile/update',
+    personaHandle: 'user_a',
+    bodyPreview: oversized,
+    offline: true,
+  })
+  assert.equal(capped.decision, 'escalate_human')
+  assert.equal(capped.stage, 'hard_escalation')
+  assert.match(capped.reason, /classification cap/i)
 })
 
 test('MEDIUM #10: agent rationale cannot reach the safety judge or weaken its decision', async () => {

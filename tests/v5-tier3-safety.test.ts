@@ -72,7 +72,7 @@ test('invariant 1: GUARDIAN_ALLOW_LOCAL_LAB=1 never relaxes Tier-3 approvals for
       { label: 'DELETE', input: { method: 'DELETE' as const, pathAndQuery: '/api/items/42' } },
       { label: 'multipart', input: { method: 'POST' as const, pathAndQuery: '/api/upload', hasMultipart: true } },
       { label: 'rce_proof', input: { method: 'POST' as const, pathAndQuery: '/api/eval', isRceProof: true } },
-      { label: 'high-risk keyword', input: { method: 'POST' as const, pathAndQuery: '/api/billing/refund' } },
+      { label: 'compressed body', input: { method: 'POST' as const, pathAndQuery: '/api/state-eval', hasCompressedBody: true } },
     ]
 
     for (const environment of ['public', undefined] as const) {
@@ -162,13 +162,14 @@ test('invariant 2: local-lab auto-approval requires a loopback or LabRunner-inte
       assert.notEqual(result.decidedBy, 'auto-review:local-lab')
     }
 
-    // High-risk keyword probes against an external mislabeled origin also escalate.
+    // Grey-area probes against an external mislabeled origin still escalate (no keyword gate).
     const externalKeyword = await evaluateTier3Approval({
       policy: 'auto_review',
       environment: 'local-lab',
       origin: EXTERNAL_ORIGIN,
       method: 'POST',
-      pathAndQuery: '/api/billing/refund',
+      pathAndQuery: '/api/state-eval',
+      bodyPreview: '{"probe":"tier3"}' ,
     })
     assert.equal(externalKeyword.decision, 'escalate_human')
     assert.notEqual(externalKeyword.decidedBy, 'auto-review:local-lab')
@@ -549,7 +550,8 @@ test('default environment fail-closed: a project without explicit environment is
         environment: defaultEnvironment,
         origin: LOOPBACK_ORIGIN,
         method: 'POST',
-        pathAndQuery: '/api/billing/refund',
+        pathAndQuery: '/api/state-eval',
+        bodyPreview: '{"probe":"tier3"}',
       })
       assert.equal(keywordResult.decision, 'escalate_human')
       assert.notEqual(keywordResult.decidedBy, 'auto-review:local-lab')
