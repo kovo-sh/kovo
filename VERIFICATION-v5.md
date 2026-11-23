@@ -58,6 +58,32 @@ The integration must preserve chained and white-box findings. These rules are re
 
 Scorecards in §2 (runtime) and §3 (deterministic harness) are **v5.0 history and stay unchanged**. The 25/59 and 28/59 candidate results and any slice measurements are **reference only**; they are not v5.1 shipped numbers until the flag is on by default and §0.3 is green.
 
+### 0.6 Security hardening (v5.1, merged)
+
+An independent audit produced 2 high, 3 medium and 6 medium/low findings against Guardian itself. All were fixed on `main` with regression tests; nothing here changes the v5.0 scorecards, and the deterministic capability harness was re-measured after the merge (**39/56, 100% precision, 0 decoys/unmatched** on seed 42).
+
+| # | Severity | Finding | Fix | Evidence |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | High | One automatic approval authorized every later state change on the origin (path-prefix match; query/persona/body/flags ignored; 15-minute reuse) | Exact single-use approval ledger bound to run, origin, method, exact path+query, persona, body/parts hash, multipart/race/rce flags and scope revision (60 s TTL, consumed on first use). Persisted DB rows are audit-only. Broker passes real context; operator patterns are segment-aware only (`/api/*` matches `/api/x`, not `/apix`) | `tests/v5-security-approvals.test.ts` 11/11 |
+| 2 | High | `--repo` copied symlinks; recon read through them and patches could write outside the repo | Link-free copy with `lstat` filtering, `O_NOFOLLOW` manifest reads, link-free patch work tree, `safeResolveUnderRoot` realpaths the deepest existing parent and rejects symlinked components | `tests/v5-security-repo.test.ts` 10/10 |
+| 3 | Medium | Any local process received the owner session cookie on a plain HTML GET | Bootstrap-only issuance: printed one-time `?bootstrap=` URL plus owner-only `<data>/bootstrap` (0600); secret consumed on use; `HttpOnly; SameSite=Strict`; unauthenticated requests get `401` and never reach the app handler | `tests/v5-security-authbrowser.test.ts` 12/12 |
+| 4 | Medium | Clerk/provider host taken from target HTML with a last-two-labels fallback (`co.uk` bug) and no allowlist check | PSL-aware registrable-domain check, provider discovery ignores redirects, publishable-key hosts must be in the allowlisted registrable domain | same suite |
+| 5 | Medium | Credential POSTs followed redirects, replaying passwords to arbitrary/internal hosts outside the broker's IP checks | `redirect: 'manual'` everywhere; 3xx on credential/CSRF flows fails closed; `assertCredentialTarget` enforces scheme, allowlist and public-IP DNS classification | same suite |
+| 6 | Medium | Scoped browser intercepted only HTTP; WebSocket/WebRTC egress reached loopback/LAN/metadata | `routeWebSocket` scope guard, non-proxied UDP disabled, `RTCPeerConnection` removed, host-resolver rules pin DNS | same suite |
+| 7 | Medium | Form-login browser allowed self-resolved DNS (rebinding) and cross-origin subresources to any host | Cross-origin subresources limited to target/allowlisted eTLD+1; every request re-checks DNS before `route.continue()`; documents limited to exact allowed origins | same suite |
+| 8 | Medium | Chromium ran with `--no-sandbox` while rendering target pages | Sandbox on by default; `--no-sandbox` only behind `GUARDIAN_INSECURE_NO_SANDBOX=1` with a warning | same suite |
+| 9 | Medium | IAST telemetry directory was `0777` and mounted read-write into a root-capable container | `0700` directory, explicit non-root `--user` (root rejected), read-only `/app` | `tests/v5-security-repo.test.ts` |
+| 10 | Medium | Approval fast paths were spoofable (`"query"` substring, hand-written multipart, 4 KiB scan, agent-controlled rationale) | Exact JSON `query` envelope, multipart derived from `Content-Type`/boundary, full-body scan capped at 64 KiB, rationale removed from the judge prompt | `tests/v5-security-approvals.test.ts` |
+| 11 | Medium | Worker output read without line limits; LLM-written scripts shared the bridge uid | `BoundedLineDecoder` (64 KiB/line, 4 MiB/session) terminates the session on overrun | `tests/v5-security-repo.test.ts` |
+
+**Intentional behavior changes**
+
+- Public-target `rce_proof` / `upload_probe` / `sql_time_diff` replay gates now fail closed unless the request is local-lab auto-approved or operator-pattern authorized; they no longer ride the context-free fast path.
+- Headless UI is opened through the bootstrap URL; `tests/app.ts` exposes `app.open(page)` and the README documents the handshake.
+- Lab containers default to the invoking uid:gid (non-root) and reject `GUARDIAN_LAB_USER=0:*`.
+
+**Gate wiring:** the three security suites run in the fast release gate (`docs/reverify-v5.sh`) and in the `v5-*` group of the full gate.
+
 ---
 
 ## 1. Two surfaces, two scorecards
