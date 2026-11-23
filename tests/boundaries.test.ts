@@ -20,10 +20,8 @@ import {
 } from '../src/server/broker.ts'
 import type { Grant, PublicAddress } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
-import { ColdGraphCompactor } from '../src/server/compactor.ts'
 import { queryCves } from '../src/server/cve-broker.ts'
 import { cloneGithubRepos, listMountedRepos, projectReposDir, syncGithubRepos } from '../src/server/github-connector.ts'
-import { privateModelProfiles, saveModelProfile } from '../src/server/model-settings.ts'
 import {
   createProjectPersona,
   listProjectPersonas,
@@ -1177,34 +1175,12 @@ test('enforces rce_proof cryptographic nonces (dynamic_math, split_echo, oob_can
 // 9. Transitive Scope-Revocation Tainting, Cold-Graph Digest Compaction, and budget_paused -> Resume
 // ============================================================================
 
-test('transitively taints downstream graph nodes on scope revocation, compacts cold facts into digests, and enforces budget_paused -> resume', async t => {
+test('transitively taints downstream graph nodes on scope revocation, keeps early facts raw, and enforces budget_paused -> resume', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'guardian-graph-budget-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
 
-  // Local mock LLM server for ColdGraphCompactor minor digest summarization
-  const llmServer = await httpFixture((req, res) => {
-    req.resume()
-    res.writeHead(200, { 'Content-Type': 'text/event-stream' })
-    res.end([
-      `data: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm1', role: 'assistant', content: [], status: 'in_progress' } })}`,
-      `data: ${JSON.stringify({ type: 'response.output_text.delta', output_index: 0, delta: 'Cold digest summary: recon facts for api.northstar.example.' })}`,
-      `data: ${JSON.stringify({ type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'm1', role: 'assistant', content: [{ type: 'output_text', text: 'Cold digest summary: recon facts for api.northstar.example.' }], status: 'completed' } })}`,
-      `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'r1', status: 'completed', output: [], usage: { input_tokens: 200, output_tokens: 40 } } })}`,
-      'data: [DONE]',
-    ].join('\n\n') + '\n\n')
-  })
-  t.after(() => llmServer.close())
-
-  await saveModelProfile({
-    name: 'Compactor Fixture',
-    endpoint: llmServer.url,
-    model: 'compactor-fixture',
-    protocol: 'responses',
-    key: 'compactor-fixture-key-1234',
-    priority: 100,
-  }, storage, { skipConnectionCheck: true })
 
   const { id: projectId } = storage.createProject({
     requestId: randomUUID(), name: 'Chain Graph Test', seeds: [northstar, apiOrigin], environment: 'public',
@@ -1274,24 +1250,11 @@ test('transitively taints downstream graph nodes on scope revocation, compacts c
     })
   }
 
-  // Run ColdGraphCompactor across 4 idle planner rounds -> triggers minor compaction!
-  const compactor = new ColdGraphCompactor({ coldAfterRounds: 4, minorThreshold: 5 })
-  const profiles = privateModelProfiles(storage)
-  let triggered: string = 'none'
-  for (let r = 0; r < 5; r += 1) {
-    const res = compactor.onPlannerRound(storage, runId, profiles, AbortSignal.timeout(10_000))
-    if (res.promise) {
-      await res.promise
-      triggered = res.triggered
-      break
-    }
-  }
-  assert.equal(triggered, 'minor')
-  const digests = storage.listDigests(runId, true)
-  assert.ok(digests.length >= 1)
-  const expanded = compactor.expandDigest(storage, runId, digests[0].id)
-  assert.ok(expanded)
-  assert.ok(expanded.facts.length >= 5)
+  // v6: cold-graph compaction is retired — early facts stay raw, live and retrievable.
+  const roundBefore = storage.run(runId).roundNo
+  storage.updateRun(runId, { roundNo: roundBefore + 1 })
+  assert.equal(storage.listDigests(runId, true).length, 0)
+  assert.ok(storage.listFacts(runId, { includeTainted: false, limit: 500 }).length >= 5)
 
   // Save report v1 BEFORE revoking origin A
   storage.writeReport(storage.run(runId), true)
