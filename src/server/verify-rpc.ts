@@ -36,6 +36,7 @@ import { buildPersonaHeader } from './persona-vault.ts'
 import {
   assessBoundary,
   assessImpactEvidence,
+  assessMfaBypass,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
   normalizeRole,
@@ -295,6 +296,20 @@ export type VerifyClaim =
       actorTenants?: Record<string, string>
       message?: string
     }
+  /**
+   * MFA/2FA gate evidence: an enrolled control read, a protected read denied/challenged before the
+   * code check, and the same actor's granted read of the same resource after it.
+   */
+  | {
+      kind: 'mfa'
+      enrolledExchangeId: string
+      preChallengeExchangeId: string
+      postChallengeExchangeId: string
+      challengeExchangeId?: string
+      actorRoles?: Record<string, string>
+      actorTenants?: Record<string, string>
+      message?: string
+    }
 
 export interface VerifyScriptResult {
   sdk?: string
@@ -409,6 +424,11 @@ function isClaim(value: unknown): value is VerifyClaim {
         typeof rec.probeExchangeId === 'string' &&
         typeof rec.boundaryClass === 'string' && knownClasses.has(rec.boundaryClass)
     }
+    case 'mfa':
+      return typeof rec.enrolledExchangeId === 'string' &&
+        typeof rec.preChallengeExchangeId === 'string' &&
+        typeof rec.postChallengeExchangeId === 'string'
+
     default:
       return false
   }
@@ -716,7 +736,7 @@ function transcriptImpactStep(
 
 function transcriptBoundaryStep(
   store: TranscriptStore,
-  claim: Extract<VerifyClaim, { kind: 'boundary' | 'impact' }>,
+  claim: Extract<VerifyClaim, { kind: 'boundary' | 'impact' | 'mfa' }>,
   id: string,
   arm: ImpactStep['arm'],
 ): ImpactStep | null {
@@ -777,6 +797,38 @@ function evaluateBoundaryClaim(
     steps: [control, probe],
     expectControlDenied: claim.expectControlDenied,
   })
+  return {
+    claim,
+    passed: assessment.required && assessment.satisfied,
+    detail: assessment.reason,
+    observed: assessment.evidence,
+  }
+}
+
+function evaluateMfaClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'mfa' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const ids = [claim.enrolledExchangeId, claim.preChallengeExchangeId, claim.postChallengeExchangeId, ...(claim.challengeExchangeId ? [claim.challengeExchangeId] : [])]
+  for (const id of ids) {
+    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) {
+      return { claim, passed: false, detail: `Unknown MFA exchange ${id}.` }
+    }
+    if (!store.get(id)) return { claim, passed: false, detail: `Unknown MFA exchange ${id}.` }
+  }
+  const steps: ImpactStep[] = []
+  const add = (id: string | undefined, arm: ImpactStep['arm']) => {
+    if (!id) return
+    const step = transcriptBoundaryStep(store, claim, id, arm)
+    if (step) steps.push(step)
+  }
+  add(claim.enrolledExchangeId, 'control')
+  add(claim.preChallengeExchangeId, 'control')
+  add(claim.challengeExchangeId, 'probe')
+  add(claim.postChallengeExchangeId, 'probe')
+  steps.sort((a, b) => ((a as unknown as { seq?: number }).seq ?? 0) - ((b as unknown as { seq?: number }).seq ?? 0))
+  const assessment = assessMfaBypass({ impactClass: 'other', steps })
   return {
     claim,
     passed: assessment.required && assessment.satisfied,
@@ -846,6 +898,13 @@ function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
       ids.add(claim.probeExchangeId)
       continue
     }
+    if (claim.kind === 'mfa') {
+      ids.add(claim.enrolledExchangeId)
+      ids.add(claim.preChallengeExchangeId)
+      ids.add(claim.postChallengeExchangeId)
+      if (claim.challengeExchangeId) ids.add(claim.challengeExchangeId)
+      continue
+    }
     ids.add(claim.exchangeId)
   }
   return [...ids]
@@ -909,6 +968,8 @@ function evaluateClaim(
       return evaluateImpactClaim(store, claim, context)
     case 'boundary':
       return evaluateBoundaryClaim(store, claim, context)
+    case 'mfa':
+      return evaluateMfaClaim(store, claim, context)
     case 'status': {
       const record = requireRecord(claim.exchangeId)
       if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}; claims must reference recorded RPC exchanges.` }
@@ -1118,6 +1179,10 @@ export function evaluateClaims(
   // Universal default-deny: authentication/bypass claims confirm only with a signed, challenged
   // control that the variant crosses. No label can pass on a 2xx from an ungated request.
   const claimedBoundary = context.claimedBoundary
+  const mfaClaimPassed = checks.some(check => check.passed && check.claim.kind === 'mfa')
+  if (claimedBoundary === 'mfa' && !mfaClaimPassed) {
+    failures.push('boundary: MFA/2FA claim requires an `mfa` claim showing an enrolled account, a protected read denied/challenged before the code check, and the same actor granted the same resource after it; an OTP endpoint that returns {ok:true} without gating anything is advisory only.')
+  }
   if (claimedBoundary === 'auth' && !boundaryClaimPassed) {
     failures.push('boundary: authentication/bypass claim requires a `boundary` claim over a denied/challenged control (401/403, login redirect or MFA challenge) and a variant that crosses it; a 2xx from an ungated request is not a bypass.')
   }
@@ -1210,6 +1275,17 @@ export function causalFingerprints(
         path: pathFingerprint(probe?.request?.pathAndQuery),
         status: probe?.response?.status ?? null,
         expectation: { boundaryClass: claim.boundaryClass },
+        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+      }
+    }
+    if (claim.kind === 'mfa') {
+      const probe = store.get(claim.postChallengeExchangeId)
+      return {
+        kind: claim.kind,
+        method: probe?.request?.method ?? '',
+        path: pathFingerprint(probe?.request?.pathAndQuery),
+        status: probe?.response?.status ?? null,
+        expectation: { mfa: true },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
     }

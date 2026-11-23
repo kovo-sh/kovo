@@ -67,6 +67,7 @@ interface Fixture {
     billing: { plan: string; price: number; credits: number }
     settings: Json
     cached: string | null
+    mfaSessions: Set<string>
   }
 }
 
@@ -94,6 +95,7 @@ async function startFixture(options: FixtureOptions = {}): Promise<Fixture> {
     billing: { plan: 'pro', price: 4900, credits: 100 },
     settings: { theme: 'light' },
     cached: null,
+    mfaSessions: new Set<string>(),
   }
   const server = createServer((req, res) => {
     void handle(req, res, state, options).catch(error => {
@@ -167,6 +169,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: Fixture[
     return
   }
 
+  // Decorative OTP endpoint: returns {ok:true} for any/absent code and gates nothing.
+  if (url.pathname === '/api/auth/2fa' && req.method === 'POST') {
+    if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
+    return json(res, 200, { ok: true })
+  }
   if (url.pathname === '/api/auth/2fa/verify' && req.method === 'POST') {
     if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
     // Only persona_a has 2FA enabled. For an account without 2FA there is no challenged control,
@@ -175,9 +182,22 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: Fixture[
     const bypass = req.headers['x-2fa-bypass']
     const code = String(body.code ?? '')
     if (bypass === '1' || code === '123456') {
+      state.mfaSessions.add(actor.handle)
       return json(res, 200, { ok: true, user: { id: 'u-42', email: 'owner@acme.test' } })
     }
     return json(res, 401, { error: 'mfa_required', challenge: 'totp', message: 'verification code required' })
+  }
+  if (url.pathname === '/api/me') {
+    if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
+    return json(res, 200, { handle: 'account', twofa_enabled: TWOFA_ENABLED.has(actor.handle) })
+  }
+  if (url.pathname === '/api/account') {
+    if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
+    // A real MFA gate: an enrolled account must complete the challenge before reading this resource.
+    if (TWOFA_ENABLED.has(actor.handle) && !state.mfaSessions.has(actor.handle)) {
+      return json(res, 401, { error: 'mfa_required', challenge: 'totp', message: 'verification code required' })
+    }
+    return json(res, 200, { id: 'acct-1', email: 'owner@acme.test', balance: 4200 })
   }
   if (url.pathname === '/api/plans') {
     json(res, 200, { plans: [{ code: 'free', price: 0 }, { code: 'pro', price: 4900 }] })
@@ -515,7 +535,7 @@ test('policy: CSRF is dismissed when the session cookie is SameSite=Lax and the 
 // 5b. Universal default-deny: no challenged control ⇒ no auth bypass
 // ---------------------------------------------------------------------------
 
-test('boundary: a 2FA bypass claim on an account without 2FA is dismissed (no challenged control)', async () => {
+test('boundary: a decorative 2FA endpoint (any code, no state change) is dismissed', async () => {
   const fx = await startFixture()
   try {
     const spec = baseFields(fx.origin, {
@@ -523,11 +543,41 @@ test('boundary: a 2FA bypass claim on an account without 2FA is dismissed (no ch
       category: 'auth-identity',
       cwe: 'CWE-287',
       steps: [
-        { id: 'ctrl', role: 'control', description: 'Sign in without a 2FA code on an account without 2FA', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa/verify', persona: 'persona_b', jsonBody: { email: 'persona_b@acme.test' } } },
-        { id: 'probe', role: 'probe', description: 'Sign in without a 2FA code on the same account', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa/verify', persona: 'persona_b', jsonBody: { email: 'persona_b@acme.test' } } },
+        { id: 'enrolled', role: 'control', description: 'Read the account security state', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'persona_a' } },
+        { id: 'before', role: 'control', description: 'Read account data before any code (no challenge exists)', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/billing', persona: 'persona_a' } },
+        { id: 'probe', role: 'probe', description: 'Post a bogus OTP code to the decorative endpoint', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa', persona: 'persona_a', jsonBody: { code: '000000' } } },
+        { id: 'after', role: 'control', description: 'Read the same account data after the code (unchanged)', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/billing', persona: 'persona_a' } },
       ],
       assertionsJq: `{
-        controlPassed: (.steps.ctrl.status == 200),
+        controlPassed: (.steps.enrolled.status == 200 and .steps.enrolled.json.twofa_enabled == true),
+        confirmed: (.steps.probe.status == 200 and .steps.probe.json.ok == true and .steps.after.json.plan == .steps.before.json.plan),
+        observed: ("probe=" + (.steps.probe.status | tostring)),
+        expected: "the 2FA challenge is bypassed"
+      }`,
+    })
+    const res = await verify(spec, fx.origin)
+    assert.notEqual(res.verdict, 'confirmed', String(res.outcome.reason))
+    assert.match(res.outcome.reason ?? '', /decorative 2FA|denied\/challenged control|advisory/i)
+    const gate = res.evidencePayload.boundaryGate as { satisfied?: boolean; evidence?: { decorative?: boolean; enrolled?: boolean } } | undefined
+    assert.equal(gate?.satisfied, false)
+    assert.equal(gate?.evidence?.decorative, true)
+  } finally { await fx.close() }
+})
+
+test('boundary: an unenrolled account is dismissed even with a 401/200 pair', async () => {
+  const fx = await startFixture()
+  try {
+    const spec = baseFields(fx.origin, {
+      title: 'MFA bypass: OTP verification accepts an absent code',
+      category: 'auth-identity',
+      cwe: 'CWE-287',
+      steps: [
+        { id: 'enrolled', role: 'control', description: 'Account security state (2FA not enabled)', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'persona_b' } },
+        { id: 'control', role: 'control', description: 'A protected read is denied before the check', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/account', persona: 'persona_b' } },
+        { id: 'probe', role: 'probe', description: 'OTP verify with an absent code', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa/verify', persona: 'persona_b', jsonBody: {} } },
+      ],
+      assertionsJq: `{
+        controlPassed: (.steps.enrolled.status == 200),
         confirmed: (.steps.probe.status == 200 and .steps.probe.json.ok == true),
         observed: ("probe=" + (.steps.probe.status | tostring)),
         expected: "the 2FA challenge is bypassed"
@@ -535,14 +585,11 @@ test('boundary: a 2FA bypass claim on an account without 2FA is dismissed (no ch
     })
     const res = await verify(spec, fx.origin)
     assert.notEqual(res.verdict, 'confirmed', String(res.outcome.reason))
-    assert.match(res.outcome.reason ?? '', /denied\/challenged control|not a bypass/i)
-    const gate = res.evidencePayload.boundaryGate as { satisfied?: boolean; boundaryClass?: string } | undefined
-    assert.equal(gate?.boundaryClass, 'auth')
-    assert.equal(gate?.satisfied, false)
+    assert.match(res.outcome.reason ?? '', /not enrolled|enrolled|decorative/i)
   } finally { await fx.close() }
 })
 
-test('boundary: a 2FA bypass with a challenged control and a crossing variant confirms', async () => {
+test('boundary: a real MFA challenge with a pre/post access differential confirms', async () => {
   const fx = await startFixture()
   try {
     const spec = baseFields(fx.origin, {
@@ -550,22 +597,25 @@ test('boundary: a 2FA bypass with a challenged control and a crossing variant co
       category: 'auth-identity',
       cwe: 'CWE-287',
       steps: [
-        { id: 'ctrl', role: 'control', description: '2FA verify without a code is challenged', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa/verify', persona: 'persona_a', jsonBody: {} } },
-        { id: 'probe', role: 'probe', description: '2FA verify with a bypass header crosses the challenge', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa/verify', persona: 'persona_a', headers: { 'x-2fa-bypass': '1' }, jsonBody: { code: '000000' } } },
+        { id: 'enrolled', role: 'control', description: 'Enrolled account state', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'persona_a' } },
+        { id: 'pre', role: 'control', description: 'Protected read is challenged before the code', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/account', persona: 'persona_a' } },
+        { id: 'challenge', role: 'probe', description: 'OTP verify with a bypass header crosses the challenge', request: { origin: fx.origin, method: 'POST', pathAndQuery: '/api/auth/2fa/verify', persona: 'persona_a', headers: { 'x-2fa-bypass': '1' }, jsonBody: { code: '000000' } } },
+        { id: 'post', role: 'probe', description: 'Same actor reads the protected account after the challenge', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/account', persona: 'persona_a' } },
       ],
       assertionsJq: `{
-        controlPassed: (.steps.ctrl.status == 401),
-        confirmed: (.steps.probe.status == 200 and .steps.probe.json.ok == true and .steps.probe.json.user.id == "u-42"),
-        observed: ("control=" + (.steps.ctrl.status | tostring) + " probe=" + (.steps.probe.status | tostring)),
+        controlPassed: (.steps.enrolled.json.twofa_enabled == true and .steps.pre.status == 401),
+        confirmed: (.steps.challenge.status == 200 and .steps.post.status == 200 and .steps.post.json.id == "acct-1"),
+        observed: ("pre=" + (.steps.pre.status | tostring) + " post=" + (.steps.post.status | tostring)),
         expected: "the MFA challenge cannot be bypassed"
       }`,
     })
     const res = await verify(spec, fx.origin)
     assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
-    const gate = res.evidencePayload.boundaryGate as { satisfied?: boolean; arm?: string; controlKind?: string } | undefined
+    const gate = res.evidencePayload.boundaryGate as { satisfied?: boolean; evidence?: { enrolled?: boolean; sameActor?: boolean; sameRoute?: boolean } } | undefined
     assert.equal(gate?.satisfied, true)
-    assert.equal(gate?.arm, 'control_denied')
-    assert.equal(gate?.controlKind, 'denied')
+    assert.equal(gate?.evidence?.enrolled, true)
+    assert.equal(gate?.evidence?.sameActor, true)
+    assert.equal(gate?.evidence?.sameRoute, true)
   } finally { await fx.close() }
 })
 
@@ -1066,68 +1116,68 @@ test('parity: guardian_verify confirms a genuine cross-tenant write with a clean
   }
 })
 
-test('parity: guardian_verify dismisses the no-2FA "bypass" over the same exchanges', async () => {
+test('parity: guardian_verify dismisses the decorative 2FA over-claim', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
+    const enrolled = await rpc(server, 'http', { path: '/api/me', persona: 'persona_a' })
     const probe = await rpc(server, 'http', {
-      path: '/api/auth/2fa/verify',
+      path: '/api/auth/2fa',
       method: 'POST',
-      persona: 'persona_b',
+      persona: 'persona_a',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'persona_b@acme.test' }),
+      body: JSON.stringify({ code: '000000' }),
     })
+    const enrolledId = (enrolled.result as { exchangeId: string }).exchangeId
     const probeId = (probe.result as { exchangeId: string }).exchangeId
     const claims: VerifyClaim[] = [
       { kind: 'status', exchangeId: probeId, expected: 200 },
       { kind: 'jsonpath', exchangeId: probeId, path: 'ok', equals: true },
+      // Even a generic boundary claim over the ungated endpoint cannot confirm an MFA bypass.
+      { kind: 'boundary', boundaryClass: 'auth', controlExchangeId: enrolledId, probeExchangeId: probeId },
     ]
     const dismissed = oracleFor(server, '2FA bypass: verification accepts an absent code', claims)
     assert.equal(dismissed.passed, false)
-    assert.match(dismissed.failures.join(' '), /boundary: authentication\/bypass claim/i)
+    assert.match(dismissed.failures.join(' '), /MFA\/2FA claim requires an `mfa` claim/i)
   } finally {
     await server.close()
     await fx.close()
   }
 })
 
-test('parity: guardian_verify confirms a real 2FA bypass only with a challenged control', async () => {
+test('parity: guardian_verify confirms a real MFA bypass with enrolled + pre/post access evidence', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
-    const control = await rpc(server, 'http', {
-      path: '/api/auth/2fa/verify',
-      method: 'POST',
-      persona: 'persona_a',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({}),
-    })
-    const probe = await rpc(server, 'http', {
+    const enrolled = await rpc(server, 'http', { path: '/api/me', persona: 'persona_a' })
+    const pre = await rpc(server, 'http', { path: '/api/account', persona: 'persona_a' })
+    const challenge = await rpc(server, 'http', {
       path: '/api/auth/2fa/verify',
       method: 'POST',
       persona: 'persona_a',
       headers: { 'content-type': 'application/json', 'x-2fa-bypass': '1' },
       body: JSON.stringify({ code: '000000' }),
     })
-    const controlId = (control.result as { exchangeId: string }).exchangeId
-    const probeId = (probe.result as { exchangeId: string }).exchangeId
+    const post = await rpc(server, 'http', { path: '/api/account', persona: 'persona_a' })
+    const id = (res: RpcResponse) => (res.result as { exchangeId: string }).exchangeId
     const claims: VerifyClaim[] = [
-      { kind: 'status', exchangeId: controlId, expected: 401 },
-      { kind: 'status', exchangeId: probeId, expected: 200 },
-      { kind: 'jsonpath', exchangeId: probeId, path: 'ok', equals: true },
+      { kind: 'status', exchangeId: id(pre), expected: 401 },
+      { kind: 'status', exchangeId: id(challenge), expected: 200 },
+      { kind: 'status', exchangeId: id(post), expected: 200 },
       {
-        kind: 'boundary',
-        boundaryClass: 'auth',
-        controlExchangeId: controlId,
-        probeExchangeId: probeId,
+        kind: 'mfa',
+        enrolledExchangeId: id(enrolled),
+        preChallengeExchangeId: id(pre),
+        challengeExchangeId: id(challenge),
+        postChallengeExchangeId: id(post),
         actorRoles: { persona_a: 'owner' },
         actorTenants: { persona_a: 'acme' },
       },
     ]
     const result = oracleFor(server, '2FA bypass: verification accepts an absent code', claims)
     assert.equal(result.passed, true, result.failures.join('; '))
-    const boundaryCheck = result.checks.find(check => check.claim.kind === 'boundary')
-    assert.equal(boundaryCheck?.passed, true)
+    const mfaCheck = result.checks.find(check => check.claim.kind === 'mfa')
+    assert.equal(mfaCheck?.passed, true)
   } finally {
     await server.close()
     await fx.close()
@@ -1135,7 +1185,8 @@ test('parity: guardian_verify confirms a real 2FA bypass only with a challenged 
 })
 
 test('units: boundary classification and the control-denied gate are mechanical', () => {
-  assert.equal(classifyBoundaryClaim({ title: '2FA bypass on OTP verification' }), 'auth')
+  assert.equal(classifyBoundaryClaim({ title: '2FA bypass on OTP verification' }), 'mfa')
+  assert.equal(classifyBoundaryClaim({ title: 'MFA step-up bypass' }), 'mfa')
   assert.equal(classifyBoundaryClaim({ title: 'SSO confusion between tenants' }), 'auth')
   assert.equal(classifyBoundaryClaim({ cwe: 'CWE-287', title: 'Authentication bypass' }), 'auth')
   assert.equal(classifyBoundaryClaim({ title: 'IDOR on invoice read' }), 'access')

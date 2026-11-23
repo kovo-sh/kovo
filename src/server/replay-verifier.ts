@@ -35,6 +35,7 @@ import {
   actorFromPersona,
   assessBoundary,
   assessImpactEvidence,
+  assessMfaBypass,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
   normalizeRole,
@@ -205,7 +206,7 @@ export function impactStepsFromStepsOut(
   spec: DeclarativeReplaySpec,
   stepsOut: Record<string, unknown>,
 ): ImpactStep[] {
-  if (spec.kind !== 'http_chain') return []
+  if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return []
   return spec.steps.map(step => {
     const entry = stepsOut[step.id] as Record<string, unknown> | undefined
     const handle = (typeof entry?.personaHandle === 'string' ? entry.personaHandle : null) ?? step.request.persona ?? null
@@ -1320,16 +1321,25 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         })
         const boundaryGate = boundaryClass === 'other'
           ? null
-          : assessBoundary({
-              impactClass,
-              steps: impactSteps,
-              requiredRole: spec.requiredRole ?? null,
-              resourceTenant: spec.resourceTenant ?? null,
-              expectControlDenied: spec.expectControlDenied,
-              oracleEvents,
-              targetOrigin: spec.origin,
-              boundaryClass,
-            })
+          : boundaryClass === 'mfa'
+            ? assessMfaBypass({
+                impactClass,
+                steps: impactSteps,
+                requiredRole: spec.requiredRole ?? null,
+                resourceTenant: spec.resourceTenant ?? null,
+                oracleEvents,
+                targetOrigin: spec.origin,
+              })
+            : assessBoundary({
+                impactClass,
+                steps: impactSteps,
+                requiredRole: spec.requiredRole ?? null,
+                resourceTenant: spec.resourceTenant ?? null,
+                expectControlDenied: spec.expectControlDenied,
+                oracleEvents,
+                targetOrigin: spec.origin,
+                boundaryClass,
+              })
         if (impactGate?.required && !impactGate.satisfied && !proofGuardFailure) {
           proofGuardFailure = impactGate.reason
         }
@@ -2426,6 +2436,30 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           }
         }
 
+        // Auth-protocol proofs are auth/bypass claims: they still need a denied/challenged control
+        // (or, for MFA, the full enrolled + pre/post access differential).
+        const authSteps = impactStepsFromStepsOut(spec, stepsOut)
+        const authBoundaryClass = classifyBoundaryClaim({
+          cwe: spec.cwe,
+          category: spec.category,
+          title: spec.title,
+          impact: spec.impact,
+        })
+        const authBoundaryGate = authBoundaryClass === 'mfa'
+          ? assessMfaBypass({ impactClass: 'other', steps: authSteps, targetOrigin: spec.origin })
+          : authBoundaryClass === 'auth' || authBoundaryClass === 'access'
+            ? assessBoundary({
+                impactClass: 'other',
+                steps: authSteps,
+                boundaryClass: authBoundaryClass,
+                expectControlDenied: spec.expectControlDenied,
+                targetOrigin: spec.origin,
+              })
+            : null
+        if (authBoundaryGate?.required && !authBoundaryGate.satisfied) {
+          deterministicProofPassed = false
+          proofFailureReason = authBoundaryGate.reason
+        }
         evidencePayload = {
           ...evidencePayload,
           protocol: spec.protocol,
@@ -2436,6 +2470,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(mintedTokens.length > 0 ? { mintedTokens } : {}),
           ...(canaryProof ? { canaryProof } : {}),
           ...(spaCatchall ? { spaCatchall } : {}),
+          ...(authBoundaryGate ? { boundaryGate: authBoundaryGate } : {}),
         }
       } finally {
         await canarySession?.close()

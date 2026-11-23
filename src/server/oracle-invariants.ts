@@ -20,7 +20,7 @@
 
 export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'other'
 /** Orthogonal boundary class: what kind of gate must be demonstrated for a claim. */
-export type BoundaryClass = 'auth' | 'access' | 'other'
+export type BoundaryClass = 'auth' | 'mfa' | 'access' | 'other'
 export type RoleName = 'viewer' | 'member' | 'admin' | 'owner'
 export type AmbientAuth = 'cookie' | 'bearer' | 'header' | 'unknown'
 
@@ -790,7 +790,8 @@ export function knownOracleEvent(event: string): boolean {
  * never gated is not a bypass (e.g. "2FA bypass" on an account that never enabled 2FA), so these
  * claims require a *challenged/denied control* and a variant that crosses that exact boundary.
  */
-const AUTH_BOUNDARY_RE = /\b(?:2fa|mfa|two[- ]?factor|multi[- ]?factor|one[- ]?time[- ]?pass(?:word|code)?|otp|totp|authenticat(?:ion|or)[- ]?(?:bypass|confusion)|auth[- ]?bypass|login[- ]?bypass|session[- ]?fixation|token[- ]?forgery|jwt|sso|single[- ]?sign[- ]?on|oauth[- ]?confusion|confused[- ]?deputy|legacy[- ]?auth)\b/i
+const MFA_CLAIM_RE = /\b(?:2fa|mfa|two[- ]?factor|multi[- ]?factor|one[- ]?time[- ]?pass(?:word|code)?|otp|totp|authenticator|step[- ]?up)\b/i
+const AUTH_BOUNDARY_RE = /\b(?:authenticat(?:ion|or)[- ]?(?:bypass|confusion)|auth[- ]?bypass|login[- ]?bypass|session[- ]?fixation|token[- ]?forgery|jwt|sso|single[- ]?sign[- ]?on|oauth[- ]?confusion|confused[- ]?deputy|legacy[- ]?auth)\b/i
 const AUTH_BOUNDARY_CWE_RE = /^CWE-(?:287|288|290|294|302|303|305|306|346|384|522|620|798)$/i
 const ACCESS_BOUNDARY_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|insecure[- ]direct[- ]object)\b/i
 const ACCESS_BOUNDARY_CWE_RE = /^CWE-(?:269|284|285|566|639|862|863|1021|1220)$/i
@@ -807,6 +808,7 @@ export function classifyBoundaryClaim(parts: BoundaryDescriptor): BoundaryClass 
   // Titles and categories are the claim's label; generic impact boilerplate ("outside their
   // authorization") must not turn an XXE/SSRF claim into an access-control claim.
   const text = `${parts.title ?? ''} ${parts.category ?? ''}`
+  if (MFA_CLAIM_RE.test(text)) return 'mfa'
   if (AUTH_BOUNDARY_RE.test(text) || AUTH_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'auth'
   if (ACCESS_BOUNDARY_RE.test(text) || ACCESS_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'access'
   return 'other'
@@ -882,6 +884,144 @@ function boundarySignalOf(step: ImpactStep, successFamilies: ReadonlySet<string>
     if (MFA_CHALLENGE_RE.test(body) && (step.json === undefined || step.json === null)) return { step, kind: 'challenge' }
   }
   return null
+}
+
+/**
+ * MFA/2FA bypass gate. A 2xx from an OTP endpoint is not a bypass unless:
+ *   1. a control read shows the account is enrolled (`twofa_enabled`/`mfa`/`totp` claim);
+ *   2. a protected read is denied/challenged before the code check; and
+ *   3. the same session/actor is granted the same protected resource after it.
+ * A decorative endpoint that returns `{ok:true}` for any code but gates nothing is reported as an
+ * advisory (not confirmed): there is no challenged control to cross.
+ */
+const MFA_ENROLL_FIELD_RE = /^(?:twofa|two_?fa|mfa|totp|otp|two_?factor|two_?factor_?enabled|twofa_?enabled|mfa_?enabled|totp_?enabled|authenticator(?:_?enabled)?|enrolled|mfa_?enrolled|two_?step)$/i
+const MFA_ROUTE_RE = /\/(?:2fa|mfa|otp|totp|verify|challenge|step-?up)(?:\/|$|\?)/i
+
+function truthyJsonLeaf(value: string): boolean {
+  const lower = value.trim().toLowerCase()
+  return lower === 'true' || lower === '1' || lower === 'yes' || lower === 'enabled' || lower === 'on' || lower === '"true"'
+}
+
+export interface MfaAssessment extends ImpactAssessment {
+  evidence: {
+    enrolled: boolean
+    enrolledStep: string | null
+    enrolledField: string | null
+    preDenied: boolean
+    preStep: string | null
+    postGranted: boolean
+    postStep: string | null
+    challengeStep: string | null
+    sameActor: boolean
+    sameRoute: boolean
+    decorative: boolean
+  }
+}
+
+export function assessMfaBypass(input: ImpactInput): MfaAssessment {
+  const steps = input.steps
+  const evidence = {
+    enrolled: false,
+    enrolledStep: null as string | null,
+    enrolledField: null as string | null,
+    preDenied: false,
+    preStep: null as string | null,
+    postGranted: false,
+    postStep: null as string | null,
+    challengeStep: null as string | null,
+    sameActor: false,
+    sameRoute: false,
+    decorative: false,
+  }
+  // 1. Enrollment must come from a control/setup read of the account state, not the probe echo.
+  for (const step of steps) {
+    if (step.arm === 'probe' || step.json === undefined || step.json === null) continue
+    for (const [path, value] of flattenJson(step.json)) {
+      const leaf = path.split('.').pop() ?? ''
+      if (MFA_ENROLL_FIELD_RE.test(leaf) && truthyJsonLeaf(value)) {
+        evidence.enrolled = true
+        evidence.enrolledStep = step.id
+        evidence.enrolledField = path
+        break
+      }
+    }
+    if (evidence.enrolled) break
+  }
+  // 2. Protected reads exclude the OTP/challenge endpoint itself.
+  const protectedReads = steps.filter(step =>
+    isReadMethod(step.method) &&
+    !MFA_ROUTE_RE.test(step.pathAndQuery ?? '') &&
+    !MFA_ROUTE_RE.test(step.route ?? ''))
+  const challenge = steps.find(step =>
+    isMutatingMethod(step.method) &&
+    (MFA_ROUTE_RE.test(step.pathAndQuery ?? '') || MFA_ROUTE_RE.test(step.route ?? '') || MFA_CHALLENGE_RE.test(step.body ?? ''))) ??
+    steps.find(step => step.arm === 'probe' && isMutatingMethod(step.method)) ??
+    null
+  evidence.challengeStep = challenge?.id ?? null
+  const challengeIndex = challenge ? steps.indexOf(challenge) : steps.length
+  const deniedRead = (step: ImpactStep): boolean =>
+    step.status === 401 || step.status === 403 ||
+    (step.status !== null && step.status >= 300 && step.status < 400) ||
+    MFA_CHALLENGE_RE.test(`${headerField(step.responseHeaders, /^(?:www-authenticate|x-mfa|mfa|challenge)$/i) ?? ''} ${(step.body ?? '').slice(0, 1024)}`)
+  const pre = [...protectedReads].reverse().find(step => steps.indexOf(step) < challengeIndex && deniedRead(step)) ?? null
+  const post = protectedReads.find(step =>
+    steps.indexOf(step) > (pre ? steps.indexOf(pre) : -1) &&
+    isSuccess(step.status) &&
+    ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ?? null
+  evidence.preDenied = pre !== null
+  evidence.preStep = pre?.id ?? null
+  evidence.postGranted = post !== null
+  evidence.postStep = post?.id ?? null
+  evidence.sameActor = Boolean(pre && post && pre.actor.handle === post.actor.handle)
+  evidence.sameRoute = Boolean(pre && post && routeFamily(pre.route ?? '') === routeFamily(post.route ?? ''))
+  evidence.decorative = !pre
+
+  if (!pre) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: no protected read was denied/challenged before the code check, so the OTP endpoint gates nothing (decorative 2FA). Report this as an advisory, not a confirmed bypass.',
+      evidence,
+    }
+  }
+  if (!evidence.enrolled) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: no control read shows the account is enrolled (twofa_enabled/mfa/totp claim). A 2xx from an OTP endpoint on an unenrolled account is not a bypass.',
+      evidence,
+    }
+  }
+  if (!post) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: no post-challenge read of the same protected resource shows the boundary was crossed with data/state proof.',
+      evidence,
+    }
+  }
+  if (!evidence.sameActor) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: the pre-challenge denial and post-challenge grant are not tied to the same session/actor.',
+      evidence,
+    }
+  }
+  if (!evidence.sameRoute) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'MFA/2FA claim dismissed: the denied pre-challenge read and the granted post-challenge read are different resources, so no access differential is proven.',
+      evidence,
+    }
+  }
+  return {
+    required: true,
+    satisfied: true,
+    reason: `MFA gate crossed: enrolled (${evidence.enrolledField}) control shows the boundary, "${pre.id}" was denied/challenged, and the same actor read ${post.route ?? 'the protected resource'} with data after the code check.`,
+    evidence,
+  }
 }
 
 /**
