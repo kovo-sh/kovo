@@ -1163,6 +1163,52 @@ export function assessImpactEvidence(input: ImpactInput): ImpactAssessment {
   }
 }
 
+/** Canonical machine-readable labels for a *verified* impact class. */
+export interface EvidenceClassLabel {
+  vulnClass: string
+  cwe: string
+  category: string
+}
+
+const IMPACT_CLASS_LABELS: Partial<Record<ImpactClass, EvidenceClassLabel>> = {
+  mass_assignment: { vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment' },
+  csrf: { vulnClass: 'csrf', cwe: 'CWE-352', category: 'csrf' },
+  markup: { vulnClass: 'xss_stored', cwe: 'CWE-79', category: 'xss' },
+  disclosure: { vulnClass: 'info_disclosure', cwe: 'CWE-200', category: 'information-disclosure' },
+  business_logic: { vulnClass: 'business_logic', cwe: 'CWE-840', category: 'business-logic' },
+}
+
+const IMPACT_CLASS_CWES: Partial<Record<ImpactClass, number[]>> = {
+  mass_assignment: [915],
+  csrf: [352],
+  markup: [79, 80, 83],
+  disclosure: [200, 359, 522, 532],
+  business_logic: [840, 841, 472],
+}
+
+/** Label for a verified impact class, or null when the class has no single canonical label. */
+export function evidenceClassLabel(impactClass: string | null | undefined): EvidenceClassLabel | null {
+  return impactClass ? IMPACT_CLASS_LABELS[impactClass as ImpactClass] ?? null : null
+}
+
+/**
+ * Align a claim's machine-readable class with the *verified* evidence class. Only applied when the
+ * evidence class is specific (mass assignment, csrf, markup, disclosure, business logic) and the
+ * declared CWE is outside that class's family: e.g. a `tenant_id` overpost reported as BOLA
+ * (CWE-639) is mass assignment (CWE-915). Authorization evidence never relabels a claim.
+ */
+export function alignClaimClass(
+  claim: { cwe?: string | null; category?: string | null; vulnClass?: string | null },
+  impactClass: string | null | undefined,
+): EvidenceClassLabel | null {
+  const label = evidenceClassLabel(impactClass)
+  if (!label) return null
+  const family = IMPACT_CLASS_CWES[impactClass as ImpactClass] ?? []
+  const declared = /(\d+)/.exec(claim.cwe ?? '')?.[1]
+  if (declared !== undefined && family.includes(Number(declared))) return null
+  return label
+}
+
 /** True when the declared oracle event names a class whose evidence the verifier can check. */
 export function knownOracleEvent(event: string): boolean {
   return [
