@@ -5,6 +5,7 @@ import type { Server } from 'node:http'
 import { diffResponse, dnsTakeoverAnalyze } from '../../worker/analyzers.ts'
 import { maxInlineVerifyRetries } from '../domain.ts'
 import type { InlineVerifyFeedback, VerificationTier } from '../domain.ts'
+import type { StateChangeApprovalContext } from './approval-judge.ts'
 import {
   cacheBusterValueRegex,
   containsDestructivePayload,
@@ -1028,8 +1029,28 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     }
     const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
     const approvalFn = grant.isStateChangeApproved
+    // Reproduce the exact fingerprint a Tier-3 decision registers (origin/method/path/persona/body
+    // hash + multipart/rce flags). Without context the one-shot ledger can never be consumed, and a
+    // matching operator pattern would be the only way through — which must never authorize an
+    // RCE/upload proof of execution, so both kinds are flagged `isRceProof`.
+    const approvalContext: StateChangeApprovalContext = spec.kind === 'rce_proof'
+      ? {
+          personaHandle: spec.probeStep.request.persona ?? null,
+          body: spec.probeStep.request.textBody ??
+            (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : null),
+          hasMultipart: false,
+          isRaceBurst: false,
+          isRceProof: true,
+        }
+      : {
+          personaHandle: spec.uploadStep.persona ?? null,
+          body: spec.uploadStep.contentTemplate,
+          hasMultipart: true,
+          isRaceBurst: false,
+          isRceProof: true,
+        }
     const approved = approvalFn
-      ? approvalFn(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery)
+      ? approvalFn(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery, approvalContext)
       : localLab
     if (!approved) {
       grant.audit('denied', gateRequest.origin)
@@ -2574,7 +2595,24 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           return inconclusiveResult('sql_time_diff is blocked on public projects below Tier 3 (requires local-lab or Tier 3 HITL approval).', exchanges, exchangeIds, { kind: spec.kind })
         }
         const approved = grant.isStateChangeApproved
-          ? grant.isStateChangeApproved(spec.targetOrigin, spec.method, spec.pathAndQuery)
+          ? grant.isStateChangeApproved(
+              spec.targetOrigin,
+              spec.method,
+              spec.pathAndQuery,
+              {
+                personaHandle: spec.persona ?? null,
+                // Spec-scoped approval: the pre-gate authorizes the declared request (the mutated
+                // timing payloads are derived from it), so the fingerprint uses the declared body.
+                body: spec.paramLocation === 'json' && spec.jsonBody !== undefined
+                  ? JSON.stringify(spec.jsonBody)
+                  : spec.paramLocation === 'xml'
+                    ? spec.xmlTemplate ?? null
+                    : null,
+                hasMultipart: false,
+                isRaceBurst: false,
+                isRceProof: false,
+              },
+            )
           : false
         if (!approved) {
           grant.audit('denied', spec.targetOrigin)
