@@ -2,7 +2,7 @@
 // the stable contract shared by the shell, the site modules and the generator; vocab/param synonyms
 // are randomized per seed. Site specs are discovered at runtime from sites/<id>/spec.ts so the shell
 // starts with zero sites mounted.
-import type { AppBlueprint, AppName, RouteTemplate, SiteSpec } from '../../../lib/types.ts'
+import type { AppBlueprint, RouteTemplate, SiteSpec } from '../../../lib/types.ts'
 
 const r = (method: string, path: string): RouteTemplate => ({ method, path })
 
@@ -127,7 +127,7 @@ const ID_FORMATS = ['int', 'uuid', 'prefixed', 'hashid'] as const
 export function blueprintWith(sites: SiteSpec[]): AppBlueprint {
   const decoy = sites.length === 0 ? { min: 0, max: 0 } : { min: Math.min(5, sites.length), max: Math.min(5, sites.length) }
   return {
-    app: 'ledgerflow' as unknown as AppName,
+    app: 'ledgerflow',
     apiPrefixes: ['/api', '/rest', '/api/v1'],
     vocab: VOCAB,
     paramVocab: PARAM_VOCAB,
