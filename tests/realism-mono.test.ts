@@ -34,6 +34,7 @@ import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import { extractRepoProgramGraph, runPhase0Recon } from '../src/server/phase0-recon.ts'
 import { resolveRouteSinkPaths } from '../src/server/program-graph.ts'
+import { redact } from '../src/server/redact.ts'
 import { callGraphFromProgramGraph, resolveSuspectEntrypoint } from '../src/server/semantic-audit.ts'
 import type { EndpointRow } from '../src/server/store.ts'
 import { Store } from '../src/server/store.ts'
@@ -66,6 +67,7 @@ describe('realism #4 monorepo: briefing -> declared surface -> AST reachability'
   let tempRoot: string
   let openApiOps = 0
   let openApiBytes = 0
+  let openApiContent = ''
   let harness: HarnessPathResult
   let storage: Store | undefined
 
@@ -81,7 +83,8 @@ describe('realism #4 monorepo: briefing -> declared surface -> AST reachability'
     const doc = briefingToOpenApi({ fixture: FIXTURE, originLabel: 'app', api: briefing.api })
     assert.ok(doc, 'briefing publishes an app API reference')
     openApiOps = countOpenApiOperations(doc)
-    openApiBytes = Buffer.byteLength(JSON.stringify(doc), 'utf8')
+    openApiContent = JSON.stringify(doc)
+    openApiBytes = Buffer.byteLength(openApiContent, 'utf8')
 
     const store = new Store(join(tempRoot, 'data'))
     storage = store
@@ -138,6 +141,9 @@ describe('realism #4 monorepo: briefing -> declared surface -> AST reachability'
     )
     assert.equal(openApiOps, DECLARED_OPERATIONS, 'OpenAPI keeps one operation per declared route')
     assert.ok(openApiBytes < maxSpecBytes, `spec is ${openApiBytes} bytes, below the ${maxSpecBytes}-byte cap`)
+    // The stored spec passes through redaction; it must stay valid JSON so Phase-0 uses the
+    // lossless parser instead of the 300-operation tolerant fallback.
+    assert.doesNotThrow(() => JSON.parse(redact(openApiContent)))
   })
 
   test('OpenAPI operations keep their method and path/query parameters', () => {
