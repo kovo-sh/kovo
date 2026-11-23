@@ -1,3 +1,4 @@
+process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= "1"
 /**
  * v5 M3 specs3 contracts: impact-first synthesis for the realistic classes that previously produced
  * no confirmed findings. Each case combines a synthesis assertion (jq evaluated against the exact
