@@ -60,6 +60,8 @@ export interface EndpointHarvest {
   seedValues: string[]
   /** Query parameter names whose benign value demonstrably changed the response. */
   activeQueryParams: string[]
+  /** Identifiers observed on the lower-privileged (viewer) persona's own identity route. */
+  viewerIds?: string[]
 }
 
 export interface EngineConfirmed {
@@ -177,6 +179,11 @@ export function pathHasSearchHint(path: string): boolean {
   return /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|browse|catalog)(?:$|[/_.-])/i.test(path)
 }
 
+/** A route whose shape says it runs an operator-supplied host/command probe. */
+export function pathHasCommandHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:diag|diagnostics?|exec|execute|command|cmd|shell|ping|nslookup|lookup|resolve|whois|healthcheck|system)(?:$|[/_.-])/i.test(path)
+}
+
 export function pathHasPrivilegedHint(path: string): boolean {
   return /(?:^|[/_.-])(?:admin|internal|manage|management|staff|superuser|privileged|permission|permissions|role|roles|impersonate|grant|feature[-_]?flag|backoffice)(?:$|[/_.-])/i.test(path)
 }
@@ -255,6 +262,23 @@ export function redirectParamNames(path: string): string[] {
   if (/(?:checkout|return)/i.test(path)) return ['next', 'returnUrl', 'returnTo', 'redirect']
   if (/(?:download|export)/i.test(path)) return ['url', 'next', 'returnTo', 'redirect']
   return ['url', 'next', 'redirect', 'returnTo']
+}
+
+/** Body fields a render/evaluate route plausibly reads (route semantics, not a route wordlist). */
+export function templateParamNames(path: string): string[] {
+  if (/(?:email|mail|message)/i.test(path)) return ['body', 'content', 'template', 'text', 'source']
+  if (/(?:snippet|page|docs?|report|preview|render|layout|template)/i.test(path)) {
+    return ['template', 'templateSrc', 'content', 'layout', 'source', 'body', 'text']
+  }
+  return ['content', 'body', 'text', 'source']
+}
+
+/** Body fields a host/command diagnostic route plausibly reads. */
+export function commandParamNames(path: string): string[] {
+  if (/(?:ping|nslookup|lookup|resolve|whois|diag|diagnostics?)/i.test(path)) {
+    return ['host', 'hostname', 'endpointHost', 'target', 'address', 'ip', 'domain', 'command']
+  }
+  return ['command', 'cmd', 'host', 'target', 'input', 'query', 'script']
 }
 
 function inferredParam(name: string, location: SurfaceParamLocation): EngineParam {
@@ -384,6 +408,21 @@ export function enumerateHypotheses(
     ].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id))
     return [...new Set(ids)].slice(0, 5)
   }
+  // Field names observed anywhere on the origin (route maps and config documents publish the real
+  // body-field spelling as a scalar value). Bounded and evidence-derived: it never invents a name
+  // the target did not itself expose; the route-semantic fallbacks stay last.
+  const originSchemaPool = new Map<string, string[]>()
+  for (const endpoint of endpoints) {
+    const harvest = harvests.get(endpoint.id)
+    if (!harvest) continue
+    const pool = originSchemaPool.get(endpoint.origin) ?? []
+    for (const value of [...harvest.fields, ...Object.values(harvest.values).flat(), ...harvest.seedValues]) {
+      if (value.length < 2 || value.length > 40) continue
+      if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(value)) continue
+      if (!pool.includes(value)) pool.push(value)
+    }
+    originSchemaPool.set(endpoint.origin, pool.slice(0, 120))
+  }
 
   for (const endpoint of endpoints) {
     const bare = endpoint.pathTemplate.split('?')[0] || '/'
@@ -407,8 +446,8 @@ export function enumerateHypotheses(
       : bare
 
     // --- Authorization / BOLA / IDOR / BFLA ------------------------------------------------
-    if (options.tier >= 2 && picks.owner && picks.crossTenant && method !== 'DELETE' &&
-        (options.tier >= 3 || method === 'GET' || method === 'POST')) {
+    if (options.tier >= 2 && picks.owner && picks.crossTenant &&
+        (options.tier >= 3 || method === 'GET' || method === 'POST' || method === 'DELETE')) {
       const authzOwner = privileged ? (picks.admin ?? picks.owner) : picks.owner
       const authzOther = privileged
         ? (sensitiveRead && !mutating ? (picks.crossTenant ?? picks.lower) : (picks.lower ?? picks.owner ?? picks.crossTenant))
@@ -441,7 +480,7 @@ export function enumerateHypotheses(
           endpoint,
           probeClass: 'authz_matrix',
           intent: 'authz',
-          method: method === 'POST' ? 'POST' : (method === 'PUT' || method === 'PATCH' ? method : 'GET'),
+          method: method === 'POST' || method === 'DELETE' ? method : (method === 'PUT' || method === 'PATCH' ? method : 'GET'),
           pathAndQuery,
           ownerPersona: authzOwner.handle,
           otherPersona: authzOther.handle,
@@ -607,6 +646,99 @@ export function enumerateHypotheses(
       })
     }
 
+    // --- Template evaluation and shell-command sinks -----------------------------------------
+    // Both families only make sense on a route whose own shape consumes renderable text or an
+    // operator-supplied host/command. Candidate field names come from what the target published
+    // (route map/config document) first, then the route's semantic vocabulary.
+    if (mutating && !pathHasUrlHint(bare) && !pathHasFileHint(bare)) {
+      const declaredBody = inferred.filter(p => p.location === 'json' || p.location === 'form')
+      const published = originSchemaPool.get(endpoint.origin) ?? []
+      const candidatesFor = (pattern: RegExp, fallbacks: string[]): EngineParam[] => {
+        const names = [...new Set([
+          ...declaredBody.map(p => p.name),
+          ...published.filter(value => pattern.test(value)),
+          ...fallbacks,
+        ])].slice(0, 3)
+        return names.map(name => declaredBody.find(p => p.name === name) ?? inferredParam(name, 'json'))
+      }
+      if (pathHasTemplateHint(bare)) {
+        for (const param of candidatesFor(/template|layout|markup|content|snippet|source|body|text|render/i, templateParamNames(bare)).slice(0, 2)) {
+          add({
+            key: `ssti_math|${endpoint.id}|${param.name}`,
+            endpoint,
+            probeClass: 'ssti_math',
+            intent: 'ssti',
+            method,
+            pathAndQuery: resolvedPath,
+            param,
+            location: 'json',
+            ownerPersona: picks.owner?.handle,
+            baselineValue: 'guardian',
+            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+            risk: endpointRiskScore(endpoint) + 14,
+          })
+        }
+      }
+      if (pathHasCommandHint(bare)) {
+        for (const param of candidatesFor(/host|hostname|target|address|domain|command|cmd|script|input|endpoint/i, commandParamNames(bare)).slice(0, 2)) {
+          add({
+            key: `command_injection|${endpoint.id}|${param.name}`,
+            endpoint,
+            probeClass: 'command_injection',
+            intent: 'command_injection',
+            method,
+            pathAndQuery: resolvedPath,
+            param,
+            location: 'json',
+            ownerPersona: picks.owner?.handle,
+            baselineValue: '127.0.0.1',
+            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+            risk: endpointRiskScore(endpoint) + 14,
+          })
+        }
+      }
+    }
+
+    // --- Workflow step skip ------------------------------------------------------------------
+    // A terminal action verb on an identified resource, seeded from the collection's own list or
+    // detail read. Repeating it must be rejected once the object left its prerequisite state.
+    const actionVerb = /(?:confirm|approve|complete|finalize|fulfil|ship|activate|publish|accept|settle)$/i
+    if (method === 'POST' && hasIdPath && actionVerb.test(lastSegment)) {
+      const collection = collectionPathOf(bare)
+      const barePath = (candidate: EngineEndpoint) => candidate.pathTemplate.split('?')[0] || '/'
+      const list = collection
+        ? endpoints.find(candidate => candidate.method.toUpperCase() === 'GET' && barePath(candidate) === collection)
+        : undefined
+      const detail = collection
+        ? endpoints.find(candidate => {
+            const candidatePath = barePath(candidate)
+            return candidate.method.toUpperCase() === 'GET' && candidatePath.startsWith(`${collection}/`) &&
+              hasDynamicIdSegment(candidatePath) &&
+              candidatePath.split('/').filter(Boolean).length === collection.split('/').filter(Boolean).length + 1
+          })
+        : undefined
+      const creator = collection
+        ? endpoints.find(candidate => candidate.method.toUpperCase() === 'POST' && barePath(candidate) === collection)
+        : undefined
+      if (list || detail || creator) {
+        add({
+          key: `workflow_invariant|${endpoint.id}`,
+          endpoint,
+          probeClass: 'workflow_invariant',
+          intent: 'workflow',
+          method: 'POST',
+          pathAndQuery: bare.replace(idSegmentRe, '/{{id}}'),
+          ownerPersona: picks.owner?.handle,
+          repeatTransition: true,
+          ...(list ? { workflowListPath: barePath(list) } : {}),
+          ...(detail ? { workflowReadPath: barePath(detail) } : {}),
+          workflowTargetTemplate: bare,
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+          risk: endpointRiskScore(endpoint) + 8,
+        })
+      }
+    }
+
     // --- Open redirect ----------------------------------------------------------------------
     if (method === 'GET' && pathHasRedirectHint(bare)) {
       const candidates = new Set(redirectParamNames(bare))
@@ -698,9 +830,9 @@ export function enumerateHypotheses(
     }
 
     // --- Credential exposure on a read surface ----------------------------------------------
+    // A collection/config read that the target itself publishes credentials from is scanned with a
+    // non-entitled viewer actor; the anonymous denial in the same matrix is the control.
     if (method === 'GET' && !hasIdPath && /(?:^|\/)(?:tokens?|keys?|apikeys?|links?|integrations?)(?:\/|$)/i.test(bare)) {
-      const ids = globalIds(harvest, endpoint.origin)
-      const idParam = /(?:^|\/)(?:links?|integrations?)(?:\/|$)/i.test(bare) ? 'iid' : undefined
       add({
         key: `secret_disclosure|${endpoint.id}`,
         endpoint,
@@ -709,8 +841,11 @@ export function enumerateHypotheses(
         method: 'GET',
         pathAndQuery: resolvedPath,
         ownerPersona: picks.owner?.handle,
-        resourceIds: ids,
-        ...(idParam ? { idParamName: idParam, param: { name: idParam, location: 'query' as const } } : {}),
+        functionLevel: true,
+        secretScan: true,
+        ...((picks.lower?.handle ?? picks.crossTenant?.handle)
+          ? { viewerPersona: (picks.lower?.handle ?? picks.crossTenant?.handle)! }
+          : {}),
         risk: endpointRiskScore(endpoint) + 30,
       })
     }
@@ -762,16 +897,38 @@ export function enumerateHypotheses(
       })
     }
 
-    // --- Mass assignment (create-shaped POST only at Tier 2) --------------------------------
-    if (method === 'POST' && !hasIdPath) {
+    // --- Mass assignment: create-shaped POST or an identified PATCH/PUT write -----------------
+    // A privileged/ownership field written through an ordinary update body is the same overpost
+    // class as on create. The route's real method is kept; the object id must be concrete.
+    const massPath = method === 'POST' && !hasIdPath
+      ? bare
+      : (method === 'PATCH' || method === 'PUT')
+        ? (idIsLast ? resolvedPath
+          : objectIdParam ? `${bare}?${encodeURIComponent(objectIdParam.name)}=${encodeURIComponent(ownerId)}`
+            : null)
+        : null
+    if (massPath) {
       const observedFields = harvest?.fields ?? []
-      const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|is_admin|visibility|amount|total|price|status)/i
+      const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|is_admin|visibility|amount|total|price|payment_state|status|state)/i
+      const fieldRank = (field: string): number =>
+        /role|roles|permission|privilege|grant|admin|tenant|owner|org|team/i.test(field) ? 0
+          : /amount|total|price|payment_state|status|state/i.test(field) ? 1 : 2
       const observedPrivilege = observedFields.filter(f => privilegeField.test(f))
-      const candidates = [...new Set([
-        ...observedPrivilege,
-        ...['role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified'],
-      ])].filter(f => /^[A-Za-z0-9_.-]{1,64}$/.test(f)).slice(0, 10)
-      if (candidates.length > 0 && (observedPrivilege.length > 0 || pathHasPrivilegedHint(bare))) {
+        .sort((a, b) => fieldRank(a) - fieldRank(b))
+      // On an update route, ordinary editable columns (name, amount, status) are not evidence of
+      // overposting by themselves. Restrict the PATCH/PUT candidate set to ownership/privilege and
+      // settlement fields that are never a normal client-editable property.
+      const updateSensitive = /role|roles|permission|permissions|privilege|grant|level|admin|is_admin|isAdmin|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|visibility|payment_state|return_url/i
+      const isUpdate = method === 'PATCH' || method === 'PUT'
+      const candidateSource = isUpdate
+        ? [...observedFields.filter(f => updateSensitive.test(f)), 'role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']
+        : [...observedPrivilege, ...['role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']]
+      const candidates = [...new Set(candidateSource)]
+        .filter(f => /^[A-Za-z0-9_.-]{1,64}$/.test(f)).slice(0, 10)
+      const eligible = isUpdate
+        ? observedFields.some(f => updateSensitive.test(f)) || pathHasPrivilegedHint(bare)
+        : observedPrivilege.length > 0 || pathHasPrivilegedHint(bare)
+      if (candidates.length > 0 && eligible) {
         const values: Record<string, string | boolean | number> = {}
         for (const field of candidates) {
           const observed = harvest?.otherValues[field]?.[0]
@@ -780,14 +937,24 @@ export function enumerateHypotheses(
         // The cross-tenant persona's tenant label is itself a legitimate overpost value even when
         // the collection response does not expose the owning tenant id field.
         if (picks.crossTenant?.tenant && values.tenant_id === undefined) values.tenant_id = picks.crossTenant.tenant
+        // A role/privilege write must be performed by a genuinely lower-privileged actor on that
+        // actor's own record: an owner editing its own row cannot demonstrate escalation.
+        const roleField = candidates.find(f => /^(?:role|roles|permission|permissions|privilege|grant|level|is_admin|isAdmin|admin)$/i.test(f))
+        const viewerTarget = isUpdate && roleField && picks.lower && (harvest?.viewerIds?.length ?? 0) > 0
+          ? harvest!.viewerIds![0]
+          : null
+        const writer = viewerTarget ? picks.lower!.handle : picks.owner?.handle
+        const targetPath = viewerTarget && hasIdPath
+          ? bare.replace(idSegmentRe, `/${encodeURIComponent(viewerTarget)}`)
+          : massPath
         add({
           key: `mass_assignment|${endpoint.id}`,
           endpoint,
           probeClass: 'mass_assignment',
           intent: 'mass_assignment',
-          method: 'POST',
-          pathAndQuery: resolvedPath,
-          ownerPersona: picks.owner?.handle,
+          method: method === 'PATCH' ? 'PATCH' : method === 'PUT' ? 'PUT' : 'POST',
+          pathAndQuery: targetPath,
+          ownerPersona: writer,
           otherPersona: picks.crossTenant?.handle,
           candidateFields: candidates,
           candidateValues: values,
@@ -801,15 +968,16 @@ export function enumerateHypotheses(
   const intentPriority: Record<string, number> = {
     // SQLi is deliberately last: error-based payloads legitimately return 5xx and can trip the
     // broker's defensive circuit, which pauses the run. Every non-5xx class gets its pass first.
-    authz: 100, secret_disclosure: 98, graphql: 95, xxe: 90, ssrf: 88, traversal: 85,
+    authz: 100, secret_disclosure: 98, graphql: 95, ssti: 94, command_injection: 93, workflow: 92,
+    xxe: 90, ssrf: 88, traversal: 85,
     redirect: 75, xss: 65, mass_assignment: 60, stored_xss: 55, cache: 50, csrf: 45, sqli: 10,
   }
   // Quota selection, not a pure global slice: late classes (SQLi in particular) must not be
   // starved when a richer surface forms more authz/xxe/ssrf hypotheses than the cap.
   const quotas: Record<string, number> = {
     authz: 52, secret_disclosure: 4, graphql: 2, xxe: 6, ssrf: 8, traversal: 6, redirect: 6,
-    xss: 5, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 2, webhook: 2,
-    auth_protocol: 2, sqli: 14,
+    xss: 5, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
+    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 14,
   }
   const max = options.maxHypotheses ?? defaultEngineMaxHypotheses
   const used: Record<string, number> = {}
@@ -932,7 +1100,7 @@ class SurfaceHarvester {
 }
 
 function emptyHarvest(): EndpointHarvest {
-  return { ownerIds: [], otherIds: [], fields: [], values: {}, otherValues: {}, seedValues: [], activeQueryParams: [] }
+  return { ownerIds: [], otherIds: [], fields: [], values: {}, otherValues: {}, seedValues: [], activeQueryParams: [], viewerIds: [] }
 }
 
 function mergeHarvest(target: EndpointHarvest, next: JsonHarvest): void {
@@ -959,6 +1127,12 @@ function mergeOtherHarvest(target: EndpointHarvest, next: JsonHarvest): void {
   }
 }
 
+function mergeViewerHarvest(target: EndpointHarvest, next: JsonHarvest): void {
+  const ids = target.viewerIds ?? []
+  for (const id of next.ids) if (!ids.includes(id)) ids.push(id)
+  target.viewerIds = ids.slice(0, 4)
+}
+
 async function harvestSurface(
   input: DeterministicEngineInput,
   ranked: readonly EngineEndpoint[],
@@ -971,6 +1145,7 @@ async function harvestSurface(
   let endpointsHarvested = 0
   const owner = picks.owner?.handle
   const other = picks.crossTenant?.handle
+  const lower = picks.lower?.handle
 
   const take = (endpoint: EngineEndpoint): EndpointHarvest => {
     const existing = harvests.get(endpoint.id)
@@ -1049,7 +1224,7 @@ async function harvestSurface(
     .filter(endpoint => endpoint.method.toUpperCase() === 'GET' && /(?:^|\/)(?:me|session|whoami)(?:\/|$)/i.test(endpoint.pathTemplate))
     .map(endpoint => endpoint.pathTemplate.split('?')[0])
   for (const path of identityPaths.slice(0, 2)) {
-    for (const persona of [owner, other]) {
+    for (const persona of [owner, other, lower]) {
       if (!persona) continue
       const identity = await harvester.get(persona, path)
       budget.requestsUsed += 1
@@ -1057,7 +1232,8 @@ async function harvestSurface(
       if (!target) continue
       const profile = take(target)
       if (persona === owner) mergeHarvest(profile, identity)
-      else mergeOtherHarvest(profile, identity)
+      else if (persona === other) mergeOtherHarvest(profile, identity)
+      else mergeViewerHarvest(profile, identity)
     }
   }
   log('deterministic_engine.harvest', `Harvested ${endpointsHarvested} endpoint profile(s) with ${budget.requestsUsed} request(s).`)
@@ -1117,6 +1293,25 @@ function buildProbeRequest(
         paramLocation: hyp.location,
         baselineValue: hyp.baselineValue,
         ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+      }
+    case 'ssti_math':
+    case 'command_injection':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location ?? 'json',
+        ...(hyp.baselineValue ? { baselineValue: hyp.baselineValue } : {}),
+        ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+      }
+    case 'workflow_invariant':
+      return {
+        ...base,
+        ...(hyp.workflowListPath ? { workflowListPath: hyp.workflowListPath } : {}),
+        ...(hyp.workflowReadPath ? { workflowReadPath: hyp.workflowReadPath } : {}),
+        ...(hyp.workflowTargetTemplate ? { workflowTargetTemplate: hyp.workflowTargetTemplate } : {}),
+        ...(hyp.repeatTransition ? { repeatTransition: true } : {}),
+        ...(hyp.quantityField ? { quantityField: hyp.quantityField } : {}),
+        jsonBody: hyp.jsonBody ?? {},
       }
     case 'path_traversal_benign':
       return {
@@ -1184,7 +1379,7 @@ function buildProbeRequest(
     case 'mass_assignment':
       return {
         ...base,
-        method: 'POST',
+        method: hyp.method === 'PATCH' || hyp.method === 'PUT' ? hyp.method : 'POST',
         paramLocation: 'json',
         candidateFields: hyp.candidateFields ?? [],
         jsonBody: hyp.jsonBody ?? {},
@@ -1564,6 +1759,9 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     graphql: 2,
     mass_assignment: 6,
     csrf: 4,
+    workflow: 3,
+    ssti: 3,
+    command_injection: 3,
   }
   const intentUsed: Record<string, number> = {}
   for (const hyp of hypotheses) {
@@ -1729,6 +1927,9 @@ export function engineClassKeywords(vulnClass: string): string[] {
     case 'xss_reflected': case 'xss_stored': return ['xss', 'cross-site scripting', 'script injection']
     case 'graphql_bola': return ['graphql', 'resolver']
     case 'mass_assignment': return ['mass assignment', 'mass-assignment', 'overpost']
+    case 'ssti': return ['ssti', 'template injection', 'template']
+    case 'command_injection': return ['command injection', 'os command', 'rce', 'shell']
+    case 'workflow_bypass': return ['workflow', 'step skip', 'business logic']
     case 'cache_poisoning': case 'cache_deception': return ['cache']
     case 'csrf': return ['csrf', 'state change']
     default: return [vulnClass]
@@ -1777,6 +1978,8 @@ export function intentFamily(intent: string): string {
     case 'cache': return 'cache'
     case 'secret_disclosure': return 'disclosure'
     case 'workflow': return 'logic'
+    case 'ssti': return 'ssti'
+    case 'command_injection': return 'cmdi'
     case 'webhook': return 'webhook'
     case 'auth_protocol': return 'auth'
     default: return intent

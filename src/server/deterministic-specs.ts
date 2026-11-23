@@ -32,7 +32,7 @@ export interface EngineEndpoint {
 }
 
 export type EngineIntent =
-  | 'authz' | 'sqli' | 'xxe' | 'ssrf' | 'traversal' | 'redirect' | 'xss' | 'graphql'
+  | 'authz' | 'sqli' | 'ssti' | 'command_injection' | 'xxe' | 'ssrf' | 'traversal' | 'redirect' | 'xss' | 'graphql'
   | 'mass_assignment' | 'cache' | 'stored_xss' | 'csrf' | 'workflow' | 'webhook' | 'auth_protocol' | 'secret_disclosure'
 
 export interface EngineHypothesis {
@@ -62,6 +62,16 @@ export interface EngineHypothesis {
   triggerPath?: string
   /** Second-order XSS / CSRF: downstream read route. */
   readPath?: string
+  /** workflow_invariant: collection list used to seed a transition target. */
+  workflowListPath?: string
+  /** workflow_invariant: readable detail route that exposes the object state. */
+  workflowReadPath?: string
+  /** workflow_invariant: the transition template with its original path placeholder. */
+  workflowTargetTemplate?: string
+  /** workflow_invariant: invoke the same terminal transition twice (step-skip proof). */
+  repeatTransition?: boolean
+  /** workflow_invariant: numeric quantity field for a conserved-value bound. */
+  quantityField?: string
   /** Bound session handle used for CSRF replay (no Authorization/Cookie headers). */
   session?: string
   graphqlRoots?: string[]
@@ -310,7 +320,9 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       const ownerRow = idRows.find(r => r.actor === 'owner')
       const probeRow = idRows.find(r => r.actor === probeActor)
       if (!ownerRow || ownerRow.accessible !== true || typeof ownerRow.status !== 'number' || ownerRow.status < 200 || ownerRow.status >= 300) ownerOk = false
-      else if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= (mutating ? 12 : 2)) ownerOk = false
+      // A mutating control can legitimately return a compact acknowledgement ({"ok":true}); the
+      // bogus-id negative control, not the body size, is what rules out a no-op route.
+      else if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= 2) ownerOk = false
       if (!probeRow || probeRow.accessible !== true) probeOk = false
       else if (!mutating && Number(probeRow.similarityToOwner ?? hit.similarityToOwner ?? 0) < 0.7) probeOk = false
       const anonRow = idRows.find(r => r.actor === 'anonymous')
@@ -336,8 +348,8 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     const stepExtra = mutating && hyp.csrfBind ? { csrfBind: true } : {}
     const probePersona = hit.actor === 'anonymous' ? null : other
     const neg = functionLevel ? null : negativeControlJq(mutating)
-    const ownerJq = nonTrivial('c1', mutating ? 12 : 3)
-    const probeJq = nonTrivial('p1', mutating ? 12 : 3)
+    const ownerJq = nonTrivial('c1', 3)
+    const probeJq = nonTrivial('p1', 3)
     const jq = `{ controlPassed: ((${ownerJq})${neg ? ` and (${neg})` : ''}), ` +
       `confirmed: ((${probeJq})${neg ? ` and (${neg})` : ''} and (${matchesOwnerJq()})), ` +
       `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
@@ -429,9 +441,11 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
       if (!out.some(existing => JSON.stringify(existing.spec) === JSON.stringify(candidate.spec))) out.push(candidate)
     }
     push(make(style))
-    // A LIKE-wrapped search needs a broad baseline to make the true/false branch differ enough
-    // for the verifier's randomized rounds; try the observed value plus short common terms.
-    for (const baseline of ['a', 'e', '1']) {
+    // A LIKE-wrapped search needs a broad baseline so the true branch still resembles the baseline
+    // request. An empty term matches the whole (tenant-scoped) collection; short common letters are
+    // narrower fallbacks. This is a control-vs-variant choice, not a weaker assertion.
+    const broadStyle = style === 'or_branch' || style === 'like_breakout'
+    for (const baseline of (broadStyle ? ['', 'a', 'e', '1'] : ['a', 'e', '1'])) {
       const candidate = make(style)
       candidate.spec.baselineValue = baseline
       push(candidate)
@@ -668,6 +682,9 @@ function synthGraphql(hyp: EngineHypothesis, result: DifferentialResult): Synthe
 
 function massAssignmentValue(field: string, privileged: boolean, observed?: string | boolean | number): string | boolean | number | null {
   if (privileged && observed !== undefined && observed !== null) return observed
+  if (/^(?:amount|total|price|cents|quantity|qty|count|balance|credit|limit)$/i.test(field)) {
+    return privileged ? 987654321 : 0
+  }
   if (/^(?:is|has|verified|admin|emailVerified|enabled|active|superuser|staff)/i.test(field)) return privileged
   if (privileged) {
     if (/role|admin|permission|privilege|scope/i.test(field)) return 'admin'
@@ -977,6 +994,145 @@ function synthReflectedXss(hyp: EngineHypothesis, result: DifferentialResult): S
 }
 
 // ---------------------------------------------------------------------------------------------
+// Server-side template injection / command injection (verifier-minted nonce proofs)
+// ---------------------------------------------------------------------------------------------
+
+const sstiTemplates: Record<string, string> = {
+  'jinja2/twig': '{{{{nonce_a}}*{{nonce_b}}}}',
+  erb: '<%={{nonce_a}}*{{nonce_b}}%>',
+  'freemarker/el': '${{{nonce_a}}*{{nonce_b}}}',
+  'spel/pebble': '#{{{nonce_a}}*{{nonce_b}}}',
+  thymeleaf: '[[${{{nonce_a}}*{{nonce_b}}}]]',
+}
+
+function synthSsti(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(a => a.type === 'expression_evaluated')
+  if (!hit || !hyp.param) return []
+  const template = sstiTemplates[String(hit.engine)]
+  if (!template) return []
+  const control = requestParts(hyp, 'guardian')
+  const probe = requestParts(hyp, template)
+  if (!control || !probe) return []
+  const jq = '{ controlPassed: (.control.status < 500), confirmed: (.proof.mathVerified == true), ' +
+    'observed: ("mathVerified=" + ((.proof.mathVerified // false) | tostring)), expected: "template input is not evaluated" }'
+  return [{
+    kind: 'rce_proof',
+    vulnClass: 'ssti',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(hyp.endpoint.origin, 'Server-side template injection (arithmetic evaluation)', 'CWE-1336', 'injection-input', 'high', jq),
+      kind: 'rce_proof',
+      proofMode: 'dynamic_math',
+      requiresTier3Approval: true,
+      controlStep: stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign template value', control, hyp.ownerPersona),
+      probeStep: stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Verifier-minted arithmetic expression', probe, hyp.ownerPersona),
+    },
+  }]
+}
+
+function synthCommandInjection(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(a => a.type === 'command_executed')
+  if (!hit || !hyp.param) return []
+  const base = String(hit.baseValue ?? '127.0.0.1').slice(0, 64)
+  const variant = String(hit.variant ?? 'semicolon_echo')
+  // The two nonces are joined by execution syntax, never literal adjacency, so plain reflection
+  // cannot satisfy the proof.
+  const templates: Record<string, string> = {
+    semicolon_echo: `${base}; echo {{nonce_part1}}$(echo {{nonce_part2}})`,
+    subshell_echo: `${base}$(echo {{nonce_part1}})$(echo {{nonce_part2}})`,
+    quote_break: `${base}"; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
+    quote_break_id: `${base}"; id; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
+    pipe_echo: `${base} | echo {{nonce_part1}}$(echo {{nonce_part2}})`,
+    backtick_echo: `${base}\`echo {{nonce_part1}}$(echo {{nonce_part2}})\``,
+  }
+  const template = templates[variant] ?? templates.semicolon_echo
+  const control = requestParts(hyp, base)
+  const probe = requestParts(hyp, template)
+  if (!control || !probe) return []
+  const jq = '{ controlPassed: (.control.status < 500), confirmed: (.proof.splitEchoVerified == true), ' +
+    'observed: ("splitEcho=" + ((.proof.splitEchoVerified // false) | tostring)), expected: "shell metacharacters are inert data" }'
+  const out: SynthesizedEngineSpec[] = [{
+    kind: 'rce_proof',
+    vulnClass: 'command_injection',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(hyp.endpoint.origin, 'Command injection via shell metacharacters (nonce echo proof)', 'CWE-78', 'injection-input', 'critical', jq),
+      kind: 'rce_proof',
+      proofMode: 'split_echo',
+      requiresTier3Approval: true,
+      controlStep: stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign value', control, hyp.ownerPersona),
+      probeStep: stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Verifier-minted split echo operands', probe, hyp.ownerPersona),
+    },
+  }]
+  // Some interpreters render a command substitution on its own line, so the assembled nonce is not
+  // contiguous even though it executed. The probe already proved the nonce appeared while the
+  // template did not; replay the same payload and assert the nonce is present but the payload is
+  // not reflected (plain reflection cannot satisfy both halves).
+  const observedPayload = typeof hit.payload === 'string' ? hit.payload : ''
+  const nonce = typeof hit.nonce === 'string' ? hit.nonce : ''
+  if (observedPayload.length > 0 && observedPayload.length <= 200 && !/[\r\n\0]/.test(observedPayload) &&
+      /^[A-Za-z0-9]{8,40}$/.test(nonce)) {
+    const observedProbe = requestParts(hyp, observedPayload)
+    if (observedProbe) {
+      const chainJq = `{ controlPassed: ((.steps.c1.status < 500) and ((.steps.c1.body | contains(${jqStr(nonce)})) | not)), ` +
+        `confirmed: ((${is2xx('p1')}) and (.steps.p1.body | contains(${jqStr(nonce)})) and ((.steps.p1.body | contains(${jqStr(observedPayload)})) | not)), ` +
+        `observed: ("nonce=" + (${jqStr(nonce)}) + " reflected=" + ((.steps.p1.body | contains(${jqStr(observedPayload)})) | tostring)), expected: "shell metacharacters are inert data" }`
+      out.push({
+        kind: 'http_chain',
+        vulnClass: 'command_injection',
+        endpoint: hyp.endpoint.pathTemplate,
+        spec: {
+          ...baseFields(hyp.endpoint.origin, 'Command injection via shell metacharacters (observed nonce proof)', 'CWE-78', 'injection-input', 'critical', chainJq),
+          kind: 'http_chain',
+          steps: [
+            stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign value', control, hyp.ownerPersona),
+            stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Observed metacharacter payload', observedProbe, hyp.ownerPersona),
+          ],
+        },
+      })
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Workflow step-skip (repeat terminal transition)
+// ---------------------------------------------------------------------------------------------
+
+function synthWorkflowStepSkip(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(a => a.type === 'workflow_step_skip')
+  if (!hit) return []
+  const safeId = /^[A-Za-z0-9_.:-]{1,128}$/
+  const targetId = typeof hit.targetId === 'string' && safeId.test(hit.targetId) ? hit.targetId : null
+  const template = typeof hit.targetTemplate === 'string' && hit.targetTemplate.startsWith('/')
+    ? hit.targetTemplate
+    : (hyp.workflowTargetTemplate ?? hyp.pathAndQuery)
+  if (!template.startsWith('/')) return []
+  const target = targetId ? template.replaceAll('{{id}}', encodeURIComponent(targetId)) : template
+  if (!targetId && target.includes('{{id}}')) return []
+  const method = (hyp.method === 'PUT' ? 'PUT' : hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
+  const body = hit.targetBody && typeof hit.targetBody === 'object' && !Array.isArray(hit.targetBody)
+    ? hit.targetBody as Record<string, unknown>
+    : (hyp.jsonBody ?? {})
+  const write = { method, pathAndQuery: target, jsonBody: body }
+  const jq = `{ controlPassed: (${is2xx('c3')}), confirmed: (${is2xx('p1')}), ` +
+    'observed: ("repeat transition status=" + (.steps.p1.status | tostring)), expected: "a terminal transition is rejected once the object left its prior state" }'
+  return [{
+    kind: 'http_chain',
+    vulnClass: 'workflow_bypass',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(hyp.endpoint.origin, 'Workflow step skip: terminal transition accepted twice', 'CWE-840', 'business-logic', 'medium', jq),
+      kind: 'http_chain',
+      steps: [
+        stepOf(hyp.endpoint.origin, 'c3', 'control', 'Perform the transition once (legal)', write, hyp.ownerPersona, {}, [200, 201, 204]),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Invoke the same terminal transition again', write, hyp.ownerPersona, {}, [200, 201, 204]),
+      ],
+    },
+  }]
+}
+
+// ---------------------------------------------------------------------------------------------
 
 /** All schema-shaped candidate specs for a signal, most specific first. */
 export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
@@ -990,6 +1146,9 @@ export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: Differentia
     switch (hyp.probeClass) {
       case 'authz_matrix': return synthAuthz(hyp, result)
       case 'sqli_boolean': return synthSqlBoolean(hyp, result)
+      case 'ssti_math': return synthSsti(hyp, result)
+      case 'command_injection': return synthCommandInjection(hyp, result)
+      case 'workflow_invariant': return synthWorkflowStepSkip(hyp, result)
       case 'xxe_canary': return synthXxe(hyp, result)
       case 'ssrf_canary': return synthSsrf(hyp, result)
       case 'path_traversal_benign': return synthTraversal(hyp, result)
@@ -1024,6 +1183,9 @@ export function vulnClassOfSpec(spec: Record<string, unknown>): string {
     case 'CWE-525': return 'cache_poisoning'
     case 'CWE-352': return 'csrf'
     case 'CWE-200': return 'info_disclosure'
+    case 'CWE-1336': return 'ssti'
+    case 'CWE-78': return 'command_injection'
+    case 'CWE-840': return 'workflow_bypass'
     default: return 'unknown'
   }
 }
