@@ -5,7 +5,7 @@ import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, Grant } from './broker.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
-import { personaSecrets } from './persona-vault.ts'
+import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { evaluateBrowserScopeRequest } from './scope-policy.ts'
@@ -38,6 +38,10 @@ export interface BrowserSessionBundle {
   cookies?: BrowserSeedCookie[]
   localStorage?: Record<string, string>
   sessionStorage?: Record<string, string>
+  /** Pre-built storage hydration script (v6-auth `storageHydrationScript()`). */
+  initScript?: string | null
+  /** Per-origin request headers attached to the persona (broker still injects on the wire). */
+  headers?: Record<string, string>
 }
 
 /** Passive CDN/static hydration scope. Active probing never uses this allowance. */
@@ -765,8 +769,11 @@ function isReadOnlyGraphqlDocument(doc: string): boolean {
   return /^\s*(?:query\b|\{)/.test(stripped) || /^\s*fragment\b/.test(stripped)
 }
 
-const readOnlyRpcMethodRe = /^(?:get|list|search|query|read|describe|introspect|fetch|lookup|find|count|view|status|health)(?:$|[._:-])/i
-const mutatingRpcMethodRe = /(?:^|[._:-])(?:create|update|delete|remove|write|set|put|post|patch|mutate|insert|drop|truncate|charge|pay|send|upload|import|reset|revoke|grant)(?:$|[._:-])/i
+const readOnlyRpcSegmentRe = /^(?:get|list|search|query|read|describe|introspect|fetch|lookup|find|count|view|status|health)/i
+const mutatingRpcSegments = new Set([
+  'create', 'update', 'delete', 'remove', 'write', 'set', 'put', 'post', 'patch', 'mutate',
+  'insert', 'drop', 'truncate', 'charge', 'pay', 'send', 'upload', 'import', 'reset', 'revoke', 'grant',
+])
 
 /**
  * True when a POST body is a read-only GraphQL operation (`query`/anonymous selection set) —
@@ -801,7 +808,11 @@ export function isReadOnlyRpcOperation(body: string | null | undefined): boolean
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
   const record = parsed as Record<string, unknown>
   const method = typeof record.method === 'string' ? record.method : ''
-  if (!method || !readOnlyRpcMethodRe.test(method) || mutatingRpcMethodRe.test(method)) return false
+  if (!method) return false
+  const segments = method.split(/[._:-]+/).filter(Boolean)
+  if (segments.some(segment => mutatingRpcSegments.has(segment.toLowerCase()))) return false
+  const lastSegment = segments[segments.length - 1] ?? ''
+  if (!readOnlyRpcSegmentRe.test(lastSegment) && !readOnlyRpcSegmentRe.test(method)) return false
   if (record.mutation !== undefined || record.subscription !== undefined) return false
   return true
 }
@@ -959,6 +970,7 @@ export interface BrowserPoolStats {
 
 interface PooledRuntime {
   key: string
+  runId: string | undefined
   context: PlaywrightContext
   page: PlaywrightPage
   sockets: Map<string, BrowserWebSocketRecord>
@@ -1032,24 +1044,57 @@ function normalizeSeedBundle(raw: unknown): BrowserSessionBundle | null {
   const session = normalizeStorage(record.sessionStorage)
   if (local) bundle.localStorage = local
   if (session) bundle.sessionStorage = session
+  if (typeof record.initScript === 'string' && record.initScript) bundle.initScript = record.initScript
+  if (record.headers && typeof record.headers === 'object' && !Array.isArray(record.headers)) {
+    const headers: Record<string, string> = {}
+    for (const [k, v] of Object.entries(record.headers as Record<string, unknown>).slice(0, 32)) {
+      if (typeof v === 'string' && !/[\r\n\0]/.test(k + v)) headers[k.slice(0, 128)] = v.slice(0, 4096)
+    }
+    if (Object.keys(headers).length > 0) bundle.headers = headers
+  }
   return Object.keys(bundle).length > 0 ? bundle : null
 }
 
-/** Structural read of optional persona session material (the vault may evolve without a schema bump here). */
-export function personaSessionBundle(grant: Grant, persona: string | undefined): BrowserSessionBundle | null {
+/** Structural read of optional persona session material (legacy `headerType`/`value` sessions keep working). */
+export function personaSessionBundle(grant: Grant, persona: string | undefined, origin?: string): BrowserSessionBundle | null {
   if (!persona) return null
-  const resolved = grant.personas?.get(persona) as unknown as Record<string, unknown> | undefined
+  const resolved = grant.personas?.get(persona)
   if (!resolved) return null
+  if (origin) {
+    try {
+      const attachment = buildPersonaBrowserAttachment(resolved, origin)
+      if (attachment) {
+        return {
+          cookies: attachment.cookies.map(cookie => ({
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path,
+            secure: cookie.secure,
+            httpOnly: cookie.httpOnly,
+            ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
+            ...(cookie.expires !== undefined ? { expires: cookie.expires } : {}),
+          })),
+          ...(attachment.storage?.localStorage ? { localStorage: attachment.storage.localStorage } : {}),
+          ...(attachment.storage?.sessionStorage ? { sessionStorage: attachment.storage.sessionStorage } : {}),
+          ...(attachment.initScript ? { initScript: attachment.initScript } : {}),
+          ...(Object.keys(attachment.headers).length > 0 ? { headers: attachment.headers } : {}),
+        }
+      }
+    } catch {
+      // Fall through to structural legacy material.
+    }
+  }
+  const record = resolved as unknown as Record<string, unknown>
   for (const key of ['sessionBundle', 'bundle']) {
-    const bundle = normalizeSeedBundle(resolved[key])
+    const bundle = normalizeSeedBundle(record[key])
     if (bundle) return bundle
   }
-  const inline = normalizeSeedBundle({
-    cookies: resolved.cookies,
-    localStorage: resolved.localStorage,
-    sessionStorage: resolved.sessionStorage,
+  return normalizeSeedBundle({
+    cookies: record.cookies,
+    localStorage: record.localStorage,
+    sessionStorage: record.sessionStorage,
   })
-  return inline
 }
 
 function seedStorageInitScript(bundle: BrowserSessionBundle | null, origin: string): string | null {
@@ -1265,24 +1310,27 @@ async function attachWebSocketCapture(
   }
   const ensureSocket = (payload: Record<string, unknown>): BrowserWebSocketRecord | null => {
     const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
+    if (!requestId) return null
     const url = typeof payload.url === 'string' ? payload.url : ''
-    if (!requestId || !url) return null
     let record = sockets.get(requestId)
-    if (!record) {
-      if (sockets.size >= 20) return null
-      let socketOrigin = ''
-      try { socketOrigin = new URL(url).origin } catch { /* keep empty */ }
-      record = {
-        url: redact(url, [...secrets]).slice(0, 512),
-        origin: socketOrigin,
-        protocol: null,
-        handshakeStatus: null,
-        openedAt: Date.now(),
-        frames: [],
-        frameCount: 0,
-      }
-      sockets.set(requestId, record)
+    if (record) return record
+    if (!url) return null
+    if (sockets.size >= 20) return null
+    let socketOrigin = ''
+    try {
+      const parsed = new URL(url)
+      socketOrigin = `${parsed.protocol === 'wss:' ? 'https:' : parsed.protocol === 'ws:' ? 'http:' : parsed.protocol}//${parsed.host}`
+    } catch { /* keep empty */ }
+    record = {
+      url: redact(url, [...secrets]).slice(0, 512),
+      origin: socketOrigin,
+      protocol: null,
+      handshakeStatus: null,
+      openedAt: Date.now(),
+      frames: [],
+      frameCount: 0,
     }
+    sockets.set(requestId, record)
     return record
   }
   session.on('Network.webSocketCreated', payload => { ensureSocket(payload) })
@@ -1390,16 +1438,20 @@ export class ScopedBrowser {
 
   private async resolveBundle(req: BrowserVisitRequest, grant: Grant, origin: string): Promise<BrowserSessionBundle | null> {
     if (req.sessionBundle) return normalizeSeedBundle(req.sessionBundle)
+    // v6-auth: composite bundle (HttpOnly cookies, headers, persisted web storage) is the default
+    // seeding source; legacy `headerType`/`value` sessions still resolve through the same helper.
+    const fromVault = personaSessionBundle(grant, req.persona, origin)
+    if (fromVault) return fromVault
     if (this.options.resolveSessionBundle && req.persona) {
       try {
         const resolved = await this.options.resolveSessionBundle(req.persona, origin)
         const bundle = normalizeSeedBundle(resolved)
         if (bundle) return bundle
       } catch {
-        // Fall through to structural persona material.
+        // No bundle available; context is seeded with broker jar cookies only.
       }
     }
-    return personaSessionBundle(grant, req.persona)
+    return null
   }
 
   private async ensurePooledContext(
@@ -1410,7 +1462,7 @@ export class ScopedBrowser {
     bundle: BrowserSessionBundle | null,
     allowLocalLab: boolean,
   ): Promise<PooledRuntime> {
-    const key = req.persona ? `persona:${req.persona}` : 'anonymous'
+    const key = `${req.runId ?? 'default'}::${req.persona ? `persona:${req.persona}` : 'anonymous'}`
     const existing = this.pooled.get(key)
     if (existing) {
       existing.lastUsed = Date.now()
@@ -1448,11 +1500,12 @@ export class ScopedBrowser {
       allowLocalLab,
       audit: (decision, origin) => grant.audit(decision, origin),
     })
-    const storageSeed = seedStorageInitScript(bundle, initialOrigin)
+    const storageSeed = bundle?.initScript ?? seedStorageInitScript(bundle, initialOrigin)
     if (storageSeed) await context.addInitScript(storageSeed)
 
     const runtime: PooledRuntime = {
       key,
+      runId: req.runId,
       context,
       page: undefined as unknown as PlaywrightPage,
       sockets: new Map(),
@@ -1617,6 +1670,16 @@ export class ScopedBrowser {
     const tier = grant.tier ?? 1
     if (tier === 0) throw new BrokerDenied('Scoped browser inspection is disabled in Tier 0 (offline prepared mode).')
     if (!Array.isArray(requests) || requests.length === 0) return []
+    // A pooled context carries persona cookies/storage; never let a later run reuse it.
+    const activeRunId = requests[0]?.runId
+    for (const [key, entry] of [...this.pooled.entries()]) {
+      if (entry.runId === activeRunId) continue
+      this.pooled.delete(key)
+      await entry.cdp?.detach?.().catch(() => undefined)
+      await entry.page.close().catch(() => undefined)
+      await entry.context.close().catch(() => undefined)
+      this.poolStats.contextsClosed += 1
+    }
     const browser = await this.ensurePoolBrowser()
     const results: BrowserVisitResult[] = []
     const allowLocalLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
