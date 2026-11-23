@@ -58,6 +58,21 @@ import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
 import { Store } from '../src/server/store.ts'
 import type { EndpointRow } from '../src/server/store.ts'
+import {
+  DEFAULT_SNAPSHOT_MAX_AGE_MS,
+  SnapshotError,
+  applyRunSnapshot,
+  assertSnapshotUsable,
+  captureRunSnapshot,
+  copySnapshotDatabase,
+  readRunSnapshot,
+} from '../src/server/run-snapshot.ts'
+import type {
+  CaptureRunSnapshotResult,
+  LoadedRunSnapshot,
+  SnapshotCheckpoint,
+  SnapshotCounts,
+} from '../src/server/run-snapshot.ts'
 import { selectVerifierBackend } from './benchmark-backend.ts'
 import type { VerifierBackendKind } from './benchmark-backend.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
@@ -90,6 +105,16 @@ export interface RealisticArgs {
   reuseReconDir?: string
   /** Ignore any existing snapshot and recapture it after a fresh Phase-0 pass. */
   refreshRecon: boolean
+  /** Capture a post-floor/planner-round checkpoint into this directory (v5.1 inner loop). */
+  snapshotAfterFloorDir?: string
+  /** Resume the product harness from a checkpoint instead of paying Phase-0/floor again. */
+  resumeSnapshotDir?: string
+  /** Reject checkpoints older than this (default 24 h). */
+  snapshotMaxAgeMs: number
+  /** Ignore an existing checkpoint and recapture it. */
+  snapshotRefresh: boolean
+  /** Explicitly allow reusing a salted held-out checkpoint (refused by default). */
+  allowHeldoutSnapshot: boolean
   help: boolean
 }
 
@@ -130,6 +155,20 @@ Flags:
                           never skipped and scorecards always come from real probes.
   --refresh-recon         ignore any existing snapshot and recapture it after a
                           fresh Phase-0 pass (requires --reuse-recon)
+  --snapshot-after-floor <dir>
+                          capture a run checkpoint at the post-floor boundary (and
+                          each planner round) so the live-model iteration can resume
+                          in seconds. Directory/file modes are 0700/0600.
+  --resume-snapshot <dir>
+                          resume from a checkpoint: boot the seeded app fresh,
+                          rebind origins/ports, re-authenticate personas, and start
+                          agentic investigation directly (no Phase-0, no floor).
+  --snapshot-max-age-ms <n>
+                          refuse checkpoints older than n ms (default 24 h)
+  --snapshot-refresh      ignore an existing checkpoint and recapture it
+  --allow-heldout-snapshot
+                          explicitly allow reusing a salted held-out checkpoint
+                          (refused by default)
   --help                  show this help
 
 Environment:
@@ -157,6 +196,20 @@ Recon cache (v5.1 inner loop):
   honest. Snapshot files are owner-only (0600) and contain no cookies, bearer tokens,
   passwords or session values; a key mismatch/corrupt file falls back to fresh discovery.
   --refresh-recon ignores an existing snapshot and recaptures it after a fresh Phase-0.
+
+Snapshot resume (v5.1 primary inner loop):
+  --snapshot-after-floor <dir> captures <dir>/guardian.sqlite (VACUUM INTO),
+  snapshot.json (coordinator state + version stamps) and target.json (app/seed/mode +
+  mutating replay log) at the post-floor boundary and at each planner round (round
+  snapshots go to <dir>/planner-round-<n>/). --resume-snapshot <dir> copies that DB
+  into a fresh data dir, rebinds loopback origins/ports to the freshly booted app and
+  canary listener, recreates persona login credentials for fresh sessions, and starts
+  the normal agentic loop at 'investigation'. Phase-0 and the deterministic floor are
+  never re-run; meta.record has resumedFrom + snapshotSkippedMs. Checkpoints expire
+  after --snapshot-max-age-ms (24 h) and salted held-out checkpoints are refused unless
+  --allow-heldout-snapshot is passed. The resumed scorecard only counts oracle evidence
+  produced by requests in the resumed process; persisted engine evidence (findings,
+  facts, specs) is preserved exactly, and nothing is faked.
 
 Artifacts per cell:
   <out-dir>/<app>-seed<seed>-<mode>.json      Scorecard (benchmark grader schema)
@@ -219,6 +272,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
     'out-dir', 'concurrency', 'data-dir', 'no-llm', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
+    'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
+    'allow-heldout-snapshot',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
@@ -233,6 +288,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       keepDataDirs: Boolean(a['keep-data-dirs']),
       allowInertWorkers: Boolean(a['allow-inert-workers']),
       verifier: 'auto', refreshRecon: a['refresh-recon'] === true, help: true,
+      snapshotMaxAgeMs: DEFAULT_SNAPSHOT_MAX_AGE_MS,
+      snapshotRefresh: false, allowHeldoutSnapshot: false,
     }
   }
 
@@ -240,6 +297,22 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   if (a['reuse-recon'] === true) fail('--reuse-recon requires a directory argument')
   const refreshRecon = a['refresh-recon'] === true
   if (refreshRecon && !reuseReconRaw) fail('--refresh-recon requires --reuse-recon <dir> (the snapshot directory to rewrite)')
+
+  const snapshotAfterFloorRaw = stringFlag(a, 'snapshot-after-floor')
+  if (a['snapshot-after-floor'] === true) fail('--snapshot-after-floor requires a directory argument')
+  const resumeSnapshotRaw = stringFlag(a, 'resume-snapshot')
+  if (a['resume-snapshot'] === true) fail('--resume-snapshot requires a directory argument')
+  if (snapshotAfterFloorRaw && resumeSnapshotRaw) {
+    fail('use either --snapshot-after-floor or --resume-snapshot, not both')
+  }
+  if (resumeSnapshotRaw && reuseReconRaw) fail('--resume-snapshot already carries Phase-0 state; drop --reuse-recon')
+  const snapshotRefresh = a['snapshot-refresh'] === true
+  if (snapshotRefresh && !snapshotAfterFloorRaw) {
+    fail('--snapshot-refresh requires --snapshot-after-floor <dir>')
+  }
+  const snapshotMaxAgeMs = a['snapshot-max-age-ms'] === undefined
+    ? DEFAULT_SNAPSHOT_MAX_AGE_MS
+    : parsePositiveInt(stringFlag(a, 'snapshot-max-age-ms') ?? '', '--snapshot-max-age-ms')
 
   const modeRaw = stringFlag(a, 'mode') ?? 'grey-box'
   if (modeRaw !== 'black-box' && modeRaw !== 'grey-box' && modeRaw !== 'white-box') {
@@ -275,6 +348,10 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     : parsePositiveInt(stringFlag(a, 'concurrency') ?? '', '--concurrency')
   const outDirRaw = stringFlag(a, 'out-dir') ?? '.guardian/realistic-bench'
   const dataDirRaw = stringFlag(a, 'data-dir') ?? env.GUARDIAN_DATA_DIR
+  const noLlm = a['no-llm'] === true
+  if (resumeSnapshotRaw && noLlm) {
+    fail('--resume-snapshot requires the live agentic model; drop --no-llm')
+  }
 
   return {
     apps: parseAppList(stringFlag(a, 'app')),
@@ -286,7 +363,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     outDir: isAbsolute(outDirRaw) ? outDirRaw : resolve(outDirRaw),
     concurrency,
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
-    noLlm: a['no-llm'] === true,
+    noLlm,
     isolateDataDir: a['isolate-data-dir'] === true,
     keepDataDirs: a['keep-data-dirs'] === true,
     allowInertWorkers: a['allow-inert-workers'] === true,
@@ -295,6 +372,15 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       ? { reuseReconDir: isAbsolute(reuseReconRaw) ? reuseReconRaw : resolve(reuseReconRaw) }
       : {}),
     refreshRecon,
+    ...(snapshotAfterFloorRaw
+      ? { snapshotAfterFloorDir: isAbsolute(snapshotAfterFloorRaw) ? snapshotAfterFloorRaw : resolve(snapshotAfterFloorRaw) }
+      : {}),
+    ...(resumeSnapshotRaw
+      ? { resumeSnapshotDir: isAbsolute(resumeSnapshotRaw) ? resumeSnapshotRaw : resolve(resumeSnapshotRaw) }
+      : {}),
+    snapshotMaxAgeMs,
+    snapshotRefresh,
+    allowHeldoutSnapshot: a['allow-heldout-snapshot'] === true,
     help: false,
   }
 }
@@ -1623,6 +1709,178 @@ export function applyReconSnapshot(input: ApplyReconInput): ApplyReconResult {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Snapshot resume metadata + rehydration helpers (v5.1 primary inner loop)
+// ---------------------------------------------------------------------------------------------
+
+export interface SnapshotCaptureMeta {
+  requested: boolean
+  directory: string | null
+  captured: boolean
+  reason: string | null
+  checkpoints: string[]
+  primary: {
+    path: string
+    capturedAt: number
+    skippedMs: number
+    checkpoint: string
+    counts: SnapshotCounts
+  } | null
+}
+
+export interface SnapshotResumeMeta {
+  requested: boolean
+  loaded: boolean
+  directory: string | null
+  capturedAt: number | null
+  ageMs: number | null
+  skippedMs: number
+  phase0Skipped: boolean
+  originsRebound: number
+  personaSessionsRebound: number
+  schemaVersion: number | null
+  gitSha: string | null
+  seedSet: string | null
+  heldOutOverride: boolean
+  incompatibleReason: string | null
+}
+
+export interface SnapshotRunMeta {
+  capture: SnapshotCaptureMeta
+  resume: SnapshotResumeMeta
+}
+
+export function emptySnapshotMeta(): SnapshotRunMeta {
+  return {
+    capture: {
+      requested: false,
+      directory: null,
+      captured: false,
+      reason: null,
+      checkpoints: [],
+      primary: null,
+    },
+    resume: {
+      requested: false,
+      loaded: false,
+      directory: null,
+      capturedAt: null,
+      ageMs: null,
+      skippedMs: 0,
+      phase0Skipped: false,
+      originsRebound: 0,
+      personaSessionsRebound: 0,
+      schemaVersion: null,
+      gitSha: null,
+      seedSet: null,
+      heldOutOverride: false,
+      incompatibleReason: null,
+    },
+  }
+}
+
+/** One cell writes verbatim; a matrix gets a per-cell subdirectory. */
+export function snapshotDirectoryFor(
+  base: string,
+  app: AppName,
+  seed: number,
+  mode: BenchMode,
+  cellCount: number,
+): string {
+  return cellCount > 1 ? join(base, cellSlug(app, seed, mode)) : base
+}
+
+/** Accept either a checkpoint root or a matrix root that contains one per-cell child. */
+export function resolveResumeSnapshotDirectory(
+  base: string,
+  app: AppName,
+  seed: number,
+  mode: BenchMode,
+): string {
+  if (existsSync(join(base, 'snapshot.json'))) return base
+  const child = join(base, cellSlug(app, seed, mode))
+  if (existsSync(join(child, 'snapshot.json'))) return child
+  return base
+}
+
+/**
+ * Link the snapshot's model profile credential files from the source data dir into the fresh
+ * resume data dir. The provider key is never copied; only an owner-only symlink is created, the
+ * same invariant `prepareIsolatedDataDir` uses. Persona credentials are written separately.
+ */
+export function linkSnapshotModelCredentials(input: {
+  snapshotDb: string
+  sourceDataDir?: string
+  targetDataDir: string
+}): { profiles: number; linked: number } {
+  const snapshot = new DatabaseSync(input.snapshotDb, { readOnly: true })
+  let rows: Array<{ credential_id?: string; name?: string; model?: string }> = []
+  try {
+    rows = snapshot.prepare(
+      'select credential_id, name, model from model_profiles where enabled = 1 order by priority desc, updated_at desc',
+    ).all() as Array<{ credential_id?: string; name?: string; model?: string }>
+  } catch {
+    rows = []
+  } finally {
+    snapshot.close()
+  }
+  if (!rows.length) return { profiles: 0, linked: 0 }
+  if (!input.sourceDataDir) {
+    throw new PreflightError(
+      '--resume-snapshot needs --data-dir (or GUARDIAN_DATA_DIR) pointing at the enabled model '
+      + 'profile whose key the resumed run must use',
+    )
+  }
+  const sourceCredentials = join(resolve(input.sourceDataDir), 'credentials')
+  const targetCredentials = join(resolve(input.targetDataDir), 'credentials')
+  mkdirSync(targetCredentials, { recursive: true, mode: 0o700 })
+
+  // Fall back to matching the profile by name/model when the source credential id differs
+  // (e.g. the checkpoint came from a different isolated copy of the same profile).
+  let sourceRows: Array<{ credential_id?: string; name?: string; model?: string }> = []
+  const sourceDb = join(resolve(input.sourceDataDir), 'guardian.sqlite')
+  if (existsSync(sourceDb)) {
+    const source = new DatabaseSync(sourceDb, { readOnly: true })
+    try {
+      sourceRows = source.prepare(
+        'select credential_id, name, model from model_profiles where enabled = 1',
+      ).all() as Array<{ credential_id?: string; name?: string; model?: string }>
+    } catch {
+      sourceRows = []
+    } finally {
+      source.close()
+    }
+  }
+
+  let linked = 0
+  for (const row of rows) {
+    const id = row.credential_id ? String(row.credential_id) : ''
+    if (!id) continue
+    let sourcePath = join(sourceCredentials, id)
+    if (!existsSync(sourcePath)) {
+      const match = sourceRows.find(candidate =>
+        candidate.credential_id && candidate.name === row.name && candidate.model === row.model)
+      if (match?.credential_id) sourcePath = join(sourceCredentials, String(match.credential_id))
+    }
+    if (!existsSync(sourcePath)) {
+      throw new PreflightError(
+        `profile '${String(row.name ?? id)}' has no credential file in ${sourceCredentials}; `
+        + 'resume needs the same --data-dir source that captured the checkpoint',
+      )
+    }
+    const mode = statSync(sourcePath).mode
+    if ((mode & 0o077) !== 0) {
+      throw new PreflightError(`profile '${String(row.name ?? id)}' credential must be owner-only (mode 600)`)
+    }
+    const targetPath = join(targetCredentials, id)
+    if (!existsSync(targetPath)) {
+      symlinkSync(sourcePath, targetPath)
+      linked += 1
+    }
+  }
+  return { profiles: rows.length, linked }
+}
+
 export interface CellMeta {
   app: AppName
   seed: number
@@ -1642,6 +1900,11 @@ export interface CellMeta {
   budgetUsd: number
   maxDurationMs: number
   reconCache: ReconCacheMeta
+  snapshot: SnapshotRunMeta
+  /** Checkpoint directory this run resumed from (null for a cold run). */
+  resumedFrom: string | null
+  /** Wall-clock of cold work the checkpoint skipped. */
+  snapshotSkippedMs: number
   startedAt: number
   endedAt: number
   durationMs: number
@@ -1787,9 +2050,61 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
   const sourceDataDir = args.noLlm ? undefined : args.dataDir
   const isolate = shouldIsolateDataDir(args)
+  const resumeRequested = Boolean(args.resumeSnapshotDir)
+  const notes: string[] = []
+  const snapshotMeta = emptySnapshotMeta()
+  snapshotMeta.resume.requested = resumeRequested
+  snapshotMeta.resume.heldOutOverride = args.allowHeldoutSnapshot
+  snapshotMeta.capture.requested = Boolean(args.snapshotAfterFloorDir)
+  const captureBaseDir = args.snapshotAfterFloorDir
+    ? snapshotDirectoryFor(args.snapshotAfterFloorDir, app, seed, args.mode, cellCount)
+    : undefined
+  snapshotMeta.capture.directory = captureBaseDir ?? null
+  if (captureBaseDir && args.snapshotRefresh) {
+    rmSync(captureBaseDir, { recursive: true, force: true })
+  }
+
   let dataDir = join(args.outDir, 'data', slug)
   let isolated: IsolatedDataDirResult | undefined
-  if (isolate && sourceDataDir) {
+  let loadedSnapshot: LoadedRunSnapshot | undefined
+  if (resumeRequested) {
+    const resumeDir = resolveResumeSnapshotDirectory(args.resumeSnapshotDir!, app, seed, args.mode)
+    snapshotMeta.resume.directory = resumeDir
+    loadedSnapshot = readRunSnapshot(resumeDir)
+    const targetApp = loadedSnapshot.target
+    if (targetApp.app !== app || targetApp.seed !== seed || targetApp.mode !== args.mode) {
+      throw new PreflightError(
+        `snapshot ${resumeDir} is for ${targetApp.app} seed ${targetApp.seed} ${targetApp.mode}, `
+        + `not ${app} seed ${seed} ${args.mode}`,
+      )
+    }
+    const usable = assertSnapshotUsable(loadedSnapshot, {
+      heldOut: args.heldOut,
+      allowHeldOut: args.allowHeldoutSnapshot,
+      maxAgeMs: args.snapshotMaxAgeMs,
+    })
+    snapshotMeta.resume.loaded = true
+    snapshotMeta.resume.capturedAt = targetApp.capturedAt
+    snapshotMeta.resume.ageMs = usable.ageMs
+    snapshotMeta.resume.skippedMs = usable.skippedMs
+    snapshotMeta.resume.schemaVersion = loadedSnapshot.snapshot.versions.snapshotSchemaVersion
+    snapshotMeta.resume.gitSha = loadedSnapshot.snapshot.versions.gitSha
+    snapshotMeta.resume.seedSet = targetApp.seedSet
+    snapshotMeta.resume.phase0Skipped = Boolean(loadedSnapshot.snapshot.coordinator.phase0CompletedAt)
+    // Resume always uses a fresh data dir; --data-dir is only the credential/profile source.
+    dataDir = join(args.outDir, 'data', `${slug}-resume`)
+    copySnapshotDatabase({ snapshotDir: resumeDir, targetDir: dataDir })
+    const linked = linkSnapshotModelCredentials({
+      snapshotDb: join(dataDir, 'guardian.sqlite'),
+      ...(sourceDataDir ? { sourceDataDir } : {}),
+      targetDataDir: dataDir,
+    })
+    notes.push(
+      `resume snapshot loaded from ${resumeDir} (captured ${new Date(targetApp.capturedAt).toISOString()}, `
+      + `age ${Math.round(usable.ageMs / 1000)}s, checkpoint skipped ${Math.round(usable.skippedMs / 1000)}s of cold work); `
+      + `${linked.linked} model credential link(s)`,
+    )
+  } else if (isolate && sourceDataDir) {
     isolated = prepareIsolatedDataDir({ sourceDataDir, targetDir: dataDir })
   } else if (sourceDataDir) {
     dataDir = cellCount === 1 ? sourceDataDir : join(sourceDataDir, slug)
@@ -1813,7 +2128,6 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   let appStopped = false
   let canaryStopped = false
   let whiteBoxRoot: string | undefined
-  const notes: string[] = []
   if (args.isolateDataDir && !sourceDataDir && !args.noLlm) {
     notes.push('--isolate-data-dir had no --data-dir/GUARDIAN_DATA_DIR source; using a fresh cell data dir')
   }
@@ -1890,19 +2204,22 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const briefing = briefingFor(started, args.mode)
     for (const p of briefing.personas) secrets.push({ value: p.password, placeholder: '[[persona-password]]' })
 
-    let loginPath = pickLoginPath(briefing)
-    if (!loginPath && args.mode === 'black-box') {
+    let loginPath = resumeRequested && loadedSnapshot?.target.loginPath
+      ? loadedSnapshot.target.loginPath
+      : pickLoginPath(briefing)
+    if (!loginPath && args.mode === 'black-box' && !resumeRequested) {
       loginPath = await probeLoginPath(briefing.origin, briefing.personas)
       if (loginPath) notes.push(`black-box login route discovered by convention probe: ${loginPath}`)
       else notes.push('black-box login route not discovered; personas are not registered')
     }
     const plan = planCell(briefing, loginPath)
     const gitSha = resolveGitSha()
+    const canaryBaseUrl = listener.localBaseUrl ?? listener.effectiveBaseUrl ?? null
 
     // Recon-cache key: (app, seed, split, mode, variantHash). The variant hash covers only the
     // discovery inputs (briefing surface + persona handles + login route), never the port.
     const recon = emptyReconCacheMeta(args.refreshRecon)
-    if (args.reuseReconDir) {
+    if (args.reuseReconDir && !resumeRequested) {
       const keyInputs: ReconCacheKeyInputs = {
         app,
         seed,
@@ -1923,92 +2240,129 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       recon.path = reconCachePath(args.reuseReconDir, keyInputs)
     }
 
-    const project = storage.createProject({
-      requestId: randomUUID(),
-      name: `realistic-bench ${app} seed ${seed} (${args.mode})`,
-      seeds: [briefing.origin],
-      environment: 'local-lab',
-    })
-    projectId = project.id
+    let mountedRepos: string[] = []
+    let personaIds: string[] = []
+    if (resumeRequested && loadedSnapshot) {
+      // Resume: the checkpoint already carries project/persona/run/scope state. Only the
+      // benchmark's white-box source mount is recreated under the new data dir.
+      projectId = loadedSnapshot.target.projectId
+      runId = loadedSnapshot.target.runId
+      const run = storage.run(runId)
+      personaIds = [...run.approvedPersonaIds]
+      if (args.mode === 'white-box') {
+        mountedRepos = await makeWhiteBoxMount(briefing, dataDir, projectId)
+        if (mountedRepos.length) {
+          whiteBoxRoot = join(projectReposDir(dataDir, projectId), 'bench', briefing.app)
+          notes.push(`white-box read-only source mount (resumed): ${mountedRepos.join(', ')}`)
+        }
+      }
+      const applied = applyRunSnapshot({
+        storage,
+        snapshot: loadedSnapshot.snapshot,
+        target: loadedSnapshot.target,
+        newOrigin: briefing.origin,
+        ...(canaryBaseUrl ? { newCanaryBaseUrls: [canaryBaseUrl] } : {}),
+        personaCredentials: plan.personas.map(p => ({
+          handle: p.handle, email: p.email, password: p.password,
+        })),
+      })
+      snapshotMeta.resume.originsRebound = applied.origins.rowsUpdated
+      snapshotMeta.resume.personaSessionsRebound = applied.personaSessionsRebound
+      snapshotMeta.resume.phase0Skipped = applied.phase0Skipped
+      snapshotMeta.resume.skippedMs = applied.skippedMs
+      notes.push(
+        `snapshot resumed at ${applied.runId}: phase0Skipped=${applied.phase0Skipped}, `
+        + `origins rebound (${applied.origins.rowsUpdated} rows), `
+        + `${applied.personaSessionsRebound} persona credential(s) re-created for fresh sessions, `
+        + `${applied.assignmentsCanceled} in-flight assignment(s) discarded`,
+      )
+    } else {
+      const project = storage.createProject({
+        requestId: randomUUID(),
+        name: `realistic-bench ${app} seed ${seed} (${args.mode})`,
+        seeds: [briefing.origin],
+        environment: 'local-lab',
+      })
+      projectId = project.id
 
-    if (plan.openApi) {
-      storage.importProjectSpec({
+      if (plan.openApi) {
+        storage.importProjectSpec({
+          requestId: randomUUID(),
+          projectId,
+          name: `realistic-bench-${app}-api.json`,
+          kind: 'openapi',
+          origin: briefing.origin,
+          content: JSON.stringify(plan.openApi, null, 2),
+        })
+      }
+
+      mountedRepos = args.mode === 'white-box'
+        ? await makeWhiteBoxMount(briefing, dataDir, projectId)
+        : []
+      if (mountedRepos.length) {
+        whiteBoxRoot = join(projectReposDir(dataDir, projectId), 'bench', briefing.app)
+        notes.push(`white-box read-only source mount: ${mountedRepos.join(', ')}`)
+      }
+
+      if (loginPath) {
+        for (const p of plan.personas) {
+          const created = createProjectPersona(storage, {
+            requestId: randomUUID(),
+            projectId,
+            handle: p.handle,
+            roleLabel: p.roleLabel,
+            originAllowlist: [briefing.origin],
+            authKind: 'login',
+            loginConfig: {
+              adapter: 'json',
+              email: p.email,
+              loginUrl: new URL(loginPath, briefing.origin).toString(),
+            },
+            secret: p.password,
+            canaryMarkers: p.canaryMarkers,
+          })
+          personaIds.push(created.id)
+        }
+      }
+
+      const createdRun = storage.createRun({
         requestId: randomUUID(),
         projectId,
-        name: `realistic-bench-${app}-api.json`,
-        kind: 'openapi',
-        origin: briefing.origin,
-        content: JSON.stringify(plan.openApi, null, 2),
+        goal: plan.mission,
+        sourceMode: 'public',
+        capabilityTier: plan.capabilityTier,
+        approvalPolicy: 'auto_review',
+        approvedPersonaIds: personaIds,
+        budgetUsd: args.budgetUsd,
+        budgetRequests: 2_000,
+        maxRpsPerOrigin: 10,
+        workerConcurrency: Math.min(4, Math.max(1, args.concurrency)),
+        workerMaxTurns: 30,
+        multiTrialEnabled: true,
+      })
+      runId = createdRun.id
+
+      storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
+      const assetIds = storage.run(runId).candidates.map(c => c.id)
+      if (!assetIds.length) fail('discovery produced no candidate assets for the briefing origin')
+      storage.command({
+        requestId: randomUUID(),
+        runId,
+        action: 'scope',
+        expectedScopeRevision: 0,
+        assetIds,
+        consent: true,
+        capabilityTier: plan.capabilityTier,
+        approvedPersonaIds: personaIds,
+        budgetUsd: args.budgetUsd,
+        budgetRequests: 2_000,
+        maxRpsPerOrigin: 10,
       })
     }
 
-    const mountedRepos = args.mode === 'white-box'
-      ? await makeWhiteBoxMount(briefing, dataDir, projectId)
-      : []
-    if (mountedRepos.length) {
-      whiteBoxRoot = join(projectReposDir(dataDir, projectId), 'bench', briefing.app)
-      notes.push(`white-box read-only source mount: ${mountedRepos.join(', ')}`)
-    }
-
-    const personaIds: string[] = []
-    if (loginPath) {
-      for (const p of plan.personas) {
-        const created = createProjectPersona(storage, {
-          requestId: randomUUID(),
-          projectId,
-          handle: p.handle,
-          roleLabel: p.roleLabel,
-          originAllowlist: [briefing.origin],
-          authKind: 'login',
-          loginConfig: {
-            adapter: 'json',
-            email: p.email,
-            loginUrl: new URL(loginPath, briefing.origin).toString(),
-          },
-          secret: p.password,
-          canaryMarkers: p.canaryMarkers,
-        })
-        personaIds.push(created.id)
-      }
-    }
-
-    const createdRun = storage.createRun({
-      requestId: randomUUID(),
-      projectId,
-      goal: plan.mission,
-      sourceMode: 'public',
-      capabilityTier: plan.capabilityTier,
-      approvalPolicy: 'auto_review',
-      approvedPersonaIds: personaIds,
-      budgetUsd: args.budgetUsd,
-      budgetRequests: 2_000,
-      maxRpsPerOrigin: 10,
-      workerConcurrency: Math.min(4, Math.max(1, args.concurrency)),
-      workerMaxTurns: 30,
-      multiTrialEnabled: true,
-    })
-    runId = createdRun.id
-
-    storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
-    const assetIds = storage.run(runId).candidates.map(c => c.id)
-    if (!assetIds.length) fail('discovery produced no candidate assets for the briefing origin')
-    storage.command({
-      requestId: randomUUID(),
-      runId,
-      action: 'scope',
-      expectedScopeRevision: 0,
-      assetIds,
-      consent: true,
-      capabilityTier: plan.capabilityTier,
-      approvedPersonaIds: personaIds,
-      budgetUsd: args.budgetUsd,
-      budgetRequests: 2_000,
-      maxRpsPerOrigin: 10,
-    })
-
     // Recon cache (v5.1): seed the run's Store from a prior Phase-0 snapshot and let the engine's
     // own `phase0CompletedAt` gate skip discovery. Probing/verification still run in full.
-    if (recon.requested && recon.directory && recon.keyInputs) {
+    if (!resumeRequested && recon.requested && recon.directory && recon.keyInputs) {
       if (args.refreshRecon) {
         recon.reason = 'refresh requested; a fresh Phase-0 pass will recapture the snapshot'
         notes.push('recon cache refresh requested: existing snapshot ignored')
@@ -2074,16 +2428,93 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       }
     }
 
+    // --- Snapshot checkpoints (v5.1 primary inner loop) -------------------------------------
+    const capturedCheckpointKeys = new Set<string>()
+    const captureCheckpoint = (checkpoint: SnapshotCheckpoint): void => {
+      if (resumeRequested || !captureBaseDir || !runId) return
+      try {
+        const latest = storage.run(runId)
+        const round = latest.roundNo
+        const key = checkpoint === 'planner-round' ? `${checkpoint}:${round}` : checkpoint
+        if (capturedCheckpointKeys.has(key)) return
+        const dir = checkpoint === 'planner-round'
+          ? join(captureBaseDir, `planner-round-${round}`)
+          : checkpoint === 'phase0'
+            ? join(captureBaseDir, 'phase0')
+            : captureBaseDir
+        if (!args.snapshotRefresh && existsSync(join(dir, 'snapshot.json'))) {
+          if (checkpoint === 'planner-round' || checkpoint === 'phase0') {
+            capturedCheckpointKeys.add(key)
+            snapshotMeta.capture.reason = `checkpoint ${key} already present`
+            return
+          }
+          try {
+            const existing = readRunSnapshot(dir)
+            if (existing.snapshot.coordinator.checkpoint !== 'phase0') {
+              capturedCheckpointKeys.add(key)
+              snapshotMeta.capture.reason = 'fresh checkpoint already present; pass --snapshot-refresh to recapture'
+              return
+            }
+          } catch { /* corrupt existing checkpoint: overwrite it */ }
+        }
+        const result: CaptureRunSnapshotResult = captureRunSnapshot({
+          storage,
+          snapshotDir: dir,
+          checkpoint,
+          target: {
+            app,
+            seed,
+            seedSet: started?.plan.seedSet ?? (args.heldOut ? 'held-out' : 'dev'),
+            mode: args.mode,
+            origin: briefing.origin,
+            loginPath,
+            canaryBaseUrls: canaryBaseUrl ? [canaryBaseUrl] : [],
+            projectId,
+            runId,
+          },
+          gitSha,
+          secrets,
+        })
+        capturedCheckpointKeys.add(key)
+        snapshotMeta.capture.captured = true
+        snapshotMeta.capture.reason = null
+        snapshotMeta.capture.checkpoints.push(checkpoint)
+        if (dir === captureBaseDir) {
+          snapshotMeta.capture.primary = {
+            path: result.snapshotDir,
+            capturedAt: result.snapshot.capturedAt,
+            skippedMs: result.snapshot.coordinator.virtualElapsedMs,
+            checkpoint,
+            counts: result.counts,
+          }
+        }
+        notes.push(
+          `snapshot checkpoint '${checkpoint}' written to ${result.snapshotDir}: `
+          + `${result.counts.endpoints} endpoints, ${result.counts.facts} facts `
+          + `(${result.counts.detLeads} det_lead), ${result.counts.findings} findings, `
+          + `${result.counts.replaySpecs} replay specs; cold work skipped on resume `
+          + `~${Math.round(result.snapshot.coordinator.virtualElapsedMs / 1000)}s`,
+        )
+        log(`[${slug}] checkpoint ${checkpoint} captured (${Math.round(result.snapshot.coordinator.virtualElapsedMs / 1000)}s state)`)
+      } catch (error) {
+        const message = error instanceof SnapshotError ? error.message : (error instanceof Error ? error.message : String(error))
+        snapshotMeta.capture.reason = `capture failed: ${redact(message).slice(0, 200)}`
+        notes.push(`snapshot checkpoint '${checkpoint}' skipped: ${snapshotMeta.capture.reason}`)
+      }
+    }
+
     engine = new Execution(storage, {
       canaryBroker: canary,
       ...(backend ? { backend } : {}),
       deterministicOnly: args.noLlm,
+      onCheckpoint: event => captureCheckpoint(event.checkpoint as SnapshotCheckpoint),
     })
     engine.start()
     engine.wake()
     runStartedAt = nowMs()
 
     const captureRecon = (completedAt: number): void => {
+      if (resumeRequested) return
       if (!recon.requested || recon.captured || recon.hit || !recon.keyInputs || !recon.directory) return
       try {
         const resolved = resolveRunPersonas(storage, projectId, personaIds)
@@ -2238,6 +2669,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       budgetUsd: args.budgetUsd,
       maxDurationMs: args.maxDurationMs,
       reconCache: recon,
+      snapshot: snapshotMeta,
+      resumedFrom: snapshotMeta.resume.loaded ? snapshotMeta.resume.directory : null,
+      snapshotSkippedMs: snapshotMeta.resume.loaded ? snapshotMeta.resume.skippedMs : 0,
       startedAt,
       endedAt,
       durationMs: endedAt - startedAt,
@@ -2278,6 +2712,26 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         reconCache: recon.requested
           ? { key: recon.key, hit: recon.hit, refreshed: args.refreshRecon, phase0Skipped: recon.phase0Skipped }
           : null,
+        snapshot: {
+          capture: snapshotMeta.capture.requested
+            ? {
+                directory: snapshotMeta.capture.directory,
+                captured: snapshotMeta.capture.captured,
+                checkpoints: snapshotMeta.capture.checkpoints,
+              }
+            : null,
+          resume: snapshotMeta.resume.requested
+            ? {
+                loaded: snapshotMeta.resume.loaded,
+                directory: snapshotMeta.resume.directory,
+                capturedAt: snapshotMeta.resume.capturedAt,
+                ageMs: snapshotMeta.resume.ageMs,
+                skippedMs: snapshotMeta.resume.skippedMs,
+                phase0Skipped: snapshotMeta.resume.phase0Skipped,
+                heldOut: snapshotMeta.resume.seedSet === 'held-out',
+              }
+            : null,
+        },
       },
       targetsTotal: card.targets,
       confirmedCount: card.confirmed,
@@ -2405,7 +2859,7 @@ async function main(): Promise<void> {
     process.stdout.write(`[realistic-bench] starting ${app} seed=${seed} ${args.mode}\n`)
     const result = finalizeCellResult(await runCell(args, app, seed, line => process.stdout.write(`${line}\n`)))
     const c = result.scorecard
-    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}${result.meta.reconCache.requested ? ` recon=${result.meta.reconCache.hit ? 'hit' : 'miss'} saved=${result.meta.reconCache.reconTimeSavedMs}ms` : ''}\n`)
+    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}${result.meta.reconCache.requested ? ` recon=${result.meta.reconCache.hit ? 'hit' : 'miss'} saved=${result.meta.reconCache.reconTimeSavedMs}ms` : ''}${result.meta.resumedFrom ? ` resumed=yes skipped=${result.meta.snapshotSkippedMs}ms` : ''}${result.meta.snapshot.capture.requested ? ` snapshot=${result.meta.snapshot.capture.captured ? result.meta.snapshot.capture.checkpoints.join('+') : 'not-captured'}` : ''}\n`)
     return result
   })
 
