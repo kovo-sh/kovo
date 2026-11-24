@@ -28,9 +28,6 @@ import {
   CODE_LEAD_PRIORITY_RISK,
   Execution,
   TIER_A_STEP_PRIORITY,
-  buildCodeLeadCrossTenantProof,
-  buildCodeLeadSqlErrorProof,
-  codeLeadMatrixRows,
   deriveCodeLeadIdentifierTargets,
   detLeadEvidenceGate,
   evaluateDispatchStop,
@@ -299,96 +296,13 @@ test('the engine lane assignment carries the Program-Graph lead facts it consume
 })
 
 // ============================================================================
-// 5. Fallback proof shapes (existing http_chain primitive + existing oracle)
+// 5. Canonical proof synthesis (fallbacks retired)
 // ============================================================================
-
-function hypothesis(overrides: Partial<EngineHypothesis> = {}): EngineHypothesis {
-  return {
-    key: 'authz|derived:0:GET:/v2/billing/invoices/:id|path',
-    endpoint: {
-      id: 'derived:0:GET:/v2/billing/invoices/:id',
-      origin: ORIGIN,
-      method: 'GET',
-      pathTemplate: '/v2/billing/invoices/:id',
-      params: [{ name: 'id', location: 'path', isObjectId: true }],
-      riskScore: CODE_LEAD_PRIORITY_RISK,
-      source: 'program_graph',
-    },
-    probeClass: 'authz_matrix',
-    intent: 'authz',
-    method: 'GET',
-    pathAndQuery: '/v2/billing/invoices/{{id}}',
-    ownerPersona: 'mono-alice',
-    otherPersona: 'mono-bob',
-    resourceIds: ['inv-alpha-1'],
-    risk: 90,
-    ...overrides,
-  }
-}
-
-test('cross-tenant proof is a valid http_chain bound to the served object id', () => {
-  const spec = buildCodeLeadCrossTenantProof({
-    origin: ORIGIN,
-    hypothesis: hypothesis(),
-    resourceId: 'inv-alpha-1',
-    probeActor: 'other_persona',
-    ownerPersona: 'mono-alice',
-    otherPersona: 'mono-bob',
-  })
-  assert.ok(spec)
-  const parsed = httpChainReplaySpecSchema.safeParse(spec)
-  assert.equal(parsed.success, true, JSON.stringify(parsed.error?.issues))
-  assert.equal(parsed.data!.kind, 'http_chain')
-  assert.equal(parsed.data!.cwe, 'CWE-639')
-  assert.deepEqual(parsed.data!.steps.map(step => step.role), ['control', 'probe'])
-  assert.deepEqual(parsed.data!.steps.map(step => step.request.persona), ['mono-alice', 'mono-bob'])
-  assert.equal(parsed.data!.steps[0]!.request.pathAndQuery, '/v2/billing/invoices/inv-alpha-1')
-  assert.match(parsed.data!.assertionsJq, /contains\("inv-alpha-1"\)/)
-
-  assert.equal(buildCodeLeadCrossTenantProof({
-    origin: ORIGIN,
-    hypothesis: hypothesis({ method: 'PATCH' }),
-    resourceId: 'inv-alpha-1',
-    probeActor: 'other_persona',
-    ownerPersona: 'mono-alice',
-    otherPersona: 'mono-bob',
-  }), null, 'mutating routes are not rendered by this read shape')
-})
-
-test('SQL error proof asserts the injected arm went 5xx while the control stayed healthy', () => {
-  const sqlHypothesis = hypothesis({
-    key: 'sqli_boolean|derived:2:GET:/v2/reports/export|sort',
-    endpoint: {
-      id: 'derived:2:GET:/v2/reports/export',
-      origin: ORIGIN,
-      method: 'GET',
-      pathTemplate: '/v2/reports/export',
-      params: [{ name: 'sort', location: 'query' }],
-      riskScore: CODE_LEAD_PRIORITY_RISK,
-      source: 'program_graph',
-    },
-    probeClass: 'sqli_boolean',
-    intent: 'sqli',
-    method: 'GET',
-    pathAndQuery: '/v2/reports/export',
-    param: { name: 'sort', location: 'query' },
-    location: 'query',
-    baselineValue: 'created_at',
-    ownerPersona: 'mono-alice',
-    otherPersona: undefined,
-    resourceIds: undefined,
-  })
-  const spec = buildCodeLeadSqlErrorProof({ origin: ORIGIN, hypothesis: sqlHypothesis, dialect: 'sqlite' })
-  assert.ok(spec)
-  const parsed = httpChainReplaySpecSchema.safeParse(spec)
-  assert.equal(parsed.success, true, JSON.stringify(parsed.error?.issues))
-  assert.equal(parsed.data!.kind, 'http_chain')
-  assert.equal(parsed.data!.cwe, 'CWE-89')
-  assert.match(parsed.data!.steps[0]!.request.pathAndQuery, /sort=created_at$/)
-  assert.match(parsed.data!.steps[1]!.request.pathAndQuery, /sort=created_at%27$/)
-  assert.match(parsed.data!.assertionsJq, /status >= 500/)
-  assert.equal(buildCodeLeadSqlErrorProof({ origin: ORIGIN, hypothesis: hypothesis() }), null)
-})
+// The two bounded fallback shapes (`buildCodeLeadCrossTenantProof`,
+// `buildCodeLeadSqlErrorProof`) were deleted once `synthesizeEngineSpecs` rendered both signals
+// canonically: the identity-scoped GET rule and the fingerprint-bound SQL error chain are pinned in
+// `tests/v7-spec-authz.test.ts`, and the monorepo-whitebox 4-hop funnel confirms 3/3 through the
+// product `Execution` path with no fallback.
 
 // ============================================================================
 // 6. Round-1 Tier-A seeding + dry-round guard + stop telemetry
@@ -496,19 +410,3 @@ test('Tier-A leads seed as ready Round-1 steps without runtime contrast evidence
   assert.equal(internals(execution).queueTierALeadSteps(storage.run(run.id), new Set([ORIGIN]), 50), 0, 're-seeding is idempotent')
 })
 
-test('matrix parsing is typed and drops malformed rows', () => {
-  const rows = codeLeadMatrixRows({
-    details: {
-      matrix: [
-        { resourceId: 'inv-alpha-1', actor: 'owner', status: 200, accessible: true },
-        { resourceId: 'inv-alpha-1', actor: 'other_persona', status: 200, accessible: true },
-        { resourceId: 7, actor: 'owner', status: 200 },
-        { actor: 'owner' },
-      ],
-    },
-  })
-  assert.deepEqual(rows, [
-    { resourceId: 'inv-alpha-1', actor: 'owner', status: 200, accessible: true },
-    { resourceId: 'inv-alpha-1', actor: 'other_persona', status: 200, accessible: true },
-  ])
-})

@@ -148,3 +148,45 @@ Canonical class labelling for agentic submissions belongs to the agent/spec stre
 - Canonical fixes for the two spec-synthesis defects belong in
   `deterministic-specs.ts` / `floor-recipes.ts` (GET authz body equality; 5xx error-based boolean).
   The fallback here is bounded to Tier-A code leads and can be deleted once those land.
+
+---
+
+## Addendum (v7 M5 `agents/spec-authz`): canonical synthesis, fallbacks deleted
+
+The two bounded fallback proof shapes described above are **gone**. `synthesizeEngineSpecs` now
+renders both signals itself, so `execution.ts` carries no proof synthesis at all (deletion-only
+diff: `CODE_LEAD_PROOF_FALLBACK_CAP`, `buildCodeLeadCrossTenantProof`,
+`buildCodeLeadSqlErrorProof`, `codeLeadMatrixRows`, `queueCodeLeadProofFallback` and its call site).
+
+Canonical rules (`src/server/deterministic-specs.ts`):
+
+1. **Object authz GET is identity-scoped.** `objectIdentityJq` requires the addressed victim
+   identifier in the non-owner body (`contains("<id>")`), OR-ed with the old byte/key-identical
+   rule. An app that echoes `actor` now confirms; the publicness veto (anonymous row served the same
+   payload) and the bogus-id negative control are unchanged.
+2. **SQL structural errors are fingerprint-bound.** `buildSqlErrorChain` emits the benign/quote-arm
+   `http_chain` only when the probe observed a known dialect, and the assertion requires
+   `status >= 500` **and** a dialect/engine term in the probe body. A bare 5xx cannot be rendered,
+   and the universal status-only ban is untouched. The boolean shapes remain as backups.
+3. **Privileged function mutations prove a persisted escalation.** The matrix body stays benign
+   (it must not escalate every listed record); the replay applies `authzRequiredRole` to the
+   privilege field the body already carries, the control arm restores a non-privileged baseline
+   first (otherwise the delta is an idempotent no-op), the class is `bfla`, and a bogus-id mutation
+   acknowledged with 2xx is admissible only when the same bogus identifier reads back 404/410
+   (new `c3` control). The baseline write precedes the negative controls so `findPersistence`'s
+   attribution arm is not poisoned by a 404 readback.
+4. **Readback inference is family-bound** (`deterministic-engine.ts`): a cross-family route that
+   only shares the identifier's parameter name is no longer borrowed as a readback; collection
+   (50), same-noun (70) and exact-shape (100) reads still win, and a privileged surface prefers the
+   addressed record's own detail read. Privileged collections are harvested as the **admin**
+   persona, so a directory read actually yields object ids.
+
+Fixture capability addition: `GET /v3/admin/users` + `GET /v3/admin/users/:id`, admin-only
+(`requireAdmin`), seeded `users` table. The planted BFLA mutation is unchanged; only its persisted
+effect is now observable. Logged in `benchmarks/CHANGELOG.md`.
+
+Measured after deletion (`--no-llm`, docker verifier): 3/3 dispatched + route-hit, 3/3 verify,
+**3/3 confirmed, 3 TP / 0 FP (100%)**, wiring PASS (5,389 stored / 2,567 declared, p99 0.74 ms,
+3/3 Tier-A), chain `mono-tenant-takeover` 2/2. Only `sast-live-link-85` remains unmet (no SAST
+suspects; not this lease). Dev floor 36/59 ×3 (0 spread), 100%; xben 25/25; held-out-saas 20/20 +
+patches 20/20 reproduced → 20/20 fixed, all-patches `fixed`.

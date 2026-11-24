@@ -61,6 +61,22 @@ export async function runSelfTest(): Promise<string[]> {
     assert.equal(promote.status, 200)
     const promoted = (await promote.json()) as { user: { role: string } }
     assert.equal(promoted.user.role, 'admin')
+
+    // 5b. Legitimate admin readback: a member is refused, an admin observes the persisted change.
+    const refusedRead = await fetch(`${app}/v3/admin/users/mono-bob`, { headers })
+    assert.equal(refusedRead.status, 403)
+    const admin = fixture.personas.find((p) => p.id === 'mono-admin')!
+    const adminHeaders = { authorization: `Bearer ${admin.token}` }
+    const directory = await fetch(`${app}/v3/admin/users`, { headers: adminHeaders })
+    assert.equal(directory.status, 200)
+    const directoryBody = (await directory.json()) as { users: Array<{ id: string }> }
+    assert.ok(directoryBody.users.some((user) => user.id === 'mono-bob'))
+    const record = await fetch(`${app}/v3/admin/users/mono-bob`, { headers: adminHeaders })
+    assert.equal(record.status, 200)
+    assert.equal(((await record.json()) as { role: string }).role, 'admin')
+    const unknown = await fetch(`${app}/v3/admin/users/guardian-none-selftest`, { headers: adminHeaders })
+    assert.equal(unknown.status, 404)
+    checks.push('admin read surface exposes the persisted role change to admins only')
     checks.push('authz + sqli sinks reachable through nested mounts')
 
     // 6. Scoped profile decoy + generated route reachability

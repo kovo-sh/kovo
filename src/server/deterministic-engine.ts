@@ -1235,6 +1235,23 @@ function inferAuthzReadback(input: {
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score || a.route.segments.length - b.route.segments.length ||
       a.route.path.length - b.route.path.length || a.route.path.localeCompare(b.route.path))
+  // A same-family read (detail of the same record family, the containing collection, or the exact
+  // detail shape) is a genuine readback of the mutated object.
+  const sameFamily = ranked.find(item => item.score !== 60)
+  const ownDetail = placeholderIndex === segments.length - 1 ? `/${segments.join('/')}` : null
+  // A privileged function surface persists the addressed *record*; a directory read as the admin
+  // cannot attribute a sibling's change to this mutation, so the object's own detail read wins.
+  if (ownDetail && pathHasPrivilegedHint(input.bare) && (!sameFamily || sameFamily.score < 70)) {
+    return { path: ownDetail }
+  }
+  if (sameFamily) return { path: sameFamily.route.path }
+  // The object's own detail read is the canonical readback. A route from a *different* resource
+  // family that merely shares the identifier's parameter name (`GET /v2/billing/invoices/:id` for
+  // `PATCH /v3/admin/users/:id`) is not a read of the mutated object: borrow it and the "delta" is
+  // an unrelated document. The engine's endpoint view is a bounded prefix, so the own-shape GET may
+  // simply be absent; reading it anyway either observes the change or fails cleanly (404), never
+  // confirms against another resource.
+  if (ownDetail) return { path: ownDetail }
   if (ranked[0]) return { path: ranked[0].route.path }
   // Self-service: the mutating actor's own identity route is the only observable state.
   if (input.selfIds.length > 0 && input.probePersona) {
@@ -2803,6 +2820,16 @@ async function harvestSurface(
   const owner = picks.owner?.handle
   const other = picks.crossTenant?.handle
   const lower = picks.lower?.handle
+  /**
+   * A privileged route only publishes its records to an entitled caller: reading the admin
+   * directory as the generic member harvests a 403 and leaves the authz matrix with no object id.
+   * Harvest those routes as the admin persona when one exists; every other route keeps the member
+   * harvest so cross-tenant contrast stays the member's own view.
+   */
+  const harvestPersonaFor = (endpoint: EngineEndpoint): string | undefined => {
+    const bare = endpoint.pathTemplate.split('?')[0] || '/'
+    return pathHasPrivilegedHint(bare) && picks.admin?.handle ? picks.admin.handle : owner
+  }
   const limit = Math.min(budget.maxRequests, ceiling)
 
   const take = (endpoint: EngineEndpoint): EndpointHarvest => {
@@ -2840,7 +2867,7 @@ async function harvestSurface(
       for (const candidate of forms) {
         if (budget.requestsUsed + tried >= limit || tried >= 10 || input.signal.aborted) break
         const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(candidate)}`)
-        const probe = await harvester.get(owner, detailPath)
+        const probe = await harvester.get(harvestPersonaFor(endpoint), detailPath)
         budget.requestsUsed += 1
         tried += 1
         if (!probe.body.trim().startsWith('{')) continue
@@ -2868,16 +2895,17 @@ async function harvestSurface(
     const method = endpoint.method.toUpperCase()
     const collection = collectionPathOf(bare)
     const target = take(endpoint)
+    const readPersona = harvestPersonaFor(endpoint)
     let baseline: JsonHarvest | null = null
     if (method === 'GET' && !hasDynamicIdSegment(bare)) {
       // The route itself is a readable collection/detail page.
-      const own = await harvester.get(owner, bare)
+      const own = await harvester.get(readPersona, bare)
       budget.requestsUsed += 1
       mergeHarvest(target, own)
       baseline = own
     }
     if (collection && collection !== '/' && (hasDynamicIdSegment(bare) || method !== 'GET')) {
-      const own = await harvester.get(owner, collection)
+      const own = await harvester.get(readPersona, collection)
       budget.requestsUsed += 1
       mergeHarvest(target, own)
       if (other) {
@@ -2903,7 +2931,7 @@ async function harvestSurface(
       for (const candidate of candidates) {
         const separator = bare.includes('?') ? '&' : '?'
         const probePath = `${bare}${separator}${encodeURIComponent(candidate.name)}=${encodeURIComponent(sampleFor(candidate.name))}`
-        const probed = await harvester.get(owner, probePath)
+        const probed = await harvester.get(readPersona, probePath)
         budget.requestsUsed += 1
         mergeHarvest(target, probed)
         const changed = probed.body.length > 0 && (
@@ -2917,8 +2945,9 @@ async function harvestSurface(
     }
     // Detail read with a harvested owner id, so field names (body schema) are observable.
     if (hasDynamicIdSegment(bare) && target.fields.length === 0) {
-      const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(target.ownerIds[0] ?? '1')}`)
-      const detail = await harvester.get(owner, detailPath)
+      const detailId = target.ownerIds[0] ?? '1'
+      const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(detailId)}`)
+      const detail = await harvester.get(readPersona, detailPath)
       budget.requestsUsed += 1
       mergeHarvest(target, detail)
     }
