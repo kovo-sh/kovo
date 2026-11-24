@@ -62,16 +62,21 @@ export default function register(app: AppContext): void {
     return ctx.json({ id: ext, status: 'open' }, 201)
   })
 
+  // Carts are owner-scoped: an id is not an authorization token. Guest carts remain readable by
+  // the anonymous actor that created them; another persona or a different tenant gets the same 404
+  // as an unknown id, which is what the checkout/race targets already assume.
+  const ownsCart = (ctx: ReqCtx, cart: { owner?: unknown }): boolean => cart.owner === ctx.actor
+
   app.route('getCart', (ctx) => {
     const cart = app.findByExternalId('carts', String(ctx.params[app.paramName('cartId')] ?? ''))
-    if (!cart) return ctx.json({ error: 'not_found' }, 404)
+    if (!cart || !ownsCart(ctx, cart)) return ctx.json({ error: 'not_found' }, 404)
     const items = db.all('SELECT product_id, qty, unit_price FROM cart_items WHERE cart_id = ?', [cart.id])
     return ctx.json({ cart, items })
   })
 
   app.route('addCartItem', (ctx) => {
     const cart = app.findByExternalId('carts', String(ctx.params[app.paramName('cartId')] ?? ''))
-    if (!cart) return ctx.json({ error: 'not_found' }, 404)
+    if (!cart || !ownsCart(ctx, cart)) return ctx.json({ error: 'not_found' }, 404)
     const qty = Number(body(ctx)[app.paramName('itemQty')] ?? 1)
     if (!Number.isFinite(qty) || qty < 1) return ctx.json({ error: 'invalid_quantity' }, 400)
     db.run('INSERT INTO cart_items (cart_id, product_id, qty, unit_price) VALUES (?, ?, ?, ?)', [cart.id, 0, Math.floor(qty), 1200])

@@ -15,7 +15,7 @@ function addItem(app: AppContext, ctx: ReqCtx, cart: Record<string, unknown>, qt
 export default function register(app: AppContext): void {
   app.route('addCartItem', (ctx: ReqCtx) => {
     const cart = app.findByExternalId('carts', String(ctx.params[app.paramName('cartId')] ?? ''))
-    if (!cart) return ctx.json({ error: 'not_found' }, 404)
+    if (!cart || cart.owner !== ctx.actor) return ctx.json({ error: 'not_found' }, 404)
     const body = ctx.body && typeof ctx.body === 'object' ? (ctx.body as Record<string, unknown>) : {}
     const qty = Math.trunc(Number(body[app.paramName('itemQty')] ?? 1))
     if (!Number.isFinite(qty) || qty === 0) return ctx.json({ error: 'invalid_quantity' }, 400)
