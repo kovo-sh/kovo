@@ -272,7 +272,12 @@ test('recipe-wired boolean receipts are byte-identical across runs on identical 
 // ============================================================================
 
 test('the no-fallback assertion throws for every wired pair and stays quiet for unmapped kinds', () => {
-  for (const [kind, vulnClass] of [['sql_boolean_diff', 'sqli']] as const) {
+  for (const [kind, vulnClass] of [
+    ['sql_boolean_diff', 'sqli'],
+    ['http_chain', 'bola'],
+    ['http_chain', 'bfla'],
+    ['http_chain', 'cross_tenant_write'],
+  ] as const) {
     assert.equal(wiredRecipeForSpecKind(kind, vulnClass) !== null, true, `${kind} must be wired`)
     assert.throws(
       () => assertNotRecipeWiredLegacyCall({ kind, category: vulnClass }),
@@ -286,9 +291,6 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
     ['http_chain', 'open_redirect'],
     ['http_chain', 'xss_reflected'],
     ['http_chain', 'info_disclosure'],
-    ['http_chain', 'bola'],
-    ['http_chain', 'bfla'],
-    ['http_chain', 'cross_tenant_write'],
     ['race_burst', 'race_double_spend'],
     ['sql_time_diff', 'sqli'],
     ['browser_chain', 'xss_reflected'],
@@ -302,9 +304,6 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
 test('unmapped families still synthesize legacy specs and never get a recipe plan', () => {
   const probe = booleanProbe()
   for (const [specKind, vulnClass] of [
-    ['http_chain', 'bola'],
-    ['http_chain', 'bfla'],
-    ['http_chain', 'cross_tenant_write'],
     ['http_chain', 'mass_assignment'],
     ['http_chain', 'info_disclosure'],
     ['http_chain', 'xxe'],

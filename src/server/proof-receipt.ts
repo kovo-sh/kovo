@@ -17,6 +17,7 @@ import { scopedAssetOrigin } from '../domain.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
+  assessInjectionImpact,
   assessStatusOnlyDivergence,
   knownOracleEvent,
   routeFamily,
@@ -62,6 +63,12 @@ export interface ReceiptTranscriptEntry {
    * injected canary token reached the target — never to re-run a request.
    */
   carrierText?: string
+  /**
+   * Evidence role the recipe asked the exchange to fill (`benign_baseline`, `tautology`,
+   * `contradiction`, `denied_control`, ...). The status-differential rule uses it to pair arms;
+   * without it the rule falls back to inferring the triangle from status and request shape.
+   */
+  evidenceRole?: string
 }
 
 /** One durable OOB delivery promoted by the relay (host-observed, not model-supplied). */
@@ -96,7 +103,7 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'browser' | 'redirect' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'none'
   reason: string
   observed: string
   expected: string
@@ -106,6 +113,13 @@ export interface ReceiptVerification {
 const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob|webhook_forgery)$/i
 const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing|race)$/i
 const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
+/**
+ * The paired status-boolean shape: a benign 2xx baseline, a 2xx tautology arm and a <500
+ * contradiction arm on the same request shape. This is deliberately a separate class from `sqli`
+ * (which selects the structural differential rule) so a caller can never obtain the weaker status
+ * rule by accident.
+ */
+const STATUS_DIFF_CLASS_RE = /^(?:sqli_status|sql_status|sql_status_diff|status_sqli|status_boolean)$/i
 const REDIRECT_CLASS_RE = /^(?:open_redirect|redirect|url_redirect|unvalidated_redirect)$/i
 
 const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
@@ -150,6 +164,7 @@ const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
 /** Classify a receipt's vulnerability label into the shared impact model (or a non-impact rule). */
 export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
   if (OOB_CLASS_RE.test(vulnClass)) return { rule: 'oob' }
+  if (STATUS_DIFF_CLASS_RE.test(vulnClass)) return { rule: 'status_differential' }
   if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
   if (REDIRECT_CLASS_RE.test(vulnClass)) return { rule: 'redirect' }
@@ -327,6 +342,50 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
   }
 
+  if (rule === 'status_differential') {
+    const arms = receipt.exchangeIds.map(id => entriesById.get(id)!.step)
+    const triangle = statusDifferentialRounds(arms)
+    if (!triangle) {
+      return reject(receipt, rule, 'A status differential needs a benign 2xx baseline, a 2xx tautology arm and a <500 contradiction arm on the same request shape, in every round.')
+    }
+    if (triangle.rounds.length < 2) {
+      return reject(receipt, rule, 'A status differential needs at least two complete benign/tautology/contradiction rounds.')
+    }
+    for (const [index, round] of triangle.rounds.entries()) {
+      const assessment = assessInjectionImpact({
+        impactClass: 'injection',
+        steps: [round.benign, round.tautology, round.contradiction],
+        injection: { family: 'sqli', statusBoolean: round },
+      })
+      if (!assessment.satisfied) {
+        return {
+          confirmed: false,
+          vulnClass: receipt.vulnClass,
+          rule,
+          reason: `Status differential round ${index + 1} was rejected: ${assessment.reason}`,
+          observed: receipt.claimedDelta,
+          expected: 'a benign 2xx baseline and a tautology-vs-contradiction predicate contrast',
+          evidence: assessment.evidence,
+        }
+      }
+    }
+    const stable = new Set(triangle.rounds.map(round => `${round.tautology.status}/${round.contradiction.status}`)).size === 1
+    if (!stable) {
+      return reject(receipt, rule, 'The tautology/contradiction status pair was unstable across rounds; a status differential must reproduce identically.')
+    }
+    return {
+      confirmed: true,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: `Paired status-only boolean exception reproduced across ${triangle.rounds.length} rounds: the benign baseline (${triangle.rounds[0]!.benign.status}) and tautology arm (${triangle.rounds[0]!.tautology.status}) are 2xx while the contradiction arm fails (${triangle.rounds[0]!.contradiction.status}) on the same request shape. A single malformed request that turns 200 into 500 is not this shape.`,
+      observed: receipt.claimedDelta,
+      expected: 'identical status for equivalent boolean predicates',
+      evidence: { rounds: triangle.rounds.length, statuses: triangle.rounds.map(round => ({
+        benign: round.benign.status, tautology: round.tautology.status, contradiction: round.contradiction.status,
+      })) },
+    }
+  }
+
   if (rule === 'timing') {
     if (receipt.exchangeIds.length < 2) return reject(receipt, rule, 'A timing receipt needs a control and a probe exchange.')
     const timed = receipt.exchangeIds.map(id => entriesById.get(id)!)
@@ -458,6 +517,54 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     expected: 'an authorized actor or control shows the boundary the probe crossed',
     evidence: assessment.evidence,
   }
+}
+
+/**
+ * Reconstruct the benign / tautology / contradiction triangle from the cited arms.
+ *
+ * The recipe records an `evidenceRole` per exchange, so the normal case is an exact role match.
+ * Transcripts built by other producers (async promotion, unit callers) may not carry roles; the
+ * fallback infers the triangle from the universal shape — a 2xx baseline without a boolean
+ * operator, a 2xx arm with one, and a <500 failing arm with one. A 5xx contradiction is never
+ * accepted, so a single malformed request cannot be mistaken for a predicate contrast.
+ */
+function statusDifferentialRounds(arms: readonly ImpactStep[]): { rounds: Array<{ benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }> } | null {
+  const entries = arms as Array<ImpactStep & { evidenceRole?: string }>
+  const byRole = (role: string): ImpactStep[] => entries.filter(arm => arm.evidenceRole === role)
+  const roleBenign = byRole('benign_baseline')
+  const roleTautology = byRole('tautology')
+  const roleContradiction = byRole('contradiction')
+  const booleanRequest = (step: ImpactStep): boolean => {
+    const raw = `${step.pathAndQuery ?? ''}${step.requestJson === undefined ? '' : JSON.stringify(step.requestJson)}`
+    let text = raw
+    try { text = decodeURIComponent(raw) } catch { /* keep raw */ }
+    return /\b(?:AND|OR)\b/i.test(text)
+  }
+  const success = (status: number | null): boolean => status !== null && status >= 200 && status < 300
+  const finishing = (status: number | null): boolean => status !== null && status >= 400 && status < 500
+  const benign = roleBenign.length > 0
+    ? roleBenign
+    : entries.filter(step => step.arm === 'control' && success(step.status) && !booleanRequest(step))
+  const tautology = roleTautology.length > 0
+    ? roleTautology
+    : entries.filter(step => success(step.status) && booleanRequest(step))
+  const contradiction = roleContradiction.length > 0
+    ? roleContradiction
+    : entries.filter(step => finishing(step.status) && booleanRequest(step))
+  if (benign.length === 0 || tautology.length === 0 || contradiction.length === 0) return null
+  const rounds = Math.min(tautology.length, contradiction.length)
+  if (rounds === 0) return null
+  // Every arm of the triangle must be a well-formed member: the baseline is a 2xx without a
+  // predicate, the two predicate arms are one 2xx and one <500 failure. Anything else means the
+  // caller assembled the triangle from unrelated exchanges.
+  if (benign.some(step => !success(step.status) || booleanRequest(step))) return null
+  if (tautology.some(step => !success(step.status))) return null
+  if (contradiction.some(step => !finishing(step.status))) return null
+  return { rounds: Array.from({ length: rounds }, (_, index) => ({
+    benign: benign[index] ?? benign[benign.length - 1]!,
+    tautology: tautology[index]!,
+    contradiction: contradiction[index]!,
+  })) }
 }
 
 function deriveDifferingParam(control: ReceiptTranscriptEntry, probe: ReceiptTranscriptEntry): string | null {

@@ -15,20 +15,22 @@
  * declarative-spec assertion. A wired pair must not fall back to `verifyReplaySpec`; the verifier
  * throws if it is called for one (`assertRecipeWiredKind`).
  */
-import { createHash } from 'node:crypto'
-import { baseFields } from './deterministic-specs.ts'
+import { createHash, randomBytes } from 'node:crypto'
+import { baseFields, bogusIdFor } from './deterministic-specs.ts'
 import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './deterministic-specs.ts'
 import type { EnginePersona } from './deterministic-engine.ts'
 import type { DifferentialResult } from './surface-engine.ts'
 import { injectUniversalParam } from './probes/context.ts'
 import { floorRecipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
 import type {
+  AccessBoundaryArgs,
   BooleanOrTimingArgs,
   FloorActor,
   FloorRecipeArgs,
   FloorRecipeExecution,
   FloorRecipeId,
   FloorRequestSpec,
+  PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
 import type { ImpactStep, RoleName } from './oracle-invariants.ts'
@@ -264,6 +266,200 @@ function planRaceRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Object-level / function-level authorization
+// ---------------------------------------------------------------------------------------------
+
+const PRIVILEGED_ACTION_RE = /(?:^|\/)(?:admin|administrator|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?|impersonate|feature[-_]?flags?)(?:\/|$)/i
+const BASELINE_STRONG_NUMERIC_FIELD_RE = /(?:^|[_-])(?:amount|total|price|value|cents|balance|qty|quantity|count|seats?|credits?)(?:$|[_-])/i
+const BASELINE_TEXT_FIELD_RE = /^(?:name|title|label|description|note|notes|body|text|summary|message|subject|comment|company|address)$/i
+const BASELINE_STATE_FIELD_RE = /^(?:status|state|stage|phase|visibility|priority|archived?|active)$/i
+const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|created|updated)(?:$|[_-])/i
+
+function fillResourceId(pathAndQuery: string, id: string): string {
+  return pathAndQuery.replaceAll('{{id}}', encodeURIComponent(id))
+}
+
+function resourceIdOf(input: FloorRecipePlanInput): string | null {
+  const valid = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
+  const matrix = Array.isArray(input.probe.details.matrix)
+    ? input.probe.details.matrix as Array<Record<string, unknown>>
+    : null
+  // The differential probe reports one anomaly per (method, object). Prefer the object whose owner
+  // read carried the most data: an empty-but-2xx collection is a legal matrix row, but it can never
+  // satisfy the read differential (the bogus-id control returns the same empty body). Legacy ranked
+  // hits by similarity; body size is the stable tie-breaker that survives an all-1.0 similarity.
+  const ownerBytes = (id: string): number => {
+    if (!matrix) return 0
+    let best = 0
+    for (const row of matrix) {
+      if (String(row.resourceId ?? '') !== id) continue
+      if (String(row.actor ?? '') !== 'owner') continue
+      if (row.accessible !== true) continue
+      const status = typeof row.status === 'number' ? row.status : 0
+      if (status < 200 || status >= 300) continue
+      const bytes = typeof row.bodyBytes === 'number' ? row.bodyBytes : 0
+      if (bytes > best) best = bytes
+    }
+    return best
+  }
+  const candidates = input.probe.anomalies
+    .filter(anomaly => anomaly.type === 'unauthorized_access' &&
+      String(anomaly.method ?? 'GET').toUpperCase() === input.hypothesis.method &&
+      valid(anomaly.resourceId))
+    .map(anomaly => anomaly.resourceId as string)
+  if (candidates.length > 0) {
+    let best = candidates[0]!
+    let bestBytes = ownerBytes(best)
+    for (const candidate of candidates.slice(1)) {
+      const bytes = ownerBytes(candidate)
+      if (bytes > bestBytes) { best = candidate; bestBytes = bytes }
+    }
+    return best
+  }
+  return input.hypothesis.resourceIds?.find(valid) ?? null
+}
+
+/** Readback route for a mutation, mirroring the legacy synthesizer's choice set. */
+function authzReadbackPath(input: FloorRecipePlanInput, id: string | null, functionLevel: boolean): string | null {
+  const hyp = input.hypothesis
+  if (hyp.readbackPath) return id ? fillResourceId(hyp.readbackPath, id) : hyp.readbackPath
+  const bare = hyp.pathAndQuery.split('?')[0]!
+  if (functionLevel) return PRIVILEGED_ACTION_RE.test(bare) ? hyp.pathAndQuery : null
+  if (!id) return null
+  const queryAt = hyp.pathAndQuery.indexOf('?')
+  if (queryAt >= 0 && hyp.pathAndQuery.slice(queryAt).includes('{{id}}')) return hyp.pathAndQuery
+  const segments = bare.split('/')
+  const placeholder = segments.findIndex(segment => segment === '{{id}}' || /^\{[^}]+\}$/.test(segment) || /^:[A-Za-z_][A-Za-z0-9_]*$/.test(segment))
+  if (placeholder <= 0) return null
+  if (placeholder === segments.length - 1) return fillResourceId(hyp.pathAndQuery, id)
+  if (placeholder === segments.length - 2 && PRIVILEGED_ACTION_RE.test(bare)) {
+    return fillResourceId(segments.slice(0, -1).join('/'), id)
+  }
+  return null
+}
+
+/** A fresh baseline value for one mutable field of the probe body, or null when none is writable. */
+function baselineWriteFor(body: unknown): { body: Record<string, unknown>; field: string } | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null
+  const scalars = Object.entries(body as Record<string, unknown>)
+    .filter(([field, value]) => /^[A-Za-z0-9_.-]{1,64}$/.test(field) &&
+      (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
+  const eligible = scalars.filter(([field]) => !BASELINE_EXCLUDED_FIELD_RE.test(field))
+  const chosen = eligible.find(([field]) => BASELINE_STRONG_NUMERIC_FIELD_RE.test(field))
+    ?? eligible.find(([field]) => BASELINE_TEXT_FIELD_RE.test(field))
+    ?? eligible.find(([, value]) => typeof value === 'boolean')
+    ?? eligible.find(([field]) => BASELINE_STATE_FIELD_RE.test(field))
+    ?? eligible.find(([field]) => !BASELINE_EXCLUDED_FIELD_RE.test(field))
+  if (!chosen) return null
+  const [field, value] = chosen
+  const nonce = randomBytes(4).toString('hex')
+  const baseline = typeof value === 'boolean'
+    ? !value
+    : typeof value === 'number' || /^-?\d+(?:\.\d+)?$/.test(String(value))
+      ? 424_242 + (Number.parseInt(nonce.slice(0, 4), 16) % 1_000)
+      : `guardian-baseline-${nonce}`
+  return { field, body: { ...(body as Record<string, unknown>), [field]: baseline } }
+}
+
+function authzBodyOf(input: FloorRecipePlanInput): Record<string, unknown> | null {
+  const hyp = input.hypothesis
+  if (hyp.functionState?.body) return hyp.functionState.body
+  const hits = input.probe.anomalies.filter(anomaly =>
+    anomaly.type === 'unauthorized_access' &&
+    anomaly.bodyTemplate !== undefined && anomaly.bodyTemplate !== null &&
+    typeof anomaly.bodyTemplate === 'object' && !Array.isArray(anomaly.bodyTemplate))
+  const hit = hits.find(anomaly => String(anomaly.method ?? 'GET').toUpperCase() === hyp.method) ?? hits[0]
+  if (hit?.bodyTemplate) return hit.bodyTemplate as Record<string, unknown>
+  return hyp.jsonBody ?? null
+}
+
+function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
+  const hyp = input.hypothesis
+  const recipeId: FloorRecipeId = hyp.method === 'GET' ? 'access_boundary' : 'persisted_mutation'
+  const vulnClass = hyp.functionLevel ? 'bfla' : 'bola'
+  const sketch: FloorRecipePlan = {
+    recipeId,
+    specKind: input.specKind,
+    vulnClass,
+    endpoint: hyp.endpoint.pathTemplate,
+    args: {} as FloorRecipeArgs,
+  }
+  const ownerHandle = hyp.ownerPersona
+  const probeHandle = hyp.otherPersona
+  if (!ownerHandle || !probeHandle) return { ...sketch, skipReason: 'authz hypothesis has no owner/probe persona pair' }
+  const id = resourceIdOf(input)
+  const functionLevel = hyp.functionLevel === true
+  if (!functionLevel && !id) return { ...sketch, skipReason: 'object-level authz hypothesis has no usable resource identifier' }
+  const privileged = PRIVILEGED_ACTION_RE.test(hyp.pathAndQuery.split('?')[0]!)
+  // A destructive probe matrix consumes the identifiers it exercises. The engine reserves one live
+  // victim for the replay when a privileged delete needs an observable removal; reuse it so the
+  // pre-read, mutation and post-read all address a real object.
+  const reserved = hyp.method === 'DELETE' && !functionLevel && privileged && hyp.reservedVictimId
+    ? hyp.reservedVictimId
+    : null
+  const resolvedId = reserved && /^[A-Za-z0-9_.:-]{1,128}$/.test(reserved) ? reserved : id
+  const realPath = resolvedId ? fillResourceId(hyp.pathAndQuery, resolvedId) : hyp.pathAndQuery
+  const owner = floorActorFor(ownerHandle, input.personas)
+  const probe = floorActorFor(probeHandle, input.personas)
+  const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
+
+  if (hyp.method === 'GET') {
+    // The legacy read proof is an entitled read plus a cross-actor read, with an authenticated
+    // bogus-id control where the route only denies nonexistent identifiers. The shared
+    // authorization oracle decides whether the denial is boundary evidence or merely selectivity,
+    // and confirms a cross-tenant disclosure from the entitled/probe pair.
+    const deniedPath = id && !functionLevel ? fillResourceId(hyp.pathAndQuery, bogusIdFor(id)) : realPath
+    const idInPath = /\/\{\{id\}\}(?:\/|$|\?)/.test(hyp.pathAndQuery) || /\/:\w+(?:\/|$|\?)/.test(hyp.pathAndQuery)
+    const args: AccessBoundaryArgs = {
+      origin: hyp.endpoint.origin,
+      method: 'GET',
+      pathAndQuery: realPath,
+      vulnClass,
+      owner,
+      probe,
+      denied: owner,
+      ...(deniedPath !== realPath ? { deniedPathAndQuery: deniedPath } : {}),
+      ...(!idInPath ? { controlEvidence: 'denial_or_distinct' as const } : {}),
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    }
+    return { ...sketch, args, paramLocation: 'path' }
+  }
+
+  // A mutation proves impact only through a separate readback. The legacy shape needs both a
+  // pre-mutation readback and a post-mutation delta, plus a control that keeps the delta
+  // attributable (a fresh baseline write, or a reset for self-service session state).
+  const body = authzBodyOf(input)
+  if (!body) return { ...sketch, skipReason: 'authz mutation hypothesis has no request body template' }
+  const readbackPath = authzReadbackPath(input, resolvedId, functionLevel)
+  if (!readbackPath) return { ...sketch, skipReason: 'authz mutation hypothesis has no separate readback route' }
+  const readbackActor = floorActorFor(hyp.readbackPersona ?? ownerHandle, input.personas)
+  const selfState = Boolean(hyp.functionState?.bindings?.length)
+  const baselineWrite = !functionLevel && !selfState && hyp.method !== 'DELETE' ? baselineWriteFor(body) : null
+  const resetBody = selfState && hyp.functionState?.reset?.length
+    ? { ...body, ...Object.fromEntries(hyp.functionState.reset.map(item => [item.field, item.value])) }
+    : null
+  const args: PersistedMutationArgs = {
+    origin: hyp.endpoint.origin,
+    method: hyp.method,
+    pathAndQuery: realPath,
+    vulnClass,
+    actor: probe,
+    body,
+    baselineMethod: 'GET',
+    baselinePathAndQuery: readbackPath,
+    readbackMethod: 'GET',
+    readbackPathAndQuery: readbackPath,
+    readbackActor,
+    ...(baselineWrite ? { baselineWrite: { body: baselineWrite.body, actor: owner, method: hyp.method } } : {}),
+    ...(resetBody ? { reset: { body: resetBody, actor: probe, method: hyp.method } } : {}),
+    ...(hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
+    ...(functionLevel && privileged && hyp.authzRequiredRole ? { oracleEvents: ['privilege_escalation'] } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  }
+  return { ...sketch, args, paramLocation: 'path' }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Planning entrypoint
 // ---------------------------------------------------------------------------------------------
 
@@ -278,6 +474,8 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
   switch (recipe) {
     case 'boolean_or_timing': return planBooleanRecipe(input)
     case 'race_burst': return planRaceRecipe(input)
+    case 'access_boundary':
+    case 'persisted_mutation': return planAuthzRecipe(input)
     default: return {
       recipeId: recipe,
       specKind: input.specKind,
@@ -384,8 +582,13 @@ const isDeniedJq = (id: string) =>
  * persisted proof (reproduced vs fixed), not the confirmation path: it restates the receipt's
  * structural precondition over the recorded steps so a hardened fixture cannot replay as reproduced.
  */
-function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; role: string }[]): string {
-  const ids = (role: string) => steps.filter(step => step.role === role).map(step => step.id)
+function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; role: string; description?: string }[], args?: FloorRecipeArgs): string {
+  // Evidence roles (`entitled_read`, `baseline_read`, ...) are carried in the step description: the
+  // persisted http_chain schema only allows arm roles. Match the description first so a replay
+  // assertion never silently references a step it does not have.
+  const ids = (role: string) => steps
+    .filter(step => step.description === role || (step.description === undefined && step.role === role))
+    .map(step => step.id)
   const first = (role: string) => ids(role)[0] ?? null
   const all = (predicate: (id: string) => string) => {
     const parts = steps.map(step => predicate(step.id))
@@ -396,9 +599,17 @@ function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; ro
       const entitled = first('entitled_read') ?? first('probe_baseline')
       const denied = first('denied_control')
       const probe = first('probe_request')
+      // A collection-reference negative control is selective through a different 2xx body, not a
+      // denial; the retest must assert the same predicate the proof used.
+      const distinctControl = (args as AccessBoundaryArgs | undefined)?.controlEvidence === 'denial_or_distinct'
+      const deniedJq = denied
+        ? distinctControl && entitled
+          ? `(${is2xxJq(denied)} and (.steps.${denied}.body != .steps.${entitled}.body))`
+          : isDeniedJq(denied)
+        : 'true'
       const confirmed = [probe, denied].filter((id): id is string => Boolean(id))
       return `{ controlPassed: (${entitled ? is2xxJq(entitled) : 'true'}), `
-        + `confirmed: (${confirmed.length ? confirmed.map(id => (id === denied ? isDeniedJq(id) : is2xxJq(id))).join(' and ') : 'true'}), `
+        + `confirmed: (${confirmed.length ? confirmed.map(id => (id === denied ? deniedJq : is2xxJq(id))).join(' and ') : 'true'}), `
         + 'observed: "recipe replay: boundary arms re-observed", expected: "the denied control is refused while the probe is served" }'
     }
     case 'disclosure': {
@@ -413,8 +624,11 @@ function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; ro
       const baseline = first('baseline_read')
       const probe = first('mutation_probe')
       const after = first('post_mutation_read')
+      const reset = first('state_reset')
+      const baselineWrite = first('baseline_write')
       const diff = baseline && after ? `(.steps.${after}.body != .steps.${baseline}.body)` : 'true'
-      return `{ controlPassed: (${baseline ? is2xxJq(baseline) : 'true'}), `
+      const controls = [baseline, reset, baselineWrite].filter((id): id is string => Boolean(id))
+      return `{ controlPassed: (${controls.length ? controls.map(is2xxJq).join(' and ') : 'true'}), `
         + `confirmed: (${probe ? is2xxJq(probe) : 'true'} and ${diff}), `
         + 'observed: "recipe replay: mutation and readback re-observed", expected: "the readback shows no persisted change" }'
     }
@@ -480,7 +694,7 @@ function recordSpecFor(
   const cwe = CWE_BY_CLASS[plan.vulnClass] ?? 'CWE-639'
   const title = TITLE_BY_RECIPE[plan.recipeId]
   const steps = recordSteps(origin, execution)
-  const jq = retestAssertion(plan.recipeId, steps)
+  const jq = retestAssertion(plan.recipeId, steps, plan.args)
   const base = baseFields(origin, title, cwe, plan.vulnClass, severity, jq)
   if (plan.specKind === 'sql_boolean_diff') {
     const args = plan.args as BooleanOrTimingArgs

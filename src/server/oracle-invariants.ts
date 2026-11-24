@@ -131,6 +131,12 @@ export interface ImpactStep {
   secretMatches?: readonly string[]
   /** Host-recorded wall-clock duration (timing-differential evidence). */
   durationMs?: number
+  /**
+   * Evidence role the recipe asked this exchange to fill (`benign_baseline`, `tautology`,
+   * `contradiction`, `denied_control`, ...). Optional: the shared oracles infer what they can
+   * from arm/status/shape, and use the role only to pair the status-differential triangle.
+   */
+  evidenceRole?: string
 }
 
 /**
@@ -548,6 +554,10 @@ interface PersistenceProof {
   controlDelta: StateDelta | null
 }
 
+function isDeleteStep(step: Pick<ImpactStep, 'method' | 'requestJson'>): boolean {
+  return isMutatingMethod(step.method) && (step.method ?? '').toUpperCase() === 'DELETE' && !isReadOnlyGraphqlRequest(step)
+}
+
 function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): PersistenceProof {
   const reads = steps.filter(step => isReadMethod(step.method) && step.json !== undefined && step.json !== null)
   const before = [...reads].reverse().find(step => step.status !== null && isSuccess(step.status) && steps.indexOf(step) < steps.indexOf(probe)) ?? null
@@ -556,6 +566,13 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
   // mutation response itself is excluded because it is not a read method.
   const after = reads.find(step => steps.indexOf(step) > steps.indexOf(probe) &&
     (step.arm === 'control' || isSuccess(step.status) || step.status === 404 || step.status === 410)) ?? null
+  // A successful DELETE proves persistence when the separate readback reports the resource gone,
+  // even if the tombstone response carries no JSON body. For any other verb a 404 readback is not a
+  // state delta (the route may simply not be readable), so this exception is DELETE-only.
+  const deletedRead = !after && isDeleteStep(probe)
+    ? steps.find(step => steps.indexOf(step) > steps.indexOf(probe) && isReadMethod(step.method) &&
+      (step.status === 404 || step.status === 410)) ?? null
+    : null
   const clean = Boolean(after && step_isCleanRead(after, probe))
   const delta = before && after ? stateDelta(before.json, after.json, after.status) : null
   // A control mutation must leave the field unchanged; if it changed, the delta is unattributable.
@@ -569,6 +586,10 @@ function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): Persi
     if (controlBefore && controlAfter) controlDelta = stateDelta(controlBefore.json, controlAfter.json, controlAfter.status)
   }
   if (!before) return { persisted: false, reason: 'no pre-mutation readback exists; a mutation response echo cannot prove persistence', before, after, delta, clean, controlDelta }
+  if (!after && !deletedRead) return { persisted: false, reason: 'no separate post-mutation GET readback exists; the mutation echo alone is not persistence', before, after, delta, clean, controlDelta }
+  if (deletedRead) {
+    return { persisted: true, reason: `the post-mutation readback reports the resource removed (HTTP ${deletedRead.status})`, before, after: deletedRead, delta, clean, controlDelta }
+  }
   if (!after) return { persisted: false, reason: 'no separate post-mutation GET readback exists; the mutation echo alone is not persistence', before, after, delta, clean, controlDelta }
   const changed = delta ? [...delta.changed, ...delta.added, ...delta.removed] : []
   if (delta?.deleted) return { persisted: true, reason: 'the readback resource was removed', before, after, delta, clean, controlDelta }
@@ -1843,10 +1864,17 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
       contradiction.status >= 400 && contradiction.status < 500
     const sameShape = sameInjectionRoute(tautology, contradiction) &&
       tautology.method.toUpperCase() === contradiction.method.toUpperCase()
+    // The request target is percent-encoded on the wire, so `%20AND%20` would defeat a bare word
+    // boundary. Decode before looking for the boolean operator (a failed decode leaves the raw text;
+    // the check only ever accepts a stronger match, never a weaker one).
+    const requestText = (step: ImpactStep): string => {
+      const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}`
+      try { return decodeURIComponent(raw) } catch { return raw }
+    }
     const contrast = Boolean(
       stepText(tautology) !== stepText(contradiction) &&
-      /\b(?:AND|OR)\b/i.test(`${tautology.pathAndQuery ?? ''}${safeJson(tautology.requestJson)}`) &&
-      /\b(?:AND|OR)\b/i.test(`${contradiction.pathAndQuery ?? ''}${safeJson(contradiction.requestJson)}`),
+      /\b(?:AND|OR)\b/i.test(requestText(tautology)) &&
+      /\b(?:AND|OR)\b/i.test(requestText(contradiction)),
     )
     if (benignOk && tautologyOk && contradictionFails && sameShape && contrast) {
       evidence.statusBoolean = true
