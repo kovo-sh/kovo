@@ -1135,7 +1135,7 @@ export function confirmedVulnerabilityCounts(dbPath: string): {
 
 interface RealismArtifact {
   fixture?: string
-  grade?: { truePositives?: number; falsePositives?: number; precision?: number }
+  grade?: { submitted?: number; truePositives?: number; falsePositives?: number; precision?: number }
   metrics?: {
     wiring?: { status?: string }
     oob?: { blindSqliConfirmed?: boolean; asyncSsrfConfirmed?: boolean; asyncXxeConfirmed?: boolean; webhookForgeryConfirmed?: boolean }
@@ -1204,6 +1204,10 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     return `${result.fixture}: wiring=${wiring} capability=${capability}${result.error ? ` error=${result.error}` : ''}`
   })
   const wiringPass = results.every(result => result.artifact?.metrics?.wiring?.status === 'pass')
+  const submitted = results.reduce((sum, result) => sum + (result.artifact?.grade?.submitted ?? 0), 0)
+  const truePositives = results.reduce((sum, result) => sum + (result.artifact?.grade?.truePositives ?? 0), 0)
+  const falsePositives = results.reduce((sum, result) => sum + (result.artifact?.grade?.falsePositives ?? 0), 0)
+  const precision = submitted > 0 ? truePositives / (truePositives + falsePositives || 1) : 1
   return {
     id: plan.id,
     kind: 'micro',
@@ -1211,9 +1215,9 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     source: 'local',
     targets: results.length,
     confirmed: results.reduce((sum, result) => sum + microCapability(result.fixture, result.artifact), 0),
-    precision: 1,
+    precision,
     decoyFalsePositives: 0,
-    unmatchedFalsePositives: 0,
+    unmatchedFalsePositives: falsePositives,
     netNew: null,
     floorConfirmed: null,
     floorPreserved: null,
