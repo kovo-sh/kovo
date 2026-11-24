@@ -7,31 +7,29 @@ Leases are exclusive: a task may start only if its files are not held by an acti
 Format:
 `- [ ] <task> | status: ready|active|blocked | lease: <files> | deps: <task ids or -> | stream: <branch or ->`
 
-## Active (2026-11-24)
+## Active (2026-11-24, 11:15)
 
-- [ ] P0 dispatch killer (opsportal 1/7, acme 2/19 planned steps stranded) + funnel invariant | status: active | lease: src/server/execution.ts, src/server/graph-leads.ts, scripts/worker-gate.sh, tests/v7-dispatch-funnel.test.ts | deps: - | stream: agents/dispatch-funnel
-- [ ] Cut 3a strict strangler (wire 6 recipe families, delete their VM branches, no-fallback assert) | status: active | lease: src/server/deterministic-engine.ts, src/server/deterministic-specs.ts, src/server/replay-verifier.ts, src/replay-spec.ts, src/server/floor-recipes.ts, tests/v7-cut3a.test.ts | deps: - | stream: agents/cut3a
-- [ ] Realism gate split (oob_wiring_fnr vs fixture_capability_recall) + #4 3-number funnel | status: active | lease: scripts/benchmark-realism.ts, benchmarks/realism-suite/** (gates only), docs/SMOKE-BATTERY.md, tests/v6-realism-gates.test.ts | deps: - | stream: agents/realism-gates
-
-## Active additions (2026-11-24, post-autopsy)
-
-- [ ] SQLi boolean arms grounded in target's own baseline rows | status: active | lease: src/server/probes/injection.ts, tests/v7-sqli-baseline.test.ts | deps: - | stream: agents/sqli-baseline
-- [ ] Spec-or-proof-gap mandatory at settlement (19/23 route-hit targets submitted no spec) | status: active | lease: src/server/agent-session.ts, src/server/assignment-brief.ts, tests/v7-spec-submission.test.ts | deps: - | stream: agents/spec-submission
-
-## Held for engine lane (complete, waiting on a file lease)
-
-- [ ] `catalog-public` @ 48092b7 — publicness rule in `oracle-invariants.ts` + shopflow cache-poison fixture + 3 Tier-0 archetypes; shopflow held-out 9/19 @100% | status: held | lease: src/server/oracle-invariants.ts (held by status-diff-guard) | stream: agents/catalog-public
+- [ ] `spec-authz` — canonical actor-echo authz jq + fingerprinted 5xx SQL proof; delete the two bounded fallbacks; add monorepo admin readback | lease: deterministic-specs, deterministic-engine, probes/authz, probes/injection, execution.ts (fallbacks only), monorepo fixture, tests | stream: agents/spec-authz
+- [ ] `persona-binding` — hard per-request persona scope `Map<workerId,Map<personaHandle,IsolatedSession>>`; served-store table; invalidate mismatched evidence | lease: broker, surface-engine, probes/context, tests | stream: agents/persona-binding
+- [ ] `retest-receipts` — patch retest + benchmark-live onto receipts/recipes, then delete the legacy VM | lease: patch-workflow, floor-recipe-engine (retest), scripts/benchmark-live.ts, replay-verifier, replay-spec, tests | stream: agents/retest-receipts
+- [ ] `gap-validation` — validate each coded proof gap against the Layer-1 transcript per route | lease: agent-session, tests | stream: agents/gap-validation
 
 ## Ready (dispatch when a lease frees)
 
-- [ ] **Engine lane (FIFO)** — one writer at a time on `execution.ts`, `deterministic-specs.ts`, `replay-verifier.ts`; merge order: sqli-baseline -> dispatch-funnel -> spec-submission -> cut3a | status: active | lease: coordinator discipline | deps: - | stream: -
-- [ ] Cut 3b: migrate remaining legacy kinds (browser_chain, rce_proof, auth_protocol_proof, cache_differential, http_chain traversal/redirect/xss/ssti/cmdi, dns_takeover, tls_audit, ws_chain, upload_probe, static_ast_proof) -> execution.ts < 8.5K, replay-verifier < 1.0K | status: blocked | lease: src/server/replay-verifier.ts, src/replay-spec.ts, src/server/floor-recipes.ts, src/server/proof-receipt.ts | deps: cut3a | stream: -
-- [ ] Realism #4 4-hop conversion 0/3 (act on the funnel verdict: brief depth vs proof conversion) | status: blocked | lease: src/server/execution.ts, src/server/assignment-brief.ts | deps: dispatch-funnel, realism-gates | stream: -
-- [ ] Realism #2 remaining capability: blind-SQLi + chain leg 3/3 | status: blocked | lease: src/server/deterministic-engine.ts, src/server/probes/** | deps: cut3a, realism-gates | stream: -
-- [ ] Realism #2 FP corpus: add both held-out unmatched FPs as Tier-0 archetypes once triaged | status: blocked | lease: benchmarks/realism-suite/traps/** | deps: heldout-lift | stream: -
-- [ ] Tier-1 smoke calibration study (8 varied builds vs reference) | status: ready | lease: scripts/smoke-agentic.ts, benchmarks/realism-suite/traps/** | deps: dispatch-funnel | stream: -
-- [ ] Certification matrix on post-Cut-3a code (dev n=3, held-out n=2-3, 600 s) at the +6pp bar | status: blocked | lease: none (measurement) | deps: cut3a, dispatch-funnel, realism-gates | stream: -
-- [ ] Pre-existing suite hang: `tests/v4-m4-surface-orchestration.test.ts` file-level teardown >15 min | status: ready | lease: tests/v4-m4-surface-orchestration.test.ts | deps: - | stream: -
+- [ ] Capability lane: `api-jwt-alg-none` (JWT boundary), `giftcard-race` (h2 race), `coupon-reuse` (workflow), `inventory-oversell` (race/stateful) — worth ~+4–5 held-out | lease: probes/*, deterministic-engine/specs | deps: spec-authz | stream: -
+- [ ] #2 blind SQLi + chain leg 3/3 | lease: probes/injection, deterministic-engine | deps: spec-authz | stream: -
+- [ ] Wire `onProofObligation` + `assignedTargetRoutes` + early-exit stat into `execution.ts` | lease: execution.ts | deps: spec-authz | stream: -
+- [ ] Profile-aware no-token watchdog (28 s aborts cost 552 turns) + demote unstarted trial duplicates (287 turns) + planner coverage assert | lease: execution.ts | deps: spec-authz | stream: -
+- [ ] Tier-1 smoke calibration study (8 varied builds vs reference) | lease: scripts/smoke-agentic.ts, traps | deps: persona-binding | stream: -
+- [ ] Pre-existing suite: `tests/v5-engine-coverage.test.ts` 2 failures (content vs template param pick; OR-branch baseline) | lease: tests + engine | deps: - | stream: -
+- [ ] Pre-existing hang: `tests/v4-m4-surface-orchestration.test.ts` file-level teardown >15 min | lease: tests | deps: - | stream: -
+
+## Sequence after the current batch
+
+1. Persona fix → **Tier-1 smoke (~6 min, ~$1.30, precision trap)** → full dev+held-out agentic matrix (serialized).
+2. Certificate erratum: 26/58 vs 28/58 per the bisect outcome.
+3. Capability lane (4 named misses), then #2 blind SQLi/chain.
+4. Engine-lane cleanup behind it (watchdog profile, trial demotion, coverage assert).
 
 ## Completed
 
