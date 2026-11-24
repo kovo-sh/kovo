@@ -4478,7 +4478,7 @@ export function buildWorkerTools(
         status: oneOf(coverageStatuses),
         summary: str({ maxLength: 600 }),
         enforcingControl: opt(str({ description: 'REQUIRED when status="ruled_out": exact file:line in /repos or exact negative-control exchangeId.', maxLength: 500 })),
-        proofGapReason: opt(str({ description: `REQUIRED when status="needs_follow_up": machine-readable code plus detail (${SPEC_PROOF_GAP_CODES.join('|')}) explaining the exact blocker.`, maxLength: 600 })),
+        proofGapReason: opt(str({ description: `REQUIRED when status="needs_follow_up": machine-readable code plus detail (${[...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES].join('|')}) explaining the exact blocker.`, maxLength: 600 })),
         route: opt(str({ description: 'Route this closure applies to, as "METHOD /path" (path parameters may be concrete: "GET /api/orders/1001"). REQUIRED for a coded needs_follow_up gap when more than one route was probed, because the gap discharges only that route.', maxLength: 200 })),
         linkedFindingId: opt(str({ description: 'Finding ID when status="reported".', maxLength: 64 })),
       }),
@@ -4500,7 +4500,7 @@ export function buildWorkerTools(
             isError: true,
             output: [{
               type: 'text' as const,
-              text: `record_coverage validation failed: status="needs_follow_up" REQUIRES a non-empty proofGapReason explaining what is needed to confirm or rule out this lead. Use a machine-readable code so the settlement proof gap is auditable: ${SPEC_PROOF_GAP_CODES.join(', ')}.`,
+              text: `record_coverage validation failed: status="needs_follow_up" REQUIRES a non-empty proofGapReason explaining what is needed to confirm or rule out this lead. Use a machine-readable code so the settlement proof gap is auditable: ${[...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES].join(', ')}.`,
             }],
           }
         }
