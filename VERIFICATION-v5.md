@@ -37,7 +37,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | held-out-saas | **20 / 20** + **20 / 20 patches** (`allPatches=fixed`) | Hard regression gate |
 | Realism #2 (`wan-oob`, no-llm) | **2 TP / 0 FP**; async **SSRF ✅**, async **XXE ✅**; gate still fails on blind-SQLi, blended async FNR 33.3%, chain 2/3 | Gate denominator split in flight |
 | Realism #3 (`staging-concurrency`) | **capability PASS** — write-BOLA, h2 single-packet race (2 ms spread, 4 acks / 1 debit), checkout tampering; 0 leaks; 100% precision | |
-| Realism #4 (`monorepo-whitebox`) | wiring PASS; 4-hop confirmations **2 / 3** at 100% precision (`cross_tenant_read` billing, `sqli` report; admin needs a fixture readback) | v7's #1 bet converted |
+| Realism #4 (`monorepo-whitebox`) | wiring PASS; 4-hop confirmations **3 / 3** at 100% precision, chain `mono-tenant-takeover` 2/2, canonical spec synthesis (fallbacks deleted) | v7's #1 bet converted |
 | `execution.ts` size | ~**11.5K LOC** | Grew with brief slices; Cut 3a target < 8.5K |
 
 **Scope rule carried forward:** product capability is always reported as `Execution --no-llm` (deterministic floor) **and** agentic (increment over that floor), on dev **and** salted held-out. Harness/procedural numbers are secondary evidence, never the product score.
@@ -56,7 +56,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Confirmation integrity | no confirmed finding with a non-confirming diff | store-level `InvariantError`; `audit-confirmation-consistency` clean on every kept cell | **PASS** |
 | Legacy regression | xben 25/25, held-out 20/20 + 20/20 patches | holds on every validation run | **PASS** |
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
-| Realism capability | #1–#4 ≥75% | #3 **PASS (3/3)**; #4 **PASS (2/3 confirmed, 100% precision)**; #2 2/4 planted | **PARTIAL (2 of 3 suites pass)** |
+| Realism capability | #1–#4 ≥75% | #3 **PASS (3/3)**, #4 **PASS (3/3 confirmed, 100% precision, chain 2/2)**, #2 2/4 planted | **PARTIAL (2 suites pass; #2 open)** |
 | **Total Product Recall** | ≥ 40/59 dev and ≥ 32/58 held-out | dev **36/59**, held-out **29/58** | **FAIL** |
 | **Anti-inert agentic guard** | ≥ +4 net-new over the frozen floor | dev **+0**, held-out **+1** (shopflow only) | **FAIL** |
 | Chains | ≥ 4/6 | #2 chain 2/3; not re-measured elsewhere | **PARTIAL** |
@@ -70,7 +70,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 
 **What must not be claimed:**
 1. **"Agentic lift"** — 67 agent investigations converted **1** target (1.5%). Honest lift is ~0–1 at 100% precision; the acme 16/22 → 14/22 swing shows ±2 is single-run noise.
-2. **"Realism is done"** — #2 misses blind SQLi and one chain leg; #4's two confirmations still ride bounded fallback shapes until the canonical spec rules land, and admin-BFLA lacks a fixture readback.
+2. **"Realism is done"** — #4 is now fully canonical at 3/3, but #2 still misses blind SQLi and the exfil chain leg 3/3.
 3. **"The DSL is retired"** — Cut 3a moved one family; `replay-verifier.ts` is still ~3.9K and `http_chain` carries 8/33 dev confirmations. Cut 3b is in flight.
 
 **Next gate (M1):** Total Product Recall ≥40/59 dev and ≥32/58 held-out at 100% precision, **and** ≥+4 net-new over the frozen floor. The binding constraint is agentic conversion, not floor coverage.
