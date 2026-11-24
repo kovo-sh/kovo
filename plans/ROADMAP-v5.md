@@ -719,3 +719,21 @@ Actions: `status-diff-guard` closes the 5xx-only confirmation loophole generally
 | 8 | Batch order: close the 3 over-claims to 100% precision → then Realism #4 (0/3 → ≥2/3) + stall/warm-pool → then `cut3b-parity` | **ACCEPT** | coordinator |
 
 **Certification definition update (adopted):** a lift claim now requires BOTH bars — Total Product Recall (≥40/59 dev, ≥32/58 held-out) at 100% worst-run precision, and ≥+4 net-new over the frozen floor snapshot. Current: dev 14+? / held-out **+1**. Still red.
+
+### 2026-11-24 — catalog-public ruled "intended public"; 2 held-out FPs removed at 100% precision
+
+`catalog-public` @ `48092b7` (held, not merged: it edits `src/server/oracle-invariants.ts`, currently leased by `status-diff-guard` — engine-lane rule).
+
+**Truth ruling from fixture source** (the three claimed templates map to shopflow storefront routes):
+
+| route | handler | guard | ruling |
+|---|---|---|---|
+| `GET /api/v1/catalog` | `listProducts` | none, `WHERE store_id = caller` | **intended public** browse |
+| `GET /api/v1/catalog/:id` | `getProduct` | none, returns the public product row | **intended public** detail |
+| `GET /api/v1/stores/:storeId/catalog/:productId` | `storeProductPage` | none; planted class is `cache_poisoning`, not access control | **intended public** |
+
+The only **unintended** data was the vulnerable cache-poison twin resolving `customers.note` (loyalty canary) for the anonymous fallback — a customer-scoped note on a public payload. Hardened: the note resolves only when the signed-in tenant equals the viewed store; anonymous/foreign/forged reads get the public store name, while the cross-tenant cache **HIT** still carries the owner canary so the planted target still emits `cache_poisoned`. Logged in `benchmarks/CHANGELOG.md`.
+
+Verifier (the general dismissal rule): `assessPublicness()` gates both the cross-tenant and read-disclosure branches — a successful **anonymous** read on the same route, or a non-owner payload **identical** to the owner reference (or differing only in publicly listed fields) is publicness. A genuine crossing survives when the payload binds an **owner-scoped identity** or carries a tenant/secret canary also served to the control.
+
+Measured: held-out shopflow **9/19 at 100% precision (0 unmatched)**, $0.484 — the two catalog FPs are gone with confirms unchanged. Tier-0 corpus **11/11 dismissed**. Dev floor reported 34/59 on its base (predates the quota merge); to be re-verified at 36/59 after the engine-lane merge.

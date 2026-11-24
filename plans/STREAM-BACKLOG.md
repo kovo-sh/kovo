@@ -18,6 +18,10 @@ Format:
 - [ ] SQLi boolean arms grounded in target's own baseline rows | status: active | lease: src/server/probes/injection.ts, tests/v7-sqli-baseline.test.ts | deps: - | stream: agents/sqli-baseline
 - [ ] Spec-or-proof-gap mandatory at settlement (19/23 route-hit targets submitted no spec) | status: active | lease: src/server/agent-session.ts, src/server/assignment-brief.ts, tests/v7-spec-submission.test.ts | deps: - | stream: agents/spec-submission
 
+## Held for engine lane (complete, waiting on a file lease)
+
+- [ ] `catalog-public` @ 48092b7 — publicness rule in `oracle-invariants.ts` + shopflow cache-poison fixture + 3 Tier-0 archetypes; shopflow held-out 9/19 @100% | status: held | lease: src/server/oracle-invariants.ts (held by status-diff-guard) | stream: agents/catalog-public
+
 ## Ready (dispatch when a lease frees)
 
 - [ ] **Engine lane (FIFO)** — one writer at a time on `execution.ts`, `deterministic-specs.ts`, `replay-verifier.ts`; merge order: sqli-baseline -> dispatch-funnel -> spec-submission -> cut3a | status: active | lease: coordinator discipline | deps: - | stream: -
