@@ -114,7 +114,7 @@ Measured on the agentic monorepo cell (`/tmp/opencode/re4-agentic2`, 600 s, dock
 | `dry_rounds` stops with Pass-1 work | possible (2-dry-round stop) | **0 dry stops**; 5 dry-round readings all reset by new primitives |
 | `remainingReady` / stranded | ready work abandoned at stop | 24–35 ready, `planner.ready_steps_stranded = 0` |
 | `planner.coverage_at_stop` | no such reading | emitted on every real stop (this cell ended on the harness wall clock, not a planner stop) |
-| 4-hop funnel (`--no-llm`) | 0/0/0 dispatched, 0 verify, 0 confirmed | 3/3 dispatched + hit, 2 slices verify-called, 2 confirmed @100% |
+| 4-hop funnel (`--no-llm`) | dispatched 0/0/1, route hit 0/0/1, 0 verify, 0 confirmed | 3/3 dispatched + hit, 2 slices verify-called, 2 confirmed @100% |
 | 4-hop funnel (agentic, 600 s) | — | dispatched 8/3/5, route-hit 7/2/5, verify 6/1/2, 2/3 confirmed |
 
 Agentic note: the same cell submitted two `open_proof_gap` admin-BFLA claims with the generic OWASP
