@@ -1,4 +1,4 @@
-import type { ProviderSettings } from '../domain.ts'
+import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
@@ -9,10 +9,51 @@ type Prepared = WeakMap<Fields, Set<string>>
 
 export const defaultStreamResponseLimit = 16 * 1024 * 1024
 export const maxStreamResponseLimit = 32 * 1024 * 1024
+/** Default no-token watchdog window for fast/non-reasoning profiles (ms). */
+export const DEFAULT_NO_TOKEN_WATCHDOG_MS = 28_000
+/** Medium-thinking profile no-token watchdog window before first/next SSE frame (ms). */
+export const MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS = 45_000
+/** High-thinking / reasoning-model no-token watchdog window (ms). */
+export const REASONING_NO_TOKEN_WATCHDOG_MS = 60_000
+const REASONING_MODEL_RE = /(?:reasoner|thinking|(?:^|[-_/])r1\b|(?:^|[-_/])o[134](?:[-_]|$)|deepseek-v4)/i
+
+/**
+ * Profile-aware no-token watchdog window. Reasoning / thinking models routinely pause 25–45 s
+ * before emitting their first SSE frame (or between reasoning bursts under concurrent load),
+ * whereas a flat 28 s threshold aborts healthy turns. An explicit `GUARDIAN_PROVIDER_NO_TOKEN_MS`
+ * override always wins (clamped 5–180 s).
+ */
+export function resolveProfileNoTokenWatchdogMs(
+  profile?: { model?: string; thinkingLevel?: ThinkingLevel; roleAffinity?: RoleAffinity },
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = Number(env.GUARDIAN_PROVIDER_NO_TOKEN_MS)
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.max(5_000, Math.min(180_000, Math.floor(raw)))
+  }
+  if (!profile) return DEFAULT_NO_TOKEN_WATCHDOG_MS
+  if (
+    profile.thinkingLevel === 'high' ||
+    profile.roleAffinity === 'reasoning' ||
+    (typeof profile.model === 'string' && REASONING_MODEL_RE.test(profile.model))
+  ) {
+    return REASONING_NO_TOKEN_WATCHDOG_MS
+  }
+  if (profile.thinkingLevel === 'medium') {
+    return MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS
+  }
+  return DEFAULT_NO_TOKEN_WATCHDOG_MS
+}
 
 export interface StreamSanitizeOptions {
   secrets?: readonly NamedSecret[]
   responseLimit?: number
+  /**
+   * Called in real time as each upstream SSE data frame arrives (before end-of-stream redaction
+   * buffering completes). Used to reset provider idle/no-token watchdogs so active streams are
+   * never misclassified as stalled.
+   */
+  onActivity?: () => void
 }
 
 const replacement = '[redacted]'
@@ -187,6 +228,7 @@ export function sanitizeProviderStream(
   responseLimitArg?: number,
 ): ReadableStream<Uint8Array> {
   const secrets = isSecretList(secretsOrOptions) ? secretsOrOptions : (secretsOrOptions.secrets ?? [])
+  const onActivity = isSecretList(secretsOrOptions) ? undefined : secretsOrOptions.onActivity
   const requestedLimit = isSecretList(secretsOrOptions)
     ? (responseLimitArg ?? defaultStreamResponseLimit)
     : (secretsOrOptions.responseLimit ?? responseLimitArg ?? defaultStreamResponseLimit)
@@ -222,6 +264,9 @@ export function sanitizeProviderStream(
       throw new Error('The model returned data after the turn ended.')
     }
     frames.push(frame)
+    if (frame.data !== undefined && onActivity) {
+      try { onActivity() } catch { /* activity signal must never break the stream */ }
+    }
     if (frame.data === '[DONE]' || terminalEvents.has(String(frame.data?.type))) finished = true
     if (finished) emit(controller)
   }

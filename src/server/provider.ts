@@ -84,6 +84,8 @@ export type ProviderOptions = {
   roleAffinity?: RoleAffinity
   beforeCall?: () => void
   onUsage?: UsageCallback
+  /** Called in real time on each upstream SSE data frame (resets no-token stall watchdogs). */
+  onStreamActivity?: () => void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
 }
@@ -159,6 +161,7 @@ async function readStreamWithIdleTimeout(
   stream: ReadableStream<Uint8Array>,
   idleTimeoutMs: number,
   signal: AbortSignal,
+  registerActivityReset?: (reset: () => void) => void,
 ): Promise<string> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
@@ -167,9 +170,16 @@ async function readStreamWithIdleTimeout(
     for (;;) {
       signal.throwIfAborted()
       let timer: ReturnType<typeof setTimeout> | undefined
+      let rejectIdle: ((err: Error) => void) | undefined
+      const armTimer = () => {
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(() => rejectIdle?.(new Error('The model stream timed out while waiting for data.')), idleTimeoutMs)
+      }
       const idle = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('The model stream timed out while waiting for data.')), idleTimeoutMs)
+        rejectIdle = reject
+        armTimer()
       })
+      registerActivityReset?.(armTimer)
       const onAbort = () => {
         if (timer) clearTimeout(timer)
       }
@@ -178,6 +188,7 @@ async function readStreamWithIdleTimeout(
       try {
         next = await Promise.race([reader.read(), idle])
       } finally {
+        registerActivityReset?.(() => undefined)
         if (timer) clearTimeout(timer)
         signal.removeEventListener('abort', onAbort)
       }
@@ -281,11 +292,18 @@ function makeFetch(
       throw new Error('The provider did not return a streaming response.')
     }
 
+    let resetIdleTimer: () => void = () => undefined
     const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
       secrets,
       responseLimit,
+      onActivity: () => {
+        resetIdleTimer()
+        options.onStreamActivity?.()
+      },
     })
-    const text = await readStreamWithIdleTimeout(sanitized, idleTimeoutMs, totalSignal)
+    const text = await readStreamWithIdleTimeout(sanitized, idleTimeoutMs, totalSignal, reset => {
+      resetIdleTimer = reset
+    })
     recordResponse?.(text)
 
     if (options.onUsage) {
@@ -346,7 +364,9 @@ function buildSingleStreamImpl(
     fetch: send,
     maxTokens,
     maxRetries: 0,
-    timeoutMs: options.idleTimeoutMs ?? defaultIdleTimeoutMs,
+    // Total call ceiling for the SDK; per-chunk idle timeouts are enforced inside `makeFetch`
+    // and reset in real time on every upstream SSE frame via `sanitizeProviderStream`.
+    timeoutMs: options.totalTimeoutMs ?? defaultTotalTimeoutMs,
   }
 
   const implementation: ProviderStreams = api === 'openai-responses' ? {
