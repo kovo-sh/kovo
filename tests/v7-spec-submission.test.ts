@@ -32,6 +32,10 @@ import {
   type SpecRouteEvidence,
 } from '../src/server/agent-session.ts'
 import { renderSettlementSpecDirective } from '../src/server/assignment-brief.ts'
+import {
+  buildFalsePositiveEvidence,
+  withFalsePositiveEvidence,
+} from '../scripts/benchmark-realistic.ts'
 
 const ORIGIN = 'https://spec.submission.test'
 const ROUTE: SpecRouteEvidence = { method: 'POST', path: '/v1/baskets/current/coupons', params: ['code'] }
@@ -361,4 +365,74 @@ test('the settlement directive is pure, redacts values and keeps parameter names
     GUARDIAN_VERIFY_SPEC_SHAPE,
     SPEC_PROOF_GAP_CODES,
   ))
+})
+
+// ============================================================================
+// 6. FP evidence capture: durable redacted proof for unmatched findings
+// ============================================================================
+
+test('an unmatched finding yields a redacted proof block in both cell artifacts', () => {
+  const evidence = buildFalsePositiveEvidence({
+    findingIds: ['fp-1'],
+    findings: [{
+      id: 'fp-1',
+      category: 'sqli',
+      cwe: 'CWE-89',
+      title: 'Order lookup injectable',
+      reason: 'observed delta SECRET-CANARY',
+      exchangeIds: ['ex-1'],
+      verificationStatus: 'runtime_confirmed',
+      provenance: 'agent_only',
+    }],
+    replaySpecs: [{
+      findingId: 'fp-1',
+      spec: {
+        category: 'injection',
+        steps: [
+          { id: 'control', request: { method: 'GET', pathAndQuery: '/api/orders/1?user=SECRET-CANARY' } },
+          { id: 'probe', request: { method: 'GET', pathAndQuery: '/api/orders/2' } },
+        ],
+      },
+      lastVerificationDiff: {
+        verdict: 'dismissed',
+        failedStepId: 'probe',
+        jqError: 'similarity_below_gate',
+        stepStatuses: [{ id: 'control', status: 200 }, { id: 'probe', status: 200 }],
+        assertionSummary: { observed: '200', expected: '403', reason: 'owner gate absent on the probe' },
+      },
+    }],
+    exchanges: [{ id: 'ex-1', method: 'GET', pathAndQuery: '/api/orders/1?user=SECRET-CANARY', status: 200 }],
+  }, [{ value: 'SECRET-CANARY', placeholder: '[redacted]' }])
+
+  assert.equal(evidence.length, 1)
+  const block = evidence[0]!
+  assert.equal(block.findingId, 'fp-1')
+  assert.equal(block.vulnClass, 'sqli')
+  assert.equal(block.cwe, 'CWE-89')
+  assert.equal(block.category, 'injection')
+  assert.deepEqual(block.route, { method: 'GET', pathTemplate: '/api/orders/:id' })
+  assert.equal(block.verificationClass, 'runtime_confirmed')
+  assert.equal(block.provenance, 'agent_only')
+  assert.equal(block.oracleRulePassed, false, 'a dismissed oracle is not a passed rule')
+  assert.ok(block.exchangeSummaries.some(step => step.stepId === 'probe' && step.rejectedBy === 'similarity_below_gate'))
+  assert.doesNotMatch(JSON.stringify(block), /SECRET-CANARY/, 'no values or secrets survive')
+
+  const card = { app: 'shopflow', unmatchedFindingIds: ['fp-1'], unmatchedFalsePositives: 1 }
+  const cellJson = withFalsePositiveEvidence(card, evidence) as typeof card & { falsePositiveEvidence: unknown[] }
+  assert.equal(cellJson.falsePositiveEvidence.length, 1, 'the --out JSON artifact carries the block')
+  const meta = { app: 'shopflow', seed: 1, runId: 'run-1' }
+  const metaJson = withFalsePositiveEvidence(meta, evidence) as typeof meta & { falsePositiveEvidence: unknown[] }
+  assert.equal(metaJson.falsePositiveEvidence.length, 1, 'the per-cell .meta.json carries the block')
+})
+
+test('a 0-FP cell writes no evidence block (artifact unchanged)', () => {
+  assert.deepEqual(buildFalsePositiveEvidence({
+    findingIds: [],
+    findings: [],
+    replaySpecs: [],
+    exchanges: [],
+  }), [])
+  const card = { app: 'shopflow', unmatchedFalsePositives: 0 }
+  assert.equal(withFalsePositiveEvidence(card, []), card, 'the same object is returned, with no added key')
+  assert.equal('falsePositiveEvidence' in withFalsePositiveEvidence(card, []), false)
 })
