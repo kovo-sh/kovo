@@ -44,27 +44,36 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 
 ### V7.2 Certification status
 
-**TWO CLAIMS, TWO STATUSES.** "Floor + realism wiring" is recordable now; **"agentic lift" is not certifiable** (dev +2, held-out +0).
+**CERTIFICATE M0/M1-interim — issued 2026-11-24 (reviewer-ratified).** Scope is deliberately narrow:
+
+> **Floor + Realism wiring + precision are certified. Agentic lift is NOT certified.**
 
 | Gate | Target | Measured | Status |
 | :--- | :--- | :--- | :--- |
-| **Floor** dev | 0 spread, 100% precision | 33/59, 3 identical repeats, 100% | **PASS** |
-| **Floor** salted held-out | 100% precision, no regression | **28/58**, 100%, 2 identical runs; invariant-clean | **PASS** |
-| Legacy regression | xben 25/25, held-out 20/20 + 20/20 | both hold | **PASS** |
+| **Floor** dev | 0 spread, 100% precision | **36/59 (61.0%)**, 3 runs, 0 spread, identical site sets | **PASS** |
+| **Floor** salted held-out | 100% precision, no regression | **28/58 (48.3%)**, 2 identical runs | **PASS** |
+| Worst-run precision (agentic) | 100% on every cell | dev **36/59** and held-out **29/58**, both **100%**, 0 unmatched / 0 decoy / 0 misclassified | **PASS** |
+| Confirmation integrity | no confirmed finding with a non-confirming diff | store-level `InvariantError`; `audit-confirmation-consistency` clean on every kept cell | **PASS** |
+| Legacy regression | xben 25/25, held-out 20/20 + 20/20 patches | holds on every validation run | **PASS** |
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
-| Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
-| Worst-run precision (agentic) | 100% on every lift cell | **held-out 3-app run at 100%** (0 unmatched, 0 decoy); dev 100% | **PASS** |
-| **Total Product Recall** (unified `Execution`, 100% worst-run precision) | ≥ **40/59 dev** and ≥ **32/58** salted held-out | held-out unified **29/58** at 100% precision (floor 28); dev unified measuring | **FAIL (recall)** |
-| Frozen floor reference | 36/59 dev, 28/58 held-out (snapshot, not a moving target) | **36/59** dev, **28/58** held-out, both 100% | **PASS** |
-| Anti-inert agentic guard | ≥ +4 net-new over the frozen floor, plus reason-bench lift | held-out **+1**; reason-bench unmeasured | **FAIL** |
-| Dispatch coverage | ready steps are not stranded | fixed: opsportal 6→**19–25** distinct steps, acme 7→**14**; stranded only at wall-clock; invariant live in worker-gate | **PASS** |
-| Proof submission | route-hit targets produce a spec or an explicit proof gap | was **19 of 23** no-spec; after the 18-turn/120 s raise + settlement gate: **5/10 (50%)** spec-on-route in the measured cell | **IMPROVING (P0)** |
-| Confirmation integrity | no confirmed finding may carry a non-confirming diff | store-level `InvariantError` now enforces it; 0 violations on dev+held-out floor re-runs | **PASS (forward)** |
+| Realism capability | #1–#4 ≥75% | #3 PASS (3/3); #2 2/4 planted; #4 **0/3** | **PARTIAL** |
+| **Total Product Recall** | ≥ 40/59 dev and ≥ 32/58 held-out | dev **36/59**, held-out **29/58** | **FAIL** |
+| **Anti-inert agentic guard** | ≥ +4 net-new over the frozen floor | dev **+0**, held-out **+1** (shopflow only) | **FAIL** |
 | Chains | ≥ 4/6 | #2 chain 2/3; not re-measured elsewhere | **PARTIAL** |
 
-**M0-interim milestone (recorded 2026-11-24, pre-Cut3):** the floor (33/59 dev, 24/58 held-out, 0-spread, 100% precision), legacy regression gates, realism wiring, Realism #3 capability, and Realism #2 async SSRF+XXE are citable **with the explicit provenance "pre-Cut3: floor still confirms via declarative specs in `replay-verifier.ts`; receipts are shadow/convert for the agent path."** Cut 3a retires six of those spec families; the milestone must be re-gated after it lands.
+**Hard numbers behind the certificate (provenance: docker verifier, 600 s cells, K=6, generous budgets, serialized agentic runs):**
 
-Two claims that must not be made: (a) "agentic lift is proven" — held-out is exactly the floor, and the dev +2 sits inside a dispatch defect that left 13 of 14 planned acme steps and 6 of 7 opsportal steps undispatched; (b) "realism is done" — #4 has 0 confirmations and #2 misses blind SQLi plus one chain leg.
+| Surface | Floor | Unified | Lift | Precision |
+| :--- | :--- | :--- | :--- | :--- |
+| Dev seed 1 | 36/59 | 36/59 | **0** | 100% |
+| Salted held-out 1000042 | 28/58 | 29/58 | **+1** | 100% |
+
+**What must not be claimed:**
+1. **"Agentic lift"** — 67 agent investigations converted **1** target (1.5%). Honest lift is ~0–1 at 100% precision; the acme 16/22 → 14/22 swing shows ±2 is single-run noise.
+2. **"Realism is done"** — #4 is 0/3 confirmed, #2 misses blind SQLi and one chain leg.
+3. **"The DSL is retired"** — Cut 3a moved one family; `replay-verifier.ts` is still ~3.9K and `http_chain` carries 8/33 dev confirmations. Cut 3b is in flight.
+
+**Next gate (M1):** Total Product Recall ≥40/59 dev and ≥32/58 held-out at 100% precision, **and** ≥+4 net-new over the frozen floor. The binding constraint is agentic conversion, not floor coverage.
 
 ### V7.3 Smoke battery (adopted design)
 

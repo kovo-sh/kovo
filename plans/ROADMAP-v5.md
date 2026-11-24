@@ -816,3 +816,29 @@ Measured: dev **36/59** (opsportal 9/18 → **10/18**, `og.diag-cmdi` via `rce_p
 **Infrastructure lessons (both cost runs):**
 1. `/tmp` is a 15 GB tmpfs; accumulated benchmark dirs filled it (`EDQUOT`). Keep dirs only for cells under triage; clean after extracting evidence.
 2. The model-profile data dir takes `BEGIN EXCLUSIVE` on `process-lock.sqlite`, so **agentic runs are globally serialized** on this host. Floor (`--no-llm`) runs do not need the profile and can still run in parallel. Concurrent agentic runs were also a source of earlier p50 noise.
+
+### 2026-11-24 — certificate issued (floor + realism wiring + precision); lift stays RED; conversion autopsy opened
+
+**Final measurements on the certificate tree** (docker, 600 s, K=6, serialized):
+
+| surface | floor | unified | lift | precision | investigations |
+|---|---|---|---|---|---|
+| Dev seed 1 | 36/59 | **36/59** | **0** | 100% | 5/21, 10/24, 13/23 |
+| Salted held-out 1000042 | 28/58 | **29/58** | **+1** (shopflow only) | **100%** | 15/29, 13/22, 11/29 |
+
+**Certificate (reviewer-ratified): Floor + Realism wiring + 100% precision.** Agentic lift is explicitly **not** certified. Recorded in `VERIFICATION-v5.md` §V7.2 with the "must not claim" list.
+
+**Check-in #15 triage:**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Keep dev, held-out **and** reason-bench as tracked surfaces — 23/59 dev and 30/58 held-out targets are still unfound, and those are exactly the Layer-3 classes | **ACCEPT** (no dev downgrade) | certification |
+| 2 | **`dry_rounds` must never abort Pass 1**: it may only cut speculative re-investigation (`attempt >= 1`), never terminate while a first-pass route/class or Tier-A slice is uninvestigated. Emit `{ stopReason, uncoveredTierAEndpointsAtStop, uninvestigatedFirstPassClassesAtStop, filteredByReason }` | **ACCEPT** | `realism4-convert` (lease) |
+| 3 | Certify (a) Floor + Realism Wiring + 100% Precision now; keep Agentic Lift RED as M1. **Never** (c) weaken/re-baseline the app suite | **ACCEPT (done)** | coordinator |
+| 4 | Realism #4: do **not** make 4-hop deterministic — add mandatory **Tier-A Round-1 seeding** (all 3 slices in the first K slots) and an explicit proof contract in Tier-A briefs (slice up to ~1.5 KB, exact control/variant persona pair, invoke `guardian_verify` on that sink or emit a coded `proofGapReason`) | **ACCEPT** | `realism4-convert` |
+| 5 | Finish `cut3b-parity` **now** — 150–250 LOC of receipt primitives to delete 3.8K LOC of dual-path VM, parallel to capability work | **ACCEPT** | `cut3b-parity` |
+| 6 | Held-out +1 is **noise**, not proven lift (±2 single-run variance confirmed by acme 16/22 → 14/22) | **ACCEPT** | certification |
+| 7 | Before more features: **True-Positive Rejection Autopsy** over all 67 investigations, bucketed `never_dispatched` / `route_hit_no_verify` / `verify_called_but_oracle_rejected` / `probed_missed_bug` | **ACCEPT** | `conversion-autopsy` (launched) |
+| 8 | 1-cell frontier-model control to separate "model too weak" from "pipeline bug" | **DEFERRED (constraint)** — the operator requires the same production model (`deepseek/deepseek-v4.1-flash-1017`); a different-model control would need explicit operator approval. The autopsy bucket split answers the same question for structure, and bucket 4 is the only one that would implicate the model. | — |
+
+**Open question answered:** acme dev's 5/21 is now treated as suspected **premature Pass-1 dry-termination**, not a healthy dry queue — the bucket distinctor is whether first-pass work was still queued at stop, which the new metrics will report.
