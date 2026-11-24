@@ -1565,3 +1565,56 @@ test('verifier: a satisfied mass-assignment gate records evidenceClass on the pa
     assert.equal(res.evidencePayload.evidenceClass, 'mass_assignment')
   } finally { await fx.close() }
 })
+
+// ---------------------------------------------------------------------------
+// 13. Create-time caller-chosen money values are not invariants (45-min K=6 FP)
+// ---------------------------------------------------------------------------
+
+test('units: a negative-amount create is not a business-logic invariant without a declared event', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const invoiceCreate = (amount: number) => ({
+    impactClass: 'business_logic' as const,
+    steps: [
+      { id: 'create_control', arm: 'control' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount: 777 }, json: { id: 'ctl' } },
+      { id: 'read_control', arm: 'control' as const, method: 'GET', route: '/api/invoices/ctl', status: 200, actor: owner, json: { id: 'ctl', amount: 777 } },
+      { id: 'create_probe', arm: 'probe' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount }, json: { id: 'prb' } },
+      { id: 'read_probe', arm: 'probe' as const, method: 'GET', route: '/api/invoices/prb', status: 200, actor: owner, json: { id: 'prb', amount } },
+    ],
+  })
+  const rejected = assessBusinessLogicImpact(invoiceCreate(-777))
+  assert.equal(rejected.required, true)
+  assert.equal(rejected.satisfied, false)
+  assert.match(rejected.reason, /caller-supplied amount|money value|invariant event/i)
+
+  // Same shape with the endpoint's invariant event declared is a legitimate proof.
+  const accepted = assessBusinessLogicImpact({ ...invoiceCreate(-777), oracleEvents: ['invariant_violation'] })
+  assert.equal(accepted.satisfied, true, accepted.reason)
+
+  // The planted billing tamper mutates one existing resource (PATCH), not a create: unchanged.
+  const billing = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/plans/current', status: 200, actor: owner, json: { plan: 'pro', price: 4900 } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/plans/current', status: 200, actor: owner, requestJson: { price: 1 }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/plans/current', status: 200, actor: owner, json: { plan: 'pro', price: 1 } },
+    ],
+  })
+  assert.equal(billing.satisfied, true, billing.reason)
+})
+
+test('units: a create-time amount overpost is not mass assignment without a catalog or event', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const steps = [
+    { id: 'control', arm: 'control' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount: 777 }, json: { id: 'ctl' } },
+    { id: 'read_control', arm: 'control' as const, method: 'GET', route: '/api/invoices/ctl', status: 200, actor: owner, json: { id: 'ctl', amount: 777 } },
+    { id: 'probe', arm: 'probe' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount: -777 }, json: { id: 'prb' } },
+    { id: 'after', arm: 'probe' as const, method: 'GET', route: '/api/invoices/prb', status: 200, actor: owner, json: { id: 'prb', amount: -777 } },
+  ]
+  // Note: the before/after reads address different resources; persistence alone does not bind a rule.
+  const rejected = assessMassAssignmentImpact({ impactClass: 'mass_assignment', steps })
+  assert.equal(rejected.satisfied, false, rejected.reason)
+  assert.match(rejected.reason, /caller-supplied amount|money value|catalog|invariant event/i)
+
+  const accepted = assessMassAssignmentImpact({ impactClass: 'mass_assignment', steps, oracleEvents: ['invariant_violation'] })
+  assert.equal(accepted.satisfied, true, accepted.reason)
+})

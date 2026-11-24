@@ -201,6 +201,16 @@ function sameRoute(a: ImpactStep, b: ImpactStep): boolean {
   return (a.route ?? '') !== '' && a.route === b.route
 }
 
+/** True when the probe creates a new collection member (POST with no id-like final segment). */
+function isCreateShapedProbe(step: ImpactStep): boolean {
+  if ((step.method ?? '').toUpperCase() !== 'POST') return false
+  const path = (step.route ?? '').replace(/\/+$/, '')
+  const last = path.split('/').filter(Boolean).pop() ?? ''
+  return !/\d/.test(last)
+}
+
+
+
 // ---------------------------------------------------------------------------
 // Impact classification (title / category / CWE descriptors only)
 // ---------------------------------------------------------------------------
@@ -787,6 +797,14 @@ export function assessMassAssignmentImpact(input: ImpactInput): MassAssignmentAs
       evidence,
     }
   }
+  if (protectedFields.length > 0 && protectedFields.every(isPriceField) && isCreateShapedProbe(mutatingProbe) && !oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `A create-time caller-chosen money value (${protectedFields.slice(0, 6).join(', ')}) persisted, but no catalog or invariant event binds it: a caller-supplied amount is not mass assignment of an entitlement.`,
+      evidence,
+    }
+  }
   if (!oracleDeclared && protectedFields.length === 0) {
     return { required: true, satisfied: false, reason: 'Mass-assignment claim requires the endpoint\'s declared impact event or a persisted protected-field change.', evidence }
   }
@@ -917,6 +935,18 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
   labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
+  // A create-time caller-chosen *money* value (invoice amount, price) is not an invariant: the app
+  // may legitimately accept it, and no control arm binds it. Require the endpoint's declared
+  // invariant event for price/amount-only persistences on create-shaped probes.
+  const priceOnly = labels.protectedFields.length > 0 && labels.protectedFields.every(isPriceField)
+  if (labels.persisted && priceOnly && isCreateShapedProbe(mutatingProbe) && !labels.oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `A create-time caller-chosen money value (${labels.protectedFields.slice(0, 6).join(', ')}) persisted, but no invariant event is declared and no control arm binds the value: a caller-supplied amount is not an invariant violation.`,
+      evidence: labels,
+    }
+  }
   if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
     return {
       required: true,
