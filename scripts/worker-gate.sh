@@ -22,6 +22,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$ROOT"
+
+# Guard the coordinator's main checkout: a subagent writing here instead of its worktree
+# corrupts production runs (seen: a TS parameter property broke `Execution --no-llm`).
+if [[ "$(git rev-parse --show-toplevel 2>/dev/null || true)" == "/home/omarchy/guardian" ]]; then
+  if [[ -n "$(git status --porcelain -uno 2>/dev/null | head -1)" ]]; then
+    echo "FAIL: main checkout has uncommitted tracked changes; subagents must work in their worktrees." >&2
+    git status --porcelain -uno | head -5 >&2
+    exit 1
+  fi
+fi
+
 fail=0
 step() { printf '\n== %s\n' "$1"; }
 run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; fi; }
