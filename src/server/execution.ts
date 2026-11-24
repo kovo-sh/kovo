@@ -563,6 +563,292 @@ export function computeMultiTrialFanout(
 }
 
 // ============================================================================
+// v7 dispatch funnel — structured coverage accounting
+//
+// The v7 coverage defect was invisible in logs: the planner reported "added N steps" while the
+// scheduler dispatched far fewer, because planned → enqueued → ready → dispatched is a funnel and
+// every stage can silently drop work. These helpers make the funnel a structured object (never
+// derived from log text) and pin the two product invariants:
+//
+//   1. multi-trial fanout may only spend *surplus* worker slots; it must never turn one planned
+//      hypothesis into the whole fleet while distinct hypotheses wait in the queue, and
+//   2. a dry-round/coordinator-done stop may not strand dispatchable ready steps unless the run is
+//      genuinely out of budget/requests/wall clock.
+// ============================================================================
+
+/** Why the planner/dispatcher stopped (or `running` while it may continue). */
+export type DispatchStopReason =
+  | 'running'
+  | 'dry_rounds'
+  | 'coordinator_done'
+  | 'budget_exhausted'
+  | 'requests_exhausted'
+  | 'wallclock_exhausted'
+  | 'circuit_open'
+  | 'run_paused'
+  | 'run_stopped'
+
+/** Stop reasons that must never leave dispatchable planned work behind. */
+export const STRANDED_READY_STOP_REASONS: readonly DispatchStopReason[] = ['dry_rounds', 'coordinator_done']
+
+/** Structured per-round dispatch funnel. Every field is a count of step/hypothesis objects. */
+export interface DispatchFunnelCounts {
+  roundNo: number
+  /** Hypotheses the planner/lead lanes produced this round, before any filtering. */
+  planned: number
+  /** Dropped because the route/class is already confirmed and the step cites no parent evidence. */
+  filteredAlreadyConfirmed: number
+  /** Dropped by the reinvestigation cap (same route+class re-emitted with no new evidence). */
+  filteredCap: number
+  /** Pending steps whose declared dependencies can never be satisfied (permanently blocked). */
+  filteredDep: number
+  /** Dropped as a duplicate title already queued for this goal revision. */
+  filteredDedupe: number
+  /** Dropped because no approved asset matches the hypothesis origins. */
+  filteredNoAsset: number
+  /** Dropped because the dynamic step budget had no remaining slot. */
+  filteredBudget: number
+  /** Steps actually persisted as chain steps this round. */
+  enqueued: number
+  /** Cumulative distinct steps that reached `running` (assignedWorkerId set). */
+  dispatched: number
+  /** Distinct steps dispatched during this round window. */
+  dispatchedThisRound: number
+  /** Steps currently dispatchable (ready, or pending without an unsatisfiable dependency). */
+  remainingReady: number
+  /** Dispatchable steps left when the stop decision was taken (0 when it may continue). */
+  remainingReadyAtStop: number
+  stopReason: DispatchStopReason
+}
+
+export type DispatchFunnelCountKey =
+  | 'planned' | 'filteredAlreadyConfirmed' | 'filteredCap' | 'filteredDep'
+  | 'filteredDedupe' | 'filteredNoAsset' | 'filteredBudget' | 'enqueued'
+
+export const DISPATCH_FUNNEL_COUNT_KEYS: readonly DispatchFunnelCountKey[] = [
+  'planned', 'filteredAlreadyConfirmed', 'filteredCap', 'filteredDep',
+  'filteredDedupe', 'filteredNoAsset', 'filteredBudget', 'enqueued',
+]
+
+/** Accumulate one source's funnel counts into the round total (structured objects only). */
+export function addFunnelCounts(
+  target: DispatchFunnelCounts,
+  delta: Partial<Record<DispatchFunnelCountKey, number>>,
+): DispatchFunnelCounts {
+  for (const key of DISPATCH_FUNNEL_COUNT_KEYS) target[key] += Math.max(0, delta[key] ?? 0)
+  return target
+}
+
+export function emptyDispatchFunnel(roundNo = 0): DispatchFunnelCounts {
+  return {
+    roundNo,
+    planned: 0,
+    filteredAlreadyConfirmed: 0,
+    filteredCap: 0,
+    filteredDep: 0,
+    filteredDedupe: 0,
+    filteredNoAsset: 0,
+    filteredBudget: 0,
+    enqueued: 0,
+    dispatched: 0,
+    dispatchedThisRound: 0,
+    remainingReady: 0,
+    remainingReadyAtStop: 0,
+    stopReason: 'running',
+  }
+}
+
+/** Map a scheduler reason onto the funnel vocabulary (`diminishing_returns` is the dry stop). */
+export function normalizeDispatchStopReason(reason: string | null | undefined): DispatchStopReason {
+  switch ((reason ?? '').trim()) {
+    case 'diminishing_returns':
+    case 'dry_rounds':
+      return 'dry_rounds'
+    case 'coordinator_done':
+      return 'coordinator_done'
+    case 'budget_exhausted':
+      return 'budget_exhausted'
+    case 'requests_exhausted':
+      return 'requests_exhausted'
+    case 'wallclock_exhausted':
+      return 'wallclock_exhausted'
+    case 'circuit_open':
+      return 'circuit_open'
+    case 'paused':
+      return 'run_paused'
+    case 'stopped':
+      return 'run_stopped'
+    default:
+      return 'running'
+  }
+}
+
+export interface DispatchFunnelStep {
+  id: string
+  status: string
+  dependsOnFactIds?: readonly string[]
+  dependsOnStepIds?: readonly string[]
+}
+
+/**
+ * Pending steps whose declared dependencies can never resolve: a step dependency that is missing,
+ * canceled or tainted, or (when the fact set is supplied) a fact id that does not exist. These are
+ * permanently stranded — `refreshReadyChainSteps` can never promote them — so the funnel reports
+ * them as `filteredDep` instead of losing them silently.
+ */
+export function permanentlyBlockedStepIds(
+  steps: readonly DispatchFunnelStep[],
+  knownFactIds?: ReadonlySet<string>,
+): string[] {
+  const byId = new Map(steps.map(step => [step.id, step]))
+  const blocked: string[] = []
+  for (const step of steps) {
+    if (step.status !== 'pending') continue
+    const deadStepDep = (step.dependsOnStepIds ?? []).some(id => {
+      const dep = byId.get(id)
+      return !dep || dep.status === 'canceled' || dep.status === 'tainted'
+    })
+    const missingFactDep = knownFactIds
+      ? (step.dependsOnFactIds ?? []).some(id => !knownFactIds.has(id))
+      : false
+    if (deadStepDep || missingFactDep) blocked.push(step.id)
+  }
+  return blocked
+}
+
+/** Steps the scheduler could still dispatch: `ready`, plus `pending` with satisfiable deps. */
+export function dispatchableReadySteps<T extends DispatchFunnelStep>(
+  steps: readonly T[],
+  knownFactIds?: ReadonlySet<string>,
+): T[] {
+  const blocked = new Set(permanentlyBlockedStepIds(steps, knownFactIds))
+  return steps.filter(step => step.status === 'ready' || (step.status === 'pending' && !blocked.has(step.id)))
+}
+
+/**
+ * Worker slots a multi-trial fanout may spend without starving a distinct hypothesis: the fleet
+ * minus the hypotheses already queued. With 6 slots and 19 planned steps this is 0, so each planned
+ * hypothesis gets its own worker; with 1 planned step and 6 slots it is 5, so the intended
+ * deterministic-trial fanout still happens.
+ */
+export function multiTrialSurplusSlots(distinctQueued: number, concurrency: number): number {
+  return Math.max(0, Math.max(1, Math.floor(concurrency)) - Math.max(0, Math.floor(distinctQueued)))
+}
+
+export interface MultiTrialExpansion<T> {
+  step: T
+  /** Total size of the trial group (1 = no expansion). Never exceeds the surplus budget. */
+  fanout: number
+}
+
+/**
+ * Choose which queued hypotheses fan out into duplicate trials this tick. Expansion is capped by
+ * {@link multiTrialSurplusSlots} so duplicate trials can never occupy a slot a distinct planned
+ * hypothesis could use. Order is the caller's (priority/seq) order, so the choice is deterministic.
+ */
+export function planMultiTrialExpansion<T extends DispatchFunnelStep & {
+  priority: number
+  trialGroupId?: string | null
+}>(input: {
+  steps: readonly T[]
+  concurrency: number
+  multiTrialEnabled?: boolean
+  highSignalFactIds?: ReadonlySet<string>
+}): MultiTrialExpansion<T>[] {
+  if (input.multiTrialEnabled === false) return []
+  const concurrency = Math.max(1, Math.floor(input.concurrency))
+  if (concurrency <= 1) return []
+  const queued = input.steps.filter(step =>
+    (step.status === 'pending' || step.status === 'ready') && !step.trialGroupId)
+  let surplus = multiTrialSurplusSlots(queued.length, concurrency)
+  if (surplus <= 0) return []
+  const expansions: MultiTrialExpansion<T>[] = []
+  for (const step of queued) {
+    const requested = computeMultiTrialFanout(
+      { multiTrialEnabled: true, workerConcurrency: concurrency },
+      {
+        priority: step.priority,
+        dependsOnFactIds: [...(step.dependsOnFactIds ?? [])],
+        trialGroupId: step.trialGroupId ?? null,
+      },
+      input.highSignalFactIds,
+    )
+    const fanout = Math.min(requested, surplus + 1)
+    if (fanout <= 1) continue
+    expansions.push({ step, fanout })
+    surplus -= fanout - 1
+    if (surplus <= 0) break
+  }
+  return expansions
+}
+
+export interface DispatchStopEvaluation {
+  /** Decision after the stranded-ready guard (`continue` wins when queued work can use a slot). */
+  decision: 'continue' | 'stop'
+  stopReason: DispatchStopReason
+  remainingReady: number
+  /** True when the guard deferred a stop so planned ready work could be dispatched. */
+  deferred: boolean
+  /** True when a dry/coordinator stop would abandon dispatchable planned work. */
+  stranded: boolean
+}
+
+/**
+ * v7 coverage guard: never honour a dry-round/coordinator-done stop while dispatchable planned
+ * work can still use a free worker slot. Budget/request/wall-clock exhaustion is terminal and is
+ * reported as such (those steps are unaffordable, not stranded), and a genuinely empty queue (or a
+ * queue waiting only on in-flight slots) still stops.
+ */
+export function evaluateDispatchStop(input: {
+  decision: 'continue' | 'stop'
+  reason: string
+  remainingReady: number
+  freeSlots?: number
+  /** Investigation assignments still in flight; they release the slots queued work waits for. */
+  inFlight?: number
+  budgetExhausted?: boolean
+  requestExhausted?: boolean
+  wallExhausted?: boolean
+}): DispatchStopEvaluation {
+  const stopReason = normalizeDispatchStopReason(input.reason)
+  const remainingReady = Math.max(0, Math.floor(input.remainingReady))
+  if (input.decision !== 'stop') {
+    return { decision: 'continue', stopReason, remainingReady, deferred: false, stranded: false }
+  }
+  const exhausted = input.budgetExhausted === true || input.requestExhausted === true || input.wallExhausted === true
+  const guarded = STRANDED_READY_STOP_REASONS.includes(stopReason)
+  if (guarded && !exhausted && remainingReady > 0) {
+    if ((input.freeSlots ?? 0) > 0) {
+      return { decision: 'continue', stopReason, remainingReady, deferred: true, stranded: false }
+    }
+    // A busy fleet is not stranding: every ready step is queued behind an in-flight assignment and
+    // the scheduler dispatches it as the slot frees. Only an idle fleet abandons planned work.
+    if ((input.inFlight ?? 0) > 0) {
+      return { decision: 'stop', stopReason, remainingReady, deferred: false, stranded: false }
+    }
+    return { decision: 'stop', stopReason, remainingReady, deferred: false, stranded: true }
+  }
+  return { decision: 'stop', stopReason, remainingReady, deferred: false, stranded: false }
+}
+
+/**
+ * Breaker policy: a route-scoped 5xx cooldown is evidence (often the target's own response to an
+ * approved probe) and must never block traffic or pause a run; only an origin-wide trip does.
+ */
+export function circuitBreakAction(input: {
+  originWide: boolean
+  approvedOrigins: readonly string[]
+  trippedOrigin: string
+  /** Predicate over the *other* approved origins (true when that origin's circuit is also open). */
+  isOpen?: (origin: string) => boolean
+}): 'continue' | 'block_origin' | 'pause_run' {
+  if (!input.originWide) return 'continue'
+  const others = input.approvedOrigins.filter(origin => origin !== input.trippedOrigin)
+  const allTripped = others.length === 0 || others.every(origin => input.isOpen?.(origin) ?? false)
+  return allTripped ? 'pause_run' : 'block_origin'
+}
+
+// ============================================================================
 // v6 Phase B F2 — dispatch policy
 //
 // The Phase-B diagnosis found that four `det_lead` upgrade steps (created at priority 88) consumed
@@ -2058,6 +2344,10 @@ export class Execution {
   private readonly plannerDryRounds = new Map<string, number>()
   /** runId → last observed (confirmed findings, chain primitives) counts for dry-round accounting. */
   private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
+  /** runId → latest structured dispatch funnel (run meta for the final report / metrics). */
+  private readonly dispatchFunnels = new Map<string, DispatchFunnelCounts>()
+  /** runId → count of `planner.ready_steps_stranded` violations (never silently tolerated). */
+  private readonly strandedReadyEvents = new Map<string, number>()
   /** runId → `(route, class)` reinvestigation guard (v7 precision; cap 2 unless evidence unlocks). */
   private readonly reinvestigationGuards = new Map<string, ReinvestigationGuard>()
   private readonly recordedPersonaResources = new Map<string, Set<string>>()
@@ -2236,6 +2526,7 @@ export class Execution {
       for (const runId of runIds) {
         try { this.recordFloorMetrics(runId, 'finalize') } catch { /* metrics are best-effort */ }
         try { this.recordAssignmentMetrics(runId, 'finalize') } catch { /* metrics are best-effort */ }
+        try { this.recordDispatchFunnelSummary(runId) } catch { /* metrics are best-effort */ }
       }
     } catch { /* store may be unavailable during teardown */ }
     // v6 staging: agent-tool mutations captured a grant while tagging; hand the run tag back to the
@@ -2573,34 +2864,47 @@ export class Execution {
           { assignmentId: job.assignment.id, origin, status })
         if (outcome === 'circuit_open') {
           const fresh = this.storage.run(run.id)
-          if (fresh.status === 'running') {
-            const approvedOrigins = [...this.approvedOriginsSet(fresh)]
-            const allTripped = approvedOrigins.length <= 1 ||
-              approvedOrigins.every(o => o === origin || this.broker.isCircuitOpen(o))
+          // A `circuit_open` audit also fires for *route-scoped* 5xx cooldowns (a single endpoint
+          // returning 5xx, often the target's own response to an approved injection probe). Those
+          // are evidence, not target unavailability: only an origin-wide trip may block traffic or
+          // pause the run. Pausing on a route trip abandoned every planned step for the rest of the
+          // wall clock (the v7 opsportal coverage defect).
+          const originWide = this.broker.isCircuitOpen(origin)
+          const approvedOrigins = [...this.approvedOriginsSet(fresh)]
+          const action = circuitBreakAction({
+            originWide, approvedOrigins, trippedOrigin: origin,
+            isOpen: candidate => this.broker.isCircuitOpen(candidate),
+          })
+          if (fresh.status === 'running' && action === 'continue') {
+            this.storage.event(run.id, 'broker.route_circuit',
+              `Route-level 5xx cooldown on ${new URL(origin).hostname}${status ? ` (${status})` : ''}; dispatch continues.`,
+              { assignmentId: job.assignment.id, origin, status })
+            return
+          }
+          if (fresh.status === 'running' && action === 'pause_run') {
             const notifyKey = `${run.id}:${origin}`
-            if (allTripped) {
-              this.storage.setStatus(fresh, 'paused')
-              if (!this.circuitNotified.has(notifyKey)) {
-                this.circuitNotified.add(notifyKey)
-                this.storage.message(run.id, fresh.coordinatorId, 'guardian',
-                  `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Run paused to protect target availability.`)
-                this.postBrokerBlocker(fresh, origin, status)
+            this.storage.setStatus(fresh, 'paused')
+            if (!this.circuitNotified.has(notifyKey)) {
+              this.circuitNotified.add(notifyKey)
+              this.storage.message(run.id, fresh.coordinatorId, 'guardian',
+                `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Run paused to protect target availability.`)
+              this.postBrokerBlocker(fresh, origin, status)
+            }
+          } else if (fresh.status === 'running' && action === 'block_origin') {
+            // Isolate circuit breaker to the affected origin while healthy hosts continue
+            for (const st of this.storage.listChainSteps(run.id, fresh.goalRevision)) {
+              if ((st.status === 'pending' || st.status === 'ready') &&
+                  st.sourceOrigins.length > 0 &&
+                  st.sourceOrigins.every(o => o === origin || this.broker.isCircuitOpen(o))) {
+                this.storage.updateChainStep(st.id, { status: 'blocked' })
               }
-            } else {
-              // Isolate circuit breaker to the affected origin while healthy hosts continue
-              for (const st of this.storage.listChainSteps(run.id, fresh.goalRevision)) {
-                if ((st.status === 'pending' || st.status === 'ready') &&
-                    st.sourceOrigins.length > 0 &&
-                    st.sourceOrigins.every(o => o === origin || this.broker.isCircuitOpen(o))) {
-                  this.storage.updateChainStep(st.id, { status: 'blocked' })
-                }
-              }
-              if (!this.circuitNotified.has(notifyKey)) {
-                this.circuitNotified.add(notifyKey)
-                this.storage.message(run.id, fresh.coordinatorId, 'guardian',
-                  `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Further traffic to ${origin} is blocked while healthy hosts continue.`)
-                this.postBrokerBlocker(fresh, origin, status)
-              }
+            }
+            const notifyKey = `${run.id}:${origin}`
+            if (!this.circuitNotified.has(notifyKey)) {
+              this.circuitNotified.add(notifyKey)
+              this.storage.message(run.id, fresh.coordinatorId, 'guardian',
+                `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Further traffic to ${origin} is blocked while healthy hosts continue.`)
+              this.postBrokerBlocker(fresh, origin, status)
             }
           }
         }
@@ -4790,12 +5094,17 @@ export class Execution {
         .map(f => f.id),
     )
 
-    for (const step of steps) {
-      if (step.status !== 'pending' && step.status !== 'ready') continue
-      if (step.trialGroupId) continue
-      const fanout = computeMultiTrialFanout(run, step, highSignalFacts)
-      if (fanout <= 1) continue
-
+    // Trial budget = worker slots left after every distinct queued hypothesis. Duplicate trials may
+    // fill idle capacity; they must never displace a planned hypothesis (the v7 funnel defect).
+    const expansions = planMultiTrialExpansion({
+      steps,
+      concurrency: conc,
+      multiTrialEnabled: true,
+      highSignalFactIds: highSignalFacts,
+    })
+    if (!expansions.length) return
+    let expanded = 0
+    for (const { step, fanout } of expansions) {
       const trialGroupId = randomUUID()
       this.storage.updateChainStep(step.id, { trialGroupId, trialIndex: 0 })
       for (let idx = 1; idx < fanout; idx += 1) {
@@ -4814,7 +5123,13 @@ export class Execution {
           trialIndex: idx,
         })
       }
+      expanded += fanout - 1
     }
+    this.storage.event(run.id, 'scheduler.multi_trial', `Expanded ${expansions.length} hypothesis(es) into ${expanded} surplus trial step(s).`, {
+      concurrency: conc,
+      distinctQueued: steps.filter(s => (s.status === 'pending' || s.status === 'ready') && !s.trialGroupId).length,
+      expansions: expansions.map(entry => ({ stepId: entry.step.id, fanout: entry.fanout })),
+    })
   }
 
   private cancelSiblingTrialsOnConfirmation(run: Run, winningStepId: string | null, findingId?: string) {
@@ -5946,6 +6261,96 @@ export class Execution {
         'planner.capped_reinvestigations',
         `Capped reinvestigation of ${key.replace('\u0000', ' ')} (attempt ${attempted + 1} > cap ${guard.cap}); no new chain primitive or parent evidence.`,
         { routeClass: key, attempted: attempted + 1, cap: guard.cap, ...guard.snapshot() },
+      )
+    } catch { /* best-effort */ }
+  }
+
+  /** Persist the latest structured funnel so the final metrics/report can read it directly. */
+  private recordDispatchFunnel(runId: string, funnel: DispatchFunnelCounts): void {
+    const previous = this.dispatchFunnels.get(runId)
+    if (previous && previous.roundNo >= funnel.roundNo) return
+    const cumulative = emptyDispatchFunnel(funnel.roundNo)
+    if (previous) {
+      // Per-round counts are additive; the remaining/dispatched fields are observations, so the
+      // latest round wins for those (the final report wants the end-of-run picture).
+      for (const key of DISPATCH_FUNNEL_COUNT_KEYS) cumulative[key] = previous[key] + funnel[key]
+      cumulative.filteredDep = funnel.filteredDep
+    } else {
+      for (const key of DISPATCH_FUNNEL_COUNT_KEYS) cumulative[key] = funnel[key]
+    }
+    cumulative.dispatched = funnel.dispatched
+    cumulative.dispatchedThisRound = Math.max(0, funnel.dispatched - (previous?.dispatched ?? 0))
+    cumulative.remainingReady = funnel.remainingReady
+    cumulative.remainingReadyAtStop = funnel.remainingReadyAtStop
+    cumulative.stopReason = funnel.stopReason
+    this.dispatchFunnels.set(runId, cumulative)
+  }
+
+  /**
+   * Run-meta emission: the structured dispatch funnel for the whole run, plus the stranded-ready
+   * invariant verdict. `stopReason` comes from the persisted run status so a wall-clock/budget stop
+   * is reported as such (and therefore never counted as a violation).
+   */
+  private recordDispatchFunnelSummary(runId: string): void {
+    const funnel = this.dispatchFunnels.get(runId)
+    if (!funnel) return
+    let status = ''
+    try { status = this.storage.run(runId).status } catch { return }
+    const stopReason: DispatchStopReason = status === 'paused'
+      ? 'run_paused'
+      : status === 'stopped' ? 'run_stopped' : funnel.stopReason
+    const latestSteps = this.storage.listChainSteps(runId)
+    const knownFacts = new Set(this.pageAll((offset, limit) =>
+      this.storage.listFacts(runId, { includeTainted: true, limit, offset })).map(fact => fact.id))
+    const remainingReady = dispatchableReadySteps(latestSteps, knownFacts).length
+    const dispatched = latestSteps.filter(step => step.assignedWorkerId !== null).length
+    const blocked = permanentlyBlockedStepIds(latestSteps, knownFacts).length
+    const evaluation = evaluateDispatchStop({
+      decision: STRANDED_READY_STOP_REASONS.includes(stopReason) ? 'stop' : 'continue',
+      reason: stopReason,
+      remainingReady,
+      freeSlots: 0,
+      inFlight: latestSteps.filter(step => step.status === 'running').length,
+      budgetExhausted: stopReason === 'budget_exhausted',
+      requestExhausted: stopReason === 'requests_exhausted',
+      wallExhausted: stopReason === 'wallclock_exhausted' || stopReason === 'run_stopped',
+    })
+    const strandedEventsBefore = this.strandedReadyEvents.get(runId) ?? 0
+    if (evaluation.stranded) {
+      this.noteStrandedReadySteps(runId, {
+        roundNo: funnel.roundNo, stopReason, remainingReady, dispatched, planned: funnel.planned,
+      })
+    }
+    const strandedEvents = this.strandedReadyEvents.get(runId) ?? 0
+    try {
+      this.storage.event(
+        runId,
+        'planner.funnel.summary',
+        `Dispatch funnel: planned ${funnel.planned}, enqueued ${funnel.enqueued}, dispatched ${dispatched}, ready ${remainingReady}, blocked ${blocked}, stop ${stopReason}, stranded events ${strandedEvents}.`,
+        {
+          ...funnel, stopReason, remainingReadyAtStop: status === 'running' ? 0 : remainingReady,
+          dispatched, filteredDep: blocked, strandedEvents,
+          stranded: evaluation.stranded || strandedEventsBefore > 0,
+        },
+      )
+    } catch { /* metrics are best-effort */ }
+  }
+
+  /** Loud, counted signal: a terminal planner stop abandoned dispatchable planned work. */
+  private noteStrandedReadySteps(runId: string, detail: {
+    roundNo: number
+    stopReason: DispatchStopReason
+    remainingReady: number
+    dispatched: number
+    planned: number
+  }): void {
+    this.strandedReadyEvents.set(runId, (this.strandedReadyEvents.get(runId) ?? 0) + 1)
+    try {
+      this.storage.event(
+        runId,
+        'planner.ready_steps_stranded',
+        `Planner stopped (${detail.stopReason}) with ${detail.remainingReady} dispatchable step(s) undispatched; planned ${detail.planned}, dispatched ${detail.dispatched}.`,
+        { ...detail, strandedEvents: this.strandedReadyEvents.get(runId) ?? 1 },
       )
     } catch { /* best-effort */ }
   }
@@ -7833,25 +8238,29 @@ export class Execution {
     return collectAllPages(fetchPage, pageSize)
   }
 
-  /** Persist a validated dispatch plan as chain steps, citing parent facts and capability bundles. */
-  private persistDispatchPlan(run: Run, plan: DispatchPlan, factIds: ReadonlySet<string>, detLeadFactIds: ReadonlySet<string> = new Set()): number {
+  /**
+   * Persist a validated dispatch plan as chain steps, citing parent facts and capability bundles.
+   * Returns the structured funnel counts so a planner round can report exactly where planned
+   * hypotheses were dropped (title dedupe, already-confirmed route, no approved asset, cap, budget).
+   */
+  private persistDispatchPlan(run: Run, plan: DispatchPlan, factIds: ReadonlySet<string>, detLeadFactIds: ReadonlySet<string> = new Set()): Pick<DispatchFunnelCounts, 'planned' | 'enqueued' | 'filteredDedupe' | 'filteredAlreadyConfirmed' | 'filteredNoAsset'> {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const titles = new Set(existing.map(step => step.title.trim().toLowerCase()))
     const confirmed = this.alreadyConfirmedRefs(run, 40)
-    let added = 0
+    const counts = { planned: plan.plan.length, enqueued: 0, filteredDedupe: 0, filteredAlreadyConfirmed: 0, filteredNoAsset: 0 }
     for (const step of plan.plan) {
       const title = compactChainTitle(step.hypothesis)
       const key = title.toLowerCase()
-      if (titles.has(key)) continue
+      if (titles.has(key)) { counts.filteredDedupe += 1; continue }
       const boundFactIds = step.parentEvidenceIds.filter(id => factIds.has(id))
       // Tool-dispatched hypotheses obey the same no-re-dispatch rule as planner JSON steps.
       if (this.stepRepeatsConfirmedWork({
         title, hypothesis: step.hypothesis, dependsOnFactIds: boundFactIds, dependsOnStepIds: [],
-      }, confirmed)) continue
+      }, confirmed)) { counts.filteredAlreadyConfirmed += 1; continue }
       const assetIds = run.candidates
         .filter(candidate => step.origins.includes(candidate.origin) && run.approved.includes(candidate.id))
         .map(candidate => candidate.id)
-      if (!assetIds.length) continue
+      if (!assetIds.length) { counts.filteredNoAsset += 1; continue }
       const category = step.probeClass === 'stored_xss' ? 'cors-client-side'
         : step.probeClass === 'authz_replay' || step.probeClass === 'auth_bypass' ? 'broken-access-control'
           : step.probeClass === 'ssrf' ? 'injection-input' : 'broken-access-control'
@@ -7870,29 +8279,30 @@ export class Execution {
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
       titles.add(key)
-      added += 1
+      counts.enqueued += 1
     }
-    return added
+    return counts
   }
 
   /**
    * Explicit chaining round: derive typed primitives from the untruncated store (same-origin and
    * cross-origin), plan 2–3 hop hypotheses and dispatch each with parent evidence + capabilities.
    */
-  private dispatchChainRound(run: Run, coordinator: GraphCoordinator, budget: number, factIds: ReadonlySet<string>): number {
+  private dispatchChainRound(run: Run, coordinator: GraphCoordinator, budget: number, factIds: ReadonlySet<string>, funnel?: DispatchFunnelCounts): number {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const remaining = Math.max(0, budget - existing.length)
     if (remaining <= 0) return 0
     const hypotheses = coordinator.planChainRound({ maxHops: 3, limit: Math.min(12, remaining) })
     if (!hypotheses.length) return 0
     const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(hypotheses), { maxSteps: remaining })
-    const added = this.persistDispatchPlan(run, plan, factIds)
-    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${added} hypothesis(es) with parent evidence.`, {
-      hypotheses: hypotheses.length, dispatched: added, rejected: plan.rejected.length,
+    const counts = this.persistDispatchPlan(run, plan, factIds)
+    if (funnel) addFunnelCounts(funnel, counts)
+    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with parent evidence.`, {
+      hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
       crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
       primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
     })
-    return added
+    return counts.enqueued
   }
 
   private async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
@@ -7907,6 +8317,8 @@ export class Execution {
     const dynamicStepBudget = Math.min(hardChainStepsCeiling, computeDynamicStepBudget(this.storage, fresh.id))
     this.storage.updateRunDynamicStepBudget(fresh.id, dynamicStepBudget)
     this.noteDryStreak(fresh)
+    // v7 dispatch funnel: planned → filtered* → enqueued → dispatched, from step objects only.
+    const funnel = emptyDispatchFunnel(roundNo)
 
     // v6 Phase 1: prioritized deterministic leads become upgrade assignments before the planner
     // runs, so the agentic lane never idles on confirmed routes and never loses a floor signal.
@@ -7914,6 +8326,8 @@ export class Execution {
     try {
       detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, this.approvedOriginsSet(fresh), dynamicStepBudget)
     } catch { /* lead queueing is additive */ }
+    funnel.planned += detLeadSteps
+    funnel.enqueued += detLeadSteps
 
     const approvedOrigins = this.approvedOriginsSet(updated)
     const factIds = new Set(this.pageAll((offset, limit) =>
@@ -7930,7 +8344,7 @@ export class Execution {
     // store dispatch *before* the LLM turn, so a planner failure can never leave an empty window.
     let chainSteps = 0
     if (roundNo >= 2) {
-      try { chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds) } catch { /* additive */ }
+      try { chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel) } catch { /* additive */ }
     }
 
     const allSteps = this.storage.listChainSteps(fresh.id, updated.goalRevision)
@@ -7979,6 +8393,8 @@ export class Execution {
           sourceOrigins: [origin],
           specialistProfile: 'bola-bfla-specialist',
         })
+        funnel.planned += 1
+        funnel.enqueued += 1
         bolaAutoSteps += 1
         perOriginSteps.set(origin, (perOriginSteps.get(origin) ?? 0) + 1)
       }
@@ -8013,6 +8429,8 @@ export class Execution {
         sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(origin => approvedOrigins.has(origin)),
         specialistProfile: crossPersona ? 'bola-bfla-specialist' : 'client-browser-dom-specialist',
       })
+      funnel.planned += 1
+      funnel.enqueued += 1
       secondOrderAutoSteps += 1
     }
 
@@ -8021,7 +8439,11 @@ export class Execution {
     const handlers = coordinatorPlannerHandlers({
       coordinator,
       onDispatch: plan => {
-        try { toolDispatched += this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds, detLeadFactIds) } catch { /* additive */ }
+        try {
+          const counts = this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds, detLeadFactIds)
+          addFunnelCounts(funnel, counts)
+          toolDispatched += counts.enqueued
+        } catch { /* additive */ }
       },
     })
     const pendingOob = coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total
@@ -8081,18 +8503,37 @@ export class Execution {
       }
       const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 40)
       const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
+      const candidateSteps = parsedPlanner.data.newSteps
+        .map(step => ({ ...step, origins: step.origins.filter(origin => currentApproved.has(origin)) }))
       const budgetedNewSteps = applyCrownJewelStepBudget(
-        parsedPlanner.data.newSteps.map(step => ({ ...step, origins: step.origins.filter(origin => currentApproved.has(origin)) })),
+        candidateSteps,
         computeHostTiers([...currentApproved], this.storage.latestThreatModel(run.id, currentRun.goalRevision)?.entries),
         existingSteps,
         remainingSlots,
-      ).filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
-      for (const step of budgetedNewSteps) {
+      )
+      const dispatchableNewSteps = budgetedNewSteps.filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
+      // Attribute the budget gate precisely: duplicate titles and unusable origins are their own
+      // funnel buckets; only the remaining drops are capacity (step-budget/crown-jewel share).
+      const existingTitles = new Set(existingSteps.map(step => step.title.trim().toLowerCase()))
+      const preBudgetDedupe = candidateSteps.filter(step => existingTitles.has(step.title.trim().toLowerCase())).length
+      const preBudgetNoAsset = candidateSteps.filter(step => step.origins.length === 0).length
+      const droppedAtBudget = Math.max(0, candidateSteps.length - budgetedNewSteps.length)
+      funnel.planned += candidateSteps.length
+      funnel.filteredDedupe += Math.min(preBudgetDedupe, droppedAtBudget)
+      funnel.filteredNoAsset += Math.min(preBudgetNoAsset, Math.max(0, droppedAtBudget - preBudgetDedupe))
+      funnel.filteredBudget += Math.max(0, droppedAtBudget - preBudgetDedupe - preBudgetNoAsset)
+      funnel.filteredAlreadyConfirmed += Math.max(0, budgetedNewSteps.length - dispatchableNewSteps.length)
+      // Dependency sanitisation: a planner-emitted id that does not exist can never resolve, and
+      // `refreshReadyChainSteps` requires every parent fact/step to exist. Drop unknown ids at
+      // enqueue so planned work cannot be stranded as a permanently `pending` step.
+      const liveFactIds = new Set(factIds)
+      const liveStepIds = new Set(existingSteps.map(step => step.id))
+      for (const step of dispatchableNewSteps) {
         const validOrigins = step.origins.filter(origin => currentApproved.has(origin))
         const assetIds = currentRun.candidates
           .filter(candidate => validOrigins.includes(candidate.origin) && currentRun.approved.includes(candidate.id))
           .map(candidate => candidate.id)
-        if (!assetIds.length) continue
+        if (!assetIds.length) { funnel.filteredNoAsset += 1; continue }
         // v7 precision guard: a plain re-emission of the same (route, class) is capped at 2
         // investigations unless the step cites a chain primitive or parent evidence.
         const guardRoutes = this.stepMentionedRoutes(step)
@@ -8102,21 +8543,26 @@ export class Execution {
           const verdict = this.reinvestigationGuardFor(run.id).record(guardKey, unlocked)
           if (!verdict.allowed) {
             this.noteCappedReinvestigation(run, guardKey, verdict.count)
+            funnel.filteredCap += 1
             continue
           }
         }
+        const parentFactIds = step.dependsOnFactIds.filter(id => liveFactIds.has(id))
+        const parentStepIds = step.dependsOnStepIds.filter(id => liveStepIds.has(id))
         // F2: a planner re-emission of a det_lead upgrade must not jump back above class steps.
-        const leadBound = step.dependsOnFactIds.some(id => detLeadFactIds.has(id)) ||
+        const leadBound = parentFactIds.some(id => detLeadFactIds.has(id)) ||
           isDetLeadDispatchStep({ title: step.title, hypothesis: step.hypothesis })
         const specialistProfile = routeStepToSpecialist({
           title: step.title, hypothesis: step.hypothesis, category: step.category, skills: step.skills,
         })
-        this.storage.addChainStep(currentRun, {
+        const created = this.storage.addChainStep(currentRun, {
           title: step.title, hypothesis: step.hypothesis, category: step.category,
           priority: leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
-          targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: step.dependsOnFactIds,
-          dependsOnStepIds: step.dependsOnStepIds, sourceOrigins: validOrigins, specialistProfile,
+          targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: parentFactIds,
+          dependsOnStepIds: parentStepIds, sourceOrigins: validOrigins, specialistProfile,
         })
+        liveStepIds.add(created.id)
+        funnel.enqueued += 1
         addedCount += 1
       }
     }
@@ -8165,21 +8611,81 @@ export class Execution {
       highPriorityQueueEmpty: queueDrained,
       consecutiveDryRounds: dryRounds,
     })
-    if (decision.decision === 'stop') this.plannerDoneRound.set(run.id, roundNo)
+
+    // v7 coverage guard: a dry/coordinator stop must not abandon planned, dispatchable work while a
+    // worker slot is free. The stop is deferred (never silently dropped) and the funnel records it.
+    const finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
+    const finalFactIds = new Set(this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: true, limit, offset })).map(fact => fact.id))
+    const remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
+    const dispatchedTotal = finalSteps.filter(step => step.assignedWorkerId !== null).length
+    const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, latest.workerConcurrency || defaultWorkerConcurrency))
+    const activeForRun = [...this.active.values()].filter(job =>
+      job.assignment.runId === run.id && job.assignment.phase === 'investigation').length
+    const stopEval = evaluateDispatchStop({
+      decision: decision.decision,
+      reason: decision.reason,
+      remainingReady,
+      freeSlots: Math.max(0, maxConc - activeForRun),
+      inFlight: activeForRun,
+      budgetExhausted: this.storage.checkBudgetExceeded(run.id),
+      requestExhausted: latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0,
+      wallExhausted: this.maxDurationMs > 0 && latest.createdAt + this.maxDurationMs <= Date.now(),
+    })
+    if (stopEval.deferred) {
+      this.storage.event(
+        run.id,
+        'planner.stop_deferred',
+        `Planner ${decision.reason} stop deferred: ${remainingReady} dispatchable step(s) still queued for ${Math.max(0, maxConc - activeForRun)} free slot(s).`,
+        { roundNo, stopReason: decision.reason, remainingReady, freeSlots: Math.max(0, maxConc - activeForRun) },
+      )
+    }
+    if (stopEval.decision === 'stop') this.plannerDoneRound.set(run.id, roundNo)
+    funnel.dispatched = dispatchedTotal
+    funnel.dispatchedThisRound = Math.max(0, dispatchedTotal - (this.dispatchFunnels.get(run.id)?.dispatched ?? 0))
+    funnel.remainingReady = remainingReady
+    funnel.remainingReadyAtStop = stopEval.decision === 'stop' ? remainingReady : 0
+    funnel.stopReason = stopEval.decision === 'stop' ? stopEval.stopReason : 'running'
+    funnel.filteredDep = permanentlyBlockedStepIds(finalSteps, finalFactIds).length
+    if (stopEval.stranded) {
+      this.noteStrandedReadySteps(run.id, {
+        roundNo, stopReason: stopEval.stopReason, remainingReady,
+        dispatched: dispatchedTotal, planned: funnel.planned,
+      })
+    }
+    this.recordDispatchFunnel(run.id, funnel)
+    this.storage.event(
+      run.id,
+      'planner.funnel',
+      `Dispatch funnel r${roundNo}: planned ${funnel.planned}, enqueued ${funnel.enqueued}, dispatched ${funnel.dispatched}, ready ${funnel.remainingReady}, stop ${funnel.stopReason}.`,
+      { ...funnel, filtered: {
+        alreadyConfirmed: funnel.filteredAlreadyConfirmed, cap: funnel.filteredCap,
+        dep: funnel.filteredDep, dedupe: funnel.filteredDedupe,
+        noAsset: funnel.filteredNoAsset, budget: funnel.filteredBudget,
+      } },
+    )
+
     this.tracePlannerDecision(run.id, {
       roundIdx: roundNo, factsCount: allUntaintedFacts.length, detLeadsCount: detLeadSteps,
-      alreadyConfirmedCount: 0, spawnedSteps: addedCount, k6DryStreak: emptyRounds,
+      alreadyConfirmedCount: funnel.filteredAlreadyConfirmed, spawnedSteps: addedCount, k6DryStreak: emptyRounds,
       dynamicStepBudget, durationMs: Date.now() - plannerStartedAt,
       costUsd: Math.max(0, Number((this.storage.run(run.id).spentUsd - updated.spentUsd).toFixed(6))),
     })
     this.storage.event(run.id, 'planner.round', `Planner round ${roundNo}: added ${addedCount} steps.`, {
       roundNo, addedCount, chainSteps, bolaAutoSteps, secondOrderAutoSteps, detLeadSteps, toolDispatched,
       done: parsedPlanner?.success === true ? parsedPlanner.data.done : false,
-      decision: decision.decision, reason: decision.reason,
-      terminationReason: decision.decision === 'stop' ? decision.reason : null,
+      decision: stopEval.decision, reason: stopEval.decision === 'stop' ? decision.reason : 'continue',
+      terminationReason: stopEval.decision === 'stop' ? decision.reason : null,
+      deferredStopReason: stopEval.deferred ? decision.reason : null,
       consecutiveDryRounds: dryRounds,
       highPriorityQueueEmpty: queueDrained,
       cappedReinvestigations: this.reinvestigationGuardFor(run.id).cappedCount(),
+      funnel: {
+        planned: funnel.planned, enqueued: funnel.enqueued, dispatched: funnel.dispatched,
+        remainingReady: funnel.remainingReady, remainingReadyAtStop: funnel.remainingReadyAtStop,
+        filteredCap: funnel.filteredCap, filteredDep: funnel.filteredDep,
+        filteredAlreadyConfirmed: funnel.filteredAlreadyConfirmed, stopReason: funnel.stopReason,
+      },
       summary: parsedPlanner?.success ? parsedPlanner.data.summary.slice(0, 300) : compactText(answer, 300),
     })
   }

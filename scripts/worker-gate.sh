@@ -39,6 +39,17 @@ run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; f
 
 run "typecheck" npm run check
 
+# v7 dispatch-funnel invariant (<=15 lines): the pure helpers must be wired into the engine and the
+# synthetic fixture must prove (a) a dry/coordinator stop never strands dispatchable ready steps and
+# (b) multi-trial fanout only spends surplus worker slots. Catches this coverage class in minutes.
+step "dispatch funnel invariant"
+if grep -q 'evaluateDispatchStop(' src/server/execution.ts \
+   && grep -q 'planMultiTrialExpansion(' src/server/execution.ts \
+   && node --test tests/v7-dispatch-funnel.test.ts >/dev/null 2>&1; then :; else
+  echo "FAILED: dispatch funnel invariant (dry-stop stranding / multi-trial slot starvation)" >&2
+  fail=1
+fi
+
 # Fast contract invariants: planner/dedupe/orchestration behavior that engine-port broke.
 run "contract invariants" node --test \
   tests/v4-m7-orch.test.ts \
