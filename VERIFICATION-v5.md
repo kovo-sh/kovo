@@ -49,14 +49,15 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Gate | Target | Measured | Status |
 | :--- | :--- | :--- | :--- |
 | **Floor** dev | 0 spread, 100% precision | 33/59, 3 identical repeats, 100% | **PASS** |
-| **Floor** salted held-out | 100% precision, no regression | 24/58, 100% | **PASS** |
+| **Floor** salted held-out | 100% precision, no regression | 24/58, 100%; re-verified under the store confirmation invariant | **PASS** |
 | Legacy regression | xben 25/25, held-out 20/20 + 20/20 | both hold | **PASS** |
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
 | Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
 | Worst-run precision (agentic) | 100% on every lift cell | dev 100%; **held-out 2 unmatched FPs** | **FAIL** |
 | Agentic lift | ≥ +6–8 pp dev / ≥ +6 pp held-out | dev **+2** over the 33/59 tree (superseded by the 34/59 tree, remeasuring); held-out **+1 (+1.7 pp)** | **FAIL (bar held red)** |
 | Dispatch coverage | ready steps are not stranded | fixed: opsportal 6→**19–25** distinct steps, acme 7→**14**; stranded only at wall-clock; invariant live in worker-gate | **PASS** |
-| Proof submission | route-hit targets produce a spec or an explicit proof gap | **19 of 23** route-hit held-out targets submitted **no spec** | **FAIL (P0)** |
+| Proof submission | route-hit targets produce a spec or an explicit proof gap | was **19 of 23** no-spec; after the 18-turn/120 s raise + settlement gate: **5/10 (50%)** spec-on-route in the measured cell | **IMPROVING (P0)** |
+| Confirmation integrity | no confirmed finding may carry a non-confirming diff | store-level `InvariantError` now enforces it; 0 violations on dev+held-out floor re-runs | **PASS (forward)** |
 | Chains | ≥ 4/6 | #2 chain 2/3; not re-measured elsewhere | **PARTIAL** |
 
 **M0-interim milestone (recorded 2026-11-24, pre-Cut3):** the floor (33/59 dev, 24/58 held-out, 0-spread, 100% precision), legacy regression gates, realism wiring, Realism #3 capability, and Realism #2 async SSRF+XXE are citable **with the explicit provenance "pre-Cut3: floor still confirms via declarative specs in `replay-verifier.ts`; receipts are shadow/convert for the agent path."** Cut 3a retires six of those spec families; the milestone must be re-gated after it lands.
