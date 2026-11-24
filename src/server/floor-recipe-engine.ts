@@ -34,7 +34,8 @@ import type {
   RaceBurstArgs,
 } from './floor-recipes.ts'
 import type { ImpactStep, RoleName } from './oracle-invariants.ts'
-import type { ReplayVerificationResult } from './replay-verifier.ts'
+import type { ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
+import type { FloorRecipeEnvelope } from '../replay-spec.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import { brokerFloorRecipeDeps } from './floor-recipes.ts'
 
@@ -744,7 +745,9 @@ export function recipeSpecRecord(plan: FloorRecipePlan, execution: FloorRecipeEx
     kind: plan.specKind,
     vulnClass: plan.vulnClass,
     endpoint: plan.endpoint,
-    spec: recordSpecFor(plan, execution, plan.args.origin),
+    // The receipt owns the retest: persist the exact recipe that confirmed so a retest re-runs it and
+    // validates a fresh ProofReceipt instead of re-interpreting the legacy declarative shape.
+    spec: { ...recordSpecFor(plan, execution, plan.args.origin), recipe: { recipeId: plan.recipeId, args: plan.args } },
   }
 }
 
@@ -767,6 +770,80 @@ export function recipeRetestResult(
   exchangeIds: readonly string[],
 ): ReplayVerificationResult {
   return recipeResult(plan, execution, exchangeIds, execution.result.confirmed)
+}
+
+/**
+ * Receipt-based retest of a persisted recipe (Cut 3 retest migration).
+ *
+ * Re-runs the exact `recipeId` + args the confirmation recorded, through the same broker seam, and
+ * lets `runFloorRecipe` → `verifyReceipt()` decide. The legacy declarative verifier is never called
+ * for a recipe-owned proof, so the persisted spec's shape is not the retest contract.
+ *
+ * Verdict mapping keeps the patch gate's semantics:
+ *   - the receipt confirms again → `reproduced`
+ *   - the receipt is rejected, or a precondition no longer holds (e.g. the vulnerable route now
+ *     refuses the actor) → `fixed`
+ *   - the recipe could not finish (aborted / schema error / timeout) → `inconclusive`
+ */
+export async function retestPersistedRecipe(input: {
+  envelope: FloorRecipeEnvelope
+  specKind: string
+  vulnClass: string
+  endpoint: string
+  /** Target origin for every exchange; callers rebase it when a rebuilt lab moves ports. */
+  origin: string
+  broker: RequestBroker
+  grant: Grant
+  signal: AbortSignal
+  runId?: string
+  assignmentId?: string
+  probeClass?: string
+  recordExchange?: (exchange: BrokerExchangeResult) => string | void
+}): Promise<{ verdict: RetestVerdict; execution: FloorRecipeExecution | null; replay: ReplayVerificationResult }> {
+  const args = input.envelope.args as unknown as FloorRecipeArgs
+  const plan: FloorRecipePlan = {
+    recipeId: input.envelope.recipeId,
+    specKind: input.specKind,
+    vulnClass: input.vulnClass,
+    endpoint: input.endpoint,
+    args,
+  }
+  let execution: FloorRecipeExecution
+  try {
+    execution = await runFloorRecipe(floorRecipe(input.envelope.recipeId, args), brokerFloorRecipeDeps({
+      broker: input.broker,
+      grant: input.grant,
+      signal: input.signal,
+      origin: input.origin,
+      ...(input.probeClass ? { probeClass: input.probeClass } : {}),
+      ...(input.runId ? { runId: input.runId } : {}),
+      ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+      ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
+    }))
+  } catch (error) {
+    // A recipe that cannot execute at all is not evidence the vulnerability is gone.
+    const reason = `recipe retest could not run: ${error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300)}`
+    return {
+      verdict: 'inconclusive',
+      execution: null,
+      replay: {
+        verdict: 'inconclusive',
+        outcome: { confirmed: false, controlPassed: false, observed: reason, expected: 'the persisted recipe re-executes', reason },
+        exchangeIds: [],
+        exchanges: [],
+        evidencePayload: { kind: plan.specKind, recipe: plan.recipeId, confirmation: 'proof_receipt' },
+        evidenceSha256: createHash('sha256').update(reason).digest('hex'),
+      },
+    }
+  }
+  const exchangeIds = [...execution.result.exchangeIds]
+  const replay = recipeRetestResult(plan, execution, exchangeIds)
+  const verdict: RetestVerdict = execution.result.confirmed
+    ? 'reproduced'
+    : execution.failure?.code === 'recipe_error'
+      ? 'inconclusive'
+      : 'fixed'
+  return { verdict, execution, replay }
 }
 
 function recipeResult(
