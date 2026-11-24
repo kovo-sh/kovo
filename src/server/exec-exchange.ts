@@ -1,12 +1,43 @@
 import { and, eq } from 'drizzle-orm'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
-import { owaspCategories, type InlineVerifyFeedback, type OwaspCategory } from '../domain.ts'
-import type { BrokerExchangeResult, PublicObservation } from './broker.ts'
+import { owaspCategories, type Finding, type InlineVerifyFeedback, type OwaspCategory } from '../domain.ts'
+import type { DeclarativeReplaySpec } from '../replay-spec.ts'
+import type { BrokerExchangeResult, PublicObservation, RequestBroker } from './broker.ts'
+import type { CanaryBroker } from './canary-broker.ts'
 import { extractSpecDedupeFields, type ExistingFindingRef } from './dedupe.ts'
 import type { EvidenceReview } from './evidence-checks.ts'
+import { recordProfileFailure, recordProfileSuccess } from './model-settings.ts'
 import type { NamedSecret } from './redact.ts'
 import { findings } from './schema.ts'
+import type { ScopedBrowser } from './scoped-browser.ts'
 import type { Assignment, Run, Store } from './store.ts'
+import type { WorkerBackend } from './worker-backend.ts'
+
+export interface ExecCoreServices {
+  storage: Store
+  broker: RequestBroker
+  browser: ScopedBrowser
+  canaryBroker: CanaryBroker
+  backend: WorkerBackend
+}
+
+export class ExecServiceModule<THost extends ExecCoreServices> {
+  protected readonly host: THost
+  constructor(host: THost) { this.host = host }
+  protected get storage() { return this.host.storage }
+  protected get broker() { return this.host.broker }
+  protected get browser() { return this.host.browser }
+  protected get canaryBroker() { return this.host.canaryBroker }
+  protected get backend() { return this.host.backend }
+}
+
+export function publicPersonasFromGrant(
+  grant: { personas?: ReadonlyMap<string, { handle: string; roleLabel: string; originAllowlist: string[] }> },
+) {
+  return [...grant.personas?.values() ?? []].map(p => ({
+    handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
+  }))
+}
 
 export type ExecActiveJob = {
   assignment: Assignment
@@ -186,5 +217,43 @@ export function recordReportedFindingCoverage(
       summary,
       linkedFindingId,
     })
+  }
+}
+
+export function findFindingRow(storage: Store, runId: string, findingId: string) {
+  return storage.db.select().from(findings).where(and(eq(findings.runId, runId), eq(findings.id, findingId))).get()
+}
+
+export function llmRunHooks(storage: Store, runId: string) {
+  return {
+    onUsage: (u: { costUsd: number; inputTokens: number; outputTokens: number }) =>
+      storage.recordLlmSpend(runId, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
+    onProfileSuccess: (id: string) => recordProfileSuccess(id, storage),
+    onProfileFailure: (id: string, err: string | Error, hard: boolean) => recordProfileFailure(id, err, hard, storage),
+  }
+}
+
+export function buildChainFindingBase(
+  spec: DeclarativeReplaySpec,
+  findingId: string,
+  specRowId: string,
+  scopeRevision: number,
+  extra: Partial<Finding> & Pick<Finding, 'status' | 'confidence' | 'verification' | 'chainFactIds' | 'exchangeIds' | 'evidenceIds'>,
+): Finding {
+  return {
+    id: findingId,
+    origin: spec.origin,
+    title: spec.title,
+    severity: spec.severity,
+    reason: spec.severityRationale,
+    remediation: spec.remediation,
+    impact: spec.impact,
+    recheck: spec.recheckInstructions,
+    category: spec.category,
+    cwe: spec.cwe,
+    findingKind: 'multi_step_chain',
+    replaySpecId: specRowId,
+    scopeRevision,
+    ...extra,
   }
 }

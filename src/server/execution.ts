@@ -72,14 +72,17 @@ import {
   tagStagingEntityBody,
 } from './deterministic-engine.ts'
 import {
+  buildChainFindingBase,
   buildExistingFindingRefs,
   createExchangeRecorder,
+  findFindingRow,
+  llmRunHooks,
+  publicPersonasFromGrant,
   recordBrokerExchange,
   retryLimitExceededFeedback,
   type ExecActiveJob,
-  type ExecCapture,
   type ExecCoordinatorTask,
-  type ExecReviewInput,
+  type ExecCoreServices,
 } from './exec-exchange.ts'
 import { DETERMINISTIC_PARAM_HINT_RE, ExecFloorLane } from './exec-floor-lane.ts'
 import { ExecReconPlanner } from './exec-recon-planner.ts'
@@ -91,8 +94,6 @@ import { seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
 import { LabRunner, type LabTargetHandle } from './lab-runner.ts'
 import {
   privateModelProfiles,
-  recordProfileFailure,
-  recordProfileSuccess,
   resolveProfilePoolForRole,
   type ResolvedModelProfile,
 } from './model-settings.ts'
@@ -101,13 +102,13 @@ import { generateAndReviewPatch } from './patch-workflow.ts'
 import { PersonaAuthManager, type PersonaSessionClone } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
-import { ProbePlanRegistry, selectRankedProbeTargets, type Phase0GraphwireExtras, type Phase0ProbePlanSummary } from './probe-plan.ts'
+import { ProbePlanRegistry } from './probe-plan.ts'
 import type { CodeDataflowSlice, CodeToRuntimeHypothesis } from './program-graph.ts'
 import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { buildInlineVerifyFeedback, runAgentScriptProof } from './replay-verifier.ts'
-import { approvalRequests, findings, messages } from './schema.ts'
+import { approvalRequests, findings } from './schema.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { runThreeStageSemanticAudit, toChainStepInputs } from './semantic-audit.ts'
@@ -185,8 +186,6 @@ export * from './exec-dispatch.ts'
 import { ExecBoardManager } from './exec-board.ts'
 
 type Active = ExecActiveJob
-type Capture = ExecCapture
-type ReviewInput = ExecReviewInput
 type CoordinatorTask = ExecCoordinatorTask
 
 function createBroker(options: { storage: SecondOrderStore; canaryBroker: CanaryBroker }) {
@@ -314,12 +313,6 @@ export class Execution {
   private readonly probePlans = new ProbePlanRegistry()
   /** `${runId}\0${hypothesisId}` leads already persisted as det_lead facts (idempotent seeding). */
   private readonly programGraphLeadsSeeded = new Set<string>()
-  /** runId → consecutive planner rounds with zero dispatched work (K=2 diminishing-returns guard). */
-  private readonly plannerEmptyRounds = new Map<string, number>()
-  /** runId → consecutive rounds with no new runtime_confirmed finding and no new chain primitive. */
-  private readonly plannerDryRounds = new Map<string, number>()
-  /** runId → last observed (confirmed findings, chain primitives) counts for dry-round accounting. */
-  private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
   /** runId → latest structured dispatch funnel (run meta for the final report / metrics). */
   private readonly dispatchFunnels = new Map<string, DispatchFunnelCounts>()
   /** runId → count of `planner.ready_steps_stranded` violations (never silently tolerated). */
@@ -401,15 +394,9 @@ export class Execution {
   /** runId → honest investigation termination reason when a phase budget ends the phase. */
   private readonly phaseTerminationReason = new Map<string, string>()
   private readonly detLeadConsumed = new Set<string>()
-  private readonly detLeadStepKeys = new Set<string>()
   /** Tier-A Program-Graph facts/steps: seeded first, exempt from the generic lead cap. */
   private readonly tierAFactIds = new Set<string>()
   private readonly tierAStepIds = new Set<string>()
-  private readonly tierAStepKeys = new Set<string>()
-  /** Facts whose lead contract failed the contrast gate; emit the skip reason once. */
-  private readonly detLeadGateRejected = new Set<string>()
-  /** det_lead fact ids whose capped reinvestigation was already reported (emit once per fact). */
-  private readonly cappedLeadReported = new Set<string>()
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
@@ -459,27 +446,26 @@ export class Execution {
     })
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.labRunner = options.labRunner ?? new LabRunner()
+    const core: ExecCoreServices = {
+      storage: this.storage, broker: this.broker, browser: this.browser,
+      canaryBroker: this.canaryBroker, backend: this.backend,
+    }
+    const approvedOriginsSet = (run: Run) => this.approvedOriginsSet(run)
+    const permitted = (run: Run, origin: string) => this.permitted(run, origin)
+    const buildGrant = (job: Active, run: Run, allowed: ReadonlySet<string>) => this.buildGrant(job, run, allowed)
+    const projectReposMount = (projectId: string) => this.projectReposMount(projectId)
+    const completeWorker = (w: Assignment, r: Run, o: string, e: string[], c?: CheckCoverage[], s?: readonly NamedSecret[]) =>
+      this.completeWorker(w, r, o, e, c, s)
+
     this.board = new ExecBoardManager({
-      storage: this.storage,
-      warm: this.warm,
-      boardHandleByAssignment: this.boardHandleByAssignment,
-      approvedOriginsSet: run => this.approvedOriginsSet(run),
-      scheduleWake: () => this.scheduleWake(),
+      storage: this.storage, warm: this.warm, boardHandleByAssignment: this.boardHandleByAssignment,
+      approvedOriginsSet, scheduleWake: () => this.scheduleWake(),
     })
     this.floorLane = new ExecFloorLane({
-      storage: this.storage,
-      broker: this.broker,
-      browser: this.browser,
-      canaryBroker: this.canaryBroker,
-      backend: this.backend,
-      probePlans: this.probePlans,
-      stagingTaggedMutations: this.stagingTaggedMutations,
-      stagingUntaggedSkipped: this.stagingUntaggedSkipped,
-      stagingCleaned: this.stagingCleaned,
-      stagingCreatedEntities: this.stagingCreatedEntities,
-      approvedOriginsSet: run => this.approvedOriginsSet(run),
-      permitted: (run, origin) => this.permitted(run, origin),
-      buildGrant: (job, run, permitted) => this.buildGrant(job, run, permitted),
+      ...core, probePlans: this.probePlans,
+      stagingTaggedMutations: this.stagingTaggedMutations, stagingUntaggedSkipped: this.stagingUntaggedSkipped,
+      stagingCleaned: this.stagingCleaned, stagingCreatedEntities: this.stagingCreatedEntities,
+      approvedOriginsSet, permitted, buildGrant,
       beginFloorRequestPhase: run => this.beginFloorRequestPhase(run),
       phaseRequestRemaining: run => this.phaseRequestRemaining(run),
       markEndpointCoverage: (run, o, m, p, c) => this.markEndpointCoverage(run, o, m, p, c),
@@ -491,16 +477,8 @@ export class Execution {
         }),
     })
     this.verifier = new ExecVerifier({
-      storage: this.storage,
-      broker: this.broker,
-      browser: this.browser,
-      canaryBroker: this.canaryBroker,
-      backend: this.backend,
-      approvedOriginsSet: run => this.approvedOriginsSet(run),
-      permitted: (run, origin) => this.permitted(run, origin),
+      ...core, approvedOriginsSet, permitted, buildGrant, projectReposMount, completeWorker,
       check: job => this.check(job),
-      buildGrant: (job, run, permitted) => this.buildGrant(job, run, permitted),
-      projectReposMount: projectId => this.projectReposMount(projectId),
       isCanaryDnsConfigured: () => this.isCanaryDnsConfigured(),
       isCanaryListenerConfigured: () => this.isCanaryListenerConfigured(),
       markEndpointCoverage: (run, o, m, p, c) => this.markEndpointCoverage(run, o, m, p, c),
@@ -509,55 +487,30 @@ export class Execution {
       postVerificationVerdict: (run, opts) => this.postVerificationVerdict(run, opts),
       cancelSiblingTrialsOnConfirmation: (run, stepId, findingId) => this.cancelSiblingTrialsOnConfirmation(run, stepId, findingId),
       scheduleVariantSweepForFinding: (run, row) => this.scheduleVariantSweepForFinding(run, row),
-      completeWorker: (w, r, o, e, c, s) => this.completeWorker(w, r, o, e, c, s),
       recordSpecVerification: (runId, specId, feedback, summary) =>
         this.storage.recordReplaySpecVerification(runId, specId, feedback, summary),
       resolveInlineVerdictRow: (runId, findingRow) => {
-        const verdictRow = findingRow
-          ? this.storage.db.select().from(findings).where(and(eq(findings.runId, runId), eq(findings.id, findingRow.id))).get()
-          : undefined
+        const verdictRow = findingRow ? findFindingRow(this.storage, runId, findingRow.id) : undefined
         return verdictRow
       },
     })
     this.reconPlanner = new ExecReconPlanner({
-      storage: this.storage,
-      broker: this.broker,
-      browser: this.browser,
-      canaryBroker: this.canaryBroker,
-      backend: this.backend,
-      labRunner: this.labRunner,
-      maxDurationMs: this.maxDurationMs,
-      active: this.active,
-      coordinator: this.coordinator,
-      probePlans: this.probePlans,
-      startedLabRuns: this.startedLabRuns,
-      startedLabHandles: this.startedLabHandles,
-      prePhase0SeededSteps: this.prePhase0SeededSteps,
-      plannerDoneRound: this.plannerDoneRound,
-      plannerEmptyRounds: this.plannerEmptyRounds,
-      plannerDryRounds: this.plannerDryRounds,
-      plannerEvidenceFrontier: this.plannerEvidenceFrontier,
-      dispatchFunnels: this.dispatchFunnels,
-      detLeadConsumed: this.detLeadConsumed,
-      detLeadStepKeys: this.detLeadStepKeys,
-      detLeadGateRejected: this.detLeadGateRejected,
-      cappedLeadReported: this.cappedLeadReported,
-      tierAStepKeys: this.tierAStepKeys,
-      tierAStepIds: this.tierAStepIds,
-      tierAFactIds: this.tierAFactIds,
-      approvedOriginsSet: run => this.approvedOriginsSet(run),
+      ...core, labRunner: this.labRunner, maxDurationMs: this.maxDurationMs,
+      active: this.active, coordinator: this.coordinator, probePlans: this.probePlans,
+      startedLabRuns: this.startedLabRuns, startedLabHandles: this.startedLabHandles,
+      prePhase0SeededSteps: this.prePhase0SeededSteps, plannerDoneRound: this.plannerDoneRound,
+      dispatchFunnels: this.dispatchFunnels, detLeadConsumed: this.detLeadConsumed,
+      tierAStepIds: this.tierAStepIds, tierAFactIds: this.tierAFactIds,
+      approvedOriginsSet, buildGrant, projectReposMount, completeWorker,
       authorize: job => this.authorize(job),
       currentCoordinator: (runId, task) => this.currentCoordinator(runId, task),
-      buildGrant: (job, run, permitted) => this.buildGrant(job, run, permitted),
-      projectReposMount: projectId => this.projectReposMount(projectId),
       deterministicLaneKey: run => this.deterministicLaneKey(run),
       notifyCheckpoint: (runId, cp) => this.notifyCheckpoint(runId, cp),
       seedCodeToRuntimeLeads: (run, assignment, hyps) => this.seedCodeToRuntimeLeads(run, assignment, hyps),
       correlateSpecDependencies: (r, c, s, o, d, sig, sec) => this.correlateSpecDependencies(r, c, s, o, d, sig, sec),
       runSourceFirstCodeAudit: (r, tm, p, sig) => this.runSourceFirstCodeAudit(r, tm, p, sig),
       baselineFinding: (r, a, rev) => this.baselineFinding(r, a, rev),
-      saveBaselineFinding: (r, a, rev, st, reason, eIds, exId) => this.saveBaselineFinding(r, a, rev, st, reason, eIds, exId),
-      completeWorker: (w, r, o, e, c, s) => this.completeWorker(w, r, o, e, c, s),
+      saveBaselineFinding: (r, a, rev, st, reason, eIds, exId) => this.verifier.saveBaselineFinding(r, a, rev, st, reason, eIds, exId),
       expandEligibleMultiTrialSteps: run => this.expandEligibleMultiTrialSteps(run),
       endpointGraphCatalog: runId => this.endpointGraphCatalog(runId),
       noteDryStreak: run => this.noteDryStreak(run),
@@ -569,7 +522,7 @@ export class Execution {
       tracePlannerDecision: (runId, payload) => this.tracePlannerDecision(runId, payload),
       codeSliceForAssignment: (run, step, facts) => this.codeSliceForAssignment(run, step, facts),
       shouldCoordinatorAnswer: content => this.shouldCoordinatorAnswer(content),
-      resetBoardHops: run => this.resetBoardHops(run),
+      resetBoardHops: run => this.board.resetBoardHops(run),
     })
   }
 
@@ -589,6 +542,33 @@ export class Execution {
       process.env.GUARDIAN_CANARY_ENABLE === '1' ||
       this.isCanaryDnsConfigured(),
     )
+  }
+
+  private async ensureCanaryListenerForRun(run: Run, ignoreErrors = false): Promise<void> {
+    const project = this.storage.project(run.projectId)
+    if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && isLocalLabEnvEnabled())) {
+      const p = this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() })
+      await (ignoreErrors ? p.catch(() => undefined) : p)
+    }
+  }
+
+  private safeEvent(runId: string, kind: string, message: string, detail?: Record<string, unknown>): void {
+    try { this.storage.event(runId, kind, message, detail) } catch { /* telemetry is best-effort */ }
+  }
+
+  private async stageProjectSpecs(
+    projectId: string,
+    session: Awaited<ReturnType<WorkerBackend['openSession']>>,
+    signal: AbortSignal,
+  ): Promise<Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string }>> {
+    const staged: Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string }> = []
+    for (const [idx, spec] of this.storage.listProjectSpecsFull(projectId).slice(0, 8).entries()) {
+      try {
+        const stagedPath = await session.stage(`specs/spec-${idx + 1}.txt`, spec.content.slice(0, 1_500_000), signal)
+        staged.push({ name: spec.name, kind: spec.kind, origin: spec.origin, stagedPath })
+      } catch { /* skip oversized */ }
+    }
+    return staged
   }
 
   private parseOriginForRun(run: Run, raw: string): string {
@@ -983,8 +963,7 @@ export class Execution {
           // A `circuit_open` audit also fires for *route-scoped* 5xx cooldowns (a single endpoint
           // returning 5xx, often the target's own response to an approved injection probe). Those
           // are evidence, not target unavailability: only an origin-wide trip may block traffic or
-          // pause the run. Pausing on a route trip abandoned every planned step for the rest of the
-          // wall clock (the v7 opsportal coverage defect).
+          // pause the run. Pausing on a route trip abandoned planned steps for the rest of the wall clock.
           const originWide = this.broker.isCircuitOpen(origin)
           const approvedOrigins = [...this.approvedOriginsSet(fresh)]
           const action = circuitBreakAction({
@@ -997,29 +976,25 @@ export class Execution {
               { assignmentId: job.assignment.id, origin, status })
             return
           }
-          if (fresh.status === 'running' && action === 'pause_run') {
-            const notifyKey = `${run.id}:${origin}`
-            this.storage.setStatus(fresh, 'paused')
-            if (!this.circuitNotified.has(notifyKey)) {
-              this.circuitNotified.add(notifyKey)
-              this.storage.message(run.id, fresh.coordinatorId, 'guardian',
-                `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Run paused to protect target availability.`)
-              this.postBrokerBlocker(fresh, origin, status)
-            }
-          } else if (fresh.status === 'running' && action === 'block_origin') {
-            // Isolate circuit breaker to the affected origin while healthy hosts continue
-            for (const st of this.storage.listChainSteps(run.id, fresh.goalRevision)) {
-              if ((st.status === 'pending' || st.status === 'ready') &&
-                  st.sourceOrigins.length > 0 &&
-                  st.sourceOrigins.every(o => o === origin || this.broker.isCircuitOpen(o))) {
-                this.storage.updateChainStep(st.id, { status: 'blocked' })
+          if (fresh.status === 'running' && (action === 'pause_run' || action === 'block_origin')) {
+            if (action === 'pause_run') {
+              this.storage.setStatus(fresh, 'paused')
+            } else {
+              for (const st of this.storage.listChainSteps(run.id, fresh.goalRevision)) {
+                if ((st.status === 'pending' || st.status === 'ready') &&
+                    st.sourceOrigins.length > 0 &&
+                    st.sourceOrigins.every(o => o === origin || this.broker.isCircuitOpen(o))) {
+                  this.storage.updateChainStep(st.id, { status: 'blocked' })
+                }
               }
             }
             const notifyKey = `${run.id}:${origin}`
             if (!this.circuitNotified.has(notifyKey)) {
               this.circuitNotified.add(notifyKey)
               this.storage.message(run.id, fresh.coordinatorId, 'guardian',
-                `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Further traffic to ${origin} is blocked while healthy hosts continue.`)
+                action === 'pause_run'
+                  ? `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Run paused to protect target availability.`
+                  : `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Further traffic to ${origin} is blocked while healthy hosts continue.`)
               this.postBrokerBlocker(fresh, origin, status)
             }
           }
@@ -1042,11 +1017,8 @@ export class Execution {
     return loggedOut
   }
 
-  // --- v5 M5 Swarm Board wiring (delegated to ExecBoardManager) ----------------
-
+  // --- Delegators preserved for tests & source-level wiring assertions ---------
   private shouldCoordinatorAnswer(content: string): boolean { return this.board.shouldCoordinatorAnswer(content) }
-  private boardHandleForAssignmentId(run: Run, assignmentId: string): string { return this.board.boardHandleForAssignmentId(run, assignmentId) }
-  private allocateBoardHandle(run: Run, profile: NonNullable<ChainStep['specialistProfile']>, step: ChainStep): string { return this.board.allocateBoardHandle(run, profile, step) }
   private postCoordinatorBrief(run: Run, step: ChainStep, handle: string, origins: readonly string[]): BoardMessageRow | null { return this.board.postCoordinatorBrief(run, step, handle, origins) }
   private postVerificationVerdict(run: Run, opts: Parameters<ExecBoardManager['postVerificationVerdict']>[1]): BoardMessageRow | null { return this.board.postVerificationVerdict(run, opts) }
   private postBrokerBlocker(run: Run, origin: string, status?: number): BoardMessageRow | null { return this.board.postBrokerBlocker(run, origin, status) }
@@ -1054,47 +1026,26 @@ export class Execution {
   private postApprovalResolution(run: Run, assignmentId: string, input: Parameters<ExecBoardManager['postApprovalResolution']>[2]): void { this.board.postApprovalResolution(run, assignmentId, input) }
   private postCanaryLead(run: Run, input: Parameters<ExecBoardManager['postCanaryLead']>[1]): BoardMessageRow | null { return this.board.postCanaryLead(run, input) }
   private boardTurnDelta(run: Run, handle: string, lastReadSeq: number): { text: string; cursor: number } { return this.board.boardTurnDelta(run, handle, lastReadSeq) }
-  private resetBoardHops(run: Run): void { this.board.resetBoardHops(run) }
   private syncBoardRoster(run: Run): void { this.board.syncBoardRoster(run) }
   private routeOperatorBoardMessages(run: Run): void { this.board.routeOperatorBoardMessages(run) }
-  private wakeBoardMember(run: Run, handle: string, message: BoardMessageRow): ChainStep | null { return this.board.wakeBoardMember(run, handle, message) }
-  private finishBoardMember(run: Run, assignmentId: string): void { this.board.finishBoardMember(run, assignmentId) }
 
-  // --- Deterministic floor lane delegators (ExecFloorLane) ---------------------
   private deriveDeterministicRouteTargets(...a: Parameters<ExecFloorLane['deriveDeterministicRouteTargets']>) { return this.floorLane.deriveDeterministicRouteTargets(...a) }
   private runDeterministicInvestigation(...a: Parameters<ExecFloorLane['runDeterministicInvestigation']>) { return this.floorLane.runDeterministicInvestigation(...a) }
   private runEngineInvestigation(...a: Parameters<ExecFloorLane['runEngineInvestigation']>) { return this.floorLane.runEngineInvestigation(...a) }
   private persistDeterministicConfirmed(...a: Parameters<ExecFloorLane['persistDeterministicConfirmed']>) { return this.floorLane.persistDeterministicConfirmed(...a) }
   private persistDeterministicLead(...a: Parameters<ExecFloorLane['persistDeterministicLead']>) { return this.floorLane.persistDeterministicLead(...a) }
 
-  // --- Verification & receipt delegators (ExecVerifier) ------------------------
-  private promoteReceiptOob(...a: Parameters<ExecVerifier['promoteReceiptOob']>) { return this.verifier.promoteReceiptOob(...a) }
-  private convertOobPromotions(...a: Parameters<ExecVerifier['convertOobPromotions']>) { return this.verifier.convertOobPromotions(...a) }
   private persistReceiptFinding(...a: Parameters<ExecVerifier['persistReceiptFinding']>) { return this.verifier.persistReceiptFinding(...a) }
   private verifyReplaySpecJob(...a: Parameters<ExecVerifier['verifyReplaySpecJob']>) { return this.verifier.verifyReplaySpecJob(...a) }
-  private backendSupportsVerifyScript() { return this.verifier.backendSupportsVerifyScript() }
-  private readAgentProofScript(...a: Parameters<ExecVerifier['readAgentProofScript']>) { return this.verifier.readAgentProofScript(...a) }
   private persistAgentScriptProof(...a: Parameters<ExecVerifier['persistAgentScriptProof']>) { return this.verifier.persistAgentScriptProof(...a) }
   private executeInlineVerification(...a: Parameters<ExecVerifier['executeInlineVerification']>) { return this.verifier.executeInlineVerification(...a) }
-  private verifyBaselineJob(...a: Parameters<ExecVerifier['verifyBaselineJob']>) { return this.verifier.verifyBaselineJob(...a) }
-  private runRetestJob(...a: Parameters<ExecVerifier['runRetestJob']>) { return this.verifier.runRetestJob(...a) }
   private baselineFinding(...a: Parameters<ExecVerifier['baselineFinding']>) { return this.verifier.baselineFinding(...a) }
-  private saveBaselineFinding(...a: Parameters<ExecVerifier['saveBaselineFinding']>) { return this.verifier.saveBaselineFinding(...a) }
 
-  // --- Recon, planner & briefing delegators (ExecReconPlanner) -----------------
-  private runThreatModel(...a: Parameters<ExecReconPlanner['runThreatModel']>) { return this.reconPlanner.runThreatModel(...a) }
-  private runPostConfirmationVariantSweep(...a: Parameters<ExecReconPlanner['runPostConfirmationVariantSweep']>) { return this.reconPlanner.runPostConfirmationVariantSweep(...a) }
-  private startCoordinator(...a: Parameters<ExecReconPlanner['startCoordinator']>) { return this.reconPlanner.startCoordinator(...a) }
   private coordinatorDeps(...a: Parameters<ExecReconPlanner['coordinatorDeps']>) { return this.reconPlanner.coordinatorDeps(...a) }
-  private pageAll<T>(fetchPage: (offset: number, limit: number) => readonly T[]): T[] { return this.reconPlanner.pageAll(fetchPage) }
   private dispatchChainRound(...a: Parameters<ExecReconPlanner['dispatchChainRound']>) { return this.reconPlanner.dispatchChainRound(...a) }
   private runChainPlanner(...a: Parameters<ExecReconPlanner['runChainPlanner']>) { return this.reconPlanner.runChainPlanner(...a) }
   private alreadyConfirmedRefs(...a: Parameters<ExecReconPlanner['alreadyConfirmedRefs']>) { return this.reconPlanner.alreadyConfirmedRefs(...a) }
-  private unconfirmedHardSurfaceRefs(...a: Parameters<ExecReconPlanner['unconfirmedHardSurfaceRefs']>) { return this.reconPlanner.unconfirmedHardSurfaceRefs(...a) }
   private detLeadSummaries(...a: Parameters<ExecReconPlanner['detLeadSummaries']>) { return this.reconPlanner.detLeadSummaries(...a) }
-  private stepMentionedRoutes(...a: Parameters<ExecReconPlanner['stepMentionedRoutes']>) { return this.reconPlanner.stepMentionedRoutes(...a) }
-  private passOneCoverageFor(...a: Parameters<ExecReconPlanner['passOneCoverageFor']>) { return this.reconPlanner.passOneCoverageFor(...a) }
-  private queueHighRiskCoverageSteps(...a: Parameters<ExecReconPlanner['queueHighRiskCoverageSteps']>) { return this.reconPlanner.queueHighRiskCoverageSteps(...a) }
   private stepRepeatsConfirmedWork(...a: Parameters<ExecReconPlanner['stepRepeatsConfirmedWork']>) { return this.reconPlanner.stepRepeatsConfirmedWork(...a) }
   private queueTierALeadSteps(...a: Parameters<ExecReconPlanner['queueTierALeadSteps']>) { return this.reconPlanner.queueTierALeadSteps(...a) }
   private queueDetLeadUpgradeSteps(...a: Parameters<ExecReconPlanner['queueDetLeadUpgradeSteps']>) { return this.reconPlanner.queueDetLeadUpgradeSteps(...a) }
@@ -1105,40 +1056,14 @@ export class Execution {
    * Runs in Execution (not only inside RequestBroker) so injected/custom brokers are covered too.
    */
   /** SQLite endpoint-parameter and API-dependency catalog, resolved to route/method display keys. */
-  private endpointGraphCatalog(runId: string): {
-    endpointParams: Array<{
-      endpoint: string
-      origin: string
-      method: string
-      name: string
-      location: string
-      inferredType: string | null
-      isCsrf: boolean
-      isObjectId: boolean
-      source: string
-    }>
-    apiDependencies: Array<{
-      producer: string
-      consumer: string
-      resourceKey: string
-      personaHandle: string | null
-      testedBola: boolean
-    }>
-  } {
-    const endpoints = this.storage.listEndpoints(runId, { limit: 2000 })
-    const byId = new Map(endpoints.map(ep => [ep.id, ep]))
+  private endpointGraphCatalog(runId: string) {
+    const byId = new Map(this.storage.listEndpoints(runId, { limit: 2000 }).map(ep => [ep.id, ep]))
     const endpointParams = this.storage.listEndpointParams(runId).slice(0, 400).map(param => {
       const ep = byId.get(param.endpointId)
       return {
         endpoint: ep ? `${ep.method} ${ep.pathTemplate}` : param.endpointId,
-        origin: ep?.origin ?? '',
-        method: ep?.method ?? '',
-        name: param.name,
-        location: param.location,
-        inferredType: param.inferredType,
-        isCsrf: param.isCsrf,
-        isObjectId: param.isObjectId,
-        source: param.source,
+        origin: ep?.origin ?? '', method: ep?.method ?? '', name: param.name, location: param.location,
+        inferredType: param.inferredType, isCsrf: param.isCsrf, isObjectId: param.isObjectId, source: param.source,
       }
     })
     const apiDependencies = this.storage.listApiDependencies(runId).slice(0, 200).map(dep => {
@@ -1147,9 +1072,7 @@ export class Execution {
       return {
         producer: producer ? `${producer.method} ${producer.pathTemplate}` : dep.producerEndpointId,
         consumer: consumer ? `${consumer.method} ${consumer.pathTemplate}` : dep.consumerEndpointId,
-        resourceKey: dep.resourceKey,
-        personaHandle: dep.personaHandle,
-        testedBola: dep.testedBola,
+        resourceKey: dep.resourceKey, personaHandle: dep.personaHandle, testedBola: dep.testedBola,
       }
     })
     return { endpointParams, apiDependencies }
@@ -1428,38 +1351,27 @@ export class Execution {
       instances: input.approvalInstances,
     })
 
+    const baseApproval = {
+      origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
+      personaHandle: input.personaHandle, rationale: input.rationale,
+      requestPreview: input.requestPreview, riskLevel: evaluation.riskLevel,
+      policyNote: evaluation.reason, secrets: input.secrets,
+    }
     if (evaluation.decision === 'approve' || evaluation.decision === 'deny') {
       const approved = evaluation.decision === 'approve'
       this.storage.recordAutoApprovalDecision(run, job.assignment, {
-        origin: input.origin,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-        personaHandle: input.personaHandle,
-        rationale: input.rationale,
-        requestPreview: input.requestPreview,
+        ...baseApproval,
         decision: approved ? 'approved' : 'denied',
         decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
-        riskLevel: evaluation.riskLevel,
-        policyNote: evaluation.reason,
-        secrets: input.secrets,
       })
       if (!approved) return { approved: false, deniedReason: evaluation.reason }
-      // The audit row above is never authoritative. Authorize only the exact request the judge
-      // evaluated, via a single-use fingerprint the broker retry consumes once.
       registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, grantTarget(), input.additionalApprovalTargets ?? [])
       return { approved: true }
     }
 
     const approvalKey = [
-      run.id,
-      run.scopeRevision,
-      input.origin,
-      input.method.toUpperCase(),
-      input.pathAndQuery,
-      input.personaHandle ?? '',
-      input.isRceProof ? 'rce' : '',
-      input.isRaceBurst ? 'race' : '',
-      input.bodyPreview ?? '',
+      run.id, run.scopeRevision, input.origin, input.method.toUpperCase(), input.pathAndQuery,
+      input.personaHandle ?? '', input.isRceProof ? 'rce' : '', input.isRaceBurst ? 'race' : '', input.bodyPreview ?? '',
     ].join('\0')
     if (this.pendingTier3ApprovalKeys.has(approvalKey)) {
       return {
@@ -1472,17 +1384,7 @@ export class Execution {
     let decision: 'approved' | 'denied' | 'canceled' | 'expired'
     let postedApprovalId: string | undefined
     try {
-      const req = this.storage.createApprovalRequest(run, job.assignment, {
-        origin: input.origin,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-        personaHandle: input.personaHandle,
-        rationale: input.rationale,
-        requestPreview: input.requestPreview,
-        policyNote: evaluation.reason,
-        riskLevel: evaluation.riskLevel,
-        secrets: input.secrets,
-      })
+      const req = this.storage.createApprovalRequest(run, job.assignment, baseApproval)
       postedApprovalId = req.id
       this.postApprovalCard(run, job.assignment.id, {
         approvalId: req.id,
@@ -1688,7 +1590,7 @@ export class Execution {
       this.routeOperatorBoardMessages(run)
 
       if (profiles.length) {
-        this.startCoordinator(run, profiles)
+        this.reconPlanner.startCoordinator(run, profiles)
       }
 
       if (
@@ -1798,7 +1700,7 @@ export class Execution {
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
     this.threatModeling.set(run.id, task)
-    void this.runThreatModel(run, profiles, task).catch(error => {
+    void this.reconPlanner.runThreatModel(run, profiles, task).catch(error => {
       if (!this.currentCoordinator(run.id, task)) return
       const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
       this.storage.transaction(() => {
@@ -1867,11 +1769,26 @@ export class Execution {
     currentSecrets: () => readonly NamedSecret[],
     options: {
       offlineScriptLabel: string
+      deriveEvidenceTitle: string
       onFactRecorded?: (curRun: Run) => void
     },
   ) {
     return {
       spillOutput: async (id: string, content: string, sig: AbortSignal) => session.stage(`tool-output/${id}.txt`, content, sig),
+      derive_evidence: async ({ command, outputs, timeoutMs }: Parameters<NonNullable<WorkerToolHandlers['derive_evidence']>>[0], sig: AbortSignal) => {
+        const curRun = this.check(job)
+        const res = await session.exec(command, outputs ?? ['result.txt'], sig, timeoutMs ?? 60_000)
+        const sec = currentSecrets()
+        const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', options.deriveEvidenceTitle,
+          JSON.stringify({
+            command: redact(command, sec),
+            exitStatus: res.exitCode,
+            stdout: redact(res.stdout, sec),
+            stderr: redact(res.stderr, sec),
+            outputs: res.outputs,
+          }, null, 2), undefined, sec)
+        return { evidenceId: ev.id, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs }
+      },
       analyze_artifact: async (args: Parameters<NonNullable<WorkerToolHandlers['analyze_artifact']>>[0], sig: AbortSignal) => {
         this.check(job)
         const { tool, ...rest } = args
@@ -2018,37 +1935,13 @@ export class Execution {
     const startedAt = Date.now()
 
     try {
-      const specs = this.storage.listProjectSpecsFull(run.projectId)
-      const stagedSpecs: Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string }> = []
-      for (const [idx, spec] of specs.slice(0, 8).entries()) {
-        try {
-          const stagedPath = await session.stage(`specs/spec-${idx + 1}.txt`, spec.content.slice(0, 1_500_000), controller.signal)
-          stagedSpecs.push({ name: spec.name, kind: spec.kind, origin: spec.origin, stagedPath })
-        } catch { /* skip oversized */ }
-      }
+      const stagedSpecs = await this.stageProjectSpecs(run.projectId, session, controller.signal)
+      const handlers: WorkerToolHandlers = this.buildSharedSessionHandlers(job, session, currentSecrets, {
+        offlineScriptLabel: 'Offline {runtime} script (code audit)',
+        deriveEvidenceTitle: 'Code audit analysis',
+      })
 
-      const handlers: WorkerToolHandlers = {
-        ...this.buildSharedSessionHandlers(job, session, currentSecrets, {
-          offlineScriptLabel: 'Offline {runtime} script (code audit)',
-        }),
-        derive_evidence: async ({ command, outputs, timeoutMs }, sig) => {
-          const curRun = this.check(job)
-          const res = await session.exec(command, outputs ?? ['result.txt'], sig, timeoutMs ?? 60_000)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', 'Code audit analysis',
-            JSON.stringify({
-              command: redact(command, secrets),
-              exitStatus: res.exitCode,
-              stdout: redact(res.stdout, secrets),
-              stderr: redact(res.stderr, secrets),
-              outputs: res.outputs,
-            }, null, 2), undefined, secrets)
-          return { evidenceId: ev.id, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs }
-        },
-      }
-
-      const personasPub = [...grant.personas?.values() ?? []].map(p => ({
-        handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
-      }))
+      const personasPub = publicPersonasFromGrant(grant)
 
       // Stage 1-3 deterministic + semantic code audit pipeline (IRIS + call-graph + git history)
       try {
@@ -2123,18 +2016,11 @@ export class Execution {
             throw new BudgetExceededError('Run spend or request budget exceeded.')
           }
         },
-        onUsage: usage => {
-          this.storage.recordLlmSpend(run.id, {
-            usd: usage.costUsd,
-            tokens: usage.inputTokens + usage.outputTokens,
-          })
-        },
+        ...llmRunHooks(this.storage, run.id),
         onTurn: turn => {
           this.storage.updateWorker(claimed.id, { turnsUsed: turn })
           this.storage.recordLlmSpend(run.id, { turns: 1 })
         },
-        onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-        onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
       })
 
       const latestRun = this.storage.run(run.id)
@@ -2297,7 +2183,7 @@ export class Execution {
     if (locs.length === 0) return
 
     this.variantSweepInFlight.add(findingRow.id)
-    void this.runPostConfirmationVariantSweep(run, findingRow, reposDir, mountedRepos)
+    void this.reconPlanner.runPostConfirmationVariantSweep(run, findingRow, reposDir, mountedRepos)
       .catch(() => { /* best-effort variant sweep */ })
       .finally(() => {
         this.variantSweepInFlight.delete(findingRow.id)
@@ -2439,37 +2325,23 @@ export class Execution {
       agentRequests: 0,
     }
     this.phaseRequestState.set(run.id, state)
-    try {
-      this.storage.event(
-        run.id,
-        'request_budget.phase_started',
-        phase === 'floor'
-          ? `Phase A request allowance ${state.floorBudget}; Phase B allowance ${state.agentBudget} (split budgets; no borrowing).`
-          : `Phase B request allowance ${state.agentBudget} (no Phase-A floor in this run).`,
-        {
-          phase,
-          floorRequestBudget: state.floorBudget,
-          agentRequestBudget: state.agentBudget,
-          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
-          spentRequestsAtStart: state.baselineRequests,
-        },
-      )
-    } catch { /* telemetry is best-effort */ }
+    this.safeEvent(
+      run.id, 'request_budget.phase_started',
+      phase === 'floor'
+        ? `Phase A request allowance ${state.floorBudget}; Phase B allowance ${state.agentBudget} (split budgets; no borrowing).`
+        : `Phase B request allowance ${state.agentBudget} (no Phase-A floor in this run).`,
+      {
+        phase, floorRequestBudget: state.floorBudget, agentRequestBudget: state.agentBudget,
+        totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null, spentRequestsAtStart: state.baselineRequests,
+      },
+    )
     return state
   }
 
-  private beginFloorRequestPhase(run: Run): PhaseRequestState | null {
-    return this.beginRequestPhase(run, 'floor')
-  }
+  private beginFloorRequestPhase(run: Run): PhaseRequestState | null { return this.beginRequestPhase(run, 'floor') }
+  private beginAgentRequestPhase(run: Run): PhaseRequestState | null { return this.beginRequestPhase(run, 'agent') }
 
-  private beginAgentRequestPhase(run: Run): PhaseRequestState | null {
-    return this.beginRequestPhase(run, 'agent')
-  }
-
-  /**
-   * Freeze Phase-A spend and expose the Phase-B allowance. Called when the floor settles (lane
-   * completion or `--no-llm` completion). Idempotent.
-   */
+  /** Freeze Phase-A spend and expose the Phase-B allowance. Idempotent. */
   private settleFloorRequestPhase(runId: string, reason: string): void {
     const state = this.phaseRequestState.get(runId)
     if (!state || state.floorSettled) return
@@ -2478,42 +2350,27 @@ export class Execution {
     state.floorRequests = Math.max(0, run.spentRequests - state.baselineRequests)
     state.floorSettled = true
     state.floorBudgetExhausted = state.floorRequests >= state.floorBudget
-    try {
-      this.storage.event(
-        runId,
-        'request_budget.floor_settled',
-        `Phase A used ${state.floorRequests}/${state.floorBudget} request(s); Phase B allowance is ${state.agentBudget}.`,
-        {
-          phase: 'floor',
-          reason,
-          floorRequests: state.floorRequests,
-          floorRequestBudget: state.floorBudget,
-          agentRequestBudget: state.agentBudget,
-          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
-          spentRequestsAtStart: state.baselineRequests,
-          spentRequestsAtSettle: run.spentRequests,
-          floorBudgetExhausted: state.floorBudgetExhausted,
-        },
-      )
-    } catch { /* telemetry is best-effort */ }
+    this.safeEvent(
+      runId, 'request_budget.floor_settled',
+      `Phase A used ${state.floorRequests}/${state.floorBudget} request(s); Phase B allowance is ${state.agentBudget}.`,
+      {
+        phase: 'floor', reason, floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget,
+        agentRequestBudget: state.agentBudget, totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
+        spentRequestsAtStart: state.baselineRequests, spentRequestsAtSettle: run.spentRequests,
+        floorBudgetExhausted: state.floorBudgetExhausted,
+      },
+    )
     if (state.floorBudgetExhausted && !state.floorExhaustedReported) {
       state.floorExhaustedReported = true
-      try {
-        this.storage.event(
-          runId,
-          'request_budget.floor_exhausted',
-          `Phase A floor exhausted its ${state.floorBudget}-request allowance; Phase B keeps its own allowance.`,
-          { phase: 'floor', floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget },
-        )
-      } catch { /* telemetry is best-effort */ }
+      this.safeEvent(
+        runId, 'request_budget.floor_exhausted',
+        `Phase A floor exhausted its ${state.floorBudget}-request allowance; Phase B keeps its own allowance.`,
+        { phase: 'floor', floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget },
+      )
     }
   }
 
-  /**
-   * Freeze Phase-B spend when agentic investigation ends. Verification (Phase 3) still sends
-   * requests from the run-total cap, but they must not be reported as Phase-B consumption.
-   * Idempotent; `--no-llm` runs have no Phase B and never reach here.
-   */
+  /** Freeze Phase-B spend when agentic investigation ends. Idempotent. */
   private settleAgentRequestPhase(runId: string, reason: string): void {
     const state = this.phaseRequestState.get(runId)
     if (!state || !state.floorSettled || state.agentSettled) return
@@ -2522,24 +2379,17 @@ export class Execution {
     state.agentRequests = Math.max(0, run.spentRequests - state.baselineRequests - state.floorRequests)
     state.agentSettled = true
     if (state.agentRequests >= state.agentBudget) state.agentBudgetExhausted = true
-    try {
-      this.storage.event(
-        runId,
-        'request_budget.phase_ended',
-        `Phase B used ${state.agentRequests}/${state.agentBudget} request(s) (floor ${state.floorRequests}/${state.floorBudget}).`,
-        {
-          phase: 'agent',
-          reason,
-          agentRequests: state.agentRequests,
-          agentRequestBudget: state.agentBudget,
-          floorRequests: state.floorRequests,
-          floorRequestBudget: state.floorBudget,
-          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
-          agentBudgetExhausted: state.agentBudgetExhausted,
-          terminationReason: this.phaseTerminationReason.get(runId) ?? null,
-        },
-      )
-    } catch { /* telemetry is best-effort */ }
+    this.safeEvent(
+      runId, 'request_budget.phase_ended',
+      `Phase B used ${state.agentRequests}/${state.agentBudget} request(s) (floor ${state.floorRequests}/${state.floorBudget}).`,
+      {
+        phase: 'agent', reason, agentRequests: state.agentRequests, agentRequestBudget: state.agentBudget,
+        floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget,
+        totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
+        agentBudgetExhausted: state.agentBudgetExhausted,
+        terminationReason: this.phaseTerminationReason.get(runId) ?? null,
+      },
+    )
   }
 
   /**
@@ -2620,24 +2470,17 @@ export class Execution {
     state.agentExhaustedReported = true
     this.phaseTerminationReason.set(run.id, 'agent_budget_exhausted')
     const snapshot = this.requestBudgetSnapshot(run.id, 0)
-    try {
-      this.storage.event(
-        run.id,
-        'request_budget.agent_exhausted',
-        `Phase B agent request allowance exhausted (${snapshot.agentRequests}/${snapshot.agentRequestBudget}); `
-        + `${readySteps} ready step(s) left undispatched, ${activeAssignments} assignment(s) still in flight.`,
-        {
-          phase: 'agent',
-          reason: 'agent_budget_exhausted',
-          agentRequests: snapshot.agentRequests,
-          agentRequestBudget: snapshot.agentRequestBudget,
-          floorRequests: snapshot.floorRequests,
-          floorRequestBudget: snapshot.floorRequestBudget,
-          readySteps,
-          activeAssignments,
-        },
-      )
-    } catch { /* telemetry is best-effort */ }
+    this.safeEvent(
+      run.id, 'request_budget.agent_exhausted',
+      `Phase B agent request allowance exhausted (${snapshot.agentRequests}/${snapshot.agentRequestBudget}); `
+      + `${readySteps} ready step(s) left undispatched, ${activeAssignments} assignment(s) still in flight.`,
+      {
+        phase: 'agent', reason: 'agent_budget_exhausted',
+        agentRequests: snapshot.agentRequests, agentRequestBudget: snapshot.agentRequestBudget,
+        floorRequests: snapshot.floorRequests, floorRequestBudget: snapshot.floorRequestBudget,
+        readySteps, activeAssignments,
+      },
+    )
   }
 
   /**
@@ -2727,22 +2570,16 @@ export class Execution {
       requestBudgets: budget,
       phaseTimings,
     }
-    try {
-      this.storage.event(
-        runId,
-        'deterministic_lane.metrics',
-        `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${this.detLeadConsumed.size} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
-        detail,
-      )
-    } catch { /* metrics are best-effort */ }
-    try {
-      this.storage.event(
-        runId,
-        'deterministic_floor.summary',
-        `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${this.detLeadConsumed.size} consumed, ${budget.floorRequests} floor request(s)${budget.floorRequestBudget !== null ? `/${budget.floorRequestBudget}` : ''}, ${budget.agentRequests ?? 0} agent request(s)${budget.agentRequestBudget !== null ? `/${budget.agentRequestBudget}` : ''}, Phase A ${Math.round(laneWallMs / 1000)}s${budget.terminationReason ? `, stopped: ${budget.terminationReason}` : ''}.`,
-        detail,
-      )
-    } catch { /* metrics are best-effort */ }
+    this.safeEvent(
+      runId, 'deterministic_lane.metrics',
+      `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${this.detLeadConsumed.size} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
+      detail,
+    )
+    this.safeEvent(
+      runId, 'deterministic_floor.summary',
+      `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${this.detLeadConsumed.size} consumed, ${budget.floorRequests} floor request(s)${budget.floorRequestBudget !== null ? `/${budget.floorRequestBudget}` : ''}, ${budget.agentRequests ?? 0} agent request(s)${budget.agentRequestBudget !== null ? `/${budget.agentRequestBudget}` : ''}, Phase A ${Math.round(laneWallMs / 1000)}s${budget.terminationReason ? `, stopped: ${budget.terminationReason}` : ''}.`,
+      detail,
+    )
   }
 
   /**
@@ -2803,14 +2640,11 @@ export class Execution {
         : {}),
     }
     this.lastAssignmentMetrics.set(runId, metrics)
-    try {
-      this.storage.event(
-        runId,
-        'agentic.assignment_metrics',
-        `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s) / ${metrics.providerStallRetries} bounded retry(ies) / ${metrics.providerStallTimeouts} no-token timeout(s) (${(metrics.providerStallWallSavedMs / 1000).toFixed(1)}s saved), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s) (${(metrics.containerReuseHitRate * 100).toFixed(0)}% hit rate, ${metrics.idleWarmContainers}/${metrics.warmCapacity} idle).`,
-        { ...metrics },
-      )
-    } catch { /* metrics are best-effort */ }
+    this.safeEvent(
+      runId, 'agentic.assignment_metrics',
+      `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s) / ${metrics.providerStallRetries} bounded retry(ies) / ${metrics.providerStallTimeouts} no-token timeout(s) (${(metrics.providerStallWallSavedMs / 1000).toFixed(1)}s saved), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s) (${(metrics.containerReuseHitRate * 100).toFixed(0)}% hit rate, ${metrics.idleWarmContainers}/${metrics.warmCapacity} idle).`,
+      { ...metrics },
+    )
     return metrics
   }
 
@@ -2929,7 +2763,7 @@ export class Execution {
       ? 'run_paused'
       : status === 'stopped' ? 'run_stopped' : funnel.stopReason
     const latestSteps = this.storage.listChainSteps(runId)
-    const knownFacts = new Set(this.pageAll((offset, limit) =>
+    const knownFacts = new Set(this.reconPlanner.pageAll((offset, limit) =>
       this.storage.listFacts(runId, { includeTainted: true, limit, offset })).map(fact => fact.id))
     const remainingReady = dispatchableReadySteps(latestSteps, knownFacts).length
     const dispatched = latestSteps.filter(step => step.assignedWorkerId !== null).length
@@ -2993,7 +2827,7 @@ export class Execution {
     step: Pick<ChainStep, 'title' | 'hypothesis'>,
     parentFacts: readonly Fact[],
   ): CodeDataflowSlice | undefined {
-    const mentioned = new Set(this.stepMentionedRoutes(step).map(route => normalizeEndpointTemplate(route)))
+    const mentioned = new Set(this.reconPlanner.stepMentionedRoutes(step).map(route => normalizeEndpointTemplate(route)))
     const text = `${step.title} ${step.hypothesis}`
     const candidates = [
       ...parentFacts.filter(fact => fact.data?.kind === 'det_lead'),
@@ -3389,7 +3223,7 @@ export class Execution {
     const warmMember = wakeHandle ? this.storage.boardMember(run.id, wakeHandle) : undefined
     const boardHandle = wakeHandle && warmMember && warmMember.state !== 'retired'
       ? wakeHandle
-      : this.allocateBoardHandle(run, resolvedSpecialistId, step)
+      : this.board.allocateBoardHandle(run, resolvedSpecialistId, step)
     const warmSessionId = wakeHandle && warmMember && warmMember.state !== 'retired' ? warmMember.sessionId : undefined
     const baseSpecialistTurns = Math.max(
       25,
@@ -3399,7 +3233,7 @@ export class Execution {
     // Throughput: a standalone step gets a short cap so the slot turns over; only a step that
     // cites upstream evidence keeps the long chain budget.
     const budget = planAssignmentBudget({
-      routes: this.stepMentionedRoutes(step),
+      routes: this.reconPlanner.stepMentionedRoutes(step),
       parentEvidenceIds: step.dependsOnFactIds,
       dependsOnStepIds: step.dependsOnStepIds,
       multiStep: isMultiStepAssignment({
@@ -3518,7 +3352,7 @@ export class Execution {
       })
     }).finally(() => {
       this.active.delete(assignment.id)
-      try { this.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
+      try { this.board.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
       this.schedulePlanner(run.id)
       this.scheduleWake()
     })
@@ -3543,11 +3377,9 @@ export class Execution {
     const priorEpoch = this.warmSecretEpochByRun.get(run.id)
     if (priorEpoch !== undefined && priorEpoch !== secretEpoch) {
       this.warmPoolPolicyRotationsByRun.set(run.id, (this.warmPoolPolicyRotationsByRun.get(run.id) ?? 0) + 1)
-      try {
-        this.storage.event(run.id, 'worker.warm_pool_rotated', 'Credential generation changed; rebuilding idle warm containers.', {
-          assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: secretEpoch,
-        })
-      } catch { /* telemetry only */ }
+      this.safeEvent(run.id, 'worker.warm_pool_rotated', 'Credential generation changed; rebuilding idle warm containers.', {
+        assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: secretEpoch,
+      })
     }
     this.warmSecretEpochByRun.set(run.id, secretEpoch)
     try { this.backend.setWarmPoolPolicy?.(`${run.id}:${secretEpoch}`) } catch { /* pooling is best-effort */ }
@@ -3594,12 +3426,10 @@ export class Execution {
         const previousThresholdMs = stallAbortMs()
         const wallSavedMs = Math.max(0, previousThresholdMs - idleMs)
         this.providerStallWallSavedByRun.set(run.id, (this.providerStallWallSavedByRun.get(run.id) ?? 0) + wallSavedMs)
-        try {
-          this.storage.event(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(idleMs / 1000)}s without a token); aborting to free the slot.`, {
-            assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: idleMs, thresholdMs,
-            previousThresholdMs, wallSavedMs, stallAbortMs: stallAbortMs(), wallClockMs: budget.wallClockMs,
-          })
-        } catch { /* telemetry only */ }
+        this.safeEvent(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(idleMs / 1000)}s without a token); aborting to free the slot.`, {
+          assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: idleMs, thresholdMs,
+          previousThresholdMs, wallSavedMs, stallAbortMs: stallAbortMs(), wallClockMs: budget.wallClockMs,
+        })
         job.controller.abort(new Error('Provider stream stalled (no token).'))
       },
     })
@@ -3621,16 +3451,7 @@ export class Execution {
     }
 
     try {
-      // Stage relevant specs and parent facts inside the air-gapped container
-      const specs = this.storage.listProjectSpecsFull(run.projectId)
-      const stagedSpecs: Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string }> = []
-      for (const [idx, spec] of specs.slice(0, 8).entries()) {
-        const safeName = `specs/spec-${idx + 1}.txt`
-        try {
-          const stagedPath = await session.stage(safeName, spec.content.slice(0, 1_500_000), job.controller.signal)
-          stagedSpecs.push({ name: spec.name, kind: spec.kind, origin: spec.origin, stagedPath })
-        } catch { /* skip oversized */ }
-      }
+      const stagedSpecs = await this.stageProjectSpecs(run.projectId, session, job.controller.signal)
 
       const parentFacts = step.dependsOnFactIds.length
         ? this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
@@ -3825,6 +3646,25 @@ export class Execution {
         return { exchangeId: saved.id, stagedPath, result: res }
       }
 
+      const buildNormalizedBrokerBody = (r: { headers?: Record<string, string>; textBody?: string; jsonBody?: unknown }) => {
+        const headers = { ...(r.headers ?? {}) }
+        let body: string | undefined
+        if (r.textBody !== undefined) body = r.textBody
+        else if (r.jsonBody !== undefined) {
+          body = JSON.stringify(r.jsonBody)
+          if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json'
+        }
+        return { headers, body }
+      }
+      const recordTrackedBatchExchange = (curRun: Run, res: BrokerExchangeResult) =>
+        recordBrokerExchange(this.storage, curRun, job.assignment.id, res, currentSecrets(), {
+          markCoverage: (r, o, m, p) => this.markEndpointCoverage(r, o, m, p, 'http_exchange'),
+          onSaved: (r, e, id) => {
+            trackPersonaResources(r, e, id)
+            this.scanSecondOrderExchange(r, job.assignment.id, e, id)
+          },
+        })
+
       const executeRaceBurstTool = async (args: RequestHttpRaceArgs, signal: AbortSignal) => {
         const curRun = this.check(job)
         if (curRun.capabilityTier < 2) {
@@ -3839,63 +3679,28 @@ export class Execution {
         const racePolicy = this.storage.scopePolicy(curRun)
         const raceEntityTag = racePolicy.mode === 'staging_isolated' ? tenantTagForRun(curRun.id) : null
         const brokerReqs: BrokerHttpRequest[] = args.requests.map(r => {
-          const headers = { ...(r.headers ?? {}) }
-          let body: string | undefined
-          if (r.textBody !== undefined) body = r.textBody
-          else if (r.jsonBody !== undefined) {
-            body = JSON.stringify(r.jsonBody)
-            if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json'
-          }
+          const { headers, body } = buildNormalizedBrokerBody(r)
           return {
-            origin: r.origin,
-            method: r.method,
-            pathAndQuery: r.pathAndQuery,
-            headers,
-            body,
-            persona: r.persona,
-            session: r.session,
-            csrfBind: r.csrfBind,
-            authMutation: r.authMutation,
-            probeClass: r.probeClass,
-            traceId: r.traceId,
-            runId: curRun.id,
-            assignmentId: job.assignment.id,
-            scopeRevision: curRun.scopeRevision,
-            followRedirects: r.followRedirects ?? false,
+            origin: r.origin, method: r.method, pathAndQuery: r.pathAndQuery,
+            headers, body, persona: r.persona, session: r.session,
+            csrfBind: r.csrfBind, authMutation: r.authMutation, probeClass: r.probeClass,
+            traceId: r.traceId, runId: curRun.id, assignmentId: job.assignment.id,
+            scopeRevision: curRun.scopeRevision, followRedirects: r.followRedirects ?? false,
           }
         })
         const stagedReqs = this.stageAgentRaceBurst(curRun.id, grant, racePolicy.mode, raceEntityTag, brokerReqs)
-
-        // One synchronized decision covers every instance of the burst. Identical requests
-        // register one single-use instance each (never one shared grant), so the legitimate
-        // 3x/5x/10x burst no longer loops through fresh approval cards after the first consume.
         const burst = await this.executeApprovedRaceBurst(job, stagedReqs, grant, signal, {
           stepTitle: step.title,
           rationale: args.rationale,
           secrets: currentSecrets(),
           execute: () => this.broker.executeRaceBurst(stagedReqs, grant, signal),
         })
-
-        const summaries = burst.results.map(res => {
-          const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, res, currentSecrets(), {
-            markCoverage: (r, o, m, p) => this.markEndpointCoverage(r, o, m, p, 'http_exchange'),
-            onSaved: (r, e, id) => {
-              trackPersonaResources(r, e, id)
-              this.scanSecondOrderExchange(r, job.assignment.id, e, id)
-            },
-          })
-          return {
-            exchangeId: saved.id,
-            origin: res.origin,
-            method: res.method,
-            pathAndQuery: res.pathAndQuery,
-            personaHandle: res.personaHandle,
-            status: res.status,
-            durationMs: res.durationMs,
-            bodySha256: res.bodySha256,
-            bodyPreview: res.bodyPreview.slice(0, 800),
-          }
-        })
+        const summaries = burst.results.map(res => ({
+          exchangeId: recordTrackedBatchExchange(curRun, res).id,
+          origin: res.origin, method: res.method, pathAndQuery: res.pathAndQuery,
+          personaHandle: res.personaHandle, status: res.status, durationMs: res.durationMs,
+          bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
+        }))
         const stagedPath = await session.stage(`exchanges/race-${randomUUID().slice(0, 8)}.json`,
           JSON.stringify({ summary: burst.summary, results: summaries }, null, 2), signal).catch(() => null)
         boardTools.noteEvidence()
@@ -3903,14 +3708,14 @@ export class Execution {
       }
 
       const boardHandle = this.boardHandleByAssignment.get(job.assignment.id) ??
-        this.boardHandleForAssignmentId(run, job.assignment.id)
+        this.board.boardHandleForAssignmentId(run, job.assignment.id)
       const boardTools = createBoardTools({
         store: this.storage,
         run: run.id,
         handle: boardHandle,
         redact: (text: string) => redact(text, currentSecrets()),
         onWakeup: (target, message) => {
-          try { this.wakeBoardMember(this.storage.run(run.id), target, message) } catch { /* advisory */ }
+          try { this.board.wakeBoardMember(this.storage.run(run.id), target, message) } catch { /* advisory */ }
         },
       })
 
@@ -3937,6 +3742,10 @@ export class Execution {
         const stagedPath = await session.stage(filename.replace('{id}', ev.id.slice(0, 8)), serialized, signal).catch(() => null)
         return { evidenceId: ev.id, stagedPath }
       }
+      const verifyInline = (spec: DeclarativeReplaySpec, findingId?: string, replaySpecId?: string) =>
+        this.executeInlineVerification({
+          job, grant, currentSecrets, reposDir, spec, findingId, replaySpecId, onExchangeObserved: trackPersonaResources,
+        })
       const makeTrackedExchangeRecorder = (curRun: Run) =>
         createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets, {
           onSaved: (r, e, id) => {
@@ -3947,6 +3756,7 @@ export class Execution {
 
       const sharedHandlers = this.buildSharedSessionHandlers(job, session, currentSecrets, {
         offlineScriptLabel: 'Offline {runtime} script',
+        deriveEvidenceTitle: 'Derived evidence',
         onFactRecorded: curRun => {
           boardTools.noteEvidence()
           this.schedulePlanner(curRun.id)
@@ -3981,13 +3791,7 @@ export class Execution {
           const curRun = this.check(job)
           if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Budget exceeded.')
           const brokerReqs = args.requests.map(r => {
-            const headers = { ...(r.headers ?? {}) }
-            let body: string | undefined
-            if (r.textBody !== undefined) body = r.textBody
-            else if (r.jsonBody !== undefined) {
-              body = JSON.stringify(r.jsonBody)
-              if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json'
-            }
+            const { headers, body } = buildNormalizedBrokerBody(r)
             return {
               origin: r.origin, method: r.method, pathAndQuery: r.pathAndQuery,
               headers, body, persona: r.persona, session: r.session,
@@ -3998,28 +3802,17 @@ export class Execution {
               followRedirects: r.followRedirects ?? false,
             }
           })
-          // One synchronized approval covers the whole batch. Identical items share a fingerprint
-          // and register one single-use instance each, so a retry never fails on an already
-          // consumed grant and never spams one card per item.
           const results = await this.executeApprovedBatch(job, brokerReqs, grant, signal, {
             stepTitle: step.title,
             rationale: args.rationale,
             secrets: currentSecrets(),
             execute: () => this.broker.executeBatch(brokerReqs, grant, signal),
           })
-          const summaries = results.map(res => {
-            const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, res, currentSecrets(), {
-              markCoverage: (r, o, m, p) => this.markEndpointCoverage(r, o, m, p, 'http_exchange'),
-              onSaved: (r, e, id) => {
-                trackPersonaResources(r, e, id)
-                this.scanSecondOrderExchange(r, job.assignment.id, e, id)
-              },
-            })
-            return {
-              exchangeId: saved.id, status: res.status, durationMs: res.durationMs,
-              bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
-            }
-          })
+          const summaries = results.map(res => ({
+            exchangeId: recordTrackedBatchExchange(curRun, res).id,
+            status: res.status, durationMs: res.durationMs,
+            bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
+          }))
           const stagedPath = await session.stage(`exchanges/batch-${randomUUID().slice(0, 8)}.json`,
             JSON.stringify(summaries, null, 2), signal).catch(() => null)
           boardTools.noteEvidence()
@@ -4093,13 +3886,12 @@ export class Execution {
             domSnippet: res.domSnippet.slice(0, 6000),
             durationMs: res.durationMs,
           }
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'browser',
-            `Browser visit · ${args.origin}${args.pathAndQuery.slice(0, 60)}`,
-            JSON.stringify(summaryObj, null, 2), undefined, currentSecrets())
-          const stagedPath = await session.stage(`browser-${ev.id.slice(0, 8)}.json`,
-            JSON.stringify(summaryObj, null, 2), signal).catch(() => null)
+          const staged = await stageJsonArtifact(
+            curRun, 'browser', `Browser visit · ${args.origin}${args.pathAndQuery.slice(0, 60)}`,
+            'browser-{id}.json', summaryObj, signal,
+          )
           boardTools.noteEvidence()
-          return { evidenceId: ev.id, stagedPath, ...summaryObj }
+          return { ...staged, ...summaryObj }
         },
 
         browser_session: async ({ steps }, signal) => {
@@ -4261,12 +4053,7 @@ export class Execution {
                 .filter(name => /(?:url|uri|link|redirect|callback|dest|host|path|file|fetch|webhook|next|return)/i.test(name))
                 .slice(0, 16)
 
-          if (args.probeClass === 'ssrf_canary') {
-            const project = this.storage.project(curRun.projectId)
-            if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && isLocalLabEnvEnabled())) {
-              await this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() }).catch(() => undefined)
-            }
-          }
+          if (args.probeClass === 'ssrf_canary') await this.ensureCanaryListenerForRun(curRun, true)
 
           const res = await probeDifferential({
             probeClass: args.probeClass,
@@ -4435,26 +4222,6 @@ export class Execution {
           return { exchangeId: saved.id, ...staged, ...wsRes }
         },
 
-        derive_evidence: async ({ command, outputs, timeoutMs }, signal) => {
-          const curRun = this.check(job)
-          const res = await session.exec(command, outputs ?? ['result.txt'], signal, timeoutMs ?? 60_000)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', 'Derived evidence',
-            JSON.stringify({
-              command: redact(command, secrets),
-              exitStatus: res.exitCode,
-              stdout: redact(res.stdout, secrets),
-              stderr: redact(res.stderr, secrets),
-              outputs: res.outputs,
-            }, null, 2), undefined, secrets)
-          return {
-            evidenceId: ev.id,
-            exitCode: res.exitCode,
-            stdout: res.stdout,
-            stderr: res.stderr,
-            outputs: res.outputs,
-          }
-        },
-
         query_cves: async (args, signal) => {
           const res = await sharedHandlers.query_cves!(args, signal)
           return {
@@ -4465,10 +4232,7 @@ export class Execution {
 
         mint_canary: async ({ purpose }) => {
           const curRun = this.check(job)
-          const project = this.storage.project(curRun.projectId)
-          if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && isLocalLabEnvEnabled())) {
-            await this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() })
-          }
+          await this.ensureCanaryListenerForRun(curRun)
           return this.canaryBroker.mintCanary(curRun.id, purpose, targetOrigins[0], {
             storage: this.storage,
             assignmentId: job.assignment.id,
@@ -4501,10 +4265,7 @@ export class Execution {
         mint_second_order_canary: async (args) => {
           const curRun = this.check(job)
           const cleanOrigin = this.parseOriginForRun(curRun, args.injectedOrigin)
-          const project = this.storage.project(curRun.projectId)
-          if (this.isCanaryListenerConfigured() || (project.environment === 'local-lab' && isLocalLabEnvEnabled())) {
-            await this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() })
-          }
+          await this.ensureCanaryListenerForRun(curRun)
           // Route through the CanaryBroker so the marker is registered for OOB callback
           // correlation and for multi-surface second-order scanning.
           const minted = this.canaryBroker.mintSecondOrderCanary({
@@ -4785,22 +4546,10 @@ export class Execution {
             JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
             undefined, currentSecrets())
           const chainTags = step.skills.filter(skill => skill.startsWith('chain:')).map(skill => skill.slice('chain:'.length))
-          const finding: Finding = {
-            id: findingId,
-            origin: parsed.origin,
-            title: parsed.title,
+          const finding = buildChainFindingBase(parsed, findingId, specRow.id, curRun.scopeRevision, {
             status: 'pending',
-            severity: parsed.severity,
-            reason: parsed.severityRationale,
-            remediation: parsed.remediation,
-            impact: parsed.impact,
-            recheck: parsed.recheckInstructions,
-            category: parsed.category,
-            cwe: parsed.cwe,
             confidence: 'medium',
             verification: `Pending Zero-LLM ${parsed.kind} replay verification (spec ${specRow.id}).${chainTags.length ? ` Chain primitives: ${chainTags.join(', ')}.` : ''}`,
-            findingKind: 'multi_step_chain',
-            replaySpecId: specRow.id,
             fingerprintHash: dedupeDecision.fingerprintHash,
             counterevidence: ext.counterevidence ?? null,
             confidenceRationale: ext.confidenceRationale ?? null,
@@ -4810,8 +4559,7 @@ export class Execution {
             chainFactIds: validFactIds,
             exchangeIds: [...new Set(exchangeIds)],
             evidenceIds: [ev.id],
-            scopeRevision: curRun.scopeRevision,
-          }
+          })
           const savedFinding = this.storage.upsertChainFinding(curRun, asset.id, finding, specRow.id, [...sourceOrigins])
           for (const fid of validFactIds) {
             this.storage.addGraphEdge(curRun.id, { fromKind: 'fact', fromId: fid, toKind: 'finding', toId: savedFinding.id, edgeKind: 'proves' })
@@ -4820,16 +4568,7 @@ export class Execution {
           this.schedulePlanner(curRun.id)
 
           if (verifyNow) {
-            const inline = await this.executeInlineVerification({
-              job,
-              grant,
-              currentSecrets,
-              reposDir,
-              spec: parsed,
-              findingId: savedFinding.id,
-              replaySpecId: specRow.id,
-              onExchangeObserved: trackPersonaResources,
-            })
+            const inline = await verifyInline(parsed, savedFinding.id, specRow.id)
             return {
               findingId: savedFinding.id,
               replaySpecId: inline.replaySpecId,
@@ -4859,9 +4598,7 @@ export class Execution {
         update_proposed_finding: async (args) => {
           const curRun = this.check(job)
           const currentApproved = this.approvedOriginsSet(curRun)
-          const existingRow = this.storage.db.select().from(findings).where(and(
-            eq(findings.runId, curRun.id), eq(findings.id, args.findingId),
-          )).get()
+          const existingRow = findFindingRow(this.storage, curRun.id, args.findingId)
           if (!existingRow) throw new Error(`Finding ${args.findingId} not found in this run.`)
 
           const isAlreadyVerified = existingRow.finding.status === 'confirmed' || existingRow.finding.status === 'static_verified'
@@ -4938,16 +4675,7 @@ export class Execution {
 
           const shouldVerifyNow = Boolean(parsedUpdatedSpec && (args.verifyNow ?? true) && !isAlreadyVerified)
           if (shouldVerifyNow && parsedUpdatedSpec) {
-            const inline = await this.executeInlineVerification({
-              job,
-              grant,
-              currentSecrets,
-              reposDir,
-              spec: parsedUpdatedSpec,
-              findingId: existingRow.id,
-              replaySpecId: createdSpecRowId ?? nextReplaySpecId,
-              onExchangeObserved: trackPersonaResources,
-            })
+            const inline = await verifyInline(parsedUpdatedSpec, existingRow.id, createdSpecRowId ?? nextReplaySpecId)
             return {
               findingId: updated.id,
               replaySpecId: inline.replaySpecId,
@@ -4971,16 +4699,7 @@ export class Execution {
         verify_replay_spec: async (args) => {
           const spec = args.spec ?? args.replaySpec
           if (!spec) throw new Error('verify_replay_spec requires spec or replaySpec.')
-          const inline = await this.executeInlineVerification({
-            job,
-            grant,
-            currentSecrets,
-            reposDir,
-            spec,
-            findingId: args.findingId,
-            replaySpecId: args.replaySpecId,
-            onExchangeObserved: trackPersonaResources,
-          })
+          const inline = await verifyInline(spec, args.findingId, args.replaySpecId)
           return {
             findingId: inline.findingId ?? args.findingId ?? null,
             replaySpecId: inline.replaySpecId,
@@ -4993,7 +4712,7 @@ export class Execution {
         // v7 M5: the Layer-3 script proof path, persisted as a receipt. Registered only when the
         // worker backend can run an air-gapped verification session; a replay-only backend keeps the
         // (unchanged) declarative compilers instead of producing an inert script tool.
-        ...(this.backendSupportsVerifyScript() ? {
+        ...(this.verifier.backendSupportsVerifyScript() ? {
           guardian_verify: async (args: GuardianVerifyArgs) => {
             const curRun = this.check(job)
             const runtime: GuardianVerifyRuntime = args.runtime
@@ -5001,7 +4720,7 @@ export class Execution {
             const script = typeof args.script === 'string' && args.script.trim()
               ? args.script.trim()
               : args.scriptPath
-                ? this.readAgentProofScript(reposDir, args.scriptPath)
+                ? this.verifier.readAgentProofScript(reposDir, args.scriptPath)
                 : ''
             if (!script) {
               throw new Error('guardian_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
@@ -5048,9 +4767,7 @@ export class Execution {
         complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
       }
 
-      const personasPub = [...grant.personas?.values() ?? []].map(p => ({
-        handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
-      }))
+      const personasPub = publicPersonasFromGrant(grant)
 
       // F4/F2: never inject the full cross-persona queue (58 items / 53 KB) into every worker.
       // Only BOLA/IDOR-relevant assignments receive a bounded, relevance-ordered slice; the
@@ -5102,7 +4819,7 @@ export class Execution {
       })
 
       const confirmedRefs = this.alreadyConfirmedRefs(run)
-      const unconfirmedHardSurface = this.unconfirmedHardSurfaceRefs(run, confirmedRefs)
+      const unconfirmedHardSurface = this.reconPlanner.unconfirmedHardSurfaceRefs(run, confirmedRefs)
       const detLeads = this.detLeadSummaries(run)
       const assignmentBrief = this.assignmentBriefForStep({
         run,
@@ -5175,12 +4892,11 @@ export class Execution {
             throw new BudgetExceededError('Run spend or request budget exceeded.')
           }
         },
+        ...llmRunHooks(this.storage, run.id),
         onUsage: usage => {
-          this.storage.recordLlmSpend(run.id, {
-            usd: usage.costUsd,
-            tokens: usage.inputTokens + usage.outputTokens,
-          })
-          this.board.noteTokens(job.assignment.id, boardHandle, usage.inputTokens + usage.outputTokens)
+          const tokens = usage.inputTokens + usage.outputTokens
+          this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens })
+          this.board.noteTokens(job.assignment.id, boardHandle, tokens)
         },
         onTurn: turn => {
           recordTurnLatency()
@@ -5198,17 +4914,11 @@ export class Execution {
             messages: [turn === 1 ? injectBoardTurnInstructions('', delta.text) : delta.text],
           }
         },
-        onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-        onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
         approvedOrigins: [...permittedAtAdmission],
         ...(assignedTargetRoutes.length ? { assignedTargetRoutes } : {}),
         onProofObligation: (info: ProofObligationEvent) => {
           const prev = this.proofObligationByRun.get(run.id) ?? {
-            probedRoutes: 0,
-            coveredRoutes: 0,
-            gapRoutes: 0,
-            demandedRoutes: 0,
-            dischargedByGap: 0,
+            probedRoutes: 0, coveredRoutes: 0, gapRoutes: 0, demandedRoutes: 0, dischargedByGap: 0,
           }
           this.proofObligationByRun.set(run.id, {
             probedRoutes: prev.probedRoutes + info.probedRoutes,
@@ -5217,14 +4927,11 @@ export class Execution {
             demandedRoutes: prev.demandedRoutes + info.demandedRoutes,
             dischargedByGap: prev.dischargedByGap + info.dischargedByGap,
           })
-          try {
-            this.storage.event(
-              run.id,
-              'agent.proof_obligation',
-              `Proof obligation: ${info.coveredRoutes}/${info.probedRoutes} probed route(s) covered, ${info.gapRoutes} gap(s), ${info.demandedRoutes} demanded.`,
-              { assignmentId: job.assignment.id, stepId: step.id, ...info },
-            )
-          } catch { /* telemetry is best-effort */ }
+          this.safeEvent(
+            run.id, 'agent.proof_obligation',
+            `Proof obligation: ${info.coveredRoutes}/${info.probedRoutes} probed route(s) covered, ${info.gapRoutes} gap(s), ${info.demandedRoutes} demanded.`,
+            { assignmentId: job.assignment.id, stepId: step.id, ...info },
+          )
         },
         onGapValidation: (info: GapValidationEvent) => {
           const prev = this.gapValidationByRun.get(run.id) ?? { accepted: 0, rejected: 0, byCode: {} }
@@ -5234,18 +4941,13 @@ export class Execution {
             byCode[code] = { accepted: cur.accepted + counts.accepted, rejected: cur.rejected + counts.rejected }
           }
           this.gapValidationByRun.set(run.id, {
-            accepted: prev.accepted + info.accepted,
-            rejected: prev.rejected + info.rejected,
-            byCode,
+            accepted: prev.accepted + info.accepted, rejected: prev.rejected + info.rejected, byCode,
           })
-          try {
-            this.storage.event(
-              run.id,
-              'agent.gap_validation',
-              `Gap validation: ${info.accepted} accepted, ${info.rejected} rejected.`,
-              { assignmentId: job.assignment.id, stepId: step.id, ...info },
-            )
-          } catch { /* telemetry is best-effort */ }
+          this.safeEvent(
+            run.id, 'agent.gap_validation',
+            `Gap validation: ${info.accepted} accepted, ${info.rejected} rejected.`,
+            { assignmentId: job.assignment.id, stepId: step.id, ...info },
+          )
         },
         onEarlyExit: info => {
           this.earlyExitTurnsSavedByRun.set(run.id,
@@ -5294,13 +4996,13 @@ export class Execution {
     // were finishing, before this drain started. Callbacks that arrive during the bounded wait are
     // converted by the proxy as the shared drain promotes them (a promotion is claim-once, so a
     // post-drain call would never see them again).
-    let promotedReceipts = this.promoteReceiptOob(runId)
+    let promotedReceipts = this.verifier.promoteReceiptOob(runId)
     const convertingRelay = new Proxy(this.canaryBroker, {
       get: (target, prop, receiver) => {
         if (prop === 'promoteLate') {
           return (opts: { runId?: string; now?: number } = {}) => {
             const promotions = target.promoteLate(opts)
-            try { promotedReceipts += this.convertOobPromotions(runId, promotions) } catch { /* best-effort */ }
+            try { promotedReceipts += this.verifier.convertOobPromotions(runId, promotions) } catch { /* best-effort */ }
             return promotions
           }
         }
@@ -5310,14 +5012,11 @@ export class Execution {
     })
     const result = await drainPendingOob(convertingRelay, runId, options)
     this.lastOobDrain.set(runId, result)
-    try {
-      this.storage.event(
-        runId,
-        'oob.drain_complete',
-        `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${promotedReceipts} confirmed by ProofReceipt, ${result.remaining} still pending).`,
-        { ...result, promotedReceipts },
-      )
-    } catch { /* store closed */ }
+    this.safeEvent(
+      runId, 'oob.drain_complete',
+      `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${promotedReceipts} confirmed by ProofReceipt, ${result.remaining} still pending).`,
+      { ...result, promotedReceipts },
+    )
     return result
   }
 
@@ -5450,29 +5149,30 @@ export class Execution {
     }
   }
 
-  private startVerificationWorker(run: Run, worker: Assignment) {
+  private claimAndDispatchWorker(
+    run: Run,
+    worker: Assignment,
+    eventPrefix: 'worker' | 'retest',
+    failureLabel: string,
+    work: (job: Active) => Promise<void>,
+    skipIfUnauthorized: boolean,
+  ): void {
     const claimed = this.storage.transaction(() => {
       const w = this.storage.updateWorker(worker.id, {
         status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + 10 * 60_000, outcome: null,
       })
-      this.storage.event(run.id, 'worker.started', worker.title + ' started.', { assignmentId: worker.id })
+      this.storage.event(run.id, `${eventPrefix}.started`, worker.title + ' started.', { assignmentId: worker.id })
       return w
     })
     if (!claimed) return
-
     const job: Active = { assignment: claimed, origins: new Set(claimed.sourceOrigins), controller: new AbortController() }
     this.active.set(claimed.id, job)
-
-    const work = claimed.stepId
-      ? this.verifyReplaySpecJob(job, claimed.stepId)
-      : this.verifyBaselineJob(job)
-
-    void work.catch(error => {
-      if (!this.authorize(job) || job.controller.signal.aborted) return
+    void work(job).catch(error => {
+      if (skipIfUnauthorized && (!this.authorize(job) || job.controller.signal.aborted)) return
       const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
       this.storage.transaction(() => {
         this.storage.updateWorker(claimed.id, { status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null })
-        this.storage.event(run.id, 'worker.failed', `Verification failed: ${msg}`, { assignmentId: claimed.id })
+        this.storage.event(run.id, `${eventPrefix}.failed`, `${failureLabel}: ${msg}`, { assignmentId: claimed.id })
       })
     }).finally(() => {
       this.active.delete(claimed.id)
@@ -5480,29 +5180,16 @@ export class Execution {
     })
   }
 
-  // --- One-Click Verify Fix Retest ---
+  private startVerificationWorker(run: Run, worker: Assignment) {
+    this.claimAndDispatchWorker(
+      run, worker, 'worker', 'Verification failed',
+      job => (job.assignment.stepId ? this.verifyReplaySpecJob(job, job.assignment.stepId) : this.verifier.verifyBaselineJob(job)),
+      true,
+    )
+  }
 
   private startRetestWorker(run: Run, worker: Assignment) {
-    const claimed = this.storage.transaction(() => {
-      const w = this.storage.updateWorker(worker.id, {
-        status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + 10 * 60_000, outcome: null,
-      })
-      this.storage.event(run.id, 'retest.started', worker.title + ' started.', { assignmentId: worker.id })
-      return w
-    })
-    if (!claimed) return
-
-    const job: Active = { assignment: claimed, origins: new Set(claimed.sourceOrigins), controller: new AbortController() }
-    this.active.set(claimed.id, job)
-
-    void this.runRetestJob(job).catch(error => {
-      const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
-      this.storage.updateWorker(claimed.id, { status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null })
-      this.storage.event(run.id, 'retest.failed', `Verify Fix retest failed: ${msg}`, { assignmentId: claimed.id })
-    }).finally(() => {
-      this.active.delete(claimed.id)
-      this.scheduleWake()
-    })
+    this.claimAndDispatchWorker(run, worker, 'retest', 'Verify Fix retest failed', job => this.verifier.runRetestJob(job), false)
   }
 
   // --- On-Demand / Opt-In Air-Gapped Verified Patch Workflow (§4.6) ---
@@ -5514,9 +5201,7 @@ export class Execution {
     signal?: AbortSignal,
   ): Promise<PatchProposal> {
     const run = this.storage.run(runId)
-    const findingRow = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id), eq(findings.id, findingId),
-    )).get()
+    const findingRow = findFindingRow(this.storage, run.id, findingId)
     if (!findingRow) throw new Error('Finding not found.')
 
     const hydratedFinding: Finding = {

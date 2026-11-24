@@ -1,13 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Candidate, Finding } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplaySpec } from '../replay-spec.ts'
-import {
-  BrokerDenied,
-  type BrokerExchangeResult,
-  type Grant,
-  type RequestBroker,
-} from './broker.ts'
-import type { CanaryBroker } from './canary-broker.ts'
+import { BrokerDenied, type BrokerExchangeResult, type Grant } from './broker.ts'
 import { checkStructuralDuplicate, extractSpecDedupeFields } from './dedupe.ts'
 import {
   runDeterministicEngine,
@@ -28,10 +22,13 @@ import {
   tenantLabelsFromRoleLabels,
 } from './exec-dispatch.ts'
 import {
+  ExecServiceModule,
+  buildChainFindingBase,
   buildExistingFindingRefs,
   createExchangeRecorder,
   recordReportedFindingCoverage,
   type ExecActiveJob,
+  type ExecCoreServices,
 } from './exec-exchange.ts'
 import { graphLeadTargets } from './graph-leads.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
@@ -40,19 +37,12 @@ import type { ProbePlanRegistry } from './probe-plan.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { tenantTagForRun } from './scope-policy.ts'
-import type { ScopedBrowser } from './scoped-browser.ts'
 import type { Assignment, ReplaySpecRow, Run, Store } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
-import type { WorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
 
-export interface ExecFloorLaneHost {
-  storage: Store
-  broker: RequestBroker
-  browser: ScopedBrowser
-  canaryBroker: CanaryBroker
-  backend: WorkerBackend
+export interface ExecFloorLaneHost extends ExecCoreServices {
   probePlans: ProbePlanRegistry
   stagingTaggedMutations: Map<string, number>
   stagingUntaggedSkipped: Map<string, number>
@@ -225,14 +215,7 @@ function parseTolerantOpenApiTargets(
   }
 }
 
-export class ExecFloorLane {
-  private readonly host: ExecFloorLaneHost
-  constructor(host: ExecFloorLaneHost) { this.host = host }
-  private get storage(): Store { return this.host.storage }
-  private get broker(): RequestBroker { return this.host.broker }
-  private get browser(): ScopedBrowser { return this.host.browser }
-  private get canaryBroker(): CanaryBroker { return this.host.canaryBroker }
-  private get backend(): WorkerBackend { return this.host.backend }
+export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
 
 
   private createFloorExchangeRecorder(currentId: string, claimedId: string, currentSecrets: () => NamedSecret[]) {
@@ -502,6 +485,42 @@ export class ExecFloorLane {
   }
 
 
+  private claimFloorWorker(
+    current: Run,
+    asset: Candidate,
+    title: string,
+    objective: string,
+    leaseMs: number,
+    extra: { sourceOrigins: string[]; parentFactIds?: string[] },
+  ): Assignment {
+    const worker = this.storage.makeWorker(current, 'investigation', asset, title, objective, extra)
+    return this.storage.updateWorker(worker.id, {
+      status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + leaseMs,
+    }) ?? worker
+  }
+
+  private emitProbeSelectionTelemetry(
+    runId: string,
+    kind: string,
+    selection: ReturnType<typeof selectProbeCandidates>,
+    suffix = '',
+  ): void {
+    try {
+      this.storage.event(
+        runId,
+        kind,
+        `Probe selection ranked ${selection.considered} candidate route(s) from ${selection.storedRows} stored row(s); probing ${selection.selected} (cap ${selection.cap}${suffix}).`,
+        probeSelectionMetrics(selection),
+      )
+    } catch { /* metrics only */ }
+  }
+
+  private completeFloorWorker(assignmentId: string, outcome: string): void {
+    try {
+      this.storage.updateWorker(assignmentId, { status: 'complete', outcome, lease: null, leaseExpiresAt: null })
+    } catch { /* run may have been deleted */ }
+  }
+
   /**
    * Bounded, tier/scope/budget-aware deterministic hypotheses for discovered endpoints. Used only
    * when the run has no model profile: it probes the highest-value discovered routes, records
@@ -514,8 +533,6 @@ export class ExecFloorLane {
     const approvedOrigins = this.host.approvedOriginsSet(current)
     if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
 
-    // Graphwire: full lossless store in, bounded ranked probe subset out. DELETE stays excluded
-    // from this legacy M1 fallback pass (its own tier gate lives in the engine lane).
     const probeSelection = selectProbeCandidates({
       endpoints: listEndpointsPaged(this.storage, current.id, { orderBy: 'risk' }),
       probePlan: this.host.probePlans.get(this.storage, current.id),
@@ -524,18 +541,9 @@ export class ExecFloorLane {
       excludeMethods: ['DELETE'],
     })
     const endpoints = probeSelection.targets
-    try {
-      this.storage.event(
-        current.id,
-        'deterministic_probe.selection',
-        `Probe selection ranked ${probeSelection.considered} candidate route(s) from ${probeSelection.storedRows} stored row(s); probing ${probeSelection.selected} (cap ${probeSelection.cap}).`,
-        probeSelectionMetrics(probeSelection),
-      )
-    } catch { /* metrics only */ }
+    this.emitProbeSelectionTelemetry(current.id, 'deterministic_probe.selection', probeSelection)
 
     const paramsByEndpoint = indexEndpointParams(this.storage, current.id)
-
-
     const personas = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
     const personaHandles = personas.map(p => p.handle)
     const tier = current.capabilityTier
@@ -552,29 +560,16 @@ export class ExecFloorLane {
     const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
     if (!asset) return
 
-    const worker = this.storage.makeWorker(
-      current,
-      'investigation',
-      asset,
-      'Deterministic differential probes',
+    const claimed = this.claimFloorWorker(
+      current, asset, 'Deterministic differential probes',
       'No model profile configured: bounded deterministic probe pass over discovered endpoints.',
-      { sourceOrigins: [...approvedOrigins] },
+      10 * 60_000, { sourceOrigins: [...approvedOrigins] },
     )
-    const claimed = this.storage.updateWorker(worker.id, {
-      status: 'running',
-      lease: randomUUID(),
-      leaseExpiresAt: Date.now() + 10 * 60_000,
-    }) ?? worker
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
     const { grant, currentSecrets } = this.host.buildGrant(job, current, approvedOrigins)
-
     const recordExchange = this.createFloorExchangeRecorder(current.id, claimed.id, currentSecrets)
-
     const signal = job.controller.signal
 
-    // Route-map/OpenAPI-derived entry routes: grey-box/white-box runs import API references, and
-    // phase-0 may not have materialized every path yet on this branch. Parsing them here keeps the
-    // deterministic baseline meaningful without depending on an LLM planner.
     const derivedTargets = [
       ...this.deriveDeterministicRouteTargets(current, approvedOrigins, endpoints),
       ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
@@ -583,36 +578,18 @@ export class ExecFloorLane {
     )
     const syntheticEndpoints = derivedTargets.map(target => ({
       id: `derived:${target.method}:${target.pathTemplate}`,
-      runId: current.id,
-      scopeRevision: current.scopeRevision,
-      origin: target.origin,
-      method: target.method,
-      pathTemplate: target.pathTemplate,
-      source: 'openapi' as const,
-      framework: null,
-      authRequirement: null,
-      ownershipGuard: null,
-      sinkKinds: [] as string[],
-      testedClasses: [] as string[],
-      coveragePct: 0,
-      riskScore: target.riskScore,
-      codeLocation: null,
-      createdAt: current.createdAt,
-      updatedAt: current.createdAt,
+      runId: current.id, scopeRevision: current.scopeRevision, origin: target.origin,
+      method: target.method, pathTemplate: target.pathTemplate, source: 'openapi' as const,
+      framework: null, authRequirement: null, ownershipGuard: null,
+      sinkKinds: [] as string[], testedClasses: [] as string[], coveragePct: 0,
+      riskScore: target.riskScore, codeLocation: null, createdAt: current.createdAt, updatedAt: current.createdAt,
     }))
     for (const [idx, target] of derivedTargets.entries()) {
       const endpointId = syntheticEndpoints[idx].id
       paramsByEndpoint.set(endpointId, target.params.map((param, paramIdx) => ({
-        id: `${endpointId}:p${paramIdx}`,
-        runId: current.id,
-        endpointId,
-        name: param.name,
-        location: param.location,
-        inferredType: null,
-        isCsrf: false,
-        isObjectId: /^(?:id|uuid|[a-z][a-z0-9]*Id)$/i.test(param.name),
-        source: 'openapi',
-        createdAt: current.createdAt,
+        id: `${endpointId}:p${paramIdx}`, runId: current.id, endpointId, name: param.name,
+        location: param.location, inferredType: null, isCsrf: false,
+        isObjectId: /^(?:id|uuid|[a-z][a-z0-9]*Id)$/i.test(param.name), source: 'openapi', createdAt: current.createdAt,
       })) as unknown as ReturnType<Store['listEndpointParams']>)
     }
     const probeEndpoints = [...endpoints, ...syntheticEndpoints]
@@ -621,66 +598,55 @@ export class ExecFloorLane {
     const injectableLocations = new Set(['query', 'json', 'form'])
     const ranked = probeEndpoints
       .map(ep => {
-        const epParams = paramsByEndpoint.get(ep.id) ?? []
-        const injectable = epParams
+        const injectable = (paramsByEndpoint.get(ep.id) ?? [])
           .filter(p => injectableLocations.has(p.location))
           .sort((a, b) => Number(DETERMINISTIC_PARAM_HINT_RE.test(b.name)) - Number(DETERMINISTIC_PARAM_HINT_RE.test(a.name)))
           .slice(0, 2)
-        const queryNames = deterministicQueryParamNames(ep.pathTemplate)
         const paramCandidates = injectable.length
           ? injectable.map(p => ({ name: p.name, location: p.location as 'query' | 'json' | 'form' }))
-          : queryNames.slice(0, 2).map(name => ({ name, location: 'query' as const }))
+          : deterministicQueryParamNames(ep.pathTemplate).slice(0, 2).map(name => ({ name, location: 'query' as const }))
         const idPath = deterministicIdPath(ep.pathTemplate)
         const originResources = resourceQueue.filter(item => item.origin === ep.origin)
         let score = ep.riskScore
-        if (paramCandidates.length) score += 25
-        if (idPath) score += 12
-        if ((ep.sinkKinds ?? []).length > 0) score += 10
-        if (originResources.length > 0) score += 15
-        // Generic hints that a route consumes query input even when recon did not persist params.
-        if (/\b(?:search|query|filter|export|report|list|lookup|find|browse)\b/i.test(ep.pathTemplate)) score += 20
-        if (/^\/api\/[a-z][a-z0-9_-]{1,40}$/i.test(ep.pathTemplate.replace(/\?.*$/, ''))) score += 8
-        // Prefer routes with injectable parameters before path-only id routes.
-        if (!paramCandidates.length && !idPath) score -= 20
+          + (paramCandidates.length ? 25 : 0) + (idPath ? 12 : 0)
+          + ((ep.sinkKinds ?? []).length > 0 ? 10 : 0) + (originResources.length > 0 ? 15 : 0)
+          + (/\b(?:search|query|filter|export|report|list|lookup|find|browse)\b/i.test(ep.pathTemplate) ? 20 : 0)
+          + (/^\/api\/[a-z][a-z0-9_-]{1,40}$/i.test(ep.pathTemplate.replace(/\?.*$/, '')) ? 8 : 0)
+          + (!paramCandidates.length && !idPath ? -20 : 0)
         return { ep, paramCandidates, idPath, originResources, score }
       })
-      .filter(item => {
-        // Nothing testable: path placeholders without harvested ids and no injectable parameter.
-        const placeholderOnly = /:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]+\]/.test(item.ep.pathTemplate)
-        if (item.paramCandidates.length) return true
-        if (item.idPath !== null && item.originResources.length > 0) return true
-        return !placeholderOnly
-      })
+      .filter(item =>
+        item.paramCandidates.length > 0 || (item.idPath !== null && item.originResources.length > 0) ||
+        !/:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]+\]/.test(item.ep.pathTemplate))
       .sort((a, b) => b.score - a.score)
 
     if (!ranked.length) return
 
     const maxEndpoints = Math.min(22, Math.max(4, Math.floor((current.dynamicStepBudget ?? 24) * 0.9)))
-    const requestCap = current.budgetRequests > 0
-      ? Math.max(0, Math.min(200, current.budgetRequests - current.spentRequests))
-      : 200
+    const requestCap = current.budgetRequests > 0 ? Math.max(0, Math.min(200, current.budgetRequests - current.spentRequests)) : 200
     if (requestCap < 6) return
 
     let requestsUsed = 0
     let findingsCreated = 0
+    const runDiff = async (params: Parameters<typeof probeDifferential>[0]) => {
+      try {
+        return { outcome: await probeDifferential(params, this.broker, grant, this.canaryBroker, signal), abort: false }
+      } catch (error) {
+        return { outcome: undefined, abort: error instanceof BudgetExceededError || error instanceof BrokerDenied }
+      }
+    }
     try {
       for (const item of ranked.slice(0, maxEndpoints)) {
         if (requestsUsed >= requestCap || signal.aborted) break
         const latest = this.storage.run(current.id)
-        if (latest.status !== 'running' || latest.phase !== 'investigation') break
-        if (this.storage.checkBudgetExceeded(current.id)) break
+        if (latest.status !== 'running' || latest.phase !== 'investigation' || this.storage.checkBudgetExceeded(current.id)) break
         if (!approvedOrigins.has(item.ep.origin)) continue
 
         const perEndpointCap = Math.max(4, Math.min(16, requestCap - requestsUsed))
         if (perEndpointCap < 4) break
-
         const base = {
-          origin: item.ep.origin,
-          runId: current.id,
-          assignmentId: claimed.id,
-          storage: this.storage,
-          maxRequests: perEndpointCap,
-          onExchange: recordExchange,
+          origin: item.ep.origin, runId: current.id, assignmentId: claimed.id,
+          storage: this.storage, maxRequests: perEndpointCap, onExchange: recordExchange,
         }
 
         // 1) Cross-persona object authz (ID-bearing routes with harvested owner resources).
@@ -689,69 +655,45 @@ export class ExecFloorLane {
           const owner = resource.ownerPersona
           const other = personaHandles.find(handle => handle !== owner)
           if (other) {
-            let outcome
-            try {
-              outcome = await probeDifferential({
-                ...base,
-                probeClass: 'authz_matrix',
-                method: 'GET',
-                pathAndQuery: item.idPath,
-                persona: owner,
-                ownerPersona: owner,
-                otherPersona: other,
-                resourceIds: item.originResources.slice(0, 3).map(r => r.resourceId),
-                includeAnonymous: false,
-                includeHeaderBypass: false,
-              }, this.broker, grant, this.canaryBroker, signal)
-            } catch (error) {
-              if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
-              outcome = undefined
-            }
+            const { outcome, abort } = await runDiff({
+              ...base, probeClass: 'authz_matrix', method: 'GET', pathAndQuery: item.idPath,
+              persona: owner, ownerPersona: owner, otherPersona: other,
+              resourceIds: item.originResources.slice(0, 3).map(r => r.resourceId),
+              includeAnonymous: false, includeHeaderBypass: false,
+            })
+            if (abort) break
             if (outcome) {
               requestsUsed += outcome.requestsSent
               this.host.markEndpointCoverage(latest, item.ep.origin, 'GET', item.idPath, 'diff:authz_matrix')
               const unauthorized = outcome.anomalies.find(a => a.type === 'unauthorized_access')
               if (outcome.verdict === 'signal' && unauthorized) {
                 const resourceId = typeof unauthorized.resourceId === 'string' ? unauthorized.resourceId : resource.resourceId
-                const probePath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId))
-                const controlPath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId))
-                const findingId = this.recordDeterministicFinding({
-                  run: latest,
-                  assignment: claimed,
-                  asset,
+                const objPath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId))
+                if (this.recordDeterministicFinding({
+                  run: latest, assignment: claimed, asset,
                   spec: {
                     ...baseReplaySpecFields(item.ep.origin, {
                       title: `Cross-persona object access · ${item.ep.method} ${item.ep.pathTemplate.slice(0, 80)}`,
-                      category: 'broken-access-control',
-                      cwe: 'CWE-639',
-                      severity: 'high',
+                      category: 'broken-access-control', cwe: 'CWE-639', severity: 'high',
                       severityRationale: `Persona ${owner} owns ${resourceId}; persona ${other} received HTTP ${String(unauthorized.status)} on the same object.`,
-                      impact: 'Horizontal privilege escalation: one tenant can read another tenant\'s object by ID.',
+                      impact: "Horizontal privilege escalation: one tenant can read another tenant's object by ID.",
                       remediation: 'Enforce an ownership/tenant predicate on the object lookup before returning or mutating it.',
                       recheckInstructions: 'Replay the owner control and the cross-persona probe after the fix.',
                     }),
-                    kind: 'http_chain',
-                    spaCatchallControl: false,
+                    kind: 'http_chain', spaCatchallControl: false,
                     assertionsJq: '{ controlPassed: (.steps.ctrl.status == 200), confirmed: (.steps.prb.status == 200), observed: ("probe status " + (.steps.prb.status | tostring)), expected: "cross-persona probe denied" }',
                     steps: [
-                      { id: 'ctrl', role: 'control', description: `Owner ${owner} reads its own object`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: controlPath, persona: owner, followRedirects: false } },
-                      { id: 'prb', role: 'probe', description: `Persona ${other} replays the owner object id`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: probePath, persona: other, followRedirects: false } },
+                      { id: 'ctrl', role: 'control', description: `Owner ${owner} reads its own object`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: objPath, persona: owner, followRedirects: false } },
+                      { id: 'prb', role: 'probe', description: `Persona ${other} replays the owner object id`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: objPath, persona: other, followRedirects: false } },
                     ],
                   },
                   factData: {
-                    subkind: 'differential_anomaly',
-                    probeClass: 'authz_matrix',
-                    endpoint: item.ep.pathTemplate,
-                    resourceId,
-                    ownerPersona: owner,
-                    otherPersona: other,
-                    anomalies: [unauthorized],
+                    subkind: 'differential_anomaly', probeClass: 'authz_matrix', endpoint: item.ep.pathTemplate,
+                    resourceId, ownerPersona: owner, otherPersona: other, anomalies: [unauthorized],
                   },
                   factSummary: `Deterministic authz_matrix signal: ${other} reached ${owner}'s resource ${resourceId} at ${item.ep.method} ${item.ep.pathTemplate} (HTTP ${String(unauthorized.status)}).`,
-                  exchangeIds: outcome.exchangeIds,
-                  secrets: currentSecrets(),
-                })
-                if (findingId) findingsCreated += 1
+                  exchangeIds: outcome.exchangeIds, secrets: currentSecrets(),
+                })) findingsCreated += 1
               }
             }
             continue
@@ -759,36 +701,23 @@ export class ExecFloorLane {
         }
 
         // 2) SQL injection differential on parameterized routes (non-destructive boolean/error only).
-        // When recon did not persist parameters, discover them first with the deterministic
-        // param-differential surface mode (bounded), then inject into the discovered names.
         let candidateParams: Array<{ name: string; location: 'query' | 'json' | 'form' }> = item.paramCandidates
         if (!candidateParams.length && item.ep.method !== 'DELETE' && requestsUsed < requestCap - 6) {
           try {
             const discovery = await probeSurface({
-              origin: item.ep.origin,
-              mode: 'params',
-              basePath: item.ep.pathTemplate.split('?')[0],
-              paramLocation: 'query',
-              methods: ['GET'],
-              persona: personaHandles[0],
-              maxRequests: Math.max(4, Math.min(12, requestCap - requestsUsed - 4)),
-              onExchange: recordExchange,
+              origin: item.ep.origin, mode: 'params', basePath: item.ep.pathTemplate.split('?')[0],
+              paramLocation: 'query', methods: ['GET'], persona: personaHandles[0],
+              maxRequests: Math.max(4, Math.min(12, requestCap - requestsUsed - 4)), onExchange: recordExchange,
             }, this.broker, grant, signal)
             requestsUsed += discovery.requestsSent
             this.host.markEndpointCoverage(latest, item.ep.origin, 'GET', item.ep.pathTemplate, 'surface:params')
-            const discovered = [...new Set(
-              discovery.anomalies
-                .filter(a => a.kind === 'param' && typeof a.param === 'string')
-                .map(a => String(a.param)),
-            )].slice(0, 2)
-            candidateParams = discovered.map(name => ({ name, location: 'query' as const }))
+            candidateParams = [...new Set(
+              discovery.anomalies.filter(a => a.kind === 'param' && typeof a.param === 'string').map(a => String(a.param)),
+            )].slice(0, 2).map(name => ({ name, location: 'query' as const }))
           } catch (error) {
             if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
           }
         }
-
-        // Search-like routes commonly take a free-text term even when recon/OpenAPI did not record
-        // the parameter name; try the conventional term once (bounded, non-destructive).
         if (!candidateParams.length && /(?:search|query|filter|find|lookup|browse)/i.test(item.ep.pathTemplate)) {
           candidateParams = [{ name: 'q', location: 'query' }]
         }
@@ -798,31 +727,19 @@ export class ExecFloorLane {
           const location = candidate.location
           const method = item.ep.method === 'POST' ? 'POST' : 'GET'
           if (method === 'POST' && !['query', 'json', 'form'].includes(location)) continue
-          const baselineValue = DETERMINISTIC_NUMERIC_PARAM_RE.test(candidate.name) ? '1' : 'guardian'
-          const quoteStyle: 'single' | 'double' | 'numeric' = DETERMINISTIC_NUMERIC_PARAM_RE.test(candidate.name) ? 'numeric' : 'single'
+          const isNumeric = DETERMINISTIC_NUMERIC_PARAM_RE.test(candidate.name)
+          const baselineValue = isNumeric ? '1' : 'guardian'
+          const quoteStyle: 'single' | 'double' | 'numeric' = isNumeric ? 'numeric' : 'single'
           const pathAndQuery = location === 'query'
             ? withQueryParam(item.ep.pathTemplate, candidate.name, baselineValue)
             : item.ep.pathTemplate.split('?')[0]
-          const jsonBody = method === 'POST' && location === 'json'
-            ? { [candidate.name]: baselineValue }
-            : undefined
-          let outcome
-          try {
-            outcome = await probeDifferential({
-              ...base,
-              probeClass: 'sqli_boolean',
-              method,
-              pathAndQuery,
-              param: candidate.name,
-              paramLocation: location,
-              baselineValue,
-              ...(jsonBody ? { jsonBody } : {}),
-              ...(personaHandles[0] ? { persona: personaHandles[0] } : {}),
-            }, this.broker, grant, this.canaryBroker, signal)
-          } catch (error) {
-            if (error instanceof BudgetExceededError || error instanceof BrokerDenied) break
-            outcome = undefined
-          }
+          const jsonBody = method === 'POST' && location === 'json' ? { [candidate.name]: baselineValue } : undefined
+          const { outcome, abort } = await runDiff({
+            ...base, probeClass: 'sqli_boolean', method, pathAndQuery,
+            param: candidate.name, paramLocation: location, baselineValue,
+            ...(jsonBody ? { jsonBody } : {}), ...(personaHandles[0] ? { persona: personaHandles[0] } : {}),
+          })
+          if (abort) break
           if (!outcome) continue
           requestsUsed += outcome.requestsSent
           this.host.markEndpointCoverage(latest, item.ep.origin, method, pathAndQuery, 'diff:sqli_boolean')
@@ -830,71 +747,43 @@ export class ExecFloorLane {
           const dbError = outcome.anomalies.find(a => a.type === 'db_error_fingerprint')
           if (outcome.verdict !== 'signal' || (!booleanSignal && !dbError)) continue
           const dialect = typeof dbError?.dialect === 'string' ? dbError.dialect : null
-          const findingId = this.recordDeterministicFinding({
-            run: latest,
-            assignment: claimed,
-            asset,
+          if (this.recordDeterministicFinding({
+            run: latest, assignment: claimed, asset,
             spec: {
               ...baseReplaySpecFields(item.ep.origin, {
                 title: `SQL parameterization differential · ${method} ${item.ep.pathTemplate.slice(0, 80)} (${candidate.name})`,
-                category: 'injection-input',
-                cwe: 'CWE-89',
-                severity: 'high',
+                category: 'injection-input', cwe: 'CWE-89', severity: 'high',
                 severityRationale: `Deterministic ${booleanSignal ? 'boolean differential' : 'SQL error fingerprint'} observed on parameter "${candidate.name}"${dialect ? ` (${dialect})` : ''}.`,
                 impact: 'Unparameterized SQL handling allows boolean/oracle-based data inference.',
                 remediation: 'Bind the parameter with the ORM/query parameterizer and remove string interpolation.',
                 recheckInstructions: 'Replay the boolean differential after switching to a bound parameter.',
               }),
-              kind: 'sql_boolean_diff',
-              targetOrigin: item.ep.origin,
-              method,
-              pathAndQuery,
-              paramName: candidate.name,
-              paramLocation: location,
-              baselineValue,
-              quoteStyle,
+              kind: 'sql_boolean_diff', targetOrigin: item.ep.origin, method, pathAndQuery,
+              paramName: candidate.name, paramLocation: location, baselineValue, quoteStyle,
               ...(jsonBody ? { jsonBody } : {}),
               assertionsJq: '{ controlPassed: true, confirmed: true, observed: "deterministic boolean differential", expected: "parameterized query" }',
             },
             factData: {
-              subkind: 'differential_anomaly',
-              probeClass: 'sqli_boolean',
-              endpoint: item.ep.pathTemplate,
-              param: candidate.name,
-              paramLocation: location,
-              method,
-              dialect,
-              anomalies: outcome.anomalies.slice(0, 5),
+              subkind: 'differential_anomaly', probeClass: 'sqli_boolean', endpoint: item.ep.pathTemplate,
+              param: candidate.name, paramLocation: location, method, dialect, anomalies: outcome.anomalies.slice(0, 5),
             },
             factSummary: `Deterministic sqli_boolean signal on ${method} ${item.ep.pathTemplate} parameter "${candidate.name}"${dialect ? ` (${dialect} error fingerprint)` : ''}.`,
-            exchangeIds: outcome.exchangeIds,
-            secrets: currentSecrets(),
-          })
-          if (findingId) findingsCreated += 1
+            exchangeIds: outcome.exchangeIds, secrets: currentSecrets(),
+          })) findingsCreated += 1
         }
       }
 
       this.storage.event(
-        current.id,
-        'deterministic_probes.summary',
+        current.id, 'deterministic_probes.summary',
         `Deterministic probe pass used ${requestsUsed} request(s) across ${Math.min(ranked.length, maxEndpoints)} endpoint(s) and proposed ${findingsCreated} replay spec(s).`,
         { requestsUsed, endpointsConsidered: ranked.length, endpointsProbed: Math.min(ranked.length, maxEndpoints), findingsCreated, requestCap },
       )
       this.storage.message(
-        current.id,
-        current.coordinatorId,
-        'guardian',
+        current.id, current.coordinatorId, 'guardian',
         `No model profile is configured, so Guardian ran a bounded deterministic probe pass (${requestsUsed} requests) and proposed ${findingsCreated} deterministic replay spec(s) for Zero-LLM verification.`,
       )
     } finally {
-      try {
-        this.storage.updateWorker(claimed.id, {
-          status: 'complete',
-          outcome: `Deterministic probes: ${requestsUsed} request(s), ${findingsCreated} spec(s).`,
-          lease: null,
-          leaseExpiresAt: null,
-        })
-      } catch { /* run may have been deleted */ }
+      this.completeFloorWorker(claimed.id, `Deterministic probes: ${requestsUsed} request(s), ${findingsCreated} spec(s).`)
     }
   }
 
@@ -931,61 +820,34 @@ export class ExecFloorLane {
       approvedOrigins,
     })
     const storedEndpoints = probeSelection.targets
-    try {
-      this.storage.event(
-        current.id,
-        'deterministic_engine.probe_selection',
-        `Probe selection ranked ${probeSelection.considered} candidate route(s) from ${probeSelection.storedRows} stored row(s); probing ${probeSelection.selected} (cap ${probeSelection.cap}; full store retained).`,
-        probeSelectionMetrics(probeSelection),
-      )
-    } catch { /* metrics only */ }
+    this.emitProbeSelectionTelemetry(current.id, 'deterministic_engine.probe_selection', probeSelection, '; full store retained')
     if (probeSelection.usedPlan) {
       try {
         this.storage.event(
-          current.id,
-          'deterministic_engine.probe_plan_applied',
+          current.id, 'deterministic_engine.probe_plan_applied',
           `Engine probing ${probeSelection.selected} of ${probeSelection.selected + probeSelection.skippedStored} candidate routes from the ranked plan (full store retained).`,
           { usedPlan: true, probed: probeSelection.selected, skippedStored: probeSelection.skippedStored },
         )
       } catch { /* run may be gone */ }
     }
     const paramsByEndpoint = indexEndpointParams(this.storage, current.id)
-
     const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
     if (!asset) return
 
-    // Tier-A Program-Graph leads this pass will probe. They are attached to the assignment so the
-    // dispatch funnel can attribute the lane to the exact code→runtime hypotheses it consumes
-    // (bounded: the same cap the engine applies to lead-derived targets).
     const leadFacts = this.storage.listFacts(current.id, { includeTainted: false, limit: 200 })
     const codeLeadFactIds = leadFacts
       .filter(fact => fact.data?.kind === 'det_lead' && fact.data.source === 'program_graph')
-      .map(fact => fact.id)
-      .slice(0, 8)
-    // Tier-A hypotheses outrank the generic surface in the engine's bounded risk prefix.
+      .map(fact => fact.id).slice(0, 8)
     const codeLeadTargets = prioritizeCodeLeadTargets(graphLeadTargets(leadFacts))
-    const codeLeadKeys = new Set(codeLeadTargets.map(target =>
-      `${target.method.toUpperCase()}|${target.pathTemplate}`))
+    const codeLeadKeys = new Set(codeLeadTargets.map(target => `${target.method.toUpperCase()}|${target.pathTemplate}`))
 
-    // Name the Tier-A hypotheses this pass drives: a dispatch is attributed to the route the lane
-    // was created for, not to whichever exchange happened to land first.
     const codeLeadObjective = codeLeadTargets.length
-      ? `Deterministic closed loop over Tier-A code leads (${[...new Set(codeLeadTargets.map(target =>
-          `${target.method.toUpperCase()} ${target.pathTemplate}`))].slice(0, 6).join(', ')}): risk-ranked triage, differential probes and Zero-LLM replay verification.`
+      ? `Deterministic closed loop over Tier-A code leads (${[...new Set(codeLeadTargets.map(t => `${t.method.toUpperCase()} ${t.pathTemplate}`))].slice(0, 6).join(', ')}): risk-ranked triage, differential probes and Zero-LLM replay verification.`
       : 'Deterministic closed loop: risk-ranked triage, differential probes and Zero-LLM replay verification.'
-    const worker = this.storage.makeWorker(
-      current,
-      'investigation',
-      asset,
-      'Deterministic differential engine',
-      codeLeadObjective.slice(0, 400),
-      { sourceOrigins: [...approvedOrigins].sort(), ...(codeLeadFactIds.length ? { parentFactIds: codeLeadFactIds } : {}) },
+    const claimed = this.claimFloorWorker(
+      current, asset, 'Deterministic differential engine', codeLeadObjective.slice(0, 400),
+      15 * 60_000, { sourceOrigins: [...approvedOrigins].sort(), ...(codeLeadFactIds.length ? { parentFactIds: codeLeadFactIds } : {}) },
     )
-    const claimed = this.storage.updateWorker(worker.id, {
-      status: 'running',
-      lease: randomUUID(),
-      leaseExpiresAt: Date.now() + 15 * 60_000,
-    }) ?? worker
     if (laneOptions.onAssignment) {
       try { laneOptions.onAssignment(claimed.id) } catch { /* bookkeeping only */ }
     }
@@ -997,19 +859,11 @@ export class ExecFloorLane {
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller }
     const { grant, currentSecrets } = this.host.buildGrant(job, current, approvedOrigins)
     const signal = controller.signal
-
     const recordExchange = this.createFloorExchangeRecorder(current.id, claimed.id, currentSecrets)
 
     let leadCount = 0
     try {
-      let derivedTargets: Array<{
-        origin: string
-        method: string
-        pathTemplate: string
-        riskScore: number
-        source?: string
-        params: Array<{ name: string; location: string }>
-      }> = []
+      let derivedTargets: Array<Omit<DerivedRouteTarget, 'params'> & { source?: string; params: Array<{ name: string; location: string }> }> = []
       try {
         const specTargets = this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints)
         // Graphwire: Program-Graph code→runtime hypotheses are probed first by the floor. Their
@@ -1196,21 +1050,18 @@ export class ExecFloorLane {
       const byClass = Object.entries(report.byClass)
         .map(([intent, stats]) => `${intent}:${stats.confirmed}/${stats.hypotheses}`)
         .join(' ')
+      const addCounter = (map: Map<string, number>, delta: number) => map.set(current.id, (map.get(current.id) ?? 0) + delta)
       if (report.stagingTaggedMutations > 0 || report.stagingUntaggedSkipped > 0 || report.stagingCleaned > 0) {
-        this.host.stagingTaggedMutations.set(current.id,
-          (this.host.stagingTaggedMutations.get(current.id) ?? 0) + report.stagingTaggedMutations)
-        this.host.stagingUntaggedSkipped.set(current.id,
-          (this.host.stagingUntaggedSkipped.get(current.id) ?? 0) + report.stagingUntaggedSkipped)
-        this.host.stagingCleaned.set(current.id,
-          (this.host.stagingCleaned.get(current.id) ?? 0) + report.stagingCleaned)
+        addCounter(this.host.stagingTaggedMutations, report.stagingTaggedMutations)
+        addCounter(this.host.stagingUntaggedSkipped, report.stagingUntaggedSkipped)
+        addCounter(this.host.stagingCleaned, report.stagingCleaned)
         if (report.stagingCreatedEntityIds.length > 0) {
           const set = this.host.stagingCreatedEntities.get(current.id) ?? new Set<string>()
           for (const id of report.stagingCreatedEntityIds) set.add(id)
           this.host.stagingCreatedEntities.set(current.id, set)
         }
         this.storage.event(
-          current.id,
-          'staging.mutations',
+          current.id, 'staging.mutations',
           `Staging pass tagged ${report.stagingTaggedMutations} mutation(s), skipped ${report.stagingUntaggedSkipped} untaggable, cleaned ${report.stagingCleaned}.`,
           {
             stagingTaggedMutations: report.stagingTaggedMutations,
@@ -1221,23 +1072,14 @@ export class ExecFloorLane {
         )
       }
       this.storage.event(
-        current.id,
-        'deterministic_engine.summary',
+        current.id, 'deterministic_engine.summary',
         `Deterministic engine used ${report.requestsUsed} request(s), confirmed ${report.confirmed}, rejected ${report.rejectedSpecs}, leads ${report.leads}.`,
         {
-          requestsUsed: report.requestsUsed,
-          endpointsConsidered: report.endpointsConsidered,
-          endpointsHarvested: report.endpointsHarvested,
-          hypothesesFormed: report.hypothesesFormed,
-          hypothesesRun: report.hypothesesRun,
-          signals: report.signals,
-          specsSubmitted: report.specsSubmitted,
-          confirmed: report.confirmed,
-          rejectedSpecs: report.rejectedSpecs,
-          leads: report.leads,
-          stoppedReason: report.stoppedReason,
-          durationMs: report.durationMs,
-          byClass,
+          requestsUsed: report.requestsUsed, endpointsConsidered: report.endpointsConsidered,
+          endpointsHarvested: report.endpointsHarvested, hypothesesFormed: report.hypothesesFormed,
+          hypothesesRun: report.hypothesesRun, signals: report.signals, specsSubmitted: report.specsSubmitted,
+          confirmed: report.confirmed, rejectedSpecs: report.rejectedSpecs, leads: report.leads,
+          stoppedReason: report.stoppedReason, durationMs: report.durationMs, byClass,
           stagingTaggedMutations: report.stagingTaggedMutations,
           stagingUntaggedSkipped: report.stagingUntaggedSkipped,
           stagingCleaned: report.stagingCleaned,
@@ -1250,14 +1092,7 @@ export class ExecFloorLane {
         `Deterministic engine finished: ${report.confirmed} confirmed finding(s) from ${report.hypothesesFormed} hypothesis(es), ${report.specsSubmitted} replay spec(s), ${report.requestsUsed} request(s) (${report.stoppedReason}).${byClass ? ` Classes ${byClass}.` : ''}`,
       )
     } finally {
-      try {
-        this.storage.updateWorker(claimed.id, {
-          status: 'complete',
-          outcome: 'Deterministic engine complete.',
-          lease: null,
-          leaseExpiresAt: null,
-        })
-      } catch { /* run may have been deleted */ }
+      this.completeFloorWorker(claimed.id, 'Deterministic engine complete.')
     }
   }
 
@@ -1383,29 +1218,18 @@ export class ExecFloorLane {
       secrets,
     )
     const uniqueTitle = `${spec.title.slice(0, 150)} · ${confirmed.hypothesis.method} ${confirmed.endpoint}`.slice(0, 200)
-    const finding: Finding = {
-      id: findingId,
-      origin: spec.origin,
+    const finding = buildChainFindingBase(spec, findingId, specRow.id, run.scopeRevision, {
       title: uniqueTitle,
       status: 'confirmed',
       verificationTier: 'runtime_confirmed',
-      severity: spec.severity,
       reason: redact(confirmed.result.outcome.reason || spec.severityRationale, secrets),
-      remediation: spec.remediation,
-      impact: spec.impact,
-      recheck: spec.recheckInstructions,
-      category: spec.category,
-      cwe: spec.cwe,
       confidence: 'high',
       verification: `Deterministic Zero-LLM ${spec.kind} replay confirmed (controlPassed=${confirmed.result.outcome.controlPassed}), verified by the engine's own differential pass.`,
-      findingKind: 'multi_step_chain',
-      replaySpecId: specRow.id,
       fingerprintHash: duplicate.fingerprint.hash,
       chainFactIds: [fact.id],
       exchangeIds: [...new Set(confirmed.exchangeIds)].slice(0, 6),
       evidenceIds: [artifact.id],
-      scopeRevision: run.scopeRevision,
-    }
+    })
     const saved = this.storage.upsertChainFinding(
       run, asset.id, finding, specRow.id, origins,
       { provenance: 'floor', verificationClass: 'runtime_confirmed' },
@@ -1506,46 +1330,27 @@ export class ExecFloorLane {
     })
 
     const findingId = randomUUID()
-    const specRow = this.storage.createReplaySpec(input.run, input.assignment, findingId, spec, [...new Set(replaySpecOrigins(spec))])
+    const origins = [...new Set(replaySpecOrigins(spec))]
+    const specRow = this.storage.createReplaySpec(input.run, input.assignment, findingId, spec, origins)
     const artifact = this.storage.addArtifact(
-      input.run,
-      input.assignment,
-      'replay',
-      `Deterministic proposed spec · ${spec.title}`,
+      input.run, input.assignment, 'replay', `Deterministic proposed spec · ${spec.title}`,
       JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec }, null, 2),
-      undefined,
-      input.secrets,
+      undefined, input.secrets,
     )
-    const finding: Finding = {
-      id: findingId,
-      origin: spec.origin,
-      title: spec.title,
+    const finding = buildChainFindingBase(spec, findingId, specRow.id, input.run.scopeRevision, {
       status: 'pending',
-      severity: spec.severity,
-      reason: spec.severityRationale,
-      remediation: spec.remediation,
-      impact: spec.impact,
-      recheck: spec.recheckInstructions,
-      category: spec.category,
-      cwe: spec.cwe,
       confidence: 'medium',
       verification: `Pending Zero-LLM ${spec.kind} replay verification proposed deterministically (spec ${specRow.id}).`,
-      findingKind: 'multi_step_chain',
-      replaySpecId: specRow.id,
       fingerprintHash: duplicate.fingerprint.hash,
       chainFactIds: [fact.id],
       exchangeIds: [...new Set(input.exchangeIds)].slice(0, 6),
       evidenceIds: [artifact.id],
-      scopeRevision: input.run.scopeRevision,
-    }
-    const saved = this.storage.upsertChainFinding(input.run, input.asset.id, finding, specRow.id, [...new Set(replaySpecOrigins(spec))])
+    })
+    const saved = this.storage.upsertChainFinding(input.run, input.asset.id, finding, specRow.id, origins)
     this.storage.makeWorker(
-      input.run,
-      'verification',
-      input.asset,
-      `Replay verify · ${spec.title.slice(0, 80)}`,
+      input.run, 'verification', input.asset, `Replay verify · ${spec.title.slice(0, 80)}`,
       `Zero-LLM deterministic replay verification of deterministically proposed spec ${specRow.id}.`,
-      { stepId: specRow.id, sourceOrigins: [...new Set(replaySpecOrigins(spec))] },
+      { stepId: specRow.id, sourceOrigins: origins },
     )
     this.storage.addGraphEdge(input.run.id, { fromKind: 'fact', fromId: fact.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
     return saved.id

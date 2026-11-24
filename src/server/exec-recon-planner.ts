@@ -41,9 +41,7 @@ import {
   type BrokerExchangeResult,
   type Grant,
   type PublicObservation,
-  type RequestBroker,
 } from './broker.ts'
-import type { CanaryBroker } from './canary-broker.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
@@ -88,10 +86,14 @@ import {
   type ReinvestigationGuard,
 } from './exec-dispatch.ts'
 import {
+  ExecServiceModule,
+  llmRunHooks,
+  publicPersonasFromGrant,
   recordBrokerExchange,
   type ExecActiveJob,
   type ExecCapture,
   type ExecCoordinatorTask,
+  type ExecCoreServices,
 } from './exec-exchange.ts'
 import {
   createGraphCoordinator,
@@ -104,8 +106,6 @@ import {
 import type { LabRunner, LabTargetHandle } from './lab-runner.ts'
 import {
   privateModelProfiles,
-  recordProfileFailure,
-  recordProfileSuccess,
   resolveProfilePoolForRole,
   type ResolvedModelProfile,
 } from './model-settings.ts'
@@ -117,21 +117,52 @@ import type { NamedSecret } from './redact.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { findings, messages } from './schema.ts'
-import type { ScopedBrowser } from './scoped-browser.ts'
 import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
-import type { WorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
 type CoordinatorTask = ExecCoordinatorTask
 
-export interface ExecReconPlannerHost {
-  storage: Store
-  broker: RequestBroker
-  browser: ScopedBrowser
-  canaryBroker: CanaryBroker
-  backend: WorkerBackend
+const VALID_REFERRER_POLICIES = [
+  'no-referrer', 'no-referrer-when-downgrade', 'origin', 'origin-when-cross-origin',
+  'same-origin', 'strict-origin', 'strict-origin-when-cross-origin', 'unsafe-url',
+] as const
+
+function buildObservationFromHeaders(
+  row: { origin: string; finalOrigin: string; status: number; mediaType: string },
+  headersObj: Record<string, string>,
+): PublicObservation {
+  const h = (name: string): string | undefined => headersObj[name.toLowerCase()]
+  const transport = h('strict-transport-security') ?? ''
+  const ages = transport.split(';').filter(d => /^\s*max-age\s*(?:=|$)/i.test(d))
+  const parsedAge = ages.length === 1 ? ages[0].match(/^\s*max-age\s*=\s*(?:"(\d+)"|(\d+))\s*$/i) : null
+  const maxAge = parsedAge ? Number(parsedAge[1] ?? parsedAge[2]) : NaN
+  const xcto = h('x-content-type-options')
+  const cspVal = h('content-security-policy')
+  const cspRo = h('content-security-policy-report-only')
+  const xfo = h('x-frame-options')
+  const frameAncestors = Boolean(cspVal && /(?:^|;)\s*frame-ancestors\s+[^;]+/i.test(cspVal))
+  const validXfo = Boolean(xfo && /^(?:deny|sameorigin)\s*$/i.test(xfo.split(',', 1)[0]))
+  const refRaw = h('referrer-policy')
+  const refPolicy: PublicObservation['referrerPolicy'] = refRaw === undefined ? 'absent'
+    : refRaw.includes('"') ? 'unrecognized'
+      : (refRaw.split(',').map(t => t.trim()).findLast((t): t is typeof VALID_REFERRER_POLICIES[number] => (VALID_REFERRER_POLICIES as readonly string[]).includes(t)) ?? 'unrecognized')
+  const srv = h('server')?.trim()
+  return {
+    origin: row.origin, finalOrigin: row.finalOrigin, status: row.status, mediaType: row.mediaType || 'unknown',
+    transportMaxAge: Number.isSafeInteger(maxAge) && maxAge >= 0 ? maxAge : null,
+    includeSubDomains: /(?:^|;)\s*includeSubDomains\s*(?:;|$)/i.test(transport),
+    source: 'public response',
+    contentTypeOptions: xcto === undefined ? 'absent' : xcto.split(',', 1)[0].trim().toLowerCase() === 'nosniff' ? 'nosniff' : 'unrecognized',
+    referrerPolicy: refPolicy,
+    contentSecurityPolicy: cspVal !== undefined ? (cspVal.trim() ? 'enforced' : 'unrecognized') : cspRo !== undefined ? (cspRo.trim() ? 'report-only' : 'unrecognized') : 'absent',
+    frameProtection: frameAncestors && validXfo ? 'both' : frameAncestors ? 'csp-frame-ancestors' : validXfo ? 'x-frame-options' : xfo !== undefined ? 'unrecognized' : 'absent',
+    serverDisclosure: h('x-powered-by') ? 'technology' : !srv ? 'absent' : /(?:\d|\/|next|express|php|asp\.net|nginx|apache)/i.test(srv) ? 'technology' : 'generic',
+  }
+}
+
+export interface ExecReconPlannerHost extends ExecCoreServices {
   labRunner: LabRunner
   maxDurationMs: number
   active: Map<string, Active>
@@ -141,15 +172,8 @@ export interface ExecReconPlannerHost {
   startedLabHandles: Map<string, LabTargetHandle>
   prePhase0SeededSteps: Map<string, boolean>
   plannerDoneRound: Map<string, number>
-  plannerEmptyRounds: Map<string, number>
-  plannerDryRounds: Map<string, number>
-  plannerEvidenceFrontier: Map<string, { confirmed: number; primitives: number }>
   dispatchFunnels: Map<string, DispatchFunnelCounts>
   detLeadConsumed: Set<string>
-  detLeadStepKeys: Set<string>
-  detLeadGateRejected: Set<string>
-  cappedLeadReported: Set<string>
-  tierAStepKeys: Set<string>
   tierAStepIds: Set<string>
   tierAFactIds: Set<string>
   approvedOriginsSet: (run: Run) => Set<string>
@@ -187,15 +211,19 @@ export interface ExecReconPlannerHost {
   resetBoardHops: (run: Run) => void
 }
 
-export class ExecReconPlanner {
-  private readonly host: ExecReconPlannerHost
-  constructor(host: ExecReconPlannerHost) { this.host = host }
-  private get storage(): Store { return this.host.storage }
-  private get broker(): RequestBroker { return this.host.broker }
-  private get browser(): ScopedBrowser { return this.host.browser }
-  private get canaryBroker(): CanaryBroker { return this.host.canaryBroker }
-  private get backend(): WorkerBackend { return this.host.backend }
-  private get labRunner(): LabRunner { return this.host.labRunner }
+export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
+  private readonly plannerEmptyRounds = new Map<string, number>()
+  private readonly plannerDryRounds = new Map<string, number>()
+  private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
+  private readonly detLeadStepKeys = new Set<string>()
+  private readonly detLeadGateRejected = new Set<string>()
+  private readonly cappedLeadReported = new Set<string>()
+  private readonly tierAStepKeys = new Set<string>()
+  private get labRunner() { return this.host.labRunner }
+
+  private approvedAsset(run: Run, origin: string): Candidate | undefined {
+    return run.candidates.find(c => c.origin === origin && run.approved.includes(c.id))
+  }
 
 
   async runThreatModel(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
@@ -218,9 +246,7 @@ export class ExecReconPlanner {
             thinkingLevel: 'off',
             prompt: reviewPlanPrompt(run.goal, run.sourceMode, available),
             signal: task.controller.signal,
-            onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
-            onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-            onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+            ...llmRunHooks(this.storage, run.id),
           })
           selection = parseReviewPlan(answer, available) ?? selection
         } catch {
@@ -424,84 +450,31 @@ export class ExecReconPlanner {
                 } | undefined
               : undefined
 
+            const pushObs = (
+              row: { finalOrigin: string; status: number; mediaType: string },
+              headers: Record<string, string>,
+              exchangeId?: string,
+            ) => {
+              observations.push({
+                origin: asset.origin, finalOrigin: row.finalOrigin, status: row.status, mediaType: row.mediaType,
+                server: headers['server'], poweredBy: headers['x-powered-by'], ...(exchangeId ? { exchangeId } : {}),
+              })
+            }
             if (cachedPhase0Root) {
               capture = { observation: cachedPhase0Root.observation, note: 'Recorded approved HTTPS root response.' }
-              observations.push({
-                origin: asset.origin,
-                finalOrigin: cachedPhase0Root.finalOrigin,
-                status: cachedPhase0Root.status,
-                mediaType: cachedPhase0Root.mediaType,
-                server: cachedPhase0Root.respHeaders['server'],
-                poweredBy: cachedPhase0Root.respHeaders['x-powered-by'],
-              })
+              pushObs(cachedPhase0Root, cachedPhase0Root.respHeaders)
             } else if (priorRootRow) {
               let headersObj: Record<string, string> = {}
               try { headersObj = JSON.parse(priorRootRow.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
-              const h = (name: string): string | undefined => headersObj[name.toLowerCase()]
-              const transport = h('strict-transport-security') ?? ''
-              const ages = transport.split(';').filter(d => /^\s*max-age\s*(?:=|$)/i.test(d))
-              const parsedAge = ages.length === 1 ? ages[0].match(/^\s*max-age\s*=\s*(?:"(\d+)"|(\d+))\s*$/i) : null
-              const maxAge = parsedAge ? Number(parsedAge[1] ?? parsedAge[2]) : NaN
-              const xcto = h('x-content-type-options')
-              const nosniff = xcto?.split(',', 1)[0].trim().toLowerCase() === 'nosniff'
-              const cspVal = h('content-security-policy')
-              const cspRo = h('content-security-policy-report-only')
-              const xfo = h('x-frame-options')
-              const frameAncestors = Boolean(cspVal && /(?:^|;)\s*frame-ancestors\s+[^;]+/i.test(cspVal))
-              const validXfo = Boolean(xfo && /^(?:deny|sameorigin)\s*$/i.test(xfo.split(',', 1)[0]))
-              const refRaw = h('referrer-policy')
-              const validRefs = ['no-referrer', 'no-referrer-when-downgrade', 'origin', 'origin-when-cross-origin', 'same-origin', 'strict-origin', 'strict-origin-when-cross-origin', 'unsafe-url'] as const
-              const refPolicy: PublicObservation['referrerPolicy'] = refRaw === undefined
-                ? 'absent'
-                : refRaw.includes('"')
-                  ? 'unrecognized'
-                  : (refRaw.split(',').map(t => t.trim()).findLast((t): t is typeof validRefs[number] => (validRefs as readonly string[]).includes(t)) ?? 'unrecognized')
-              const srv = h('server')?.trim()
-              capture = {
-                observation: {
-                  origin: priorRootRow.origin,
-                  finalOrigin: priorRootRow.finalOrigin,
-                  status: priorRootRow.status,
-                  mediaType: priorRootRow.mediaType || 'unknown',
-                  transportMaxAge: Number.isSafeInteger(maxAge) && maxAge >= 0 ? maxAge : null,
-                  includeSubDomains: /(?:^|;)\s*includeSubDomains\s*(?:;|$)/i.test(transport),
-                  source: 'public response',
-                  contentTypeOptions: xcto === undefined ? 'absent' : nosniff ? 'nosniff' : 'unrecognized',
-                  referrerPolicy: refPolicy,
-                  contentSecurityPolicy: cspVal !== undefined ? (cspVal.trim() ? 'enforced' : 'unrecognized') : cspRo !== undefined ? (cspRo.trim() ? 'report-only' : 'unrecognized') : 'absent',
-                  frameProtection: frameAncestors && validXfo ? 'both' : frameAncestors ? 'csp-frame-ancestors' : validXfo ? 'x-frame-options' : xfo !== undefined ? 'unrecognized' : 'absent',
-                  serverDisclosure: h('x-powered-by') ? 'technology' : !srv ? 'absent' : /(?:\d|\/|next|express|php|asp\.net|nginx|apache)/i.test(srv) ? 'technology' : 'generic',
-                },
-                note: 'Reused recorded approved HTTPS root response.',
-              }
-              observations.push({
-                origin: asset.origin,
-                finalOrigin: priorRootRow.finalOrigin,
-                status: priorRootRow.status,
-                mediaType: priorRootRow.mediaType,
-                server: headersObj['server'],
-                poweredBy: headersObj['x-powered-by'],
-                exchangeId: priorRootRow.id,
-              })
+              capture = { observation: buildObservationFromHeaders(priorRootRow, headersObj), note: 'Reused recorded approved HTTPS root response.' }
+              pushObs(priorRootRow, headersObj, priorRootRow.id)
             } else {
               const ex = await this.broker.executeHttp({
-                origin: asset.origin,
-                method: 'GET',
-                pathAndQuery: '/',
-                followRedirects: true,
-                timeoutMs: 12_000,
+                origin: asset.origin, method: 'GET', pathAndQuery: '/', followRedirects: true, timeoutMs: 12_000,
               }, grant, task.controller.signal)
               const savedEx = recordBrokerExchange(this.storage, freshRun, hostWorker.id, ex, secrets)
               capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
-              observations.push({
-                origin: asset.origin,
-                finalOrigin: ex.finalOrigin,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                server: ex.respHeaders['server'],
-                poweredBy: ex.respHeaders['x-powered-by'],
-                exchangeId: savedEx.id,
-              })
+              pushObs(ex, ex.respHeaders, savedEx.id)
             }
           } catch (error) {
             capture = {
@@ -562,9 +535,7 @@ export class ExecReconPlanner {
 
       if (profiles.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0) {
         try {
-          const personasPub = [...grant.personas?.values() ?? []].map(p => ({
-            handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
-          }))
+          const personasPub = publicPersonasFromGrant(grant)
           const graphCatalog = this.host.endpointGraphCatalog(freshRun.id)
           const answer = await agentTurn({
             directory: this.storage.directory,
@@ -597,9 +568,7 @@ export class ExecReconPlanner {
             }),
             signal: task.controller.signal,
             secrets,
-            onUsage: u => this.storage.recordLlmSpend(freshRun.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
-            onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-            onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+            ...llmRunHooks(this.storage, freshRun.id),
           })
           const parsed = threatModelResponseSchema.safeParse(JSON.parse(stripJsonFences(answer)))
           if (parsed.success) {
@@ -770,8 +739,7 @@ export class ExecReconPlanner {
       ? findingRow.finding.origin
       : [...approvedOrigins][0]
     if (!targetOrigin) return
-    const asset = run.candidates.find(c => c.origin === targetOrigin && run.approved.includes(c.id))
-      ?? run.candidates.find(c => run.approved.includes(c.id))
+    const asset = this.approvedAsset(run, targetOrigin) ?? run.candidates.find(c => run.approved.includes(c.id))
     if (!asset) return
 
     const siblingHits: Array<{ repo: string; file: string; line: number; preview: string }> = []
@@ -801,6 +769,7 @@ export class ExecReconPlanner {
 
     if (searchTokens.length > 0) {
       const scanExt = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
+      const skipDirs = new Set(['node_modules', '.git', 'dist', 'build'])
       for (const mountedRepo of mountedRepos) {
         const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
         const repoRoot = join(reposDir, repoRel)
@@ -811,28 +780,23 @@ export class ExecReconPlanner {
           let entries: string[]
           try { entries = readdirSync(dir) } catch { continue }
           for (const entry of entries) {
-            if (entry === 'node_modules' || entry === '.git' || entry === 'dist' || entry === 'build') continue
+            if (skipDirs.has(entry)) continue
             const full = join(dir, entry)
             let st
             try { st = statSync(full) } catch { continue }
-            if (st.isDirectory()) {
-              stack.push(full)
-            } else if (st.isFile() && st.size <= 256 * 1024 && scanExt.has(extname(entry).toLowerCase())) {
-              const relFile = relative(repoRoot, full).split(sep).join('/')
-              let content: string
-              try { content = readFileSync(full, 'utf8') } catch { continue }
-              const lines = content.split('\n')
-              for (let i = 0; i < lines.length; i += 1) {
-                if (searchTokens.some(tok => lines[i].includes(tok))) {
-                  const lineNo = i + 1
-                  if (overlapsOriginal(repoRel, relFile, lineNo)) continue
-                  const key = `${repoRel}:${relFile}:${lineNo}`
-                  if (seenHit.has(key)) continue
-                  seenHit.add(key)
-                  siblingHits.push({ repo: repoRel, file: relFile, line: lineNo, preview: lines[i].trim().slice(0, 180) })
-                }
-              }
-            }
+            if (st.isDirectory()) { stack.push(full); continue }
+            if (!st.isFile() || st.size > 256 * 1024 || !scanExt.has(extname(entry).toLowerCase())) continue
+            const relFile = relative(repoRoot, full).split(sep).join('/')
+            let content: string
+            try { content = readFileSync(full, 'utf8') } catch { continue }
+            content.split('\n').forEach((line, i) => {
+              const lineNo = i + 1
+              if (!searchTokens.some(tok => line.includes(tok)) || overlapsOriginal(repoRel, relFile, lineNo)) return
+              const key = `${repoRel}:${relFile}:${lineNo}`
+              if (seenHit.has(key)) return
+              seenHit.add(key)
+              siblingHits.push({ repo: repoRel, file: relFile, line: lineNo, preview: line.trim().slice(0, 180) })
+            })
           }
         }
       }
@@ -1068,23 +1032,16 @@ export class ExecReconPlanner {
     })
     const seededEndpoints: string[] = []
     for (const ep of candidates) {
-      const asset = run.candidates.find(candidate => candidate.origin === ep.origin && run.approved.includes(candidate.id))
+      const asset = this.approvedAsset(run, ep.origin)
       if (!asset) continue
       const method = (ep.method || 'GET').toUpperCase()
       const title = `High-risk route coverage · ${method} ${ep.pathTemplate}`
       const hypothesis = `Discovered high-risk endpoint ${method} ${ep.pathTemplate} on ${ep.origin} (risk ${ep.riskScore}, coverage ${ep.coveragePct ?? 0}%) has no first-pass investigation yet. Probe authorization boundaries, state invariants, and input validation with control vs. variant evidence; submit a verified proof or coded record_coverage gap.`
       const category = 'broken-access-control'
-      const specialistProfile = routeStepToSpecialist({ title, hypothesis, category, skills: [] })
       this.storage.addChainStep(run, {
-        title,
-        hypothesis,
-        category,
-        priority: 70,
-        targetAssetIds: [asset.id],
-        skills: ['false-positive-elimination'],
-        dependsOnFactIds: [],
-        sourceOrigins: [ep.origin],
-        specialistProfile,
+        title, hypothesis, category, priority: 70, targetAssetIds: [asset.id],
+        skills: ['false-positive-elimination'], dependsOnFactIds: [], sourceOrigins: [ep.origin],
+        specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills: [] }),
       })
       seededEndpoints.push(`${method} ${ep.pathTemplate}`)
     }
@@ -1131,6 +1088,42 @@ export class ExecReconPlanner {
   }
 
 
+  private enqueueLeadStep(
+    run: Run,
+    asset: Candidate,
+    fact: Fact,
+    input: {
+      probeClass: string; method: string; endpoint: string; category: string
+      dedupeKey: string; isTierA: boolean; reason: string; eventKind: string; eventMessage: string; extraDetail?: Record<string, unknown>
+    },
+  ): ChainStep {
+    const skills = detLeadSkills(input.probeClass)
+    const title = `${input.isTierA ? 'Tier-A code lead' : 'det_lead upgrade'} · ${input.probeClass} ${input.method} ${input.endpoint}`.slice(0, 180)
+    const hypothesis = input.isTierA
+      ? `A white-box dataflow slice proves a ${input.probeClass} sink on ${input.method} ${input.endpoint} (${input.reason}). Prove it on the live route (control/variant differential) or record a coded proofGapReason.`
+      : `The deterministic floor observed an unproven ${input.probeClass} signal at ${input.method} ${input.endpoint} (${input.reason}). Reproduce it, identify the concretely mutated input, and submit a verified proof or chain it into a higher-impact finding.`
+    const createdStep = this.storage.addChainStep(run, {
+      title, hypothesis, category: input.category,
+      priority: input.isTierA ? TIER_A_STEP_PRIORITY : DET_LEAD_STEP_PRIORITY,
+      targetAssetIds: [asset.id], skills, dependsOnFactIds: [fact.id], sourceOrigins: [fact.origin],
+      specialistProfile: routeStepToSpecialist({ title, hypothesis, category: input.category, skills }),
+    })
+    this.storage.updateChainStep(createdStep.id, { status: 'ready' })
+    this.detLeadStepKeys.add(input.dedupeKey)
+    if (input.isTierA) {
+      this.tierAStepKeys.add(input.dedupeKey)
+      this.host.tierAStepIds.add(createdStep.id)
+      this.host.tierAFactIds.add(fact.id)
+    }
+    try {
+      this.storage.event(run.id, input.eventKind, input.eventMessage, {
+        probeClass: input.probeClass, endpoint: input.endpoint, method: input.method,
+        factId: fact.id, stepId: createdStep.id, ...input.extraDetail,
+      })
+    } catch { /* best-effort */ }
+    return createdStep
+  }
+
   /**
    * Seed every Tier-A Program-Graph lead as a ready step before the planner's first round. These
    * are the white-box 4-hop hypotheses; they must never wait behind generic class/route steps or a
@@ -1146,61 +1139,35 @@ export class ExecReconPlanner {
     for (const fact of facts) {
       if (slots <= 0) break
       this.host.tierAFactIds.add(fact.id)
-      if (boundFactIds.has(fact.id)) continue
-      if (!approvedOrigins.has(fact.origin)) continue
+      if (boundFactIds.has(fact.id) || !approvedOrigins.has(fact.origin)) continue
       const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
       const probeClass = typeof fact.data?.probeClass === 'string' ? fact.data.probeClass : ''
       const method = typeof fact.data?.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
       if (!endpoint.startsWith('/') || !probeClass) continue
-      const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
+      const asset = this.approvedAsset(run, fact.origin)
       if (!asset) continue
       const category = detLeadCategory(probeClass)
-      const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
-      const dedupeKey = `${method} ${routeKey}`
-      if (this.host.tierAStepKeys.has(dedupeKey) || this.host.detLeadStepKeys.has(dedupeKey)) continue
+      const dedupeKey = `${method} ${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
+      if (this.tierAStepKeys.has(dedupeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
       const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'white-box dataflow slice'
-      const skills = detLeadSkills(probeClass)
-      const title = `Tier-A code lead · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
-      const hypothesis = `A white-box dataflow slice proves a ${probeClass} sink on ${method} ${endpoint} (${reason}). Prove it on the live route (control/variant differential) or record a coded proofGapReason.`
-      const createdStep = this.storage.addChainStep(run, {
-        title,
-        hypothesis,
-        category,
-        priority: TIER_A_STEP_PRIORITY,
-        targetAssetIds: [asset.id],
-        skills,
-        dependsOnFactIds: [fact.id],
-        sourceOrigins: [fact.origin],
-        specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills }),
+      this.enqueueLeadStep(run, asset, fact, {
+        probeClass, method, endpoint, category, dedupeKey, isTierA: true, reason,
+        eventKind: 'deterministic_lane.tier_a_seeded',
+        eventMessage: `Tier-A code lead ${probeClass} on ${method} ${endpoint} seeded as a Round-1 step.`,
+        extraDetail: { priority: TIER_A_STEP_PRIORITY },
       })
-      this.storage.updateChainStep(createdStep.id, { status: 'ready' })
-      this.host.tierAStepKeys.add(dedupeKey)
-      this.host.tierAStepIds.add(createdStep.id)
-      this.host.detLeadStepKeys.add(dedupeKey)
       slots -= 1
       created += 1
-      try {
-        this.storage.event(
-          run.id,
-          'deterministic_lane.tier_a_seeded',
-          `Tier-A code lead ${probeClass} on ${method} ${endpoint} seeded as a Round-1 step.`,
-          { probeClass, endpoint, method, factId: fact.id, stepId: createdStep.id, priority: TIER_A_STEP_PRIORITY },
-        )
-      } catch { /* best-effort */ }
     }
     return created
   }
 
 
   queueDetLeadUpgradeSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
-    const confirmed = this.alreadyConfirmedRefs(run, 40)
-    const confirmedKeys = new Set(confirmed.map(ref =>
+    const confirmedKeys = new Set(this.alreadyConfirmedRefs(run, 40).map(ref =>
       `${normalizeEndpointTemplate(ref.path)}|${confirmedCategoryFamily(ref.probeClass ?? '')}`))
     const facts = [...this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })]
-      // det_lead facts are listed in store row order (random row-id tiebreak). The upgrade queue
-      // takes the first N, so sort by stable leading fields before choosing.
       .sort((a, b) => {
-        // Program-Graph (Tier-A) leads sort first; the generic cap can then never displace them.
         const keyOf = (fact: typeof a) =>
           `${fact.data?.source === 'program_graph' ? '0' : '1'}\u0000${String(fact.data?.endpoint ?? '')}\u0000${String(fact.data?.method ?? '')}\u0000${String(fact.data?.probeClass ?? '')}\u0000${fact.id}`
         return keyOf(a).localeCompare(keyOf(b))
@@ -1211,24 +1178,22 @@ export class ExecReconPlanner {
     let created = 0
     for (const fact of facts) {
       if (slots <= 0 || created >= 4) break
-      if (fact.data?.kind !== 'det_lead') continue
-      if (!approvedOrigins.has(fact.origin)) continue
+      if (fact.data?.kind !== 'det_lead' || !approvedOrigins.has(fact.origin) || boundFactIds.has(fact.id)) continue
       const endpoint = typeof fact.data.endpoint === 'string' ? fact.data.endpoint : ''
       const probeClass = typeof fact.data.probeClass === 'string' ? fact.data.probeClass : ''
       const method = typeof fact.data.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
       if (!endpoint.startsWith('/') || !probeClass) continue
-      if (boundFactIds.has(fact.id)) continue
-      const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(detLeadCategory(probeClass))}`
-      if (confirmedKeys.has(routeKey)) continue
-      if (this.host.detLeadStepKeys.has(`${method} ${routeKey}`)) continue
+      const category = detLeadCategory(probeClass)
+      const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
+      const dedupeKey = `${method} ${routeKey}`
+      if (confirmedKeys.has(routeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
       const gate = detLeadEvidenceGate(fact.data)
       if (!gate.admitted) {
-        if (!this.host.detLeadGateRejected.has(fact.id)) {
-          this.host.detLeadGateRejected.add(fact.id)
+        if (!this.detLeadGateRejected.has(fact.id)) {
+          this.detLeadGateRejected.add(fact.id)
           try {
             this.storage.event(
-              run.id,
-              'deterministic_lane.lead_deferred',
+              run.id, 'deterministic_lane.lead_deferred',
               `det_lead ${probeClass} on ${method} ${endpoint} not promoted: ${gate.reason}.`,
               { probeClass, endpoint, method, factId: fact.id, reason: gate.reason },
             )
@@ -1236,57 +1201,27 @@ export class ExecReconPlanner {
         }
         continue
       }
-      const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
+      const asset = this.approvedAsset(run, fact.origin)
       if (!asset) continue
-      const category = detLeadCategory(probeClass)
-      // v7 precision guard: cap re-investigation of the same (route, class) at 2 unless the lead
-      // carries a new chain primitive / parent evidence that actually escalates the attempt.
       const guardKey = reinvestigationKey(endpoint, category)
       const verdict = this.host.reinvestigationGuardFor(run.id)
         .record(guardKey, detLeadUnlocksReinvestigation(fact.data))
       if (!verdict.allowed) {
-        if (!this.host.cappedLeadReported.has(fact.id)) {
-          this.host.cappedLeadReported.add(fact.id)
+        if (!this.cappedLeadReported.has(fact.id)) {
+          this.cappedLeadReported.add(fact.id)
           this.host.noteCappedReinvestigation(run, guardKey, verdict.count)
         }
         continue
       }
       const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'differential observation'
-      const skills = detLeadSkills(probeClass)
-      const isTierA = fact.data.source === 'program_graph'
-      const title = `${isTierA ? 'Tier-A code lead' : 'det_lead upgrade'} · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
-      const hypothesis = isTierA
-        ? `A white-box dataflow slice proves a ${probeClass} sink on ${method} ${endpoint} (${reason}). Prove it on the live route (control/variant differential) or record a coded proofGapReason.`
-        : `The deterministic floor observed an unproven ${probeClass} signal at ${method} ${endpoint} (${reason}). Reproduce it, identify the concretely mutated input, and submit a verified proof or chain it into a higher-impact finding.`
-      const createdStep = this.storage.addChainStep(run, {
-        title,
-        hypothesis,
-        category,
-        priority: isTierA ? TIER_A_STEP_PRIORITY : DET_LEAD_STEP_PRIORITY,
-        targetAssetIds: [asset.id],
-        skills,
-        dependsOnFactIds: [fact.id],
-        sourceOrigins: [fact.origin],
-        specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills }),
+      this.enqueueLeadStep(run, asset, fact, {
+        probeClass, method, endpoint, category, dedupeKey, isTierA: fact.data.source === 'program_graph', reason,
+        eventKind: 'deterministic_lane.lead_consumed',
+        eventMessage: `det_lead ${probeClass} on ${method} ${endpoint} queued as a prioritized upgrade assignment.`,
       })
-      this.storage.updateChainStep(createdStep.id, { status: 'ready' })
-      this.host.detLeadStepKeys.add(`${method} ${routeKey}`)
-      if (isTierA) {
-        this.host.tierAStepIds.add(createdStep.id)
-        this.host.tierAFactIds.add(fact.id)
-        this.host.tierAStepKeys.add(`${method} ${routeKey}`)
-      }
       this.host.detLeadConsumed.add(fact.id)
       slots -= 1
       created += 1
-      try {
-        this.storage.event(
-          run.id,
-          'deterministic_lane.lead_consumed',
-          `det_lead ${probeClass} on ${method} ${endpoint} queued as a prioritized upgrade assignment.`,
-          { probeClass, endpoint, method, factId: fact.id, stepId: createdStep.id },
-        )
-      } catch { /* best-effort */ }
     }
     return created
   }
@@ -1722,7 +1657,7 @@ export class ExecReconPlanner {
     // v7 precision guard: remember the evidence frontier across rounds. A round that adds no
     // runtime_confirmed finding and no chain primitive is dry; two consecutive dry rounds after the
     // high-priority queue drains end the planner.
-    const evidenceFrontier = this.host.plannerEvidenceFrontier.get(run.id) ?? {
+    const evidenceFrontier = this.plannerEvidenceFrontier.get(run.id) ?? {
       confirmed: coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total,
       primitives: coordinator.deriveChainPrimitives().length,
     }
@@ -1755,9 +1690,7 @@ export class ExecReconPlanner {
       signal: task.controller.signal,
       maxTurns: 10,
       handlers,
-      onUsage: usage => this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens: usage.inputTokens + usage.outputTokens }),
-      onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-      onProfileFailure: (id, error, hard) => recordProfileFailure(id, error, hard, this.storage),
+      ...llmRunHooks(this.storage, run.id),
     })
     if (!this.host.currentCoordinator(run.id, task)) return
 
@@ -1841,20 +1774,20 @@ export class ExecReconPlanner {
     }
 
     // Deterministic scheduler guard outside the LLM: budget/requests/wall/K=2/done+pending OOB.
-    const emptyRounds = addedCount === 0 ? (this.host.plannerEmptyRounds.get(run.id) ?? 0) + 1 : 0
-    this.host.plannerEmptyRounds.set(run.id, emptyRounds)
+    const emptyRounds = addedCount === 0 ? (this.plannerEmptyRounds.get(run.id) ?? 0) + 1 : 0
+    this.plannerEmptyRounds.set(run.id, emptyRounds)
     const chainPrimitivesAfterRound = coordinator.deriveChainPrimitives().length
     const confirmedAfterRound = coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total
     const newChainPrimitives = Math.max(0, chainPrimitivesAfterRound - evidenceFrontier.primitives)
     const newRuntimeConfirmed = Math.max(0, confirmedAfterRound - evidenceFrontier.confirmed)
-    this.host.plannerEvidenceFrontier.set(run.id, {
+    this.plannerEvidenceFrontier.set(run.id, {
       confirmed: confirmedAfterRound,
       primitives: chainPrimitivesAfterRound,
     })
     const dryRounds = newRuntimeConfirmed + newChainPrimitives > 0
       ? 0
-      : (this.host.plannerDryRounds.get(run.id) ?? 0) + 1
-    this.host.plannerDryRounds.set(run.id, dryRounds)
+      : (this.plannerDryRounds.get(run.id) ?? 0) + 1
+    this.plannerDryRounds.set(run.id, dryRounds)
     const queueDrained = this.host.highPriorityQueueEmpty({
       id: run.id,
       goalRevision: this.storage.run(run.id).goalRevision,
@@ -1887,50 +1820,40 @@ export class ExecReconPlanner {
 
     // v7 coverage guard: a dry/coordinator stop must not abandon planned, dispatchable work while a
     // worker slot is free. The stop is deferred (never silently dropped) and the funnel records it.
-    let finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
     const finalFactIds = new Set(this.pageAll((offset, limit) =>
       this.storage.listFacts(run.id, { includeTainted: true, limit, offset })).map(fact => fact.id))
-    let remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
-    let coverage = this.passOneCoverageFor(run, finalSteps)
-    // A dry stop in front of unseeded Tier-A work is a bug, not a drained queue: seed every
-    // remaining Tier-A lead now and re-evaluate the stop against the refreshed queue.
+    const refreshQueueState = () => {
+      const steps = this.storage.listChainSteps(run.id, latest.goalRevision)
+      return {
+        steps,
+        remainingReady: dispatchableReadySteps(steps, finalFactIds).length,
+        coverage: this.passOneCoverageFor(run, steps),
+      }
+    }
+    let { steps: finalSteps, remainingReady, coverage } = refreshQueueState()
     let tierASeededAtStop = 0
     if (decision.decision === 'stop' && (coverage.uninvestigatedFirstPassClasses.length || coverage.uncoveredTierAEndpoints.length)) {
       tierASeededAtStop = this.queueTierALeadSteps(
-        this.storage.run(run.id),
-        this.host.approvedOriginsSet(run),
-        computeDynamicStepBudget(this.storage, run.id),
+        this.storage.run(run.id), this.host.approvedOriginsSet(run), computeDynamicStepBudget(this.storage, run.id),
       )
-      if (tierASeededAtStop > 0) {
-        finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
-        remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
-        coverage = this.passOneCoverageFor(run, finalSteps)
-      }
+      if (tierASeededAtStop > 0) ({ steps: finalSteps, remainingReady, coverage } = refreshQueueState())
     }
-    // Planner coverage assertion: before honoring a dry/coordinator stop when budget/requests/wall
-    // remain, seed first-pass steps for discovered high-risk unconfirmed routes (`riskScore >= 60`).
     const stopBudgetExhausted = this.storage.checkBudgetExceeded(run.id)
     const stopRequestExhausted = latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0
     const stopWallExhausted = this.host.maxDurationMs > 0 && latest.createdAt + this.host.maxDurationMs <= Date.now()
     let highRiskSeededAtStop = 0
     if (decision.decision === 'stop' && !stopBudgetExhausted && !stopRequestExhausted && !stopWallExhausted) {
       const seededHighRisk = this.queueHighRiskCoverageSteps(
-        this.storage.run(run.id),
-        this.host.approvedOriginsSet(run),
-        computeDynamicStepBudget(this.storage, run.id),
-        finalSteps,
+        this.storage.run(run.id), this.host.approvedOriginsSet(run), computeDynamicStepBudget(this.storage, run.id), finalSteps,
       )
       if (seededHighRisk.seeded > 0) {
         highRiskSeededAtStop = seededHighRisk.seeded
         funnel.planned += seededHighRisk.seeded
         funnel.enqueued += seededHighRisk.seeded
-        finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
-        remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
-        coverage = this.passOneCoverageFor(run, finalSteps)
+        ;({ steps: finalSteps, remainingReady, coverage } = refreshQueueState())
         try {
           this.storage.event(
-            run.id,
-            'planner.high_risk_coverage_assert',
+            run.id, 'planner.high_risk_coverage_assert',
             `Planner coverage assertion seeded ${seededHighRisk.seeded} uncovered high-risk route(s) before stop.`,
             { roundNo, seeded: seededHighRisk.seeded, endpoints: seededHighRisk.endpoints },
           )
@@ -2107,9 +2030,7 @@ export class ExecReconPlanner {
       thinkingLevel: 'off',
       prompt,
       signal: controller.signal,
-      onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
-      onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-      onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+      ...llmRunHooks(this.storage, run.id),
     }).then(answer => {
       if (!this.host.currentCoordinator(run.id, task)) return
       this.storage.transaction(() => {

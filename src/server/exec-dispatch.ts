@@ -261,41 +261,34 @@ export function resolvePhaseRequestBudgets(
   }
 }
 
-/**
- * Legacy v5.1 parser: an *unset* flag resolves to `off`. Kept exported and unchanged for callers
- * that pin the old opt-in semantics. `Execution` uses `resolveFloorLaneMode` instead.
- */
+function parseSweepMode(
+  option: boolean | 'always' | undefined,
+  env: NodeJS.ProcessEnv,
+  defaultMode: 'on' | 'off',
+): DeterministicSweepMode {
+  if (option === 'always') return 'always'
+  if (option === true) return 'on'
+  if (option === false) return 'off'
+  const raw = env.GUARDIAN_DETERMINISTIC_SWEEP?.trim().toLowerCase()
+  if (raw === 'always') return 'always'
+  if (defaultMode === 'off') return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on' ? 'on' : 'off'
+  return raw === '0' || raw === 'off' || raw === 'false' || raw === 'no' ? 'off' : 'on'
+}
+
+/** Legacy v5.1 parser: unset resolves to `off`. `Execution` uses `resolveFloorLaneMode`. */
 export function resolveDeterministicSweepMode(
   option?: boolean | 'always',
   env: NodeJS.ProcessEnv = process.env,
 ): DeterministicSweepMode {
-  if (option === 'always') return 'always'
-  if (option === true) return 'on'
-  if (option === false) return 'off'
-  const raw = env.GUARDIAN_DETERMINISTIC_SWEEP?.trim().toLowerCase()
-  if (raw === 'always') return 'always'
-  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return 'on'
-  return 'off'
+  return parseSweepMode(option, env, 'off')
 }
 
-/**
- * v6 Phase 1: the Layer-2 deterministic floor is always-on. An agentic run starts the concurrent
- * lane unless the operator explicitly disables it (`deterministicSweep: false` or
- * `GUARDIAN_DETERMINISTIC_SWEEP=0`). `'always'` additionally bypasses the resumed-run guard.
- * `--no-llm` runs the same engine unrestricted in `driveEngineInvestigation` and never starts the
- * lane, so the floor is present on every run either way.
- */
+/** v6 Phase 1: Layer-2 deterministic floor is always-on unless explicitly disabled. */
 export function resolveFloorLaneMode(
   option?: boolean | 'always',
   env: NodeJS.ProcessEnv = process.env,
 ): DeterministicSweepMode {
-  if (option === 'always') return 'always'
-  if (option === false) return 'off'
-  if (option === true) return 'on'
-  const raw = env.GUARDIAN_DETERMINISTIC_SWEEP?.trim().toLowerCase()
-  if (raw === 'always') return 'always'
-  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
-  return 'on'
+  return parseSweepMode(option, env, 'on')
 }
 /** Page a Store listing to exhaustion; the coordinator never plans from a fixed-size snapshot. */
 export function collectAllPages<T>(
@@ -2216,61 +2209,42 @@ export function buildBolaTestQueue(
   ).slice(0, overallBudget)
 }
 
-export function detLeadCategory(probeClass: string): string {
-  switch (probeClass) {
-    case 'authz_matrix': return 'broken-access-control'
-    case 'sqli_boolean':
-    case 'sqli_time_diff':
-    case 'sql_boolean_diff':
-    case 'sql_time_diff':
-    case 'ssti_math': return 'injection'
-    case 'xss_context':
-    case 'stored_xss': return 'xss'
-    case 'ssrf_canary': return 'ssrf'
-    case 'xxe_canary': return 'xxe'
-    case 'command_injection': return 'command-injection'
-    case 'path_traversal_benign': return 'path-traversal'
-    case 'workflow_invariant': return 'business-logic'
-    case 'open_redirect_differential': return 'open-redirect'
-    case 'csrf_state_change': return 'csrf'
-    case 'mass_assignment': return 'mass-assignment'
-    case 'graphql_audit': return 'broken-access-control'
-    case 'cache_poison_deception': return 'misconfig-exposure'
-    default: return 'misconfig-exposure'
-  }
+const DET_LEAD_CATEGORY_MAP: Record<string, string> = {
+  authz_matrix: 'broken-access-control', graphql_audit: 'broken-access-control',
+  sqli_boolean: 'injection', sqli_time_diff: 'injection', sql_boolean_diff: 'injection', sql_time_diff: 'injection', ssti_math: 'injection',
+  xss_context: 'xss', stored_xss: 'xss', ssrf_canary: 'ssrf', xxe_canary: 'xxe',
+  command_injection: 'command-injection', path_traversal_benign: 'path-traversal',
+  workflow_invariant: 'business-logic', open_redirect_differential: 'open-redirect',
+  csrf_state_change: 'csrf', mass_assignment: 'mass-assignment', cache_poison_deception: 'misconfig-exposure',
 }
+
+export function detLeadCategory(probeClass: string): string {
+  return DET_LEAD_CATEGORY_MAP[probeClass] ?? 'misconfig-exposure'
+}
+
+const CONFIRMED_CATEGORY_FAMILY_RULES: ReadonlyArray<[RegExp, string]> = [
+  [/access-control|authz|bola|bfla|idor/, 'authz'], [/injection/, 'sqli'], [/xss/, 'xss'],
+  [/ssrf/, 'ssrf'], [/xxe/, 'xxe'], [/traversal/, 'traversal'], [/redirect/, 'redirect'],
+  [/mass|overpost/, 'mass_assign'], [/csrf/, 'csrf'], [/logic|business/, 'logic'],
+  [/disclos|exposure/, 'disclosure'], [/cmdi|command/, 'cmdi'],
+]
 
 /** v6 Phase 1: map a persisted finding category onto the engine family namespace. */
 export function confirmedCategoryFamily(category: string): string {
   const raw = category.toLowerCase()
-  if (/access-control|authz|bola|bfla|idor/.test(raw)) return 'authz'
-  if (/injection/.test(raw)) return 'sqli'
-  if (/xss/.test(raw)) return 'xss'
-  if (/ssrf/.test(raw)) return 'ssrf'
-  if (/xxe/.test(raw)) return 'xxe'
-  if (/traversal/.test(raw)) return 'traversal'
-  if (/redirect/.test(raw)) return 'redirect'
-  if (/mass|overpost/.test(raw)) return 'mass_assign'
-  if (/csrf/.test(raw)) return 'csrf'
-  if (/logic|business/.test(raw)) return 'logic'
-  if (/disclos|exposure/.test(raw)) return 'disclosure'
-  if (/cmdi|command/.test(raw)) return 'cmdi'
-  return intentFamily(category)
+  return CONFIRMED_CATEGORY_FAMILY_RULES.find(([re]) => re.test(raw))?.[1] ?? intentFamily(category)
+}
+
+const DET_LEAD_SKILL_MAP: Record<string, string> = {
+  authz_matrix: 'bola-idor-race', graphql_audit: 'bola-idor-race',
+  sqli_boolean: 'injection-sqli-nosqli', sqli_time_diff: 'injection-sqli-nosqli',
+  sql_boolean_diff: 'injection-sqli-nosqli', sql_time_diff: 'injection-sqli-nosqli',
+  ssrf_canary: 'oob-ssrf-browser-chain', xss_context: 'client-side-xss-postmessage',
+  stored_xss: 'client-side-xss-postmessage', workflow_invariant: 'business-logic-chains',
 }
 
 /** v6 Phase 1: the skills a det_lead upgrade assignment should pre-inject. */
 export function detLeadSkills(probeClass: string): string[] {
-  switch (probeClass) {
-    case 'authz_matrix':
-    case 'graphql_audit': return ['bola-idor-race', 'false-positive-elimination']
-    case 'sqli_boolean':
-    case 'sqli_time_diff':
-    case 'sql_boolean_diff':
-    case 'sql_time_diff': return ['injection-sqli-nosqli', 'false-positive-elimination']
-    case 'ssrf_canary': return ['oob-ssrf-browser-chain', 'false-positive-elimination']
-    case 'xss_context':
-    case 'stored_xss': return ['client-side-xss-postmessage', 'false-positive-elimination']
-    case 'workflow_invariant': return ['business-logic-chains', 'false-positive-elimination']
-    default: return ['false-positive-elimination']
-  }
+  const primary = DET_LEAD_SKILL_MAP[probeClass]
+  return primary ? [primary, 'false-positive-elimination'] : ['false-positive-elimination']
 }

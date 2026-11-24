@@ -20,15 +20,18 @@ import {
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type AgentScriptProofEnvelope, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
-import { BrokerDenied, type BrokerExchangeResult, type Grant, type RequestBroker } from './broker.ts'
+import { BrokerDenied, type BrokerExchangeResult, type Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { checkCoverage, readComparisons, verificationCommand, type EvidenceReview } from './evidence-checks.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
+  ExecServiceModule,
   createExchangeRecorder,
+  findFindingRow,
   recordReportedFindingCoverage,
   type ExecActiveJob,
   type ExecCapture,
+  type ExecCoreServices,
   type ExecReviewInput,
   type ExecTier3ApprovalInput,
 } from './exec-exchange.ts'
@@ -47,7 +50,6 @@ import {
 } from './replay-verifier.ts'
 import { responseReview } from './response-checks.ts'
 import { canaries, findings, type ReplayProofReceiptRow } from './schema.ts'
-import type { ScopedBrowser } from './scoped-browser.ts'
 import {
   assessmentAssignments,
   InvariantError,
@@ -58,18 +60,13 @@ import {
   type Run,
   type Store,
 } from './store.ts'
-import { LinuxWorkerBackend, type WorkerBackend } from './worker-backend.ts'
+import { LinuxWorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
 type ReviewInput = ExecReviewInput
 
-export interface ExecVerifyHost {
-  storage: Store
-  broker: RequestBroker
-  browser: ScopedBrowser
-  canaryBroker: CanaryBroker
-  backend: WorkerBackend
+export interface ExecVerifyHost extends ExecCoreServices {
   approvedOriginsSet: (run: Run) => Set<string>
   permitted: (run: Run, origin: string) => boolean
   check: (job: Active) => Run
@@ -382,14 +379,66 @@ function serializeProofReceiptRow(
   }
 }
 
-export class ExecVerifier {
-  private readonly host: ExecVerifyHost
-  constructor(host: ExecVerifyHost) { this.host = host }
-  private get storage(): Store { return this.host.storage }
-  private get broker(): RequestBroker { return this.host.broker }
-  private get browser(): ScopedBrowser { return this.host.browser }
-  private get canaryBroker(): CanaryBroker { return this.host.canaryBroker }
-  private get backend(): WorkerBackend { return this.host.backend }
+export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
+
+  private addReplayReceiptArtifact(
+    run: Run,
+    assignment: Assignment,
+    title: string,
+    specRow: ReplaySpecRow,
+    spec: DeclarativeReplaySpec,
+    finalStatus: string,
+    verificationTier: VerificationTier | undefined,
+    result: ReplayVerificationResult,
+    secrets: readonly NamedSecret[],
+    extra?: { tag?: string; attemptCount?: number; feedback?: InlineVerifyFeedback; sourceOrigins?: string[] },
+  ) {
+    return this.storage.addArtifact(
+      run, assignment, 'replay', title,
+      JSON.stringify({
+        replaySpecId: specRow.id,
+        ...(extra?.attemptCount !== undefined ? { attemptCount: extra.attemptCount } : {}),
+        specSha256: specRow.specSha256,
+        kind: spec.kind,
+        origin: spec.origin,
+        verdict: finalStatus,
+        verificationTier: verificationTier ?? null,
+        outcome: result.outcome,
+        ...(extra?.feedback ? { feedback: extra.feedback } : {}),
+        exchangeIds: result.exchangeIds,
+        ...(extra?.sourceOrigins ? { sourceOrigins: extra.sourceOrigins } : {}),
+        evidenceSha256: result.evidenceSha256,
+        evidencePayload: result.evidencePayload,
+        receipt: result.receipt?.verification ?? null,
+        receiptArtifact: result.receipt?.receipt ?? null,
+      }, null, 2),
+      extra?.tag,
+      secrets,
+    )
+  }
+
+  private persistReplayConfirmation(
+    run: Run,
+    assignment: Assignment,
+    findingRow: typeof findings.$inferSelect,
+    spec: DeclarativeReplaySpec,
+    specRowId: string,
+    origins: string[],
+    updatedFinding: Finding,
+    result: ReplayVerificationResult,
+    finalStatus: Finding['status'],
+    cancelSiblingStepId?: string | null,
+  ): void {
+    this.storage.upsertChainFinding(run, findingRow.assetId, alignFindingForEvidence(updatedFinding, result), specRowId, origins)
+    recordReportedFindingCoverage(
+      this.storage, run, assignment.id, spec.origin, spec.category,
+      `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${spec.title}`,
+      findingRow.id, (r, o) => this.host.permitted(r, o),
+    )
+    if (cancelSiblingStepId !== undefined) this.host.cancelSiblingTrialsOnConfirmation(run, cancelSiblingStepId, findingRow.id)
+    const refreshedRow = findFindingRow(this.storage, run.id, findingRow.id)
+    if (refreshedRow) this.host.scheduleVariantSweepForFinding(run, refreshedRow)
+  }
 
   private async ensureCanaryListenerForSpec(spec: DeclarativeReplaySpec): Promise<void> {
     if ((spec.kind === 'rce_proof' && spec.proofMode === 'oob_canary') || this.host.isCanaryListenerConfigured()) {
@@ -664,9 +713,7 @@ export class ExecVerifier {
   async verifyReplaySpecJob(job: Active, replaySpecId: string) {
     const run = this.host.check(job)
     const specRow = this.storage.getReplaySpec(run.id, replaySpecId)
-    const findingRow = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id), eq(findings.id, specRow.findingId),
-    )).get()
+    const findingRow = findFindingRow(this.storage, run.id, specRow.findingId)
     if (!findingRow) {
       this.host.completeWorker(job.assignment, run, 'Finding no longer exists.', [])
       return
@@ -730,25 +777,12 @@ export class ExecVerifier {
     this.storage.transaction(() => {
       // Strict Tier Separation (Invariant #4): static_ast_proof NEVER promotes to 'confirmed' / 'runtime_confirmed'
       const { isStaticAst, finalStatus, verificationTier } = deriveReplayOutcomeStatus(specRow.spec, result)
-      const receipt = this.storage.addArtifact(current, job.assignment, 'replay',
-        `${isStaticAst ? 'Deterministic Static AST' : 'Zero-LLM replay'} · ${specRow.spec.title}`,
-        JSON.stringify({
-          replaySpecId: specRow.id,
-          specSha256: specRow.specSha256,
-          kind: specRow.spec.kind,
-          origin: specRow.spec.origin,
-          verdict: finalStatus,
-          verificationTier: verificationTier ?? null,
-          outcome: result.outcome,
-          exchangeIds: result.exchangeIds,
-          sourceOrigins: specRow.sourceOrigins,
-          evidenceSha256: result.evidenceSha256,
-          evidencePayload: result.evidencePayload,
-          receipt: result.receipt?.verification ?? null,
-          receiptArtifact: result.receipt?.receipt ?? null,
-        }, null, 2), 'replay:' + specRow.id, currentSecrets())
-
       const secretsList = currentSecrets()
+      const receipt = this.addReplayReceiptArtifact(
+        current, job.assignment, `${isStaticAst ? 'Deterministic Static AST' : 'Zero-LLM replay'} · ${specRow.spec.title}`,
+        specRow, specRow.spec, finalStatus, verificationTier, result, secretsList,
+        { tag: 'replay:' + specRow.id, sourceOrigins: specRow.sourceOrigins },
+      )
       const { patch, cleanObserved } = buildReplayFindingPatch(
         specRow.spec, result, findingRow.finding, finalStatus, verificationTier, 'replay', secretsList,
       )
@@ -760,47 +794,25 @@ export class ExecVerifier {
         scopeRevision: current.scopeRevision,
       }
       const rawFeedback = buildInlineVerifyFeedback(
-        specRow.spec,
-        result,
-        Math.max(1, specRow.attemptCount),
-        maxInlineVerifyRetries,
-        currentSecrets(),
+        specRow.spec, result, Math.max(1, specRow.attemptCount), maxInlineVerifyRetries, secretsList,
       )
       phaseFeedback = rawFeedback
-      // Route every diff through the store: confirmation writes persist the confirming verdict
-      // before the finding write, and a non-confirming retest demotes an already-confirmed claim
-      // (and is counted) instead of leaving it contradicted by its own evidence.
       this.host.recordSpecVerification(
-        current.id,
-        specRow.id,
-        rawFeedback,
+        current.id, specRow.id, rawFeedback,
         `phase3 ${specRow.spec.kind} attempt ${specRow.attemptCount} returned ${finalStatus}`,
       )
       if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
-        this.storage.upsertChainFinding(current, findingRow.assetId, alignFindingForEvidence(updatedFinding, result), specRow.id, specRow.sourceOrigins)
-        recordReportedFindingCoverage(this.storage, current, job.assignment.id, specRow.spec.origin, specRow.spec.category, `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${specRow.spec.title}`, findingRow.id, (r, o) => this.host.permitted(r, o))
-        const refreshedRow = this.storage.db.select().from(findings).where(and(
-          eq(findings.runId, current.id), eq(findings.id, findingRow.id),
-        )).get()
-        if (refreshedRow) this.host.scheduleVariantSweepForFinding(current, refreshedRow)
+        this.persistReplayConfirmation(
+          current, job.assignment, findingRow, specRow.spec, specRow.id, specRow.sourceOrigins, updatedFinding, result, finalStatus,
+        )
       } else {
-        this.storage.updateProposedFinding(current, findingRow.id, {
-          verificationTier: null,
-          finding: updatedFinding,
-        })
+        this.storage.updateProposedFinding(current, findingRow.id, { verificationTier: null, finding: updatedFinding })
       }
       this.host.completeWorker(
-        job.assignment,
-        current,
-        `Replay verdict: ${finalStatus} (${cleanObserved.slice(0, 160)})`,
-        [receipt.id],
-        undefined,
-        secretsList,
+        job.assignment, current, `Replay verdict: ${finalStatus} (${cleanObserved.slice(0, 160)})`, [receipt.id], undefined, secretsList,
       )
     }, { behavior: 'immediate' })
-    const refreshed = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, current.id), eq(findings.id, findingRow.id),
-    )).get()
+    const refreshed = findFindingRow(this.storage, current.id, findingRow.id)
     if (refreshed) {
       this.host.postVerificationVerdict(current, {
         replaySpecId: specRow.id,
@@ -1081,9 +1093,7 @@ export class ExecVerifier {
     const persisted = persistedAgentScriptOf(specRow.spec)
     if (!persisted?.envelope) return null
     const envelope = persisted.envelope
-    const findingRow = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id), eq(findings.id, specRow.findingId),
-    )).get()
+    const findingRow = findFindingRow(this.storage, run.id, specRow.findingId)
     const origin = (persisted.origin || specRow.spec.origin || '').trim()
     const approved = this.host.approvedOriginsSet(run)
     if (!origin || !approved.has(origin)) return null
@@ -1233,11 +1243,7 @@ export class ExecVerifier {
       throw new BrokerDenied('Replay spec references an origin outside current approved scope.')
     }
 
-    const findingRow = params.findingId
-      ? this.storage.db.select().from(findings).where(and(
-          eq(findings.runId, curRun.id), eq(findings.id, params.findingId),
-        )).get()
-      : undefined
+    const findingRow = params.findingId ? findFindingRow(this.storage, curRun.id, params.findingId) : undefined
     const isAlreadyVerified = Boolean(
       findingRow && (findingRow.finding.status === 'confirmed' || findingRow.finding.status === 'static_verified'),
     )
@@ -1313,11 +1319,7 @@ export class ExecVerifier {
             })
           }
           const deniedRun = this.host.check(params.job)
-          const deniedRow = findingRow
-            ? this.storage.db.select().from(findings).where(and(
-                eq(findings.runId, deniedRun.id), eq(findings.id, findingRow.id),
-              )).get()
-            : undefined
+          const deniedRow = findingRow ? findFindingRow(this.storage, deniedRun.id, findingRow.id) : undefined
           return {
             findingId: findingRow?.id,
             replaySpecId: updatedSpec.id,
@@ -1377,29 +1379,11 @@ export class ExecVerifier {
       secrets: params.currentSecrets(),
     })
 
-    const receipt = this.storage.addArtifact(
-      latestRun,
-      params.job.assignment,
-      'replay',
+    const receipt = this.addReplayReceiptArtifact(
+      latestRun, params.job.assignment,
       `Inline ${isStaticAst ? 'Static AST' : 'Zero-LLM replay'} attempt #${updatedSpec.attemptCount} · ${parsed.title}`,
-      JSON.stringify({
-        replaySpecId: updatedSpec.id,
-        attemptCount: updatedSpec.attemptCount,
-        specSha256: updatedSpec.specSha256,
-        kind: parsed.kind,
-        origin: parsed.origin,
-        verdict: finalStatus,
-        verificationTier: verificationTier ?? null,
-        outcome: replay.outcome,
-        feedback: normalizedFeedback,
-        exchangeIds: replay.exchangeIds,
-        evidenceSha256: replay.evidenceSha256,
-        evidencePayload: replay.evidencePayload,
-        receipt: replay.receipt?.verification ?? null,
-        receiptArtifact: replay.receipt?.receipt ?? null,
-      }, null, 2),
-      undefined,
-      params.currentSecrets(),
+      updatedSpec, parsed, finalStatus, verificationTier, replay, params.currentSecrets(),
+      { attemptCount: updatedSpec.attemptCount, feedback: normalizedFeedback },
     )
 
     if (findingRow && !isAlreadyVerified) {
@@ -1407,35 +1391,16 @@ export class ExecVerifier {
       const { patch } = buildReplayFindingPatch(
         parsed, replay, findingRow.finding, finalStatus, verificationTier, 'inline replay', params.currentSecrets(),
       )
-      const nextFindingPatch: Partial<Finding> = {
-        ...patch,
-        evidenceIds: [receipt.id],
-        exchangeIds: replay.exchangeIds,
-      }
+      const nextFindingPatch: Partial<Finding> = { ...patch, evidenceIds: [receipt.id], exchangeIds: replay.exchangeIds }
       if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
-        this.storage.upsertChainFinding(
-          latestRun,
-          findingRow.assetId,
-          alignFindingForEvidence(
-            { ...findingRow.finding, ...nextFindingPatch, replaySpecId: updatedSpec.id, scopeRevision: latestRun.scopeRevision },
-            replay,
-          ),
-          updatedSpec.id,
-          mergedOrigins,
+        this.persistReplayConfirmation(
+          latestRun, params.job.assignment, findingRow, parsed, updatedSpec.id, mergedOrigins,
+          { ...findingRow.finding, ...nextFindingPatch, replaySpecId: updatedSpec.id, scopeRevision: latestRun.scopeRevision },
+          replay, finalStatus, params.job.assignment.stepId,
         )
-        recordReportedFindingCoverage(this.storage, latestRun, params.job.assignment.id, parsed.origin, parsed.category, `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${parsed.title}`, findingRow.id, (r, o) => this.host.permitted(r, o))
-        // Multi-Trial Early Stopping: cancel sibling trials immediately on first Zero-LLM confirmation
-        this.host.cancelSiblingTrialsOnConfirmation(latestRun, params.job.assignment.stepId, findingRow.id)
-        const refreshedRow = this.storage.db.select().from(findings).where(and(
-          eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
-        )).get()
-        if (refreshedRow) this.host.scheduleVariantSweepForFinding(latestRun, refreshedRow)
       } else {
         this.storage.updateProposedFinding(latestRun, findingRow.id, {
-          replaySpecId: updatedSpec.id,
-          sourceOrigins: mergedOrigins,
-          verificationTier: null,
-          finding: nextFindingPatch,
+          replaySpecId: updatedSpec.id, sourceOrigins: mergedOrigins, verificationTier: null, finding: nextFindingPatch,
         })
       }
     }
@@ -1557,9 +1522,7 @@ export class ExecVerifier {
     const run = this.host.check(job)
     const findingId = job.assignment.stepId
     if (!findingId) throw new Error('Retest worker missing finding reference.')
-    const findingRow = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id), eq(findings.id, findingId),
-    )).get()
+    const findingRow = findFindingRow(this.storage, run.id, findingId)
     if (!findingRow?.replaySpecId) throw new Error('Finding has no Declarative Replay Spec.')
     const specRow: ReplaySpecRow = this.storage.getReplaySpec(run.id, findingRow.replaySpecId)
     const permittedAtAdmission = this.host.approvedOriginsSet(run)

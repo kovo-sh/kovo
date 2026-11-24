@@ -218,23 +218,27 @@ export class ExecBoardManager {
     })
   }
 
-  /** Tier-3 gate: pause the warm member and post an approval card linked by refApprovalId. */
+  private transitionApprovalMember(run: Run, handle: string, assignmentId: string, toState: 'paused' | 'working'): void {
+    const member = this.storage.boardMember(run.id, handle)
+    if (!member || member.role !== 'specialist') return
+    if (toState === 'working' && member.state !== 'paused') return
+    try {
+      this.storage.updateBoardMemberState(run.id, handle, { state: toState, activeAssignmentId: assignmentId })
+      this.warm.register(handle, {
+        sessionId: member.sessionId,
+        state: toState === 'paused' ? 'working' : 'paused',
+        lastReadSeq: member.lastReadSeq,
+      })
+      if (toState === 'paused') this.warm.pause(handle, assignmentId)
+      else this.warm.resume(handle, assignmentId)
+    } catch { /* roster mirror is best-effort */ }
+  }
+
   postApprovalCard(run: Run, assignmentId: string, input: {
-    approvalId: string
-    origin: string
-    method: string
-    pathAndQuery: string
-    rationale: string
+    approvalId: string; origin: string; method: string; pathAndQuery: string; rationale: string
   }, secrets: readonly NamedSecret[] = []): BoardMessageRow | null {
     const handle = this.boardHandleForAssignmentId(run, assignmentId)
-    const member = this.storage.boardMember(run.id, handle)
-    if (member && member.role === 'specialist') {
-      try {
-        this.storage.updateBoardMemberState(run.id, handle, { state: 'paused', activeAssignmentId: assignmentId })
-        this.warm.register(handle, { sessionId: member.sessionId, state: 'working', lastReadSeq: member.lastReadSeq })
-        this.warm.pause(handle, assignmentId)
-      } catch { /* roster mirror is best-effort */ }
-    }
+    this.transitionApprovalMember(run, handle, assignmentId, 'paused')
     return this.postBoard(run, {
       authorHandle: 'broker',
       authorRole: 'system',
@@ -247,21 +251,10 @@ export class ExecBoardManager {
   }
 
   postApprovalResolution(run: Run, assignmentId: string, input: {
-    approvalId: string
-    decision: string
-    origin: string
-    method: string
-    pathAndQuery: string
+    approvalId: string; decision: string; origin: string; method: string; pathAndQuery: string
   }): void {
     const handle = this.boardHandleForAssignmentId(run, assignmentId)
-    const member = this.storage.boardMember(run.id, handle)
-    if (member && member.role === 'specialist' && member.state === 'paused') {
-      try {
-        this.storage.updateBoardMemberState(run.id, handle, { state: 'working', activeAssignmentId: assignmentId })
-        this.warm.register(handle, { sessionId: member.sessionId, state: 'paused', lastReadSeq: member.lastReadSeq })
-        this.warm.resume(handle, assignmentId)
-      } catch { /* roster mirror is best-effort */ }
-    }
+    this.transitionApprovalMember(run, handle, assignmentId, 'working')
     this.postBoard(run, {
       authorHandle: 'broker',
       authorRole: 'system',
