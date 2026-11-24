@@ -492,6 +492,16 @@ test('race and multi-step assignments get 20–30 turns; single-step stays 12', 
   assert.equal(isMultiStepAssignment({ skills: ['bola-idor-race'] }), true)
   assert.equal(isMultiStepAssignment({ title: 'Cross-persona BOLA/IDOR matrix' }), true)
   assert.equal(isMultiStepAssignment({ title: 'det_lead upgrade · authz_matrix PATCH /v3/admin/users/:id', category: 'broken-access-control' }), false)
+  assert.equal(
+    isMultiStepAssignment({
+      title: 'det_lead upgrade · sqli_boolean POST /api/orders/:id',
+      hypothesis: 'Reproduce it and chain it into a higher-impact finding.',
+      category: 'injection',
+      skills: ['injection-sqli-nosqli', 'false-positive-elimination'],
+    }),
+    false,
+    'det_lead prose mentioning "chain" is still a single-step assignment',
+  )
 })
 
 // ============================================================================

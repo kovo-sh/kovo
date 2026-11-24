@@ -1124,7 +1124,7 @@ export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 85_000
 export const MULTI_STEP_ASSIGNMENT_MIN_TURNS = 20
 export const MULTI_STEP_ASSIGNMENT_MAX_TURNS = 30
 /** Multi-step evidence work: race bursts, cross-persona matrices, workflow/second-order chains. */
-const MULTI_STEP_ASSIGNMENT_RE = /\brace\b|race[_-]|bola|bfla|idor|cross[_-]?persona|multi[_-]?step|second[_-]?order|workflow|business[_-]?logic|chain|escalat/i
+const MULTI_STEP_ASSIGNMENT_RE = /\brace\b|race[_-]|bola|bfla|idor|cross[_-]?persona|multi[_-]?step|second[_-]?order|workflow|business[_-]?logic|\bchain\b|escalat/i
 /** Multi-step/race assignments keep the long wall cap (never the 85 s single-step cap). */
 export function isMultiStepAssignment(input: {
   title?: string
@@ -1132,8 +1132,11 @@ export function isMultiStepAssignment(input: {
   category?: string | null
   skills?: readonly string[]
 }): boolean {
+  // Deliberately ignores `hypothesis` prose: a det_lead says "chain it into a higher-impact finding"
+  // on every upgrade, which is not a multi-step assignment. Structured title/category/skill signals
+  // are the reliable contracts.
   const skillText = (input.skills ?? []).join(' ')
-  return MULTI_STEP_ASSIGNMENT_RE.test(`${input.title ?? ''} ${input.hypothesis ?? ''} ${input.category ?? ''} ${skillText}`)
+  return MULTI_STEP_ASSIGNMENT_RE.test(`${input.title ?? ''} ${input.category ?? ''} ${skillText}`)
 }
 /** Multi-step chains that cite parent evidence keep the long cap (bounded below). */
 export const CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS = 120_000
