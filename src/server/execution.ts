@@ -9017,11 +9017,10 @@ export class Execution {
     const turnLatencies: number[] = []
     let generationStartedAt: number | undefined
     const noTokenMs = resolveProviderStallNoTokenMs()
-    /** Never let the watchdog outlive the assignment wall: leave 10 s to requeue (floor 5 s). */
-    const noTokenThresholdMs = () => {
-      const remainingWall = Math.max(0, budget.wallClockMs - (Date.now() - startedAt))
-      return Math.min(noTokenMs, Math.max(5_000, remainingWall - 10_000))
-    }
+    // Always the full no-token window. Never shrink it near the assignment wall: that turned
+    // healthy-but-slow final turns into "stalls", burning a bounded retry on work the wall budget
+    // was already going to settle.
+    const noTokenThresholdMs = () => noTokenMs
     const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50), turnLatencies.length)
     const stallWatchdog = new ProviderNoTokenWatchdog({
       thresholdMs: noTokenThresholdMs,
