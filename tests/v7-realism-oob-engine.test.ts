@@ -270,6 +270,56 @@ function acceptedExchange(req: BrokerHttpRequest): BrokerExchangeResult {
   } as unknown as BrokerExchangeResult
 }
 
+test('realism oob: a query-location URL carrier is delivered in the query string, still traceable', async () => {
+  const broker = localBroker()
+  const sent: BrokerHttpRequest[] = []
+  const requestBroker = {
+    executeHttp: async (req: BrokerHttpRequest) => {
+      sent.push(req)
+      return acceptedExchange(req)
+    },
+  } as unknown as RequestBroker
+
+  const report = await runDeterministicEngine({
+    runId: `${runId}-query`,
+    assignmentId,
+    signal: new AbortController().signal,
+    endpoints: [{
+      id: 'openapi:POST:/svc/fetch/verify',
+      origin: ORIGIN,
+      method: 'POST',
+      pathTemplate: '/svc/fetch/verify',
+      params: [{ name: 'targetUri', location: 'query' }],
+      riskScore: 80,
+      source: 'openapi',
+    }],
+    personas: [],
+    broker: requestBroker,
+    grant: engineGrant(),
+    backend: {} as never,
+    canaryBroker: broker,
+    tier: 3,
+    maxRequests: 120,
+    maxDurationMs: 20_000,
+    classes: new Set(['ssrf']),
+    environmentMode: 'ephemeral_lab',
+    onConfirmed: () => null,
+  })
+
+  const pending = broker.pending(`${runId}-query`)
+  assert.ok(pending.length >= 1, 'the query carrier mints a durable canary')
+  const tokens = new Set(pending.map(sub => sub.token))
+  const carrying = sent.filter(req => req.pathAndQuery.includes('targetUri=')
+    && [...tokens].some(token => req.pathAndQuery.includes(encodeURIComponent(token))))
+  assert.ok(carrying.length >= 1, 'the injected canary travels in the query string, where the sink reads it')
+  for (const req of carrying) {
+    const token = [...tokens].find(candidate => req.pathAndQuery.includes(encodeURIComponent(candidate)))!
+    assert.equal(req.traceId, token, 'the query carrier is attributable through its correlation id')
+    assert.ok(!(req.body as string).includes(token), 'the URL is not duplicated into a JSON body the sink ignores')
+  }
+  assert.ok(report.notes.some(note => /canary attempt\(s\) injected/.test(note)))
+})
+
 test('realism oob: the engine names the injected canary on the carrying request and reports the pending attempt', async () => {
   const broker = localBroker()
   const sent: BrokerHttpRequest[] = []

@@ -3332,12 +3332,19 @@ async function probeSecondOrderSsrf(
   // fetch as part of the write, so the write exchange is the trigger and no second call is needed.
   const triggerIsSelf = trigger.split('?')[0] === hyp.pathAndQuery.split('?')[0]
   const send = async (pathAndQuery: string, value: string, traceId?: string): Promise<BrokerExchangeResult | null> => {
-    const body = { ...stagingBody, [param.name]: value }
+    // The hypothesis records *where* the URL carrier lives. A query carrier must be delivered in
+    // the query string (the body would be ignored by the sink); a body carrier keeps the staged
+    // sibling body and overrides only its own field.
+    const queryCarrier = param.location === 'query'
+    const target = queryCarrier
+      ? `${pathAndQuery}${pathAndQuery.includes('?') ? '&' : '?'}${encodeURIComponent(param.name)}=${encodeURIComponent(value)}`
+      : pathAndQuery
+    const body = queryCarrier ? stagingBody : { ...stagingBody, [param.name]: value }
     try {
       const exchange = await input.broker.executeHttp({
         origin: hyp.endpoint.origin,
         method: 'POST',
-        pathAndQuery,
+        pathAndQuery: target,
         headers: { 'Content-Type': 'application/json', ...stagingHeaders },
         body: JSON.stringify(body),
         // In a local lab the broker records this as `X-Guardian-Trace-Id`, so the exchange that
