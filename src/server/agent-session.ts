@@ -2126,8 +2126,8 @@ export interface SpecialistProfileConfig {
 
 export const SPECIALIST_COMMON_TOOLS: readonly (keyof WorkerToolHandlers)[] = [
   'spillOutput',
-  'verify_replay_spec',
   'guardian_verify',
+  'verify_replay_spec',
   'prove_authz_read_diff',
   'prove_state_mutation_diff',
   'prove_business_invariant',
@@ -2497,9 +2497,9 @@ const scenarioInstructions: Record<AgentScenario, string> = {
     '3. Multi-persona BOLA/IDOR & race verification (Tier 2/3): harvest resource IDs owned by user_a via record_fact (kind="object_ref", subkind="persona_resource") and test across user_b and anonymous via probe_differential(authz_matrix) or 3-way controls. Use request_http_race (2–10 synchronized requests) for TOCTOU checks and DELETE/multipart ONLY at Tier 3 (HITL approval) or local-lab.',
     '4. Correlate CVEs responsibly: call query_cves on fingerprinted frameworks/packages. Version hits and raw SAST/template matches are ONLY cve_hypothesis or candidate leads—never confirmed until proven deterministically.',
     '5. Strict 3-State Closure Discipline (record_coverage): every tested surface MUST close in one of three states: (a) "reported" (with linkedFindingId), (b) "ruled_out" (REQUIRES non-empty enforcingControl quoting exact file:line in /repos or exact negative-control exchangeId—generic claims like "framework probably escapes it" are rejected), or (c) "needs_follow_up" (REQUIRES non-empty proofGapReason explaining the exact blocker such as Tier 2 persona, Tier 3 approval, or local-lab runtime).',
-    '6. Mandatory Counterevidence, Deduplication & Inline Zero-LLM Verification: every propose_chain_finding call MUST include non-empty counterevidence (strongest argument against exploitability), confidenceRationale, optional severityChangeConditions/codeLocations, and a valid DeclarativeReplaySpec across any of the 14 kinds (http_chain, dns_takeover, tls_audit, browser_dom, browser_chain, race_burst, rce_proof, sql_boolean_diff, ws_chain, upload_probe, static_ast_proof, auth_protocol_proof, cache_differential, sql_time_diff). By default verifyNow=true runs deterministic Zero-LLM ReplayVerifier immediately and returns sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). If inline verification returns dismissed/inconclusive, inspect the feedback, repair the spec, and re-verify via verify_replay_spec or update_proposed_finding (up to 2 repair retries = 3 total attempts). Remember static_ast_proof verifies to the separate static_verified tier—NEVER conflate it with runtime confirmed. If submission deduplication returns an existing findingId, call update_proposed_finding to enrich/upgrade it instead of creating duplicates.',
-    '7. Never craft destructive payloads, webshells, reverse shells, file writes, or credential exfiltration. Never probe internal IPs or cloud metadata endpoints; use benign signed OOB HTTP/DNS canaries (mint_canary/check_canary) for blind outbound validation. Active rce_proof and upload_probe specs require Tier 3 HITL approval (or local-lab) and strictly non-destructive verifier-minted nonces.',
-    '8. When finished (or when entering the 85% settlement phase), commit all unrecorded facts, 3-state coverage entries, and replay specs, then call complete_intent with status (proved | ruled_out | blocked | partial) and a concise evidence-backed summary.',
+    '6. Primary Verification Path (`guardian_verify`) & Fallback Spec Rules: when `guardian_verify` is available, confirm EVERY runtime vulnerability by calling `guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")` (`prove_access_boundary`, `prove_persisted_mutation`, `prove_boolean_or_timing_diff`, `prove_oob_callback`, or `prove_race_burst`) so Guardian runs two fresh sessions and persists a verified ProofReceipt (`proof_kind="agent_script"`). On failure read `rejectedBy`, `missingEvidence`, and `transcriptSummary` and repair the script in the next turn. Use `propose_chain_finding` / `verify_replay_spec` ONLY as legacy fallback (for `static_ast_proof` -> `static_verified` tier, or when `guardian_verify` is absent; retired legacy kinds `dns_takeover`, `tls_audit`, `browser_dom`, `ws_chain`, `upload_probe` fail closed). Every `propose_chain_finding` call requires non-empty counterevidence, confidenceRationale, and a valid DeclarativeReplaySpec; if deduplication returns an existing findingId, call `update_proposed_finding` instead of creating duplicates.',
+    '7. Never craft destructive payloads, webshells, reverse shells, file writes, or credential exfiltration. Never probe internal IPs or cloud metadata endpoints; use benign signed OOB HTTP/DNS canaries (mint_canary/check_canary) for blind outbound validation. Active rce_proof specs require Tier 3 HITL approval (or local-lab) and strictly non-destructive verifier-minted nonces.',
+    '8. When finished (or when entering the 85% settlement phase), commit all unrecorded facts, 3-state coverage entries, and `guardian_verify` proof scripts (or coded `proofGapReason`), then call complete_intent with status (proved | ruled_out | blocked | partial) and a concise evidence-backed summary.',
     boardGuardrailInstructions(),
   ].join('\n'),
 
@@ -3385,25 +3385,40 @@ function previewText(value: unknown, maxBytes = proofRepairBodyPreviewBytes): st
   return truncateUtf8Head(text, maxBytes)
 }
 
-function derivedRepairFix(result: Record<string, unknown>): string {
+/** Resolve system instructions for a scenario, pinning `guardian_verify` as primary when active. */
+export function workerSessionInstructions(
+  scenario: AgentScenario,
+  options?: { hasGuardianVerify?: boolean },
+): string {
+  const base = scenarioInstructions[scenario]
+  if (scenario === 'worker-investigation' && options?.hasGuardianVerify) {
+    return `${base}\nPRIMARY PROOF CONTRACT: \`guardian_verify\` is active in this session. Confirm EVERY runtime vulnerability via \`guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")\` so Guardian persists a verified ProofReceipt (\`proof_kind="agent_script"\`). Do NOT call legacy \`verify_replay_spec\` or \`propose_chain_finding\` with \`http_chain\` for runtime proofs.`
+  }
+  return base
+}
+
+function derivedRepairFix(result: Record<string, unknown>, preferGuardianVerify = false): string {
+  const toolHint = preferGuardianVerify ? 'guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")' : 'verify_replay_spec'
   const jqError = typeof result.jqError === 'string' ? result.jqError : ''
   const failedStepId = typeof result.failedStepId === 'string' ? result.failedStepId : ''
   const reason = isPlainRecord(result.assertionSummary) && typeof result.assertionSummary.reason === 'string'
     ? result.assertionSummary.reason
     : ''
   if (jqError) {
-    return `Fix assertionsJq so it emits {"confirmed":bool,"controlPassed":bool,"observed":string,"expected":string}. jq error: ${jqError}`
+    return preferGuardianVerify
+      ? `Switch to ${toolHint} (no jq needed), or fix assertionsJq so it emits {"confirmed":bool,"controlPassed":bool,"observed":string,"expected":string}. jq error: ${jqError}`
+      : `Fix assertionsJq so it emits {"confirmed":bool,"controlPassed":bool,"observed":string,"expected":string}. jq error: ${jqError}`
   }
   if (result.spaCatchallMatched === true) {
-    return 'The control matched the SPA catchall shell. Target a concrete API route with a body distinct from the shell, then re-verify with verify_replay_spec.'
+    return `The control matched the SPA catchall shell. Target a concrete API route with a body distinct from the shell, then re-verify with ${toolHint}.`
   }
   if (failedStepId) {
-    return `Repair step ${failedStepId}: keep the control non-error and make the probe expose the identifier/marker (status alone is not proof); then re-run verify_replay_spec.`
+    return `Repair step ${failedStepId}: keep the control non-error and make the probe expose the identifier/marker (status alone is not proof); then re-run ${toolHint}.`
   }
   if (reason) {
-    return `Tighten the assertion so observed/expected bind the identifier or marker. Verifier reason: ${reason}`
+    return `Tighten the assertion so observed/expected bind the identifier or marker${preferGuardianVerify ? ` (prefer ${toolHint})` : ''}. Verifier reason: ${reason}`
   }
-  return 'Keep the control non-error and make the probe expose the identifier/marker in the body; then re-run verify_replay_spec.'
+  return `Keep the control non-error and make the probe expose the identifier/marker in the body; then re-run ${toolHint}.`
 }
 
 const verifierFeedbackKeys = ['inlineVerifyFeedback', 'verifierFeedback', 'verification', 'feedback'] as const
@@ -3416,7 +3431,7 @@ function verificationOutcome(result: Record<string, unknown>): Record<string, un
   return result
 }
 
-export function verifierRepairFeedback(result: unknown): VerifierRepairFeedback | null {
+export function verifierRepairFeedback(result: unknown, preferGuardianVerify = false): VerifierRepairFeedback | null {
   if (!isPlainRecord(result)) return null
   const outcome = verificationOutcome(result)
   if (!outcome) return null
@@ -3446,14 +3461,14 @@ export function verifierRepairFeedback(result: unknown): VerifierRepairFeedback 
     extractedVars: outcome.extractedVars ?? null,
     suggestedFix: typeof outcome.suggestedFix === 'string' && outcome.suggestedFix.trim()
       ? outcome.suggestedFix
-      : derivedRepairFix(outcome),
+      : derivedRepairFix(outcome, preferGuardianVerify),
   }
 }
 
 /** Attach repair feedback to a failed verification outcome; non-verification results pass through. */
-export function withVerifierRepairFeedback(result: unknown): unknown {
+export function withVerifierRepairFeedback(result: unknown, preferGuardianVerify = false): unknown {
   if (!isPlainRecord(result)) return result
-  const feedback = verifierRepairFeedback(result)
+  const feedback = verifierRepairFeedback(result, preferGuardianVerify)
   if (!feedback) return result
   return { ...result, repair: feedback }
 }
@@ -4606,12 +4621,79 @@ export function buildWorkerTools(
     }
   }
 
+  const hasGuardianVerify = Boolean(handlers.guardian_verify)
+
+  if (handlers.guardian_verify) {
+    const fn = handlers.guardian_verify
+    tools.push(defineTool({
+      name: 'guardian_verify',
+      description: GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+      parameters: obj({
+        script: opt(str({ description: 'Inline verification script (TypeScript or Python). Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
+        scriptPath: opt(str({ description: 'Workspace-relative path to a previously written verification script.', maxLength: 512 })),
+        runtime: opt(oneOf(['ts', 'python'] as const)),
+        title: opt(str({ description: 'Short proof title (echoed by the verdict).', maxLength: 300 })),
+        timeoutMs: opt(int({ minimum: 1_000, maximum: 120_000 })),
+      }),
+      replay: 'unsafe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        const inlineScript = args.script?.trim()
+        const scriptPath = args.scriptPath?.trim()
+        if (!inlineScript && !scriptPath) {
+          return {
+            isError: true,
+            output: [{
+              type: 'text' as const,
+              text: 'guardian_verify validation failed: provide `script` (inline) or `scriptPath` (a file written into the workspace).',
+            }],
+          }
+        }
+        const runtime: GuardianVerifyRuntime = args.runtime
+          ?? (scriptPath && /\.py$/i.test(scriptPath) ? 'python' : 'ts')
+        const payload: GuardianVerifyArgs = {
+          ...(inlineScript ? { script: inlineScript } : { scriptPath }),
+          runtime,
+          ...(args.title?.trim() ? { title: args.title.trim() } : {}),
+          ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+        }
+        return wrapExec(
+          'guardian_verify',
+          async () => {
+            const result = await fn(payload, signal)
+            const summary = summarizeGuardianVerifyOutcome(result)
+            const transcriptRoutes = summary.transcriptSummary
+              .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
+              .map(entry => ({
+                method: typeof entry.method === 'string' ? entry.method : undefined,
+                path: typeof entry.route === 'string'
+                  ? entry.route
+                  : typeof entry.pathAndQuery === 'string'
+                    ? entry.pathAndQuery
+                    : typeof entry.path === 'string'
+                      ? entry.path
+                      : undefined,
+              }))
+              .filter(entry => Boolean(entry.path))
+            specSubmission?.tracker?.noteVerifyScript(payload.script, transcriptRoutes)
+            return summary
+          },
+          signal,
+        )
+      },
+    }))
+  }
+
   if (handlers.propose_chain_finding) {
     const fn = handlers.propose_chain_finding
     tools.push(defineTool({
       name: 'propose_chain_finding',
       description: [
-        'Submit a candidate (pending) finding with mandatory counterevidence, confidenceRationale, and a strict DeclarativeReplaySpec across ALL 14 supported kinds for Zero-LLM Replay Verification (http_chain, dns_takeover, tls_audit, browser_dom, browser_chain, race_burst, rce_proof, sql_boolean_diff, ws_chain, upload_probe, static_ast_proof, auth_protocol_proof, cache_differential, sql_time_diff).',
+        ...(hasGuardianVerify ? [
+          '[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")` instead of proposing `http_chain` specs so findings persist a verified ProofReceipt (`proof_kind="agent_script"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]',
+        ] : []),
+        'Submit a candidate (pending) finding with mandatory counterevidence, confidenceRationale, and a strict DeclarativeReplaySpec for Zero-LLM Replay Verification (http_chain, browser_chain, race_burst, rce_proof, sql_boolean_diff, static_ast_proof, auth_protocol_proof, cache_differential, sql_time_diff; retired legacy kinds dns_takeover, tls_audit, browser_dom, ws_chain, upload_probe fail closed).',
         'NOTE: static_ast_proof promotes ONLY to status="static_verified" (never runtime "confirmed"). If submission deduplication detects a duplicate of an existing finding, call update_proposed_finding(findingId) instead.',
         'assertionsJq runs against /evidence/replay-results.json and MUST emit { "confirmed": boolean, "controlPassed": boolean, "observed": string, "expected": string } where observed and expected are concise STRINGS.',
         'Exact /evidence/replay-results.json schema by kind:',
@@ -4692,7 +4774,7 @@ export function buildWorkerTools(
           verifyNow: args.verifyNow ?? true,
         }, signal).then(result => {
           specSubmission?.tracker?.noteSpecAttempt(replaySpecRouteSteps(parsed.data))
-          return withVerifierRepairFeedback(result)
+          return withVerifierRepairFeedback(result, hasGuardianVerify)
         }), signal)
       },
     }))
@@ -4749,70 +4831,8 @@ export function buildWorkerTools(
           verifyNow: args.verifyNow,
         }, signal).then(result => {
           specSubmission?.tracker?.noteSpecAttempt(parsedSpec ? replaySpecRouteSteps(parsedSpec) : undefined)
-          return withVerifierRepairFeedback(result)
+          return withVerifierRepairFeedback(result, hasGuardianVerify)
         }), signal)
-      },
-    }))
-  }
-
-  if (handlers.guardian_verify) {
-    const fn = handlers.guardian_verify
-    tools.push(defineTool({
-      name: 'guardian_verify',
-      description: GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-      parameters: obj({
-        script: opt(str({ description: 'Inline verification script (TypeScript or Python). Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
-        scriptPath: opt(str({ description: 'Workspace-relative path to a previously written verification script.', maxLength: 512 })),
-        runtime: opt(oneOf(['ts', 'python'] as const)),
-        title: opt(str({ description: 'Short proof title (echoed by the verdict).', maxLength: 300 })),
-        timeoutMs: opt(int({ minimum: 1_000, maximum: 120_000 })),
-      }),
-      replay: 'unsafe',
-      outputLimits,
-      execute: async (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        const inlineScript = args.script?.trim()
-        const scriptPath = args.scriptPath?.trim()
-        if (!inlineScript && !scriptPath) {
-          return {
-            isError: true,
-            output: [{
-              type: 'text' as const,
-              text: 'guardian_verify validation failed: provide `script` (inline) or `scriptPath` (a file written into the workspace).',
-            }],
-          }
-        }
-        const runtime: GuardianVerifyRuntime = args.runtime
-          ?? (scriptPath && /\.py$/i.test(scriptPath) ? 'python' : 'ts')
-        const payload: GuardianVerifyArgs = {
-          ...(inlineScript ? { script: inlineScript } : { scriptPath }),
-          runtime,
-          ...(args.title?.trim() ? { title: args.title.trim() } : {}),
-          ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
-        }
-        return wrapExec(
-          'guardian_verify',
-          async () => {
-            const result = await fn(payload, signal)
-            const summary = summarizeGuardianVerifyOutcome(result)
-            const transcriptRoutes = summary.transcriptSummary
-              .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
-              .map(entry => ({
-                method: typeof entry.method === 'string' ? entry.method : undefined,
-                path: typeof entry.route === 'string'
-                  ? entry.route
-                  : typeof entry.pathAndQuery === 'string'
-                    ? entry.pathAndQuery
-                    : typeof entry.path === 'string'
-                      ? entry.path
-                      : undefined,
-              }))
-              .filter(entry => Boolean(entry.path))
-            specSubmission?.tracker?.noteVerifyScript(payload.script, transcriptRoutes)
-            return summary
-          },
-          signal,
-        )
       },
     }))
   }
@@ -4821,7 +4841,7 @@ export function buildWorkerTools(
     const fn = handlers.verify_replay_spec
     tools.push(defineTool({
       name: 'verify_replay_spec',
-      description: `Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${GUARDIAN_VERIFY_SPEC_SHAPE}`,
+      description: `${hasGuardianVerify ? '[LEGACY FALLBACK — `guardian_verify` is active in this session. Prefer `guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${GUARDIAN_VERIFY_SPEC_SHAPE}`,
       parameters: obj({
         spec: opt(unsafe<Record<string, unknown>>({
           type: 'object',
@@ -4865,7 +4885,7 @@ export function buildWorkerTools(
           replaySpecId: args.replaySpecId?.trim() || undefined,
         }, signal).then(result => {
           specSubmission?.tracker?.noteSpecAttempt(replaySpecRouteSteps(parsed.data))
-          return withVerifierRepairFeedback(result)
+          return withVerifierRepairFeedback(result, hasGuardianVerify)
         }), signal)
       },
     }))
@@ -5618,7 +5638,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       thinkingLevel: effectiveThinking,
       maxTurns,
       extensions,
-      instructions: options.instructions ?? scenarioInstructions[options.scenario],
+      instructions: options.instructions ?? workerSessionInstructions(options.scenario, {
+        hasGuardianVerify: Boolean(options.handlers?.guardian_verify),
+      }),
     }
     const conversation = await harness.root(context, { agent })
     await conversation.configure(agent, context)
