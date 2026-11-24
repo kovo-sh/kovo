@@ -99,3 +99,27 @@ Pre-agreed rule applied to §2:
 non-empty: `{ findingId, vulnClass, cwe, category, route{method,pathTemplate}, verificationClass,
 provenance, oracleRulePassed, claimedDeltaSummary, exchangeSummaries[{stepId,method,status,rejectedBy}] }`.
 Captured before temp dirs are removed; 0-FP artifacts are byte-identical (no key).
+
+## 5. After the fixes: measured held-out cell
+
+Salted held-out shopflow, seed 1000042, grey-box, K=6, 600 s, docker, traced
+(`GUARDIAN_TRACE_DIR=/tmp/spec-sub-trace-final`), SHA `e3b4ffc` (agent-session + bench changes only;
+the `execution.ts` cap patch is not in this branch):
+
+| metric | baseline (kept autopsy cell) | after |
+| --- | ---: | ---: |
+| targets with an agent request on the target route+method | 16/19 | 10/19 |
+| of those, a replay spec on the target route (`verify_called`) | 2 (12.5%) | **5 (50.0%)** |
+| confirmed | 8/19 (all floor) | **9/19** (`review-stored-xss` now agent-confirmed) |
+| precision | 100% | 90.0% (1 unmatched FP) |
+| cost | — | $0.5455 |
+
+Trace facts: `agent.spec_submission_required` fired once (turn 9, `complete_intent(proved)` on a
+probed `GET /api/v1/health`); the settlement directive did not appear because no assignment reached
+N-2 with a pending obligation (the long-budget assignments closed early). The one unmatched FP is a
+cross-tenant `GET /api/v1/catalog/:id` read with `oracleRulePassed=true`, captured durably by §4:
+`{findingId, route{GET,/api/v1/catalog/:id}, verificationClass=runtime_confirmed, provenance=agent_only,
+claimedDeltaSummary="persona_b cross-tenant GET catalog/201 status=200 bodyContainsStore9ca676=true"}`.
+
+The recall/funnel gain comes from the wrap-up enforcement + route-specific proof obligation; the
+remaining 5 no-spec targets are the early-`ruled_out`/cap population, which the §3 cap raise targets.
