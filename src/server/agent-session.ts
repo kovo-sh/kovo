@@ -199,6 +199,10 @@ export const SPEC_SUBMISSION_TOOLS: ReadonlySet<string> = new Set([
   'guardian_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
   'prove_authz_read_diff', 'prove_state_mutation_diff', 'prove_business_invariant', 'prove_canary_or_redirect',
 ])
+/** Tools whose arguments carry a replay spec/script we can bind to route evidence. */
+const ROUTE_BOUND_SPEC_TOOLS: ReadonlySet<string> = new Set([
+  'guardian_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
+])
 
 /**
  * Offline/analysis tools paused during settlement while a probed route still has no spec. The
@@ -256,6 +260,8 @@ export interface SpecSubmissionSnapshot {
   route?: SpecRouteEvidence
   /** Accepted guardian_verify / verify_replay_spec / finding-spec submissions. */
   specAttempts: number
+  /** True when a submitted spec/script positively covers the target route (or is route-opaque). */
+  targetCovered: boolean
   /** Coded proof-gap entries (machine-readable reason) recorded via record_coverage. */
   codedProofGaps: number
   /** Every proof-gap entry, coded or free-text. */
@@ -280,14 +286,46 @@ function cleanSpecRoute(input: { method?: string; pathAndQuery?: string; origin?
   return { method, path, params, ...(origin && /^https?:\/\//i.test(origin) ? { origin } : {}) }
 }
 
+/** Extract step request routes from a DeclarativeReplaySpec (or any nested spec-shaped object). */
+export function replaySpecRouteSteps(spec: unknown): Array<{ method: string; path: string }> {
+  const out: Array<{ method: string; path: string }> = []
+  const seen = new Set<unknown>()
+  const visit = (value: unknown, depth: number) => {
+    if (out.length >= 32 || depth > 10 || !value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1)
+      return
+    }
+    const rec = value as Record<string, unknown>
+    const request = rec.request && typeof rec.request === 'object' && !Array.isArray(rec.request)
+      ? rec.request as Record<string, unknown>
+      : rec
+    const rawPath = typeof request.pathAndQuery === 'string' ? request.pathAndQuery : typeof request.path === 'string' ? request.path : null
+    const rawMethod = typeof request.method === 'string' ? request.method : null
+    if (rawPath && rawMethod) {
+      const path = rawPath.split(/[?#]/, 1)[0] ?? '/'
+      if (path.startsWith('/')) out.push({ method: rawMethod.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10), path: path.slice(0, 160) })
+    }
+    for (const child of Object.values(rec)) if (child !== request) visit(child, depth + 1)
+    return
+  }
+  visit(spec, 0)
+  return out
+}
+
 /**
  * Per-assignment spec-submission ledger. Small, mutable and dependency-free so the tool layer and
  * the settlement runner share one source of truth without touching session storage.
  */
 export class SpecSubmissionTracker {
-  private state: SpecSubmissionSnapshot = { probes: 0, specAttempts: 0, codedProofGaps: 0, proofGaps: [], required: 0 }
+  private state: SpecSubmissionSnapshot = { probes: 0, specAttempts: 0, targetCovered: false, codedProofGaps: 0, proofGaps: [], required: 0 }
   /** Probed route key → evidence + probe count; the most-probed route is the target proxy. */
   private readonly routeCounts = new Map<string, { route: SpecRouteEvidence; count: number }>()
+  /** Route keys (`METHOD path`) that a submitted spec or verify script positively covers. */
+  private readonly coveredRoutes = new Set<string>()
+  /** Attempts whose spec shape could not be attributed to a route; treated as covering any target. */
+  private opaqueSpecAttempts = 0
 
   noteProbe(): void {
     this.state = { ...this.state, probes: this.state.probes + 1 }
@@ -313,8 +351,39 @@ export class SpecSubmissionTracker {
     return best?.route
   }
 
-  noteSpecAttempt(): void {
+  private markCovered(routes: readonly { method?: string; path?: string }[] | undefined, text?: string): void {
+    if (routes?.length) {
+      for (const route of routes) {
+        const method = (route.method ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10)
+        const path = (route.path ?? '').split(/[?#]/, 1)[0] ?? ''
+        if (!method || !path) continue
+        this.coveredRoutes.add(`${method} ${path}`)
+      }
+      return
+    }
+    if (text) {
+      let matched = false
+      for (const [key, entry] of this.routeCounts) {
+        if (entry.route.path !== '/' && text.includes(entry.route.path)) {
+          this.coveredRoutes.add(key)
+          matched = true
+        }
+      }
+      if (matched) return
+    }
+    this.opaqueSpecAttempts += 1
+  }
+
+  /** A persisted/attempted replay spec. Route steps bind the attempt to the route(s) it proves. */
+  noteSpecAttempt(routes?: readonly { method?: string; path?: string }[]): void {
     this.state = { ...this.state, specAttempts: this.state.specAttempts + 1 }
+    this.markCovered(routes)
+  }
+
+  /** A guardian_verify script: cover every probed route whose path appears verbatim. */
+  noteVerifyScript(script: string | undefined): void {
+    this.state = { ...this.state, specAttempts: this.state.specAttempts + 1 }
+    this.markCovered(undefined, script)
   }
 
   noteProofGap(input: { proofGapReason?: string; category?: string }): void {
@@ -339,17 +408,22 @@ export class SpecSubmissionTracker {
   }
 
   snapshot(): SpecSubmissionSnapshot {
+    const target = this.state.route
+    const targetCovered = target
+      ? this.coveredRoutes.has(`${target.method} ${target.path}`) || (this.state.probes > 0 && this.opaqueSpecAttempts > 0)
+      : this.opaqueSpecAttempts > 0
     return {
       ...this.state,
+      targetCovered,
       proofGaps: [...this.state.proofGaps],
-      ...(this.state.route ? { route: { ...this.state.route, params: [...this.state.route.params] } } : {}),
+      ...(target ? { route: { ...target, params: [...target.params] } } : {}),
     }
   }
 }
 
-/** A probed route with neither a spec attempt nor a coded proof gap still owes a proof. */
+/** A probed target route with neither a spec attempt nor a coded proof gap still owes a proof. */
 export function specSubmissionPending(snapshot: SpecSubmissionSnapshot): boolean {
-  return snapshot.probes > 0 && snapshot.specAttempts === 0 && snapshot.codedProofGaps === 0
+  return snapshot.probes > 0 && snapshot.codedProofGaps === 0 && !snapshot.targetCovered
 }
 
 /** Settlement must refuse a leaning conclusion when the proof obligation is still open. */
@@ -2584,7 +2658,7 @@ export function buildWorkerTools(
   ) => {
     try {
       const result = await fn()
-      if (SPEC_SUBMISSION_TOOLS.has(toolName)) specSubmission?.tracker?.noteSpecAttempt()
+      if (SPEC_SUBMISSION_TOOLS.has(toolName) && !ROUTE_BOUND_SPEC_TOOLS.has(toolName)) specSubmission?.tracker?.noteSpecAttempt()
       if (ROUTE_EVIDENCE_TOOLS.has(toolName)) specSubmission?.tracker?.noteProbe()
       const text = await formatToolOutput(result, toolName, scrub, inlineLimit, handlers.spillOutput, signal)
       return {
@@ -3564,7 +3638,10 @@ export function buildWorkerTools(
           severityChangeConditions: args.severityChangeConditions?.trim() ? scrub(args.severityChangeConditions.trim()) : undefined,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow ?? true,
-        }, signal).then(withVerifierRepairFeedback), signal)
+        }, signal).then(result => {
+          specSubmission?.tracker?.noteSpecAttempt(replaySpecRouteSteps(parsed.data))
+          return withVerifierRepairFeedback(result)
+        }), signal)
       },
     }))
   }
@@ -3618,7 +3695,10 @@ export function buildWorkerTools(
           replaySpec: parsedSpec,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow,
-        }, signal).then(withVerifierRepairFeedback), signal)
+        }, signal).then(result => {
+          specSubmission?.tracker?.noteSpecAttempt(parsedSpec ? replaySpecRouteSteps(parsedSpec) : undefined)
+          return withVerifierRepairFeedback(result)
+        }), signal)
       },
     }))
   }
@@ -3660,7 +3740,11 @@ export function buildWorkerTools(
         }
         return wrapExec(
           'guardian_verify',
-          async () => summarizeGuardianVerifyOutcome(await fn(payload, signal)),
+          async () => {
+            const result = await fn(payload, signal)
+            specSubmission?.tracker?.noteVerifyScript(payload.script)
+            return summarizeGuardianVerifyOutcome(result)
+          },
           signal,
         )
       },
@@ -3713,7 +3797,10 @@ export function buildWorkerTools(
           replaySpec: parsed.data,
           findingId: args.findingId?.trim() || undefined,
           replaySpecId: args.replaySpecId?.trim() || undefined,
-        }, signal).then(withVerifierRepairFeedback), signal)
+        }, signal).then(result => {
+          specSubmission?.tracker?.noteSpecAttempt(replaySpecRouteSteps(parsed.data))
+          return withVerifierRepairFeedback(result)
+        }), signal)
       },
     }))
   }

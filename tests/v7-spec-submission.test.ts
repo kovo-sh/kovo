@@ -28,6 +28,7 @@ import {
   settlementToolBlock,
   specSubmissionPending,
   specSubmissionRequiredFor,
+  replaySpecRouteSteps,
   type SpecRouteEvidence,
 } from '../src/server/agent-session.ts'
 import { renderSettlementSpecDirective } from '../src/server/assignment-brief.ts'
@@ -207,6 +208,62 @@ test('a successful guardian_verify attempt clears the obligation and complete_in
   const accepted = await invoke(toolByName(tools, 'complete_intent')!, { status: 'proved', summary: 'Verified.' })
   assert.notEqual(accepted.isError, true, 'no extra prompt after a spec submission')
   assert.equal(completions.length, 1)
+})
+
+test('a spec for a different route does not clear the target obligation', async () => {
+  const tracker = new SpecSubmissionTracker()
+  const spec = (path: string) => ({
+    version: 1,
+    origin: ORIGIN,
+    title: 'Coupon reuse differential',
+    category: 'injection',
+    cwe: 'CWE-89',
+    severity: 'high',
+    severityRationale: 'Control and probe differ consistently.',
+    impact: 'An attacker can reuse a coupon.',
+    remediation: 'Bind coupons to baskets.',
+    recheckInstructions: 'Replay the same control/probe pair.',
+    assertionsJq: '.probe.status == 200',
+    steps: [
+      { id: 'control', role: 'control', description: 'Baseline coupon use', request: { origin: ORIGIN, method: 'POST', pathAndQuery: '/v1/control' } },
+      { id: 'probe', role: 'probe', description: 'Probe the coupon route', request: { origin: ORIGIN, method: 'POST', pathAndQuery: path } },
+    ],
+  })
+  const tools = buildWorkerTools({
+    request_http: async () => ({ exchangeId: 'ex-1', status: 200 }),
+    verify_replay_spec: async () => ({ oraclePassed: false, rejectedBy: 'dismissed', attempts: [] }),
+    complete_intent: async () => ({ recorded: true }),
+  }, value => value, AbortSignal.timeout(5_000), 24 * 1024, () => {}, { tracker })
+
+  await probeRoute(tools)
+  const other = await invoke(toolByName(tools, 'verify_replay_spec')!, { spec: spec('/v1/other/route') })
+  assert.notEqual(other.isError, true, 'the unrelated spec is schema-valid and verified')
+  assert.equal(tracker.snapshot().specAttempts, 1)
+  assert.equal(tracker.snapshot().targetCovered, false)
+  assert.equal(specSubmissionPending(tracker.snapshot()), true, 'the target route is still unproven')
+
+  const rejected = await invoke(toolByName(tools, 'complete_intent')!, { status: 'proved', summary: 'Likely reuse.' })
+  assert.equal(rejected.isError, true, 'a spec on another route cannot support the target claim')
+
+  // The same spec shape pointed at the target route clears it.
+  await invoke(toolByName(tools, 'verify_replay_spec')!, { spec: spec('/v1/baskets/current/coupons?code=x') })
+  assert.equal(tracker.snapshot().targetCovered, true)
+  assert.equal(specSubmissionPending(tracker.snapshot()), false)
+})
+
+test('replaySpecRouteSteps extracts requests from mixed spec shapes', () => {
+  const steps = replaySpecRouteSteps({
+    steps: {
+      control: { request: { method: 'get', pathAndQuery: '/v1/a?x=1' } },
+      probe: { method: 'POST', path: '/v1/b' },
+    },
+    probe: { request: { method: 'PATCH', pathAndQuery: '/v1/c' } },
+  })
+  assert.deepEqual(steps, [
+    { method: 'GET', path: '/v1/a' },
+    { method: 'POST', path: '/v1/b' },
+    { method: 'PATCH', path: '/v1/c' },
+  ])
 })
 
 // ============================================================================
