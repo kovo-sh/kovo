@@ -259,3 +259,83 @@ describe('cut3cd: SQL spec envelope emission', () => {
     assert.ok(recipe!.args.probePathAndQuery)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Cut 3d: conserved_balance (race_burst retirement)
+// ---------------------------------------------------------------------------
+
+interface ConservedState { balance: number }
+
+function conservedDeps(state: ConservedState, racy: boolean): FloorRecipeDeps {
+  let counter = 0
+  const reply = (status: number, json: unknown): FloorExchange => ({
+    exchangeId: `cb-${++counter}`,
+    status,
+    json,
+    body: JSON.stringify(json),
+    durationMs: 5,
+  })
+  return {
+    request: (spec: FloorRequestSpec): FloorExchange => {
+      const amount = Number((spec.jsonBody as { amount?: number } | undefined)?.amount ?? 0)
+      if (spec.role.includes('read') || amount === 0) return reply(200, { balance: state.balance })
+      if (state.balance < amount) return reply(409, { error: 'insufficient' })
+      state.balance -= amount
+      return reply(200, { balance: state.balance, redeemed: amount })
+    },
+    burst: (specs: readonly FloorRequestSpec[]): FloorExchange[] => {
+      const amount = Number((specs[0]?.jsonBody as { amount?: number } | undefined)?.amount ?? 0)
+      // A racy service acknowledges every request but debits once; a correct one debits each.
+      state.balance -= racy ? amount : amount * specs.length
+      const shared = state.balance + (racy ? amount * (specs.length - 1) : 0)
+      return specs.map(() => reply(200, { balance: shared, redeemed: amount }))
+    },
+  }
+}
+
+const conservedArgs = {
+  origin,
+  method: 'POST',
+  pathAndQuery: '/giftcards/1/redeem',
+  vulnClass: 'race_double_spend',
+  actor,
+  body: { amount: 4 },
+  burst: 4,
+  readback: { method: 'POST', pathAndQuery: '/giftcards/1/redeem', jsonBody: { amount: 0 } },
+  balanceField: 'balance',
+  unitDebit: 4,
+} as const
+
+describe('cut3cd: conserved_balance recipe', () => {
+  test('confirms a double-spend where four acknowledgements debit the conserved value once', async () => {
+    const state: ConservedState = { balance: 100 }
+    const execution = await runCut3Recipe(cut3FloorRecipe('conserved_balance', { ...conservedArgs }), conservedDeps(state, true))
+    assert.equal(execution.result.confirmed, true, execution.result.verification.reason)
+    assert.equal(execution.result.verification.rule, 'conserved_balance')
+    assert.equal(execution.receipt.vulnClass, 'race_double_spend')
+  })
+
+  test('dismisses a correct service that debits every acknowledged request', async () => {
+    const state: ConservedState = { balance: 100 }
+    const execution = await runCut3Recipe(cut3FloorRecipe('conserved_balance', { ...conservedArgs }), conservedDeps(state, false))
+    assert.equal(execution.result.confirmed, false)
+    assert.equal(execution.result.verification.rule, 'conserved_balance')
+    assert.equal(execution.failure?.code, 'receipt_rejected')
+    assert.match(String(execution.result.verification.reason), /no conservation violation|under-debit/i)
+  })
+
+  test('fails closed without a serial control readback', async () => {
+    const state: ConservedState = { balance: 100 }
+    const deps = conservedDeps(state, true)
+    // Remove the serial control's post-read by failing the serial mutation instead.
+    const failing: FloorRecipeDeps = {
+      ...deps,
+      request: (spec: FloorRequestSpec) => {
+        if (spec.role === 'serial_control_1') return { exchangeId: 'cb-fail', status: 500, json: { error: 'boom' }, body: '{}', durationMs: 5 }
+        return deps.request(spec)
+      },
+    }
+    const execution = await runCut3Recipe(cut3FloorRecipe('conserved_balance', { ...conservedArgs }), failing)
+    assert.equal(execution.result.confirmed, false)
+  })
+})

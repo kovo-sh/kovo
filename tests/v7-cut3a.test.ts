@@ -274,6 +274,8 @@ test('recipe-wired boolean receipts are byte-identical across runs on identical 
 test('the no-fallback assertion throws for every wired pair and stays quiet for unmapped kinds', () => {
   for (const [kind, vulnClass] of [
     ['sql_boolean_diff', 'sqli'],
+    ['sql_time_diff', 'sqli'],
+    ['race_burst', 'race_double_spend'],
     ['http_chain', 'bola'],
     ['http_chain', 'bfla'],
     ['http_chain', 'cross_tenant_write'],
@@ -291,8 +293,6 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
     ['http_chain', 'open_redirect'],
     ['http_chain', 'xss_reflected'],
     ['http_chain', 'info_disclosure'],
-    ['race_burst', 'race_double_spend'],
-    ['sql_time_diff', 'sqli'],
     ['browser_chain', 'xss_reflected'],
     ['rce_proof', 'ssti'],
   ] as const) {
@@ -308,8 +308,6 @@ test('unmapped families still synthesize legacy specs and never get a recipe pla
     ['http_chain', 'info_disclosure'],
     ['http_chain', 'xxe'],
     ['http_chain', 'path_traversal'],
-    ['race_burst', 'race_double_spend'],
-    ['sql_time_diff', 'sqli'],
   ] as const) {
     assert.equal(planFloorRecipe({
       hypothesis: booleanHypothesis(),

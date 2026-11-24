@@ -90,8 +90,13 @@ export const FLOOR_RECIPE_IDS: readonly FloorRecipeId[] = [
  * runnable/testable; registering them for persistence is a one-line follow-up in each of those two
  * files (reported in the handoff).
  */
-export type Cut3FloorRecipeId = 'redirect' | 'browser_sink' | 'injection_fingerprint'
-export const CUT3_FLOOR_RECIPE_IDS: readonly Cut3FloorRecipeId[] = ['redirect', 'browser_sink', 'injection_fingerprint']
+export type Cut3FloorRecipeId = 'redirect' | 'browser_sink' | 'injection_fingerprint' | 'conserved_balance'
+export const CUT3_FLOOR_RECIPE_IDS: readonly Cut3FloorRecipeId[] = [
+  'redirect',
+  'browser_sink',
+  'injection_fingerprint',
+  'conserved_balance',
+]
 
 /** A persona the recipe sends as. Host-resolved in production; explicit in fixtures. */
 export interface FloorActor {
@@ -148,6 +153,8 @@ export interface FloorBrowserInput {
 
 export interface FloorRecipeDeps {
   request(spec: FloorRequestSpec): Promise<FloorExchange> | FloorExchange
+  /** Optional synchronized concurrent burst execution (production wires `broker.executeRaceBurst`). */
+  burst?(specs: readonly FloorRequestSpec[]): Promise<FloorExchange[]> | FloorExchange[]
   /** Durable callback lookup for the token the injection exchange carried. */
   oob?(query: FloorOobQuery): Promise<ReceiptOobEvent | null> | ReceiptOobEvent | null
   /**
@@ -272,12 +279,51 @@ export interface OobCallbackArgs extends FloorRecipeBaseArgs {
   oracleEvents?: string[]
 }
 
+export interface ConservedBalanceStepSpec {
+  method: string
+  pathAndQuery: string
+  jsonBody?: unknown
+  headers?: Record<string, string>
+  actor?: FloorActor
+  /** Optional JSON dot-path extractions stored into `{{varName}}` for downstream steps. */
+  extract?: ReadonlyArray<{ varName: string; selector: string }>
+}
+
 export interface RaceBurstArgs extends FloorRecipeBaseArgs {
   actor: FloorActor
   /** Identical body for every burst request (the terminal transition). */
   body: Record<string, unknown>
   /** Number of synchronized requests, clamped to 2..8. */
   burst: number
+  /** Optional ordered prerequisite steps (e.g. minting a single-use token) run before the burst. */
+  setupSteps?: readonly ConservedBalanceStepSpec[]
+  /** Optional cleanup steps run in `finally` (never cited in the receipt). */
+  cleanupSteps?: readonly ConservedBalanceStepSpec[]
+  oracleEvents?: string[]
+}
+
+export interface ConservedBalanceArgs extends FloorRecipeBaseArgs {
+  actor: FloorActor
+  /** Body for each concurrent burst mutation (supports `{{var}}` from `setupSteps`). */
+  body: Record<string, unknown>
+  /** Number of synchronized burst requests, clamped to 2..8. */
+  burst: number
+  /** Request used to read the conserved numeric field before and after the burst. */
+  readback: ConservedBalanceStepSpec
+  /** Optional override for post-burst and post-serial readbacks if distinct from `readback`. */
+  postReadback?: ConservedBalanceStepSpec
+  /** Optional ordered prerequisite steps (e.g. minting a token) run before the baseline read. */
+  setupSteps?: readonly ConservedBalanceStepSpec[]
+  /** Optional serial control mutation override (defaults to the burst method/path/body). */
+  serialControl?: ConservedBalanceStepSpec
+  /** Optional cleanup steps run in `finally` (never cited as proof evidence). */
+  cleanupSteps?: readonly ConservedBalanceStepSpec[]
+  /** Explicit numeric conserved field name for `verifyConservedBalanceReceipt`. */
+  balanceField?: string
+  /** Explicit cap/limit field name for `verifyConservedBalanceReceipt`. */
+  capField?: string
+  /** Expected unit debit per acknowledged mutation when the request body omits an amount field. */
+  unitDebit?: number
   oracleEvents?: string[]
 }
 
@@ -341,6 +387,7 @@ export interface Cut3FloorRecipeArgsMap {
   redirect: RedirectArgs
   browser_sink: BrowserSinkArgs
   injection_fingerprint: InjectionFingerprintArgs
+  conserved_balance: ConservedBalanceArgs
 }
 
 export type Cut3FloorRecipeArgs = Cut3FloorRecipeArgsMap[Cut3FloorRecipeId]
@@ -370,6 +417,8 @@ export interface FloorRecipeContext {
   /** Host exchange ids recorded so far, in order. */
   readonly exchangeIds: readonly string[]
   send(spec: FloorRequestSpec): Promise<FloorRecipeStep>
+  /** Execute 2..8 requests concurrently (via `deps.burst` when wired, else `Promise.all`). */
+  sendBurst(specs: readonly FloorRequestSpec[]): Promise<FloorRecipeStep[]>
   oob(query: FloorOobQuery): Promise<ReceiptOobEvent | null>
   /** Record (and cite) a host-recorded browser trace; null when the host produced none. */
   browser(input: FloorBrowserInput): Promise<ReceiptBrowserTrace | null>
@@ -477,25 +526,13 @@ class RecipeContext implements FloorRecipeContext {
     }
   }
 
-  async send(spec: FloorRequestSpec): Promise<FloorRecipeStep> {
-    if (this.exchangeCount >= MAX_FLOOR_RECIPE_STEPS) {
-      throw new FloorRecipeAbort(
-        'step_budget_exceeded',
-        `Recipe exceeded the ${MAX_FLOOR_RECIPE_STEPS}-exchange budget.`,
-        ['step_budget'],
-      )
-    }
-    if (!spec.pathAndQuery.trim()) {
-      throw new FloorRecipeAbort('recipe_error', `Recipe sent an empty path for role ${spec.role}.`, [spec.role])
-    }
-    this.exchangeCount += 1
-    const exchange = await this.deps.request(spec)
+  private recordExchange(spec: FloorRequestSpec, exchange: FloorExchange, index: number): FloorRecipeStep {
     const exchangeId = exchange.exchangeId
       ?? this.deps.nextExchangeId?.()
-      ?? `fr-${this.exchangeCount}`
+      ?? `fr-${index}`
     const route = exchange.route ?? pathOnly(spec.pathAndQuery)
     const step: ImpactStep = {
-      id: `s${this.exchangeCount}:${spec.role}`,
+      id: `s${index}:${spec.role}`,
       arm: spec.arm,
       method: spec.method.toUpperCase(),
       route,
@@ -537,6 +574,45 @@ class RecipeContext implements FloorRecipeContext {
       evidenceRole: spec.role,
     })
     return recorded
+  }
+
+  async send(spec: FloorRequestSpec): Promise<FloorRecipeStep> {
+    if (this.exchangeCount >= MAX_FLOOR_RECIPE_STEPS) {
+      throw new FloorRecipeAbort(
+        'step_budget_exceeded',
+        `Recipe exceeded the ${MAX_FLOOR_RECIPE_STEPS}-exchange budget.`,
+        ['step_budget'],
+      )
+    }
+    if (!spec.pathAndQuery.trim()) {
+      throw new FloorRecipeAbort('recipe_error', `Recipe sent an empty path for role ${spec.role}.`, [spec.role])
+    }
+    this.exchangeCount += 1
+    const index = this.exchangeCount
+    const exchange = await this.deps.request(spec)
+    return this.recordExchange(spec, exchange, index)
+  }
+
+  async sendBurst(specs: readonly FloorRequestSpec[]): Promise<FloorRecipeStep[]> {
+    if (specs.length === 0) return []
+    if (this.exchangeCount + specs.length > MAX_FLOOR_RECIPE_STEPS) {
+      throw new FloorRecipeAbort(
+        'step_budget_exceeded',
+        `Recipe exceeded the ${MAX_FLOOR_RECIPE_STEPS}-exchange budget.`,
+        ['step_budget'],
+      )
+    }
+    for (const spec of specs) {
+      if (!spec.pathAndQuery.trim()) {
+        throw new FloorRecipeAbort('recipe_error', `Recipe sent an empty path for role ${spec.role}.`, [spec.role])
+      }
+    }
+    const startIndex = this.exchangeCount + 1
+    this.exchangeCount += specs.length
+    const exchanges = this.deps.burst
+      ? await this.deps.burst(specs)
+      : await Promise.all(specs.map(spec => Promise.resolve(this.deps.request(spec))))
+    return specs.map((spec, idx) => this.recordExchange(spec, exchanges[idx]!, startIndex + idx))
   }
 
   async oob(query: FloorOobQuery): Promise<ReceiptOobEvent | null> {
@@ -986,19 +1062,112 @@ function outcomeOf(step: FloorRecipeStep): string {
  * repeated terminal transition (business-logic impact); the recipe separately requires a divergent
  * outcome set, because a burst where everything succeeded/failed uniformly proves no race.
  */
+function interpolateVarString(template: string, vars: Readonly<Record<string, string>>): string {
+  return template.replace(/\{\{([A-Za-z0-9_.-]+)\}\}/g, (match, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? vars[name]! : match)
+}
+
+function interpolateVarValue(value: unknown, vars: Readonly<Record<string, string>>): unknown {
+  if (typeof value === 'string') return interpolateVarString(value, vars)
+  if (Array.isArray(value)) return value.map(item => interpolateVarValue(item, vars))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = interpolateVarValue(v, vars)
+    }
+    return out
+  }
+  return value
+}
+
+function extractVarPath(json: unknown, selector: string): string | null {
+  if (!json || typeof json !== 'object') return null
+  let cur: unknown = json
+  for (const seg of selector.split('.')) {
+    if (!cur || typeof cur !== 'object') return null
+    cur = (cur as Record<string, unknown>)[seg]
+  }
+  if (typeof cur === 'string' && cur.length > 0) return cur
+  if (typeof cur === 'number' && Number.isFinite(cur)) return String(cur)
+  return null
+}
+
+function buildStepRequest(
+  step: ConservedBalanceStepSpec,
+  arm: FloorArm,
+  role: string,
+  defaultActor: FloorActor,
+  defaultHeaders: Record<string, string> | undefined,
+  vars: Readonly<Record<string, string>>,
+): FloorRequestSpec {
+  const mergedHeaders = { ...(defaultHeaders ?? {}), ...(step.headers ?? {}) }
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(mergedHeaders)) headers[k] = interpolateVarString(v, vars)
+  return {
+    arm,
+    role,
+    method: step.method,
+    pathAndQuery: interpolateVarString(step.pathAndQuery, vars),
+    actor: step.actor ?? defaultActor,
+    ...(step.jsonBody !== undefined ? { jsonBody: interpolateVarValue(step.jsonBody, vars) } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  }
+}
+
+async function runSetupSequence(
+  ctx: FloorRecipeContext,
+  setupSteps: readonly ConservedBalanceStepSpec[] | undefined,
+  defaultActor: FloorActor,
+  defaultHeaders: Record<string, string> | undefined,
+  vars: Record<string, string>,
+): Promise<void> {
+  for (let i = 0; i < (setupSteps?.length ?? 0); i += 1) {
+    const spec = setupSteps![i]!
+    const res = await ctx.send(buildStepRequest(spec, 'setup', `setup_${i + 1}`, defaultActor, defaultHeaders, vars))
+    for (const ex of spec.extract ?? []) {
+      const parsed = res.exchange.json ?? (typeof res.exchange.body === 'string' ? (() => { try { return JSON.parse(res.exchange.body) } catch { return undefined } })() : undefined)
+      const val = extractVarPath(parsed, ex.selector)
+      if (val !== null) vars[ex.varName] = val
+    }
+  }
+}
+
+async function runCleanupSequence(
+  ctx: FloorRecipeContext,
+  cleanupSteps: readonly ConservedBalanceStepSpec[] | undefined,
+  defaultActor: FloorActor,
+  defaultHeaders: Record<string, string> | undefined,
+  vars: Readonly<Record<string, string>>,
+): Promise<void> {
+  for (let i = 0; i < (cleanupSteps?.length ?? 0); i += 1) {
+    try {
+      await ctx.send(buildStepRequest(cleanupSteps![i]!, 'cleanup', `cleanup_${i + 1}`, defaultActor, defaultHeaders, vars))
+    } catch {
+      // Cleanup is best-effort and must never mask the primary verdict.
+    }
+  }
+}
+
 const raceBurst = defineRecipe<RaceBurstArgs>('race_burst', async (args, ctx) => {
   const count = Math.min(MAX_RACE_BURST, Math.max(MIN_RACE_BURST, Math.trunc(args.burst)))
-  const steps: FloorRecipeStep[] = []
-  for (let index = 0; index < count; index += 1) {
-    steps.push(await ctx.send({
+  const vars: Record<string, string> = {}
+  await runSetupSequence(ctx, args.setupSteps, args.actor, args.headers, vars)
+  let steps: FloorRecipeStep[] = []
+  try {
+    const burstPath = interpolateVarString(args.pathAndQuery, vars)
+    const burstBody = interpolateVarValue(args.body, vars)
+    const burstSpecs: FloorRequestSpec[] = Array.from({ length: count }, (_, index) => ({
       arm: 'probe',
       role: `burst_${index + 1}`,
       method: args.method,
-      pathAndQuery: args.pathAndQuery,
+      pathAndQuery: burstPath,
       actor: args.actor,
-      jsonBody: args.body,
+      jsonBody: burstBody,
       ...(args.headers ? { headers: args.headers } : {}),
     }))
+    steps = await ctx.sendBurst(burstSpecs)
+  } finally {
+    await runCleanupSequence(ctx, args.cleanupSteps, args.actor, args.headers, vars)
   }
   const successes = steps.filter(step => isSuccess(step.exchange.status))
   const distinct = new Set(steps.map(outcomeOf)).size
@@ -1244,10 +1413,92 @@ const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_f
   })
 })
 
+/**
+ * Cut 3d conserved-balance concurrency recipe:
+ *  1. Optional prerequisite setup steps (e.g. minting a resource or token),
+ *  2. Baseline numeric readback (`baseline_read`),
+ *  3. Synchronized concurrent burst (`burst_1..N`) via `ctx.sendBurst`,
+ *  4. Post-burst numeric readback (`post_read`),
+ *  5. Serial control mutation (`serial_control_1`) + conditional post-serial readback
+ *     (`serial_post_read`) when the serial mutation returns 2xx,
+ *  6. Best-effort cleanup in `finally`.
+ * Confirmation is owned solely by `verifyConservedBalanceReceipt` in `proof-receipt.ts`.
+ */
+const conservedBalance = defineRecipe<ConservedBalanceArgs>('conserved_balance', async (args, ctx) => {
+  const count = Math.min(MAX_RACE_BURST, Math.max(MIN_RACE_BURST, Math.trunc(args.burst)))
+  const vars: Record<string, string> = {}
+  await runSetupSequence(ctx, args.setupSteps, args.actor, args.headers, vars)
+
+  const postReadSpec = args.postReadback ?? args.readback
+  let baseline: FloorRecipeStep
+  let burstSteps: FloorRecipeStep[]
+  let postRead: FloorRecipeStep
+  let serialMutation: FloorRecipeStep
+  let serialPostRead: FloorRecipeStep | null = null
+
+  try {
+    baseline = await ctx.send(buildStepRequest(args.readback, 'setup', 'baseline_read', args.actor, args.headers, vars))
+
+    const burstPath = interpolateVarString(args.pathAndQuery, vars)
+    const burstBody = interpolateVarValue(args.body, vars)
+    const burstSpecs: FloorRequestSpec[] = Array.from({ length: count }, (_, index) => ({
+      arm: 'probe',
+      role: `burst_${index + 1}`,
+      method: args.method,
+      pathAndQuery: burstPath,
+      actor: args.actor,
+      jsonBody: burstBody,
+      ...(args.headers ? { headers: args.headers } : {}),
+    }))
+    burstSteps = await ctx.sendBurst(burstSpecs)
+
+    postRead = await ctx.send(buildStepRequest(postReadSpec, 'control', 'post_read', args.actor, args.headers, vars))
+
+    const serialSpec: ConservedBalanceStepSpec = args.serialControl ?? {
+      method: args.method,
+      pathAndQuery: args.pathAndQuery,
+      jsonBody: args.body,
+      actor: args.actor,
+      ...(args.headers ? { headers: args.headers } : {}),
+    }
+    serialMutation = await ctx.send(buildStepRequest(serialSpec, 'control', 'serial_control_1', args.actor, args.headers, vars))
+    if (isSuccess(serialMutation.exchange.status)) {
+      serialPostRead = await ctx.send(buildStepRequest(postReadSpec, 'control', 'serial_post_read', args.actor, args.headers, vars))
+    }
+  } finally {
+    await runCleanupSequence(ctx, args.cleanupSteps, args.actor, args.headers, vars)
+  }
+
+  const exchangeIds = [
+    baseline.exchangeId,
+    ...burstSteps.map(step => step.exchangeId),
+    postRead.exchangeId,
+    serialMutation.exchangeId,
+    ...(serialPostRead ? [serialPostRead.exchangeId] : []),
+  ]
+  const ackedCount = burstSteps.filter(step => isSuccess(step.exchange.status)).length
+  const conservedBalanceMeta = {
+    ...(args.balanceField ? { balanceField: args.balanceField } : {}),
+    ...(args.capField ? { capField: args.capField } : {}),
+    ...(args.unitDebit !== undefined ? { unitDebit: args.unitDebit } : {}),
+  }
+  return buildProofReceipt({
+    vulnClass: args.vulnClass || 'race_double_spend',
+    target: targetOf(args),
+    exchangeIds,
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: `A synchronized burst of ${count} ${args.method.toUpperCase()} ${pathOnly(args.pathAndQuery)} requests acknowledged ${ackedCount} mutations with conserved-balance readbacks and serial control.`,
+    ...(Object.keys(conservedBalanceMeta).length > 0 ? { conservedBalance: conservedBalanceMeta } : {}),
+    ...(args.oracleEvents ? { oracleEvents: args.oracleEvents } : { oracleEvents: ['invariant_violation', 'state_delta'] }),
+  })
+})
+
 const CUT3_DEFINITIONS: { readonly [K in Cut3FloorRecipeId]: FloorRecipeDefinition<Cut3FloorRecipeArgsMap[K]> } = {
   redirect,
   browser_sink: browserSink,
   injection_fingerprint: injectionFingerprint,
+  conserved_balance: conservedBalance,
 }
 
 export interface Cut3FloorRecipe {
@@ -1419,6 +1670,16 @@ function inferMissingRoles(
     return ['oob_callback']
   }
 
+  if (verification.rule === 'conserved_balance') {
+    if (/baseline numeric readback/.test(reason)) return ['baseline_read']
+    if (/post-burst numeric readback/.test(reason)) return ['post_read']
+    if (/concurrent mutation|no 2xx acknowledged|Only \d+ concurrent/.test(reason)) return ['burst_mutation']
+    if (/post-serial numeric readback/.test(reason)) return ['serial_post_read']
+    if (/serial control/i.test(reason)) return ['serial_control']
+    if (/shared numeric conserved field/.test(reason)) return ['conserved_field']
+    return ['conservation_violation']
+  }
+
   if (/pre-mutation readback/.test(reason)) return ['baseline_read']
   if (/separate post-mutation GET/.test(reason)) return ['post_mutation_read']
   if (/identical to the baseline|state echo|not impact|idempotent|removed|no persisted impact/.test(reason)) return ['persisted_delta']
@@ -1502,36 +1763,47 @@ export function exchangeToFloorExchange(
 export function brokerFloorRecipeDeps(options: FloorRecipeBrokerOptions): FloorRecipeDeps {
   const personaFor = options.personaFor
     ?? ((actor: FloorActor) => (ANONYMOUS_ACTOR_HANDLES.has(actor.handle.trim().toLowerCase()) ? null : actor.handle))
+  const toBrokerRequest = (spec: FloorRequestSpec): BrokerHttpRequest => {
+    const method = spec.method.toUpperCase()
+    if (!BROKER_HTTP_METHODS.has(method)) {
+      throw new FloorRecipeAbort('recipe_error', `Recipe asked for unsupported method ${method}.`, [spec.role])
+    }
+    const persona = personaFor(spec.actor)
+    const body = spec.textBody ?? (spec.jsonBody !== undefined ? JSON.stringify(spec.jsonBody) : undefined)
+    const headers = { ...(options.headers ?? {}), ...(spec.headers ?? {}) }
+    return {
+      origin: options.origin,
+      method: method as BrokerHttpRequest['method'],
+      pathAndQuery: spec.pathAndQuery,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      ...(persona ? { persona } : {}),
+      ...(body !== undefined ? { body } : {}),
+      ...(options.probeClass ? { probeClass: options.probeClass } : {}),
+      ...(options.runId ? { runId: options.runId } : {}),
+      ...(options.assignmentId ? { assignmentId: options.assignmentId } : {}),
+      ...(options.traceId ? { traceId: options.traceId } : {}),
+      followRedirects: false,
+    }
+  }
+  const project = (exchange: BrokerExchangeResult, spec: FloorRequestSpec): FloorExchange => {
+    const exchangeId = options.recordExchange?.(exchange)
+    const projected = options.mapExchange
+      ? options.mapExchange(exchange, spec)
+      : exchangeToFloorExchange(exchange, spec)
+    return {
+      ...projected,
+      ...(typeof exchangeId === 'string' && exchangeId ? { exchangeId } : {}),
+    }
+  }
   return {
     async request(spec: FloorRequestSpec): Promise<FloorExchange> {
-      const method = spec.method.toUpperCase()
-      if (!BROKER_HTTP_METHODS.has(method)) {
-        throw new FloorRecipeAbort('recipe_error', `Recipe asked for unsupported method ${method}.`, [spec.role])
-      }
-      const persona = personaFor(spec.actor)
-      const body = spec.textBody ?? (spec.jsonBody !== undefined ? JSON.stringify(spec.jsonBody) : undefined)
-      const headers = { ...(options.headers ?? {}), ...(spec.headers ?? {}) }
-      const exchange = await options.broker.executeHttp({
-        origin: options.origin,
-        method: method as BrokerHttpRequest['method'],
-        pathAndQuery: spec.pathAndQuery,
-        ...(Object.keys(headers).length > 0 ? { headers } : {}),
-        ...(persona ? { persona } : {}),
-        ...(body !== undefined ? { body } : {}),
-        ...(options.probeClass ? { probeClass: options.probeClass } : {}),
-        ...(options.runId ? { runId: options.runId } : {}),
-        ...(options.assignmentId ? { assignmentId: options.assignmentId } : {}),
-        ...(options.traceId ? { traceId: options.traceId } : {}),
-        followRedirects: false,
-      }, options.grant, options.signal)
-      const exchangeId = options.recordExchange?.(exchange)
-      const projected = options.mapExchange
-        ? options.mapExchange(exchange, spec)
-        : exchangeToFloorExchange(exchange, spec)
-      return {
-        ...projected,
-        ...(typeof exchangeId === 'string' && exchangeId ? { exchangeId } : {}),
-      }
+      const exchange = await options.broker.executeHttp(toBrokerRequest(spec), options.grant, options.signal)
+      return project(exchange, spec)
+    },
+    async burst(specs: readonly FloorRequestSpec[]): Promise<FloorExchange[]> {
+      const brokerReqs = specs.map(toBrokerRequest)
+      const burstResult = await options.broker.executeRaceBurst(brokerReqs, options.grant, options.signal)
+      return specs.map((spec, idx) => project(burstResult.results[idx]!, spec))
     },
     ...(options.oob ? { oob: options.oob } : {}),
   }
@@ -1547,7 +1819,7 @@ export interface SpecKindRecipeMapping {
   /** Legacy `vulnClass` values this row applies to (empty = the kind itself is the key). */
   vulnClasses: readonly string[]
   /** Replacement recipe, or null when the receipt model cannot express the evidence yet. */
-  recipe: FloorRecipeId | null
+  recipe: FloorRecipeId | Cut3FloorRecipeId | null
   note: string
 }
 
@@ -1614,7 +1886,7 @@ export const SPEC_KIND_RECIPES: readonly SpecKindRecipeMapping[] = [
 ]
 
 /** Resolve the replacement recipe for a legacy spec, or null when it has no receipt shape yet. */
-export function recipeForSpecKind(specKind: string, vulnClass?: string | null): FloorRecipeId | null {
+export function recipeForSpecKind(specKind: string, vulnClass?: string | null): FloorRecipeId | Cut3FloorRecipeId | null {
   for (const row of SPEC_KIND_RECIPES) {
     if (row.specKind !== specKind) continue
     if (row.vulnClasses.length === 0 || (vulnClass && row.vulnClasses.includes(vulnClass))) return row.recipe
@@ -1632,6 +1904,12 @@ export function recipeForSpecKind(specKind: string, vulnClass?: string | null): 
  * the gap is explicit instead of looking like an oversight.
  */
 export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
+  {
+    specKind: 'race_burst',
+    vulnClasses: ['race_double_spend'],
+    recipe: 'conserved_balance',
+    note: 'Cut 3d: the conserved-balance recipe reads the value before and after a synchronized burst, requires the serial control to debit every acknowledgement, and confirms only an under-debit / oversell / cap overshoot. The legacy race VM branch is retired.',
+  },
   {
     specKind: 'sql_time_diff',
     vulnClasses: ['sqli'],
@@ -1653,13 +1931,7 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
 ]
 
 /** Rows whose recipe exists but that stay on the legacy verifier for a measured reason. */
-export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId; reason: string }[] = [
-  {
-    specKind: 'race_burst',
-    vulnClasses: ['race_double_spend'],
-    recipe: 'race_burst',
-    reason: '`receiptRuleFor("race_double_spend")` has no confirmation rule: the receipt model cannot yet express the conserved-balance debit, so a race confirmation would silently lose its class.',
-  },
+export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId | Cut3FloorRecipeId; reason: string }[] = [
   {
     specKind: 'http_chain',
     vulnClasses: ['mass_assignment', 'workflow_bypass', 'business_logic', 'price_tampering', 'csrf'],
@@ -1684,7 +1956,7 @@ export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses:
  * Resolve the **wired** recipe for a legacy spec kind/class pair. This is the function the verifier
  * uses for its no-fallback assertion, so a wired pair can never silently reach the legacy path.
  */
-export function wiredRecipeForSpecKind(specKind: string, vulnClass?: string | null): FloorRecipeId | null {
+export function wiredRecipeForSpecKind(specKind: string, vulnClass?: string | null): FloorRecipeId | Cut3FloorRecipeId | null {
   for (const row of WIRED_SPECKIND_RECIPES) {
     if (row.specKind !== specKind) continue
     if (row.vulnClasses.length === 0 || (vulnClass && row.vulnClasses.includes(vulnClass))) return row.recipe

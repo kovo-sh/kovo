@@ -25,6 +25,7 @@ import { CUT3_FLOOR_RECIPE_IDS, cut3FloorRecipe, floorRecipe, runCut3Recipe, run
 import type {
   AccessBoundaryArgs,
   BooleanOrTimingArgs,
+  ConservedBalanceArgs,
   Cut3FloorRecipeArgs,
   Cut3FloorRecipeArgsMap,
   Cut3FloorRecipeId,
@@ -300,14 +301,17 @@ function planRaceRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const hyp = input.hypothesis
   const hit = input.probe.anomalies.find(anomaly => anomaly.type === 'race_double_spend')
   const sketch: FloorRecipePlan = {
-    recipeId: 'race_burst',
+    recipeId: 'conserved_balance',
     specKind: input.specKind,
     vulnClass: 'race_double_spend',
     endpoint: hyp.endpoint.pathTemplate,
-    args: {} as FloorRecipeArgs,
+    args: {} as ConservedBalanceArgs,
   }
   if (!hit) return { ...sketch, skipReason: 'no race_double_spend evidence on the probe result' }
   const amountField = typeof hit.amountField === 'string' ? hit.amountField : ''
+  const balanceField = typeof hit.balanceField === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.balanceField)
+    ? hit.balanceField
+    : undefined
   const amount = Number(hit.amount)
   const burst = Number(hit.burstSize)
   if (!/^[A-Za-z0-9_.-]{1,64}$/.test(amountField) || !Number.isFinite(amount) || amount <= 0) {
@@ -316,22 +320,38 @@ function planRaceRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   if (!Number.isFinite(burst) || burst < 2 || burst > 10) {
     return { ...sketch, skipReason: 'race evidence did not name a usable burst size' }
   }
+  const raceOrigin = typeof hit.raceOrigin === 'string' && /^https?:\/\//.test(hit.raceOrigin)
+    ? hit.raceOrigin
+    : hyp.endpoint.origin
   const path = typeof hit.path === 'string' && hit.path.startsWith('/')
     ? hit.path.split('?')[0]!
     : hyp.pathAndQuery.split('?')[0]!
   const idempotencyKey = typeof hit.idempotencyKey === 'string' && /^[A-Za-z0-9_.:-]{1,80}$/.test(hit.idempotencyKey)
     ? hit.idempotencyKey
     : null
-  const body: Record<string, unknown> = { [amountField]: amount, ...(idempotencyKey ? { idempotencyKey } : {}) }
+  const bodyFor = (value: number): Record<string, unknown> => ({
+    [amountField]: value,
+    ...(idempotencyKey ? { idempotencyKey } : {}),
+  })
   const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
-  const args: RaceBurstArgs = {
-    origin: hyp.endpoint.origin,
+  const actor = floorActorFor(hyp.ownerPersona ?? null, input.personas)
+  const args: ConservedBalanceArgs = {
+    origin: raceOrigin,
     method: 'POST',
     pathAndQuery: path,
     vulnClass: 'race_double_spend',
-    actor: floorActorFor(hyp.ownerPersona ?? null, input.personas),
-    body,
-    burst: Math.trunc(burst),
+    actor,
+    body: bodyFor(amount),
+    burst: Math.min(8, Math.trunc(burst)),
+    readback: {
+      method: 'POST',
+      pathAndQuery: path,
+      jsonBody: bodyFor(0),
+      actor,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    },
+    ...(balanceField ? { balanceField } : {}),
+    unitDebit: amount,
     ...(Object.keys(headers).length > 0 ? { headers } : {}),
   }
   return { ...sketch, args }
@@ -545,7 +565,8 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
   if (!recipe) return null
   switch (recipe) {
     case 'boolean_or_timing': return planBooleanRecipe(input)
-    case 'race_burst': return planRaceRecipe(input)
+    case 'race_burst':
+    case 'conserved_balance': return planRaceRecipe(input)
     case 'access_boundary':
     case 'persisted_mutation': return planAuthzRecipe(input)
     default: return {
@@ -581,7 +602,7 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
     broker: input.broker,
     grant: input.grant,
     signal: input.signal,
-    origin: input.hypothesis.endpoint.origin,
+    origin: input.plan.args.origin || input.hypothesis.endpoint.origin,
     probeClass: input.hypothesis.probeClass,
     ...(input.runId ? { runId: input.runId } : {}),
     ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
@@ -654,6 +675,7 @@ const TITLE_BY_RECIPE: Readonly<Record<PersistedFloorRecipeId, string>> = {
   redirect: 'Open redirect to off-origin destination',
   browser_sink: 'Client-side browser sink execution',
   injection_fingerprint: 'Parser or engine injection fingerprint',
+  conserved_balance: 'Conserved-balance concurrency violation',
 }
 
 const is2xxJq = (id: string) => `(.steps.${id}.status >= 200 and .steps.${id}.status < 300)`
@@ -726,11 +748,20 @@ function retestAssertion(recipe: PersistedFloorRecipeId, steps: readonly { id: s
         + `confirmed: (${all(is2xxJq)} and (${pairs.length ? pairs.join(' and ') : 'true'})), `
         + 'observed: "recipe replay: paired boolean rounds re-observed", expected: "the boolean predicate separates every pair" }'
     }
-    case 'race_burst': {
-      const burst = steps.filter(step => step.role.startsWith('burst_')).map(step => step.id)
+    case 'race_burst':
+    case 'conserved_balance': {
+      const burst = steps.filter(step => (step.description ?? step.role).startsWith('burst_')).map(step => step.id)
       const successes = burst.length >= 2
         ? burst.map(id => is2xxJq(id)).slice(0, 2).join(' and ')
         : 'true'
+      const baseline = first('baseline_read')
+      const post = first('post_read')
+      if (recipe === 'conserved_balance') {
+        const readOk = [baseline, post].filter((id): id is string => Boolean(id)).map(is2xxJq).join(' and ') || 'true'
+        return `{ controlPassed: (${readOk}), `
+          + `confirmed: ((${readOk}) and (${successes})), `
+          + 'observed: "recipe replay: conserved-balance burst re-observed", expected: "concurrent mutations preserve conservation identically to serial execution" }'
+      }
       const divergence = burst.slice(1)
         .map((id, index) => `(.steps.${id}.body != .steps.${burst[index]}.body)`)
         .join(' or ') || 'true'
@@ -960,6 +991,11 @@ function recipeResult(
 ): ReplayVerificationResult {
   const verification = execution.result.verification
   const steps = recordSteps(plan.args.origin, execution)
+  const burstResults = plan.specKind === 'race_burst'
+    ? execution.result.steps
+      .filter(step => step.role.startsWith('burst_'))
+      .map(step => ({ status: step.status, method: step.method, pathAndQuery: step.pathAndQuery, durationMs: step.durationMs }))
+    : null
   const evidencePayload: Record<string, unknown> = {
     kind: plan.specKind,
     origin: plan.args.origin,
@@ -968,6 +1004,7 @@ function recipeResult(
     recipe: plan.recipeId,
     receipt: execution.receipt,
     verification,
+    ...(burstResults && burstResults.length > 0 ? { burst: { results: burstResults } } : {}),
     steps: Object.fromEntries(steps.map((step, index) => [step.id, {
       role: step.role,
       status: execution.result.steps[index]?.status ?? null,
@@ -977,15 +1014,21 @@ function recipeResult(
     exchangeIds: [...execution.result.exchangeIds],
   }
   const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
+  const isRecipeError = !confirmed && execution.failure?.code === 'recipe_error'
+  const reason = isRecipeError
+    ? (execution.failure?.message ?? verification.reason)
+    : !confirmed && execution.failure?.code === 'precondition_unsatisfied'
+      ? execution.failure.message
+      : verification.reason
   return {
-    verdict: confirmed ? 'confirmed' : 'dismissed',
+    verdict: confirmed ? 'confirmed' : isRecipeError ? 'inconclusive' : 'dismissed',
     ...(confirmed ? { verificationTier: 'runtime_confirmed' as const } : {}),
     outcome: {
       confirmed,
       controlPassed: confirmed,
       observed: verification.observed.slice(0, 1200),
       expected: verification.expected.slice(0, 1200),
-      reason: verification.reason.slice(0, 1200),
+      reason: reason.slice(0, 1200),
     },
     exchangeIds: [...exchangeIds],
     exchanges: [],

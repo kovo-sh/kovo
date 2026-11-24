@@ -167,10 +167,10 @@ test('Cut 3c recipe wiring: redirect, browser_sink, and injection_fingerprint pe
   assert.equal(browserFixed.verdict, 'fixed')
 })
 
-test('Cut 3c-1 & 3c-2 retirement: all 7 retired legacy spec kinds fail closed without executing legacy VM code', async () => {
+test('Cut 3c/3d retirement: all 8 retired legacy spec kinds fail closed without executing legacy VM code', async () => {
   const retiredKinds = [
     'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
-    'sql_boolean_diff', 'sql_time_diff',
+    'sql_boolean_diff', 'sql_time_diff', 'race_burst',
   ] as const
   for (const kind of retiredKinds) {
     assert.ok(RETIRED_LEGACY_SPEC_KINDS.has(kind), `missing retired kind ${kind}`)
@@ -261,6 +261,16 @@ test('Cut 3c-1 & 3c-2 retirement: all 7 retired legacy spec kinds fail closed wi
       quoteStyle: 'single' as const,
       dialect: 'postgres' as const,
       delayMs: 1500,
+    },
+    {
+      // Cut 3d retired the raw race VM branch: a legacy race_burst spec must fail closed (it is
+      // replaced by the conserved_balance floor recipe).
+      ...base,
+      kind: 'race_burst' as const,
+      burst: [
+        { origin, method: 'POST' as const, pathAndQuery: '/giftcards/1/redeem', jsonBody: { amount: 4 } },
+        { origin, method: 'POST' as const, pathAndQuery: '/giftcards/1/redeem', jsonBody: { amount: 4 } },
+      ],
     },
   ]
 
