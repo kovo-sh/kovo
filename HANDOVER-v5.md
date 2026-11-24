@@ -2,8 +2,67 @@
 
 **Status:** **v5.0 FREEZE CANDIDATE** — deterministic engine meets G4/G9; shipped `Execution` has no deterministic floor; final gate pending.
 **Snapshot:** 2026-11-22, `main` @ `d26cd01` (engine-port revert `a73f07e`)
+**Current line:** v7 planning (2026-11-23) — v6 is the shipped baseline, v7 M0 has not passed. See [§0](#0-v6--v7-handover-2026-11-23--planning-not-a-release-claim). §1–§9 remain the historical v5.0/v5.1 record.
 **Read first:** [VERIFICATION-v5.md](VERIFICATION-v5.md) · [plans/ROADMAP-v5.md](plans/ROADMAP-v5.md)
 **Previous line:** [HANDOVER-v4.md](HANDOVER-v4.md) · [VERIFICATION-v4.md](VERIFICATION-v4.md) (historical)
+
+---
+
+## 0. v6 → v7 handover (2026-11-23) — planning, not a release claim
+
+> This section is **new**. It does not revise the v5.0/v5.1 record below; §1–§9 stay as written. Nothing here is a certification or a release gate result.
+
+### 0.1 What v6 proved
+
+| Claim | Evidence |
+| :--- | :--- |
+| **Product has a real deterministic floor** | `Execution --no-llm` **31/59 (52.5%)** at **100%** precision, 0 decoy/unmatched (acme 11, shopflow 11, opsportal 9; 3-app dev seed 1, serial, wordlists off) |
+| **The floor is deterministic** | Canonical ordering + request-first termination + state-clobber isolation: **0 spread** (3 repeats identical at 26/59); loaded runs (8 CPU hogs) match idle (`driftApps=0`). The **31/59** tree is not yet re-gated |
+| **Legacy regressions hold** | XBEN **25/25** (restored from 24/25), held-out-saas **20/20** + **20/20 patches** |
+| **Budgets are decoupled and honest** | Phase A/B allowances (600 s: 6k/25k/31k, $5; 45 min: 12k/100k/112k, $10), 50 RPS lab cap, `agent_budget_exhausted` termination, per-phase accounting, no borrowing |
+| **The proof path is typed and evidence-first** | Default-deny boundary across both proof paths, real MFA gate, typed SDK helpers aligned to `oracle-invariants`, advisory separation, provenance-derived lift |
+| **The certification harness exists** | `scripts/certify-phase1.ts` encodes floor spread, preservation, worst-run precision and lift as machine-checked criteria |
+
+### 0.2 What v6 did not prove
+
+- **Realism capability is 0.** #4 and #3 wiring passes; #2 was still a wiring FAIL at last check (no `pending_oob` registered). Wiring connected ≠ findings converted.
+- **Agentic lift is small and concentrated.** 600 s: **13/22 (+2)** at 100%; 45 min: **15/22 (+4)** at **88.2%**, kept rerun **13/22 (+2)** at **92.9%** — acme only, 1–2 unmatched claims. The pre-split K=6 n=3 was 11/12/11 of 22 with median lift 0.
+- **Not certifiable.** Worst-run precision at the horizon is below 100%, and +2..+4 on one app is not the +10 pp aggregate bar.
+- **Budgets were never the constraint.** 3.8% of the agent allowance, 13–30% of dollars, 1.1–1.7 req/s of 50 RPS. Throughput and proof quality are.
+- **The floor is not re-gated on the 31/59 tree**, and the salted held-out product floor is **stale** (last 23/58, before the restore).
+- **The DSL is not retired.** `execution.ts` remains ~10.5K LOC; chains, white-box and reason-bench are unmeasured in v6.
+
+### 0.3 v7 plan (M0–M4)
+
+| Milestone | Scope | Gate |
+| :--- | :--- | :--- |
+| **M0** | ProofReceipt as the single confirmation primitive over host-signed transcripts; floor/patch-retest/`pending_oob` migration; three deletion cuts (agent compilers/fallback → floor migration → spec VM); budget split **done** | Floor **≥31/59, 0 spread** on the retired tree; xben 25/25; held-out 20/20 + 20/20; `execution.ts < 7.5K`; Tier-0/1 smoke green |
+| **M1** | Realism conversion #1–#4: white-box slices in Tier-A briefs, H2 race/workflow dispatch, SPA hybrid HTTP→browser receipts, #2 async OOB re-verified end-to-end | ≥75% capability recall on #1–#4 at 100% precision; #3 zero leaked entities; #4 ≥2/3 4-hop |
+| **M2** | White-box-first interprocedural analysis, RBAC diffing, typed chain primitives, delete black-box-first overrides when source is mounted | Chains ≥4/6; reason-bench agentic ≥40% with floor locked 0/28; OSS dev ≥60% at ≥95% |
+| **M3** | **Deferred to v8** — continuous scheduled scanning + persistent org graph + PR-diff | Revisit after M1/M2 and M4 isolation |
+| **M4** | Signed scope manifest, <2 s kill switch, ZDR/PII redaction, artifact TTL, tenant isolation/audit, coverage-gap reporting, portable ProofReceipt export | Sealed OSS ≥60% at 100%; 0 FPs on negative controls; chaos test PASS |
+
+**Certification protocol (adopted):** M0 gates first → 3-app 600 s smoke, all cells 100% precision → n=3 per app dev + n=2–3 held-out via `certify-phase1.ts`, gated on median [min–max] with worst-run precision 100% and ≤1 target floor spread. A 45-min endurance cell is a **precision diagnostic**, never a certification cell.
+
+**Fast loop (adopted):** Tier 0 (<90 s, $0: worker-gate + archetype replay) → Tier 1 (~6 min, ~$1: paired acme lift, rotating second app, pre-exhausted precision trap must confirm **0**, one realism micro-slice) → Tier 2 (30–45 min: cold 3-app n=3, salted held-out, endurance, realism, xben/held-out). Tier 1 is a regression tripwire until the 8-variant calibration study (Spearman ≥ 0.75) lands.
+
+Full detail: [plans/v7.md](plans/v7.md) · [VERIFICATION-v5.md §V7](VERIFICATION-v5.md#v7-planning-snapshot-2026-11-23--not-a-release-claim).
+
+### 0.4 Known regressions fixed this cycle
+
+| Regression | Fix | Result |
+| :--- | :--- | :--- |
+| XBEN **24/25** after the verifier required post-mutation readback (`xben-12` → `replay_spec_miss`) | Spec-side pre/post readback for `synthAuthz`; gate not weakened | **25/25** |
+| held-out-saas BFLA lost in floor hardening | Role-exclusive function-surface delta counts as vertical impact | **20/20** + **20/20 patches** |
+| Floor **26/59** after hardening (shopflow 7, opsportal 8) | All-occurrence XSS canary scan choosing the strongest executable context (opsportal +1) | **31/59** at 100% |
+| Floor repeat spread **29 / 30 / 33** | Canonical ordering, state-clobber isolation, request-first termination | **0 spread** (3 identical repeats at 26/59, site sets identical); idle vs 8-CPU-hog runs identical |
+| 3 unmatched FPs at K=6 (planted mass-assign labelled BOLA; 2 fixture XSS escapes) | Evidence-first impact classification (CWE-915); fixture escaping | **100%** on K=6 |
+| Stored-2FA over-claim; `/api/admin/activity` false charge | Universal default-deny boundary + real MFA gate; `misclassifiedFindingIds` bucket (neither TP nor FP) | Over-claim dismissed; 100% precision on acme samples |
+| **Open:** 45-min negative-invoice-amount claim | Triage in flight (invariant bug vs echo/clamp) | **Unresolved** — why 45-min worst-run precision is not 100% |
+
+### 0.5 Reporting rule
+
+Report **both** product metrics — `Execution --no-llm` floor and the agentic increment — on **dev and salted held-out**. Never quote a procedural/harness number as the product score, a wiring pass as a capability result, or a single-app lift as an aggregate. §1–§9 below are unchanged history.
 
 ---
 
