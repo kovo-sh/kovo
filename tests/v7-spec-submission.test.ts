@@ -251,6 +251,14 @@ test('a spec for a different route does not clear the target obligation', async 
   assert.equal(specSubmissionPending(tracker.snapshot()), false)
 })
 
+test('batch/race-only route evidence is never spec-gated without a routable target', () => {
+  const tracker = new SpecSubmissionTracker()
+  tracker.noteProbe()
+  tracker.noteSpecAttempt([{ method: 'GET', path: '/api/other' }])
+  assert.equal(tracker.snapshot().route, undefined)
+  assert.equal(specSubmissionPending(tracker.snapshot()), false, 'no routable target means no false rejection')
+})
+
 test('replaySpecRouteSteps extracts requests from mixed spec shapes', () => {
   const steps = replaySpecRouteSteps({
     steps: {

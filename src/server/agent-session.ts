@@ -409,9 +409,11 @@ export class SpecSubmissionTracker {
 
   snapshot(): SpecSubmissionSnapshot {
     const target = this.state.route
-    const targetCovered = target
+    // Bind only when we have a non-root target route. Without one (batch/race/probe-only evidence)
+    // any submitted spec is conservative: never reject a conclusion we cannot route-check.
+    const targetCovered = target && target.path !== '/'
       ? this.coveredRoutes.has(`${target.method} ${target.path}`) || (this.state.probes > 0 && this.opaqueSpecAttempts > 0)
-      : this.opaqueSpecAttempts > 0
+      : this.state.specAttempts > 0
     return {
       ...this.state,
       targetCovered,
