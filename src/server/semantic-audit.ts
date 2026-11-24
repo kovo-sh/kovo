@@ -10,8 +10,8 @@ import { type CodeAuditSuspectData, type HostTier, classifyHostTier } from './ag
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import { providerPool, type UsageCallback } from './provider.ts'
 import { type NamedSecret, redact } from './redact.ts'
-import { resolveRouteForLocation } from './program-graph.ts'
-import type { ProgramGraph, ProgramNode, ProgramSinkKind } from './program-graph.ts'
+import { resolveRouteForLocation, resolveRouteSinkPaths } from './program-graph.ts'
+import type { ProgramGraph, ProgramNode, ProgramRoute, ProgramSinkKind, RouteSinkPath } from './program-graph.ts'
 import type { Assignment, Run, Store } from './store.ts'
 import type {
   CallGraphResult,
@@ -1284,6 +1284,13 @@ export function analyzeSinkBackwardPaths(
   return results
 }
 
+export interface ResolvedEntrypointHop {
+  symbol: string
+  file: string
+  line: number
+  kind: 'route' | 'function' | 'middleware' | 'sink'
+}
+
 export interface ResolvedEntrypoint {
   routePath: string
   httpMethod?: string
@@ -1293,6 +1300,14 @@ export interface ResolvedEntrypoint {
   paramNames: string[]
   matchedBy: 'range' | 'nearest' | 'reverse' | 'none'
   reconciledEndpoint?: string
+  /** Full route -> ... -> sink chain (route first, sink last) for briefs. */
+  chain?: ResolvedEntrypointHop[]
+  /** Union of route + hop guards, chain order, bounded. */
+  guards?: string[]
+  /** `chain.length - 1`; >= 6 when resolved through a deep Program Graph path. */
+  depth?: number
+  /** Terminal sink attached to the chain, when one was found. */
+  sink?: { kind: AuditSinkKind; at: string }
 }
 
 const ROUTE_PARAM_RE = /(?::([A-Za-z_][A-Za-z0-9_]*)|[{<]([A-Za-z_][A-Za-z0-9_]*)[}>])/g
@@ -1420,11 +1435,122 @@ export function combineCallGraphs(primary: CallGraphIndex | undefined, supplemen
   }
 }
 
+/** Cached per-graph sink paths (deterministic, read-only) so repeated suspect binding stays cheap. */
+const PROGRAM_SINK_PATH_CACHE = new WeakMap<ProgramGraph, Map<string, RouteSinkPath[]>>()
+
+/** Cached per-graph sink paths (deterministic, read-only) so repeated suspect binding stays cheap. */
+function sinkPathsByRoute(graph: ProgramGraph): Map<string, RouteSinkPath[]> {
+  const cached = PROGRAM_SINK_PATH_CACHE.get(graph)
+  if (cached) return cached
+  const byRoute = new Map<string, RouteSinkPath[]>()
+  for (const path of resolveRouteSinkPaths(graph, { maxDepth: 16, maxPaths: 5000 })) {
+    const list = byRoute.get(path.routeId) ?? []
+    list.push(path)
+    byRoute.set(path.routeId, list)
+  }
+  PROGRAM_SINK_PATH_CACHE.set(graph, byRoute)
+  return byRoute
+}
+
+function programSinkRank(kind: ProgramSinkKind): number {
+  if (kind === 'db_query' || kind === 'command') return 3
+  if (kind === 'outbound_fetch' || kind === 'template' || kind === 'file') return 2
+  if (kind === 'redirect') return 1
+  return 0
+}
+
+function pickSinkPath(paths: readonly RouteSinkPath[], maxHops: number): RouteSinkPath | undefined {
+  return [...paths]
+    .filter(path => path.hops <= maxHops)
+    .sort((a, b) =>
+      programSinkRank(b.sinkKind) - programSinkRank(a.sinkKind) ||
+      b.hops - a.hops ||
+      a.sinkId.localeCompare(b.sinkId))[0]
+}
+
+function dedupeGuards(values: readonly string[], limit = 8): string[] {
+  const out: string[] = []
+  for (const value of values) {
+    const guard = value.trim()
+    if (!guard || out.includes(guard)) continue
+    out.push(guard)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+function hopKind(kind: CallGraphNode['kind']): ResolvedEntrypointHop['kind'] {
+  if (kind === 'entrypoint') return 'route'
+  if (kind === 'sink') return 'sink'
+  if (kind === 'middleware' || kind === 'guard') return 'middleware'
+  return 'function'
+}
+
+interface EntrypointEvidence {
+  chain: ResolvedEntrypointHop[]
+  guards: string[]
+  depth: number
+  sink?: { kind: AuditSinkKind; at: string }
+}
+
+/**
+ * Full route -> ... -> sink chain for a Program Graph route, including per-hop guards.
+ * Falls back to the route node alone when no call path reaches a sink.
+ */
+function evidenceForProgramRoute(graph: ProgramGraph, route: ProgramRoute, maxHops: number): EntrypointEvidence {
+  const sinkPath = pickSinkPath(sinkPathsByRoute(graph).get(route.id) ?? [], maxHops)
+  const nodeGuardsById = new Map(graph.nodes.map(node => [node.id, node.guards]))
+  if (sinkPath) {
+    const chain: ResolvedEntrypointHop[] = sinkPath.chain
+      .slice(0, maxHops + 1)
+      .map(hop => ({
+        symbol: hop.symbol,
+        file: hop.file,
+        line: hop.line,
+        kind: hop.kind === 'route' || hop.kind === 'sink' || hop.kind === 'middleware' ? hop.kind : 'function',
+      }))
+    const guards = dedupeGuards([
+      ...route.guards,
+      ...sinkPath.chain.flatMap(hop => nodeGuardsById.get(hop.id) ?? []),
+    ])
+    return {
+      chain,
+      guards,
+      depth: Math.max(0, chain.length - 1),
+      sink: { kind: PROGRAM_SINK_KIND_MAP[sinkPath.sinkKind] ?? 'other', at: `${sinkPath.sinkFile}:${sinkPath.sinkLine}` },
+    }
+  }
+  const chain: ResolvedEntrypointHop[] = [{ symbol: route.handler, file: route.file, line: route.line, kind: 'route' }]
+  return { chain, guards: dedupeGuards(route.guards), depth: 0 }
+}
+
+/** Evidence for call-graph-only binding: entrypoint node plus the hop stack it reached. */
+function evidenceForCallGraphChain(nodes: readonly CallGraphNode[]): EntrypointEvidence {
+  const chain: ResolvedEntrypointHop[] = nodes.map(node => ({
+    symbol: node.symbol,
+    file: node.file,
+    line: node.line,
+    kind: hopKind(node.kind),
+  }))
+  const terminal = nodes[nodes.length - 1]
+  return {
+    chain,
+    guards: dedupeGuards(nodes.flatMap(node => node.guards)),
+    depth: Math.max(0, chain.length - 1),
+    ...(terminal?.kind === 'sink' && terminal.sinkKind
+      ? { sink: { kind: terminal.sinkKind, at: `${terminal.file}:${terminal.line}` } }
+      : {}),
+  }
+}
+
 /**
  * Map a `file:line` SAST suspect backwards to its enclosing HTTP entrypoint.
  * Resolution order: containing function span -> nearest preceding entrypoint in
  * the same file -> multi-hop reverse call graph (depth 6-8) -> Program Graph
  * reverse route resolution -> none (caller keeps the raw file target).
+ *
+ * The result carries the full chain (route -> ... -> sink) and dominating guards so a brief or
+ * planner can render code evidence without re-walking the repository.
  */
 export function resolveSuspectEntrypoint(
   graph: CallGraphIndex | undefined,
@@ -1440,7 +1566,7 @@ export function resolveSuspectEntrypoint(
   const entrypoints = effectiveGraph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath)
   const inFile = entrypoints.filter(n => n.file === target.file)
   const sorted = [...inFile].sort((a, b) => a.line - b.line)
-  let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' | 'reverse' } | null = null
+  let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' | 'reverse'; chainNodes?: CallGraphNode[] } | null = null
   for (const node of sorted) {
     const end = node.endLine ?? node.line
     if (target.line >= node.line && target.line <= end) {
@@ -1464,11 +1590,11 @@ export function resolveSuspectEntrypoint(
     const start = sameFileNodes.find(n => target.line >= n.line && target.line <= (n.endLine ?? n.line))
       ?? sameFileNodes.find(n => n.line <= target.line)
     if (start) {
-      let found: { node: CallGraphNode; hops: number } | null = null
-      const walk = (current: CallGraphNode, hops: number, visited: Set<string>) => {
-        if (found && hops >= (found as { node: CallGraphNode; hops: number }).hops) return
+      let found: { node: CallGraphNode; hops: number; stack: CallGraphNode[] } | null = null
+      const walk = (current: CallGraphNode, hops: number, visited: Set<string>, stack: CallGraphNode[]) => {
+        if (found && hops >= found.hops) return
         if (current.kind === 'entrypoint' && current.routePath) {
-          found = { node: current, hops }
+          found = { node: current, hops, stack }
           return
         }
         if (hops >= maxHops) return
@@ -1476,12 +1602,15 @@ export function resolveSuspectEntrypoint(
           const caller = nodeById.get(edge.fromId)
           if (!caller || visited.has(caller.id)) continue
           visited.add(caller.id)
-          walk(caller, hops + 1, visited)
+          walk(caller, hops + 1, visited, [...stack, caller])
           visited.delete(caller.id)
         }
       }
-      walk(start, 0, new Set([start.id]))
-      if (found) best = { node: (found as { node: CallGraphNode }).node, matchedBy: 'reverse' }
+      walk(start, 0, new Set([start.id]), [start])
+      if (found) {
+        const resolved = found as { node: CallGraphNode; hops: number; stack: CallGraphNode[] }
+        best = { node: resolved.node, matchedBy: 'reverse', chainNodes: [...resolved.stack].reverse() }
+      }
     }
     if (!best && options.programGraph) {
       // Clean fallback: use the Program Graph's own reverse route resolution (still 1..maxHops),
@@ -1490,6 +1619,7 @@ export function resolveSuspectEntrypoint(
       if (routed) {
         const routePath = routed.route.path
         const httpMethod = routed.route.method
+        const evidence = evidenceForProgramRoute(options.programGraph, routed.route, maxHops)
         return {
           routePath,
           ...(httpMethod ? { httpMethod } : {}),
@@ -1498,6 +1628,7 @@ export function resolveSuspectEntrypoint(
           line: routed.route.line,
           paramNames: routeTemplateParamNames(routePath),
           matchedBy: routed.matchedBy === 'nearest' ? 'nearest' : 'reverse',
+          ...evidence,
           ...(() => {
             const reconciled = reconcileSuspectWithEndpoints(httpMethod, routePath, liveEndpoints)
             return reconciled ? { reconciledEndpoint: reconciled } : {}
@@ -1509,6 +1640,18 @@ export function resolveSuspectEntrypoint(
   }
   const routePath = best.node.routePath ?? best.node.symbol
   const reconciled = reconcileSuspectWithEndpoints(best.node.httpMethod, routePath, liveEndpoints)
+  const programRoute = options.programGraph?.routes.find(route =>
+    route.path === best!.node.routePath &&
+    (!best!.node.httpMethod || route.method.toUpperCase() === best!.node.httpMethod.toUpperCase()))
+  const evidence: EntrypointEvidence = best.chainNodes
+    ? evidenceForCallGraphChain(best.chainNodes)
+    : programRoute
+      ? evidenceForProgramRoute(options.programGraph!, programRoute, maxHops)
+      : {
+          chain: [{ symbol: best.node.symbol, file: best.node.file, line: best.node.line, kind: 'route' }],
+          guards: dedupeGuards(best.node.guards),
+          depth: 0,
+        }
   return {
     routePath,
     ...(best.node.httpMethod ? { httpMethod: best.node.httpMethod } : {}),
@@ -1517,6 +1660,7 @@ export function resolveSuspectEntrypoint(
     line: best.node.line,
     paramNames: routeTemplateParamNames(routePath),
     matchedBy: best.matchedBy,
+    ...evidence,
     ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
   }
 }

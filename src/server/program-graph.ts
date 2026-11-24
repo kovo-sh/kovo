@@ -97,6 +97,8 @@ export interface ProgramGraph {
   edges: ProgramEdge[]
   globalMiddleware: string[]
   warnings: string[]
+  /** Bounded, value-free secret/IaC hints per route module (v7 white-box evidence). */
+  codeHints?: Record<string, CodeSliceHint[]>
 }
 
 export interface RouteSinkPath {
@@ -1521,6 +1523,7 @@ function buildGraph(
 
   const frameworks = [...new Set(routes.map(r => r.framework))]
   if (routes.some(r => r.framework === 'unknown')) warningsOut.push('Some routes were extracted with unknown framework.')
+  const codeHints = deriveGraphCodeHints(files, routes)
   return {
     repo,
     filesScanned: files.length,
@@ -1530,6 +1533,7 @@ function buildGraph(
     edges,
     globalMiddleware,
     warnings: warningsOut,
+    ...(Object.keys(codeHints).length ? { codeHints } : {}),
   }
 }
 
@@ -1820,17 +1824,20 @@ export function deriveCodeToRuntimeHypotheses(
     seen.add(hypothesis.id)
     hypotheses.push(hypothesis)
   }
+  const guardIndex = buildSiblingGuardIndex(graph)
 
   for (const route of graph.routes) {
     const adminPath = /\/(?:admin|internal|manage|management|backoffice|staff|console|superuser)(?:\/|$)/i.test(route.path)
     const adminHandler = /(?:admin|backoffice|superuser|staff)/i.test(route.handler)
     const hasAdminGuard = route.guards.some(guard => ADMIN_GUARD_RE.test(guard))
+    const guardDiffEvidence = guardDiffsForRoute(route, guardIndex)
+      .map(diff => `missing_guard=${diff.guard} ${diff.symbol}@${diff.at} (sibling ${diff.sibling})`)
     if ((adminPath || adminHandler) && !hasAdminGuard) {
       push({
         id: `hyp:admin:${route.id}`, kind: 'admin_route_missing_admin_guard', severity: 'high', confidence: adminPath ? 0.82 : 0.68,
         framework: route.framework, method: route.method, path: route.path, file: route.file, line: route.line,
         routeId: route.id, rationale: `Privileged route ${route.method} ${route.path} has no admin/RBAC middleware in its mounted chain.`,
-        evidence: [`guards=[${route.guards.join(', ')}]`, `middleware=[${route.middleware.join(', ')}]`],
+        evidence: [`guards=[${route.guards.join(', ')}]`, `middleware=[${route.middleware.join(', ')}]`, ...guardDiffEvidence],
         probeClass: 'auth_bypass',
       })
     }
@@ -1842,7 +1849,7 @@ export function deriveCodeToRuntimeHypotheses(
         id: `hyp:tenant:${route.id}`, kind: 'tenant_param_without_scope', severity: 'high', confidence: 0.7,
         framework: route.framework, method: route.method, path: route.path, file: route.file, line: route.line,
         routeId: route.id, rationale: `Mutating ${route.method} ${route.path} reads an object identifier (${route.input.params.join(', ')}) without a tenant/ownership guard.`,
-        evidence: [`params=[${route.input.params.join(', ')}]`, `guards=[${route.guards.join(', ')}]`],
+        evidence: [`params=[${route.input.params.join(', ')}]`, `guards=[${route.guards.join(', ')}]`, ...guardDiffEvidence],
         probeClass: 'bola_bfla',
       })
     }
@@ -1885,6 +1892,611 @@ export function deriveCodeToRuntimeHypotheses(
     })
   }
   return hypotheses
+}
+
+// ============================================================================
+// White-box dataflow slices (v7 M1/M2): bounded code evidence for briefs
+// ============================================================================
+
+/** Hard cap for a single rendered dataflow slice (bytes of compact JSON). */
+export const CODE_DATAFLOW_SLICE_MAX_BYTES = 600
+/** Expanded budget a coordinator may request when it wants the full hop chain. */
+export const CODE_DATAFLOW_SLICE_EXPANDED_BYTES = 1600
+
+export interface CodeSliceHop {
+  /** Exact `file:line`, relative to {@link CodeDataflowSlice.root} when present. */
+  at: string
+  /** Omitted means `function` (kept implicit to fit the byte cap). */
+  kind?: 'route' | 'function' | 'middleware' | 'sink'
+  /** Guard identifiers that dominate this hop (function-level checks included). */
+  guards?: string[]
+}
+
+export interface CodeSliceGuardDiff {
+  kind: 'missing_guard'
+  /** Guard family the target route lacks (`admin` / `tenant`). */
+  guard: string
+  /** Concrete sibling guard identifier, e.g. `requireAdmin`. */
+  symbol: string
+  /** `METHOD /path` of the sibling route that carries the guard. */
+  sibling: string
+  /** Sibling `file:line` where the guard is applied/declared. */
+  at: string
+}
+
+export interface CodeSliceHint {
+  /** `secret` = secret-shaped literal; `iac` = infrastructure exposure. */
+  kind: 'secret' | 'iac'
+  at: string
+  /** Bounded, value-free description (never the secret itself). */
+  note: string
+}
+
+export interface CodeDataflowSlice {
+  /** `METHOD /mounted/:path`. */
+  route: string
+  mounts: string[]
+  methods: string[]
+  input?: { params?: string[]; query?: string[]; body?: string[]; schemas?: string[] }
+  /** `guarded` when the mounted chain carries auth/RBAC/tenant middleware. */
+  auth: 'guarded' | 'unguarded'
+  guards: string[]
+  /** Shared directory prefix for hop/sink `at` paths (kept explicit to save bytes). */
+  root?: string
+  /** route -> controller -> ... -> sink, 1..8 hops with exact file:line. */
+  hops: CodeSliceHop[]
+  sink?: { at: string; kind: ProgramSinkKind }
+  guardDiff?: CodeSliceGuardDiff[]
+  hints?: CodeSliceHint[]
+  /** Set when the byte ladder dropped hops/fields; the graph retains the full chain. */
+  truncated?: boolean
+}
+
+export interface CodeSliceBuildOptions {
+  maxBytes?: number
+  /** Hop budget for the sink path (default 8, clamped 1..8). */
+  maxHops?: number
+  /** Repository sources used for secrets/IaC hints (read-only). */
+  files?: ReadonlyArray<{ path: string; content: string }>
+  /** Reuse a precomputed sink-path set (avoids re-walking a large graph). */
+  sinkPaths?: readonly RouteSinkPath[]
+}
+
+export interface RenderedCodeDataflowSlice {
+  slice: CodeDataflowSlice
+  text: string
+  bytes: number
+  truncated: boolean
+}
+
+const VERSION_SEGMENT_RE = /^(?:api|rest|internal|public|v\d+)$/i
+
+/**
+ * Module key used for sibling guard diffs and module-scoped hints. Enterprise monorepos mount
+ * services under versioned prefixes (`/v2`, `/v3`, `/v4`), so the first non-version static
+ * segment is the service/module identity (`/v2/billing/...` and `/v4/billing/...` both → billing).
+ */
+export function routeModuleKey(routePath: string): string {
+  const segments = routePath
+    .split('/')
+    .map(segment => segment.trim())
+    .filter(segment => segment && !/^[:{<]/.test(segment))
+  for (const segment of segments) {
+    if (VERSION_SEGMENT_RE.test(segment)) continue
+    const clean = segment.toLowerCase().replace(/[^a-z0-9_-]/g, '')
+    if (clean) return clean
+  }
+  return ''
+}
+
+function guardsByFamily(guards: readonly string[]): Map<'admin' | 'tenant', string> {
+  const found = new Map<'admin' | 'tenant', string>()
+  for (const guard of guards) {
+    if (!found.has('admin') && ADMIN_GUARD_RE.test(guard)) found.set('admin', guard)
+    if (!found.has('tenant') && TENANT_GUARD_RE.test(guard)) found.set('tenant', guard)
+  }
+  return found
+}
+
+interface SiblingGuardIndex {
+  byModule: Map<string, Map<'admin' | 'tenant', ProgramRoute>>
+}
+
+const SIBLING_GUARD_INDEX_CACHE = new WeakMap<ProgramGraph, SiblingGuardIndex>()
+
+/** Precompute the first guarded sibling per (module, guard family) once per graph pass. */
+function buildSiblingGuardIndex(graph: ProgramGraph): SiblingGuardIndex {
+  const cached = SIBLING_GUARD_INDEX_CACHE.get(graph)
+  if (cached) return cached
+  const byModule = new Map<string, Map<'admin' | 'tenant', ProgramRoute>>()
+  const routes = [...graph.routes].sort((a, b) =>
+    a.path.localeCompare(b.path) || a.method.localeCompare(b.method) || a.file.localeCompare(b.file) || a.line - b.line)
+  for (const route of routes) {
+    const module = routeModuleKey(route.path)
+    if (!module) continue
+    const families = guardsByFamily(route.guards)
+    if (!families.size) continue
+    const perModule = byModule.get(module) ?? new Map<'admin' | 'tenant', ProgramRoute>()
+    for (const [family, _guard] of families) {
+      if (!perModule.has(family)) perModule.set(family, route)
+    }
+    byModule.set(module, perModule)
+  }
+  const index = { byModule }
+  SIBLING_GUARD_INDEX_CACHE.set(graph, index)
+  return index
+}
+
+function guardDiffsForRoute(
+  route: ProgramRoute,
+  index: SiblingGuardIndex,
+  options: { limit?: number; excludeRouteId?: string } = {},
+): CodeSliceGuardDiff[] {
+  const module = routeModuleKey(route.path)
+  if (!module) return []
+  const siblings = index.byModule.get(module)
+  if (!siblings) return []
+  const owned = guardsByFamily(route.guards)
+  const out: CodeSliceGuardDiff[] = []
+  const limit = Math.max(1, Math.min(options.limit ?? 2, 4))
+  for (const family of ['admin', 'tenant'] as const) {
+    if (out.length >= limit) break
+    if (owned.has(family)) continue
+    const sibling = siblings.get(family)
+    if (!sibling || sibling.id === route.id || sibling.id === options.excludeRouteId) continue
+    const guardSymbol = guardsByFamily(sibling.guards).get(family)
+    if (!guardSymbol) continue
+    out.push({
+      kind: 'missing_guard',
+      guard: family,
+      symbol: guardSymbol.slice(0, 48),
+      sibling: `${sibling.method} ${sibling.path}`.slice(0, 120),
+      at: `${sibling.file}:${sibling.line}`.slice(0, 160),
+    })
+  }
+  return out
+}
+
+const SECRET_HINT_PATTERNS: ReadonlyArray<{ re: RegExp; note: string }> = [
+  { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, note: 'cloud access key' },
+  { re: /\bsk_(?:live|test)_[A-Za-z0-9]{8,}\b/, note: 'payment secret key' },
+  { re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/, note: 'private key block' },
+  { re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s'"`]*:[^\s'"`@]+@/i, note: 'credentialed conn-string' },
+  { re: /\b(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\b\s*[:=]\s*['"][^'"\n]{8,}['"]/i, note: 'secret-shaped assignment' },
+  { re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/, note: 'forge access token' },
+  { re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, note: 'chat app token' },
+]
+
+const IAC_FILE_RE = /(?:^|\/)(?:\.?env(?:\.[\w.-]+)?|infra|deploy(?:ment)?s?|k8s|kubernetes|helm|terraform|ops|docker-compose[\w.-]*\.ya?ml|Dockerfile[\w.-]*)$/i
+const IAC_HINT_PATTERNS: ReadonlyArray<{ re: RegExp; note: string }> = [
+  { re: /\b0\.0\.0\.0\/0\b|\b::\/0\b/, note: 'open ingress CIDR' },
+  { re: /\bprivileged\s*:\s*true\b/, note: 'privileged container' },
+  { re: /\bhostNetwork\s*:\s*true\b/, note: 'host network namespace' },
+  { re: /\brunAsUser\s*:\s*0\b/, note: 'container runs as root' },
+  { re: /\b(?:allow_privilege_escalation|allowPrivilegeEscalation)\s*:\s*true\b/, note: 'privilege escalation allowed' },
+]
+
+function fileInModule(file: string, module: string): boolean {
+  if (!module) return false
+  const normalized = file.replaceAll('\\', '/').toLowerCase()
+  return normalized.split('/').includes(module) || normalized.startsWith(`${module}/`)
+}
+
+/** Single fast prefilter so a repository-wide hint pass stays cheap on generated trees. */
+const HINT_PREFILTER_RE = /(?:AKIA|ASIA)[0-9A-Z]{16}|sk_(?:live|test)_[A-Za-z0-9]{8,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|:\/\/[^\s'"`]*:[^\s'"`@]+@|(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\s*[:=]\s*['"]|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|0\.0\.0\.0\/0|::\/0|privileged\s*:\s*true|hostNetwork\s*:\s*true|runAsUser\s*:\s*0|allow[_]?[Pp]rivilege[_]?[Ee]scalation\s*:\s*true/
+
+/**
+ * Build per-module hint blocks once per extraction. Files are prefilted, so generated route
+ * trees (thousands of files) cost one regex per file and no line scan unless a hint is present.
+ * Hints contain only `file:line` and a fixed note; matched text is never copied.
+ */
+export function deriveGraphCodeHints(
+  files: ReadonlyArray<{ path: string; content: string }>,
+  routes: readonly ProgramRoute[],
+  options: { maxModules?: number; maxHintsPerModule?: number } = {},
+): Record<string, CodeSliceHint[]> {
+  const modules = [...new Set(routes.map(route => routeModuleKey(route.path)).filter(Boolean))]
+    .sort()
+    .slice(0, Math.max(1, Math.min(options.maxModules ?? 200, 2000)))
+  if (!modules.length) return {}
+  const moduleSet = new Set(modules)
+  const byModule = new Map<string, Array<{ path: string; content: string }>>()
+  for (const file of files) {
+    const normalized = file.path.replaceAll('\\', '/').toLowerCase()
+    const segments = normalized.split('/')
+    for (const module of moduleSet) {
+      if (segments.includes(module) || normalized.startsWith(`${module}/`)) {
+        const list = byModule.get(module) ?? []
+        list.push(file)
+        byModule.set(module, list)
+      }
+    }
+  }
+  const out: Record<string, CodeSliceHint[]> = {}
+  const maxHints = Math.max(1, Math.min(options.maxHintsPerModule ?? 3, 8))
+  for (const module of modules) {
+    const candidates = byModule.get(module)
+    if (!candidates) continue
+    const scoped = candidates.filter(file => file.content.length <= 512 * 1024 && HINT_PREFILTER_RE.test(file.content))
+    if (!scoped.length) continue
+    const hints = collectModuleCodeHints(scoped, module, { limit: maxHints })
+    if (hints.length) out[module] = hints
+  }
+  return out
+}
+
+/**
+ * Scan module sources for secret-shaped literals and IaC exposures on the route's module.
+ * The returned hints carry a file:line and a value-free note: the matched text is never copied.
+ */
+export function collectModuleCodeHints(
+  files: ReadonlyArray<{ path: string; content: string }>,
+  module: string,
+  options: { limit?: number; maxFileBytes?: number } = {},
+): CodeSliceHint[] {
+  const limit = Math.max(1, Math.min(options.limit ?? 3, 8))
+  const maxFileBytes = Math.max(4096, options.maxFileBytes ?? 512 * 1024)
+  const hints: CodeSliceHint[] = []
+  const ordered = [...files]
+    .filter(file => file.content.length <= maxFileBytes)
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  for (const file of ordered) {
+    if (hints.length >= limit) break
+    if (module && !fileInModule(file.path, module)) continue
+    const lines = file.content.split('\n')
+    const looksIac = IAC_FILE_RE.test(file.path) || /\b(?:resource|module)\s+["']/.test(file.content.slice(0, 2048))
+    for (let i = 0; i < lines.length; i += 1) {
+      if (hints.length >= limit) break
+      const line = lines[i]
+      if (!line || line.length > 4096) continue
+      for (const pattern of SECRET_HINT_PATTERNS) {
+        if (!pattern.re.test(line)) continue
+        hints.push({ kind: 'secret', at: `${file.path}:${i + 1}`.slice(0, 160), note: pattern.note })
+        break
+      }
+      if (!looksIac || hints.length >= limit) continue
+      for (const pattern of IAC_HINT_PATTERNS) {
+        if (!pattern.re.test(line)) continue
+        hints.push({ kind: 'iac', at: `${file.path}:${i + 1}`.slice(0, 160), note: pattern.note })
+        break
+      }
+    }
+  }
+  return hints
+}
+
+function sinkKindRank(kind: ProgramSinkKind): number {
+  if (kind === 'db_query' || kind === 'command') return 3
+  if (kind === 'outbound_fetch' || kind === 'template' || kind === 'file') return 2
+  if (kind === 'redirect') return 1
+  return 0
+}
+
+function boundedStringList(values: readonly string[] | undefined, max: number): string[] {
+  return [...new Set((values ?? []).map(value => value.trim()).filter(Boolean))].slice(0, max)
+}
+
+/** Longest shared directory prefix across hop/sink files (min 1 segment, trailing slash). */
+function commonDirPrefix(files: readonly string[]): string {
+  const split = files.filter(Boolean).map(file => file.split('/').slice(0, -1))
+  if (!split.length || !split[0].length) return ''
+  const first = split[0]
+  let length = first.length
+  for (const segments of split.slice(1)) {
+    let i = 0
+    while (i < length && i < segments.length && segments[i] === first[i]) i += 1
+    length = i
+  }
+  return length ? `${first.slice(0, length).join('/')}/` : ''
+}
+
+function relativeAt(file: string, line: number, root: string): string {
+  const relative = root && file.startsWith(root) ? file.slice(root.length) : file
+  return `${relative}:${line}`.slice(0, 160)
+}
+
+function buildSliceFromRoute(
+  graph: ProgramGraph,
+  route: ProgramRoute,
+  sinkPath: RouteSinkPath | null,
+  options: CodeSliceBuildOptions,
+): CodeDataflowSlice {
+  const maxHops = Math.max(1, Math.min(options.maxHops ?? 8, 8))
+  const nodeGuardsById = new Map(graph.nodes.map(node => [node.id, node.guards]))
+  const rawHops: Array<{ file: string; line: number; kind: CodeSliceHop['kind']; guards: string[] }> = []
+  if (sinkPath) {
+    for (const hop of sinkPath.chain.slice(0, maxHops + 1)) {
+      const nodeGuards = hop.kind === 'sink' ? [] : boundedStringList(nodeGuardsById.get(hop.id), 3)
+      rawHops.push({
+        file: hop.file,
+        line: hop.line,
+        kind: hop.kind === 'route' || hop.kind === 'sink' || hop.kind === 'middleware' ? hop.kind : 'function',
+        guards: nodeGuards,
+      })
+    }
+  } else {
+    rawHops.push({ file: route.file, line: route.line, kind: 'route', guards: [] })
+    const handlerNode = graph.nodes.find(node =>
+      node.kind === 'function' && node.symbol === route.handler && node.file === (route.handlerFile ?? route.file))
+    if (handlerNode) rawHops.push({ file: handlerNode.file, line: handlerNode.line, kind: 'function', guards: [] })
+  }
+
+  const root = commonDirPrefix([...rawHops.map(hop => hop.file), ...(sinkPath ? [sinkPath.sinkFile] : [])])
+  const hops: CodeSliceHop[] = rawHops.map(hop => ({
+    at: relativeAt(hop.file, hop.line, root),
+    ...(hop.kind !== 'function' ? { kind: hop.kind } : {}),
+    ...(hop.guards.length ? { guards: hop.guards } : {}),
+  }))
+
+  const input = route.input
+  const pathParams = new Set(routeParamNames(route.path))
+  const params = boundedStringList(input.params, 4).filter(name => !pathParams.has(name))
+  const query = boundedStringList(input.query, 4)
+  const body = boundedStringList(input.body, 3)
+  const schemas = boundedStringList(input.schemas, 3)
+
+  const index = buildSiblingGuardIndex(graph)
+  const guardDiff = guardDiffsForRoute(route, index)
+  const module = routeModuleKey(route.path)
+  const hints = options.files?.length
+    ? collectModuleCodeHints(options.files, module, { limit: 2 })
+    : (graph.codeHints?.[module] ?? []).slice(0, 2)
+
+  return {
+    route: `${route.method} ${route.path}`.slice(0, 180),
+    mounts: boundedStringList(route.mountedFrom, 4).map(mount => mount.slice(0, 40)),
+    methods: [route.method],
+    ...(params.length || query.length || body.length || schemas.length
+      ? {
+          input: {
+            ...(params.length ? { params } : {}),
+            ...(query.length ? { query } : {}),
+            ...(body.length ? { body } : {}),
+            ...(schemas.length ? { schemas } : {}),
+          },
+        }
+      : {}),
+    auth: route.guards.length ? 'guarded' : 'unguarded',
+    guards: boundedStringList(route.guards, 6).map(guard => guard.slice(0, 48)),
+    ...(root ? { root: root.slice(0, 120) } : {}),
+    hops,
+    ...(sinkPath ? { sink: { at: relativeAt(sinkPath.sinkFile, sinkPath.sinkLine, root), kind: sinkPath.sinkKind } } : {}),
+    ...(guardDiff.length ? { guardDiff } : {}),
+    ...(hints.length ? { hints } : {}),
+  }
+}
+
+/** Pick the strongest sink path per route (db/command > network/template/file > rest, then depth). */
+function bestSinkPath(paths: readonly RouteSinkPath[]): RouteSinkPath | null {
+  if (!paths.length) return null
+  return [...paths].sort((a, b) =>
+    sinkKindRank(b.sinkKind) - sinkKindRank(a.sinkKind) ||
+    b.hops - a.hops ||
+    a.sinkId.localeCompare(b.sinkId) ||
+    a.routeId.localeCompare(b.routeId))[0]
+}
+
+/**
+ * Build a compact, deterministic dataflow slice for one hypothesis route.
+ *
+ * Accepts a route id (`PROGRAM_ROUTE` id), a `METHOD /path` string, a `ProgramRoute`, or a
+ * code-to-runtime hypothesis carrying `routeId`/`method`/`path`. Returns `null` when the route is
+ * not in the graph. The returned slice is always <= `maxBytes` (default 600).
+ */
+export function buildCodeDataflowSlice(
+  graph: ProgramGraph,
+  routeRef: string | Pick<ProgramRoute, 'id' | 'method' | 'path'> | { routeId?: string; method?: string; path?: string },
+  options: CodeSliceBuildOptions = {},
+): CodeDataflowSlice | null {
+  const route = resolveSliceRoute(graph, routeRef)
+  if (!route) return null
+  const maxHops = Math.max(1, Math.min(options.maxHops ?? 8, 8))
+  const sinkPaths = options.sinkPaths
+    ?? resolveRouteSinkPaths(graph, { maxDepth: maxHops, maxPaths: 500 })
+  const path = bestSinkPath(sinkPaths.filter(candidate => candidate.routeId === route.id))
+  const slice = buildSliceFromRoute(graph, route, path, options)
+  return renderCodeDataflowSlice(slice, options.maxBytes ?? CODE_DATAFLOW_SLICE_MAX_BYTES).slice
+}
+
+function resolveSliceRoute(
+  graph: ProgramGraph,
+  routeRef: string | Pick<ProgramRoute, 'id' | 'method' | 'path'> | { routeId?: string; method?: string; path?: string },
+): ProgramRoute | null {
+  if (typeof routeRef === 'string') {
+    const direct = graph.routes.find(route => route.id === routeRef)
+    if (direct) return direct
+    const trimmed = routeRef.trim()
+    const methodMatch = /^([A-Za-z]+)\s+(.+)$/.exec(trimmed)
+    const method = methodMatch ? methodMatch[1].toUpperCase() : undefined
+    const path = (methodMatch ? methodMatch[2] : trimmed).trim()
+    return graph.routes.find(route =>
+      route.path === path && (!method || route.method.toUpperCase() === method)) ?? null
+  }
+  const candidate = routeRef as { id?: string; routeId?: string; method?: string; path?: string }
+  const id = candidate.id ?? candidate.routeId
+  if (id) {
+    const byId = graph.routes.find(route => route.id === id)
+    if (byId) return byId
+  }
+  if (!candidate.path) return null
+  const method = candidate.method?.toUpperCase()
+  return graph.routes.find(route =>
+    route.path === candidate.path && (!method || route.method.toUpperCase() === method)) ?? null
+}
+
+/**
+ * Reduce a slice to a byte budget with a fixed ladder: hints → guard diffs → input detail →
+ * middle hops (keeping the route and sink) → mounts. Deterministic and pure.
+ */
+export function renderCodeDataflowSlice(
+  input: CodeDataflowSlice,
+  maxBytes = CODE_DATAFLOW_SLICE_MAX_BYTES,
+): RenderedCodeDataflowSlice {
+  const cap = Math.max(64, Math.floor(maxBytes))
+  let slice: CodeDataflowSlice = cloneSlice(input)
+  let truncated = Boolean(input.truncated)
+  const render = () => {
+    const candidate: CodeDataflowSlice = truncated ? { ...slice, truncated: true } : slice
+    const text = JSON.stringify(candidate)
+    return { candidate, text, bytes: Buffer.byteLength(text, 'utf8') }
+  }
+  const finish = (rendered: { candidate: CodeDataflowSlice; text: string; bytes: number }) => ({
+    slice: rendered.candidate,
+    text: rendered.text,
+    bytes: rendered.bytes,
+    truncated,
+  })
+
+  for (let guard = 0; guard < 200; guard += 1) {
+    const rendered = render()
+    if (rendered.bytes <= cap) return finish(rendered)
+    truncated = true
+    if (slice.hints?.length) {
+      const hints = slice.hints.slice(0, -1)
+      slice = hints.length ? { ...slice, hints } : omit(slice, 'hints')
+      continue
+    }
+    if (slice.guardDiff?.length) {
+      const guardDiff = slice.guardDiff.slice(0, -1)
+      slice = guardDiff.length ? { ...slice, guardDiff } : omit(slice, 'guardDiff')
+      continue
+    }
+    if (slice.input && (slice.input.query?.length || slice.input.body?.length || slice.input.schemas?.length)) {
+      slice = { ...slice, input: slice.input.params?.length ? { params: slice.input.params } : undefined }
+      if (!slice.input) slice = omit(slice, 'input')
+      continue
+    }
+    if (slice.hops.length > 2) {
+      const hops = [...slice.hops]
+      hops.splice(1, 1)
+      slice = { ...slice, hops }
+      continue
+    }
+    if (slice.hops.some(hop => hop.guards?.length)) {
+      slice = { ...slice, hops: slice.hops.map(hop => (hop.guards ? { at: hop.at, kind: hop.kind } : hop)) }
+      continue
+    }
+    if (slice.input) {
+      slice = omit(slice, 'input')
+      continue
+    }
+    if (slice.mounts?.length) {
+      const mounts = slice.mounts.slice(0, -1)
+      slice = mounts.length ? { ...slice, mounts } : omit(slice, 'mounts')
+      continue
+    }
+    if (slice.guards?.length) {
+      slice = { ...slice, guards: [] }
+      continue
+    }
+    // Guaranteed-under-cap fallback: route + sink only.
+    slice = {
+      route: slice.route.slice(0, 120),
+      mounts: [],
+      methods: slice.methods.slice(0, 2),
+      auth: slice.auth,
+      guards: [],
+      ...(slice.root ? { root: slice.root } : {}),
+      hops: slice.hops.slice(0, 2),
+      ...(slice.sink ? { sink: slice.sink } : {}),
+      truncated: true,
+    }
+    const fallback = render()
+    if (fallback.bytes <= cap) return finish(fallback)
+    slice = {
+      route: slice.route.slice(0, 80),
+      mounts: [],
+      methods: slice.methods.slice(0, 1),
+      auth: slice.auth,
+      guards: [],
+      hops: [],
+      truncated: true,
+    }
+    return finish(render())
+  }
+
+  slice = {
+    route: input.route.slice(0, 80),
+    mounts: [],
+    methods: input.methods.slice(0, 1),
+    auth: input.auth,
+    guards: [],
+    hops: [],
+    truncated: true,
+  }
+  truncated = true
+  return finish(render())
+}
+
+function cloneSlice(slice: CodeDataflowSlice): CodeDataflowSlice {
+  return {
+    ...slice,
+    mounts: [...slice.mounts],
+    methods: [...slice.methods],
+    guards: [...slice.guards],
+    hops: slice.hops.map(hop => ({ ...hop, ...(hop.guards ? { guards: [...hop.guards] } : {}) })),
+    ...(slice.input
+      ? {
+          input: {
+            ...(slice.input.params ? { params: [...slice.input.params] } : {}),
+            ...(slice.input.query ? { query: [...slice.input.query] } : {}),
+            ...(slice.input.body ? { body: [...slice.input.body] } : {}),
+            ...(slice.input.schemas ? { schemas: [...slice.input.schemas] } : {}),
+          },
+        }
+      : {}),
+    ...(slice.sink ? { sink: { ...slice.sink } } : {}),
+    ...(slice.guardDiff ? { guardDiff: slice.guardDiff.map(diff => ({ ...diff })) } : {}),
+    ...(slice.hints ? { hints: slice.hints.map(hint => ({ ...hint })) } : {}),
+  }
+}
+
+function omit<K extends keyof CodeDataflowSlice>(slice: CodeDataflowSlice, key: K): CodeDataflowSlice {
+  const next = { ...slice }
+  delete next[key]
+  return next
+}
+
+/** Render a slice as compact JSON text, hard-truncated to the budget. */
+export function renderCodeDataflowSliceText(input: CodeDataflowSlice, maxBytes = CODE_DATAFLOW_SLICE_MAX_BYTES): string {
+  return renderCodeDataflowSlice(input, maxBytes).text
+}
+
+/**
+ * Resolve a hop/sink `at` value back to its repo path. Hop and sink `at` values are relative to
+ * `slice.root` (a shared directory prefix kept explicit to fit the byte cap); guard-diff and hint
+ * `at` values are already repo-relative.
+ */
+export function expandCodeSlicePath(slice: CodeDataflowSlice, at: string): string {
+  if (!slice.root || !at || at.startsWith(slice.root)) return at
+  return `${slice.root}${at}`
+}
+
+/**
+ * Explicit `missing_guard` evidence lines for hypothesis evidence arrays.
+ * Format: `missing_guard=<family> <symbol>@<sibling file:line> (sibling <METHOD /path>)`.
+ */
+export function describeGuardDiffs(graph: ProgramGraph, route: ProgramRoute, limit = 2): string[] {
+  return guardDiffsForRoute(route, buildSiblingGuardIndex(graph), { limit })
+    .map(diff => `missing_guard=${diff.guard} ${diff.symbol}@${diff.at} (sibling ${diff.sibling})`)
+}
+
+/** Attach bounded slices to hypotheses so a planner can hand code evidence to specialists. */
+export function attachCodeSlicesToHypotheses(
+  graph: ProgramGraph,
+  hypotheses: readonly CodeToRuntimeHypothesis[],
+  options: CodeSliceBuildOptions = {},
+): Array<CodeToRuntimeHypothesis & { codeSlice?: CodeDataflowSlice }> {
+  const sinkPaths = options.sinkPaths ?? resolveRouteSinkPaths(graph, { maxDepth: options.maxHops ?? 8, maxPaths: 500 })
+  return hypotheses.map(hypothesis => {
+    if (!hypothesis.routeId && !hypothesis.path) return hypothesis
+    const slice = buildCodeDataflowSlice(
+      graph,
+      hypothesis.routeId ?? { method: hypothesis.method, path: hypothesis.path as string },
+      { ...options, sinkPaths },
+    )
+    return slice ? { ...hypothesis, codeSlice: slice } : hypothesis
+  })
 }
 
 // ============================================================================
