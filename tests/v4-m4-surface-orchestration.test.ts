@@ -333,6 +333,7 @@ test('M4.3 crawlStateGraph crawls personas, intercepts XHR/forms/CSRF/postMessag
   })
   const broker = new RequestBroker({ rejectUnauthorized: false })
   const browser = new ScopedBrowser(broker)
+  t.after(() => browser.close())
   const grant = makeLabGrant(fx.origin, { tier: 2, personas: personaMap })
 
   const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
@@ -683,12 +684,35 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
   assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 4 }, { priority: 99, dependsOnFactIds: [], trialGroupId: 'grp-1' }, highFacts), 1)
 
   // Live Execution multi-trial test with local jq backend (zero Docker dependency)
+  const slowTimers = new Set<ReturnType<typeof setTimeout>>()
+  t.after(() => {
+    for (const timer of slowTimers) clearTimeout(timer)
+    slowTimers.clear()
+  })
   const fx = await startHttpFixture(t, async (req, _b, res) => {
     if (req.url === '/slow-sibling') {
-      await new Promise(r => setTimeout(r, 30_000))
+      await new Promise<void>(resolve => {
+        const done = () => {
+          clearTimeout(timer)
+          slowTimers.delete(timer)
+          resolve()
+        }
+        const timer = setTimeout(done, 30_000)
+        timer.unref?.()
+        slowTimers.add(timer)
+        res.once('close', done)
+      })
+      if (res.writableEnded || res.destroyed) return
+    }
+    const reqUrl = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (reqUrl.searchParams.get('id')?.includes("'")) {
+      res.statusCode = 500
+      res.setHeader('Content-Type', 'text/plain')
+      res.end('SQLITE_ERROR: near syntax error')
+      return
     }
     res.setHeader('Content-Type', 'application/json')
-    res.end(JSON.stringify({ leaked: req.url === '/probe' }))
+    res.end(JSON.stringify({ ok: true }))
   })
 
   let llmCalls = 0
@@ -736,14 +760,15 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
         verifyNow: true,
         replaySpec: {
           ...baseReplaySpecFields(fx.origin),
-          title: 'Crown Jewel Auth Bypass',
-          category: 'auth-identity',
+          title: 'Crown Jewel SQL Injection',
+          category: 'injection-input',
+          cwe: 'CWE-89',
           severity: 'critical',
           kind: 'http_chain',
-          assertionsJq: '{ controlPassed: (.steps.c1.json.leaked == false), confirmed: (.steps.p1.json.leaked == true), observed: (.steps.p1.json.leaked | tostring), expected: "false" }',
+          assertionsJq: '{ controlPassed: (.steps.c1.status == 200), confirmed: (.steps.p1.status == 500 and (.steps.p1.body | contains("SQLITE_ERROR"))), observed: (.steps.p1.status | tostring), expected: "200 without SQLITE_ERROR" }',
           steps: [
-            { id: 'c1', role: 'control', description: 'Control', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/control' } },
-            { id: 'p1', role: 'probe', description: 'Probe', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/probe' } },
+            { id: 'c1', role: 'control', description: 'Control', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/probe?id=1' } },
+            { id: 'p1', role: 'probe', description: 'Probe', request: { origin: fx.origin, method: 'GET', pathAndQuery: "/probe?id=1'" } },
           ],
         },
       }),

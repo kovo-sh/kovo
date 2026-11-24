@@ -55,7 +55,9 @@ function html(res: ServerResponse, status: number, body: string): void {
 function persona(handle: string, origin: string): ResolvedPersona {
   return {
     id: handle, handle, roleLabel: handle, originAllowlist: [origin], authKind: 'header',
-    headerName: 'X-Persona', secret: handle, canaryMarkers: [],
+    // Distinct credential token so RequestBroker secret redaction does not scrub the JSON field
+    // name `"owner"` out of the response body.
+    headerName: 'X-Persona', secret: `tok-${handle}`, canaryMarkers: [],
   }
 }
 
@@ -106,7 +108,7 @@ function ordersFixture(hardened: boolean) {
     if (url.pathname !== '/api/orders/42') return json(res, 404, { error: 'not_found' })
     const actor = req.headers['x-persona']
     if (!actor) return json(res, 401, { error: 'unauthorized' })
-    if (hardened && actor !== 'owner') return json(res, 403, { error: 'forbidden' })
+    if (hardened && actor !== 'tok-owner') return json(res, 403, { error: 'forbidden' })
     return json(res, 200, { id: 42, owner: 'owner', total: 9912 })
   })
 }

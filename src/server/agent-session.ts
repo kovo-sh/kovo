@@ -5230,6 +5230,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     roleAffinity: effectiveRole,
     beforeCall: options.beforeCall,
     onUsage: options.onUsage,
+    onStreamActivity: options.onStreamActivity,
     onProfileSuccess: options.onProfileSuccess,
     onProfileFailure: options.onProfileFailure,
   }
