@@ -582,7 +582,7 @@ const isDeniedJq = (id: string) =>
  * persisted proof (reproduced vs fixed), not the confirmation path: it restates the receipt's
  * structural precondition over the recorded steps so a hardened fixture cannot replay as reproduced.
  */
-function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; role: string; description?: string }[]): string {
+function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; role: string; description?: string }[], args?: FloorRecipeArgs): string {
   // Evidence roles (`entitled_read`, `baseline_read`, ...) are carried in the step description: the
   // persisted http_chain schema only allows arm roles. Match the description first so a replay
   // assertion never silently references a step it does not have.
@@ -599,9 +599,17 @@ function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; ro
       const entitled = first('entitled_read') ?? first('probe_baseline')
       const denied = first('denied_control')
       const probe = first('probe_request')
+      // A collection-reference negative control is selective through a different 2xx body, not a
+      // denial; the retest must assert the same predicate the proof used.
+      const distinctControl = (args as AccessBoundaryArgs | undefined)?.controlEvidence === 'denial_or_distinct'
+      const deniedJq = denied
+        ? distinctControl && entitled
+          ? `(${is2xxJq(denied)} and (.steps.${denied}.body != .steps.${entitled}.body))`
+          : isDeniedJq(denied)
+        : 'true'
       const confirmed = [probe, denied].filter((id): id is string => Boolean(id))
       return `{ controlPassed: (${entitled ? is2xxJq(entitled) : 'true'}), `
-        + `confirmed: (${confirmed.length ? confirmed.map(id => (id === denied ? isDeniedJq(id) : is2xxJq(id))).join(' and ') : 'true'}), `
+        + `confirmed: (${confirmed.length ? confirmed.map(id => (id === denied ? deniedJq : is2xxJq(id))).join(' and ') : 'true'}), `
         + 'observed: "recipe replay: boundary arms re-observed", expected: "the denied control is refused while the probe is served" }'
     }
     case 'disclosure': {
@@ -686,7 +694,7 @@ function recordSpecFor(
   const cwe = CWE_BY_CLASS[plan.vulnClass] ?? 'CWE-639'
   const title = TITLE_BY_RECIPE[plan.recipeId]
   const steps = recordSteps(origin, execution)
-  const jq = retestAssertion(plan.recipeId, steps)
+  const jq = retestAssertion(plan.recipeId, steps, plan.args)
   const base = baseFields(origin, title, cwe, plan.vulnClass, severity, jq)
   if (plan.specKind === 'sql_boolean_diff') {
     const args = plan.args as BooleanOrTimingArgs
