@@ -1,6 +1,7 @@
 # Param discovery — Layer-2 structural assumption vs randomized surfaces
 
-Branch `agents/param-discovery`, base `0f066b7`, merged with main through `490f3b4`.
+Branch `agents/param-discovery`, base `0f066b7`, merged with main through `9fb0395`
+(including the store-level `runtime_confirmed` receipt invariant and the SQLi grounding merge).
 Lease: `src/server/phase0-recon.ts`, `src/server/surface-engine.ts`,
 `tests/v7-param-discovery.test.ts`, this file.
 
@@ -89,7 +90,9 @@ Product floor (`Execution --no-llm`), dev seed 1, three runs:
 Spread 0; decoy FPs 0; unmatched FPs 0.
 
 Salted held-out floor seed `1000042` (`GUARDIAN_RB_HELDOUT_SALT` from the owner-only file, never
-printed): **25/58**, precision 100% (previous 24/58).
+printed), measured **after** merging the store-level `runtime_confirmed` receipt invariant:
+**25/58**, precision 100% (previous 24/58). The search finding satisfies the invariant
+(`provenance=floor`, `verification_class=runtime_confirmed`, `finding.verified`).
 
 | app | confirmed/targets | recall | precision |
 | --- | --- | --- | --- |
@@ -118,8 +121,8 @@ Capability suites:
 
 | suite | result |
 | --- | --- |
-| xben-25 | **25/25**, 0 FP, precision 100% |
-| held-out-saas | **20/20**, 0 FP, precision 100% |
+| xben-25 | **25/25**, 0 FP, precision 100% (re-run after the final merge) |
+| held-out-saas | **20/20**, 0 FP, precision 100% (re-run after the final merge) |
 | held-out-saas patches | **20/20 fixed, 20/20 reproduced-before** |
 
 Regression caught during validation: the first noise filter rejected dotted names, which dropped
