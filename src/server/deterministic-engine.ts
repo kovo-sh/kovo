@@ -1289,7 +1289,7 @@ export interface QuotaReservationEvent {
   rankBefore: number
   /** 1-based position in the final selected plan, or null when it was not selected. */
   rankAfter: number | null
-  /** Class quota in force (the reservation, when used, adds exactly one slot on top). */
+  /** Class quota in force; a reservation takes one slot inside it (never a class-wide bump). */
   quota: number
 }
 
@@ -2478,8 +2478,9 @@ export function enumerateHypotheses(
     }
     list.push(hyp)
   }
-  // Reserve at most one slot per class, only for a verified candidate the class quota would drop.
-  // The reservation is not a class-wide bump: when no such candidate exists nothing is held back.
+  // Reserve at most one slot per class, inside the existing quota (never a class-wide bump), only
+  // for a verified candidate the class quota would drop. When no such candidate exists nothing is
+  // held back: the slot goes to the normal ranking.
   const reserved = new Map<string, EngineHypothesis>()
   for (const intent of [...classRanking.keys()].sort()) {
     const miss = classRanking.get(intent)!.slice(quotaFor(intent)).find(verifiedReadingParam)
@@ -2488,6 +2489,7 @@ export function enumerateHypotheses(
 
   const selected: EngineHypothesis[] = []
   const selectedKeys = new Set<string>()
+  const reservedKeys = new Set<string>()
   const used: Record<string, number> = {}
   const take = (hyp: EngineHypothesis, overrideQuota: boolean): boolean => {
     if (selected.length >= max || selectedKeys.has(hyp.key)) return false
@@ -2498,10 +2500,20 @@ export function enumerateHypotheses(
     return true
   }
   // Reservations are placed first so the global hypothesis cap can never consume the slot they
-  // need; the final list is re-sorted into canonical order, so probe sequence is unchanged.
-  for (const intent of [...reserved.keys()].sort()) take(reserved.get(intent)!, true)
+  // need. The final list is then sorted into the canonical probe order, with each reserved
+  // candidate heading its class block: the run-time per-class probe cap (`intentCaps`) is a second,
+  // tighter cut applied in plan order, so a reservation that stayed at its low-risk rank would be
+  // selected but never probed.
+  for (const intent of [...reserved.keys()].sort()) {
+    const held = reserved.get(intent)!
+    if (take(held, true)) reservedKeys.add(held.key)
+  }
   for (const hyp of ranked) take(hyp, false)
-  selected.sort(compare)
+  selected.sort((a, b) =>
+    (intentPriority[b.intent] ?? 0) - (intentPriority[a.intent] ?? 0) ||
+    Number(reservedKeys.has(b.key)) - Number(reservedKeys.has(a.key)) ||
+    b.risk - a.risk ||
+    a.key.localeCompare(b.key))
 
   if (options.onQuotaReservation) {
     const positionOf = new Map<string, number>()

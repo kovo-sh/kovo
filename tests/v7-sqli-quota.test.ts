@@ -143,6 +143,12 @@ test('verified reading param that would miss the SQLi quota gets one reserved sl
 
   const searchKey = 'sqli_boolean|ep-search|query'
   assert.ok(keys.includes(searchKey), 'reserved candidate is selected despite ranking outside the quota')
+  // The run-time per-class probe cap is a second, tighter cut applied in plan order. A reserved
+  // candidate left at its low-risk rank would be selected but never probed, so it heads its class.
+  const sqliKeys = keys.filter(key => key.startsWith('sqli_boolean|'))
+  assert.equal(sqliKeys[0], searchKey,
+    'reserved candidate heads the class block so the probe cap cannot drop it')
+  assert.equal(sqliKeys.length, 17, 'the reservation stays inside the quota (no class-wide bump)')
 
   const event = events.find(entry => entry.class === 'sqli')
   assert.ok(event, 'sqli reservation decision is reported')
