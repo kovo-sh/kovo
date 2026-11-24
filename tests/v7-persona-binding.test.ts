@@ -23,7 +23,6 @@ import { probeDifferential } from '../src/server/surface-engine.ts'
 import { floorRecipe, runFloorRecipe } from '../src/server/floor-recipes.ts'
 
 const origin = 'https://tenanta.example'
-const ORIGIN_FOR_RECIPE = 'https://tenanta.example'
 const publicAddr: PublicAddress = { address: '93.184.216.34', family: 4 }
 
 function persona(handle: string, authKind: ResolvedPersona['authKind'], secret: string): ResolvedPersona {
@@ -283,7 +282,7 @@ test('an identity-assumption proof restores the actor baseline before the next p
     return { status: 200, json: { actor, store: current }, body: JSON.stringify({ actor, store: current }), route: '/api/v1/session' }
   }
   const execution = await runFloorRecipe(floorRecipe('persisted_mutation', {
-    origin: ORIGIN_FOR_RECIPE,
+    origin,
     method: 'POST',
     pathAndQuery: '/api/v1/admin/impersonate',
     vulnClass: 'bfla',
