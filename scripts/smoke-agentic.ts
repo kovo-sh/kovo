@@ -37,6 +37,127 @@ export const LIFT_APPS = ['acme-saas'] as const
 export const ROTATION_APPS = ['shopflow', 'opsportal'] as const
 export const MICRO_FIXTURES = ['wan-oob', 'staging-concurrency', 'monorepo-whitebox'] as const
 
+/**
+ * Post-recon snapshot support for the realism micro-slice.
+ *
+ * `benchmark-realistic.ts` resumes apps from a `--resume-snapshot` checkpoint, but
+ * `scripts/benchmark-realism.ts` owns fixture boot + a full `Execution` run and has no
+ * `--resume-recon-snapshot` / `--snapshot-after-recon` flag yet: every cell re-runs Phase-0 from a
+ * cold fixture. Until that harness flag lands, monorepo-whitebox cannot *consume* a cached
+ * post-recon snapshot, so the micro cell records the exact blocker and falls back to a bounded,
+ * longer cold slice instead of silently hitting the 180 s wall. The snapshot path/marker is still
+ * probed so the gate output reports `snapshot` vs `cold`/`unsupported` honestly.
+ */
+export const REALISM_RECON_SNAPSHOT_SUPPORTED = false
+/** Extended cold bounded budget for monorepo-whitebox (route materialization + Phase-0 AST). */
+export const DEFAULT_MICRO_RECON_TIMEOUT_SEC = 420
+/** Grey-box cannot see the repo source; #4 needs the white-box mount for 4-hop AST chains. */
+export const MICRO_MODES: Record<string, 'grey-box' | 'white-box'> = {
+  'wan-oob': 'grey-box',
+  'staging-concurrency': 'grey-box',
+  'monorepo-whitebox': 'white-box',
+}
+
+export type MicroSnapshotState = 'not-applicable' | 'snapshot' | 'cold' | 'unsupported'
+
+export interface MicroSnapshotStatus {
+  state: MicroSnapshotState
+  /** True only when the harness can actually resume from `dir`. */
+  used: boolean
+  dir: string
+  reason: string
+}
+
+export interface MicroSlicePlan {
+  fixture: string
+  mode: 'grey-box' | 'white-box'
+  /** Bounded wall-clock budget for this fixture (seconds). */
+  timeoutSec: number
+  snapshot: MicroSnapshotStatus
+}
+
+/** Snapshot directory probed for a cached post-recon monorepo checkpoint. */
+export function realismReconSnapshotDir(root: string, fixture: string, seed: number): string {
+  return join(root, 'realism', `${fixture}-seed${seed}-post-recon`)
+}
+
+/**
+ * Resolve the micro-slice plan for one fixture. Pure so the snapshot used/cold/unsupported
+ * branches are testable without booting a fixture.
+ */
+export function resolveMicroSlice(input: {
+  fixture: string
+  seed: number
+  snapshotRoot: string
+  microDurationSec: number
+  microReconTimeoutSec?: number
+  resumeSupported?: boolean
+}): MicroSlicePlan {
+  const mode = MICRO_MODES[input.fixture] ?? 'grey-box'
+  const base = input.microDurationSec
+  if (input.fixture !== 'monorepo-whitebox') {
+    return {
+      fixture: input.fixture,
+      mode,
+      timeoutSec: base,
+      snapshot: {
+        state: 'not-applicable',
+        used: false,
+        dir: '',
+        reason: 'this fixture has no post-recon snapshot checkpoint',
+      },
+    }
+  }
+  const dir = realismReconSnapshotDir(input.snapshotRoot, input.fixture, input.seed)
+  const present = hasSnapshot(dir)
+  const supported = input.resumeSupported ?? REALISM_RECON_SNAPSHOT_SUPPORTED
+  const extended = Math.max(base, input.microReconTimeoutSec ?? DEFAULT_MICRO_RECON_TIMEOUT_SEC)
+  if (present && supported) {
+    return {
+      fixture: input.fixture,
+      mode,
+      timeoutSec: base,
+      snapshot: { state: 'snapshot', used: true, dir, reason: `resuming post-recon snapshot ${dir}` },
+    }
+  }
+  if (present) {
+    return {
+      fixture: input.fixture,
+      mode,
+      timeoutSec: extended,
+      snapshot: {
+        state: 'unsupported',
+        used: false,
+        dir,
+        reason: 'post-recon snapshot present but benchmark-realism.ts has no --resume-recon-snapshot; '
+          + `falling back to a bounded ${extended} s cold slice (not a silent timeout)`,
+      },
+    }
+  }
+  return {
+    fixture: input.fixture,
+    mode,
+    timeoutSec: extended,
+    snapshot: {
+      state: 'cold',
+      used: false,
+      dir,
+      reason: 'no post-recon snapshot; benchmark-realism.ts cannot capture/resume one yet; '
+        + `using a bounded ${extended} s cold slice instead of the ${base} s default`,
+    },
+  }
+}
+
+export function planMicroSlices(opts: SmokeArgs): MicroSlicePlan[] {
+  return opts.microFixtures.map(fixture => resolveMicroSlice({
+    fixture,
+    seed: opts.seed,
+    snapshotRoot: opts.snapshotRoot,
+    microDurationSec: opts.microDurationSec,
+    microReconTimeoutSec: opts.microReconTimeoutSec,
+  }))
+}
+
 export type Tier = 0 | 1 | 2
 export type AssessorKind = 'mfa' | 'business_logic' | 'mass_assignment' | 'csrf' | 'authorization' | 'bfla'
 
@@ -54,6 +175,8 @@ export interface SmokeArgs {
   durationSec: number
   trapDurationSec: number
   microDurationSec: number
+  /** Extended bounded budget for the monorepo cold micro-slice (post-recon snapshot fallback). */
+  microReconTimeoutSec: number
   outDir: string
   dataDir: string
   snapshotRoot: string
@@ -92,7 +215,10 @@ Tier 1 (~6 min, ~$1, four parallel cells):
   3. precision trap    hardened zero-vuln target with writable-looking decoys, 240 s;
                        any confirmed vulnerability finding fails the cell.
   4. micro-slice       realism #2 (async OOB), #3 (staging race/write-BOLA), #4
-                       (4-hop Tier-A sink); wiring and capability are reported apart.
+                       (4-hop Tier-A sink, white-box). #4 probes for a cached
+                       post-recon snapshot and reports snapshot/cold explicitly;
+                       the current realism harness has no resume flag, so it uses a
+                       bounded 420 s cold fallback instead of a silent 180 s timeout.
 
 Tier 2 (documented, not run by default):
   Full 3-app agentic matrix + salted held-out + endurance. Print with --tier 2.
@@ -105,6 +231,9 @@ Flags:
   --duration-sec <n>        lift/rotation budget (default 300)
   --trap-duration-sec <n>   trap budget (default 240)
   --micro-duration-sec <n>  per-fixture micro-slice budget (default 300)
+  --micro-recon-timeout-sec <n>
+                            bounded cold fallback for monorepo-whitebox when no
+                            resumable post-recon snapshot exists (default 420)
   --out-dir <path>          artifacts (default .guardian/smoke-battery)
   --data-dir <path>         Guardian data dir (default $GUARDIAN_DATA_DIR or
                             /home/omarchy/guardian-data)
@@ -185,7 +314,7 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
   const { flags } = take(argv)
   const known = new Set([
     'tier', 'dry-run', 'cell-index', 'seed', 'duration-sec', 'trap-duration-sec',
-    'micro-duration-sec', 'out-dir', 'data-dir', 'snapshot-root', 'floor-scorecard',
+    'micro-duration-sec', 'micro-recon-timeout-sec', 'out-dir', 'data-dir', 'snapshot-root', 'floor-scorecard',
     'lift-baseline', 'corpus', 'json', 'calibrate', 'variants', 'rerun-on-minus-one',
     'skip-worker-gate', 'micro-fixtures', 'budget-usd-per-cell', 'help',
   ])
@@ -193,7 +322,9 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
   if (flags.help === true) {
     return {
       repoRoot: ROOT, tier: 1, dryRun: false, cellIndex: 0, seed: 1, durationSec: 300,
-      trapDurationSec: 240, microDurationSec: 300, outDir: DEFAULT_OUT,
+      trapDurationSec: 240, microDurationSec: 300,
+      microReconTimeoutSec: DEFAULT_MICRO_RECON_TIMEOUT_SEC,
+      outDir: DEFAULT_OUT,
       dataDir: DEFAULT_DATA_DIR, snapshotRoot: join(DEFAULT_OUT, 'snapshots'),
       liftBaseline: 0, corpusPath: CORPUS_PATH, json: false, calibrate: false,
       rerunOnMinusOne: false, skipWorkerGate: false, microFixtures: [...MICRO_FIXTURES],
@@ -228,6 +359,9 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
     durationSec: positiveInt(str(flags, 'duration-sec'), '--duration-sec', 300),
     trapDurationSec: positiveInt(str(flags, 'trap-duration-sec'), '--trap-duration-sec', 240),
     microDurationSec: positiveInt(str(flags, 'micro-duration-sec'), '--micro-duration-sec', 300),
+    microReconTimeoutSec: positiveInt(
+      str(flags, 'micro-recon-timeout-sec'), '--micro-recon-timeout-sec', DEFAULT_MICRO_RECON_TIMEOUT_SEC,
+    ),
     outDir,
     dataDir: str(flags, 'data-dir') ?? DEFAULT_DATA_DIR,
     snapshotRoot,
@@ -432,6 +566,10 @@ export interface CellMetrics {
   crashes: number
   wiring?: string | null
   capability?: number | null
+  /** Late OOB conversions promoted into findings (micro cell; sums the realism wiring metrics). */
+  latePromotions?: number | null
+  /** Post-recon snapshot cache status (micro cell): snapshot / cold+Ns / unsupported+Ns. */
+  snapshot?: string | null
   detail?: string
   error?: string
 }
@@ -994,6 +1132,8 @@ function emptyCell(plan: CellPlan, extra: Partial<CellMetrics> = {}): CellMetric
     completedAssignments: 0,
     wallMs: 0,
     crashes: 0,
+    latePromotions: null,
+    snapshot: null,
     ...extra,
   }
 }
@@ -1138,7 +1278,10 @@ interface RealismArtifact {
   fixture?: string
   grade?: { submitted?: number; truePositives?: number; falsePositives?: number; precision?: number }
   metrics?: {
-    wiring?: { status?: string }
+    wiring?: {
+      status?: string
+      metrics?: { latePromotions?: number | null; lateCallbacksMatched?: number | null; oobDrainWaitedMs?: number | null }
+    }
     oob?: { blindSqliConfirmed?: boolean; asyncSsrfConfirmed?: boolean; asyncXxeConfirmed?: boolean; webhookForgeryConfirmed?: boolean }
     staging?: { writeBolaConfirmed?: boolean; raceConfirmed?: boolean; checkoutConfirmed?: boolean }
     monorepo?: { fourHopConfirmations?: number }
@@ -1162,48 +1305,79 @@ export function microCapability(fixture: string, artifact: RealismArtifact | nul
   return artifact.grade?.truePositives ?? 0
 }
 
+export function formatSnapshotStatus(snapshot: MicroSnapshotStatus, timeoutSec: number): string {
+  if (snapshot.state === 'not-applicable') return 'n/a'
+  return snapshot.used ? 'snapshot' : `${snapshot.state}+${timeoutSec}s`
+}
+
 async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics> {
   mkdirSync(plan.outDir, { recursive: true, mode: 0o700 })
-  const results = await Promise.all(opts.microFixtures.map(async (fixture) => {
+  const slicePlans = planMicroSlices(opts)
+  const results = await Promise.all(slicePlans.map(async (slice) => {
+    const fixture = slice.fixture
     const fixtureOut = join(plan.outDir, fixture)
     mkdirSync(fixtureOut, { recursive: true, mode: 0o700 })
     const dataDir = join(fixtureOut, 'data')
     const prepared = await prepareIsolated(opts.dataDir, dataDir)
-    if (!prepared.ok) return { fixture, error: prepared.reason, artifact: null, wallMs: 0, db: '', log: '' }
+    if (!prepared.ok) {
+      return { slice, error: prepared.reason, artifact: null, wallMs: 0, timedOut: false, db: '', log: '' }
+    }
     const logPath = join(fixtureOut, 'run.log')
+    const args = [
+      'scripts/benchmark-realism.ts',
+      '--fixture', fixture,
+      '--mode', slice.mode,
+      '--max-duration-ms', String(slice.timeoutSec * 1000),
+      '--budget-usd', String(opts.budgetUsdPerCell),
+      '--out-dir', fixtureOut,
+      '--data-dir', dataDir,
+      '--keep-data-dirs',
+      '--verifier', 'docker',
+      // Only added when the harness advertises resume support; the current harness does not.
+      ...(slice.snapshot.used ? ['--resume-recon-snapshot', slice.snapshot.dir] : []),
+    ]
     const result = await spawnLogged({
       command: 'node',
-      args: [
-        'scripts/benchmark-realism.ts',
-        '--fixture', fixture,
-        '--mode', 'grey-box',
-        '--max-duration-ms', String(opts.microDurationSec * 1000),
-        '--budget-usd', String(opts.budgetUsdPerCell),
-        '--out-dir', fixtureOut,
-        '--data-dir', dataDir,
-        '--keep-data-dirs',
-        '--verifier', 'docker',
-      ],
+      args,
       cwd: opts.repoRoot,
       env: baseEnv(opts),
       logPath,
       docker: true,
-      killAfterMs: opts.microDurationSec * 1000 + 150_000,
+      killAfterMs: slice.timeoutSec * 1000 + 150_000,
     })
+    const artifact = readJson<RealismArtifact>(join(fixtureOut, `${fixture}-grey-box.json`))
+      ?? readJson<RealismArtifact>(join(fixtureOut, `${fixture}-white-box.json`))
+    const detail = result.timedOut
+      ? `timed out after the bounded ${slice.timeoutSec} s slice (snapshot=${slice.snapshot.state}: ${slice.snapshot.reason})`
+      : undefined
     return {
-      fixture,
-      error: undefined as string | undefined,
-      artifact: readJson<RealismArtifact>(join(fixtureOut, `${fixture}-grey-box.json`)),
+      slice,
+      error: result.timedOut && !artifact ? detail : undefined,
+      artifact,
       wallMs: result.wallMs,
-      db: join(dataDir, `${fixture}-grey-box`, 'guardian.sqlite'),
+      timedOut: result.timedOut,
+      db: join(dataDir, `${fixture}-${slice.mode}`, 'guardian.sqlite'),
       log: readLog(logPath),
     }
   }))
   const details = results.map(result => {
+    const fixture = result.slice.fixture
     const wiring = result.artifact?.metrics?.wiring?.status ?? 'unmeasured'
-    const capability = microCapability(result.fixture, result.artifact)
-    return `${result.fixture}: wiring=${wiring} capability=${capability}${result.error ? ` error=${result.error}` : ''}`
+    const capability = microCapability(fixture, result.artifact)
+    const late = result.artifact?.metrics?.wiring?.metrics?.latePromotions
+    const snapshot = formatSnapshotStatus(result.slice.snapshot, result.slice.timeoutSec)
+    return `${fixture}: wiring=${wiring} capability=${capability} latePromotions=${late ?? 'n/a'} snapshot=${snapshot}`
+      + `${result.error ? ` error=${result.error}` : result.timedOut ? ' (artifact kept)' : ''}`
   })
+  const snapshotSummary = results
+    .map(result => formatSnapshotStatus(result.slice.snapshot, result.slice.timeoutSec))
+    .filter(label => label !== 'n/a')
+    .join('/') || 'n/a'
+  const lateValues = results.flatMap(result => {
+    const value = result.artifact?.metrics?.wiring?.metrics?.latePromotions
+    return typeof value === 'number' && Number.isFinite(value) ? [value] : []
+  })
+  const latePromotions = lateValues.length > 0 ? lateValues.reduce((sum, value) => sum + value, 0) : null
   const wiringPass = results.every(result => result.artifact?.metrics?.wiring?.status === 'pass')
   const submitted = results.reduce((sum, result) => sum + (result.artifact?.grade?.submitted ?? 0), 0)
   const truePositives = results.reduce((sum, result) => sum + (result.artifact?.grade?.truePositives ?? 0), 0)
@@ -1215,7 +1389,7 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     app: plan.app,
     source: 'local',
     targets: results.length,
-    confirmed: results.reduce((sum, result) => sum + microCapability(result.fixture, result.artifact), 0),
+    confirmed: results.reduce((sum, result) => sum + microCapability(result.slice.fixture, result.artifact), 0),
     precision,
     decoyFalsePositives: 0,
     unmatchedFalsePositives: falsePositives,
@@ -1234,7 +1408,9 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     wallMs: Math.max(0, ...results.map(result => result.wallMs)),
     crashes: results.reduce((sum, result) => sum + countCrashes(result.log), 0),
     wiring: wiringPass ? 'pass' : (results.some(result => result.artifact?.metrics?.wiring?.status === 'fail') ? 'fail' : 'unmeasured'),
-    capability: results.reduce((sum, result) => sum + microCapability(result.fixture, result.artifact), 0),
+    capability: results.reduce((sum, result) => sum + microCapability(result.slice.fixture, result.artifact), 0),
+    latePromotions,
+    snapshot: snapshotSummary,
     detail: details.join('; '),
   }
 }
@@ -1288,7 +1464,7 @@ function gitSha(): string {
 }
 
 export function renderCompactTable(cells: CellMetrics[]): string {
-  const header = ['cell', 'app/source', 'conf/target', 'prec', 'net-new', 'preserved', 'conv', 'p50', 'done', 'cost']
+  const header = ['cell', 'app/source', 'conf/target', 'prec', 'net-new', 'preserved', 'conv', 'p50', 'done', 'cost', 'late', 'snap']
   const rows = cells.map(cell => [
     cell.id,
     `${cell.app}/${cell.source}`,
@@ -1300,6 +1476,8 @@ export function renderCompactTable(cells: CellMetrics[]): string {
     cell.p50AssignmentMs === null ? 'n/a' : `${Math.round(cell.p50AssignmentMs / 1000)}s`,
     String(cell.completedAssignments),
     `$${cell.costUsd.toFixed(3)}`,
+    cell.latePromotions === null || cell.latePromotions === undefined ? 'n/a' : String(cell.latePromotions),
+    cell.snapshot ?? 'n/a',
   ])
   const widths = header.map((title, index) => Math.max(title.length, ...rows.map(row => (row[index] ?? '').length)))
   const line = (row: string[]) => row.map((value, index) => value.padEnd(widths[index]!)).join('  ')
@@ -1373,6 +1551,15 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
     cells: report.cells.length,
   }
   for (const cell of report.cells) if (cell.error) report.notes.push(`${cell.id}: ${cell.error}`)
+  const monorepoSlice = planMicroSlices(opts).find(slice => slice.fixture === 'monorepo-whitebox')
+  if (monorepoSlice && monorepoSlice.snapshot.state !== 'not-applicable' && !monorepoSlice.snapshot.used) {
+    report.notes.push(
+      `micro #4 post-recon snapshot ${monorepoSlice.snapshot.state}: ${monorepoSlice.snapshot.reason}`,
+    )
+  }
+  if (micro.latePromotions !== undefined) {
+    report.notes.push(`micro latePromotions=${micro.latePromotions ?? 'n/a'} (conversion events, not drain-only)`)
+  }
 }
 
 export function tierTwoCommand(): string[] {
@@ -1458,6 +1645,8 @@ async function runCalibration(opts: SmokeArgs): Promise<void> {
         wall_ms: cell.wallMs,
         wiring: cell.wiring ?? '',
         capability: cell.capability ?? '',
+        late_promotions: cell.latePromotions ?? '',
+        snapshot: cell.snapshot ?? '',
         error: cell.error ?? '',
       })
     }
@@ -1506,7 +1695,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   await runTierZero(opts, report)
 
   if (opts.dryRun) {
-    report.cells = planTierOne(opts).map(plan => emptyCell(plan))
+    report.cells = planTierOne(opts).map(plan => {
+      if (plan.kind !== 'micro') return emptyCell(plan)
+      const snapshot = planMicroSlices(opts)
+        .map(slice => formatSnapshotStatus(slice.snapshot, slice.timeoutSec))
+        .filter(label => label !== 'n/a')
+        .join('/') || 'n/a'
+      return emptyCell(plan, { snapshot })
+    })
     report.totals = { confirmed: 0, netNew: null, costUsd: 0, wallMs: 0, cells: report.cells.length }
     report.notes.push('dry-run: no model, worker, CLI or fixture runs were started')
     if (!report.tier0.pass) {
