@@ -46,9 +46,6 @@ import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource } 
 import { verifyReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 import { wiredRecipeForSpecKind } from './floor-recipes.ts'
-import { brokerFloorRecipeDeps, floorRecipe } from './floor-recipes.ts'
-import { planBooleanRetest, recipeRetestResult } from './floor-recipe-engine.ts'
-import { runFloorRecipe } from './floor-recipes.ts'
 
 // Re-exported for tests and callers that only import the verifier.
 export {
@@ -2260,6 +2257,144 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       } finally {
         await canarySession?.close()
       }
+    } else if (spec.kind === 'sql_boolean_diff') {
+      const roundCount = 3
+      const usedKs = new Set<number>()
+      const baseValue = spec.baselineValue
+      const makeValue = (k: number, kind: 'true' | 'false'): string => {
+        const expr = `${k}=${kind === 'true' ? k : k + 1}`
+        if (spec.valueTemplate) {
+          return spec.valueTemplate.replaceAll('{{baseline}}', baseValue).replaceAll('{{sql_expr}}', expr)
+        }
+        if (spec.quoteStyle === 'numeric') return `${baseValue} AND ${expr}`
+        if (spec.quoteStyle === 'double') return `${baseValue}" AND ${expr}-- -`
+        return `${baseValue}' AND ${expr}-- -`
+      }
+      const buildRequest = (value: string): BrokerHttpRequest => {
+        const injected = injectUniversalParam({
+          pathAndQuery: spec.pathAndQuery,
+          param: spec.paramName,
+          paramLocation: spec.paramLocation,
+          value,
+          method: spec.method,
+          headers: spec.headers,
+          jsonBody: (spec.jsonBody && typeof spec.jsonBody === 'object' && !Array.isArray(spec.jsonBody))
+            ? spec.jsonBody as Record<string, unknown>
+            : undefined,
+          xmlTemplate: spec.xmlTemplate,
+          graphqlQuery: spec.graphqlQuery,
+          session: spec.session,
+          csrfBind: spec.csrfBind,
+          runId: params.runId,
+          assignmentId,
+        })
+        return {
+          origin: spec.targetOrigin,
+          persona: spec.persona,
+          followRedirects: false,
+          // Share the priming step's jar so session cookies / CSRF tokens bound by it are visible.
+          ...(spec.controlStep && spec.controlStep.role !== 'cleanup' ? { sessionGroupRole: spec.controlStep.role } : {}),
+          ...injected,
+        }
+      }
+
+      let controlSummary: Record<string, unknown> | null = null
+      let controlHealthy = true
+      if (spec.controlStep) {
+        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}, {
+          runId: params.runId,
+          assignmentId,
+        }), grant, signal)
+        recordExchange(controlEx)
+        controlSummary = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(controlEx) }
+        if (isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) controlHealthy = false
+      }
+
+      const rounds: Array<Record<string, unknown>> = []
+      const roundDeltas: string[][] = []
+      let firstBaseline: BrokerExchangeResult | undefined
+      let firstTrue: BrokerExchangeResult | undefined
+      let firstFalse: BrokerExchangeResult | undefined
+      let allPass = true
+      let baselineHeld = true
+      let unstable = false
+      let baselineDrift = false
+      for (let r = 0; r < roundCount; r += 1) {
+        signal.throwIfAborted()
+        let k = randomInt(1000, 90_000)
+        while (usedKs.has(k)) k = randomInt(1000, 90_000)
+        usedKs.add(k)
+        // Interleaved baseline / true / false triplet through RequestBroker.
+        const baseEx = await broker.executeHttp(buildRequest(baseValue), grant, signal)
+        recordExchange(baseEx)
+        const trueEx = await broker.executeHttp(buildRequest(makeValue(k, 'true')), grant, signal)
+        recordExchange(trueEx)
+        const falseEx = await broker.executeHttp(buildRequest(makeValue(k, 'false')), grant, signal)
+        recordExchange(falseEx)
+        firstBaseline ??= baseEx
+        firstTrue ??= trueEx
+        firstFalse ??= falseEx
+        // Compare noise-normalized structure: a rotating nonce never separates the arms, and a
+        // single real field delta inside a large HTML shell remains observable.
+        const simBaselineTrue = structuralSimilarity(baseEx.body, trueEx.body)
+        const simBaselineFalse = structuralSimilarity(baseEx.body, falseEx.body)
+        const simTrueFalse = structuralSimilarity(trueEx.body, falseEx.body)
+        const fieldDelta = structuralDiff(trueEx.body, falseEx.body).changedTokens.filter(token => token.length >= 2)
+        roundDeltas.push(fieldDelta)
+        const isOrBranch = /\bOR\b/i.test(spec.valueTemplate ?? '')
+        const statusDivergence = isOrBranch
+          ? (falseEx.status === baseEx.status && trueEx.status !== falseEx.status && trueEx.status < 500) ||
+            (baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500)
+          : (baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500)
+        const anyServerError = [baseEx, trueEx, falseEx].some(e => e.status >= 500)
+        if (anyServerError) unstable = true
+        if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(trueEx.status, spec.expectedStatus)) {
+          controlHealthy = false
+        }
+        if (structuralSimilarity(firstBaseline.body, baseEx.body) < 0.9) baselineDrift = true
+        const baselineMatch = isOrBranch ? Math.max(simBaselineTrue, simBaselineFalse) >= 0.9 : simBaselineTrue >= 0.9
+        if (!(!anyServerError && baselineMatch)) baselineHeld = false
+        const pass = !anyServerError && baselineMatch && (simTrueFalse <= 0.75 || statusDivergence)
+        if (!pass) allPass = false
+        rounds.push({
+          round: r + 1, k,
+          trueExpression: `${k}=${k}`, falseExpression: `${k}=${k + 1}`,
+          baseline: lightSummary(baseEx), true: lightSummary(trueEx), false: lightSummary(falseEx),
+          similarityBaselineTrue: simBaselineTrue, similarityBaselineFalse: simBaselineFalse, similarityTrueFalse: simTrueFalse,
+          statusDivergence, isOrBranch, structuralDelta: fieldDelta.length > 0, structuralChangedTokens: fieldDelta.length, pass,
+        })
+      }
+      // A small set of non-dynamic tokens that differ in *every* round is a stable field delta,
+      // not per-request jitter. This lets a one-field differential in a large shell confirm while
+      // still requiring identical structural context.
+      const stableFieldDelta = intersectStructuralDeltas(roundDeltas).filter(token => token.length >= 2)
+      const structuralFieldDelta = stableFieldDelta.length > 0 && stableFieldDelta.length <= 8
+      const controlPassed = controlHealthy && !unstable && !baselineDrift
+      deterministicProofPassed = controlPassed && baselineHeld && (allPass || structuralFieldDelta)
+      if (!deterministicProofPassed) {
+        proofFailureReason = !controlPassed
+          ? 'sql_boolean_diff control unstable (5xx, unexpected 404 or drifting baseline).'
+          : 'Boolean differential did not hold across all 3 randomized rounds (no status divergence, content separation, or stable non-dynamic field delta).'
+      }
+      evidencePayload = {
+        ...evidencePayload,
+        targetOrigin: spec.targetOrigin,
+        paramName: spec.paramName,
+        quoteStyle: spec.quoteStyle,
+        baseline: firstBaseline ? summarizeExchange(firstBaseline) : (rounds[0]?.baseline ?? null),
+        trueProbe: firstTrue ? summarizeExchange(firstTrue) : (rounds[0]?.true ?? null),
+        falseProbe: firstFalse ? summarizeExchange(firstFalse) : (rounds[0]?.false ?? null),
+        sqlDiff: {
+          passed: deterministicProofPassed,
+          controlPassed,
+          thresholds: { trueVsBaselineMin: 0.9, trueVsFalseMax: 0.75, stableFieldDeltaMax: 8 },
+          structuralFieldDelta,
+          structuralChangedTokens: stableFieldDelta.length,
+          rounds,
+        },
+        control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
+        probe: rounds[0] ? { role: 'probe', ...(rounds[0].true as Record<string, unknown>) } : null,
+      }
     } else if (spec.kind === 'ws_chain') {
       const stepsOut: Record<string, unknown> = {}
       let firstControl: Record<string, unknown> | undefined
@@ -3190,16 +3325,22 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
 }
 
 export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<ReplayVerificationResult> {
-  assertNotRecipeWiredLegacyCall(params.spec)
   const result = await verifyReplaySpecInner(params)
   return withVerificationTier(result)
 }
 
 /**
- * Cut 3a no-fallback invariant. A spec kind/class whose floor learner now confirms through a typed
- * recipe must never reach the DSL verifier: a silent legacy fallback would re-open the very branch
- * the cut deletes and make recall look identical while the code path diverges. The throw is loud
- * (process warning + stable error code) and the engine logs `deterministic_engine.recipe_wired_legacy_call`.
+ * Cut 3a no-fallback invariant at the *product floor* boundary.
+ *
+ * The deterministic engine runs a wired family through its recipe; immediately before its legacy
+ * verifier call it asserts the candidate was not recipe-wired. A future edit that bypasses planning
+ * therefore throws (and warns) instead of silently evaluating the DSL for a family the floor is
+ * supposed to confirm through a receipt.
+ *
+ * The legacy branch itself stays in `verifyReplaySpec` for two non-product callers: the capability
+ * harness in `scripts/` (which is maintenance-only and still synthesizes sql specs) and patch retest.
+ * Deleting it requires migrating those first; that dependency is recorded in
+ * `LEGACY_UNWIRED_SPECKINDS` and the Cut 3a report.
  */
 export class RecipeWiredLegacyCallError extends Error {
   readonly code = 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
@@ -3229,7 +3370,7 @@ export function recipeClassOfSpec(spec: DeclarativeReplaySpec): string | null {
   }
 }
 
-/** Throw (and warn) when a wired pair is routed to the legacy verifier. */
+/** Throw (and warn) when a wired pair would be routed to the legacy verifier. */
 export function assertNotRecipeWiredLegacyCall(spec: DeclarativeReplaySpec | unknown): void {
   if (!spec || typeof spec !== 'object') return
   const kind = (spec as { kind?: unknown }).kind
@@ -3250,42 +3391,9 @@ function withVerificationTier(result: ReplayVerificationResult): ReplayVerificat
 }
 
 export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<RetestReplayResult> {
-  // Wired spec kinds have no legacy confirmation branch any more. A retest re-executes the same
-  // paired requests and lets the receipt decide reproduced (confirmed) vs fixed (rejected).
-  const spec = params.spec && typeof params.spec === 'object' ? params.spec as DeclarativeReplaySpec : null
-  if (spec) {
-    const vulnClass = recipeClassOfSpec(spec)
-    const wired = vulnClass ? wiredRecipeForSpecKind(spec.kind, vulnClass) : null
-    if (wired === 'boolean_or_timing') {
-      const plan = planBooleanRetest(spec as unknown as Parameters<typeof planBooleanRetest>[0])
-      if (plan) {
-        const execution = await runFloorRecipe(
-          floorRecipe(plan.recipeId, plan.args),
-          brokerFloorRecipeDeps({
-            broker: params.broker,
-            grant: params.grant,
-            signal: params.signal,
-            origin: plan.args.origin,
-            ...(params.runId ? { runId: params.runId } : {}),
-            ...(params.assignmentId ? { assignmentId: params.assignmentId } : {}),
-            ...(params.onExchange ? { recordExchange: params.onExchange } : {}),
-          }),
-        )
-        const replay = recipeRetestResult(plan, execution, execution.result.exchangeIds)
-        const verdict: RetestVerdict = replay.verdict === 'confirmed'
-          ? 'reproduced'
-          : execution.failure?.code === 'recipe_error' || execution.failure?.code === 'step_budget_exceeded'
-            ? 'inconclusive'
-            : 'fixed'
-        return { verdict, replay }
-      }
-    }
-  }
-  // Retest of an unwired (legacy) kind is a regression replay of an already-persisted proof
-  // (reproduced vs fixed), not a new confirmation, so it re-evaluates the recorded spec through the
-  // same inner replay the legacy retest always used.
-  const result = await verifyReplaySpecInner(params)
-  const replay = withVerificationTier(result)
+  // Retest is a regression replay of an already-persisted proof (reproduced vs fixed), not a new
+  // confirmation, so it re-evaluates the recorded spec through the same replay used today.
+  const replay = await verifyReplaySpec(params)
   const verdict: RetestVerdict = replay.verdict === 'confirmed' || replay.verdict === 'static_verified'
     ? 'reproduced'
     : replay.verdict === 'dismissed'

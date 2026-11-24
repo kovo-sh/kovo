@@ -19,7 +19,7 @@ import { declarativeReplaySpecSchema } from '../replay-spec.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import { probeDifferential, responseSimilarity } from './surface-engine.ts'
 import type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialRequest, SurfaceParamLocation } from './surface-engine.ts'
-import { verifyReplaySpec } from './replay-verifier.ts'
+import { assertNotRecipeWiredLegacyCall, verifyReplaySpec } from './replay-verifier.ts'
 import type { ReplayVerificationResult } from './replay-verifier.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
@@ -4738,6 +4738,9 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         report.confirmedPairs.push({ endpoint: hyp.endpoint.pathTemplate, vulnClass: recipePlan.vulnClass })
         break
       }
+      // Hard no-fallback assertion: a wired pair must have been planned above. If a future edit
+      // bypasses recipe planning this throws (and warns) instead of silently using the DSL.
+      assertNotRecipeWiredLegacyCall(parsed.data)
       let replay: ReplayVerificationResult
       try {
         replay = await (input.verify ?? verifyReplaySpec)({

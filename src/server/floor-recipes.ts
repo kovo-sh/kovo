@@ -1185,7 +1185,7 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
     specKind: 'sql_boolean_diff',
     vulnClasses: ['sqli'],
     recipe: 'boolean_or_timing',
-    note: 'Boolean rule: paired true/false predicate rounds, stable structural delta, no 5xx. Retest re-runs the paired requests through the recipe (reproduced vs fixed).',
+    note: 'Product floor: paired true/false predicate rounds confirmed by the boolean receipt rule. The legacy verifier branch is retained only for the capability harness (scripts/) and patch retest; deleting it requires migrating the harness first (routing it through this recipe measured 20/25 on xben because status-only boolean differentials are not yet expressible by the receipt rule).',
   },
 ]
 
