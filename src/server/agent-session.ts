@@ -589,6 +589,7 @@ export class SpecSubmissionTracker {
   private readonly demandedRoutes = new Set<string>()
   /** Attempts whose spec shape could not be attributed to a route; treated as covering any target. */
   private opaqueSpecAttempts = 0
+  private confirmedProofs = 0
   private sequence = 0
 
   noteProbe(): void {
@@ -736,9 +737,18 @@ export class SpecSubmissionTracker {
   }
 
   /** A guardian_verify script: cover host-observed transcript routes first, then matched script paths. */
-  noteVerifyScript(script: string | undefined, transcriptRoutes?: readonly { method?: string; path?: string }[]): void {
+  noteVerifyScript(
+    script: string | undefined,
+    transcriptRoutes?: readonly { method?: string; path?: string }[],
+    options?: { confirmed?: boolean },
+  ): void {
     this.state = { ...this.state, specAttempts: this.state.specAttempts + 1 }
+    if (options?.confirmed) this.confirmedProofs += 1
     this.markCovered(transcriptRoutes?.length ? transcriptRoutes : undefined, script)
+  }
+
+  hasConfirmedProof(): boolean {
+    return this.confirmedProofs > 0
   }
 
   /** Resolve the route a coded gap binds to; ambiguous or unknown bindings are rejected. */
@@ -1166,18 +1176,25 @@ export function specSubmissionRequiredFor(snapshot: SpecSubmissionSnapshot): boo
 // while a spec submission is in flight, a complete_intent repair is in flight, or a free-text proof
 // gap is still uncoded, so an unearned exit can never suppress work in progress.
 
-/** Hardened/denial statuses: the route answers the same refusal to every attempt. */
-export const EARLY_EXIT_HARDENED_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 405, 410])
+/** Hardened/denial statuses: the route answers the same refusal/rejection to every attempt. */
+export const EARLY_EXIT_HARDENED_STATUSES: ReadonlySet<number> = new Set([400, 401, 403, 404, 405, 410, 422])
 /** Methods whose non-denial answer is a state change (blocks the static/catch-all reason). */
 export const EARLY_EXIT_STATE_CHANGE_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 /** Distinct attempts required before a route may be called clean. */
 export const EARLY_EXIT_MIN_ATTEMPTS = 2
+/** Distinct identical-body attempts required to call a non-mutating 2xx route unchanged/hardened. */
+export const EARLY_EXIT_UNCHANGED_MIN_ATTEMPTS = 3
 /** Settlement must be armed for at least this many turns before early exit is considered. */
 export const EARLY_EXIT_MIN_TURNS = 4
 /** Turns granted after the trigger to submit the spec/verify or coded gap and call complete_intent. */
 export const EARLY_EXIT_GRACE_TURNS = 2
 
-export type EarlyExitReason = 'hardened_denial' | 'static_no_state_change' | 'hypothesis_refuted'
+export type EarlyExitReason =
+  | 'hardened_denial'
+  | 'static_no_state_change'
+  | 'hypothesis_refuted'
+  | 'unchanged_response'
+  | 'proof_confirmed'
 
 export type EarlyExitBlock =
   | 'below_min_turns'
@@ -1210,20 +1227,26 @@ export interface EarlyExitInput {
   unresolvedProofGap?: boolean
   /** One or more explicitly assigned target routes have not been probed, covered, or gap-bound yet. */
   unprobedAssignedRoutes?: boolean
+  /** A `guardian_verify` script already passed the independent transcript oracle (`confirmed: true`). */
+  proofConfirmed?: boolean
 }
 
 /**
- * Pure early-exit predicate. Order matters: turn floor, then work-in-flight blockers, then anomaly,
- * then evidence sufficiency, then one of the three earned reasons.
+ * Pure early-exit predicate. Order matters: work-in-flight blockers first, then an already-confirmed
+ * `guardian_verify` proof (no need to burn remaining turns once the target is proven), then turn
+ * floor, anomaly guard, evidence sufficiency, and one of the earned clean-route reasons.
  */
 export function earlyExitEligible(input: EarlyExitInput): EarlyExitDecision {
-  const minTurns = input.minTurns ?? EARLY_EXIT_MIN_TURNS
-  if (input.turnsUsed < minTurns) return { eligible: false, blockedBy: 'below_min_turns' }
   if (input.specPending) return { eligible: false, blockedBy: 'spec_pending' }
   if (input.repairInFlight) return { eligible: false, blockedBy: 'repair_in_flight' }
   if (input.unresolvedProofGap) return { eligible: false, blockedBy: 'unresolved_proof_gap' }
   if (input.unprobedAssignedRoutes) return { eligible: false, blockedBy: 'unprobed_assigned_routes' }
   const evidence = input.evidence
+  if (input.proofConfirmed) {
+    return { eligible: true, reason: 'proof_confirmed', evidenceCount: Math.max(1, evidence.attempts) }
+  }
+  const minTurns = input.minTurns ?? EARLY_EXIT_MIN_TURNS
+  if (input.turnsUsed < minTurns) return { eligible: false, blockedBy: 'below_min_turns' }
   if (evidence.anomalyCount > 0) return { eligible: false, blockedBy: 'anomaly_recorded' }
   // At least two distinct attempts, on distinct routes or distinct parameter sets.
   const distinctAttempts = evidence.attempts >= EARLY_EXIT_MIN_ATTEMPTS &&
@@ -1238,6 +1261,13 @@ export function earlyExitEligible(input: EarlyExitInput): EarlyExitDecision {
   }
   if (evidence.refutedHypotheses > 0) {
     return { eligible: true, reason: 'hypothesis_refuted', evidenceCount: evidence.attempts }
+  }
+  const unchangedClean = evidence.attempts >= EARLY_EXIT_UNCHANGED_MIN_ATTEMPTS &&
+    evidence.distinctAttempts >= EARLY_EXIT_UNCHANGED_MIN_ATTEMPTS &&
+    evidence.distinctBodies === 1 &&
+    evidence.stateChangeAttempts === 0
+  if (unchangedClean) {
+    return { eligible: true, reason: 'unchanged_response', evidenceCount: evidence.attempts }
   }
   return { eligible: false, blockedBy: 'insufficient_evidence' }
 }
@@ -1295,7 +1325,11 @@ export function earlyExitDirectiveMessage(input: EarlyExitEvent & {
     ? `every attempt on${routeText} returned a consistent hardened denial (${input.denialStatuses.join('/') || 'denied'}) with no differential`
     : input.reason === 'static_no_state_change'
       ? `${routeText} is a calibrated static/catch-all route with no state change`
-      : `the class hypothesis on${routeText} was refuted by a control-vs-probe negative control`
+      : input.reason === 'unchanged_response'
+        ? `every attempt on${routeText} returned an identical non-anomalous response body with no state change`
+        : input.reason === 'proof_confirmed'
+          ? `guardian_verify already confirmed a verified ProofReceipt for this assignment`
+          : `the class hypothesis on${routeText} was refuted by a control-vs-probe negative control`
   return [
     `[GUARDIAN EARLY EXIT — Turn ${input.turnsUsed}/${input.maxTurns}]`,
     `Wrap-up started early (${input.reason}) because ${reasonText} across ${input.evidenceCount} distinct attempts with no anomaly recorded. ${input.turnsSaved} turn(s) saved; do not probe further.`,
@@ -2201,7 +2235,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     maxTurnsCeiling: 60,
     roleAffinity: 'tactical',
     skills: ['bola-idor-race', 'source-first-audit', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding with a multi-persona http_chain DeclarativeReplaySpec. BFLA needs IMPACT: a 2xx from a lower-privileged actor on a read-only route is not escalation by itself - include a privileged mutation that succeeds (2xx) or a same-route role differential (one actor gets data, another is denied), otherwise the Zero-LLM verifier will dismiss it.',
+    focusPrompt: 'Focus strictly on horizontal BOLA/IDOR, vertical BFLA, cross-tenant producer-consumer lifecycles, and authorization header bypasses. Confirm every finding via guardian_verify (inline script using ctx.prove_access_boundary or ctx.prove_persisted_mutation). BFLA needs IMPACT: a 2xx from a lower-privileged actor on a read-only route is not escalation by itself - include a privileged mutation that succeeds (2xx) or a same-route role differential (one actor gets data, another is denied), otherwise the oracle will dismiss it.',
   },
   'injection-parser-specialist': {
     id: 'injection-parser-specialist',
@@ -2211,7 +2245,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     roleAffinity: 'tactical',
     capabilities: ['oob'],
     skills: ['sqli-boolean-differential', 'ssti-non-destructive', 'xxe-canary-proof', 'injection-benign-proof', 'path-traversal-canonicalization', 'source-first-audit', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on SQLi (boolean/time/error across query/json/form/path/header/xml/graphql_var), NoSQLi, SSTI, XXE, SSRF, path traversal, and command injection. Confirm via sql_boolean_diff, sql_time_diff, rce_proof, or http_chain.',
+    focusPrompt: 'Focus strictly on SQLi (boolean/time/error across query/json/form/path/header/xml/graphql_var), NoSQLi, SSTI, XXE, SSRF, path traversal, and command injection. Confirm via guardian_verify (inline script using ctx.prove_boolean_or_timing_diff or ctx.prove_oob_callback).',
   },
   'auth-session-oauth-specialist': {
     id: 'auth-session-oauth-specialist',
@@ -2221,7 +2255,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     roleAffinity: 'tactical',
     capabilities: ['oob', 'browser'],
     skills: ['jwt-session-security', 'auth-oauth-oidc', 'clerk-auth0-oidc', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on JWT authMutation flaws (alg_none, strip_signature, kid_inject, rs256_to_hs256_jwks, jku_x5u_canary, expired_replay), OAuth redirect_uri parser differentials, PKCE downgrades, CSRF, and session fixation. Confirm via auth_protocol_proof or http_chain.',
+    focusPrompt: 'Focus strictly on JWT authMutation flaws (alg_none, strip_signature, kid_inject, rs256_to_hs256_jwks, jku_x5u_canary, expired_replay), OAuth redirect_uri parser differentials, PKCE downgrades, CSRF, and session fixation. Confirm via guardian_verify (inline script using ctx.prove_access_boundary or ctx.prove_persisted_mutation).',
   },
   'client-browser-dom-specialist': {
     id: 'client-browser-dom-specialist',
@@ -2231,7 +2265,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     roleAffinity: 'tactical',
     capabilities: ['browser', 'oob'],
     skills: ['client-side-xss-postmessage', 'prototype-pollution-dom-server', 'cors-csrf-cross-origin', 'websocket-cswsh', 'oob-ssrf-browser-chain', 'cross-host-chaining', 'recon-modern-spa'],
-    focusPrompt: 'Focus strictly on Reflected/DOM/Stored XSS, postMessage origin bypass, CSWSH WebSocket hijacking, and client-side state/storage leaks. Confirm via browser_chain (dom_xss_sink_hook/postmessage_probe) or ws_chain.',
+    focusPrompt: 'Focus strictly on Reflected/DOM/Stored XSS, postMessage origin bypass, CSWSH WebSocket hijacking, and client-side state/storage leaks. Confirm via guardian_verify (inline script using ctx.browser / ctx.prove_oob_callback).',
   },
   'graphql-api-specialist': {
     id: 'graphql-api-specialist',
@@ -2241,7 +2275,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     roleAffinity: 'tactical',
     capabilities: ['sast'],
     skills: ['api-rest-graphql', 'bola-idor-race', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on GraphQL schema introspection/SDL analysis, nested-edge resolver BOLA/BFLA, mutation authorization, alias batching/depth limits, and scalar argument injection via graphql_var.',
+    focusPrompt: 'Focus strictly on GraphQL schema introspection/SDL analysis, nested-edge resolver BOLA/BFLA, mutation authorization, alias batching/depth limits, and scalar argument injection via graphql_var. Confirm via guardian_verify (inline script using ctx.prove_*).',
   },
   'business-logic-race-specialist': {
     id: 'business-logic-race-specialist',
@@ -2251,7 +2285,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     roleAffinity: 'tactical',
     capabilities: ['race', 'browser'],
     skills: ['business-logic-workflows', 'mass-assignment-overposting', 'bola-idor-race', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on workflow step-skip (e.g. draft -> refund), quantity/price invariant violations (-1, 0, overflow), mass assignment, and TOCTOU double-spend races. Confirm via race_burst or http_chain.',
+    focusPrompt: 'Focus strictly on workflow step-skip (e.g. draft -> refund), quantity/price invariant violations (-1, 0, overflow), mass assignment, and TOCTOU double-spend races. Confirm via guardian_verify (inline script using ctx.prove_race_burst or ctx.prove_persisted_mutation).',
   },
   'protocol-cache-edge-specialist': {
     id: 'protocol-cache-edge-specialist',
@@ -2261,7 +2295,7 @@ export const SPECIALIST_PROFILES: Record<SpecialistProfile, SpecialistProfileCon
     roleAffinity: 'tactical',
     capabilities: ['http2', 'sast'],
     skills: ['cache-smuggling-desync', 'cve-runtime-correlation', 'cors-csrf-cross-origin', 'false-positive-elimination'],
-    focusPrompt: 'Focus strictly on shared cache poisoning/deception (mandatory ?_gcb=), CORS/header misconfigurations, DNS takeover, TLS posture, and tech-matched CVE runtime reachability. Confirm via cache_differential, dns_takeover, tls_audit, or http_chain.',
+    focusPrompt: 'Focus strictly on shared cache poisoning/deception (mandatory ?_gcb=), CORS/header misconfigurations, DNS takeover, TLS posture, and tech-matched CVE runtime reachability. Confirm via guardian_verify (inline script using ctx.http / ctx.prove_access_boundary).',
   },
 }
 
@@ -4676,7 +4710,7 @@ export function buildWorkerTools(
                       : undefined,
               }))
               .filter(entry => Boolean(entry.path))
-            specSubmission?.tracker?.noteVerifyScript(payload.script, transcriptRoutes)
+            specSubmission?.tracker?.noteVerifyScript(payload.script, transcriptRoutes, { confirmed: summary.confirmed })
             return summary
           },
           signal,
@@ -5358,7 +5392,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     // Only genuinely early: at/after the 85% settlement turn the banner already handles wrap-up.
     if (turnsUsed >= settlementTurn) return
     const evidence = specTracker.observationSnapshot()
-    if (!evidence.attempts) return
+    const proofConfirmed = specTracker.hasConfirmedProof()
+    if (!evidence.attempts && !proofConfirmed) return
     const snapshot = specSnapshot()
     const decision = earlyExitEligible({
       evidence,
@@ -5368,6 +5403,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       repairInFlight: repairTurn !== undefined && specSubmissionPending(snapshot),
       unresolvedProofGap: snapshot.proofGaps.some(gap => !gap.code),
       unprobedAssignedRoutes: snapshot.obligations.some(o => o.assigned && o.attempts === 0 && !o.covered && !o.gap),
+      proofConfirmed,
     })
     if (!decision.eligible) return
     earlyExit = buildEarlyExitEvent({ reason: decision.reason, evidence, turnsUsed, maxTurns })

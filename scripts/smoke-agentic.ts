@@ -741,6 +741,64 @@ export function preservedSiteIds(card: ScorecardLike | null, baselineIds: string
   return baselineIds.filter(id => matched.has(id)).length
 }
 
+export interface ResolvedLiftBaseline {
+  card: ScorecardLike
+  conversion: number | null
+  source: 'floor-scorecard' | 'snapshot-baseline' | 'default-baseline' | 'snapshot-counts'
+  path: string
+}
+
+/**
+ * Resolve the floor baseline scorecard / conversion for the lift cell without weakening any gate:
+ * 1. explicit `--floor-scorecard`
+ * 2. `<snapshotRoot>/baseline/<app>-seed<seed>-grey-box.json`
+ * 3. `<defaultSnapshotRoot>/baseline/<app>-seed<seed>-grey-box.json` (when `--out-dir` moved snapshotRoot)
+ * 4. post-floor `snapshot.json` captured in the same run (`counts.runtimeConfirmed / liftTargets`)
+ */
+export function resolveLiftBaseline(input: {
+  floorScorecard?: string
+  snapshotRoot: string
+  defaultSnapshotRoot?: string
+  snapshotDir?: string
+  app: string
+  seed: number
+  liftTargets?: number
+}): ResolvedLiftBaseline | null {
+  const filename = `${input.app}-seed${input.seed}-grey-box.json`
+  if (input.floorScorecard) {
+    const card = readJson<ScorecardLike>(input.floorScorecard)
+    if (card) return { card, conversion: conversionOf(card), source: 'floor-scorecard', path: input.floorScorecard }
+  }
+  const localPath = join(input.snapshotRoot, 'baseline', filename)
+  const localCard = readJson<ScorecardLike>(localPath)
+  if (localCard) return { card: localCard, conversion: conversionOf(localCard), source: 'snapshot-baseline', path: localPath }
+
+  if (input.defaultSnapshotRoot && resolve(input.defaultSnapshotRoot) !== resolve(input.snapshotRoot)) {
+    const defaultPath = join(input.defaultSnapshotRoot, 'baseline', filename)
+    const defaultCard = readJson<ScorecardLike>(defaultPath)
+    if (defaultCard) return { card: defaultCard, conversion: conversionOf(defaultCard), source: 'default-baseline', path: defaultPath }
+  }
+
+  if (input.snapshotDir && (input.liftTargets ?? 0) > 0) {
+    const snapDir = bestSnapshotDir(input.snapshotDir) ?? (hasSnapshot(input.snapshotDir) ? input.snapshotDir : null)
+    if (snapDir) {
+      const snapPath = join(snapDir, 'snapshot.json')
+      const snap = readJson<{ counts?: { runtimeConfirmed?: number } }>(snapPath)
+      const confirmed = snap?.counts?.runtimeConfirmed
+      if (typeof confirmed === 'number' && Number.isFinite(confirmed) && confirmed >= 0) {
+        const card: ScorecardLike = {
+          app: input.app,
+          seed: input.seed,
+          targets: input.liftTargets!,
+          confirmed,
+        }
+        return { card, conversion: conversionOf(card), source: 'snapshot-counts', path: snapPath }
+      }
+    }
+  }
+  return null
+}
+
 export function conversionOf(card: ScorecardLike | null): number | null {
   if (!card) return null
   // Prefer overall target conversion (confirmed/targets); fall back to spec conversion when a
@@ -1068,8 +1126,29 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
   })
   const card = readJson<ScorecardLike>(scorecardPath(plan.outDir, plan.app, opts.seed))
   const meta = readJson<MetaLike>(metaPath(plan.outDir, plan.app, opts.seed))
-  const baselinePath = opts.floorScorecard ?? join(opts.snapshotRoot, 'baseline', `${plan.app}-seed${opts.seed}-grey-box.json`)
-  const baseline = plan.kind === 'lift' ? readJson<ScorecardLike>(baselinePath) : null
+  const resolvedBaseline = plan.kind === 'lift'
+    ? resolveLiftBaseline({
+        floorScorecard: opts.floorScorecard,
+        snapshotRoot: opts.snapshotRoot,
+        defaultSnapshotRoot: join(DEFAULT_OUT, 'snapshots'),
+        snapshotDir: plan.snapshot,
+        app: plan.app,
+        seed: opts.seed,
+        liftTargets: card?.targets,
+      })
+    : null
+  if (
+    plan.kind === 'lift' &&
+    plan.source === 'cold' &&
+    resolvedBaseline?.source === 'snapshot-counts'
+  ) {
+    const baselineDest = join(opts.snapshotRoot, 'baseline', `${plan.app}-seed${opts.seed}-grey-box.json`)
+    if (!existsSync(baselineDest)) {
+      mkdirSync(dirname(baselineDest), { recursive: true, mode: 0o700 })
+      writeFileSync(baselineDest, `${JSON.stringify({ ...resolvedBaseline.card, source: 'snapshot-after-floor' }, null, 2)}\n`, { mode: 0o600 })
+    }
+  }
+  const baseline = resolvedBaseline?.card ?? null
   const baselineIds = confirmedSiteIds(baseline)
   const confirmed = card?.confirmed ?? 0
   const floorConfirmed = baseline?.confirmed ?? (plan.kind === 'lift' ? opts.liftBaseline : null)
@@ -1533,12 +1612,19 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
     runMicroCell(microPlan, opts),
   ])
   report.cells = [lift.cell, rotation, trap, micro]
-  const baselinePath = opts.floorScorecard ?? join(opts.snapshotRoot, 'baseline', `acme-saas-seed${opts.seed}-grey-box.json`)
-  const baseline = readJson<ScorecardLike>(baselinePath)
+  const baseline = resolveLiftBaseline({
+    floorScorecard: opts.floorScorecard,
+    snapshotRoot: opts.snapshotRoot,
+    defaultSnapshotRoot: join(DEFAULT_OUT, 'snapshots'),
+    snapshotDir: liftPlan.snapshot,
+    app: liftPlan.app,
+    seed: opts.seed,
+    liftTargets: lift.cell.targets,
+  })
   report.gates = evaluateGates({
     cells: report.cells,
     liftBaseline: opts.liftBaseline,
-    baselineConversion: conversionOf(baseline),
+    baselineConversion: baseline?.conversion ?? null,
     trapConfirmed: trap.confirmed,
     rerunExecuted: lift.rerun,
     perCellBudgetUsd: opts.budgetUsdPerCell,
