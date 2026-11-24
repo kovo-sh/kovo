@@ -569,3 +569,20 @@ xben stayed 25/25 (the probe maps `tautology` → `or_branch` so legacy builders
 **But two replay-side edits are still required for the +1, and a bigger blocker sits underneath.** With the grounded pair the replay dismisses on `simBaselineTrue = 0.8333 < 0.9` because the echoed `{"query":…}` contains the payload and `k` tokens; scrubbing the reflected request value yields `1.0` and confirms 3/3 (verified on a scratch copy). Those edits (`replay-verifier` scrub, `deterministic-specs` grounded pair) are being re-landed by `sqli-baseline2` **only where the live path still reaches them** after Cut 3a.
 
 **The blocker that actually holds held-out at 24/58:** the floor never forms an sqli hypothesis for `/api/v1/search` because recon stores **zero `endpoint_params`** for that route (`bucket=hypothesis_miss`). No pair fix can help a route the floor cannot describe. New stream `param-discovery` derives candidate params from evidence the crawler already holds (link query keys, form fields, XHR/GraphQL args, bundle literals near the path, schema docs) with `observed` vs `inferred` provenance — inferred params may form a hypothesis but can never create a confirmation.
+
+### 2026-11-24 — hourly check-in #13: accept p50 bump, claim-halt on the precision hole, don't abandon VM deletion
+
+**Triage (accept/reject/defer):**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Accept a modest p50 bump for the 4× proof-submission gain: Tier-1 **p50 110 s hard / 85 s warn** (was 90/75); do **not** split probing and proof into two assignments (splitting drops live cookies/IDs/repair context and doubles overhead) | **ACCEPT** (gate updated) | coordinator |
+| 2 | Pull p50 back down by **early-exit settlement on clearly clean/hardened routes** (stop at turn 5–6 instead of burning 7–18) plus warm-pool containers, without lowering the 18-turn/120 s ceiling | **ACCEPT** | queued (agent-session) |
+| 3 | Inferred params: explicit provenance (`observed` / `inferred_bundle` / `inferred_html` / `inferred_ast`), never a static advisory, noise-filtered, **one-request sensitivity check or paired differential** before any confirmation path | **ACCEPT** | `param-discovery` |
+| 4 | Do **not** exclude bundle/HTML/XHR params from the +6pp gate — that is universal recon, not overfitting; only hardcoded benchmark wordlists are forbidden | **ACCEPT** | certification |
+| 5 | Precision-integrity hole: **halt certification claims**, ship a **store-level invariant** (`runtime_confirmed` requires `receipt.verdict === 'confirmed'`, typed `InvariantError`), triage recovered FP rows into Tier-0 archetypes, verify forward only (worker-gate + trap 0 + one clean held-out cell) — **no** hours spent re-auditing dead runs | **ACCEPT** | `confirm-consistency` |
+| 6 | Wait for `confirm-consistency` + `param-discovery`, **then** run dev + salted held-out 3-app (600 s, K=6, n=1) before any capability pivot | **ACCEPT** | coordinator |
+| 7 | Do **not** abandon deleting the VM: after the re-baseline, one `cut3b-parity` stream adds the two missing receipt primitives (~150–250 LOC): `status_differential` for xben's 5 SQL targets, and authz baseline/self-state readback for the 5 dev authz targets | **ACCEPT** | queued after re-baseline |
+| 8 | +6pp is likely within reach without a new capability class: funnel math on 25 route hits × 50% spec × 35–50% confirm ⇒ +4–6 targets | **NOTED** | measurement pending |
+
+**Claim status:** agentic-lift certification remains **halted** until the store invariant lands and a clean held-out cell exists.

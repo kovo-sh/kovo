@@ -293,7 +293,7 @@ test('gate fail fixtures: precision, trap, net-new, conversion, crashes, p50, th
   const errored = gateInput({ cells: gateInput().cells.map(item => item.kind === 'trap' ? { ...item, error: 'cli exit 1' } : item) })
   assert.equal(gatesById(errored).get('crashes'), false)
 
-  const slow = gateInput({ cells: gateInput().cells.map(item => item.kind === 'lift' ? { ...item, p50AssignmentMs: 100_000 } : item) })
+  const slow = gateInput({ cells: gateInput().cells.map(item => item.kind === 'lift' ? { ...item, p50AssignmentMs: 120_000 } : item) })
   assert.equal(gatesById(slow).get('p50-assignment'), false)
   const idle = gateInput({ cells: gateInput().cells.map(item => item.kind === 'lift' ? { ...item, completedAssignments: 11 } : item) })
   assert.equal(gatesById(idle).get('throughput'), false)
