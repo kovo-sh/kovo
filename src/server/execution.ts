@@ -339,6 +339,7 @@ import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import {
   buildInlineVerifyFeedback,
+  persistedAgentScriptOf,
   retestReplaySpec,
   runAgentScriptProof,
   verifyReplaySpec,
@@ -12574,6 +12575,172 @@ export class Execution {
     }
   }
 
+  /**
+   * Receipt-first re-verification of a persisted agent script proof.
+   *
+   * The script is re-run through the same fresh-session double-run, and the fresh receipt is
+   * re-validated with `verifyReceipt()`. Nothing here interprets the declarative attribution row.
+   * Returns null only when the row carries no script envelope (legacy/agent-authored DSL proofs),
+   * which keeps the old path available for kinds with no script form.
+   */
+  private async reverifyAgentScriptProof(
+    run: Run,
+    params: {
+      job: Active
+      grant: Grant
+      currentSecrets: () => readonly NamedSecret[]
+      findingId?: string
+      replaySpecId?: string
+      onExchangeObserved?: (curRun: Run, ex: BrokerExchangeResult, exchangeId: string) => void
+    },
+    proof: AgentScriptProofRecord,
+  ): Promise<{
+    findingId?: string
+    replaySpecId: string
+    attemptCount: number
+    status: Finding['status']
+    verificationTier?: VerificationTier
+    feedback: InlineVerifyFeedback
+  } | null> {
+    const specRow = this.storage.getReplaySpec(run.id, proof.replaySpecId)
+    const persisted = persistedAgentScriptOf(specRow.spec)
+    if (!persisted?.envelope) return null
+    const envelope = persisted.envelope
+    const findingRow = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id), eq(findings.id, specRow.findingId),
+    )).get()
+    const origin = (persisted.origin || specRow.spec.origin || '').trim()
+    const approved = this.approvedOriginsSet(run)
+    if (!origin || !approved.has(origin)) return null
+
+    const result = await runAgentScriptProof({
+      script: envelope.script,
+      runtime: envelope.runtime,
+      ...(envelope.vulnClass ? { title: `${envelope.vulnClass} agent proof re-verification` } : {}),
+      broker: this.broker,
+      grant: params.grant,
+      backend: this.backend,
+      runId: run.id,
+      assignmentId: params.job.assignment.id,
+      targetOrigins: [origin],
+      signal: params.job.controller.signal,
+      canaryBroker: this.canaryBroker,
+    })
+    const receiptOk = !envelope.vulnClass || result.receipt?.verification.confirmed === true
+    const confirmed = result.verdict.confirmed && receiptOk
+    const status: Finding['status'] = confirmed
+      ? 'confirmed'
+      : result.verdict.reason === 'oracle_failed'
+        ? 'dismissed'
+        : 'inconclusive'
+    const verificationTier: VerificationTier | undefined = confirmed ? 'runtime_confirmed' : undefined
+    const feedback: InlineVerifyFeedback = {
+      verdict: status === 'confirmed' ? 'confirmed' : status === 'dismissed' ? 'dismissed' : 'inconclusive',
+      ...(verificationTier ? { verificationTier } : {}),
+      controlPassed: result.verdict.attempts.every(attempt => attempt.oraclePassed),
+      assertionSummary: {
+        observed: confirmed
+          ? `Agent script ${envelope.runtime} proof reproduced and its receipt re-validated.`
+          : `Agent script proof did not re-confirm: ${result.verdict.reason}.`,
+        expected: 'the persisted script reproduces the confirmation and its receipt re-validates',
+        ...(result.verdict.detail ? { reason: result.verdict.detail } : {}),
+      },
+      stepStatuses: [],
+      retriesRemaining: maxInlineVerifyRetries,
+    }
+    const updatedSpec = this.storage.incrementReplaySpecAttempt(specRow.id, feedback, {
+      spec: specRow.spec,
+      sourceOrigins: specRow.sourceOrigins,
+      secrets: params.currentSecrets(),
+    })
+    const receiptRow = result.receipt
+      ? {
+          receipt: {
+            vulnClass: result.receipt.receipt.vulnClass,
+            target: result.receipt.receipt.target,
+            exchangeIds: result.receipt.receipt.exchangeIds,
+            oobEventIds: result.receipt.receipt.oobEventIds,
+            browserTraceIds: result.receipt.receipt.browserTraceIds,
+            claimedDelta: result.receipt.receipt.claimedDelta,
+            ...(result.receipt.receipt.oracleEvents ? { oracleEvents: result.receipt.receipt.oracleEvents } : {}),
+            ...(result.receipt.receipt.requiredRole ? { requiredRole: result.receipt.receipt.requiredRole } : {}),
+            ...(result.receipt.receipt.resourceTenant ? { resourceTenant: result.receipt.receipt.resourceTenant } : {}),
+            ...(result.receipt.receipt.expectControlDenied !== undefined
+              ? { expectControlDenied: result.receipt.receipt.expectControlDenied }
+              : {}),
+            ...(result.receipt.receipt.proofPatterns ? { proofPatterns: result.receipt.receipt.proofPatterns } : {}),
+          } satisfies ReplayProofReceiptRow['receipt'],
+          verification: {
+            confirmed: result.receipt.verification.confirmed,
+            vulnClass: result.receipt.verification.vulnClass,
+            rule: result.receipt.verification.rule,
+            reason: result.receipt.verification.reason,
+            observed: result.receipt.verification.observed,
+            expected: result.receipt.verification.expected,
+          },
+        } satisfies ReplayProofReceiptRow
+      : proof.receipt ?? null
+    this.storage.setReplaySpecProof(run.id, updatedSpec.id, {
+      ...proof,
+      replaySpecId: updatedSpec.id,
+      verdict: status === 'confirmed' ? 'confirmed' : status === 'dismissed' ? 'dismissed' : 'inconclusive',
+      receipt: receiptRow,
+      createdAt: Date.now(),
+    })
+
+    if (findingRow) {
+      const nextFinding: Finding = {
+        ...findingRow.finding,
+        status,
+        verificationTier,
+        reason: result.verdict.detail || result.verdict.reason,
+        confidence: confirmed ? 'high' : 'low',
+        verification: confirmed
+          ? `ProofReceipt · ${result.receipt?.verification.rule ?? 'script'} rule · ${result.receipt?.verification.reason ?? result.verdict.reason}`
+          : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
+        exchangeIds: result.exchanges.map(exchange => exchange.exchangeId),
+        replaySpecId: updatedSpec.id,
+        scopeRevision: run.scopeRevision,
+      }
+      if (confirmed) {
+        const assetId = findingRow.assetId
+        this.storage.upsertChainFinding(run, assetId, nextFinding, updatedSpec.id, specRow.sourceOrigins)
+      } else {
+        this.storage.updateProposedFinding(run, findingRow.id, {
+          replaySpecId: updatedSpec.id,
+          verificationTier: null,
+          finding: {
+            status,
+            verificationTier: undefined,
+            reason: nextFinding.reason,
+            confidence: 'low',
+            verification: nextFinding.verification,
+            exchangeIds: nextFinding.exchangeIds,
+          },
+        })
+      }
+    }
+    this.postVerificationVerdict(run, {
+      replaySpecId: updatedSpec.id,
+      findingId: findingRow?.id ?? null,
+      title: findingRow?.finding.title ?? 'Agent script proof',
+      status,
+      verificationTier,
+      feedback,
+      assignmentId: updatedSpec.assignmentId ?? params.job.assignment.id,
+      refStepId: params.job.assignment.stepId,
+      attempt: updatedSpec.attemptCount,
+    })
+    return {
+      findingId: findingRow?.id ?? specRow.findingId,
+      replaySpecId: updatedSpec.id,
+      attemptCount: updatedSpec.attemptCount,
+      status,
+      ...(verificationTier ? { verificationTier } : {}),
+      feedback,
+    }
+  }
+
   private async executeInlineVerification(params: {
     job: Active
     grant: Grant
@@ -12595,6 +12762,18 @@ export class Execution {
     const curRun = this.check(params.job)
     if (this.storage.checkBudgetExceeded(curRun.id)) {
       throw new BudgetExceededError('Run spend or request budget exceeded.')
+    }
+    // Receipt-first: a finding that already carries a persisted agent script proof is judged by
+    // re-running that script and re-validating its receipt. The declarative shape is attribution
+    // only, so it is never parsed or interpreted for such a finding.
+    const agentProof = params.replaySpecId
+      ? this.storage.replaySpecProof(curRun.id, params.replaySpecId)
+      : params.findingId
+        ? this.storage.agentProofForFinding(curRun.id, params.findingId)
+        : null
+    if (agentProof) {
+      const receiptFirst = await this.reverifyAgentScriptProof(curRun, params, agentProof)
+      if (receiptFirst) return receiptFirst
     }
     const parsed = declarativeReplaySpecSchema.parse(params.spec)
     const specOrigins = replaySpecOrigins(parsed)
