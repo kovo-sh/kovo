@@ -1489,44 +1489,80 @@ function synthSsti(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
   }]
 }
 
+/**
+ * Split-echo payload builders, keyed by the probe variant that actually executed on this target.
+ *
+ * The two verifier-minted halves must be (a) separated in the outbound request and (b) joined by the
+ * target's own evaluation, so plain reflection cannot satisfy the proof. They are separated by an
+ * empty quoted word (`''`): a shell's quoting pass deletes it and the halves become contiguous,
+ * while a raw echo of the input still carries the quotes. Command substitution is deliberately not
+ * used to join them: several interpreters (and the local shell model) render substitution output on
+ * its own line, so the assembled nonce is non-contiguous even though the command executed — the
+ * probe signal is real, but the proof would be lost.
+ */
+const splitEchoConnectors: Record<string, (base: string) => string> = {
+  semicolon_echo: base => `${base}; echo {{nonce_part1}}''{{nonce_part2}}`,
+  subshell_echo: base => `${base}$(echo {{nonce_part1}}''{{nonce_part2}})`,
+  quote_break: base => `${base}"; echo {{nonce_part1}}''{{nonce_part2}}; "`,
+  quote_break_id: base => `${base}"; id; echo {{nonce_part1}}''{{nonce_part2}}; "`,
+  pipe_echo: base => `${base} | echo {{nonce_part1}}''{{nonce_part2}}`,
+  backtick_echo: base => `${base}\`echo {{nonce_part1}}''{{nonce_part2}}\``,
+}
+
+/**
+ * Alternate join for the same connector: command substitution is expanded inside the argument, so
+ * a POSIX shell also produces the two halves contiguously. Tried only after the quoting shape is
+ * rejected (the engine stops at the first confirmed candidate), bounded to one extra request pair
+ * per signal. It covers a target that evaluates substitution but does not delete an empty quoted
+ * word; it is derived from the recorded probe variant, never from a fresh probe.
+ */
+const substitutionConnectors: Record<string, (base: string) => string> = {
+  semicolon_echo: base => `${base}; echo {{nonce_part1}}$(echo {{nonce_part2}})`,
+  subshell_echo: base => `${base}$(echo {{nonce_part1}})$(echo {{nonce_part2}})`,
+  quote_break: base => `${base}"; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
+  quote_break_id: base => `${base}"; id; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
+  pipe_echo: base => `${base} | echo {{nonce_part1}}$(echo {{nonce_part2}})`,
+  backtick_echo: base => `${base}\`echo {{nonce_part1}}$(echo {{nonce_part2}})\``,
+}
+
 function synthCommandInjection(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const hit = result.anomalies.find(a => a.type === 'command_executed')
   if (!hit || !hyp.param) return []
   const base = String(hit.baseValue ?? '127.0.0.1').slice(0, 64)
   const variant = String(hit.variant ?? 'semicolon_echo')
-  // The two nonces are joined by execution syntax, never literal adjacency, so plain reflection
-  // cannot satisfy the proof.
-  const templates: Record<string, string> = {
-    semicolon_echo: `${base}; echo {{nonce_part1}}$(echo {{nonce_part2}})`,
-    subshell_echo: `${base}$(echo {{nonce_part1}})$(echo {{nonce_part2}})`,
-    quote_break: `${base}"; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
-    quote_break_id: `${base}"; id; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
-    pipe_echo: `${base} | echo {{nonce_part1}}$(echo {{nonce_part2}})`,
-    backtick_echo: `${base}\`echo {{nonce_part1}}$(echo {{nonce_part2}})\``,
-  }
-  const template = templates[variant] ?? templates.semicolon_echo
   const control = requestParts(hyp, base)
-  const probe = requestParts(hyp, template)
-  if (!control || !probe) return []
+  if (!control) return []
   const jq = '{ controlPassed: (.control.status < 500), confirmed: (.proof.splitEchoVerified == true), ' +
     'observed: ("splitEcho=" + ((.proof.splitEchoVerified // false) | tostring)), expected: "shell metacharacters are inert data" }'
-  const out: SynthesizedEngineSpec[] = [{
-    kind: 'rce_proof',
-    vulnClass: 'command_injection',
-    endpoint: hyp.endpoint.pathTemplate,
-    spec: {
-      ...baseFields(hyp.endpoint.origin, 'Command injection via shell metacharacters (nonce echo proof)', 'CWE-78', 'injection-input', 'critical', jq),
+  const rceSpec = (template: string): SynthesizedEngineSpec | null => {
+    const probe = requestParts(hyp, template)
+    if (!probe) return null
+    return {
       kind: 'rce_proof',
-      proofMode: 'split_echo',
-      requiresTier3Approval: true,
-      controlStep: stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign value', control, hyp.ownerPersona),
-      probeStep: stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Verifier-minted split echo operands', probe, hyp.ownerPersona),
-    },
-  }]
-  // Some interpreters render a command substitution on its own line, so the assembled nonce is not
-  // contiguous even though it executed. The probe already proved the nonce appeared while the
-  // template did not; replay the same payload and assert the nonce is present but the payload is
-  // not reflected (plain reflection cannot satisfy both halves).
+      vulnClass: 'command_injection',
+      endpoint: hyp.endpoint.pathTemplate,
+      spec: {
+        ...baseFields(hyp.endpoint.origin, 'Command injection via shell metacharacters (nonce echo proof)', 'CWE-78', 'injection-input', 'critical', jq),
+        kind: 'rce_proof',
+        proofMode: 'split_echo',
+        requiresTier3Approval: true,
+        controlStep: stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign value', control, hyp.ownerPersona),
+        probeStep: stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Verifier-minted split echo operands', probe, hyp.ownerPersona),
+      },
+    }
+  }
+  // Reuse the connector shape the probe already proved executes on *this* parameter and evidence.
+  // The quoting shape comes first (contiguous under both a real shell and a line-oriented shell
+  // model); the substitution shape is the bounded fallback.
+  const out: SynthesizedEngineSpec[] = []
+  for (const connectors of [splitEchoConnectors, substitutionConnectors]) {
+    const built = rceSpec((connectors[variant] ?? connectors.semicolon_echo!)(base))
+    if (built) out.push(built)
+  }
+  // Fallback for a target whose shell model joins the halves differently: replay the exact payload
+  // the probe observed and assert the probe nonce is present while the sent payload is not
+  // reflected (plain reflection cannot satisfy both halves). This is bounded to one extra candidate
+  // and reuses recorded probe evidence — it never re-probes.
   const observedPayload = typeof hit.payload === 'string' ? hit.payload : ''
   const nonce = typeof hit.nonce === 'string' ? hit.nonce : ''
   if (observedPayload.length > 0 && observedPayload.length <= 200 && !/[\r\n\0]/.test(observedPayload) &&
