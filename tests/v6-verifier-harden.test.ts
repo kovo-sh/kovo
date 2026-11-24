@@ -1618,3 +1618,64 @@ test('units: a create-time amount overpost is not mass assignment without a cata
   const accepted = assessMassAssignmentImpact({ impactClass: 'mass_assignment', steps, oracleEvents: ['invariant_violation'] })
   assert.equal(accepted.satisfied, true, accepted.reason)
 })
+
+// ---------------------------------------------------------------------------
+// 14. A claim-declared resource tenant cannot manufacture a mirror boundary
+// ---------------------------------------------------------------------------
+
+test('units: a cross-tenant 404 cannot be a boundary for a same-tenant viewer write', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const other = { handle: 'persona_b', role: 'owner' as const, tenant: 'globex', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const viewer = { handle: 'viewer', role: 'viewer' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+
+  // The 45-min FP: viewer writes its own tenant's space; persona_b's 404 is on that same object
+  // (tenant isolation working). The claim declares the resource tenant as globex to look mirrored.
+  const forged = assessAuthorizationImpact({
+    impactClass: 'authorization',
+    resourceTenant: 'globex',
+    steps: [
+      { id: 'owner_before', arm: 'control', method: 'GET', route: '/api/spaces/s1', status: 200, actor: owner, json: { id: 's1', name: 'Alpha' } },
+      { id: 'cross_control', arm: 'control', method: 'PATCH', route: '/api/spaces/s1', status: 404, actor: other, requestJson: { name: 'x' } },
+      { id: 'viewer_patch', arm: 'probe', method: 'PATCH', route: '/api/spaces/s1', status: 200, actor: viewer, requestJson: { name: 'x' } },
+      { id: 'owner_after', arm: 'control', method: 'GET', route: '/api/spaces/s1', status: 200, actor: owner, json: { id: 's1', name: 'x' } },
+    ],
+  })
+  assert.equal(forged.satisfied, false, forged.reason)
+
+  // The legitimate mirrored case: the other tenant owns the object and reads it, then acme writes it.
+  const genuine = assessAuthorizationImpact({
+    impactClass: 'authorization',
+    resourceTenant: 'globex',
+    steps: [
+      { id: 'own_read', arm: 'control', method: 'GET', route: '/api/invoices/i2', status: 200, actor: other, json: { id: 'i2', owner: 'persona_b' } },
+      { id: 'acme_write', arm: 'probe', method: 'PATCH', route: '/api/invoices/i2', status: 200, actor: viewer, requestJson: { status: 'void' } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i2', status: 200, actor: other, json: { id: 'i2', status: 'void' } },
+    ],
+  })
+  assert.equal(genuine.satisfied, true, genuine.reason)
+})
+
+test('parity: a boundary claim alone cannot confirm a same-tenant viewer write', async () => {
+  const fx = await startFixture()
+  const server = await startRpc(fx)
+  try {
+    const id = (res: RpcResponse) => (res.result as { exchangeId: string }).exchangeId
+    const before = id(await rpc(server, 'http', { path: '/api/projects/p1', persona: 'persona_a' }))
+    const cross = id(await rpc(server, 'http', { path: '/api/projects/p1', method: 'PATCH', body: JSON.stringify({ name: 'x' }), persona: 'persona_b' }))
+    const probe = id(await rpc(server, 'http', { path: '/api/projects/p1', method: 'PATCH', body: JSON.stringify({ name: 'x' }), persona: 'viewer' }))
+    const after = id(await rpc(server, 'http', { path: '/api/projects/p1', persona: 'persona_a' }))
+    const claims: VerifyClaim[] = [
+      { kind: 'status', exchangeId: before, expected: 200 },
+      { kind: 'status', exchangeId: cross, expected: 404 },
+      { kind: 'status', exchangeId: probe, expected: 200 },
+      { kind: 'jsonpath', exchangeId: after, path: 'name', equals: 'x' },
+      { kind: 'boundary', boundaryClass: 'access', controlExchangeId: cross, probeExchangeId: probe },
+    ]
+    const res = oracleFor(server, "Same-tenant viewer can modify another user's private space via PATCH /api/spaces/:id (missing per-object ownership/role check)", claims)
+    assert.equal(res.passed, false, 'a cross-tenant 404 plus a same-tenant write is not impact')
+    assert.match(res.failures.join(' '), /impact: authorization claim|state-changing request|persisted-impact/i)
+  } finally {
+    await server.close()
+    await fx.close()
+  }
+})

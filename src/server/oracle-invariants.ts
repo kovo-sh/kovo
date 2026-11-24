@@ -224,7 +224,7 @@ function isCreateShapedProbe(step: ImpactStep): boolean {
 
 const CSRF_RE = /\bcsrf\b|cross[- ]site\s+request\s+forgery|CWE-352/i
 const MASS_ASSIGN_RE = /mass[- ]?assign|over[- ]?post|CWE-915/i
-const AUTHZ_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant)\b/i
+const AUTHZ_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|per[- ]object|object[- ]ownership|ownership[- ]check|same[- ]tenant|cross[- ]object|another user'?s)\b/i
 const AUTHZ_CWE_RE = /^CWE-(?:269|284|285|362|566|639|862|863|1021|1220)$/i
 const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- ]transition|invariant|business[- ]rule)\b/i
 const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472)$/i
@@ -503,13 +503,18 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // which is the app working, not a boundary the probe crossed.
   const probeTenant = probe?.actor.tenant ?? null
   const declaredResourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  // A claim-declared resource tenant is untrusted: the mirror direction only counts when an actor
+  // in that tenant actually read the same resource successfully (a control on the same object).
+  const mirrorCorroborated = declaredResourceTenant !== null && probe !== undefined && steps.some(step =>
+    step.actor.tenant === declaredResourceTenant &&
+    isReadMethod(step.method) &&
+    isSuccess(step.status) &&
+    sameRoute(step, probe))
   const peerDenial = (control: ImpactStep): boolean => {
     const tenant = control.actor.tenant ?? null
     if (tenant === null || probeTenant === null) return true
-    // Same-tenant peer (vertical BFLA) or the mirrored cross-tenant direction: the denied control
-    // lives in the resource tenant the probe crossed into (B denied on A while A writes B).
     return tenant === probeTenant ||
-      (declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
+      (mirrorCorroborated && declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
   }
   const boundaryControlDenied = deniedControls.some(control =>
     peerDenial(control) &&
@@ -941,11 +946,16 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   }
   const probeTenant = mutatingProbe.actor.tenant ?? null
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const mirrorCorroborated = resourceTenant !== null && steps.some(step =>
+    step.actor.tenant === resourceTenant &&
+    isReadMethod(step.method) &&
+    isSuccess(step.status) &&
+    sameRoute(step, mutatingProbe))
   const peerDenial = (control: ImpactStep): boolean => {
     const tenant = control.actor.tenant ?? null
     if (tenant === null || probeTenant === null) return true
     return tenant === probeTenant ||
-      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
+      (mirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
   }
   const boundaryControlDenied = steps.some(control =>
     control.arm === 'control' &&
@@ -1525,13 +1535,16 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     .map(step => boundarySignalOf(step, successFamilies))
     .filter((signal): signal is BoundarySignal => signal !== null)
     .filter(signal => firstProbeIndex < 0 || steps.indexOf(signal.step) < firstProbeIndex)
-  const probeActor = steps.find(step => step.arm === 'probe')?.actor ?? null
+  const probeStep = steps.find(step => step.arm === 'probe') ?? null
+  const probeActor = probeStep?.actor ?? null
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const boundaryMirrorCorroborated = resourceTenant !== null && probeStep !== null && steps.some(step =>
+    step.actor.tenant === resourceTenant && isReadMethod(step.method) && isSuccess(step.status) && sameRoute(step, probeStep))
   const peerSignal = signals.find(entry => {
     const tenant = entry.step.actor.tenant ?? null
     if (tenant === null || probeActor?.tenant == null) return true
     return tenant === probeActor.tenant ||
-      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
+      (boundaryMirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
   }) ?? null
   const signal = peerSignal ?? null
   const controlDenied = signal !== null
