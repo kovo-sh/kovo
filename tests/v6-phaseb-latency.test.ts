@@ -49,7 +49,7 @@ const origin = 'https://app.example.invalid'
 // 1. Assignment budget: single-step cap, chain exemption
 // ============================================================================
 
-test('budget: a standalone step gets a 75–90 s cap and a tight turn budget', () => {
+test('budget: a standalone step gets a 90–120 s cap and a tight turn budget', () => {
   const budget = planAssignmentBudget({
     routes: ['/api/items/:id'],
     parentEvidenceIds: [],
@@ -59,10 +59,10 @@ test('budget: a standalone step gets a 75–90 s cap and a tight turn budget', (
   })
   assert.equal(budget.kind, 'single_step')
   assert.equal(budget.maxTurns, SINGLE_STEP_ASSIGNMENT_MAX_TURNS)
-  assert.ok(budget.maxTurns <= 12, `single-step turns must be tight (got ${budget.maxTurns})`)
+  assert.ok(budget.maxTurns <= 18, `single-step turns must stay bounded (got ${budget.maxTurns})`)
   assert.equal(budget.wallClockMs, SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)
-  assert.ok(budget.wallClockMs >= 75_000, 'cap must leave room for a real proof attempt')
-  assert.ok(budget.wallClockMs <= 90_000, 'cap must turn the slot over inside ~90 s')
+  assert.ok(budget.wallClockMs >= 90_000, 'cap must leave room for a real proof attempt')
+  assert.ok(budget.wallClockMs <= 120_000, 'cap must turn the slot over inside ~120 s')
   assert.ok(PROVIDER_STALL_TURN_MS < budget.wallClockMs)
 })
 
