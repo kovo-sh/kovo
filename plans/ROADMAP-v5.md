@@ -586,3 +586,18 @@ xben stayed 25/25 (the probe maps `tautology` → `or_branch` so legacy builders
 | 8 | +6pp is likely within reach without a new capability class: funnel math on 25 route hits × 50% spec × 35–50% confirm ⇒ +4–6 targets | **NOTED** | measurement pending |
 
 **Claim status:** agentic-lift certification remains **halted** until the store invariant lands and a clean held-out cell exists.
+
+### 2026-11-24 — grounded SQLi pair reaches the live (recipe) path
+
+`sqli-baseline2` answered the "which edits are actually live after Cut 3a" question by reading the code instead of assuming:
+
+| Edit | Verdict |
+|---|---|
+| `execution.ts` grounded spec | **not live** — `--no-llm` runs `deterministicOnly`, so the inline spec pass is never reached; reverted, lease released |
+| `deterministic-specs.ts` grounded fields + `tautology` | **not live** — wired `sql_boolean_diff/sqli` confirms via the recipe and persists `recipeSpecRecord(recordGeneratedFromArgs)`, never the synthesized spec; reverted |
+| `replay-verifier.ts` echo scrub | **kept** — `verifyReplaySpec` is still reached by verification workers and patch retest, so the legacy branch is live; receipt rule already scrubbed, this covers the legacy branch |
+| `floor-recipe-engine.ts` + `floor-recipes.ts` | **new and required** — the planner was replaying `hyp.baselineValue` (a seed literal); it now carries the probe anomaly's grounded `baselineValue`/`valueTemplate`/`quoteStyle` into the recorded spec so patch retest replays the same pair |
+
+Validation on the reduced tree: dev **34/59** (3 runs, 0 spread, 100%), xben 25/25, held-out-saas 20/20 + 20/20 patches, held-out **24/58** @100%. Dev shopflow confirms `/api/v1/search` sqli through `boolean_or_timing` (`deterministic_engine.recipe_confirmed`).
+
+**Sharpened held-out diagnosis:** `/api/v1/search` *does* declare a param (`searchQuery`); the floor still never creates an `sqli_boolean` hypothesis for it (only `mass_assignment` probes the route). So the gap is **param anchoring for a class**, not necessarily param discovery — `param-discovery` has been asked to distinguish (A) missing param vs (B) present-but-not-anchored and to report the rejecting predicate if it lives outside its lease.
