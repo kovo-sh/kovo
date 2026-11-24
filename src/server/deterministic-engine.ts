@@ -768,6 +768,11 @@ export function endpointRiskScore(endpoint: EngineEndpoint): number {
   if (pathHasRedirectHint(bare)) score += 10
   if (/(?:token|tokens|key|keys|secret|secrets|activity|audit|config|settings)/i.test(bare)) score += 10
   if (/(?:^|\/)(?:login|auth|token|sso|whoami|session)(?:\/|$)/i.test(bare)) score += 6
+  // Reporting / integration reads are machine-to-machine surfaces that typically authenticate with
+  // a bearer token rather than the browser session, so they are a real signed-token boundary. The
+  // engine's 120-route prefix is otherwise filled by generated `/vN` noise, which is how a
+  // reporting endpoint was excluded before any hypothesis could form.
+  if (/(?:^|\/)(?:reports?|analytics|metrics|statistics|stats|dashboards?|sales|revenue|ledger|integrations?|partners?)(?:\/|$)/i.test(bare)) score += 22
   if (endpoint.source === 'conventional') score -= 15
   if ((endpoint.sinkKinds ?? []).length > 0) score += 10
   const depth = bare.split('/').filter(Boolean).length
@@ -1286,7 +1291,7 @@ export interface EnumerateOptions {
   classes?: ReadonlySet<string>
   /** Actor identity routes per origin (self-service observable state for privileged mutations). */
   identityProfiles?: ReadonlyMap<string, IdentityProfile>
-  /** Environment contract: multi-step price/race conversion probes are isolated-lab/staging only. */
+  /** Environment contract: multi-step price/race conversion probes run in staging or an ephemeral lab, never in prod_readonly. */
   environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
   /** Structured quota-reservation decisions, one per class holding verified reading-param evidence. */
   onQuotaReservation?: (event: QuotaReservationEvent) => void
@@ -2048,7 +2053,11 @@ export function enumerateHypotheses(
     // tampered client price (probe), so confirmation is a value invariant, never a status claim.
     const terminalMoneyVerb = /^(?:pay|payment|purchase|checkout|settle|charge|complete|confirm|place-?order|submit-?order)$/i
     const producerVerb = /^(?:start|create|new|init|begin|prepare|open|cart|session)$/i
-    const conversionEnvironment = options.environmentMode === 'staging_isolated'
+    // Multi-step price/race conversion probes are safe in any disposable environment. Only a
+    // production read-only engagement must never form them; `ephemeral_lab` is the benchmark's
+    // isolated lab and is exactly where a race/price proof is legitimate.
+    const conversionEnvironment = options.environmentMode === 'staging_isolated' ||
+      options.environmentMode === 'ephemeral_lab'
     if (conversionEnvironment && method === 'POST' && terminalMoneyVerb.test(lastSegment)) {
       const parent = pathSegments.slice(0, -1).join('/')
       const producer = endpoints
@@ -2085,6 +2094,25 @@ export function enumerateHypotheses(
     const createOnly = /^(?:start|create|new|init|begin|prepare|open|quote|preview|estimate)$/i
     if (conversionEnvironment && method === 'POST' && options.tier >= 2 && !createOnly.test(lastSegment) &&
         !/__|cleanup|orphan|health|healthz/i.test(bare) && raceHint.test(bare)) {
+      // A race needs (a) a concrete object id and (b) a readable state surface for the conserved
+      // value. Both are derived from the route family, never from a benchmark literal: the id pool
+      // comes from the harvest and the readback is the collection GET above the mutation.
+      const raceCollection = collectionPathOf(bare)
+      const raceRead = raceCollection
+        ? endpoints.find(candidate => candidate.method.toUpperCase() === 'GET' &&
+            (candidate.pathTemplate.split('?')[0] || '/') === raceCollection) ??
+          endpoints.find(candidate => {
+            const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+            return candidate.method.toUpperCase() === 'GET' &&
+              candidatePath.startsWith(`${raceCollection}/`) && hasDynamicIdSegment(candidatePath)
+          })
+        : undefined
+      // The mutation route rarely harvests its own objects, so the id pool comes from the route's
+      // own harvest first and the collection read's harvest second (both are evidence, not guesses).
+      const collectionHarvest = raceRead ? harvests.get(raceRead.id) : undefined
+      const raceIds = [...(harvest?.otherIds ?? []), ...(collectionHarvest?.otherIds ?? [])]
+        .filter((id, index, all) => /^[A-Za-z0-9_.:-]{1,64}$/.test(id) && all.indexOf(id) === index)
+        .slice(0, 8)
       add({
         key: `race_burst|${endpoint.id}`,
         endpoint,
@@ -2094,6 +2122,8 @@ export function enumerateHypotheses(
         pathAndQuery: bare,
         ownerPersona: picks.owner?.handle,
         raceBurst: true,
+        ...(raceIds.length > 0 ? { resourceIds: raceIds } : {}),
+        ...(raceRead ? { readbackPath: raceRead.pathTemplate.split('?')[0] || '/' } : {}),
         jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
         risk: endpointRiskScore(endpoint) + (observedFields.some(field => /amount|quantity|qty|count|balance|stock/i.test(field)) ? 18 : 6),
       })
@@ -3949,7 +3979,8 @@ export function classifyRaceMode(input: {
  * pre/post read of the conserved value. A burst that did not use the HTTP/2 barrier is reported as
  * a fallback and never becomes a finding.
  */
-async function probeRaceDoubleSpend(
+/** Exported for the focused unit suite (`tests/v7-capability-misses.test.ts`). */
+export async function probeRaceDoubleSpend(
   hyp: EngineHypothesis,
   input: DeterministicEngineInput,
   track: (exchange: BrokerExchangeResult) => void | string,
@@ -3958,20 +3989,48 @@ async function probeRaceDoubleSpend(
   const base = emptyDifferential(hyp, 'No synchronized over-count was observed for this state-changing route.')
   const exchangeIds: string[] = []
   let requests = 0
+  // The declared path may still carry an object placeholder (`{{id}}` / `:id`). A race on a
+  // collection path is meaningless (it would create new objects), so the id must be resolved from
+  // the hypothesis' harvested ids or a collection GET before any request is sent.
+  let racePath = hyp.pathAndQuery.split('?')[0]!
+  const placeholderRe = /\{\{[^}]+\}\}|\{[^}]+\}|:(?:id|userId|resourceId|itemId|accountId|cardId|orderId)\b/i
+  const substituteId = (path: string, id: string | null): string =>
+    id === null ? path : path.replace(placeholderRe, encodeURIComponent(id))
+  const recordId = (exchange: BrokerExchangeResult | null): void => {
+    if (!exchange) return
+    const id = track(exchange)
+    if (typeof id === 'string') exchangeIds.push(id)
+  }
+  const sendGet = async (origin: string, path: string): Promise<BrokerExchangeResult | null> => {
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin,
+        method: 'GET',
+        pathAndQuery: path,
+        persona: hyp.ownerPersona,
+        timeoutMs: 10_000,
+      }, input.grant, input.signal)
+      requests += 1
+      recordId(exchange)
+      return exchange
+    } catch {
+      requests += 1
+      return null
+    }
+  }
   const send = async (origin: string, body: Record<string, unknown>): Promise<BrokerExchangeResult | null> => {
     try {
       const exchange = await input.broker.executeHttp({
         origin,
         method: 'POST',
-        pathAndQuery: hyp.pathAndQuery.split('?')[0]!,
+        pathAndQuery: racePath,
         headers: { 'Content-Type': 'application/json', ...(hyp.headers ?? {}) },
         body: JSON.stringify(body),
         persona: hyp.ownerPersona,
         timeoutMs: 10_000,
       }, input.grant, input.signal)
       requests += 1
-      const id = track(exchange)
-      if (typeof id === 'string') exchangeIds.push(id)
+      recordId(exchange)
       return exchange
     } catch {
       requests += 1
@@ -3981,43 +4040,143 @@ async function probeRaceDoubleSpend(
   // The declared route may be served by a sibling origin (e.g. an h2c transfer service). Try the
   // declared origin first, then other in-scope origins, and keep the first that accepts the shape.
   const origins = [...new Set([hyp.endpoint.origin, ...input.endpoints.map(endpoint => endpoint.origin)])].slice(0, 4)
-  let raceOrigin: string | null = null
-  let record: Record<string, unknown> | null = null
-  for (const origin of origins) {
-    const shaped = await send(origin, {})
-    if (!shaped || shaped.status < 200 || shaped.status >= 300) continue
-    const parsed = jsonRecordOf(shaped.body)
-    if (!parsed || numericEntries(parsed).length === 0) continue
-    raceOrigin = origin
-    record = parsed
-    break
+
+  // Resolve the addressed object before sending a mutation. Prefer ids the harvest already
+  // observed; otherwise read the family collection and take an id-shaped field.
+  const idOf = (value: unknown): string | null => {
+    if (typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(value)) return value
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+    return null
   }
-  if (!raceOrigin || !record) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
-  const balancePair = numericEntries(record).find(([field]) => /balance|available|remaining/i.test(field)) ??
-    numericEntries(record).sort((a, b) => b[1] - a[1])[0]
-  if (!balancePair) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
-  const balanceField = balancePair[0]
-  const baselineBalance = balancePair[1]
-  const candidates = ['amount', 'value', 'quantity', 'qty', 'total', 'price', 'count', 'units', 'seats', 'credits']
-  let amountField: string | null = null
-  let transferredField: string | null = null
-  for (const candidate of candidates.slice(0, 5)) {
-    const attempt = await send(raceOrigin, { [candidate]: 1 })
-    if (!attempt || attempt.status < 200 || attempt.status >= 300) continue
-    const parsed = jsonRecordOf(attempt.body)
-    if (!parsed) continue
-    const nums = numericEntries(parsed)
-    const echo = nums.find(([field, value]) => value === 1 && /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))
-    const observed = nums.find(([field]) => field === balanceField)?.[1]
-    const movedByOne = observed !== undefined && baselineBalance - observed === 1
-    if (echo || movedByOne) {
-      amountField = candidate
-      transferredField = echo?.[0] ?? null
-      break
+  const firstId = (value: unknown, depth = 0): string | null => {
+    if (depth > 3 || value === null || value === undefined) return null
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 8)) {
+        const found = firstId(item, depth + 1)
+        if (found) return found
+      }
+      return null
+    }
+    if (typeof value !== 'object') return null
+    const record = value as Record<string, unknown>
+    for (const key of ['id', 'external_id', 'externalId', 'uuid', 'code', 'reference', 'ref']) {
+      const found = idOf(record[key])
+      if (found) return found
+    }
+    for (const item of Object.values(record)) {
+      const found = firstId(item, depth + 1)
+      if (found) return found
+    }
+    return null
+  }
+  let resolvedId = hyp.resourceIds?.[0] ?? null
+  if (!resolvedId && placeholderRe.test(racePath) && hyp.readbackPath) {
+    for (const origin of origins) {
+      const collection = await sendGet(origin, hyp.readbackPath)
+      if (!collection || collection.status < 200 || collection.status >= 300) continue
+      const parsed = jsonRecordOf(collection.body)
+      resolvedId = firstId(parsed)
+      if (resolvedId) break
     }
   }
+  if (!resolvedId && placeholderRe.test(racePath)) {
+    return {
+      ...base,
+      summary: 'The race route addresses an object by id, but no object id could be resolved from the harvest or the family readback.',
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  racePath = substituteId(racePath, resolvedId)
+
+  // A collection readback may be a bare array; the conserved value lives on the first row.
+  const readableRecord = (body: string | undefined): Record<string, unknown> | null => {
+    if (!body) return null
+    let parsed: unknown
+    try { parsed = JSON.parse(body) } catch { return null }
+    if (Array.isArray(parsed)) {
+      const first = parsed.find(item => item !== null && typeof item === 'object')
+      return first ? first as Record<string, unknown> : null
+    }
+    return parsed !== null && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+  }
+
+  let raceOrigin: string | null = null
+  let balanceField: string | null = null
+  let baselineBalance = 0
+  let amountField: string | null = null
+  let transferredField: string | null = null
+
+  // Preferred baseline: read the conserved value through the family readback. This is read-only,
+  // so unlike the legacy shape probe it cannot mutate the state before the burst.
+  if (hyp.readbackPath) {
+    for (const origin of origins) {
+      const read = await sendGet(origin, hyp.readbackPath)
+      if (!read || read.status < 200 || read.status >= 300) continue
+      const parsed = readableRecord(read.body)
+      const pair = numericEntries(parsed).find(([field]) => /balance|available|remaining|stock|on_?hand|quantity|credits?|points?/i.test(field))
+      if (!pair) continue
+      raceOrigin = origin
+      balanceField = pair[0]
+      baselineBalance = pair[1]
+      break
+    }
+    if (raceOrigin) {
+      amountField = Object.keys(hyp.jsonBody ?? {})
+        .find(field => /^(?:amount|value|quantity|qty|count|units|seats|credits|total)$/i.test(field)) ?? null
+    }
+  }
+
+  // Legacy shape probe: no readable baseline, so infer the conserved field and the amount field
+  // from a single shaped request (kept for routes whose readback is not exposed).
+  if (!raceOrigin) {
+    let record: Record<string, unknown> | null = null
+    for (const origin of origins) {
+      const shaped = await send(origin, {})
+      if (!shaped || shaped.status < 200 || shaped.status >= 300) continue
+      const parsed = jsonRecordOf(shaped.body)
+      if (!parsed || numericEntries(parsed).length === 0) continue
+      raceOrigin = origin
+      record = parsed
+      break
+    }
+    if (!raceOrigin || !record) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+    const balancePair = numericEntries(record).find(([field]) => /balance|available|remaining/i.test(field)) ??
+      numericEntries(record).sort((a, b) => b[1] - a[1])[0]
+    if (!balancePair) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+    balanceField = balancePair[0]
+    baselineBalance = balancePair[1]
+    const candidates = ['amount', 'value', 'quantity', 'qty', 'total', 'price', 'count', 'units', 'seats', 'credits']
+    for (const candidate of candidates.slice(0, 5)) {
+      const attempt = await send(raceOrigin, { [candidate]: 1 })
+      if (!attempt || attempt.status < 200 || attempt.status >= 300) continue
+      const parsed = jsonRecordOf(attempt.body)
+      if (!parsed) continue
+      const nums = numericEntries(parsed)
+      const echo = nums.find(([field, value]) => value === 1 && /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))
+      const observed = nums.find(([field]) => field === balanceField)?.[1]
+      const movedByOne = observed !== undefined && baselineBalance - observed === 1
+      if (echo || movedByOne) {
+        amountField = candidate
+        transferredField = echo?.[0] ?? null
+        break
+      }
+    }
+  }
+
+  if (!balanceField) {
+    return { ...base, summary: 'No conserved numeric field was observed on the race family; the burst shape is unknown.', requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  }
+
   if (!amountField) {
-    return { ...base, summary: 'No numeric request field changed the conserved value; the burst shape is unknown.', requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+    return {
+      ...base,
+      summary: 'The race route has no discoverable numeric request field, so the burst amount is unknown; refusing to claim a race from acknowledgements alone.',
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
   }
   if (!transferredField) {
     const zero = await send(raceOrigin, { [amountField]: 0 })
@@ -4026,6 +4185,14 @@ async function probeRaceDoubleSpend(
   }
   if (!transferredField) transferredField = amountField
   const readBalance = async (): Promise<number | null> => {
+    // Prefer the read-only family readback; a zero-amount POST is the fallback for routes that do
+    // not expose one.
+    if (hyp.readbackPath) {
+      const read = await sendGet(raceOrigin!, hyp.readbackPath)
+      const parsed = read ? readableRecord(read.body) : null
+      const value = parsed ? numericEntries(parsed).find(([field]) => field === balanceField)?.[1] : undefined
+      if (value !== undefined) return value
+    }
     const read = await send(raceOrigin!, { [amountField!]: 0 })
     const parsed = read ? jsonRecordOf(read.body) : null
     const value = numericEntries(parsed).find(([field]) => field === balanceField)?.[1]
@@ -4036,6 +4203,11 @@ async function probeRaceDoubleSpend(
     return { ...base, summary: 'The conserved value could not be read before the burst.', requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
   }
   const burstSize = 4
+  // Burst the largest per-request amount the conserved value can fund **twice** over: the burst
+  // itself plus the serial control that follows it. A correct server then debits exactly what it
+  // acknowledged and a racy one debits less; falling back to 1 keeps the classic single-ticket
+  // over-count arm intact.
+  const burstAmount = Math.max(1, Math.min(Math.floor(pre / (burstSize * 2)), burstSize))
   const grant = input.grant
   let burst: Awaited<ReturnType<RequestBroker['executeRaceBurst']>>
   try {
@@ -4045,7 +4217,7 @@ async function probeRaceDoubleSpend(
         method: 'POST' as const,
         pathAndQuery: hyp.pathAndQuery.split('?')[0]!,
         headers: { 'Content-Type': 'application/json', ...(hyp.headers ?? {}) },
-        body: JSON.stringify({ [amountField!]: 1 }),
+        body: JSON.stringify({ [amountField!]: burstAmount }),
         persona: hyp.ownerPersona,
       })),
       grant,
@@ -4075,13 +4247,17 @@ async function probeRaceDoubleSpend(
     .map(rec => numericEntries(rec).find(([field]) => field === balanceField)?.[1])
     .filter((value): value is number => value !== undefined)
   const burstAcks = burst.results.filter(result => result.status >= 200 && result.status < 300).length
-  const burstTransferred = burstRecords.reduce((total, rec) =>
+  // Acknowledged transfer: prefer an explicit echo of the transferred field; otherwise every 2xx
+  // acknowledgement of a request carrying `amount` IS a claim that the amount moved. The conserved
+  // readback is what decides whether it actually moved.
+  const echoedTransferred = burstRecords.reduce((total, rec) =>
     total + (numericEntries(rec).find(([field]) => field === transferredField)?.[1] ?? 0), 0)
+  const burstTransferred = echoedTransferred > 0 ? echoedTransferred : burstAcks * burstAmount
   const burstDebit = pre - post
   // Serial control: the same N requests one at a time must debit N. Read the conserved value again.
   let serialAcks = 0
   for (let i = 0; i < burstSize; i += 1) {
-    const serial = await send(raceOrigin, { [amountField]: 1 })
+    const serial = await send(raceOrigin, { [amountField]: burstAmount })
     if (serial && serial.status >= 200 && serial.status < 300) serialAcks += 1
   }
   const serialPost = await readBalance()
@@ -4099,6 +4275,7 @@ async function probeRaceDoubleSpend(
     balanceField,
     transferredField,
     burstSize,
+    burstAmount,
     burstAcks,
     burstTransferred,
     preBalance: pre,
@@ -4120,8 +4297,9 @@ async function probeRaceDoubleSpend(
       durationMs: Date.now() - started,
     }
   }
-  const overCount = burstAcks === burstSize && burstTransferred >= burstSize && burstDebit >= 1 && burstDebit < burstSize
-  const serialControl = serialAcks === burstSize && serialDebit === burstSize
+  const overCount = burstAcks === burstSize && burstTransferred >= burstSize * burstAmount &&
+    burstDebit >= 1 && burstDebit < burstTransferred
+  const serialControl = serialAcks === burstSize && serialDebit === burstSize * burstAmount
   if (!(overCount && serialControl)) {
     return {
       ...base,
@@ -4138,12 +4316,12 @@ async function probeRaceDoubleSpend(
     summary: `${burstSize} same-ticket transfers were acknowledged but the balance was debited ${burstDebit} time(s); the serial control debited all ${serialDebit}.`,
     anomalies: [{
       type: 'race_double_spend',
-      path: hyp.pathAndQuery.split('?')[0],
+      path: racePath,
       raceOrigin,
       amountField,
       balanceField,
       transferredField,
-      amount: 1,
+      amount: burstAmount,
       burstSize,
       burstAcks,
       burstTransferred,
@@ -4644,7 +4822,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     ssti: capFor(3),
     command_injection: capFor(3),
     webhook: capFor(2),
-    auth_protocol: capFor(2),
+    auth_protocol: capFor(3),
   }
   const intentUsed: Record<string, number> = {}
   // CSRF probes on sibling transitions of one resource family share the same session/cookie
