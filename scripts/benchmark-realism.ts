@@ -707,7 +707,11 @@ export interface WiringMetricValues {
   oobDrainWaitedMs: number | null
   /** Subscriptions promoted after the immediate correlation window. */
   lateCallbacksMatched: number | null
-  /** `promotedLate` recorded by the bounded drain event. */
+  /**
+   * Late OOB conversions promoted into findings. Counted from `oob.receipt_confirmed`
+   * subscription events (authoritative) and the drain event's `promotedReceipts`; falls back to
+   * the bounded-drain `promotedLate` counter only when no conversion evidence exists.
+   */
   latePromotions: number | null
   /** Blocking approval requests (manual/pending), never auto-review audit rows. */
   approvalBlocks: number | null
@@ -976,6 +980,57 @@ interface OobRunMetrics {
   latePromoted: number
 }
 
+/**
+ * Count OOB subscriptions the engine actually converted through `ProofReceipt`.
+ *
+ * The bounded drain counter (`oob.drain_complete.promotedLate`) only sees relay promotions queued
+ * after the drain started. A late callback that landed while the last verification worker was
+ * finishing is converted by the pre-drain `promoteReceiptOob` pass instead, so the drain counter
+ * stays at zero even though findings were created. `oob.receipt_confirmed` is emitted once per
+ * converted subscription and is the authoritative "promoted into a finding" count.
+ *
+ * Distinct subscriptions are counted once even if a retry emitted a second confirmation. An event
+ * without a subscription id still counts once (the conversion happened).
+ */
+export function countReceiptPromotions(events: RunEventRow[] | null): number | null {
+  if (events === null) return null
+  const subscriptions = new Set<string>()
+  let unidentified = 0
+  for (const event of events) {
+    if (event.kind !== 'oob.receipt_confirmed') continue
+    const id = event.detail?.oobSubscriptionId
+    if (typeof id === 'string' && id.length > 0) subscriptions.add(id)
+    else unidentified += 1
+  }
+  return subscriptions.size + unidentified
+}
+
+/**
+ * Resolve the reported `latePromotions` from conversion evidence, falling back to the drain
+ * counter for runs where the receipt event path was not recorded.
+ *
+ * Conversion events win because they match the finding count the gate is about; the drain counter
+ * remains a legacy/fallback measurement when no conversion evidence is available.
+ */
+export function resolveLatePromotions(input: {
+  /** `promotedLate` meta from the latest `oob.drain_complete` event. */
+  drainPromotedLate: number | null
+  /** `promotedReceipts` meta from the same drain event (conversions attributed by the drain). */
+  drainPromotedReceipts: number | null
+  /** Distinct `oob.receipt_confirmed` subscriptions (null when the event log is unreadable). */
+  receiptConfirmed: number | null
+}): number | null {
+  const converted = Math.max(input.receiptConfirmed ?? 0, input.drainPromotedReceipts ?? 0)
+  if (converted > 0) return converted
+  if (input.drainPromotedLate !== null) return input.drainPromotedLate
+  if (input.receiptConfirmed !== null) return 0
+  return null
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
 /** Read the per-run OOB relay rows. The relay lives beside the run store in the cell data dir. */
 function readOobRunMetrics(dataDir: string, runId: string): OobRunMetrics | null {
   const path = join(dataDir, 'oob-relay.sqlite')
@@ -1186,11 +1241,14 @@ export function collectWiringMetrics(input: {
   const oobDrainWaitedMs = typeof drainEvent?.detail?.oobDrainMs === 'number'
     ? Number(drainEvent.detail.oobDrainMs)
     : null
-  const latePromotions = typeof drainEvent?.detail?.promotedLate === 'number'
-    ? Number(drainEvent.detail.promotedLate)
-    : null
+  const drainPromotedLate = numberOrNull(drainEvent?.detail?.promotedLate)
+  const drainPromotedReceipts = numberOrNull(drainEvent?.detail?.promotedReceipts)
+  const receiptConfirmed = countReceiptPromotions(events)
 
   const oob = readOobRunMetrics(input.dataDir, input.runId)
+  // Conversion events are authoritative; the drain counter alone misses receipts converted before
+  // the bounded drain started (see countReceiptPromotions).
+  const latePromotions = resolveLatePromotions({ drainPromotedLate, drainPromotedReceipts, receiptConfirmed })
   const leads = readProgramGraphLeads(input.storage, input.runId)
 
   const approvalRequestsCreated = countSql(

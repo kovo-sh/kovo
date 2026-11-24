@@ -34,14 +34,39 @@ npm run smoke:agentic -- --tier 0
 | `lift` | acme-saas post-floor snapshot | 300 s | paired net-new, floor preservation, precision 100% |
 | `rotation` | shopflow **or** opsportal post-floor snapshot | 300 s | precision 100% |
 | `trap` | hardened zero-vuln fixture with writable-looking decoys | 240 s | **0 confirmed** |
-| `micro` | realism #2 async OOB, #3 staging race/write-BOLA, #4 4-hop Tier-A sink | 300 s each | wiring and capability reported separately |
+| `micro` | realism #2 async OOB, #3 staging race/write-BOLA (300 s grey-box); #4 4-hop Tier-A sink (white-box, 420 s cold fallback) | 300 s each | wiring and capability reported separately; `latePromotions` and snapshot state printed |
 
 Cell 2 rotates by `--cell-index` (or day of year when omitted). If the post-floor
 snapshot is missing, the cell falls back to a cold run and captures a snapshot for
 next time. Every cell gets an isolated data dir, so the four cells run concurrently.
 
+### Post-recon snapshot for the #4 micro-slice
+
+The lift/rotation cells resume from a `benchmark-realistic.ts` post-floor
+checkpoint. `monorepo-whitebox` is different: it runs through
+`scripts/benchmark-realism.ts`, which boots the fixture and the full `Execution`
+loop. **Exact blocker:** that harness has no `--resume-recon-snapshot` /
+`--snapshot-after-recon` flag (only `benchmark-realistic.ts` exposes
+`--resume-snapshot` / `--snapshot-after-floor`), so it cannot yet capture or
+consume a resumable post-recon checkpoint. The micro-slice therefore:
+
+1. probes `<snapshot-root>/realism/monorepo-whitebox-seed<n>-post-recon/snapshot.json`;
+2. reports `snapshot` when a harness advertises resume support and the marker
+   exists, otherwise `unsupported` (marker present, harness cannot resume) or
+   `cold` (no marker);
+3. falls back to a **bounded** cold slice of `--micro-recon-timeout-sec` (default
+   420 s, white-box so AST 4-hop chains are visible) instead of timing out
+   silently at 180 s;
+4. records `snapshot=<state>`, the per-fixture timeout and `latePromotions` in the
+   cell detail (and the `snap`/`late` compact-table columns). A timeout with no
+   artifact becomes a cell `error`, never a silent zero.
+
+Remove the fallback once `scripts/benchmark-realism.ts` learns
+`--resume-recon-snapshot`; `resolveMicroSlice` already consumes it through the
+`resumeSupported` branch.
+
 ```bash
-npm run smoke:agentic -- --tier 1 --out-dir /tmp/smoke
+npm run smoke:agentic -- --tier 1 --out-dir /tmp/smoke --micro-recon-timeout-sec 420
 ```
 
 The lift cell compares the resumed run against
@@ -66,8 +91,10 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-realistic.ts \
 - <= $0.80 per cell.
 
 Exit code is 0 only when Tier 0 passes and every Tier 1 gate passes. The compact
-table is printed on stdout; the full shape is written to
-`<out-dir>/smoke-report.json` (add `--json` to print it).
+table is printed on stdout; it includes `late` (OOB conversions promoted into
+findings) and `snap` (post-recon snapshot state, e.g. `cold+420s`) so a cold
+micro-slice is never mistaken for a snapshot-backed one. The full shape is written
+to `<out-dir>/smoke-report.json` (add `--json` to print it).
 
 ## Tier 2 — documented, not run by default
 
