@@ -236,6 +236,10 @@ function skipBalanced(src: string, i: number, state: ParseState, open: string, c
   while (i < src.length) {
     const c = src[i]!
     if (c === '"') { i = readString(src, i, state).i; continue }
+    if (c === '#') {
+      while (i < src.length && src[i] !== '\n' && src[i] !== '\r') { i++; tick(state) }
+      continue
+    }
     if (c === open) depth++
     else if (c === close) {
       depth--
@@ -265,6 +269,10 @@ function readValue(src: string, i: number, state: ParseState): { value: string; 
     while (i < src.length) {
       const ch = src[i]!
       if (ch === '"') { i = readString(src, i, state).i; continue }
+      if (ch === '#') {
+        while (i < src.length && src[i] !== '\n' && src[i] !== '\r') { i++; tick(state) }
+        continue
+      }
       if (ch === '[' || ch === '{') { closers.push(ch === '[' ? ']' : '}'); i++; tick(state); continue }
       if (ch === ']' || ch === '}') {
         const expected = closers.pop()!

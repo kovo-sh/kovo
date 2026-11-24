@@ -134,6 +134,10 @@ test('leading/trailing whitespace, comments and comma separators are ignored', (
     executeGraph('  \n\t{ items ( first : 5 , other : "x y" ) # trailing comment\n { id } }  \n', fields, {}),
     { items: [{ id: 'i1' }, { id: 'i2' }] },
   )
+  assert.deepEqual(
+    executeGraph('{ hero { label } # comment with a stray } brace\n }', fields, {}),
+    { hero: { label: 'hero-label' } },
+  )
   assert.deepEqual(executeGraph('', fields, {}), {})
   assert.deepEqual(executeGraph('   ', fields, {}), {})
 })
