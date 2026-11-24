@@ -106,10 +106,26 @@ export default function register(app: AppContext): void {
     return ctx.json({ id: ext, token }, 201)
   })
 
+  // The settings document is a fixed-schema merchant config (currency/timezone/…), not a free-form
+  // bag: merge allow-listed keys into the stored object and reject anything else, so a caller cannot
+  // persist arbitrary security-looking fields (a `role`, a `providerKey`, …) into their own config.
+  // The planted settings leak reads the provider_key/webhook_secret columns, so this changes no target.
+  const SETTINGS_KEYS = new Set(['currency', 'timezone', 'locale', 'theme', 'dateFormat'])
   app.route('updateSettings', (ctx) => {
     if (!guard(ctx)) return ctx.json({ error: 'unauthorized' }, 401)
     if (!privileged(ctx)) return ctx.json({ error: 'forbidden' }, 403)
-    db.run('UPDATE store_config SET settings_json = ? WHERE store_id = ?', [JSON.stringify(body(ctx).settings ?? {}), ctx.tenant])
-    return ctx.json({ ok: true })
+    const patch = body(ctx).settings
+    if (patch !== undefined && (patch === null || typeof patch !== 'object' || Array.isArray(patch))) {
+      return ctx.json({ error: 'invalid_settings' }, 400)
+    }
+    const supplied = (patch ?? {}) as Record<string, unknown>
+    const unknown = Object.keys(supplied).filter(key => !SETTINGS_KEYS.has(key))
+    if (unknown.length > 0) return ctx.json({ error: 'unknown_setting', keys: unknown.slice(0, 8) }, 400)
+    const cfg = db.get<{ settings_json: string }>('SELECT settings_json FROM store_config WHERE store_id = ?', [ctx.tenant])
+    let current: Record<string, unknown> = {}
+    try { current = cfg ? JSON.parse(cfg.settings_json) as Record<string, unknown> : {} } catch { current = {} }
+    const merged = { ...current, ...supplied }
+    db.run('UPDATE store_config SET settings_json = ? WHERE store_id = ?', [JSON.stringify(merged), ctx.tenant])
+    return ctx.json({ ok: true, settings: merged })
   })
 }
