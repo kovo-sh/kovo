@@ -12,6 +12,7 @@ import {
   assessImpactEvidence,
   assessInjectionImpact,
   assessStatusOnlyDivergence,
+  classifyImpactDescriptor,
 } from '../src/server/oracle-invariants.ts'
 import type { ImpactStep } from '../src/server/oracle-invariants.ts'
 import { receiptRuleFor, verifyReceipt } from '../src/server/proof-receipt.ts'
@@ -61,6 +62,12 @@ function opsportalShape(): ImpactStep[] {
     }),
   ]
 }
+
+test('status-diff guard: the injection-input category is a machine-readable injection label', () => {
+  assert.equal(classifyImpactDescriptor({ category: 'injection-input', cwe: 'CWE-20' }), 'injection')
+  // Free-text remains unmodelled: only a CWE/category label may gate a class.
+  assert.equal(classifyImpactDescriptor({ title: 'unhandled query construction error' }), 'other')
+})
 
 test('status-diff guard: the exact opsportal 200 -> 500 artifact is status-only and rejected', () => {
   const steps = opsportalShape()
