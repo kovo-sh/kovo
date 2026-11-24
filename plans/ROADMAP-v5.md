@@ -436,3 +436,12 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Gates:** 100% precision on lift cells + 0 on trap; paired net-new non-regression (allow −1 only with conversion gain + rerun); conversion drop ≤10pp; 0 crashes; p50 ≤75 s; ≥12 completions/300 s; ≤$0.80/cell; rotate the second app; fix general invariants, never trap-specific names.
 - **Calibration study (accepted, ~$22–24):** 8 variants vs full reference; trust at Spearman ≥0.75, 100% directional agreement for Δ≥2 targets, trap catches every variant below 95% precision.
 - **Stream launched:** `smoke-battery` (Tier 0 corpus, Tier 1 runner with snapshot resume + trap fixture, gates, calibration helper).
+
+### 2026-11-23 — hourly check-in #10: don't certify yet; shopflow FP is P0
+
+- **Tier-1 smoke paid for itself:** rotation shopflow 0/19 with **1 unmatched FP** and **p50 98 s**, trap 0, acme +1 @100%, floor preserved. Two gates failed on real defects.
+- **Certification rule (accepted):** no cert while any FP is active or held-out is unmeasured. Held-out hard blockers: any FP, preservation <0.95, unified < floor, aggregate lift ≤+3.5pp, or 0 net-new on 2+ apps. Acceptable variance: 100% precision, preservation ≥0.95, aggregate +5–7pp.
+- **Order:** triage shopflow FP first (hard P0), then p50/0-lift; **Cut 3 becomes P0 immediately after** (`execution.ts <8.5K`, `replay-verifier <1.5K`) because LOC drift reversed (9.5K → 11.5K / 3.4K → 3.8K).
+- **Horizon finding:** 45 min yielded **0 marginal recall over 10 min** (13/22 both) at 3× cost, so remaining gaps are hypothesis/proof coverage (white-box slices, workflows, chains), not runtime.
+- **Gate calibration accepted:** p50 hard fail ≤90 s (>75 s warns); monorepo micro-slice should use a cached post-recon snapshot.
+- **M1 rank after cert:** (1) #4 4-hop via attached slices, (2) #2 no-SSRF-hypothesis gap (promotion path already merged), (3) #3 race/workflow capability.
