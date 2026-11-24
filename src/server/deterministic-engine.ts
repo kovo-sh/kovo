@@ -680,9 +680,10 @@ export function pathHasTemplateHint(path: string): boolean {
 /**
  * Search-surface vocabulary. Membership is tested against whole path segments and whole tokens
  * within a segment (split on `-`, `_`, `.`), never as a substring of a longer word. `catalog` is a
- * listing noun, not a search surface: it is deliberately absent (it used to be matched by the
- * generic `log` file hint and consumed SQL injection quota on routes that never read a query).
- * `logs` / `audit-log` are file/audit surfaces; they belong to `pathHasFileHint`, not here.
+ * listing noun, not a search surface and deliberately absent: it used to sit in this vocabulary,
+ * so derived `catalog*` routes formed search-parameter SQL injection hypotheses and spent the
+ * class quota on routes that never read a query. `logs` / `audit-log` are file/audit surfaces;
+ * their whole tokens (`log`, `logs`) belong to `pathHasFileHint`, not here.
  */
 const searchHintTokens = new Set([
   'search', 'searches', 'lookup', 'find', 'filter', 'query', 'queries', 'browse',
