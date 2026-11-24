@@ -425,3 +425,14 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 
 - **Issue:** hourly Gemini check-ins lapsed after #8 because the background timer was not relaunched and long benchmark waits hid the gap.
 - **Fix:** `consult.sh` stamps `~/.config/guardian/last-consult` on every successful reply; `parallel-pulse.sh` prints **GEMINI CHECK-IN OVERDUE** when the stamp is missing or older than 60 minutes. The pulse is the backstop, so the cadence cannot silently lapse again.
+
+### 2026-11-23 — smoke-testing consult: fast + predictive is possible
+
+- **Reviewer verdict:** yes, ~85–90% of changes can be covered by a **~6 min / ~$1** Tier-1 battery, if smoke is decoupled from "a smaller 45-min scan."
+- **Tier 0 (<90 s, $0):** worker-gate + deterministic replay of past FP/over-claim archetypes through verifier/dedupe/scheduler.
+- **Tier 1 (~6 min, ~$1, 4 parallel cells):** paired lift from post-floor snapshots (acme), rotating second app (shopflow/opsportal), **pre-exhausted precision trap must confirm 0**, realism conversion micro-slice (async OOB / staging race / 4-hop).
+- **Tier 2 (30–45 min):** cold 3-app dev n=3 + salted held-out n=2 + one 45-min endurance + realism + xben/held-out. Blind spots: cold Phase-A→B integration and multi-hour DB drift stay here.
+- **Technique ranking:** paired snapshot A/B 9.5/10; precision trap 9/10; transcript replay 8.5/10 ($0); stratified slices 7.5/10; bootstrap CIs 4/10 (reject). Frozen LLM-turn VCR is plumbing-only, never recall.
+- **Gates:** 100% precision on lift cells + 0 on trap; paired net-new non-regression (allow −1 only with conversion gain + rerun); conversion drop ≤10pp; 0 crashes; p50 ≤75 s; ≥12 completions/300 s; ≤$0.80/cell; rotate the second app; fix general invariants, never trap-specific names.
+- **Calibration study (accepted, ~$22–24):** 8 variants vs full reference; trust at Spearman ≥0.75, 100% directional agreement for Δ≥2 targets, trap catches every variant below 95% precision.
+- **Stream launched:** `smoke-battery` (Tier 0 corpus, Tier 1 runner with snapshot resume + trap fixture, gates, calibration helper).
