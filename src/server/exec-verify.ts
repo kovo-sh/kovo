@@ -244,7 +244,43 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Require a per-session anti-CSRF token (or SameSite=Lax cookies) on state-changing routes.',
     }
   }
-  if (/^(?:sqli|sql_boolean|blind_sqli|injection|nosqli|ssti|template_injection|command_injection|cmdi|path_traversal|directory_traversal)$/.test(key)) {
+  if (/^(?:ssti|template_injection)$/.test(key)) {
+    return {
+      label: 'server-side template injection',
+      cwe: 'CWE-1336',
+      category: 'injection-input',
+      impact: 'Untrusted input was evaluated by a server-side template engine.',
+      remediation: 'Pass user input as template data rather than compiling it as template source; use a logic-less or sandboxed template context.',
+    }
+  }
+  if (/^(?:sqli|sql_boolean|sql_boolean_diff|blind_sqli|sqli_status|sqli_time)$/.test(key)) {
+    return {
+      label: 'SQL injection',
+      cwe: 'CWE-89',
+      category: 'injection-input',
+      impact: 'Injected input changed the SQL query structure or timing of the server-side operation.',
+      remediation: 'Use parameterized queries / prepared statements; never concatenate input into SQL.',
+    }
+  }
+  if (/^(?:command_injection|cmdi)$/.test(key)) {
+    return {
+      label: 'command injection',
+      cwe: 'CWE-78',
+      category: 'injection-input',
+      impact: 'Injected input altered a server-side OS command execution.',
+      remediation: 'Pass arguments as an argv array without a shell and strictly allowlist dynamic parameters.',
+    }
+  }
+  if (/^(?:path_traversal|directory_traversal)$/.test(key)) {
+    return {
+      label: 'path traversal',
+      cwe: 'CWE-22',
+      category: 'injection-input',
+      impact: 'Path input escaped the intended base directory on the server.',
+      remediation: 'Resolve canonical paths and verify they remain inside the allowed root directory.',
+    }
+  }
+  if (/^(?:injection|nosqli|nosql_injection)$/.test(key)) {
     return {
       label: 'injection',
       cwe: 'CWE-74',
@@ -262,7 +298,16 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Encode output for the HTML context and apply a restrictive Content-Security-Policy.',
     }
   }
-  if (/^(?:ssrf|blind_ssrf|xxe|blind_xxe|oob|webhook_forgery)$/.test(key)) {
+  if (/^(?:xxe|blind_xxe)$/.test(key)) {
+    return {
+      label: 'XML external entity injection',
+      cwe: 'CWE-611',
+      category: 'ssrf-redirects',
+      impact: 'The XML parser resolved an attacker-supplied external entity or out-of-band canary.',
+      remediation: 'Disable external entities and DTD processing in the XML parser.',
+    }
+  }
+  if (/^(?:ssrf|blind_ssrf|oob|webhook_forgery)$/.test(key)) {
     return {
       label: 'server-side request forgery',
       cwe: 'CWE-918',
@@ -271,7 +316,7 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Allowlist outbound destinations and disable external entity resolution for XML parsers.',
     }
   }
-  if (/^(?:race|race_double_spend)$/.test(key)) {
+  if (/^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/.test(key)) {
     return {
       label: 'race condition',
       cwe: 'CWE-362',

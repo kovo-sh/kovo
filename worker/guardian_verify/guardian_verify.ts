@@ -34,7 +34,8 @@ export interface StructuralDiffClaim { kind: 'structural_diff'; controlIds: stri
 export interface RaceClaim { kind: 'race'; exchangeIds: string[]; mode?: 'h2-single-packet' | 'http1-fallback'; minDistinctOutcomes?: number; expectAllSuccess?: boolean; message?: string }
 export interface ImpactClaim {
   kind: 'impact'
-  impactClass: 'authorization' | 'bfla' | 'mass_assignment' | 'csrf'
+  impactClass: 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'injection'
+  vulnClass?: string
   probeExchangeId: string
   controlExchangeIds?: string[]
   beforeExchangeId?: string
@@ -43,6 +44,7 @@ export interface ImpactClaim {
   resourceTenant?: string
   expectControlDenied?: boolean
   oracleEvents?: string[]
+  proofPatterns?: string[]
   actorRoles?: Record<string, string>
   actorTenants?: Record<string, string>
   requestBody?: unknown
@@ -1199,10 +1201,96 @@ export class VerifyContext {
     return Math.max(30_000, Math.min(60_000, 15_000 + requestCount * 2_000))
   }
 
+  /**
+   * Injection / SSTI differential proof (benign control vs probe).
+   * When `expectedOutput` (length >= 4) is given, verifies non-reflected server-side evaluation
+   * (marker present in probe body, absent in control body, absent from probe request) and emits
+   * paired `body_contains` claims. Otherwise emits an `impact: injection` claim for engine/parser
+   * fingerprint verification.
+   */
+  async proveInjectionDifferential(input: {
+    control: DifferentialArmInput | HttpTarget
+    probe: DifferentialArmInput | HttpTarget
+    expectedOutput?: string
+    vulnClass?: string
+    session?: string
+    message?: string
+  }): Promise<{
+    ok: boolean
+    control: HttpExchange
+    probe: HttpExchange
+    claims: VerifyClaim[]
+    evaluated: boolean
+  } & ProofFeedback> {
+    const armOf = (arm: DifferentialArmInput | HttpTarget): DifferentialArmInput =>
+      (typeof arm === 'string' || (typeof arm === 'object' && arm !== null && 'url' in arm && !('target' in arm)))
+        ? { target: arm as HttpTarget }
+        : arm as DifferentialArmInput
+    const controlArm = armOf(input.control)
+    const probeArm = armOf(input.probe)
+    const session = input.session ?? 'injection-diff'
+    const control = await this.http(controlArm.target, { ...controlArm.options, role: 'control', session })
+    const probe = await this.http(probeArm.target, { ...probeArm.options, role: 'probe', session })
+    const expected = input.expectedOutput?.trim() ?? ''
+    const missingEvidence: string[] = []
+    const emitted: VerifyClaim[] = []
+    let evaluated = false
+    if (expected.length >= 4) {
+      const probeReqText = `${typeof probeArm.target === 'string' ? probeArm.target : JSON.stringify(probeArm.target)}\n${JSON.stringify(probeArm.options?.body ?? '')}`
+      const inProbe = (probe.body ?? '').includes(expected)
+      const inControl = (control.body ?? '').includes(expected)
+      const reflected = probeReqText.includes(expected)
+      evaluated = inProbe && !inControl && !reflected
+      if (!isSuccessStatus(control.status)) missingEvidence.push('control_2xx')
+      if (!inProbe) missingEvidence.push('evaluated_marker_in_probe')
+      if (inControl) missingEvidence.push('marker_absent_from_control')
+      if (reflected) missingEvidence.push('non_reflected_expression')
+      const absentClaim: BodyClaim = {
+        kind: 'body_contains',
+        exchangeId: control.exchangeId,
+        text: expected,
+        absent: true,
+        message: `${input.vulnClass ?? 'ssti'} control lacks evaluated marker`,
+      }
+      const presentClaim: BodyClaim = {
+        kind: 'body_contains',
+        exchangeId: probe.exchangeId,
+        text: expected,
+        absent: false,
+        message: input.message ?? `${input.vulnClass ?? 'ssti'} evaluated marker present in probe`,
+      }
+      this.claims.push(absentClaim, presentClaim)
+      emitted.push(absentClaim, presentClaim)
+    } else {
+      const impactClaim: ImpactClaim = {
+        kind: 'impact',
+        impactClass: 'injection',
+        ...(input.vulnClass ? { vulnClass: input.vulnClass } : {}),
+        controlExchangeIds: [control.exchangeId],
+        probeExchangeId: probe.exchangeId,
+        ...(input.message ? { message: input.message } : {}),
+      }
+      this.claims.push(impactClaim)
+      emitted.push(impactClaim)
+    }
+    return {
+      ok: missingEvidence.length === 0,
+      control,
+      probe,
+      claims: emitted,
+      evaluated,
+      ...feedback(missingEvidence.length ? 'injection_differential' : null, missingEvidence, [
+        transcriptEntry('control', control),
+        transcriptEntry('probe', probe),
+      ]),
+    }
+  }
+
   /** snake_case aliases matching the documented helper contract. */
   prove_access_boundary(input: AccessBoundaryInput): Promise<AccessBoundaryProof> { return this.proveAccessBoundary(input) }
   prove_persisted_mutation(input: PersistedMutationInput): Promise<PersistedMutationProof> { return this.provePersistedMutation(input) }
   prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput): Promise<DifferentialProof> { return this.proveBooleanOrTimingDiff(input) }
+  prove_injection_differential(input: Parameters<VerifyContext['proveInjectionDifferential']>[0]) { return this.proveInjectionDifferential(input) }
   prove_oob_callback(input: OobCallbackInput): Promise<OobCallbackProof> { return this.proveOobCallback(input) }
   prove_race_burst(input: RaceBurstInput): Promise<RaceBurstProof> { return this.proveRaceBurst(input) }
 

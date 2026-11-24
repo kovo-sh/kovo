@@ -511,6 +511,10 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     return reject(receipt, rule, `The ${impactClass} oracle has no requirement this receipt can satisfy.`)
   }
   if (!assessment.satisfied) {
+    if (impactClass === 'injection') {
+      const evaluated = verifyEvaluatedExpression(receipt, entriesById)
+      if (evaluated) return evaluated
+    }
     return {
       confirmed: false,
       vulnClass: receipt.vulnClass,
@@ -849,6 +853,66 @@ function verifyConservedBalanceReceipt(
 }
 
 /**
+ * Fail-closed evaluated-expression oracle for SSTI / server-side expression evaluation (`CWE-1336`).
+ * Requires:
+ *  1. Same route family across a 2xx control and 2xx probe with distinct request inputs,
+ *  2. An explicit non-trivial expected marker (`proofPatterns`, length >= 4),
+ *  3. Strict anti-reflection: the marker appears in the probe response body, is ABSENT from every
+ *     control response body, AND is ABSENT from the probe request itself (path, headers, body).
+ */
+function verifyEvaluatedExpression(
+  receipt: ProofReceipt,
+  entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+): ReceiptVerification | null {
+  const patterns = (receipt.proofPatterns ?? []).filter(p => p.length >= 4)
+  if (patterns.length === 0) return null
+  const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
+  const controls = cited.filter(entry => entry.step.arm === 'control' && is2xxStatus(entry.step.status))
+  const probes = cited.filter(entry => entry.step.arm === 'probe' && is2xxStatus(entry.step.status))
+  if (controls.length === 0 || probes.length === 0) return null
+  const bodyOf = (step: ImpactStep): string =>
+    typeof step.body === 'string' ? step.body : step.json !== undefined ? JSON.stringify(step.json) : ''
+  const requestTextOf = (entry: ReceiptTranscriptEntry): string => {
+    const parts = [
+      entry.step.pathAndQuery ?? '',
+      entry.step.requestJson !== undefined ? JSON.stringify(entry.step.requestJson) : '',
+      entry.step.requestHeaders ? JSON.stringify(entry.step.requestHeaders) : '',
+    ]
+    const raw = parts.join('\n')
+    try { return `${raw}\n${decodeURIComponent(raw)}` } catch { return raw }
+  }
+  const controlBodies = controls.map(c => bodyOf(c.step)).join('\n')
+  for (const probe of probes) {
+    const probeRoute = routeOf(probe.step)
+    const matchingControl = controls.find(control => {
+      if (routeOf(control.step) !== probeRoute) return false
+      const samePath = (control.step.pathAndQuery ?? '') === (probe.step.pathAndQuery ?? '')
+      const sameBody = JSON.stringify(control.step.requestJson ?? null) === JSON.stringify(probe.step.requestJson ?? null)
+      return !(samePath && sameBody)
+    })
+    if (!matchingControl) continue
+    const probeBody = bodyOf(probe.step)
+    const probeReqText = requestTextOf(probe)
+    for (const marker of patterns) {
+      if (!probeBody.includes(marker)) continue
+      if (controlBodies.includes(marker)) continue
+      // Anti-reflection: a marker present verbatim in the request is reflection, not evaluation.
+      if (probeReqText.includes(marker)) continue
+      return {
+        confirmed: true,
+        vulnClass: receipt.vulnClass,
+        rule: 'impact',
+        reason: `Server-side expression evaluation confirmed: computed marker "${marker}" appeared in the probe response while absent from both the control response and the probe request (non-reflected).`,
+        observed: receipt.claimedDelta,
+        expected: 'user input is rendered literally without server-side expression evaluation',
+        evidence: { evaluatedMarker: marker, route: probeRoute, antiReflectionPassed: true },
+      }
+    }
+  }
+  return null
+}
+
+/**
  * Reconstruct the benign / tautology / contradiction triangle from the cited arms.
  *
  * The recipe records an `evidenceRole` per exchange, so the normal case is an exact role match.
@@ -1062,7 +1126,11 @@ export function buildAgentScriptReceipt(input: {
     if (recordField(claim, 'kind') !== 'impact') continue
     const impactClass = recordField(claim, 'impactClass')
     if (typeof impactClass !== 'string') continue
-    const vulnClass = IMPACT_CLASS_TO_VULN_CLASS[impactClass]
+    const rawVulnClass = recordField(claim, 'vulnClass')
+    const explicitVuln = typeof rawVulnClass === 'string' ? rawVulnClass.trim().toLowerCase() : ''
+    const vulnClass = explicitVuln && IMPACT_CLASS_BY_VULN[explicitVuln] === impactClass
+      ? explicitVuln
+      : IMPACT_CLASS_TO_VULN_CLASS[impactClass]
     if (!vulnClass) continue
     const probeId = recordField(claim, 'probeExchangeId')
     if (typeof probeId !== 'string') continue
@@ -1125,6 +1193,56 @@ export function buildAgentScriptReceipt(input: {
         ...(recordField(claim, 'expectControlDenied') === true ? { expectControlDenied: true } : {}),
         ...(oracleEvents.length ? { oracleEvents: [...new Set(oracleEvents)].slice(0, 8) } : {}),
         ...(proofPatterns.length ? { proofPatterns } : {}),
+      }),
+      transcript,
+    }
+  }
+
+  for (const claim of input.claims) {
+    if (recordField(claim, 'kind') !== 'boundary') continue
+    const rawBoundaryClass = recordField(claim, 'boundaryClass')
+    if (typeof rawBoundaryClass !== 'string') continue
+    const boundaryClass = rawBoundaryClass.toLowerCase()
+    if (boundaryClass !== 'access' && boundaryClass !== 'auth') continue
+    const controlId = recordField(claim, 'controlExchangeId')
+    const probeId = recordField(claim, 'probeExchangeId')
+    if (typeof controlId !== 'string' || typeof probeId !== 'string') continue
+    const control = byId.get(controlId)
+    const probe = byId.get(probeId)
+    if (!control || !probe) continue
+    // Mutating boundary claims require persisted before/after readbacks (`impact` claim); only
+    // non-mutating read boundaries map directly onto a `bola`/`bfla` ProofReceipt.
+    const probeMethod = probe.method.toUpperCase()
+    if (probeMethod !== 'GET' && probeMethod !== 'HEAD') continue
+    const rawVuln = typeof recordField(claim, 'vulnClass') === 'string'
+      ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
+      : ''
+    const vulnClass = rawVuln && IMPACT_CLASS_BY_VULN[rawVuln]
+      ? rawVuln
+      : boundaryClass === 'auth'
+        ? 'bfla'
+        : 'bola'
+    const exchangeIds = [...new Set([controlId, probeId])]
+      .sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    const armOverrides = new Map<string, ImpactStep['arm']>([
+      [controlId, 'control'],
+      [probeId, 'probe'],
+    ])
+    const transcript = buildTranscript(armOverrides)
+    const expectControlDenied = recordField(claim, 'expectControlDenied') !== false
+    return {
+      receipt: buildProofReceipt({
+        vulnClass,
+        target: {
+          origin: probe.origin || input.origin,
+          method: probe.method.toUpperCase(),
+          pathAndQuery: probe.pathAndQuery,
+        },
+        exchangeIds,
+        oobEventIds: [],
+        browserTraceIds: [],
+        claimedDelta: `${input.title} — access boundary crossed (${control.status ?? 'n/a'} control vs ${probe.status ?? 'n/a'} probe).`.slice(0, 1200),
+        expectControlDenied,
       }),
       transcript,
     }
@@ -1269,6 +1387,53 @@ export function buildAgentScriptReceipt(input: {
         }),
         transcript,
       }
+    }
+  }
+
+  // Paired non-reflected evaluated-expression claims (`body_contains` absent on control + present
+  // on probe for the same >=4-char marker, emitted by `ctx.prove_injection_differential`).
+  const bodyClaims = input.claims.filter(claim =>
+    recordField(claim, 'kind') === 'body_contains' &&
+    typeof recordField(claim, 'exchangeId') === 'string' &&
+    typeof recordField(claim, 'text') === 'string' &&
+    (recordField(claim, 'text') as string).length >= 4)
+  for (const present of bodyClaims) {
+    if (recordField(present, 'absent') === true) continue
+    const marker = recordField(present, 'text') as string
+    const probeId = recordField(present, 'exchangeId') as string
+    const probe = byId.get(probeId)
+    if (!probe) continue
+    const absent = bodyClaims.find(c =>
+      recordField(c, 'absent') === true &&
+      recordField(c, 'text') === marker &&
+      typeof recordField(c, 'exchangeId') === 'string' &&
+      recordField(c, 'exchangeId') !== probeId &&
+      byId.has(recordField(c, 'exchangeId') as string))
+    if (!absent) continue
+    const controlId = recordField(absent, 'exchangeId') as string
+    const exchangeIds = [controlId, probeId].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    const armOverrides = new Map<string, ImpactStep['arm']>([
+      [controlId, 'control'],
+      [probeId, 'probe'],
+    ])
+    const transcript = buildTranscript(armOverrides)
+    const msg = `${input.title} ${String(recordField(present, 'message') ?? '')}`.toLowerCase()
+    const vulnClass = /ssti|template/.test(msg) ? 'ssti' : 'injection'
+    return {
+      receipt: buildProofReceipt({
+        vulnClass,
+        target: {
+          origin: probe.origin || input.origin,
+          method: probe.method.toUpperCase(),
+          pathAndQuery: probe.pathAndQuery,
+        },
+        exchangeIds,
+        oobEventIds: [],
+        browserTraceIds: [],
+        claimedDelta: `${input.title} — evaluated marker "${marker}" observed only in probe response.`.slice(0, 1200),
+        proofPatterns: [marker],
+      }),
+      transcript,
     }
   }
   return null

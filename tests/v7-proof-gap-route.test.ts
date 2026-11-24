@@ -49,6 +49,7 @@ function textOf(result: InvokeResult): string {
 /** Worker surface with two route families: an anomalous 5xx admin route and a benign 2xx order. */
 function fixture(options?: {
   routes?: ReadonlyArray<{ method: string; path: string; result: unknown }>
+  includeGuardianVerify?: boolean
 }) {
   const routes = options?.routes ?? [
     { method: ADMIN.method, path: ADMIN.path, result: { status: 500, anomalies: ['status-diff'], bodySha256: 'sha-admin' } },
@@ -64,7 +65,7 @@ function fixture(options?: {
       return hit?.result ?? { status: 200 }
     },
     verify_replay_spec: async () => ({ oraclePassed: true, attempts: [] }),
-    guardian_verify: async () => ({ oraclePassed: true, attempts: [] }),
+    ...(options?.includeGuardianVerify === false ? {} : { guardian_verify: async () => ({ oraclePassed: true, attempts: [] }) }),
     record_coverage: async args => {
       coverage.push(args as unknown as Record<string, unknown>)
       return { id: `cov-${coverage.length}`, status: args.status }
@@ -244,7 +245,7 @@ test('the reserved wrap-up turn targets the anomalous route even when a benign r
 // ============================================================================
 
 test('a route covered by a submitted verify spec needs no gap and no extra demand', async () => {
-  const { tracker, required, completions, tools } = fixture()
+  const { tracker, required, completions, tools } = fixture({ includeGuardianVerify: false })
   await probe(tools, ORDER)
 
   const verify = await invoke(toolByName(tools, 'verify_replay_spec')!, { spec: specFor(ORDER.method, ORDER.path) })
