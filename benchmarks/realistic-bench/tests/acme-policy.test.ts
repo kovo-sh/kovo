@@ -106,3 +106,23 @@ test('hardened plan route ignores caller price/limit/credit fields and stays ora
     await app.stop()
   }
 })
+
+test('legacy search is anonymous-safe and tenant-scoped', async () => {
+  const app = await startRealisticApp({ app: 'acme-saas', seed: 1 })
+  try {
+    const ctx = makeSolverCtx(app)
+    const anon = await ctx.fetch(ctx.path('reflectedSearch', {}, { q: 'Acme' }))
+    assert.equal(anon.status, 200)
+    assert.doesNotMatch(anon.text, /Acme Robotics Project/, 'anonymous search must not list tenant projects')
+
+    const owner = await ctx.login('persona_a')
+    const own = await ctx.fetch(ctx.path('reflectedSearch', {}, { q: 'Acme' }), { session: owner })
+    assert.match(own.text, /Acme Robotics Project/, 'the owner still searches its own tenant')
+
+    const other = await ctx.login('persona_b')
+    const foreign = await ctx.fetch(ctx.path('reflectedSearch', {}, { q: 'Acme' }), { session: other })
+    assert.doesNotMatch(foreign.text, /Acme Robotics Project/, 'tenant isolation applies to search')
+  } finally {
+    await app.stop()
+  }
+})

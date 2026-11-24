@@ -1210,7 +1210,9 @@ export interface EvidenceClassLabel {
   category: string
 }
 
-const IMPACT_CLASS_LABELS: Partial<Record<ImpactClass, EvidenceClassLabel>> = {
+const IMPACT_CLASS_LABELS: Record<string, EvidenceClassLabel> = {
+  // Cross-tenant evidence is object-level authorization regardless of the model's business framing.
+  bola: { vulnClass: 'bola', cwe: 'CWE-639', category: 'broken-access-control' },
   mass_assignment: { vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment' },
   csrf: { vulnClass: 'csrf', cwe: 'CWE-352', category: 'csrf' },
   markup: { vulnClass: 'xss_stored', cwe: 'CWE-79', category: 'xss' },
@@ -1218,7 +1220,8 @@ const IMPACT_CLASS_LABELS: Partial<Record<ImpactClass, EvidenceClassLabel>> = {
   business_logic: { vulnClass: 'business_logic', cwe: 'CWE-840', category: 'business-logic' },
 }
 
-const IMPACT_CLASS_CWES: Partial<Record<ImpactClass, number[]>> = {
+const IMPACT_CLASS_CWES: Record<string, number[]> = {
+  bola: [639],
   mass_assignment: [915],
   csrf: [352],
   markup: [79, 80, 83],
@@ -1228,7 +1231,7 @@ const IMPACT_CLASS_CWES: Partial<Record<ImpactClass, number[]>> = {
 
 /** Label for a verified impact class, or null when the class has no single canonical label. */
 export function evidenceClassLabel(impactClass: string | null | undefined): EvidenceClassLabel | null {
-  return impactClass ? IMPACT_CLASS_LABELS[impactClass as ImpactClass] ?? null : null
+  return impactClass ? IMPACT_CLASS_LABELS[impactClass] ?? null : null
 }
 
 /**
@@ -1243,7 +1246,7 @@ export function alignClaimClass(
 ): EvidenceClassLabel | null {
   const label = evidenceClassLabel(impactClass)
   if (!label) return null
-  const family = IMPACT_CLASS_CWES[impactClass as ImpactClass] ?? []
+  const family = (impactClass ? IMPACT_CLASS_CWES[impactClass] : undefined) ?? []
   const declared = /(\d+)/.exec(claim.cwe ?? '')?.[1]
   if (declared !== undefined && family.includes(Number(declared))) return null
   return label

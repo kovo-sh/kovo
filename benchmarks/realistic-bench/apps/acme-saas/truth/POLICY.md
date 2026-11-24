@@ -246,3 +246,21 @@ mutation still proves the planted plan-price/credits/seats cases (billing-tamper
 A declared invariant event still confirms the negative-amount shape, so a future planted invoice
 invariant would be detectable.
 
+## Seventh triage round (45-min rerun): cross-tenant framing and legacy search
+
+Two further 45-min findings were charged unmatched:
+
+- *"Cross-tenant write BOLA: persona_b tampers tenant f6e944 invoice amount"* (CWE-840) — the planted
+  `acme.invoice-write-bola` behaviour, framed as business logic because the mutated field is an
+  amount. Cross-tenant evidence is object-level authorization: the verifier now labels a
+  business-logic/authorization proof whose *probe* actor sits outside the tenant that read the same
+  route as `bola` (CWE-639), and `execution` aligns the persisted finding. In-tenant amount edits
+  (billing price, duplicate charges) keep their business-logic label.
+- *"Legacy /api/v1/search serves tenant data to unauthenticated users"* (CWE-306) — both
+  `reflected-search-xss` twins queried **all tenants' projects** without auth scoping, a uniform twin
+  defect (the planted bug is the reflected XSS in the empty-state). Hardened the twins: anonymous
+  callers get the empty state and matches are scoped to the caller's tenant, while the vulnerable
+  twin still reflects the term unescaped (the solver is anonymous and only needs the empty state).
+
+No truth changes.
+

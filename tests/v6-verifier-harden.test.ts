@@ -1535,6 +1535,11 @@ test('units: verified evidence class relabels a mislabelled claim (and only then
   assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'markup')?.cwe, 'CWE-79')
   assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'disclosure')?.cwe, 'CWE-200')
   assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'csrf')?.cwe, 'CWE-352')
+  // Cross-tenant evidence always lands on object-level authorization.
+  assert.deepEqual(alignClaimClass({ cwe: 'CWE-840' }, 'bola'), {
+    vulnClass: 'bola', cwe: 'CWE-639', category: 'broken-access-control',
+  })
+  assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'bola'), null)
   assert.equal(alignClaimClass({ cwe: 'CWE-472' }, 'business_logic'), null, 'same family keeps the more precise CWE')
   assert.deepEqual(evidenceClassLabel('mass_assignment'), {
     vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment',
