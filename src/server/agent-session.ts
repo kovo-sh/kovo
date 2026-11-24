@@ -252,7 +252,45 @@ export interface SpecProofGapEntry {
   reason: string
   code: SpecProofGapCode | null
   category?: string
+  /** Stable `METHOD /family` proof-obligation key this gap is bound to. Required for a coded gap. */
+  route?: string
 }
+
+/** One route family's proof obligation: probed or assigned, and how it was discharged. */
+export interface ProofRouteObligation {
+  /** `METHOD normalized/path` — the binding key for a spec or a coded gap. */
+  key: string
+  method: string
+  /** Most recent concrete path observed on this family (body-free). */
+  path: string
+  /** Resource-id-normalized path family. */
+  family: string
+  params: readonly string[]
+  origin?: string
+  /** Host-observed probe attempts on this family. */
+  attempts: number
+  /** Last observed HTTP status, or null when the probe tool does not surface one. */
+  status: number | null
+  /** At least one host-observed anomaly on this family. */
+  anomaly: boolean
+  /** True when the route came from the assignment (Tier-A/chain target) rather than a probe. */
+  assigned: boolean
+  /** A submitted spec/verify positively covers this family. */
+  covered: boolean
+  /** Machine-readable gap bound to this family (one per route, idempotent). */
+  gap?: SpecProofGapCode
+}
+
+/** Route-scoped proof coverage emitted as the `agent.proof_obligation` funnel stat. */
+export interface ProofObligationStats {
+  probedRoutes: number
+  coveredRoutes: number
+  gapRoutes: number
+  demandedRoutes: number
+  dischargedByGap: number
+}
+
+export type ProofObligationEvent = ProofObligationStats & { type: 'agent.proof_obligation' }
 
 export interface SpecSubmissionSnapshot {
   /** Successful network probes in this session. */
@@ -267,6 +305,12 @@ export interface SpecSubmissionSnapshot {
   codedProofGaps: number
   /** Every proof-gap entry, coded or free-text. */
   proofGaps: readonly SpecProofGapEntry[]
+  /** Per-route proof obligations (probed families + assignment targets). */
+  obligations: readonly ProofRouteObligation[]
+  /** Route-scoped proof stats (same shape as `agent.proof_obligation`). */
+  obligation: ProofObligationStats
+  /** Highest-value uncovered route: anomaly/2xx first, then probe density. */
+  obligationTarget?: SpecRouteEvidence
   /** complete_intent rejections caused by a missing spec/gap. */
   required: number
 }
@@ -331,10 +375,21 @@ function normalizeRouteFamily(path: string): string {
     if (/^\d+$/.test(segment)) return ':id'
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) return ':id'
     if (/^[0-9a-f]{16,}$/i.test(segment)) return ':id'
-    if (/^\{\{[a-z0-9_]+\}\}$/i.test(segment)) return ':id'
+    if (/^\{\{?[a-z0-9_]+\}?\}$/i.test(segment)) return ':id'
+    if (/^:[a-z0-9_]+$/i.test(segment)) return ':id'
     return segment
   })
   return parts.join('/').slice(0, 160)
+}
+
+/**
+ * Stable route-obligation key: `METHOD` plus the resource-id-normalized path family. A proof gap or
+ * spec bound to `/api/orders/1001` covers `/api/orders/1002` (same family) but never `/api/admin/1`.
+ */
+export function proofRouteKey(method: string, path: string): string {
+  const cleanMethod = (method ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10)
+  const cleanPath = (path ?? '').split(/[?#]/, 1)[0] ?? '/'
+  return `${cleanMethod} ${normalizeRouteFamily(cleanPath)}`
 }
 
 /**
@@ -404,30 +459,131 @@ export interface RouteObservation {
  * Per-assignment spec-submission ledger. Small, mutable and dependency-free so the tool layer and
  * the settlement runner share one source of truth without touching session storage.
  */
+interface RouteFamilyState {
+  key: string
+  method: string
+  family: string
+  route: SpecRouteEvidence
+  attempts: number
+  status: number | null
+  anomaly: boolean
+  assigned: boolean
+  /** Monotonic insertion order, so ties resolve to the most recently touched family. */
+  seq: number
+}
+
+/** Route value: an anomalous route is the best use of the reserved verify turn, then a 2xx route. */
+function routeObligationValue(obligation: ProofRouteObligation): number {
+  let score = Math.min(obligation.attempts, 20)
+  if (obligation.anomaly) score += 1000
+  if (obligation.status !== null && obligation.status >= 200 && obligation.status < 300) score += 100
+  if (obligation.assigned) score += 10
+  return score
+}
+
+/** Pick the highest-value route from a set (anomaly > 2xx > probe density; ties → latest). */
+function pickHighestValueRoute(obligations: readonly ProofRouteObligation[]): ProofRouteObligation | undefined {
+  let best: ProofRouteObligation | undefined
+  let bestScore = -1
+  for (const obligation of obligations) {
+    const score = routeObligationValue(obligation)
+    if (!best || score >= bestScore) {
+      best = obligation
+      bestScore = score
+    }
+  }
+  return best
+}
+
+/** Parse a worker-supplied route binding (`METHOD /path`, or `/path` when the method is unambiguous). */
+function parseRouteReference(raw: string): { key: string; family: string; hasMethod: boolean } | undefined {
+  const trimmed = raw.trim()
+  if (!trimmed) return undefined
+  const match = /^([A-Za-z]+)\s+(.+)$/.exec(trimmed)
+  const method = match ? (match[1] ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10) : ''
+  const path = (match ? match[2] ?? '' : trimmed).split(/[?#]/, 1)[0] ?? '/'
+  if (!path.startsWith('/')) return undefined
+  return {
+    key: proofRouteKey(method, path),
+    family: normalizeRouteFamily(path),
+    hasMethod: Boolean(method),
+  }
+}
+
 export class SpecSubmissionTracker {
-  private state: SpecSubmissionSnapshot = { probes: 0, specAttempts: 0, targetCovered: false, codedProofGaps: 0, proofGaps: [], required: 0 }
+  private state: SpecSubmissionSnapshot = {
+    probes: 0, specAttempts: 0, targetCovered: false, codedProofGaps: 0, proofGaps: [],
+    obligations: [], obligation: { probedRoutes: 0, coveredRoutes: 0, gapRoutes: 0, demandedRoutes: 0, dischargedByGap: 0 },
+    required: 0,
+  }
   /** Probed route key → evidence + probe count; the most-probed route is the target proxy. */
   private readonly routeCounts = new Map<string, { route: SpecRouteEvidence; count: number }>()
   /** Bounded, body-free route response ledger (status/sha/anomaly only) for early-exit settlement. */
   private readonly observations: RouteAttemptObservation[] = []
   /** Route keys (`METHOD path`) that a submitted spec or verify script positively covers. */
   private readonly coveredRoutes = new Set<string>()
+  /** `METHOD family` keys covered by an explicit spec/verify route step. */
+  private readonly coveredFamilies = new Set<string>()
+  /** One obligation per probed/assigned route family. */
+  private readonly routeFamilies = new Map<string, RouteFamilyState>()
+  /** Route-scoped coded gaps, at most one per family (idempotent). */
+  private readonly gapByRoute = new Map<string, SpecProofGapEntry>()
+  /** Route keys explicitly demanded (complete_intent rejection or the reserved wrap-up turn). */
+  private readonly demandedRoutes = new Set<string>()
   /** Attempts whose spec shape could not be attributed to a route; treated as covering any target. */
   private opaqueSpecAttempts = 0
+  private sequence = 0
 
   noteProbe(): void {
     this.state = { ...this.state, probes: this.state.probes + 1 }
   }
 
+  private registerFamily(route: SpecRouteEvidence): RouteFamilyState {
+    const family = normalizeRouteFamily(route.path)
+    const key = proofRouteKey(route.method, route.path)
+    const existing = this.routeFamilies.get(key)
+    if (existing) {
+      // Preserve the origin captured by `noteRoute`: `noteObservation` does not carry it.
+      existing.route = route.origin || !existing.route.origin
+        ? route
+        : { ...route, origin: existing.route.origin }
+      return existing
+    }
+    const created: RouteFamilyState = {
+      key,
+      method: route.method,
+      family,
+      route,
+      attempts: 0,
+      status: null,
+      anomaly: false,
+      assigned: false,
+      seq: ++this.sequence,
+    }
+    this.routeFamilies.set(key, created)
+    return created
+  }
+
   noteRoute(input: { method?: string; pathAndQuery?: string; origin?: string }): void {
     const route = cleanSpecRoute(input)
     if (!route) return
+    // Route registration never counts as an attempt: `noteObservation` owns the attempt ledger.
+    this.registerFamily(route)
     const key = `${route.method} ${route.path}`
     const existing = this.routeCounts.get(key)
     const count = (existing?.count ?? 0) + 1
     this.routeCounts.delete(key)
     this.routeCounts.set(key, { route, count })
     this.state = { ...this.state, route: this.targetRoute() }
+  }
+
+  /** Assignment targets (Tier-A/chain) still owe proof even if the worker never probes them. */
+  noteAssignedRoutes(routes?: readonly { method?: string; path?: string; origin?: string }[]): void {
+    for (const input of routes ?? []) {
+      const route = cleanSpecRoute({ method: input.method, pathAndQuery: input.path, origin: input.origin })
+      if (!route) continue
+      this.registerFamily(route).assigned = true
+    }
   }
 
   /** Highest probe-count route (ties resolve to the most recent), so the directive names the target. */
@@ -446,6 +602,8 @@ export class SpecSubmissionTracker {
         const path = (route.path ?? '').split(/[?#]/, 1)[0] ?? ''
         if (!method || !path) continue
         this.coveredRoutes.add(`${method} ${path}`)
+        const family = normalizeRouteFamily(path)
+        if (family !== '/') this.coveredFamilies.add(`${method} ${family}`)
       }
       return
     }
@@ -454,12 +612,39 @@ export class SpecSubmissionTracker {
       for (const [key, entry] of this.routeCounts) {
         if (entry.route.path !== '/' && text.includes(entry.route.path)) {
           this.coveredRoutes.add(key)
+          this.coveredFamilies.add(proofRouteKey(entry.route.method, entry.route.path))
           matched = true
         }
       }
       if (matched) return
     }
+    // A route-opaque spec/verify covers exactly one route. Bind it now, to the highest-value route
+    // that exists at submission time, so a later probe cannot inherit this proof.
     this.opaqueSpecAttempts += 1
+    const candidate = this.highestValueUncoveredFamily()
+    if (candidate) {
+      this.coveredFamilies.add(candidate.key)
+      this.opaqueSpecAttempts -= 1
+    }
+  }
+
+  /** Highest-value route family that is neither covered nor gap-bound (used for opaque specs). */
+  private highestValueUncoveredFamily(): RouteFamilyState | undefined {
+    let best: RouteFamilyState | undefined
+    let bestScore = -1
+    for (const family of this.routeFamilies.values()) {
+      if (family.family === '/' || this.coveredFamilies.has(family.key) || this.gapByRoute.has(family.key)) continue
+      const score = routeObligationValue({
+        key: family.key, method: family.method, path: family.route.path, family: family.family,
+        params: family.route.params, attempts: family.attempts, status: family.status,
+        anomaly: family.anomaly, assigned: family.assigned, covered: false,
+      })
+      if (!best || score >= bestScore) {
+        best = family
+        bestScore = score
+      }
+    }
+    return best
   }
 
   /** A persisted/attempted replay spec. Route steps bind the attempt to the route(s) it proves. */
@@ -474,19 +659,121 @@ export class SpecSubmissionTracker {
     this.markCovered(undefined, script)
   }
 
-  noteProofGap(input: { proofGapReason?: string; category?: string }): void {
+  /** Resolve the route a coded gap binds to; ambiguous or unknown bindings are rejected. */
+  checkGapRoute(raw?: string): { ok: true; key: string } | { ok: false; error: string } {
+    const obligations = this.obligationList()
+    if (!obligations.length) return { ok: true, key: '' }
+    const keys = obligations.slice(0, 8).map(obligation => obligation.key).join(', ')
+    const reject = (detail: string) => ({
+      ok: false as const,
+      error: `record_coverage validation failed: status="needs_follow_up" with a coded proofGapReason is route-scoped. Missing required field \`route\` (the probed route this gap applies to, e.g. "GET /api/orders/:id"); ${detail}. Probed routes: ${keys}.`,
+    })
+    const trimmed = (raw ?? '').trim()
+    if (trimmed) {
+      const parsed = parseRouteReference(trimmed)
+      if (!parsed) return reject(`route "${trimmed}" is not a \`METHOD /path\` reference`)
+      const exact = obligations.find(obligation => obligation.key === parsed.key)
+      if (exact) return { ok: true, key: exact.key }
+      const byFamily = obligations.filter(obligation => obligation.family === parsed.family)
+      if (!parsed.hasMethod && byFamily.length === 1) return { ok: true, key: byFamily[0]!.key }
+      return reject(`route "${trimmed}" does not match a probed route`)
+    }
+    const uncovered = obligations.filter(obligation => !obligation.covered && !obligation.gap)
+    if (uncovered.length === 1) return { ok: true, key: uncovered[0]!.key }
+    return reject(
+      uncovered.length > 1
+        ? 'more than one route is uncovered, so the gap cannot be bound automatically'
+        : 'every probed route is already covered or has a bound gap',
+    )
+  }
+
+  noteProofGap(input: { proofGapReason?: string; category?: string; route?: string }): { ok: true } | { ok: false; error: string } {
     const reason = (input.proofGapReason ?? '').trim()
-    if (reason.length < 5) return
+    if (reason.length < 5) return { ok: true }
+    const code = parseProofGapCode(reason)
+    let routeKey = ''
+    if (code) {
+      const binding = this.checkGapRoute(input.route)
+      if (!binding.ok) return binding
+      routeKey = binding.key
+      if (routeKey && this.gapByRoute.has(routeKey)) {
+        // One route-scoped gap per route: a repeated gap is idempotent (no counter/array growth).
+        return { ok: true }
+      }
+    } else if (input.route) {
+      const parsed = parseRouteReference(input.route)
+      if (parsed) routeKey = parsed.key
+    }
     const entry: SpecProofGapEntry = {
       reason: reason.slice(0, 600),
-      code: parseProofGapCode(reason),
+      code,
+      ...(routeKey ? { route: routeKey } : {}),
       ...(input.category ? { category: input.category } : {}),
     }
+    if (code && routeKey) this.gapByRoute.set(routeKey, entry)
     this.state = {
       ...this.state,
       proofGaps: [...this.state.proofGaps, entry].slice(-12),
-      codedProofGaps: this.state.codedProofGaps + (entry.code ? 1 : 0),
+      codedProofGaps: this.state.codedProofGaps + (code ? 1 : 0),
     }
+    return { ok: true }
+  }
+
+  /** Mark a route as explicitly demanded (deduplicated: a route is demanded at most once). */
+  noteDemand(key: string | undefined): void {
+    if (key) this.demandedRoutes.add(key)
+  }
+
+  private obligationList(): ProofRouteObligation[] {
+    const list: ProofRouteObligation[] = []
+    for (const family of [...this.routeFamilies.values()].sort((a, b) => a.seq - b.seq)) {
+      if (family.family === '/') continue
+      const gap = this.gapByRoute.get(family.key)
+      list.push({
+        key: family.key,
+        method: family.method,
+        path: family.route.path,
+        family: family.family,
+        params: [...family.route.params],
+        ...(family.route.origin ? { origin: family.route.origin } : {}),
+        attempts: family.attempts,
+        status: family.status,
+        anomaly: family.anomaly,
+        assigned: family.assigned,
+        covered: this.coveredFamilies.has(family.key),
+        ...(gap?.code ? { gap: gap.code } : {}),
+      })
+    }
+    // A route-opaque spec/verify covers one route only (highest value first), never every route.
+    let opaque = this.opaqueSpecAttempts
+    while (opaque > 0) {
+      const candidate = pickHighestValueRoute(list.filter(obligation => !obligation.covered))
+      if (!candidate) break
+      candidate.covered = true
+      opaque -= 1
+    }
+    return list
+  }
+
+  private statsFrom(obligations: readonly ProofRouteObligation[]): ProofObligationStats {
+    return {
+      probedRoutes: obligations.filter(obligation => obligation.attempts > 0 || !obligation.assigned).length,
+      coveredRoutes: obligations.filter(obligation => obligation.covered).length,
+      gapRoutes: obligations.filter(obligation => Boolean(obligation.gap)).length,
+      demandedRoutes: obligations.filter(obligation => this.demandedRoutes.has(obligation.key)).length,
+      dischargedByGap: obligations.filter(obligation => !obligation.covered && Boolean(obligation.gap)).length,
+    }
+  }
+
+  proofObligationStats(): ProofObligationStats {
+    return this.statsFrom(this.obligationList())
+  }
+
+  private obligationTarget(obligations: readonly ProofRouteObligation[]): SpecRouteEvidence | undefined {
+    const best = pickHighestValueRoute(obligations.filter(obligation => !obligation.covered && !obligation.gap))
+    return best
+      ? { method: best.method, path: best.path, params: [...best.params], ...(best.origin ? { origin: best.origin } : {}) }
+      : undefined
   }
 
   noteRequired(): number {
@@ -513,6 +800,11 @@ export class SpecSubmissionTracker {
     if (!route) return
     const raw = (input.pathAndQuery ?? '').trim()
     const status = typeof input.status === 'number' && Number.isFinite(input.status) ? Math.trunc(input.status) : null
+    // Every observed response is a successful probe on this route family: register/refresh it.
+    const family = this.registerFamily(route)
+    family.attempts += 1
+    if (status !== null) family.status = status
+    if (input.anomaly === true) family.anomaly = true
     this.observations.push({
       method: route.method,
       path: route.path,
@@ -591,18 +883,28 @@ export class SpecSubmissionTracker {
     const targetCovered = target && target.path !== '/'
       ? this.coveredRoutes.has(`${target.method} ${target.path}`) || (this.state.probes > 0 && this.opaqueSpecAttempts > 0)
       : this.state.specAttempts > 0
+    const obligations = this.obligationList()
+    const obligationTarget = this.obligationTarget(obligations)
     return {
       ...this.state,
       targetCovered,
       proofGaps: [...this.state.proofGaps],
+      obligations,
+      obligation: this.statsFrom(obligations),
       ...(target ? { route: { ...target, params: [...target.params] } } : {}),
+      ...(obligationTarget ? { obligationTarget } : {}),
     }
   }
 }
 
-/** A probed target route with neither a spec attempt nor a coded proof gap still owes a proof. */
+/**
+ * A proof is owed per route: every probed/assigned route family must be covered by a submitted
+ * spec/verify or carry its own coded proof gap. A gap on one route never discharges another.
+ */
 export function specSubmissionPending(snapshot: SpecSubmissionSnapshot): boolean {
-  return snapshot.probes > 0 && snapshot.codedProofGaps === 0 && !snapshot.targetCovered
+  const obligations = snapshot.obligations ?? []
+  if (!obligations.length) return false
+  return obligations.some(obligation => !obligation.covered && !obligation.gap)
 }
 
 /** Settlement must refuse a leaning conclusion when the proof obligation is still open. */
@@ -1047,6 +1349,8 @@ export interface RecordCoverageArgs {
   enforcingControl?: string
   /** Required non-empty when status === 'needs_follow_up': state exact proof gap / blocker. */
   proofGapReason?: string
+  /** Route the closure applies to, as `METHOD /path`; required to bind a coded proof gap. */
+  route?: string
   /** Linked finding ID when status === 'reported'. */
   linkedFindingId?: string
 }
@@ -1193,11 +1497,14 @@ export function formatReplaySpecValidationIssues(
  * only for the settlement nudge/banner and the reserved-turn block, never the byte-capped packet.
  */
 export function settlementSpecDirective(route?: SpecRouteEvidence): string {
-  return renderSettlementSpecDirective(
+  const base = renderSettlementSpecDirective(
     route ? { method: route.method, path: route.path, params: route.params, ...(route.origin ? { origin: route.origin } : {}) } : undefined,
     GUARDIAN_VERIFY_SPEC_SHAPE,
     SPEC_PROOF_GAP_CODES,
   )
+  return route
+    ? `${base} Route-scoped: a coded gap discharges only this route, so pass route="${route.method} ${route.path}" to record_coverage.`
+    : base
 }
 
 /**
@@ -1207,10 +1514,11 @@ export function settlementSpecDirective(route?: SpecRouteEvidence): string {
 export function specSubmissionRequiredMessage(route?: SpecRouteEvidence): string {
   const routeText = route ? ` for ${route.method} ${route.path}${route.params.length ? ` param=${route.params.join('|')}` : ''}` : ''
   const codes = SPEC_PROOF_GAP_CODES.join(', ')
+  const routeArg = route ? `, route="${route.method} ${route.path}"` : ''
   return [
     `complete_intent rejected (agent.spec_submission_required): missing required field \`proofGapReason\` or a submitted replay spec${routeText}.`,
-    `You probed a route but never submitted a guardian_verify/verify_replay_spec result, so a proved/partial conclusion is unsupported.`,
-    `Repair now: call guardian_verify${routeText} (DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or call record_coverage(status="needs_follow_up", proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
+    `You probed a route but never submitted a guardian_verify/verify_replay_spec result covering it, so a proved/partial conclusion is unsupported. Each probed route owes its own proof; a gap on another route does not discharge this one.`,
+    `Repair now: call guardian_verify${routeText} (DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or call record_coverage(status="needs_follow_up"${routeArg}, proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
     'If the hypothesis genuinely cannot be proven, complete_intent(status="blocked") is accepted with a concise reason.',
   ].join(' ')
 }
@@ -3895,6 +4203,7 @@ export function buildWorkerTools(
         '- status="reported": link to a confirmed or static_verified finding via linkedFindingId.',
         '- status="ruled_out": REQUIRES non-empty enforcingControl quoting the exact file:line in /repos or exact negative-control exchangeId proving the control runs on the attacker path (generic claims are rejected).',
         '- status="needs_follow_up": REQUIRES a non-empty machine-readable proofGapReason (e.g. no_spec_shape, no_authenticated_persona, baseline_empty) explaining the exact blocker so the Coordinator Planner and the held-out autopsy can distinguish an honest gap from a silent skip.',
+        'Proof gaps are route-scoped: a coded gap MUST name the route it applies to via route="METHOD /path" (e.g. route="GET /api/orders/:id"); a gap on one route never discharges another probed route.',
       ].join(' '),
       parameters: obj({
         origin: str({ maxLength: 256 }),
@@ -3903,6 +4212,7 @@ export function buildWorkerTools(
         summary: str({ maxLength: 600 }),
         enforcingControl: opt(str({ description: 'REQUIRED when status="ruled_out": exact file:line in /repos or exact negative-control exchangeId.', maxLength: 500 })),
         proofGapReason: opt(str({ description: `REQUIRED when status="needs_follow_up": machine-readable code plus detail (${SPEC_PROOF_GAP_CODES.join('|')}) explaining the exact blocker.`, maxLength: 600 })),
+        route: opt(str({ description: 'Route this closure applies to, as "METHOD /path" (path parameters may be concrete: "GET /api/orders/1001"). REQUIRED for a coded needs_follow_up gap when more than one route was probed, because the gap discharges only that route.', maxLength: 200 })),
         linkedFindingId: opt(str({ description: 'Finding ID when status="reported".', maxLength: 64 })),
       }),
       replay: 'safe',
@@ -3927,14 +4237,34 @@ export function buildWorkerTools(
             }],
           }
         }
+        // A coded gap must bind to a route before it is persisted: one gap discharges one route.
+        let boundRoute = args.route?.trim() || undefined
+        if (args.status === 'needs_follow_up' && parseProofGapCode(args.proofGapReason)) {
+          const binding = specSubmission?.tracker?.checkGapRoute(args.route)
+          if (binding && !binding.ok) {
+            return { isError: true, output: [{ type: 'text' as const, text: binding.error }] }
+          }
+          if (binding?.ok && binding.key) boundRoute = binding.key
+        }
+        const routeText = boundRoute
+        // Persist the binding alongside the machine-readable code (the ledger has no route column):
+        // `no_spec_shape: ... [route=GET /api/orders/:id]`.
+        const persistedGapReason = args.proofGapReason?.trim()
+          ? `${args.proofGapReason.trim()}${routeText ? ` [route=${routeText}]` : ''}`
+          : undefined
         return wrapExec('record_coverage', () => fn({
           ...args,
           enforcingControl: args.enforcingControl?.trim() || undefined,
-          proofGapReason: args.proofGapReason?.trim() || undefined,
+          proofGapReason: persistedGapReason,
+          route: routeText,
           linkedFindingId: args.linkedFindingId?.trim() || undefined,
         }, signal).then(result => {
           if (args.status === 'needs_follow_up' && args.proofGapReason?.trim()) {
-            specSubmission?.tracker?.noteProofGap({ proofGapReason: args.proofGapReason, category: args.category })
+            specSubmission?.tracker?.noteProofGap({
+              proofGapReason: args.proofGapReason,
+              category: args.category,
+              ...(args.route ? { route: args.route } : {}),
+            })
           }
           return result
         }), signal)
@@ -4306,14 +4636,17 @@ export function buildWorkerTools(
         const snapshot = specSubmission?.tracker?.snapshot()
         if (snapshot && (args.status === 'proved' || args.status === 'partial') && specSubmissionRequiredFor(snapshot)) {
           const count = specSubmission?.tracker?.noteRequired() ?? 0
+          // Demand the highest-value uncovered route, never whichever happened to be last.
+          const target = snapshot.obligationTarget ?? snapshot.route
+          if (target) specSubmission?.tracker?.noteDemand(proofRouteKey(target.method, target.path))
           specSubmission?.onRequired?.({
             status: args.status,
             count,
-            ...(snapshot.route ? { route: snapshot.route } : {}),
+            ...(target ? { route: target } : {}),
           })
           return {
             isError: true,
-            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(snapshot.route) }],
+            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(target) }],
           }
         }
         const completion: IntentCompletion = {
@@ -4500,6 +4833,16 @@ export interface RunAgentSessionOptions {
    */
   onSpecSubmissionRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
   /**
+   * Route-scoped proof coverage at session end. Wire this to the `agent.proof_obligation` run event
+   * so the funnel can prove covered/gap/demanded counts per route.
+   */
+  onProofObligation?: (info: ProofObligationEvent) => void
+  /**
+   * Tier-A/chain target routes the assignment requires proof for even when the worker never probes
+   * them. Each is a route obligation with its own spec/verify or coded gap.
+   */
+  assignedTargetRoutes?: readonly { method?: string; path?: string; origin?: string }[]
+  /**
    * Called once when settlement starts early because the target route is provably clean/hardened.
    * Wire this to the `agent.early_exit` run event and the `earlyExitTurnsSaved` assignment stat.
    */
@@ -4523,6 +4866,8 @@ export interface AgentSessionResult {
   specSubmissionRequired?: number
   /** Final spec-submission ledger (route evidence / spec attempts / coded gaps). */
   specSubmission?: SpecSubmissionSnapshot
+  /** Route-scoped proof coverage (`agent.proof_obligation` payload). */
+  proofObligation?: ProofObligationStats
   /** Earned early exit (`agent.early_exit`): reason, turns used, evidence count, turns saved. */
   earlyExit?: EarlyExitEvent
   /** Turns the session never spent because settlement started early (0 when it did not). */
@@ -4606,14 +4951,28 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   let completion: IntentCompletion | undefined
   /** Shared with the tool layer: route evidence, spec attempts and coded proof gaps. */
   const specTracker = new SpecSubmissionTracker()
+  specTracker.noteAssignedRoutes(options.assignedTargetRoutes)
   /** Earned early exit; set at most once so the event/stat are never double counted. */
   let earlyExit: EarlyExitEvent | undefined
   /** Turn on which complete_intent was last rejected for a missing spec/gap (repair window). */
   let repairTurn: number | undefined
   const specSnapshot = () => specTracker.snapshot()
-  const specDirectiveForRun = () => {
+  /**
+   * One wrap-up demand: name the highest-value uncovered route (anomaly/2xx before probe density),
+   * not whichever route happened to be probed last. `demand` records the route once for the funnel.
+   */
+  const specDirectiveForRun = (demand = false) => {
     const snapshot = specSnapshot()
-    return specSubmissionPending(snapshot) ? settlementSpecDirective(snapshot.route) : undefined
+    if (!specSubmissionPending(snapshot)) return undefined
+    const target = snapshot.obligationTarget ?? snapshot.route
+    if (demand && target) specTracker.noteDemand(proofRouteKey(target.method, target.path))
+    return settlementSpecDirective(target)
+  }
+  /** Attach the route-scoped proof stat to a session result and emit the funnel event once. */
+  const finish = (result: AgentSessionResult): AgentSessionResult => {
+    const stats = specTracker.proofObligationStats()
+    try { options.onProofObligation?.({ type: 'agent.proof_obligation', ...stats }) } catch { /* telemetry only */ }
+    return { ...result, proofObligation: stats }
   }
   /**
    * Evidence-gated early exit, evaluated after every assistant turn. Distinct from the 85% banner:
@@ -4631,8 +4990,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       evidence,
       turnsUsed,
       maxTurns,
-      specPending: snapshot.specAttempts > 0 && !snapshot.targetCovered,
-      repairInFlight: repairTurn !== undefined && snapshot.codedProofGaps === 0 && !snapshot.targetCovered,
+      specPending: snapshot.specAttempts > 0 && specSubmissionPending(snapshot),
+      repairInFlight: repairTurn !== undefined && specSubmissionPending(snapshot),
       unresolvedProofGap: snapshot.proofGaps.some(gap => !gap.code),
     })
     if (!decision.eligible) return
@@ -4719,7 +5078,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           role: 'user' as const, content, timestamp: Date.now(),
         }))
         const settlingNow = isSettling()
-        const specDirective = specDirectiveForRun()
+        const willNudge = Boolean(handlers.complete_intent) && turnsUsed + 1 === settlementNudgeTurn
+        const specDirective = specDirectiveForRun(Boolean(earlyExit) || settlingNow || willNudge)
         if (earlyExit) {
           extraMessages.push({
             role: 'user' as const,
@@ -4826,7 +5186,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           turnsUsed,
           maxTurns,
           finalTurn: finalTurnForRun(),
-          ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.route) } : {}),
+          ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.obligationTarget ?? snapshot.route) } : {}),
         })
         return block ? { block } : undefined
       },
@@ -4944,7 +5304,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }
 
     if (completion) {
-      return {
+      return finish({
         answer: completion.summary,
         turnsUsed,
         settled,
@@ -4954,13 +5314,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         specSubmissionRequired: specTracker.snapshot().required,
         specSubmission: specTracker.snapshot(),
         ...earlyExitFields(),
-      }
+      })
     }
 
     if (result.status === 'unanswered' && result.reason === 'turn_limit') {
       const view = await conversation.context(context)
       const lastText = extractLastAssistantText(view.entries)
-      return {
+      return finish({
         answer: scrub(lastText || `Reached maxTurns (${maxTurns}) without calling complete_intent.`),
         turnsUsed,
         settled,
@@ -4969,7 +5329,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         specSubmissionRequired: specTracker.snapshot().required,
         specSubmission: specTracker.snapshot(),
         ...earlyExitFields(),
-      }
+      })
     }
 
     // Legacy single-turn baseline fallback when derive_evidence is used without complete_intent
@@ -4977,13 +5337,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       const view = await conversation.context(context)
       const toolResults = view.entries.flatMap(item => item.model ?? []).filter(msg => msg.role === 'toolResult')
       if (toolResults.some(msg => !msg.isError)) {
-        return {
+        return finish({
           answer: 'The model reached its output limit after recording the evidence command result.',
           turnsUsed,
           settled,
           nudgesUsed,
           status: 'completed',
-        }
+        })
       }
       if (toolResults.length) {
         options.signal.throwIfAborted()
@@ -4991,13 +5351,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           { command: 'jq -c . /evidence/observed.json > /work/result.txt && cat /work/result.txt' },
           options.signal,
         )
-        return {
+        return finish({
           answer: 'The model did not provide a usable evidence command. Guardian recorded the standard observation extraction.',
           turnsUsed,
           settled,
           nudgesUsed,
           status: 'completed',
-        }
+        })
       }
     }
 
@@ -5017,13 +5377,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           : fallbackCommand
         await handlers.derive_evidence({ command }, options.signal)
       }
-      return {
+      return finish({
         answer: 'The model reached its output limit. The worker used the recorded response metadata for the evidence check.',
         turnsUsed,
         settled,
         nudgesUsed,
         status: 'completed',
-      }
+      })
     }
 
     const answer = assistant
@@ -5033,25 +5393,25 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
 
     if (!answer) {
       if (handlers.derive_evidence && usedTool) {
-        return {
+        return finish({
           answer: 'The worker recorded its analysis of the supplied response metadata.',
           turnsUsed,
           settled,
           nudgesUsed,
           status: 'completed',
-        }
+        })
       }
       throw new Error('The model returned an empty response.')
     }
 
-    return {
+    return finish({
       answer: scrub(answer),
       turnsUsed,
       settled,
       nudgesUsed,
       status: requireCompleteIntent && !completion ? 'nudged_out' : 'completed',
       ...earlyExitFields(),
-    }
+    })
   } finally {
     await activityWatch?.stop().catch(() => undefined)
     await harness.close(BACKGROUND_CONTEXT)
