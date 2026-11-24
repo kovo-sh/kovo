@@ -384,6 +384,20 @@ test('M0: verifyReplaySpec and retestReplaySpec confirm through the receipt on a
   assert.equal(verified.receipt!.mode, 'shadow')
   assert.equal(verified.receipt!.receipt.exchangeIds.length, 3)
 
+  // Strict mode runs the same receipt as the final gate and still confirms a substantiated replay.
+  const priorMode = process.env.GUARDIAN_PROOF_RECEIPT
+  process.env.GUARDIAN_PROOF_RECEIPT = 'strict'
+  try {
+    state = { owner_id: 'u1', status: 'open' }
+    const strict = await verifyReplaySpec(params)
+    assert.equal(strict.verdict, 'confirmed', strict.outcome.reason ?? 'no reason')
+    assert.equal(strict.receipt?.mode, 'strict')
+    assert.equal(strict.receipt?.verification.confirmed, true)
+  } finally {
+    if (priorMode === undefined) delete process.env.GUARDIAN_PROOF_RECEIPT
+    else process.env.GUARDIAN_PROOF_RECEIPT = priorMode
+  }
+
   state = { owner_id: 'u1', status: 'open' }
   const retest = await retestReplaySpec(params)
   assert.equal(retest.verdict, 'reproduced', retest.replay.outcome.reason ?? 'no reason')
