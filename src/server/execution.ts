@@ -3276,6 +3276,8 @@ export class Execution {
     }, { behavior: 'immediate' })
     const effectiveStep: ChainStep = { ...step, specialistProfile: resolvedSpecialistId }
 
+    const baselineFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length
+    const baselineFindings = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all().length
     const job: Active = { assignment, origins: new Set(targetOrigins), controller: new AbortController() }
     this.active.set(assignment.id, job)
     this.boardHandleByAssignment.set(assignment.id, boardHandle)
@@ -3353,7 +3355,19 @@ export class Execution {
     }).finally(() => {
       this.active.delete(assignment.id)
       try { this.board.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
-      this.schedulePlanner(run.id)
+      // Avoid premature mid-wave planner triggers when Wave 2+ still buffers >= maxConc ready steps
+      // and this assignment produced no new fact or finding.
+      let shouldPlan = true
+      try {
+        const latestRun = this.storage.run(run.id)
+        const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, latestRun.workerConcurrency || defaultWorkerConcurrency))
+        const readySteps = this.storage.listChainSteps(run.id, latestRun.goalRevision)
+          .filter(s => s.status === 'ready').length
+        const newFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length > baselineFacts
+        const newFinding = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all().length > baselineFindings
+        shouldPlan = readySteps < maxConc || newFact || newFinding
+      } catch { /* run may be gone */ }
+      if (shouldPlan) this.schedulePlanner(run.id)
       this.scheduleWake()
     })
   }

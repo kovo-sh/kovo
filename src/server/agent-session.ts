@@ -3158,6 +3158,7 @@ export function coordinatorPlannerPrompt(input: CoordinatorPlannerPromptInput): 
     protocol: [
       'Page the untruncated store with query_endpoints/query_facts (v1 cursor, max 500/page) and query_program_graph/query_findings before deciding.',
       'In Rounds 1–2 prioritize unconfirmed non-floor semantic classes (workflow, business_logic, race, auth_protocol, chain) via query_endpoints(untestedSemanticOnly=true) over re-probing generic read routes already swept by the floor.',
+      'In Rounds 1–2, batch up to 12 diverse unconfirmed hypotheses (2 waves of parallel work across distinct routes and classes) in dispatch_investigations so worker slots stay saturated without idle gaps.',
       'Treat confirmed findings from query_findings(status="confirmed") as read-only chain primitives (cite their IDs in parentEvidenceIds) rather than dispatching duplicate investigations on already-confirmed routes.',
       'Commit each new investigation through dispatch_investigations with a hypothesis, approved origins, parentEvidenceIds and a capability bundle (http/browser/oob/race/http2/sast).',
       'A hypothesis without parent evidence is rejected; cite fact/finding/endpoint ids from the query results.',

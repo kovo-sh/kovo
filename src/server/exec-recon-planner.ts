@@ -72,9 +72,11 @@ import {
   hardChainStepsCeiling,
   hostTierOrder,
   isDetLeadDispatchStep,
+  nextPlannerDryRounds,
   passOneCoverage,
   permanentlyBlockedStepIds,
   plannerResponseSchema,
+  plannerWaveDispatchCap,
   reinvestigationKey,
   selectUncoveredHighRiskEndpoints,
   stripJsonFences,
@@ -214,6 +216,7 @@ export interface ExecReconPlannerHost extends ExecCoreServices {
 export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly plannerEmptyRounds = new Map<string, number>()
   private readonly plannerDryRounds = new Map<string, number>()
+  private readonly plannerCompletedAtLastRound = new Map<string, number>()
   private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
   private readonly detLeadStepKeys = new Set<string>()
   private readonly detLeadGateRejected = new Set<string>()
@@ -998,9 +1001,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     approvedOrigins: ReadonlySet<string>,
     dynamicStepBudget: number,
     existingSteps: readonly ChainStep[],
+    limitOverride?: number,
   ): { seeded: number; endpoints: string[] } {
     const remainingBudget = Math.max(0, dynamicStepBudget - existingSteps.length)
-    const cap = Math.min(6, remainingBudget)
+    const defaultCap = plannerWaveDispatchCap(run.workerConcurrency || defaultWorkerConcurrency, remainingBudget)
+    const cap = limitOverride !== undefined ? Math.max(0, Math.min(limitOverride, remainingBudget)) : defaultCap
     if (cap <= 0) return { seeded: 0, endpoints: [] }
     let endpoints: Array<{
       origin: string
@@ -1011,7 +1016,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       testedClasses?: string[] | null
     }> = []
     try {
-      endpoints = this.storage.listEndpoints(run.id, { orderBy: 'risk', limit: 40 })
+      endpoints = this.storage.listEndpoints(run.id, { orderBy: 'risk', limit: 80 })
     } catch {
       return { seeded: 0, endpoints: [] }
     }
@@ -1540,11 +1545,13 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const factIds = new Set(this.pageAll((offset, limit) =>
       this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset })).map(fact => fact.id))
     const remainingBudget = Math.max(0, dynamicStepBudget - this.storage.listChainSteps(fresh.id, updated.goalRevision).length)
+    const maxConcForPlan = Math.max(1, Math.min(maxWorkerConcurrency, updated.workerConcurrency || defaultWorkerConcurrency))
+    const waveBufferTarget = Math.max(12, maxConcForPlan * 2)
     const coordinator = createGraphCoordinator({
       deps: this.coordinatorDeps(updated),
       approvedOrigins: [...approvedOrigins],
       budgetUsd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
-      maxDispatchSteps: Math.min(6, remainingBudget),
+      maxDispatchSteps: plannerWaveDispatchCap(maxConcForPlan, remainingBudget),
     })
 
     // Chain round after the floor + first planner round. Deterministic hypotheses over the full
@@ -1773,6 +1780,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
 
+    // Round-1 2-wave pipeline top-up: ensure Wave 1 + Wave 2 stay buffered when uncovered
+    // high-risk routes remain so fast workers never sit idle waiting for Round 2.
+    if (roundNo === 1 && funnel.enqueued < waveBufferTarget) {
+      const stepsAfterRound1 = this.storage.listChainSteps(run.id, currentRun.goalRevision)
+      const topUp = this.queueHighRiskCoverageSteps(
+        currentRun, currentApproved, dynamicStepBudget, stepsAfterRound1, waveBufferTarget - funnel.enqueued,
+      )
+      if (topUp.seeded > 0) {
+        funnel.planned += topUp.seeded
+        funnel.enqueued += topUp.seeded
+        addedCount += topUp.seeded
+        try {
+          this.storage.event(
+            run.id, 'planner.wave_topup',
+            `Round-1 2-wave buffer topped up ${topUp.seeded} uncovered high-risk route(s) (target ${waveBufferTarget}).`,
+            { roundNo, seeded: topUp.seeded, waveBufferTarget, endpoints: topUp.endpoints },
+          )
+        } catch { /* telemetry is best-effort */ }
+      }
+    }
+
     // Deterministic scheduler guard outside the LLM: budget/requests/wall/K=2/done+pending OOB.
     const emptyRounds = addedCount === 0 ? (this.plannerEmptyRounds.get(run.id) ?? 0) + 1 : 0
     this.plannerEmptyRounds.set(run.id, emptyRounds)
@@ -1784,9 +1812,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       confirmed: confirmedAfterRound,
       primitives: chainPrimitivesAfterRound,
     })
-    const dryRounds = newRuntimeConfirmed + newChainPrimitives > 0
-      ? 0
-      : (this.plannerDryRounds.get(run.id) ?? 0) + 1
+    const completedInvestigations = this.storage.workerList(run.id)
+      .filter(w => w.phase === 'investigation' && (w.status === 'complete' || w.status === 'failed')).length
+    const previousCompletedInvestigations = this.plannerCompletedAtLastRound.get(run.id) ?? completedInvestigations
+    this.plannerCompletedAtLastRound.set(run.id, completedInvestigations)
+    const dryRounds = nextPlannerDryRounds({
+      roundNo,
+      previousDryRounds: this.plannerDryRounds.get(run.id) ?? 0,
+      newRuntimeConfirmed,
+      newChainPrimitives,
+      completedInvestigations,
+      previousCompletedInvestigations,
+    })
     this.plannerDryRounds.set(run.id, dryRounds)
     const queueDrained = this.host.highPriorityQueueEmpty({
       id: run.id,
@@ -1801,6 +1838,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         limit: DRY_ROUND_LIMIT,
         newRuntimeConfirmed,
         newChainPrimitives,
+        completedSinceLastRound: Math.max(0, completedInvestigations - previousCompletedInvestigations),
         highPriorityQueueEmpty: queueDrained,
       },
     )

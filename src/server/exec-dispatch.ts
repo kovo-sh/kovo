@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import {
   defaultWorkerConcurrency,
+  maxWorkerConcurrency,
   type Candidate,
   type OwaspCategory,
   type ThreatModelSummary,
@@ -351,6 +352,34 @@ export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): 
     }
   }
   return decision
+}
+
+/**
+ * Advance the planner's dry-round streak without false-dry kills:
+ *  - Round 1 seeds initial agentic work before any specialist wave has run (`-> 0`).
+ *  - A mid-wave round with zero newly completed investigation assignments has no new worker
+ *    evidence to judge yet, so preserve the existing streak rather than incrementing it.
+ *  - Any new runtime confirmation or chain primitive resets the streak to 0.
+ *  - Keeps `DRY_ROUND_LIMIT = 2` intact once real completed waves stop advancing the frontier.
+ */
+export function nextPlannerDryRounds(input: {
+  roundNo: number
+  previousDryRounds: number
+  newRuntimeConfirmed: number
+  newChainPrimitives: number
+  completedInvestigations: number
+  previousCompletedInvestigations: number
+}): number {
+  if (input.newRuntimeConfirmed + input.newChainPrimitives > 0) return 0
+  if (input.roundNo <= 1) return 0
+  if (input.completedInvestigations <= input.previousCompletedInvestigations) return input.previousDryRounds
+  return input.previousDryRounds + 1
+}
+
+/** 2-wave planner dispatch capacity (`>= 12` or `workerConcurrency * 2`, clamped to remaining budget). */
+export function plannerWaveDispatchCap(workerConcurrency: number, remainingBudget: number): number {
+  const conc = Math.max(1, Math.min(maxWorkerConcurrency, workerConcurrency || defaultWorkerConcurrency))
+  return Math.max(0, Math.min(Math.max(12, conc * 2), remainingBudget))
 }
 
 /** Map chained hypotheses onto validated dispatch inputs (ordered by the planner's ranking). */

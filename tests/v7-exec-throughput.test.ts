@@ -10,15 +10,18 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { coordinatorPlannerPrompt } from '../src/server/agent-session.ts'
 import {
   Execution,
   extractAssignedTargetRoutes,
+  nextPlannerDryRounds,
   planMultiTrialExpansion,
   planRoundRobinDispatch,
+  plannerWaveDispatchCap,
   selectUncoveredHighRiskEndpoints,
 } from '../src/server/execution.ts'
 import type { DispatchLaneStep } from '../src/server/execution.ts'
-import { saveModelProfile } from '../src/server/model-settings.ts'
+import { privateModelProfiles, saveModelProfile } from '../src/server/model-settings.ts'
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import {
   makeStore,
@@ -224,4 +227,124 @@ test('Execution wires onProofObligation, onGapValidation, and assignedTargetRout
   const events = storage.client.prepare('SELECT kind FROM events WHERE run_id = ?').all(runId) as Array<{ kind: string }>
   assert.ok(events.some(e => e.kind === 'agent.proof_obligation'), 'expected agent.proof_obligation run event')
   assert.ok(events.some(e => e.kind === 'agent.gap_validation'), 'expected agent.gap_validation run event')
+})
+
+test('nextPlannerDryRounds ignores Round 1 and mid-wave rounds with 0 newly completed workers while preserving DRY_ROUND_LIMIT', () => {
+  // Round 1 seeds Wave 1 before any agent worker has completed -> never counts as dry.
+  assert.equal(nextPlannerDryRounds({
+    roundNo: 1, previousDryRounds: 0, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 1, previousCompletedInvestigations: 1,
+  }), 0)
+  // Round 2 mid-wave with zero newly completed investigation assignments -> keeps previousDryRounds.
+  assert.equal(nextPlannerDryRounds({
+    roundNo: 2, previousDryRounds: 0, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 1, previousCompletedInvestigations: 1,
+  }), 0)
+  // Round 2 after completed agentic work with no frontier progress -> increments to 1.
+  assert.equal(nextPlannerDryRounds({
+    roundNo: 2, previousDryRounds: 0, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 4, previousCompletedInvestigations: 1,
+  }), 1)
+  // Mid-wave Round 3 with no additional completions -> stays at 1 (no false kill).
+  assert.equal(nextPlannerDryRounds({
+    roundNo: 3, previousDryRounds: 1, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 4, previousCompletedInvestigations: 4,
+  }), 1)
+  // Next completed wave with no frontier progress -> hits DRY_ROUND_LIMIT (2).
+  assert.equal(nextPlannerDryRounds({
+    roundNo: 4, previousDryRounds: 1, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 8, previousCompletedInvestigations: 4,
+  }), 2)
+  // Any new confirmation or chain primitive resets to 0.
+  assert.equal(nextPlannerDryRounds({
+    roundNo: 4, previousDryRounds: 1, newRuntimeConfirmed: 1, newChainPrimitives: 0,
+    completedInvestigations: 8, previousCompletedInvestigations: 4,
+  }), 0)
+})
+
+test('plannerWaveDispatchCap buffers 2 waves (>= 12 or maxConc * 2) and coordinatorPlannerPrompt hints 12 hypotheses', () => {
+  assert.equal(plannerWaveDispatchCap(6, 40), 12)
+  assert.equal(plannerWaveDispatchCap(8, 40), 16)
+  assert.equal(plannerWaveDispatchCap(4, 40), 12)
+  assert.equal(plannerWaveDispatchCap(6, 7), 7)
+  const prompt = coordinatorPlannerPrompt({
+    goal: 'verify api', roundNo: 1, capabilityTier: 2, approvedOrigins: [origin],
+    budgetRemaining: { usd: 2, requests: 500 }, dynamicStepBudget: 40, pendingOob: 0, chainSteps: [],
+  })
+  assert.match(prompt, /up to 12 diverse unconfirmed hypotheses/i)
+})
+
+test('runChainPlanner buffers 2 waves on Round 1 and never increments dryRounds on Round 1 or 0-completion mid-wave Round 2', async (t) => {
+  const llm = await startMockLlmServer(t, () => ({
+    type: 'text',
+    text: JSON.stringify({
+      done: false,
+      summary: 'Seeded initial hypotheses.',
+      cancelStepIds: [],
+      newSteps: [
+        {
+          title: 'Workflow step 1',
+          hypothesis: 'Probe POST /api/v1/orders/checkout workflow invariant.',
+          category: 'business-logic',
+          priority: 85,
+          origins: [origin],
+          skills: ['business-logic-chains'],
+          dependsOnFactIds: [],
+          dependsOnStepIds: [],
+        },
+      ],
+    }),
+  }))
+  const { storage } = makeStore(t)
+  await saveModelProfile({
+    name: 'Planner-Wave-Mock', endpoint: llm.endpoint, model: 'mock-wave', protocol: 'responses', key: 'sk-mock-wave-1234',
+    priority: 100, enabled: true, contextWindow: 128_000, maxTokens: 4096, thinkingLevel: 'medium', roleAffinity: 'tactical',
+    inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
+  }, storage, { skipConnectionCheck: true })
+
+  const { runId, run } = await setupApprovedRun(storage, { seeds: [origin] })
+  storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 6, multiTrialEnabled: false })
+  for (let i = 1; i <= 14; i += 1) {
+    storage.upsertEndpoint({
+      runId, scopeRevision: run.scopeRevision, origin, method: 'POST',
+      pathTemplate: `/api/v1/resource-${i}/action`, source: 'openapi', riskScore: 80 - i,
+    })
+  }
+
+  const engine = new Execution(storage, { deterministicSweep: false })
+  const profiles = privateModelProfiles(storage)
+  const priv = engine as unknown as {
+    runChainPlanner: (r: ReturnType<typeof storage.run>, p: typeof profiles, task: { controller: AbortController; goalRevision: number }) => Promise<void>
+    plannerDoneRound: Map<string, number>
+  }
+
+  // Round 1: should top up to 2 waves (12 steps) with dryRounds = 0.
+  const task1 = { controller: new AbortController(), goalRevision: run.goalRevision }
+  await priv.runChainPlanner(storage.run(runId), profiles, task1)
+  const stepsAfterR1 = storage.listChainSteps(runId, run.goalRevision)
+  assert.ok(stepsAfterR1.length >= 12, `expected 2-wave buffer (>=12 steps) on Round 1, got ${stepsAfterR1.length}`)
+  const dryEventsAfterR1 = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'planner.dry_rounds')
+  assert.equal(dryEventsAfterR1.at(-1)?.detail?.consecutiveDryRounds, 0, 'Round 1 must never increment dryRounds')
+  assert.equal(priv.plannerDoneRound.has(runId), false)
+
+  // Round 2 mid-wave (0 newly completed investigation assignments): must stay at dryRounds = 0.
+  const task2 = { controller: new AbortController(), goalRevision: run.goalRevision }
+  await priv.runChainPlanner(storage.run(runId), profiles, task2)
+  const dryEventsAfterR2 = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'planner.dry_rounds')
+  assert.equal(dryEventsAfterR2.at(-1)?.detail?.consecutiveDryRounds, 0, 'mid-wave Round 2 with 0 new completions must not increment dryRounds')
+  assert.equal(priv.plannerDoneRound.has(runId), false)
+
+  // Now simulate completed investigation workers without new confirmations across Rounds 3 & 4 -> dryRounds hits 1 then 2.
+  const asset = storage.run(runId).candidates[0]!
+  const w1 = storage.makeWorker(storage.run(runId), 'investigation', asset, 'Completed wave 1', 'done')
+  storage.updateWorker(w1.id, { status: 'complete', outcome: 'no finding' })
+  await priv.runChainPlanner(storage.run(runId), profiles, { controller: new AbortController(), goalRevision: run.goalRevision })
+  const dryEventsAfterR3 = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'planner.dry_rounds')
+  assert.equal(dryEventsAfterR3.at(-1)?.detail?.consecutiveDryRounds, 1, 'completed wave without progress increments dryRounds to 1')
+
+  const w2 = storage.makeWorker(storage.run(runId), 'investigation', asset, 'Completed wave 2', 'done')
+  storage.updateWorker(w2.id, { status: 'complete', outcome: 'no finding' })
+  await priv.runChainPlanner(storage.run(runId), profiles, { controller: new AbortController(), goalRevision: run.goalRevision })
+  const dryEventsAfterR4 = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'planner.dry_rounds')
+  assert.equal(dryEventsAfterR4.at(-1)?.detail?.consecutiveDryRounds, 2, 'second completed dry wave reaches DRY_ROUND_LIMIT=2')
 })
