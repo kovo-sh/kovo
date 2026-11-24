@@ -554,3 +554,50 @@ Follow-ups created: (a) status-divergent boolean receipt rule in `oracle-invaria
 2. The grounded-SQLi fix was built on a stale base and violated leases → parked; re-landed cleanly on main by `sqli-baseline2`.
 
 **Tooling:** `worker-gate.sh` lease guard now has a documented coordinator override (`WORKER_GATE_ALLOW_DIRTY_MAIN=1`) so the coordinator can validate its own in-flight edits while subagents stay blocked. Stale `v5-agentic-lane` test replaced: it referenced the `submitProofSpec` internal retired in M0 Cut 1, and now pins the live `verifierRepairFeedback` contract.
+
+### 2026-11-24 — grounded SQLi arms (probe-only) + the real held-out blocker: zero discovered params
+
+**Probe-side fix validated (`agents/sqli-baseline` @ `e7ccd6d`, probe + test only after the lease revert):** the boolean probe now sends one benign empty-term request, harvests a literal operand from the returned rows, and uses it for the baseline and every shape, with the tautology pair as the only fallback. Measured arms on held-out shopflow `product-search-sqli`:
+
+| | baseline | true arm | false arm | result |
+|---|---|---|---|---|
+| before | `Item` → 3 rows | 0 rows | 0 rows | no separation; dismissed |
+| after | `Item 1` → 1 row | **1 row, 200** | **0 rows, 200** | 2/2 rounds pass; `provenStyle=single_quote` |
+
+xben stayed 25/25 (the probe maps `tautology` → `or_branch` so legacy builders still replay correctly), dev floor 33/59 at 100%, held-out 24/58 at 100%.
+
+**But two replay-side edits are still required for the +1, and a bigger blocker sits underneath.** With the grounded pair the replay dismisses on `simBaselineTrue = 0.8333 < 0.9` because the echoed `{"query":…}` contains the payload and `k` tokens; scrubbing the reflected request value yields `1.0` and confirms 3/3 (verified on a scratch copy). Those edits (`replay-verifier` scrub, `deterministic-specs` grounded pair) are being re-landed by `sqli-baseline2` **only where the live path still reaches them** after Cut 3a.
+
+**The blocker that actually holds held-out at 24/58:** the floor never forms an sqli hypothesis for `/api/v1/search` because recon stores **zero `endpoint_params`** for that route (`bucket=hypothesis_miss`). No pair fix can help a route the floor cannot describe. New stream `param-discovery` derives candidate params from evidence the crawler already holds (link query keys, form fields, XHR/GraphQL args, bundle literals near the path, schema docs) with `observed` vs `inferred` provenance — inferred params may form a hypothesis but can never create a confirmation.
+
+### 2026-11-24 — hourly check-in #13: accept p50 bump, claim-halt on the precision hole, don't abandon VM deletion
+
+**Triage (accept/reject/defer):**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Accept a modest p50 bump for the 4× proof-submission gain: Tier-1 **p50 110 s hard / 85 s warn** (was 90/75); do **not** split probing and proof into two assignments (splitting drops live cookies/IDs/repair context and doubles overhead) | **ACCEPT** (gate updated) | coordinator |
+| 2 | Pull p50 back down by **early-exit settlement on clearly clean/hardened routes** (stop at turn 5–6 instead of burning 7–18) plus warm-pool containers, without lowering the 18-turn/120 s ceiling | **ACCEPT** | queued (agent-session) |
+| 3 | Inferred params: explicit provenance (`observed` / `inferred_bundle` / `inferred_html` / `inferred_ast`), never a static advisory, noise-filtered, **one-request sensitivity check or paired differential** before any confirmation path | **ACCEPT** | `param-discovery` |
+| 4 | Do **not** exclude bundle/HTML/XHR params from the +6pp gate — that is universal recon, not overfitting; only hardcoded benchmark wordlists are forbidden | **ACCEPT** | certification |
+| 5 | Precision-integrity hole: **halt certification claims**, ship a **store-level invariant** (`runtime_confirmed` requires `receipt.verdict === 'confirmed'`, typed `InvariantError`), triage recovered FP rows into Tier-0 archetypes, verify forward only (worker-gate + trap 0 + one clean held-out cell) — **no** hours spent re-auditing dead runs | **ACCEPT** | `confirm-consistency` |
+| 6 | Wait for `confirm-consistency` + `param-discovery`, **then** run dev + salted held-out 3-app (600 s, K=6, n=1) before any capability pivot | **ACCEPT** | coordinator |
+| 7 | Do **not** abandon deleting the VM: after the re-baseline, one `cut3b-parity` stream adds the two missing receipt primitives (~150–250 LOC): `status_differential` for xben's 5 SQL targets, and authz baseline/self-state readback for the 5 dev authz targets | **ACCEPT** | queued after re-baseline |
+| 8 | +6pp is likely within reach without a new capability class: funnel math on 25 route hits × 50% spec × 35–50% confirm ⇒ +4–6 targets | **NOTED** | measurement pending |
+
+**Claim status:** agentic-lift certification remains **halted** until the store invariant lands and a clean held-out cell exists.
+
+### 2026-11-24 — grounded SQLi pair reaches the live (recipe) path
+
+`sqli-baseline2` answered the "which edits are actually live after Cut 3a" question by reading the code instead of assuming:
+
+| Edit | Verdict |
+|---|---|
+| `execution.ts` grounded spec | **not live** — `--no-llm` runs `deterministicOnly`, so the inline spec pass is never reached; reverted, lease released |
+| `deterministic-specs.ts` grounded fields + `tautology` | **not live** — wired `sql_boolean_diff/sqli` confirms via the recipe and persists `recipeSpecRecord(recordGeneratedFromArgs)`, never the synthesized spec; reverted |
+| `replay-verifier.ts` echo scrub | **kept** — `verifyReplaySpec` is still reached by verification workers and patch retest, so the legacy branch is live; receipt rule already scrubbed, this covers the legacy branch |
+| `floor-recipe-engine.ts` + `floor-recipes.ts` | **new and required** — the planner was replaying `hyp.baselineValue` (a seed literal); it now carries the probe anomaly's grounded `baselineValue`/`valueTemplate`/`quoteStyle` into the recorded spec so patch retest replays the same pair |
+
+Validation on the reduced tree: dev **34/59** (3 runs, 0 spread, 100%), xben 25/25, held-out-saas 20/20 + 20/20 patches, held-out **24/58** @100%. Dev shopflow confirms `/api/v1/search` sqli through `boolean_or_timing` (`deterministic_engine.recipe_confirmed`).
+
+**Sharpened held-out diagnosis:** `/api/v1/search` *does* declare a param (`searchQuery`); the floor still never creates an `sqli_boolean` hypothesis for it (only `mass_assignment` probes the route). So the gap is **param anchoring for a class**, not necessarily param discovery — `param-discovery` has been asked to distinguish (A) missing param vs (B) present-but-not-anchored and to report the rejecting predicate if it lives outside its lease.

@@ -185,6 +185,16 @@ export interface BooleanOrTimingArgs extends FloorRecipeBaseArgs {
   probeJsonBody?: unknown
   /** Paired rounds for the boolean rule (clamped to 2..4; timing ignores it). */
   rounds?: number
+  /**
+   * Operand the probe proved the predicate with. A response-grounded value (or the empty term of the
+   * tautology pair) must travel onto the recorded spec so a patch retest replays the same pair
+   * instead of rotating back to a seed literal the target's data does not contain.
+   */
+  baselineValue?: string
+  /** Shape of the proven predicate; carried for the recorded spec's replay. */
+  quoteStyle?: 'single' | 'double' | 'numeric'
+  /** Exact proven single-template shape (`{{baseline}}` / `{{sql_expr}}` placeholders). */
+  valueTemplate?: string
 }
 
 export interface OobCallbackArgs extends FloorRecipeBaseArgs {

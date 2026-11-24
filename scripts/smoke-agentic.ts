@@ -257,7 +257,7 @@ Flags:
 Gates (Tier 1):
   precision 100% on lift/rotation; 0 confirmed on the trap; paired net-new >=
   --lift-baseline (a -1 is allowed once with improved conversion and a rerun);
-  conversion drop <= 10pp; 0 RPC/sandbox crashes; p50 assignment <= 90 s (>75 s warns);
+  conversion drop <= 10pp; 0 RPC/sandbox crashes; p50 assignment <= 110 s (>85 s warns);
   >= 12 completed assignments in the 300 s lift cell; <= $0.80/cell.
 
 Environment:
@@ -665,16 +665,16 @@ export function evaluateGates(input: GateInput): GateResult[] {
       : String(crashes),
   })
 
-  const p50Warnings = agentic.filter(cell => cell.p50AssignmentMs !== null && cell.p50AssignmentMs > 75_000)
-  const p50Failures = agentic.filter(cell => cell.p50AssignmentMs === null || cell.p50AssignmentMs > 90_000)
+  const p50Warnings = agentic.filter(cell => cell.p50AssignmentMs !== null && cell.p50AssignmentMs > 85_000)
+  const p50Failures = agentic.filter(cell => cell.p50AssignmentMs === null || cell.p50AssignmentMs > 110_000)
   gates.push({
     id: 'p50-assignment',
-    label: 'p50 assignment <= 90 s (>75 s warns)',
+    label: 'p50 assignment <= 110 s (>85 s warns)',
     pass: agentic.length > 0 && p50Failures.length === 0,
     observed: agentic.length === 0
       ? 'not measured'
       : p50Failures.length === 0
-        ? `${agentic.map(cell => `${cell.id}=${Math.round((cell.p50AssignmentMs ?? 0) / 1000)}s`).join(', ')}${p50Warnings.length ? ' (warn >75s)' : ''}`
+        ? `${agentic.map(cell => `${cell.id}=${Math.round((cell.p50AssignmentMs ?? 0) / 1000)}s`).join(', ')}${p50Warnings.length ? ' (warn >85s)' : ''}`
         : `fail: ${p50Failures.map(cell => `${cell.id}=${cell.p50AssignmentMs === null ? 'n/a' : `${Math.round(cell.p50AssignmentMs / 1000)}s`}`).join(', ')}`,
   })
 
