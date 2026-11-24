@@ -4615,6 +4615,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
    */
   const evaluateEarlyExit = () => {
     if (!enableSettlement || earlyExit || completion || !handlers.complete_intent) return
+    // Only genuinely early: at/after the 85% settlement turn the banner already handles wrap-up.
+    if (turnsUsed >= settlementTurn) return
     const evidence = specTracker.observationSnapshot()
     if (!evidence.attempts) return
     const snapshot = specSnapshot()
