@@ -1799,21 +1799,26 @@ export function enumerateHypotheses(
 
     // --- SSRF -------------------------------------------------------------------------------
     // A URL-consuming *write* is the SSRF source. Eligibility is structural: a declared body
-    // parameter whose family or observed value is URL-shaped, or a collection response that
-    // already publishes URL values (the target itself fetches them). Trigger routes are paired as
-    // the second-order fetch step, never probed as if they accepted a URL body.
+    // parameter whose family or observed value is URL-shaped, a URL-shaped query value on a
+    // mutating route, or a collection response that already publishes URL values (the target
+    // itself fetches them). Trigger routes are paired as the second-order fetch step, never probed
+    // as if they accepted a URL body.
     const triggerShaped = hasDynamicIdSegment(bare) && /(?:ping|test|trigger|fetch|replay|send|deliver|run|execute|verify)$/i.test(lastSegment)
-    const urlBodyParams = rankedFor(param =>
-      (param.location === 'json' || param.location === 'form') &&
+    const urlShapedParams = rankedFor(param =>
+      (param.location === 'json' || param.location === 'form' || param.location === 'query') &&
       (paramNameShape(param.name) === 'url' || param.observedShape === 'url'))
+    const urlBodyParams = urlShapedParams.filter(item => item.param.location !== 'query')
     const collectionPublishesUrls = (observedEvidence.urlValues?.length ?? 0) > 0
     if ((method === 'POST' || method === 'PUT') && !triggerShaped &&
-        (urlBodyParams.length > 0 || collectionPublishesUrls)) {
-      const declared = urlBodyParams.slice(0, 3).map(item => item.param)
+        (urlShapedParams.length > 0 || collectionPublishesUrls)) {
+      const declared = urlShapedParams.slice(0, 3).map(item => item.param)
       const params = declared.length > 0
         ? declared
         : [inferredParam(urlParamNames(bare)[0] ?? 'url', 'json')]
-      // Second-order: a sibling trigger route for the same resource collection.
+      // Second-order: a sibling trigger route for the same resource collection, or the write route
+      // itself when its own last segment is a fetch verb (the write is the trigger). Route nouns
+      // only shape the parameter vocabulary; a webhook/receiver family is selected from the
+      // route-family hint, not from an app-specific path literal.
       const trigger = endpoints.find(candidate => {
         const candidateBare = candidate.pathTemplate.split('?')[0] || '/'
         if (candidate.method.toUpperCase() !== 'POST') return false
@@ -1822,6 +1827,9 @@ export function enumerateHypotheses(
         return parts.length >= 2 && /(?:ping|test|trigger|fetch|replay|send|deliver|run)/i.test(parts[parts.length - 1] ?? '') &&
           (parent === bare || parent.startsWith(`${bare}/`) || bare.startsWith(`${parent}/`))
       })
+      // A write whose own last segment is a fetch verb runs the fetch as part of the write: the
+      // write exchange *is* the trigger, so pairing it buys no second call.
+      const selfTrigger = /(?:ping|test|trigger|fetch|replay|send|deliver|run|execute|verify)$/i.test(lastSegment)
       for (const param of params) {
         add({
           key: `ssrf_canary|${endpoint.id}|${param.name}`,
@@ -1835,8 +1843,8 @@ export function enumerateHypotheses(
           ownerPersona: picks.owner?.handle,
           jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
           ssrfParams: [param.name],
-          ...(trigger && method === 'POST'
-            ? { triggerPath: (trigger.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, '/{{id}}') }
+          ...((trigger || selfTrigger) && method === 'POST'
+            ? { triggerPath: (trigger?.pathTemplate.split('?')[0] || bare).replace(idSegmentRe, '/{{id}}') }
             : {}),
           risk: endpointRiskScore(endpoint) + 12,
         })
@@ -3320,15 +3328,29 @@ async function probeSecondOrderSsrf(
   if (!info.running) info = await canaryBroker.startListener()
   const exchangeIds: string[] = []
   let requests = 0
-  const send = async (pathAndQuery: string, value: string): Promise<BrokerExchangeResult | null> => {
-    const body = { ...stagingBody, [param.name]: value }
+  // A route whose own last segment is a trigger verb (`…/test`, `…/send`, `…/verify`) runs the
+  // fetch as part of the write, so the write exchange is the trigger and no second call is needed.
+  const triggerIsSelf = trigger.split('?')[0] === hyp.pathAndQuery.split('?')[0]
+  const send = async (pathAndQuery: string, value: string, traceId?: string): Promise<BrokerExchangeResult | null> => {
+    // The hypothesis records *where* the URL carrier lives. A query carrier must be delivered in
+    // the query string (the body would be ignored by the sink); a body carrier keeps the staged
+    // sibling body and overrides only its own field.
+    const queryCarrier = param.location === 'query'
+    const target = queryCarrier
+      ? `${pathAndQuery}${pathAndQuery.includes('?') ? '&' : '?'}${encodeURIComponent(param.name)}=${encodeURIComponent(value)}`
+      : pathAndQuery
+    const body = queryCarrier ? stagingBody : { ...stagingBody, [param.name]: value }
     try {
       const exchange = await input.broker.executeHttp({
         origin: hyp.endpoint.origin,
         method: 'POST',
-        pathAndQuery,
+        pathAndQuery: target,
         headers: { 'Content-Type': 'application/json', ...stagingHeaders },
         body: JSON.stringify(body),
+        // In a local lab the broker records this as `X-Guardian-Trace-Id`, so the exchange that
+        // carried the injected canary is identifiable when the callback arrives after the probe
+        // window (request bodies are not indexed, headers are).
+        ...(traceId ? { traceId } : {}),
         ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
         runId: input.runId,
         assignmentId: input.assignmentId,
@@ -3369,7 +3391,7 @@ async function probeSecondOrderSsrf(
 
   const control = await send(hyp.pathAndQuery, 'http://guardian-control.invalid/')
   const controlId = control ? extractCreatedId(control.body) : null
-  if (controlId) await triggerFetch(controlId)
+  if (controlId && !triggerIsSelf) await triggerFetch(controlId)
 
   const minted = canaryBroker.mintCanary(
     input.runId,
@@ -3377,9 +3399,9 @@ async function probeSecondOrderSsrf(
     hyp.endpoint.origin,
     input.storage ? { storage: input.storage, assignmentId: input.assignmentId } : undefined,
   )
-  const probe = await send(hyp.pathAndQuery, minted.httpUrl)
+  const probe = await send(hyp.pathAndQuery, minted.httpUrl, minted.token)
   const probeId = probe ? extractCreatedId(probe.body) : null
-  if (probeId) await triggerFetch(probeId)
+  if (probeId && !triggerIsSelf) await triggerFetch(probeId)
 
   const deadline = Date.now() + 3_000
   let hit = false
@@ -4163,6 +4185,23 @@ export function trackFloorCanarySubscriptions(
       anomaly.promoted = record.promoted
     }
 
+    // A hit is not the only admissible outcome: a hypothesis whose canary was minted and sent but
+    // whose callback has not arrived yet is a recorded *attempt*, not a silent miss. The durable
+    // subscription is the evidence that the run-level drain can still promote it; this record makes
+    // the attempt inspectable while it is pending.
+    const attempts = [...byToken.values()].filter(record => record.stage === 'pending' && !record.promoted)
+    for (const record of attempts) {
+      log('deterministic_engine.oob_attempt',
+        `Floor canary ${record.canaryId} was injected; durable subscription ${record.subscriptionId ?? 'none'} is still pending at probe finalize (no callback inside the probe window).`, {
+          canaryId: record.canaryId,
+          subscriptionId: record.subscriptionId,
+          label: record.label,
+          probeClass: result.probeClass,
+          endpoint: result.pathAndQuery,
+          verdict: result.verdict,
+        })
+    }
+
     const records = [...byToken.values()]
     const primary = records.find(record => record.stage === 'late')
       ?? records.find(record => record.stage === 'immediate')
@@ -4181,6 +4220,17 @@ export function trackFloorCanarySubscriptions(
       ...(primary ? { oobCanaryId: primary.canaryId } : {}),
       ...(primary ? { canaryProbeStage: primary.stage } : {}),
       promoted: records.some(record => record.promoted),
+      ...(attempts.length > 0
+        ? {
+            oobAttempts: attempts.map(record => ({
+              token: record.token,
+              canaryId: record.canaryId,
+              label: record.label,
+              subscriptionId: record.subscriptionId,
+              stage: record.stage,
+            })),
+          }
+        : {}),
     }
   }
 
@@ -4527,6 +4577,10 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       continue
     }
     canaryTracker?.finalize(probe)
+    const oobAttempts = Array.isArray(probe.details.oobAttempts) ? probe.details.oobAttempts.length : 0
+    if (oobAttempts > 0 && probe.verdict !== 'signal') {
+      report.notes.push(`${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}: ${oobAttempts} canary attempt(s) injected, durable OOB subscription pending (no callback inside the probe window).`)
+    }
     if (hyp.raceBurst) {
       const mode = typeof probe.details.raceMode === 'string' ? probe.details.raceMode : 'unmeasured'
       // Loud, structured transport note: a raced route that fell back to HTTP/1.1 must never look
