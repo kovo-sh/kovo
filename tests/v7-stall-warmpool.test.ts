@@ -224,6 +224,24 @@ test('a credential rotation retires idle containers and rebuilds the pool', asyn
   assert.ok(backend.containerStats().created >= 2, 'launch metrics survive the pool rollover')
 })
 
+test('teardown removes idle warm containers from the host', async () => {
+  const docker = dockerStub()
+  const backend = new LinuxWorkerBackend({
+    workspace: { id: 'tenant-teardown', directory: '/tmp' },
+    cell: 'teardown-cell',
+    dockerRunner: docker.runner,
+  })
+  backend.setWarmPoolPolicy('run-t:gen1')
+  await waitFor(() => backend.warmPoolStats?.idle === 1, 'pool warm')
+  const idleName = docker.created[0]!
+  await backend.closeWarmPool()
+  assert.equal(backend.warmPoolStats, undefined)
+  assert.ok(
+    docker.calls.some(args => args[0] === 'container' && args[1] === 'rm' && args.includes(idleName)),
+    'idle container is removed on teardown',
+  )
+})
+
 test('warm capacity is bounded like the worker-slot pool (K=6 requested)', () => {
   assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '6' }), 6)
   assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '99' }), 8, 'hard ceiling')

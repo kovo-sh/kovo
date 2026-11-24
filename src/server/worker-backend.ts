@@ -330,6 +330,8 @@ export interface WorkerBackend {
    * discards idle containers instead of reusing them across runs, tenants, or secret rotations.
    */
   setWarmPoolPolicy?(policy: string): void
+  /** Remove idle warm containers on teardown instead of leaving them on the host. */
+  closeWarmPool?(): Promise<void>
 }
 
 function clamp(val: number | undefined, fallback: number, min: number, max: number): number {
@@ -1020,6 +1022,18 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const normalized = policy.trim()
     if (!normalized) return
     this.installWarmPool(normalized)
+  }
+
+  /** Shutdown seam: remove idle containers so a finished run leaves no warm pool behind. */
+  async closeWarmPool(): Promise<void> {
+    const pool = this.warmPool
+    this.warmPool = undefined
+    if (!pool) return
+    const stats = pool.stats
+    this.retiredPoolStats.created += stats.created
+    this.retiredPoolStats.reused += stats.reused
+    this.retiredPoolStats.failures += stats.failures
+    await pool.close().catch(() => undefined)
   }
 
   /** Warm-pool state (test/diagnostic seam; never contains secrets). */

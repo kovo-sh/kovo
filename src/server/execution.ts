@@ -2687,6 +2687,9 @@ export class Execution {
     for (const lane of this.agenticLaneJobs.values()) {
       try { lane.controller.abort(new Error('execution stopped')) } catch { /* already aborted */ }
     }
+    // No idle warm container may outlive the run: a 29 GB host cannot accumulate one pool per
+    // benchmark cell. Sessions still finishing release into the closed pool and remove themselves.
+    try { await this.backend.closeWarmPool?.() } catch { /* teardown is best-effort */ }
     for (const assignmentId of [...this.workerSessionClones.keys()]) this.disposeWorkerSessions(assignmentId)
     for (const trace of this.runTraces.values()) {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
@@ -9031,7 +9034,7 @@ export class Execution {
         this.providerStallTimeoutsByRun.set(run.id, (this.providerStallTimeoutsByRun.get(run.id) ?? 0) + 1)
         this.providerStallTurnsByRun.set(run.id, (this.providerStallTurnsByRun.get(run.id) ?? 0) + 1)
         // What the previous generation watchdog would have waited before aborting this turn.
-        const previousThresholdMs = Math.min(stallAbortMs(), Math.max(15_000, budget.wallClockMs - (Date.now() - startedAt) - 10_000))
+        const previousThresholdMs = stallAbortMs()
         const wallSavedMs = Math.max(0, previousThresholdMs - idleMs)
         this.providerStallWallSavedByRun.set(run.id, (this.providerStallWallSavedByRun.get(run.id) ?? 0) + wallSavedMs)
         try {
