@@ -30,7 +30,7 @@ import type {
 import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { EndpointRow, Store } from './store.ts'
-import { parseGraphqlIntrospection, runSafeTemplates } from './surface-engine.ts'
+import { parseGraphqlIntrospection, probeSurface, runSafeTemplates } from './surface-engine.ts'
 
 export interface Phase0ReconParams {
   storage: Store
@@ -65,6 +65,8 @@ export interface Phase0ReconResult {
   paramsDiscovered: number
   frameworksDetected: string[]
   techFingerprint: string[]
+  /** Per-endpoint provenance totals for persisted `endpoint_params` (observed vs inferred). */
+  paramDiscovery?: ParamDiscoverySummary
   dynamicWordlist: {
     paths: string[]
     params: string[]
@@ -2242,8 +2244,10 @@ function recordQueryParamsForEndpoint(input: {
     return 0
   }
   let count = 0
-  for (const name of names.slice(0, 12)) {
-    if (!name) continue
+  const observedSource = source.startsWith('observed') ? source : 'observed:url_query'
+  // Sort keys so identical crawl input produces an identical insertion (and read) order.
+  for (const name of [...new Set(names)].sort().slice(0, 12)) {
+    if (!name || !isUsefulParamForLocation(name, 'query')) continue
     storage.upsertEndpointParam({
       runId,
       endpointId,
@@ -2251,12 +2255,258 @@ function recordQueryParamsForEndpoint(input: {
       location: 'query',
       isCsrf: CSRF_PARAM_RE.test(name),
       isObjectId: OBJECT_ID_PARAM_RE.test(name),
-      source,
+      source: observedSource,
     })
     dynamicParams.add(name)
     count += 1
   }
   return count
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parameter discovery: provenance, confidence and generic candidate derivation
+// ---------------------------------------------------------------------------------------------
+//
+// Layer-2 surfaces are randomized: a held-out app may rename a search/filter parameter that the
+// crawler never sees verbatim. Recon therefore records *where a name came from* and how much the
+// evidence supports it. Only an `observed` name (seen on the wire, declared by the target, or
+// verified by a response differential) is treated as surface truth. An `inferred` name exists to
+// let the deterministic floor form a hypothesis; the floor still has to prove the differential, so
+// a wrong inferred name ends as `inconclusive`/`hypothesis_miss`, never as a finding.
+
+export type ParamProvenance = 'observed' | 'inferred_bundle' | 'inferred_html' | 'inferred_ast'
+
+export interface DiscoveredParamCandidate {
+  name: string
+  location: ParamLocation
+  /**
+   * Explicit, preserved provenance tag:
+   *  - `observed[:detail]` — seen on the wire or declared by the target (link query key, form
+   *    field, redirect query key, OpenAPI/route-map declaration, validation body hint);
+   *  - `inferred_bundle[:sensitive]` — visible in shipped client JS;
+   *  - `inferred_html[:sensitive]` — inferred from an HTML/JSON document field or route semantics;
+   *  - `inferred_ast[:sensitive]` — harvested from a parsed request/AST shape.
+   * The optional `:sensitive` suffix means a bounded control-vs-probe differential showed the
+   * target reads the name. It is still not a confirmation: `verifyReceipt`/oracle invariants must
+   * prove the value crossed a security boundary.
+   */
+  source: string
+}
+
+/** Provenance rank for deterministic ordering (observed first, then inferred families). */
+const PROVENANCE_RANK: Record<ParamProvenance, number> = {
+  observed: 0,
+  inferred_bundle: 1,
+  inferred_html: 2,
+  inferred_ast: 3,
+}
+
+function legacyInferredProvenance(raw: string): ParamProvenance {
+  if (raw.includes('bundle') || raw.includes('xhr') || raw.includes('graphql')) return 'inferred_bundle'
+  if (raw.includes('response_field') || raw.includes('route_vocabulary') || raw.includes('html')) return 'inferred_html'
+  return 'inferred_ast'
+}
+
+/** True when a bounded sensitivity differential showed the target reads this name. */
+export function paramSourceSensitivityPassed(source: string): boolean {
+  return /:sensitive\b/i.test(source)
+}
+
+/**
+ * Confidence in a discovered parameter name (0-100), derived deterministically from its source.
+ * A sensitivity-checked inference is strong evidence for hypothesis priority but is *not* an
+ * observation and can never, on its own, produce a finding.
+ */
+export function paramDiscoveryConfidence(source: string): number {
+  const raw = source.toLowerCase()
+  if (raw.startsWith('observed:')) {
+    if (raw.includes('url_query') || raw.includes('form_field')) return 95
+    if (raw.includes('redirect_query')) return 90
+    if (raw.includes('openapi') || raw.includes('route_map')) return 85
+    return 85
+  }
+  if (raw.startsWith('inferred_')) {
+    const sensitive = paramSourceSensitivityPassed(raw)
+    if (raw.startsWith('inferred_bundle')) return sensitive ? 88 : 65
+    if (raw.startsWith('inferred_html')) return sensitive ? 85 : 55
+    if (raw.startsWith('inferred_ast')) return sensitive ? 85 : 65
+    return sensitive ? 80 : 50
+  }
+  // Legacy source strings predate explicit provenance prefixes.
+  if (raw === 'js_ast') return 65
+  if (raw === 'openapi' || raw === 'route_map' || raw === 'graphql' || raw === 'phase0_xml' || raw === 'phase0_validation') return 85
+  if (raw === 'surface_probe' || raw === 'spa_crawl' || raw === 'phase0_html' || raw === 'phase0_sibling') return 90
+  return 70
+}
+
+/**
+ * Observed vs inferred. Wire/declaration evidence is `observed`. Anything that only exists in
+ * shipped client code, a document field, or a parsed shape is one of the explicit inferred tags,
+ * even after it passes a sensitivity check.
+ */
+export function paramProvenanceOfSource(source: string): ParamProvenance {
+  const raw = source.toLowerCase()
+  if (raw.startsWith('observed:') || raw === 'observed') return 'observed'
+  if (raw.startsWith('js_ast') || raw.startsWith('inferred_ast')) return 'inferred_ast'
+  if (raw.startsWith('inferred_bundle')) return 'inferred_bundle'
+  if (raw.startsWith('inferred_html')) return 'inferred_html'
+  if (raw.startsWith('inferred:')) return legacyInferredProvenance(raw)
+  // Legacy declaration/wire sources.
+  return 'observed'
+}
+
+/** JS/UI noise literals that look like names but can never be request parameters. */
+const PARAM_NOISE_RE = /^(?:undefined|null|true|false|nan|this|self|window|document|console|function|return|then|catch|finally|length|prototype|constructor|tostring|valueof|hasownproperty|appendchild|addeventlistener|preventdefault|stoppropagation|innerhtml|textcontent|classname|queryselector|queryselectorall|getelementbyid|setattribute|getattribute|removeattribute|classlist|dataset|style|children|props|component|render|mount|unmount|jsx|css)$/i
+
+/** Whether a harvested literal is plausibly a request parameter (drops obvious JS/UI noise). */
+export function isUsefulParamName(name: string): boolean {
+  if (!PARAM_NAME_RE.test(name)) return false
+  if (PARAM_NOISE_RE.test(name)) return false
+  if (/^\d+$/.test(name)) return false
+  if (/^(?:on[a-z]|aria-|data-)/i.test(name) && name.length > 2) return false
+  // Dotted AST paths are legitimate JSON body fields (`filter.name`); callers reject them for
+  // query locations, where a dot is never a wire key.
+  return true
+}
+
+/** Location-aware usefulness: dotted names are body fields, not query keys. */
+export function isUsefulParamForLocation(name: string, location: ParamLocation): boolean {
+  if (!isUsefulParamName(name)) return false
+  return !(location === 'query' && name.includes('.'))
+}
+
+/** Total order for discovered parameters: provenance rank, then name/location/source. */
+export function compareDiscoveredParams(a: DiscoveredParamCandidate, b: DiscoveredParamCandidate): number {
+  const rankA = PROVENANCE_RANK[paramProvenanceOfSource(a.source)]
+  const rankB = PROVENANCE_RANK[paramProvenanceOfSource(b.source)]
+  if (rankA !== rankB) return rankA - rankB
+  return a.name.localeCompare(b.name) ||
+    a.location.localeCompare(b.location) ||
+    a.source.localeCompare(b.source)
+}
+
+export function orderDiscoveredParams<T extends DiscoveredParamCandidate>(candidates: readonly T[]): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const candidate of [...candidates].sort(compareDiscoveredParams)) {
+    const key = `${candidate.name}|${candidate.location}`
+    if (!candidate.name || seen.has(key) || !isUsefulParamForLocation(candidate.name, candidate.location)) continue
+    seen.add(key)
+    out.push(candidate)
+  }
+  return out
+}
+
+const SEARCH_ROUTE_HINT = /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|browse|catalog)(?:$|[/_.-])/i
+const FILE_ROUTE_HINT = /(?:^|[/_.-])(?:download|downloads|file|files|asset|assets|view|serve|log|logs|journal|journals|billing[-_]?docs?|document|documents|attachment|attachments|backup|backups|archive|archives)(?:$|[/_.-])/i
+const URL_ROUTE_HINT = /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhook|webhooks|hook|hooks|callback|callbacks|integration|integrations|connector|connectors|proxy|proxies|fetch|remote|link|links|manifest|manifests)(?:$|[/_.-])/i
+const REDIRECT_ROUTE_HINT = /(?:^|[/_.-])(?:redirect|return|callback|continue|resume|sso|oauth|authorize|checkout|download|export|next)(?:$|[/_.-])/i
+
+/**
+ * Candidate free-text parameter names implied by a route's semantics. These are *inferred* and are
+ * only attached when independent evidence (a response field, a bundle literal, a form/link) already
+ * points at the route; the name itself is never treated as observed.
+ */
+export function routeParamVocabulary(pathTemplate: string, method = 'GET'): DiscoveredParamCandidate[] {
+  if (method.toUpperCase() !== 'GET') return []
+  const bare = pathTemplate.split('?')[0] || '/'
+  const names: string[] = []
+  if (/(?:^|[/_.-])(?:logs?|journals?|audit)(?:$|[/_.-])/i.test(bare)) names.push('filter', 'q', 'query')
+  else if (SEARCH_ROUTE_HINT.test(bare)) names.push('q', 'query', 'term', 'keyword')
+  if (FILE_ROUTE_HINT.test(bare)) names.push('file', 'path', 'name')
+  if (URL_ROUTE_HINT.test(bare)) names.push('url', 'src', 'target')
+  if (REDIRECT_ROUTE_HINT.test(bare)) names.push('next', 'returnUrl', 'redirect')
+  return [...new Set(names)].map(name => ({ name, location: 'query' as ParamLocation, source: 'inferred_html' }))
+}
+
+/**
+ * Response field names that match the route's inferred vocabulary. A search route that publishes
+ * `{"query": ...}` names its own reading parameter; the name is still only an inference until a
+ * response differential verifies it.
+ */
+export function deriveResponseFieldParams(
+  pathTemplate: string,
+  responseFields: Iterable<string>,
+  method = 'GET',
+): DiscoveredParamCandidate[] {
+  const fields = new Set<string>()
+  for (const field of responseFields) fields.add(field.toLowerCase())
+  return routeParamVocabulary(pathTemplate, method)
+    .filter(candidate => fields.has(candidate.name.toLowerCase()))
+    .map(candidate => ({ ...candidate, source: 'inferred_html' }))
+}
+
+/** Query keys carried by a same-origin redirect Location are wire-observed for the target route. */
+export function paramCandidatesFromRedirect(targetPath: string, searchParams: Iterable<string>): DiscoveredParamCandidate[] {
+  const out: DiscoveredParamCandidate[] = []
+  for (const name of searchParams) {
+    if (!PARAM_NAME_RE.test(name)) continue
+    out.push({ name, location: 'query', source: 'observed:redirect_query' })
+  }
+  return orderDiscoveredParams(out)
+}
+
+export interface ParamDiscoveryEndpointMetric {
+  endpoint: string
+  observed: number
+  inferred: number
+  sensitivityPassed: number
+  byProvenance: Record<ParamProvenance, number>
+  bySource: Record<string, number>
+}
+
+export interface ParamDiscoverySummary {
+  endpoints: ParamDiscoveryEndpointMetric[]
+  totals: {
+    observed: number
+    inferred: number
+    sensitivityPassed: number
+    byProvenance: Record<ParamProvenance, number>
+    bySource: Record<string, number>
+  }
+}
+
+const emptyProvenanceCounts = (): Record<ParamProvenance, number> => ({
+  observed: 0, inferred_bundle: 0, inferred_html: 0, inferred_ast: 0,
+})
+
+/** Deterministic per-endpoint parameter-discovery metrics for persisted `endpoint_params`. */
+export function summarizeParamDiscovery(storage: Store, runId: string, maxEndpoints = 200): ParamDiscoverySummary {
+  const endpoints = storage.listEndpoints(runId, { limit: 20_000 })
+  const byId = new Map(endpoints.map(endpoint => [endpoint.id, endpoint]))
+  const metricsById = new Map<string, ParamDiscoveryEndpointMetric>()
+  const totals: ParamDiscoverySummary['totals'] = {
+    observed: 0, inferred: 0, sensitivityPassed: 0, byProvenance: emptyProvenanceCounts(), bySource: {},
+  }
+  for (const param of storage.listEndpointParams(runId)) {
+    const endpoint = byId.get(param.endpointId)
+    const key = endpoint ? `${endpoint.method.toUpperCase()} ${endpoint.pathTemplate}` : param.endpointId
+    const provenance = paramProvenanceOfSource(param.source)
+    const sensitive = paramSourceSensitivityPassed(param.source)
+    const metric = metricsById.get(key) ?? {
+      endpoint: key, observed: 0, inferred: 0, sensitivityPassed: 0,
+      byProvenance: emptyProvenanceCounts(), bySource: {},
+    }
+    if (provenance === 'observed') metric.observed += 1
+    else metric.inferred += 1
+    if (sensitive) metric.sensitivityPassed += 1
+    metric.byProvenance[provenance] += 1
+    metric.bySource[param.source] = (metric.bySource[param.source] ?? 0) + 1
+    metricsById.set(key, metric)
+    if (provenance === 'observed') totals.observed += 1
+    else totals.inferred += 1
+    if (sensitive) totals.sensitivityPassed += 1
+    totals.byProvenance[provenance] += 1
+    totals.bySource[param.source] = (totals.bySource[param.source] ?? 0) + 1
+  }
+  const sortRecord = (record: Record<string, number>): Record<string, number> =>
+    Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)))
+  const endpointsOut = [...metricsById.values()]
+    .sort((a, b) => a.endpoint.localeCompare(b.endpoint))
+    .slice(0, maxEndpoints)
+  totals.bySource = sortRecord(totals.bySource)
+  for (const metric of endpointsOut) metric.bySource = sortRecord(metric.bySource)
+  return { endpoints: endpointsOut, totals }
 }
 
 const HTTP_VERBS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
@@ -3056,6 +3306,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let navigationEndpoints = 0
   let authRequests = 0
   let soft404Rejected = 0
+  // Sensitivity-check accounting for inferred parameters (checked / passed / dropped as dead).
+  const paramSensitivity = { checked: 0, passed: 0, dropped: 0 }
   const visibleToPersonasUnion = new Map<string, Set<string>>()
   const privilegedSurface: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }> = []
   const frameworksDetected = new Set<string>()
@@ -3343,6 +3595,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const writeOnlyPaths = new Set<string>()
     const protectedPaths = new Set<string>()
     const configBindings = new Map<string, RouteMapParamBinding[]>()
+    // Crawl-time parameter evidence, keyed by normalized route template. `fields` comes from a
+    // served JSON response body; `redirectQuery` comes from a same-origin Location header.
+    const paramEvidence = new Map<string, { fields: Set<string>; redirectQuery: Set<string> }>()
+    const evidenceFor = (template: string) => {
+      let evidence = paramEvidence.get(template)
+      if (!evidence) {
+        evidence = { fields: new Set<string>(), redirectQuery: new Set<string>() }
+        paramEvidence.set(template, evidence)
+      }
+      return evidence
+    }
     let observedFieldAttachments = 0
     let originHalted = false
     let personaRejected = false
@@ -3385,6 +3648,26 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (/[:{}[\]]/.test(bare) || /[\r\n\0]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
       if ([301, 302, 303, 307, 308, 401, 403].includes(ex.status) && protectedPaths.size < 12) {
         protectedPaths.add(bare)
+      }
+      // Parameter evidence the crawler already holds. Bounded and passive: no extra requests.
+      if (ex.status >= 200 && ex.status < 300 && /json/i.test(ex.mediaType) && ex.body.length <= 262_144) {
+        const fields = extractJsonFieldNames(ex.body, 32)
+        if (fields.length > 0) {
+          const evidence = evidenceFor(normalizeDiscoveryTemplate(bare))
+          for (const field of fields) evidence.fields.add(field)
+        }
+      }
+      if ([301, 302, 303, 307, 308].includes(ex.status)) {
+        const location = ex.respHeaders?.location ?? ex.respHeaders?.Location
+        if (typeof location === 'string' && location.length <= 2048) {
+          try {
+            const target = new URL(location, origin)
+            if (target.origin === origin && target.search) {
+              const evidence = evidenceFor(normalizeDiscoveryTemplate(target.pathname))
+              for (const name of target.searchParams.keys()) evidence.redirectQuery.add(name)
+            }
+          } catch { /* malformed Location */ }
+        }
       }
     }
 
@@ -3505,7 +3788,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const recordParams = (endpointId: string, paramList: readonly { name: string; location: ParamLocation }[], source: string): number => {
       let added = 0
       for (const p of paramList.slice(0, 24)) {
-        if (!p.name || !PARAM_NAME_RE.test(p.name)) continue
+        if (!p.name || !isUsefulParamForLocation(p.name, p.location)) continue
         storage.upsertEndpointParam({
           runId,
           endpointId,
@@ -3638,6 +3921,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             for (const form of html.forms) {
               const ep = recordEndpoint(form.method, form.action, 'surface_probe')
               for (const inp of form.inputs) {
+                if (!isUsefulParamName(inp)) continue
                 storage.upsertEndpointParam({
                   runId,
                   endpointId: ep.id,
@@ -3645,7 +3929,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
                   location: form.method === 'GET' ? 'query' : 'form',
                   isCsrf: CSRF_PARAM_RE.test(inp),
                   isObjectId: OBJECT_ID_PARAM_RE.test(inp),
-                  source: 'phase0_html',
+                  source: 'observed:form_field',
                 })
                 dynamicParams.add(inp)
                 paramsDiscovered += 1
@@ -3692,6 +3976,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         for (const form of html.forms) {
           const ep = recordEndpoint(form.method, form.action, 'surface_probe')
           for (const inp of form.inputs) {
+            if (!isUsefulParamName(inp)) continue
             storage.upsertEndpointParam({
               runId,
               endpointId: ep.id,
@@ -3699,7 +3984,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
               location: form.method === 'GET' ? 'query' : 'form',
               isCsrf: CSRF_PARAM_RE.test(inp),
               isObjectId: OBJECT_ID_PARAM_RE.test(inp),
-              source: 'phase0_html',
+              source: 'observed:form_field',
             })
             dynamicParams.add(inp)
             paramsDiscovered += 1
@@ -3828,15 +4113,16 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           queueJsonDoc(clean)
         }
         for (const bk of bodyKeys.slice(0, 20)) {
-          if (!bk) continue
+          const bkLocation: ParamLocation = method.toUpperCase() === 'GET' ? 'query' : 'json'
+          if (!bk || !isUsefulParamForLocation(bk, bkLocation)) continue
           storage.upsertEndpointParam({
             runId,
             endpointId: ep.id,
             name: bk,
-            location: method.toUpperCase() === 'GET' ? 'query' : 'json',
+            location: bkLocation,
             isCsrf: CSRF_PARAM_RE.test(bk),
             isObjectId: OBJECT_ID_PARAM_RE.test(bk),
-            source: 'js_ast',
+            source: 'inferred_ast',
           })
           dynamicParams.add(bk)
           paramsDiscovered += 1
@@ -3860,6 +4146,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const epId = addJsEndpoint(spec.method, spec.path)
         if (!epId) continue
         for (const p of spec.params) {
+          if (!isUsefulParamForLocation(p.name, p.location)) continue
           storage.upsertEndpointParam({
             runId,
             endpointId: epId,
@@ -3867,7 +4154,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             location: p.location,
             isCsrf: CSRF_PARAM_RE.test(p.name),
             isObjectId: OBJECT_ID_PARAM_RE.test(p.name),
-            source: 'js_ast',
+            source: 'inferred_bundle',
           })
           dynamicParams.add(p.name)
           paramsDiscovered += 1
@@ -3881,9 +4168,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       for (const proc of harvestTrpcProcedures(ex.body).slice(0, 24)) {
         const trpcPath = `/trpc/${proc.router}.${proc.procedure}`
         const getId = addJsEndpoint('GET', trpcPath)
-        if (getId) recordParams(getId, [{ name: 'input', location: 'query' }], 'js_ast')
+        if (getId) recordParams(getId, [{ name: 'input', location: 'query' }], 'inferred_bundle')
         const postId = addJsEndpoint('POST', trpcPath)
-        if (postId) recordParams(postId, [{ name: 'input', location: 'json' }], 'js_ast')
+        if (postId) recordParams(postId, [{ name: 'input', location: 'json' }], 'inferred_bundle')
       }
       // Runtime config-parameter -> API body-field bindings for route-map expansion.
       for (const binding of harvestConfigParamBindings(ex.body)) {
@@ -3911,7 +4198,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const pagePath = jsPageByScript.get(jsPath)
         if (pagePath) {
           const pageEp = recordEndpoint('POST', pagePath, 'js_ast', { framework: 'nextjs', riskScore: 88 })
-          recordParams(pageEp.id, [{ name: 'Next-Action', location: 'header' }], 'js_ast')
+          recordParams(pageEp.id, [{ name: 'Next-Action', location: 'header' }], 'inferred_bundle')
         }
       }
 
@@ -4213,6 +4500,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const parsed = extractHtmlLinksAndScripts(ex.body, origin)
         for (const inp of parsed.inputs.slice(0, 8)) {
           if (inp.type && /^(?:hidden|submit|button|reset|checkbox|radio|file|image)$/i.test(inp.type)) continue
+          if (!isUsefulParamName(inp.name)) continue
           storage.upsertEndpointParam({
             runId,
             endpointId: ep.id,
@@ -4220,7 +4508,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             location: 'query',
             isCsrf: CSRF_PARAM_RE.test(inp.name),
             isObjectId: OBJECT_ID_PARAM_RE.test(inp.name),
-            source: 'phase0_html',
+            source: 'observed:form_field',
           })
           dynamicParams.add(inp.name)
           paramsDiscovered += 1
@@ -4282,7 +4570,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (observedFieldAttachments >= 12 || attached >= 4) break
         // Per-endpoint param lookup keeps the full-scan cost off the navigation hot path.
         if (storage.listEndpointParams(runId, target.id).length > 0) continue
-        recordParams(target.id, ranked.slice(0, 4).map(name => ({ name, location: 'json' as const })), 'openapi')
+        recordParams(target.id, ranked.slice(0, 4).map(name => ({ name, location: 'json' as const })), 'inferred_html')
         observedFieldAttachments += 1
         attached += 1
       }
@@ -4589,6 +4877,136 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     } catch { /* best-effort static edge inference */ }
 
+    // 2f-bis. Parameter discovery from crawl evidence. A held-out surface can randomize the search
+    // parameter name so it never appears verbatim in a link or a declaration. Recon attaches the
+    // names its own evidence supports (response field echo, same-origin redirect query, bundle/AST
+    // literal, route vocabulary) with an explicit provenance tag, then runs a bounded paired
+    // control-vs-probe sensitivity check on inferred names. A name the target demonstrably reads is
+    // kept as `inferred_*:sensitive` (never `observed`, never a confirmation); a dead literal is
+    // dropped so it cannot inflate probe queues.
+    const PARAM_DISCOVERY_ACTIVE_CAP = 6
+    const PARAM_DISCOVERY_RISK_BONUS = 15
+    let activeParamProbes = 0
+    for (const ep of readPaged('param_discovery', rows => rows.filter(row =>
+      row.method.toUpperCase() === 'GET' && !/[:{}[\]]/.test(row.pathTemplate.split('?')[0] ?? '/')).length)) {
+      if (originHalted || signal.aborted) break
+      if (ep.method.toUpperCase() !== 'GET') continue
+      const bare = ep.pathTemplate.split('?')[0] || '/'
+      if (!bare.startsWith('/') || bare === '/' || /[:{}[\]]/.test(bare) || STATIC_ASSET_RE.test(bare)) continue
+      const evidence = paramEvidence.get(ep.pathTemplate) ?? paramEvidence.get(normalizeDiscoveryTemplate(bare))
+      const existingParams = storage.listEndpointParams(runId, ep.id)
+      const existing = new Set(existingParams.map(param => `${param.name}|${param.location}`))
+      const candidates = orderDiscoveredParams([
+        ...(evidence ? deriveResponseFieldParams(bare, evidence.fields, 'GET') : []),
+        ...(evidence ? paramCandidatesFromRedirect(bare, evidence.redirectQuery) : []),
+      ]).filter(candidate => !existing.has(`${candidate.name}|${candidate.location}`))
+      const inferredExisting = existingParams.filter(param =>
+        paramProvenanceOfSource(param.source) !== 'observed' && param.location === 'query')
+      if (candidates.length === 0 && inferredExisting.length === 0) continue
+
+      // Sensitivity check: one bounded paired differential decides which inferred names the target
+      // actually reads. Limited to a handful of routes per origin and never a mutating request.
+      const probeNames = [...new Set([
+        ...candidates.filter(candidate => candidate.location === 'query').map(candidate => candidate.name),
+        ...inferredExisting.map(param => param.name),
+      ])].slice(0, 6)
+      let checked = false
+      let verified = new Set<string>()
+      if (probeNames.length > 0 && activeParamProbes < PARAM_DISCOVERY_ACTIVE_CAP &&
+          originUsed + 6 < perOriginCap && grant.canRead(origin)) {
+        activeParamProbes += 1
+        checked = true
+        try {
+          const discovery = await probeSurface({
+            origin,
+            mode: 'params',
+            basePath: bare,
+            params: probeNames,
+            paramLocation: 'query',
+            methods: ['GET'],
+            ...(discoveryPersona ? { persona: discoveryPersona } : {}),
+            maxRequests: Math.max(4, Math.min(12, perOriginCap - originUsed - 1)),
+            onExchange: ex => {
+              originUsed += 1
+              requestsUsed += 1
+              noteDiscoveryResponse(ex)
+              return params.onExchange?.(ex)
+            },
+          }, broker, grant, signal)
+          verified = new Set(discovery.anomalies
+            .filter(anomaly => anomaly.kind === 'param' && typeof anomaly.param === 'string')
+            .map(anomaly => String(anomaly.param)))
+        } catch { /* differential discovery is best-effort */ }
+      }
+      if (checked) {
+        paramSensitivity.checked += probeNames.length
+        paramSensitivity.passed += probeNames.filter(name => verified.has(name)).length
+        paramSensitivity.dropped += probeNames.filter(name => !verified.has(name)).length
+      }
+
+      let attached = 0
+      for (const candidate of candidates) {
+        if (checked && !verified.has(candidate.name)) continue // dead literal: do not queue it
+        const provenance = paramProvenanceOfSource(candidate.source)
+        const source = verified.has(candidate.name) && checked
+          ? `${provenance}:sensitive`
+          : candidate.source
+        storage.upsertEndpointParam({
+          runId,
+          endpointId: ep.id,
+          name: candidate.name,
+          location: candidate.location,
+          inferredType: candidate.location === 'query' ? 'string' : null,
+          isCsrf: CSRF_PARAM_RE.test(candidate.name),
+          isObjectId: OBJECT_ID_PARAM_RE.test(candidate.name),
+          source,
+        })
+        dynamicParams.add(candidate.name)
+        paramsDiscovered += 1
+        attached += 1
+      }
+      for (const param of inferredExisting) {
+        if (checked && !verified.has(param.name)) {
+          // Dead inferred literal from the crawl: remove it rather than inflate the probe queue.
+          storage.client.prepare(
+            'DELETE FROM endpoint_params WHERE run_id = ? AND endpoint_id = ? AND name = ? AND location = ?',
+          ).run(runId, ep.id, param.name, param.location)
+          continue
+        }
+        if (checked && verified.has(param.name) && !paramSourceSensitivityPassed(param.source)) {
+          const provenance = paramProvenanceOfSource(param.source)
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: param.name,
+            location: param.location,
+            inferredType: param.inferredType,
+            isCsrf: param.isCsrf,
+            isObjectId: param.isObjectId,
+            source: `${provenance}:sensitive`,
+          })
+          attached += 1
+        }
+      }
+      const hasSensitive = checked
+        ? verified.size > 0
+        : existingParams.some(param => paramSourceSensitivityPassed(param.source))
+      if (hasSensitive) {
+        // A sensitivity-checked reading parameter is the strongest injectable-surface signal recon
+        // can produce; rank the route accordingly (upsert keeps the maximum risk score). This is
+        // still only a hypothesis seed: the floor's differential and verifyReceipt must confirm.
+        storage.upsertEndpoint({
+          runId,
+          scopeRevision,
+          origin,
+          method: ep.method,
+          pathTemplate: ep.pathTemplate,
+          source: ep.source,
+          riskScore: Math.min(100, ep.riskScore + PARAM_DISCOVERY_RISK_BONUS),
+        })
+      }
+    }
+
     // 2g. Persona-union visibility: persist `visibleToPersonas` on discovered endpoints and surface
     // admin/privileged routes immediately instead of waiting for a later probe pass.
     // One paged snapshot instead of a full-store read per visibility key.
@@ -4647,6 +5065,15 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       { routes: privilegedSurface.slice(0, 20) })
   }
 
+  // Per-endpoint param-discovery metrics: one event, deterministic ordering, no raw bodies.
+  const paramDiscovery = summarizeParamDiscovery(storage, runId)
+  if (paramDiscovery.endpoints.length > 0) {
+    const provenance = paramDiscovery.totals.byProvenance
+    storage.event(runId, 'phase0.param_discovery',
+      `Parameter discovery: ${provenance.observed} observed / ${provenance.inferred_bundle} inferred_bundle / ${provenance.inferred_html} inferred_html / ${provenance.inferred_ast} inferred_ast across ${paramDiscovery.endpoints.length} endpoint(s); sensitivity ${paramSensitivity.checked} checked, ${paramSensitivity.passed} passed, ${paramSensitivity.dropped} dead dropped.`,
+      { endpoints: paramDiscovery.endpoints, totals: paramDiscovery.totals, sensitivity: { ...paramSensitivity } })
+  }
+
   storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts.', {
     requestsUsed,
     perOriginCap,
@@ -4670,6 +5097,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     paramsDiscovered,
     frameworksDetected: [...frameworksDetected],
     techFingerprint: [...techFingerprint],
+    ...(paramDiscovery.endpoints.length > 0 ? { paramDiscovery } : {}),
     dynamicWordlist: {
       paths: [...dynamicPaths].slice(0, 120),
       params: [...dynamicParams].slice(0, 80),
