@@ -226,8 +226,8 @@ const CSRF_RE = /\bcsrf\b|cross[- ]site\s+request\s+forgery|CWE-352/i
 const MASS_ASSIGN_RE = /mass[- ]?assign|over[- ]?post|CWE-915/i
 const AUTHZ_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|per[- ]object|object[- ]ownership|ownership[- ]check|same[- ]tenant|cross[- ]object|another user'?s)\b/i
 const AUTHZ_CWE_RE = /^CWE-(?:269|284|285|362|566|639|862|863|1021|1220)$/i
-const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- ]transition|invariant|business[- ]rule)\b/i
-const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472)$/i
+const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- ]transition|invariant|business[- ]rule|safe[- ]integer|range validation|sign validation|negative (?:amount|value|invoice)|client-supplied amount)\b/i
+const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472|1284)$/i
 const MARKUP_RE = /\b(?:xss|cross[- ]site\s+scripting|html[- ]injection|markup[- ]injection|script[- ]injection|scripting)\b/i
 const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
@@ -1543,7 +1543,18 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   const boundaryMirrorCorroborated = resourceTenant !== null && probeStep !== null && steps.some(step =>
     step.actor.tenant === resourceTenant && isReadMethod(step.method) && isSuccess(step.status) && sameRoute(step, probeStep))
-  const peerSignal = signals.find(entry => {
+  // A post-mutation 404 readback (e.g. the control deletes the object, then reads it) is
+  // persistence evidence, not a boundary denial; drop signals that follow a control mutation on the
+  // same route.
+  const controlMutationIndexes = steps
+    .map((step, index) => (step.arm === 'control' && stepMutatesState(step) ? index : -1))
+    .filter(index => index >= 0)
+  const boundarySignals = signals.filter(entry => {
+    const at = steps.indexOf(entry.step)
+    if (at < 0) return true
+    return !controlMutationIndexes.some(mutatedAt => mutatedAt < at && sameRoute(steps[mutatedAt]!, entry.step))
+  })
+  const peerSignal = boundarySignals.find(entry => {
     const tenant = entry.step.actor.tenant ?? null
     if (tenant === null || probeActor?.tenant == null) return true
     return tenant === probeActor.tenant ||
