@@ -935,3 +935,21 @@ Remaining missed route-hit targets: `api-jwt-alg-none`, `giftcard-race`, `coupon
 | 6 | Batch order: (c) engine lane retest + VM deletion **and** (a) capability lane (`api-jwt-alg-none`, `giftcard-race`, `coupon-reuse`, `inventory-oversell` = 1 JWT boundary + 3 stateful race/workflow, general classes worth +4–5 held-out); (b) #2 blind SQLi/chain after. If those four still fail at 69% verify, a 1-cell frontier-model control needs operator approval (same-model constraint) | **ACCEPT** | coordinator |
 
 **Active after this pulse:** `spec-authz`, `persona-binding`, `retest-receipts`, `gap-validation`. Capability lane waits on `spec-authz`'s `deterministic-specs`/`probes` lease.
+
+### 2026-11-24 — floor audit on main: dev 36/59 (firm), held-out **26/58** (certificate erratum pending bisect)
+
+Independent audit on main (`/tmp/floor-audit-*`, docker, `--no-llm`, serialized):
+
+| surface | acme | shopflow | opsportal | total | precision |
+|---|---|---|---|---|---|
+| Dev seed 1 | 14/22 | 12/19 | 10/18 | **36/59 (61.0%)** | **100%** |
+| Salted held-out 1000042 | 11/22 | **8/19** | 7/17 | **26/58 (44.8%)** | **100%** |
+
+So the held-out figure in the #15 certificate (**28/58**) is **not reproducible on main**; the honest current number is **26/58**, with shopflow at 8 rather than 10. Per the reviewer's pre-commitment, the erratum waits on the `persona-binding` bisect:
+
+- if the viewer **legitimately** owns persona_a's store and a regression introduced the wrong-tenant serving → fix it and re-confirm 28;
+- if `2621bab` reached 28 only through **cross-persona session bleed** → re-issue at **26/58 with an erratum** (and the two "gains" were artifacts, not recall).
+
+Either way the Total Product Recall bar stays ≥32/58, and dev 36/59 at 100% remains firm.
+
+**Certificate status: precision/floor certificate remains valid for dev; the held-out cell is marked provisional until this resolves.**
