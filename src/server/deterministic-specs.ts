@@ -164,7 +164,7 @@ const is2xx = (stepId: string) => `(.steps.${stepId}.status >= 200 and .steps.${
 const nonTrivial = (stepId: string, minBytes = 3) =>
   `(((${is2xx(stepId)})) and (((.steps.${stepId}.body | length) > ${minBytes}) or (((.steps.${stepId}.json | type) == "object") and (((.steps.${stepId}.json | keys | length) >= 2)))))`
 
-function baseFields(
+export function baseFields(
   origin: string,
   title: string,
   cwe: string,

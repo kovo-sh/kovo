@@ -44,6 +44,7 @@
  * stripping, a stable control baseline, and no 5xx. Echo/nonce-only changes are rejected.
  */
 import type { AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildProofReceipt, verifyReceipt } from './proof-receipt.ts'
 import type {
   ProofReceipt,
@@ -110,6 +111,8 @@ export interface FloorExchange {
   carrierText?: string
   route?: string
   responseHeaders?: Record<string, string> | null
+  /** Pre-redaction credential fingerprints observed by the broker (never raw values). */
+  secretMatches?: readonly string[]
 }
 
 export interface FloorOobQuery {
@@ -172,6 +175,10 @@ export interface BooleanOrTimingArgs extends FloorRecipeBaseArgs {
   controlPathAndQuery?: string
   /** Path with the injected/false predicate; defaults to `pathAndQuery`. */
   probePathAndQuery?: string
+  /** JSON body carrying the baseline value (JSON-located parameters cannot move a query string). */
+  controlJsonBody?: unknown
+  /** JSON body carrying the injected predicate. */
+  probeJsonBody?: unknown
   /** Paired rounds for the boolean rule (clamped to 2..4; timing ignores it). */
   rounds?: number
 }
@@ -383,6 +390,7 @@ class RecipeContext implements FloorRecipeContext {
       ...(spec.jsonBody !== undefined ? { requestJson: spec.jsonBody } : {}),
       ...(spec.headers ? { requestHeaders: spec.headers } : {}),
       ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
+      ...(exchange.secretMatches?.length ? { secretMatches: exchange.secretMatches.slice(0, 16) } : {}),
     }
     const recorded: FloorRecipeStep = {
       exchangeId,
@@ -625,6 +633,8 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
         method: args.method,
         pathAndQuery: controlPath,
         actor,
+        ...(args.headers ? { headers: args.headers } : {}),
+        ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}),
       })
       const probe = await ctx.send({
         arm: 'probe',
@@ -632,6 +642,8 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
         method: args.method,
         pathAndQuery: probePath,
         actor,
+        ...(args.headers ? { headers: args.headers } : {}),
+        ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
       })
       exchangeIds.push(control.exchangeId, probe.exchangeId)
       if ((control.exchange.status ?? 0) >= 500 || (probe.exchange.status ?? 0) >= 500) serverError = true
@@ -653,6 +665,8 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     method: args.method,
     pathAndQuery: controlPath,
     actor,
+    ...(args.headers ? { headers: args.headers } : {}),
+    ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}),
   })
   const probe = await ctx.send({
     arm: 'probe',
@@ -660,6 +674,8 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     method: args.method,
     pathAndQuery: probePath,
     actor,
+    ...(args.headers ? { headers: args.headers } : {}),
+    ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
   })
 
   return buildProofReceipt({
@@ -961,6 +977,112 @@ function inferMissingRoles(
 }
 
 // ---------------------------------------------------------------------------
+// Layer-1 broker adapter (production `FloorRecipeDeps`)
+// ---------------------------------------------------------------------------
+
+/** Persona handles the broker treats as unauthenticated. */
+const ANONYMOUS_ACTOR_HANDLES = new Set(['', 'anon', 'anonymous', 'guest', 'public', 'unauthenticated'])
+
+const BROKER_HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+
+export interface FloorRecipeBrokerOptions {
+  broker: RequestBroker
+  grant: Grant
+  signal: AbortSignal
+  /** Assignment origin every recipe exchange is sent to. */
+  origin: string
+  runId?: string
+  assignmentId?: string
+  /**
+   * Probe class carried on every brokered request. The broker uses it for the same policy,
+   * evidence and telemetry it applies to a probe exchange (`5xx` evidence, tracer tags, logs).
+   */
+  probeClass?: string
+  /** Run-scoped headers (staging tenant/run tag) every exchange inherits. */
+  headers?: Record<string, string>
+  /** Host recorder; its return value is the persisted exchange id the receipt cites. */
+  recordExchange?: (exchange: BrokerExchangeResult) => string | void
+  /** Reflection canary header for probes that prove in-band execution. */
+  traceId?: string
+  /** Durable callback lookup (Layer-2 relay) for `oob_callback` recipes. */
+  oob?: FloorRecipeDeps['oob']
+  /** Brokers authenticate by persona handle; recipes name their actors by handle. */
+  personaFor?: (actor: FloorActor) => string | null
+  /** Test seam: override the exchange projection (never used in production). */
+  mapExchange?: (exchange: BrokerExchangeResult, spec: FloorRequestSpec) => Omit<FloorExchange, 'exchangeId'>
+}
+
+/**
+ * Map one host-recorded broker exchange onto the recipe's Layer-1 view. JSON is parsed only when the
+ * broker says the wire body was JSON, so an HTML error page is never mistaken for a record.
+ */
+export function exchangeToFloorExchange(
+  exchange: BrokerExchangeResult,
+  spec: FloorRequestSpec,
+): Omit<FloorExchange, 'exchangeId'> {
+  let json: unknown
+  if (exchange.mediaType.includes('json')) {
+    try { json = JSON.parse(exchange.body) } catch { json = undefined }
+  }
+  return {
+    status: exchange.status,
+    ...(json !== undefined ? { json } : {}),
+    body: exchange.body,
+    durationMs: exchange.durationMs,
+    carrierText: carrierTextOf(spec),
+    route: exchange.finalPathAndQuery ?? exchange.pathAndQuery,
+    responseHeaders: exchange.respHeaders,
+    ...(exchange.secretMatches?.length
+      ? { secretMatches: exchange.secretMatches.slice(0, 16).map(match => match.sha256Prefix) }
+      : {}),
+  }
+}
+
+/**
+ * The production `FloorRecipeDeps`: every recipe exchange goes through the existing
+ * `RequestBroker.executeHttp` path with the run's grant/scope/rate/destructive guards, the same
+ * staging headers and probe class as the differential probe, and the run's exchange recorder so the
+ * receipt cites persisted exchange ids.
+ */
+export function brokerFloorRecipeDeps(options: FloorRecipeBrokerOptions): FloorRecipeDeps {
+  const personaFor = options.personaFor
+    ?? ((actor: FloorActor) => (ANONYMOUS_ACTOR_HANDLES.has(actor.handle.trim().toLowerCase()) ? null : actor.handle))
+  return {
+    async request(spec: FloorRequestSpec): Promise<FloorExchange> {
+      const method = spec.method.toUpperCase()
+      if (!BROKER_HTTP_METHODS.has(method)) {
+        throw new FloorRecipeAbort('recipe_error', `Recipe asked for unsupported method ${method}.`, [spec.role])
+      }
+      const persona = personaFor(spec.actor)
+      const body = spec.textBody ?? (spec.jsonBody !== undefined ? JSON.stringify(spec.jsonBody) : undefined)
+      const headers = { ...(options.headers ?? {}), ...(spec.headers ?? {}) }
+      const exchange = await options.broker.executeHttp({
+        origin: options.origin,
+        method: method as BrokerHttpRequest['method'],
+        pathAndQuery: spec.pathAndQuery,
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+        ...(persona ? { persona } : {}),
+        ...(body !== undefined ? { body } : {}),
+        ...(options.probeClass ? { probeClass: options.probeClass } : {}),
+        ...(options.runId ? { runId: options.runId } : {}),
+        ...(options.assignmentId ? { assignmentId: options.assignmentId } : {}),
+        ...(options.traceId ? { traceId: options.traceId } : {}),
+        followRedirects: false,
+      }, options.grant, options.signal)
+      const exchangeId = options.recordExchange?.(exchange)
+      const projected = options.mapExchange
+        ? options.mapExchange(exchange, spec)
+        : exchangeToFloorExchange(exchange, spec)
+      return {
+        ...projected,
+        ...(typeof exchangeId === 'string' && exchangeId ? { exchangeId } : {}),
+      }
+    },
+    ...(options.oob ? { oob: options.oob } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Legacy spec-kind -> recipe mapping (Cut 3 migration table)
 // ---------------------------------------------------------------------------
 
@@ -1044,3 +1166,74 @@ export function recipeForSpecKind(specKind: string, vulnClass?: string | null): 
   }
   return null
 }
+
+/**
+ * The rows that are **wired**: `deterministic-engine.ts` runs the recipe instead of evaluating a
+ * `DeclarativeReplaySpec`, and `verifyReplaySpec()` hard-refuses the kind/class combination.
+ *
+ * This is deliberately narrower than `SPEC_KIND_RECIPES` (the target table). A row graduates here
+ * only after the recipe reproduces the legacy confirmation set on the dev floor. Rows that are
+ * still on the legacy path are listed in `LEGACY_UNWIRED_SPECKINDS` with the blocking reason, so
+ * the gap is explicit instead of looking like an oversight.
+ */
+export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
+  {
+    specKind: 'http_chain',
+    vulnClasses: ['bola', 'idor', 'bfla', 'authorization', 'cross_tenant_read', 'cross_tenant_write'],
+    recipe: 'access_boundary',
+    note: 'Read hits run access_boundary (entitled control served, matrix-denied control refused, probe served); mutating hits run persisted_mutation (baseline read, cross-actor write, separate readback).',
+  },
+  {
+    specKind: 'sql_boolean_diff',
+    vulnClasses: ['sqli'],
+    recipe: 'boolean_or_timing',
+    note: 'Boolean rule: paired true/false predicate rounds, stable structural delta, no 5xx.',
+  },
+]
+
+/** Rows whose recipe exists but that stay on the legacy verifier for a measured reason. */
+export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId; reason: string }[] = [
+  {
+    specKind: 'sql_time_diff',
+    vulnClasses: ['sqli'],
+    recipe: 'boolean_or_timing',
+    reason: 'Timing receipts are selected by vulnClass (`sql_time`), not by spec kind; the engine synthesizer never emits sql_time_diff, so wiring it would delete a branch with no producer before the receipt vocabulary is aligned.',
+  },
+  {
+    specKind: 'race_burst',
+    vulnClasses: ['race_double_spend'],
+    recipe: 'race_burst',
+    reason: '`receiptRuleFor("race_double_spend")` has no confirmation rule: the receipt model cannot yet express the conserved-balance debit, so a race confirmation would silently lose its class.',
+  },
+  {
+    specKind: 'http_chain',
+    vulnClasses: ['mass_assignment', 'workflow_bypass', 'business_logic', 'price_tampering', 'csrf'],
+    recipe: 'persisted_mutation',
+    reason: 'Legacy chain binds the mutated field value and staging tag into the readback assertion; the recipe readback is a plain before/after pair, which is weaker on self-service writes.',
+  },
+  {
+    specKind: 'http_chain',
+    vulnClasses: ['info_disclosure', 'secret_disclosure', 'disclosure'],
+    recipe: 'disclosure',
+    reason: 'Credential/audit reads confirm on pre-redaction secret fingerprints; the disclosure recipe requires a probe-owned baseline read that API-key/audit routes do not expose.',
+  },
+  {
+    specKind: 'http_chain',
+    vulnClasses: ['xxe', 'ssrf', 'webhook_forgery'],
+    recipe: 'oob_callback',
+    reason: 'The legacy OOB proof mints and waits on a durable canary subscription inside the verifier; the recipe adapter needs that relay seam (canary session + late promotion) before moving.',
+  },
+]
+
+/**
+ * Resolve the **wired** recipe for a legacy spec kind/class pair. This is the function the verifier
+ * uses for its no-fallback assertion, so a wired pair can never silently reach the legacy path.
+ */
+export function wiredRecipeForSpecKind(specKind: string, vulnClass?: string | null): FloorRecipeId | null {
+  for (const row of WIRED_SPECKIND_RECIPES) {
+    if (row.specKind !== specKind) continue
+    if (row.vulnClasses.length === 0 || (vulnClass && row.vulnClasses.includes(vulnClass))) return row.recipe
+  }
+  return null
+}
+
