@@ -286,8 +286,8 @@ test('v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain repl
     assert.equal(boundedBytes.connected, true)
     assert.ok(boundedBytes.totalBytes <= 1024, `expected <= 1024 bytes, got ${boundedBytes.totalBytes}`)
 
-    // Deterministic ws_chain verification: vulnerable CSWSH confirmed
-    const cswshConfirmed = await verifyReplaySpec({
+    // Cut 3c-1: legacy ws_chain interpreter is retired and fails closed without running steps
+    const wsRetired = await verifyReplaySpec({
       spec: {
         version: 1,
         kind: 'ws_chain',
@@ -326,90 +326,16 @@ test('v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain repl
             waitMs: 500,
           },
         ],
-        assertionsJq: '{ controlPassed: (.steps.control.connected and .steps.control.json.authenticated == true), confirmed: (.steps.probe.connected and .steps.probe.upgradeStatus == 101 and .steps.probe.json.authenticated == true and .steps.probe.json.originSeen == "https://evil.invalid"), observed: ("probe_status=" + (.steps.probe.upgradeStatus | tostring)), expected: "untrusted Origin rejected with 403" }',
+        assertionsJq: '{ controlPassed: true, confirmed: true, observed: "retired", expected: "retired" }',
       },
       broker,
       backend,
       grant: makeLabGrant(origin, { tier: 2, personas }),
       signal: sig,
     })
-    assert.equal(cswshConfirmed.verdict, 'confirmed', `expected confirmed, got ${cswshConfirmed.verdict}: ${cswshConfirmed.outcome.observed}`)
-    assert.equal(cswshConfirmed.verificationTier, 'runtime_confirmed')
-    assert.ok(!JSON.stringify(cswshConfirmed.evidencePayload).includes(personaSecret))
-
-    // Deterministic ws_chain verification: hardened strict endpoint dismissed
-    const strictDismissed = await verifyReplaySpec({
-      spec: {
-        version: 1,
-        kind: 'ws_chain',
-        origin,
-        title: 'Cross-Site WebSocket Hijacking check on /ws/strict',
-        category: 'cors-client-side',
-        cwe: 'CWE-346',
-        severity: 'high',
-        severityRationale: 'Verify Origin enforcement on strict WebSocket endpoint.',
-        impact: 'Untrusted origin could hijack session if Origin is not checked.',
-        remediation: 'Enforce strict Origin allowlist.',
-        recheckInstructions: 'Confirm untrusted Origin receives HTTP 403.',
-        steps: [
-          {
-            id: 'control',
-            role: 'control',
-            description: 'Same-origin WebSocket handshake',
-            origin,
-            pathAndQuery: '/ws/strict',
-            originHeader: origin,
-            persona: 'alice',
-            maxFrames: 3,
-            waitMs: 500,
-          },
-          {
-            id: 'probe',
-            role: 'probe',
-            description: 'Untrusted-origin WebSocket handshake',
-            origin,
-            pathAndQuery: '/ws/strict',
-            originHeader: 'https://evil.invalid',
-            persona: 'alice',
-            maxFrames: 3,
-            waitMs: 500,
-          },
-        ],
-        assertionsJq: '{ controlPassed: (.steps.control.connected and .steps.control.upgradeStatus == 101), confirmed: (.steps.probe.connected and .steps.probe.upgradeStatus == 101), observed: ("probe_status=" + (.steps.probe.upgradeStatus | tostring)), expected: "403 on untrusted origin" }',
-      },
-      broker,
-      backend,
-      grant: makeLabGrant(origin, { tier: 2, personas }),
-      signal: sig,
-    })
-    assert.equal(strictDismissed.verdict, 'dismissed', `expected dismissed, got ${strictDismissed.verdict}`)
-
-    // requireControlNonError on ws_chain unexpected 404 -> inconclusive
-    const ws404 = await verifyReplaySpec({
-      spec: {
-        version: 1,
-        kind: 'ws_chain',
-        origin,
-        title: 'WebSocket endpoint missing',
-        category: 'cors-client-side',
-        cwe: 'CWE-346',
-        severity: 'medium',
-        severityRationale: 'Check posture on missing WebSocket endpoint.',
-        impact: 'None when endpoint does not exist.',
-        remediation: 'N/A',
-        recheckInstructions: 'Verify endpoint path.',
-        steps: [
-          { id: 'control', role: 'control', description: 'Missing WS', origin, pathAndQuery: '/ws/missing', maxFrames: 2, waitMs: 300 },
-          { id: 'probe', role: 'probe', description: 'Missing WS probe', origin, pathAndQuery: '/ws/missing', originHeader: 'https://evil.invalid', maxFrames: 2, waitMs: 300 },
-        ],
-        assertionsJq: '{ controlPassed: true, confirmed: true, observed: "404", expected: "101" }',
-      },
-      broker,
-      backend,
-      grant: makeLabGrant(origin, { tier: 2 }),
-      signal: sig,
-    })
-    assert.equal(ws404.verdict, 'inconclusive', 'unexpected 404 on ws_chain posture check must yield inconclusive')
+    assert.equal(wsRetired.verdict, 'dismissed')
+    assert.equal(wsRetired.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(wsRetired.exchanges.length, 0)
   })
 })
 
@@ -605,56 +531,19 @@ test('v3 upload: Tier 3 gating, webshell & 256 KiB rejection, and upload_probe i
       assertionsJq: '{ controlPassed: (.steps.control.status == 200 and .uploadProof.nonceInFetchBody == true and .uploadProof.controlLeak == false), confirmed: (.uploadProof.nonceInFetchBody == true and .uploadProof.unsafeInlineRender == true and .uploadProof.hasAttachmentDisposition == false), observed: ("ct=" + (.uploadProof.fetchContentType // "") + " attachment=" + (.uploadProof.hasAttachmentDisposition | tostring)), expected: "Content-Disposition: attachment" }',
     })
 
-    // upload_probe blocked below Tier 3 and without Tier 3 HITL approval
-    const deniedTier2 = await verifyReplaySpec({
-      spec: makeUploadSpec('/api/upload/inline'),
-      broker,
-      backend,
-      grant: makeLabGrant(origin, { tier: 2 }),
-      signal: sig,
-    })
-    assert.equal(deniedTier2.verdict, 'inconclusive')
-
-    const deniedHitl = await verifyReplaySpec({
-      spec: makeUploadSpec('/api/upload/inline'),
-      broker,
-      backend,
-      grant: makeLabGrant(origin, { tier: 3, isStateChangeApproved: () => false }),
-      signal: sig,
-    })
-    assert.equal(deniedHitl.verdict, 'inconclusive')
-
-    // Approved Tier 3 upload_probe against inline SVG endpoint -> confirmed + cleanup executed
-    const inlineConfirmed = await verifyReplaySpec({
+    // Cut 3c-1: legacy upload_probe interpreter is retired and fails closed without running steps
+    const uploadRetired = await verifyReplaySpec({
       spec: makeUploadSpec('/api/upload/inline'),
       broker,
       backend,
       grant: makeLabGrant(origin, { tier: 3, isStateChangeApproved: () => true }),
       signal: sig,
     })
-    assert.equal(inlineConfirmed.verdict, 'confirmed', `expected confirmed, got ${inlineConfirmed.verdict}: ${inlineConfirmed.outcome.observed}`)
-    assert.equal(inlineConfirmed.verificationTier, 'runtime_confirmed')
-    const inlineProof = inlineConfirmed.evidencePayload.uploadProof as Record<string, unknown>
-    assert.equal(inlineProof.nonceInFetchBody, true)
-    assert.equal(inlineProof.hasAttachmentDisposition, false)
-    assert.equal(inlineProof.unsafeInlineRender, true)
-    assert.equal(cleanupCalls, 1, 'cleanupStep must remove uploaded test artifact')
+    assert.equal(uploadRetired.verdict, 'dismissed')
+    assert.equal(uploadRetired.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(uploadRetired.exchanges.length, 0)
+    assert.equal(cleanupCalls, 0)
     assert.equal(uploads.size, 0)
-
-    // Approved Tier 3 upload_probe against Content-Disposition: attachment control -> dismissed + cleanup executed
-    const safeDismissed = await verifyReplaySpec({
-      spec: makeUploadSpec('/api/upload/safe'),
-      broker,
-      backend,
-      grant: makeLabGrant(origin, { tier: 3, isStateChangeApproved: () => true }),
-      signal: sig,
-    })
-    assert.equal(safeDismissed.verdict, 'dismissed', `expected dismissed on attachment control, got ${safeDismissed.verdict}`)
-    const safeProof = safeDismissed.evidencePayload.uploadProof as Record<string, unknown>
-    assert.equal(safeProof.nonceInFetchBody, true)
-    assert.equal(safeProof.hasAttachmentDisposition, true)
-    assert.equal(safeProof.unsafeInlineRender, false)
-    assert.equal(cleanupCalls, 2)
   })
 })
 

@@ -21,12 +21,17 @@ import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './determ
 import type { EnginePersona } from './deterministic-engine.ts'
 import type { DifferentialResult } from './surface-engine.ts'
 import { injectUniversalParam } from './probes/context.ts'
-import { floorRecipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
+import { CUT3_FLOOR_RECIPE_IDS, cut3FloorRecipe, floorRecipe, runCut3Recipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
 import type {
   AccessBoundaryArgs,
   BooleanOrTimingArgs,
+  Cut3FloorRecipeArgs,
+  Cut3FloorRecipeArgsMap,
+  Cut3FloorRecipeId,
   FloorActor,
   FloorRecipeArgs,
+  FloorRecipeArgsMap,
+  FloorRecipeDeps,
   FloorRecipeExecution,
   FloorRecipeId,
   FloorRequestSpec,
@@ -39,14 +44,41 @@ import type { FloorRecipeEnvelope } from '../replay-spec.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import { brokerFloorRecipeDeps } from './floor-recipes.ts'
 
+export type PersistedFloorRecipeId = FloorRecipeId | Cut3FloorRecipeId
+export type PersistedFloorRecipeArgs = FloorRecipeArgs | Cut3FloorRecipeArgs
+
+const CUT3_RECIPE_ID_SET: ReadonlySet<string> = new Set(CUT3_FLOOR_RECIPE_IDS)
+
+function isCut3RecipeId(id: PersistedFloorRecipeId): id is Cut3FloorRecipeId {
+  return CUT3_RECIPE_ID_SET.has(id)
+}
+
+/** Dispatch any persisted floor recipe id (core 6 + Cut 3 recipes) through its typed runner. */
+export function executeFloorRecipeById(
+  recipeId: PersistedFloorRecipeId,
+  args: PersistedFloorRecipeArgs,
+  deps: FloorRecipeDeps,
+): Promise<FloorRecipeExecution> {
+  if (isCut3RecipeId(recipeId)) {
+    return runCut3Recipe(
+      cut3FloorRecipe(recipeId, args as Cut3FloorRecipeArgsMap[typeof recipeId]),
+      deps,
+    )
+  }
+  return runFloorRecipe(
+    floorRecipe(recipeId, args as FloorRecipeArgsMap[typeof recipeId]),
+    deps,
+  )
+}
+
 /** The exact target a wired recipe confirmed; the record spec re-uses it. */
 export interface FloorRecipePlan {
-  recipeId: FloorRecipeId
+  recipeId: PersistedFloorRecipeId
   /** Legacy spec kind this plan replaces (used for attribution and the no-fallback assertion). */
   specKind: string
   vulnClass: string
   endpoint: string
-  args: FloorRecipeArgs
+  args: PersistedFloorRecipeArgs
   /** Injection location of the parameter the recipe drives (record-spec metadata). */
   paramLocation?: string
   /** Machine-readable reason the plan could not be expressed, when `args` is absent. */
@@ -517,7 +549,7 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
     ...(input.headers ? { headers: input.headers } : {}),
     ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
   })
-  return runFloorRecipe(floorRecipe(input.plan.recipeId, input.plan.args), deps)
+  return executeFloorRecipeById(input.plan.recipeId, input.plan.args, deps)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -542,6 +574,10 @@ const SEVERITY_BY_CLASS: Readonly<Record<string, Severity>> = {
   webhook_forgery: 'high',
   sqli: 'high',
   race_double_spend: 'critical',
+  open_redirect: 'medium',
+  url_redirect: 'medium',
+  dom_xss: 'high',
+  injection: 'high',
 }
 
 const CWE_BY_CLASS: Readonly<Record<string, string>> = {
@@ -563,15 +599,22 @@ const CWE_BY_CLASS: Readonly<Record<string, string>> = {
   webhook_forgery: 'CWE-345',
   sqli: 'CWE-89',
   race_double_spend: 'CWE-362',
+  open_redirect: 'CWE-601',
+  url_redirect: 'CWE-601',
+  dom_xss: 'CWE-79',
+  injection: 'CWE-89',
 }
 
-const TITLE_BY_RECIPE: Readonly<Record<FloorRecipeId, string>> = {
+const TITLE_BY_RECIPE: Readonly<Record<PersistedFloorRecipeId, string>> = {
   access_boundary: 'Cross-actor object or function access',
   persisted_mutation: 'Persisted unauthorized state change',
   boolean_or_timing: 'SQL injection differential',
   oob_callback: 'Out-of-band callback from injected payload',
   race_burst: 'Synchronized burst double-spend',
   disclosure: 'Unauthorized record disclosure',
+  redirect: 'Open redirect to off-origin destination',
+  browser_sink: 'Client-side browser sink execution',
+  injection_fingerprint: 'Parser or engine injection fingerprint',
 }
 
 const is2xxJq = (id: string) => `(.steps.${id}.status >= 200 and .steps.${id}.status < 300)`
@@ -583,7 +626,7 @@ const isDeniedJq = (id: string) =>
  * persisted proof (reproduced vs fixed), not the confirmation path: it restates the receipt's
  * structural precondition over the recorded steps so a hardened fixture cannot replay as reproduced.
  */
-function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; role: string; description?: string }[], args?: FloorRecipeArgs): string {
+function retestAssertion(recipe: PersistedFloorRecipeId, steps: readonly { id: string; role: string; description?: string }[], args?: PersistedFloorRecipeArgs): string {
   // Evidence roles (`entitled_read`, `baseline_read`, ...) are carried in the step description: the
   // persisted http_chain schema only allows arm roles. Match the description first so a replay
   // assertion never silently references a step it does not have.
@@ -655,6 +698,25 @@ function retestAssertion(recipe: FloorRecipeId, steps: readonly { id: string; ro
       return `{ controlPassed: true, `
         + `confirmed: ((${successes}) and (${divergence})), `
         + 'observed: "recipe replay: burst re-observed", expected: "a repeated terminal transition never produces divergent outcomes" }'
+    }
+    case 'redirect': {
+      const probe = first('redirect_probe')
+      const control = first('same_origin_control')
+      const is3xx = (id: string) => `(.steps.${id}.status >= 300 and .steps.${id}.status < 400)`
+      return `{ controlPassed: (${control ? `(.steps.${control}.status >= 200 and .steps.${control}.status < 400)` : 'true'}), `
+        + `confirmed: (${probe ? is3xx(probe) : 'true'}), `
+        + 'observed: "recipe replay: off-origin redirect re-observed", expected: "redirect stays on origin" }'
+    }
+    case 'browser_sink': {
+      return '{ controlPassed: true, confirmed: true, observed: "recipe replay: browser sink re-observed", expected: "no untrusted browser sink execution" }'
+    }
+    case 'injection_fingerprint': {
+      const control = first('benign_control')
+      const probe = first('injection_probe')
+      const diff = control && probe ? `(.steps.${probe}.body != .steps.${control}.body)` : 'true'
+      return `{ controlPassed: (${control ? is2xxJq(control) : 'true'}), `
+        + `confirmed: (${diff}), `
+        + 'observed: "recipe replay: injection fingerprint re-observed", expected: "no parser/engine error fingerprint on probe" }'
     }
     default:
       return '{ controlPassed: true, confirmed: true, observed: "recipe replay", expected: "recipe evidence reproduced" }'
@@ -799,8 +861,9 @@ export async function retestPersistedRecipe(input: {
   assignmentId?: string
   probeClass?: string
   recordExchange?: (exchange: BrokerExchangeResult) => string | void
+  browserTrace?: FloorRecipeDeps['browserTrace']
 }): Promise<{ verdict: RetestVerdict; execution: FloorRecipeExecution | null; replay: ReplayVerificationResult }> {
-  const args = input.envelope.args as unknown as FloorRecipeArgs
+  const args = input.envelope.args as unknown as PersistedFloorRecipeArgs
   const plan: FloorRecipePlan = {
     recipeId: input.envelope.recipeId,
     specKind: input.specKind,
@@ -810,7 +873,7 @@ export async function retestPersistedRecipe(input: {
   }
   let execution: FloorRecipeExecution
   try {
-    execution = await runFloorRecipe(floorRecipe(input.envelope.recipeId, args), brokerFloorRecipeDeps({
+    const baseDeps = brokerFloorRecipeDeps({
       broker: input.broker,
       grant: input.grant,
       signal: input.signal,
@@ -819,7 +882,11 @@ export async function retestPersistedRecipe(input: {
       ...(input.runId ? { runId: input.runId } : {}),
       ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
       ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
-    }))
+    })
+    const deps: FloorRecipeDeps = input.browserTrace
+      ? { ...baseDeps, browserTrace: input.browserTrace }
+      : baseDeps
+    execution = await executeFloorRecipeById(input.envelope.recipeId, args, deps)
   } catch (error) {
     // A recipe that cannot execute at all is not evidence the vulnerability is gone.
     const reason = `recipe retest could not run: ${error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300)}`

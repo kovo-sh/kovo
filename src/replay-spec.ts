@@ -197,6 +197,9 @@ export const floorRecipeIds = [
   'oob_callback',
   'race_burst',
   'disclosure',
+  'redirect',
+  'browser_sink',
+  'injection_fingerprint',
 ] as const
 
 export const floorRecipeEnvelopeSchema = z.object({

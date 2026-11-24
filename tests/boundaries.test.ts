@@ -796,94 +796,56 @@ test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules o
 })
 
 // ============================================================================
-// 7. Zero-LLM Replay Verifier: dns_takeover, tls_audit, browser_dom (Real Playwright!)
+// 7. Retired legacy VM kinds (dns_takeover, tls_audit, browser_dom) + brokered Playwright abort
 // ============================================================================
 
-test('verifies dns_takeover, tls_audit, and 100%-brokered Playwright browser_dom with third-party abort', { timeout: 30_000 }, async t => {
+test('retires dns_takeover, tls_audit, and browser_dom fail-closed while ScopedBrowser enforces 100%-brokered third-party abort', { timeout: 30_000 }, async t => {
   const backend = new LinuxWorkerBackend()
-
-  // dns_takeover
-  let dangling = true
-  const dnsBroker = new RequestBroker({
+  const noopBroker = new RequestBroker({
     resolve: async () => [publicAddr],
-    dnsResolver: async () => ({
-      a: dangling ? [] : ['93.184.216.34'],
-      aaaa: [],
-      cname: dangling ? ['unclaimed-org.github.io'] : [],
-      txt: [],
-      ns: [],
-      nxdomain: false,
-    }),
-    transport: async () => ({
-      status: dangling ? 404 : 200,
-      headers: { 'content-type': 'text/html' },
-      body: dangling ? "There isn't a GitHub Pages site here." : 'OK',
-    }),
+    transport: async () => { throw new Error('retired legacy VM branch must never touch transport') },
   })
-  const dnsSpec: DeclarativeReplaySpec = {
-    ...replayBaseFields(northstar),
-    kind: 'dns_takeover',
-    title: 'Dangling GitHub Pages CNAME Subdomain Takeover',
-    category: 'dns-takeover-infra',
-    cwe: 'CWE-284',
-    targetOrigin: northstar,
-    probePath: '/',
-    assertionsJq: `{
-      controlPassed: ((.dns.hostname | length) > 0),
-      confirmed: (.analysis.likelyTakeover == true),
-      observed: (.dns.cname | join(",")),
-      expected: "No dangling third-party CNAME"
-    }`,
-  }
-  const dnsConfirmed = await verifyReplaySpec({ spec: dnsSpec, broker: dnsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
-  assert.equal(dnsConfirmed.verdict, 'confirmed')
-  dangling = false
-  const dnsDismissed = await verifyReplaySpec({ spec: dnsSpec, broker: dnsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
-  assert.equal(dnsDismissed.verdict, 'dismissed')
 
-  // tls_audit
-  let weakTls = true
-  const tlsBroker = new RequestBroker({
-    resolve: async () => [publicAddr],
-    tlsInspector: async () => ({
-      protocol: weakTls ? 'TLSv1.1' : 'TLSv1.3',
-      cipher: weakTls ? 'AES128-SHA' : 'TLS_AES_256_GCM_SHA384',
-      authorized: !weakTls,
-      authorizationError: weakTls ? 'CERT_HAS_EXPIRED' : null,
-      subject: { CN: 'northstar.example' },
-      issuer: { CN: 'Test CA' },
-      sans: ['northstar.example'],
-      validFrom: '2020-01-01T00:00:00Z',
-      validTo: weakTls ? '2021-01-01T00:00:00Z' : '2030-01-01T00:00:00Z',
-      fingerprint256: 'AA:BB',
-      serialNumber: '01',
-      daysUntilExpiry: weakTls ? -500 : 1000,
-      expired: weakTls,
-      hostnameMatchesSan: true,
-      weakProtocol: weakTls,
-    }),
-  })
-  const tlsSpec: DeclarativeReplaySpec = {
-    ...replayBaseFields(northstar),
-    kind: 'tls_audit',
-    title: 'Deprecated TLSv1.1 and Expired Certificate',
-    category: 'crypto-tls-transport',
-    cwe: 'CWE-327',
-    targetOrigin: northstar,
-    assertionsJq: `{
-      controlPassed: (.tls.tls.protocol != null),
-      confirmed: (.tls.tls.weakProtocol == true or .tls.tls.expired == true),
-      observed: (.tls.tls.protocol + " expired=" + (.tls.tls.expired | tostring)),
-      expected: "TLSv1.2+ with valid certificate"
-    }`,
+  for (const spec of [
+    {
+      ...replayBaseFields(northstar),
+      kind: 'dns_takeover' as const,
+      title: 'Dangling CNAME Subdomain Takeover',
+      category: 'dns-takeover-infra',
+      cwe: 'CWE-284',
+      targetOrigin: northstar,
+      probePath: '/',
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "ok" }',
+    },
+    {
+      ...replayBaseFields(northstar),
+      kind: 'tls_audit' as const,
+      title: 'Deprecated TLSv1.1 and Expired Certificate',
+      category: 'crypto-tls-transport',
+      cwe: 'CWE-327',
+      targetOrigin: northstar,
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "ok" }',
+    },
+    {
+      ...replayBaseFields(northstar),
+      kind: 'browser_dom' as const,
+      title: 'Unchecked postMessage Listener Accepts Untrusted Origins',
+      category: 'cors-client-side',
+      cwe: 'CWE-345',
+      targetOrigin: northstar,
+      controlPath: '/safe',
+      probePath: '/vulnerable',
+      checkKind: 'postmessage' as const,
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "ok" }',
+    },
+  ]) {
+    const res = await verifyReplaySpec({ spec, broker: noopBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(10_000) })
+    assert.equal(res.verdict, 'dismissed')
+    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(res.exchanges.length, 0)
   }
-  const tlsConfirmed = await verifyReplaySpec({ spec: tlsSpec, broker: tlsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
-  assert.equal(tlsConfirmed.verdict, 'confirmed')
-  weakTls = false
-  const tlsDismissed = await verifyReplaySpec({ spec: tlsSpec, broker: tlsBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
-  assert.equal(tlsDismissed.verdict, 'dismissed')
 
-  // browser_dom via real Playwright Chromium + 100% RequestBroker routing + third-party trap server
+  // Real Playwright Chromium + 100% RequestBroker routing + third-party trap server via ScopedBrowser
   let thirdPartyHits = 0
   const thirdPartyServer = await httpFixture((_req, res) => {
     thirdPartyHits += 1
@@ -898,17 +860,6 @@ test('verifies dns_takeover, tls_audit, and 100%-brokered Playwright browser_dom
       brokeredPaths.push(url.pathname)
       if (url.pathname === '/api/profile') {
         return { status: 200, headers: { 'content-type': 'application/json' }, body: '{"user":"alice"}' }
-      }
-      if (url.pathname === '/safe') {
-        return {
-          status: 200,
-          headers: { 'content-type': 'text/html; charset=utf-8' },
-          body: `<!doctype html><html><head><title>Safe Page</title></head><body>
-            <script>
-              window.addEventListener('message', function(e) { if (e.origin === 'https://northstar.example') console.log(e.data); });
-            </script>
-          </body></html>`,
-        }
       }
       return {
         status: 200,
@@ -928,41 +879,20 @@ test('verifies dns_takeover, tls_audit, and 100%-brokered Playwright browser_dom
     },
   })
   const scopedBrowser = new ScopedBrowser(browserBroker)
-  const domSpec: DeclarativeReplaySpec = {
-    ...replayBaseFields(northstar),
-    kind: 'browser_dom',
-    title: 'Unchecked postMessage Listener Accepts Untrusted Origins',
-    category: 'cors-client-side',
-    cwe: 'CWE-345',
-    targetOrigin: northstar,
-    controlPath: '/safe',
-    probePath: '/vulnerable',
+  t.after(() => scopedBrowser.close())
+  const visit = await scopedBrowser.visitPage({
+    origin: northstar,
+    pathAndQuery: '/vulnerable',
     checkKind: 'postmessage',
-    assertionsJq: `{
-      controlPassed: (.control.postMessageListeners.canaryHandledWithoutOriginCheck == false),
-      confirmed: (.probe.postMessageListeners.canaryHandledWithoutOriginCheck == true and ((.probe.blockedOrigins | length) >= 1)),
-      observed: ("unchecked=" + (.probe.postMessageListeners.canaryHandledWithoutOriginCheck | tostring) + ", blocked=" + (.probe.blockedOrigins | join(","))),
-      expected: "All postMessage listeners validate event.origin"
-    }`,
-  }
-  const domRes = await verifyReplaySpec({
-    spec: domSpec,
-    broker: browserBroker,
-    browser: scopedBrowser,
-    backend,
-    grant: makeGrant(),
-    signal: AbortSignal.timeout(25_000),
-  })
-  assert.equal(domRes.verdict, 'confirmed')
+  }, makeGrant(), AbortSignal.timeout(25_000))
+  assert.equal(visit.postMessageListeners.canaryHandledWithoutOriginCheck, true)
   assert.equal(thirdPartyHits, 0, 'Unapproved third-party subresource MUST NEVER receive a direct socket connection!')
-  assert.ok(brokeredPaths.includes('/safe'))
   assert.ok(brokeredPaths.includes('/vulnerable'))
   assert.ok(brokeredPaths.includes('/api/profile'))
   // Storage value must NOT leak; only key name captured
-  const probePayload = domRes.evidencePayload.probe as { localStorageKeys: string[]; blockedOrigins: string[] }
-  assert.ok(probePayload.localStorageKeys.includes('auth_token_key'))
-  assert.ok(!JSON.stringify(domRes.evidencePayload).includes('secret-storage-value-123'))
-  assert.ok(probePayload.blockedOrigins.some(o => o.startsWith('http://127.0.0.1:')))
+  assert.ok(visit.localStorageKeys.includes('auth_token_key'))
+  assert.ok(!JSON.stringify(visit).includes('secret-storage-value-123'))
+  assert.ok(visit.blockedOrigins.some(o => o.startsWith('http://127.0.0.1:')))
 })
 
 // ============================================================================
