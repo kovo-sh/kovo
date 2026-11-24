@@ -101,7 +101,8 @@ test('two denial attempts on distinct params earn hardened_denial with a structu
   const snapshot = tracker.observationSnapshot()
   assert.equal(snapshot.attempts, 2)
   assert.equal(snapshot.distinctAttempts, 2, 'two distinct resource ids')
-  assert.equal(snapshot.distinctPaths, 2, 'two distinct paths under the same route family')
+  assert.equal(snapshot.distinctPaths, 2, 'two resource ids, one route family')
+  assert.deepEqual(snapshot.routes.map(route => route.family), ['/api/invoices/:id'], 'ids normalize to one family')
   assert.deepEqual([...snapshot.denialStatuses], [403, 403], 'both attempts answered the hardened denial')
   assert.equal(snapshot.anomalyCount, 0)
 
@@ -331,6 +332,7 @@ test('a calibrated static catch-all with no state change is an earned exit; a mu
     stateChangeAttempts: 0,
     staticCatchAll: true,
     refutedHypotheses: 0,
+    routes: [],
   }
   const decision = earlyExitEligible({ evidence, turnsUsed: 6, maxTurns: MAX_TURNS })
   assert.equal(decision.eligible, true)
@@ -340,15 +342,21 @@ test('a calibrated static catch-all with no state change is an earned exit; a mu
   assert.equal(mutated.eligible, false, 'a state change disqualifies the static reading')
 })
 
-test('the event route is the most-observed route and evidence count matches the ledger', async () => {
+test('the event route is the target family and evidence count matches its attempts', async () => {
   const { tracker, tools } = fixture()
   await probe(tools, 'GET', '/api/invoices/1001?tenant=alpha')
   await probe(tools, 'GET', '/api/invoices/1002?tenant=beta')
   await probe(tools, 'DELETE', '/api/invoices/1003?tenant=gamma')
+  await probe(tools, 'DELETE', '/api/invoices/1004?tenant=gamma')
+  await probe(tools, 'DELETE', '/api/invoices/1005?tenant=gamma')
   const snapshot = tracker.observationSnapshot()
-  assert.equal(snapshot.attempts, 3)
+  assert.equal(snapshot.attempts, 3, 'three attempts on the hottest family (DELETE)')
+  assert.deepEqual(snapshot.routes.map(route => `${route.method} ${route.family}`).sort(), [
+    'DELETE /api/invoices/:id',
+    'GET /api/invoices/:id',
+  ])
   const route: SpecRouteEvidence | undefined = snapshot.route
-  assert.deepEqual(route, { method: 'DELETE', path: '/api/invoices/1003', params: ['tenant'] })
+  assert.deepEqual(route, { method: 'DELETE', path: '/api/invoices/1005', params: ['tenant'] })
   const event = buildEarlyExitEvent({ reason: 'hardened_denial', evidence: snapshot, turnsUsed: 5, maxTurns: MAX_TURNS })
   assert.equal(event.evidenceCount, 3)
   assert.equal(event.turnsSaved, 11)

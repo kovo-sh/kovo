@@ -314,6 +314,28 @@ export function replaySpecRouteSteps(spec: unknown): Array<{ method: string; pat
   return out
 }
 
+/** Parameter names from a pathAndQuery (values are never retained). */
+function paramNamesOf(pathAndQuery: string): string[] {
+  return (pathAndQuery.split('?', 2)[1] ?? '')
+    .split('&')
+    .map(pair => (pair.split('=', 1)[0] ?? '').replace(/[^A-Za-z0-9_.:\[\]-]/g, ''))
+    .filter(Boolean)
+    .sort()
+}
+
+/** Resource-id segments collapse so `/api/items/1001` and `/api/items/1002` share a family. */
+function normalizeRouteFamily(path: string): string {
+  const parts = path.split('/').map(segment => {
+    if (!segment) return segment
+    if (/^\d+$/.test(segment)) return ':id'
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) return ':id'
+    if (/^[0-9a-f]{16,}$/i.test(segment)) return ':id'
+    if (/^\{\{[a-z0-9_]+\}\}$/i.test(segment)) return ':id'
+    return segment
+  })
+  return parts.join('/').slice(0, 160)
+}
+
 /**
  * One observed response on a probed route. Body-free by construction: only the status code, the
  * recorded body hash (a shape fingerprint, never content) and host-observed anomaly/refutation
@@ -335,26 +357,46 @@ export interface RouteAttemptObservation {
   staticCatchAll: boolean
 }
 
-/** Route-evidence aggregate consumed by the early-exit predicate. Pure data, no bodies. */
+/**
+ * Route-evidence aggregate consumed by the early-exit predicate. Pure data, no bodies. The
+ * top-level numbers are scoped to the **target route family** (the most-attempted route, with
+ * resource-id segments normalized to `:id`) so denials on one hardened route are not diluted by
+ * 200s on unrelated recon routes. `anomalyCount` stays global: any signal anywhere blocks the exit.
+ */
 export interface RouteObservationSnapshot {
+  /** Attempts on the target route family. */
   attempts: number
-  /** Distinct `METHOD pathAndQuery` attempts (exact repeats collapse: repetition is not evidence). */
+  /** Distinct `METHOD pathAndQuery` attempts on the target family (exact repeats collapse). */
   distinctAttempts: number
-  /** Distinct `METHOD path` routes touched. */
+  /** Distinct concrete `METHOD path` values inside the target family (e.g. two resource ids). */
   distinctPaths: number
-  /** Distinct parameter-name sets exercised. */
+  /** Distinct parameter-name sets exercised on the target family. */
   distinctParams: number
-  /** Distinct body shas observed (<=1 with >=2 attempts means one stable shape). */
+  /** Distinct body shas on the target family (1 = one stable shape). */
   distinctBodies: number
+  /** Global anomaly count across every route in the ledger (0 required to exit). */
   anomalyCount: number
   statuses: readonly number[]
   denialStatuses: readonly number[]
-  /** Non-denial responses to state-changing methods (POST/PUT/PATCH/DELETE). */
+  /** Non-denial responses to state-changing methods (POST/PUT/PATCH/DELETE) on the target family. */
   stateChangeAttempts: number
   staticCatchAll: boolean
   refutedHypotheses: number
-  /** Most-observed route (method/path/params only). */
+  /** Most recent concrete route of the target family (method/path/params only). */
   route?: SpecRouteEvidence
+  /** Every observed route family (bounded, body-free). */
+  routes: readonly RouteObservation[]
+}
+
+/** One route family's observations, for funnel/debug breakdowns. */
+export interface RouteObservation {
+  /** Normalized path (`/api/items/1001` → `/api/items/:id`). */
+  family: string
+  method: string
+  attempts: number
+  distinctAttempts: number
+  statuses: readonly number[]
+  anomalyCount: number
 }
 
 /**
@@ -485,56 +527,46 @@ export class SpecSubmissionTracker {
 
   /** Aggregate the route ledger into the numbers the early-exit predicate and event report. */
   observationSnapshot(): RouteObservationSnapshot {
-    const routeCounts = new Map<string, { route: SpecRouteEvidence; count: number }>()
-    const attemptKeys = new Set<string>()
-    const pathKeys = new Set<string>()
-    const paramKeys = new Set<string>()
-    const bodies = new Set<string>()
-    const statuses: number[] = []
-    let attempts = 0
+    interface FamilyState {
+      key: string
+      method: string
+      family: string
+      observations: RouteAttemptObservation[]
+    }
+    const families = new Map<string, FamilyState>()
     let anomalyCount = 0
-    let stateChangeAttempts = 0
-    let staticCatchAll = false
-    let refutedHypotheses = 0
-    let targetRoute: SpecRouteEvidence | undefined
     for (const observation of this.observations) {
-      attempts += 1
-      const key = `${observation.method} ${observation.path}`
-      pathKeys.add(key)
-      attemptKeys.add(`${key}?${(observation.pathAndQuery.split('?', 2)[1] ?? '')}`)
-      const params = (observation.pathAndQuery.split('?', 2)[1] ?? '')
-        .split('&')
-        .map(pair => (pair.split('=', 1)[0] ?? ''))
-        .filter(Boolean)
-        .sort()
-      paramKeys.add(params.join('&'))
-      if (observation.bodySha256) bodies.add(observation.bodySha256)
-      if (observation.status !== null) statuses.push(observation.status)
       if (observation.anomaly) anomalyCount += 1
-      if (observation.staticCatchAll) staticCatchAll = true
-      if (observation.refuted) refutedHypotheses += 1
-      if (EARLY_EXIT_STATE_CHANGE_METHODS.has(observation.method) &&
-        observation.status !== null && !EARLY_EXIT_HARDENED_STATUSES.has(observation.status)) {
-        stateChangeAttempts += 1
-      }
-      const existing = routeCounts.get(key)
-      const count = (existing?.count ?? 0) + 1
-      routeCounts.delete(key)
-      routeCounts.set(key, {
-        route: { method: observation.method, path: observation.path, params: params.slice(0, 4) },
-        count,
+      const family = normalizeRouteFamily(observation.path)
+      const key = `${observation.method} ${family}`
+      const existing = families.get(key)
+      if (existing) existing.observations.push(observation)
+      else families.set(key, { key, method: observation.method, family, observations: [observation] })
+    }
+    const routeSummaries: RouteObservation[] = []
+    let target: FamilyState | undefined
+    for (const family of families.values()) {
+      const statuses = family.observations.map(o => o.status).filter((status): status is number => status !== null)
+      routeSummaries.push({
+        family: family.family,
+        method: family.method,
+        attempts: family.observations.length,
+        distinctAttempts: new Set(family.observations.map(o => o.pathAndQuery)).size,
+        statuses,
+        anomalyCount: family.observations.filter(o => o.anomaly).length,
       })
+      // Highest attempt count wins; ties resolve to the most recently touched family.
+      if (!target || family.observations.length >= target.observations.length) target = family
     }
-    // Highest observation count wins; ties resolve to the most recently touched route.
-    let best = 0
-    for (const entry of routeCounts.values()) {
-      if (entry.count >= best) {
-        best = entry.count
-        targetRoute = entry.route
-      }
-    }
+    const observations = target?.observations ?? []
+    const attemptKeys = new Set(observations.map(o => o.pathAndQuery))
+    const pathKeys = new Set(observations.map(o => `${o.method} ${o.path}`))
+    const paramKeys = new Set(observations.map(o => paramNamesOf(o.pathAndQuery).join('&')))
+    const bodies = new Set(observations.map(o => o.bodySha256).filter((sha): sha is string => Boolean(sha)))
+    const statuses = observations.map(o => o.status).filter((status): status is number => status !== null)
+    const last = observations[observations.length - 1]
     return {
-      attempts,
+      attempts: observations.length,
       distinctAttempts: attemptKeys.size,
       distinctPaths: pathKeys.size,
       distinctParams: paramKeys.size,
@@ -542,10 +574,12 @@ export class SpecSubmissionTracker {
       anomalyCount,
       statuses,
       denialStatuses: statuses.filter(status => EARLY_EXIT_HARDENED_STATUSES.has(status)),
-      stateChangeAttempts,
-      staticCatchAll,
-      refutedHypotheses,
-      ...(targetRoute ? { route: targetRoute } : {}),
+      stateChangeAttempts: observations.filter(o =>
+        EARLY_EXIT_STATE_CHANGE_METHODS.has(o.method) && o.status !== null && !EARLY_EXIT_HARDENED_STATUSES.has(o.status)).length,
+      staticCatchAll: observations.some(o => o.staticCatchAll),
+      refutedHypotheses: observations.filter(o => o.refuted).length,
+      ...(last ? { route: { method: last.method, path: last.path, params: paramNamesOf(last.pathAndQuery).slice(0, 4) } } : {}),
+      routes: routeSummaries,
     }
   }
 
