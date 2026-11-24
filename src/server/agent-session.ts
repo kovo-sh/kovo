@@ -1822,7 +1822,32 @@ export function gapValidationRejectedMessage(
 
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
-  'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Prefer this over JSON-only proof specs and pass `script` inline (works with or without a mounted repo; `scriptPath` only reads from a mounted workspace): call one of the typed helpers (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_oob_callback / ctx.prove_race_burst) or ctx.http/ctx.browser/ctx.oob, then return ctx.result({ title, claims }).'
+  'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script") — no propose_chain_finding or verify_replay_spec call is needed. Pass `script` inline (works with or without a mounted repo; `scriptPath` only reads from a mounted workspace): call a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst) or ctx.http/ctx.browser/ctx.oob, then return ctx.result({ title }).'
+
+/** Runtime DeclarativeReplaySpec kinds rejected on legacy tools while `guardian_verify` is active. */
+export const GUARDIAN_VERIFY_ENFORCED_RUNTIME_KINDS: ReadonlySet<string> = new Set([
+  'http_chain',
+  'browser_chain',
+  'sql_boolean_diff',
+  'sql_time_diff',
+  'race_burst',
+  'rce_proof',
+  'auth_protocol_proof',
+  'cache_differential',
+])
+
+function preferredHelperForLegacyKind(kind: string): string {
+  if (kind === 'race_burst') return 'prove_race_burst'
+  if (kind === 'sql_boolean_diff' || kind === 'sql_time_diff') return 'prove_boolean_or_timing_diff'
+  if (kind === 'rce_proof') return 'prove_injection_differential'
+  return 'prove_access_boundary'
+}
+
+/** Crisp 1-line tool-boundary error steering runtime specs to `guardian_verify` when active. */
+export function guardianVerifyRedirectMessage(kind: string): string {
+  const helper = preferredHelperForLegacyKind(kind)
+  return `Runtime DeclarativeReplaySpec "${kind}" is disabled while guardian_verify is active — call guardian_verify(script="export default async (ctx) => { await ctx.${helper}({ ... }); return ctx.result({ title: '...' }) }", runtime="ts") instead (guardian_verify BOTH proves AND persists the confirmed finding with ProofReceipt; only static_ast_proof is accepted on legacy spec tools).`
+}
 
 export const GUARDIAN_VERIFY_TOOL_DESCRIPTION =
   `${GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE}\n\n${guardianVerifyHelperGuidance()}`
@@ -4786,6 +4811,15 @@ export function buildWorkerTools(
           errors.push('- confidenceRationale: must be a non-empty justification explaining why the finding holds (>= 10 chars).')
         }
         const parsed = declarativeReplaySpecSchema.safeParse(args.replaySpec)
+        if (hasGuardianVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
+          return {
+            isError: true,
+            output: [{
+              type: 'text' as const,
+              text: guardianVerifyRedirectMessage(parsed.data.kind),
+            }],
+          }
+        }
         if (!parsed.success) {
           errors.push(formatReplaySpecValidationIssues(parsed.error.issues, 'replaySpec'))
         }
@@ -4904,6 +4938,15 @@ export function buildWorkerTools(
           }
         }
         const parsed = declarativeReplaySpecSchema.safeParse(rawSpec)
+        if (hasGuardianVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
+          return {
+            isError: true,
+            output: [{
+              type: 'text' as const,
+              text: guardianVerifyRedirectMessage(parsed.data.kind),
+            }],
+          }
+        }
         if (!parsed.success) {
           return {
             isError: true,

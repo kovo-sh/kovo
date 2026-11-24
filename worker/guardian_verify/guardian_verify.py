@@ -975,6 +975,71 @@ class VerifyContext:
             **_feedback("race" if missing else None, missing, transcript),
         }
 
+    def prove_injection_differential(
+        self,
+        control: Any,
+        probe: Any,
+        *,
+        expected_output: Optional[str] = None,
+        vuln_class: Optional[str] = None,
+        session: str = "injection-diff",
+        message: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Benign control vs injection/SSTI probe (evaluated marker with anti-reflection, or engine fingerprint)."""
+        def _split_arm(arm: Any) -> tuple[Any, dict[str, Any]]:
+            if isinstance(arm, dict) and "target" in arm:
+                return arm["target"], dict(arm.get("options") or {})
+            return arm, {}
+        c_target, c_opts = _split_arm(control)
+        p_target, p_opts = _split_arm(probe)
+        c_ex = self.http(c_target, role="control", session=session, **c_opts)
+        p_ex = self.http(p_target, role="probe", session=session, **p_opts)
+        expected = (expected_output or "").strip()
+        missing: list[str] = []
+        emitted: list[dict[str, Any]] = []
+        evaluated = False
+        if len(expected) >= 4:
+            probe_req_text = f"{p_target}\n{p_opts.get('body', '')}"
+            in_probe = expected in (p_ex.body or "")
+            in_control = expected in (c_ex.body or "")
+            reflected = expected in probe_req_text
+            evaluated = in_probe and not in_control and not reflected
+            if not _is_success(c_ex.status):
+                missing.append("control_2xx")
+            if not in_probe:
+                missing.append("evaluated_marker_in_probe")
+            if in_control:
+                missing.append("marker_absent_from_control")
+            if reflected:
+                missing.append("non_reflected_expression")
+            absent_claim = {
+                "kind": "body_contains", "exchangeId": c_ex.exchange_id, "text": expected,
+                "absent": True, "message": f"{vuln_class or 'ssti'} control lacks evaluated marker",
+            }
+            present_claim = {
+                "kind": "body_contains", "exchangeId": p_ex.exchange_id, "text": expected,
+                "absent": False, "message": message or f"{vuln_class or 'ssti'} evaluated marker present in probe",
+            }
+            self.claims.extend([absent_claim, present_claim])
+            emitted.extend([absent_claim, present_claim])
+        else:
+            impact_claim: dict[str, Any] = {
+                "kind": "impact", "impactClass": "injection",
+                "controlExchangeIds": [c_ex.exchange_id], "probeExchangeId": p_ex.exchange_id,
+            }
+            if vuln_class:
+                impact_claim["vulnClass"] = vuln_class
+            if message:
+                impact_claim["message"] = message
+            self.claims.append(impact_claim)
+            emitted.append(impact_claim)
+        return {
+            "ok": not missing, "control": c_ex, "probe": p_ex, "claims": emitted, "evaluated": evaluated,
+            **_feedback("injection_differential" if missing else None, missing, [
+                _entry("control", c_ex), _entry("probe", p_ex),
+            ]),
+        }
+
     # -- camelCase aliases matching the TS contract ----------------------
     def proveAccessBoundary(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return self.prove_access_boundary(*args, **kwargs)
@@ -984,6 +1049,9 @@ class VerifyContext:
 
     def proveBooleanOrTimingDiff(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return self.prove_boolean_or_timing_diff(*args, **kwargs)
+
+    def proveInjectionDifferential(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.prove_injection_differential(*args, **kwargs)
 
     def proveOobCallback(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return self.prove_oob_callback(*args, **kwargs)
